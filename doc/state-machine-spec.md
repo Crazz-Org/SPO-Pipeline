@@ -1,8 +1,10 @@
-# Orchestrator state-machine spec — v1
+# Orchestrator state-machine spec — v1.1
 
-Status: **draft for shadow mode**. This is the contract the daemon implements; it will be
-revised against the measured improvisation rate mined from the experiment's transcripts
-(audit phase 2) before the first real card runs.
+Status: **draft for shadow mode**, revised against the measured improvisation analysis
+([improvisation-analysis.md](improvisation-analysis.md), phase 2: 16 card sessions, 35.2 %
+of driver actions improvised, dispositions BRANCH 78 % · PARK 18 % · DIAGNOSE 4 %). v1.1
+adds the two states that analysis found missing (CI_CHECKS, the `main`-moved transition) and
+the design consequences at the bottom.
 
 ## Principles
 
@@ -24,12 +26,12 @@ revised against the measured improvisation rate mined from the experiment's tran
 ## Task lifecycle
 
 ```
-INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → VALIDATE → MERGE → FINISH → DONE
-                      ▲         ▲                  │         │
-                      │         └── DIAGNOSE ◄─────┘         │  (gate FAIL, ≤3 attempts,
-                      │                │                     │   each a distinct root cause)
-                      │                └─────────────────────┘  (validator REJECT, own budget ≤3)
-  any state ──────────┴──────────────────────────────► PARKED (catch-all: report + stop)
+INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI_CHECKS → VALIDATE → MERGE → FINISH → DONE
+                                ▲                          │         │           │
+                                └────────── DIAGNOSE ◄─────┴─────────┴───────────┘
+                                                  (gate FAIL ≤3 distinct root causes ·
+                                                   unknown CI failure · validator REJECT ≤3)
+  any state ────────────────────────────────────────────► PARKED (catch-all: report + stop)
 ```
 
 | State | Kind | Does | Success → | Failure → |
@@ -40,10 +42,11 @@ INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → VA
 | IMPLEMENT | `claude -p` | write code + tests in the worktree per plan | CHECK | DIAGNOSE |
 | CHECK | script | typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines), invariant substring check | PUSH_PR | DIAGNOSE |
 | PUSH_PR | script | commit, push, open PR (`Closes #N`) — PR precedes gate (CI needs it) | GATE | PARKED |
-| GATE | script | `npm run gate` (bench job, background wait); read **exit code**: 0 PASS · 1 fail · 2 dirty · 3 worker down · 4 timeout | VALIDATE | 1 → DIAGNOSE · 2/3/4 → PARKED |
+| GATE | script | `npm run gate` (bench job, background wait); read **exit code**: 0 PASS · 1 fail · 2 dirty · 3 worker down · 4 timeout | CI_CHECKS | 1 → DIAGNOSE · 2/3/4 → PARKED |
+| CI_CHECKS | script | Two checks the bench does not make. (a) `gh pr checks <n>` once — CI normally concluded while the gate queued; on red, map the failing check **by name**: `Coverage of changed lines` → IMPLEMENT · `Lint` → IMPLEMENT · `PR rules` (protected files, needs `rdo-approved`) → PARKED · anything else → DIAGNOSE. (b) the `main`-moved test: intersect `git diff --name-only <baseMain>..origin/main` with the branch's changed files — non-empty → merge `origin/main`, back to CHECK and re-gate (once; a second move → PARKED); while the nightly says `main` is red, never merge from it → PARKED. *(Added in v1.1: 5/16 measured sessions reached a green gate and could not merge — every one improvised CI forensics; 4/16 needed the `main`-moved branch.)* | VALIDATE | per cause table |
 | DIAGNOSE | `claude -p` | one-line root cause from diff + gate log + ledger; append to ledger | IMPLEMENT (retry) | PARKED (3 attempts, or same root cause twice) |
 | VALIDATE | `claude -p` ×1–2 | `citation-verifier` (only if `rdo-members.ts` changed) then `change-validator`; JSON verdicts | MERGE | REJECT → IMPLEMENT (own budget of 3) · false citation → PARKED |
-| MERGE | script | `gh pr merge --merge` (enqueues), `npm run pr:wait`; exit code is the verdict | FINISH | PARKED |
+| MERGE | script | `gh pr merge --merge` (enqueues), `npm run pr:wait`; exit code is the verdict. Exit 4 (still open) → **one** more bounded wait, then PARKED. The queue is never dequeued, re-enqueued, `--admin`-forced or fed empty commits by the machine — the measured costliest improvisation family (24 episodes; one wrote Done on an open PR). | FINISH | PARKED |
 | FINISH | script | fast-forward main checkout, reap worktree, close task (board sync: Done + short comment) | DONE | PARKED |
 
 Ledger per task (`journal/<task>/ledger.md`): one line per attempt —
@@ -94,6 +97,27 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   `claude --resume`). A generated static HTML dashboard comes after the CLI, fed by the same
   journals.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).
+
+## Design consequences from the measured improvisation (v1.1)
+
+The analysis's top families are mostly **states not to have** rather than branches to write:
+
+1. **No shell-read alphabet in orchestrator states.** 164 ad-hoc `grep`/`cat`/`tail`/`ls`
+   calls measured, half of them polling for a sub-agent's file. The orchestrator reads
+   nothing ad hoc: steps read through their own granted tools, and the orchestrator consumes
+   only declared outputs (JSON payloads, exit codes, journal events).
+2. **No edit capability outside IMPLEMENT.** 15 blocked driver writes measured (3 aimed at
+   the wrong checkout). Only the IMPLEMENT step holds edit tools, and only inside the task's
+   worktree.
+3. **Every step has a wall-clock deadline.** The "sub-agent hadn't returned" family (18
+   episodes: list/ping/re-spawn loops, twice a duplicate executor) becomes: spawn once, wait
+   with a deadline, on expiry kill → retry once → PARKED. Never two live executors for one
+   task.
+4. **Only allowlisted command forms are ever emitted** (58 guard refusals, 26 re-spelling
+   episodes measured). The orchestrator's command table is the allowlist; there is nothing to
+   re-spell.
+5. **PARK is cheap, stalls are not.** PARK is only 18 % of episodes but ~31 % of wasted
+   volume: the machine parks early on queue/infra stalls instead of waiting creatively.
 
 ## Shadow mode and promotion
 
