@@ -1,0 +1,75 @@
+# SPO-Pipeline
+
+The factory that builds Starpeace WebClient — a **script-first orchestrator** that drives
+development tasks end-to-end (intake → plan → implement → gate → validate → merge → release)
+by calling Claude Code in headless mode (`claude -p`) for the steps that need judgement, and
+plain scripts for everything else.
+
+This repository is the successor of the in-repo experiment that lived inside
+`SPO-WebClient/.claude/` (driver prompts, hooks, kanban governance). The experiment proved
+the pipeline; this repo rebuilds its orchestration as code, while the product repository
+stays clean of every development-environment concern.
+
+## The one rule
+
+**Nothing in [SPO-WebClient](https://github.com/Crazz-Org/SPO-WebClient) belongs to the dev
+environment.** The product repo holds the client, the gateway, the shared RDO layer, its
+unit/protocol tests and its domain documentation. Everything that *operates on* the product —
+orchestrator, bench, prompts, accounts, monitoring — lives here, and works on product
+worktrees from the outside.
+
+## Repository map
+
+| Path | Holds | Status |
+|---|---|---|
+| `doc/environments.md` | The three environments (dev / pre-prod = L2 LIVE / production) and the flows between them | ✅ |
+| `doc/jewels-inventory.md` | The assets that must survive the v2 migration, and where each one goes | ✅ |
+| `doc/state-machine-spec.md` | The orchestrator: states, transitions, step contracts, account pool, observability | ✅ v1 |
+| `accounts/spo-test-accounts.yml` | SPO test accounts registry with special accesses (Mayor, ministries, presidential exception) | ✅ |
+| `scripts/usage-report.js` | Token-usage analyzer over local Claude Code transcripts (baseline + per-account later) | ✅ v0 |
+| `orchestrator/` | The daemon (state machine, queue, workers) | planned |
+| `prompts/` | Step prompts (plan, implement, diagnose, validate, citation-verifier) | planned — migrated from `SPO-WebClient/.claude/agents/` |
+| `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |
+| `console/` | Pipeline console: tasks, steps, Claude sessions, accounts, bench — see below | planned |
+| `journal/` | Per-task append-only event journals (git-ignored, local surface) | runtime |
+| `claude-accounts/` | Claude Max account registry (git-ignored — secrets) | runtime |
+
+## Ecosystem
+
+| Repo | Role |
+|---|---|
+| [SPO-WebClient](https://github.com/Crazz-Org/SPO-WebClient) | The product (public). Releases via `v*` tags. |
+| [SPO-Deploy](https://github.com/Crazz-Org/SPO-Deploy) | Production deployment on the dedicated server. Consumes product releases. |
+| **SPO-Pipeline** (this repo) | The factory. Private. |
+| `~/SPO-Original`, `~/SPO-ASP` | Read-only historical references (Delphi servers + Voyager client, ASP pages). |
+
+## Observability — sessions and pipeline
+
+Every component writes append-only JSONL journals; the console is a *reader*, never a second
+source of truth (same philosophy as `~/.spo-bench/`):
+
+- every state transition of every task is one journal event;
+- every `claude -p` step records its **`session_id`**, model, effort, cost and result —
+  any step can be reopened interactively for debugging with `claude --resume <session_id>`;
+- account events (limit hit, cooldown, recovery) are journal events too;
+- `spo status` / `spo task <id>` (CLI, planned) render the journals + `~/.spo-bench/`
+  verdicts/nightly/queue; a generated static HTML view comes after the CLI.
+
+## Migration (strangler, not big-bang)
+
+1. **Jewels inventory** — done (`doc/jewels-inventory.md`).
+2. **Daemon skeleton + shadow mode** on synthetic tasks — the orchestrator is built here
+   from day one; the product repo accepts no new tooling.
+3. **Real S-sized cards** through the pipeline; measure parking rate and weighted tokens per
+   merged card against the baseline.
+4. **Retire** the in-product process prose and hooks as the old path stops being used.
+5. **Extend intake**: `/triage-report` queue first, then in-game bug reports from production
+   (the far target: player report → nightly fix → release).
+
+The maintainer's plan (measured baseline, levers, decisions) lives in a Claude artifact;
+decisions of record are mirrored into this repo's docs as they land.
+
+## Language
+
+Repository content is English (same rule as the product board). Conversations with the
+maintainer may be French; translate on the way in.

@@ -1,0 +1,57 @@
+# SPO test accounts registry — the special accesses live testing relies on.
+# Mirrored from SPO-WebClient CLAUDE.md § "E2E credentials — LOCKED" (public repo, so these
+# test credentials are already public). This file is the machine-readable source the
+# pipeline's L2/L3 steps consume.
+#
+# LOCKED: never change these accounts without explicit developer approval.
+
+zone: "Free Space" # NOT the BETA zone — the live directory hosts these worlds under Free Space
+worlds:
+  live: [planitia, shamba, zorcon] # BETA zone only has aries
+  gate_world: planitia
+
+accounts:
+  - login: SPO_test3
+    password: test3
+    role: primary
+    world: planitia
+    special_access:
+      - "Mayor of Helartia"
+      - "Minister of Agriculture"
+    company: "SPO_test3 - Green"
+    used_for:
+      - governance reads and writes
+      - roads
+      - zones
+    blast_radius: "mutations only on Helartia (the town this account is Mayor of)"
+
+  - login: Crazz
+    password: test
+    role: secondary
+    world: planitia
+    special_access: []
+    holdings: "basic account, 2 buildings"
+    used_for:
+      - permission-negative checks
+      - mail receive (one test mail per run, deleted in the same run)
+      - rating another tycoon's term
+    blast_radius: "no flow touches its buildings"
+
+# Accesses NOBODY holds — recorded exceptions, not gaps to work around.
+missing_capabilities:
+  president:
+    holder: none
+    scope:
+      - "the six TPresidentialHall members"
+      - "every canGovern-gated Capitol path"
+    policy: >
+      The gate reads the capability from the server (IsPresident in the tycoon cache,
+      canGovern on the Capitol), never from the UI: a missing control is a bug to fix, a
+      refused capability is a recorded exception the gate continues past. If the server ever
+      grants it, the gate fails closed until a flow drives the member — no flag and no human
+      text clears it (SPO-WebClient doc/E2E-POLICY.md §7).
+
+global_rules:
+  - "Never another player's assets, never a world-scope value."
+  - "A mutation is proven by the FIVEMODELSERVER/Survival log line, not by success: true."
+  - "Adding or changing an account here requires explicit developer approval (LOCKED)."
