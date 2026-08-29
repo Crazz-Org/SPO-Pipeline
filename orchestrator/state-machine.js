@@ -40,6 +40,9 @@ const {
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
+const { moveCard } = require('./board');
+const { postParkComment, unparkScan } = require('./park-loop');
+const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 
 // True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
 // condition under which a scripted step's handler dispatches to steps/scripted.js's real
@@ -129,7 +132,7 @@ async function handleWorktree(ctx) {
     throw new ParkSignal('main-red-refuse-worktree', {});
   }
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx));
+    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'WORKTREE', () =>
     runScripted(ctx, 'worktree', { defaultExit: 0 })
@@ -140,7 +143,7 @@ async function handleWorktree(ctx) {
 }
 
 async function handlePlan(ctx) {
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN');
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
   if (payload && payload.ok !== false) return 'IMPLEMENT';
@@ -148,7 +151,11 @@ async function handlePlan(ctx) {
 }
 
 async function handleImplement(ctx) {
-  const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT');
+  // Kanban piloting: move to "Implementing" before the LLM call -- IMPLEMENT is an LLM step, not
+  // a scripted one, so there is no realX(ctx, deps) function for board.js's moveCard to live
+  // inside; it runs here instead, gated the same way every real-mode call in this file is.
+  if (isRealMode(ctx)) moveCard(ctx, ctx.deps, 'IMPLEMENT');
+  const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload });
   if (payload && payload.ok !== false) return 'CHECK';
@@ -157,7 +164,7 @@ async function handleImplement(ctx) {
 
 async function handleCheck(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'CHECK', () => realCheck(ctx));
+    return callWithDeadline(ctx, 'CHECK', () => realCheck(ctx, ctx.deps));
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'CHECK', () =>
     runScripted(ctx, 'check', { defaultExit: 0 })
@@ -169,7 +176,7 @@ async function handleCheck(ctx) {
 
 async function handlePushPr(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'PUSH_PR', () => realPushPr(ctx));
+    return callWithDeadline(ctx, 'PUSH_PR', () => realPushPr(ctx, ctx.deps));
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'PUSH_PR', () =>
     runScripted(ctx, 'pushPr', { defaultExit: 0 })
@@ -181,7 +188,7 @@ async function handlePushPr(ctx) {
 
 async function handleGate(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'GATE', () => realGate(ctx));
+    return callWithDeadline(ctx, 'GATE', () => realGate(ctx, ctx.deps));
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'GATE', () =>
     runScripted(ctx, 'gate', { defaultExit: 0 })
@@ -200,7 +207,7 @@ async function handleGate(ctx) {
 //  (b) only if (a) was green: the main-moved test, at most one re-merge-and-regate per task.
 async function handleCiChecks(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx));
+    return callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx, ctx.deps));
   }
   const failingCheck = ctx.fixture('ciChecks', null);
   if (failingCheck) {
@@ -235,7 +242,7 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
-  const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE');
+  const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
   const attemptN = ++ctx.counters.diagnoseAttempts;
   const rootCause = (result && result.rootCause) || `unspecified-cause-${attemptN}`;
   appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', { attempt: attemptN, rootCause });
@@ -255,15 +262,19 @@ async function handleDiagnose(ctx) {
 // change-validator REJECT has its own budget (config.validateRejectBudget), separate from
 // DIAGNOSE's -- a false citation from citation-verifier parks immediately, no budget.
 async function handleValidate(ctx) {
+  // Kanban piloting: move to "Validation" once per VALIDATE entry, before either LLM call --
+  // same reasoning as handleImplement's own moveCard (no realX(ctx, deps) split for an LLM step).
+  if (isRealMode(ctx)) moveCard(ctx, ctx.deps, 'VALIDATE');
+
   if (ctx.task.touchesRdoMembers) {
-    const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER');
+    const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
     const verdict = (cv && cv.verdict) || 'PASS';
     appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict });
     if (verdict === 'REJECT') throw new ParkSignal('citation-false', { verdict });
     // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
   }
 
-  const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE');
+  const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', ctx.deps);
   const verdict = result && result.verdict;
   appendEvent(ctx.taskDir, 'VALIDATE', 'change-validator', { verdict, findings: result && result.findings });
 
@@ -282,7 +293,7 @@ async function handleValidate(ctx) {
 // bounded re-wait, never a loop. Exit 0 -> FINISH, anything else -> PARKED.
 async function handleMerge(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'MERGE', () => realMerge(ctx));
+    return callWithDeadline(ctx, 'MERGE', () => realMerge(ctx, ctx.deps));
   }
   const enqueue = await callWithDeadline(ctx, 'MERGE', () => runScripted(ctx, 'prMergeEnqueue', { defaultExit: 0 }));
   appendEvent(ctx.taskDir, 'MERGE', 'pr-merge-enqueue', { exit: enqueue.exit });
@@ -303,7 +314,7 @@ async function handleMerge(ctx) {
 
 async function handleFinish(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'FINISH', () => realFinish(ctx));
+    return callWithDeadline(ctx, 'FINISH', () => realFinish(ctx, ctx.deps));
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'FINISH', () =>
     runScripted(ctx, 'finish', { defaultExit: 0 })
@@ -345,6 +356,13 @@ function buildCtx(id, task, taskDir, config) {
     shadowMode: !!config.shadowMode,
     dryRun: !!config.dryRun,
     fixture: makeFixtureReader(task),
+    // The one real-mode injection point every realX(ctx, deps)/callLlmStep(ctx, ..., deps) call
+    // site in this file now threads through: production never sets config.deps, so this is {}
+    // (real spawnSync/claude) unless a test explicitly builds config with one -- same convention
+    // as steps/scripted.js's own deps.spawnSync, one level up so board.js's moveCard and
+    // park-loop.js's postParkComment (called from inside this file, with no realX split of
+    // their own) share it too.
+    deps: (config && config.deps) || {},
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
     counters: {
@@ -378,6 +396,15 @@ function finalizePark(ctx, lastState, reason, detail) {
   snap.lastState = lastState;
   writeState(ctx.taskDir, snap);
   writeReport(ctx.taskDir, { id: ctx.id, reason, lastState, ts: snap.updatedAt, detail });
+
+  // Kanban piloting, the park half of the round trip: real mode, kind:"card" tasks only -- never
+  // for shadow/dry-run (every existing PARKED test in this suite is shadow mode and must see no
+  // new spawn) and never for a non-card task (nothing to comment on). park-loop.js's own
+  // moveCard('PARKED') call inside postParkComment skips itself, journaled, when the worktree
+  // was never created (a pre-WORKTREE park) -- the gh comment still posts either way.
+  if (isRealMode(ctx) && ctx.task && ctx.task.kind === 'card') {
+    postParkComment(ctx, ctx.deps, { reason, detail, lastState });
+  }
 }
 
 // Runs one task through the state machine to completion (DONE or PARKED). Never throws for a
@@ -477,10 +504,28 @@ async function drainQueueOnce(queueDir, journalRoot, config) {
 
 // Polls the queue directory forever, draining whatever has arrived since the last pass. Used
 // by `daemon.js` when --once is not given; not exercised by the test suite (which always runs
-// --shadow --once against a fully-prepared queue).
+// --shadow --once against a fully-prepared queue), same as before this function grew two more
+// real-mode-only calls -- park-loop.js's unparkScan (kanban piloting's retry/abandon
+// round trip) and auto-pull.js's timed board pull, both individually unit-tested against
+// injected deps elsewhere (test/park-loop.test.js, test/auto-pull.test.js). config.real gates
+// both the same way isRealMode(ctx) gates everything else real in this file; config.deps is the
+// same injection point buildCtx already threads through HANDLERS.
 async function runForever(queueDir, journalRoot, config) {
+  let lastAutoPullAt = null;
   for (;;) {
     await drainQueueOnce(queueDir, journalRoot, config);
+
+    if (config.real) {
+      const deps = config.deps || {};
+      await unparkScan(queueDir, journalRoot, config, deps);
+
+      const now = Date.now();
+      if (shouldAutoPull(lastAutoPullAt, now, config.autoPullMs)) {
+        lastAutoPullAt = now;
+        await runAutoPull(queueDir, journalRoot, config, deps);
+      }
+    }
+
     await sleep(config.pollIntervalMs);
   }
 }

@@ -34,6 +34,7 @@ const { spawnSync } = require('child_process');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
+const { moveCard } = require('../board');
 
 function lastLines(text, n = 20) {
   if (!text) return '';
@@ -176,7 +177,12 @@ async function realWorktree(ctx, deps = {}) {
   const claim = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['run', 'board:take', '--', String(issue)], {
     cwd: worktreePath,
   });
-  if (claim.exit === 0) return 'PLAN';
+  if (claim.exit === 0) {
+    // Kanban piloting: the worktree now exists and cwd for board:move -- move the card to
+    // "Planning" (the state PLAN, next, belongs to). Never blocks (board.js's own rule).
+    moveCard(ctx, deps, 'WORKTREE');
+    return 'PLAN';
+  }
   if (claim.exit === 3) throw new ParkSignal('claim-lost', { exit: claim.exit });
   if (claim.exit === 4 || claim.exit === 5) throw new ParkSignal('claim-rate-limited', { exit: claim.exit });
   if (claim.exit === 6) throw new ParkSignal('claim-finished-worktree', { exit: claim.exit });
@@ -191,6 +197,7 @@ const CHECK_ALIASES = ['typecheck', 'lint', 'coverage:changed'];
 
 async function realCheck(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
+  moveCard(ctx, deps, 'CHECK'); // kanban piloting: "Checks & PR" -- covers PUSH_PR too, no separate move there
   for (const alias of CHECK_ALIASES) {
     const r = spawnStep(ctx, deps, 'CHECK', 'npm', ['run', alias], { cwd: worktreePath });
     if (r.exit !== 0) {
@@ -268,6 +275,7 @@ async function realPushPr(ctx, deps = {}) {
 // -> PARKED. Mirrors handleGate's own shadow-mode cause table exactly.
 async function realGate(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
+  moveCard(ctx, deps, 'GATE'); // kanban piloting
   const r = spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate'], { cwd: worktreePath });
   if (r.exit === 0) return 'CI_CHECKS';
   if (r.exit === 1) return 'DIAGNOSE';
@@ -375,6 +383,8 @@ async function realMerge(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
   const prNumber = ctx.prNumber;
+
+  moveCard(ctx, deps, 'MERGE'); // kanban piloting
 
   const enqueue = spawnStep(ctx, deps, 'MERGE', 'gh', [
     'pr',

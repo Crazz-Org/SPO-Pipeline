@@ -83,6 +83,15 @@ module.exports = {
   // ~/.spo-bench/verdicts/<sha>.json (CI_CHECKS' baseMain, for the main-moved intersection).
   spoBenchDir: path.join(os.homedir(), '.spo-bench'),
 
+  // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
+  //
+  // daemon.js --real polls the board on this timer, between drain passes (state-machine.js's
+  // runForever), running the same pullBoard + makeTask `spo pull` already does by hand, for the
+  // top autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
+  // overrides -- see orchestrator/README.md § Kanban piloting for the GraphQL cost.
+  autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
+  autoPullLimit: 3,
+
   REPO_ROOT,
   cwdForStep,
   WORKTREE_SIDE_STEPS,

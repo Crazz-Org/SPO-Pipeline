@@ -22,6 +22,7 @@ worktrees from the outside.
 
 | Path | Holds | Status |
 |---|---|---|
+| `.claude/commands/SPO-Draft.md` | `/SPO-Draft` — interactive-session front end for the intake brainstorm lane: synthesizes a conversation into a draft card, shows the `--dry` review verdict verbatim, files only on explicit confirmation (see `orchestrator/README.md` § Intake) | ✅ |
 | `doc/environments.md` | The three environments (dev / pre-prod = L2 LIVE / production) and the flows between them | ✅ |
 | `doc/jewels-inventory.md` | The assets that must survive the v2 migration, and where each one goes | ✅ |
 | `doc/state-machine-spec.md` | The orchestrator: states, transitions, step contracts, account pool, observability | ✅ v1 |
