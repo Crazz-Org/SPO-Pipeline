@@ -62,20 +62,28 @@ function writeJson(file, obj) {
 
 // ---- WORKTREE -------------------------------------------------------------------------------
 
+// Fake spawnSync for a `realWorktree` run with NO leftovers at all: `worktree list --porcelain`
+// reports nothing, and both `rev-parse --verify --quiet` leftover-detection calls (local branch,
+// remote branch) report "not found" (a real `git rev-parse --verify --quiet` on a missing ref
+// exits non-zero) -- distinguished from the pre-existing `rev-parse origin/main` call, which has
+// no `--verify` flag, by checking for it explicitly.
+function noLeftoversSpawnSync(calls, { originMainSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } = {}) {
+  return (command, args, opts) => {
+    calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+    if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftover branch, local or remote
+    if (args.includes('rev-parse')) return ok(`${originMainSha}\n`);
+    if (args.includes('board:take')) return ok('claimed\n');
+    return ok('');
+  };
+}
+
 test('realWorktree: fetch -> rev-parse -> worktree add -> npm ci -> board:take -> board:move (Planning), exact argv, sets worktreePath', async () => {
   const config = testConfig();
   const task = { id: 'card-42', kind: 'card', issue: 42, title: 'Add a widget' };
   const ctx = testCtx({ id: 'card-42', task, config });
 
   const calls = [];
-  const deps = {
-    spawnSync: (command, args, opts) => {
-      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
-      if (args.includes('rev-parse')) return ok('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n');
-      if (args.includes('board:take')) return ok('claimed\n');
-      return ok('');
-    },
-  };
+  const deps = { spawnSync: noLeftoversSpawnSync(calls) };
 
   const next = await realWorktree(ctx, deps);
 
@@ -90,25 +98,46 @@ test('realWorktree: fetch -> rev-parse -> worktree add -> npm ci -> board:take -
     args: ['-C', config.productRepo, 'rev-parse', 'origin/main'],
     cwd: undefined,
   });
+  // card #424: the leftover sweep (worktree list, then local/remote branch --verify checks --
+  // see sweepWorktreeLeftovers) always runs between the nightly check and the add, even when it
+  // finds nothing to clean.
   assert.deepEqual(calls[2], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'worktree', 'list', '--porcelain'],
+    cwd: undefined,
+  });
+  assert.deepEqual(calls[3], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'rev-parse', '--verify', '--quiet', 'refs/heads/claude-pipe/card-42'],
+    cwd: undefined,
+  });
+  assert.deepEqual(calls[4], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/claude-pipe/card-42'],
+    cwd: undefined,
+  });
+  // Nothing found -> no worktree remove/prune, no branch -D, no push --delete -- the add and
+  // everything after it is byte-identical to before this fix.
+  assert.deepEqual(calls[5], {
     command: 'git',
     args: ['-C', config.productRepo, 'worktree', 'add', expectedWorktreePath, '-b', 'claude-pipe/card-42', 'origin/main'],
     cwd: undefined,
   });
-  assert.deepEqual(calls[3], { command: 'npm', args: ['ci'], cwd: expectedWorktreePath });
-  assert.deepEqual(calls[4], {
+  assert.deepEqual(calls[6], { command: 'npm', args: ['ci'], cwd: expectedWorktreePath });
+  assert.deepEqual(calls[7], {
     command: 'npm',
     args: ['run', 'board:take', '--', '42'],
     cwd: expectedWorktreePath,
   });
   // Kanban piloting: once the claim succeeds (and the worktree exists), WORKTREE moves the card
   // to "Planning" -- see orchestrator/board.js's COLUMN_BY_STATE.
-  assert.deepEqual(calls[5], {
+  assert.deepEqual(calls[8], {
     command: 'npm',
     args: ['run', 'board:move', '--', '42', 'Planning'],
     cwd: expectedWorktreePath,
   });
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 9);
+  assert.ok(!calls.some((c) => c.args.includes('remove') || c.args.includes('prune') || c.args.includes('-D') || c.args.includes('--delete')));
 });
 
 test('realWorktree: nightly says main is red at the fetched origin/main sha -> PARKED before worktree add', async () => {
@@ -143,12 +172,7 @@ test('realWorktree: nightly FAIL at a DIFFERENT sha does not refuse', async () =
   const task = { id: 'card-notred', kind: 'card', issue: 44 };
   const ctx = testCtx({ id: 'card-notred', task, config });
 
-  const deps = {
-    spawnSync: (command, args) => {
-      if (args.includes('rev-parse')) return ok('freshsha0000000000000000000000000000000\n');
-      return ok('');
-    },
-  };
+  const deps = { spawnSync: noLeftoversSpawnSync([], { originMainSha: 'freshsha0000000000000000000000000000000' }) };
 
   const next = await realWorktree(ctx, deps);
   assert.equal(next, 'PLAN');
@@ -167,7 +191,8 @@ for (const [exit, reason] of [
     const ctx = testCtx({ id: `card-claim-${exit}`, task, config });
 
     const deps = {
-      spawnSync: (command, args) => {
+      spawnSync: (command, args, opts) => {
+        if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers
         if (args.includes('rev-parse')) return ok('sha0000000000000000000000000000000000000\n');
         if (args.includes('board:take')) return fail(exit, 'claim failed');
         return ok('');
@@ -190,6 +215,7 @@ test('realWorktree: git worktree add failure -> PARKED (worktree-add-failed), np
   const deps = {
     spawnSync: (command, args) => {
       calls.push(args);
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers
       if (args.includes('rev-parse')) return ok('sha0000000000000000000000000000000000000\n');
       if (args.includes('worktree') && args.includes('add')) return fail(1, 'already exists');
       return ok('');
@@ -201,6 +227,163 @@ test('realWorktree: git worktree add failure -> PARKED (worktree-add-failed), np
     (err) => err instanceof ParkSignal && err.reason === 'worktree-add-failed'
   );
   assert.ok(!calls.some((a) => a[0] === 'ci'));
+});
+
+// ---- WORKTREE: card #424's leftover sweep (sweepWorktreeLeftovers) ------------------------
+//
+// The pipeline retries a task by restarting it at INTAKE (runTask, state-machine.js), so a
+// second real pass of a task parked past WORKTREE collides with the first pass's own worktree
+// directory / local branch / pushed remote branch, all three living in the pipeline's own
+// exclusive namespace (worktrees/<taskId>, claude-pipe/<taskId>). realWorktree now cleans its
+// own leftovers there before the add. These tests build a task id + worktreePath by hand
+// (instead of testCtx's usual fresh id) so the "leftover" is a real directory this test itself
+// creates ahead of time, standing in for a previous pass's worktree.
+
+function readJournal(taskDir) {
+  return fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+test('realWorktree leftover sweep: clean worktree dir + a local branch merged into origin/main -- both removed, add proceeds, both cleanups journaled', async () => {
+  const config = testConfig();
+  const task = { id: 'card-retry-a', kind: 'card', issue: 424 };
+  const ctx = testCtx({ id: 'card-retry-a', task, config });
+  const branch = 'claude-pipe/card-retry-a';
+  const worktreePath = path.join(config.pipelineWorktreesDir, 'card-retry-a');
+  fs.mkdirSync(worktreePath, { recursive: true }); // stands in for a previous pass's worktree
+
+  const localSha = 'localsha00000000000000000000000000000000';
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('status') && args.includes('--porcelain')) return ok(''); // clean
+      if (args.includes('worktree') && args.includes('list')) return ok(''); // not registered -- found via disk instead
+      if (args.includes('rev-parse') && args.includes(`refs/heads/${branch}`)) return ok(`${localSha}\n`);
+      if (args.includes('merge-base') && args.includes('--is-ancestor')) return ok(''); // exit 0 -> ancestor of origin/main
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no remote branch leftover
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      if (args.includes('board:take')) return ok('claimed\n');
+      return ok('');
+    },
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+
+  assert.ok(calls.some((c) => c.args.includes('remove') && c.args.includes(worktreePath)), 'expected worktree remove');
+  assert.ok(calls.some((c) => c.args.includes('prune')), 'expected worktree prune');
+  assert.ok(calls.some((c) => c.args.includes('-D') && c.args.includes(branch)), 'expected branch -D');
+  assert.ok(!calls.some((c) => c.args.includes('--delete')), 'no remote branch leftover -- push --delete must not run');
+
+  const journal = readJournal(ctx.taskDir);
+  const removedEvent = journal.find((e) => e.event === 'leftover-worktree-removed');
+  assert.ok(removedEvent && removedEvent.wasOnDisk === true);
+  const branchEvent = journal.find((e) => e.event === 'leftover-branch-deleted');
+  assert.ok(branchEvent && branchEvent.branch === branch && branchEvent.sha === localSha);
+
+  // The add ran (this is the whole point -- the collision from card #424 is gone).
+  assert.ok(calls.some((c) => c.args.includes('add') && c.args.includes(worktreePath)));
+});
+
+test('realWorktree leftover sweep: a DIRTY leftover worktree parks worktree-dirty-leftover -- nothing is removed', async () => {
+  const config = testConfig();
+  const task = { id: 'card-retry-b', kind: 'card', issue: 425 };
+  const ctx = testCtx({ id: 'card-retry-b', task, config });
+  const worktreePath = path.join(config.pipelineWorktreesDir, 'card-retry-b');
+  fs.mkdirSync(worktreePath, { recursive: true });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M some-uncommitted-file.ts\n'); // dirty
+      if (args.includes('worktree') && args.includes('list')) return ok('');
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no branch leftovers
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realWorktree(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'worktree-dirty-leftover'
+  );
+
+  assert.ok(!calls.some((c) => c.args.includes('remove')), 'a dirty leftover must never be removed');
+  assert.ok(fs.existsSync(worktreePath), 'the dirty directory itself must still be on disk');
+  assert.ok(!calls.some((c) => c.args.includes('add')), 'worktree add must never run past a dirty-leftover park');
+});
+
+test('realWorktree leftover sweep: a local branch with an unpushed, unmerged tip parks branch-unmerged-leftover -- never deleted', async () => {
+  const config = testConfig();
+  const task = { id: 'card-retry-c', kind: 'card', issue: 426 };
+  const ctx = testCtx({ id: 'card-retry-c', task, config });
+  const branch = 'claude-pipe/card-retry-c';
+
+  const localSha = 'localonlysha0000000000000000000000000000';
+  const remoteSha = 'staleremotesha000000000000000000000000000'; // an older push -- not the same commit
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('worktree') && args.includes('list')) return ok(''); // no worktree-path leftover
+      if (args.includes('rev-parse') && args.includes(`refs/heads/${branch}`)) return ok(`${localSha}\n`);
+      if (args.includes('merge-base') && args.includes('--is-ancestor')) return fail(1); // NOT an ancestor of main
+      if (args.includes('rev-parse') && args.includes(`refs/remotes/origin/${branch}`)) return ok(`${remoteSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realWorktree(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'branch-unmerged-leftover' &&
+      err.detail.localSha === localSha &&
+      err.detail.remoteSha === remoteSha
+  );
+
+  assert.ok(!calls.some((c) => c.args.includes('-D')), 'an unmerged local-only branch must never be deleted');
+  assert.ok(!calls.some((c) => c.args.includes('add') && c.args.includes('worktree')), 'worktree add must never run past this park');
+});
+
+test('realWorktree leftover sweep: a pushed remote branch leftover (no local branch) is deleted with push --delete, before the add', async () => {
+  const config = testConfig();
+  const task = { id: 'card-retry-d', kind: 'card', issue: 427 };
+  const ctx = testCtx({ id: 'card-retry-d', task, config });
+  const branch = 'claude-pipe/card-retry-d';
+
+  const remoteSha = 'remotesha0000000000000000000000000000000';
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('worktree') && args.includes('list')) return ok(''); // no worktree-path leftover
+      if (args.includes('rev-parse') && args.includes(`refs/heads/${branch}`)) return fail(1); // no local branch
+      if (args.includes('rev-parse') && args.includes(`refs/remotes/origin/${branch}`)) return ok(`${remoteSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      if (args.includes('board:take')) return ok('claimed\n');
+      return ok('');
+    },
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+
+  const deleteIdx = calls.findIndex((c) => c.args.includes('push') && c.args.includes('--delete') && c.args.includes(branch));
+  const addIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('worktree') && c.args.includes('add'));
+  assert.ok(deleteIdx !== -1, 'expected git push origin --delete <branch>');
+  assert.ok(addIdx !== -1);
+  assert.ok(deleteIdx < addIdx, 'the remote-branch cleanup must run before worktree add, not after');
+
+  const journal = readJournal(ctx.taskDir);
+  const cleanedEvent = journal.find((e) => e.event === 'remote-branch-cleaned');
+  assert.ok(cleanedEvent && cleanedEvent.branch === branch && cleanedEvent.sha === remoteSha);
 });
 
 // ---- CHECK ----------------------------------------------------------------------------------
@@ -793,6 +976,8 @@ test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHE
   const deps = {
     spawnSync: (command, args, opts) => {
       log.push({ command, args: [...args], cwd: opts && opts.cwd });
+      // card #424's leftover sweep -- no leftovers for this fresh, never-retried task.
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1);
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha000000000000000000000000000\n');
       if (args.includes('board:take')) return ok('claimed\n');
