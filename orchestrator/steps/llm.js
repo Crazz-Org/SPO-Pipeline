@@ -59,7 +59,7 @@ const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { resolveStepContract, LLM_STEP_DEADLINE_MS } = require('../step-contracts');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
-const { buildPromptValues, scratchDir } = require('../task-values');
+const { buildPromptValues } = require('../task-values');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
 
@@ -257,23 +257,22 @@ function withCamelAliases(payload) {
 // enough to walk the state machine to DONE, never a stand-in for an actual judgement. Every
 // shape carries `dryRun: true` so nothing downstream can mistake it for a real verdict.
 //
-// PLAN's plan_path/invariants_path cannot be null here even though nothing ever reads them for
-// real in a dry run: handlePlan journals this payload verbatim, and task-values.js's IMPLEMENT/
-// VALIDATE derivation reads it back from that journal on the *next* dry-run LLM call in the same
-// walk -- a null would fail their own placeholder fill as "missing" (correctly; null is never a
-// valid path) and PARK the very walk --dry-run exists to complete end to end. Using the same
-// scratch_dir/plan-<issue>.md convention plan.md's own text specifies keeps this consistent with
-// what a real PLAN call would have produced.
+// PLAN's plan_markdown/invariants_markdown cannot be empty here even though nothing ever reads
+// the *content* for real in a dry run: handlePlan (state-machine.js) validates both are non-empty
+// strings and writes them to scratch_dir/plan-<issue>.md / invariants-<issue>.md exactly as a
+// real PLAN reply would, then journals the resulting plan_path/invariants_path -- task-values.js's
+// IMPLEMENT/VALIDATE derivation reads those paths back from that journal on the *next* dry-run LLM
+// call in the same walk. An empty string would fail handlePlan's own validation as "plan invalid"
+// and PARK the very walk --dry-run exists to complete end to end.
 function cannedDryRunPayload(stepName, contract, ctx) {
   const base = { ok: true, dryRun: true };
   switch (stepName) {
     case 'PLAN': {
-      const dir = scratchDir(ctx.taskDir);
       const issue = (ctx.task && ctx.task.issue) || 'unknown';
       return {
         ...base,
-        plan_path: path.join(dir, `plan-${issue}.md`),
-        invariants_path: path.join(dir, `invariants-${issue}.md`),
+        plan_markdown: `# Plan (dry run)\n\n[dry-run] no real plan was composed for issue ${issue}.\n`,
+        invariants_markdown: `# Invariants (dry run)\n\n[dry-run] no invariants were composed.\n`,
         invariant_ids: [],
         check_commands: [],
       };

@@ -43,6 +43,15 @@ test('dry-run demo: a card task reaches DONE with dryrun-<STATE>.md for every LL
   assert.ok(!fs.existsSync(path.join(taskDir, 'dryrun-DIAGNOSE.md')));
   assert.ok(!fs.existsSync(path.join(taskDir, 'dryrun-CITATION_VERIFIER.md')));
 
+  // handlePlan (state-machine.js) writes PLAN's two documents itself -- even under --dry-run,
+  // from the canned plan_markdown/invariants_markdown steps/llm.js's cannedDryRunPayload
+  // supplies -- at the same scratch_dir/plan-<issue>.md convention a real PLAN reply would use.
+  assert.ok(fs.existsSync(path.join(taskDir, 'scratch', 'plan-123.md')), 'expected scratch/plan-123.md to be written');
+  assert.ok(
+    fs.existsSync(path.join(taskDir, 'scratch', 'invariants-123.md')),
+    'expected scratch/invariants-123.md to be written'
+  );
+
   const events = readJournal(journalDir, 'card-dryrun-001');
   assert.ok(events.some((e) => e.event === 'dry-run' && e.state === 'PLAN'));
   assert.ok(events.some((e) => e.event === 'dry-run' && e.state === 'IMPLEMENT'));
@@ -98,7 +107,7 @@ test('dry-run demo: dryrun-PLAN.md shows the real argv (--model/--effort/--json-
   assert.match(content, /--effort/);
   assert.match(content, /medium/); // size "M" -> effort "medium"
   assert.match(content, /--json-schema/);
-  assert.match(content, /plan_path/); // PLAN's output contract, inside the json-schema
+  assert.match(content, /plan_markdown/); // PLAN's output contract, inside the json-schema
 
   assert.match(content, /## filled prompt/);
   assert.match(content, new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
@@ -162,6 +171,9 @@ test('dry-run demo: WORKTREE-side steps (PLAN, IMPLEMENT) never spawn -- deps.sp
     assert.equal(spawned, false, '--dry-run must never call spawnSync');
     assert.equal(result.dryRun, true);
     assert.equal(result.ok, true);
-    assert.deepEqual(Object.keys(result).sort(), ['check_commands', 'dryRun', 'invariant_ids', 'invariants_path', 'ok', 'plan_path'].sort());
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ['check_commands', 'dryRun', 'invariant_ids', 'invariants_markdown', 'ok', 'plan_markdown'].sort()
+    );
   });
 });
