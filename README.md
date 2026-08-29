@@ -27,11 +27,14 @@ worktrees from the outside.
 | `doc/state-machine-spec.md` | The orchestrator: states, transitions, step contracts, account pool, observability | ✅ v1 |
 | `accounts/spo-test-accounts.yml` | SPO test accounts registry with special accesses (Mayor, ministries, presidential exception) | ✅ |
 | `scripts/usage-report.js` | Token-usage analyzer over local Claude Code transcripts (baseline + per-account later) | ✅ v0 |
-| `orchestrator/` | The daemon (state machine, queue, workers) | planned |
+| `orchestrator/` | The daemon (state machine, queue, workers) — see `orchestrator/README.md` | ✅ v2 skeleton, shadow mode |
+| `bin/spo` | Console CLI: `status` / `task <id>` / `parked`, reads only the journals | ✅ v0 |
+| `test/` | `node --test` suite for the orchestrator, shadow mode, temp queue/journal dirs | ✅ |
 | `prompts/` | Step prompts (plan, implement, diagnose, validate, citation-verifier) | planned — migrated from `SPO-WebClient/.claude/agents/` |
 | `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |
-| `console/` | Pipeline console: tasks, steps, Claude sessions, accounts, bench — see below | planned |
+| `console/` | Pipeline console: tasks, steps, Claude sessions, accounts, bench — see below | planned (static HTML dashboard; `bin/spo` covers the CLI) |
 | `journal/` | Per-task append-only event journals (git-ignored, local surface) | runtime |
+| `queue/` | Task queue: one JSON file per task, taken in filename order (git-ignored, local surface) | runtime |
 | `claude-accounts/` | Claude Max account registry (git-ignored — secrets) | runtime |
 
 ## Ecosystem

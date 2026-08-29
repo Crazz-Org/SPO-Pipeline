@@ -1,0 +1,151 @@
+#!/usr/bin/env node
+'use strict';
+// spo -- reads ONLY the journals under journal/<id>/ (never its own state).
+//
+//   spo status              queue depth, active/parked/done counts, per-task state + last event
+//   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl
+//   spo parked              parked tasks + reasons
+//
+// Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
+
+const fs = require('fs');
+const path = require('path');
+
+function parseArgs(argv) {
+  const opts = { journal: null, queue: null, _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--journal') opts.journal = argv[++i];
+    else if (a === '--queue') opts.queue = argv[++i];
+    else opts._.push(a);
+  }
+  return opts;
+}
+
+function resolveDirs(opts) {
+  const repoRoot = path.join(__dirname, '..');
+  return {
+    journalRoot: opts.journal || path.join(repoRoot, 'journal'),
+    queueDir: opts.queue || path.join(repoRoot, 'queue'),
+  };
+}
+
+function readJsonSafe(p, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function listTaskDirs(journalRoot) {
+  if (!fs.existsSync(journalRoot)) return [];
+  return fs
+    .readdirSync(journalRoot, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort();
+}
+
+function readJournalLines(taskDir) {
+  const p = path.join(taskDir, 'journal.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function cmdStatus(opts) {
+  const { journalRoot, queueDir } = resolveDirs(opts);
+  const queueDepth = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length : 0;
+
+  const ids = listTaskDirs(journalRoot);
+  let active = 0;
+  let parked = 0;
+  let done = 0;
+  const rows = [];
+  for (const id of ids) {
+    const dir = path.join(journalRoot, id);
+    const state = readJsonSafe(path.join(dir, 'state.json'), {});
+    const lines = readJournalLines(dir);
+    const last = lines.length ? lines[lines.length - 1] : null;
+    const cur = state.state || 'UNKNOWN';
+    if (cur === 'DONE') done++;
+    else if (cur === 'PARKED') parked++;
+    else active++;
+    rows.push(`${id}  ${cur}  ${last ? last.event : ''}`);
+  }
+
+  console.log(`queue depth: ${queueDepth}`);
+  console.log(`active: ${active}  parked: ${parked}  done: ${done}`);
+  for (const r of rows) console.log(r);
+}
+
+function cmdTask(id, opts) {
+  const { journalRoot } = resolveDirs(opts);
+  const dir = path.join(journalRoot, id);
+  const lines = readJournalLines(dir);
+  if (lines.length === 0) {
+    console.error(`no journal for task "${id}" under ${journalRoot}`);
+    process.exitCode = 1;
+    return;
+  }
+  for (const ev of lines) {
+    const detail = { ...ev };
+    delete detail.ts;
+    delete detail.state;
+    delete detail.event;
+    const detailStr = Object.keys(detail).length ? ` ${JSON.stringify(detail)}` : '';
+    console.log(`[${ev.ts}] ${String(ev.state).padEnd(12)} ${ev.event}${detailStr}`);
+  }
+}
+
+function cmdParked(opts) {
+  const { journalRoot } = resolveDirs(opts);
+  const ids = listTaskDirs(journalRoot);
+  let any = false;
+  for (const id of ids) {
+    const dir = path.join(journalRoot, id);
+    const state = readJsonSafe(path.join(dir, 'state.json'), {});
+    if (state.state === 'PARKED') {
+      any = true;
+      console.log(`${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}`);
+    }
+  }
+  if (!any) console.log('(no parked tasks)');
+}
+
+function printUsage() {
+  console.error('usage: spo <status|task <id>|parked> [--journal <dir>] [--queue <dir>]');
+}
+
+function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  const opts = parseArgs(rest);
+
+  if (cmd === 'status') return cmdStatus(opts);
+  if (cmd === 'task') {
+    const id = opts._[0];
+    if (!id) {
+      console.error('usage: spo task <id>');
+      process.exitCode = 1;
+      return;
+    }
+    return cmdTask(id, opts);
+  }
+  if (cmd === 'parked') return cmdParked(opts);
+
+  printUsage();
+  process.exitCode = 1;
+}
+
+main();
