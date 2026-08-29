@@ -41,6 +41,7 @@ const config = require('./config');
 const { invokeClaudeReal } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { SMALL_BUDGET_USD, BUG_REPORT_BUDGET_USD } = require('./step-contracts');
+const { parseCommentId } = require('./park-loop');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 const DRAFT_CARD_PROMPT = path.join(PROMPTS_DIR, 'draft-card.md');
@@ -252,6 +253,11 @@ async function reviewCard(draft, deps = {}) {
     card_size: draft.size,
     card_area: draft.area,
     repo: ghRepo,
+    // 'yes' only when auto-triage.js passes deps.humanConfirmed for a report a maintainer has
+    // already replied "confirm" to (orchestrator/report-intake.js's reportConfirmScan) -- every
+    // other caller (spo ask, /SPO-Draft, spo pull's own review of a board candidate) gets the
+    // default 'no'. See prompts/review-card.md § 0 for what this changes.
+    human_confirmed: deps.humanConfirmed ? 'yes' : 'no',
   });
 
   const opts = {
@@ -345,8 +351,11 @@ function parseIssueUrl(stdout) {
 // postIssueComment(issueNumber, markdown, deps) -- `gh issue comment <n> --body-file <f>` against
 // a temp file, the exact call fileCard already made for the review verdict, extracted so
 // auto-triage.js's duplicate-report path (posting a new-occurrence note on an existing issue,
-// never a fresh one) reuses the identical spawn instead of a second implementation. Returns
-// {ok: true} or {ok: false, error}.
+// never a fresh one) and report-intake.js's confirm-instruction comment reuse the identical spawn
+// instead of a second implementation. Returns {ok: true, commentId} (commentId parsed from `gh`'s
+// own `.../issues/<n>#issuecomment-<id>` stdout, same regex park-loop.js's parseCommentId already
+// uses -- report-intake.js's stage 1 needs it as reportConfirmScan's anchor; every other caller
+// simply ignores the field) or {ok: false, error}.
 function postIssueComment(issueNumber, markdown, deps = {}) {
   const ghRepo = deps.ghRepo || config.ghRepo;
   const tmpDir = deps.tmpDir || os.tmpdir();
@@ -367,7 +376,7 @@ function postIssueComment(issueNumber, markdown, deps = {}) {
   if (commentExit !== 0) {
     return { ok: false, error: `postIssueComment: gh issue comment exited ${commentExit}` };
   }
-  return { ok: true, commentFile };
+  return { ok: true, commentFile, commentId: parseCommentId(commentResult.stdout) };
 }
 
 // fileCard(draft, review, deps) -- applies review's mechanical corrections, writes the body and
@@ -427,6 +436,90 @@ function fileCard(draft, review, deps = {}) {
   return { ok: true, issueNumber, url, bodyFile, commentFile: commented.commentFile };
 }
 
+// amendCard(issueNumber, draft, review, deps) -- fileCard's sibling for the human-first intake
+// path: EDITS the issue a report was already mechanically filed under (report-intake.js's
+// runReportIntake) instead of creating a second one. Deliberate, not a shortcut -- see
+// orchestrator/README.md § Report intake for the full argument, summarized: the raw card already
+// carries the report's `<!-- anchorKey: k -->` marker (it has to, so a repeat report's dedup
+// search finds it); a second issue with the same marker would make that search ambiguous
+// forever, and prompts/triage-bug-report.md § 3's own dedup, run against THIS report, would find
+// its own raw card and call the report a duplicate of itself.
+//
+// The pre-edit body is preserved (never silently lost to the overwrite) inside a collapsed
+// `<details>` block appended after the drafted body -- string concatenation, not a judgement
+// call, and it sits alongside GitHub's own edit history as a second record of what the
+// maintainer actually confirmed.
+//
+// Same refusal guard as fileCard, same applyMechanicalCorrections reuse, same postIssueComment
+// reuse for the review verdict. Returns {ok: true, issueNumber, url} or {ok: false, error}.
+function amendCard(issueNumber, draft, review, deps = {}) {
+  if (!review || (review.verdict !== 'FILE' && review.verdict !== 'FILE_AMENDED')) {
+    return { ok: false, error: `amendCard: refusing to amend for verdict "${review && review.verdict}"` };
+  }
+
+  const ghRepo = deps.ghRepo || config.ghRepo;
+  const tmpDir = deps.tmpDir || os.tmpdir();
+
+  const original = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${issueNumber}`]);
+  if (normalizeExit(original) !== 0) {
+    return { ok: false, error: `amendCard: gh api issues/${issueNumber} exited ${normalizeExit(original)}` };
+  }
+  let originalBody = '';
+  try {
+    originalBody = (JSON.parse(original.stdout) || {}).body || '';
+  } catch {
+    return { ok: false, error: `amendCard: gh api issues/${issueNumber} reply was not valid JSON` };
+  }
+
+  const { applied } = applyMechanicalCorrections(draft, review.corrections);
+
+  const body = [
+    applied.body_markdown || '',
+    '',
+    '<details><summary>Original report (raw intake, before reproduction/review)</summary>',
+    '',
+    originalBody,
+    '',
+    '</details>',
+    '',
+  ].join('\n');
+
+  const stamp = `${Date.now()}-${process.pid}`;
+  const bodyFile = path.join(tmpDir, `spo-amend-body-${stamp}.md`);
+  fs.writeFileSync(bodyFile, body);
+
+  const reportIntakeLabel = deps.reportIntakeLabel || config.reportIntakeLabel;
+  const editArgs = [
+    'issue',
+    'edit',
+    String(issueNumber),
+    '--repo',
+    ghRepo,
+    '--title',
+    applied.title,
+    '--body-file',
+    bodyFile,
+    '--add-label',
+    `cat:${applied.category}`,
+    '--add-label',
+    `size:${applied.size}`,
+  ];
+  if (reportIntakeLabel) editArgs.push('--remove-label', reportIntakeLabel);
+
+  const editResult = runSync(deps, 'gh', editArgs);
+  const editExit = normalizeExit(editResult);
+  if (editExit !== 0) {
+    return { ok: false, error: `amendCard: gh issue edit exited ${editExit}`, stderr: editResult && editResult.stderr };
+  }
+
+  const commented = postIssueComment(issueNumber, review.first_comment_markdown, { ...deps, ghRepo, tmpDir });
+  if (!commented.ok) {
+    return { ok: false, error: `amendCard: ${commented.error}`, issueNumber };
+  }
+
+  return { ok: true, issueNumber, url: `https://github.com/${ghRepo}/issues/${issueNumber}`, bodyFile };
+}
+
 // ---- triageBugReport --------------------------------------------------------------------------
 
 // triageBugReport(reportFile, deps) -- calls prompts/triage-bug-report.md through
@@ -444,7 +537,13 @@ function fileCard(draft, review, deps = {}) {
 // execution-shaped work like draftCard. Bash is in allowedTools (unlike draftCard's read-only
 // set): step 1's server-log curl and step 3's `gh issue list --search` dedup both need it;
 // permissionMode stays 'plan' regardless -- neither of those is a write.
-async function triageBugReport(reportFile, deps = {}) {
+//
+// `selfIssue` -- required, not optional: under the human-first design the report has ALREADY
+// been filed as a raw card (orchestrator/report-intake.js's runReportIntake) before this ever
+// runs, so its own dedup search (prompts/triage-bug-report.md § 3) would otherwise find its own
+// raw card and call the report a duplicate of itself. Every real caller (auto-triage.js's
+// processConfirmedReport) always has this issue number by construction.
+async function triageBugReport(reportFile, selfIssue, deps = {}) {
   let account;
   try {
     account = pickAccount(deps);
@@ -461,6 +560,7 @@ async function triageBugReport(reportFile, deps = {}) {
     product_repo: productRepo,
     repo: ghRepo,
     today,
+    self_issue: String(selfIssue),
   });
 
   const opts = {
@@ -653,6 +753,20 @@ function makeTask(candidate, deps = {}) {
 
   const body = issue.body || '';
   const labels = Array.isArray(issue.labels) ? issue.labels.map((l) => String((l && l.name) || l)) : [];
+
+  // Second, independent guard against a mechanically-filed raw report card (report-intake.js's
+  // runReportIntake, labeled config.reportIntakeLabel) ending up drained by the daemon before a
+  // human has confirmed it and auto-triage has amended it with a real category/size/area. The
+  // FIRST guard is the board column itself (SPO-WebClient's claim-read.sh only reads Status ==
+  // Todo) -- this one covers the case that column move failed and the raw card ended up in Todo
+  // anyway (see report-intake.js's own header on that failure mode). Skipping, not erroring:
+  // a raw card here is not a mistake to report, it is exactly the state it is meant to be in
+  // until a human acts.
+  const reportIntakeLabel = deps.reportIntakeLabel || config.reportIntakeLabel;
+  if (reportIntakeLabel && labels.includes(reportIntakeLabel)) {
+    return { ok: true, skipped: true, id, reason: `${id} still carries "${reportIntakeLabel}" -- not yet confirmed/triaged` };
+  }
+
   const sizeLabel = labels.find((l) => /^size:/i.test(l));
   const size = sizeLabel ? sizeLabel.split(':')[1].trim().toUpperCase() : 'M';
   const area = candidate.area || '';
@@ -682,6 +796,7 @@ module.exports = {
   loadDraftFile,
   reviewCard,
   fileCard,
+  amendCard,
   postIssueComment,
   triageBugReport,
   pullBoard,

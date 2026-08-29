@@ -538,56 +538,94 @@ this timer does not add a new *kind* of GitHub read, it just runs the existing o
 instead of only on request. At the default 5-minute interval that is at most ~12 reads/hour,
 well inside the shared 5000-point/hour budget.
 
-### Auto-triage
+### Report intake (human-first bug-report pipeline)
 
 The webclient has its own bug-report feature (`SPO-WebClient`'s `doc/bug-reporting.md`): a test
 session flags what looks wrong, and a JSON report lands in that repo's `~/.spo-reports` queue.
 `SPO-WebClient`'s `/triage-report` command reads that queue by hand -- reproduces each report,
 routes it (desktop → data-correctness, mobile → ergonomics), dedups by `anchorKey`, drafts a
-card, runs it through review, files it. `orchestrator/auto-triage.js` is that same reasoning,
-automated: `daemon.js --real`, when `config.autoTriageMs` is set, runs `runAutoTriage` on a
-second, independent timer between drain passes (`state-machine.js`'s `runForever`) -- exactly the
-`auto-pull`/`shouldAutoPull` pattern above, applied to the report queue instead of the board.
+card, runs it through review, files it. This pipeline automates that same reasoning, but **no
+LLM ever looks at a report until a maintainer has read it in raw form and asked for it to be
+pursued** -- design history below explains why.
 
-**What changed vs. a human running `/triage-report`:** the reproduction/routing/dedup reasoning
-(§0–§4 of `/triage-report`) is its own pipeline-side step, `intake.triageBugReport`
-(`prompts/triage-bug-report.md`, model fable, effort high -- Bash included, for the model-server
-log `curl` and the `gh issue list --search` dedup check) -- a **new**, from-scratch prompt, never
-a copy of the product repo's command text. It never files anything itself; a `draft` outcome goes
-through the exact same `reviewCard`/`fileCard` gate every other card here gets (§5 of
-`/triage-report`, done here by the *existing* step, not a second one). Only the mechanical
-bookkeeping (§6/§7: archiving the report, writing the one-line disposition sidecar, deciding when
-to journal) is `auto-triage.js`'s own code -- and it never reads report *content* (no `journal`,
-`anchorKey`, `geometry` field is parsed here), only report *filenames*, to sequence and archive
-them; every byte of schema/reproduction knowledge stays inside the `claude -p` session
-`triageBugReport` spawns, reasoning against the product tree with `cwd = config.productRepo`. See
-the file headers of `orchestrator/auto-triage.js` and `prompts/triage-bug-report.md` for the full
-"the one rule" accounting.
+**Design history, 2026-08-30.** The first version of this automation ran the whole thing
+unattended: an LLM (`intake.triageBugReport`) reproduced and judged each report, and a
+successful judgement filed a GitHub issue with nobody watching. That was replaced by the current
+design after the risk was named explicitly: unlike auto-pull (which only ever reads a board a
+human already curated), reproduction is a genuine LLM judgement call -- log correlation,
+geometry-predicate reasoning -- and a downstream review gate that checks *citations* cannot catch
+a *wrong inference drawn from a real citation*. The fix was not a second review gate (which
+suffers the same limitation) but moving the human decision **upstream**, to the one point where a
+maintainer has the most information for the least effort: reading the report exactly as
+captured, before any classification has had a chance to misjudge it -- including misjudging a
+mobile/visual ergonomics report as "not really a bug" (a mistake `prompts/review-card.md` § 0 and
+`prompts/triage-bug-report.md` § 1 now both call out explicitly and guard against).
 
-`config.spoReportsDir` (default `~/.spo-reports`, `SPO_REPORTS_DIR` override) is where the queue
-lives -- outside any git tree by design (`SPO-WebClient/doc/bug-reporting.md`: `npm run finish`
-retires worktrees, and a queue inside one would disappear with the branch that produced the
-reports), same class of direct machine-level read as `spoBenchDir`.
+**The pipeline, three stages, three independent daemon timers:**
 
-**Deliberately not symmetric with auto-pull.** Auto-pull only ever reads a board a human already
-curated; auto-triage's reproduction step is a genuine LLM judgement call (log correlation,
-geometry-predicate reasoning), so filing unattended on a hallucinated "reproduced" verdict is a
-real risk auto-pull never carries. Maintainer decision, 2026-08-29: `config.autoTriageMs`
-defaults to **0 (disabled)**, unlike `autoPullMs`'s nonzero default -- set `SPO_AUTO_TRIAGE_MS`
-explicitly once `spo triage --dry` (below) has been run by hand enough times to trust the
-reproduction step. `config.autoTriageLimit` (default 3, `SPO_AUTO_TRIAGE_LIMIT` override) is the
-most reports one cycle takes off the queue.
+```
+~/.spo-reports/<file>.json
+   │  STAGE 1 -- orchestrator/report-intake.js's runReportIntake, MECHANICAL, zero LLM calls.
+   │  `npm run report:card` (SPO-WebClient, reads src/shared/bug-report-schema.ts) renders the
+   │  report RAW -- no reproduction, no category/size/area. Mechanical anchorKey dedup (a grep,
+   │  not a judgement). Files a card labeled report:raw, moves it to the "Intake" board column,
+   │  posts confirm/discard instructions. config.autoIntakeMs (nonzero by default -- SAME risk
+   │  class as auto-pull, since nothing here judges anything).
+   ▼
+GitHub issue, column "Intake", label report:raw, body = the report exactly as captured
+   │  STAGE 2 -- reportConfirmScan, the SAME retry/abandon comment-scan idiom park-loop.js's
+   │  unparkScan already uses. A maintainer replies "confirm" or "discard" on the issue.
+   │  config.reportConfirmScanMs (nonzero by default).
+   ▼  "confirm"
+   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report.
+   │  intake.triageBugReport (reproduce/route/dedup/draft) -> the SAME reviewCard gate every
+   │  other card here gets (deps.humanConfirmed: true -- review-card.md § 0 no longer re-opens
+   │  desirability, since a human already settled it) -> intake.amendCard (EDITS the raw-intake
+   │  issue in place -- never files a second one, see amendCard's own header for why that is
+   │  load-bearing for anchorKey dedup) -> moves the card to Todo. config.autoTriageMs -- kept its
+   │  pre-redesign name/env var (SPO_AUTO_TRIAGE_MS) on purpose, see below.
+   ▼
+Todo  →  auto-pull  →  PLAN/IMPLEMENT   (unchanged)
+```
 
-Journals exactly one `auto-triage` event (`{processed, filed, duplicates, notReproduced,
-insufficient, schemaVersion, doNotFile, errors}`) to `journal/daemon.jsonl` per **real** (non-dry)
-cycle, and only when at least one report was actually disposed of -- same "only journal on real
-output" rule `auto-pull` follows. A report whose `triageBugReport`/`reviewCard`/`fileCard` call
-fails mechanically (bad account, bad JSON, a failed `gh` call) is left in the queue for the next
-cycle in both dry and real runs -- never archived on an outcome that was never judged.
+**A negative outcome after "confirm" is never silently dropped.** `not-reproduced` /
+`insufficient` / `schema-version` / a `DO_NOT_FILE` review verdict all comment the reason on the
+issue and leave the card HELD in "Intake", never archived -- overturning a report a human already
+asked for is not this pipeline's call to make silently. Only `duplicate` and a successful
+`draft` → `FILE`/`FILE_AMENDED` dispose of the report file (`~/.spo-reports/pending/` →
+`.../archive/`, the same one-line disposition sidecar `/triage-report` itself writes). A
+mechanical failure at any stage (bad account, bad JSON, a failed `gh`/`npm` call) leaves the
+report queued/pending, retried next cycle -- never journaled as triaged or held.
 
-A report filed this cycle becomes an ordinary Todo card, picked up later by the *next* auto-pull
-cycle like any other -- the "player report → nightly fix" chain README.md's migration step 5
-names; auto-triage itself stops at "filed", the same boundary `/triage-report` itself draws.
+**"The one rule", worked through concretely.** None of `report-intake.js`/`auto-triage.js` ever
+reads report *content* (no `profile`/`anchor`/`journal`/`geometry` field is parsed in this repo).
+Rendering the RAW card -- the one step that necessarily needs that content -- lives beside the
+schema it reads: `SPO-WebClient/scripts/report-card.js`, spawned via `npm run report:card` and
+relayed as opaque stdout, the exact same relationship `pullBoard` already has with
+`npm run board:claim`. `intake.triageBugReport`'s own reproduction reasoning still runs entirely
+inside a `claude -p` session with `cwd = config.productRepo`, same as before.
+
+**Config** (`orchestrator/config.js`):
+
+| key | default | why |
+|---|---|---|
+| `spoReportsDir` | `~/.spo-reports` (`SPO_REPORTS_DIR`) | outside any git tree by design (`npm run finish` retires worktrees) |
+| `autoIntakeMs` | 15 min (`SPO_AUTO_INTAKE_MS`) | stage 1, zero LLM judgement -- same risk class as `autoPullMs` |
+| `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle |
+| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- not `"Parked"`, see `report-intake.js`'s header on `board-move.sh`'s driver-scope disarm |
+| `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
+| `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
+| `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
+| `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
+| `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
+
+Journals: `report-intake` / `report-intake-duplicate` / `report-intake-schema-version` /
+`report-intake-move-failed` (stage 1), `report-confirmed` / `report-discarded` (stage 2),
+`report-triaged` / `report-held` / `auto-triage` (stage 3) -- all to `journal/daemon.jsonl`, the
+same append-only surface `auto-pull` already uses. `orchestrator/auto-triage.js`'s
+`findConfirmedAwaitingTriage` and `report-intake.js`'s `findPendingIntake` both use the same
+anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed
+from a per-task `journal.jsonl` to this flat daemon-level log.
 
 ## Intake
 
@@ -614,10 +652,18 @@ daemon.js --real          -- drains queue/, drives each task PLAN -> ... -> DONE
 ```
 
 A second, parallel entry lane files cards from the webclient's own bug-report queue instead of a
-maintainer's request -- see "Auto-triage" above for what `spo triage` does before the board:
+maintainer's request -- see "Report intake (human-first bug-report pipeline)" above for the full
+three-stage design; the maintainer-facing shape is:
 
 ```
-spo triage [--limit N]   -- reproduce/route/dedup/file/archive the /triage-report queue
+spo intake [--limit N]   -- STAGE 1: files a RAW card, zero LLM judgement, per queued report
+   |
+   v  a maintainer replies "confirm" or "discard" on the issue (`spo reports` lists what's waiting)
+   |                        STAGE 2: reportConfirmScan reads that reply (daemon timer, or wait)
+   v
+spo triage [--limit N]   -- STAGE 3: reproduce/route/dedup/draft the CONFIRMED reports, then the
+                             SAME reviewCard gate `spo ask` uses, then amendCard (edits the raw
+                             card in place) and a move to Todo
    |
    v  (same board auto-add -> Todo as spo ask)
 npm run board:claim  ->  spo pull  ->  daemon.js --real     -- (as above)
@@ -718,6 +764,13 @@ Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` 
 `systemctl --user stop spo-pipeline-daemon.service`. Re-run the installer after pulling
 daemon changes; it rebuilds nothing (no build step) and restarts.
 
+**Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
+default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
+cards and reacts to "confirm"/"discard" replies with no extra configuration. Stage 3
+(`autoTriageMs`, the reproduction/filing step) stays off by default -- a drop-in setting
+`Environment=SPO_AUTO_TRIAGE_MS=900000` is what turns it on; the same
+`systemctl --user edit spo-pipeline-daemon.service` mechanism, `[Service]` section.
+
 ## Park alerting
 
 A park is well recorded (journal event, `state.json`, `report.md`, the gh comment, the board
@@ -810,7 +863,9 @@ bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disa
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
 bin/spo pull [--limit <n>]                         # write queue/<seq>-issue-<n>.json for the top N claimable board cards
-bin/spo triage [--limit <n>] [--reports-dir <dir>] [--file]   # triage the bug-report queue (see "Auto-triage" above); defaults to --dry
+bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
+bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
+bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
 ```
 
 ## Dashboard
@@ -870,8 +925,12 @@ piloting's own tests follow the same convention one layer up: `test/board-move.t
 `test/park-loop.test.js` covers the park comment's content and the PARKED round trip via
 `runTask` directly, plus `unparkScan`'s retry/abandon/idempotency; `test/auto-pull.test.js`
 covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
-enqueued rules; `test/auto-triage.test.js` covers the same for `shouldAutoTriage`/
-`runAutoTriage` (outcome routing, the dry/real split, a mechanical failure leaving a report
-queued) and `test/spo-triage.test.js` covers `cmdTriage`'s flag wiring, same convention as
-`test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage. None of them ever touch a real `git`, `npm`,
-`gh` or `claude` process, so the whole suite stays hermetic.
+enqueued rules; `test/report-intake.test.js` covers stages 1-2 of the human-first bug-report
+pipeline (`shouldAutoIntake`/`shouldScanConfirms`, `parseCardOutput`, the mechanical dedup, the
+confirm/discard comment scan's anchor logic); `test/auto-triage.test.js` covers stage 3
+(`shouldAutoTriage`, `findConfirmedAwaitingTriage`, `processConfirmedReport`'s outcome routing --
+including the "a negative outcome after confirm is HELD, never archived" rule -- and the dry/real
+split); `test/spo-triage.test.js` covers `cmdIntake`/`cmdReports`/`cmdTriage`'s flag wiring, same
+convention as `test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage (which also covers
+`amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). None of them ever touch a real
+`git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.

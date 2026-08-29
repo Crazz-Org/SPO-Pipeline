@@ -1,56 +1,59 @@
 'use strict';
-// auto-triage.js -- turns the webclient's bug-report queue (~/.spo-reports, config.spoReportsDir)
-// into filed GitHub issues, without a human running `/triage-report` by hand. Behind `spo triage`
-// (on demand, bin/spo) and, when config.autoTriageMs is set, the daemon's own timer
-// (state-machine.js's runForever, real mode only) -- the exact same automate-the-manual-command
-// pattern auto-pull.js already established for `spo pull`.
+// auto-triage.js -- stages 3+ of the human-first bug-report intake pipeline: reproduction,
+// routing, dedup and drafting (intake.triageBugReport) then the SAME reviewCard/fileCard-shaped
+// gate every other card here goes through, but ONLY for a report a maintainer has already
+// replied "confirm" to (orchestrator/report-intake.js's reportConfirmScan -- stages 1-2, which
+// mechanically file a RAW card with zero LLM judgement and wait for that reply). Behind `spo
+// triage` (on demand, bin/spo) and, when config.autoTriageMs is set, the daemon's own timer
+// (state-machine.js's runForever, real mode only).
 //
-// Reuses orchestrator/intake.js end to end: triageBugReport (reproduce/route/dedup/draft, via
-// prompts/triage-bug-report.md) for the reasoning `/triage-report` asks a human session to do,
-// then the SAME reviewCard/fileCard gate every other card filed by this repo goes through --
-// never a second, parallel review or filing path. Only the mechanical bookkeeping
-// `/triage-report`'s own §6/§7 describe (moving the report to archive/, writing the one-line
-// disposition sidecar, deciding when to journal) lives here.
+// Design history, 2026-08-30: this file used to scan ~/.spo-reports directly and file a NEW
+// issue per report. That single-stage design let an LLM's reproduction verdict alone decide
+// whether something autonomous got filed -- superseded by the current two-stage split (see
+// orchestrator/report-intake.js's own header and orchestrator/README.md § Report intake for the
+// full argument): nothing here ever runs until a human has read the RAW report and asked for it.
 //
-// "The one rule": this file never reads report CONTENT (no `journal`, `anchorKey`, `geometry`,
-// `profile` field is ever parsed here) -- it only lists report FILENAMES under spoReportsDir to
-// sequence them (the same class of direct read this repo already does for ~/.spo-bench), and
-// archives/comments using only the outcome intake.triageBugReport already judged. All schema and
-// reproduction knowledge stays inside the `claude -p` session triageBugReport spawns, reasoning
-// against the product tree itself -- never encoded in this file. See orchestrator/README.md
-// § Auto-triage and doc/bug-reporting.md (the product repo) for the queue's own shape.
+// What that changes about disposal: a report that reaches this stage was already judged worth
+// pursuing by a human, so a negative outcome from triageBugReport/reviewCard is never silently
+// archived -- it is commented on the issue and HELD (report-held), never disposed of unseen. Only
+// a `duplicate` or a successful `draft` -> FILE/FILE_AMENDED disposes of the report file (moves
+// it to archive/). See processConfirmedReport's outcome table below.
 //
-// Maintainer decision, 2026-08-29: unlike auto-pull (which only ever reads a board a human
-// already curated), an unattended `spo triage` risks filing on a hallucinated "reproduced"
-// verdict with nobody watching -- reproduction is a genuine LLM judgement call, not a
-// deterministic parse. So: `spo triage` defaults to --dry (bin/spo), and the daemon timer stays
-// OPT-IN (config.autoTriageMs defaults to 0/disabled, unlike autoPullMs's nonzero default) until
-// a maintainer has run `spo triage --dry` by hand enough times to trust the reproduction step.
+// Reuses orchestrator/intake.js end to end: triageBugReport for the reasoning `/triage-report`
+// asks a human session to do, then reviewCard (unchanged) and intake.amendCard -- EDITS the
+// existing raw-intake issue rather than filing a second one (see amendCard's own header for why
+// that is load-bearing for anchorKey dedup, not a style choice).
+//
+// "The one rule": this file never reads report CONTENT -- it only reads daemon.jsonl's own
+// journaled events (issue numbers, file paths, outcomes it already judged) to decide what to
+// process next. All schema and reproduction knowledge stays inside the `claude -p` session
+// triageBugReport spawns, reasoning against the product tree itself.
 
 const fs = require('fs');
 const path = require('path');
 
 const intake = require('./intake');
+const board = require('./board');
 const { appendDaemonEvent } = require('./journal');
 
-const DEFAULT_AUTO_TRIAGE_MS = 15 * 60 * 1000; // maintainer's own call once enabled -- see config.js
+const DEFAULT_AUTO_TRIAGE_MS = 15 * 60 * 1000; // maintainer's own call -- see config.js
 const DEFAULT_AUTO_TRIAGE_LIMIT = 3;
 
 // Pure decision function, same shape as auto-pull.js's shouldAutoPull -- no Date.now() baked in,
-// a test drives it with any (lastTriageAt, nowMs) pair. autoTriageMs <= 0 (the default) disables
-// the timer entirely regardless of lastTriageAt.
+// a test drives it with any (lastTriageAt, nowMs) pair. autoTriageMs <= 0 disables the timer
+// entirely regardless of lastTriageAt.
 function shouldAutoTriage(lastTriageAt, nowMs, autoTriageMs) {
   if (!(autoTriageMs > 0)) return false;
   if (lastTriageAt === null || lastTriageAt === undefined) return true;
   return nowMs - lastTriageAt >= autoTriageMs;
 }
 
-// listQueuedReports(spoReportsDir) -- the queue's own top-level *.json files (never
-// spoReportsDir/archive/, which readdirSync's isFile() filter already excludes since it is a
-// directory entry, not a file), oldest first. doc/bug-reporting.md: filenames are
-// <createdAtUtc>_<profile>_<anchorKey>.json, so lexical order IS chronological order -- the same
-// fact triage-report.md's own § 0 states. A missing directory is an empty queue, not an error
-// (doc/bug-reporting.md: "An empty queue is a normal outcome").
+// listQueuedReports(spoReportsDir) -- the queue's own top-level *.json files (never `pending/` or
+// `archive/`, which readdirSync's isFile() filter already excludes since they are directory
+// entries, not files), oldest first. SPO-WebClient's doc/bug-reporting.md: filenames are
+// <createdAtUtc>_<profile>_<anchorKey>.json, so lexical order IS chronological order. A missing
+// directory is an empty queue, not an error. Used by report-intake.js's stage 1; re-exported here
+// for backward compatibility with anything still importing it from this file.
 function listQueuedReports(spoReportsDir) {
   if (!fs.existsSync(spoReportsDir)) return [];
   return fs
@@ -61,164 +64,210 @@ function listQueuedReports(spoReportsDir) {
     .map((name) => path.join(spoReportsDir, name));
 }
 
-// archiveReport(reportPath, dispositionLine) -- mv into <spoReportsDir>/archive/ and write the
-// one-line disposition sidecar beside it, the exact convention triage-report.md § 6 documents
-// (`<file>.disposition.txt`), so a maintainer reading the archive later sees the identical shape
-// whether a human or this driver triaged the report.
-function archiveReport(reportPath, dispositionLine) {
-  const dir = path.dirname(reportPath);
-  const archiveDir = path.join(dir, 'archive');
-  fs.mkdirSync(archiveDir, { recursive: true });
+// moveReportTo(reportPath, targetDir, dispositionLine) -- mv into targetDir/ and write the
+// one-line disposition sidecar beside it (triage-report.md § 6's convention, `<file>
+// .disposition.txt`), so a maintainer reading the target dir later sees the identical shape
+// whether a human or this pipeline moved it there. Shared by report-intake.js (-> pending/,
+// -> archive/ on discard) and this file (-> archive/ on duplicate/filed).
+function moveReportTo(reportPath, targetDir, dispositionLine) {
+  fs.mkdirSync(targetDir, { recursive: true });
   const base = path.basename(reportPath);
-  fs.renameSync(reportPath, path.join(archiveDir, base));
-  fs.writeFileSync(path.join(archiveDir, `${base}.disposition.txt`), `${dispositionLine}\n`);
+  const dest = path.join(targetDir, base);
+  fs.renameSync(reportPath, dest);
+  fs.writeFileSync(path.join(targetDir, `${base}.disposition.txt`), `${dispositionLine}\n`);
+  return dest;
 }
 
 function firstNonBlankLine(text) {
   return ((text || '').split('\n').find((l) => l.trim()) || '').trim();
 }
 
-// The disposition line for an outcome that never reaches a draft -- triage-report.md § 6's own
-// table, reused verbatim.
-function dispositionLineFor(triaged, today) {
-  if (triaged.outcome === 'not-reproduced') return `not-reproduced: ${triaged.reason} — ${today}`;
-  if (triaged.outcome === 'insufficient') return `insufficient: ${triaged.reason} — ${today}`;
-  if (triaged.outcome === 'schema-version') {
-    return `schema-version: ${triaged.found} vs ${triaged.expected} — ${today}`;
-  }
-  return `unknown outcome "${triaged.outcome}" — ${today}`;
+function readDaemonEvents(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
 }
 
-// runAutoTriage(spoReportsDir, journalRoot, config, deps, opts) -- triageBugReport, then
-// reviewCard/fileCard (both REUSED, unchanged) for the top config.autoTriageLimit queued reports.
-// `opts.dry` (default false): runs triageBugReport and, for a draft, reviewCard too -- so the
-// caller sees the full verdict -- but never calls fileCard/postIssueComment/archiveReport and
-// never journals; the queue is left exactly as found (the same "look, don't touch" `spo ask
-// --dry` already gives the fast-lane intake path). A report whose triageBugReport/reviewCard/
-// fileCard call fails mechanically (bad account, bad JSON, a failed gh call) is left in the
-// queue for the next cycle, in both modes -- never archived on a failure that was never judged.
+// findConfirmedAwaitingTriage(journalRoot, limit) -- every `report-confirmed` event in
+// daemon.jsonl with no LATER `report-triaged`/`report-held` event for the same issue number (the
+// same "anchor + alreadyHandled" idiom park-loop.js's findParkAnchor already uses, transposed
+// from a per-task journal.jsonl to this flat daemon-level log, since a confirmed report belongs
+// to no single task). Oldest first, capped at `limit`.
+function findConfirmedAwaitingTriage(journalRoot, limit) {
+  const lines = readDaemonEvents(journalRoot);
+  const confirmed = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].event !== 'report-confirmed') continue;
+    const issue = lines[i].issue;
+    const handledLater = lines
+      .slice(i + 1)
+      .some((e) => (e.event === 'report-triaged' || e.event === 'report-held') && e.issue === issue);
+    if (!handledLater) confirmed.push(lines[i]);
+  }
+  return confirmed.slice(0, limit);
+}
+
+// The comment posted on a HELD report -- a negative outcome after a human already confirmed it,
+// so it must be visible and explained, never silently disposed of. See this file's own header.
+function buildHoldComment(outcome, detail) {
+  const lines = [
+    '### Pipeline: reproduction did not confirm this report',
+    '',
+    `**Outcome:** \`${outcome}\``,
+    '',
+    detail,
+    '',
+    'This report is still confirmed and still in the intake column -- nothing was discarded. If',
+    'the reason above is wrong, or you can supply the missing evidence, reply with more detail and',
+    'the next `spo triage` cycle will not re-run automatically (this outcome is now held); ask a',
+    'maintainer to re-run `spo triage --file` by hand once the report or the reason has been',
+    'addressed.',
+  ];
+  return lines.join('\n');
+}
+
+// processConfirmedReport(entry, journalRoot, config, deps, opts) -- triageBugReport, then (for a
+// draft) reviewCard/amendCard, for ONE confirmed report. `entry` is the `report-confirmed` daemon
+// event: {issue, pendingPath, commentId}. Returns {ok: true, outcome, ...} (never throws for a
+// recognized failure) -- `outcome` is one of the values documented in the outcome table below.
+async function processConfirmedReport(entry, journalRoot, config, deps = {}, opts = {}) {
+  const dry = !!opts.dry;
+  const today = deps.today || new Date().toISOString().slice(0, 10);
+  const spoReportsDir = config.spoReportsDir;
+  const archiveDir = path.join(spoReportsDir, 'archive');
+
+  const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, deps);
+  if (!triaged.ok) {
+    return { ok: false, error: triaged.error }; // mechanical failure -- retried next cycle, no journal
+  }
+
+  if (triaged.outcome === 'duplicate') {
+    if (dry) return { ok: true, outcome: 'would-duplicate', issueNumber: triaged.issue_number };
+    const commented = intake.postIssueComment(triaged.issue_number, triaged.comment_markdown, deps);
+    if (!commented.ok) return { ok: false, error: commented.error };
+    const closed = intake.postIssueComment(
+      entry.issue,
+      `Duplicate of #${triaged.issue_number} -- closing this intake card.`,
+      deps
+    );
+    if (!closed.ok) return { ok: false, error: closed.error };
+    moveReportTo(entry.pendingPath, archiveDir, `duplicate: #${triaged.issue_number} — ${today}`);
+    appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'duplicate', duplicateOf: triaged.issue_number });
+    return { ok: true, outcome: 'duplicate', issueNumber: triaged.issue_number };
+  }
+
+  if (triaged.outcome !== 'draft') {
+    // 'not-reproduced' | 'insufficient' | 'schema-version' -- HELD, never archived (see header).
+    const detail =
+      triaged.outcome === 'schema-version'
+        ? `Schema version mismatch: found ${triaged.found}, expected ${triaged.expected}. This report likely predates a schema change and needs a maintainer's own look.`
+        : `Reason: ${triaged.reason}`;
+    if (dry) return { ok: true, outcome: 'would-hold', reason: triaged.reason || detail };
+    const commented = intake.postIssueComment(entry.issue, buildHoldComment(triaged.outcome, detail), deps);
+    if (!commented.ok) return { ok: false, error: commented.error };
+    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: triaged.outcome, reason: triaged.reason || detail });
+    return { ok: true, outcome: triaged.outcome, reason: triaged.reason || detail };
+  }
+
+  // outcome === 'draft' -- the same reviewCard gate every other card here gets, with
+  // deps.humanConfirmed: true so review-card.md § 0 does not re-litigate desirability.
+  const reviewed = await intake.reviewCard(triaged.draft, { ...deps, humanConfirmed: true });
+  if (!reviewed.ok) return { ok: false, error: reviewed.error };
+
+  if (reviewed.review.verdict === 'DO_NOT_FILE') {
+    const reason = firstNonBlankLine(reviewed.review.first_comment_markdown);
+    if (dry) return { ok: true, outcome: 'would-hold', reason };
+    const commented = intake.postIssueComment(entry.issue, reviewed.review.first_comment_markdown, deps);
+    if (!commented.ok) return { ok: false, error: commented.error };
+    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: 'do-not-file', reason });
+    return { ok: true, outcome: 'do-not-file', reason };
+  }
+
+  if (dry) {
+    return { ok: true, outcome: 'would-file', draft: triaged.draft, review: reviewed.review };
+  }
+
+  const amended = intake.amendCard(entry.issue, triaged.draft, reviewed.review, deps);
+  if (!amended.ok) return { ok: false, error: amended.error };
+
+  if (config.autoTriagePromoteToTodo !== false) {
+    const moved = board.moveIssueToColumn(entry.issue, 'Todo', deps, { cwd: config.productRepo });
+    if (!moved.ok) {
+      appendDaemonEvent(journalRoot, 'report-promote-failed', { issue: entry.issue, exit: moved.exit });
+    }
+  }
+
+  moveReportTo(entry.pendingPath, archiveDir, `filed: #${entry.issue} — ${today}`);
+  appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'filed' });
+  return { ok: true, outcome: 'filed', issueNumber: entry.issue, url: amended.url };
+}
+
+// runAutoTriage(journalRoot, config, deps, opts) -- processConfirmedReport for the top
+// config.autoTriageLimit CONFIRMED-and-not-yet-triaged reports (findConfirmedAwaitingTriage).
+// `opts.dry`: previews every outcome (still runs triageBugReport/reviewCard so the caller sees
+// the real verdict) but never comments, amends, moves, or journals a terminal event -- the exact
+// same "look, don't touch" `spo ask --dry` already gives the fast-lane intake path.
 //
-// Journals exactly one `auto-triage` event to journalRoot/daemon.jsonl per REAL (non-dry) call,
-// and only when at least one report was actually disposed of -- same "only journal on real
-// output" rule auto-pull.js's runAutoPull already follows. Returns {ok: true, processed, filed,
-// duplicates, notReproduced, insufficient, schemaVersion, doNotFile, errors, results}.
-async function runAutoTriage(spoReportsDir, journalRoot, config, deps = {}, opts = {}) {
+// Journals exactly one `auto-triage` summary event per REAL (non-dry) call, and only when at
+// least one report was actually disposed of or held -- same "only journal on real output" rule
+// auto-pull.js's runAutoPull already follows.
+async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   const limit = (config && config.autoTriageLimit) || DEFAULT_AUTO_TRIAGE_LIMIT;
-  const today = deps.today || new Date().toISOString().slice(0, 10);
 
-  const top = listQueuedReports(spoReportsDir).slice(0, limit);
+  const top = findConfirmedAwaitingTriage(journalRoot, limit);
 
   const results = [];
   const errors = [];
   let filed = 0;
   let duplicates = 0;
-  let notReproduced = 0;
-  let insufficient = 0;
-  let schemaVersion = 0;
-  let doNotFile = 0;
+  let held = 0;
 
-  for (const reportPath of top) {
-    const file = path.basename(reportPath);
-
-    const triaged = await intake.triageBugReport(reportPath, deps);
-    if (!triaged.ok) {
-      errors.push({ file, error: triaged.error });
-      results.push({ file, outcome: 'error', error: triaged.error });
-      continue; // stays queued -- never judged, never archived
-    }
-
-    if (triaged.outcome === 'duplicate') {
-      duplicates++;
-      if (!dry) {
-        const commented = intake.postIssueComment(triaged.issue_number, triaged.comment_markdown, deps);
-        if (!commented.ok) {
-          errors.push({ file, error: commented.error });
-          results.push({ file, outcome: 'error', error: commented.error });
-          continue; // stays queued -- the comment failed, retry next cycle
-        }
-        archiveReport(reportPath, `duplicate: #${triaged.issue_number} — ${today}`);
-      }
-      results.push({ file, outcome: 'duplicate', issueNumber: triaged.issue_number });
+  for (const entry of top) {
+    const outcome = await processConfirmedReport(entry, journalRoot, config, deps, { dry });
+    if (!outcome.ok) {
+      errors.push({ issue: entry.issue, error: outcome.error });
+      results.push({ issue: entry.issue, outcome: 'error', error: outcome.error });
       continue;
     }
-
-    if (triaged.outcome !== 'draft') {
-      // 'not-reproduced' | 'insufficient' | 'schema-version' -- no gh call at all, just archive.
-      if (triaged.outcome === 'not-reproduced') notReproduced++;
-      else if (triaged.outcome === 'insufficient') insufficient++;
-      else if (triaged.outcome === 'schema-version') schemaVersion++;
-
-      if (!dry) archiveReport(reportPath, dispositionLineFor(triaged, today));
-      results.push({ file, outcome: triaged.outcome, reason: triaged.reason });
-      continue;
-    }
-
-    // outcome === 'draft' -- the same reviewCard gate every other card here goes through.
-    const reviewed = await intake.reviewCard(triaged.draft, deps);
-    if (!reviewed.ok) {
-      errors.push({ file, error: reviewed.error });
-      results.push({ file, outcome: 'error', error: reviewed.error });
-      continue; // stays queued
-    }
-
-    if (reviewed.review.verdict === 'DO_NOT_FILE') {
-      doNotFile++;
-      if (!dry) {
-        archiveReport(reportPath, `do-not-file: ${firstNonBlankLine(reviewed.review.first_comment_markdown)} — ${today}`);
-      }
-      results.push({ file, outcome: 'do-not-file', review: reviewed.review });
-      continue;
-    }
-
-    if (dry) {
-      results.push({ file, outcome: 'would-file', draft: triaged.draft, review: reviewed.review });
-      continue;
-    }
-
-    const filedResult = intake.fileCard(triaged.draft, reviewed.review, deps);
-    if (!filedResult.ok) {
-      errors.push({ file, error: filedResult.error });
-      results.push({ file, outcome: 'error', error: filedResult.error });
-      continue; // stays queued -- the filing failed, retry next cycle
-    }
-    filed++;
-    archiveReport(reportPath, `filed: #${filedResult.issueNumber} — ${today}`);
-    results.push({ file, outcome: 'filed', issueNumber: filedResult.issueNumber, url: filedResult.url });
+    if (outcome.outcome === 'filed' || outcome.outcome === 'would-file') filed++;
+    else if (outcome.outcome === 'duplicate' || outcome.outcome === 'would-duplicate') duplicates++;
+    else held++;
+    results.push({ issue: entry.issue, ...outcome });
   }
 
-  const disposed = filed + duplicates + notReproduced + insufficient + schemaVersion + doNotFile;
+  const disposed = filed + duplicates + held;
   if (!dry && disposed > 0) {
     appendDaemonEvent(journalRoot, 'auto-triage', {
       processed: top.length,
       filed,
       duplicates,
-      notReproduced,
-      insufficient,
-      schemaVersion,
-      doNotFile,
+      held,
       errors: errors.length,
     });
   }
 
-  return {
-    ok: true,
-    processed: top.length,
-    filed,
-    duplicates,
-    notReproduced,
-    insufficient,
-    schemaVersion,
-    doNotFile,
-    errors,
-    results,
-  };
+  return { ok: true, processed: top.length, filed, duplicates, held, errors, results };
 }
 
 module.exports = {
   shouldAutoTriage,
   runAutoTriage,
+  processConfirmedReport,
+  findConfirmedAwaitingTriage,
   listQueuedReports,
+  moveReportTo,
   DEFAULT_AUTO_TRIAGE_MS,
   DEFAULT_AUTO_TRIAGE_LIMIT,
 };

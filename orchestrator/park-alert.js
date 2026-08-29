@@ -38,20 +38,34 @@ function normalizeExit(result) {
   return status === null || status === undefined ? 1 : status;
 }
 
-// alertPark(ctx, deps, {reason, lastState}) -- spawns config.parkAlertCmd with the park's
-// identity on argv. No configured command is the silent common case (not journaled -- every
-// park would carry the same noise line). Never throws.
+// alertDaemon(cmd, deps, [id, reason, label]) -- the generic three-positional spawn every alert
+// in this codebase reduces to: `<cmd> <id> <reason> <label>`. `label` defaults to `PARKED` in
+// scripts/park-alert.sh (its 4th, optional positional -- backward compatible with every existing
+// 3-arg spawn, this function's own default included) so a non-park alert (orchestrator/
+// report-intake.js's own failure alerts) shows up distinctly in the log/ntfy title instead of
+// misreporting itself as a park. Returns {ok, exit} -- never throws, no configured `cmd` is a
+// silent no-op (the common case: not journaled, since every call would otherwise carry the same
+// noise line).
+function alertDaemon(cmd, deps, [id, reason, label]) {
+  if (!cmd) return { ok: true, skipped: true };
+  const result = runSync(deps, cmd, [String(id), String(reason), String(label || 'PARKED')]);
+  const exit = normalizeExit(result);
+  return { ok: exit === 0, exit };
+}
+
+// alertPark(ctx, deps, {reason, lastState}) -- alertDaemon wrapper for the park case specifically,
+// journaling `park-alert`/`park-alert-failed` onto the task's own journal (every other caller of
+// alertDaemon has no per-task journal to write into, and journals into daemon.jsonl itself).
 function alertPark(ctx, deps, { reason, lastState }) {
   const cmd = ctx.config && ctx.config.parkAlertCmd;
   if (!cmd) return;
 
-  const result = runSync(deps, cmd, [String(ctx.id), String(reason), String(lastState)]);
-  const exit = normalizeExit(result);
-  if (exit !== 0) {
-    appendEvent(ctx.taskDir, 'PARKED', 'park-alert-failed', { cmd, exit });
+  const result = alertDaemon(cmd, deps, [ctx.id, reason, lastState]);
+  if (!result.ok) {
+    appendEvent(ctx.taskDir, 'PARKED', 'park-alert-failed', { cmd, exit: result.exit });
     return;
   }
   appendEvent(ctx.taskDir, 'PARKED', 'park-alert', { cmd, reason });
 }
 
-module.exports = { alertPark, ALERT_TIMEOUT_MS };
+module.exports = { alertPark, alertDaemon, ALERT_TIMEOUT_MS };

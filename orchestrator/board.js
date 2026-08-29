@@ -80,4 +80,22 @@ function moveCard(ctx, deps, state) {
   appendEvent(ctx.taskDir, state, 'board-move', { column });
 }
 
-module.exports = { COLUMN_BY_STATE, moveCard, runSync, normalizeExit };
+// moveIssueToColumn(issueNumber, column, deps, {cwd}) -- the same `npm run board:move --
+// <issue> "<Column>"` call moveCard makes, for a caller with no ctx/taskDir/worktree at all
+// (orchestrator/report-intake.js, orchestrator/auto-triage.js -- neither has a task worktree,
+// only an issue number and config.productRepo as cwd, the same cwd pullBoard/makeTask already
+// use for their own npm/gh calls). Unlike moveCard, this does NOT journal (the caller has no
+// ctx.taskDir -- it journals into daemon.jsonl itself) and DOES return the result, since a
+// caller here has to react to a failed move (see report-intake.js's own header on why a failed
+// move to "Intake" is not safe to ignore, unlike every moveCard failure). Never blocks by
+// itself; whether to treat a failure as blocking is entirely the caller's call.
+function moveIssueToColumn(issueNumber, column, deps, { cwd } = {}) {
+  const result = runSync(deps, 'npm', ['run', 'board:move', '--', String(issueNumber), column], { cwd });
+  const exit = normalizeExit(result);
+  if (exit !== 0) {
+    return { ok: false, exit, stderr: result && result.stderr };
+  }
+  return { ok: true };
+}
+
+module.exports = { COLUMN_BY_STATE, moveCard, moveIssueToColumn, runSync, normalizeExit };

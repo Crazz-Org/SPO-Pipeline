@@ -1,14 +1,16 @@
 'use strict';
-// Unit tests for bin/spo's cmdTriage wiring around orchestrator/auto-triage.js's runAutoTriage,
-// via the same deps.autoTriage test-only override convention test/intake.test.js already uses
-// for deps.intake (cmdAsk/cmdPull) -- drives the REAL cmdTriage/parseArgs against a fake
-// auto-triage module, never the real orchestrator/auto-triage.js, so no account pool / spawnSync
-// fixture is needed here.
+// Unit tests for bin/spo's cmdIntake/cmdReports/cmdTriage wiring, via the same deps.reportIntake/
+// deps.autoTriage test-only override convention test/intake.test.js already uses for deps.intake
+// (cmdAsk/cmdPull) -- drives the REAL commands/parseArgs against fake modules, never the real
+// orchestrator/*.js, so no account pool / spawnSync fixture is needed here.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 
 const spo = require('../bin/spo');
+const { mkTmp } = require('./helpers');
 
 function captureConsole() {
   const logs = [];
@@ -39,30 +41,19 @@ function withExitCodeReset(fn) {
   };
 }
 
+// ---- cmdTriage ----------------------------------------------------------------------------
+
 test(
   'spo triage: defaults to dry -- passes {dry: true} through to runAutoTriage',
   withExitCodeReset(async () => {
     let seenDry = null;
     let seenLimit = null;
-    let seenReportsDir = null;
     const fakeAutoTriage = {
       DEFAULT_AUTO_TRIAGE_LIMIT: 3,
-      runAutoTriage: async (reportsDir, journalRoot, config, deps, opts) => {
+      runAutoTriage: async (journalRoot, config, deps, opts) => {
         seenDry = opts.dry;
         seenLimit = config.autoTriageLimit;
-        seenReportsDir = reportsDir;
-        return {
-          ok: true,
-          processed: 0,
-          filed: 0,
-          duplicates: 0,
-          notReproduced: 0,
-          insufficient: 0,
-          schemaVersion: 0,
-          doNotFile: 0,
-          errors: [],
-          results: [],
-        };
+        return { ok: true, processed: 0, filed: 0, duplicates: 0, held: 0, errors: [], results: [] };
       },
     };
 
@@ -76,9 +67,8 @@ test(
 
     assert.equal(seenDry, true);
     assert.equal(seenLimit, 3);
-    assert.ok(seenReportsDir);
     assert.equal(process.exitCode, undefined);
-    assert.ok(console_.logs.some((l) => l.includes('no queued reports')));
+    assert.ok(console_.logs.some((l) => l.includes('no confirmed reports')));
   })
 );
 
@@ -88,20 +78,9 @@ test(
     let seenDry = null;
     const fakeAutoTriage = {
       DEFAULT_AUTO_TRIAGE_LIMIT: 3,
-      runAutoTriage: async (reportsDir, journalRoot, config, deps, opts) => {
+      runAutoTriage: async (journalRoot, config, deps, opts) => {
         seenDry = opts.dry;
-        return {
-          ok: true,
-          processed: 0,
-          filed: 0,
-          duplicates: 0,
-          notReproduced: 0,
-          insufficient: 0,
-          schemaVersion: 0,
-          doNotFile: 0,
-          errors: [],
-          results: [],
-        };
+        return { ok: true, processed: 0, filed: 0, duplicates: 0, held: 0, errors: [], results: [] };
       },
     };
 
@@ -118,40 +97,26 @@ test(
 );
 
 test(
-  'spo triage --limit 2 --reports-dir <dir>: flags reach runAutoTriage',
+  'spo triage --limit 2: flag reaches runAutoTriage config',
   withExitCodeReset(async () => {
     let seenLimit = null;
-    let seenReportsDir = null;
     const fakeAutoTriage = {
       DEFAULT_AUTO_TRIAGE_LIMIT: 3,
-      runAutoTriage: async (reportsDir, journalRoot, config) => {
+      runAutoTriage: async (journalRoot, config) => {
         seenLimit = config.autoTriageLimit;
-        seenReportsDir = reportsDir;
-        return {
-          ok: true,
-          processed: 0,
-          filed: 0,
-          duplicates: 0,
-          notReproduced: 0,
-          insufficient: 0,
-          schemaVersion: 0,
-          doNotFile: 0,
-          errors: [],
-          results: [],
-        };
+        return { ok: true, processed: 0, filed: 0, duplicates: 0, held: 0, errors: [], results: [] };
       },
     };
 
     const console_ = captureConsole();
     try {
-      const opts = spo.parseArgs(['--limit', '2', '--reports-dir', '/tmp/fake-reports']);
+      const opts = spo.parseArgs(['--limit', '2']);
       await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
     } finally {
       console_.restore();
     }
 
     assert.equal(seenLimit, 2);
-    assert.equal(seenReportsDir, '/tmp/fake-reports');
   })
 );
 
@@ -165,14 +130,11 @@ test(
         processed: 2,
         filed: 1,
         duplicates: 0,
-        notReproduced: 0,
-        insufficient: 0,
-        schemaVersion: 0,
-        doNotFile: 0,
-        errors: [{ file: 'b.json', error: 'boom' }],
+        held: 1,
+        errors: [{ issue: 43, error: 'boom' }],
         results: [
-          { file: 'a.json', outcome: 'filed', issueNumber: 42, url: 'https://x/42' },
-          { file: 'b.json', outcome: 'error', error: 'boom' },
+          { issue: 42, outcome: 'filed', url: 'https://x/42' },
+          { issue: 43, outcome: 'error', error: 'boom' },
         ],
       }),
     };
@@ -185,8 +147,8 @@ test(
       console_.restore();
     }
 
-    assert.ok(console_.logs.some((l) => l.includes('a.json: filed #42')));
-    assert.ok(console_.logs.some((l) => l.includes('b.json: error -- boom')));
+    assert.ok(console_.logs.some((l) => l.includes('#42: filed')));
+    assert.ok(console_.logs.some((l) => l.includes('#43: error -- boom')));
     assert.ok(console_.logs.some((l) => l.includes('filed: 1')));
     assert.equal(process.exitCode, 1);
   })
@@ -212,3 +174,96 @@ test(
     assert.ok(console_.errors.some((l) => l.includes('boom')));
   })
 );
+
+// ---- cmdIntake ------------------------------------------------------------------------------
+
+test(
+  'spo intake: reports filed/duplicate/schema-version/error lines and the summary',
+  withExitCodeReset(async () => {
+    let seenLimit = null;
+    let seenReportsDir = null;
+    const fakeReportIntake = {
+      DEFAULT_AUTO_INTAKE_LIMIT: 3,
+      runReportIntake: async (journalRoot, config) => {
+        seenLimit = config.autoIntakeLimit;
+        seenReportsDir = config.spoReportsDir;
+        return {
+          ok: true,
+          processed: 3,
+          filed: 1,
+          duplicates: 1,
+          schemaVersion: 1,
+          errors: [],
+          results: [
+            { file: 'a.json', outcome: 'filed', issueNumber: 501 },
+            { file: 'b.json', outcome: 'duplicate', issueNumber: 42 },
+            { file: 'c.json', outcome: 'schema-version', found: 2, expected: 1 },
+          ],
+        };
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--limit', '5', '--reports-dir', '/tmp/fake-reports']);
+      await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(seenLimit, 5);
+    assert.equal(seenReportsDir, '/tmp/fake-reports');
+    assert.ok(console_.logs.some((l) => l.includes('a.json: filed #501')));
+    assert.ok(console_.logs.some((l) => l.includes('b.json: duplicate of #42')));
+    assert.ok(console_.logs.some((l) => l.includes('c.json: schema version mismatch')));
+    assert.ok(console_.logs.some((l) => l.includes('filed: 1')));
+    assert.equal(process.exitCode, undefined);
+  })
+);
+
+test(
+  'spo intake: nothing queued',
+  withExitCodeReset(async () => {
+    const fakeReportIntake = {
+      DEFAULT_AUTO_INTAKE_LIMIT: 3,
+      runReportIntake: async () => ({ ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs([]);
+      await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.ok(console_.logs.some((l) => l.includes('no queued reports')));
+  })
+);
+
+// ---- cmdReports -----------------------------------------------------------------------------
+
+test('spo reports: lists pending files, or says nothing pending', () => {
+  const reportsDir = mkTmp('spo-reports-cmd-');
+  const pendingDir = path.join(reportsDir, 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.writeFileSync(path.join(pendingDir, '2026-08-30T00-00-00-000Z_desktop_aaa.json'), '{}');
+
+  const console_ = captureConsole();
+  try {
+    spo.cmdReports(spo.parseArgs(['--reports-dir', reportsDir]));
+  } finally {
+    console_.restore();
+  }
+  assert.ok(console_.logs.some((l) => l.includes('2026-08-30T00-00-00-000Z_desktop_aaa.json')));
+
+  const empty = mkTmp('spo-reports-cmd-empty-');
+  fs.mkdirSync(path.join(empty, 'pending'), { recursive: true });
+  const console2 = captureConsole();
+  try {
+    spo.cmdReports(spo.parseArgs(['--reports-dir', empty]));
+  } finally {
+    console2.restore();
+  }
+  assert.ok(console2.logs.some((l) => l.includes('nothing pending')));
+});

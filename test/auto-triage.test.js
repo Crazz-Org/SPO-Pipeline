@@ -1,11 +1,11 @@
 'use strict';
-// Tests for orchestrator/auto-triage.js: shouldAutoTriage's pure timer decision (same
-// "injectable clock" convention as test/auto-pull.test.js), listQueuedReports' ordering/filtering,
-// and runAutoTriage's triageBugReport -> reviewCard -> fileCard wiring (same deps.spawnSync
-// injection convention test/intake.test.js already uses for draftCard/reviewCard/fileCard --
-// this file only asserts what is specific to the auto-triage driver: outcome routing, the
-// dry-run/real split, "a mechanical failure leaves the report queued", and the daemon.jsonl
-// shape).
+// Tests for orchestrator/auto-triage.js -- stage 3+ of the human-first bug-report intake
+// pipeline: shouldAutoTriage's pure timer decision, findConfirmedAwaitingTriage's daemon.jsonl
+// anchor scan (report-confirmed with no later report-triaged/report-held for the same issue),
+// and runAutoTriage/processConfirmedReport's triageBugReport -> reviewCard -> amendCard wiring
+// (same deps.spawnSync injection convention test/intake.test.js already uses -- this file only
+// asserts what is specific to the auto-triage driver: outcome routing, the dry/real split, the
+// "never dispose a confirmed report on a negative outcome" hold rule, and the daemon.jsonl shape).
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -17,10 +17,12 @@ const { mkTmp, writePoolDir } = require('./helpers');
 const {
   shouldAutoTriage,
   runAutoTriage,
-  listQueuedReports,
+  processConfirmedReport,
+  findConfirmedAwaitingTriage,
   DEFAULT_AUTO_TRIAGE_MS,
   DEFAULT_AUTO_TRIAGE_LIMIT,
 } = require('../orchestrator/auto-triage');
+const { appendDaemonEvent } = require('../orchestrator/journal');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -43,10 +45,11 @@ function realShapedReply(resultObj) {
   };
 }
 
-function writeReport(spoReportsDir, filename) {
-  fs.mkdirSync(spoReportsDir, { recursive: true });
-  fs.writeFileSync(path.join(spoReportsDir, filename), JSON.stringify({ version: 1 }));
-  return path.join(spoReportsDir, filename);
+function writePendingReport(spoReportsDir, filename) {
+  const pendingDir = path.join(spoReportsDir, 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.writeFileSync(path.join(pendingDir, filename), JSON.stringify({ version: 1 }));
+  return path.join(pendingDir, filename);
 }
 
 const VALID_DRAFT = {
@@ -59,7 +62,7 @@ const VALID_DRAFT = {
     '## Done means',
     'The header balance reflects the deposit immediately.',
     '',
-    'Source: /triage-report queue, 2026-08-29',
+    'Source: /triage-report queue, 2026-08-30',
   ].join('\n'),
   category: 'defect',
   size: 'S',
@@ -68,9 +71,9 @@ const VALID_DRAFT = {
   confirmed: true,
 };
 
-// Sequenced `claude` replies (one per invokeClaudeReal call, in call order: triageBugReport
-// first, then reviewCard for a "draft" outcome) plus a `gh` responder for fileCard/postIssueComment.
-function makeDeps({ claudeReplies, ghResponder, accountsDir }) {
+// Sequenced `claude` replies (one per invokeClaudeReal call: triageBugReport, then reviewCard for
+// a "draft" outcome) plus a `gh` responder for amendCard/postIssueComment/board:move.
+function makeDeps({ claudeReplies, ghResponder, npmResponder, accountsDir }) {
   let claudeCallIdx = 0;
   return {
     accountsDir: accountsDir || poolDir(),
@@ -81,9 +84,11 @@ function makeDeps({ claudeReplies, ghResponder, accountsDir }) {
       }
       if (command === 'gh') {
         if (ghResponder) return ghResponder(args);
-        if (args[0] === 'issue' && args[1] === 'create') {
-          return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/999\n');
-        }
+        if (args[0] === 'api') return ok(JSON.stringify({ body: 'original raw body' }));
+        return ok('');
+      }
+      if (command === 'npm') {
+        if (npmResponder) return npmResponder(args);
         return ok('');
       }
       return ok('');
@@ -91,9 +96,13 @@ function makeDeps({ claudeReplies, ghResponder, accountsDir }) {
   };
 }
 
+function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1 }) {
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue, pendingPath, commentId });
+}
+
 // ---- shouldAutoTriage: pure decision function --------------------------------------------------
 
-test('shouldAutoTriage: disabled at 0 (the default), regardless of lastTriageAt', () => {
+test('shouldAutoTriage: disabled at 0, regardless of lastTriageAt', () => {
   assert.equal(shouldAutoTriage(null, Date.now(), 0), false);
   assert.equal(shouldAutoTriage(Date.now() - 10_000_000, Date.now(), 0), false);
 });
@@ -119,139 +128,166 @@ test('defaults: 15 minutes / top 3', () => {
   assert.equal(DEFAULT_AUTO_TRIAGE_LIMIT, 3);
 });
 
-// ---- listQueuedReports -------------------------------------------------------------------------
+// ---- findConfirmedAwaitingTriage -----------------------------------------------------------
 
-test('listQueuedReports: chronological (lexical) order, excludes archive/, ignores non-json, missing dir -> []', () => {
-  const dir = mkTmp('spo-autotriage-list-');
-  assert.deepEqual(listQueuedReports(path.join(dir, 'nope')), []);
+test('findConfirmedAwaitingTriage: only unhandled report-confirmed events, oldest first, capped at limit', () => {
+  const journalRoot = mkTmp('spo-autotriage-find1-');
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 101, pendingPath: '/a' });
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 102, pendingPath: '/b' });
+  appendDaemonEvent(journalRoot, 'report-triaged', { issue: 101, outcome: 'filed' }); // 101 handled
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 103, pendingPath: '/c' });
 
-  writeReport(dir, '2026-08-29T10-00-00-000Z_desktop_aaa.json');
-  writeReport(dir, '2026-08-29T09-00-00-000Z_mobile_bbb.json');
-  fs.writeFileSync(path.join(dir, 'notes.txt'), 'ignore me');
-  fs.mkdirSync(path.join(dir, 'archive'), { recursive: true });
-  writeReport(path.join(dir, 'archive'), '2026-08-28T00-00-00-000Z_desktop_zzz.json');
+  const found = findConfirmedAwaitingTriage(journalRoot, 10);
+  assert.deepEqual(found.map((f) => f.issue), [102, 103]);
 
-  const got = listQueuedReports(dir).map((p) => path.basename(p));
-  assert.deepEqual(got, ['2026-08-29T09-00-00-000Z_mobile_bbb.json', '2026-08-29T10-00-00-000Z_desktop_aaa.json']);
+  const capped = findConfirmedAwaitingTriage(journalRoot, 1);
+  assert.deepEqual(capped.map((f) => f.issue), [102]);
 });
 
-// ---- runAutoTriage ------------------------------------------------------------------------------
+test('findConfirmedAwaitingTriage: a report-held event also counts as handled', () => {
+  const journalRoot = mkTmp('spo-autotriage-find2-');
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 201, pendingPath: '/a' });
+  appendDaemonEvent(journalRoot, 'report-held', { issue: 201, outcome: 'not-reproduced' });
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+});
 
-test('runAutoTriage: draft -> FILE -> filed, archived with a "filed:" sidecar, journals one auto-triage event', async () => {
+// ---- processConfirmedReport / runAutoTriage --------------------------------------------------
+
+test('runAutoTriage: draft -> FILE -> amendCard + move to Todo, report archived, journals one auto-triage event', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports1-');
   const journalRoot = mkTmp('spo-autotriage-journal1-');
-  const reportPath = writeReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_aaa.json');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_aaa.json');
+  confirmedEntry(journalRoot, { issue: 999, pendingPath });
 
+  const seenGh = [];
+  const seenNpm = [];
   const deps = makeDeps({
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
-      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-29\n\n**Verdict:** FILE' },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
     ],
+    ghResponder: (args) => {
+      seenGh.push(args);
+      if (args[0] === 'api') return ok(JSON.stringify({ body: 'original raw body' }));
+      return ok('');
+    },
+    npmResponder: (args) => {
+      seenNpm.push(args);
+      return ok('');
+    },
   });
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true }, deps, { dry: false });
 
   assert.equal(result.ok, true);
   assert.equal(result.filed, 1);
   assert.equal(result.results[0].outcome, 'filed');
-  assert.equal(result.results[0].issueNumber, 999);
 
-  assert.equal(fs.existsSync(reportPath), false);
-  const archived = path.join(spoReportsDir, 'archive', path.basename(reportPath));
+  assert.ok(seenGh.some((a) => a[0] === 'issue' && a[1] === 'edit' && a[2] === '999'));
+  assert.ok(seenNpm.some((a) => a.join(' ') === 'run board:move -- 999 Todo'));
+
+  assert.equal(fs.existsSync(pendingPath), false);
+  const archived = path.join(spoReportsDir, 'archive', path.basename(pendingPath));
   assert.equal(fs.existsSync(archived), true);
-  const sidecar = fs.readFileSync(`${archived}.disposition.txt`, 'utf8');
-  assert.match(sidecar, /^filed: #999 —/);
+  assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), /^filed: #999 —/);
 
   const daemonLog = fs
     .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
     .split('\n')
     .filter(Boolean)
     .map((l) => JSON.parse(l));
-  assert.equal(daemonLog.length, 1);
-  assert.equal(daemonLog[0].event, 'auto-triage');
-  assert.equal(daemonLog[0].filed, 1);
+  assert.ok(daemonLog.some((e) => e.event === 'report-triaged' && e.issue === 999 && e.outcome === 'filed'));
+  assert.ok(daemonLog.some((e) => e.event === 'auto-triage' && e.filed === 1));
 });
 
-test('runAutoTriage: draft -> DO_NOT_FILE -> archived, gh issue create never called', async () => {
+test('runAutoTriage: draft -> DO_NOT_FILE -> HELD (commented, never archived), gh issue edit never called', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports2-');
   const journalRoot = mkTmp('spo-autotriage-journal2-');
-  const reportPath = writeReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_bbb.json');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_bbb.json');
+  confirmedEntry(journalRoot, { issue: 888, pendingPath });
 
-  let ghCreateCalled = false;
+  let editCalled = false;
   const deps = makeDeps({
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
-      { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'No reproduction supplied.\nMore detail here.' },
+      { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Not a real defect.' },
     ],
     ghResponder: (args) => {
-      if (args[0] === 'issue' && args[1] === 'create') ghCreateCalled = true;
+      if (args[0] === 'issue' && args[1] === 'edit') editCalled = true;
       return ok('');
     },
   });
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
-  assert.equal(result.doNotFile, 1);
-  assert.equal(ghCreateCalled, false);
-  assert.equal(fs.existsSync(reportPath), false);
-  const sidecar = fs.readFileSync(path.join(spoReportsDir, 'archive', `${path.basename(reportPath)}.disposition.txt`), 'utf8');
-  assert.match(sidecar, /^do-not-file: No reproduction supplied\. —/);
+  assert.equal(result.held, 1);
+  assert.equal(editCalled, false);
+  assert.equal(fs.existsSync(pendingPath), true); // still there -- HELD, never disposed of
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"report-held"/);
+  assert.match(daemonLog, /"outcome":"do-not-file"/);
 });
 
-test('runAutoTriage: outcome duplicate -> posts a comment on the existing issue, never gh issue create', async () => {
+test('runAutoTriage: outcome duplicate -> comments both issues, closes nothing wrong, archives the report', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports3-');
   const journalRoot = mkTmp('spo-autotriage-journal3-');
-  const reportPath = writeReport(spoReportsDir, '2026-08-29T10-00-00-000Z_mobile_ccc.json');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_mobile_ccc.json');
+  confirmedEntry(journalRoot, { issue: 777, pendingPath });
 
-  const seenGhCalls = [];
+  const seenComments = [];
   const deps = makeDeps({
-    claudeReplies: [{ outcome: 'duplicate', issue_number: 42, comment_markdown: 'Also seen 2026-08-29, mobile.' }],
+    claudeReplies: [{ outcome: 'duplicate', issue_number: 42, comment_markdown: 'Also seen 2026-08-30, mobile.' }],
     ghResponder: (args) => {
-      seenGhCalls.push(args);
+      if (args[0] === 'issue' && args[1] === 'comment') seenComments.push(args[2]);
       return ok('');
     },
   });
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.duplicates, 1);
-  assert.equal(result.results[0].issueNumber, 42);
-  assert.ok(seenGhCalls.some((a) => a[0] === 'issue' && a[1] === 'comment' && a[2] === '42'));
-  assert.ok(!seenGhCalls.some((a) => a[0] === 'issue' && a[1] === 'create'));
-  assert.equal(fs.existsSync(reportPath), false);
+  assert.deepEqual(seenComments.sort(), ['42', '777']); // occurrence note on #42, closure note on #777
+  assert.equal(fs.existsSync(pendingPath), false);
+  const archived = path.join(spoReportsDir, 'archive', path.basename(pendingPath));
+  assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), /^duplicate: #42 —/);
 });
 
-test('runAutoTriage: not-reproduced / insufficient / schema-version -- archived, no gh call at all', async () => {
+test('runAutoTriage: not-reproduced / insufficient / schema-version -- HELD, never archived, no gh issue edit', async () => {
   for (const outcome of ['not-reproduced', 'insufficient', 'schema-version']) {
     const spoReportsDir = mkTmp(`spo-autotriage-reports-${outcome}-`);
     const journalRoot = mkTmp(`spo-autotriage-journal-${outcome}-`);
-    const reportPath = writeReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_ddd.json');
+    const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_ddd.json');
+    confirmedEntry(journalRoot, { issue: 555, pendingPath });
 
-    let ghCalled = false;
+    let editCalled = false;
+    let commentCalled = false;
     const reply =
       outcome === 'schema-version'
         ? { outcome, found: 2, expected: 3 }
         : { outcome, reason: 'no journal entries around the flagged click' };
     const deps = makeDeps({
       claudeReplies: [reply],
-      ghResponder: () => {
-        ghCalled = true;
+      ghResponder: (args) => {
+        if (args[0] === 'issue' && args[1] === 'edit') editCalled = true;
+        if (args[0] === 'issue' && args[1] === 'comment') commentCalled = true;
         return ok('');
       },
     });
 
-    const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+    const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
-    assert.equal(ghCalled, false);
-    assert.equal(fs.existsSync(reportPath), false);
-    assert.equal(fs.existsSync(path.join(spoReportsDir, 'archive', `${path.basename(reportPath)}.disposition.txt`)), true);
+    assert.equal(result.held, 1);
+    assert.equal(editCalled, false);
+    assert.equal(commentCalled, true); // held reports are commented, not silently dropped
+    assert.equal(fs.existsSync(pendingPath), true);
   }
 });
 
-test('runAutoTriage: dry run -- draft+review still happen, but no gh call, report stays queued, no journal', async () => {
+test('runAutoTriage: dry run -- draft+review still happen, but no gh call, report stays pending, no journal', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports4-');
   const journalRoot = mkTmp('spo-autotriage-journal4-');
-  const reportPath = writeReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_eee.json');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_eee.json');
+  confirmedEntry(journalRoot, { issue: 333, pendingPath });
 
   let ghCalled = false;
   const deps = makeDeps({
@@ -259,39 +295,51 @@ test('runAutoTriage: dry run -- draft+review still happen, but no gh call, repor
       { outcome: 'draft', draft: VALID_DRAFT },
       { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
     ],
-    ghResponder: () => {
-      ghCalled = true;
-      return ok('');
+    ghResponder: (args) => {
+      if (!(args[0] === 'api')) ghCalled = true; // the read-only issue fetch never happens in dry mode either
+      return ok('{}');
     },
   });
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: true });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
 
   assert.equal(ghCalled, false);
   assert.equal(result.results[0].outcome, 'would-file');
-  assert.equal(fs.existsSync(reportPath), true); // still queued
-  assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
+  assert.equal(fs.existsSync(pendingPath), true);
+  assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), true); // report-confirmed itself is on it
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.doesNotMatch(daemonLog, /"event":"report-triaged"/);
+  assert.doesNotMatch(daemonLog, /"event":"report-held"/);
+  assert.doesNotMatch(daemonLog, /"event":"auto-triage"/);
 });
 
-test('runAutoTriage: a mechanical triageBugReport failure leaves the report queued, pushes to errors, no journal', async () => {
+test('runAutoTriage: a mechanical triageBugReport failure is not journaled as triaged/held (retried next cycle)', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports5-');
   const journalRoot = mkTmp('spo-autotriage-journal5-');
-  const reportPath = writeReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_fff.json');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_fff.json');
+  confirmedEntry(journalRoot, { issue: 222, pendingPath });
 
   const deps = makeDeps({ claudeReplies: ['not json at all'] });
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.errors.length, 1);
-  assert.equal(fs.existsSync(reportPath), true);
-  assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
+  assert.equal(fs.existsSync(pendingPath), true);
+  const daemonLog = fs.existsSync(path.join(journalRoot, 'daemon.jsonl'))
+    ? fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    : '';
+  assert.doesNotMatch(daemonLog, /"event":"report-triaged"/);
+  assert.doesNotMatch(daemonLog, /"event":"report-held"/);
+  // still "awaiting triage" next scan
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [222]);
 });
 
-test('runAutoTriage: default limit 3 -- only the top 3 of 5 queued reports are processed', async () => {
+test('runAutoTriage: default limit 3 -- only the top 3 of 5 confirmed reports are processed', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports6-');
   const journalRoot = mkTmp('spo-autotriage-journal6-');
   for (let i = 0; i < 5; i++) {
-    writeReport(spoReportsDir, `2026-08-29T10-0${i}-00-000Z_desktop_r${i}.json`);
+    const p = writePendingReport(spoReportsDir, `2026-08-29T10-0${i}-00-000Z_desktop_r${i}.json`);
+    confirmedEntry(journalRoot, { issue: 600 + i, pendingPath: p });
   }
 
   const deps = makeDeps({
@@ -302,20 +350,19 @@ test('runAutoTriage: default limit 3 -- only the top 3 of 5 queued reports are p
     ],
   });
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.processed, 3);
-  assert.equal(fs.readdirSync(spoReportsDir).filter((f) => f.endsWith('.json')).length, 2); // 2 left queued
 });
 
-test('runAutoTriage: nothing queued -- no claude/gh spawn at all, no journal event', async () => {
+test('runAutoTriage: nothing confirmed -- no claude/gh spawn at all, no journal event', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports7-');
   const journalRoot = mkTmp('spo-autotriage-journal7-');
 
   let spawned = false;
   const deps = { accountsDir: poolDir(), spawnSync: () => { spawned = true; return ok(''); } };
 
-  const result = await runAutoTriage(spoReportsDir, journalRoot, {}, deps, { dry: false });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.processed, 0);
   assert.equal(spawned, false);

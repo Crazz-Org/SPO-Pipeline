@@ -102,8 +102,16 @@ module.exports = {
   autoPullLimit:
     process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 1,
 
-  // ---- kanban piloting: auto-triage (orchestrator/auto-triage.js) ------------------------
+  // ---- kanban piloting: human-first bug-report intake --------------------------------------
   //
+  // Two independent stages, on two independent timers -- orchestrator/report-intake.js (stage
+  // 1: mechanical filing, stage 2: the confirm/discard comment scan) and orchestrator/
+  // auto-triage.js (stage 3+: reproduction + the existing reviewCard/fileCard gate, but ONLY for
+  // a report a human has already replied "confirm" to). Maintainer decision, 2026-08-30,
+  // superseding the single-stage "probation column" design: no LLM looks at a report until a
+  // human has read it RAW (no reproduction, no classification) and asked for it to be pursued.
+  // See orchestrator/README.md § Auto-triage / § Report intake for the full design and why.
+
   // Where the webclient's bug-report queue lives -- outside any git tree by design
   // (SPO-WebClient's doc/bug-reporting.md § "The queue": `npm run finish` retires worktrees, and
   // a queue inside one would disappear with the branch that produced the reports). Never derived
@@ -111,27 +119,67 @@ module.exports = {
   // SPO_REPORTS_DIR overrides.
   spoReportsDir: process.env.SPO_REPORTS_DIR || path.join(os.homedir(), '.spo-reports'),
 
-  // daemon.js --real polls the bug-report queue on this timer, between drain passes
-  // (state-machine.js's runForever), the same way autoPullMs already drives auto-pull.js --
-  // running orchestrator/intake.js's triageBugReport + the existing reviewCard/fileCard gate for
-  // the top autoTriageLimit queued reports.
-  //
-  // Default 0 (DISABLED), unlike autoPullMs -- deliberately NOT symmetric with auto-pull.
-  // Maintainer decision, 2026-08-29: auto-pull only ever reads a board a human already curated;
-  // auto-triage's own reproduction step is a genuine LLM judgement call (log correlation,
-  // geometry-predicate reasoning), so filing unattended on a hallucinated "reproduced" verdict is
-  // a real risk auto-pull never carries. Stays off until a maintainer has run `spo triage --dry`
-  // by hand enough times to trust it, then sets SPO_AUTO_TRIAGE_MS explicitly. See
-  // orchestrator/README.md § Auto-triage.
+  // daemon.js --real polls ~/.spo-reports on this timer and mechanically files a RAW card per
+  // report (orchestrator/report-intake.js's runReportIntake) -- render + grep-shaped dedup +
+  // `gh issue create` + a column move. Nonzero by default, UNLIKE autoTriageMs below: this stage
+  // contains zero LLM judgement (see report-intake.js's own header), so it is the same risk
+  // class as auto-pull, not auto-triage. SPO_AUTO_INTAKE_MS overrides, 0 disables.
+  autoIntakeMs:
+    process.env.SPO_AUTO_INTAKE_MS !== undefined ? Number(process.env.SPO_AUTO_INTAKE_MS) : 15 * 60 * 1000,
+
+  // How many queued reports one intake cycle files. SPO_AUTO_INTAKE_LIMIT overrides.
+  autoIntakeLimit:
+    process.env.SPO_AUTO_INTAKE_LIMIT !== undefined ? Number(process.env.SPO_AUTO_INTAKE_LIMIT) : 3,
+
+  // The Status column a raw report's card is filed into -- a human moves it out (by replying
+  // "confirm"/"discard" on the issue, per report-intake.js's reportConfirmScan; this is a
+  // comment-driven trigger, the card's OWN column never has to move for the pipeline to notice).
+  // Deliberately not "Parked": SPO-WebClient's scripts/board-move.sh disarms the driver-scope
+  // marker of whatever checkout the move runs from on a move to Done/Parked -- this repo has no
+  // task worktree for these moves (cwd = config.productRepo, same as pullBoard/makeTask), and
+  // "Intake"/"Todo" both avoid that branch entirely. A new Status option on the product's
+  // project board -- see orchestrator/README.md § Report intake for the one-time board setup.
+  // SPO_REPORT_INTAKE_COLUMN overrides.
+  reportIntakeColumn: process.env.SPO_REPORT_INTAKE_COLUMN || 'Intake',
+
+  // Marks a mechanically-filed raw card so nothing downstream mistakes it for a judged one.
+  // Gates nothing by itself -- SPO-WebClient's claim-read.sh (what auto-pull reads) never
+  // consults labels, only the Status column -- so intake.makeTask ALSO skips any issue carrying
+  // this label, as a second, independent guard against a raw card that ends up in Todo through a
+  // failed column move (see report-intake.js's own header on that failure mode).
+  reportIntakeLabel: process.env.SPO_REPORT_INTAKE_LABEL || 'report:raw',
+
+  // The confirm/discard comment scan's own timer (orchestrator/report-intake.js's
+  // reportConfirmScan) -- deliberately NOT hung off pollIntervalMs (5s): a pending raw card may
+  // sit for days, and N pending cards x 12 scans/minute is a REST budget leak for no benefit.
+  // SPO_REPORT_CONFIRM_SCAN_MS overrides, 0 disables (report-intake still FILES raw cards, they
+  // just never automatically progress past a maintainer's comment).
+  reportConfirmScanMs:
+    process.env.SPO_REPORT_CONFIRM_SCAN_MS !== undefined ? Number(process.env.SPO_REPORT_CONFIRM_SCAN_MS) : 5 * 60 * 1000,
+
+  // daemon.js --real polls for reports a human has already replied "confirm" to (via the scan
+  // above) on this timer, running orchestrator/intake.js's triageBugReport (reproduce/route/
+  // dedup) + the existing reviewCard/fileCard gate. 0 (DISABLED) is no longer the load-bearing
+  // safety default it was in the single-stage design -- see report-intake.js's header: nothing
+  // reaches this stage without a prior human "confirm", so the risk this timer used to gate
+  // (autonomous filing on a hallucinated reproduction) already requires a human act upstream.
+  // Kept nonzero-by-default is still deliberately the maintainer's OWN call, not silently
+  // flipped in this rewrite -- SPO_AUTO_TRIAGE_MS keeps the exact same name and env var; the
+  // live systemd drop-in (SPO_AUTO_TRIAGE_MS=900000) keeps meaning "how often confirmed reports
+  // are processed" without needing to change.
   autoTriageMs:
     process.env.SPO_AUTO_TRIAGE_MS !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_MS) : 0,
 
-  // How many queued reports one auto-triage cycle takes off the queue. SPO_AUTO_TRIAGE_LIMIT
-  // overrides. Default 3: unmeasured guess (see auto-triage.js's own DEFAULT_AUTO_TRIAGE_LIMIT
-  // comment) -- reports may need more real-server-log grepping per item than a board candidate
-  // does, so this may prove too high once a real run exists.
+  // How many CONFIRMED reports one auto-triage cycle processes. SPO_AUTO_TRIAGE_LIMIT overrides.
   autoTriageLimit:
     process.env.SPO_AUTO_TRIAGE_LIMIT !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_LIMIT) : 3,
+
+  // Once a confirmed report survives reproduction + review as FILE/FILE_AMENDED, its (single,
+  // amended-in-place) card moves straight to Todo -- true by default, since the human already
+  // authorized it by confirming. Set false to leave it in reportIntakeColumn for a second human
+  // look before it becomes eligible for auto-pull. SPO_AUTO_TRIAGE_PROMOTE_TO_TODO overrides
+  // ('0'/'false' disables).
+  autoTriagePromoteToTodo: !['0', 'false'].includes(String(process.env.SPO_AUTO_TRIAGE_PROMOTE_TO_TODO).toLowerCase()),
 
   // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
   //

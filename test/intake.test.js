@@ -208,6 +208,23 @@ test('reviewCard: sends model fable / effort high, returns a DO_NOT_FILE verdict
   assert.equal(seenArgv[effortIdx + 1], 'high');
 });
 
+test('reviewCard: deps.humanConfirmed threads {{human_confirmed}} into the prompt ("yes"/"no")', async () => {
+  let seenPrompts = [];
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      seenPrompts.push(argv[1]);
+      return { status: 0, stdout: JSON.stringify(realShapedReply({ verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' })), stderr: '', signal: null };
+    }),
+  };
+
+  await intake.reviewCard(VALID_DRAFT, { ...deps, humanConfirmed: true });
+  await intake.reviewCard(VALID_DRAFT, deps); // no humanConfirmed at all -- every other caller
+
+  assert.ok(seenPrompts[0].includes('human_confirmed:  yes'));
+  assert.ok(seenPrompts[1].includes('human_confirmed:  no'));
+});
+
 // ---- fileCard: mechanical corrections + gh argv shapes -----------------------------------------
 
 test('fileCard: FILE_AMENDED applies mechanical category/size/area corrections, leaves prose alone', () => {
@@ -310,6 +327,68 @@ test('fileCard: gh issue create failure -> clear error, never attempts the comme
   const result = intake.fileCard(VALID_DRAFT, review, deps);
   assert.equal(result.ok, false);
   assert.equal(spawnCalls.length, 1); // never reached the comment call
+});
+
+// ---- amendCard: edits the raw-intake issue in place, never creates a second one ----------------
+
+test('amendCard: edits the existing issue, preserves the original body in a <details> block, posts the review comment', () => {
+  const spawnCalls = [];
+  const deps = {
+    ghRepo: 'x/y',
+    reportIntakeLabel: 'report:raw',
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'api') return { status: 0, stdout: JSON.stringify({ body: 'RAW REPORT BODY HERE' }), stderr: '', signal: null };
+      if (argv[0] === 'issue' && argv[1] === 'edit') return { status: 0, stdout: '', stderr: '', signal: null };
+      if (argv[0] === 'issue' && argv[1] === 'comment') return { status: 0, stdout: 'https://x/y/issues/501#issuecomment-1\n', stderr: '', signal: null };
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'review verdict text' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.issueNumber, 501);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(editCall, 'gh issue edit was called');
+  assert.equal(editCall[2], '501');
+  assert.ok(editCall.includes('--remove-label'));
+  assert.ok(editCall.includes('report:raw'));
+
+  const bodyFileArg = editCall[editCall.indexOf('--body-file') + 1];
+  const writtenBody = fs.readFileSync(bodyFileArg, 'utf8');
+  assert.ok(writtenBody.includes('RAW REPORT BODY HERE')); // original preserved
+  assert.ok(writtenBody.includes('<details>'));
+
+  assert.ok(spawnCalls.some((a) => a[0] === 'issue' && a[1] === 'comment' && a[2] === '501'));
+});
+
+test('amendCard: refuses to run for a DO_NOT_FILE verdict, never spawns', () => {
+  let called = false;
+  const deps = { spawnSync: fakeSpawnSync(() => { called = true; return { status: 0, stdout: '', stderr: '', signal: null }; }) };
+  const review = { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'nope' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, false);
+  assert.equal(called, false);
+});
+
+test('amendCard: gh issue edit failure -> clear error, never attempts the comment', () => {
+  const spawnCalls = [];
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'api') return { status: 0, stdout: JSON.stringify({ body: 'x' }), stderr: '', signal: null };
+      return { status: 1, stdout: '', stderr: 'gh: boom', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, false);
+  assert.equal(spawnCalls.filter((a) => a[0] === 'issue' && a[1] === 'comment').length, 0);
 });
 
 // ---- pullBoard: board:claim output parsing -----------------------------------------------------
@@ -463,6 +542,29 @@ test('makeTask: skips an issue already present in journal/, never spawns', () =>
   assert.equal(result.ok, true);
   assert.equal(result.skipped, true);
   assert.equal(called, false);
+});
+
+test('makeTask: skips an issue still carrying reportIntakeLabel -- not yet confirmed/triaged by the human-first pipeline', () => {
+  const queueDir = mkTmp('spo-intake-queue-rawskip-');
+  const journalRoot = mkTmp('spo-intake-journal-rawskip-');
+
+  const deps = {
+    queueDir,
+    journalRoot,
+    reportIntakeLabel: 'report:raw',
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify({ title: 'raw card', body: 'raw body', labels: [{ name: 'report:raw' }] }),
+      stderr: '',
+      signal: null,
+    })),
+  };
+
+  const result = intake.makeTask({ rank: 1, issue: 502, area: 'client', title: 'x' }, deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /report:raw/);
+  assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 0);
 });
 
 // ---- bin/spo: cmdAsk / cmdPull wiring, via deps.intake --------------------------------------
