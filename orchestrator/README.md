@@ -14,14 +14,19 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
 - `--once` drains the whole `queue/` directory serially (filename sort = processing order) and
   exits, printing `<id>  <finalState>` per task. Without `--once` the daemon polls the queue
   directory forever (`--interval-ms`, default 5000).
-- `--shadow` is required — `daemon.js` itself still only drives shadow-mode task files. Real
-  execution of the *scripted* steps (`npm run gate`, `gh pr merge`, …) remains a documented stub
-  in `steps/scripted.js`. The *LLM* steps (`steps/llm.js`) now have a real implementation —
-  see "Real mode" below — but nothing in `daemon.js`/`state-machine.js` reaches it yet, because
-  every task still arrives with `shadow: {...}` and never `ctx.shadowMode === false`. Real mode
-  is exercised today only by direct unit tests (`test/llm-real.test.js`,
-  `test/account-rotation.test.js`) and the one manual smoke script
-  (`scripts/smoke-llm.js`), never by `daemon.js` or the `node --test` suite.
+- One of `--shadow` or `--dry-run` is required. `--shadow` drives shadow-mode task files only
+  (`task.shadow.*` fixtures, no real code path reached). `--dry-run` drives a *real*
+  `kind: "card"` task file through real-mode semantics — step-contracts.js resolution,
+  prompt-template.js fill, account rotation — with the one spawn point in each step (a `claude`
+  CLI call, a scripted command) replaced by a fixture-free "assumed success" — see "Real mode"
+  → "--dry-run" below. Real execution of the *scripted* steps (`npm run gate`, `gh pr merge`, …)
+  remains a documented stub in `steps/scripted.js` regardless of mode — the *LLM* steps
+  (`steps/llm.js`) are the only ones with a real (non-dry-run) implementation today, exercised
+  by direct unit tests (`test/llm-real.test.js`, `test/llm-real-card.test.js`,
+  `test/account-rotation.test.js`) and the one manual smoke script (`scripts/smoke-llm.js`),
+  never by an actual `daemon.js` run with real spawning (`--dry-run` walks the same real-mode
+  code paths but never spawns; nothing in the `node --test` suite ever calls the real `claude`
+  CLI).
 - Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
   missing). Point both at a temp dir to run an isolated batch — this is how the test suite
   works.
@@ -155,6 +160,113 @@ that call comes back `{kind: 'limit'}`, cools the account down (journaled as
 registry, never a second lap. If `accounts.pick()` finds nothing healthy to begin with, or the
 whole pass is exhausted, the task is PARKED (`all-accounts-cooling-until-<iso>` /
 `all-accounts-cooling-after-retry`).
+
+### Step contracts + prompt fill (the real `kind: "card"` path)
+
+`runLlm`'s real branch has two sub-paths. If the task supplies `ctx.task.llm.<stepName>`
+directly (model/effort/promptText/... — the shape the "Real mode" code sample above builds by
+hand), that config is honoured verbatim: no template fill, no output-contract validation. This
+is the legacy interim path, kept only so a hand-authored real-mode task file, or a raw
+`invokeClaudeReal`-style call, still works; it is what `test/llm-real.test.js` and
+`test/account-rotation.test.js` exercise.
+
+A real **`kind: "card"`** task should *not* set `ctx.task.llm.<step>` — instead each LLM step's
+model, effort, tools, permission mode, `$` budget and `--json-schema` come from
+`orchestrator/step-contracts.js`'s table (one entry per orchestrator LLM step: PLAN, IMPLEMENT,
+DIAGNOSE, CITATION_VERIFIER, VALIDATE — sourced from `doc/state-machine-spec.md` § Step
+contracts, with `prompts/README.md`'s own per-step table consulted only where the spec is
+silent; every place the two disagreed is a comment on the field it affects), and the prompt
+itself is `prompts/<file>.md` with its declared `{{placeholders}}` filled by
+`orchestrator/task-values.js` + `orchestrator/prompt-template.js`.
+
+A card task's own fields:
+
+```json
+{
+  "id": "card-123",
+  "kind": "card",
+  "issue": 123,
+  "title": "Add a status badge to the header",
+  "criterion": "the header shows a status badge reflecting connection state",
+  "worktreePath": "/home/crazz/.spo-worktrees/card-123",
+  "size": "S",
+  "touchesRdoMembers": false,
+  "escalate": false,
+  "citations": ["ObjectAt — RDOObjectServer.pas:118 — function, 2 args"],
+  "spoOriginalPath": "/home/crazz/SPO-Original"
+}
+```
+
+`size` (`S`/`M`/`L`) drives effort and budget for PLAN/IMPLEMENT (`step-contracts.js`'s
+`EFFORT_BY_SIZE`/`BUDGET_BY_SIZE_USD`); `touchesRdoMembers` is the RDO wire-rule escalation flag
+for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
+PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
+CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
+only when `touchesRdoMembers` is true.
+
+Each prompt's `{{placeholder}}` values come from one of two places
+(`orchestrator/task-values.js`):
+
+- **known at build time** — read straight off the task or `ctx.taskDir`:
+  `{{issue_number}}`/`{{task_title}}`/`{{task_criterion}}`/`{{worktree}}`/`{{task_size}}` from
+  the task fields above; `{{scratch_dir}}` = `journal/<id>/scratch`; `{{ledger_path}}` =
+  `journal/<id>/ledger.md` (the file `journal.js` already owns); `{{spo_original_path}}`
+  defaults to `~/SPO-Original`.
+- **unknown at build time** — produced by an *earlier* state's own LLM call and read back from
+  that state's journaled `result` event (`handlePlan` already does
+  `appendEvent(ctx.taskDir, 'PLAN', 'result', { payload })` — `task-values.js` is the reader
+  side of that same record): `{{plan_path}}`/`{{invariants_path}}`/`{{invariant_ids}}`/
+  `{{check_commands}}` feed IMPLEMENT, and `{{invariants_path}}`/`{{invariant_ids}}` feed
+  VALIDATE, both from PLAN's own output.
+- `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are named as fixed
+  `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions — nothing writes them yet,
+  since real CHECK/GATE/PUSH_PR execution remains the documented stub described above; naming
+  the path now fixes the contract a future real implementation of those steps must honour.
+
+A missing value for any placeholder a prompt's header declares — PLAN called before
+`worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws
+`prompt-template.js`'s `MissingPlaceholderError`, caught in `runLlm` and re-thrown as
+`ParkSignal('prompt-missing-placeholder:<name>', { promptFile, placeholder, missing })`: the
+task parks, it never sends a prompt with a bare `{{...}}` still in it. Fill is all-or-nothing —
+one missing placeholder blocks the whole call, never a partial substitution.
+
+A successful reply's `result` string is `JSON.parse`d and checked against the step's
+`outputContract.required` (`in` check, so a legitimately-`null` field like DIAGNOSE's
+`root_cause` still counts as present); a missing key returns the same `{ok: false, kind:
+'error'}` shape `invokeClaudeReal` itself uses for a spawn/parse failure — handled by the same
+existing DIAGNOSE/PARK paths in `state-machine.js`, no new failure category. The validated
+payload is also given a snake_case→camelCase alias of every key (`root_cause` → `rootCause`
+too, additively — this is the one step whose contract key differs from what
+`state-machine.js`'s handlers already read; every other step's key names matched by
+coincidence).
+
+### --dry-run
+
+`node orchestrator/daemon.js --dry-run --once [--queue <dir>] [--journal <dir>]` runs real-mode
+semantics — step-contracts.js resolution, prompt-template.js fill, account rotation — **without
+spawning anything**. `runLlm` (steps/llm.js) and `runScripted` (steps/scripted.js) both check
+`ctx.dryRun` immediately before their own spawn point:
+
+- an **LLM step** builds the real prompt and the real argv (via the same `buildArgv` real mode
+  uses), writes both to `journal/<id>/dryrun-<STATE>.md` (the argv with the `-p` prompt elided
+  to a pointer, then the filled prompt in full underneath — otherwise the one line worth
+  scanning for `--model`/`--effort`/`--json-schema` is buried inside one giant JSON string),
+  journals a `dry-run` event (never `llm-call`), and returns a minimal
+  `outputContract`-satisfying payload marked `{dryRun: true}` — enough to walk the state machine
+  forward, never a stand-in for a real judgement. PLAN's canned `plan_path`/`invariants_path`
+  use the same `{{scratch_dir}}/plan-<issue>.md` convention a real PLAN call would have produced
+  (not `null`) — IMPLEMENT and VALIDATE's own dry-run calls, later in the same walk, read those
+  paths back out of the journal exactly like a real run would, and a `null` would incorrectly
+  park them as "missing".
+- a **scripted step** (WORKTREE, CHECK, PUSH_PR, GATE, MERGE, FINISH) returns a fixture-free
+  `{exit: 0, stdoutTail: '[dry-run] <key> -> assumed success'}` — no fixture consulted, no
+  command run.
+
+`--dry-run` is ignored if `--shadow` is also passed (shadow wins). `test/dry-run-demo.test.js`
+walks a synthetic `kind: "card"` task through the full lifecycle this way and asserts on the
+final `DONE` state, the three `dryrun-{PLAN,IMPLEMENT,VALIDATE}.md` files (DIAGNOSE and
+CITATION_VERIFIER are never reached on a happy path), and that `dryrun-PLAN.md` shows the real
+argv flags and the filled prompt.
 
 ### Account registry
 

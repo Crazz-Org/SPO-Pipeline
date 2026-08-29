@@ -35,7 +35,7 @@ checks:     {{check_commands}}
 
 1. **Read `{{plan_path}}` in full before touching anything.** It is the only design you follow.
 2. **Implement exactly what the plan describes** inside `{{worktree}}`. If the plan turns out
-   wrong or insufficient for `{{criterion}}`, stop and say so in `summary` rather than
+   wrong or insufficient for `{{task_criterion}}`, stop and say so in `summary` rather than
    improvising a different design — a plan defect is reported, not silently corrected by you.
    The plan owns the design; you own the execution of it.
 3. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's

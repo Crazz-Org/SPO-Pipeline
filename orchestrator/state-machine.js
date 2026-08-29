@@ -279,6 +279,12 @@ const HANDLERS = {
 
 // ---- task runner ------------------------------------------------------------------------
 
+// dryRun (daemon.js's --dry-run): real-mode semantics -- config.shadowMode stays false, so
+// callLlmStep takes its real branch (step-contracts.js + prompt-template.js, account rotation)
+// -- but nothing spawns. steps/llm.js's runLlm and steps/scripted.js's runScripted both check
+// ctx.dryRun before their own spawn point and return a fixture-free "assumed success" (scripted)
+// or a canned outputContract-satisfying payload (LLM), so a --dry-run run can walk a synthetic
+// card task to DONE with zero subprocesses and zero `claude` CLI calls.
 function buildCtx(id, task, taskDir, config) {
   return {
     id,
@@ -286,6 +292,7 @@ function buildCtx(id, task, taskDir, config) {
     taskDir,
     config,
     shadowMode: !!config.shadowMode,
+    dryRun: !!config.dryRun,
     fixture: makeFixtureReader(task),
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     counters: {
