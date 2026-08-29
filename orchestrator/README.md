@@ -442,6 +442,82 @@ a `kind: "card"` task against the real product repo and a real GitHub PR, a main
 watching: it worktree-adds off `origin/main`, runs `npm ci`, claims a real board card, pushes a
 real branch, opens a real PR, and — on the happy path — merges it and removes its own worktree.
 
+## Intake
+
+`orchestrator/intake.js` is the maintainer-facing path from a free-text request to a filed
+GitHub issue, and from the product board to a local `queue/` task file -- behind `bin/spo`'s
+`ask` and `pull` commands. Neither command runs `daemon.js` or drives a task through the
+lifecycle above; `spo ask` only files an issue (the board's own auto-add workflow puts it in
+Todo), and `spo pull` only writes `queue/` files for a later `daemon.js --real` run to drain.
+
+**The maintainer flow, end to end:**
+
+```
+spo ask "<request>"     -- file a card from a request (or --draft-file, see below)
+   |
+   v  (the board's auto-add workflow moves the new issue to Todo)
+npm run board:claim      -- (in the product repo) the priority order `spo pull` reads
+   |
+   v
+spo pull [--limit N]     -- write queue/<seq>-issue-<n>.json for the top N claimable cards
+   |
+   v
+daemon.js --real          -- drains queue/, drives each task PLAN -> ... -> DONE/PARKED for real
+```
+
+**Two entry lanes into `spo ask`:**
+
+- **Fast lane** -- `spo ask "<request text>"` -- joins the remaining argv as one free-text
+  request (any language) and runs it through DRAFT_CARD (`prompts/draft-card.md`) itself.
+- **Brainstorm lane** -- `spo ask --draft-file <path>` -- for a request that came out of an
+  interactive session instead: that session writes its own draft JSON (the same
+  `{title, body_markdown, category, size, area, is_bug_report, confirmed}` shape DRAFT_CARD
+  produces) to `<path>`, and this skips the DRAFT_CARD LLM call entirely
+  (`intake.loadDraftFile`) -- straight to review. The file is checked against the identical
+  contract DRAFT_CARD's own reply is validated against; a missing key or an unrecognized
+  `category`/`size`/`area` is reported clearly and exits non-zero, never silently guessed at.
+
+Both lanes converge on the same two steps:
+
+1. **DRAFT_CARD** (`prompts/draft-card.md`, Sonnet 5, effort medium; fast lane only) -- turns the
+   request into a draft card: title, body (what's wrong/missing, `file:line` refs or the
+   explicit reason there are none, a "Done means" criterion, a `Source: maintainer request,
+   <date>` line), `category`/`size`/`area`, and `is_bug_report`/`confirmed`. Sonnet, not Fable --
+   drafting is execution-shaped work, the same tier IMPLEMENT runs on.
+2. **review-card** (`prompts/review-card.md`, Fable 5, effort high -- the existing step, not new
+   here) -- the neutral second reader every other backlog card already gets
+   (`.claude/agents/card-reviewer.md`'s pipeline-side twin). Its own **§ 0** is the confirmation
+   gate for a bug report: `DO_NOT_FILE` unless the request supplies a reproduction the body can
+   replay, or the code confirms it -- see `is_bug_report`/`confirmed` above, which DRAFT_CARD (or
+   the brainstorm session) is expected to have set honestly going in. `FILE`/`FILE_AMENDED` both
+   file; `DO_NOT_FILE` files nothing and prints the reason.
+
+`intake.fileCard` applies only the *mechanical* part of a `FILE_AMENDED` verdict --
+a `category:`/`size:`/`area:` correction naming one of the valid enum values -- and leaves
+everything else (a missing citation, a rewritten "Done means" sentence) as the draft wrote it;
+the full correction text still reaches the maintainer, since `review-card`'s own
+`first_comment_markdown` is posted verbatim as the filed issue's first comment (`gh issue
+create` + `gh issue comment`, `orchestrator/intake.js`).
+
+**Cost**: `spo ask` makes about two real `claude -p` calls per request -- one DRAFT_CARD (skipped
+entirely in the brainstorm lane) and one review-card -- both at `SMALL_BUDGET_USD`
+(`step-contracts.js`), an order of magnitude cheaper than a single PLAN/IMPLEMENT call.
+
+**`spo pull`** never claims a card and never writes the board -- it only spawns
+`npm run board:claim` (cwd = the product repo, the cheap ~2-point GraphQL read
+`doc/kanban-workflow.md` § GitHub API discipline describes) and parses its claimable-candidate
+lines, in the priority order they were printed. For each of the top `--limit` (default 5) it
+fetches the issue body (`gh api repos/<repo>/issues/<n>`) and writes
+`queue/<zero-padded-seq>-issue-<n>.json` in the `kind: "card"` shape `takeNextTask()` already
+consumes (see "Task-file format" above) -- skipping, never overwriting, an issue already present
+in `queue/` or `journal/`.
+
+Every LLM call above goes through the exact same `invokeClaudeReal` primitive real mode's five
+step contracts already use (never a second spawn path), and every account comes from the same
+pool (`accounts.pick`); every `gh`/`npm` call is injected the same way `steps/scripted.js`'s
+`spawnStep` already is (`deps.spawnSync`) -- production code never passes it, so a real run
+always spawns the real binaries on `PATH`.
+
 ## Where journals live
 
 ```
@@ -465,6 +541,9 @@ bin/spo resume <id> [--journal <dir>]              # print `claude --resume <ses
 bin/spo accounts [--accounts-dir <dir>]            # list the account pool: name, enabled, cooldown, token, credentials
 bin/spo account add <name> [--accounts-dir <dir>]  # create the pool slot, print the guided setup steps
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
+bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
+bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
+bin/spo pull [--limit <n>]                         # write queue/<seq>-issue-<n>.json for the top N claimable board cards
 ```
 
 ## Dashboard

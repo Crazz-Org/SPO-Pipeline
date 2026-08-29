@@ -30,7 +30,7 @@ worktrees from the outside.
 | `scripts/usage-report.js` | Token-usage analyzer over local Claude Code transcripts (baseline + per-account later) | ✅ v0 |
 | `scripts/smoke-llm.js` | Manual smoke test: the one real `claude` CLI call through `steps/llm.js`'s real mode — not part of `node --test` | ✅ |
 | `orchestrator/` | The daemon (state machine, queue, workers) — see `orchestrator/README.md` | ✅ v2 skeleton, shadow mode |
-| `bin/spo` | Console CLI: `status` / `task <id>` / `parked` / `resume <id>` / `dashboard`, reads only the journals | ✅ v0 |
+| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` / `dashboard`, reads only the journals) + intake (`ask` / `pull`, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |
 | `test/` | `node --test` suite for the orchestrator, shadow mode, temp queue/journal dirs | ✅ |
 | `prompts/` | Step prompts (plan, implement, diagnose, validate, citation-verifier) | planned — migrated from `SPO-WebClient/.claude/agents/` |
 | `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |
