@@ -674,6 +674,30 @@ move) but every surface has to be gone and looked at. Two push halves close that
   journaled (`park-alert-failed`) and never blocks anything — the task is terminal before the
   alert runs.
 
+## Spend: the reader and the ceiling
+
+`orchestrator/cost.js` reads what the pipeline has spent back out of the journals — every real
+`claude -p` call already records its own `costUsd` in an `llm-call` event, so there is no
+second ledger to keep in sync. Two callers share the one computation:
+
+- **`spo cost`** — per task (state, calls, cost, park reasons), then the aggregate, cost per
+  DONE card and the parking rate. Parked-task count and park-*event* count are both printed
+  because they answer different questions: card #247 parked six times and still reached DONE.
+- **The cumulative ceiling** — `SPO_SOAK_BUDGET_USD` (config `soakBudgetUsd`, unset by default,
+  so a supervised run is unaffected). Distinct from `step-contracts.js`'s **per-step** caps
+  ($2/$5/$12 by size, $3 small, PLAN floor $3): those bound one call, this bounds a whole
+  unattended run.
+
+Reaching the ceiling stops the daemon **taking new work** and never interrupts a task in
+flight — a card killed mid-flight leaves a worktree, a branch and possibly a PR half-done,
+which costs more to clean up than the overrun it saves. The check runs *before* `takeNextTask`,
+so a refused task stays in `queue/` untouched (nothing to clean up, and it runs as-is once the
+ceiling is raised), and auto-pull stops enqueuing. One `budget-ceiling-reached` event per drain
+pass lands in `<journalRoot>/daemon.jsonl`.
+
+Note the daemon drains **serially** — one task at a time (`drainQueueOnce`). `autoPullLimit`
+is how many cards are *enqueued* per auto-pull cycle, not a concurrency setting.
+
 ## Where journals live
 
 ```

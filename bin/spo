@@ -5,6 +5,12 @@
 //   spo status              queue depth, active/parked/done counts, per-task state + last event
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl
 //   spo parked              parked tasks + reasons
+//   spo cost                 what the pipeline has spent, read back from the journals' own
+//                            `llm-call` costUsd events (orchestrator/cost.js -- no second
+//                            ledger): per task (state, calls, cost, park reasons), then the
+//                            aggregate, cost per DONE card and parking rate -- the two numbers
+//                            migration step 3 asks for. Names the SPO_SOAK_BUDGET_USD ceiling
+//                            and what is left of it when one is set.
 //   spo resume <id>         PRINTS `claude --resume <sessionId>` for a task's recorded LLM
 //                            steps, or for a bare session id, the same command directly. Never
 //                            executes anything -- see doc/state-machine-spec.md § Observability.
@@ -54,6 +60,7 @@ const { renderDashboard } = require('../console/render');
 const accounts = require('../orchestrator/accounts');
 const defaultConfig = require('../orchestrator/config');
 const intake = require('../orchestrator/intake');
+const { costReport } = require('../orchestrator/cost');
 
 function parseArgs(argv) {
   const opts = {
@@ -174,6 +181,54 @@ function cmdTask(id, opts) {
     delete detail.event;
     const detailStr = Object.keys(detail).length ? ` ${JSON.stringify(detail)}` : '';
     console.log(`[${ev.ts}] ${String(ev.state).padEnd(12)} ${ev.event}${detailStr}`);
+  }
+}
+
+// `spo cost` -- the soak's read-out: per task, then the two numbers migration step 3 asks for
+// (parking rate and cost per merged card). Everything comes from orchestrator/cost.js, i.e.
+// from the journals' own `llm-call` costUsd events -- there is no second ledger.
+//
+// Parked-task count and park-EVENT count are both printed because they answer different
+// questions: card #247 parked 6 times and still reached DONE.
+function cmdCost(opts) {
+  const { journalRoot } = resolveDirs(opts);
+  const report = costReport(journalRoot);
+
+  if (report.tasks.length === 0) {
+    console.log(`no task journals under ${journalRoot}`);
+    return;
+  }
+
+  const idWidth = Math.max(4, ...report.tasks.map((t) => t.id.length));
+  console.log(`${'task'.padEnd(idWidth)}  ${'state'.padEnd(7)}  ${'calls'.padStart(5)}  ${'cost'.padStart(8)}  parks`);
+  for (const t of report.tasks) {
+    const parks = t.parkReasons.length ? `${t.parkReasons.length} [${t.parkReasons.join(', ')}]` : '';
+    console.log(
+      `${t.id.padEnd(idWidth)}  ${t.state.padEnd(7)}  ${String(t.llmCalls).padStart(5)}  ` +
+        `${('$' + t.costUsd.toFixed(2)).padStart(8)}  ${parks}`
+    );
+  }
+
+  const finished = report.done + report.parked;
+  console.log('');
+  console.log(`total: $${report.totalUsd.toFixed(2)} over ${report.tasks.length} tasks`);
+  console.log(`done: ${report.done}  parked: ${report.parked}  park events: ${report.parks}`);
+  if (report.done > 0) {
+    console.log(`cost per DONE card: $${(report.totalUsd / report.done).toFixed(2)}`);
+  }
+  if (finished > 0) {
+    // The parking RATE the migration plan asks for: of the cards that reached a terminal
+    // state, the share that ended parked rather than done.
+    console.log(`parking rate: ${((report.parked / finished) * 100).toFixed(0)}% (${report.parked}/${finished} terminal)`);
+  }
+
+  const ceiling = defaultConfig.soakBudgetUsd;
+  if (ceiling > 0) {
+    const left = ceiling - report.totalUsd;
+    console.log(
+      `ceiling: $${ceiling.toFixed(2)} (SPO_SOAK_BUDGET_USD) -- ` +
+        (left > 0 ? `$${left.toFixed(2)} left` : 'REACHED: the daemon takes no new work')
+    );
   }
 }
 
@@ -477,6 +532,7 @@ function main() {
     return cmdTask(id, opts);
   }
   if (cmd === 'parked') return cmdParked(opts);
+  if (cmd === 'cost') return cmdCost(opts);
   if (cmd === 'resume') {
     const id = opts._[0];
     if (!id) {

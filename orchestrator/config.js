@@ -100,6 +100,17 @@ module.exports = {
   // (notify-send, ntfy, a reason filter); the daemon only reports. Never blocks a task.
   parkAlertCmd: process.env.SPO_PARK_ALERT_CMD || null,
 
+  // ---- cumulative spend ceiling (orchestrator/cost.js) -------------------------------------
+  //
+  // Total USD the pipeline may spend across every task in a journal root, summed from the
+  // journals' own `llm-call` costUsd events. Distinct from step-contracts.js's PER-STEP caps:
+  // those bound one call, this bounds the whole unattended run -- the thing a soak needs
+  // bounded. Unset (the default) means no ceiling, so nothing changes for a supervised run;
+  // set SPO_SOAK_BUDGET_USD for a soak. Reaching it stops the daemon TAKING NEW WORK (queued
+  // tasks stay queued, auto-pull stops enqueuing) and never interrupts a task in flight --
+  // see state-machine.js's ceilingReached.
+  soakBudgetUsd: process.env.SPO_SOAK_BUDGET_USD !== undefined ? Number(process.env.SPO_SOAK_BUDGET_USD) : null,
+
   REPO_ROOT,
   cwdForStep,
   WORKTREE_SIDE_STEPS,
