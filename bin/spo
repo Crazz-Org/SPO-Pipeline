@@ -23,10 +23,28 @@
 //                            Never runs `claude` itself.
 //   spo account enable/disable <name>
 //                            Creates or removes the `disabled` marker file for that account.
+//   spo ask <text…>          Intake, fast lane: joins remaining argv as the free-text request,
+//                            drafts a card (DRAFT_CARD, Sonnet 5), sends it to review-card
+//                            (Fable 5, the neutral judge), then files it on FILE/FILE_AMENDED or
+//                            prints the reason and files nothing on DO_NOT_FILE. See
+//                            orchestrator/intake.js and orchestrator/README.md § Intake.
+//                            --dry prints the draft + review verdict and files nothing.
+//                            --draft-file <path>  Intake, brainstorm lane: skips the DRAFT_CARD
+//                            LLM call and reads an already-written draft JSON from <path>
+//                            instead (the hand-off point for an interactive session that
+//                            formalized its own card) -- still goes through review -> file.
+//                            Combines with --dry. Ignores any positional text when given.
+//   spo pull [--limit N]     Reads the product board's cheap pool read (`npm run board:claim`,
+//                            never a claim, never a board write) and writes a local
+//                            queue/<seq>-issue-<n>.json task file for each of the top N
+//                            claimable candidates (default 5), skipping one already queued or
+//                            journaled. See orchestrator/intake.js.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
 // Flags (accounts commands + dashboard): --accounts-dir <dir>  (default: the account pool --
 //   see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
+// Flags (ask): --dry  --draft-file <path>
+// Flags (pull): --limit <n>  (default 5)
 
 const fs = require('fs');
 const path = require('path');
@@ -35,6 +53,7 @@ const { collectAll } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
 const accounts = require('../orchestrator/accounts');
 const defaultConfig = require('../orchestrator/config');
+const intake = require('../orchestrator/intake');
 
 function parseArgs(argv) {
   const opts = {
@@ -45,6 +64,9 @@ function parseArgs(argv) {
     serve: false,
     port: null,
     accountsDir: null,
+    dry: false,
+    draftFile: null,
+    limit: null,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -56,6 +78,9 @@ function parseArgs(argv) {
     else if (a === '--serve') opts.serve = true;
     else if (a === '--port') opts.port = argv[++i];
     else if (a === '--accounts-dir') opts.accountsDir = argv[++i];
+    else if (a === '--dry') opts.dry = true;
+    else if (a === '--draft-file') opts.draftFile = argv[++i];
+    else if (a === '--limit') opts.limit = argv[++i];
     else opts._.push(a);
   }
   return opts;
@@ -318,11 +343,121 @@ function cmdAccountDisable(name, opts) {
   console.log(`${name}: disabled`);
 }
 
+// `spo ask <text…>` -- intake, fast lane: DRAFT_CARD (Sonnet 5) -> review-card (Fable 5) -> file
+// on FILE/FILE_AMENDED, or print the reason and file nothing on DO_NOT_FILE. `--draft-file
+// <path>` is the brainstorm lane instead: an interactive session has already formalized its own
+// draft JSON, so this skips the DRAFT_CARD LLM call entirely (see orchestrator/intake.js's
+// loadDraftFile) and goes straight to review -> file. `--dry` (either lane) prints the draft +
+// verdict and files nothing. Exit 0 for every JUDGED outcome (FILE/FILE_AMENDED/DO_NOT_FILE);
+// non-zero only for a mechanical failure (no account, a bad LLM reply, a malformed --draft-file,
+// a failed gh call).
+//
+// `deps.intake` is a test-only override (default: the real orchestrator/intake.js module) --
+// same injection convention as everywhere else in this repo, applied at this one extra layer so
+// the test suite can drive the real CLI wiring (parseArgs -> cmdAsk's own dry/DO_NOT_FILE/filing
+// branches) against a fake intake module instead of a real `claude`/`gh` spawn.
+async function cmdAsk(opts, deps = {}) {
+  const intakeImpl = deps.intake || intake;
+  let draft;
+
+  if (opts.draftFile) {
+    const loaded = intakeImpl.loadDraftFile(opts.draftFile);
+    if (!loaded.ok) {
+      console.error(loaded.error);
+      process.exitCode = 1;
+      return;
+    }
+    draft = loaded.draft;
+  } else {
+    const requestText = opts._.join(' ').trim();
+    if (!requestText) {
+      console.error('usage: spo ask <text…> | spo ask --draft-file <path>  [--dry]');
+      process.exitCode = 1;
+      return;
+    }
+    const drafted = await intakeImpl.draftCard(requestText, {});
+    if (!drafted.ok) {
+      console.error(drafted.error);
+      process.exitCode = 1;
+      return;
+    }
+    draft = drafted.draft;
+  }
+
+  const reviewed = await intakeImpl.reviewCard(draft, {});
+  if (!reviewed.ok) {
+    console.error(reviewed.error);
+    process.exitCode = 1;
+    return;
+  }
+  const review = reviewed.review;
+
+  if (opts.dry) {
+    console.log('--- draft ---');
+    console.log(JSON.stringify(draft, null, 2));
+    console.log('--- review ---');
+    console.log(JSON.stringify(review, null, 2));
+    return;
+  }
+
+  if (review.verdict === 'DO_NOT_FILE') {
+    console.log('DO_NOT_FILE');
+    console.log(review.first_comment_markdown);
+    return;
+  }
+
+  const filed = intakeImpl.fileCard(draft, review, {});
+  if (!filed.ok) {
+    console.error(filed.error);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`${review.verdict}: filed #${filed.issueNumber}`);
+  console.log(filed.url);
+}
+
+// `spo pull [--limit N]` -- reads the product board's cheap pool read (npm run board:claim,
+// never a claim, never a board write) and writes a local queue/<seq>-issue-<n>.json for each of
+// the top N claimable candidates (default 5), skipping one already queued or journaled. Never
+// runs `daemon.js` itself -- `spo pull` only ever populates queue/. `deps.intake`: see cmdAsk.
+async function cmdPull(opts, deps = {}) {
+  const intakeImpl = deps.intake || intake;
+  const limit = opts.limit ? Number(opts.limit) : 5;
+  const pulled = intakeImpl.pullBoard({});
+  if (!pulled.ok) {
+    console.error(pulled.error);
+    process.exitCode = 1;
+    return;
+  }
+  for (const warning of pulled.warnings) console.error(warning);
+
+  const top = pulled.candidates.slice(0, limit);
+  if (top.length === 0) {
+    console.log('(no claimable candidates)');
+    return;
+  }
+
+  for (const candidate of top) {
+    const made = intakeImpl.makeTask(candidate, {});
+    if (!made.ok) {
+      console.error(`#${candidate.issue}: ${made.error}`);
+      process.exitCode = 1;
+      continue;
+    }
+    if (made.skipped) {
+      console.log(`#${candidate.issue}: skipped -- ${made.reason}`);
+    } else {
+      console.log(`#${candidate.issue}: wrote queue/${made.file}`);
+    }
+  }
+}
+
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>>',
+      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
+      '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
     ].join('\n')
   );
 }
@@ -363,9 +498,35 @@ function main() {
     process.exitCode = 1;
     return;
   }
+  if (cmd === 'ask') return cmdAsk(opts);
+  if (cmd === 'pull') return cmdPull(opts);
 
   printUsage();
   process.exitCode = 1;
 }
 
-main();
+// cmdAsk/cmdPull are async (they await orchestrator/intake.js's LLM/spawn calls); every other
+// command is synchronous and main() just returns undefined for them. Awaiting unconditionally
+// here would be a no-op for the sync commands (Promise.resolve(undefined) still resolves this
+// tick) but it is skipped anyway so a thrown synchronous error (e.g. `spo task` with no
+// journal) keeps its original, un-wrapped stack rather than becoming an unhandled rejection.
+function run() {
+  const result = main();
+  if (result && typeof result.then === 'function') {
+    result.catch((err) => {
+      console.error(`spo: ${err && err.message ? err.message : err}`);
+      process.exitCode = 1;
+    });
+  }
+}
+
+// Only actually run when invoked as the CLI (`node bin/spo ...`, including every existing
+// execFileSync-based test) -- `require.main === module` is false when the test suite instead
+// `require()`s this file to reach parseArgs/cmdAsk/cmdPull directly with an injected fake
+// `intake` module (see cmdAsk's `deps.intake`), so requiring it for that never spawns anything
+// or touches this process's own argv/exit code.
+if (require.main === module) {
+  run();
+}
+
+module.exports = { parseArgs, cmdAsk, cmdPull, main };
