@@ -57,7 +57,7 @@ const { sleep } = require('./scripted');
 const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
-const { resolveStepContract } = require('../step-contracts');
+const { resolveStepContract, LLM_STEP_DEADLINE_MS } = require('../step-contracts');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues, scratchDir } = require('../task-values');
 
@@ -370,7 +370,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       promptFile: override.promptFile,
       cwd,
       account,
-      deadlineMs: ctx.config && ctx.config.stepDeadlineMs,
+      deadlineMs: LLM_STEP_DEADLINE_MS,
     };
 
     const result = await invokeClaudeReal(opts, deps);
@@ -426,7 +426,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     promptText,
     cwd,
     account,
-    deadlineMs: ctx.config && ctx.config.stepDeadlineMs,
+    deadlineMs: LLM_STEP_DEADLINE_MS,
   };
 
   if (ctx.dryRun) {
