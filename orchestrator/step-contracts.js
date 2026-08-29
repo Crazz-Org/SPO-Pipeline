@@ -33,7 +33,13 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 
 // Inferred (see file header) -- not sourced from spec or README.
 const BUDGET_BY_SIZE_USD = { S: 2, M: 5, L: 12 };
-const SMALL_BUDGET_USD = 1;
+// Was $1 -- too tight for review-card: verifying a citation into the sibling repo (product repo
+// cwd, ~SPO-Pipeline code reviewed by intake.js's reviewCard, model fable effort high) makes real
+// tool calls whose cache-read/cache-write tokens alone can clear $1, and the CLI kills the session
+// mid-flight on `--max-budget-usd`. Reproduced twice: sessions died at ~61s with ~18k output +
+// ~840k cache-read + ~125k cache-write tokens. $3 gives headroom without opening this up to
+// PLAN/IMPLEMENT-sized spend -- see BUDGET_BY_SIZE_USD above for that tier.
+const SMALL_BUDGET_USD = 3;
 
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
 // to `escalatedModel` -- resolved by resolveStepContract() below, per

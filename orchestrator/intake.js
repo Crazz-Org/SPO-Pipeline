@@ -46,6 +46,29 @@ const VALID_CATEGORIES = new Set(['defect', 'latent-trap', 'feature', 'observati
 const VALID_SIZES = new Set(['S', 'M', 'L']);
 const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'client', 'e2e', 'shared', 'ci']);
 
+// formatLlmFailure(prefix, raw) -- renders an invokeClaudeReal {ok: false, ...} failure as a
+// one-line diagnosable message. The base `${raw.error || raw.result || ''}` clause is empty for
+// exactly the case that matters most: a budget kill ends with `is_error: true` and an empty
+// `result` (steps/llm.js's classifyFailure path), so on its own the message collapses to
+// "claude call failed (error): " -- no signal at all. raw also carries terminalReason,
+// apiErrorStatus, and raw (the exit code) whenever steps/llm.js's is_error/non-zero-exit branch
+// set them; appended here, present-fields-only, so the message stays diagnosable even when the
+// primary text is blank.
+function formatLlmFailure(prefix, raw) {
+  const base = `${prefix}: claude call failed (${raw.kind || 'error'}): ${raw.error || raw.result || ''}`;
+  const details = [];
+  if (raw.terminalReason !== undefined && raw.terminalReason !== null) {
+    details.push(`terminal_reason=${raw.terminalReason}`);
+  }
+  if (raw.apiErrorStatus !== undefined && raw.apiErrorStatus !== null) {
+    details.push(`api_error_status=${raw.apiErrorStatus}`);
+  }
+  if (raw.raw !== undefined && raw.raw !== null) {
+    details.push(`exit=${raw.raw}`);
+  }
+  return details.length > 0 ? `${base} [${details.join(', ')}]` : base;
+}
+
 // ---- shared spawn primitive (same injection convention as steps/llm.js / steps/scripted.js) ----
 
 function runSync(deps, command, args, opts = {}) {
@@ -110,7 +133,7 @@ async function draftCard(requestText, deps = {}) {
 
   const raw = await invokeClaudeReal(opts, deps);
   if (!raw.ok) {
-    return { ok: false, error: `draftCard: claude call failed (${raw.kind || 'error'}): ${raw.error || raw.result || ''}` };
+    return { ok: false, error: formatLlmFailure('draftCard', raw) };
   }
 
   let parsed;
@@ -223,7 +246,7 @@ async function reviewCard(draft, deps = {}) {
 
   const raw = await invokeClaudeReal(opts, deps);
   if (!raw.ok) {
-    return { ok: false, error: `reviewCard: claude call failed (${raw.kind || 'error'}): ${raw.error || raw.result || ''}` };
+    return { ok: false, error: formatLlmFailure('reviewCard', raw) };
   }
 
   let parsed;
