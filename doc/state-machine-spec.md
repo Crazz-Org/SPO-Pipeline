@@ -70,8 +70,15 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 
 ## Account pool
 
-- Registry in `claude-accounts/` (git-ignored): one `CLAUDE_CONFIG_DIR` per Claude Max
-  account, authenticated once via `claude setup-token`.
+- **One place holds account information** (maintainer decision, 2026-08-29): the pool
+  directory, default `~/.claude-accounts` (`SPO_ACCOUNTS_DIR` overrides it) — no separate
+  registry file, no implicit fallback to the machine's ambient `claude` login. Every
+  subdirectory of the pool is one account and is that account's own `CLAUDE_CONFIG_DIR`,
+  authenticated once via `claude setup-token`; see `doc/setup.md` § Accounts for the guided
+  procedure (`spo account add <name>`).
+- A pool with zero registered accounts is a hard stop for real mode: `orchestrator/accounts.js`'s
+  `pick()` throws `NoAccountsRegisteredError`, the state machine parks on it, and
+  `daemon.js --real` refuses to even start.
 - The scheduler assigns each step an account; a limit error (5 h window / weekly cap) puts
   the account in **cooldown** until its window resets and the step retries on the next
   healthy account. Cooldowns are journal events.

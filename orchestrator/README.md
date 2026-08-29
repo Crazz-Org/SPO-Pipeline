@@ -273,27 +273,41 @@ argv flags and the filled prompt.
 
 ### Account registry
 
-`claude-accounts/` is git-ignored (secrets) and has two files, created as needed:
+**One place holds account information (maintainer decision, 2026-08-29): the pool directory
+itself.** `orchestrator/accounts.js` discovers accounts by listing the pool directory's
+subdirectories — there is no `accounts.json` to keep in sync, and no implicit fallback to
+whatever `claude` login happens to be ambient on this machine. Default pool directory:
+`~/.claude-accounts` (machine-level, deliberately outside this repo), overridable with the
+`SPO_ACCOUNTS_DIR` env var (`orchestrator/config.js`'s `claudeAccountsDir`) or, as every
+`accounts.js` function already does, an explicit first argument (tests point this at a temp
+dir). Full guided procedure: `doc/setup.md` § Accounts.
 
-- **`accounts.json`** — hand-authored, the registry: `[{name, configDir, enabled}]`.
-  `configDir` is an absolute path to a `CLAUDE_CONFIG_DIR`, or `null` for the ambient default
-  login. A missing file, or an empty array, both fall back to one implicit account —
-  `{name: "default", configDir: null}` — so a fresh checkout with no registry still runs real
-  mode against whatever `claude` is already logged into.
-- **`state.json`** — machine-written, runtime cooldowns: `{accountName: {cooldownUntil:
-  epochMs}}`. Not authored, not committed, disposable — deleting it just clears every cooldown.
-
-**Adding a Claude Max account**: each additional account is one more subscription logged into
-its own config directory, then one more registry line:
-
-```bash
-CLAUDE_CONFIG_DIR=/home/crazz/.claude-accounts/acct-2 claude setup-token
+```
+<poolDir>/<name>/          one directory per account — this IS the account's CLAUDE_CONFIG_DIR
+  oauth-token               optional: the long-lived token `claude setup-token` prints, pasted
+                             here by the operator
+  disabled                  optional marker file (content ignored) — its presence disables the
+                             account
+<poolDir>/state.json        machine-written, runtime cooldowns: {accountName: {cooldownUntil:
+                             epochMs}}. Disposable — deleting it just clears every cooldown.
 ```
 
-then add `{"name": "acct-2", "configDir": "/home/crazz/.claude-accounts/acct-2", "enabled":
-true}` to `claude-accounts/accounts.json`. `K` parallel workers scales with `K` healthy
-accounts — the gate itself stays serialized (one live world), so adding an account adds
-implementation capacity, not gate throughput (state-machine-spec.md § Account pool).
+A pool directory with zero subdirectories registers zero accounts: `accounts.pick()` throws a
+typed `NoAccountsRegisteredError` (`state-machine.js` maps it to PARKED, same as
+`AllAccountsCoolingError`), and `daemon.js --real` refuses to even start.
+
+**Adding a Claude Max account** — guided, via `bin/spo`, never by hand-editing a registry file:
+
+```bash
+spo account add acct-2
+```
+
+prints the exact next steps (`CLAUDE_CONFIG_DIR=... claude setup-token`, where to paste the
+token, the `chmod 600`, then `spo accounts` to verify) — it never runs `claude` itself.
+`spo account enable <name>` / `spo account disable <name>` toggle the `disabled` marker.
+`K` parallel workers scales with `K` healthy accounts — the gate itself stays serialized (one
+live world), so adding an account adds implementation capacity, not gate throughput
+(state-machine-spec.md § Account pool).
 
 ### cwd policy
 
@@ -319,10 +333,12 @@ with a trivial haiku/low-effort/$0.10-budget prompt. It is **not** part of `node
 deliberately kept out of `test/` (any `.js` file directly under a directory literally named
 `test/` is auto-discovered by bare `node --test` on this Node version, even without a `.test.js`
 suffix, so the only way to keep it out of the automatic suite is to keep it out of that
-directory). Run it by hand:
+directory). It takes a required account-name argument, resolved from the pool (no ambient
+fallback, consistent with the account-pool decision above) — with none given, or an unknown
+name, it errors and lists what's registered instead of guessing. Run it by hand:
 
 ```bash
-node scripts/smoke-llm.js
+node scripts/smoke-llm.js pool1
 ```
 
 ## Real scripted steps
@@ -446,6 +462,9 @@ bin/spo status [--journal <dir>] [--queue <dir>]   # queue depth, active/parked/
 bin/spo task <id> [--journal <dir>]                # human-readable timeline from journal.jsonl
 bin/spo parked [--journal <dir>]                   # parked tasks + reasons
 bin/spo resume <id> [--journal <dir>]              # print `claude --resume <sessionId>` for a task's LLM steps
+bin/spo accounts [--accounts-dir <dir>]            # list the account pool: name, enabled, cooldown, token, credentials
+bin/spo account add <name> [--accounts-dir <dir>]  # create the pool slot, print the guided setup steps
+bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
 ```
 
 ## Dashboard
@@ -456,8 +475,9 @@ bin/spo dashboard --watch                                            # regenerat
 ```
 
 `console/collect.js` reads the same local surfaces as the rest of `bin/spo` (`journal/<id>/`,
-`queue/`), plus `claude-accounts/{accounts.json,state.json}` and the read-only
-`~/.spo-bench/{nightly/latest.json, verdicts/*.json}`, and hands the result to
+`queue/`), plus the account pool directory (discovered through `orchestrator/accounts.js`, see
+§ Account registry above) and the read-only `~/.spo-bench/{nightly/latest.json,
+verdicts/*.json}`, and hands the result to
 `console/render.js` -- a pure function that turns that data into one self-contained HTML file:
 inline CSS, no external requests, a 30s `<meta http-equiv="refresh">`, light+dark via
 `prefers-color-scheme`. A missing source (no `claude-accounts/`, no `~/.spo-bench/`, an empty

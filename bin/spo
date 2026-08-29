@@ -9,22 +9,44 @@
 //                            steps, or for a bare session id, the same command directly. Never
 //                            executes anything -- see doc/state-machine-spec.md § Observability.
 //   spo dashboard            GENERATES a self-contained static HTML file from the same local
-//                            surfaces (journals, queue, claude-accounts/, ~/.spo-bench/) --
+//                            surfaces (journals, queue, the account pool, ~/.spo-bench/) --
 //                            console/collect.js + console/render.js do the work; this command
 //                            just wires them to disk. --out <path> (default:
 //                            console/dashboard.html), --watch regenerates every 30s (Ctrl-C to
 //                            stop) instead of running once. Prints the absolute output path.
+//   spo accounts             Lists every account discovered in the pool directory: name,
+//                            enabled, cooldownUntil (if cooling), whether an oauth-token file
+//                            is present, whether the account's CLAUDE_CONFIG_DIR holds any
+//                            credentials file of its own. See orchestrator/accounts.js /
+//                            doc/setup.md § Accounts.
+//   spo account add <name>   Creates <accounts-dir>/<name>/ and prints the guided next steps.
+//                            Never runs `claude` itself.
+//   spo account enable/disable <name>
+//                            Creates or removes the `disabled` marker file for that account.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
+// Flags (accounts commands + dashboard): --accounts-dir <dir>  (default: the account pool --
+//   see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { collectAll } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
+const accounts = require('../orchestrator/accounts');
+const defaultConfig = require('../orchestrator/config');
 
 function parseArgs(argv) {
-  const opts = { journal: null, queue: null, out: null, watch: false, serve: false, port: null, _: [] };
+  const opts = {
+    journal: null,
+    queue: null,
+    out: null,
+    watch: false,
+    serve: false,
+    port: null,
+    accountsDir: null,
+    _: [],
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--journal') opts.journal = argv[++i];
@@ -33,6 +55,7 @@ function parseArgs(argv) {
     else if (a === '--watch') opts.watch = true;
     else if (a === '--serve') opts.serve = true;
     else if (a === '--port') opts.port = argv[++i];
+    else if (a === '--accounts-dir') opts.accountsDir = argv[++i];
     else opts._.push(a);
   }
   return opts;
@@ -44,6 +67,10 @@ function resolveDirs(opts) {
     journalRoot: opts.journal || path.join(repoRoot, 'journal'),
     queueDir: opts.queue || path.join(repoRoot, 'queue'),
   };
+}
+
+function resolveAccountsDir(opts) {
+  return opts.accountsDir || defaultConfig.claudeAccountsDir;
 }
 
 function readJsonSafe(p, fallback) {
@@ -168,13 +195,13 @@ function cmdResume(id, opts) {
 }
 
 // `spo dashboard` -- generates console/dashboard.html (or --out <path>) from the same local
-// surfaces the other commands read, plus claude-accounts/ and ~/.spo-bench/ (nightly, gate
+// surfaces the other commands read, plus the account pool and ~/.spo-bench/ (nightly, gate
 // verdicts). All fs work lives in console/collect.js; all HTML rendering lives in
 // console/render.js as a pure function -- this is just the CLI glue between the two and disk.
 function cmdDashboard(opts) {
   const { journalRoot, queueDir } = resolveDirs(opts);
   const repoRoot = path.join(__dirname, '..');
-  const accountsDir = path.join(repoRoot, 'claude-accounts');
+  const accountsDir = resolveAccountsDir(opts);
   const benchRoot = path.join(os.homedir(), '.spo-bench');
   const outPath = opts.out ? path.resolve(opts.out) : path.join(repoRoot, 'console', 'dashboard.html');
 
@@ -205,9 +232,98 @@ function cmdDashboard(opts) {
   }
 }
 
+// `spo accounts` -- lists every account discovered in the pool directory (one subdirectory per
+// account -- see orchestrator/accounts.js): name, enabled, cooldownUntil (only shown while
+// actually cooling), whether an oauth-token file is present, and whether the account's
+// CLAUDE_CONFIG_DIR holds any credentials file of its own (anything besides oauth-token/
+// disabled). Same fields the dashboard's "Comptes Claude" section shows.
+function cmdAccounts(opts) {
+  const accountsDir = resolveAccountsDir(opts);
+  const registry = accounts.readRegistry(accountsDir);
+  if (registry.length === 0) {
+    console.log(`(no accounts registered in ${accountsDir} -- see doc/setup.md § Accounts)`);
+    return;
+  }
+
+  const state = accounts.readState(accountsDir);
+  const now = Date.now();
+  for (const a of registry) {
+    const entry = state[a.name];
+    const cooldownUntil = entry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
+    const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
+    const token = a.oauthTokenFile ? 'yes' : 'no';
+    const credentials = accounts.hasCredentials(a.configDir) ? 'yes' : 'no';
+    console.log(
+      `${a.name}  enabled=${a.enabled}  cooldownUntil=${cooling ? new Date(cooldownUntil).toISOString() : '-'}  token=${token}  credentials=${credentials}`
+    );
+  }
+}
+
+// `spo account add <name>` -- creates <accounts-dir>/<name>/ and PRINTS the guided next steps.
+// Never runs `claude` itself (see CLAUDE.md-style "never probe/never spawn" discipline this
+// whole CLI follows -- bin/spo only ever reads and, here, creates a directory).
+function cmdAccountAdd(name, opts) {
+  if (!name) {
+    console.error('usage: spo account add <name>');
+    process.exitCode = 1;
+    return;
+  }
+  const accountsDir = resolveAccountsDir(opts);
+  const dir = path.join(accountsDir, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const tokenFile = path.join(dir, accounts.OAUTH_TOKEN_FILENAME);
+
+  console.log(`Created ${dir}`);
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  1. CLAUDE_CONFIG_DIR=${dir} claude setup-token`);
+  console.log(`  2. paste the printed token into ${tokenFile}`);
+  console.log(`  3. chmod 600 ${tokenFile}`);
+  // Complete, copy-pasteable command (maintainer rule: never a bare subcommand).
+  console.log(`  4. ${path.join(__dirname, 'spo')} accounts   # verify it shows up, enabled, token=yes`);
+}
+
+function accountMarkerDir(accountsDir, name, subcommand) {
+  if (!name) {
+    console.error(`usage: spo account ${subcommand} <name>`);
+    process.exitCode = 1;
+    return null;
+  }
+  const dir = path.join(accountsDir, name);
+  if (!fs.existsSync(dir)) {
+    console.error(`spo account ${subcommand}: no account "${name}" in ${accountsDir} (see \`spo accounts\`)`);
+    process.exitCode = 1;
+    return null;
+  }
+  return dir;
+}
+
+// `spo account enable/disable <name>` -- create or remove the `disabled` marker file. The
+// marker's mere presence disables the account (accounts.js's readRegistry); content is never
+// read, so an empty file is enough.
+function cmdAccountEnable(name, opts) {
+  const accountsDir = resolveAccountsDir(opts);
+  const dir = accountMarkerDir(accountsDir, name, 'enable');
+  if (!dir) return;
+  const marker = path.join(dir, accounts.DISABLED_MARKER_FILENAME);
+  if (fs.existsSync(marker)) fs.rmSync(marker);
+  console.log(`${name}: enabled`);
+}
+
+function cmdAccountDisable(name, opts) {
+  const accountsDir = resolveAccountsDir(opts);
+  const dir = accountMarkerDir(accountsDir, name, 'disable');
+  if (!dir) return;
+  fs.writeFileSync(path.join(dir, accounts.DISABLED_MARKER_FILENAME), '');
+  console.log(`${name}: disabled`);
+}
+
 function printUsage() {
   console.error(
-    'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard> [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]]'
+    [
+      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>>',
+      '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
+    ].join('\n')
   );
 }
 
@@ -236,6 +352,17 @@ function main() {
     return cmdResume(id, opts);
   }
   if (cmd === 'dashboard') return cmdDashboard(opts);
+  if (cmd === 'accounts') return cmdAccounts(opts);
+  if (cmd === 'account') {
+    const sub = opts._[0];
+    const name = opts._[1];
+    if (sub === 'add') return cmdAccountAdd(name, opts);
+    if (sub === 'enable') return cmdAccountEnable(name, opts);
+    if (sub === 'disable') return cmdAccountDisable(name, opts);
+    console.error('usage: spo account <add|enable|disable> <name>');
+    process.exitCode = 1;
+    return;
+  }
 
   printUsage();
   process.exitCode = 1;

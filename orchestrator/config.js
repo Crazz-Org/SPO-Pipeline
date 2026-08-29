@@ -52,10 +52,16 @@ module.exports = {
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,
 
-  // Claude Max account pool: registry (accounts.json) + runtime cooldown state (state.json),
-  // see orchestrator/accounts.js. Git-ignored (claude-accounts/ in .gitignore) -- a missing
-  // registry here is not an error, accounts.js falls back to one implicit default account.
-  claudeAccountsDir: path.join(REPO_ROOT, 'claude-accounts'),
+  // Claude Max account pool directory -- the single source of truth (maintainer decision,
+  // 2026-08-29): every subdirectory is one account, plus a machine-written state.json for
+  // cooldowns. See orchestrator/accounts.js and doc/setup.md § Accounts. Machine-level by
+  // default, deliberately outside the repo (never git-ignored-but-present here) -- overridable
+  // with the SPO_ACCOUNTS_DIR env var, and as always by the explicit first argument every
+  // accounts.js function takes (tests point this at a temp dir). A missing or empty pool
+  // directory is not an error by itself -- accounts.js.readRegistry() just returns []; it is
+  // accounts.pick() (called once a step actually needs an account) that throws
+  // NoAccountsRegisteredError, and daemon.js --real refuses to start on that.
+  claudeAccountsDir: process.env.SPO_ACCOUNTS_DIR || path.join(os.homedir(), '.claude-accounts'),
 
   // ---- real-mode scripted steps (steps/scripted.js) --------------------------------------
   //

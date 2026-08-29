@@ -63,7 +63,10 @@ function isRealMode(ctx) {
 // 'account-cooldown') and asks pick() again for the next one. The loop is bounded to the number
 // of enabled accounts in the registry, so a step can never retry the same account twice or spin
 // forever: once every account has been tried, or pick() itself finds none healthy
-// (AllAccountsCoolingError), the task is PARKED -- the spec's "then PARKED" for this path.
+// (AllAccountsCoolingError), the task is PARKED -- the spec's "then PARKED" for this path. An
+// empty pool (accounts.pick()'s NoAccountsRegisteredError -- no subdirectories under
+// claudeAccountsDir at all) is mapped to PARKED the same way; see also daemon.js, which
+// refuses to even START in --real mode on an empty pool.
 async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   if (ctx.shadowMode) {
     return callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
@@ -78,7 +81,7 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
     try {
       account = accounts.pick(accountsDir);
     } catch (err) {
-      if (err instanceof accounts.AllAccountsCoolingError) {
+      if (err instanceof accounts.AllAccountsCoolingError || err instanceof accounts.NoAccountsRegisteredError) {
         throw new ParkSignal(err.reason, err.detail);
       }
       throw err;
