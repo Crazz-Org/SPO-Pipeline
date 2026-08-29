@@ -10,6 +10,14 @@
 //                 via prompts/review-card.md. Both lanes above feed the same reviewCard.
 //   fileCard   -- applies review's mechanical corrections, then `gh issue create` + `gh issue
 //                 comment` (the first comment is the review verdict, verbatim).
+//   postIssueComment -- `gh issue comment` against a temp file, extracted out of fileCard so
+//                 auto-triage.js's duplicate-report path (a comment on an EXISTING issue, no new
+//                 issue) reuses the same spawn instead of a second implementation.
+//   triageBugReport -- the auto-triage driver's own step: reproduces/routes/dedups ONE report
+//                 from `~/.spo-reports` via prompts/triage-bug-report.md, and either drafts a
+//                 card (still going through reviewCard/fileCard below, never filing itself) or
+//                 reports why it stopped short. Behind `spo triage` / orchestrator/auto-triage.js
+//                 -- see orchestrator/README.md § Auto-triage.
 //   pullBoard  -- reads the product repo's cheap pool read (`npm run board:claim`) and parses its
 //                 claimable-candidate lines, in priority order.
 //   makeTask   -- turns one candidate into a local queue/<seq>-issue-<n>.json task file, the same
@@ -32,15 +40,18 @@ const accounts = require('./accounts');
 const config = require('./config');
 const { invokeClaudeReal } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
-const { SMALL_BUDGET_USD } = require('./step-contracts');
+const { SMALL_BUDGET_USD, BUG_REPORT_BUDGET_USD } = require('./step-contracts');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 const DRAFT_CARD_PROMPT = path.join(PROMPTS_DIR, 'draft-card.md');
 const REVIEW_CARD_PROMPT = path.join(PROMPTS_DIR, 'review-card.md');
+const TRIAGE_BUG_REPORT_PROMPT = path.join(PROMPTS_DIR, 'triage-bug-report.md');
 
 const DRAFT_REQUIRED = ['title', 'body_markdown', 'category', 'size', 'area', 'is_bug_report', 'confirmed'];
 const REVIEW_REQUIRED = ['verdict', 'corrections', 'first_comment_markdown'];
 const REVIEW_VERDICTS = new Set(['FILE', 'FILE_AMENDED', 'DO_NOT_FILE']);
+
+const TRIAGE_OUTCOMES = new Set(['schema-version', 'not-reproduced', 'insufficient', 'duplicate', 'draft']);
 
 const VALID_CATEGORIES = new Set(['defect', 'latent-trap', 'feature', 'observation', 'doc-infra']);
 const VALID_SIZES = new Set(['S', 'M', 'L']);
@@ -331,6 +342,34 @@ function parseIssueUrl(stdout) {
   return m ? m[0] : null;
 }
 
+// postIssueComment(issueNumber, markdown, deps) -- `gh issue comment <n> --body-file <f>` against
+// a temp file, the exact call fileCard already made for the review verdict, extracted so
+// auto-triage.js's duplicate-report path (posting a new-occurrence note on an existing issue,
+// never a fresh one) reuses the identical spawn instead of a second implementation. Returns
+// {ok: true} or {ok: false, error}.
+function postIssueComment(issueNumber, markdown, deps = {}) {
+  const ghRepo = deps.ghRepo || config.ghRepo;
+  const tmpDir = deps.tmpDir || os.tmpdir();
+  const stamp = `${Date.now()}-${process.pid}`;
+  const commentFile = path.join(tmpDir, `spo-card-comment-${stamp}.md`);
+  fs.writeFileSync(commentFile, markdown || '');
+
+  const commentResult = runSync(deps, 'gh', [
+    'issue',
+    'comment',
+    String(issueNumber),
+    '--repo',
+    ghRepo,
+    '--body-file',
+    commentFile,
+  ]);
+  const commentExit = normalizeExit(commentResult);
+  if (commentExit !== 0) {
+    return { ok: false, error: `postIssueComment: gh issue comment exited ${commentExit}` };
+  }
+  return { ok: true, commentFile };
+}
+
 // fileCard(draft, review, deps) -- applies review's mechanical corrections, writes the body and
 // first-comment files under os.tmpdir(), then runs exactly the two gh commands CLAUDE.md's
 // intake flow names:
@@ -353,9 +392,7 @@ function fileCard(draft, review, deps = {}) {
 
   const stamp = `${Date.now()}-${process.pid}`;
   const bodyFile = path.join(tmpDir, `spo-card-body-${stamp}.md`);
-  const commentFile = path.join(tmpDir, `spo-card-comment-${stamp}.md`);
   fs.writeFileSync(bodyFile, applied.body_markdown || '');
-  fs.writeFileSync(commentFile, review.first_comment_markdown || '');
 
   const createResult = runSync(deps, 'gh', [
     'issue',
@@ -381,22 +418,92 @@ function fileCard(draft, review, deps = {}) {
     return { ok: false, error: 'fileCard: could not parse an issue number from gh issue create output' };
   }
 
-  const commentResult = runSync(deps, 'gh', [
-    'issue',
-    'comment',
-    String(issueNumber),
-    '--repo',
-    ghRepo,
-    '--body-file',
-    commentFile,
-  ]);
-  const commentExit = normalizeExit(commentResult);
-  if (commentExit !== 0) {
-    return { ok: false, error: `fileCard: gh issue comment exited ${commentExit}`, issueNumber };
+  const commented = postIssueComment(issueNumber, review.first_comment_markdown, { ...deps, ghRepo, tmpDir });
+  if (!commented.ok) {
+    return { ok: false, error: `fileCard: ${commented.error}`, issueNumber };
   }
 
   const url = parseIssueUrl(createResult.stdout) || `https://github.com/${ghRepo}/issues/${issueNumber}`;
-  return { ok: true, issueNumber, url, bodyFile, commentFile };
+  return { ok: true, issueNumber, url, bodyFile, commentFile: commented.commentFile };
+}
+
+// ---- triageBugReport --------------------------------------------------------------------------
+
+// triageBugReport(reportFile, deps) -- calls prompts/triage-bug-report.md through
+// invokeClaudeReal (model fable, effort high, an account from the pool) for ONE report file
+// under ~/.spo-reports: reproduces it, routes it (desktop/mobile), dedups by anchorKey, and
+// either drafts a card (never files it -- reviewCard/fileCard do that, same gate every other
+// card gets) or reports why it stopped short. Returns {ok: true, outcome, ...} where the extra
+// fields depend on outcome (see prompts/triage-bug-report.md's header), or {ok: false, error} for
+// a mechanical failure (no account, a bad spawn, invalid JSON, an unrecognized outcome, or -- for
+// outcome "draft" -- a draft that fails the same validateDraftContract every other draft is
+// checked against). Never throws for a recognized failure, same discipline as draftCard/reviewCard.
+//
+// Model/effort/budget: fable/high, same tier reviewCard runs on -- this step judges evidence
+// (log correlation, geometry predicates) the same way reviewCard judges a citation, not
+// execution-shaped work like draftCard. Bash is in allowedTools (unlike draftCard's read-only
+// set): step 1's server-log curl and step 3's `gh issue list --search` dedup both need it;
+// permissionMode stays 'plan' regardless -- neither of those is a write.
+async function triageBugReport(reportFile, deps = {}) {
+  let account;
+  try {
+    account = pickAccount(deps);
+  } catch (err) {
+    return { ok: false, error: `triageBugReport: ${err.message}` };
+  }
+
+  const productRepo = deps.productRepo || config.productRepo;
+  const ghRepo = deps.ghRepo || config.ghRepo;
+  const today = deps.today || new Date().toISOString().slice(0, 10);
+
+  const promptText = fillPromptTemplate(TRIAGE_BUG_REPORT_PROMPT, {
+    report_file: reportFile,
+    product_repo: productRepo,
+    repo: ghRepo,
+    today,
+  });
+
+  const opts = {
+    step: 'TRIAGE_BUG_REPORT',
+    model: 'fable',
+    effort: 'high',
+    allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    permissionMode: 'plan', // read-only -- triage-bug-report.md: "never file, never post, never move the report"
+    maxBudgetUsd: deps.maxBudgetUsd || BUG_REPORT_BUDGET_USD,
+    jsonSchema: { type: 'object', required: ['outcome'] },
+    promptText,
+    cwd: productRepo, // needs Read/Grep/Bash over the product tree, plus curl/gh
+    account,
+    deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
+  };
+
+  const raw = await invokeClaudeReal(opts, deps);
+  if (!raw.ok) {
+    return { ok: false, error: formatLlmFailure('triageBugReport', raw) };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.result);
+  } catch {
+    return { ok: false, error: 'triageBugReport: reply was not valid JSON' };
+  }
+
+  if (!parsed || typeof parsed !== 'object' || !TRIAGE_OUTCOMES.has(parsed.outcome)) {
+    return { ok: false, error: `triageBugReport: unrecognized outcome "${parsed && parsed.outcome}"` };
+  }
+
+  if (parsed.outcome === 'draft') {
+    const check = validateDraftContract(parsed.draft);
+    if (!check.ok) {
+      return { ok: false, error: `triageBugReport: draft ${check.error}` };
+    }
+  }
+  if (parsed.outcome === 'duplicate' && !(Number.isInteger(parsed.issue_number) && parsed.issue_number > 0)) {
+    return { ok: false, error: 'triageBugReport: outcome "duplicate" missing a valid issue_number' };
+  }
+
+  return { ok: true, outcome: parsed.outcome, ...parsed, sessionId: raw.sessionId, costUsd: raw.costUsd };
 }
 
 // ---- pullBoard ------------------------------------------------------------------------------
@@ -575,6 +682,8 @@ module.exports = {
   loadDraftFile,
   reviewCard,
   fileCard,
+  postIssueComment,
+  triageBugReport,
   pullBoard,
   makeTask,
   // exported for direct unit tests of the parsing/matching helpers
@@ -589,4 +698,5 @@ module.exports = {
   VALID_CATEGORIES,
   VALID_SIZES,
   VALID_AREAS,
+  TRIAGE_OUTCOMES,
 };

@@ -102,6 +102,37 @@ module.exports = {
   autoPullLimit:
     process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 1,
 
+  // ---- kanban piloting: auto-triage (orchestrator/auto-triage.js) ------------------------
+  //
+  // Where the webclient's bug-report queue lives -- outside any git tree by design
+  // (SPO-WebClient's doc/bug-reporting.md § "The queue": `npm run finish` retires worktrees, and
+  // a queue inside one would disappear with the branch that produced the reports). Never derived
+  // from productRepo -- a sibling machine-level surface, same class as spoBenchDir above.
+  // SPO_REPORTS_DIR overrides.
+  spoReportsDir: process.env.SPO_REPORTS_DIR || path.join(os.homedir(), '.spo-reports'),
+
+  // daemon.js --real polls the bug-report queue on this timer, between drain passes
+  // (state-machine.js's runForever), the same way autoPullMs already drives auto-pull.js --
+  // running orchestrator/intake.js's triageBugReport + the existing reviewCard/fileCard gate for
+  // the top autoTriageLimit queued reports.
+  //
+  // Default 0 (DISABLED), unlike autoPullMs -- deliberately NOT symmetric with auto-pull.
+  // Maintainer decision, 2026-08-29: auto-pull only ever reads a board a human already curated;
+  // auto-triage's own reproduction step is a genuine LLM judgement call (log correlation,
+  // geometry-predicate reasoning), so filing unattended on a hallucinated "reproduced" verdict is
+  // a real risk auto-pull never carries. Stays off until a maintainer has run `spo triage --dry`
+  // by hand enough times to trust it, then sets SPO_AUTO_TRIAGE_MS explicitly. See
+  // orchestrator/README.md § Auto-triage.
+  autoTriageMs:
+    process.env.SPO_AUTO_TRIAGE_MS !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_MS) : 0,
+
+  // How many queued reports one auto-triage cycle takes off the queue. SPO_AUTO_TRIAGE_LIMIT
+  // overrides. Default 3: unmeasured guess (see auto-triage.js's own DEFAULT_AUTO_TRIAGE_LIMIT
+  // comment) -- reports may need more real-server-log grepping per item than a board candidate
+  // does, so this may prove too high once a real run exists.
+  autoTriageLimit:
+    process.env.SPO_AUTO_TRIAGE_LIMIT !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_LIMIT) : 3,
+
   // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
   //
   // One executable, spawned as `<cmd> <taskId> <reason> <lastState>` every time a real-mode

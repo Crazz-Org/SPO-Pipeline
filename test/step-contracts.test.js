@@ -29,6 +29,12 @@ test('draft-card.md has no entry either -- intake path (spo ask), not a state-ma
   }
 });
 
+test('triage-bug-report.md has no entry either -- intake path (spo triage), not a state-machine-spec.md step', () => {
+  for (const contract of Object.values(STEP_CONTRACTS)) {
+    assert.ok(!contract.promptFile.endsWith('triage-bug-report.md'));
+  }
+});
+
 test('every contract promptFile exists under prompts/ and every non-intake-path prompt file is used by exactly one contract', () => {
   const usedFiles = new Set();
   for (const [step, contract] of Object.entries(STEP_CONTRACTS)) {
@@ -38,10 +44,11 @@ test('every contract promptFile exists under prompts/ and every non-intake-path 
   const allPromptFiles = fs
     .readdirSync(PROMPTS_DIR)
     .filter((f) => f.endsWith('.md') && f !== 'README.md');
-  // review-card.md and draft-card.md are both driven by the intake path
-  // (orchestrator/intake.js: `spo ask`), never by state-machine.js's callLlmStep -- see the two
-  // tests above.
-  const expected = allPromptFiles.filter((f) => f !== 'review-card.md' && f !== 'draft-card.md').sort();
+  // review-card.md, draft-card.md and triage-bug-report.md are all driven by the intake path
+  // (orchestrator/intake.js: `spo ask` / `spo triage`), never by state-machine.js's callLlmStep
+  // -- see the three tests above.
+  const INTAKE_PATH_PROMPTS = ['review-card.md', 'draft-card.md', 'triage-bug-report.md'];
+  const expected = allPromptFiles.filter((f) => !INTAKE_PATH_PROMPTS.includes(f)).sort();
   assert.deepEqual([...usedFiles].sort(), expected);
 });
 

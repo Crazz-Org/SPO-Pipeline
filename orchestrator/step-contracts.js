@@ -41,6 +41,15 @@ const BUDGET_BY_SIZE_USD = { S: 2, M: 5, L: 12 };
 // PLAN/IMPLEMENT-sized spend -- see BUDGET_BY_SIZE_USD above for that tier.
 const SMALL_BUDGET_USD = 3;
 
+// triage-bug-report (orchestrator/intake.js's triageBugReport, behind `spo triage` /
+// auto-triage.js) does everything reviewCard does (fable, effort high, real cross-repo reads)
+// plus a curl against the model-server log and a `gh issue list --search` dedup call on top --
+// plausibly heavier than SMALL_BUDGET_USD's $3, but unmeasured against a real run (no soak of
+// this step exists yet, unlike SMALL_BUDGET_USD's own history above). $6 is this build's own
+// starting guess, not an empirical figure -- raise or lower it once a real `spo triage` run
+// either dies at this cap or comes in well under it. See orchestrator/README.md § Auto-triage.
+const BUG_REPORT_BUDGET_USD = 6;
+
 // config.js's stepDeadlineMs (120000ms) is sized for the daemon's own scripted steps
 // (steps/scripted.js) and is not a fit for a real LLM step: BUDGET_BY_SIZE_USD/SMALL_BUDGET_USD
 // above are the actual spend bound a call is meant to die by, and the deadline must not fire
@@ -244,6 +253,7 @@ module.exports = {
   EFFORT_BY_SIZE,
   BUDGET_BY_SIZE_USD,
   SMALL_BUDGET_USD,
+  BUG_REPORT_BUDGET_USD,
   LLM_STEP_DEADLINE_MS,
   shouldEscalate,
   resolveStepContract,

@@ -70,8 +70,11 @@ source of truth (same philosophy as `~/.spo-bench/`):
 3. **Real S-sized cards** through the pipeline; measure parking rate and weighted tokens per
    merged card against the baseline.
 4. **Retire** the in-product process prose and hooks as the old path stops being used.
-5. **Extend intake**: `/triage-report` queue first, then in-game bug reports from production
-   (the far target: player report → nightly fix → release).
+5. **Extend intake**: `/triage-report` queue first — done (`orchestrator/auto-triage.js` /
+   `spo triage`, opt-in until proven: `spo triage` defaults to `--dry` and the daemon timer
+   stays off until `SPO_AUTO_TRIAGE_MS` is set by hand; see `orchestrator/README.md` §
+   Auto-triage) — then in-game bug reports from production (the far target: player report →
+   nightly fix → release).
 
 The maintainer's plan (measured baseline, levers, decisions) lives in a Claude artifact;
 decisions of record are mirrored into this repo's docs as they land.
