@@ -13,7 +13,7 @@ read out of order.
 
 | Step | Prompt file | Model | Effort | Tools | Ground |
 |---|---|---|---|---|---|
-| PLAN | `plan.md` | Fable 5 (Opus 5 on the wire rule or as fallback) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; writes only under `{{scratch_dir}}` |
+| PLAN | `plan.md` | Fable 5 (Opus 5 on the wire rule or as fallback) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}` |
 | IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on the wire rule — `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases — or an `L`-sized task) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
 | DIAGNOSE | `diagnose.md` | Fable 5 | high | `Read, Grep, Bash(ro)` | reads `{{diff_path}}`, `{{gate_log_path}}`, `{{ledger_path}}` |
 | VALIDATE — citation-verifier | `verify-citations.md` | Fable 5 | high | `Read, Grep` (product + `~/SPO-Original`, read-only) | reads the diff and `{{spo_original_path}}/Rdo/Server/`; runs only when `rdo-members.ts` changed, and always before `validate-change.md` |
@@ -30,9 +30,13 @@ executing step needs to know it may be running as Opus rather than assume Sonnet
 - **`{{worktree}}`** — always absolute, always rooted in the task's own worktree, never the main
   checkout and never a sibling task's worktree. Only IMPLEMENT ever writes inside it.
 - **`{{scratch_dir}}`** — absolute, **outside** `{{worktree}}` — the task's scratch area under
-  the pipeline's own `journal/`/scratch tree. `plan.md` and the invariants file always go here,
-  never inside the worktree, so a plan can be written without dirtying the tree the gate later
-  judges.
+  the pipeline's own `journal/`/scratch tree. `plan.md` and the invariants file always land
+  here, never inside the worktree, so a plan can be written without dirtying the tree the gate
+  later judges. PLAN itself never writes them (it runs read-only, `permissionMode: 'plan'`) --
+  it returns their full text as `plan_markdown`/`invariants_markdown` and the driver
+  (`state-machine.js`'s `handlePlan`) writes both files here once the reply validates, the same
+  compose/write split `draft-card.md`'s intake path already uses (`draftCard` composes,
+  `fileCard` writes).
 - **`{{invariants_path}}` / `{{invariant_ids}}`** — the invariant file's path travels with the
   list of ids, **never the quotes themselves**. Every step that consumes an invariant re-reads
   its quote from the file at the cited `file:line`/`file:start-end` — this is the mechanism

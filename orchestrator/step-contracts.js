@@ -94,7 +94,12 @@ const STEP_CONTRACTS = {
     maxBudgetUsd: 'bySize',
     cwdKind: 'worktree', // reads {{worktree}}; config.cwdForStep already encodes this split
     outputContract: {
-      required: ['plan_path', 'invariants_path', 'invariant_ids', 'check_commands'],
+      // plan_path/invariants_path are NOT here: PLAN runs permissionMode: 'plan' (read-only --
+      // see below) and cannot write those files itself, so it returns their full text instead
+      // (plan_markdown/invariants_markdown) and handlePlan (state-machine.js) writes them at the
+      // canonical scratch_dir/plan-<issue>.md convention, then journals plan_path/invariants_path
+      // itself for task-values.js's IMPLEMENT/VALIDATE placeholder derivation to keep reading.
+      required: ['plan_markdown', 'invariants_markdown', 'invariant_ids', 'check_commands'],
     },
   },
 

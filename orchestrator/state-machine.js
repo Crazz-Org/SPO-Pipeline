@@ -23,6 +23,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { appendEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
+const { scratchDir } = require('./task-values');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
 const { callWithDeadline } = require('./deadline');
@@ -154,12 +155,73 @@ async function handleWorktree(ctx) {
   throw new ParkSignal('worktree-failed', { exit });
 }
 
+// PLAN runs permissionMode: 'plan' (step-contracts.js) -- the harness refuses every Write call,
+// so the model cannot write plan-<issue>.md / invariants-<issue>.md itself (confirmed by
+// today's real run of card issue-247: plan-mode Write refusals, followed by the model reporting
+// paths in its structured output anyway -- files that were never created). PLAN's contract
+// (prompts/plan.md, step-contracts.js) now has the model RETURN both documents' full text as
+// plan_markdown/invariants_markdown; this handler is the one place that writes them, the same
+// division of labour intake.js's draftCard (composes) / fileCard (writes) already uses.
+//
+// `result === null` means no shadow.llm.PLAN fixture was wired for this task at all (fixture.js
+// returns the caller's default) -- the pre-existing "trivially ok, nothing to validate"
+// convention this file already used before this fix (see handleImplement below, same idiom) is
+// kept unchanged for that case: there is no plan content to validate or write, and plenty of
+// tests unrelated to PLAN rely on it. Once a payload actually exists -- a real LLM reply, an
+// explicit shadow fixture, or --dry-run's own canned payload (steps/llm.js) -- it is held to the
+// real contract.
 async function handlePlan(ctx) {
   const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
-  if (payload && payload.ok !== false) return 'IMPLEMENT';
-  throw new ParkSignal('plan-invalid', { payload });
+  if (!payload || payload.ok === false) {
+    throw new ParkSignal('plan-invalid', { payload });
+  }
+  if (result === null) return 'IMPLEMENT';
+
+  const planMarkdown = payload.plan_markdown;
+  const invariantsMarkdown = payload.invariants_markdown;
+  const missing = [];
+  if (typeof planMarkdown !== 'string' || planMarkdown.trim() === '') missing.push('plan_markdown');
+  if (typeof invariantsMarkdown !== 'string' || invariantsMarkdown.trim() === '') missing.push('invariants_markdown');
+  if (missing.length > 0) {
+    throw new ParkSignal('plan-invalid', { payload, missing });
+  }
+
+  const dir = scratchDir(ctx.taskDir);
+  fs.mkdirSync(dir, { recursive: true });
+  const issue = ctx.task && ctx.task.issue != null ? ctx.task.issue : ctx.id;
+  const planPath = path.join(dir, `plan-${issue}.md`);
+  const invariantsPath = path.join(dir, `invariants-${issue}.md`);
+  fs.writeFileSync(planPath, planMarkdown);
+  fs.writeFileSync(invariantsPath, invariantsMarkdown);
+  appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath });
+
+  // Re-journal PLAN's 'result' with plan_path/invariants_path added -- task-values.js's
+  // lastResultPayload reads the *last* PLAN 'result' event for IMPLEMENT/VALIDATE's own
+  // placeholder derivation, and that lookup must keep resolving to these exact paths.
+  appendEvent(ctx.taskDir, 'PLAN', 'result', {
+    payload: { ...payload, plan_path: planPath, invariants_path: invariantsPath },
+  });
+
+  return 'IMPLEMENT';
+}
+
+// Parses IMPLEMENT's files_changed value, which arrives as either a real array or (as seen in
+// today's card issue-247 run) a JSON-encoded string like "[]". Returns null for anything that
+// isn't cleanly one or the other -- missing, unparsable, or the wrong shape are all treated the
+// same as "no files changed" by the caller below.
+function parseFilesChanged(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 async function handleImplement(ctx) {
@@ -170,8 +232,43 @@ async function handleImplement(ctx) {
   const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload });
-  if (payload && payload.ok !== false) return 'CHECK';
-  return 'DIAGNOSE';
+  if (!payload || payload.ok === false) return 'DIAGNOSE';
+
+  // Transport-level ok:true is not enough to trust CHECK with the worktree: today's real run of
+  // card issue-247 saw IMPLEMENT return {ok: true, filesChanged: "[]", allGreen: "false",
+  // summary: "Cannot proceed: the required plan file ... does not exist"} -- the old code sent
+  // that straight to CHECK, which passed on the untouched worktree, and PUSH_PR only then parked
+  // (push-pr-failed, "nothing to commit") two states and one misleading reason later than the
+  // real problem. Route an empty/unparsable files_changed to DIAGNOSE instead, the existing
+  // bounded remediation path.
+  //
+  // Gated on BOTH isRealMode(ctx) AND the payload actually carrying a files_changed/filesChanged
+  // key, not on isRealMode alone -- two existing, legitimate shapes would otherwise break:
+  //   - --dry-run's own canned IMPLEMENT payload (steps/llm.js's cannedDryRunPayload) reports
+  //     files_changed: [] on purpose (nothing really ran); isRealMode(ctx) is already false for
+  //     --dry-run, so the key-presence check is redundant there but kept for clarity.
+  //   - the legacy ctx.task.llm.IMPLEMENT override path (steps/llm.js's runLlm: "honoured
+  //     verbatim, no outputContract validation" -- still real mode, still exercised by
+  //     test/board-move.test.js) returns invokeClaudeReal's raw {ok, result, ...} shape, which
+  //     never has a files_changed field at all -- that is a different payload shape, not an
+  //     empty-implement bug, so it is left alone and still reaches CHECK as before.
+  // A legitimate implement with red tests (non-empty filesChanged, allGreen false) is untouched
+  // by either condition and still reaches CHECK exactly as today.
+  if (isRealMode(ctx)) {
+    const hasFilesChangedField =
+      Object.prototype.hasOwnProperty.call(payload, 'files_changed') ||
+      Object.prototype.hasOwnProperty.call(payload, 'filesChanged');
+    if (hasFilesChangedField) {
+      const raw = 'files_changed' in payload ? payload.files_changed : payload.filesChanged;
+      const filesChanged = parseFilesChanged(raw);
+      if (!filesChanged || filesChanged.length === 0) {
+        appendEvent(ctx.taskDir, 'IMPLEMENT', 'empty-implement', { filesChanged: raw, summary: payload.summary });
+        return 'DIAGNOSE';
+      }
+    }
+  }
+
+  return 'CHECK';
 }
 
 async function handleCheck(ctx) {

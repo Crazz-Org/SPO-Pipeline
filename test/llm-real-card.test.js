@@ -62,8 +62,8 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
     spawnSync: fakeSpawnSync((command, argv) => {
       seenArgv = argv;
       const reply = realShapedReply({
-        plan_path: '/tmp/scratch-99/plan-99.md',
-        invariants_path: '/tmp/scratch-99/invariants-99.md',
+        plan_markdown: '# Plan\n\nAdd a widget to the header.\n',
+        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
         invariant_ids: [],
         check_commands: ['npm run typecheck'],
       });
@@ -74,7 +74,7 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
 
   assert.equal(result.ok, true);
-  assert.equal(result.plan_path, '/tmp/scratch-99/plan-99.md');
+  assert.equal(result.plan_markdown, '# Plan\n\nAdd a widget to the header.\n');
   assert.deepEqual(result.check_commands, ['npm run typecheck']);
   assert.equal(result.sessionId, 'sess-card-1');
 
@@ -173,11 +173,11 @@ test('reply missing a required output key -> {ok:false, kind:"error"}, existing 
 
   const deps = {
     spawnSync: fakeSpawnSync(() => {
-      // PLAN's contract requires plan_path/invariants_path/invariant_ids/check_commands --
-      // this reply is missing check_commands.
+      // PLAN's contract requires plan_markdown/invariants_markdown/invariant_ids/check_commands
+      // -- this reply is missing check_commands.
       const reply = realShapedReply({
-        plan_path: '/tmp/plan.md',
-        invariants_path: '/tmp/invariants.md',
+        plan_markdown: '# Plan\n',
+        invariants_markdown: '# Invariants\n',
         invariant_ids: [],
       });
       return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
