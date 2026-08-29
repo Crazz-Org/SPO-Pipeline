@@ -62,7 +62,7 @@ function writeJson(file, obj) {
 
 // ---- WORKTREE -------------------------------------------------------------------------------
 
-test('realWorktree: fetch -> rev-parse -> worktree add -> npm ci -> board:take, exact argv, sets worktreePath', async () => {
+test('realWorktree: fetch -> rev-parse -> worktree add -> npm ci -> board:take -> board:move (Planning), exact argv, sets worktreePath', async () => {
   const config = testConfig();
   const task = { id: 'card-42', kind: 'card', issue: 42, title: 'Add a widget' };
   const ctx = testCtx({ id: 'card-42', task, config });
@@ -101,7 +101,14 @@ test('realWorktree: fetch -> rev-parse -> worktree add -> npm ci -> board:take, 
     args: ['run', 'board:take', '--', '42'],
     cwd: expectedWorktreePath,
   });
-  assert.equal(calls.length, 5);
+  // Kanban piloting: once the claim succeeds (and the worktree exists), WORKTREE moves the card
+  // to "Planning" -- see orchestrator/board.js's COLUMN_BY_STATE.
+  assert.deepEqual(calls[5], {
+    command: 'npm',
+    args: ['run', 'board:move', '--', '42', 'Planning'],
+    cwd: expectedWorktreePath,
+  });
+  assert.equal(calls.length, 6);
 });
 
 test('realWorktree: nightly says main is red at the fetched origin/main sha -> PARKED before worktree add', async () => {
@@ -215,7 +222,11 @@ test('realCheck: typecheck fails -> DIAGNOSE, names the alias, lint/coverage nev
 
   const next = await realCheck(ctx, deps);
   assert.equal(next, 'DIAGNOSE');
-  assert.equal(calls.length, 1);
+  // Kanban piloting: CHECK moves the card to "Checks & PR" before the alias loop -- that spawn
+  // is calls[0], typecheck is calls[1].
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], ['run', 'board:move', '--', '70', 'Checks & PR']);
+  assert.deepEqual(calls[1], ['run', 'typecheck']);
 
   const journal = fs
     .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
@@ -243,7 +254,9 @@ test('realCheck: lint fails after typecheck passes -> DIAGNOSE names "lint", cov
 
   const next = await realCheck(ctx, deps);
   assert.equal(next, 'DIAGNOSE');
-  assert.equal(calls.length, 2); // typecheck (pass), lint (fail) -- coverage:changed never spawned
+  // board:move, typecheck (pass), lint (fail) -- coverage:changed never spawned
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0], ['run', 'board:move', '--', '71', 'Checks & PR']);
 
   const journal = fs
     .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
@@ -264,8 +277,9 @@ test('realCheck: all three pass -> PUSH_PR', async () => {
 
   const next = await realCheck(ctx, deps);
   assert.equal(next, 'PUSH_PR');
-  assert.equal(calls.length, 3);
-  assert.deepEqual(calls.map((a) => a[1]), ['typecheck', 'lint', 'coverage:changed']);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls[0], ['run', 'board:move', '--', '72', 'Checks & PR']);
+  assert.deepEqual(calls.slice(1).map((a) => a[1]), ['typecheck', 'lint', 'coverage:changed']);
 });
 
 // ---- PUSH_PR --------------------------------------------------------------------------------

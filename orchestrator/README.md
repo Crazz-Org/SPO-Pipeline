@@ -442,18 +442,115 @@ a `kind: "card"` task against the real product repo and a real GitHub PR, a main
 watching: it worktree-adds off `origin/main`, runs `npm ci`, claims a real board card, pushes a
 real branch, opens a real PR, and — on the happy path — merges it and removes its own worktree.
 
+## Kanban piloting
+
+Real mode (`daemon.js --real`) drives the product board, not just the pipeline's own journals --
+column moves at (most) states, and a park/retry/abandon round trip through the issue's own
+comments, both maintainer-approved (2026-08-29, "lot B").
+
+### Column mapping
+
+The maintainer created five kanban columns for this (`Planning`, `Implementing`, `Checks & PR`,
+`Merging`, `Parked`) alongside the existing `Todo` / `Gate` / `Validation` / `Done`.
+`orchestrator/board.js`'s `COLUMN_BY_STATE` is the one table every mover reads:
+
+| State | Column | Where the move happens |
+|---|---|---|
+| WORKTREE (once the claimed worktree exists) | `Planning` | `steps/scripted.js`'s `realWorktree`, right after `board:take` succeeds |
+| IMPLEMENT | `Implementing` | `state-machine.js`'s `handleImplement` (an LLM step, no `realX` split) |
+| CHECK | `Checks & PR` | `steps/scripted.js`'s `realCheck`, before the alias loop -- covers PUSH_PR too, no separate move there |
+| GATE | `Gate` | `steps/scripted.js`'s `realGate` |
+| VALIDATE | `Validation` | `state-machine.js`'s `handleValidate`, once per entry regardless of `touchesRdoMembers` |
+| MERGE | `Merging` | `steps/scripted.js`'s `realMerge` |
+| FINISH | `Done` | `steps/scripted.js`'s `realFinish` -- unchanged, pre-existing, and still the one move that **blocks** the task on failure |
+| PARKED | `Parked` | `park-loop.js`'s `postParkComment`, called from `finalizePark` |
+
+`CI_CHECKS` is deliberately absent -- it stays under `Gate`, no move. Every move above except
+FINISH's own goes through `board.js`'s `moveCard(ctx, deps, state)`: `npm run board:move --
+<issue> "<Column>"`, cwd = the task's worktree. **A failed move is journaled
+(`board-move-failed`) and never blocks the task** -- board display is best-effort, the journal
+is the truth. Before the worktree exists (a pre-WORKTREE park, e.g. `nightly-main-red`), the
+move is skipped and journaled `board-move-skipped` (`reason: "no worktree"`) instead of
+attempting a `board:move` with no product cwd to run it from; the issue comment (gh needs no
+cwd) still posts either way.
+
+### Park <-> kanban round trip
+
+When a real, `kind: "card"` task parks, `state-machine.js`'s `finalizePark` calls
+`park-loop.js`'s `postParkComment`: moves the card to `Parked` (never blocks, see above) and
+posts a structured comment on the issue -- the reason, what the machine expects from the
+maintainer, and this literal line:
+
+```
+pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to close this attempt.
+```
+
+`gh issue comment`'s own stdout carries the created comment's URL
+(`.../issues/<n>#issuecomment-<id>`); the numeric id is journaled (`park-comment`, `commentId`)
+as the anchor for what comes next -- GitHub comment ids are monotonically increasing site-wide,
+so "posted after the park comment" is exactly "id greater than the anchor", no clock needed.
+
+**`unparkScan`** (`park-loop.js`) runs once per daemon poll cycle, real mode only
+(`state-machine.js`'s `runForever`, gated on `config.real` the same way everything else real in
+that file is). For every journaled task still `PARKED` with a park-comment anchor not yet acted
+on, it reads the issue's comments (`gh api repos/<repo>/issues/<n>/comments` -- one page,
+GitHub's default 30; a very long-lived parked issue could in principle need pagination this
+build does not implement) and looks only at comments posted after the anchor, oldest first. The
+first one whose **first line** is `retry` (optionally followed by more text) or `abandon`,
+case-insensitive, decides the outcome; anything else on the issue -- a `retry` posted *before*
+the park comment, or a comment matching neither word -- is left alone, since a human
+conversation on the issue is allowed:
+
+- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/retry-<ts>-<id>.json`
+  with the original `task.json` fields, `worktreePath`/`branch` dropped so WORKTREE derives both
+  fresh, same as a first attempt) and journals `unparked-by-maintainer`. `buildCtx`'s fresh
+  `ctx.counters` on the next `runTask` naturally resets the transient DIAGNOSE/VALIDATE-reject
+  counters; the ledger (`journal/<id>/ledger.md`) is untouched, since the retry reuses the same
+  `journal/<id>` directory the ledger already lives in.
+- **`abandon`** -- terminal: `state.json`'s `state` is rewritten to `ABANDONED` directly (this
+  task never re-enters `runTask`'s loop), journaled `abandoned-by-maintainer`, and a one-line ack
+  comment ("Understood -- closing this attempt.") is posted on the issue. The card's *column* is
+  deliberately left alone here -- where it lands next is the maintainer's own board gesture, not
+  this build's to make.
+
+Idempotent across scans: a task already acted on for its current park cycle (an
+`unparked-by-maintainer`/`abandoned-by-maintainer` event already follows the anchor
+`park-comment` in the journal) is skipped, whether or not the re-enqueued task has been drained
+back out of `PARKED` yet.
+
+### Auto-pull
+
+`daemon.js --real`, when not `--once`, also runs `auto-pull.js`'s `runAutoPull` on a timer
+between drain passes (`state-machine.js`'s `runForever`) -- the exact same `pullBoard` +
+`makeTask` `spo pull` already runs by hand (same dedup: `makeTask` skips an issue already in
+`queue/` or `journal/`), for the top `config.autoPullLimit` (default 3) claimable candidates.
+`config.autoPullMs` (default 5 minutes, `SPO_AUTO_PULL_MS` env override, `0` disables the timer
+entirely) gates it via `shouldAutoPull(lastPullAt, nowMs, autoPullMs)` -- a pure function with no
+`Date.now()`/`setInterval` baked in, so a test drives it with any clock pair directly. Journals
+exactly one `auto-pull` event (`{enqueued, issues}`) to `journal/daemon.jsonl` -- a daemon-level
+counterpart to `journal.js`'s per-task `appendEvent`, since a pull cycle belongs to no single
+task -- and only when at least one candidate was actually written, never for a cycle that found
+nothing new.
+
+**Cost**: `npm run board:claim` is the same ~2-4 point cheap pool read
+`doc/kanban-workflow.md` § GitHub API discipline already documents for `spo pull` (see below) --
+this timer does not add a new *kind* of GitHub read, it just runs the existing one on a schedule
+instead of only on request. At the default 5-minute interval that is at most ~12 reads/hour,
+well inside the shared 5000-point/hour budget.
+
 ## Intake
 
 `orchestrator/intake.js` is the maintainer-facing path from a free-text request to a filed
 GitHub issue, and from the product board to a local `queue/` task file -- behind `bin/spo`'s
-`ask` and `pull` commands. Neither command runs `daemon.js` or drives a task through the
-lifecycle above; `spo ask` only files an issue (the board's own auto-add workflow puts it in
+`ask` and `pull` commands, and (for the brainstorm lane) the `.claude/commands/SPO-Draft.md`
+interactive-session command. Neither `bin/spo` command runs `daemon.js` or drives a task through
+the lifecycle above; `spo ask` only files an issue (the board's own auto-add workflow puts it in
 Todo), and `spo pull` only writes `queue/` files for a later `daemon.js --real` run to drain.
 
 **The maintainer flow, end to end:**
 
 ```
-spo ask "<request>"     -- file a card from a request (or --draft-file, see below)
+spo ask "<request>"     -- file a card from a request (or /SPO-Draft, see below)
    |
    v  (the board's auto-add workflow moves the new issue to Todo)
 npm run board:claim      -- (in the product repo) the priority order `spo pull` reads
@@ -476,6 +573,13 @@ daemon.js --real          -- drains queue/, drives each task PLAN -> ... -> DONE
   (`intake.loadDraftFile`) -- straight to review. The file is checked against the identical
   contract DRAFT_CARD's own reply is validated against; a missing key or an unrecognized
   `category`/`size`/`area` is reported clearly and exits non-zero, never silently guessed at.
+  **`/SPO-Draft`** (`.claude/commands/SPO-Draft.md`) is this lane's human-facing front end: it
+  drives an interactive Claude Code session to synthesize the brainstorm into that same contract,
+  write it to the session scratchpad, run `bin/spo ask --draft-file <that file> --dry` and show
+  the maintainer the draft plus the review verdict verbatim, then ask an explicit yes/no
+  confirmation (never files without it) before re-running the same command without `--dry`. It
+  replaces the raw `--draft-file` gymnastics above for a human at the keyboard; the flag itself
+  is unchanged and still the thing `/SPO-Draft` ultimately calls.
 
 Both lanes converge on the same two steps:
 
@@ -592,9 +696,16 @@ All state-machine tests run in `--shadow` mode against `fs.mkdtempSync(os.tmpdir
 queue/journal directories — no shared state, no product-repo or bench interaction, no network.
 `test/llm-real.test.js`, `test/llm-real-card.test.js` and `test/account-rotation.test.js`
 exercise **real-mode** LLM code (`invokeClaudeReal`, `callLlmStep`) and `test/real-steps.test.js`
-exercises the real-mode **scripted** functions ("Real scripted steps" above) — all of them only
-ever through an injected fake `spawnSync` (`deps.spawnSync`), calling
+exercises the real-mode **scripted** functions ("Real scripted steps" above, now including each
+one's own `board.js` `moveCard` call) — all of them only ever through an injected fake
+`spawnSync` (`deps.spawnSync`), calling
 `realWorktree`/`realCheck`/`realPushPr`/`realGate`/`realCiChecks`/`realMerge`/`realFinish`
-directly rather than through `daemon.js`'s own dispatch (which has no injection point). None of
-them ever touch a real `git`, `npm`, `gh` or `claude` process, so the whole suite stays
-hermetic.
+directly rather than through `daemon.js`'s own dispatch (which has no injection point). Kanban
+piloting's own tests follow the same convention one layer up: `test/board-move.test.js` covers
+`board.js`'s `moveCard` directly plus `HANDLERS.IMPLEMENT`/`HANDLERS.VALIDATE`'s real-mode move
+(via `buildCtx`'s `config.deps`, since neither state has a `realX(ctx, deps)` split of its own);
+`test/park-loop.test.js` covers the park comment's content and the PARKED round trip via
+`runTask` directly, plus `unparkScan`'s retry/abandon/idempotency; `test/auto-pull.test.js`
+covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
+enqueued rules. None of them ever touch a real `git`, `npm`, `gh` or `claude` process, so the
+whole suite stays hermetic.

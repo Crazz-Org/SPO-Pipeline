@@ -17,6 +17,16 @@ function appendEvent(taskDir, state, event, detail = {}) {
   fs.appendFileSync(path.join(taskDir, 'journal.jsonl'), JSON.stringify(record) + '\n');
 }
 
+// A daemon-level counterpart to appendEvent, for events that belong to no single task -- today
+// only auto-pull.js's `auto-pull` cycle summary. Lives at <journalRoot>/daemon.jsonl, sibling to
+// the per-task journal/<id>/ directories, same append-only shape minus the `state` field (there
+// is no state machine involved).
+function appendDaemonEvent(journalRoot, event, detail = {}) {
+  fs.mkdirSync(journalRoot, { recursive: true });
+  const record = { ts: new Date().toISOString(), event, ...detail };
+  fs.appendFileSync(path.join(journalRoot, 'daemon.jsonl'), JSON.stringify(record) + '\n');
+}
+
 function appendLedgerLine(taskDir, attemptN, rootCause, outcome) {
   fs.appendFileSync(path.join(taskDir, 'ledger.md'), `attempt ${attemptN} | ${rootCause} | ${outcome}\n`);
 }
@@ -42,4 +52,4 @@ function writeReport(taskDir, { id, reason, lastState, ts, detail }) {
   fs.writeFileSync(path.join(taskDir, 'report.md'), body);
 }
 
-module.exports = { appendEvent, appendLedgerLine, writeState, writeReport };
+module.exports = { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeReport };
