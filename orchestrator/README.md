@@ -622,6 +622,25 @@ pool (`accounts.pick`); every `gh`/`npm` call is injected the same way `steps/sc
 `spawnStep` already is (`deps.spawnSync`) -- production code never passes it, so a real run
 always spawns the real binaries on `PATH`.
 
+## Single-instance lock
+
+The daemon refuses to start if another daemon already holds the same journal root
+(`orchestrator/lock.js`): one JSON file at `<journalRoot>/daemon.lock` — `{host, pid,
+startedAt, mode}`, created atomically with `open(..., 'wx')` — acquired in `daemon.js` right
+after the directories exist, released on exit and on SIGINT/SIGTERM. A second daemon on the
+same root exits 1 naming the holder; the likely collision is a hand-run
+`node orchestrator/daemon.js --real` while the systemd unit is up.
+
+Why it exists: `takeNextTask`'s rename is atomic, so a contended task never runs twice — but
+the losing daemon's `fs.renameSync` throws ENOENT, which (per `park-signal.js`'s catch-all
+doctrine) crashes it; and two daemons also clobber the account pool's `state.json`
+read-modify-write and double-run the auto-pull timer.
+
+The lock is scoped to the journal root, not the process, so the test suite's temp-dir daemons
+never contend with a live one. A holder whose pid is dead (hard kill, power loss) is swept and
+taken over on the next start, journaled as a `lock-stale-taken` event in
+`<journalRoot>/daemon.jsonl`.
+
 ## Where journals live
 
 ```

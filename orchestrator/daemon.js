@@ -36,6 +36,8 @@ const path = require('path');
 const defaultConfig = require('./config');
 const { drainQueueOnce, runForever } = require('./state-machine');
 const accounts = require('./accounts');
+const { acquireLock, LockHeldError } = require('./lock');
+const { appendDaemonEvent } = require('./journal');
 
 function parseArgs(argv) {
   const opts = {
@@ -127,6 +129,31 @@ async function main() {
   const journalRoot = opts.journal || path.join(repoRoot, 'journal');
   fs.mkdirSync(queueDir, { recursive: true });
   fs.mkdirSync(journalRoot, { recursive: true });
+
+  // Single-instance lock, scoped to this journal root (orchestrator/lock.js) -- the same
+  // refuse-to-start posture as the account-pool guard above: two daemons on one queue is a
+  // startup config error to surface here, not a per-task ENOENT crash to debug later. The
+  // suite's temp-dir daemons each lock their own journal root, so they never contend.
+  let lock;
+  try {
+    lock = acquireLock(journalRoot, opts.shadow ? 'shadow' : opts.dryRun ? 'dry-run' : 'real');
+  } catch (err) {
+    if (err instanceof LockHeldError) {
+      console.error(`orchestrator/daemon.js: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+  if (lock.stale) {
+    appendDaemonEvent(journalRoot, 'lock-stale-taken', { stale: lock.stale });
+  }
+  // Release on every exit path. SIGINT/SIGTERM need explicit handlers because the default
+  // signal death skips 'exit' handlers entirely -- process.exit() here makes them run.
+  process.once('exit', lock.release);
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143));
+  }
 
   const config = {
     ...defaultConfig,
