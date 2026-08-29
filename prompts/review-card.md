@@ -44,6 +44,23 @@ claimer's.
 
 ## What you do — four checks, in this order
 
+### 0 · A bug report enters confirmed, or not at all
+
+This pre-check applies when the draft's source is a **bug report** (a player report, the
+in-game reporter, the `/triage-report` queue) — maintainer decision, 2026-08-29:
+
+- The defect must be **confirmed**: a reproduction the body describes precisely enough to
+  replay, or verifiable visual evidence (data displayed in the wrong place, an unusable or
+  unreachable control). UI/ergonomics and data-display problems are full-fledged defects —
+  confirmation is the bar, not severity.
+- A preference with no objective malfunction — the player "doesn't like it", wants different
+  behaviour with nothing demonstrably broken — is **`DO_NOT_FILE`**, and
+  `first_comment_markdown` names the missing criterion: no reproduction, and no deviation
+  from a documented or reference-client behaviour.
+- Suggestions and feature requests reach the board only through the maintainer's own
+  deliberate filing — never through the bug-report channel. Do not soften this by reclassifying
+  a preference as an "observation".
+
 ### 1 · Does the claim hold against the code?
 
 Open **every** `file:line` the draft cites, on the current tree, and read enough around it to

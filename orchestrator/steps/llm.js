@@ -137,6 +137,25 @@ async function invokeClaudeReal(opts, deps = {}) {
   if (opts.account && opts.account.configDir) {
     env.CLAUDE_CONFIG_DIR = opts.account.configDir;
   }
+  // A registry entry may carry the account's long-lived subscription token in a file (the
+  // `claude setup-token` output, pasted there by the operator -- see accounts.js's registry
+  // format). Exported as CLAUDE_CODE_OAUTH_TOKEN for this one spawn only. An unreadable file
+  // is an authoring error surfaced as a normal step failure, never a throw.
+  if (opts.account && opts.account.oauthTokenFile) {
+    try {
+      env.CLAUDE_CODE_OAUTH_TOKEN = fs.readFileSync(opts.account.oauthTokenFile, 'utf8').trim();
+    } catch (err) {
+      return {
+        ok: false,
+        kind: 'error',
+        error: `llm.js: cannot read oauthTokenFile for account "${opts.account.name}": ${err.message}`,
+        sessionId: null,
+        costUsd: 0,
+        numTurns: undefined,
+        raw: null,
+      };
+    }
+  }
 
   const spawnOpts = {
     cwd: opts.cwd,

@@ -52,6 +52,12 @@ Until the bench migrates here, the authoritative procedure lives in the product 
   intake queue (today `~/.spo-reports` + `/triage-report`; becomes the orchestrator queue).
   The far target — player reports a bug in-game, the pipeline debugs it, the fix ships in the
   nightly release — is this loop, closed.
+  **The intake contract** (maintainer decision, 2026-08-29): a report becomes a task only
+  once **confirmed** — a replayable reproduction, or verifiable visual evidence. UI/ergonomics
+  and data-display problems qualify as defects; a player preference with nothing objectively
+  broken does not (`DO_NOT_FILE`, criterion named). Suggestions enter the board only through
+  the maintainer's own filing, never through the bug-report channel — the confirmation gate is
+  `prompts/review-card.md` § 0.
 - **Verification**: branch → L2 gate (pre-prod) → merge → Release → production. The nightly
   run proves `main` itself.
 

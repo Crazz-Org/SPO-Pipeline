@@ -14,19 +14,20 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
 - `--once` drains the whole `queue/` directory serially (filename sort = processing order) and
   exits, printing `<id>  <finalState>` per task. Without `--once` the daemon polls the queue
   directory forever (`--interval-ms`, default 5000).
-- One of `--shadow` or `--dry-run` is required. `--shadow` drives shadow-mode task files only
-  (`task.shadow.*` fixtures, no real code path reached). `--dry-run` drives a *real*
+- One of `--shadow`, `--dry-run` or `--real` is required. `--shadow` drives shadow-mode task
+  files only (`task.shadow.*` fixtures, no real code path reached). `--dry-run` drives a *real*
   `kind: "card"` task file through real-mode semantics — step-contracts.js resolution,
   prompt-template.js fill, account rotation — with the one spawn point in each step (a `claude`
-  CLI call, a scripted command) replaced by a fixture-free "assumed success" — see "Real mode"
-  → "--dry-run" below. Real execution of the *scripted* steps (`npm run gate`, `gh pr merge`, …)
-  remains a documented stub in `steps/scripted.js` regardless of mode — the *LLM* steps
-  (`steps/llm.js`) are the only ones with a real (non-dry-run) implementation today, exercised
-  by direct unit tests (`test/llm-real.test.js`, `test/llm-real-card.test.js`,
-  `test/account-rotation.test.js`) and the one manual smoke script (`scripts/smoke-llm.js`),
-  never by an actual `daemon.js` run with real spawning (`--dry-run` walks the same real-mode
-  code paths but never spawns; nothing in the `node --test` suite ever calls the real `claude`
-  CLI).
+  CLI call, a scripted command) replaced by a fixture-free "assumed success" — see "Real mode" →
+  "--dry-run" below. `--real` is the one mode that actually spawns: both the LLM steps
+  (`steps/llm.js`) and the scripted steps (`steps/scripted.js`'s `realWorktree`/`realCheck`/
+  `realPushPr`/`realGate`/`realCiChecks`/`realMerge`/`realFinish`) run for real — see "Real
+  scripted steps" below. `--real` and `--shadow` are mutually exclusive (daemon.js refuses to
+  start); if `--dry-run` is also given, `--dry-run` wins, same precedence as `--shadow` winning
+  over `--dry-run`. Nothing in the `node --test` suite ever spawns a real `git`/`npm`/`gh`/
+  `claude` process — every real-mode test (`test/llm-real*.test.js`,
+  `test/account-rotation.test.js`, `test/real-steps.test.js`) injects `deps.spawnSync` and calls
+  the real-mode functions directly, never through `daemon.js`'s own child-process dispatch.
 - Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
   missing). Point both at a temp dir to run an isolated batch — this is how the test suite
   works.
@@ -260,7 +261,9 @@ spawning anything**. `runLlm` (steps/llm.js) and `runScripted` (steps/scripted.j
   park them as "missing".
 - a **scripted step** (WORKTREE, CHECK, PUSH_PR, GATE, MERGE, FINISH) returns a fixture-free
   `{exit: 0, stdoutTail: '[dry-run] <key> -> assumed success'}` — no fixture consulted, no
-  command run.
+  command run. This is `--dry-run`'s own branch inside `runScripted`; it is separate from (and
+  checked before) the real per-state functions in "Real scripted steps" below, which is what
+  `--real` dispatches to instead.
 
 `--dry-run` is ignored if `--shadow` is also passed (shadow wins). `test/dry-run-demo.test.js`
 walks a synthetic `kind: "card"` task through the full lifecycle this way and asserts on the
@@ -322,6 +325,107 @@ directory). Run it by hand:
 node scripts/smoke-llm.js
 ```
 
+## Real scripted steps
+
+`orchestrator/steps/scripted.js` has one real-mode function per orchestrator state that spawns a
+product-repo command: `realWorktree`, `realCheck`, `realPushPr`, `realGate`, `realCiChecks`,
+`realMerge`, `realFinish`. `state-machine.js`'s handlers dispatch to these the same way they
+already dispatch `steps/llm.js`'s `runLlm` — only once neither `--shadow` nor `--dry-run`
+applies (`isRealMode(ctx)`, i.e. `daemon.js --real`) — and `runScripted`'s shadow/dry-run
+branches are otherwise unchanged from the shadow-mode skeleton. Every real function takes
+`(ctx, deps = {})`; `deps.spawnSync` is the same test-injection point `steps/llm.js`'s
+`invokeClaudeReal` already uses (production never passes it, so a real call always spawns the
+real binary on `PATH`). Each function is judged on exit codes only (principle 1,
+doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure, or returns the
+next state name — the handler just wraps the call in the existing `callWithDeadline`.
+
+**Where the commands run.** `config.productRepo` is always `path.join(os.homedir(),
+'SPO-WebClient')` — the product checkout, never a relative `../SPO-WebClient` (a session
+worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
+`<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
+`<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
+`config.cwdForStep`) reads that path back off `ctx.task.worktreePath`, set once WORKTREE
+succeeds. `config.ghRepo` (`Crazz-Org/SPO-WebClient`) is the `--repo` / API path every `gh`
+call uses. `config.spoBenchDir` (default `~/.spo-bench`) is where the nightly-red refusal and
+the main-moved `baseMain` lookup read local JSON instead of polling GitHub or the bench.
+
+**WORKTREE, in order — and why claim is last.** `git -C <productRepo> fetch origin`, then `git
+-C <productRepo> rev-parse origin/main` to get the sha the nightly check compares against
+`~/.spo-bench/nightly/latest.json`'s `{verdict, sha}` (a `FAIL` at that exact sha parks
+`nightly-main-red` before anything is created); then `git -C <productRepo> worktree add
+<worktreesDir>/<taskId> -b claude-pipe/<taskId> origin/main`; then `npm ci` in the fresh
+worktree (a product worktree carries no `node_modules`); **only then** `npm run board:take --
+<issue>`, also from the fresh worktree. The claim runs last, after the worktree exists, because
+the npm aliases need a product cwd to run at all, and the one checkout that must never run them
+is the human's own main `SPO-WebClient` — there is no product cwd available before WORKTREE has
+created one. `board:take`'s exit code: 0 claims and returns `'PLAN'`; 3 → PARKED `claim-lost`; 4
+or 5 → PARKED `claim-rate-limited`; 6 → PARKED `claim-finished-worktree`; anything else → PARKED
+`claim-unrecognized-exit`. A fetch, rev-parse or `worktree add` failure parks
+`worktree-fetch-failed` / `worktree-rev-parse-failed` / `worktree-add-failed`; an `npm ci`
+failure parks `worktree-npm-ci-failed` — none of these leave a claimed card behind, since the
+claim is always the last spawn.
+
+**CHECK** runs `npm run typecheck`, `npm run lint`, `npm run coverage:changed` in that order in
+the worktree; the first non-zero exit journals `{event: 'check-failed', alias}` naming which one
+and returns `'DIAGNOSE'` (never PARKED) — the later aliases never run once one has failed.
+
+**PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
+<file>`, never the message inline on argv) and the PR body — `Closes #<issue>` plus a
+`claude-pipe/<taskId>` pipeline stamp — to `journal/<id>/pr-body.md` (`gh pr create --body-file
+<file>`), then `git add -A` / `git commit -F <file>` / `git push -u origin claude-pipe/<taskId>`
+/ `gh pr create --repo <ghRepo> --title <title> --body-file <file>`, all `git -C <worktree>`. The
+PR number is parsed off the `/pull/<n>` URL in `gh pr create`'s stdout and stored on `ctx.prNumber`
+(and from there into every `state.json` snapshot) for MERGE and FINISH to read back; an
+unparsable URL parks `push-pr-failed` (`step: 'pr-number-unparsed'`) rather than guessing.
+
+**GATE** runs `npm run gate` in the worktree; the exit-code table is unchanged from shadow mode
+(0 → `'CI_CHECKS'`, 1 → `'DIAGNOSE'`, 2/3/4 → PARKED `gate-dirty-tree`/`gate-worker-down`/
+`gate-timeout`).
+
+**CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
+<worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to
+`{name, conclusion}` pairs; the first check whose conclusion isn't `success`/`neutral`/`skipped`
+goes through `orchestrator/ci-cause-table.js` — the same lookup table `state-machine.js`'s
+shadow-fixture branch uses, factored out so the two can never drift apart. (b) only if (a) was
+green: `~/.spo-bench/verdicts/<headSha>.json`'s `baseMain` field (no file → treated as "not
+moved", straight to `'VALIDATE'`), then `git -C <worktree> diff --name-only
+<baseMain>..origin/main` intersected with `git -C <worktree> diff --name-only
+origin/main...HEAD` — a non-empty intersection means the branch touches a file `main` also
+moved since `baseMain`. The nightly-red guard and the one-shot `ctx.counters.mainMoveUsed` guard
+are checked exactly like the shadow path before merging; the merge itself is `git -C <worktree>
+merge origin/main`, and success returns `'CHECK'` to re-run CHECK and re-gate.
+
+**MERGE** runs `gh pr merge <n> --repo <ghRepo> --merge` (enqueues; **never** `--delete-branch`
+— see CLAUDE.md and `test/real-steps.test.js`'s explicit assertion of its absence), then `npm
+run pr:wait -- <n>` in the worktree, with exactly one bounded re-wait on exit 4 ("still open"),
+identical to the shadow-mode bounded-wait logic.
+
+**FINISH** runs `npm run board:move -- <issue> Done` and `gh issue comment <n> --repo <ghRepo>
+--body-file <file>` (a 2–4 line comment in `journal/<id>/final-comment.md`) **before** removing
+the worktree — the same "npm aliases need a product cwd" rule as WORKTREE's claim ordering, so
+the board sync must happen while the worktree still exists. Only then `git -C <productRepo>
+worktree remove --force <worktreePath>`. A final `finished` journal event carries the task's
+summed `costUsd` (every `llm-call` event's `costUsd` in `journal.jsonl`) and the PR number.
+
+**Every spawn**, across all seven functions, journals one compact `{state, argv (first 6
+tokens), exit, ms}` `'spawn'` event via `appendEvent`, and appends its stdout (falling back to
+stderr) to `journal/<id>/logs/<STATE>.log` — several spawns share one state's log file, in
+call order, each under its own `----- <command> -----` header.
+
+**`--real`** (`daemon.js`) is required for any `kind: "card"` task to leave `INTAKE` once neither
+`--shadow` nor `--dry-run` applies — `state-machine.js`'s `handleIntake` parks a card task with
+reason `real-flag-required` if `ctx.config.real` isn't set, as a defense-in-depth check
+independent of the CLI flag (so a caller that builds `ctx.config` by hand gets the same
+refusal). `--real` and `--shadow` are mutually exclusive at the CLI (`daemon.js` refuses to
+start with both); a non-`"card"` (e.g. `"synthetic"`) task is never gated by `--real` at all.
+
+**First live run is maintainer-supervised.** Nothing in `node --test` ever spawns a real
+`git`/`npm`/`gh` process — every test in `test/real-steps.test.js` injects `deps.spawnSync` and
+calls `realWorktree`/`realCheck`/... directly. The first time `daemon.js --real` actually drives
+a `kind: "card"` task against the real product repo and a real GitHub PR, a maintainer should be
+watching: it worktree-adds off `origin/main`, runs `npm ci`, claims a real board card, pushes a
+real branch, opens a real PR, and — on the happy path — merges it and removes its own worktree.
+
 ## Where journals live
 
 ```
@@ -341,6 +445,36 @@ journal/<id>/
 bin/spo status [--journal <dir>] [--queue <dir>]   # queue depth, active/parked/done, per-task state
 bin/spo task <id> [--journal <dir>]                # human-readable timeline from journal.jsonl
 bin/spo parked [--journal <dir>]                   # parked tasks + reasons
+bin/spo resume <id> [--journal <dir>]              # print `claude --resume <sessionId>` for a task's LLM steps
+```
+
+## Dashboard
+
+```bash
+bin/spo dashboard [--journal <dir>] [--queue <dir>] [--out <path>]   # generate once, default out: console/dashboard.html
+bin/spo dashboard --watch                                            # regenerate every 30s (setInterval), Ctrl-C to stop
+```
+
+`console/collect.js` reads the same local surfaces as the rest of `bin/spo` (`journal/<id>/`,
+`queue/`), plus `claude-accounts/{accounts.json,state.json}` and the read-only
+`~/.spo-bench/{nightly/latest.json, verdicts/*.json}`, and hands the result to
+`console/render.js` -- a pure function that turns that data into one self-contained HTML file:
+inline CSS, no external requests, a 30s `<meta http-equiv="refresh">`, light+dark via
+`prefers-color-scheme`. A missing source (no `claude-accounts/`, no `~/.spo-bench/`, an empty
+`journal/`) renders as an empty section, never a crash -- same "reader, never a second source of
+truth" rule as the rest of the console (see README.md § Observability).
+
+Each task card's per-LLM-step table comes straight from the journal's `llm-call` events
+(`step`, `model`, `account`, `costUsd`, `sessionId`) and prints the exact `claude --resume
+<sessionId>` command in a `<code>` block, same convention as `spo resume`.
+
+**Usage snapshot (optional):** if `journal/usage-snapshot.json` exists, the dashboard renders
+its `estUsd` total/`byModel` and `byPhase_Mtokens` table. Nothing writes that file
+automatically -- the operator produces it by hand when they want a token-usage view alongside
+the pipeline state:
+
+```bash
+node scripts/usage-report.js > journal/usage-snapshot.json
 ```
 
 ## Tests
@@ -357,6 +491,11 @@ file directly under `test/`, no `.test.js` suffix required — which is also why
 
 All state-machine tests run in `--shadow` mode against `fs.mkdtempSync(os.tmpdir())`
 queue/journal directories — no shared state, no product-repo or bench interaction, no network.
-`test/llm-real.test.js` and `test/account-rotation.test.js` exercise **real-mode** code
-(`invokeClaudeReal`, `callLlmStep`) but only ever through an injected fake `spawnSync`
-(`deps.spawnSync`) — they never touch the real `claude` CLI, so the whole suite stays hermetic.
+`test/llm-real.test.js`, `test/llm-real-card.test.js` and `test/account-rotation.test.js`
+exercise **real-mode** LLM code (`invokeClaudeReal`, `callLlmStep`) and `test/real-steps.test.js`
+exercises the real-mode **scripted** functions ("Real scripted steps" above) — all of them only
+ever through an injected fake `spawnSync` (`deps.spawnSync`), calling
+`realWorktree`/`realCheck`/`realPushPr`/`realGate`/`realCiChecks`/`realMerge`/`realFinish`
+directly rather than through `daemon.js`'s own dispatch (which has no injection point). None of
+them ever touch a real `git`, `npm`, `gh` or `claude` process, so the whole suite stays
+hermetic.

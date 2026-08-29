@@ -2,5 +2,7 @@ node_modules/
 journal/
 queue/
 claude-accounts/
+worktrees/
+console/dashboard.html
 *.local.*
 .DS_Store
