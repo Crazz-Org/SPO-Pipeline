@@ -105,6 +105,39 @@ test('dry-run demo: dryrun-PLAN.md shows the real argv (--model/--effort/--json-
   assert.match(content, /Add a status badge/);
 });
 
+test('dry-run demo: a card task with no pre-set worktreePath (as makeTask produces it) still reaches DONE, not PARKED', () => {
+  // Mirrors orchestrator/intake.js's makeTask() task shape exactly -- no worktreePath, no branch,
+  // since those are only ever set by a real `git worktree add` (realWorktree). --dry-run's
+  // generic scripted-WORKTREE path must synthesize them itself, or PLAN's prompt template is
+  // left with an unfilled `worktree` placeholder and the task PARKs instead of reaching DONE.
+  const queueDir = mkTmp('spo-queue-dryrun-notree-');
+  const journalDir = mkTmp('spo-journal-dryrun-notree-');
+
+  writeTask(queueDir, '001-issue-789.json', {
+    id: 'issue-789',
+    kind: 'card',
+    issue: 789,
+    title: 'Add a status badge to the header',
+    criterion: 'the header shows a status badge reflecting connection state',
+    size: 'S',
+    area: 'client',
+    touchesRdoMembers: false,
+  });
+
+  const out = runDaemonDryRun(queueDir, journalDir);
+  assert.match(out, /issue-789\s+DONE/);
+
+  const state = readState(journalDir, 'issue-789');
+  assert.equal(state.state, 'DONE');
+
+  const planFile = path.join(journalDir, 'issue-789', 'dryrun-PLAN.md');
+  assert.ok(fs.existsSync(planFile), 'expected dryrun-PLAN.md to be written (task must not PARK at PLAN)');
+
+  const content = fs.readFileSync(planFile, 'utf8');
+  assert.match(content, /## filled prompt/);
+  assert.match(content, /worktree:\s*\S/, 'expected the worktree: placeholder to be filled, not left blank');
+});
+
 test('dry-run demo: WORKTREE-side steps (PLAN, IMPLEMENT) never spawn -- deps.spawnSync would fail the test if called', () => {
   // Exercised end to end through the daemon subprocess in the tests above (no injection point
   // reaches into a spawned subprocess); this test asserts the same guarantee at the runLlm
