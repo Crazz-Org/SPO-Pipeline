@@ -14,14 +14,21 @@ const path = require('path');
 const { callLlmStep, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const accounts = require('../orchestrator/accounts');
+const { writePoolDir } = require('./helpers');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// Discovery-based pool: one subdirectory per account (see orchestrator/accounts.js). `list` is
+// an array of {name, configDir, enabled} the way the old accounts.json shaped it -- this
+// adapter keeps every call site below unchanged, translating enabled: false into the
+// `disabled` marker file writePoolDir understands.
 function writeRegistry(dir, list) {
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'accounts.json'), JSON.stringify(list, null, 2));
+  writePoolDir(
+    dir,
+    list.map((a) => ({ name: a.name, disabled: a.enabled === false }))
+  );
 }
 
 function realShapedPayload(overrides = {}) {
@@ -190,4 +197,31 @@ test('starting with every account already cooling -> ParkSignal without spawning
   assert.ok(caught instanceof ParkSignal);
   assert.match(caught.reason, /all-accounts-cooling-until-/);
   assert.equal(called, false, 'must never spawn once pick() already finds nothing healthy');
+});
+
+test('an empty pool (no accounts registered at all) -> ParkSignal("no-accounts-registered") without spawning', async () => {
+  const taskDir = mkTmp('spo-rotate-nopool-taskdir-');
+  const accountsDir = mkTmp('spo-rotate-nopool-accts-'); // created by mkTmp, but never populated
+
+  const ctx = makeCtx({
+    taskDir,
+    accountsDir,
+    task: { id: 't1', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan it' } } },
+  });
+
+  let called = false;
+  const spawnSync = () => {
+    called = true;
+    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+  };
+
+  let caught = null;
+  try {
+    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof ParkSignal);
+  assert.equal(caught.reason, 'no-accounts-registered');
+  assert.equal(called, false, 'must never spawn when the pool has nothing registered');
 });

@@ -35,6 +35,7 @@ const path = require('path');
 
 const defaultConfig = require('./config');
 const { drainQueueOnce, runForever } = require('./state-machine');
+const accounts = require('./accounts');
 
 function parseArgs(argv) {
   const opts = {
@@ -76,7 +77,9 @@ function printUsage() {
       '  --real            actually spawns git/npm/gh commands and the `claude` CLI. Required',
       '                    for any kind: "card" task (refused otherwise -- see handleIntake\'s',
       '                    "real-flag-required" park). Mutually exclusive with --shadow; if',
-      '                    --dry-run is also given, --dry-run wins.',
+      '                    --dry-run is also given, --dry-run wins. Refuses to start if the',
+      '                    account pool (config.claudeAccountsDir) has no accounts registered',
+      '                    -- see doc/setup.md § Accounts / `spo account add <name>`.',
       '  (one of --shadow, --dry-run or --real is required)',
       '  --once            drain the queue serially and exit (default: poll forever)',
       '  --queue <dir>     task queue directory (default: <repo>/queue)',
@@ -102,6 +105,21 @@ async function main() {
     console.error('orchestrator/daemon.js: --real and --shadow are mutually exclusive (see --help).');
     process.exitCode = 1;
     return;
+  }
+
+  // --real is the one mode that actually calls the `claude` CLI (steps/llm.js's account-
+  // rotation loop) -- refuse to even start if the pool has nothing registered, rather than let
+  // every task park one at a time on the same NoAccountsRegisteredError. See doc/setup.md
+  // § Accounts for how to add the first one (`spo account add <name>`).
+  if (opts.real) {
+    const registry = accounts.readRegistry(defaultConfig.claudeAccountsDir);
+    if (registry.length === 0) {
+      console.error(
+        `orchestrator/daemon.js: --real requires at least one registered account in ${defaultConfig.claudeAccountsDir} (see doc/setup.md § Accounts, or run \`spo account add <name>\`).`
+      );
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const repoRoot = path.join(__dirname, '..');

@@ -1,27 +1,33 @@
 'use strict';
-// accounts.js -- the Claude Max account pool: registry + runtime cooldown state.
-// doc/state-machine-spec.md § Account pool.
+// accounts.js -- the Claude Max account pool: discovery-based registry + runtime cooldown
+// state. doc/state-machine-spec.md § Account pool.
 //
-// Two files, two owners, same directory (default claude-accounts/, git-ignored -- see
-// .gitignore and config.js's claudeAccountsDir):
+// ONE place holds account information (maintainer decision, 2026-08-29): the pool directory
+// itself. Every SUBDIRECTORY of the pool is one account -- there is no separate accounts.json
+// to keep in sync, and no implicit fallback to whatever `claude` login happens to be active on
+// this machine. A fresh checkout with an empty (or missing) pool directory registers zero
+// accounts; NoAccountsRegisteredError below is what callers see for that -- see
+// doc/setup.md § Accounts for how an operator adds the first one (`spo account add <name>`).
 //
-//   accounts.json  the registry -- hand-authored, one entry per Claude Max account:
-//                  [{name, configDir (absolute path | null = the ambient default login),
-//                    oauthTokenFile (absolute path to a file holding the long-lived token
-//                    printed by `claude setup-token`, pasted there by the operator; null =
-//                    rely on configDir/ambient credentials), enabled}]. Missing file or an
-//                  empty array both fall back to one implicit account,
-//                  {name: "default", configDir: null} -- so a fresh checkout with no
-//                  registry still runs real mode against whatever `claude` is already logged
-//                  into.
-//   state.json     runtime-written cooldowns -- {accountName: {cooldownUntil: epochMs}}. Not
-//                  part of the registry on purpose: the registry is who exists and where their
-//                  login lives (authored), state.json is who is currently rate-limited
-//                  (machine-written, disposable -- deleting it just clears every cooldown).
+//   <poolDir>/<name>/              one directory per account, name = the account's name. This
+//                                  IS the account's CLAUDE_CONFIG_DIR.
+//     oauth-token                  optional: the long-lived token `claude setup-token` prints,
+//                                  pasted here by the operator. Its ABSENCE is not an error --
+//                                  an account can also carry credentials a plain `claude` login
+//                                  already wrote into this same directory, with no separate
+//                                  token file.
+//     disabled                     optional marker file (content ignored) -- its presence
+//                                  disables the account, same effect as `enabled: false` used
+//                                  to have in the old accounts.json.
+//   <poolDir>/state.json           runtime-written cooldowns -- {accountName: {cooldownUntil:
+//                                  epochMs}}. Machine-owned, disposable: deleting it clears
+//                                  every cooldown. Lives next to the accounts on purpose -- one
+//                                  directory, one source of truth for the whole pool.
 //
-// Every function here takes the claude-accounts directory as an explicit first argument, same
-// convention as journal.js taking taskDir -- this is what lets the test suite point at a
-// fs.mkdtempSync(os.tmpdir()) directory instead of the real claude-accounts/.
+// Every function here takes the pool directory as an explicit first argument -- this is what
+// lets the test suite point at a fs.mkdtempSync(os.tmpdir()) directory instead of the real
+// pool (default ~/.claude-accounts, see orchestrator/config.js's claudeAccountsDir / the
+// SPO_ACCOUNTS_DIR env override).
 //
 // This module never journals anything itself (same separation as scripted.js/llm.js) -- it
 // returns event payloads (markLimit's return value) for the caller to append.
@@ -29,12 +35,28 @@
 const fs = require('fs');
 const path = require('path');
 
-const DEFAULT_ACCOUNT = Object.freeze({ name: 'default', configDir: null, enabled: true });
+const OAUTH_TOKEN_FILENAME = 'oauth-token';
+const DISABLED_MARKER_FILENAME = 'disabled';
 
 // Used when a limit error carries no retry-after hint of its own -- a Claude Max 5h window is
 // the shortest real reset this can be hitting, so an hour is a conservative "come back later"
 // rather than a guess at the true reset time.
 const DEFAULT_COOLDOWN_MS = 60 * 60 * 1000;
+
+// Thrown by pick() (readRegistry() itself just returns an empty array -- this is the "someone
+// tried to actually use the pool" signal) when the pool directory has zero subdirectories: a
+// fresh checkout, or a pool directory that was never created. Distinct from
+// AllAccountsCoolingError (which means "some accounts exist, none are usable right now") --
+// this one means "there is nothing to try at all." state-machine.js maps both to PARKED the
+// same way; daemon.js additionally refuses to START in --real mode on this one.
+class NoAccountsRegisteredError extends Error {
+  constructor(reason, detail = {}) {
+    super(reason);
+    this.name = 'NoAccountsRegisteredError';
+    this.reason = reason;
+    this.detail = detail;
+  }
+}
 
 // Thrown by pick() when no enabled account has a cooldownUntil that is absent or already past.
 // The state machine catches this and maps it straight to PARKED, reusing `reason` and `detail`
@@ -49,40 +71,48 @@ class AllAccountsCoolingError extends Error {
   }
 }
 
-function accountsJsonPath(claudeAccountsDir) {
-  return path.join(claudeAccountsDir, 'accounts.json');
+function stateJsonPath(poolDir) {
+  return path.join(poolDir, 'state.json');
 }
 
-function stateJsonPath(claudeAccountsDir) {
-  return path.join(claudeAccountsDir, 'state.json');
+// The registry, discovered fresh from disk every call -- one entry per subdirectory of
+// poolDir, sorted by name for a deterministic pick() order. A missing poolDir is not an
+// error, just "nothing registered yet" -- same as an empty pool directory (both return []).
+function readRegistry(poolDir) {
+  if (!fs.existsSync(poolDir)) return [];
+  return fs
+    .readdirSync(poolDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort()
+    .map((name) => {
+      const configDir = path.join(poolDir, name);
+      const oauthTokenFile = path.join(configDir, OAUTH_TOKEN_FILENAME);
+      return {
+        name,
+        configDir,
+        oauthTokenFile: fs.existsSync(oauthTokenFile) ? oauthTokenFile : null,
+        enabled: !fs.existsSync(path.join(configDir, DISABLED_MARKER_FILENAME)),
+      };
+    });
 }
 
-// The registry, normalized. Never writes anything -- a missing/empty registry is not an error,
-// it is "this checkout hasn't set up extra accounts yet."
-function readRegistry(claudeAccountsDir) {
-  const p = accountsJsonPath(claudeAccountsDir);
-  if (!fs.existsSync(p)) return [DEFAULT_ACCOUNT];
-
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch (err) {
-    throw new Error(`accounts.js: ${p} is not valid JSON (${err.message})`);
-  }
-  if (!Array.isArray(parsed) || parsed.length === 0) return [DEFAULT_ACCOUNT];
-
-  return parsed.map((a) => ({
-    name: a.name,
-    configDir: a.configDir === undefined ? null : a.configDir,
-    oauthTokenFile: a.oauthTokenFile === undefined ? null : a.oauthTokenFile,
-    enabled: a.enabled !== false,
-  }));
+// Whether `configDir` holds anything besides the two files this module itself manages
+// (oauth-token, disabled) -- i.e. real credentials, written there by `claude setup-token`'s
+// underlying login flow (or a plain `claude` login pointed at this CLAUDE_CONFIG_DIR). Used by
+// `spo accounts` and the dashboard's accounts section to show "credentials: yes/no" without
+// hardcoding the exact filename(s) Claude Code itself writes there.
+function hasCredentials(configDir) {
+  if (!configDir || !fs.existsSync(configDir)) return false;
+  return fs
+    .readdirSync(configDir)
+    .some((entry) => entry !== OAUTH_TOKEN_FILENAME && entry !== DISABLED_MARKER_FILENAME);
 }
 
 // Runtime cooldown state. A missing or unparsable state.json is just "nobody has ever hit a
-// limit yet" -- never an error (unlike a malformed registry, which is an authoring mistake).
-function readState(claudeAccountsDir) {
-  const p = stateJsonPath(claudeAccountsDir);
+// limit yet" -- never an error.
+function readState(poolDir) {
+  const p = stateJsonPath(poolDir);
   if (!fs.existsSync(p)) return {};
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -91,18 +121,22 @@ function readState(claudeAccountsDir) {
   }
 }
 
-function writeState(claudeAccountsDir, state) {
-  fs.mkdirSync(claudeAccountsDir, { recursive: true });
-  fs.writeFileSync(stateJsonPath(claudeAccountsDir), JSON.stringify(state, null, 2) + '\n');
+function writeState(poolDir, state) {
+  fs.mkdirSync(poolDir, { recursive: true });
+  fs.writeFileSync(stateJsonPath(poolDir), JSON.stringify(state, null, 2) + '\n');
 }
 
 // First enabled account (registry order = pick order -- no round robin, no load balancing;
 // spreading calls across K healthy accounts is a scheduler-level concern, not this module's)
 // whose cooldownUntil is absent or already past `now`. `now` is a parameter, not always
 // Date.now(), so tests can assert cooldown/recovery behaviour without sleeping.
-function pick(claudeAccountsDir, now = Date.now()) {
-  const registry = readRegistry(claudeAccountsDir);
-  const state = readState(claudeAccountsDir);
+function pick(poolDir, now = Date.now()) {
+  const registry = readRegistry(poolDir);
+  if (registry.length === 0) {
+    throw new NoAccountsRegisteredError('no-accounts-registered', { poolDir });
+  }
+
+  const state = readState(poolDir);
 
   let earliestCooldown = null;
   for (const account of registry) {
@@ -129,14 +163,14 @@ function pick(claudeAccountsDir, now = Date.now()) {
 // DEFAULT_COOLDOWN_MS when retryAfterMs is not a positive number, i.e. the limit error carried
 // no usable reset hint). Returns the event payload the caller journals -- this module never
 // writes the journal itself, same separation of concerns scripted.js/llm.js already use.
-function markLimit(claudeAccountsDir, name, retryAfterMs, now = Date.now()) {
+function markLimit(poolDir, name, retryAfterMs, now = Date.now()) {
   const usedDefault = !(typeof retryAfterMs === 'number' && retryAfterMs > 0);
   const ms = usedDefault ? DEFAULT_COOLDOWN_MS : retryAfterMs;
   const cooldownUntil = now + ms;
 
-  const state = readState(claudeAccountsDir);
+  const state = readState(poolDir);
   state[name] = { cooldownUntil };
-  writeState(claudeAccountsDir, state);
+  writeState(poolDir, state);
 
   return {
     account: name,
@@ -153,7 +187,10 @@ module.exports = {
   readRegistry,
   readState,
   writeState,
+  hasCredentials,
   AllAccountsCoolingError,
-  DEFAULT_ACCOUNT,
+  NoAccountsRegisteredError,
   DEFAULT_COOLDOWN_MS,
+  OAUTH_TOKEN_FILENAME,
+  DISABLED_MARKER_FILENAME,
 };

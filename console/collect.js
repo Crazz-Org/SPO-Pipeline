@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const accountsModule = require('../orchestrator/accounts');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
@@ -117,19 +118,22 @@ function collectQueue(queueDir) {
   return { depth: files.length, nextIds };
 }
 
-// Account health, from claude-accounts/accounts.json (registry) + state.json (runtime
-// cooldowns) -- see orchestrator/accounts.js for the authoritative shapes. Deliberately does
-// NOT fall back to the implicit {name: "default"} account accounts.js itself uses when the
-// registry is absent: that fallback is a *runtime* behaviour (real mode still works with no
-// registry), but the dashboard only ever shows what is actually on disk -- an absent registry
-// is an empty section, not a synthesized row.
+// Account health, discovered straight from the pool directory (one subdirectory per account --
+// see orchestrator/accounts.js, the single source of truth this reads through rather than
+// re-implementing) + state.json (runtime cooldowns). An absent or empty pool directory is an
+// empty section, not a synthesized row -- same "reader, never a second source of truth" rule
+// as the rest of the console.
 function collectAccounts(accountsDir) {
   if (!accountsDir) return { rows: [] };
-  const registryPath = path.join(accountsDir, 'accounts.json');
-  if (!fs.existsSync(registryPath)) return { rows: [] };
 
-  const registryRaw = readJsonSafe(registryPath, []);
-  const registry = Array.isArray(registryRaw) ? registryRaw : [];
+  let registry;
+  try {
+    registry = accountsModule.readRegistry(accountsDir);
+  } catch {
+    return { rows: [] };
+  }
+  if (registry.length === 0) return { rows: [] };
+
   const state = readJsonSafe(path.join(accountsDir, 'state.json'), {});
   const now = Date.now();
 
@@ -139,9 +143,11 @@ function collectAccounts(accountsDir) {
     const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
     return {
       name: a.name,
-      enabled: a.enabled !== false,
+      enabled: a.enabled,
       cooldownUntil: cooling ? new Date(cooldownUntil).toISOString() : null,
       cooling,
+      hasToken: !!a.oauthTokenFile,
+      hasCredentials: accountsModule.hasCredentials(a.configDir),
     };
   });
 

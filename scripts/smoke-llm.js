@@ -1,20 +1,52 @@
 #!/usr/bin/env node
 'use strict';
 // smoke-llm.js -- the ONE sanctioned real invocation of the `claude` CLI for this build.
-// Run by hand only: `node scripts/smoke-llm.js`. Never part of `node --test` (see
-// orchestrator/README.md "Real mode" / "Tests" for why it deliberately lives outside test/,
-// where bare `node --test` auto-discovers any .js file).
+// Run by hand only: `node scripts/smoke-llm.js <account-name>`. Never part of `node --test`
+// (see orchestrator/README.md "Real mode" / "Tests" for why it deliberately lives outside
+// test/, where bare `node --test` auto-discovers any .js file).
 //
 // Exercises the real llm.js path end to end (argv construction, spawn, JSON parse, cost
 // summing) against a trivial, cheap call: haiku, low effort, a $0.10 budget cap, run from this
-// repo's own root (the orchestration-side cwd policy -- see config.js), the default account
-// (no CLAUDE_CONFIG_DIR override -- whatever `claude` is already logged into on this machine).
+// repo's own root (the orchestration-side cwd policy -- see config.js).
+//
+// The account is a required argument, resolved from the pool (orchestrator/accounts.js) --
+// consistent with the maintainer decision (2026-08-29) that the pipeline uses ONLY accounts
+// present in the pool directory, never an implicit fallback to whatever `claude` login happens
+// to be ambient on this machine. Run `spo accounts` (or this script with no argument) to see
+// what's registered.
 
 const assert = require('assert');
 const { invokeClaudeReal } = require('../orchestrator/steps/llm');
-const { DEFAULT_ACCOUNT } = require('../orchestrator/accounts');
+const accounts = require('../orchestrator/accounts');
+const config = require('../orchestrator/config');
 
 async function main() {
+  const accountName = process.argv[2];
+  const registry = accounts.readRegistry(config.claudeAccountsDir);
+
+  if (!accountName) {
+    console.error('usage: node scripts/smoke-llm.js <account-name>');
+    if (registry.length === 0) {
+      console.error(`no accounts registered in ${config.claudeAccountsDir} -- see doc/setup.md § Accounts.`);
+    } else {
+      console.error(`registered accounts: ${registry.map((a) => a.name).join(', ')}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const account = registry.find((a) => a.name === accountName);
+  if (!account) {
+    console.error(`scripts/smoke-llm.js: no account named "${accountName}" in ${config.claudeAccountsDir}.`);
+    console.error(
+      registry.length === 0
+        ? `no accounts registered -- see doc/setup.md § Accounts.`
+        : `registered accounts: ${registry.map((a) => a.name).join(', ')}`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   const result = await invokeClaudeReal({
     step: 'SMOKE',
     model: 'haiku',
@@ -22,7 +54,7 @@ async function main() {
     maxBudgetUsd: 0.1,
     promptText: 'Reply with exactly the single word: ok',
     cwd: '/home/crazz/SPO-Pipeline',
-    account: DEFAULT_ACCOUNT,
+    account,
   });
 
   console.log(JSON.stringify(result, null, 2));
@@ -34,7 +66,7 @@ async function main() {
 
   console.log('\nsmoke-llm: PASS');
   console.log(
-    `  ok=${result.ok} result=${JSON.stringify(result.result)} sessionId=${result.sessionId} costUsd=${result.costUsd}`
+    `  account=${account.name} ok=${result.ok} result=${JSON.stringify(result.result)} sessionId=${result.sessionId} costUsd=${result.costUsd}`
   );
 }
 

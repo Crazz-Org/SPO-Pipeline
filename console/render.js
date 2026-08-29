@@ -14,7 +14,7 @@
 //     journalTasks: [{ id, title, kind, state, reason, lastEventTs, lastEventName,
 //                       llmSteps: [{step, model, account, costUsd, sessionId}], totalCostUsd }],
 //     queue: { depth, nextIds: [id, ...] },
-//     accounts: { rows: [{ name, enabled, cooldownUntil, cooling }] },
+//     accounts: { rows: [{ name, enabled, cooldownUntil, cooling, hasToken, hasCredentials }] },
 //     nightly: { verdict, sha, jobId, finishedAt, detail } | null,
 //     verdicts: [{ file, head, verdict, createdAt, jobId, baseMain }],   // newest-first
 //     usageSnapshot: { estUsd: {total, byModel}, byPhase_Mtokens: {...} } | null,
@@ -210,7 +210,7 @@ function renderQueueSection(queue) {
 function renderAccountsSection(accounts) {
   const rows = (accounts && accounts.rows) || [];
   if (rows.length === 0) {
-    return `<section><h2>Comptes Claude</h2><p class="empty">(aucun registre de comptes local -- claude-accounts/accounts.json absent)</p></section>`;
+    return `<section><h2>Comptes Claude</h2><p class="empty">(aucun compte enregistré dans le pool -- voir doc/setup.md § Accounts)</p></section>`;
   }
   const body = rows
     .map(
@@ -218,13 +218,15 @@ function renderAccountsSection(accounts) {
       <td>${escapeHtml(a.name)}</td>
       <td>${a.enabled ? 'oui' : 'non'}</td>
       <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '—'}</td>
+      <td>${a.hasToken ? 'oui' : 'non'}</td>
+      <td>${a.hasCredentials ? 'oui' : 'non'}</td>
     </tr>`
     )
     .join('');
   return `<section>
     <h2>Comptes Claude</h2>
     <table>
-      <thead><tr><th>nom</th><th>activé</th><th>refroidissement jusqu'à</th></tr></thead>
+      <thead><tr><th>nom</th><th>activé</th><th>refroidissement jusqu'à</th><th>jeton</th><th>identifiants</th></tr></thead>
       <tbody>${body}</tbody>
     </table>
   </section>`;

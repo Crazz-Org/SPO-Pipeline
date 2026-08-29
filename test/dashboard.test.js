@@ -2,14 +2,14 @@
 // console/collect.js + console/render.js + `bin/spo dashboard` -- exercised both as pure
 // functions (fast, no subprocess) and as the real CLI (proves --out and the printed path).
 // Same fs.mkdtempSync(os.tmpdir()) discipline as the rest of the suite -- never the repo's own
-// journal/, queue/ or claude-accounts/.
+// journal/, queue/ or the real account pool (~/.claude-accounts).
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { mkTmp, runSpo } = require('./helpers');
+const { mkTmp, runSpo, writePoolDir } = require('./helpers');
 const { collectAll } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
 
@@ -37,7 +37,7 @@ test('renderDashboard with zero sources renders an empty-state document without 
   assert.match(html, /Utilisation/);
   // empty-section markers -- no source anywhere means every section says so, not a crash
   assert.match(html, /aucune tâche dans le journal/);
-  assert.match(html, /aucun registre de comptes local/);
+  assert.match(html, /aucun compte enregistré dans le pool/);
   assert.match(html, /aucun verdict local/);
 });
 
@@ -94,11 +94,11 @@ test('a DONE task and a PARKED task render with their ids, states, reason and a 
   assert.match(html, /claude --resume sess-plan-abc/);
 });
 
-test('a cooling account renders in the accounts table with its cooldown timestamp', () => {
+test('a cooling account renders in the accounts table with its cooldown timestamp, token and credentials columns', () => {
   const accountsDir = mkTmp('spo-dash-accounts-');
-  writeJson(path.join(accountsDir, 'accounts.json'), [
-    { name: 'acct-cooling', configDir: null, enabled: true },
-    { name: 'acct-healthy', configDir: null, enabled: true },
+  writePoolDir(accountsDir, [
+    { name: 'acct-cooling', oauthToken: 'tok' }, // token=yes, no other credentials file
+    { name: 'acct-healthy', extraFile: '.credentials.json' }, // no token, but real credentials present
   ]);
   const cooldownUntil = Date.now() + 60 * 60 * 1000;
   writeJson(path.join(accountsDir, 'state.json'), { 'acct-cooling': { cooldownUntil } });

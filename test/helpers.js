@@ -21,6 +21,26 @@ function writeTask(queueDir, filename, taskObj) {
   fs.writeFileSync(path.join(queueDir, filename), JSON.stringify(taskObj, null, 2));
 }
 
+// Builds a discovery-based account pool directory (see orchestrator/accounts.js's header
+// comment for the on-disk shape it discovers): one subdirectory per entry in `entries`, each
+// {name, disabled?, oauthToken?, extraFile?}. `disabled: true` writes the `disabled` marker
+// file; `oauthToken: '<text>'` writes `oauth-token` with that content; `extraFile: '<name>'`
+// writes an arbitrary extra file (content irrelevant) to simulate real `claude` credentials
+// already present -- used by tests asserting `hasCredentials`. Every pool-directory test
+// across the suite should build its fixture through this one helper rather than re-deriving
+// the discovery shape by hand.
+function writePoolDir(poolDir, entries) {
+  fs.mkdirSync(poolDir, { recursive: true });
+  for (const entry of entries) {
+    const dir = path.join(poolDir, entry.name);
+    fs.mkdirSync(dir, { recursive: true });
+    if (entry.disabled) fs.writeFileSync(path.join(dir, 'disabled'), '');
+    if (entry.oauthToken !== undefined) fs.writeFileSync(path.join(dir, 'oauth-token'), entry.oauthToken);
+    if (entry.extraFile) fs.writeFileSync(path.join(dir, entry.extraFile), 'x');
+  }
+  return poolDir;
+}
+
 function runDaemonOnce(queueDir, journalDir, extraArgs = []) {
   const args = [DAEMON, '--shadow', '--once', '--queue', queueDir, '--journal', journalDir, ...extraArgs];
   return execFileSync(process.execPath, args, { encoding: 'utf8' });
@@ -63,6 +83,7 @@ module.exports = {
   SPO_BIN,
   mkTmp,
   writeTask,
+  writePoolDir,
   runDaemonOnce,
   runDaemonDryRun,
   runSpo,

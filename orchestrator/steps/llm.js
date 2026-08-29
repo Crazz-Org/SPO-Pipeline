@@ -55,7 +55,6 @@ const { spawnSync } = require('child_process');
 
 const { sleep } = require('./scripted');
 const config = require('../config');
-const { DEFAULT_ACCOUNT } = require('../accounts');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { resolveStepContract } = require('../step-contracts');
@@ -336,7 +335,13 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     return payload;
   }
 
-  const account = ctx.account || DEFAULT_ACCOUNT;
+  // No implicit default account here (maintainer decision, 2026-08-29 -- see accounts.js):
+  // real mode always reaches this with ctx.account already set by callLlmStep's account-
+  // rotation loop. ctx.account stays null only for a handful of hand-built test contexts that
+  // call runLlm directly without going through callLlmStep -- invokeClaudeReal treats a null
+  // account the same as one with no configDir override (ambient `claude` credentials), which
+  // is fine for those unit tests but is never what production real mode does.
+  const account = ctx.account || null;
   const override = ctx.task && ctx.task.llm && ctx.task.llm[stepName];
 
   if (override) {
@@ -374,7 +379,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       step: stepName,
       model: opts.model,
       effort: opts.effort,
-      account: account.name,
+      account: account && account.name,
       sessionId: result.sessionId,
       costUsd: result.costUsd,
       numTurns: result.numTurns,
