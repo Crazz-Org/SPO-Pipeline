@@ -60,6 +60,9 @@ StartLimitBurst=5
 # (~/.local/bin -- absent from the systemd user PATH, see the header).
 Environment=HOME=$HOME
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Park notification. The script always writes ~/.spo-parks.log; set SPO_PARK_NTFY_URL in a
+# drop-in to also reach a phone, and SPO_PARK_TOAST=1 for a Windows toast. See its header.
+Environment=SPO_PARK_ALERT_CMD=$REPO/scripts/park-alert.sh
 
 [Install]
 WantedBy=default.target
@@ -79,5 +82,7 @@ sleep 2
 systemctl --user --no-pager --lines=8 status spo-pipeline-daemon.service || true
 
 echo ""
-echo "== the daemon is now AUTONOMOUS: --real, auto-pull every 5 min (top 3 claimable cards)."
-echo "== journals: $REPO/journal/   status: bin/spo status   stop: systemctl --user stop spo-pipeline-daemon.service"
+echo "== the daemon is now AUTONOMOUS: --real, auto-pull every 5 min, one card at a time."
+echo "== journals: $REPO/journal/   status: bin/spo status   cost: bin/spo cost"
+echo "== parks:    tail -f $HOME/.spo-parks.log   (set SPO_PARK_NTFY_URL in a drop-in for push)"
+echo "== stop:     systemctl --user stop spo-pipeline-daemon.service"

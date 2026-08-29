@@ -674,6 +674,22 @@ move) but every surface has to be gone and looked at. Two push halves close that
   journaled (`park-alert-failed`) and never blocks anything — the task is terminal before the
   alert runs.
 
+### The default notifier
+
+`scripts/park-alert.sh` is what `daemon-install.sh` wires as `SPO_PARK_ALERT_CMD`, so an
+installed daemon notifies out of the box. Three independent best-effort channels, cheapest
+first, and it always exits 0 — a broken channel must never become a `park-alert-failed`:
+
+| channel | switch | notes |
+|---|---|---|
+| a log line | always on | `$SPO_PARK_LOG`, default `~/.spo-parks.log`. `tail -f` this during a soak. |
+| ntfy | `$SPO_PARK_NTFY_URL` | the one that reaches a phone — what an overnight run needs. `--connect-timeout 2 -m 5`, measured at ~2 s against a black-holed host, well inside the daemon's 10 s. |
+| Windows toast (WSL) | `$SPO_PARK_TOAST=1` | opt-in: launching `powershell.exe` costs a second or more, so it is fired **detached** and never waited on. |
+
+Set the phone channel with a drop-in rather than editing the unit:
+`systemctl --user edit spo-pipeline-daemon.service` → `[Service]` /
+`Environment=SPO_PARK_NTFY_URL=https://ntfy.sh/<your-topic>`.
+
 ## Spend: what `spo cost` measures, and what it does not
 
 `orchestrator/cost.js` reads what the pipeline has spent back out of the journals — every real
