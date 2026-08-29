@@ -46,6 +46,19 @@ const VALID_CATEGORIES = new Set(['defect', 'latent-trap', 'feature', 'observati
 const VALID_SIZES = new Set(['S', 'M', 'L']);
 const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'client', 'e2e', 'shared', 'ci']);
 
+// config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted/LLM steps and must stay
+// that way -- it is not a fit for either intake step. draftCard and reviewCard are the
+// maintainer-facing `spo ask`/`spo pull` path, not the daemon loop: reviewCard in particular runs
+// fable at effort high verifying citations into the sibling product repo, real cross-repo file
+// reads that legitimately run long. Reproduced 2026-08-29 with the review budget already fixed to
+// $3 (see step-contracts.js's SMALL_BUDGET_USD, PR #13): a real review still died at the 120s
+// wall-clock mark with "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]" --
+// the spawnSync timeout firing before the model finished, not a budget kill. 300000ms (300s) is
+// this build's local, intake-only deadline -- draftCard and reviewCard each fall back to it only
+// when the caller (deps.deadlineMs, kept first so tests can still inject a short deadline) hasn't
+// already supplied one; config.stepDeadlineMs and every other step remain untouched.
+const INTAKE_DEADLINE_MS = 300000;
+
 // formatLlmFailure(prefix, raw) -- renders an invokeClaudeReal {ok: false, ...} failure as a
 // one-line diagnosable message. The base `${raw.error || raw.result || ''}` clause is empty for
 // exactly the case that matters most: a budget kill ends with `is_error: true` and an empty
@@ -128,7 +141,7 @@ async function draftCard(requestText, deps = {}) {
     promptText,
     cwd: productRepo, // needs Read/Grep over the product tree to find file:line references
     account,
-    deadlineMs: deps.deadlineMs || config.stepDeadlineMs,
+    deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
   };
 
   const raw = await invokeClaudeReal(opts, deps);
@@ -241,7 +254,7 @@ async function reviewCard(draft, deps = {}) {
     promptText,
     cwd: productRepo, // reads the product tree + `gh issue list --repo {{repo}}`
     account,
-    deadlineMs: deps.deadlineMs || config.stepDeadlineMs,
+    deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
   };
 
   const raw = await invokeClaudeReal(opts, deps);
