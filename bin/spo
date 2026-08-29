@@ -9,8 +9,9 @@
 //                            `llm-call` costUsd events (orchestrator/cost.js -- no second
 //                            ledger): per task (state, calls, cost, park reasons), then the
 //                            aggregate, cost per DONE card and parking rate -- the two numbers
-//                            migration step 3 asks for. Names the SPO_SOAK_BUDGET_USD ceiling
-//                            and what is left of it when one is set.
+//                            migration step 3 asks for. The dollars are notional (a
+//                            subscription pool, not the metered API): an efficiency metric,
+//                            not a budget.
 //   spo resume <id>         PRINTS `claude --resume <sessionId>` for a task's recorded LLM
 //                            steps, or for a bare session id, the same command directly. Never
 //                            executes anything -- see doc/state-machine-spec.md § Observability.
@@ -188,6 +189,10 @@ function cmdTask(id, opts) {
 // (parking rate and cost per merged card). Everything comes from orchestrator/cost.js, i.e.
 // from the journals' own `llm-call` costUsd events -- there is no second ledger.
 //
+// The pool is Claude Max SUBSCRIPTION accounts, so these dollars are the notional
+// API-equivalent of the work, not money spent -- an efficiency metric to compare against the
+// old driver's baseline, not a budget. Nothing caps them.
+//
 // Parked-task count and park-EVENT count are both printed because they answer different
 // questions: card #247 parked 6 times and still reached DONE.
 function cmdCost(opts) {
@@ -222,14 +227,6 @@ function cmdCost(opts) {
     console.log(`parking rate: ${((report.parked / finished) * 100).toFixed(0)}% (${report.parked}/${finished} terminal)`);
   }
 
-  const ceiling = defaultConfig.soakBudgetUsd;
-  if (ceiling > 0) {
-    const left = ceiling - report.totalUsd;
-    console.log(
-      `ceiling: $${ceiling.toFixed(2)} (SPO_SOAK_BUDGET_USD) -- ` +
-        (left > 0 ? `$${left.toFixed(2)} left` : 'REACHED: the daemon takes no new work')
-    );
-  }
 }
 
 function cmdParked(opts) {

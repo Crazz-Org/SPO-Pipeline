@@ -674,39 +674,38 @@ move) but every surface has to be gone and looked at. Two push halves close that
   journaled (`park-alert-failed`) and never blocks anything — the task is terminal before the
   alert runs.
 
-## Spend: the reader and the ceiling
+## Spend: what `spo cost` measures, and what it does not
 
 `orchestrator/cost.js` reads what the pipeline has spent back out of the journals — every real
 `claude -p` call already records its own `costUsd` in an `llm-call` event, so there is no
-second ledger to keep in sync. Two callers share the one computation:
+second ledger to keep in sync. `spo cost` prints it per task (state, calls, cost, park
+reasons), then the aggregate, cost per DONE card and the parking rate — the two numbers
+migration step 3 asks for. Parked-task count and park-*event* count are both shown because
+they answer different questions: card #247 parked six times and still reached DONE.
 
-- **`spo cost`** — per task (state, calls, cost, park reasons), then the aggregate, cost per
-  DONE card and the parking rate. Parked-task count and park-*event* count are both printed
-  because they answer different questions: card #247 parked six times and still reached DONE.
-- **The cumulative ceiling** — `SPO_SOAK_BUDGET_USD` (config `soakBudgetUsd`, unset by default,
-  so a supervised run is unaffected). Distinct from `step-contracts.js`'s **per-step** caps
-  ($2/$5/$12 by size, $3 small, PLAN floor $3): those bound one call, this bounds a whole
-  unattended run.
+**These dollars are notional.** The pool is Claude Max *subscription* accounts
+(`accounts.js`), not the metered API, so `costUsd` is the API-equivalent of the work, not
+money leaving an account. That makes it an efficiency metric — what the migration plan
+compares against the old driver's baseline — and not a budget.
 
-Reaching the ceiling stops the daemon **taking new work** and never interrupts a task in
-flight — a card killed mid-flight leaves a worktree, a branch and possibly a PR half-done,
-which costs more to clean up than the overrun it saves. The check runs *before* `takeNextTask`,
-so a refused task stays in `queue/` untouched (nothing to clean up, and it runs as-is once the
-ceiling is raised), and auto-pull stops enqueuing. One `budget-ceiling-reached` event per drain
-pass lands in `<journalRoot>/daemon.jsonl`.
+**There is deliberately no cumulative spend ceiling** (maintainer decision, 2026-08-29):
+capping notional dollars would enforce a limit that does not exist. What actually constrains a
+run is the pool — per-account rate limits and the cooldowns `accounts.js` already tracks. The
+**per-step** caps in `step-contracts.js` ($2/$5/$12 by size, $3 small, PLAN floor $3) stay,
+and are not about money either: they cut off a step that has run away, and a PLAN spinning
+past $3 is a broken PLAN whoever pays.
 
-Note the daemon drains **serially** — one task at a time (`drainQueueOnce`). `autoPullLimit`
-(`SPO_AUTO_PULL_LIMIT`, default 3) is how many cards are *enqueued* per auto-pull cycle, not a
-concurrency setting: it governs how fast the board drains into `queue/`, not how much runs at
-once, and it does not bound a run — the ceiling does.
+## How much the daemon takes on at once
 
-**The ceiling's perimeter is the whole journal root, for its whole life** — every task
-directory under it, past runs included. It is deliberately not per-call (that is
-`step-contracts.js`) and not per-card (nothing enforces one today). Lifetime rather than
-per-daemon-start is what makes it survive `Restart=always`: a since-start budget would reset
-on every systemd restart, which is precisely when a runaway would restart. The consequence to
-plan for: an existing `journal/` already carries its history's spend, so set the ceiling to
-*that baseline plus what this run may spend*. `spo cost` prints the baseline and what is left.
+The daemon drains **serially** — one task at a time (`drainQueueOnce`) — and `runForever`
+*awaits* that drain before pulling again. So a pull only ever happens with the daemon idle,
+and `autoPullLimit` (`SPO_AUTO_PULL_LIMIT`, **default 1**) is the most cards that can sit off
+the board, unstarted, at any moment — not a per-cycle burst layered on top of work in
+progress.
+
+At 1, the daemon takes one card, finishes it, then looks again: cards stay on the board —
+visible, reorderable, claimable by a human — until it is actually ready for them. Raise it if
+serial intake proves to be the bottleneck.
 
 ## Where journals live
 

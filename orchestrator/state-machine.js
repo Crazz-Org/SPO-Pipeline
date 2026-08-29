@@ -44,7 +44,6 @@ const accounts = require('./accounts');
 const { moveCard } = require('./board');
 const { postParkComment, unparkScan } = require('./park-loop');
 const { alertPark } = require('./park-alert');
-const { totalSpentUsd } = require('./cost');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 
 // True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
@@ -615,42 +614,9 @@ function takeNextTask(queueDir, journalRoot) {
   return { id, task, taskDir };
 }
 
-// The cumulative spend ceiling (config.soakBudgetUsd, unset = no ceiling). Distinct from
-// step-contracts.js's PER-STEP caps: this one bounds what the whole pipeline may spend across
-// every task in a journal root, which is what an unattended soak actually needs bounded.
-//
-// It stops the daemon TAKING NEW WORK -- never an in-flight task: a card killed mid-flight
-// leaves a worktree, a branch and possibly a PR half-done, which costs more to clean up than
-// the overrun it would have saved. Queued tasks stay in queue/ (untaken), and auto-pull stops
-// enqueuing (runForever), so raising the ceiling later resumes exactly where it stopped.
-//
-// Returns the spend when the ceiling is reached, else null. Journals once per stop.
-function ceilingReached(journalRoot, config) {
-  const ceiling = config && config.soakBudgetUsd;
-  if (!(ceiling > 0)) return null;
-  const spent = totalSpentUsd(journalRoot);
-  return spent >= ceiling ? { spent, ceiling } : null;
-}
-
 async function drainQueueOnce(queueDir, journalRoot, config) {
   const results = [];
-  let ceilingJournaled = false;
   for (;;) {
-    // Checked BEFORE takeNextTask, so a refused task is left in queue/ rather than taken and
-    // parked -- nothing to clean up, and it runs untouched once the ceiling is raised.
-    const hit = ceilingReached(journalRoot, config);
-    if (hit) {
-      if (!ceilingJournaled) {
-        appendDaemonEvent(journalRoot, 'budget-ceiling-reached', {
-          spentUsd: Number(hit.spent.toFixed(4)),
-          ceilingUsd: hit.ceiling,
-          queued: listQueueFiles(queueDir).length,
-        });
-        ceilingJournaled = true;
-      }
-      break;
-    }
-
     const taken = takeNextTask(queueDir, journalRoot);
     if (!taken) break;
     const { id, task, taskDir } = taken;
@@ -677,10 +643,11 @@ async function runForever(queueDir, journalRoot, config) {
       const deps = config.deps || {};
       await unparkScan(queueDir, journalRoot, config, deps);
 
-      // Auto-pull respects the same ceiling: past it, stop bringing NEW cards onto the board.
-      // drainQueueOnce has already journaled the stop for this pass.
+      // Note the ordering above: drainQueueOnce is AWAITED, so a pull only ever happens with
+      // the daemon idle. config.autoPullLimit is therefore the most cards that can sit off the
+      // board at once, not a per-cycle burst on top of work in progress.
       const now = Date.now();
-      if (!ceilingReached(journalRoot, config) && shouldAutoPull(lastAutoPullAt, now, config.autoPullMs)) {
+      if (shouldAutoPull(lastAutoPullAt, now, config.autoPullMs)) {
         lastAutoPullAt = now;
         await runAutoPull(queueDir, journalRoot, config, deps);
       }

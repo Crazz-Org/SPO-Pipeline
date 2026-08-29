@@ -6,9 +6,12 @@
 // summed across models by its sumCost). This module only adds them up -- it never records
 // anything, and there is no second ledger to keep in sync.
 //
-// Two callers, one computation:
-//   - `spo cost`                        the soak's read-out (per task, and the aggregate)
-//   - state-machine.js's runForever     the cumulative spend ceiling (config.soakBudgetUsd)
+// One caller: `spo cost`, the soak's read-out (per task, and the aggregate).
+//
+// What the figure MEANS: the pool is Claude Max subscription accounts, not the metered API,
+// so `costUsd` is the notional API-equivalent of the work, not money spent. That makes it an
+// efficiency metric -- the migration plan compares it against the old driver's baseline --
+// and not a budget. Nothing caps it; see config.js's note where a ceiling used to be.
 //
 // A task that parked and was retried keeps every attempt's cost, because every attempt is in
 // its journal -- which is the honest number for "what did this card cost", not the cost of
@@ -89,9 +92,4 @@ function costReport(journalRoot) {
   };
 }
 
-// totalSpentUsd(journalRoot) -- the ceiling's hot path; same sum, without building the rows.
-function totalSpentUsd(journalRoot) {
-  return costReport(journalRoot).totalUsd;
-}
-
-module.exports = { costReport, totalSpentUsd, readTaskCost };
+module.exports = { costReport, readTaskCost };
