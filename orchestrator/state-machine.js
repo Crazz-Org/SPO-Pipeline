@@ -45,6 +45,7 @@ const { moveCard } = require('./board');
 const { postParkComment, unparkScan } = require('./park-loop');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
+const { shouldAutoTriage, runAutoTriage } = require('./auto-triage');
 
 // True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
 // condition under which a scripted step's handler dispatches to steps/scripted.js's real
@@ -630,12 +631,14 @@ async function drainQueueOnce(queueDir, journalRoot, config) {
 // by `daemon.js` when --once is not given; not exercised by the test suite (which always runs
 // --shadow --once against a fully-prepared queue), same as before this function grew two more
 // real-mode-only calls -- park-loop.js's unparkScan (kanban piloting's retry/abandon
-// round trip) and auto-pull.js's timed board pull, both individually unit-tested against
-// injected deps elsewhere (test/park-loop.test.js, test/auto-pull.test.js). config.real gates
-// both the same way isRealMode(ctx) gates everything else real in this file; config.deps is the
-// same injection point buildCtx already threads through HANDLERS.
+// round trip), auto-pull.js's timed board pull, and auto-triage.js's timed bug-report-queue
+// triage, each individually unit-tested against injected deps elsewhere (test/park-loop.test.js,
+// test/auto-pull.test.js, test/auto-triage.test.js). config.real gates all three the same way
+// isRealMode(ctx) gates everything else real in this file; config.deps is the same injection
+// point buildCtx already threads through HANDLERS.
 async function runForever(queueDir, journalRoot, config) {
   let lastAutoPullAt = null;
+  let lastAutoTriageAt = null;
   for (;;) {
     await drainQueueOnce(queueDir, journalRoot, config);
 
@@ -650,6 +653,16 @@ async function runForever(queueDir, journalRoot, config) {
       if (shouldAutoPull(lastAutoPullAt, now, config.autoPullMs)) {
         lastAutoPullAt = now;
         await runAutoPull(queueDir, journalRoot, config, deps);
+      }
+
+      // Independent of auto-pull -- auto-triage files GitHub issues (like `spo ask`), it never
+      // touches queue/ itself. config.autoTriageMs defaults to 0 (disabled) -- see config.js's
+      // own comment for why this is not symmetric with autoPullMs's nonzero default. A report
+      // filed this cycle becomes an ordinary Todo card the *next* auto-pull cycle picks up
+      // later -- the "player report -> nightly fix" chain README.md's migration step 5 names.
+      if (shouldAutoTriage(lastAutoTriageAt, now, config.autoTriageMs)) {
+        lastAutoTriageAt = now;
+        await runAutoTriage(config.spoReportsDir, journalRoot, config, deps);
       }
     }
 

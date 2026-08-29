@@ -46,12 +46,24 @@
 //                            queue/<seq>-issue-<n>.json task file for each of the top N
 //                            claimable candidates (default 5), skipping one already queued or
 //                            journaled. See orchestrator/intake.js.
+//   spo triage [--limit N] [--reports-dir <dir>] [--file]
+//                            Reads the webclient's bug-report queue (~/.spo-reports, or
+//                            --reports-dir/SPO_REPORTS_DIR) and reproduces/routes/dedups/drafts
+//                            each of the top N reports (default 3) via
+//                            orchestrator/intake.js's triageBugReport, then the SAME
+//                            reviewCard/fileCard gate `spo ask` uses. A report that fails
+//                            mechanically stays queued for the next run. Never runs daemon.js.
+//                            Defaults to --dry (prints what would happen -- drafts, verdicts,
+//                            duplicates -- and touches neither GitHub nor the queue); pass --file
+//                            to actually file/comment/archive. See orchestrator/README.md
+//                            § Auto-triage for why this defaults to dry-run.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
 // Flags (accounts commands + dashboard): --accounts-dir <dir>  (default: the account pool --
 //   see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
 // Flags (ask): --dry  --draft-file <path>
 // Flags (pull): --limit <n>  (default 5)
+// Flags (triage): --limit <n>  (default 3)  --reports-dir <dir>  --file (actually file; default dry-run)
 
 const fs = require('fs');
 const path = require('path');
@@ -61,6 +73,7 @@ const { renderDashboard } = require('../console/render');
 const accounts = require('../orchestrator/accounts');
 const defaultConfig = require('../orchestrator/config');
 const intake = require('../orchestrator/intake');
+const autoTriage = require('../orchestrator/auto-triage');
 const { costReport } = require('../orchestrator/cost');
 
 function parseArgs(argv) {
@@ -75,6 +88,8 @@ function parseArgs(argv) {
     dry: false,
     draftFile: null,
     limit: null,
+    reportsDir: null,
+    file: false,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -89,6 +104,8 @@ function parseArgs(argv) {
     else if (a === '--dry') opts.dry = true;
     else if (a === '--draft-file') opts.draftFile = argv[++i];
     else if (a === '--limit') opts.limit = argv[++i];
+    else if (a === '--reports-dir') opts.reportsDir = argv[++i];
+    else if (a === '--file') opts.file = true;
     else opts._.push(a);
   }
   return opts;
@@ -504,12 +521,65 @@ async function cmdPull(opts, deps = {}) {
   }
 }
 
+// `spo triage [--limit N] [--reports-dir <dir>] [--file]` -- reproduces/routes/dedups/drafts the
+// top N reports in the webclient's bug-report queue via orchestrator/auto-triage.js's
+// runAutoTriage (triageBugReport, then the same reviewCard/fileCard gate `spo ask`/`spo pull`
+// use). Never runs `daemon.js`. Defaults to --dry -- see orchestrator/README.md § Auto-triage for
+// why this command (unlike `spo pull`, which only ever reads) does not default to acting.
+// `deps.autoTriage`: same test-only override convention as `deps.intake` (cmdAsk/cmdPull).
+async function cmdTriage(opts, deps = {}) {
+  const autoTriageImpl = deps.autoTriage || autoTriage;
+  const { journalRoot } = resolveDirs(opts);
+  const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
+  const limit = opts.limit ? Number(opts.limit) : autoTriageImpl.DEFAULT_AUTO_TRIAGE_LIMIT;
+  const dry = !opts.file;
+
+  const result = await autoTriageImpl.runAutoTriage(
+    reportsDir,
+    journalRoot,
+    { autoTriageLimit: limit },
+    {},
+    { dry }
+  );
+
+  if (!result.ok) {
+    console.error(result.error);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (result.processed === 0) {
+    console.log(`(no queued reports in ${reportsDir})`);
+    return;
+  }
+
+  for (const r of result.results) {
+    if (r.outcome === 'filed') console.log(`${r.file}: filed #${r.issueNumber} -- ${r.url}`);
+    else if (r.outcome === 'would-file') console.log(`${r.file}: would file -- ${r.draft.title}`);
+    else if (r.outcome === 'duplicate') console.log(`${r.file}: duplicate of #${r.issueNumber}`);
+    else if (r.outcome === 'do-not-file') console.log(`${r.file}: do-not-file`);
+    else if (r.outcome === 'error') console.log(`${r.file}: error -- ${r.error}`);
+    else console.log(`${r.file}: ${r.outcome}${r.reason ? ` -- ${r.reason}` : ''}`);
+  }
+
+  console.log('');
+  console.log(
+    `processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  ` +
+      `not-reproduced: ${result.notReproduced}  insufficient: ${result.insufficient}  ` +
+      `schema-version: ${result.schemaVersion}  do-not-file: ${result.doNotFile}  errors: ${result.errors.length}`
+  );
+  if (dry) console.log('(dry run -- nothing filed, nothing archived; pass --file to act)');
+
+  if (result.errors.length > 0) process.exitCode = 1;
+}
+
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull>',
+      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull|triage>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
+      '            triage: [--limit <n>] [--reports-dir <dir>] [--file]   (defaults to --dry)',
     ].join('\n')
   );
 }
@@ -553,6 +623,7 @@ function main() {
   }
   if (cmd === 'ask') return cmdAsk(opts);
   if (cmd === 'pull') return cmdPull(opts);
+  if (cmd === 'triage') return cmdTriage(opts);
 
   printUsage();
   process.exitCode = 1;
@@ -582,4 +653,4 @@ if (require.main === module) {
   run();
 }
 
-module.exports = { parseArgs, cmdAsk, cmdPull, main };
+module.exports = { parseArgs, cmdAsk, cmdPull, cmdTriage, main };

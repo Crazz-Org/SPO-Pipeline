@@ -538,6 +538,57 @@ this timer does not add a new *kind* of GitHub read, it just runs the existing o
 instead of only on request. At the default 5-minute interval that is at most ~12 reads/hour,
 well inside the shared 5000-point/hour budget.
 
+### Auto-triage
+
+The webclient has its own bug-report feature (`SPO-WebClient`'s `doc/bug-reporting.md`): a test
+session flags what looks wrong, and a JSON report lands in that repo's `~/.spo-reports` queue.
+`SPO-WebClient`'s `/triage-report` command reads that queue by hand -- reproduces each report,
+routes it (desktop → data-correctness, mobile → ergonomics), dedups by `anchorKey`, drafts a
+card, runs it through review, files it. `orchestrator/auto-triage.js` is that same reasoning,
+automated: `daemon.js --real`, when `config.autoTriageMs` is set, runs `runAutoTriage` on a
+second, independent timer between drain passes (`state-machine.js`'s `runForever`) -- exactly the
+`auto-pull`/`shouldAutoPull` pattern above, applied to the report queue instead of the board.
+
+**What changed vs. a human running `/triage-report`:** the reproduction/routing/dedup reasoning
+(§0–§4 of `/triage-report`) is its own pipeline-side step, `intake.triageBugReport`
+(`prompts/triage-bug-report.md`, model fable, effort high -- Bash included, for the model-server
+log `curl` and the `gh issue list --search` dedup check) -- a **new**, from-scratch prompt, never
+a copy of the product repo's command text. It never files anything itself; a `draft` outcome goes
+through the exact same `reviewCard`/`fileCard` gate every other card here gets (§5 of
+`/triage-report`, done here by the *existing* step, not a second one). Only the mechanical
+bookkeeping (§6/§7: archiving the report, writing the one-line disposition sidecar, deciding when
+to journal) is `auto-triage.js`'s own code -- and it never reads report *content* (no `journal`,
+`anchorKey`, `geometry` field is parsed here), only report *filenames*, to sequence and archive
+them; every byte of schema/reproduction knowledge stays inside the `claude -p` session
+`triageBugReport` spawns, reasoning against the product tree with `cwd = config.productRepo`. See
+the file headers of `orchestrator/auto-triage.js` and `prompts/triage-bug-report.md` for the full
+"the one rule" accounting.
+
+`config.spoReportsDir` (default `~/.spo-reports`, `SPO_REPORTS_DIR` override) is where the queue
+lives -- outside any git tree by design (`SPO-WebClient/doc/bug-reporting.md`: `npm run finish`
+retires worktrees, and a queue inside one would disappear with the branch that produced the
+reports), same class of direct machine-level read as `spoBenchDir`.
+
+**Deliberately not symmetric with auto-pull.** Auto-pull only ever reads a board a human already
+curated; auto-triage's reproduction step is a genuine LLM judgement call (log correlation,
+geometry-predicate reasoning), so filing unattended on a hallucinated "reproduced" verdict is a
+real risk auto-pull never carries. Maintainer decision, 2026-08-29: `config.autoTriageMs`
+defaults to **0 (disabled)**, unlike `autoPullMs`'s nonzero default -- set `SPO_AUTO_TRIAGE_MS`
+explicitly once `spo triage --dry` (below) has been run by hand enough times to trust the
+reproduction step. `config.autoTriageLimit` (default 3, `SPO_AUTO_TRIAGE_LIMIT` override) is the
+most reports one cycle takes off the queue.
+
+Journals exactly one `auto-triage` event (`{processed, filed, duplicates, notReproduced,
+insufficient, schemaVersion, doNotFile, errors}`) to `journal/daemon.jsonl` per **real** (non-dry)
+cycle, and only when at least one report was actually disposed of -- same "only journal on real
+output" rule `auto-pull` follows. A report whose `triageBugReport`/`reviewCard`/`fileCard` call
+fails mechanically (bad account, bad JSON, a failed `gh` call) is left in the queue for the next
+cycle in both dry and real runs -- never archived on an outcome that was never judged.
+
+A report filed this cycle becomes an ordinary Todo card, picked up later by the *next* auto-pull
+cycle like any other -- the "player report → nightly fix" chain README.md's migration step 5
+names; auto-triage itself stops at "filed", the same boundary `/triage-report` itself draws.
+
 ## Intake
 
 `orchestrator/intake.js` is the maintainer-facing path from a free-text request to a filed
@@ -560,6 +611,16 @@ spo pull [--limit N]     -- write queue/<seq>-issue-<n>.json for the top N claim
    |
    v
 daemon.js --real          -- drains queue/, drives each task PLAN -> ... -> DONE/PARKED for real
+```
+
+A second, parallel entry lane files cards from the webclient's own bug-report queue instead of a
+maintainer's request -- see "Auto-triage" above for what `spo triage` does before the board:
+
+```
+spo triage [--limit N]   -- reproduce/route/dedup/file/archive the /triage-report queue
+   |
+   v  (same board auto-add -> Todo as spo ask)
+npm run board:claim  ->  spo pull  ->  daemon.js --real     -- (as above)
 ```
 
 **Two entry lanes into `spo ask`:**
@@ -749,6 +810,7 @@ bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disa
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
 bin/spo pull [--limit <n>]                         # write queue/<seq>-issue-<n>.json for the top N claimable board cards
+bin/spo triage [--limit <n>] [--reports-dir <dir>] [--file]   # triage the bug-report queue (see "Auto-triage" above); defaults to --dry
 ```
 
 ## Dashboard
@@ -808,5 +870,8 @@ piloting's own tests follow the same convention one layer up: `test/board-move.t
 `test/park-loop.test.js` covers the park comment's content and the PARKED round trip via
 `runTask` directly, plus `unparkScan`'s retry/abandon/idempotency; `test/auto-pull.test.js`
 covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
-enqueued rules. None of them ever touch a real `git`, `npm`, `gh` or `claude` process, so the
-whole suite stays hermetic.
+enqueued rules; `test/auto-triage.test.js` covers the same for `shouldAutoTriage`/
+`runAutoTriage` (outcome routing, the dry/real split, a mechanical failure leaving a report
+queued) and `test/spo-triage.test.js` covers `cmdTriage`'s flag wiring, same convention as
+`test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage. None of them ever touch a real `git`, `npm`,
+`gh` or `claude` process, so the whole suite stays hermetic.
