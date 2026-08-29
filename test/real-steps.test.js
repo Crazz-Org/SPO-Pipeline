@@ -313,6 +313,10 @@ test('realPushPr: parses the PR number out of the pull URL on gh pr create stdou
     'Add a widget',
     '--body-file',
     path.join(ctx.taskDir, 'pr-body.md'),
+    '--head',
+    'claude-pipe/card-pr1',
+    '--base',
+    'main',
   ]);
   const commit = calls.find((c) => c.args.includes('commit'));
   assert.deepEqual(commit.args, ['-C', worktreePath, 'commit', '-F', path.join(ctx.taskDir, 'commit-message.txt')]);
@@ -321,6 +325,37 @@ test('realPushPr: parses the PR number out of the pull URL on gh pr create stdou
   assert.match(bodyText, /Closes #80/);
   const messageText = fs.readFileSync(path.join(ctx.taskDir, 'commit-message.txt'), 'utf8');
   assert.match(messageText, /Closes #80/);
+});
+
+test('realPushPr: gh pr create always gets an explicit --head/--base -- gh has no cwd of its own here to infer the branch from', async () => {
+  // Every other command in realPushPr targets the worktree explicitly via `git -C worktreePath`,
+  // but `gh pr create` is spawned with no cwd override -- it runs from the daemon's own process
+  // cwd (a git repo on `main`), not worktreePath. Without --head, gh silently resolved head ==
+  // base == main and refused with "No commits between main and main (createPullRequest)" --
+  // reproduced on card issue-247's 4th real pass (CHECK green, branch pushed and waiting).
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-head-wt-');
+  const task = { id: 'card-pr9', kind: 'card', issue: 90, title: 't', worktreePath }; // no task.branch -> default
+  const ctx = testCtx({ id: 'card-pr9', task, config });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/900\n');
+      return ok('');
+    },
+  };
+
+  await realPushPr(ctx, deps);
+
+  const create = calls.find((c) => c.command === 'gh');
+  const headIdx = create.args.indexOf('--head');
+  const baseIdx = create.args.indexOf('--base');
+  assert.ok(headIdx !== -1, '--head must be present');
+  assert.ok(baseIdx !== -1, '--base must be present');
+  assert.equal(create.args[headIdx + 1], 'claude-pipe/card-pr9'); // realPushPr's own branch default
+  assert.equal(create.args[baseIdx + 1], 'main');
 });
 
 test('realPushPr: unparsable gh pr create stdout -> PARKED (push-pr-failed)', async () => {

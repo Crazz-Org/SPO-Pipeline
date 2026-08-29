@@ -247,6 +247,13 @@ async function realPushPr(ctx, deps = {}) {
   const bodyFile = path.join(ctx.taskDir, 'pr-body.md');
   fs.writeFileSync(bodyFile, prBody(ctx));
 
+  // --head/--base are required here, not optional: every other command in this function targets
+  // the worktree explicitly via `git -C worktreePath`, but `gh pr create` has no `-C`/cwd of its
+  // own -- it infers the head branch from the process's own cwd, which is the daemon's cwd
+  // (~/SPO-Pipeline, itself a git repo on `main`), not `worktreePath`. Without an explicit
+  // --head, gh resolved head == base == main and refused with "No commits between main and main
+  // (createPullRequest)" -- reproduced on card issue-247's 4th real pass: CHECK green, branch
+  // `claude-pipe/issue-247` pushed and waiting, yet pr-create still parked push-pr-failed.
   const create = spawnStep(ctx, deps, 'PUSH_PR', 'gh', [
     'pr',
     'create',
@@ -256,6 +263,10 @@ async function realPushPr(ctx, deps = {}) {
     title,
     '--body-file',
     bodyFile,
+    '--head',
+    branch,
+    '--base',
+    'main',
   ]);
   if (create.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'pr-create', exit: create.exit });
 
