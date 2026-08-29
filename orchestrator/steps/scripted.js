@@ -132,6 +132,123 @@ function splitLines(text) {
 // (`npm run board:take`). Claim runs last, from inside the fresh worktree, because the npm
 // aliases need a product cwd and the human's main SPO-WebClient checkout must never run them --
 // see orchestrator/README.md "Real scripted steps" for the rationale in full.
+
+// git worktree list --porcelain prints one `worktree <path>` line per registered worktree
+// (plus HEAD/branch/bare lines this caller doesn't need). Paths are compared resolved -- git
+// prints an absolute, symlink-resolved path, and `worktreePath` here is built from config, so
+// normalize both sides before comparing rather than assume they're already byte-identical.
+function worktreeListPaths(porcelainOutput) {
+  return (porcelainOutput || '')
+    .split('\n')
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => path.resolve(line.slice('worktree '.length).trim()));
+}
+
+// card #424 -- "retry always restarts at INTAKE" bit us three times today: runTask always
+// restarts a task at INTAKE (state-machine.js), so retrying anything parked past WORKTREE
+// collided with the previous attempt's own worktree/branch and failed worktree-add-failed. The
+// pipeline owns the namespace worktrees/<taskId> + branch claude-pipe/<taskId> exclusively (no
+// human or other process ever creates either), so within that namespace it may clean its own
+// leftovers before trying again -- runTask's restart-at-INTAKE behaviour is otherwise untouched.
+// Order matters -- each rule guards the one after it:
+//   1. Worktree path leftover (registered in `git worktree list` OR present on disk at the
+//      exact task path): a dirty working tree (`git status --porcelain` non-empty) is NEVER
+//      destroyed -- it might be uncommitted human-or-unknown work -- and parks
+//      worktree-dirty-leftover so a maintainer can look. Clean -> `git worktree remove`, then
+//      `git worktree prune` to also clear a stale registration whose directory is already gone
+//      (nothing on disk to be dirty in that case, so the status check is skipped for it).
+//   2. Local branch leftover (claude-pipe/<id>): deleted with `branch -D` ONLY when its tip is
+//      an ancestor of origin/main (merged, or the previous attempt never advanced past it) OR
+//      equals origin/claude-pipe/<id>'s own tip (fully pushed, nothing local-only). Any other
+//      tip means local-only commits exist that this run never produced and cannot vouch for --
+//      parks branch-unmerged-leftover rather than guess.
+//   3. Remote branch leftover (origin/claude-pipe/<id>, checked against the fetch this step
+//      already ran): deleted with `push origin --delete`. This is always a prior, superseded
+//      attempt in the pipeline's own namespace, regenerated fresh every pass -- leaving it makes
+//      this attempt's own `push -u origin <branch>` (PUSH_PR) non-fast-forward. If a PR was open
+//      from it, deleting the branch closes that PR; PUSH_PR opens a fresh one on the retry. This
+//      step is independent of step 2 (it also runs when there was no local branch left to clean,
+//      or when step 2's own remote-tip lookup already answered the same question -- one call is
+//      redone here rather than threaded through, so each of the three rules stays independently
+//      readable and testable).
+//   4. Nothing found at any of the three checks -> no cleanup call is ever issued; the add below
+//      runs exactly as it did before this fix.
+function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }) {
+  // -- 1. worktree path -----------------------------------------------------------------------
+  const list = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'worktree', 'list', '--porcelain']);
+  const registered = list.exit === 0 && worktreeListPaths(list.stdout).includes(path.resolve(worktreePath));
+  const existsOnDisk = fs.existsSync(worktreePath);
+
+  if (registered || existsOnDisk) {
+    if (existsOnDisk) {
+      const status = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', worktreePath, 'status', '--porcelain']);
+      if (status.exit !== 0 || status.stdout.trim() !== '') {
+        throw new ParkSignal('worktree-dirty-leftover', { worktreePath, statusExit: status.exit, statusTail: status.stdoutTail });
+      }
+      const remove = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'worktree', 'remove', worktreePath]);
+      if (remove.exit !== 0) {
+        throw new ParkSignal('worktree-cleanup-failed', { step: 'worktree-remove', exit: remove.exit });
+      }
+    }
+    // Registered-only (directory already gone by some other means) or just-removed above --
+    // either way, prune clears the administrative leftover git worktree list would otherwise
+    // keep reporting.
+    spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'worktree', 'prune']);
+    appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-worktree-removed', { worktreePath, wasOnDisk: existsOnDisk });
+  }
+
+  // -- 2. local branch --------------------------------------------------------------------------
+  const localRef = `refs/heads/${branch}`;
+  const localRevParse = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'rev-parse', '--verify', '--quiet', localRef]);
+  if (localRevParse.exit === 0) {
+    const localSha = localRevParse.stdout.trim();
+    const ancestor = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+      '-C',
+      productRepo,
+      'merge-base',
+      '--is-ancestor',
+      localRef,
+      'origin/main',
+    ]);
+    let safe = ancestor.exit === 0;
+    let remoteSha = null;
+    if (!safe) {
+      const remoteRevParse = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+        '-C',
+        productRepo,
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        `refs/remotes/origin/${branch}`,
+      ]);
+      remoteSha = remoteRevParse.exit === 0 ? remoteRevParse.stdout.trim() : null;
+      safe = remoteSha !== null && remoteSha === localSha;
+    }
+    if (!safe) {
+      throw new ParkSignal('branch-unmerged-leftover', { branch, localSha, remoteSha });
+    }
+    const del = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'branch', '-D', branch]);
+    if (del.exit !== 0) throw new ParkSignal('worktree-cleanup-failed', { step: 'branch-delete', exit: del.exit });
+    appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-branch-deleted', { branch, sha: localSha });
+  }
+
+  // -- 3. remote branch -------------------------------------------------------------------------
+  const remoteCheck = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+    '-C',
+    productRepo,
+    'rev-parse',
+    '--verify',
+    '--quiet',
+    `refs/remotes/origin/${branch}`,
+  ]);
+  if (remoteCheck.exit === 0) {
+    const remoteSha = remoteCheck.stdout.trim();
+    const del = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'push', 'origin', '--delete', branch]);
+    if (del.exit !== 0) throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-branch-delete', exit: del.exit });
+    appendEvent(ctx.taskDir, 'WORKTREE', 'remote-branch-cleaned', { branch, sha: remoteSha });
+  }
+}
+
 async function realWorktree(ctx, deps = {}) {
   const config = ctx.config;
   const productRepo = config.productRepo;
@@ -152,6 +269,8 @@ async function realWorktree(ctx, deps = {}) {
   if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
     throw new ParkSignal('nightly-main-red', { sha: originMainSha });
   }
+
+  sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch });
 
   fs.mkdirSync(worktreesDir, { recursive: true });
   const add = spawnStep(ctx, deps, 'WORKTREE', 'git', [
