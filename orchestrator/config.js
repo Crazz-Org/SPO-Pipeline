@@ -90,7 +90,17 @@ module.exports = {
   // top autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
   // overrides -- see orchestrator/README.md § Kanban piloting for the GraphQL cost.
   autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
-  autoPullLimit: 3,
+  // How many claimable candidates one auto-pull cycle takes off the board. NOT a concurrency
+  // setting -- drainQueueOnce works the queue strictly serially -- but because runForever
+  // AWAITS that drain before pulling again, a pull only ever happens with the daemon idle: so
+  // this is the most cards that can sit off the board, unstarted, at any moment.
+  //
+  // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card, finishes it, then
+  // looks again. Cards stay on the board -- visible, reorderable, claimable by a human --
+  // until the daemon is actually ready for them. Raise it if serial intake proves to be the
+  // bottleneck. SPO_AUTO_PULL_LIMIT overrides.
+  autoPullLimit:
+    process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 1,
 
   // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
   //
@@ -99,6 +109,17 @@ module.exports = {
   // parked`). Unset (the default) means no-op. The command decides what a park is worth
   // (notify-send, ntfy, a reason filter); the daemon only reports. Never blocks a task.
   parkAlertCmd: process.env.SPO_PARK_ALERT_CMD || null,
+
+  // NOTE -- no cumulative spend ceiling, deliberately (maintainer decision, 2026-08-29). The
+  // pool is Claude Max SUBSCRIPTION accounts (accounts.js), not the metered API: the `costUsd`
+  // the CLI reports, and that cost.js sums, is a NOTIONAL API-equivalent figure, not money
+  // leaving an account. It is worth measuring -- it is the migration plan's efficiency metric
+  // against the old driver's baseline, and `spo cost` reports it -- but capping it would be
+  // enforcing a limit that does not exist. What actually constrains a run is the pool itself:
+  // per-account rate limits and the cooldowns accounts.js already tracks.
+  //
+  // The PER-STEP caps in step-contracts.js stay, and are not about money either: they cut off
+  // a step that has run away (a PLAN spinning past $3 is a broken PLAN, whoever pays).
 
   REPO_ROOT,
   cwdForStep,

@@ -643,6 +643,9 @@ async function runForever(queueDir, journalRoot, config) {
       const deps = config.deps || {};
       await unparkScan(queueDir, journalRoot, config, deps);
 
+      // Note the ordering above: drainQueueOnce is AWAITED, so a pull only ever happens with
+      // the daemon idle. config.autoPullLimit is therefore the most cards that can sit off the
+      // board at once, not a per-cycle burst on top of work in progress.
       const now = Date.now();
       if (shouldAutoPull(lastAutoPullAt, now, config.autoPullMs)) {
         lastAutoPullAt = now;
