@@ -90,7 +90,12 @@ module.exports = {
   // top autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
   // overrides -- see orchestrator/README.md § Kanban piloting for the GraphQL cost.
   autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
-  autoPullLimit: 3,
+  // How many claimable candidates one auto-pull cycle ENQUEUES -- not a concurrency setting:
+  // drainQueueOnce works the queue strictly serially, one task at a time, whatever this is.
+  // It therefore governs how fast the board drains into queue/, not how much runs at once,
+  // and it is not what bounds a soak -- soakBudgetUsd below is. SPO_AUTO_PULL_LIMIT overrides.
+  autoPullLimit:
+    process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 3,
 
   // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
   //

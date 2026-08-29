@@ -696,7 +696,17 @@ ceiling is raised), and auto-pull stops enqueuing. One `budget-ceiling-reached` 
 pass lands in `<journalRoot>/daemon.jsonl`.
 
 Note the daemon drains **serially** — one task at a time (`drainQueueOnce`). `autoPullLimit`
-is how many cards are *enqueued* per auto-pull cycle, not a concurrency setting.
+(`SPO_AUTO_PULL_LIMIT`, default 3) is how many cards are *enqueued* per auto-pull cycle, not a
+concurrency setting: it governs how fast the board drains into `queue/`, not how much runs at
+once, and it does not bound a run — the ceiling does.
+
+**The ceiling's perimeter is the whole journal root, for its whole life** — every task
+directory under it, past runs included. It is deliberately not per-call (that is
+`step-contracts.js`) and not per-card (nothing enforces one today). Lifetime rather than
+per-daemon-start is what makes it survive `Restart=always`: a since-start budget would reset
+on every systemd restart, which is precisely when a runaway would restart. The consequence to
+plan for: an existing `journal/` already carries its history's spend, so set the ceiling to
+*that baseline plus what this run may spend*. `spo cost` prints the baseline and what is left.
 
 ## Where journals live
 

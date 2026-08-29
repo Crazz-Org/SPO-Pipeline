@@ -13,7 +13,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const { costReport, totalSpentUsd } = require('../orchestrator/cost');
-const { DAEMON, SPO_BIN, mkTmp, writeTask, runDaemonOnce, readState } = require('./helpers');
+const { DAEMON, SPO_BIN, REPO_ROOT, mkTmp, writeTask, runDaemonOnce, readState } = require('./helpers');
+
+const CONFIG_PATH = path.join(REPO_ROOT, 'orchestrator', 'config.js');
 
 // The shadow fixture that drives a synthetic task all the way to DONE (same shape as
 // happy-path.test.js): the ceiling tests care about whether a task is TAKEN, so they need a
@@ -138,4 +140,18 @@ test('ceiling: unset (the default) imposes none -- existing behaviour is unchang
   runDaemonOnce(queueDir, journalDir); // no SPO_SOAK_BUDGET_USD in env
 
   assert.equal(readState(journalDir, 'runs-anyway').state, 'DONE');
+});
+
+test('autoPullLimit: SPO_AUTO_PULL_LIMIT overrides the default of 3', () => {
+  const read = (env) =>
+    JSON.parse(
+      execFileSync(
+        process.execPath,
+        ['-e', 'process.stdout.write(JSON.stringify(require(process.argv[1]).autoPullLimit))', CONFIG_PATH],
+        { encoding: 'utf8', env }
+      )
+    );
+
+  assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: undefined }), 3);
+  assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: '10' }), 10);
 });
