@@ -92,6 +92,14 @@ module.exports = {
   autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
   autoPullLimit: 3,
 
+  // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
+  //
+  // One executable, spawned as `<cmd> <taskId> <reason> <lastState>` every time a real-mode
+  // task parks -- the push half of a park (the pull surfaces are the journals and `spo
+  // parked`). Unset (the default) means no-op. The command decides what a park is worth
+  // (notify-send, ntfy, a reason filter); the daemon only reports. Never blocks a task.
+  parkAlertCmd: process.env.SPO_PARK_ALERT_CMD || null,
+
   REPO_ROOT,
   cwdForStep,
   WORKTREE_SIDE_STEPS,

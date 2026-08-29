@@ -22,7 +22,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { appendEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
+const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
 const { scratchDir } = require('./task-values');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
@@ -43,6 +43,7 @@ const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
 const { moveCard } = require('./board');
 const { postParkComment, unparkScan } = require('./park-loop');
+const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 
 // True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
@@ -505,6 +506,20 @@ function finalizePark(ctx, lastState, reason, detail) {
   snap.lastState = lastState;
   writeState(ctx.taskDir, snap);
   writeReport(ctx.taskDir, { id: ctx.id, reason, lastState, ts: snap.updatedAt, detail });
+
+  // The daemon-level feed: one `parked` line in <journalRoot>/daemon.jsonl alongside the
+  // per-task event above, so daemon.jsonl reads as the single chronological "needs a human"
+  // stream (auto-pull cycles, lock takeovers, parks). All modes -- it is a file append, and
+  // taskDir is join(journalRoot, id) by construction (takeNextTask), so dirname recovers the
+  // root without threading a new parameter through every ctx.
+  appendDaemonEvent(path.dirname(ctx.taskDir), 'parked', { id: ctx.id, reason, lastState });
+
+  // The push half: SPO_PARK_ALERT_CMD, real mode only (an external spawn -- shadow/dry-run
+  // tests must see none, same rule as postParkComment below). Never blocks -- park-alert.js
+  // carries board.js's failure policy.
+  if (isRealMode(ctx)) {
+    alertPark(ctx, ctx.deps, { reason, lastState });
+  }
 
   // Kanban piloting, the park half of the round trip: real mode, kind:"card" tasks only -- never
   // for shadow/dry-run (every existing PARKED test in this suite is shadow mode and must see no
