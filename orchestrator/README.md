@@ -674,6 +674,39 @@ move) but every surface has to be gone and looked at. Two push halves close that
   journaled (`park-alert-failed`) and never blocks anything — the task is terminal before the
   alert runs.
 
+## Spend: what `spo cost` measures, and what it does not
+
+`orchestrator/cost.js` reads what the pipeline has spent back out of the journals — every real
+`claude -p` call already records its own `costUsd` in an `llm-call` event, so there is no
+second ledger to keep in sync. `spo cost` prints it per task (state, calls, cost, park
+reasons), then the aggregate, cost per DONE card and the parking rate — the two numbers
+migration step 3 asks for. Parked-task count and park-*event* count are both shown because
+they answer different questions: card #247 parked six times and still reached DONE.
+
+**These dollars are notional.** The pool is Claude Max *subscription* accounts
+(`accounts.js`), not the metered API, so `costUsd` is the API-equivalent of the work, not
+money leaving an account. That makes it an efficiency metric — what the migration plan
+compares against the old driver's baseline — and not a budget.
+
+**There is deliberately no cumulative spend ceiling** (maintainer decision, 2026-08-29):
+capping notional dollars would enforce a limit that does not exist. What actually constrains a
+run is the pool — per-account rate limits and the cooldowns `accounts.js` already tracks. The
+**per-step** caps in `step-contracts.js` ($2/$5/$12 by size, $3 small, PLAN floor $3) stay,
+and are not about money either: they cut off a step that has run away, and a PLAN spinning
+past $3 is a broken PLAN whoever pays.
+
+## How much the daemon takes on at once
+
+The daemon drains **serially** — one task at a time (`drainQueueOnce`) — and `runForever`
+*awaits* that drain before pulling again. So a pull only ever happens with the daemon idle,
+and `autoPullLimit` (`SPO_AUTO_PULL_LIMIT`, **default 1**) is the most cards that can sit off
+the board, unstarted, at any moment — not a per-cycle burst layered on top of work in
+progress.
+
+At 1, the daemon takes one card, finishes it, then looks again: cards stay on the board —
+visible, reorderable, claimable by a human — until it is actually ready for them. Raise it if
+serial intake proves to be the bottleneck.
+
 ## Where journals live
 
 ```
