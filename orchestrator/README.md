@@ -641,6 +641,22 @@ never contend with a live one. A holder whose pid is dead (hard kill, power loss
 taken over on the next start, journaled as a `lock-stale-taken` event in
 `<journalRoot>/daemon.jsonl`.
 
+## Running as a service
+
+`bash scripts/daemon-install.sh` (run from the checkout that should host the daemon) installs
+`spo-pipeline-daemon.service` as a systemd `--user` unit, mirroring the bench worker's
+`bench-install.sh`: `Restart=always` with a start-rate limit (a refuse-to-start — empty
+account pool, held lock — stops after five tries instead of looping), linger enabled, and an
+**explicit PATH** including `~/.local/bin`, because the daemon spawns the `claude` CLI and the
+systemd user PATH does not reach it (the bench unit gets away without this only because it
+spawns nothing outside `/usr/bin`).
+
+The unit runs `--real` with auto-pull ON (5 min): installing it makes the daemon autonomous.
+Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` →
+`[Service]` / `Environment=SPO_AUTO_PULL_MS=0`. Stop:
+`systemctl --user stop spo-pipeline-daemon.service`. Re-run the installer after pulling
+daemon changes; it rebuilds nothing (no build step) and restarts.
+
 ## Where journals live
 
 ```
