@@ -7,8 +7,11 @@
 //
 //   accounts.json  the registry -- hand-authored, one entry per Claude Max account:
 //                  [{name, configDir (absolute path | null = the ambient default login),
-//                    enabled}]. Missing file or an empty array both fall back to one implicit
-//                  account, {name: "default", configDir: null} -- so a fresh checkout with no
+//                    oauthTokenFile (absolute path to a file holding the long-lived token
+//                    printed by `claude setup-token`, pasted there by the operator; null =
+//                    rely on configDir/ambient credentials), enabled}]. Missing file or an
+//                  empty array both fall back to one implicit account,
+//                  {name: "default", configDir: null} -- so a fresh checkout with no
 //                  registry still runs real mode against whatever `claude` is already logged
 //                  into.
 //   state.json     runtime-written cooldowns -- {accountName: {cooldownUntil: epochMs}}. Not
@@ -71,6 +74,7 @@ function readRegistry(claudeAccountsDir) {
   return parsed.map((a) => ({
     name: a.name,
     configDir: a.configDir === undefined ? null : a.configDir,
+    oauthTokenFile: a.oauthTokenFile === undefined ? null : a.oauthTokenFile,
     enabled: a.enabled !== false,
   }));
 }

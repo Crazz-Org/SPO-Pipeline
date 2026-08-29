@@ -26,9 +26,29 @@ const { appendEvent, appendLedgerLine, writeState, writeReport } = require('./jo
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
 const { callWithDeadline } = require('./deadline');
-const { runScripted, sleep } = require('./steps/scripted');
+const {
+  runScripted,
+  sleep,
+  realWorktree,
+  realCheck,
+  realPushPr,
+  realGate,
+  realCiChecks,
+  realMerge,
+  realFinish,
+} = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
+const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
+
+// True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
+// condition under which a scripted step's handler dispatches to steps/scripted.js's real
+// per-state functions (realWorktree, realCheck, ...), which spawn actual git/npm/gh commands.
+// Reachable today only via daemon.js's --real flag (see handleIntake's own gate on
+// kind: "card" tasks) or a direct unit test constructing ctx by hand.
+function isRealMode(ctx) {
+  return !ctx.shadowMode && !ctx.dryRun;
+}
 
 // ---- LLM step invocation, with account rotation in real mode --------------------------------
 //
@@ -89,6 +109,14 @@ async function handleIntake(ctx) {
     appendEvent(ctx.taskDir, 'INTAKE', 'force-state', { to });
     return to;
   }
+  // A kind: "card" task reaching real execution (neither --shadow nor --dry-run) needs the
+  // driver to have explicitly opted in with daemon.js's --real flag -- real scripted steps spawn
+  // actual git/npm/gh commands against the product repo. Checked here, not just at the CLI, so
+  // any caller that builds ctx.config by hand (a future scheduler, a test) gets the same refusal
+  // rather than a card silently running for real.
+  if (ctx.task.kind === 'card' && isRealMode(ctx) && !(ctx.config && ctx.config.real)) {
+    throw new ParkSignal('real-flag-required', { kind: ctx.task.kind });
+  }
   appendEvent(ctx.taskDir, 'INTAKE', 'ok', { title: ctx.task.title, kind: ctx.task.kind });
   return 'WORKTREE';
 }
@@ -96,6 +124,9 @@ async function handleIntake(ctx) {
 async function handleWorktree(ctx) {
   if (ctx.fixture('nightlyMainRed', false)) {
     throw new ParkSignal('main-red-refuse-worktree', {});
+  }
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx));
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'WORKTREE', () =>
     runScripted(ctx, 'worktree', { defaultExit: 0 })
@@ -122,6 +153,9 @@ async function handleImplement(ctx) {
 }
 
 async function handleCheck(ctx) {
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'CHECK', () => realCheck(ctx));
+  }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'CHECK', () =>
     runScripted(ctx, 'check', { defaultExit: 0 })
   );
@@ -131,6 +165,9 @@ async function handleCheck(ctx) {
 }
 
 async function handlePushPr(ctx) {
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'PUSH_PR', () => realPushPr(ctx));
+  }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'PUSH_PR', () =>
     runScripted(ctx, 'pushPr', { defaultExit: 0 })
   );
@@ -140,6 +177,9 @@ async function handlePushPr(ctx) {
 }
 
 async function handleGate(ctx) {
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'GATE', () => realGate(ctx));
+  }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'GATE', () =>
     runScripted(ctx, 'gate', { defaultExit: 0 })
   );
@@ -156,13 +196,15 @@ async function handleGate(ctx) {
 //  (a) map the one failing check name (if any) this visit;
 //  (b) only if (a) was green: the main-moved test, at most one re-merge-and-regate per task.
 async function handleCiChecks(ctx) {
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx));
+  }
   const failingCheck = ctx.fixture('ciChecks', null);
   if (failingCheck) {
     appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failingCheck });
-    if (failingCheck === 'Coverage of changed lines') return 'IMPLEMENT';
-    if (failingCheck === 'Lint') return 'IMPLEMENT';
-    if (failingCheck === 'PR rules') throw new ParkSignal('pr-rules-needs-approval', { check: failingCheck });
-    return 'DIAGNOSE';
+    const outcome = classifyCiFailure(failingCheck);
+    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failingCheck });
+    return outcome.nextState;
   }
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-green', {});
 
@@ -236,6 +278,9 @@ async function handleValidate(ctx) {
 // MERGE: gh pr merge --merge (enqueue) + pr:wait; pr:wait exit 4 (still open) gets exactly one
 // bounded re-wait, never a loop. Exit 0 -> FINISH, anything else -> PARKED.
 async function handleMerge(ctx) {
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'MERGE', () => realMerge(ctx));
+  }
   const enqueue = await callWithDeadline(ctx, 'MERGE', () => runScripted(ctx, 'prMergeEnqueue', { defaultExit: 0 }));
   appendEvent(ctx.taskDir, 'MERGE', 'pr-merge-enqueue', { exit: enqueue.exit });
   if (enqueue.exit !== 0) throw new ParkSignal('pr-merge-enqueue-failed', { exit: enqueue.exit });
@@ -254,6 +299,9 @@ async function handleMerge(ctx) {
 }
 
 async function handleFinish(ctx) {
+  if (isRealMode(ctx)) {
+    return callWithDeadline(ctx, 'FINISH', () => realFinish(ctx));
+  }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'FINISH', () =>
     runScripted(ctx, 'finish', { defaultExit: 0 })
   );
@@ -295,6 +343,7 @@ function buildCtx(id, task, taskDir, config) {
     dryRun: !!config.dryRun,
     fixture: makeFixtureReader(task),
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
+    prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
     counters: {
       diagnoseAttempts: 0,
       seenRootCauses: new Set(),
@@ -313,6 +362,8 @@ function snapshot(ctx, state) {
     diagnoseAttempts: ctx.counters.diagnoseAttempts,
     validateRejects: ctx.counters.validateRejects,
     mainMoveUsed: ctx.counters.mainMoveUsed,
+    prNumber: ctx.prNumber || null,
+    worktreePath: (ctx.task && ctx.task.worktreePath) || null,
     updatedAt: new Date().toISOString(),
   };
 }

@@ -6,20 +6,34 @@
 // preceded by an artificial delay read from `delays.<fixtureKey>` (ms) -- used by the step-
 // deadline test to simulate a slow step without a real subprocess.
 //
-// Real mode: opts.command / opts.args, if given, are spawned synchronously and the exit code
-// and a tail of stdout (falling back to stderr) are returned. Nothing in this build ever
-// passes opts.command from the state machine -- every scripted step in orchestrator/state-
-// machine.js only supplies a fixtureKey, so real mode is reachable but unexercised: the wiring
-// of the actual `npm run gate` / `gh pr merge` / etc. commands is future work, done when this
-// orchestrator leaves shadow mode.
-//
 // ctx.dryRun (daemon.js's --dry-run flag, real-mode semantics without spawning): every scripted
 // step is "fixture-free assumed success" -- exit 0, no command run -- so a synthetic card can
 // walk the whole lifecycle to DONE with zero subprocesses. This is the scripted-step half of
 // --dry-run; the LLM half (building the filled prompt + argv without spawning `claude`) lives in
 // steps/llm.js's runLlm.
+//
+// Real mode (ctx.shadowMode === false && ctx.dryRun === false, daemon.js's --real flag or a
+// direct unit test): one function per orchestrator state that has scripted work (realWorktree,
+// realCheck, realPushPr, realGate, realCiChecks, realMerge, realFinish below), each building the
+// exact product npm-alias / git / gh argv the state needs, spawning it through the same
+// injectable-runner pattern steps/llm.js already uses (`deps.spawnSync`, production code never
+// passing it -- see invokeClaudeReal), and judging the result on its exit code alone (principle
+// 1, doc/state-machine-spec.md). Every spawn journals a compact {state, argv (first 6 tokens),
+// exit, ms} event via appendEvent and appends its stdout (falling back to stderr) tail to
+// journal/<id>/logs/<STATE>.log -- see spawnStep. state-machine.js's handlers dispatch to these
+// functions instead of the generic runScripted()+fixture path once neither shadow nor dry-run
+// applies; runScripted() itself is otherwise unchanged from the shadow-mode skeleton.
+//
+// orchestrator/README.md "Real scripted steps" is the narrative walkthrough (ordering, cwd
+// policy, the WORKTREE claim-after-worktree-creation rule, --real).
 
+const fs = require('fs');
+const path = require('path');
 const { spawnSync } = require('child_process');
+
+const { appendEvent } = require('../journal');
+const { ParkSignal } = require('../park-signal');
+const { classifyCiFailure } = require('../ci-cause-table');
 
 function lastLines(text, n = 20) {
   if (!text) return '';
@@ -55,4 +69,413 @@ async function runScripted(ctx, fixtureKey, opts = {}) {
   return { exit, stdoutTail: lastLines(result.stdout || result.stderr || '') };
 }
 
-module.exports = { runScripted, sleep, lastLines };
+// ---- real mode: shared spawn primitive --------------------------------------------------
+
+// `deps.spawnSync` is the test injection point (same convention as steps/llm.js's
+// invokeClaudeReal) -- production code never passes it, so a real call always spawns the real
+// binary on PATH.
+function runSync(deps, command, args, opts = {}) {
+  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
+  return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+}
+
+function appendSpawnLog(taskDir, state, header, text) {
+  const dir = path.join(taskDir, 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${state}.log`);
+  fs.appendFileSync(file, `----- ${header} -----\n${text || ''}\n\n`);
+}
+
+// Spawns one real command for `state`, journals {state, argv (first 6 tokens), exit, ms} as a
+// 'spawn' event, appends its stdout (falling back to stderr) to journal/<id>/logs/<STATE>.log,
+// and returns the full result for the caller to interpret. The one place every real command in
+// this file actually runs.
+function spawnStep(ctx, deps, state, command, args, opts = {}) {
+  const start = Date.now();
+  const result = runSync(deps, command, args, opts);
+  const ms = Date.now() - start;
+
+  let exit;
+  if (result && result.error) exit = -1;
+  else exit = result.status === null || result.status === undefined ? 1 : result.status;
+
+  const stdout = (result && result.stdout) || '';
+  const stderr = (result && result.stderr) || '';
+  const tail = lastLines(stdout || stderr);
+
+  appendEvent(ctx.taskDir, state, 'spawn', { argv: [command, ...args].slice(0, 6), exit, ms });
+  appendSpawnLog(ctx.taskDir, state, [command, ...args].join(' '), stdout || stderr);
+
+  return { exit, stdout, stderr, stdoutTail: tail, ms };
+}
+
+function readJsonSafe(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function splitLines(text) {
+  return (text || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+// ---- WORKTREE ------------------------------------------------------------------------------
+//
+// fetch origin -> refuse if the nightly says main is red -> `git worktree add` off origin/main
+// -> `npm ci` (a product worktree carries no node_modules) -> THEN claim the card
+// (`npm run board:take`). Claim runs last, from inside the fresh worktree, because the npm
+// aliases need a product cwd and the human's main SPO-WebClient checkout must never run them --
+// see orchestrator/README.md "Real scripted steps" for the rationale in full.
+async function realWorktree(ctx, deps = {}) {
+  const config = ctx.config;
+  const productRepo = config.productRepo;
+  const worktreesDir = config.pipelineWorktreesDir;
+  const taskId = ctx.id;
+  const issue = ctx.task && ctx.task.issue;
+  const branch = `claude-pipe/${taskId}`;
+  const worktreePath = path.join(worktreesDir, taskId);
+
+  const fetch = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'fetch', 'origin']);
+  if (fetch.exit !== 0) throw new ParkSignal('worktree-fetch-failed', { exit: fetch.exit });
+
+  const revParse = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'rev-parse', 'origin/main']);
+  if (revParse.exit !== 0) throw new ParkSignal('worktree-rev-parse-failed', { exit: revParse.exit });
+  const originMainSha = revParse.stdout.trim();
+
+  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
+  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+    throw new ParkSignal('nightly-main-red', { sha: originMainSha });
+  }
+
+  fs.mkdirSync(worktreesDir, { recursive: true });
+  const add = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+    '-C',
+    productRepo,
+    'worktree',
+    'add',
+    worktreePath,
+    '-b',
+    branch,
+    'origin/main',
+  ]);
+  if (add.exit !== 0) throw new ParkSignal('worktree-add-failed', { exit: add.exit });
+
+  // Every later real step (CHECK/PUSH_PR/GATE/... and PLAN/IMPLEMENT via config.cwdForStep)
+  // reads this back off ctx.task -- the one place a fresh worktree's path becomes known.
+  ctx.task.worktreePath = worktreePath;
+  ctx.task.branch = branch;
+
+  const ci = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['ci'], { cwd: worktreePath });
+  if (ci.exit !== 0) throw new ParkSignal('worktree-npm-ci-failed', { exit: ci.exit });
+
+  const claim = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['run', 'board:take', '--', String(issue)], {
+    cwd: worktreePath,
+  });
+  if (claim.exit === 0) return 'PLAN';
+  if (claim.exit === 3) throw new ParkSignal('claim-lost', { exit: claim.exit });
+  if (claim.exit === 4 || claim.exit === 5) throw new ParkSignal('claim-rate-limited', { exit: claim.exit });
+  if (claim.exit === 6) throw new ParkSignal('claim-finished-worktree', { exit: claim.exit });
+  throw new ParkSignal('claim-unrecognized-exit', { exit: claim.exit });
+}
+
+// ---- CHECK ---------------------------------------------------------------------------------
+//
+// typecheck, lint, coverage:changed, in that order, in the worktree; the first non-zero exit
+// names its own alias and goes to DIAGNOSE (never PARKED -- matches the shadow-mode contract).
+const CHECK_ALIASES = ['typecheck', 'lint', 'coverage:changed'];
+
+async function realCheck(ctx, deps = {}) {
+  const worktreePath = ctx.task.worktreePath;
+  for (const alias of CHECK_ALIASES) {
+    const r = spawnStep(ctx, deps, 'CHECK', 'npm', ['run', alias], { cwd: worktreePath });
+    if (r.exit !== 0) {
+      appendEvent(ctx.taskDir, 'CHECK', 'check-failed', { alias, exit: r.exit });
+      return 'DIAGNOSE';
+    }
+  }
+  return 'PUSH_PR';
+}
+
+// ---- PUSH_PR --------------------------------------------------------------------------------
+
+function commitMessage(ctx) {
+  const title = (ctx.task && ctx.task.title) || `Card #${ctx.task && ctx.task.issue}`;
+  const issue = ctx.task && ctx.task.issue;
+  return `${title}\n\nCloses #${issue}\n`;
+}
+
+function prBody(ctx) {
+  const issue = ctx.task && ctx.task.issue;
+  return [`Closes #${issue}`, '', `_pipeline: claude-pipe/${ctx.id}_`, ''].join('\n');
+}
+
+function parsePrNumber(stdout) {
+  const m = (stdout || '').match(/\/pull\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+async function realPushPr(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+  const title = (ctx.task && ctx.task.title) || `Card #${ctx.task && ctx.task.issue}`;
+  const branch = (ctx.task && ctx.task.branch) || `claude-pipe/${ctx.id}`;
+
+  const messageFile = path.join(ctx.taskDir, 'commit-message.txt');
+  fs.writeFileSync(messageFile, commitMessage(ctx));
+
+  const add = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'add', '-A']);
+  if (add.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'add', exit: add.exit });
+
+  const commit = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'commit', '-F', messageFile]);
+  if (commit.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit });
+
+  const push = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'push', '-u', 'origin', branch]);
+  if (push.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'push', exit: push.exit });
+
+  const bodyFile = path.join(ctx.taskDir, 'pr-body.md');
+  fs.writeFileSync(bodyFile, prBody(ctx));
+
+  const create = spawnStep(ctx, deps, 'PUSH_PR', 'gh', [
+    'pr',
+    'create',
+    '--repo',
+    config.ghRepo,
+    '--title',
+    title,
+    '--body-file',
+    bodyFile,
+  ]);
+  if (create.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'pr-create', exit: create.exit });
+
+  const prNumber = parsePrNumber(create.stdout);
+  if (!prNumber) {
+    throw new ParkSignal('push-pr-failed', { step: 'pr-number-unparsed', stdoutTail: create.stdoutTail });
+  }
+  ctx.prNumber = prNumber;
+  appendEvent(ctx.taskDir, 'PUSH_PR', 'pr-created', { prNumber });
+
+  return 'GATE';
+}
+
+// ---- GATE -----------------------------------------------------------------------------------
+//
+// `npm run gate`: 0 PASS -> CI_CHECKS, 1 fail -> DIAGNOSE, 2 dirty / 3 worker down / 4 timeout
+// -> PARKED. Mirrors handleGate's own shadow-mode cause table exactly.
+async function realGate(ctx, deps = {}) {
+  const worktreePath = ctx.task.worktreePath;
+  const r = spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate'], { cwd: worktreePath });
+  if (r.exit === 0) return 'CI_CHECKS';
+  if (r.exit === 1) return 'DIAGNOSE';
+  if (r.exit === 2) throw new ParkSignal('gate-dirty-tree', { exit: r.exit });
+  if (r.exit === 3) throw new ParkSignal('gate-worker-down', { exit: r.exit });
+  if (r.exit === 4) throw new ParkSignal('gate-timeout', { exit: r.exit });
+  throw new ParkSignal('gate-unrecognized-exit', { exit: r.exit });
+}
+
+// ---- CI_CHECKS ------------------------------------------------------------------------------
+//
+// (a) read the check-runs for HEAD via `gh api`, map the one failing name through the shared
+//     ci-cause-table.js (the same table handleCiChecks' shadow-fixture path uses).
+// (b) only if (a) was green: the main-moved test -- baseMain from the bench's own verdict for
+//     this HEAD sha, intersect what origin/main touched since baseMain with what the branch
+//     itself touched; non-empty -> merge origin/main and re-CHECK (once; the nightly-red and
+//     "already used" guards mirror handleCiChecks' shadow-mode ones exactly).
+async function gitRevParse(ctx, deps, worktreePath, ref) {
+  const r = spawnStep(ctx, deps, 'CI_CHECKS', 'git', ['-C', worktreePath, 'rev-parse', ref]);
+  if (r.exit !== 0) throw new ParkSignal('ci-checks-rev-parse-failed', { ref, exit: r.exit });
+  return r.stdout.trim();
+}
+
+const CI_GREEN_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
+
+async function realCiChecks(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+
+  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
+
+  const checkRuns = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
+    'api',
+    `repos/${config.ghRepo}/commits/${headSha}/check-runs`,
+  ]);
+  if (checkRuns.exit !== 0) throw new ParkSignal('ci-checks-read-failed', { exit: checkRuns.exit });
+
+  const parsed = (() => {
+    try {
+      return JSON.parse(checkRuns.stdout);
+    } catch {
+      return null;
+    }
+  })();
+  const runs = parsed && Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
+  const checks = runs.map((r) => ({ name: r.name, conclusion: r.conclusion }));
+  const failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion));
+
+  if (failing) {
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failing.name });
+    const outcome = classifyCiFailure(failing.name);
+    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failing.name });
+    return outcome.nextState;
+  }
+  appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-green', { headSha, checks });
+
+  const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
+  const baseMain = verdict && verdict.baseMain;
+  if (!baseMain) return 'VALIDATE'; // nothing recorded to compare against -- treat as not moved
+
+  const diffMain = spawnStep(ctx, deps, 'CI_CHECKS', 'git', [
+    '-C',
+    worktreePath,
+    'diff',
+    '--name-only',
+    `${baseMain}..origin/main`,
+  ]);
+  const diffBranch = spawnStep(ctx, deps, 'CI_CHECKS', 'git', [
+    '-C',
+    worktreePath,
+    'diff',
+    '--name-only',
+    'origin/main...HEAD',
+  ]);
+
+  const filesMain = new Set(splitLines(diffMain.stdout));
+  const filesBranch = splitLines(diffBranch.stdout);
+  const moved = filesBranch.some((f) => filesMain.has(f));
+
+  if (!moved) return 'VALIDATE';
+
+  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
+  const originMainSha = await gitRevParse(ctx, deps, worktreePath, 'origin/main');
+  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+    throw new ParkSignal('main-red-no-merge', {});
+  }
+  if (ctx.counters.mainMoveUsed) {
+    throw new ParkSignal('main-moved-twice', {});
+  }
+  ctx.counters.mainMoveUsed = true;
+
+  const merge = spawnStep(ctx, deps, 'CI_CHECKS', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
+  if (merge.exit !== 0) throw new ParkSignal('main-moved-merge-failed', { exit: merge.exit });
+
+  appendEvent(ctx.taskDir, 'CI_CHECKS', 'main-moved-merge', {});
+  return 'CHECK';
+}
+
+// ---- MERGE ----------------------------------------------------------------------------------
+//
+// `gh pr merge --merge` enqueues (never --delete-branch -- see orchestrator/README.md); then
+// `npm run pr:wait`, with exactly one bounded re-wait on "still open" (exit 4), matching
+// handleMerge's own shadow-mode logic.
+async function realMerge(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+  const prNumber = ctx.prNumber;
+
+  const enqueue = spawnStep(ctx, deps, 'MERGE', 'gh', [
+    'pr',
+    'merge',
+    String(prNumber),
+    '--repo',
+    config.ghRepo,
+    '--merge',
+  ]);
+  appendEvent(ctx.taskDir, 'MERGE', 'pr-merge-enqueue', { exit: enqueue.exit });
+  if (enqueue.exit !== 0) throw new ParkSignal('pr-merge-enqueue-failed', { exit: enqueue.exit });
+
+  const w1 = spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', String(prNumber)], { cwd: worktreePath });
+  appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 1, exit: w1.exit });
+  if (w1.exit === 0) return 'FINISH';
+  if (w1.exit === 1) throw new ParkSignal('pr-closed-unmerged', { exit: w1.exit });
+  if (w1.exit === 4) {
+    const w2 = spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', String(prNumber)], { cwd: worktreePath });
+    appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 2, exit: w2.exit, bounded: true });
+    if (w2.exit === 0) return 'FINISH';
+    throw new ParkSignal('merge-queue-not-landing', { lastExit: w2.exit });
+  }
+  throw new ParkSignal('pr-wait-unrecognized-exit', { exit: w1.exit });
+}
+
+// ---- FINISH ---------------------------------------------------------------------------------
+//
+// Board sync (Done + a short comment) runs from the worktree cwd, exactly like WORKTREE's claim
+// -- the same "npm aliases need a product cwd" rule -- and BEFORE the worktree is removed.
+function finalComment(ctx) {
+  const lines = [`Merged via claude-pipe/${ctx.id}.`];
+  if (ctx.prNumber) lines.push(`PR #${ctx.prNumber}.`);
+  lines.push('Pipeline run complete.');
+  return lines.join('\n') + '\n';
+}
+
+function sumJournalCost(taskDir) {
+  const file = path.join(taskDir, 'journal.jsonl');
+  if (!fs.existsSync(file)) return 0;
+  let total = 0;
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    if (!line) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event.event === 'llm-call' && typeof event.costUsd === 'number') total += event.costUsd;
+    } catch {
+      // malformed line -- skip, never fail FINISH over a journal read
+    }
+  }
+  return total;
+}
+
+async function realFinish(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+  const issue = ctx.task && ctx.task.issue;
+
+  const move = spawnStep(ctx, deps, 'FINISH', 'npm', ['run', 'board:move', '--', String(issue), 'Done'], {
+    cwd: worktreePath,
+  });
+  if (move.exit !== 0) throw new ParkSignal('finish-failed', { step: 'board-move', exit: move.exit });
+
+  const commentFile = path.join(ctx.taskDir, 'final-comment.md');
+  fs.writeFileSync(commentFile, finalComment(ctx));
+  const comment = spawnStep(ctx, deps, 'FINISH', 'gh', [
+    'issue',
+    'comment',
+    String(issue),
+    '--repo',
+    config.ghRepo,
+    '--body-file',
+    commentFile,
+  ]);
+  if (comment.exit !== 0) throw new ParkSignal('finish-failed', { step: 'issue-comment', exit: comment.exit });
+
+  const remove = spawnStep(ctx, deps, 'FINISH', 'git', [
+    '-C',
+    config.productRepo,
+    'worktree',
+    'remove',
+    '--force',
+    worktreePath,
+  ]);
+  if (remove.exit !== 0) throw new ParkSignal('finish-failed', { step: 'worktree-remove', exit: remove.exit });
+
+  const costUsd = sumJournalCost(ctx.taskDir);
+  appendEvent(ctx.taskDir, 'FINISH', 'finished', { issue, prNumber: ctx.prNumber || null, costUsd });
+
+  return 'DONE';
+}
+
+module.exports = {
+  runScripted,
+  sleep,
+  lastLines,
+  spawnStep,
+  realWorktree,
+  realCheck,
+  realPushPr,
+  realGate,
+  realCiChecks,
+  realMerge,
+  realFinish,
+};

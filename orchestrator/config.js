@@ -4,6 +4,7 @@
 // Every field here can be overridden by a daemon.js CLI flag (see orchestrator/README.md).
 
 const path = require('path');
+const os = require('os');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -55,6 +56,26 @@ module.exports = {
   // see orchestrator/accounts.js. Git-ignored (claude-accounts/ in .gitignore) -- a missing
   // registry here is not an error, accounts.js falls back to one implicit default account.
   claudeAccountsDir: path.join(REPO_ROOT, 'claude-accounts'),
+
+  // ---- real-mode scripted steps (steps/scripted.js) --------------------------------------
+  //
+  // The product checkout every WORKTREE/CHECK/PUSH_PR/GATE/CI_CHECKS/MERGE/FINISH real command
+  // runs against or from. Always this literal join, never a relative "../SPO-WebClient" --
+  // see CLAUDE.md's own warning that ".." resolves differently from inside a worktree.
+  productRepo: path.join(os.homedir(), 'SPO-WebClient'),
+
+  // Where WORKTREE creates one `git worktree add` per task (<dir>/<taskId>). Gitignored
+  // (worktrees/ in .gitignore) -- disposable, FINISH removes its own entry with
+  // `git worktree remove --force`.
+  pipelineWorktreesDir: path.join(REPO_ROOT, 'worktrees'),
+
+  // owner/repo for every `gh api` / `gh pr` / `gh issue` real call.
+  ghRepo: 'Crazz-Org/SPO-WebClient',
+
+  // Local surfaces this build reads instead of polling GitHub/the bench for state that already
+  // has one: ~/.spo-bench/nightly/latest.json (WORKTREE's/CI_CHECKS' nightly-red refusal) and
+  // ~/.spo-bench/verdicts/<sha>.json (CI_CHECKS' baseMain, for the main-moved intersection).
+  spoBenchDir: path.join(os.homedir(), '.spo-bench'),
 
   REPO_ROOT,
   cwdForStep,
