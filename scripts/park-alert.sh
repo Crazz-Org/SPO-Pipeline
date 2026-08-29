@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# The default SPO_PARK_ALERT_CMD: what the daemon runs when a task parks.
+# The default SPO_PARK_ALERT_CMD: what the daemon runs when a task parks, and (reused, via
+# orchestrator/park-alert.js's alertDaemon) what orchestrator/report-intake.js runs when a raw
+# bug-report card cannot be safely left unattended (a failed move to the intake column, most
+# notably -- see report-intake.js's own header on why that specific failure is not safe to
+# ignore).
 #
-#   park-alert.sh <taskId> <reason> <lastState>
+#   park-alert.sh <id> <reason> <lastState> [kind]      kind defaults to PARKED (backward
+#                                                        compatible with every existing 3-arg
+#                                                        spawn) -- report-intake.js passes INTAKE
 #
-# orchestrator/park-alert.js spawns this with a 10 s timeout and treats a non-zero exit as
-# `park-alert-failed` in the journal. So this script has exactly two obligations: be FAST, and
+# orchestrator/park-alert.js's alertDaemon spawns this with a 10 s timeout and treats a non-zero
+# exit as a failure event in the journal. So this script has exactly two obligations: be FAST, and
 # never fail. Every channel below is best-effort and independently optional; the script always
 # exits 0, even when every one of them is unavailable.
 #
@@ -27,9 +33,10 @@ set -u
 task_id="${1:-?}"
 reason="${2:-?}"
 last_state="${3:-?}"
+kind="${4:-PARKED}"
 
 stamp="$(date -Is)"
-line="$stamp  PARKED  $task_id  reason=$reason  lastState=$last_state"
+line="$stamp  $kind  $task_id  reason=$reason  lastState=$last_state"
 
 # --- 1. the log, always ------------------------------------------------------------------
 log="${SPO_PARK_LOG:-$HOME/.spo-parks.log}"

@@ -7,7 +7,9 @@
   profile, dedup by anchorKey, size/categorize. This step stops short of filing: it drafts, or
   reports why it cannot, and the caller runs the draft through the same review-card gate every
   other card here gets (prompts/review-card.md) before anything is filed.
-  Placeholders: {{report_file}} {{product_repo}} {{repo}} {{today}}
+  Placeholders: {{report_file}} {{product_repo}} {{repo}} {{today}} {{self_issue}}
+                ({{self_issue}} is this report's OWN raw-intake card, filed mechanically before
+                this step ever ran -- see § 3, exclude it from the dedup search)
   Output — stdout, JSON only, nothing else. Exactly one of:
   { "outcome": "schema-version", "found": "<version found in the report>",
     "expected": "<BUG_REPORT_SCHEMA_VERSION read from src/shared/bug-report-schema.ts>" }
@@ -36,11 +38,19 @@ report_file:  {{report_file}}
 product_repo: {{product_repo}}
 repo:         {{repo}}
 today:        {{today}}
+self_issue:   {{self_issue}}
 ```
 
 `{{report_file}}` is one JSON file under `~/.spo-reports`. Read it — you were given its path, not
 its contents, because the shape belongs to `{{product_repo}}`, not to this prompt: read it fresh
 from `src/shared/bug-report-schema.ts` inside `{{product_repo}}`, never assume a shape here.
+
+**A maintainer has already read this report.** It reached you only because a human read it in
+its raw, unprocessed form (`gh issue #{{self_issue}}` — the mechanical intake card, rendered by
+`npm run report:card` with no LLM involved) and replied "confirm", asking for it to be pursued.
+Whether this is *worth* filing is therefore already settled — your job is reproduction and
+routing, not re-litigating whether the report deserves attention. See § 1 below on what this
+does and does not change about the reproduction bar itself.
 
 ## 0 · Schema version — refuse rather than guess
 
@@ -63,6 +73,15 @@ Not reproduced (the evidence does not support the claim, or is too thin to judge
 the report itself is missing the pieces it should carry (no `journal`, no `anchor`, mobile with no
 `geometry`); `not-reproduced` when the evidence is present but does not show the claimed defect.
 Never file a card that says "could not reproduce" — the claimer would start from nothing.
+
+**A `mobile`/`visual` report is a defect like any other one** — an unusable control, an
+unreachable target, data rendered where it cannot be read. Do not import "this is only about
+appearance, not a real bug" from your own priors: `not-reproduced` means **the evidence
+contradicts the claim** (the geometry shows a 48 px target when the report claims undersized, the
+log shows the frame never arrived) — never "this is cosmetic" or "this is a preference". If the
+`geometry` block is present, apply the predicates and report what they say, with the figures,
+whether they agree with the reporter or not; if it is absent on a `mobile` report, that is
+`insufficient`, not `not-reproduced`.
 
 ## 2 · Route on `profile`
 
@@ -102,10 +121,14 @@ geometry disagree, the numbers are the evidence and the picks are the symptom �
 gh issue list --repo {{repo}} --state all --search "anchorKey: <the report's anchorKey> in:body" --json number,title
 ```
 
-A match: stop, reply `{"outcome": "duplicate", "issue_number": <N>, "comment_markdown": "<the
-occurrence note>"}` — `comment_markdown` names the new occurrence (its date, its profile, what
-differed). Never propose a field edit or a status move on the matched issue; that is not your
-call and not the driver's either.
+**The search will match issue `{{self_issue}}`** — that is this report's own raw-intake card
+(see the Payload section above), filed mechanically before you ever ran. Exclude it. A match on
+any OTHER issue number is a real duplicate.
+
+A match (other than `{{self_issue}}`): stop, reply `{"outcome": "duplicate", "issue_number": <N>,
+"comment_markdown": "<the occurrence note>"}` — `comment_markdown` names the new occurrence (its
+date, its profile, what differed). Never propose a field edit or a status move on the matched
+issue; that is not your call and not the driver's either.
 
 No match: continue to drafting. The draft's `body_markdown` **must embed** the anchor key as a
 greppable marker, exactly:

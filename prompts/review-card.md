@@ -6,6 +6,7 @@
   checks, JSON output instead of a prose block.
   Placeholders: {{card_title}} {{card_body}} {{card_category}} {{card_size}} {{card_area}}
                 {{repo}}  (defaults to "Crazz-Org/SPO-WebClient" for this pipeline)
+                {{human_confirmed}}  "yes" | "no" -- see § 0
   Output — stdout, JSON only, nothing else:
   {
     "verdict": "FILE" | "FILE_AMENDED" | "DO_NOT_FILE",
@@ -29,12 +30,13 @@ finding up or a hard one down.
 ## Payload
 
 ```
-title:    {{card_title}}
-body:     {{card_body}}
-category: {{card_category}}
-size:     {{card_size}}
-area:     {{card_area}}
-repo:     {{repo}}
+title:            {{card_title}}
+body:             {{card_body}}
+category:         {{card_category}}
+size:              {{card_size}}
+area:              {{card_area}}
+repo:              {{repo}}
+human_confirmed:  {{human_confirmed}}    "yes" | "no" -- see § 0
 ```
 
 This is the **draft card, verbatim, as it would be filed** — title, body, category, size, area.
@@ -47,12 +49,28 @@ claimer's.
 ### 0 · A bug report enters confirmed, or not at all
 
 This pre-check applies when the draft's source is a **bug report** (a player report, the
-in-game reporter, the `/triage-report` queue) — maintainer decision, 2026-08-29:
+in-game reporter, the `/triage-report` queue, or SPO-Pipeline's automated triage of the
+`~/.spo-reports` queue) — maintainer decision, 2026-08-29, re-scoped 2026-08-30 (see the
+`human_confirmed` payload field above):
 
 - The defect must be **confirmed**: a reproduction the body describes precisely enough to
   replay, or verifiable visual evidence (data displayed in the wrong place, an unusable or
   unreachable control). UI/ergonomics and data-display problems are full-fledged defects —
-  confirmation is the bar, not severity.
+  confirmation is the bar, not severity. This holds **regardless of `human_confirmed`** — it is
+  never yours to soften.
+
+**`human_confirmed: yes`:** a maintainer has already read this report in its raw, unprocessed
+form (before any reproduction or classification ran) and explicitly replied "confirm" asking
+for it to be pursued. Desirability is settled — it is not yours to re-open. A report with no
+objective malfunction is then a `category` correction (`feature` or `observation`), delivered
+as `FILE_AMENDED`, **never** `DO_NOT_FILE` on desirability grounds. `DO_NOT_FILE` remains
+available, but only for checks 1–2 below (the claim does not hold against the code, or it is a
+duplicate / already fixed) — never for "this is only a preference", since a human already
+judged that question before you ever saw it.
+
+**`human_confirmed: no`** (every other caller — `spo ask`, `/SPO-Draft`, `spo pull`'s review of
+a board candidate):
+
 - A preference with no objective malfunction — the player "doesn't like it", wants different
   behaviour with nothing demonstrably broken — is **`DO_NOT_FILE`**, and
   `first_comment_markdown` names the missing criterion: no reproduction, and no deviation

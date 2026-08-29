@@ -13,7 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { COLUMN_BY_STATE, moveCard } = require('../orchestrator/board');
+const { COLUMN_BY_STATE, moveCard, moveIssueToColumn } = require('../orchestrator/board');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
 
@@ -132,6 +132,27 @@ test('moveCard: a failing board:move exit is journaled but never blocks (never t
 
   const journal = readJournal(ctx.taskDir);
   assert.ok(journal.some((e) => e.event === 'board-move-failed' && e.column === 'Merging' && e.exit === 1));
+});
+
+// ---- moveIssueToColumn: the ctx/taskDir-free sibling for report-intake.js/auto-triage.js -----
+
+test('moveIssueToColumn: spawns npm run board:move -- <issue> <column> with the given cwd, returns {ok: true}', () => {
+  let seen = null;
+  const deps = { spawnSync: (command, args, opts) => { seen = { command, args, opts }; return ok(''); } };
+
+  const result = moveIssueToColumn(707, 'Intake', deps, { cwd: '/fake/product-repo' });
+
+  assert.equal(result.ok, true);
+  assert.equal(seen.command, 'npm');
+  assert.deepEqual(seen.args, ['run', 'board:move', '--', '707', 'Intake']);
+  assert.equal(seen.opts.cwd, '/fake/product-repo');
+});
+
+test('moveIssueToColumn: a failing exit returns {ok: false, exit} -- never throws, no journal (caller\'s job)', () => {
+  const deps = { spawnSync: () => fail(4) };
+  const result = moveIssueToColumn(707, 'Intake', deps, { cwd: '/fake/product-repo' });
+  assert.equal(result.ok, false);
+  assert.equal(result.exit, 4);
 });
 
 // ---- HANDLERS.IMPLEMENT / HANDLERS.VALIDATE, real mode: moveCard fires before the LLM call ---

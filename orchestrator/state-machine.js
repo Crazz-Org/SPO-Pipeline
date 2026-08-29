@@ -46,6 +46,7 @@ const { postParkComment, unparkScan } = require('./park-loop');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 const { shouldAutoTriage, runAutoTriage } = require('./auto-triage');
+const { shouldAutoIntake, shouldScanConfirms, runReportIntake, reportConfirmScan } = require('./report-intake');
 
 // True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
 // condition under which a scripted step's handler dispatches to steps/scripted.js's real
@@ -629,15 +630,18 @@ async function drainQueueOnce(queueDir, journalRoot, config) {
 
 // Polls the queue directory forever, draining whatever has arrived since the last pass. Used
 // by `daemon.js` when --once is not given; not exercised by the test suite (which always runs
-// --shadow --once against a fully-prepared queue), same as before this function grew two more
-// real-mode-only calls -- park-loop.js's unparkScan (kanban piloting's retry/abandon
-// round trip), auto-pull.js's timed board pull, and auto-triage.js's timed bug-report-queue
-// triage, each individually unit-tested against injected deps elsewhere (test/park-loop.test.js,
-// test/auto-pull.test.js, test/auto-triage.test.js). config.real gates all three the same way
-// isRealMode(ctx) gates everything else real in this file; config.deps is the same injection
-// point buildCtx already threads through HANDLERS.
+// --shadow --once against a fully-prepared queue), same as before this function grew four more
+// real-mode-only calls -- park-loop.js's unparkScan (kanban piloting's retry/abandon round
+// trip), auto-pull.js's timed board pull, and the human-first bug-report intake pair
+// (report-intake.js's runReportIntake/reportConfirmScan, auto-triage.js's runAutoTriage), each
+// individually unit-tested against injected deps elsewhere (test/park-loop.test.js,
+// test/auto-pull.test.js, test/report-intake.test.js, test/auto-triage.test.js). config.real
+// gates all of them the same way isRealMode(ctx) gates everything else real in this file;
+// config.deps is the same injection point buildCtx already threads through HANDLERS.
 async function runForever(queueDir, journalRoot, config) {
   let lastAutoPullAt = null;
+  let lastAutoIntakeAt = null;
+  let lastConfirmScanAt = null;
   let lastAutoTriageAt = null;
   for (;;) {
     await drainQueueOnce(queueDir, journalRoot, config);
@@ -655,14 +659,29 @@ async function runForever(queueDir, journalRoot, config) {
         await runAutoPull(queueDir, journalRoot, config, deps);
       }
 
-      // Independent of auto-pull -- auto-triage files GitHub issues (like `spo ask`), it never
-      // touches queue/ itself. config.autoTriageMs defaults to 0 (disabled) -- see config.js's
-      // own comment for why this is not symmetric with autoPullMs's nonzero default. A report
-      // filed this cycle becomes an ordinary Todo card the *next* auto-pull cycle picks up
-      // later -- the "player report -> nightly fix" chain README.md's migration step 5 names.
+      // Human-first bug-report intake, three independent timers -- see report-intake.js's own
+      // header and orchestrator/README.md § Report intake for the full design:
+      //   1. runReportIntake  -- mechanical (zero LLM). Files a RAW card per queued report and
+      //      waits for a maintainer's "confirm"/"discard" reply. Nonzero by default
+      //      (config.autoIntakeMs), same risk class as auto-pull.
+      //   2. reportConfirmScan -- reads that reply. Nonzero by default (reportConfirmScanMs).
+      //   3. runAutoTriage -- reproduction + the reviewCard/fileCard-shaped gate, but ONLY for a
+      //      report reportConfirmScan already marked "confirmed". config.autoTriageMs keeps its
+      //      pre-redesign name/env var (SPO_AUTO_TRIAGE_MS) so the live systemd drop-in needs no
+      //      change; a report filed here becomes an ordinary Todo card the *next* auto-pull
+      //      cycle picks up -- the "player report -> nightly fix" chain README.md's migration
+      //      step 5 names.
+      if (shouldAutoIntake(lastAutoIntakeAt, now, config.autoIntakeMs)) {
+        lastAutoIntakeAt = now;
+        await runReportIntake(journalRoot, config, deps);
+      }
+      if (shouldScanConfirms(lastConfirmScanAt, now, config.reportConfirmScanMs)) {
+        lastConfirmScanAt = now;
+        await reportConfirmScan(journalRoot, config, deps);
+      }
       if (shouldAutoTriage(lastAutoTriageAt, now, config.autoTriageMs)) {
         lastAutoTriageAt = now;
-        await runAutoTriage(config.spoReportsDir, journalRoot, config, deps);
+        await runAutoTriage(journalRoot, config, deps);
       }
     }
 

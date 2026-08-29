@@ -46,24 +46,36 @@
 //                            queue/<seq>-issue-<n>.json task file for each of the top N
 //                            claimable candidates (default 5), skipping one already queued or
 //                            journaled. See orchestrator/intake.js.
-//   spo triage [--limit N] [--reports-dir <dir>] [--file]
-//                            Reads the webclient's bug-report queue (~/.spo-reports, or
-//                            --reports-dir/SPO_REPORTS_DIR) and reproduces/routes/dedups/drafts
-//                            each of the top N reports (default 3) via
-//                            orchestrator/intake.js's triageBugReport, then the SAME
-//                            reviewCard/fileCard gate `spo ask` uses. A report that fails
-//                            mechanically stays queued for the next run. Never runs daemon.js.
-//                            Defaults to --dry (prints what would happen -- drafts, verdicts,
-//                            duplicates -- and touches neither GitHub nor the queue); pass --file
-//                            to actually file/comment/archive. See orchestrator/README.md
-//                            § Auto-triage for why this defaults to dry-run.
+//   Human-first bug-report intake -- see orchestrator/README.md § Report intake for the full
+//   design. No LLM ever looks at a report until a maintainer has read it RAW and replied
+//   "confirm" on the issue -- three commands, one per stage:
+//   spo intake [--limit N] [--reports-dir <dir>]
+//                            Stage 1, MECHANICAL (zero LLM calls): renders each queued report
+//                            (~/.spo-reports, or --reports-dir/SPO_REPORTS_DIR) via SPO-WebClient's
+//                            `npm run report:card`, dedups it by anchorKey (a grep, not a
+//                            judgement), files a RAW card labeled report:raw, moves it to the
+//                            "Intake" board column, and posts confirm/discard instructions. See
+//                            orchestrator/report-intake.js.
+//   spo reports [--reports-dir <dir>]
+//                            Lists what is waiting in <reports-dir>/pending/ for a maintainer's
+//                            "confirm"/"discard" reply -- the intake analogue of `spo parked`.
+//   spo triage [--limit N] [--file]
+//                            Stage 3+: reproduces/routes/drafts every report already replied
+//                            "confirm" to, via orchestrator/intake.js's triageBugReport, then the
+//                            SAME reviewCard gate `spo ask` uses, then intake.amendCard (edits the
+//                            raw card in place -- never files a second issue). A report that fails
+//                            mechanically, or whose reproduction does not confirm it, is HELD
+//                            (commented, never silently dropped) -- see orchestrator/README.md
+//                            § Auto-triage. Defaults to --dry; pass --file to actually act.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
 // Flags (accounts commands + dashboard): --accounts-dir <dir>  (default: the account pool --
 //   see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
 // Flags (ask): --dry  --draft-file <path>
 // Flags (pull): --limit <n>  (default 5)
-// Flags (triage): --limit <n>  (default 3)  --reports-dir <dir>  --file (actually file; default dry-run)
+// Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>
+// Flags (reports): --reports-dir <dir>
+// Flags (triage): --limit <n>  (default 3)  --file (actually act; default dry-run)
 
 const fs = require('fs');
 const path = require('path');
@@ -74,6 +86,7 @@ const accounts = require('../orchestrator/accounts');
 const defaultConfig = require('../orchestrator/config');
 const intake = require('../orchestrator/intake');
 const autoTriage = require('../orchestrator/auto-triage');
+const reportIntake = require('../orchestrator/report-intake');
 const { costReport } = require('../orchestrator/cost');
 
 function parseArgs(argv) {
@@ -521,26 +534,70 @@ async function cmdPull(opts, deps = {}) {
   }
 }
 
-// `spo triage [--limit N] [--reports-dir <dir>] [--file]` -- reproduces/routes/dedups/drafts the
-// top N reports in the webclient's bug-report queue via orchestrator/auto-triage.js's
-// runAutoTriage (triageBugReport, then the same reviewCard/fileCard gate `spo ask`/`spo pull`
-// use). Never runs `daemon.js`. Defaults to --dry -- see orchestrator/README.md § Auto-triage for
-// why this command (unlike `spo pull`, which only ever reads) does not default to acting.
-// `deps.autoTriage`: same test-only override convention as `deps.intake` (cmdAsk/cmdPull).
+// `spo intake [--limit N] [--reports-dir <dir>]` -- stage 1 of the human-first bug-report
+// pipeline: mechanically files a RAW card per queued report (zero LLM calls) via
+// orchestrator/report-intake.js's runReportIntake and waits for a maintainer's "confirm"/
+// "discard" reply on the issue. Never runs `daemon.js`. `deps.reportIntake`: same test-only
+// override convention as `deps.intake` (cmdAsk/cmdPull).
+async function cmdIntake(opts, deps = {}) {
+  const reportIntakeImpl = deps.reportIntake || reportIntake;
+  const { journalRoot } = resolveDirs(opts);
+  const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
+  const limit = opts.limit ? Number(opts.limit) : reportIntakeImpl.DEFAULT_AUTO_INTAKE_LIMIT;
+
+  const result = await reportIntakeImpl.runReportIntake(journalRoot, { ...defaultConfig, spoReportsDir: reportsDir, autoIntakeLimit: limit }, {});
+
+  if (result.processed === 0) {
+    console.log(`(no queued reports in ${reportsDir})`);
+    return;
+  }
+  for (const r of result.results) {
+    if (r.outcome === 'filed') console.log(`${r.file}: filed #${r.issueNumber} (${defaultConfig.reportIntakeColumn}) -- reply "confirm"/"discard" on the issue`);
+    else if (r.outcome === 'duplicate') console.log(`${r.file}: duplicate of #${r.issueNumber}`);
+    else if (r.outcome === 'schema-version') console.log(`${r.file}: schema version mismatch (found ${r.found}, expected ${r.expected}) -- left in queue`);
+    else console.log(`${r.file}: error -- ${r.error}`);
+  }
+  console.log('');
+  console.log(`processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  schema-version: ${result.schemaVersion}  errors: ${result.errors.length}`);
+  if (result.errors.length > 0) process.exitCode = 1;
+}
+
+// `spo reports [--reports-dir <dir>]` -- lists what is waiting in <reports-dir>/pending/ (raw
+// cards already filed, awaiting a "confirm"/"discard" reply) -- the intake analogue of
+// `spo parked`. Reads only the filesystem, no `gh` call.
+function cmdReports(opts) {
+  const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
+  const pendingDir = path.join(reportsDir, 'pending');
+  if (!fs.existsSync(pendingDir)) {
+    console.log(`(no pending directory at ${pendingDir})`);
+    return;
+  }
+  const files = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
+  if (files.length === 0) {
+    console.log('(nothing pending)');
+    return;
+  }
+  for (const f of files.sort()) {
+    const stat = fs.statSync(path.join(pendingDir, f));
+    const ageMin = Math.round((Date.now() - stat.mtimeMs) / 60000);
+    console.log(`${f}  waiting ${ageMin}min`);
+  }
+}
+
+// `spo triage [--limit N] [--file]` -- stage 3+ of the human-first bug-report pipeline:
+// reproduces/routes/drafts every report a maintainer has already replied "confirm" to (via `spo
+// reports`/the issue comments -- see orchestrator/report-intake.js) through
+// orchestrator/auto-triage.js's runAutoTriage (triageBugReport, then the same reviewCard gate
+// `spo ask`/`spo pull` use, then intake.amendCard -- edits the raw card in place). Never runs
+// `daemon.js`. Defaults to --dry. `deps.autoTriage`: same test-only override convention as
+// `deps.intake` (cmdAsk/cmdPull).
 async function cmdTriage(opts, deps = {}) {
   const autoTriageImpl = deps.autoTriage || autoTriage;
   const { journalRoot } = resolveDirs(opts);
-  const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
   const limit = opts.limit ? Number(opts.limit) : autoTriageImpl.DEFAULT_AUTO_TRIAGE_LIMIT;
   const dry = !opts.file;
 
-  const result = await autoTriageImpl.runAutoTriage(
-    reportsDir,
-    journalRoot,
-    { autoTriageLimit: limit },
-    {},
-    { dry }
-  );
+  const result = await autoTriageImpl.runAutoTriage(journalRoot, { ...defaultConfig, autoTriageLimit: limit }, {}, { dry });
 
   if (!result.ok) {
     console.error(result.error);
@@ -549,26 +606,21 @@ async function cmdTriage(opts, deps = {}) {
   }
 
   if (result.processed === 0) {
-    console.log(`(no queued reports in ${reportsDir})`);
+    console.log('(no confirmed reports awaiting triage -- see `spo reports`)');
     return;
   }
 
   for (const r of result.results) {
-    if (r.outcome === 'filed') console.log(`${r.file}: filed #${r.issueNumber} -- ${r.url}`);
-    else if (r.outcome === 'would-file') console.log(`${r.file}: would file -- ${r.draft.title}`);
-    else if (r.outcome === 'duplicate') console.log(`${r.file}: duplicate of #${r.issueNumber}`);
-    else if (r.outcome === 'do-not-file') console.log(`${r.file}: do-not-file`);
-    else if (r.outcome === 'error') console.log(`${r.file}: error -- ${r.error}`);
-    else console.log(`${r.file}: ${r.outcome}${r.reason ? ` -- ${r.reason}` : ''}`);
+    if (r.outcome === 'filed') console.log(`#${r.issue}: filed -- ${r.url}`);
+    else if (r.outcome === 'would-file') console.log(`#${r.issue}: would file -- ${r.draft.title}`);
+    else if (r.outcome === 'duplicate' || r.outcome === 'would-duplicate') console.log(`#${r.issue}: duplicate of #${r.issueNumber}`);
+    else if (r.outcome === 'error') console.log(`#${r.issue}: error -- ${r.error}`);
+    else console.log(`#${r.issue}: held (${r.outcome}) -- ${r.reason || ''}`);
   }
 
   console.log('');
-  console.log(
-    `processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  ` +
-      `not-reproduced: ${result.notReproduced}  insufficient: ${result.insufficient}  ` +
-      `schema-version: ${result.schemaVersion}  do-not-file: ${result.doNotFile}  errors: ${result.errors.length}`
-  );
-  if (dry) console.log('(dry run -- nothing filed, nothing archived; pass --file to act)');
+  console.log(`processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  held: ${result.held}  errors: ${result.errors.length}`);
+  if (dry) console.log('(dry run -- nothing filed, nothing archived, nothing commented; pass --file to act)');
 
   if (result.errors.length > 0) process.exitCode = 1;
 }
@@ -576,10 +628,11 @@ async function cmdTriage(opts, deps = {}) {
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull|triage>',
+      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull|intake|reports|triage>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
-      '            triage: [--limit <n>] [--reports-dir <dir>] [--file]   (defaults to --dry)',
+      '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
+      '            triage: [--limit <n>] [--file]   (defaults to --dry)',
     ].join('\n')
   );
 }
@@ -623,6 +676,8 @@ function main() {
   }
   if (cmd === 'ask') return cmdAsk(opts);
   if (cmd === 'pull') return cmdPull(opts);
+  if (cmd === 'intake') return cmdIntake(opts);
+  if (cmd === 'reports') return cmdReports(opts);
   if (cmd === 'triage') return cmdTriage(opts);
 
   printUsage();
@@ -653,4 +708,4 @@ if (require.main === module) {
   run();
 }
 
-module.exports = { parseArgs, cmdAsk, cmdPull, cmdTriage, main };
+module.exports = { parseArgs, cmdAsk, cmdPull, cmdIntake, cmdReports, cmdTriage, main };

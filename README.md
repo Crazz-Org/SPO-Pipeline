@@ -70,10 +70,12 @@ source of truth (same philosophy as `~/.spo-bench/`):
 3. **Real S-sized cards** through the pipeline; measure parking rate and weighted tokens per
    merged card against the baseline.
 4. **Retire** the in-product process prose and hooks as the old path stops being used.
-5. **Extend intake**: `/triage-report` queue first — done (`orchestrator/auto-triage.js` /
-   `spo triage`, opt-in until proven: `spo triage` defaults to `--dry` and the daemon timer
-   stays off until `SPO_AUTO_TRIAGE_MS` is set by hand; see `orchestrator/README.md` §
-   Auto-triage) — then in-game bug reports from production (the far target: player report →
+5. **Extend intake**: `/triage-report` queue first — done, human-first (`orchestrator/
+   report-intake.js` + `orchestrator/auto-triage.js` / `spo intake` → a maintainer's "confirm"
+   reply → `spo triage`): no LLM judges a report until a maintainer has read it raw and asked
+   for it to be pursued -- see `orchestrator/README.md` § "Report intake (human-first bug-report
+   pipeline)" for the full design and why an earlier, fully-unattended version of this was
+   replaced — then in-game bug reports from production (the far target: player report →
    nightly fix → release).
 
 The maintainer's plan (measured baseline, levers, decisions) lives in a Claude artifact;
