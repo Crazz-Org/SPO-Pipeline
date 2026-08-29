@@ -657,6 +657,23 @@ Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` 
 `systemctl --user stop spo-pipeline-daemon.service`. Re-run the installer after pulling
 daemon changes; it rebuilds nothing (no build step) and restarts.
 
+## Park alerting
+
+A park is well recorded (journal event, `state.json`, `report.md`, the gh comment, the board
+move) but every surface has to be gone and looked at. Two push halves close that gap
+(`orchestrator/park-alert.js`):
+
+- every park — any mode — appends one `parked` line to `<journalRoot>/daemon.jsonl`, so that
+  file reads as the single chronological "needs a human" stream (auto-pull cycles, lock
+  takeovers, parks);
+- in real mode, `SPO_PARK_ALERT_CMD` (config `parkAlertCmd`, unset by default) names one
+  executable spawned as `<cmd> <taskId> <reason> <lastState>` per park. The command decides
+  what a park is worth — `notify-send`, an ntfy curl, a reason filter (a self-recovering
+  rate-limit park may not deserve a ping; the soak's parks-by-reason data is what settles
+  that). Same failure policy as `board.js`'s moves: a failed or hung alert (10 s timeout) is
+  journaled (`park-alert-failed`) and never blocks anything — the task is terminal before the
+  alert runs.
+
 ## Where journals live
 
 ```
