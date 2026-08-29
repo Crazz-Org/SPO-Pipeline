@@ -27,6 +27,7 @@ worktrees from the outside.
 | `doc/state-machine-spec.md` | The orchestrator: states, transitions, step contracts, account pool, observability | ✅ v1 |
 | `accounts/spo-test-accounts.yml` | SPO test accounts registry with special accesses (Mayor, ministries, presidential exception) | ✅ |
 | `scripts/usage-report.js` | Token-usage analyzer over local Claude Code transcripts (baseline + per-account later) | ✅ v0 |
+| `scripts/smoke-llm.js` | Manual smoke test: the one real `claude` CLI call through `steps/llm.js`'s real mode — not part of `node --test` | ✅ |
 | `orchestrator/` | The daemon (state machine, queue, workers) — see `orchestrator/README.md` | ✅ v2 skeleton, shadow mode |
 | `bin/spo` | Console CLI: `status` / `task <id>` / `parked`, reads only the journals | ✅ v0 |
 | `test/` | `node --test` suite for the orchestrator, shadow mode, temp queue/journal dirs | ✅ |

@@ -28,6 +28,55 @@ const { ParkSignal } = require('./park-signal');
 const { callWithDeadline } = require('./deadline');
 const { runScripted, sleep } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
+const accounts = require('./accounts');
+
+// ---- LLM step invocation, with account rotation in real mode --------------------------------
+//
+// Shadow mode: identical to calling callWithDeadline(ctx, stepName, () => runLlm(...)) directly
+// -- every existing shadow-mode test asserts on the exact journal/state.json shape that produces,
+// so this branch must stay byte-for-byte what it replaces.
+//
+// Real mode: one pass over the healthy accounts, per state-machine-spec.md § Account pool ("a
+// limit error ... puts the account in cooldown ... and the step retries on the next healthy
+// account"). accounts.pick() already skips cooling accounts; when a call comes back
+// {kind: 'limit'}, this cools that account down (accounts.markLimit, journaled as
+// 'account-cooldown') and asks pick() again for the next one. The loop is bounded to the number
+// of enabled accounts in the registry, so a step can never retry the same account twice or spin
+// forever: once every account has been tried, or pick() itself finds none healthy
+// (AllAccountsCoolingError), the task is PARKED -- the spec's "then PARKED" for this path.
+async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
+  if (ctx.shadowMode) {
+    return callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
+  }
+
+  const accountsDir = ctx.config.claudeAccountsDir;
+  const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
+
+  let result;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let account;
+    try {
+      account = accounts.pick(accountsDir);
+    } catch (err) {
+      if (err instanceof accounts.AllAccountsCoolingError) {
+        throw new ParkSignal(err.reason, err.detail);
+      }
+      throw err;
+    }
+
+    ctx.account = account;
+    result = await callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
+
+    if (!(result && result.ok === false && result.kind === 'limit')) {
+      return result;
+    }
+
+    const event = accounts.markLimit(accountsDir, account.name, result.retryAfterMs);
+    appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
+  }
+
+  throw new ParkSignal('all-accounts-cooling-after-retry', { attempts: maxAttempts, lastResult: result });
+}
 
 // ---- per-state handlers ----------------------------------------------------------------
 
@@ -57,7 +106,7 @@ async function handleWorktree(ctx) {
 }
 
 async function handlePlan(ctx) {
-  const result = await callWithDeadline(ctx, 'PLAN', () => runLlm(ctx, 'PLAN', 'llm.PLAN'));
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN');
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
   if (payload && payload.ok !== false) return 'IMPLEMENT';
@@ -65,7 +114,7 @@ async function handlePlan(ctx) {
 }
 
 async function handleImplement(ctx) {
-  const result = await callWithDeadline(ctx, 'IMPLEMENT', () => runLlm(ctx, 'IMPLEMENT', 'llm.IMPLEMENT'));
+  const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT');
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload });
   if (payload && payload.ok !== false) return 'CHECK';
@@ -141,7 +190,7 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
-  const result = await callWithDeadline(ctx, 'DIAGNOSE', () => runLlm(ctx, 'DIAGNOSE', 'llm.DIAGNOSE'));
+  const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE');
   const attemptN = ++ctx.counters.diagnoseAttempts;
   const rootCause = (result && result.rootCause) || `unspecified-cause-${attemptN}`;
   appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', { attempt: attemptN, rootCause });
@@ -162,16 +211,14 @@ async function handleDiagnose(ctx) {
 // DIAGNOSE's -- a false citation from citation-verifier parks immediately, no budget.
 async function handleValidate(ctx) {
   if (ctx.task.touchesRdoMembers) {
-    const cv = await callWithDeadline(ctx, 'VALIDATE', () =>
-      runLlm(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER')
-    );
+    const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER');
     const verdict = (cv && cv.verdict) || 'PASS';
     appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict });
     if (verdict === 'REJECT') throw new ParkSignal('citation-false', { verdict });
     // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
   }
 
-  const result = await callWithDeadline(ctx, 'VALIDATE', () => runLlm(ctx, 'VALIDATE', 'llm.VALIDATE'));
+  const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE');
   const verdict = result && result.verdict;
   appendEvent(ctx.taskDir, 'VALIDATE', 'change-validator', { verdict, findings: result && result.findings });
 
@@ -240,6 +287,7 @@ function buildCtx(id, task, taskDir, config) {
     config,
     shadowMode: !!config.shadowMode,
     fixture: makeFixtureReader(task),
+    account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     counters: {
       diagnoseAttempts: 0,
       seenRootCauses: new Set(),
@@ -383,4 +431,6 @@ module.exports = {
   takeNextTask,
   drainQueueOnce,
   runForever,
+  callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
+  buildCtx,
 };
