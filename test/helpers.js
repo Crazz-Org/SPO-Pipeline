@@ -26,6 +26,14 @@ function runDaemonOnce(queueDir, journalDir, extraArgs = []) {
   return execFileSync(process.execPath, args, { encoding: 'utf8' });
 }
 
+// Same as runDaemonOnce but real-mode semantics without spawning (--dry-run instead of
+// --shadow) -- see orchestrator/README.md "Real mode" / "--dry-run". Still never touches the
+// real `claude` CLI or any scripted command.
+function runDaemonDryRun(queueDir, journalDir, extraArgs = []) {
+  const args = [DAEMON, '--dry-run', '--once', '--queue', queueDir, '--journal', journalDir, ...extraArgs];
+  return execFileSync(process.execPath, args, { encoding: 'utf8' });
+}
+
 function runSpo(args) {
   return execFileSync(process.execPath, [SPO_BIN, ...args], { encoding: 'utf8' });
 }
@@ -56,6 +64,7 @@ module.exports = {
   mkTmp,
   writeTask,
   runDaemonOnce,
+  runDaemonDryRun,
   runSpo,
   readJournal,
   readState,

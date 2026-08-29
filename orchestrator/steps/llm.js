@@ -16,12 +16,26 @@
 //     is an injection point for tests (and nothing else) -- production code never passes it.
 //
 //   runLlm(ctx, stepName, fixtureKey, deps) -- the existing shadow-mode entry point every state-
-//     machine handler already calls. Its shadow branch is untouched. Its real branch reads the
-//     per-step call config from ctx.task.llm.<stepName> (the natural real-mode analogue of
-//     task.shadow.llm.<stepName> -- a real task file supplies model/effort/tools/prompt the
-//     same place a synthetic one supplies canned answers), resolves cwd via config.cwdForStep,
-//     takes the account from ctx.account (set by the caller's account-rotation retry loop --
-//     see state-machine.js's callLlmStep), calls invokeClaudeReal, and journals one event.
+//     machine handler already calls. Its shadow branch is untouched. Its real branch has two
+//     sub-paths:
+//       - ctx.task.llm.<stepName> present -- the legacy interim config source, honoured
+//         verbatim (no template fill, no outputContract validation). Kept only for backward
+//         compatibility with test/llm-real.test.js and test/account-rotation.test.js, which
+//         construct exactly this shape.
+//       - otherwise (the real `kind: "card"` path) -- step-contracts.js resolves
+//         model/effort/tools/permissionMode/maxBudgetUsd/jsonSchema for this task shape,
+//         task-values.js derives the {{placeholder}} values, prompt-template.js fills
+//         prompts/<file>.md (a missing placeholder value throws MissingPlaceholderError, turned
+//         into a ParkSignal here so the state machine parks with the placeholder named in the
+//         reason). ctx.dryRun short-circuits right before the spawn: it writes
+//         journal/<id>/dryrun-<STATE>.md (argv + filled prompt) and returns a minimal
+//         outputContract-satisfying object marked {dryRun: true}. Otherwise invokeClaudeReal
+//         runs for real, and a successful reply's `result` string is JSON.parsed and checked
+//         against outputContract.required -- a missing key returns the same {kind: 'error'}
+//         shape invokeClaudeReal itself uses for a spawn/parse failure.
+//     Every sub-path resolves cwd via config.cwdForStep, takes the account from ctx.account (set
+//     by the caller's account-rotation retry loop -- see state-machine.js's callLlmStep), and
+//     journals one event per call (an 'llm-call' for a real attempt, a 'dry-run' for a dry one).
 //
 // Deadline handling: spawnSync's own `timeout` option (set to opts.deadlineMs) is what actually
 // kills a hung `claude` process. deadline.js's callWithDeadline/withTimeout race is NOT reused
@@ -43,6 +57,10 @@ const { sleep } = require('./scripted');
 const config = require('../config');
 const { DEFAULT_ACCOUNT } = require('../accounts');
 const { appendEvent } = require('../journal');
+const { ParkSignal } = require('../park-signal');
+const { resolveStepContract } = require('../step-contracts');
+const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
+const { buildPromptValues, scratchDir } = require('../task-values');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
 
@@ -197,6 +215,100 @@ async function invokeClaudeReal(opts, deps = {}) {
   return { ok: true, result: parsed.result, sessionId, costUsd, numTurns, raw: exit };
 }
 
+// snake_case -> camelCase, e.g. "root_cause" -> "rootCause". Used to bridge one real gap: every
+// prompt file's declared JSON keys are snake_case, but state-machine.js's handlers were written
+// against shadow mode's fixtures, which are camelCase for the one step where the two differ
+// (DIAGNOSE: llm.DIAGNOSE fixtures use `rootCause`, diagnose.md's contract says `root_cause`).
+// Every other step's key names already match by coincidence (verdict, findings, ...), so this
+// is a no-op for them. Applied additively -- the original snake_case keys are always kept too,
+// never replaced -- so nothing that reads the contract's own field names loses them.
+function snakeToCamel(key) {
+  return key.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+}
+
+function withCamelAliases(payload) {
+  const aliased = {};
+  for (const [key, value] of Object.entries(payload)) {
+    const camel = snakeToCamel(key);
+    if (camel !== key) aliased[camel] = value;
+  }
+  return { ...aliased, ...payload };
+}
+
+// The minimal object that satisfies stepName's outputContract.required, for --dry-run: real
+// enough to walk the state machine to DONE, never a stand-in for an actual judgement. Every
+// shape carries `dryRun: true` so nothing downstream can mistake it for a real verdict.
+//
+// PLAN's plan_path/invariants_path cannot be null here even though nothing ever reads them for
+// real in a dry run: handlePlan journals this payload verbatim, and task-values.js's IMPLEMENT/
+// VALIDATE derivation reads it back from that journal on the *next* dry-run LLM call in the same
+// walk -- a null would fail their own placeholder fill as "missing" (correctly; null is never a
+// valid path) and PARK the very walk --dry-run exists to complete end to end. Using the same
+// scratch_dir/plan-<issue>.md convention plan.md's own text specifies keeps this consistent with
+// what a real PLAN call would have produced.
+function cannedDryRunPayload(stepName, contract, ctx) {
+  const base = { ok: true, dryRun: true };
+  switch (stepName) {
+    case 'PLAN': {
+      const dir = scratchDir(ctx.taskDir);
+      const issue = (ctx.task && ctx.task.issue) || 'unknown';
+      return {
+        ...base,
+        plan_path: path.join(dir, `plan-${issue}.md`),
+        invariants_path: path.join(dir, `invariants-${issue}.md`),
+        invariant_ids: [],
+        check_commands: [],
+      };
+    }
+    case 'IMPLEMENT':
+      return {
+        ...base,
+        summary: '[dry-run] no changes made',
+        files_changed: [],
+        invariants: [],
+        tests_run: [],
+        all_green: true,
+      };
+    case 'DIAGNOSE':
+      return { ...base, root_cause: null, reason: '[dry-run] diagnose not performed' };
+    case 'CITATION_VERIFIER':
+      return { ...base, verdict: 'PASS', entries: [] };
+    case 'VALIDATE':
+      return { ...base, verdict: 'PASS', reasons: ['[dry-run] no verdict rendered'], findings: [] };
+    default:
+      // Defensive: every step in STEP_CONTRACTS is handled above; this only fires for a step
+      // this module doesn't know about, and still satisfies whatever outputContract asked for.
+      return contract.outputContract.required.reduce((acc, key) => ({ ...acc, [key]: null }), base);
+  }
+}
+
+// Writes journal/<id>/dryrun-<STATE>.md: the exact argv `claude` would have been spawned with
+// (buildArgv never spawns anything itself), and the filled prompt text, so a --dry-run run can
+// be inspected without ever having called the CLI. The prompt itself (argv[1], the `-p` value)
+// is elided from the "## argv" block and shown once, in full, under "## filled prompt" instead
+// -- otherwise the whole flag line (--model/--effort/--json-schema, the part a reader actually
+// wants to scan) would be buried inside one enormous JSON string.
+function writeDryRunArtifact(taskDir, stepName, argv, promptText) {
+  const file = path.join(taskDir, `dryrun-${stepName}.md`);
+  const displayArgv = argv.map((value, i) => (i === 1 ? '<prompt -- see "## filled prompt" below>' : value));
+  const body = [
+    `# Dry run -- ${stepName}`,
+    '',
+    '## argv',
+    '```json',
+    JSON.stringify(displayArgv),
+    '```',
+    '',
+    '## filled prompt',
+    '```',
+    promptText,
+    '```',
+    '',
+  ].join('\n');
+  fs.writeFileSync(file, body);
+  return file;
+}
+
 async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   if (ctx.shadowMode) {
     const payload = ctx.fixture(fixtureKey, null);
@@ -205,44 +317,158 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     return payload;
   }
 
-  const callConfig = (ctx.task && ctx.task.llm && ctx.task.llm[stepName]) || {};
   const account = ctx.account || DEFAULT_ACCOUNT;
-  const cwd =
-    callConfig.cwd ||
-    config.cwdForStep(stepName, {
-      worktreePath: ctx.task && ctx.task.worktreePath,
-      repoRoot: REPO_ROOT,
+  const override = ctx.task && ctx.task.llm && ctx.task.llm[stepName];
+
+  if (override) {
+    // Legacy interim path: a task file supplying ctx.task.llm.<step> directly, honoured
+    // verbatim with no template fill and no outputContract validation. Kept for backward
+    // compatibility with hand-authored real-mode task files and this suite's own
+    // test/llm-real.test.js / test/account-rotation.test.js, which construct exactly this
+    // shape and assert on it. A `kind: "card"` task should not set ctx.task.llm.<step> -- see
+    // the branch below, which is the real path step-contracts.js + prompt-template.js drive.
+    const cwd =
+      override.cwd ||
+      config.cwdForStep(stepName, {
+        worktreePath: ctx.task && ctx.task.worktreePath,
+        repoRoot: REPO_ROOT,
+      });
+
+    const opts = {
+      step: stepName,
+      model: override.model,
+      effort: override.effort,
+      allowedTools: override.allowedTools,
+      permissionMode: override.permissionMode,
+      maxBudgetUsd: override.maxBudgetUsd,
+      jsonSchema: override.jsonSchema,
+      promptText: override.promptText,
+      promptFile: override.promptFile,
+      cwd,
+      account,
+      deadlineMs: ctx.config && ctx.config.stepDeadlineMs,
+    };
+
+    const result = await invokeClaudeReal(opts, deps);
+
+    appendEvent(ctx.taskDir, stepName, 'llm-call', {
+      step: stepName,
+      model: opts.model,
+      effort: opts.effort,
+      account: account.name,
+      sessionId: result.sessionId,
+      costUsd: result.costUsd,
+      numTurns: result.numTurns,
+      ok: result.ok,
     });
+
+    return result;
+  }
+
+  // Real `kind: "card"` path: step-contracts.js supplies model/effort/tools/budget/schema,
+  // prompt-template.js fills the step's own prompts/<file>.md from task-values.js's
+  // placeholder derivation.
+  const contract = resolveStepContract(stepName, ctx.task || {});
+
+  let promptText;
+  try {
+    const values = buildPromptValues(ctx, stepName);
+    promptText = fillPromptTemplate(contract.promptFile, values);
+  } catch (err) {
+    if (err instanceof MissingPlaceholderError) {
+      throw new ParkSignal(`prompt-missing-placeholder:${err.placeholder}`, {
+        step: stepName,
+        promptFile: err.promptFile,
+        placeholder: err.placeholder,
+        missing: err.missing,
+      });
+    }
+    throw err;
+  }
+
+  const cwd = config.cwdForStep(stepName, {
+    worktreePath: ctx.task && ctx.task.worktreePath,
+    repoRoot: REPO_ROOT,
+  });
 
   const opts = {
     step: stepName,
-    model: callConfig.model,
-    effort: callConfig.effort,
-    allowedTools: callConfig.allowedTools,
-    permissionMode: callConfig.permissionMode,
-    maxBudgetUsd: callConfig.maxBudgetUsd,
-    jsonSchema: callConfig.jsonSchema,
-    promptText: callConfig.promptText,
-    promptFile: callConfig.promptFile,
+    model: contract.model,
+    effort: contract.effort,
+    allowedTools: contract.allowedTools,
+    permissionMode: contract.permissionMode,
+    maxBudgetUsd: contract.maxBudgetUsd,
+    jsonSchema: contract.jsonSchema,
+    promptText,
     cwd,
     account,
     deadlineMs: ctx.config && ctx.config.stepDeadlineMs,
   };
 
-  const result = await invokeClaudeReal(opts, deps);
+  if (ctx.dryRun) {
+    const argv = buildArgv(opts);
+    const dryrunFile = writeDryRunArtifact(ctx.taskDir, stepName, argv, promptText);
+    appendEvent(ctx.taskDir, stepName, 'dry-run', {
+      step: stepName,
+      promptFile: contract.promptFile,
+      model: opts.model,
+      effort: opts.effort,
+      dryrunFile,
+    });
+    return cannedDryRunPayload(stepName, contract, ctx);
+  }
+
+  const raw = await invokeClaudeReal(opts, deps);
 
   appendEvent(ctx.taskDir, stepName, 'llm-call', {
     step: stepName,
     model: opts.model,
     effort: opts.effort,
     account: account.name,
-    sessionId: result.sessionId,
-    costUsd: result.costUsd,
-    numTurns: result.numTurns,
-    ok: result.ok,
+    sessionId: raw.sessionId,
+    costUsd: raw.costUsd,
+    numTurns: raw.numTurns,
+    ok: raw.ok,
   });
 
-  return result;
+  if (!raw.ok) return raw; // spawn/parse/limit/error failure from invokeClaudeReal -- unchanged
+
+  let parsedPayload;
+  try {
+    parsedPayload = JSON.parse(raw.result);
+  } catch {
+    return {
+      ok: false,
+      kind: 'error',
+      error: `llm.js: ${stepName} reply was not valid JSON`,
+      sessionId: raw.sessionId,
+      costUsd: raw.costUsd,
+      numTurns: raw.numTurns,
+      raw: raw.raw,
+    };
+  }
+
+  const missingKeys = contract.outputContract.required.filter((key) => !(key in parsedPayload));
+  if (missingKeys.length > 0) {
+    return {
+      ok: false,
+      kind: 'error',
+      error: `llm.js: ${stepName} reply missing required key(s): ${missingKeys.join(', ')}`,
+      sessionId: raw.sessionId,
+      costUsd: raw.costUsd,
+      numTurns: raw.numTurns,
+      raw: raw.raw,
+    };
+  }
+
+  return {
+    ok: true,
+    sessionId: raw.sessionId,
+    costUsd: raw.costUsd,
+    numTurns: raw.numTurns,
+    raw: raw.raw,
+    ...withCamelAliases(parsedPayload),
+  };
 }
 
 module.exports = {
@@ -251,5 +477,7 @@ module.exports = {
   buildArgv,
   sumCost,
   classifyFailure,
+  withCamelAliases,
+  cannedDryRunPayload,
   NONINTERACTIVE_ENV_DEFAULTS,
 };

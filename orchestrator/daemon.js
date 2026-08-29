@@ -1,16 +1,25 @@
 #!/usr/bin/env node
 'use strict';
-// entrypoint: node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>]
-//                                          [--deadline-ms <n>] [--interval-ms <n>]
+// entrypoint: node orchestrator/daemon.js (--shadow | --dry-run) --once [--queue <dir>]
+//                                          [--journal <dir>] [--deadline-ms <n>]
+//                                          [--interval-ms <n>]
 //
 // --once   drains the whole queue serially (filename order) and exits.
 // (absent) polls the queue directory forever, draining whatever has arrived, sleeping
 //          --interval-ms between passes.
 //
-// --shadow is required by this build: it is the only mode implemented (see orchestrator/
-// steps/llm.js and orchestrator/steps/scripted.js -- real execution is a documented stub).
-// This process never spawns a subprocess, never calls the `claude` CLI, and never touches
-// anything outside --queue/--journal in shadow mode.
+// One of --shadow or --dry-run is required:
+//   --shadow    the only mode with scripted-step coverage today (see orchestrator/
+//               steps/scripted.js -- real command execution is a documented stub). Never spawns
+//               a subprocess, never calls the `claude` CLI, never touches anything outside
+//               --queue/--journal.
+//   --dry-run   real-mode semantics without spawning: step-contracts.js + prompt-template.js
+//               resolve and fill every LLM step's real prompt, account rotation runs for real,
+//               but steps/llm.js's runLlm and steps/scripted.js's runScripted both stop short of
+//               their own spawn point -- an LLM step writes journal/<id>/dryrun-<STATE>.md
+//               (the argv + filled prompt) and returns a canned outputContract-satisfying
+//               payload; a scripted step returns a fixture-free "assumed success". Also never
+//               calls the `claude` CLI. Ignored if --shadow is also given (shadow wins).
 
 const fs = require('fs');
 const path = require('path');
@@ -19,10 +28,20 @@ const defaultConfig = require('./config');
 const { drainQueueOnce, runForever } = require('./state-machine');
 
 function parseArgs(argv) {
-  const opts = { shadow: false, once: false, queue: null, journal: null, deadlineMs: null, intervalMs: null, help: false };
+  const opts = {
+    shadow: false,
+    dryRun: false,
+    once: false,
+    queue: null,
+    journal: null,
+    deadlineMs: null,
+    intervalMs: null,
+    help: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--shadow') opts.shadow = true;
+    else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--once') opts.once = true;
     else if (a === '--queue') opts.queue = argv[++i];
     else if (a === '--journal') opts.journal = argv[++i];
@@ -36,10 +55,14 @@ function parseArgs(argv) {
 function printUsage() {
   console.log(
     [
-      'usage: node orchestrator/daemon.js --shadow (--once | ) [--queue <dir>] [--journal <dir>]',
-      '                                    [--deadline-ms <n>] [--interval-ms <n>]',
+      'usage: node orchestrator/daemon.js (--shadow | --dry-run) (--once | ) [--queue <dir>]',
+      '                                    [--journal <dir>] [--deadline-ms <n>] [--interval-ms <n>]',
       '',
-      '  --shadow          required: shadow mode is the only mode this build implements',
+      '  --shadow          shadow mode: every scripted/LLM step reads task.shadow fixtures',
+      '  --dry-run         real-mode semantics without spawning: real prompt fill + account',
+      '                    rotation, but no `claude` CLI call and no scripted command run --',
+      '                    see steps/llm.js / steps/scripted.js. Ignored if --shadow is given.',
+      '  (one of --shadow or --dry-run is required)',
       '  --once            drain the queue serially and exit (default: poll forever)',
       '  --queue <dir>     task queue directory (default: <repo>/queue)',
       '  --journal <dir>   per-task runtime/journal root (default: <repo>/journal)',
@@ -55,8 +78,8 @@ async function main() {
     printUsage();
     return;
   }
-  if (!opts.shadow) {
-    console.error('orchestrator/daemon.js: only --shadow mode is implemented in this build. Pass --shadow.');
+  if (!opts.shadow && !opts.dryRun) {
+    console.error('orchestrator/daemon.js: pass --shadow or --dry-run (see --help).');
     process.exitCode = 1;
     return;
   }
@@ -69,7 +92,8 @@ async function main() {
 
   const config = {
     ...defaultConfig,
-    shadowMode: true,
+    shadowMode: !!opts.shadow,
+    dryRun: !opts.shadow && !!opts.dryRun,
     stepDeadlineMs: opts.deadlineMs || defaultConfig.stepDeadlineMs,
     pollIntervalMs: opts.intervalMs || defaultConfig.pollIntervalMs,
   };

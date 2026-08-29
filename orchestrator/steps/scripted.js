@@ -12,6 +12,12 @@
 // machine.js only supplies a fixtureKey, so real mode is reachable but unexercised: the wiring
 // of the actual `npm run gate` / `gh pr merge` / etc. commands is future work, done when this
 // orchestrator leaves shadow mode.
+//
+// ctx.dryRun (daemon.js's --dry-run flag, real-mode semantics without spawning): every scripted
+// step is "fixture-free assumed success" -- exit 0, no command run -- so a synthetic card can
+// walk the whole lifecycle to DONE with zero subprocesses. This is the scripted-step half of
+// --dry-run; the LLM half (building the filled prompt + argv without spawning `claude`) lives in
+// steps/llm.js's runLlm.
 
 const { spawnSync } = require('child_process');
 
@@ -32,6 +38,10 @@ async function runScripted(ctx, fixtureKey, opts = {}) {
     const delay = ctx.fixture(`delays.${fixtureKey}`, 0);
     if (delay > 0) await sleep(delay);
     return { exit, stdoutTail: `[shadow] ${fixtureKey} -> exit ${exit}` };
+  }
+
+  if (ctx.dryRun) {
+    return { exit: 0, stdoutTail: `[dry-run] ${fixtureKey} -> assumed success` };
   }
 
   if (!command) {
