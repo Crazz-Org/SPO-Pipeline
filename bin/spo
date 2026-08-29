@@ -8,18 +8,31 @@
 //   spo resume <id>         PRINTS `claude --resume <sessionId>` for a task's recorded LLM
 //                            steps, or for a bare session id, the same command directly. Never
 //                            executes anything -- see doc/state-machine-spec.md § Observability.
+//   spo dashboard            GENERATES a self-contained static HTML file from the same local
+//                            surfaces (journals, queue, claude-accounts/, ~/.spo-bench/) --
+//                            console/collect.js + console/render.js do the work; this command
+//                            just wires them to disk. --out <path> (default:
+//                            console/dashboard.html), --watch regenerates every 30s (Ctrl-C to
+//                            stop) instead of running once. Prints the absolute output path.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { collectAll } = require('../console/collect');
+const { renderDashboard } = require('../console/render');
 
 function parseArgs(argv) {
-  const opts = { journal: null, queue: null, _: [] };
+  const opts = { journal: null, queue: null, out: null, watch: false, serve: false, port: null, _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--journal') opts.journal = argv[++i];
     else if (a === '--queue') opts.queue = argv[++i];
+    else if (a === '--out') opts.out = argv[++i];
+    else if (a === '--watch') opts.watch = true;
+    else if (a === '--serve') opts.serve = true;
+    else if (a === '--port') opts.port = argv[++i];
     else opts._.push(a);
   }
   return opts;
@@ -154,8 +167,48 @@ function cmdResume(id, opts) {
   console.log(`claude --resume ${id}`);
 }
 
+// `spo dashboard` -- generates console/dashboard.html (or --out <path>) from the same local
+// surfaces the other commands read, plus claude-accounts/ and ~/.spo-bench/ (nightly, gate
+// verdicts). All fs work lives in console/collect.js; all HTML rendering lives in
+// console/render.js as a pure function -- this is just the CLI glue between the two and disk.
+function cmdDashboard(opts) {
+  const { journalRoot, queueDir } = resolveDirs(opts);
+  const repoRoot = path.join(__dirname, '..');
+  const accountsDir = path.join(repoRoot, 'claude-accounts');
+  const benchRoot = path.join(os.homedir(), '.spo-bench');
+  const outPath = opts.out ? path.resolve(opts.out) : path.join(repoRoot, 'console', 'dashboard.html');
+
+  // --serve: a live HTTP view (fresh collect+render on every GET) instead of a file on disk.
+  // The local/LAN tier of the dashboard; the externally hosted copy is nginx's job
+  // (SPO-Deploy). Default port 8090 -- never 8080, which belongs to the bench worker.
+  if (opts.serve) {
+    const { createDashboardServer } = require('../console/serve');
+    const port = opts.port ? Number(opts.port) : 8090;
+    const server = createDashboardServer({ journalRoot, queueDir, accountsDir, benchRoot });
+    server.listen(port, () => {
+      console.log(`dashboard: http://localhost:${server.address().port}/  (Ctrl-C to stop)`);
+    });
+    return;
+  }
+
+  function generateOnce() {
+    const data = collectAll({ journalRoot, queueDir, accountsDir, benchRoot });
+    const html = renderDashboard(data);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, html);
+    console.log(outPath);
+  }
+
+  generateOnce();
+  if (opts.watch) {
+    setInterval(generateOnce, 30000);
+  }
+}
+
 function printUsage() {
-  console.error('usage: spo <status|task <id>|parked|resume <session_id|task-id>> [--journal <dir>] [--queue <dir>]');
+  console.error(
+    'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard> [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]]'
+  );
 }
 
 function main() {
@@ -182,6 +235,7 @@ function main() {
     }
     return cmdResume(id, opts);
   }
+  if (cmd === 'dashboard') return cmdDashboard(opts);
 
   printUsage();
   process.exitCode = 1;
