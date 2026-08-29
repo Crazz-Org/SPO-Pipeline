@@ -1,5 +1,6 @@
 node_modules/
 journal/
+queue/
 claude-accounts/
 *.local.*
 .DS_Store
