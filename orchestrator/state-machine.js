@@ -138,7 +138,19 @@ async function handleWorktree(ctx) {
     runScripted(ctx, 'worktree', { defaultExit: 0 })
   );
   appendEvent(ctx.taskDir, 'WORKTREE', 'result', { exit, stdoutTail });
-  if (exit === 0) return 'PLAN';
+  if (exit === 0) {
+    // --dry-run's generic runScripted() path (unlike realWorktree) never runs a real `git
+    // worktree add`, so it never learns a worktreePath/branch. A real kind: "card" task from
+    // spo pull/makeTask carries neither (see orchestrator/intake.js's makeTask), so without this
+    // the PLAN prompt template's `worktree` placeholder is left unfilled and the task PARKs at
+    // PLAN -- defeating --dry-run as a pre-flight check. Synthesize the same names realWorktree
+    // would have picked, but only when a fixture/test hasn't already set one.
+    if (ctx.dryRun && !ctx.task.worktreePath) {
+      ctx.task.worktreePath = path.join(ctx.config.pipelineWorktreesDir, ctx.id);
+      ctx.task.branch = `claude-pipe/${ctx.id}`;
+    }
+    return 'PLAN';
+  }
   throw new ParkSignal('worktree-failed', { exit });
 }
 
