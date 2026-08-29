@@ -92,6 +92,17 @@ const STEP_CONTRACTS = {
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only planning mode; matches the state's own name
     maxBudgetUsd: 'bySize',
+    // Continuous-daemon soak, 2026-08-29: card issue-232 (size S, BUDGET_BY_SIZE_USD.S = $2) had
+    // its PLAN killed at terminal_reason=budget_exhausted -- $2.0467 spent over 16 turns, over
+    // the S cap before the plan was even done. Card issue-247's PLAN ($1.67) barely fit earlier
+    // the same day. PLAN legitimately explores (reads product code + the Delphi reference)
+    // regardless of the card's size -- S's $2 is too tight for this one step specifically, even
+    // though S is the right size/effort tier for the change itself. Maintainer chose the
+    // surgical fix over raising BUDGET_BY_SIZE_USD.S for every step: PLAN alone gets a $3 floor,
+    // applied in resolveStepContract as max(BUDGET_BY_SIZE_USD[size], budgetFloorUsd) -- M ($5)
+    // and L ($12) already clear $3 and are unaffected by the max; every other step is untouched
+    // (no budgetFloorUsd field, no-op in the max below).
+    budgetFloorUsd: 3,
     cwdKind: 'worktree', // reads {{worktree}}; config.cwdForStep already encodes this split
     outputContract: {
       // plan_path/invariants_path are NOT here: PLAN runs permissionMode: 'plan' (read-only --
@@ -206,8 +217,12 @@ function resolveStepContract(stepName, task = {}) {
 
   const size = (task && task.size) || DEFAULT_SIZE;
   const effort = stepDef.effort === 'bySize' ? EFFORT_BY_SIZE[size] || EFFORT_BY_SIZE[DEFAULT_SIZE] : stepDef.effort;
+  // budgetFloorUsd (table-driven, PLAN only today -- see its entry above) raises a 'bySize'
+  // step's resolved budget to at least that floor; a step with no budgetFloorUsd field takes
+  // Math.max(x, undefined) === NaN, so the `|| 0` keeps every other step a no-op here.
+  const bySizeBudget = BUDGET_BY_SIZE_USD[size] || BUDGET_BY_SIZE_USD[DEFAULT_SIZE];
   const maxBudgetUsd =
-    stepDef.maxBudgetUsd === 'bySize' ? BUDGET_BY_SIZE_USD[size] || BUDGET_BY_SIZE_USD[DEFAULT_SIZE] : SMALL_BUDGET_USD;
+    stepDef.maxBudgetUsd === 'bySize' ? Math.max(bySizeBudget, stepDef.budgetFloorUsd || 0) : SMALL_BUDGET_USD;
 
   return {
     step: stepName,
