@@ -5,6 +5,9 @@
 //   spo status              queue depth, active/parked/done counts, per-task state + last event
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl
 //   spo parked              parked tasks + reasons
+//   spo resume <id>         PRINTS `claude --resume <sessionId>` for a task's recorded LLM
+//                            steps, or for a bare session id, the same command directly. Never
+//                            executes anything -- see doc/state-machine-spec.md § Observability.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
 
@@ -124,8 +127,35 @@ function cmdParked(opts) {
   if (!any) console.log('(no parked tasks)');
 }
 
+// `spo resume <session_id|task-id>` -- resolves the argument as a task id first (a directory
+// under journal/); if that exists, lists every recorded LLM step (journal event
+// {event: "llm-call", step, model, costUsd, sessionId} -- see steps/llm.js) and prints the
+// exact `claude --resume <sessionId>` command for each, oldest first. If no such task
+// directory exists, the argument is treated as a bare session id and the same command is
+// printed once. This only ever prints -- it never spawns `claude` itself.
+function cmdResume(id, opts) {
+  const { journalRoot } = resolveDirs(opts);
+  const dir = path.join(journalRoot, id);
+
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    const llmCalls = readJournalLines(dir).filter((e) => e.event === 'llm-call' && e.sessionId);
+    if (llmCalls.length === 0) {
+      console.log(`no recorded LLM steps with a session id for task "${id}"`);
+      return;
+    }
+    for (const ev of llmCalls) {
+      const cost = typeof ev.costUsd === 'number' ? ev.costUsd.toFixed(4) : '?';
+      console.log(`${String(ev.step).padEnd(18)} model=${ev.model || '?'}  costUsd=${cost}  claude --resume ${ev.sessionId}`);
+    }
+    return;
+  }
+
+  // Not a known task id -- treat the argument itself as a session id.
+  console.log(`claude --resume ${id}`);
+}
+
 function printUsage() {
-  console.error('usage: spo <status|task <id>|parked> [--journal <dir>] [--queue <dir>]');
+  console.error('usage: spo <status|task <id>|parked|resume <session_id|task-id>> [--journal <dir>] [--queue <dir>]');
 }
 
 function main() {
@@ -143,6 +173,15 @@ function main() {
     return cmdTask(id, opts);
   }
   if (cmd === 'parked') return cmdParked(opts);
+  if (cmd === 'resume') {
+    const id = opts._[0];
+    if (!id) {
+      console.error('usage: spo resume <session_id|task-id>');
+      process.exitCode = 1;
+      return;
+    }
+    return cmdResume(id, opts);
+  }
 
   printUsage();
   process.exitCode = 1;
