@@ -197,3 +197,27 @@ test('buildPromptValues: CITATION_VERIFIER defaults spo_original_path to ~/SPO-O
   assert.equal(values.spo_original_path, path.join(os.homedir(), 'SPO-Original'));
   assert.deepEqual(values.citations, ['X — Y.pas:1 — claim']);
 });
+
+// ---- prompts/*.md: no unbounded network call ------------------------------------------------
+// Card #449, 2026-08-30: prompts/triage-bug-report.md's server-log curl had no --max-time, so a
+// slow/unresponsive third-party server could hang inside the intake deadline undetected until the
+// kill. Guards every prompt against the same class of regression, not just that one line.
+
+test('prompts/*.md: every curl call inside a code fence bounds its own time (--max-time or -m)', () => {
+  const promptsDir = path.join(__dirname, '..', 'prompts');
+  for (const file of fs.readdirSync(promptsDir)) {
+    if (!file.endsWith('.md')) continue;
+    const text = fs.readFileSync(path.join(promptsDir, file), 'utf8');
+    const codeBlocks = text.match(/```[\s\S]*?```/g) || [];
+    for (const block of codeBlocks) {
+      for (const line of block.split('\n')) {
+        if (!/^\s*curl\b/.test(line)) continue;
+        assert.match(
+          line,
+          /(--max-time|-m\s)/,
+          `${file}: curl call has no --max-time/-m: ${line.trim()}`
+        );
+      }
+    }
+  }
+});

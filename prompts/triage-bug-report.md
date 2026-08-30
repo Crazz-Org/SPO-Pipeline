@@ -97,8 +97,13 @@ whether they agree with the reporter or not; if it is absent on a `mobile` repor
 day's model server log from the open listing at http://158.69.153.134/logs/ :
 
 ```bash
-curl -s "http://158.69.153.134/logs/FIVEMODELSERVER/Survival%20<YY-MM-DD>.log" -o /tmp/survival.log
+curl -s --connect-timeout 5 --max-time 20 "http://158.69.153.134/logs/FIVEMODELSERVER/Survival%20<YY-MM-DD>.log" -o /tmp/survival.log
 ```
+
+`--max-time 20` — plenty for a 2-3 MB/day file on a normal connection, but bounded so a slow or
+unresponsive third-party server can't eat the whole 5-minute intake deadline on its own (card
+#449, 2026-08-30: exactly this curl hung and burned the deadline before the orchestrator's own
+retry could ever see it). `--connect-timeout 5` fails fast if the server itself is unreachable.
 
 Grep it (2-3 MB/day — never read it whole into context). The civic members log on entry, before
 their `try`, so a line there proves the frame reached the object. Grep a window around
