@@ -10,7 +10,9 @@
 // token scanning. Those live in console/system.js, console/prod-version.js and
 // console/usage-scan.js respectively, driven by console/serve.js, and are merged into this
 // object's `system`/`prod`/`tokens` keys (always null here) only by the live server. That split
-// is what lets `spo dashboard` (no --serve) stay instant and network-free.
+// is what lets `spo dashboard` (no --serve) stay instant and network-free. `trend` is the one
+// exception -- collectTrend() below only reads an already-computed rollup file
+// (console/usage-rollups.js), it never runs the scanner, so it can be populated here too.
 
 const fs = require('fs');
 const os = require('os');
@@ -147,14 +149,18 @@ function collectAccounts(accountsDir) {
   if (registry.length === 0) return { rows: [] };
 
   const state = readJsonSafe(path.join(accountsDir, 'state.json'), {});
+  const labels = accountsModule.readLabels(accountsDir);
   const now = Date.now();
 
   const rows = registry.map((a) => {
     const entry = state[a.name];
     const cooldownUntil = entry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
     const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
+    const label = labels[a.name] || {};
     return {
       name: a.name,
+      email: label.email || null,
+      plan: label.plan || null,
       enabled: a.enabled,
       cooldownUntil: cooling ? new Date(cooldownUntil).toISOString() : null,
       cooling,
@@ -205,6 +211,19 @@ function collectVerdicts(verdictsDir, limit = VERDICTS_LIMIT) {
 function collectUsageSnapshot(journalRoot) {
   if (!journalRoot) return null;
   return readJsonSafe(path.join(journalRoot, 'usage-snapshot.json'), null);
+}
+
+// journal/usage-rollups.json -- the tokens trend section's durable daily-rollup store, written
+// by the live server (console/serve.js) on its usage-scan timer. Unlike tokens itself (always
+// null outside --serve, since it needs the live scanner), this file is a small, already-computed
+// history a static run can just READ -- one bounded JSON.parse, the same cost class as
+// collectUsageSnapshot above, not the "no network, no token scanning" walk usage-scan.js's
+// scanner does. Absent file = no trend yet, not an error.
+function collectTrend(journalRoot) {
+  if (!journalRoot) return null;
+  const rollups = require('./usage-rollups').loadRollups(path.join(journalRoot, 'usage-rollups.json'));
+  if (!rollups || Object.keys(rollups).length === 0) return null;
+  return require('./usage-scan').buildTrendViews(rollups);
 }
 
 // Bounded tail-read of <journalRoot>/daemon.jsonl -- never a full readFileSync on an
@@ -581,7 +600,9 @@ function buildSessionIndex(journalTasks) {
 // (bin/spo) so this module never has to import `os` just to find the home directory.
 // `system`/`prod`/`tokens` are always null here -- console/serve.js fills them in from live,
 // stateful samplers/probes/scanners; `spo dashboard` without --serve leaves them null and
-// render.js shows "not monitored" for those sections.
+// render.js shows "not monitored" for those sections. `trend` is the one exception: it can be
+// populated here too, since collectTrend only reads an already-computed rollup file rather than
+// running the scanner itself (see that function's own comment).
 function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsDir } = {}) {
   const journalTasks = collectJournalTasks(journalRoot);
   const queue = collectQueue(queueDir);
@@ -601,6 +622,7 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
     nightly: benchRoot ? collectNightly(path.join(benchRoot, 'nightly', 'latest.json')) : null,
     verdicts: benchRoot ? collectVerdicts(path.join(benchRoot, 'verdicts')) : [],
     usageSnapshot: collectUsageSnapshot(journalRoot),
+    trend: collectTrend(journalRoot),
     services: collectServices({ journalRoot, queueDir, benchRoot }),
     daemonStats: collectDaemonStats(journalTasks, queue.depth),
     reports: collectReportPipeline(journalRoot, reportsDir),
@@ -618,6 +640,7 @@ module.exports = {
   collectNightly,
   collectVerdicts,
   collectUsageSnapshot,
+  collectTrend,
   collectServices,
   collectDaemonStats,
   collectReportPipeline,

@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { mkTmp } = require('./helpers');
-const { createUsageScanner, buildTokenViews } = require('../console/usage-scan');
+const { createUsageScanner, buildTokenViews, buildTrendViews } = require('../console/usage-scan');
 
 function usageLine(id, model, usage) {
   return JSON.stringify({ message: { id, model, usage } });
@@ -110,4 +110,61 @@ test('buildTokenViews attributes a session to its task via sessionIndex, and buc
 
 test('buildTokenViews(null, ...) returns null', () => {
   assert.equal(buildTokenViews(null, {}), null);
+});
+
+// ---- byDay (scan()) --------------------------------------------------------------------------
+
+function usageLineTs(id, model, usage, timestamp) {
+  return JSON.stringify({ message: { id, model, usage }, timestamp });
+}
+
+test("scan()'s byDay buckets a session by the calendar day of its last message, and excludes the 'local' account", async () => {
+  const root = mkTmp('spo-usage-root-byday-');
+  const pooledRoot = path.join(root, 'pool1');
+  const ambientRoot = path.join(root, 'ambient');
+  writeSession(path.join(pooledRoot, 'proj'), 'sess-a.jsonl', [usageLineTs('m1', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 10 }, '2026-08-29T10:00:00.000Z')]);
+  writeSession(path.join(pooledRoot, 'proj'), 'sess-b.jsonl', [usageLineTs('m2', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 10 }, '2026-08-29T22:00:00.000Z')]);
+  writeSession(path.join(ambientRoot, 'proj'), 'sess-c.jsonl', [usageLineTs('m3', 'claude-sonnet-5', { input_tokens: 999, output_tokens: 999 }, '2026-08-29T10:00:00.000Z')]);
+
+  const scanner = createUsageScanner({ roots: [{ path: pooledRoot, account: 'pool1' }, { path: ambientRoot, account: 'local' }] });
+  const index = await scanner.scan();
+
+  assert.deepEqual(Object.keys(index.byDay), ['2026-08-29']);
+  assert.equal(index.byDay['2026-08-29'].sessions, 2); // sess-a + sess-b, NOT the 'local' sess-c
+  assert.equal(index.byDay['2026-08-29'].models['claude-sonnet-5'].inp, 200);
+});
+
+// ---- buildTrendViews --------------------------------------------------------------------------
+
+function rollupDay({ sessions, Minp = 0, Mcc = 0, Mcr = 0, Mout = 0, partial = false }) {
+  return { sessions, msgs: sessions, partial, Minp, Mcc, Mcr, Mout, byModel: {} };
+}
+
+test('buildTrendViews computes a per-session weighted average and flags a cache-write-ratio spike', () => {
+  const rollups = {
+    '2026-08-28': rollupDay({ sessions: 20, Minp: 1, Mcc: 0.2, Mcr: 10, Mout: 2 }),
+    '2026-08-29': rollupDay({ sessions: 20, Mcc: 5, Mcr: 5, Mout: 1 }), // cache-write ratio 0.5 > 0.25
+  };
+  const trend = buildTrendViews(rollups, { minSessionsForCompare: 5 });
+
+  assert.deepEqual(trend.series.map((d) => d.date), ['2026-08-28', '2026-08-29']);
+  assert.equal(trend.lastRecordedDate, '2026-08-29');
+  assert.equal(trend.series[0].cacheChangeFlag, false);
+  assert.equal(trend.series[1].cacheChangeFlag, true); // Mcc/(Mcc+Mcr) = 0.5 > 0.25, sessions >= 5
+  assert.ok(trend.series[0].avgWeightPerSession > 0);
+});
+
+test('buildTrendViews returns null KPI comparisons when a window has too few sessions', () => {
+  const rollups = { '2026-08-30': rollupDay({ sessions: 3, Mout: 1 }) };
+  const trend = buildTrendViews(rollups, { minSessionsForCompare: 20 });
+  assert.equal(trend.kpis.last7AvgWeightPerSession, null);
+  assert.equal(trend.kpis.todayVsLast7Pct, null);
+  assert.equal(trend.kpis.todayAvgWeightPerSession, trend.series[0].avgWeightPerSession);
+});
+
+test('buildTrendViews({}) returns an empty, non-throwing shape', () => {
+  const trend = buildTrendViews({});
+  assert.deepEqual(trend.series, []);
+  assert.equal(trend.lastRecordedDate, null);
+  assert.equal(trend.kpis.todayAvgWeightPerSession, null);
 });

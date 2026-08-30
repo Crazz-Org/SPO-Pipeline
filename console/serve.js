@@ -22,7 +22,8 @@ const http = require('http');
 const { collectAll, buildSessionIndex } = require('./collect');
 const { renderDashboard, renderDataFragments, renderSystemFragment } = require('./render');
 const { createSystemSampler } = require('./system');
-const { createUsageScanner, buildTokenViews } = require('./usage-scan');
+const { createUsageScanner, buildTokenViews, buildTrendViews } = require('./usage-scan');
+const { loadRollups, mergeRollups, saveRollups } = require('./usage-rollups');
 
 const DEFAULT_DATA_TTL_MS = 5000;
 const DEFAULT_USAGE_SCAN_MS = 5 * 60 * 1000;
@@ -58,6 +59,10 @@ function createDashboardServer(sources, opts = {}) {
   const usageScanner = opts.usageScanner || createUsageScanner({ roots: discoverUsageRoots(sources.accountsDir) });
   const dataTtlMs = opts.dataTtlMs || DEFAULT_DATA_TTL_MS;
   const usageScanMs = opts.usageScanMs || DEFAULT_USAGE_SCAN_MS;
+  // The tokens trend's durable store (console/usage-rollups.js) -- co-located with the static
+  // fallback's journal/usage-snapshot.json. No journalRoot (some test setups) means no trend.
+  const rollupsPath = sources.journalRoot ? path.join(sources.journalRoot, 'usage-rollups.json') : null;
+  let rollups = rollupsPath ? loadRollups(rollupsPath) : {};
 
   let cache = null; // {at, data}
   let usageScanTimer = null;
@@ -71,6 +76,7 @@ function createDashboardServer(sources, opts = {}) {
     base.prod = prodProbe ? prodProbe.snapshot() : null;
     const usageIndex = usageScanner.snapshot();
     base.tokens = usageIndex ? buildTokenViews(usageIndex, buildSessionIndex(base.journalTasks)) : null;
+    base.trend = Object.keys(rollups).length ? buildTrendViews(rollups) : null;
     cache = { at: now, data: base };
     return base;
   }
@@ -128,7 +134,15 @@ function createDashboardServer(sources, opts = {}) {
 
   server.on('listening', () => {
     if (prodProbe) prodProbe.start();
-    const runScan = () => usageScanner.scan().catch(() => {});
+    const runScan = () =>
+      usageScanner
+        .scan()
+        .then((idx) => {
+          if (!rollupsPath || !idx || !idx.byDay) return;
+          rollups = mergeRollups(rollups, idx.byDay, { todayDate: new Date().toISOString().slice(0, 10) });
+          saveRollups(rollupsPath, rollups);
+        })
+        .catch(() => {});
     usageScanDelayTimer = setTimeout(() => {
       runScan();
       usageScanTimer = setInterval(runScan, usageScanMs);

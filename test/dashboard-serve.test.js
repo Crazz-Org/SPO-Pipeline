@@ -5,9 +5,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const { mkTmp } = require('./helpers');
 const { createDashboardServer } = require('../console/serve');
+const { loadRollups } = require('../console/usage-rollups');
 
 function fakeSystemSampler() {
   return { sample: () => ({ cpu: { count: 1, cores: [{ i: 0, busyPct: 10 }], busyPct: 10, model: 'Test' }, memory: { totalBytes: 100, freeBytes: 50, usedBytes: 50, usedPct: 50 }, loadavg: [0, 0, 0], uptimeSec: 1, sampledAt: new Date().toISOString() }) };
@@ -15,6 +18,14 @@ function fakeSystemSampler() {
 
 function fakeUsageScanner() {
   return { scan: async () => null, snapshot: () => null, stats: () => ({ cachedFiles: 0 }) };
+}
+
+// A fake scanner whose scan() resolves with a byDay-shaped index, as console/usage-scan.js's
+// real scan() would -- exercises serve.js's rollups merge+save wiring without any real transcript
+// files or timers beyond the server's own fixed initial-scan delay.
+function fakeUsageScannerWithByDay(date) {
+  const index = { byDay: { [date]: { sessions: 7, msgs: 7, models: { 'claude-sonnet-5': { msgs: 7, inp: 1000, cc: 10, cr: 100, out: 200 } } } } };
+  return { scan: async () => index, snapshot: () => null, stats: () => ({ cachedFiles: 0 }) };
 }
 
 function startServer(sources, opts) {
@@ -50,7 +61,7 @@ function request(server, method, urlPath) {
   });
 }
 
-test('GET / renders live HTML with all 8 fragment ids and no meta refresh', async (t) => {
+test('GET / renders live HTML with all 7 fragment ids and no meta refresh', async (t) => {
   const journalRoot = mkTmp('spo-serve-journal-');
   const server = await startServer(
     { journalRoot },
@@ -81,7 +92,7 @@ test('GET /api/system returns a system snapshot + html, and never calls collectA
   assert.ok(!('journalTasks' in json)); // guard: this route must not run collectAll
 });
 
-test('GET /api/data returns the 8 fragment keys, none nested', async (t) => {
+test('GET /api/data returns the 7 fragment keys, none nested', async (t) => {
   const journalRoot = mkTmp('spo-serve-journal3-');
   const server = await startServer(
     { journalRoot },
@@ -92,7 +103,7 @@ test('GET /api/data returns the 8 fragment keys, none nested', async (t) => {
   const res = await get(server, '/api/data');
   const json = JSON.parse(res.body);
   const ids = Object.keys(json.fragments).sort();
-  assert.deepEqual(ids, ['accounts', 'daemon', 'prod', 'reports', 'secondary', 'services', 'stamp', 'tokens']);
+  assert.deepEqual(ids, ['accounts', 'daemon', 'reports', 'secondary', 'services', 'stamp', 'tokens']);
   for (const v of Object.values(json.fragments)) {
     assert.ok(typeof v !== 'string' || !v.startsWith('<section id="frag-'));
   }
@@ -124,4 +135,28 @@ test('two consecutive /api/data calls within the TTL return the same generatedAt
   const first = JSON.parse((await get(server, '/api/data')).body);
   const second = JSON.parse((await get(server, '/api/data')).body);
   assert.equal(first.generatedAt, second.generatedAt);
+});
+
+test('the usage-scan timer merges byDay into journal/usage-rollups.json, and /api/data reflects it in the tokens fragment', async (t) => {
+  const journalRoot = mkTmp('spo-serve-journal-rollups-');
+  const today = new Date().toISOString().slice(0, 10);
+  const server = await startServer(
+    { journalRoot },
+    { systemSampler: fakeSystemSampler(), prodProbe: null, usageScanner: fakeUsageScannerWithByDay(today), dataTtlMs: 0 }
+  );
+  t.after(() => server.close());
+
+  // The server's first scan fires after a fixed internal delay (console/serve.js's
+  // USAGE_SCAN_DELAY_MS) -- wait past it rather than polling, this is a one-shot timing test.
+  await new Promise((resolve) => setTimeout(resolve, 2500));
+
+  const rollupsPath = path.join(journalRoot, 'usage-rollups.json');
+  assert.ok(fs.existsSync(rollupsPath));
+  const rollups = loadRollups(rollupsPath);
+  assert.equal(rollups[today].sessions, 7);
+  assert.equal(rollups[today].partial, true);
+
+  const res = await get(server, '/api/data');
+  const json = JSON.parse(res.body);
+  assert.match(json.fragments.tokens, /today \(partial\)/);
 });

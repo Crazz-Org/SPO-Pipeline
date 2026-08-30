@@ -40,6 +40,11 @@ cd ~/SPO-Pipeline && node scripts/smoke-llm.js pool1
 - An **empty pool** refuses `--real` at daemon startup and parks mid-run
   (`no-accounts-registered`): the pipeline uses only registered accounts, never the machine's
   ambient `claude` login.
+- **Labeling accounts with an email/plan for the dashboard**: nothing Claude Code writes into an
+  account's directory carries an email address or subscription tier (only a hashed user id) —
+  the dashboard's "Claude accounts" table can only show them if you add
+  `~/.claude-accounts/labels.json` by hand, e.g. `{"pool1": {"email": "you@example.com", "plan":
+  "Max 20x"}}`. See `orchestrator/accounts.js`'s `readLabels`.
 - Each account directory **is** a `CLAUDE_CONFIG_DIR`, so it is also its own user-settings tier
   — the machine's `~/.claude/settings.json` is never read by a pipeline step. `<repo>/.claude/settings.json`
   is installed into every account as that tier, so the permission floor does not depend on which

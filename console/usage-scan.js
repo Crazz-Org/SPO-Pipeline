@@ -157,6 +157,14 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
     const bySession = {};
     const byModel = {};
     const byAccount = {};
+    // byDay: a re-key of the SAME cached aggregates by the calendar day of each file's last
+    // message -- zero extra I/O, this is the console/usage-rollups.js persistence layer's raw
+    // material (see that module's header for why a day needs a durable copy at all). A session
+    // straddling midnight is attributed whole to its end day -- an accepted approximation,
+    // orchestrator steps run minutes, not days. 'local' (ambient, non-pooled usage -- see
+    // discoverUsageRoots below) is excluded: the trend this feeds is about the daemon's own
+    // operating cost, and ad-hoc sessions on this machine aren't part of that.
+    const byDay = {};
     let totalMsgs = 0;
     let totalDupes = 0;
 
@@ -177,6 +185,17 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
         const aModel = (aEntry[model] = aEntry[model] || emptyModelAgg());
         mergeAgg(aModel, m);
       }
+
+      const date = agg.lastTs ? agg.lastTs.slice(0, 10) : null;
+      if (date && agg.account !== 'local') {
+        const dEntry = (byDay[date] = byDay[date] || { sessions: 0, msgs: 0, models: {} });
+        dEntry.sessions++;
+        dEntry.msgs += agg.msgs;
+        for (const [model, m] of Object.entries(agg.models)) {
+          const dModel = (dEntry.models[model] = dEntry.models[model] || emptyModelAgg());
+          mergeAgg(dModel, m);
+        }
+      }
     }
 
     lastIndex = {
@@ -188,6 +207,7 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
       bySession,
       byModel,
       byAccount,
+      byDay,
     };
     stats = {
       cachedFiles: cache.size,
@@ -320,6 +340,80 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
   };
 }
 
+// buildTrendViews(rollups, opts) -- pure, no I/O. Turns console/usage-rollups.js's persisted
+// daily records into the operating-cost trend view console/render.js's renderTokensTrendInner
+// needs: a sparkline-ready series plus a few headline KPIs with week-over-week and
+// today-vs-recent deltas. `rollups` is `{ 'YYYY-MM-DD': {sessions, msgs, partial, Minp, Mcc,
+// Mcr, Mout, byModel} }` (see usage-rollups.js's mergeRollups for the exact shape).
+//
+// avgWeightPerSession reuses the same WEIGHT() formula byTask/byModel already sort by --
+// necessary because cache-read tokens dominate raw counts by orders of magnitude, and an
+// unweighted average would be swamped by conversation-length noise rather than reflecting an
+// actual per-step cost change. Every rollup field is already in Mtok units, and WEIGHT is
+// linear/homogeneous, so summing the Mtok fields with the same weights yields the same relative
+// answer without ever converting back to raw token counts.
+//
+// cacheWriteRatio (Mcc / (Mcc+Mcr)) is a second, independent signal: prompt caching invalidates
+// on any change to the cached prefix, so editing a prompt/config file shows up as a same-day
+// spike in cache-creation relative to cache-read, regardless of whether the resulting work
+// itself got more or less expensive -- a near-deterministic fingerprint of "something changed
+// today" that corroborates (or contradicts) the weight trend from a completely different angle.
+function buildTrendViews(rollups, { days = 60, minSessionsForCompare = 20 } = {}) {
+  const dates = Object.keys(rollups || {}).sort();
+  const series = dates.slice(-days).map((date) => {
+    const r = rollups[date] || {};
+    const sessions = r.sessions || 0;
+    const weightM = (r.Minp || 0) + (r.Mcc || 0) + 5 * (r.Mout || 0) + 0.1 * (r.Mcr || 0);
+    const cacheTotal = (r.Mcc || 0) + (r.Mcr || 0);
+    return {
+      date,
+      sessions,
+      msgs: r.msgs || 0,
+      partial: !!r.partial,
+      Minp: r.Minp || 0,
+      Mcc: r.Mcc || 0,
+      Mcr: r.Mcr || 0,
+      Mout: r.Mout || 0,
+      avgWeightPerSession: sessions ? weightM / sessions : 0,
+      avgMoutPerSession: sessions ? (r.Mout || 0) / sessions : 0,
+      cacheWriteRatio: cacheTotal ? (r.Mcc || 0) / cacheTotal : 0,
+      cacheChangeFlag: sessions >= 5 && cacheTotal > 0 && (r.Mcc || 0) / cacheTotal > 0.25,
+    };
+  });
+
+  // Weighted average over a window of daily rows, reconstructed from each day's own average --
+  // equivalent to summing raw weight/sessions across the window, without re-deriving weight from
+  // Mtok fields a second time. null (not 0) when the window is too thin to compare -- the render
+  // layer shows "not enough sessions to compare" rather than a misleadingly precise number.
+  function windowAvg(rows) {
+    const sessions = rows.reduce((s, d) => s + d.sessions, 0);
+    if (sessions < minSessionsForCompare) return null;
+    const weight = rows.reduce((s, d) => s + d.avgWeightPerSession * d.sessions, 0);
+    return weight / sessions;
+  }
+
+  const today = series.length ? series[series.length - 1] : null;
+  const last7 = windowAvg(series.slice(-8, -1)); // 7 full days before today, excludes today
+  const prev7 = windowAvg(series.slice(-15, -8)); // the 7 days before that
+  const last30 = windowAvg(series.slice(-31, -1));
+
+  const pct = (a, b) => (a !== null && a !== undefined && b ? Math.round(((a - b) / b) * 100) : null);
+
+  return {
+    series,
+    lastRecordedDate: dates.length ? dates[dates.length - 1] : null,
+    kpis: {
+      todayAvgWeightPerSession: today ? today.avgWeightPerSession : null,
+      todayAvgMoutPerSession: today ? today.avgMoutPerSession : null,
+      last7AvgWeightPerSession: last7,
+      prev7AvgWeightPerSession: prev7,
+      last30AvgWeightPerSession: last30,
+      todayVsLast7Pct: pct(today ? today.avgWeightPerSession : null, last7),
+      last7VsPrev7Pct: pct(last7, prev7),
+    },
+  };
+}
+
 // discoverUsageRoots(accountsDir) -- one {path, account} per pool account's own
 // CLAUDE_CONFIG_DIR/projects, plus ~/.claude/projects as 'local'. Filters by existence; []
 // if accountsDir is absent.
@@ -343,4 +437,4 @@ function discoverUsageRoots(accountsDir) {
   return roots;
 }
 
-module.exports = { createUsageScanner, buildTokenViews, discoverUsageRoots };
+module.exports = { createUsageScanner, buildTokenViews, buildTrendViews, discoverUsageRoots };
