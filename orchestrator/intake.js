@@ -65,6 +65,8 @@ const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'cli
 // reads that legitimately run long. Reproduced 2026-08-29 with the review budget already fixed to
 // $3 (see step-contracts.js's SMALL_BUDGET_USD, PR #13): a real review still died at the 120s
 // wall-clock mark with "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]" --
+// (that exact message no longer occurs since the 2026-08-30 fix -- a deadline kill now says
+// "claude ran but exceeded the Xms deadline and was killed", see steps/llm.js's `timedOut`) --
 // the spawnSync timeout firing before the model finished, not a budget kill. 300000ms (300s) is
 // this build's local, intake-only deadline -- draftCard and reviewCard each fall back to it only
 // when the caller (deps.deadlineMs, kept first so tests can still inject a short deadline) hasn't
