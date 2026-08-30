@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Restarts the SPO-Pipeline systemd --user services after this repo is updated (git pull /
+# git merge). Installed as a symlink at .git/hooks/post-merge by daemon-install.sh and
+# dashboard-install.sh -- either install script re-creates the same symlink, so installing
+# one service also arms the restart-on-update behaviour for the other if it's present.
+#
+# Only touches units that are actually installed: `systemctl --user restart` on a unit that
+# was never enabled is a no-op error here, not a failure worth surfacing.
+set -euo pipefail
+
+for unit in spo-pipeline-daemon.service spo-pipeline-dashboard.service; do
+  if systemctl --user list-unit-files "$unit" >/dev/null 2>&1 && \
+     systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
+    echo "== post-merge: restarting $unit (repo updated)"
+    systemctl --user restart "$unit" || echo "!! post-merge: failed to restart $unit" >&2
+  fi
+done
