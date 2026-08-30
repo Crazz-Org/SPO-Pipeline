@@ -79,10 +79,19 @@ function lastMatchingEvent(taskDir, predicate) {
   return null;
 }
 
+// The most recent {ts, state, event: 'result', payload} record for `state` in journal.jsonl, or
+// null if that state hasn't produced one yet (fresh task, or the state never ran). Kept as its
+// own function (rather than folded into lastResultPayload) because diagnosisSummary below needs
+// the record's `ts` too, to decide which of a DIAGNOSE and a VALIDATE-reject record is more
+// recent -- lastResultPayload's callers never needed anything but the payload itself.
+function lastResultEvent(taskDir, state) {
+  return lastMatchingEvent(taskDir, (e) => e.state === state && e.event === 'result' && e.payload);
+}
+
 // The most recent {state, event: 'result', payload} record for `state` in journal.jsonl, or
 // null if that state hasn't produced one yet (fresh task, or the state never ran).
 function lastResultPayload(taskDir, state) {
-  const event = lastMatchingEvent(taskDir, (e) => e.state === state && e.event === 'result' && e.payload);
+  const event = lastResultEvent(taskDir, state);
   return event ? event.payload : null;
 }
 
@@ -107,19 +116,64 @@ function lastJournaledCitations(taskDir) {
   return event ? event.citations : null;
 }
 
-// The most recent DIAGNOSE finding, as an IMPLEMENT-facing one-liner, or a fixed "none yet"
-// string on a first attempt (never undefined -- fillPromptTemplate treats undefined as a
-// missing placeholder, and IMPLEMENT's very first invocation for a task has no DIAGNOSE event
-// to read). state-machine.js's handleDiagnose journals rootCause/category/suggestedFix on every
-// DIAGNOSE 'result' event; this is the reader side of that same record, so a DIAGNOSE attempt
-// that named a genuinely new cause is no longer invisible to the IMPLEMENT call that follows it.
+// The most recent DIAGNOSE finding and/or VALIDATE REJECT, as an IMPLEMENT-facing summary, or a
+// fixed "none yet" string when neither has ever happened for this task (never undefined --
+// fillPromptTemplate treats undefined as a missing placeholder, and IMPLEMENT's very first
+// invocation for a task has no such event to read).
+//
+// Two independent sources feed this, each journaled by its own state as a 'result' event nested
+// under `payload` (state-machine.js's handleDiagnose / handleValidate; see either one's own
+// comment on why -- lastResultPayload only ever looks at `event.payload`):
+//   - DIAGNOSE: an earlier CHECK/GATE/CI_CHECKS failure, root cause + category + suggestedFix.
+//   - VALIDATE: the change was actually built, pushed, gated green, and the change-validator
+//     REJECTed it -- reasons (+ findings, though validate-change.md documents REJECT as always
+//     carrying an empty findings list).
+// These name two different failures ("the gate/check failed and DIAGNOSE says X" vs. "the
+// change was built and the validator rejected it because Y") that call for different work from
+// IMPLEMENT, so both are rendered distinctly, never merged into one undifferentiated line. When
+// both exist, the one journaled MOST RECENTLY (by `ts`) is presented first/primary -- it is the
+// finding that actually explains why THIS IMPLEMENT attempt is happening -- but the older one
+// stays visible too, since a still-live earlier diagnosis can remain relevant.
 function diagnosisSummary(taskDir) {
-  const diag = lastResultPayload(taskDir, 'DIAGNOSE');
-  if (!diag || !diag.rootCause) return '(none yet -- this is the first IMPLEMENT attempt for this task)';
-  const parts = [`root cause: ${diag.rootCause}`];
-  if (diag.category) parts.push(`category: ${diag.category}`);
-  if (diag.suggestedFix) parts.push(`suggested fix: ${diag.suggestedFix}`);
-  return parts.join(' | ');
+  const diagEvent = lastResultEvent(taskDir, 'DIAGNOSE');
+  const validateEvent = lastResultEvent(taskDir, 'VALIDATE');
+  const diag = diagEvent && diagEvent.payload;
+  const val = validateEvent && validateEvent.payload;
+
+  let diagText = null;
+  if (diag && diag.rootCause) {
+    const parts = [`DIAGNOSE (a check/gate/CI failure): root cause: ${diag.rootCause}`];
+    if (diag.category) parts.push(`category: ${diag.category}`);
+    if (diag.suggestedFix) parts.push(`suggested fix: ${diag.suggestedFix}`);
+    diagText = parts.join(' | ');
+  }
+
+  // A REJECT is threaded whenever one was journalled at all -- reasons and findings are BOTH
+  // optional on the wire. Guarding the whole block on non-empty `reasons` (as this first did)
+  // meant a rejection carrying only `findings` threaded nothing, and if an older DIAGNOSE
+  // existed, its stale cause was presented to IMPLEMENT as the current one, with no hint that a
+  // rejection had just happened -- the precise failure 1.6 exists to prevent. handleValidate
+  // already writes '(no reason given)' on the ledger side for this case; match it here.
+  let valText = null;
+  if (val) {
+    const hasReasons = Array.isArray(val.reasons) && val.reasons.length > 0;
+    const findingTitles = Array.isArray(val.findings)
+      ? val.findings.map((f) => f && f.title).filter(Boolean)
+      : [];
+    const summary = hasReasons ? val.reasons.join('; ') : '(no reason given)';
+    const parts = [`VALIDATE REJECT (the change was built and the validator rejected it): ${summary}`];
+    if (findingTitles.length > 0) parts.push(`findings: ${findingTitles.join('; ')}`);
+    valText = parts.join(' | ');
+  }
+
+  if (!diagText && !valText) return '(none yet -- this is the first IMPLEMENT attempt for this task)';
+  if (diagText && !valText) return diagText;
+  if (valText && !diagText) return valText;
+
+  const diagIsMoreRecent = diagEvent.ts > validateEvent.ts;
+  const primary = diagIsMoreRecent ? diagText : valText;
+  const earlier = diagIsMoreRecent ? valText : diagText;
+  return `${primary} || also, from an earlier attempt: ${earlier}`;
 }
 
 function commonValues(ctx) {
@@ -203,6 +257,7 @@ function buildPromptValues(ctx, stepName) {
 module.exports = {
   buildPromptValues,
   lastResultPayload,
+  lastResultEvent,
   lastJournaledCitations,
   scratchDir,
   diffPath,

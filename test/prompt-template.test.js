@@ -185,6 +185,80 @@ test('buildPromptValues: IMPLEMENT diagnosis reads the LATEST DIAGNOSE result, n
   assert.ok(!/first-cause/.test(values.diagnosis));
 });
 
+// ---- action 1.6: a VALIDATE REJECT threaded into the next IMPLEMENT's {{diagnosis}} ----------
+
+test('buildPromptValues: IMPLEMENT diagnosis surfaces a VALIDATE REJECT\'s reasons (action 1.6)', () => {
+  const taskDir = mkTmp('spo-values-implement-validatereject-');
+  appendEvent(taskDir, 'VALIDATE', 'result', {
+    attempt: 1,
+    payload: { reasons: ['criterion not met: the widget never renders the empty state'], findings: [] },
+  });
+  const ctx = { taskDir, task: { issue: 1, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.match(values.diagnosis, /VALIDATE REJECT/);
+  assert.match(values.diagnosis, /the widget never renders the empty state/);
+});
+
+test('buildPromptValues: IMPLEMENT diagnosis attributes a VALIDATE REJECT distinctly from a DIAGNOSE finding (never merged into one undifferentiated line)', () => {
+  const taskDir = mkTmp('spo-values-implement-validatereject-attrib-');
+  appendEvent(taskDir, 'VALIDATE', 'result', {
+    attempt: 1,
+    payload: { reasons: ['integration incoherent with the neighbouring module'], findings: [] },
+  });
+  const ctx = { taskDir, task: { issue: 1, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  // Must be able to tell "the change was built and the validator rejected it" apart from a
+  // DIAGNOSE-shaped "a check/gate/CI failed" cause -- assert the VALIDATE framing is present and
+  // the DIAGNOSE framing is not.
+  assert.match(values.diagnosis, /validator rejected it/);
+  assert.ok(!/root cause:/.test(values.diagnosis));
+});
+
+test('buildPromptValues: IMPLEMENT diagnosis shows BOTH an earlier DIAGNOSE and a later VALIDATE REJECT, most recent (VALIDATE) dominant', () => {
+  const taskDir = mkTmp('spo-values-implement-both-validatelatest-');
+  appendEvent(taskDir, 'DIAGNOSE', 'result', {
+    attempt: 1,
+    ts: '2026-01-01T00:00:00.000Z',
+    payload: { rootCause: 'flaky-timeout-in-gate', category: null, suggestedFix: null },
+  });
+  appendEvent(taskDir, 'VALIDATE', 'result', {
+    attempt: 1,
+    ts: '2026-01-01T00:05:00.000Z',
+    payload: { reasons: ['criterion not met: X'], findings: [] },
+  });
+  const ctx = { taskDir, task: { issue: 1, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.match(values.diagnosis, /flaky-timeout-in-gate/);
+  assert.match(values.diagnosis, /criterion not met: X/);
+  // most recent (VALIDATE) is presented first/primary
+  assert.ok(
+    values.diagnosis.indexOf('criterion not met: X') < values.diagnosis.indexOf('flaky-timeout-in-gate'),
+    `expected the more recent VALIDATE reject to lead: ${values.diagnosis}`
+  );
+});
+
+test('buildPromptValues: IMPLEMENT diagnosis shows BOTH an earlier VALIDATE REJECT and a later DIAGNOSE, most recent (DIAGNOSE) dominant', () => {
+  const taskDir = mkTmp('spo-values-implement-both-diaglatest-');
+  appendEvent(taskDir, 'VALIDATE', 'result', {
+    attempt: 1,
+    ts: '2026-01-01T00:00:00.000Z',
+    payload: { reasons: ['criterion not met: X'], findings: [] },
+  });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', {
+    attempt: 1,
+    ts: '2026-01-01T00:05:00.000Z',
+    payload: { rootCause: 'a-new-ci-failure', category: null, suggestedFix: null },
+  });
+  const ctx = { taskDir, task: { issue: 1, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.match(values.diagnosis, /a-new-ci-failure/);
+  assert.match(values.diagnosis, /criterion not met: X/);
+  assert.ok(
+    values.diagnosis.indexOf('a-new-ci-failure') < values.diagnosis.indexOf('criterion not met: X'),
+    `expected the more recent DIAGNOSE finding to lead: ${values.diagnosis}`
+  );
+});
+
 test('buildPromptValues: DIAGNOSE ledger_path is always journal/<id>/ledger.md', () => {
   const taskDir = mkTmp('spo-values-diagnose-');
   const values = buildPromptValues({ taskDir, task: {} }, 'DIAGNOSE');
@@ -289,4 +363,33 @@ test('buildPromptValues: CITATION_VERIFIER normalizes an empty task.citations ar
   const taskDir = mkTmp('spo-values-cv-empty-array-');
   const values = buildPromptValues({ taskDir, task: { citations: [] } }, 'CITATION_VERIFIER');
   assert.equal(values.citations, undefined);
+});
+
+// A REJECT carrying findings but no reasons must still reach IMPLEMENT. Guarding the whole
+// VALIDATE branch on non-empty `reasons` threaded nothing here, and when an older DIAGNOSE
+// existed its stale cause was handed to IMPLEMENT as the current one -- 1.6's own failure mode.
+test('buildPromptValues: a VALIDATE REJECT with findings but no reasons still reaches {{diagnosis}}, and still dominates an older DIAGNOSE', () => {
+  const taskDir = mkTmp('spo-values-reject-findings-only-');
+  const { appendEvent } = require('../orchestrator/journal');
+
+  appendEvent(taskDir, 'DIAGNOSE', 'result', {
+    attempt: 1,
+    ts: '2026-08-30T10:00:00.000Z',
+    payload: { rootCause: 'stale cause from an earlier attempt' },
+  });
+  appendEvent(taskDir, 'VALIDATE', 'result', {
+    attempt: 1,
+    ts: '2026-08-30T11:00:00.000Z',
+    payload: { reasons: [], findings: [{ title: 'unhandled null in the new branch' }] },
+  });
+
+  const values = buildPromptValues({ taskDir, task: { issue: 1 } }, 'IMPLEMENT');
+  assert.match(values.diagnosis, /VALIDATE REJECT/);
+  assert.match(values.diagnosis, /unhandled null in the new branch/);
+  assert.match(values.diagnosis, /\(no reason given\)/);
+  // the rejection is primary, the older diagnose demoted -- never the other way round
+  assert.ok(
+    values.diagnosis.indexOf('VALIDATE REJECT') < values.diagnosis.indexOf('stale cause'),
+    'the more recent rejection must dominate the older diagnose'
+  );
 });

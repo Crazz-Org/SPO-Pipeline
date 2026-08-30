@@ -47,12 +47,23 @@ diagnosis:  {{diagnosis}}
    rather than improvising a different design — a plan defect is reported, not silently
    corrected by you. The plan owns the design; you own the execution of it.
 3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this
-   step. Any other value means a prior DIAGNOSE pass named a specific, reproducing cause after
-   an earlier attempt's checks/CI failed — treat its `suggested fix` as a required amendment to
-   the plan for *this* attempt, on top of (never instead of) the plan itself. Do not re-verify
-   the plan is already satisfied and stop there if the diagnosed cause is still present in the
-   worktree — that is exactly the loop DIAGNOSE exists to break, and re-declaring the plan
-   "already implemented" without addressing it just re-triggers the same diagnosis next round.
+   step. Any other value carries one or both of two distinct sources, each labeled, and calling
+   for different work:
+   - `DIAGNOSE (a check/gate/CI failure)`: a prior DIAGNOSE pass named a specific, reproducing
+     cause after an earlier attempt's checks/CI failed — treat its `suggested fix` as a required
+     amendment to the plan for *this* attempt, on top of (never instead of) the plan itself. Do
+     not re-verify the plan is already satisfied and stop there if the diagnosed cause is still
+     present in the worktree — that is exactly the loop DIAGNOSE exists to break, and
+     re-declaring the plan "already implemented" without addressing it just re-triggers the same
+     diagnosis next round.
+   - `VALIDATE REJECT`: the previous attempt's change was actually built, checked, gated, pushed
+     and reached VALIDATE — and the change-validator rejected it, either because the criterion
+     was not genuinely met or because the integration was incoherent with its surrounding code.
+     Its reasons (and any findings) are not a build/test failure to fix — re-running the same
+     checks will not help. Address exactly what the reasons describe before repeating any part
+     of the plan that produced the rejected change.
+   If both are present, the one presented first is the more recent and is what caused *this*
+   attempt; the other is earlier context, still worth reading.
 4. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
    own layout (`module.ts` → `module.test.ts`, same directory; the `unit` / `component` Jest
    projects) — do not hand-count coverage, run the real tool (step 5).
@@ -83,8 +94,10 @@ diagnosis:  {{diagnosis}}
   reach the same path.
 - **Stay inside the plan's scope, amended only by `diagnosis` above.** One card, one plan, one
   attempt — a plan that is wrong is reported in `summary`, not silently expanded around. The one
-  exception is a non-empty `diagnosis`: DIAGNOSE only ever names a cause that is already blocking
-  this same card (a failing check, a red gate, a CI failure), never new scope of its own.
+  exception is a non-empty `diagnosis`: whether it names a DIAGNOSE finding or a VALIDATE
+  REJECT, it only ever describes something already blocking this same card (a failing check, a
+  red gate, a CI failure, or the change-validator's own verdict on the previous attempt), never
+  new scope of its own.
 - **The RDO wire rule is not your call.** If the plan touches `src/shared/rdo-*`,
   `src/server/rdo.ts`, `rdo-members.ts`, or session-phase code, the caller has already escalated
   this step to Opus 5 per CLAUDE.md's wire rule — you do not choose your own model, and a new

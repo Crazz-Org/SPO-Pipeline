@@ -110,7 +110,14 @@ Two independent counters per task, both journaled and both visible in `state.jso
   cause seen twice for the same task parks immediately, even under budget. One line per
   attempt in `ledger.md`: `attempt N | root cause | outcome`.
 - **VALIDATE REJECT**: `validateRejectBudget` (default 3), separate from the above — a REJECT
-  verdict from `change-validator` retries straight to IMPLEMENT, no DIAGNOSE call.
+  verdict from `change-validator` retries straight to IMPLEMENT, no DIAGNOSE call. Its own
+  ledger line uses a distinct `kind` so it's never confused with a DIAGNOSE attempt:
+  `validate-reject N | <reasons> | outcome`. A REJECT's `reasons`/`findings` are also threaded
+  into the next IMPLEMENT's `{{diagnosis}}` placeholder (action 1.6) — `task-values.js`'s
+  `diagnosisSummary` reads back whichever of a DIAGNOSE finding and a VALIDATE reject was
+  journaled most recently as the primary line, and still shows the other (if any) for context,
+  clearly attributed to its own state so IMPLEMENT can tell "a check/gate/CI failed" apart from
+  "the change was built and the validator rejected it".
 
 ## Real mode
 
@@ -426,7 +433,19 @@ unparsable URL parks `push-pr-failed` (`step: 'pr-number-unparsed'`) rather than
 
 **CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
 <worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to
-`{name, conclusion}` pairs; the first check whose conclusion isn't `success`/`neutral`/`skipped`
+`{name, conclusion}` pairs. Before anything is judged green or failing, a bounded **in-flight
+wait** (action 1.7) treats a check-run with `conclusion: null` (still running) or a completely
+empty `check_runs` array (CI hasn't registered anything yet) as neither: it re-fetches
+(re-running the same `gh api` call through `spawnStep`, so every poll is journalled exactly like
+any other real command) up to `ciChecksMaxPolls` times total (default 30), sleeping
+`ciChecksPollIntervalMs` between polls (default 20000ms, ~10 min total — deliberately generous
+and uncalibrated, since the pipeline has never once waited for CI to conclude; see the note in
+`config.js`) — the sleep itself goes through
+`deps.sleep` (the test injection seam; production always sleeps for real). Each in-flight
+observation is journalled as a `checks-in-flight` event (`attempt`, `totalRuns`, `pendingRuns`).
+Still in flight after the last poll → `PARKED` `ci-checks-still-running`, never advancing toward
+MERGE. Only once nothing is in flight does the pre-existing decision run: the first check whose
+conclusion isn't `success`/`neutral`/`skipped`
 goes through `orchestrator/ci-cause-table.js` — the same lookup table `state-machine.js`'s
 shadow-fixture branch uses, factored out so the two can never drift apart. (b) only if (a) was
 green: `~/.spo-bench/verdicts/<headSha>.json`'s `baseMain` field (no file → treated as "not

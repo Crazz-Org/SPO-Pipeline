@@ -845,12 +845,23 @@ async function gitRevParse(ctx, deps, worktreePath, ref) {
 
 const CI_GREEN_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 
-async function realCiChecks(ctx, deps = {}) {
-  const config = ctx.config;
-  const worktreePath = ctx.task.worktreePath;
+function defaultSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
+// `deps.sleep` is the test injection point for realCiChecks' bounded in-flight poll loop below
+// -- same convention as `deps.spawnSync` (runSync above) -- production code never passes it, so
+// a real run always sleeps for real. Tests inject a no-op (or a recording stub) so the suite
+// never actually waits out ciChecksPollIntervalMs x ciChecksMaxPolls.
+function pollSleep(deps, ms) {
+  const sleepFn = (deps && deps.sleep) || defaultSleep;
+  return sleepFn(ms);
+}
 
+// One `gh api .../check-runs` fetch for `headSha`, parsed down to [{name, conclusion}]. Goes
+// through spawnStep like every other real command here, so every poll in the loop below is
+// journalled the same way a single fetch always was.
+function fetchCheckRuns(ctx, deps, config, headSha) {
   const checkRuns = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
     'api',
     `repos/${config.ghRepo}/commits/${headSha}/check-runs`,
@@ -865,7 +876,53 @@ async function realCiChecks(ctx, deps = {}) {
     }
   })();
   const runs = parsed && Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
-  const checks = runs.map((r) => ({ name: r.name, conclusion: r.conclusion }));
+  return runs.map((r) => ({ name: r.name, conclusion: r.conclusion, status: r.status }));
+}
+
+async function realCiChecks(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+
+  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
+
+  // Action 1.7: `c.conclusion && !CI_GREEN_CONCLUSIONS.has(...)` used to skip a check-run whose
+  // `conclusion` is still `null` (still running) when looking for a failing one -- so a CI run
+  // that had not finished read as green, and an empty `check_runs` array (CI has not even
+  // registered yet) had no failing element either, same silent false-green. The audit measured
+  // 8/12 real "green" events with `claude review` still in progress. Treat both as "in flight":
+  // re-poll, bounded by ciChecksMaxPolls, sleeping ciChecksPollIntervalMs between polls, before
+  // ever applying the failing/green decision below. Only once nothing is in flight does that
+  // pre-existing logic run.
+  const maxPolls = config.ciChecksMaxPolls;
+  const pollIntervalMs = config.ciChecksPollIntervalMs;
+  let checks = [];
+  for (let attempt = 1; attempt <= maxPolls; attempt++) {
+    checks = fetchCheckRuns(ctx, deps, config, headSha);
+    // In flight = anything that has not landed a usable conclusion. `conclusion == null` catches
+    // both null and an absent key, `!c.conclusion` also catches '' -- GitHub happens to always
+    // send `conclusion: null` beside `status: 'queued'|'in_progress'`, but relying on that alone
+    // left the same shape of hole 1.7 exists to close: a run with the key absent, or empty,
+    // counted as neither pending nor failing and read as green. `status !== 'completed'` is the
+    // authoritative signal, so honour it when present rather than inferring from conclusion.
+    const pendingRuns = checks.filter(
+      (c) => !c.conclusion || (c.status !== undefined && c.status !== 'completed')
+    ).length;
+    const inFlight = checks.length === 0 || pendingRuns > 0;
+
+    if (!inFlight) break;
+
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-in-flight', {
+      attempt,
+      totalRuns: checks.length,
+      pendingRuns,
+    });
+
+    if (attempt === maxPolls) {
+      throw new ParkSignal('ci-checks-still-running', { attempts: attempt, totalRuns: checks.length, pendingRuns });
+    }
+    await pollSleep(deps, pollIntervalMs);
+  }
+
   const failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion));
 
   if (failing) {

@@ -48,6 +48,12 @@ function testConfig(overrides = {}) {
     ghRepo: 'Crazz-Org/SPO-WebClient',
     spoBenchDir: mkTmp('spo-real-bench-'),
     stepDeadlineMs: 30000,
+    // action 1.7: realCiChecks' bounded in-flight poll -- small numbers here are fine, every
+    // existing CI_CHECKS test's fake spawnSync returns a fully-concluded check-run set on the
+    // very first fetch, so these never actually get exercised except by the dedicated
+    // in-flight tests below (which override them further where a specific bound matters).
+    ciChecksMaxPolls: 3,
+    ciChecksPollIntervalMs: 1000,
     ...overrides,
   };
 }
@@ -1194,6 +1200,165 @@ test('realCiChecks: nightly red at the fetched origin/main sha -> PARKED (main-r
   );
 });
 
+// ---- CI_CHECKS: bounded in-flight wait (action 1.7) ------------------------------------------
+//
+// `conclusion: null` (still running) or zero check-runs (CI hasn't registered yet) must never
+// read as green -- the audit measured 8/12 real "green" events with `claude review` still in
+// progress. Every test here injects `deps.sleep` as a recording no-op so the suite never
+// actually waits out ciChecksPollIntervalMs x ciChecksMaxPolls.
+
+function noSleepDeps(spawnSyncFn, sleeps = []) {
+  return {
+    spawnSync: spawnSyncFn,
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+}
+
+test('realCiChecks: conclusion: null on one run -> re-polls, proceeds normally once the re-poll returns a concluded green set', async () => {
+  const config = testConfig({ ciChecksMaxPolls: 4, ciChecksPollIntervalMs: 5000 });
+  const ctx = ciCtx({ config });
+  const headSha = 'headshaINFLIGHT1111111111111111111111111';
+  let apiCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    if (command === 'gh' && args[0] === 'api') {
+      apiCalls += 1;
+      if (apiCalls === 1) {
+        return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: null }] }));
+      }
+      return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+    }
+    return ok('');
+  }, sleeps);
+
+  const next = await realCiChecks(ctx, deps);
+
+  assert.equal(next, 'VALIDATE');
+  assert.equal(apiCalls, 2, 'expected the initial fetch plus exactly one re-poll');
+  assert.deepEqual(sleeps, [5000], 'expected exactly one injected sleep, for the interval configured');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(
+    journal.some((e) => e.event === 'checks-in-flight' && e.attempt === 1 && e.totalRuns === 1 && e.pendingRuns === 1),
+    'expected the in-flight observation to be journalled'
+  );
+  assert.ok(journal.some((e) => e.event === 'checks-green'));
+});
+
+test('realCiChecks: zero check-runs registered -> same bounded in-flight wait as conclusion: null', async () => {
+  const config = testConfig({ ciChecksMaxPolls: 4, ciChecksPollIntervalMs: 2000 });
+  const ctx = ciCtx({ config });
+  const headSha = 'headshaNOCHECKS2222222222222222222222222';
+  let apiCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    if (command === 'gh' && args[0] === 'api') {
+      apiCalls += 1;
+      if (apiCalls === 1) return ok(JSON.stringify({ check_runs: [] }));
+      return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+    }
+    return ok('');
+  }, sleeps);
+
+  const next = await realCiChecks(ctx, deps);
+
+  assert.equal(next, 'VALIDATE');
+  assert.equal(apiCalls, 2);
+  assert.deepEqual(sleeps, [2000]);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'checks-in-flight' && e.attempt === 1 && e.totalRuns === 0));
+});
+
+test('realCiChecks: still in flight after the configured max polls -> PARKED ci-checks-still-running, never reaches MERGE', async () => {
+  const config = testConfig({ ciChecksMaxPolls: 3, ciChecksPollIntervalMs: 1000 });
+  const ctx = ciCtx({ config });
+  const headSha = 'headshaNEVERGREEN33333333333333333333333';
+  let apiCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    if (command === 'gh' && args[0] === 'api') {
+      apiCalls += 1;
+      // Always still running -- never concludes within the bound.
+      return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: null }] }));
+    }
+    return ok('');
+  }, sleeps);
+
+  let caught = null;
+  try {
+    await realCiChecks(ctx, deps);
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.ok(caught instanceof ParkSignal, 'expected a ParkSignal');
+  assert.equal(caught.reason, 'ci-checks-still-running');
+  assert.equal(apiCalls, config.ciChecksMaxPolls, 'expected exactly ciChecksMaxPolls fetches, no more');
+  assert.equal(sleeps.length, config.ciChecksMaxPolls - 1, 'expected a sleep between every poll but the last');
+
+  // Never advanced toward MERGE: no 'checks-green' event, no failing-check routing either.
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(!journal.some((e) => e.event === 'checks-green'));
+  assert.ok(!journal.some((e) => e.event === 'check-failed'));
+});
+
+test('realCiChecks: a genuinely failing check still routes through the cause table exactly as before, even after an in-flight re-poll', async () => {
+  const config = testConfig({ ciChecksMaxPolls: 4, ciChecksPollIntervalMs: 500 });
+  const ctx = ciCtx({ config });
+  const headSha = 'headshaFAILAFTERPOLL4444444444444444444444';
+  let apiCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    if (command === 'gh' && args[0] === 'api') {
+      apiCalls += 1;
+      if (apiCalls === 1) {
+        return ok(JSON.stringify({ check_runs: [{ name: 'Lint', conclusion: null }] }));
+      }
+      return ok(JSON.stringify({ check_runs: [{ name: 'Lint', conclusion: 'failure' }] }));
+    }
+    return ok('');
+  }, sleeps);
+
+  const next = await realCiChecks(ctx, deps);
+  assert.equal(next, 'IMPLEMENT'); // same "Lint" -> IMPLEMENT routing as the non-polling test above
+  assert.equal(apiCalls, 2);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'check-failed' && e.check === 'Lint'));
+});
+
+test('realCiChecks: a genuinely green set on the first fetch decides green in one call, no polling (no bench verdict, so it returns VALIDATE before the main-moved test)', async () => {
+  const config = testConfig({ ciChecksMaxPolls: 4, ciChecksPollIntervalMs: 999 });
+  const ctx = ciCtx({ config });
+  let apiCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('rev-parse')) return ok('sha\n');
+    if (command === 'gh' && args[0] === 'api') {
+      apiCalls += 1;
+      return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+    }
+    return ok('');
+  }, sleeps);
+
+  const next = await realCiChecks(ctx, deps);
+
+  assert.equal(next, 'VALIDATE');
+  assert.equal(apiCalls, 1, 'a genuinely green set must resolve on the first fetch, no re-poll');
+  assert.deepEqual(sleeps, [], 'no sleep should ever be invoked when nothing is in flight');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(!journal.some((e) => e.event === 'checks-in-flight'));
+});
+
 // ---- MERGE ----------------------------------------------------------------------------------
 
 test('realMerge: gh pr merge --merge argv never includes --delete-branch', async () => {
@@ -2047,3 +2212,38 @@ test("runTask: DIAGNOSE from a CHECK failure is handed cameFrom 'CHECK'; DIAGNOS
   const diagVisits = seenSecond.filter((e) => e.state === 'DIAGNOSE').map((e) => e.cameFrom);
   assert.deepEqual(diagVisits, ['GATE', 'CHECK']);
 });
+
+// D3's hole: `conclusion === null` alone is not what "in flight" means. GitHub happens to send
+// conclusion: null beside status queued/in_progress, but a run whose conclusion key is ABSENT or
+// empty counted as neither pending (=== null) nor failing (truthiness) and read as GREEN -- the
+// exact shape of the bug action 1.7 exists to close, re-opened one field over.
+for (const [label, run] of [
+  ['conclusion key absent, status queued', { name: 'claude review', status: 'queued' }],
+  ['conclusion empty string', { name: 'claude review', conclusion: '', status: 'in_progress' }],
+  ['conclusion success but status in_progress', { name: 'claude review', conclusion: 'success', status: 'in_progress' }],
+]) {
+  test(`realCiChecks: ${label} counts as in flight, never as green`, async () => {
+    const taskDir = mkTmp('spo-ci-inflight-shape-');
+    const worktreePath = mkTmp('spo-ci-inflight-wt-');
+    const sleeps = [];
+    const deps = {
+      sleep: async (ms) => sleeps.push(ms),
+      spawnSync: (command, args) => {
+        if (command === 'git' && args.includes('rev-parse')) return { status: 0, stdout: 'headsha\n', stderr: '' };
+        if (command === 'gh' && args[0] === 'api') {
+          return { status: 0, stdout: JSON.stringify({ check_runs: [run] }), stderr: '' };
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      },
+    };
+
+    const ctx = testCtx({
+      taskDir,
+      task: { id: 'ci-inflight-shape', issue: 7, worktreePath },
+      config: testConfig({ ciChecksMaxPolls: 2, ciChecksPollIntervalMs: 1000 }),
+    });
+
+    await assert.rejects(() => realCiChecks(ctx, deps), (err) => err.reason === 'ci-checks-still-running');
+    assert.equal(sleeps.length, 1, 'one sleep between the two polls');
+  });
+}

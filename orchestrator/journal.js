@@ -2,7 +2,9 @@
 // Append-only journal I/O for one task's runtime directory (journal/<id>/).
 //
 //   journal.jsonl - one JSON object per line: {ts, state, event, ...detail}. Never rewritten.
-//   ledger.md     - one line per DIAGNOSE attempt: "attempt N | root cause | outcome".
+//   ledger.md     - one line per DIAGNOSE attempt ("attempt N | root cause | outcome") plus one
+//                   line per VALIDATE REJECT ("validate-reject N | <reasons> | outcome") --
+//                   action 1.6, see appendLedgerLine's own `kind` parameter.
 //   state.json    - current state + counters, overwritten on every transition (a snapshot,
 //                   not a log -- the console reads it for the "current" columns).
 //   report.md     - written once, only when a task is PARKED.
@@ -27,8 +29,12 @@ function appendDaemonEvent(journalRoot, event, detail = {}) {
   fs.appendFileSync(path.join(journalRoot, 'daemon.jsonl'), JSON.stringify(record) + '\n');
 }
 
-function appendLedgerLine(taskDir, attemptN, rootCause, outcome) {
-  fs.appendFileSync(path.join(taskDir, 'ledger.md'), `attempt ${attemptN} | ${rootCause} | ${outcome}\n`);
+// `kind` defaults to 'attempt' (DIAGNOSE's own lines, unchanged shape) -- action 1.6 passes
+// 'validate-reject' for a VALIDATE REJECT so the two are visually distinct in ledger.md while
+// keeping the same readable "<kind> N | <text> | <outcome>" one-liner-per-attempt shape, and
+// without touching any existing DIAGNOSE call site or the ledger parsing tests already rely on.
+function appendLedgerLine(taskDir, attemptN, rootCause, outcome, kind = 'attempt') {
+  fs.appendFileSync(path.join(taskDir, 'ledger.md'), `${kind} ${attemptN} | ${rootCause} | ${outcome}\n`);
 }
 
 function writeState(taskDir, snapshot) {

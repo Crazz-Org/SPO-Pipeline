@@ -581,8 +581,34 @@ async function handleValidate(ctx) {
   if (verdict === 'PASS' || verdict === 'PASS_WITH_FINDINGS') return 'MERGE';
   if (verdict === 'REJECT') {
     ctx.counters.validateRejects += 1;
-    if (ctx.counters.validateRejects >= ctx.config.validateRejectBudget) {
-      throw new ParkSignal('validate-reject-budget-exhausted', { rejects: ctx.counters.validateRejects });
+    const attemptN = ctx.counters.validateRejects;
+
+    // Action 1.6: a REJECT's reasons/findings were previously journaled only as the flat
+    // 'change-validator' event above (verdict + findings, no reasons) and never threaded any
+    // further -- the next IMPLEMENT re-read the original PLAN and its {{diagnosis}} placeholder
+    // and could reproduce the exact change VALIDATE just rejected. Mirror handleDiagnose's own
+    // fix for the same gap (DIAGNOSE -> IMPLEMENT): journal a 'result' event nested under
+    // `payload`, matching DIAGNOSE's/PLAN's/IMPLEMENT's own 'result' shape -- task-values.js's
+    // lastResultPayload (the reader every other step's derivation already goes through) only
+    // ever looks at `event.payload`, so a flat shape here would be silently invisible to it. See
+    // task-values.js's diagnosisSummary for the reader side that now also considers this event.
+    const reasons = Array.isArray(result.reasons) ? result.reasons.filter(Boolean) : [];
+    const findings = Array.isArray(result.findings) ? result.findings : [];
+    appendEvent(ctx.taskDir, 'VALIDATE', 'result', {
+      attempt: attemptN,
+      payload: { reasons, findings },
+    });
+
+    const budgetExhausted = attemptN >= ctx.config.validateRejectBudget;
+    const outcome = budgetExhausted ? 'parked (validate-reject-budget-exhausted)' : 'retry (validate reject)';
+    // Ledger line distinct from a DIAGNOSE attempt's own ("attempt N | ..."): 'validate-reject'
+    // as the line's `kind` (journal.js's appendLedgerLine) so the two are never confused when
+    // both appear in the same ledger.md, per validate-change.md's own instruction that `reasons`
+    // for a REJECT is "the root cause in one line, exactly as it should appear on the ledger".
+    appendLedgerLine(ctx.taskDir, attemptN, reasons.length ? reasons.join('; ') : '(no reason given)', outcome, 'validate-reject');
+
+    if (budgetExhausted) {
+      throw new ParkSignal('validate-reject-budget-exhausted', { rejects: attemptN });
     }
     return 'IMPLEMENT';
   }
