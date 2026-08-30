@@ -763,8 +763,63 @@ function pullBoard(deps = {}) {
 const CRITERION_HEADING_RE = /^#{1,6}\s*(?:done means|acceptance(?:\s+criteria)?)\s*$/im;
 const CRITERION_INLINE_RE = /^[ \t]*(?:\*\*)?(?:done means|acceptance(?:\s+criteria)?)(?:\*\*)?:\s*(.+)$/im;
 
+// Strips <details>...</details> blocks -- nesting included -- out of an issue body.
+//
+// Why here: amendCard (above) archives the pre-edit body inside a
+// <details><summary>Original report (raw intake...)</summary> block -- content deliberately
+// collapsed, never an acceptance criterion. An in-game bug report embeds its own
+// <details><summary>journal (N entries captured)</summary> on top, so the final body carries
+// TWO copies of the report and TWO WebSocket journals, nested. On card #452, extractCriterion's
+// fallback below (the whole body, for lack of a "Done means" heading) turned that into a 99896-
+// byte criterion -- against 1-2KB for a normal card (#347: 1048B, #201: 1930B, #450: 2177B) --
+// copied verbatim into every LLM prompt for the task.
+//
+// A depth-tracking scanner, not a regex: a non-greedy /<details.*?<\/details>/ stops at the
+// nested block's own closing tag and leaves an orphaned </details> plus a copy of the report
+// (verified against #452's real body); the greedy variant swallows real text sitting between two
+// sibling blocks instead. Neither handles arbitrary nesting.
+//
+// An unclosed <details> returns the ENTIRE original text untouched, stripping nothing: a
+// too-long criterion beats one truncated by malformed markup, and by the time an opening tag
+// has no matching close there is no well-formed prefix left to salvage anyway.
+const DETAILS_TAG_RE = /<\/?details\b[^>]*>/gi;
+
+function stripDetailsBlocks(text) {
+  let out = '';
+  let depth = 0;
+  let last = 0;
+  let match;
+  DETAILS_TAG_RE.lastIndex = 0;
+  while ((match = DETAILS_TAG_RE.exec(text))) {
+    const isOpen = match[0][1] !== '/';
+    if (isOpen) {
+      if (depth === 0) out += text.slice(last, match.index);
+      depth++;
+    } else if (depth > 0) {
+      depth--;
+      if (depth === 0) last = match.index + match[0].length;
+    } else {
+      // An orphaned </details> (no open block in progress) -- drop the tag, keep the text.
+      out += text.slice(last, match.index);
+      last = match.index + match[0].length;
+    }
+  }
+  if (depth > 0) return text; // unclosed <details> -- bail out, return the original as-is
+  out += text.slice(last);
+  return out;
+}
+
 function extractCriterion(body) {
-  const text = body || '';
+  // Stripped before EITHER search runs, not just before the fallback: a "Done means" heading
+  // could itself live inside amendCard's archived copy, and extracting it from there would
+  // report the pre-review criterion instead of the triaged one. No card filed via
+  // draft-card.md ever puts its own "## Done means" inside a <details> block -- it is always a
+  // top-level section -- so this never touches the common case.
+  const stripped = stripDetailsBlocks(body || '');
+  // Safety net: a body that is ENTIRELY one <details> block would otherwise strip to nothing,
+  // parking the card on a missing-placeholder error. A too-long criterion is recoverable; an
+  // empty one is not.
+  const text = stripped.trim() ? stripped : (body || '');
 
   const heading = text.match(CRITERION_HEADING_RE);
   if (heading) {

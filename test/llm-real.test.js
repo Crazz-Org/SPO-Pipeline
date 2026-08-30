@@ -6,7 +6,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { runLlm, invokeClaudeReal, buildArgv, sumCost, classifyFailure } = require('../orchestrator/steps/llm');
+const {
+  runLlm,
+  invokeClaudeReal,
+  buildArgv,
+  resolvePromptText,
+  sumCost,
+  classifyFailure,
+} = require('../orchestrator/steps/llm');
 
 function realShapedPayload(overrides = {}) {
   return {
@@ -35,7 +42,7 @@ function fakeSpawnSync(responder) {
 
 // ---- buildArgv ------------------------------------------------------------------------------
 
-test('buildArgv: full option set, exact flag order', () => {
+test('buildArgv: full option set, exact flag order -- no prompt in argv (it travels on stdin)', () => {
   const argv = buildArgv({
     promptText: 'hello world',
     model: 'haiku',
@@ -47,7 +54,6 @@ test('buildArgv: full option set, exact flag order', () => {
   });
   assert.deepEqual(argv, [
     '-p',
-    'hello world',
     '--model',
     'haiku',
     '--effort',
@@ -67,22 +73,21 @@ test('buildArgv: full option set, exact flag order', () => {
 
 test('buildArgv: only the required fields -- optional flags omitted entirely', () => {
   const argv = buildArgv({ promptText: 'hi', model: 'sonnet', effort: 'medium' });
-  assert.deepEqual(argv, ['-p', 'hi', '--model', 'sonnet', '--effort', 'medium', '--output-format', 'json']);
+  assert.deepEqual(argv, ['-p', '--model', 'sonnet', '--effort', 'medium', '--output-format', 'json']);
 });
 
-test('buildArgv: promptFile is read and used as the prompt text', () => {
+test('resolvePromptText: promptFile is read and used as the prompt text', () => {
   const os = require('os');
   const fs = require('fs');
   const path = require('path');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-promptfile-'));
   const file = path.join(dir, 'prompt.txt');
   fs.writeFileSync(file, 'from a file');
-  const argv = buildArgv({ promptFile: file, model: 'haiku', effort: 'low' });
-  assert.equal(argv[1], 'from a file');
+  assert.equal(resolvePromptText({ promptFile: file }), 'from a file');
 });
 
-test('buildArgv: no promptText or promptFile throws', () => {
-  assert.throws(() => buildArgv({ model: 'haiku' }), /promptText or promptFile/);
+test('resolvePromptText: no promptText or promptFile throws', () => {
+  assert.throws(() => resolvePromptText({ model: 'haiku' }), /promptText or promptFile/);
 });
 
 // ---- sumCost / classifyFailure ------------------------------------------------------------
@@ -328,9 +333,11 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
 
   const payload = realShapedPayload({ result: 'plan complete' });
   let seenArgv = null;
+  let seenInput = null;
   const deps = {
-    spawnSync: fakeSpawnSync((command, argv) => {
+    spawnSync: fakeSpawnSync((command, argv, opts) => {
       seenArgv = argv;
+      seenInput = opts.input;
       return { status: 0, stdout: JSON.stringify(payload), stderr: '', signal: null };
     }),
   };
@@ -352,7 +359,7 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
 
   assert.equal(result.ok, true);
   assert.equal(result.result, 'plan complete');
-  assert.ok(seenArgv.includes('plan this'));
+  assert.equal(seenInput, 'plan this');
   assert.ok(seenArgv.includes('fable'));
 
   const journalLines = fs
@@ -366,4 +373,34 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
   assert.equal(llmCallEvent.account, 'acct-x');
   assert.equal(llmCallEvent.ok, true);
   assert.equal(llmCallEvent.sessionId, 'sess-123');
+});
+
+// ---- regression: #452's E2BIG (a big prompt must never land in argv) -----------------------
+
+test('invokeClaudeReal: a 200KB prompt (over Linux MAX_ARG_STRLEN) goes to stdin, never into argv', async () => {
+  const huge = 'x'.repeat(200 * 1024); // 200KB > MAX_ARG_STRLEN (131072 bytes/argv entry)
+  let seenArgv = null;
+  let seenInput = null;
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv, opts) => {
+      seenArgv = argv;
+      seenInput = opts.input;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await invokeClaudeReal(
+    { step: 'IMPLEMENT', model: 'fable', effort: 'high', promptText: huge, cwd: '/tmp', account: null },
+    deps
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(seenInput, huge);
+  assert.ok(!seenArgv.includes(huge));
+  for (const arg of seenArgv) {
+    assert.ok(
+      Buffer.byteLength(arg) < 131072,
+      `argv entry exceeds MAX_ARG_STRLEN: ${arg.slice(0, 60)}...`
+    );
+  }
 });

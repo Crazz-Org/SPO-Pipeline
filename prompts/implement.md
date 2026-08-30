@@ -2,6 +2,13 @@
   Step: IMPLEMENT  (state-machine-spec.md § Step contracts)
   Placeholders: {{issue_number}} {{worktree}} {{task_criterion}} {{plan_path}} {{invariants_path}}
                 {{invariant_ids}} {{check_commands}} {{diagnosis}}
+  {{task_criterion}} appears ONLY ONCE in the body below, deliberately: prompt-template.js
+  substitutes every occurrence of a placeholder (split/join), so a second insertion duplicates
+  the whole criterion into the final prompt. On card #452 (a bug-report criterion of 99.9KB, an
+  unfiltered issue body) that doubled the IMPLEMENT prompt to 204826 bytes -- over Linux's
+  MAX_ARG_STRLEN, which is what was making the spawn fail with E2BIG before this fix. Any later
+  reference to the criterion is by name ("the `criterion` in the payload above"), never by
+  reinserting the placeholder.
   Output — stdout, JSON only, nothing else:
   {
     "summary": "<a few sentences, prose>",
@@ -36,9 +43,9 @@ diagnosis:  {{diagnosis}}
 
 1. **Read `{{plan_path}}` in full before touching anything.** It is the only design you follow.
 2. **Implement exactly what the plan describes** inside `{{worktree}}`. If the plan turns out
-   wrong or insufficient for `{{task_criterion}}`, stop and say so in `summary` rather than
-   improvising a different design — a plan defect is reported, not silently corrected by you.
-   The plan owns the design; you own the execution of it.
+   wrong or insufficient for the `criterion` in the payload above, stop and say so in `summary`
+   rather than improvising a different design — a plan defect is reported, not silently
+   corrected by you. The plan owns the design; you own the execution of it.
 3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this
    step. Any other value means a prior DIAGNOSE pass named a specific, reproducing cause after
    an earlier attempt's checks/CI failed — treat its `suggested fix` as a required amendment to

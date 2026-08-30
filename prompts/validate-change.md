@@ -4,6 +4,10 @@
   same three verdicts, JSON output instead of prose.
   Placeholders: {{diff_path}} {{task_criterion}} {{invariants_path}} {{invariant_ids}}
                 {{gate_report_path}}
+  {{task_criterion}} appears ONLY ONCE in the body below -- same fix, same reason, as
+  prompts/implement.md's header: prompt-template.js substitutes every occurrence, so a second
+  insertion would double the criterion into the final prompt (see #452 in implement.md's
+  header). The "Adequacy to the goal" section below refers to it by name instead.
   Output — stdout, JSON only, nothing else:
   {
     "verdict": "PASS" | "PASS_WITH_FINDINGS" | "REJECT",
@@ -58,8 +62,8 @@ proved all three:
 
 ### 1 · Adequacy to the goal
 
-Is `{{task_criterion}}` **genuinely** met? No workaround, no subset of the scope, no test
-written to ratify the code rather than the criterion.
+Is the `criterion` in the payload above **genuinely** met? No workaround, no subset of the
+scope, no test written to ratify the code rather than the criterion.
 
 ### 2 · Coherence of integration
 
