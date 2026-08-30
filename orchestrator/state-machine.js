@@ -418,10 +418,39 @@ async function handleValidate(ctx) {
 
   if (ctx.task.touchesRdoMembers) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
-    const verdict = (cv && cv.verdict) || 'PASS';
-    appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict });
-    if (verdict === 'REJECT') throw new ParkSignal('citation-false', { verdict });
-    // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
+
+    // Fail-closed judge (2026-08-30 audit): the citation verifier has never actually been
+    // executable in real mode, and the previous `(cv && cv.verdict) || 'PASS'` default meant a
+    // transport error, a timeout, or a malformed payload all silently became a PASS -- the only
+    // branch that has ever run. Every shape cv can take is classified explicitly below; nothing
+    // falls through to PASS by default.
+    if (cv === null && ctx.shadowMode) {
+      // No shadow.llm.CITATION_VERIFIER fixture wired for this task at all (fixture.js returns
+      // the caller's default) -- the pre-existing "trivially ok, nothing to validate" convention
+      // this file already uses (see handlePlan's `result === null` idiom) is kept for this one
+      // case, so shadow mode stays usable as a fixture harness for tasks that don't care about
+      // citation-verifier specifically. Must NOT apply outside shadow mode: a null cv in real
+      // mode or --dry-run means something actually went wrong (see the branch below).
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: 'PASS', source: 'no-fixture' });
+    } else if (!cv || cv.ok === false || typeof cv.verdict !== 'string') {
+      // Transport error ({ok: false, kind: 'error'}), timeout ({ok: false, timedOut: true}), a
+      // payload with no verdict key, or a null cv (real mode/--dry-run) -- none of these is a
+      // verdict the change-validator can be let through on. Park, don't guess.
+      const detail = { ok: cv && cv.ok, kind: cv && cv.kind, timedOut: cv && cv.timedOut, verdict: cv && cv.verdict };
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', detail);
+      throw new ParkSignal('citation-verifier-failed', detail);
+    } else if (cv.verdict === 'REJECT') {
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      throw new ParkSignal('citation-false', { verdict: cv.verdict });
+    } else if (cv.verdict === 'PASS' || cv.verdict === 'DIVERGES') {
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
+    } else {
+      // An unrecognized verdict string -- never continue on a verdict the code doesn't
+      // understand.
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      throw new ParkSignal('citation-verifier-unrecognized-verdict', { verdict: cv.verdict });
+    }
   }
 
   const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', ctx.deps);
