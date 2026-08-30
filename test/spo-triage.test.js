@@ -175,6 +175,65 @@ test(
   })
 );
 
+// ---- cmdPullReports ---------------------------------------------------------------------------
+
+test(
+  'spo pull-reports: not configured -> a clear message, exit 0',
+  withExitCodeReset(async () => {
+    const fakeRemoteReportPull = {
+      runRemoteReportPull: async () => ({ ok: true, skipped: 'no-url' }),
+    };
+    const console_ = captureConsole();
+    try {
+      await spo.cmdPullReports(spo.parseArgs([]), { remoteReportPull: fakeRemoteReportPull });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(process.exitCode, undefined);
+    assert.ok(console_.logs.some((l) => l.includes('SPO_REMOTE_REPORT_URL')));
+  })
+);
+
+test(
+  'spo pull-reports: prints the summary counts, exits non-zero when there are errors',
+  withExitCodeReset(async () => {
+    const fakeRemoteReportPull = {
+      runRemoteReportPull: async () => ({
+        ok: true,
+        listed: 2,
+        pulled: 1,
+        acked: 1,
+        rejected: 0,
+        errors: [{ file: 'x.json', error: 'ack failed: boom' }],
+      }),
+    };
+    const console_ = captureConsole();
+    try {
+      await spo.cmdPullReports(spo.parseArgs([]), { remoteReportPull: fakeRemoteReportPull });
+    } finally {
+      console_.restore();
+    }
+    assert.ok(console_.logs.some((l) => l.includes('pulled: 1')));
+    assert.ok(console_.errors.some((l) => l.includes('x.json')));
+    assert.equal(process.exitCode, 1);
+  })
+);
+
+test(
+  'spo pull-reports: a mechanical failure -> clear error, exit non-zero',
+  withExitCodeReset(async () => {
+    const fakeRemoteReportPull = { runRemoteReportPull: async () => ({ ok: false, error: 'boom' }) };
+    const console_ = captureConsole();
+    try {
+      await spo.cmdPullReports(spo.parseArgs([]), { remoteReportPull: fakeRemoteReportPull });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.errors.some((l) => l.includes('boom')));
+  })
+);
+
 // ---- cmdIntake ------------------------------------------------------------------------------
 
 test(

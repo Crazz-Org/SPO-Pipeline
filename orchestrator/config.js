@@ -181,6 +181,50 @@ module.exports = {
   // ('0'/'false' disables).
   autoTriagePromoteToTodo: !['0', 'false'].includes(String(process.env.SPO_AUTO_TRIAGE_PROMOTE_TO_TODO).toLowerCase()),
 
+  // ---- stage 0: remote report pull (orchestrator/remote-report-pull.js) -------------------
+  //
+  // Pulls queued reports from a production server's own bug-report store over HTTPS (the
+  // dev box has the initiative -- it is not reachable from outside, doc/environments.md's own
+  // "Flows between environments") and deposits them into spoReportsDir above, where stage 1
+  // (report-intake.js) picks them up exactly as it does a locally-captured report. See
+  // orchestrator/README.md § Report intake.
+  //
+  // Unset by default (both are required) -- deliberately inert until a maintainer opts a given
+  // production deployment in, same posture "the intake column is a new maintainer-owned board
+  // option" already has. SPO_REMOTE_REPORT_URL overrides; must be `https://` or the driver
+  // refuses to run rather than silently downgrading to plaintext.
+  remoteReportUrl: process.env.SPO_REMOTE_REPORT_URL || null,
+
+  // Where the pull token lives on THIS machine -- outside every git tree, chmod 600, the same
+  // "typed by hand, never scripted" reasoning SPO-Deploy's README already applies to every other
+  // credential. Must match the SPO_REPORT_PULL_TOKEN pasted into production's own .env.
+  // SPO_REPORT_PULL_TOKEN_FILE overrides.
+  remoteReportTokenFile:
+    process.env.SPO_REPORT_PULL_TOKEN_FILE || path.join(os.homedir(), '.spo-reports', '.pull-token'),
+
+  // daemon.js --real polls production's /list route on this timer. Nonzero by default is SAFE
+  // here (unlike a judgement-bearing timer) because the driver stays inert without BOTH
+  // remoteReportUrl and a readable token file -- see remote-report-pull.js's own early return.
+  // SPO_REMOTE_REPORT_PULL_MS overrides, 0 disables outright.
+  remoteReportPullMs:
+    process.env.SPO_REMOTE_REPORT_PULL_MS !== undefined ? Number(process.env.SPO_REMOTE_REPORT_PULL_MS) : 5 * 60 * 1000,
+
+  // How many production-listed reports one pull cycle fetches. SPO_REMOTE_REPORT_PULL_LIMIT overrides.
+  remoteReportPullLimit:
+    process.env.SPO_REMOTE_REPORT_PULL_LIMIT !== undefined ? Number(process.env.SPO_REMOTE_REPORT_PULL_LIMIT) : 5,
+
+  // Transport-level cap on one fetched report's byte size (untrusted input from a public
+  // server) -- not schema knowledge, just a defensive ceiling matching bug-report-schema.ts's
+  // own MAX_BODY_BYTES. SPO_REMOTE_REPORT_MAX_BYTES overrides.
+  remoteReportMaxBytes:
+    process.env.SPO_REMOTE_REPORT_MAX_BYTES !== undefined ? Number(process.env.SPO_REMOTE_REPORT_MAX_BYTES) : 4 * 1024 * 1024,
+
+  // Backpressure: a pull cycle skips outright once the LOCAL spoReportsDir queue already holds
+  // this many files, so a runaway or hostile production endpoint cannot fill the dev disk.
+  // SPO_REMOTE_REPORT_QUEUE_CEILING overrides.
+  remoteReportQueueCeiling:
+    process.env.SPO_REMOTE_REPORT_QUEUE_CEILING !== undefined ? Number(process.env.SPO_REMOTE_REPORT_QUEUE_CEILING) : 50,
+
   // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
   //
   // One executable, spawned as `<cmd> <taskId> <reason> <lastState>` every time a real-mode

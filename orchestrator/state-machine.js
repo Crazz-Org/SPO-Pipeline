@@ -47,6 +47,7 @@ const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 const { shouldAutoTriage, runAutoTriage } = require('./auto-triage');
 const { shouldAutoIntake, shouldScanConfirms, runReportIntake, reportConfirmScan } = require('./report-intake');
+const { shouldPullRemoteReports, runRemoteReportPull } = require('./remote-report-pull');
 
 // True once neither shadow fixtures nor --dry-run's fixture-free stand-ins apply -- the only
 // condition under which a scripted step's handler dispatches to steps/scripted.js's real
@@ -640,6 +641,7 @@ async function drainQueueOnce(queueDir, journalRoot, config) {
 // config.deps is the same injection point buildCtx already threads through HANDLERS.
 async function runForever(queueDir, journalRoot, config) {
   let lastAutoPullAt = null;
+  let lastRemotePullAt = null;
   let lastAutoIntakeAt = null;
   let lastConfirmScanAt = null;
   let lastAutoTriageAt = null;
@@ -659,8 +661,13 @@ async function runForever(queueDir, journalRoot, config) {
         await runAutoPull(queueDir, journalRoot, config, deps);
       }
 
-      // Human-first bug-report intake, three independent timers -- see report-intake.js's own
-      // header and orchestrator/README.md § Report intake for the full design:
+      // Human-first bug-report intake, FOUR independent timers -- see report-intake.js's own
+      // header, remote-report-pull.js's own header, and orchestrator/README.md § Report intake
+      // for the full design:
+      //   0. runRemoteReportPull -- pulls queued reports from a production deployment's own
+      //      bug-report store over HTTPS (doc/environments.md's "production -> dev" flow) into
+      //      the LOCAL spoReportsDir, before stage 1 ever looks at it. Inert until BOTH
+      //      config.remoteReportUrl and a readable token file are set -- unset by default.
       //   1. runReportIntake  -- mechanical (zero LLM). Files a RAW card per queued report and
       //      waits for a maintainer's "confirm"/"discard" reply. Nonzero by default
       //      (config.autoIntakeMs), same risk class as auto-pull.
@@ -671,6 +678,10 @@ async function runForever(queueDir, journalRoot, config) {
       //      change; a report filed here becomes an ordinary Todo card the *next* auto-pull
       //      cycle picks up -- the "player report -> nightly fix" chain README.md's migration
       //      step 5 names.
+      if (shouldPullRemoteReports(lastRemotePullAt, now, config.remoteReportPullMs)) {
+        lastRemotePullAt = now;
+        await runRemoteReportPull(journalRoot, config, deps);
+      }
       if (shouldAutoIntake(lastAutoIntakeAt, now, config.autoIntakeMs)) {
         lastAutoIntakeAt = now;
         await runReportIntake(journalRoot, config, deps);
