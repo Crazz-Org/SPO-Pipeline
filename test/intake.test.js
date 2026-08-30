@@ -721,6 +721,119 @@ test('pullBoard: a non-zero exit is reported, never crashes', () => {
   assert.match(result.error, /exited 3/);
 });
 
+// ---- extractCriterion: <details> stripping (regression #452) ------------------------------
+
+test('extractCriterion: strips amendCard\'s archived "Original report" <details> block', () => {
+  const body = [
+    'The header never shows connection state.',
+    '',
+    '<details><summary>Original report (raw intake, before reproduction/review)</summary>',
+    '',
+    'raw report text nobody should see in the criterion',
+    '',
+    '</details>',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.ok(!criterion.includes('Original report'));
+  assert.ok(!criterion.includes('raw report text'));
+  assert.ok(criterion.includes('The header never shows connection state.'));
+});
+
+test('extractCriterion: nested <details> (the real #452 shape) leaves no stray tags or archived copies', () => {
+  const body = [
+    'Triaged summary of the bug.',
+    '',
+    '<details><summary>journal (3 entries captured)</summary>',
+    'EVENT_TYCOON_UPDATE ...',
+    '</details>',
+    '',
+    '<details><summary>Original report (raw intake, before reproduction/review)</summary>',
+    '',
+    'raw report body',
+    '<details><summary>journal (3 entries captured)</summary>',
+    'EVENT_TYCOON_UPDATE ...',
+    '</details>',
+    '',
+    '</details>',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.ok(!criterion.includes('<details'));
+  assert.ok(!criterion.includes('</details'));
+  assert.ok(!criterion.includes('raw report body'));
+  assert.ok(criterion.includes('Triaged summary of the bug.'));
+});
+
+test('extractCriterion: an unclosed <details> is left intact, never truncated', () => {
+  const body = 'useful text\n<details><summary>s</summary>\nrest of the body';
+  const criterion = intake.extractCriterion(body);
+  assert.equal(criterion, body.trim());
+});
+
+test('extractCriterion: an orphaned </details> is dropped, surrounding text kept', () => {
+  const body = 'a\n</details>\nb';
+  const criterion = intake.extractCriterion(body);
+  assert.ok(!criterion.includes('</details'));
+  assert.ok(criterion.includes('a'));
+  assert.ok(criterion.includes('b'));
+});
+
+test('extractCriterion: a "Done means" heading survives the strip untouched', () => {
+  const body = ['## Done means', 'X.', '', '<details><summary>s</summary>archived</details>'].join('\n');
+  assert.equal(intake.extractCriterion(body), 'X.');
+});
+
+test('extractCriterion: a body that is ENTIRELY one <details> block falls back to the raw body, never empty', () => {
+  const body = '<details><summary>s</summary>everything is in here</details>';
+  const criterion = intake.extractCriterion(body);
+  assert.ok(criterion.length > 0);
+  assert.ok(criterion.includes('everything is in here'));
+});
+
+test('extractCriterion: a body with no <details> at all is unaffected (non-regression)', () => {
+  const body = 'The header never shows connection state.\n\nMore context here.';
+  assert.equal(intake.extractCriterion(body), body.trim());
+});
+
+test('makeTask: a card body shaped like #452 (archived original report, nested journal) yields a short criterion', () => {
+  const queueDir = mkTmp('spo-intake-queue-');
+  const journalRoot = mkTmp('spo-intake-journal-');
+  const journalBlock = '<details><summary>journal (3 entries captured)</summary>\n' + 'x'.repeat(50000) + '\n</details>';
+  const issueBody = [
+    'Building Inspector shows the wrong tenant count.',
+    '',
+    journalBlock,
+    '',
+    '<details><summary>Original report (raw intake, before reproduction/review)</summary>',
+    '',
+    'the raw report, itself containing another copy:',
+    journalBlock,
+    '',
+    '</details>',
+  ].join('\n');
+
+  const deps = {
+    queueDir,
+    journalRoot,
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify({
+        title: 'desktop . Building Inspector',
+        body: issueBody,
+        labels: [{ name: 'size:S' }],
+      }),
+      stderr: '',
+      signal: null,
+    })),
+  };
+
+  const candidate = { rank: 1, issue: 452, area: '', title: 'desktop . Building Inspector' };
+  const result = intake.makeTask(candidate, deps);
+
+  assert.equal(result.ok, true);
+  assert.ok(result.task.criterion.length < 2000, `criterion too long: ${result.task.criterion.length} bytes`);
+  assert.ok(result.task.criterion.includes('Building Inspector shows the wrong tenant count.'));
+});
+
 // ---- makeTask -------------------------------------------------------------------------------
 
 test('makeTask: writes the expected queue/<seq>-issue-<n>.json shape', () => {
