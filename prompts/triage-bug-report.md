@@ -118,6 +118,16 @@ now for today's judgement. `isKeyboardOpen: null` means unknown (no `visualViewp
 "closed". Quote the verdicts with their figures verbatim as evidence lines (`target 28×28 px,
 below the 44 px minimum`, `covered by html > body > nav.bottom`). Where `quickPicks` and the
 geometry disagree, the numbers are the evidence and the picks are the symptom — report both.
+The flagged element's own `geometry.elements[0].componentChain`, when present, names the owning
+component the same way desktop's anchor already does — use it to locate the file the same way.
+
+### Both profiles — `sessionContext`, when present
+
+A cheap second correlation axis, independent of `createdAtUtc`/log clock skew: `gameDate` (the
+in-game date at flag-time) and `surface` (the UI surface open at flag-time, e.g. `"building"`).
+Use it to sanity-check that the reproduction lines up with the reported moment, not as a
+citation on its own — it is context, not evidence a claim rests on. Either field may be `null`
+(not yet loaded / no surface open) — that is itself informative, never treat it as missing data.
 
 ## 3 · Dedup by `anchorKey`, before drafting
 
