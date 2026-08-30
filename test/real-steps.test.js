@@ -19,6 +19,7 @@ const {
   realCiChecks,
   realMerge,
   realFinish,
+  preserveWorktreeWip,
 } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
@@ -247,6 +248,39 @@ function readJournal(taskDir) {
     .map((l) => JSON.parse(l));
 }
 
+// card #385's loop: preserveWorktreeWip's commit used to run on whatever branch the worktree was
+// checked out on (claude-pipe/<id>), advancing it locally -- twelve lines later,
+// sweepWorktreeLeftovers' rule 2 couldn't vouch for that advanced tip and parked
+// branch-unmerged-leftover on the very commit this function had just made. `checkout --detach`
+// must run before `add -A`, every time, so the commit lands on no branch at all.
+test('preserveWorktreeWip: detaches HEAD before add -A, so the wip commit never advances the checked-out branch', () => {
+  const worktreePath = mkTmp('spo-real-detach-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'stray.ts'), 'uncommitted');
+  const taskDir = mkTmp('spo-real-detach-taskdir-');
+  const ctx = { id: 'card-detach', taskDir };
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M stray.ts\n');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok('detachedsha00000000000000000000000000000\n');
+      return ok('');
+    },
+  };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+  assert.ok(preserved && preserved.ref.startsWith('wip/card-detach-'));
+
+  const gitCalls = calls.filter((c) => c.command === 'git');
+  const detachIdx = gitCalls.findIndex((c) => c.args.includes('checkout') && c.args.includes('--detach'));
+  const addIdx = gitCalls.findIndex((c) => c.args.includes('add') && c.args.includes('-A'));
+  assert.ok(detachIdx !== -1, 'expected a git checkout --detach call');
+  assert.ok(addIdx !== -1, 'expected a git add -A call');
+  assert.ok(detachIdx < addIdx, 'checkout --detach must run before add -A');
+  assert.deepEqual(gitCalls[detachIdx].args, ['-C', worktreePath, 'checkout', '--detach']);
+});
+
 test('realWorktree leftover sweep: clean worktree dir + a local branch merged into origin/main -- both removed, add proceeds, both cleanups journaled', async () => {
   const config = testConfig();
   const task = { id: 'card-retry-a', kind: 'card', issue: 424 };
@@ -372,6 +406,7 @@ test('realWorktree leftover sweep: a local branch with an unpushed, unmerged tip
       if (args.includes('rev-parse') && args.includes(`refs/heads/${branch}`)) return ok(`${localSha}\n`);
       if (args.includes('merge-base') && args.includes('--is-ancestor')) return fail(1); // NOT an ancestor of main
       if (args.includes('rev-parse') && args.includes(`refs/remotes/origin/${branch}`)) return ok(`${remoteSha}\n`);
+      if (args.includes('for-each-ref')) return ok(''); // no wip/<id>-* ref exists for this task
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
       return ok('');
     },
@@ -388,6 +423,43 @@ test('realWorktree leftover sweep: a local branch with an unpushed, unmerged tip
 
   assert.ok(!calls.some((c) => c.args.includes('-D')), 'an unmerged local-only branch must never be deleted');
   assert.ok(!calls.some((c) => c.args.includes('add') && c.args.includes('worktree')), 'worktree add must never run past this park');
+});
+
+// card #385's fix: a tip the pipeline itself already saved to a durable wip/<id>-* ref
+// (preserveWorktreeWip) is not a mystery local commit -- rule 2's third safety case accepts it.
+test('realWorktree leftover sweep: a local branch not an ancestor of origin/main but covered by a wip/<id>-* ref is still deleted, journals coveredByWipRef', async () => {
+  const config = testConfig();
+  const task = { id: 'card-retry-wip', kind: 'card', issue: 428 };
+  const ctx = testCtx({ id: 'card-retry-wip', task, config });
+  const branch = 'claude-pipe/card-retry-wip';
+  const wipRefName = 'refs/remotes/origin/wip/card-retry-wip-1735689600000';
+
+  const localSha = 'localwipcoveredsha0000000000000000000000';
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('worktree') && args.includes('list')) return ok(''); // no worktree-path leftover
+      if (args.includes('rev-parse') && args.includes(`refs/heads/${branch}`)) return ok(`${localSha}\n`);
+      if (args.includes('merge-base') && args.includes('--is-ancestor') && args.includes('origin/main')) return fail(1); // not an ancestor of main
+      if (args.includes('rev-parse') && args.includes(`refs/remotes/origin/${branch}`)) return fail(1); // never pushed to its own namespace
+      if (args.includes('for-each-ref')) return ok(`${wipRefName}\n`);
+      if (args.includes('merge-base') && args.includes('--is-ancestor') && args.includes(wipRefName)) return ok(''); // ancestor of the wip ref -- covered
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      if (args.includes('board:take')) return ok('claimed\n');
+      return ok('');
+    },
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+
+  assert.ok(calls.some((c) => c.args.includes('-D') && c.args.includes(branch)), 'expected branch -D once the wip ref vouches for the tip');
+
+  const journal = readJournal(ctx.taskDir);
+  const branchEvent = journal.find((e) => e.event === 'leftover-branch-deleted');
+  assert.ok(branchEvent && branchEvent.branch === branch && branchEvent.sha === localSha);
+  assert.equal(branchEvent.coveredByWipRef, wipRefName);
 });
 
 test('realWorktree leftover sweep: a pushed remote branch leftover (no local branch) is deleted with push --delete, before the add', async () => {
@@ -524,7 +596,9 @@ test('realPushPr: parses the PR number out of the pull URL on gh pr create stdou
   assert.equal(next, 'GATE');
   assert.equal(ctx.prNumber, 777);
 
-  const create = calls.find((c) => c.command === 'gh');
+  // card #452: `gh pr list` (the PR-reuse check) now runs before `gh pr create` and is also a
+  // `gh` call this same fake stdout-URL mock happily answers -- find `pr create` specifically.
+  const create = calls.find((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'create');
   assert.deepEqual(create.args, [
     'pr',
     'create',
@@ -570,7 +644,9 @@ test('realPushPr: gh pr create always gets an explicit --head/--base -- gh has n
 
   await realPushPr(ctx, deps);
 
-  const create = calls.find((c) => c.command === 'gh');
+  // card #452: `gh pr list` (the PR-reuse check) now runs before `gh pr create` and is also a
+  // `gh` call this same fake stdout-URL mock happily answers -- find `pr create` specifically.
+  const create = calls.find((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'create');
   const headIdx = create.args.indexOf('--head');
   const baseIdx = create.args.indexOf('--base');
   assert.ok(headIdx !== -1, '--head must be present');
@@ -615,6 +691,130 @@ test('realPushPr: git push failure -> PARKED (push-pr-failed), pr create never r
     (err) => err instanceof ParkSignal && err.reason === 'push-pr-failed'
   );
   assert.equal(ghCalled, false);
+});
+
+// card #385's first park: SPO-WebClient/scripts/check-pr-rules.js's required "typecheck + tests"
+// check rejects any PR touching src/shared/rdo-members.ts with no `<Fichier>.pas:<Ligne>`
+// citation anywhere in the PR body.
+test('realPushPr: touches src/shared/rdo-members.ts with no citation in the diff or the task criterion -> PARKED (rdo-citation-missing)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-missing-wt-');
+  const task = {
+    id: 'card-rdo-missing',
+    kind: 'card',
+    issue: 385,
+    title: 't',
+    worktreePath,
+    criterion: 'add the new RDO member, no citation quoted here',
+  };
+  const ctx = testCtx({ id: 'card-rdo-missing', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/shared/rdo-members.ts\n');
+      if (args.includes('diff') && args.includes('-U0')) return ok('+  someMember: 42, // no citation on this line\n');
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realPushPr(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'rdo-citation-missing' && err.detail.file === 'src/shared/rdo-members.ts'
+  );
+});
+
+// The rdo-citation-missing park must land on a branch that is already pushed: a park between
+// the commit and the push leaves a local-only tip over a clean worktree, which preserveWorktreeWip
+// cannot save to a wip/ ref and sweepWorktreeLeftovers' rule 2 then refuses to clean -- card
+// #385's branch-unmerged-leftover loop, re-created by a mis-ordered park.
+test('realPushPr: pushes the branch BEFORE parking rdo-citation-missing, so the retry sweep can clean it', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-order-wt-');
+  const task = { id: 'card-rdo-order', kind: 'card', issue: 385, title: 't', worktreePath, criterion: 'no citation' };
+  const ctx = testCtx({ id: 'card-rdo-order', task, config });
+
+  const argvs = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      argvs.push([command, ...args].join(' '));
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/shared/rdo-members.ts\n');
+      if (args.includes('diff') && args.includes('-U0')) return ok('+  someMember: 42,\n');
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realPushPr(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'rdo-citation-missing'
+  );
+  const pushed = argvs.findIndex((line) => line.includes('push -u origin'));
+  const diffed = argvs.findIndex((line) => line.includes('--name-only'));
+  assert.ok(pushed !== -1, 'the branch must be pushed before the citation check parks');
+  assert.ok(pushed < diffed, 'push must run before the rdo citation check');
+});
+
+test('realPushPr: extracts a citation from the rdo-members.ts diff, writes it into the PR body\'s "### RDO catalogue" section, rederives touchesRdoMembers', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-cited-wt-');
+  const task = { id: 'card-rdo-cited', kind: 'card', issue: 386, title: 't', worktreePath, touchesRdoMembers: false };
+  const ctx = testCtx({ id: 'card-rdo-cited', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/shared/rdo-members.ts\n');
+      if (args.includes('diff') && args.includes('-U0')) {
+        return ok('+  // AdmMembersRDO.pas:512 -- new wire member\n+  newMember: 99,\n');
+      }
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/386\n');
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.task.touchesRdoMembers, true);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'touches-rdo-members-rederived' && e.from === false && e.to === true));
+  const citationEvent = journal.find((e) => e.event === 'rdo-citation');
+  assert.ok(citationEvent && citationEvent.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
+
+  const body = fs.readFileSync(path.join(ctx.taskDir, 'pr-body.md'), 'utf8');
+  assert.match(body, /### RDO catalogue/);
+  assert.match(body, /AdmMembersRDO\.pas:512/);
+});
+
+// A second PUSH_PR pass on the same branch (CI red -> DIAGNOSE -> IMPLEMENT -> CHECK -> back
+// here) used to call `gh pr create` unconditionally and get refused -- "a pull request for
+// branch ... already exists". `gh pr list` finding an open PR must reuse it instead.
+test('realPushPr: reuses an already-open PR for this branch -- gh pr create never runs, patches the body via gh api, never gh pr edit', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-reuse-wt-');
+  const task = { id: 'card-pr-reuse', kind: 'card', issue: 452, title: 't', worktreePath, branch: 'claude-pipe/card-pr-reuse' };
+  const ctx = testCtx({ id: 'card-pr-reuse', task, config });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'list') return ok(JSON.stringify([{ number: 452 }]));
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.prNumber, 452);
+  assert.ok(!calls.some((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'create'), 'gh pr create must never run');
+  assert.ok(!calls.some((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'edit'), 'gh pr edit is in `deny` on this repo -- CLAUDE.md');
+
+  const patchCall = calls.find((c) => c.command === 'gh' && c.args[0] === 'api');
+  assert.ok(patchCall, 'expected a gh api PATCH call');
+  assert.deepEqual(patchCall.args.slice(0, 4), ['api', `repos/${config.ghRepo}/pulls/452`, '-X', 'PATCH']);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'pr-reused' && e.prNumber === 452));
 });
 
 // ---- GATE -----------------------------------------------------------------------------------

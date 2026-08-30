@@ -157,11 +157,14 @@ function worktreeListPaths(porcelainOutput) {
 //      worktree-dirty-leftover so a maintainer can look. Clean -> `git worktree remove`, then
 //      `git worktree prune` to also clear a stale registration whose directory is already gone
 //      (nothing on disk to be dirty in that case, so the status check is skipped for it).
-//   2. Local branch leftover (claude-pipe/<id>): deleted with `branch -D` ONLY when its tip is
-//      an ancestor of origin/main (merged, or the previous attempt never advanced past it) OR
-//      equals origin/claude-pipe/<id>'s own tip (fully pushed, nothing local-only). Any other
-//      tip means local-only commits exist that this run never produced and cannot vouch for --
-//      parks branch-unmerged-leftover rather than guess.
+//   2. Local branch leftover (claude-pipe/<id>): deleted with `branch -D` when its tip is an
+//      ancestor of origin/main (merged, or the previous attempt never advanced past it), OR
+//      equals origin/claude-pipe/<id>'s own tip (fully pushed, nothing local-only), OR is an
+//      ancestor of one of this task's own `refs/remotes/origin/wip/<id>-*` refs (preserveWorktreeWip,
+//      above, already saved it durably -- this pipeline made that commit and can vouch for it,
+//      unlike an arbitrary local-only tip). Anything else means local-only commits exist that
+//      this run never produced and cannot vouch for -- parks branch-unmerged-leftover rather
+//      than guess.
 //   3. Remote branch leftover (origin/claude-pipe/<id>, checked against the fetch this step
 //      already ran): deleted with `push origin --delete`. This is always a prior, superseded
 //      attempt in the pipeline's own namespace, regenerated fresh every pass -- leaving it makes
@@ -234,12 +237,38 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
       remoteSha = remoteRevParse.exit === 0 ? remoteRevParse.stdout.trim() : null;
       safe = remoteSha !== null && remoteSha === localSha;
     }
+    // (c) neither (a) nor (b) vouches for this tip -- but a tip already contained in one of this
+    // task's own `wip/<id>-*` refs is not a mystery local commit: it's a save this pipeline made
+    // itself (preserveWorktreeWip) and pushed durably to origin, so the caution that "a local-only
+    // tip cannot be vouched for" does not apply to it. Check every wip ref this task has ever
+    // pushed, oldest first, and stop at the first one that contains this tip.
+    let wipRef = null;
+    let wipRefsChecked = 0;
     if (!safe) {
-      throw new ParkSignal('branch-unmerged-leftover', { branch, localSha, remoteSha });
+      const wipRefs = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+        '-C',
+        productRepo,
+        'for-each-ref',
+        '--format=%(refname)',
+        `refs/remotes/origin/wip/${ctx.id}-*`,
+      ]);
+      for (const candidate of splitLines(wipRefs.stdout)) {
+        wipRefsChecked += 1;
+        const covers = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'merge-base', '--is-ancestor', localRef, candidate]);
+        if (covers.exit === 0) {
+          safe = true;
+          wipRef = candidate;
+          break;
+        }
+      }
+    }
+    if (!safe) {
+      throw new ParkSignal('branch-unmerged-leftover', { branch, localSha, remoteSha, wipRefsChecked });
     }
     const del = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'branch', '-D', branch]);
     if (del.exit !== 0) throw new ParkSignal('worktree-cleanup-failed', { step: 'branch-delete', exit: del.exit });
-    appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-branch-deleted', { branch, sha: localSha });
+    const deletedDetail = wipRef ? { branch, sha: localSha, coveredByWipRef: wipRef } : { branch, sha: localSha };
+    appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-branch-deleted', deletedDetail);
   }
 
   // -- 3. remote branch -------------------------------------------------------------------------
@@ -261,15 +290,26 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
 
 // preserveWorktreeWip(ctx, deps, {worktreePath, reason, state}) -> {ref, sha} | null
 //
-// Real mode only. If `worktreePath` has uncommitted changes, commits them (`git add -A` + a
-// wip(<id>) commit) and pushes to a throwaway `wip/<id>-<ts>` branch on origin, so the diff
-// survives independently of the local worktree directory -- see the module header and
-// doc/state-machine-spec.md's note on card #385, where 620 lines of IMPLEMENT work were stranded
-// in a worktree with no durable copy anywhere else. `wip/` is a deliberately different namespace
-// from `claude-pipe/<id>` (the pipeline's own regenerate-and-delete branch): sweepWorktreeLeftovers'
-// rules 2/3 assume claude-pipe/<id> is disposable and safe to force-delete on the next attempt --
-// pushing a WIP there would make THIS branch look like an unmerged leftover on the very next
-// retry and park branch-unmerged-leftover instead of cleaning up.
+// Real mode only. If `worktreePath` has uncommitted changes, detaches HEAD, commits them
+// (`git add -A` + a wip(<id>) commit) and pushes to a throwaway `wip/<id>-<ts>` branch on
+// origin, so the diff survives independently of the local worktree directory -- see the module
+// header and doc/state-machine-spec.md's note on card #385, where 620 lines of IMPLEMENT work
+// were stranded in a worktree with no durable copy anywhere else. `wip/` is a deliberately
+// different namespace from `claude-pipe/<id>` (the pipeline's own regenerate-and-delete branch):
+// sweepWorktreeLeftovers' rules 2/3 assume claude-pipe/<id> is disposable and safe to
+// force-delete on the next attempt -- pushing a WIP there would make THIS branch look like an
+// unmerged leftover on the very next retry and park branch-unmerged-leftover instead of cleaning
+// up.
+//
+// The detach is not optional housekeeping: this worktree is checked out on `claude-pipe/<id>`,
+// and a worktree commit updates whatever branch HEAD currently points to. Committing without
+// detaching first would advance `claude-pipe/<id>` locally even though the commit is only ever
+// meant to live on the disposable `wip/` ref -- and twelve lines below (in the caller), rule 2 of
+// sweepWorktreeLeftovers then finds a claude-pipe/<id> tip it cannot vouch for (not an ancestor
+// of origin/main, not equal to origin/claude-pipe/<id>) and parks branch-unmerged-leftover on the
+// very commit this function itself just made. That was the loop observed on card #385: four
+// rigorously identical parks. Detaching first means the wip commit lands on no branch at all, so
+// claude-pipe/<id>'s local pointer never moves and rule 2 finds it exactly where WORKTREE left it.
 //
 // Never blocks or throws: a park is already terminal by the time finalizePark calls this, and the
 // dirty-leftover sweep call site treats a failed preservation as "fall back to the old
@@ -284,6 +324,12 @@ function preserveWorktreeWip(ctx, deps, { worktreePath, reason, state = 'PARKED'
     return null;
   }
   if (status.stdout.trim() === '') return null; // clean tree -- nothing to preserve
+
+  const detach = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'checkout', '--detach']);
+  if (detach.exit !== 0) {
+    appendEvent(ctx.taskDir, state, 'wip-preserve-failed', { step: 'detach', exit: detach.exit });
+    return null;
+  }
 
   const add = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'add', '-A']);
   if (add.exit !== 0) {
@@ -398,14 +444,56 @@ function commitMessage(ctx) {
   return `${title}\n\nCloses #${issue}\n`;
 }
 
-function prBody(ctx) {
+// prBody(ctx, citations) -- prBody(ctx) alone (no second argument) is byte-for-byte the original
+// two-line template; only caller is realPushPr, below. `citations`, when a non-empty array, is
+// appended as its own "### RDO catalogue" section -- see realPushPr's own header comment on why
+// this exists (SPO-WebClient's required "typecheck + tests" check rejects a PR touching
+// src/shared/rdo-members.ts without one).
+function prBody(ctx, citations) {
   const issue = ctx.task && ctx.task.issue;
-  return [`Closes #${issue}`, '', `_pipeline: claude-pipe/${ctx.id}_`, ''].join('\n');
+  const lines = [`Closes #${issue}`, '', `_pipeline: claude-pipe/${ctx.id}_`, ''];
+  if (Array.isArray(citations) && citations.length > 0) {
+    lines.push('### RDO catalogue', '', ...citations, '');
+  }
+  return lines.join('\n');
 }
 
 function parsePrNumber(stdout) {
   const m = (stdout || '').match(/\/pull\/(\d+)/);
   return m ? Number(m[1]) : null;
+}
+
+// A citation of the form `<Fichier>.pas:<Ligne>` -- what SPO-WebClient/scripts/check-pr-rules.js
+// requires somewhere in the PR body before it will let a diff touching src/shared/rdo-members.ts
+// through the required "typecheck + tests" check.
+const RDO_CITATION_RE = /[\w.-]+\.pas:\d+/i;
+
+// Pulls citations out of a `git diff -U0` against rdo-members.ts: added lines only (`+`, not the
+// `+++` file-header line), keeping the whole source line -- not just the matched token -- so the
+// citation reads as the reviewer's own justification, not a bare filename:line pair. Stripped, in
+// order: the leading `+` diff marker, a `//` comment marker (with whatever whitespace sits
+// between the two), then the line's own edge whitespace.
+function extractCitations(diffText) {
+  const citations = [];
+  for (const rawLine of (diffText || '').split('\n')) {
+    if (!rawLine.startsWith('+') || rawLine.startsWith('+++')) continue;
+    const withoutComment = rawLine.slice(1).replace(/^\s*\/\/\s*/, '');
+    const cleaned = withoutComment.trim();
+    if (RDO_CITATION_RE.test(cleaned)) citations.push(cleaned);
+  }
+  return citations;
+}
+
+// Fallback source when the diff itself carries no citation: the task's own criterion text may
+// already quote one (a maintainer citing the source record when filing the card). Kept lines are
+// used verbatim -- there is no diff `+`/`//` framing to strip here.
+function extractCitationsFromCriterion(criterion) {
+  const citations = [];
+  for (const rawLine of (criterion || '').split('\n')) {
+    const trimmed = rawLine.trim();
+    if (RDO_CITATION_RE.test(trimmed)) citations.push(trimmed);
+  }
+  return citations;
 }
 
 async function realPushPr(ctx, deps = {}) {
@@ -423,11 +511,100 @@ async function realPushPr(ctx, deps = {}) {
   const commit = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'commit', '-F', messageFile]);
   if (commit.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit });
 
+  // Order matters: the branch is pushed BEFORE the citation check below, not after. A park
+  // thrown between the commit and the push would leave a local-only, unpushed tip on
+  // claude-pipe/<id> over a CLEAN worktree -- preserveWorktreeWip has nothing to save, so no
+  // wip/ ref would cover it, and the next retry's sweepWorktreeLeftovers rule 2 would park
+  // branch-unmerged-leftover forever. Pushing first makes the tip equal origin/claude-pipe/<id>,
+  // which is rule 2's own case (b) -- the retry cleans it up instead of deadlocking on it.
   const push = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'push', '-u', 'origin', branch]);
   if (push.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'push', exit: push.exit });
 
+  // card #385's first park: SPO-WebClient/scripts/check-pr-rules.js's required "typecheck +
+  // tests" check fails any PR touching src/shared/rdo-members.ts unless the PR body itself
+  // carries a `<Fichier>.pas:<Ligne>` citation -- prBody() used to be a static two-line template,
+  // so no card touching the RDO catalogue could ever pass CI. Read the actual diff against
+  // origin/main (not the task's own declared touchesRdoMembers -- see the rederivation right
+  // below) so the citation search runs on what this attempt really changed.
+  const changed = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'diff', '--name-only', 'origin/main...HEAD']);
+  if (changed.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'diff-name-only', exit: changed.exit });
+  const touchesCatalogue = splitLines(changed.stdout).includes('src/shared/rdo-members.ts');
+
+  // The diff is ground truth; intake.js:927 only ever infers touchesRdoMembers from the issue's
+  // OWN TEXT (area === 'rdo' or a literal "rdo-members.ts" mention). Card #385 touched the
+  // catalogue with neither, so this stayed false all the way through VALIDATE and
+  // handleValidate's CITATION_VERIFIER step never ran. Correct it the moment the real diff
+  // disagrees with what intake guessed, so the rest of this task's VALIDATE pass sees the truth.
+  if (touchesCatalogue && !ctx.task.touchesRdoMembers) {
+    ctx.task.touchesRdoMembers = true;
+    appendEvent(ctx.taskDir, 'PUSH_PR', 'touches-rdo-members-rederived', { from: false, to: true });
+  }
+
+  let citations = [];
+  if (touchesCatalogue) {
+    const catalogueDiff = spawnStep(ctx, deps, 'PUSH_PR', 'git', [
+      '-C',
+      worktreePath,
+      'diff',
+      '-U0',
+      'origin/main...HEAD',
+      '--',
+      'src/shared/rdo-members.ts',
+    ]);
+    citations = extractCitations(catalogueDiff.stdout);
+    if (citations.length === 0) citations = extractCitationsFromCriterion(ctx.task && ctx.task.criterion);
+    if (citations.length === 0) {
+      throw new ParkSignal('rdo-citation-missing', { file: 'src/shared/rdo-members.ts' });
+    }
+    appendEvent(ctx.taskDir, 'PUSH_PR', 'rdo-citation', { citations });
+  }
+
+
   const bodyFile = path.join(ctx.taskDir, 'pr-body.md');
-  fs.writeFileSync(bodyFile, prBody(ctx));
+  const body = prBody(ctx, citations);
+  fs.writeFileSync(bodyFile, body);
+
+  // A second PUSH_PR pass on the same branch (CI red -> DIAGNOSE -> IMPLEMENT -> CHECK -> back
+  // here) used to call `gh pr create` unconditionally, which GitHub refuses -- "a pull request
+  // for branch ... already exists". Found by reading this function while diagnosing card #385,
+  // not from a journaled incident: #385 never got this far, its own second pass died at the
+  // commit above. Check for an open PR on this branch first and reuse it.
+  const list = spawnStep(ctx, deps, 'PUSH_PR', 'gh', [
+    'pr',
+    'list',
+    '--repo',
+    config.ghRepo,
+    '--head',
+    branch,
+    '--state',
+    'open',
+    '--json',
+    'number',
+  ]);
+  if (list.exit === 0) {
+    const existing = (() => {
+      try {
+        return JSON.parse(list.stdout);
+      } catch {
+        return null;
+      }
+    })();
+    if (Array.isArray(existing) && existing.length > 0) {
+      const prNumber = existing[0].number;
+      appendEvent(ctx.taskDir, 'PUSH_PR', 'pr-reused', { prNumber });
+      // Never `gh pr edit` -- CLAUDE.md: it's in `deny` on this repo (Projects classic board).
+      // Editing a PR goes through the REST API directly instead.
+      const patch = spawnStep(ctx, deps, 'PUSH_PR', 'gh', ['api', `repos/${config.ghRepo}/pulls/${prNumber}`, '-X', 'PATCH', '-f', `body=${body}`]);
+      if (patch.exit !== 0) {
+        appendEvent(ctx.taskDir, 'PUSH_PR', 'pr-body-patch-failed', { exit: patch.exit });
+      }
+      ctx.prNumber = prNumber;
+      return 'GATE';
+    }
+  }
+  // Empty list, unparsable JSON, or a failed `gh pr list` call all fall through to `gh pr create`
+  // exactly as before this fix -- an inability to check for an existing PR is not a reason to
+  // stop trying to open one.
 
   // --head/--base are required here, not optional: every other command in this function targets
   // the worktree explicitly via `git -C worktreePath`, but `gh pr create` has no `-C`/cwd of its

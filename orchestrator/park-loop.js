@@ -43,7 +43,35 @@ function parseCommentId(stdout) {
 const RETRY_ABANDON_LINE =
   'pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to close this attempt.';
 
-function buildParkComment({ reason, detail, lastState }) {
+// countRepeatedParks(lines, reason, detail) -- how many parks in a row, most recent first, share
+// this exact reason + JSON.stringify(detail) fingerprint. Card #385's loop: branch-unmerged-
+// leftover parked four times running, byte-identical detail every time, because each attempt's
+// own WIP commit was what tripped the NEXT park (see steps/scripted.js's preserveWorktreeWip
+// header). A maintainer's bare "retry" could never do anything but reproduce the same park --
+// this is what lets finalizePark tell them so instead of letting the streak run forever. Walks
+// only `parked` events (everything else journaled between two parks -- transitions, spawns -- is
+// irrelevant to the streak) and stops at the first one that doesn't match; the park just
+// journaled by the caller is itself included and always matches itself, so the result is never
+// less than 1.
+function countRepeatedParks(lines, reason, detail) {
+  const fingerprint = JSON.stringify(detail);
+  const parks = (lines || []).filter((line) => line && line.event === 'parked');
+  let count = 0;
+  for (let i = parks.length - 1; i >= 0; i--) {
+    const park = parks[i];
+    if (park.reason === reason && JSON.stringify(park.detail) === fingerprint) {
+      count += 1;
+    } else {
+      break;
+    }
+  }
+  return count;
+}
+
+// `repeat` defaults to 1 (a first-time park) for every existing caller/test that doesn't pass it.
+// >= 2 inserts a loop warning just above RETRY_ABANDON_LINE, which stays present verbatim in
+// every case -- unparkScan's retry/abandon parsing and the rest of this suite depend on it.
+function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
   const lines = [
     '### Pipeline parked',
     '',
@@ -53,9 +81,16 @@ function buildParkComment({ reason, detail, lastState }) {
     'What the machine expects from you: read the reason above (and the detail below, if any),',
     'fix whatever it names if it needs fixing, then reply on this issue.',
     '',
-    RETRY_ABANDON_LINE,
-    '',
   ];
+  if (repeat >= 2) {
+    lines.push(
+      `> **Ce park est identique aux ${repeat} derniers** (\`${reason}\`, même détail). Une réponse`,
+      "> `retry` seule ne changera rien : l'état que la machine refuse est inchangé d'une tentative",
+      "> à l'autre. Corrige d'abord ce que le détail ci-dessous nomme.",
+      ''
+    );
+  }
+  lines.push(RETRY_ABANDON_LINE, '');
   if (detail && Object.keys(detail).length > 0) {
     lines.push(
       '<details><summary>detail</summary>',
@@ -70,13 +105,14 @@ function buildParkComment({ reason, detail, lastState }) {
   return lines.join('\n');
 }
 
-// postParkComment(ctx, deps, {reason, detail, lastState}) -- moves the card to "Parked" (never
-// blocks -- board.js's own rule) and posts the structured comment above. Journals `park-comment`
-// with the parsed comment id (the unpark scan's anchor) on success, `park-comment-failed` on a
-// non-zero gh exit -- neither one blocks anything, since the task is already terminal by the
-// time this runs (state-machine.js's finalizePark calls it after the task's own PARKED
-// state.json/report.md are already written).
-function postParkComment(ctx, deps, { reason, detail, lastState }) {
+// postParkComment(ctx, deps, {reason, detail, lastState, repeat}) -- moves the card to "Parked"
+// (never blocks -- board.js's own rule) and posts the structured comment above. Journals
+// `park-comment` with the parsed comment id (the unpark scan's anchor) on success,
+// `park-comment-failed` on a non-zero gh exit -- neither one blocks anything, since the task is
+// already terminal by the time this runs (state-machine.js's finalizePark calls it after the
+// task's own PARKED state.json/report.md are already written). `repeat` defaults to 1, same as
+// buildParkComment's own default, for any caller that doesn't compute a streak.
+function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   moveCard(ctx, deps, 'PARKED');
 
   const issue = ctx.task && ctx.task.issue;
@@ -86,7 +122,7 @@ function postParkComment(ctx, deps, { reason, detail, lastState }) {
   }
 
   const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
-  const body = buildParkComment({ reason, detail, lastState });
+  const body = buildParkComment({ reason, detail, lastState, repeat });
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
 
@@ -263,6 +299,8 @@ module.exports = {
   unparkScan,
   findParkAnchor,
   reEnqueueTask,
+  countRepeatedParks,
   listTaskIds, // shared with orphan-scan.js -- same journal/<id>/ directory listing, one copy
   readJsonSafe, // shared with orphan-scan.js
+  readJournalLines, // shared with state-machine.js's finalizePark -- countRepeatedParks' own input
 };
