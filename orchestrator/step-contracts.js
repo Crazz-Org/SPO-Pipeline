@@ -55,6 +55,8 @@ const BUG_REPORT_BUDGET_USD = 6;
 // above are the actual spend bound a call is meant to die by, and the deadline must not fire
 // before the budget does. Reproduced 2026-08-29: a real PLAN step (fable) died at the 120s
 // wall-clock mark with "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]"
+// (that exact message no longer occurs since the 2026-08-30 fix -- a deadline kill now says
+// "claude ran but exceeded the Xms deadline and was killed", see steps/llm.js's `timedOut`)
 // -- the spawnSync timeout, not the budget, cutting the call off mid-flight -- and parked card
 // issue-247 with reason plan-invalid. This is the same family of bug PR #14 fixed for
 // intake.js's draftCard/reviewCard (INTAKE_DEADLINE_MS); this constant is steps/llm.js's

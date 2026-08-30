@@ -265,6 +265,59 @@ test('invokeClaudeReal: passes deadlineMs through to spawnSync as its timeout op
   assert.equal(seenTimeout, 5000);
 });
 
+// ---- invokeClaudeReal: telling a deadline kill apart from a real spawn failure --------------
+// Card #449, 2026-08-30: a deadline kill sets BOTH spawnResult.error (ETIMEDOUT) AND
+// spawnResult.signal, and the old code tested `error` first, so every deadline kill was reported
+// as "failed to spawn claude" -- exactly backwards, since claude ran and was killed for taking
+// too long. These three tests lock in the three distinct outcomes.
+
+test('invokeClaudeReal: a deadline kill (error ETIMEDOUT + signal) -> timedOut:true, deadlineMs, and a message that says the call RAN', async () => {
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: timeoutErr, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 5000 },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.timedOut, true);
+  assert.equal(result.deadlineMs, 5000);
+  assert.match(result.error, /exceeded the 5000ms deadline/);
+  assert.doesNotMatch(result.error, /failed to spawn/); // the regression itself
+  assert.equal(result.raw, 143);
+});
+
+test('invokeClaudeReal: a genuine spawn failure (ENOENT, no signal) still says "failed to spawn" and is NOT timedOut', async () => {
+  const enoent = new Error('spawnSync claude ENOENT');
+  enoent.code = 'ENOENT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: enoent, status: null, stdout: '', stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 5000 },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, undefined);
+  assert.match(result.error, /failed to spawn/);
+});
+
+test('invokeClaudeReal: a signal with no deadline armed is reported as an external kill, not a timeout', async () => {
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: null, stdout: '', stderr: '', signal: 'SIGKILL' })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null } }, // no deadlineMs
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, undefined);
+  assert.match(result.error, /killed by signal SIGKILL \(no deadline was armed\)/);
+});
+
 // ---- runLlm real branch (thin wrapper: reads ctx.task.llm.<step>, journals, returns) ---------
 
 test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.account, journals llm-call', async () => {

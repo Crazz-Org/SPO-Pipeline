@@ -47,7 +47,11 @@
 // -- it is enforced by Node itself while the child runs, and it actually kills the child. The
 // state machine still wraps the whole call in callWithDeadline (see callLlmStep) for its
 // existing "retry once, then PARK" bookkeeping; that layer keeps working as before because
-// invokeClaudeReal always returns (never hangs) once its own spawnSync timeout elapses.
+// invokeClaudeReal always returns (never hangs) once its own spawnSync timeout elapses. A call
+// killed this way returns `{ok: false, timedOut: true, deadlineMs, error: "... ran but exceeded
+// the Xms deadline and was killed ..."}` -- callers that need to tell a deadline kill apart from
+// a genuine spawn/parse failure (e.g. intake.js's triageBugReport, to decide whether a retry is
+// worth it) test `timedOut`, never the message text.
 
 const fs = require('fs');
 const path = require('path');
@@ -167,8 +171,48 @@ async function invokeClaudeReal(opts, deps = {}) {
   }
 
   const spawnResult = spawnSyncFn('claude', argv, spawnOpts);
+  const rawExit = spawnResult.status === undefined ? null : spawnResult.status;
+
+  // Deadline kill FIRST, before the generic `error` branch. When spawnOpts.timeout fires, Node
+  // fills in BOTH spawnResult.error (an Error with .code === 'ETIMEDOUT') AND spawnResult.signal
+  // (the signal it used to kill the child, SIGTERM here) -- so the `error` branch below used to
+  // swallow every deadline kill and report it as "failed to spawn claude", which is exactly
+  // backwards: claude spawned fine, ran, and was killed for running too long. Reproduced
+  // 2026-08-30 on card #449 (`spo triage --dry`: "triageBugReport: claude call failed (error):
+  // llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]").
+  //
+  // A bare `signal` with NO deadline armed is NOT a timeout (an OOM kill, an operator's SIGKILL)
+  // -- that case keeps its own honest branch further down and never sets `timedOut`.
+  //
+  // `kind` stays 'error' on purpose: state-machine.js's callLlmStep rotates accounts on 'limit'
+  // and treats everything else as a plain failure. A third kind would force an audit of every
+  // `kind ===` test in the repo for no gain -- `timedOut` carries the information instead, and
+  // that is what intake.js's triageBugReport retries on.
+  const deadlineArmed = typeof spawnOpts.timeout === 'number';
+  const killedByDeadline =
+    (spawnResult.error && spawnResult.error.code === 'ETIMEDOUT') || (!!spawnResult.signal && deadlineArmed);
+
+  if (killedByDeadline) {
+    const detail = spawnResult.signal
+      ? `signal ${spawnResult.signal}`
+      : (spawnResult.error && (spawnResult.error.code || spawnResult.error.message)) || 'no signal reported';
+    return {
+      ok: false,
+      kind: 'error',
+      timedOut: true,
+      deadlineMs: deadlineArmed ? spawnOpts.timeout : undefined,
+      error: deadlineArmed
+        ? `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`
+        : `llm.js: claude ran but was killed before it replied (${detail})`,
+      sessionId: null,
+      costUsd: 0,
+      numTurns: undefined,
+      raw: rawExit,
+    };
+  }
 
   if (spawnResult.error) {
+    // A REAL spawn failure: ENOENT (no `claude` on PATH), EACCES, EAGAIN...
     return {
       ok: false,
       kind: 'error',
@@ -176,18 +220,19 @@ async function invokeClaudeReal(opts, deps = {}) {
       sessionId: null,
       costUsd: 0,
       numTurns: undefined,
-      raw: spawnResult.status === undefined ? null : spawnResult.status,
+      raw: rawExit,
     };
   }
   if (spawnResult.signal) {
+    // Signalled with no deadline armed -- not this module's timeout, something external.
     return {
       ok: false,
       kind: 'error',
-      error: `llm.js: claude was killed by signal ${spawnResult.signal} (deadline exceeded?)`,
+      error: `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
       sessionId: null,
       costUsd: 0,
       numTurns: undefined,
-      raw: spawnResult.status === undefined ? null : spawnResult.status,
+      raw: rawExit,
     };
   }
 

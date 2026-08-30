@@ -229,6 +229,17 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
   }
 
   const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, deps);
+
+  // Make the retry visible: a step that silently costs twice as long and twice as much is the
+  // kind of thing that only shows up in a bill. Not a terminal event -- findConfirmedAwaitingTriage
+  // only treats `report-triaged`/`report-held` as "handled", so this never suppresses a re-scan.
+  if (!dry && triaged.retriedAfterTimeout) {
+    appendDaemonEvent(journalRoot, 'report-triage-retry', {
+      issue: entry.issue,
+      ...triaged.retriedAfterTimeout,
+    });
+  }
+
   if (!triaged.ok) {
     return { ok: false, error: triaged.error }; // mechanical failure -- retried next cycle, no journal
   }
@@ -270,9 +281,13 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
 // the real verdict) but never comments, amends, moves, or journals a terminal event -- the exact
 // same "look, don't touch" `spo ask --dry` already gives the fast-lane intake path.
 //
-// Journals exactly one `auto-triage` summary event per REAL (non-dry) call, and only when at
-// least one report was actually disposed of or held -- same "only journal on real output" rule
-// auto-pull.js's runAutoPull already follows.
+// Journals exactly one `auto-triage` summary event per REAL (non-dry) call, and only when the
+// cycle actually did something -- disposed of a report, or tried and failed. A cycle with
+// nothing confirmed (top.length === 0) stays silent, same "only journal on real output" rule
+// auto-pull.js's runAutoPull already follows. An all-errors cycle used to be silent too -- that
+// is how report #449 (a triageBugReport deadline kill, 2026-08-30) went invisible in
+// daemon.jsonl for hours; it is now journaled with `errorIssues`/`firstError` so a maintainer
+// scanning the journal can see it without re-running `spo triage` by hand.
 async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   const limit = (config && config.autoTriageLimit) || DEFAULT_AUTO_TRIAGE_LIMIT;
@@ -299,13 +314,15 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   }
 
   const disposed = filed + duplicates + held;
-  if (!dry && disposed > 0) {
+  if (!dry && (disposed > 0 || errors.length > 0)) {
     appendDaemonEvent(journalRoot, 'auto-triage', {
       processed: top.length,
       filed,
       duplicates,
       held,
       errors: errors.length,
+      errorIssues: errors.map((e) => e.issue),
+      firstError: errors.length > 0 ? String(errors[0].error).slice(0, 300) : undefined,
     });
   }
 
