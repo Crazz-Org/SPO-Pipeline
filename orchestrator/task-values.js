@@ -68,6 +68,21 @@ function lastResultPayload(taskDir, state) {
   return null;
 }
 
+// The most recent DIAGNOSE finding, as an IMPLEMENT-facing one-liner, or a fixed "none yet"
+// string on a first attempt (never undefined -- fillPromptTemplate treats undefined as a
+// missing placeholder, and IMPLEMENT's very first invocation for a task has no DIAGNOSE event
+// to read). state-machine.js's handleDiagnose journals rootCause/category/suggestedFix on every
+// DIAGNOSE 'result' event; this is the reader side of that same record, so a DIAGNOSE attempt
+// that named a genuinely new cause is no longer invisible to the IMPLEMENT call that follows it.
+function diagnosisSummary(taskDir) {
+  const diag = lastResultPayload(taskDir, 'DIAGNOSE');
+  if (!diag || !diag.rootCause) return '(none yet -- this is the first IMPLEMENT attempt for this task)';
+  const parts = [`root cause: ${diag.rootCause}`];
+  if (diag.category) parts.push(`category: ${diag.category}`);
+  if (diag.suggestedFix) parts.push(`suggested fix: ${diag.suggestedFix}`);
+  return parts.join(' | ');
+}
+
 function commonValues(ctx) {
   const task = ctx.task || {};
   return {
@@ -103,6 +118,7 @@ function buildPromptValues(ctx, stepName) {
         invariants_path: plan.invariants_path,
         invariant_ids: plan.invariant_ids,
         check_commands: plan.check_commands,
+        diagnosis: diagnosisSummary(taskDir),
       };
     }
 

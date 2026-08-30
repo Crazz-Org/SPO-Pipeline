@@ -53,6 +53,7 @@ test('fillPromptTemplate: an array value is joined with ", "', () => {
     invariants_path: '/tmp/scratch/invariants-1.md',
     invariant_ids: ['INV-1', 'INV-2'],
     check_commands: ['npm run typecheck', 'npm run lint'],
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
   });
   assert.ok(filled.includes('INV-1, INV-2'));
   assert.ok(filled.includes('npm run typecheck, npm run lint'));
@@ -94,6 +95,7 @@ test('fillPromptTemplate: an empty array is a valid value, not "missing" (zero i
     invariants_path: '/tmp/invariants.md',
     invariant_ids: [],
     check_commands: [],
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
   });
   assert.ok(!/\{\{\w+\}\}/.test(filled));
 });
@@ -147,6 +149,40 @@ test('buildPromptValues: IMPLEMENT before PLAN has run leaves plan_path etc. und
   const ctx = { taskDir, task: { issue: 7, worktreePath: '/tmp/w' } };
   const values = buildPromptValues(ctx, 'IMPLEMENT');
   assert.equal(values.plan_path, undefined);
+});
+
+test('buildPromptValues: IMPLEMENT diagnosis defaults to a fixed "none yet" string when DIAGNOSE never ran (never undefined)', () => {
+  const taskDir = mkTmp('spo-values-implement-nodiag-');
+  const ctx = { taskDir, task: { issue: 7, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.equal(values.diagnosis, '(none yet -- this is the first IMPLEMENT attempt for this task)');
+});
+
+test('buildPromptValues: IMPLEMENT diagnosis surfaces DIAGNOSE\'s rootCause/category/suggestedFix from the journal (the issue-213 gap)', () => {
+  const taskDir = mkTmp('spo-values-implement-diag-');
+  appendEvent(taskDir, 'DIAGNOSE', 'result', {
+    attempt: 1,
+    payload: {
+      rootCause: 'SSRF: proxy-image.ts:163 fetches the raw user-controlled imageUrl',
+      category: 'security',
+      suggestedFix: 'Validate imageUrl against the allow-list before fetchWithTimeout is called.',
+    },
+  });
+  const ctx = { taskDir, task: { issue: 213, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.match(values.diagnosis, /root cause: SSRF/);
+  assert.match(values.diagnosis, /category: security/);
+  assert.match(values.diagnosis, /suggested fix: Validate imageUrl/);
+});
+
+test('buildPromptValues: IMPLEMENT diagnosis reads the LATEST DIAGNOSE result, not an earlier one', () => {
+  const taskDir = mkTmp('spo-values-implement-diaglatest-');
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 1, payload: { rootCause: 'first-cause', category: null, suggestedFix: null } });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 2, payload: { rootCause: 'second-cause', category: null, suggestedFix: null } });
+  const ctx = { taskDir, task: { issue: 7, worktreePath: '/tmp/w' } };
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.match(values.diagnosis, /second-cause/);
+  assert.ok(!/first-cause/.test(values.diagnosis));
 });
 
 test('buildPromptValues: DIAGNOSE ledger_path is always journal/<id>/ledger.md', () => {

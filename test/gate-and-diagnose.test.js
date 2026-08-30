@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { mkTmp, writeTask, runDaemonOnce, readState, readLedger } = require('./helpers');
+const { mkTmp, writeTask, runDaemonOnce, readState, readLedger, readJournal } = require('./helpers');
 
 test('gate [1,0] with a DIAGNOSE fixture: one retry reaches DONE, ledger has exactly 1 attempt line', () => {
   const queueDir = mkTmp('spo-queue-retry-');
@@ -83,6 +83,34 @@ test('three gate fails with distinct root causes -> PARKED at budget (3 ledger l
 
   const ledgerLines = readLedger(journalDir, 'budget-distinct').trim().split('\n').filter(Boolean);
   assert.equal(ledgerLines.length, 3);
+});
+
+test('DIAGNOSE journals category/suggestedFix on its result event, not just rootCause (issue-213 gap: this is what lets the next IMPLEMENT see what DIAGNOSE found)', () => {
+  const queueDir = mkTmp('spo-queue-diagfields-');
+  const journalDir = mkTmp('spo-journal-diagfields-');
+
+  writeTask(queueDir, '001.json', {
+    id: 'diag-fields',
+    title: 'DIAGNOSE fields reach the journal',
+    kind: 'synthetic',
+    shadow: {
+      gate: [1, 0],
+      prWait: [0],
+      llm: {
+        DIAGNOSE: { rootCause: 'ssrf-untrusted-write', category: 'security', suggestedFix: 'validate the URL' },
+        VALIDATE: { verdict: 'PASS' },
+      },
+    },
+  });
+
+  runDaemonOnce(queueDir, journalDir);
+
+  const diagnoseResults = readJournal(journalDir, 'diag-fields').filter(
+    (e) => e.state === 'DIAGNOSE' && e.event === 'result'
+  );
+  assert.equal(diagnoseResults.length, 1);
+  assert.equal(diagnoseResults[0].payload.category, 'security');
+  assert.equal(diagnoseResults[0].payload.suggestedFix, 'validate the URL');
 });
 
 test('two gate fails with the SAME root cause -> PARKED early (before budget)', () => {
