@@ -804,6 +804,49 @@ never contend with a live one. A holder whose pid is dead (hard kill, power loss
 taken over on the next start, journaled as a `lock-stale-taken` event in
 `<journalRoot>/daemon.jsonl`.
 
+Acquisition only checks liveness once, at startup — `orchestrator/lock.js`'s `watchLock` keeps
+checking for the life of the run, re-reading `daemon.lock` every `config.lockWatchMs` (default
+15s, `SPO_LOCK_WATCH_MS` overrides). If it reads back a holder that isn't this process (two
+consecutive mismatched reads, to absorb the stale-sweep unlink+recreate race), the daemon stops:
+`state-machine.js`'s `runTask` polls `config.lockLost()` between every state transition (a
+handler can be mid-`spawnSync`, so the timer alone can't interrupt one) and lets a `LockLostError`
+propagate uncaught — deliberately **not** a park, since losing the lock means this process may no
+longer be the legitimate writer of a park's own `state.json`/`report.md`/board-move/gh-comment.
+`daemon.js` journals a `lock-lost` event and exits 75 (`EX_TEMPFAIL`); under the systemd unit
+below, `Restart=always` brings it back, and the new start either resolves cleanly or refuses
+normally against the winner's now-live lock.
+
+## Orphan recovery
+
+A task whose owning daemon process dies mid-run (crash, hard kill, a losing race against
+`watchLock` above) leaves `journal/<id>/state.json` frozen on a non-terminal state with no
+`queue/` entry — invisible to a drain pass and to `unparkScan`'s own PARKED-only scan alike.
+`orchestrator/orphan-scan.js` closes that gap: every `state.json` snapshot now carries an
+`owner: {host, pid, lockStartedAt}` (set once, from `daemon.js`'s own lock holder), and a task
+whose owner pid is no longer alive on this host — past a grace window
+(`config.orphanGraceMs`, default 4 min, to avoid racing a transition's own last write) — is
+reparked automatically with reason `task-orphaned-daemon-restart`, through the same
+`finalizePark` path a normal `ParkSignal` uses. That includes posting the retry/abandon park
+comment, so `unparkScan`'s existing round trip picks the task straight back up — no manual
+`state.json`/`journal.jsonl` edit, no fabricated comment, the way recovering card #385 required
+by hand on 2026-08-30.
+
+The scan runs unconditionally once at every daemon startup (the case that actually matters —
+crash, then a systemd restart) and again on its own timer inside `runForever`'s real-mode loop
+(`config.orphanScanMs`, default 60s), ahead of `unparkScan` so a reparked task is retryable the
+very next cycle. An owner-less or foreign-host `state.json` (an older build, or a task genuinely
+owned by another machine) is left alone and logged, never guessed at — a false-positive reparking
+would put two writers on the same task directory, worse than the status quo.
+
+A park produced this way also runs through `steps/scripted.js`'s `preserveWorktreeWip` if the
+task's worktree is still on disk and dirty: it commits the tree (`wip(<id>): parked -- <reason>`)
+and pushes it to a throwaway `wip/<id>-<ts>` ref on origin, named in the park comment — the same
+#385 incident stranded 620 lines of uncommitted `IMPLEMENT` work in the worktree with no other
+copy anywhere, which this closes independently of the lock/orphan fix above. The dirty-leftover
+check `sweepWorktreeLeftovers` (WORKTREE's own retry-time cleanup) runs the same preservation
+before removing a dirty leftover, falling back to its original `worktree-dirty-leftover` park
+only if the preservation itself fails (no network, origin refuses).
+
 ## Running as a service
 
 `bash scripts/daemon-install.sh` (run from the checkout that should host the daemon) installs

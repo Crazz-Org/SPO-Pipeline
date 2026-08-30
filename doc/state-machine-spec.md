@@ -14,7 +14,13 @@ the design consequences at the bottom.
    recognize → the task is **parked**: worktree left intact, one report written, one journal
    event, zero further tokens. Explicit error handling means a safe cheap catch-all, not
    foreseeing everything. Parked tasks are handled by the maintainer or an interactive
-   session; every parking reason that recurs becomes a new branch (frequency-ordered).
+   session; every parking reason that recurs becomes a new branch (frequency-ordered). One
+   case a task cannot produce a park for itself: the daemon *process* dying mid-run (crash,
+   hard kill, a lost single-instance lock). `orchestrator/orphan-scan.js` covers it
+   *a posteriori* — a `state.json` left on a non-terminal state with no `queue/` entry and a
+   dead owner pid is reparked automatically (`task-orphaned-daemon-restart`) through the same
+   `finalizePark` path a normal catch-all park uses, the next time any daemon starts or runs its
+   periodic scan. See `orchestrator/README.md` § Orphan recovery.
 3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.
