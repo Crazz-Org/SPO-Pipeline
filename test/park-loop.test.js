@@ -141,6 +141,49 @@ test('runTask (real mode, card): a park AFTER the worktree exists moves the card
   assert.ok(journal.some((e) => e.event === 'park-comment' && e.commentId === 777));
 });
 
+test('finalizePark: a dirty worktree still on disk gets its diff pushed to a wip/ ref, named in the park comment (card #385\'s stranded-IMPLEMENT case)', async () => {
+  const { buildCtx, finalizePark } = require('../orchestrator/state-machine');
+  const taskDir = mkTmp('spo-park-wip-taskdir-');
+  const config = testConfig();
+  const worktreePath = path.join(config.pipelineWorktreesDir, 'card-385');
+  fs.mkdirSync(worktreePath, { recursive: true });
+  fs.writeFileSync(path.join(worktreePath, 'uncommitted.ts'), 'stranded IMPLEMENT work');
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M uncommitted.ts\n');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok('wipsha385000000000000000000000000000000\n');
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/385#issuecomment-900\n');
+      }
+      return ok('');
+    },
+  };
+
+  const task = { id: 'card-385', kind: 'card', issue: 385, title: 'x', worktreePath };
+  const ctx = buildCtx('card-385', task, taskDir, { ...config, deps });
+
+  finalizePark(ctx, 'DIAGNOSE', 'task-orphaned-daemon-restart', { owner: { pid: 12345 } });
+
+  const pushCall = calls.find((c) => c.args.includes('push') && c.args.some((a) => a.startsWith('HEAD:refs/heads/wip/')));
+  assert.ok(pushCall, 'expected the WIP push to run as part of the park');
+
+  const journal = readJournal(taskDir);
+  const preserved = journal.find((e) => e.event === 'wip-preserved');
+  assert.ok(preserved && preserved.ref && preserved.ref.startsWith('wip/card-385-'));
+  assert.equal(preserved.sha, 'wipsha385000000000000000000000000000000');
+
+  const report = fs.readFileSync(path.join(taskDir, 'report.md'), 'utf8');
+  assert.match(report, /"ref": "wip\/card-385-/);
+
+  const commentCall = calls.find((c) => c.command === 'gh');
+  const bodyFile = commentCall.args[commentCall.args.indexOf('--body-file') + 1];
+  const body = fs.readFileSync(bodyFile, 'utf8');
+  assert.match(body, /wip\/card-385-/); // the retry-anchoring comment names the ref -- not just local
+});
+
 // ---- unpark scan: retry / abandon / ignored ---------------------------------------------------
 
 function parkedTaskDir(journalRoot, id, { issue, commentId }) {

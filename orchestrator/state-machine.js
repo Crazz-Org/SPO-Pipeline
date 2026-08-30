@@ -26,6 +26,7 @@ const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeRepor
 const { scratchDir } = require('./task-values');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
+const { LockLostError } = require('./lock');
 const { callWithDeadline } = require('./deadline');
 const {
   runScripted,
@@ -37,12 +38,14 @@ const {
   realCiChecks,
   realMerge,
   realFinish,
+  preserveWorktreeWip,
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
 const { moveCard } = require('./board');
 const { postParkComment, unparkScan } = require('./park-loop');
+const { shouldScanOrphans, orphanScan } = require('./orphan-scan');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 const { shouldAutoTriage, runAutoTriage } = require('./auto-triage');
@@ -491,6 +494,11 @@ function buildCtx(id, task, taskDir, config) {
     // park-loop.js's postParkComment (called from inside this file, with no realX split of
     // their own) share it too.
     deps: (config && config.deps) || {},
+    // The daemon process that owns this run, for orphan-scan.js to tell "still running" apart
+    // from "died mid-task" after a restart. null outside daemon.js (tests, --once shadow runs
+    // with no config.owner) -- orphan-scan.js treats an owner-less snapshot as unknown, never
+    // as orphaned, rather than risk a false-positive park on a task with no owner data at all.
+    owner: (config && config.owner) || null,
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
     counters: {
@@ -513,17 +521,31 @@ function snapshot(ctx, state) {
     mainMoveUsed: ctx.counters.mainMoveUsed,
     prNumber: ctx.prNumber || null,
     worktreePath: (ctx.task && ctx.task.worktreePath) || null,
+    owner: ctx.owner || null,
     updatedAt: new Date().toISOString(),
   };
 }
 
 function finalizePark(ctx, lastState, reason, detail) {
   appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
+
+  // Any park with a still-existing, still-dirty worktree gets its diff pushed to a durable wip/
+  // ref before anything else -- not just the WORKTREE-retry dirty-leftover case sweepWorktreeLeftovers
+  // itself already handles. This is what would have saved card #385's 620 lines of stranded
+  // IMPLEMENT work: a task orphaned mid-DIAGNOSE (orphan-scan.js) reparks through this exact
+  // function, and its worktree is very likely still sitting there, uncommitted.
+  let mergedDetail = detail;
+  if (isRealMode(ctx)) {
+    const worktreePath = (ctx.task && ctx.task.worktreePath) || (detail && detail.worktreePath) || null;
+    const preserved = preserveWorktreeWip(ctx, ctx.deps, { worktreePath, reason });
+    if (preserved) mergedDetail = { ...detail, wip: preserved };
+  }
+
   const snap = snapshot(ctx, 'PARKED');
   snap.reason = reason;
   snap.lastState = lastState;
   writeState(ctx.taskDir, snap);
-  writeReport(ctx.taskDir, { id: ctx.id, reason, lastState, ts: snap.updatedAt, detail });
+  writeReport(ctx.taskDir, { id: ctx.id, reason, lastState, ts: snap.updatedAt, detail: mergedDetail });
 
   // The daemon-level feed: one `parked` line in <journalRoot>/daemon.jsonl alongside the
   // per-task event above, so daemon.jsonl reads as the single chronological "needs a human"
@@ -545,7 +567,7 @@ function finalizePark(ctx, lastState, reason, detail) {
   // moveCard('PARKED') call inside postParkComment skips itself, journaled, when the worktree
   // was never created (a pre-WORKTREE park) -- the gh comment still posts either way.
   if (isRealMode(ctx) && ctx.task && ctx.task.kind === 'card') {
-    postParkComment(ctx, ctx.deps, { reason, detail, lastState });
+    postParkComment(ctx, ctx.deps, { reason, detail: mergedDetail, lastState });
   }
 }
 
@@ -569,6 +591,16 @@ async function runTask(id, task, taskDir, config) {
     if (++hops > HOP_LIMIT) {
       finalizePark(ctx, state, 'state-machine-runaway', { hops });
       return 'PARKED';
+    }
+    // Cooperative lock check, between states rather than inside a handler: a handler can be
+    // mid-spawnSync (blocking, single-threaded) when lock.js's watchLock timer fires, so the
+    // timer alone cannot interrupt a running step -- this is the point every step chain passes
+    // through. config.lockLost is set by daemon.js only; absent in every test and in --once
+    // shadow runs, so this is a no-op there. Deliberately NOT caught below (LockLostError is not
+    // a ParkSignal -- see lock.js's own doctrine comment): a park is itself a write to shared
+    // state this process may no longer be the legitimate owner of.
+    if (config.lockLost && config.lockLost()) {
+      throw new LockLostError('lock-lost-mid-task', config.lockLostHolder && config.lockLostHolder());
     }
     const handler = HANDLERS[state];
     if (!handler) {
@@ -660,11 +692,20 @@ async function runForever(queueDir, journalRoot, config) {
   let lastAutoIntakeAt = null;
   let lastConfirmScanAt = null;
   let lastAutoTriageAt = null;
+  let lastOrphanScanAt = null;
   for (;;) {
     await drainQueueOnce(queueDir, journalRoot, config);
 
     if (config.real) {
       const deps = config.deps || {};
+
+      // Before unparkScan: an orphan reparked THIS cycle must be visible to a maintainer's
+      // retry/abandon reply starting next cycle, not a full extra poll later.
+      if (shouldScanOrphans(lastOrphanScanAt, Date.now(), config.orphanScanMs)) {
+        lastOrphanScanAt = Date.now();
+        await orphanScan(queueDir, journalRoot, config, deps);
+      }
+
       await unparkScan(queueDir, journalRoot, config, deps);
 
       // Note the ordering above: drainQueueOnce is AWAITED, so a pull only ever happens with
@@ -724,4 +765,6 @@ module.exports = {
   runForever,
   callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
   buildCtx,
+  finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
+  snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it
 };

@@ -183,9 +183,19 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
     if (existsOnDisk) {
       const status = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', worktreePath, 'status', '--porcelain']);
       if (status.exit !== 0 || status.stdout.trim() !== '') {
-        throw new ParkSignal('worktree-dirty-leftover', { worktreePath, statusExit: status.exit, statusTail: status.stdoutTail });
+        // A dirty leftover is, by construction, a previous attempt's own uncommitted work (this
+        // namespace is pipeline-exclusive -- see the header above): push it to a durable wip/
+        // ref before ever destroying the worktree, rather than parking and leaving the diff to
+        // depend on this local directory surviving. Only fall back to the old park-and-wait
+        // behaviour if that preservation itself fails (no network, origin refuses, ...) -- never
+        // destroy what wasn't first saved somewhere durable.
+        const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+        if (!preserved) {
+          throw new ParkSignal('worktree-dirty-leftover', { worktreePath, statusExit: status.exit, statusTail: status.stdoutTail });
+        }
+        appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-wip-preserved', preserved);
       }
-      const remove = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'worktree', 'remove', worktreePath]);
+      const remove = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'worktree', 'remove', '--force', worktreePath]);
       if (remove.exit !== 0) {
         throw new ParkSignal('worktree-cleanup-failed', { step: 'worktree-remove', exit: remove.exit });
       }
@@ -247,6 +257,59 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
     if (del.exit !== 0) throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-branch-delete', exit: del.exit });
     appendEvent(ctx.taskDir, 'WORKTREE', 'remote-branch-cleaned', { branch, sha: remoteSha });
   }
+}
+
+// preserveWorktreeWip(ctx, deps, {worktreePath, reason, state}) -> {ref, sha} | null
+//
+// Real mode only. If `worktreePath` has uncommitted changes, commits them (`git add -A` + a
+// wip(<id>) commit) and pushes to a throwaway `wip/<id>-<ts>` branch on origin, so the diff
+// survives independently of the local worktree directory -- see the module header and
+// doc/state-machine-spec.md's note on card #385, where 620 lines of IMPLEMENT work were stranded
+// in a worktree with no durable copy anywhere else. `wip/` is a deliberately different namespace
+// from `claude-pipe/<id>` (the pipeline's own regenerate-and-delete branch): sweepWorktreeLeftovers'
+// rules 2/3 assume claude-pipe/<id> is disposable and safe to force-delete on the next attempt --
+// pushing a WIP there would make THIS branch look like an unmerged leftover on the very next
+// retry and park branch-unmerged-leftover instead of cleaning up.
+//
+// Never blocks or throws: a park is already terminal by the time finalizePark calls this, and the
+// dirty-leftover sweep call site treats a failed preservation as "fall back to the old
+// park-and-wait behaviour", not as a harder failure. Returns null (no event beyond the failure
+// one, if any) when there is nothing to preserve (no worktree, already clean) or a step failed.
+function preserveWorktreeWip(ctx, deps, { worktreePath, reason, state = 'PARKED' } = {}) {
+  if (!worktreePath || !fs.existsSync(worktreePath)) return null;
+
+  const status = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'status', '--porcelain']);
+  if (status.exit !== 0) {
+    appendEvent(ctx.taskDir, state, 'wip-preserve-failed', { step: 'status', exit: status.exit });
+    return null;
+  }
+  if (status.stdout.trim() === '') return null; // clean tree -- nothing to preserve
+
+  const add = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'add', '-A']);
+  if (add.exit !== 0) {
+    appendEvent(ctx.taskDir, state, 'wip-preserve-failed', { step: 'add', exit: add.exit });
+    return null;
+  }
+
+  const messageFile = path.join(ctx.taskDir, 'wip-message.txt');
+  fs.writeFileSync(messageFile, `wip(${ctx.id}): parked${reason ? ` -- ${reason}` : ''}\n`);
+  const commit = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'commit', '-F', messageFile]);
+  if (commit.exit !== 0) {
+    appendEvent(ctx.taskDir, state, 'wip-preserve-failed', { step: 'commit', exit: commit.exit });
+    return null;
+  }
+
+  const revParse = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+  const wipRef = `wip/${ctx.id}-${Date.now()}`;
+  const push = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'push', 'origin', `HEAD:refs/heads/${wipRef}`]);
+  if (push.exit !== 0) {
+    appendEvent(ctx.taskDir, state, 'wip-preserve-failed', { step: 'push', exit: push.exit });
+    return null;
+  }
+
+  const preserved = { ref: wipRef, sha: revParse.exit === 0 ? revParse.stdout.trim() : null };
+  appendEvent(ctx.taskDir, state, 'wip-preserved', preserved);
+  return preserved;
 }
 
 async function realWorktree(ctx, deps = {}) {
@@ -618,4 +681,5 @@ module.exports = {
   realCiChecks,
   realMerge,
   realFinish,
+  preserveWorktreeWip,
 };
