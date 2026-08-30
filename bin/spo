@@ -30,6 +30,15 @@
 //                            Never runs `claude` itself.
 //   spo account enable/disable <name>
 //                            Creates or removes the `disabled` marker file for that account.
+//   spo account sync-settings
+//                            Installs <repo>/.claude/settings.json as every pool account's
+//                            user-tier settings.json. An account directory IS a
+//                            CLAUDE_CONFIG_DIR, so the machine's ~/.claude/settings.json is
+//                            never read by a pipeline step -- this is what gives every account
+//                            the same permission floor whatever the step's cwd. Idempotent;
+//                            --dry reports what would change and writes nothing. Run
+//                            automatically by `spo account add` and at every --real daemon
+//                            start. See doc/permissions.md.
 //   spo ask <text…>          Intake, fast lane: joins remaining argv as the free-text request,
 //                            drafts a card (DRAFT_CARD, Sonnet 5), sends it to review-card
 //                            (Fable 5, the neutral judge), then files it on FILE/FILE_AMENDED or
@@ -389,6 +398,46 @@ function cmdAccountAdd(name, opts) {
   console.log(`  3. chmod 600 ${tokenFile}`);
   // Complete, copy-pasteable command (maintainer rule: never a bare subcommand).
   console.log(`  4. ${path.join(__dirname, 'spo')} accounts   # verify it shows up, enabled, token=yes`);
+
+  // The new account starts with no user-tier permission rules at all (its directory IS its
+  // CLAUDE_CONFIG_DIR). Sync immediately so it never runs a step under a different policy than
+  // its siblings -- the daemon syncs too, but only at --real startup, which may be much later.
+  const synced = accounts.syncSettings(accountsDir, readPipelineSettingsText());
+  const mine = synced.find((r) => r.name === name);
+  if (mine) console.log(`\nPermission policy ${mine.action}: ${mine.path}`);
+}
+
+// The repo's own .claude/settings.json is the single source of truth for the pool's user-tier
+// policy -- reviewed in git, applied verbatim to every account. Read here rather than kept as a
+// second copy inside the CLI, so the two can never drift.
+function readPipelineSettingsText() {
+  const source = path.join(__dirname, '..', '.claude', 'settings.json');
+  return accounts.stampManagedSettings(fs.readFileSync(source, 'utf8'), '<repo>/.claude/settings.json');
+}
+
+// `spo account sync-settings [--dry]` -- installs that policy as every pool account's user-tier
+// settings.json. Idempotent: an account already carrying the current policy reports `unchanged`
+// and is not rewritten. --dry reports what would change and writes nothing.
+function cmdAccountSyncSettings(opts) {
+  const accountsDir = resolveAccountsDir(opts);
+  let settingsText;
+  try {
+    settingsText = readPipelineSettingsText();
+  } catch (err) {
+    console.error(`spo account sync-settings: cannot read the source policy -- ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const results = accounts.syncSettings(accountsDir, settingsText, { dryRun: opts.dry });
+  if (results.length === 0) {
+    console.log(`(no accounts registered in ${accountsDir} -- see doc/setup.md § Accounts)`);
+    return;
+  }
+  for (const r of results) {
+    console.log(`${r.action.padEnd(9)} ${r.name}  ${r.path}`);
+  }
+  if (opts.dry) console.log('\n--dry: nothing written.');
 }
 
 function accountMarkerDir(accountsDir, name, subcommand) {
@@ -666,7 +715,7 @@ async function cmdTriage(opts, deps = {}) {
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull|pull-reports|intake|reports|triage>',
+      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
       '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
@@ -708,7 +757,8 @@ function main() {
     if (sub === 'add') return cmdAccountAdd(name, opts);
     if (sub === 'enable') return cmdAccountEnable(name, opts);
     if (sub === 'disable') return cmdAccountDisable(name, opts);
-    console.error('usage: spo account <add|enable|disable> <name>');
+    if (sub === 'sync-settings') return cmdAccountSyncSettings(opts);
+    console.error('usage: spo account <add|enable|disable> <name> | spo account sync-settings [--dry]');
     process.exitCode = 1;
     return;
   }

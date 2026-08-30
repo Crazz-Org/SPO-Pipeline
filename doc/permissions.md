@@ -42,6 +42,32 @@ tous les steps LLM. Restent les règles *projet*, résolues depuis le `cwd` du s
 Ces trois steps tournent en `permissionMode: 'default'` sans humain pour répondre : toute
 commande Bash non triviallement read-only est **refusée**, pas mise en attente.
 
+### La couche compte, comblée elle aussi
+
+Le tableau ci-dessus dit que les règles *utilisateur* disparaissent pour tous les steps LLM. La
+politique projet suffit tant que chaque step atterrit dans un répertoire qui en porte une —
+c'est le cas aujourd'hui (racine du pipeline ou worktree produit), ce qui **masque** le trou
+sans le combler. Un step dont le `cwd` n'aurait pas de `.claude/settings.json` tournerait sans
+aucune règle.
+
+Le répertoire d'un compte **est** son `CLAUDE_CONFIG_DIR`, donc un `settings.json` posé dedans
+est sa couche utilisateur. `spo account sync-settings` y installe `<repo>/.claude/settings.json`
+tel quel, pour chaque compte du pool : le plancher d'autorisations ne dépend plus ni du `cwd` du
+step, ni du compte que la rotation a choisi. La commande est idempotente et tourne toute seule à
+deux moments — `spo account add`, et chaque démarrage `--real` du daemon, pour qu'un compte
+ajouté ou réactivé entre deux runs ne reste pas en retard.
+
+Le fichier écrit dans le pool est machine-owned : il porte une clé `"//"` qui le dit, et il est
+réécrit à chaque sync. **La source unique reste `<repo>/.claude/settings.json`**, celle que git
+relit — le CLI ne garde pas une seconde copie des règles qui pourrait diverger. Pour changer la
+politique : éditer la source, puis `bin/spo account sync-settings`.
+
+Un détail qui aurait pu passer inaperçu : `accounts.hasCredentials()` répond « ce compte
+détient-il de vrais credentials ? » par exclusion des fichiers que le module gère lui-même. Le
+`settings.json` synchronisé y est donc explicitement exclu — sans ça, synchroniser le pool ferait
+dire à `spo accounts` que chaque compte est authentifié, y compris ceux qui ne le sont pas.
+Couvert par un test de régression.
+
 Conséquence directe : DIAGNOSE est le filet de sécurité prévu pour la CI-forensics
 (`doc/improvisation-analysis.md`, cause R2 — `gh run view --log-failed`, `gh api …/jobs`) et il
 n'a aucune de ces autorisations. VALIDATE doit lire `git diff` du worktree produit et ne le

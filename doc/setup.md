@@ -40,6 +40,20 @@ cd ~/SPO-Pipeline && node scripts/smoke-llm.js pool1
 - An **empty pool** refuses `--real` at daemon startup and parks mid-run
   (`no-accounts-registered`): the pipeline uses only registered accounts, never the machine's
   ambient `claude` login.
+- Each account directory **is** a `CLAUDE_CONFIG_DIR`, so it is also its own user-settings tier
+  — the machine's `~/.claude/settings.json` is never read by a pipeline step. `<repo>/.claude/settings.json`
+  is installed into every account as that tier, so the permission floor does not depend on which
+  account the rotation picks. `spo account add` does it for the new account and every `--real`
+  daemon start re-applies it, so this is normally automatic; run it by hand after editing the
+  policy, or to check what would change:
+
+```bash
+cd ~/SPO-Pipeline && bin/spo account sync-settings --dry
+```
+
+  The file it writes is machine-owned and carries a `"//"` marker saying so — edit
+  `<repo>/.claude/settings.json` and re-sync, never the copy in the pool. Details and the
+  reasoning: `doc/permissions.md`.
 
 Everything else (prerequisites, repos, bench/pre-prod, parameters table):
 **SPO-Deploy README § Setup**.

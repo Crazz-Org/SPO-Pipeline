@@ -37,6 +37,9 @@ const path = require('path');
 
 const OAUTH_TOKEN_FILENAME = 'oauth-token';
 const DISABLED_MARKER_FILENAME = 'disabled';
+// The account directory IS a CLAUDE_CONFIG_DIR, so a settings.json inside it is that account's
+// user-settings tier -- see syncSettings() below for why the pool needs one at all.
+const SETTINGS_FILENAME = 'settings.json';
 
 // Used when a limit error carries no retry-after hint of its own -- a Claude Max 5h window is
 // the shortest real reset this can be hitting, so an hour is a conservative "come back later"
@@ -97,16 +100,63 @@ function readRegistry(poolDir) {
     });
 }
 
-// Whether `configDir` holds anything besides the two files this module itself manages
-// (oauth-token, disabled) -- i.e. real credentials, written there by `claude setup-token`'s
-// underlying login flow (or a plain `claude` login pointed at this CLAUDE_CONFIG_DIR). Used by
-// `spo accounts` and the dashboard's accounts section to show "credentials: yes/no" without
-// hardcoding the exact filename(s) Claude Code itself writes there.
+// Whether `configDir` holds anything besides the three files this module itself manages
+// (oauth-token, disabled, settings.json) -- i.e. real credentials, written there by `claude
+// setup-token`'s underlying login flow (or a plain `claude` login pointed at this
+// CLAUDE_CONFIG_DIR). Used by `spo accounts` and the dashboard's accounts section to show
+// "credentials: yes/no" without hardcoding the exact filename(s) Claude Code itself writes
+// there. settings.json belongs in this exclusion list for the same reason the other two do:
+// syncSettings() writes it, so counting it as credentials would make every synced account
+// report "credentials: yes" the moment the pool is synced, whether or not it can authenticate.
+const MANAGED_FILENAMES = new Set([OAUTH_TOKEN_FILENAME, DISABLED_MARKER_FILENAME, SETTINGS_FILENAME]);
+
 function hasCredentials(configDir) {
   if (!configDir || !fs.existsSync(configDir)) return false;
-  return fs
-    .readdirSync(configDir)
-    .some((entry) => entry !== OAUTH_TOKEN_FILENAME && entry !== DISABLED_MARKER_FILENAME);
+  return fs.readdirSync(configDir).some((entry) => !MANAGED_FILENAMES.has(entry));
+}
+
+// Installs one permission policy as the USER-tier settings of every account in the pool.
+//
+// WHY this exists: steps/llm.js spawns `claude -p` with CLAUDE_CONFIG_DIR set to the account's
+// own directory, so the machine's ~/.claude/settings.json is never read by a pipeline step --
+// an account directory IS its own user-settings tier, and an unsynced one has no rules at all.
+// Today every step happens to land in a directory that carries a project policy (the pipeline
+// root or a product worktree), which masks the gap; a step whose cwd has no .claude/settings.json
+// would run with nothing. Syncing gives every account the same floor regardless of cwd, and
+// regardless of which account the rotation picks.
+//
+// `settingsText` is written verbatim so the repo's own .claude/settings.json stays the single
+// source of truth -- callers read it and pass it here rather than this module carrying a second
+// copy of the rules that could drift from the one git reviews.
+//
+// Overwrites unconditionally: the file is machine-owned (the marker key below says so in the
+// file itself). Never touches an account's credentials, its oauth-token, or its disabled marker.
+// A missing pool directory syncs nothing and is not an error -- same posture as readRegistry.
+function syncSettings(poolDir, settingsText, { dryRun = false } = {}) {
+  const results = [];
+  for (const account of readRegistry(poolDir)) {
+    const target = path.join(account.configDir, SETTINGS_FILENAME);
+    const before = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : null;
+    const action = before === null ? 'created' : before === settingsText ? 'unchanged' : 'updated';
+    if (!dryRun && action !== 'unchanged') {
+      fs.writeFileSync(target, settingsText);
+    }
+    results.push({ name: account.name, path: target, action });
+  }
+  return results;
+}
+
+// Stamps the policy with a machine-owned marker before it is written into an account directory,
+// so anyone opening ~/.claude-accounts/<name>/settings.json sees why it is there and that hand
+// edits do not survive. The key is a comment-shaped no-op: Claude Code's settings schema allows
+// additional top-level properties, so it is carried without being interpreted.
+function stampManagedSettings(settingsText, source) {
+  const parsed = JSON.parse(settingsText);
+  const stamped = {
+    '//': `machine-owned -- written by \`spo account sync-settings\` from ${source}. Edits here are overwritten; change the source instead.`,
+    ...parsed,
+  };
+  return `${JSON.stringify(stamped, null, 2)}\n`;
 }
 
 // Runtime cooldown state. A missing or unparsable state.json is just "nobody has ever hit a
@@ -188,9 +238,12 @@ module.exports = {
   readState,
   writeState,
   hasCredentials,
+  syncSettings,
+  stampManagedSettings,
   AllAccountsCoolingError,
   NoAccountsRegisteredError,
   DEFAULT_COOLDOWN_MS,
   OAUTH_TOKEN_FILENAME,
   DISABLED_MARKER_FILENAME,
+  SETTINGS_FILENAME,
 };

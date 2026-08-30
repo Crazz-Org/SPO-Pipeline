@@ -114,12 +114,18 @@ test('spo account add <name> creates the directory and prints the exact guided n
       // Complete, copy-pasteable command (maintainer rule: never a bare subcommand).
       `  4. ${SPO_BIN} accounts   # verify it shows up, enabled, token=yes`,
       '',
+      // The new account's user-tier permission policy, installed on the spot -- an account
+      // directory IS a CLAUDE_CONFIG_DIR, so without this it would run its first steps with no
+      // rules of its own. See test/account-settings-sync.test.js and doc/permissions.md.
+      `Permission policy created: ${path.join(dir, 'settings.json')}`,
+      '',
     ].join('\n')
   );
   assert.ok(fs.existsSync(dir) && fs.statSync(dir).isDirectory());
 
-  // `spo account add` never runs `claude` itself -- only the directory exists, nothing else.
-  assert.deepEqual(fs.readdirSync(dir), []);
+  // `spo account add` still never runs `claude` itself -- the only file it creates is the
+  // permission policy it just reported; no credentials, no token.
+  assert.deepEqual(fs.readdirSync(dir), ['settings.json']);
 });
 
 test('spo accounts reflects a pasted oauth-token as token=yes, enabled=true', () => {
