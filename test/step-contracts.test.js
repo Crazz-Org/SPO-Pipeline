@@ -117,20 +117,12 @@ test('resolveStepContract: DIAGNOSE/CITATION_VERIFIER/VALIDATE are pinned high r
   }
 });
 
-test('resolveStepContract: PLAN carries a $3 budget floor, decoupled from card size -- S resolves to the floor, M/L are unaffected', () => {
-  // Continuous-daemon soak, 2026-08-29: card issue-232 (S, BUDGET_BY_SIZE_USD.S = $2) had its
-  // PLAN killed at terminal_reason=budget_exhausted ($2.0467 over 16 turns); issue-247's PLAN
-  // ($1.67) barely fit under the same $2 cap earlier the same day. PLAN explores regardless of
-  // card size, so S alone needs raising -- M ($5) and L ($12) already clear the $3 floor.
-  assert.equal(resolveStepContract('PLAN', { size: 'S' }).maxBudgetUsd, 3);
-  assert.equal(resolveStepContract('PLAN', { size: 'M' }).maxBudgetUsd, 5);
-  assert.equal(resolveStepContract('PLAN', { size: 'L' }).maxBudgetUsd, 12);
-});
-
-test('resolveStepContract: a non-PLAN bySize step (IMPLEMENT) is unaffected by PLAN\'s budget floor -- S still resolves to the plain by-size value', () => {
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'S' }).maxBudgetUsd, 2);
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'M' }).maxBudgetUsd, 5);
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'L' }).maxBudgetUsd, 12);
+test('resolveStepContract: no $ budget cap on any step or size -- Claude Max subscription, no overage risk', () => {
+  for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
+    for (const size of ['S', 'M', 'L']) {
+      assert.equal(resolveStepContract(step, { size }).maxBudgetUsd, undefined);
+    }
+  }
 });
 
 test('resolveStepContract: jsonSchema.required mirrors the step outputContract', () => {

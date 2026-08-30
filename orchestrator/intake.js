@@ -40,7 +40,6 @@ const accounts = require('./accounts');
 const config = require('./config');
 const { invokeClaudeReal } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
-const { SMALL_BUDGET_USD, BUG_REPORT_BUDGET_USD } = require('./step-contracts');
 const { parseCommentId } = require('./park-loop');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
@@ -154,7 +153,7 @@ async function draftCard(requestText, deps = {}) {
     effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only -- draft-card.md: "you hold no edit tool"
-    maxBudgetUsd: SMALL_BUDGET_USD,
+    maxBudgetUsd: undefined, // no $ cap -- Claude Max subscription, no overage risk
     jsonSchema: { type: 'object', required: DRAFT_REQUIRED },
     promptText,
     cwd: productRepo, // needs Read/Grep over the product tree to find file:line references
@@ -289,7 +288,7 @@ async function reviewCard(draft, deps = {}) {
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'], // review-card.md: "Read, Grep, Glob, Bash(ro)"
     permissionMode: 'default',
-    maxBudgetUsd: SMALL_BUDGET_USD,
+    maxBudgetUsd: undefined, // no $ cap -- Claude Max subscription, no overage risk
     jsonSchema: { type: 'object', required: REVIEW_REQUIRED },
     promptText,
     cwd: productRepo, // reads the product tree + `gh issue list --repo {{repo}}`
@@ -626,7 +625,7 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only -- triage-bug-report.md: "never file, never post, never move the report"
-    maxBudgetUsd: deps.maxBudgetUsd || BUG_REPORT_BUDGET_USD,
+    maxBudgetUsd: deps.maxBudgetUsd, // no $ cap by default -- Claude Max subscription, no overage risk
     jsonSchema: { type: 'object', required: ['outcome'] },
     promptText,
     cwd: productRepo, // needs Read/Grep/Bash over the product tree, plus curl/gh
