@@ -507,6 +507,18 @@ function cmdAccountDisable(name, opts) {
 // non-zero only for a mechanical failure (no account, a bad LLM reply, a malformed --draft-file,
 // a failed gh call).
 //
+// `spo ask`/`spo pull` have no daemon.jsonl of their own to journal into (unlike auto-triage.js's
+// `report-triage-retry` event for triageBugReport's own retry) -- this IS the daemon.jsonl
+// equivalent for an interactive session: a stderr line, printed whenever draftCard/reviewCard
+// retried after a deadline timeout, so the maintainer sees the step ran twice instead of it
+// silently costing double.
+function logRetryIfAny(stepName, result) {
+  if (result && result.retriedAfterTimeout) {
+    const r = result.retriedAfterTimeout;
+    console.error(`${stepName}: retried after a ${r.deadlineMs}ms deadline timeout (retryOk=${r.retryOk})`);
+  }
+}
+
 // `deps.intake` is a test-only override (default: the real orchestrator/intake.js module) --
 // same injection convention as everywhere else in this repo, applied at this one extra layer so
 // the test suite can drive the real CLI wiring (parseArgs -> cmdAsk's own dry/DO_NOT_FILE/filing
@@ -531,6 +543,7 @@ async function cmdAsk(opts, deps = {}) {
       return;
     }
     const drafted = await intakeImpl.draftCard(requestText, {});
+    logRetryIfAny('draftCard', drafted);
     if (!drafted.ok) {
       console.error(drafted.error);
       process.exitCode = 1;
@@ -540,6 +553,7 @@ async function cmdAsk(opts, deps = {}) {
   }
 
   const reviewed = await intakeImpl.reviewCard(draft, {});
+  logRetryIfAny('reviewCard', reviewed);
   if (!reviewed.ok) {
     console.error(reviewed.error);
     process.exitCode = 1;

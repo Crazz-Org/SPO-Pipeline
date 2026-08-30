@@ -145,6 +145,67 @@ test('draftCard: no account registered -> clear error, never spawns', async () =
   assert.equal(called, false);
 });
 
+// ---- draftCard: one retry on a deadline timeout, never on a malformed reply -------------------
+// Same policy as triageBugReport's own retry (see that section below) -- draftCard/reviewCard
+// were the two other intake LLM steps with no retry at all (card #449 follow-up, 2026-08-30).
+
+test('draftCard: a deadline timeout is retried exactly once, and the retry\'s answer is the result', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return calls === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_DRAFT);
+    },
+  };
+  const result = await intake.draftCard('anything', deps);
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.draft, VALID_DRAFT);
+  assert.equal(result.retriedAfterTimeout.retryOk, true);
+  assert.equal(result.retriedAfterTimeout.retryTimedOut, false);
+});
+
+test('draftCard: the retry uses the SAME account and the SAME deadline as the first attempt', async () => {
+  const seenOpts = [];
+  const deps = {
+    accountsDir: poolDir(),
+    deadlineMs: 12345,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_DRAFT);
+    },
+  };
+  await intake.draftCard('anything', deps);
+  assert.equal(seenOpts.length, 2);
+  assert.equal(seenOpts[0].timeout, 12345);
+  assert.equal(seenOpts[1].timeout, 12345);
+  assert.deepEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR);
+});
+
+test('draftCard: two consecutive timeouts -- one retry only, then give up', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return timeoutSpawnResult();
+    },
+  };
+  const result = await intake.draftCard('anything', deps);
+  assert.equal(calls, 2);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /exceeded the \d+ms deadline/);
+  assert.equal(result.retriedAfterTimeout.retryTimedOut, true);
+});
+
+test('draftCard: a malformed reply is NOT retried', async () => {
+  const deps = { accountsDir: poolDir(), spawnSync: seqSpawnSync([{ status: 0, stdout: 'not json at all', stderr: '', signal: null }, okSpawnResult(VALID_DRAFT)]) };
+  const result = await intake.draftCard('anything', deps);
+  assert.equal(result.ok, false);
+  assert.equal(result.retriedAfterTimeout, undefined);
+});
+
 // ---- loadDraftFile (the brainstorm lane) -------------------------------------------------------
 
 test('loadDraftFile: happy path reads and validates an already-written draft JSON', () => {
@@ -223,6 +284,68 @@ test('reviewCard: deps.humanConfirmed threads {{human_confirmed}} into the promp
 
   assert.ok(seenPrompts[0].includes('human_confirmed:  yes'));
   assert.ok(seenPrompts[1].includes('human_confirmed:  no'));
+});
+
+// ---- reviewCard: one retry on a deadline timeout, never on a malformed reply -------------------
+
+test('reviewCard: a deadline timeout is retried exactly once, and the retry\'s answer is the result', async () => {
+  let calls = 0;
+  const VALID_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return calls === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_REVIEW);
+    },
+  };
+  const result = await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.review.verdict, 'FILE');
+  assert.equal(result.retriedAfterTimeout.retryOk, true);
+  assert.equal(result.retriedAfterTimeout.retryTimedOut, false);
+});
+
+test('reviewCard: the retry uses the SAME account and the SAME deadline as the first attempt', async () => {
+  const seenOpts = [];
+  const VALID_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+  const deps = {
+    accountsDir: poolDir(),
+    deadlineMs: 12345,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_REVIEW);
+    },
+  };
+  await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(seenOpts.length, 2);
+  assert.equal(seenOpts[0].timeout, 12345);
+  assert.equal(seenOpts[1].timeout, 12345);
+  assert.deepEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR);
+});
+
+test('reviewCard: two consecutive timeouts -- one retry only, then give up', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return timeoutSpawnResult();
+    },
+  };
+  const result = await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(calls, 2);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /exceeded the \d+ms deadline/);
+  assert.equal(result.retriedAfterTimeout.retryTimedOut, true);
+});
+
+test('reviewCard: a malformed reply is NOT retried', async () => {
+  const VALID_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+  const deps = { accountsDir: poolDir(), spawnSync: seqSpawnSync([{ status: 0, stdout: 'not json at all', stderr: '', signal: null }, okSpawnResult(VALID_REVIEW)]) };
+  const result = await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(result.ok, false);
+  assert.equal(result.retriedAfterTimeout, undefined);
 });
 
 // ---- fileCard: mechanical corrections + gh argv shapes -----------------------------------------

@@ -127,6 +127,10 @@ function pickAccount(deps) {
 // prose + citations), the same tier IMPLEMENT runs on. review-card stays the neutral judge on
 // Fable 5: a different model from the drafter, and cheap, since its own context is tiny (one
 // card, not a whole worktree).
+//
+// Retry policy: same one-retry-on-`timedOut`-only discipline as triageBugReport (see that
+// function's header for the full rationale) -- same account, same deadline, never on a
+// malformed reply. Result carries `retriedAfterTimeout` on both success and failure.
 async function draftCard(requestText, deps = {}) {
   let account;
   try {
@@ -158,24 +162,37 @@ async function draftCard(requestText, deps = {}) {
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
   };
 
-  const raw = await invokeClaudeReal(opts, deps);
+  let raw = await invokeClaudeReal(opts, deps);
+  let retriedAfterTimeout = null;
+  if (!raw.ok && raw.timedOut === true) {
+    retriedAfterTimeout = {
+      account: account.name,
+      deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
+      firstError: formatLlmFailure('draftCard', raw),
+    };
+    raw = await invokeClaudeReal(opts, deps);
+    retriedAfterTimeout.retryOk = raw.ok === true;
+    retriedAfterTimeout.retryTimedOut = raw.timedOut === true;
+  }
+  const withRetry = (res) => (retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res);
+
   if (!raw.ok) {
-    return { ok: false, error: formatLlmFailure('draftCard', raw) };
+    return withRetry({ ok: false, error: formatLlmFailure('draftCard', raw) });
   }
 
   let parsed;
   try {
     parsed = JSON.parse(raw.result);
   } catch {
-    return { ok: false, error: 'draftCard: reply was not valid JSON' };
+    return withRetry({ ok: false, error: 'draftCard: reply was not valid JSON' });
   }
 
   const check = validateDraftContract(parsed);
   if (!check.ok) {
-    return { ok: false, error: `draftCard: ${check.error}` };
+    return withRetry({ ok: false, error: `draftCard: ${check.error}` });
   }
 
-  return { ok: true, draft: parsed, sessionId: raw.sessionId, costUsd: raw.costUsd };
+  return withRetry({ ok: true, draft: parsed, sessionId: raw.sessionId, costUsd: raw.costUsd });
 }
 
 // The contract every draft must satisfy, whichever lane produced it: draftCard's own LLM reply,
@@ -237,6 +254,10 @@ function loadDraftFile(filePath) {
 // draft, calls it the same way (model fable, effort high). Returns {ok: true, review, sessionId,
 // costUsd} where `review` is {verdict, corrections, first_comment_markdown}, or {ok: false,
 // error}.
+//
+// Retry policy: same one-retry-on-`timedOut`-only discipline as triageBugReport (see that
+// function's header for the full rationale) -- same account, same deadline, never on a
+// malformed reply. Result carries `retriedAfterTimeout` on both success and failure.
 async function reviewCard(draft, deps = {}) {
   let account;
   try {
@@ -276,27 +297,40 @@ async function reviewCard(draft, deps = {}) {
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
   };
 
-  const raw = await invokeClaudeReal(opts, deps);
+  let raw = await invokeClaudeReal(opts, deps);
+  let retriedAfterTimeout = null;
+  if (!raw.ok && raw.timedOut === true) {
+    retriedAfterTimeout = {
+      account: account.name,
+      deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
+      firstError: formatLlmFailure('reviewCard', raw),
+    };
+    raw = await invokeClaudeReal(opts, deps);
+    retriedAfterTimeout.retryOk = raw.ok === true;
+    retriedAfterTimeout.retryTimedOut = raw.timedOut === true;
+  }
+  const withRetry = (res) => (retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res);
+
   if (!raw.ok) {
-    return { ok: false, error: formatLlmFailure('reviewCard', raw) };
+    return withRetry({ ok: false, error: formatLlmFailure('reviewCard', raw) });
   }
 
   let parsed;
   try {
     parsed = JSON.parse(raw.result);
   } catch {
-    return { ok: false, error: 'reviewCard: reply was not valid JSON' };
+    return withRetry({ ok: false, error: 'reviewCard: reply was not valid JSON' });
   }
 
   const missing = REVIEW_REQUIRED.filter((key) => !(key in parsed));
   if (missing.length > 0) {
-    return { ok: false, error: `reviewCard: reply missing required key(s): ${missing.join(', ')}` };
+    return withRetry({ ok: false, error: `reviewCard: reply missing required key(s): ${missing.join(', ')}` });
   }
   if (!REVIEW_VERDICTS.has(parsed.verdict)) {
-    return { ok: false, error: `reviewCard: unrecognized verdict "${parsed.verdict}"` };
+    return withRetry({ ok: false, error: `reviewCard: unrecognized verdict "${parsed.verdict}"` });
   }
 
-  return { ok: true, review: parsed, sessionId: raw.sessionId, costUsd: raw.costUsd };
+  return withRetry({ ok: true, review: parsed, sessionId: raw.sessionId, costUsd: raw.costUsd });
 }
 
 // ---- mechanical corrections ---------------------------------------------------------------
