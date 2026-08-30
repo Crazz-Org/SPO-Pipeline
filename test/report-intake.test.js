@@ -62,8 +62,20 @@ test('defaults: 15 min intake / 3 limit / 5 min confirm scan', () => {
 
 test('parseCardOutput: parses the header/body contract, null on a malformed reply', () => {
   const parsed = parseCardOutput(CARD_STDOUT);
-  assert.deepEqual(parsed, { anchorKey: 'a1b2c3d4', profile: 'mobile', title: '[report] mobile · Pay', body: 'the raw body' });
+  assert.deepEqual(parsed, { anchorKey: 'a1b2c3d4', profile: 'mobile', kind: null, title: '[report] mobile · Pay', body: 'the raw body' });
   assert.equal(parseCardOutput('garbage, no separator'), null);
+});
+
+test('parseCardOutput: reads kind when report-card.js\'s header includes it', () => {
+  const stdout = [
+    'anchorKey: cb1e2f30',
+    'profile: desktop',
+    'kind: suggestion',
+    'title: [suggestion] desktop · Add a slider',
+    '---',
+    'body',
+  ].join('\n');
+  assert.equal(parseCardOutput(stdout).kind, 'suggestion');
 });
 
 // ---- buildIntakeComment ---------------------------------------------------------------------
@@ -127,6 +139,30 @@ test('runReportIntake: happy path -- files a raw card, moves the column, comment
   const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
   assert.match(daemonLog, /"event":"report-intake"/);
   assert.match(daemonLog, /"issue":501/);
+});
+
+test('runReportIntake: threads kind through into the report-intake journal event', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-1b-');
+  const journalRoot = mkTmp('spo-reportintake-journal1b-');
+  writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg.json');
+
+  const suggestionCard = [
+    'anchorKey: cb1e2f30',
+    'profile: desktop',
+    'kind: suggestion',
+    'title: [suggestion] desktop · Add a slider',
+    '---',
+    'body',
+  ].join('\n');
+  const deps = makeIntakeDeps({
+    npmResponder: (args) => (args.includes('report:card') ? ok(suggestionCard) : ok('')),
+  });
+
+  await runReportIntake(journalRoot, { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y' }, deps);
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"report-intake"/);
+  assert.match(daemonLog, /"kind":"suggestion"/);
 });
 
 test('runReportIntake: mechanical anchorKey dedup -- comments on the existing issue, never creates a new one', async () => {
@@ -266,6 +302,19 @@ test('reportConfirmScan: "confirm" reply -> journals report-confirmed, report st
   const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
   assert.match(daemonLog, /"event":"report-confirmed"/);
   assert.match(daemonLog, /"issue":11/);
+});
+
+test('reportConfirmScan: copies kind from the report-intake entry into report-confirmed', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan-1c-');
+  const journalRoot = mkTmp('spo-confirmscan-journal1c-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'r-sugg.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'r-sugg.json', pendingPath, issue: 12, commentId: 100, kind: 'suggestion' });
+
+  const deps = confirmDeps({ comments: [{ id: 101, body: 'confirm' }] });
+  await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"report-confirmed"[^\n]*"kind":"suggestion"/);
 });
 
 test('reportConfirmScan: "discard" reply -> closes the issue, archives the report, journals report-discarded', async () => {

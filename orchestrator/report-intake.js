@@ -115,9 +115,15 @@ function buildIntakeComment({ reportFile }) {
 // Parses report-card.js's stdout contract:
 //   anchorKey: <hex>
 //   profile: desktop|mobile
+//   kind: wrong-data|broken-action|visual|suggestion
 //   title: <one line>
 //   ---
 //   <body markdown to EOF>
+//
+// `kind` is threaded through to stage 3 (auto-triage.js) via the report-intake/report-confirmed
+// journal events below -- it is the one report-content field this repo reads directly, and only
+// because report-card.js's own header already relays it as a plain enum value, the same way
+// anchorKey/profile/title already are; auto-triage.js never re-derives it from the raw report.
 function parseCardOutput(stdout) {
   const sep = (stdout || '').indexOf('\n---\n');
   if (sep === -1) return null;
@@ -125,9 +131,10 @@ function parseCardOutput(stdout) {
   const body = stdout.slice(sep + 5);
   const anchorKey = (header.match(/^anchorKey:\s*(.+)$/m) || [])[1];
   const profile = (header.match(/^profile:\s*(.+)$/m) || [])[1];
+  const kind = (header.match(/^kind:\s*(.+)$/m) || [])[1];
   const title = (header.match(/^title:\s*(.+)$/m) || [])[1];
   if (!anchorKey || !profile || !title) return null;
-  return { anchorKey: anchorKey.trim(), profile: profile.trim(), title: title.trim(), body };
+  return { anchorKey: anchorKey.trim(), profile: profile.trim(), kind: kind ? kind.trim() : null, title: title.trim(), body };
 }
 
 function readDaemonEvents(journalRoot) {
@@ -277,6 +284,7 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       pendingPath,
       issue: issueNumber,
       commentId: commented.commentId,
+      kind: card.kind,
     });
     filed++;
     results.push({ file, outcome: 'filed', issueNumber });
@@ -355,7 +363,12 @@ async function reportConfirmScan(journalRoot, config, deps = {}) {
     if (!match) continue;
 
     if (CONFIRM_RE.test(firstLine(match.body))) {
-      appendDaemonEvent(journalRoot, 'report-confirmed', { issue: entry.issue, pendingPath: entry.pendingPath, commentId: match.id });
+      appendDaemonEvent(journalRoot, 'report-confirmed', {
+        issue: entry.issue,
+        pendingPath: entry.pendingPath,
+        commentId: match.id,
+        kind: entry.kind,
+      });
       confirmed++;
       continue;
     }

@@ -137,15 +137,96 @@ function buildHoldComment(outcome, detail) {
   return lines.join('\n');
 }
 
-// processConfirmedReport(entry, journalRoot, config, deps, opts) -- triageBugReport, then (for a
-// draft) reviewCard/amendCard, for ONE confirmed report. `entry` is the `report-confirmed` daemon
-// event: {issue, pendingPath, commentId}. Returns {ok: true, outcome, ...} (never throws for a
-// recognized failure) -- `outcome` is one of the values documented in the outcome table below.
+// reviewAndFile(entry, draft, journalRoot, config, deps, opts, today) -- the tail every draft
+// goes through regardless of how it was produced (triageBugReport's reproduction, or
+// buildSuggestionDraft's mechanical path below): the same reviewCard gate every other card here
+// gets, then amendCard (edits the raw-intake issue in place) and a move to Todo. Shared so the
+// two draft sources can never quietly diverge on what "filed" means.
+async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, today) {
+  const dry = !!opts.dry;
+  const spoReportsDir = config.spoReportsDir;
+  const archiveDir = path.join(spoReportsDir, 'archive');
+
+  // deps.humanConfirmed: true so review-card.md § 0 does not re-litigate desirability -- a
+  // maintainer already confirmed this report before it ever reached here.
+  const reviewed = await intake.reviewCard(draft, { ...deps, humanConfirmed: true });
+  if (!reviewed.ok) return { ok: false, error: reviewed.error };
+
+  if (reviewed.review.verdict === 'DO_NOT_FILE') {
+    const reason = firstNonBlankLine(reviewed.review.first_comment_markdown);
+    if (dry) return { ok: true, outcome: 'would-hold', reason };
+    const commented = intake.postIssueComment(entry.issue, reviewed.review.first_comment_markdown, deps);
+    if (!commented.ok) return { ok: false, error: commented.error };
+    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: 'do-not-file', reason });
+    return { ok: true, outcome: 'do-not-file', reason };
+  }
+
+  if (dry) {
+    return { ok: true, outcome: 'would-file', draft, review: reviewed.review };
+  }
+
+  const amended = intake.amendCard(entry.issue, draft, reviewed.review, deps);
+  if (!amended.ok) return { ok: false, error: amended.error };
+
+  if (config.autoTriagePromoteToTodo !== false) {
+    const moved = board.moveIssueToColumn(entry.issue, 'Todo', deps, { cwd: config.productRepo });
+    if (!moved.ok) {
+      appendDaemonEvent(journalRoot, 'report-promote-failed', { issue: entry.issue, exit: moved.exit });
+    }
+  }
+
+  moveReportTo(entry.pendingPath, archiveDir, `filed: #${entry.issue} — ${today}`);
+  appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'filed' });
+  return { ok: true, outcome: 'filed', issueNumber: entry.issue, url: amended.url };
+}
+
+// The default area a mechanical "suggestion" draft is filed under -- reviewCard's own check 4
+// corrects it via FILE_AMENDED like any other card's area, the same safety net every other
+// draft already relies on for a wrong guess. 'client' is the most common ground for a UI/UX
+// improvement idea, which "could be better" mostly is.
+const DEFAULT_SUGGESTION_AREA = 'client';
+
+// buildSuggestionDraft(entry, deps) -- the mechanical path for a `kind: 'suggestion'` report:
+// NO reproduction, no drafting LLM call at all (a maintainer's own confirm is the only judgement
+// this outcome ever gets before reviewCard) -- just the raw-intake issue's own title/body,
+// already fully rendered by report-card.js at stage 1, wrapped into the same draft contract
+// every other source produces. Returns {ok: true, draft} or {ok: false, error}.
+function buildSuggestionDraft(entry, deps) {
+  const fetched = intake.fetchIssue(entry.issue, deps);
+  if (!fetched.ok) return { ok: false, error: fetched.error };
+
+  const title = fetched.title.replace(/^\[suggestion\]\s*/, '');
+  const draft = {
+    title: title || fetched.title,
+    body_markdown: fetched.body,
+    category: 'feature',
+    size: 'S',
+    area: DEFAULT_SUGGESTION_AREA,
+    is_bug_report: false,
+    confirmed: true,
+  };
+  return { ok: true, draft };
+}
+
+// processConfirmedReport(entry, journalRoot, config, deps, opts) -- routes ONE confirmed report
+// by its kind (threaded through from report-card.js's own header via report-intake.js's
+// report-intake/report-confirmed journal events -- see report-intake.js's parseCardOutput):
+//   kind === 'suggestion' -> buildSuggestionDraft (mechanical, no LLM) -> reviewAndFile
+//   anything else         -> triageBugReport (reproduction) -> reviewAndFile, or duplicate/held
+// `entry` is the `report-confirmed` daemon event: {issue, pendingPath, commentId, kind}. Returns
+// {ok: true, outcome, ...} (never throws for a recognized failure) -- `outcome` is one of the
+// values documented in the outcome table below.
 async function processConfirmedReport(entry, journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   const today = deps.today || new Date().toISOString().slice(0, 10);
   const spoReportsDir = config.spoReportsDir;
   const archiveDir = path.join(spoReportsDir, 'archive');
+
+  if (entry.kind === 'suggestion') {
+    const built = buildSuggestionDraft(entry, deps);
+    if (!built.ok) return { ok: false, error: built.error };
+    return reviewAndFile(entry, built.draft, journalRoot, config, deps, opts, today);
+  }
 
   const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, deps);
   if (!triaged.ok) {
@@ -180,37 +261,7 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
     return { ok: true, outcome: triaged.outcome, reason: triaged.reason || detail };
   }
 
-  // outcome === 'draft' -- the same reviewCard gate every other card here gets, with
-  // deps.humanConfirmed: true so review-card.md § 0 does not re-litigate desirability.
-  const reviewed = await intake.reviewCard(triaged.draft, { ...deps, humanConfirmed: true });
-  if (!reviewed.ok) return { ok: false, error: reviewed.error };
-
-  if (reviewed.review.verdict === 'DO_NOT_FILE') {
-    const reason = firstNonBlankLine(reviewed.review.first_comment_markdown);
-    if (dry) return { ok: true, outcome: 'would-hold', reason };
-    const commented = intake.postIssueComment(entry.issue, reviewed.review.first_comment_markdown, deps);
-    if (!commented.ok) return { ok: false, error: commented.error };
-    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: 'do-not-file', reason });
-    return { ok: true, outcome: 'do-not-file', reason };
-  }
-
-  if (dry) {
-    return { ok: true, outcome: 'would-file', draft: triaged.draft, review: reviewed.review };
-  }
-
-  const amended = intake.amendCard(entry.issue, triaged.draft, reviewed.review, deps);
-  if (!amended.ok) return { ok: false, error: amended.error };
-
-  if (config.autoTriagePromoteToTodo !== false) {
-    const moved = board.moveIssueToColumn(entry.issue, 'Todo', deps, { cwd: config.productRepo });
-    if (!moved.ok) {
-      appendDaemonEvent(journalRoot, 'report-promote-failed', { issue: entry.issue, exit: moved.exit });
-    }
-  }
-
-  moveReportTo(entry.pendingPath, archiveDir, `filed: #${entry.issue} — ${today}`);
-  appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'filed' });
-  return { ok: true, outcome: 'filed', issueNumber: entry.issue, url: amended.url };
+  return reviewAndFile(entry, triaged.draft, journalRoot, config, deps, opts, today);
 }
 
 // runAutoTriage(journalRoot, config, deps, opts) -- processConfirmedReport for the top
@@ -268,6 +319,8 @@ module.exports = {
   findConfirmedAwaitingTriage,
   listQueuedReports,
   moveReportTo,
+  buildSuggestionDraft,
   DEFAULT_AUTO_TRIAGE_MS,
   DEFAULT_AUTO_TRIAGE_LIMIT,
+  DEFAULT_SUGGESTION_AREA,
 };

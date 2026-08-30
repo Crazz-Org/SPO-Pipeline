@@ -587,16 +587,32 @@ GitHub issue, column "Intake", label report:raw, body = the report exactly as ca
    │  unparkScan already uses. A maintainer replies "confirm" or "discard" on the issue.
    │  config.reportConfirmScanMs (nonzero by default).
    ▼  "confirm"
-   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report.
-   │  intake.triageBugReport (reproduce/route/dedup/draft) -> the SAME reviewCard gate every
-   │  other card here gets (deps.humanConfirmed: true -- review-card.md § 0 no longer re-opens
-   │  desirability, since a human already settled it) -> intake.amendCard (EDITS the raw-intake
-   │  issue in place -- never files a second one, see amendCard's own header for why that is
-   │  load-bearing for anchorKey dedup) -> moves the card to Todo. config.autoTriageMs -- kept its
-   │  pre-redesign name/env var (SPO_AUTO_TRIAGE_MS) on purpose, see below.
+   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Routes
+   │  on `kind` (threaded through from report-card.js's own header via the report-intake/
+   │  report-confirmed journal events):
+   │    kind !== 'suggestion' -- intake.triageBugReport (reproduce/route/dedup/draft)
+   │    kind === 'suggestion' -- buildSuggestionDraft: NO reproduction, no drafting LLM call at
+   │       all -- "this works, but could be better" is not a defect to reproduce, and a
+   │       maintainer's own "confirm" IS the judgement. Mechanically wraps the raw-intake issue's
+   │       own title/body (already fully rendered by report-card.js at stage 1) as
+   │       category:'feature', size:'S', area:'client' (a fixed default -- reviewCard corrects a
+   │       wrong guess the same way it corrects any other card's area).
+   │  Both paths converge on reviewAndFile: the SAME reviewCard gate every other card here gets
+   │  (deps.humanConfirmed: true -- review-card.md § 0 no longer re-opens desirability, since a
+   │  human already settled it) -> intake.amendCard (EDITS the raw-intake issue in place -- never
+   │  files a second one, see amendCard's own header for why that is load-bearing for anchorKey
+   │  dedup) -> moves the card to Todo. config.autoTriageMs -- kept its pre-redesign name/env var
+   │  (SPO_AUTO_TRIAGE_MS) on purpose, see below.
    ▼
 Todo  →  auto-pull  →  PLAN/IMPLEMENT   (unchanged)
 ```
+
+**`kind: 'suggestion'`** is the one report kind that is never inferred -- only the reporter's own
+explicit pick (desktop's kind button, mobile's `could-be-better` quick pick) sets it. It is what
+lets "the thing I'm pointing at works, but could be better" reach the board through this channel
+at all, without reopening the 2026-08-29 rule that suggestions never arrive through the
+bug-report channel unjudged: a human still has to reply "confirm" before anything is filed, same
+as any other report.
 
 **A negative outcome after "confirm" is never silently dropped.** `not-reproduced` /
 `insufficient` / `schema-version` / a `DO_NOT_FILE` review verdict all comment the reason on the
