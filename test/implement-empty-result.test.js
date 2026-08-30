@@ -140,7 +140,7 @@ test('handleImplement (real mode): an unparsable filesChanged string routes to D
 test('handleImplement (real mode): a legitimate implement with red tests (non-empty filesChanged, all_green false) still goes to CHECK', async () => {
   const task = baseTask(250);
   const taskDir = mkTmp('spo-implement-redtests-');
-  const spawnSync = (command) => {
+  const spawnSync = (command, args) => {
     if (command === 'claude') {
       return ok(
         claudeReply({
@@ -152,12 +152,48 @@ test('handleImplement (real mode): a legitimate implement with red tests (non-em
         })
       );
     }
+    // The worktree cross-check (state-machine.js's handleImplement, card #385) reads
+    // `git status --porcelain` before trusting a non-empty files_changed claim -- report the
+    // worktree as genuinely dirty so this legitimate implement still reaches CHECK.
+    if (args && args.includes('status') && args.includes('--porcelain')) return ok(' M src/widget.ts\n');
     return ok('');
   };
   const ctx = realCardCtx(task, taskDir, spawnSync);
 
   const next = await HANDLERS.IMPLEMENT(ctx);
   assert.equal(next, 'CHECK');
+});
+
+// card #385: IMPLEMENT declared 30 files_changed while the worktree had not actually moved --
+// CHECK then passed on the untouched tree, and PUSH_PR only parked (push-pr-failed, "nothing to
+// commit") two states later, on a misleading reason. A non-empty, well-shaped files_changed
+// claim is no longer enough on its own -- the worktree itself must show the change.
+test('handleImplement (real mode): non-empty filesChanged but a CLEAN worktree routes to DIAGNOSE, journals no-worktree-change', async () => {
+  const task = baseTask(385);
+  const taskDir = mkTmp('spo-implement-noworktreechange-');
+  const spawnSync = (command, args) => {
+    if (command === 'claude') {
+      return ok(
+        claudeReply({
+          summary: 'implemented the widget',
+          files_changed: ['src/widget.ts', 'src/widget.test.ts'],
+          invariants: [{ id: 'INV-1', status: 'HELD' }],
+          tests_run: ['npm run typecheck'],
+          all_green: true,
+        })
+      );
+    }
+    if (args && args.includes('status') && args.includes('--porcelain')) return ok(''); // clean -- nothing actually changed
+    return ok('');
+  };
+  const ctx = realCardCtx(task, taskDir, spawnSync);
+
+  const next = await HANDLERS.IMPLEMENT(ctx);
+
+  assert.equal(next, 'DIAGNOSE');
+  const journal = readJournal(taskDir);
+  const event = journal.find((e) => e.event === 'no-worktree-change');
+  assert.ok(event && event.claimedFilesChanged === 2);
 });
 
 test('handleImplement (shadow mode): an explicit empty-filesChanged fixture is exempt -- shadow mode is not validated, still reaches CHECK', async () => {

@@ -856,6 +856,15 @@ check `sweepWorktreeLeftovers` (WORKTREE's own retry-time cleanup) runs the same
 before removing a dirty leftover, falling back to its original `worktree-dirty-leftover` park
 only if the preservation itself fails (no network, origin refuses).
 
+`preserveWorktreeWip` detaches HEAD before committing the WIP, so that commit lands on no branch
+at all instead of silently advancing `claude-pipe/<id>` — the worktree's own checked-out branch —
+underneath `sweepWorktreeLeftovers`. Its rule 2 (the local-branch leftover check) has a third
+safety case to match: a `claude-pipe/<id>` tip it otherwise can't vouch for is still deleted when
+it's an ancestor of one of this task's own `refs/remotes/origin/wip/<id>-*` refs, since that's a
+commit the pipeline made and saved durably itself, not a mystery local one. Together these two
+changes close the loop card #385 hit: four identical `branch-unmerged-leftover` parks, each one
+parking on the WIP commit the previous park's own preservation had just made.
+
 ## Running as a service
 
 `bash scripts/daemon-install.sh` (run from the checkout that should host the daemon) installs

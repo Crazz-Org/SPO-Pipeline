@@ -13,7 +13,7 @@ const os = require('os');
 const path = require('path');
 
 const { runTask } = require('../orchestrator/state-machine');
-const { buildParkComment, RETRY_ABANDON_LINE, unparkScan, findParkAnchor } = require('../orchestrator/park-loop');
+const { buildParkComment, RETRY_ABANDON_LINE, unparkScan, findParkAnchor, countRepeatedParks } = require('../orchestrator/park-loop');
 const { appendEvent, writeState } = require('../orchestrator/journal');
 
 function mkTmp(prefix) {
@@ -62,6 +62,25 @@ test('buildParkComment: names the reason, explains what the machine expects, and
 test('buildParkComment: an empty detail carries no <details> block', () => {
   const body = buildParkComment({ reason: 'nightly-main-red', detail: {}, lastState: 'WORKTREE' });
   assert.ok(!body.includes('<details>'));
+});
+
+test('buildParkComment: repeat >= 2 adds the loop-warning block, RETRY_ABANDON_LINE still present verbatim', () => {
+  const body = buildParkComment({
+    reason: 'branch-unmerged-leftover',
+    detail: { branch: 'claude-pipe/card-385' },
+    lastState: 'WORKTREE',
+    repeat: 3,
+  });
+
+  assert.match(body, /Ce park est identique aux 3 derniers/);
+  assert.match(body, /`branch-unmerged-leftover`/);
+  assert.ok(body.includes(RETRY_ABANDON_LINE));
+  assert.equal(RETRY_ABANDON_LINE, 'pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to close this attempt.');
+});
+
+test('buildParkComment: repeat omitted (or 1) carries no loop-warning block -- unchanged from before card #385\'s fix', () => {
+  const body = buildParkComment({ reason: 'nightly-main-red', detail: {}, lastState: 'WORKTREE' });
+  assert.ok(!body.includes('Ce park est identique'));
 });
 
 // ---- postParkComment via runTask: the real PARKED -> comment path ------------------------------
@@ -327,6 +346,38 @@ test('unparkScan: a non-card / non-PARKED / issue-less journal directory is skip
 });
 
 // ---- findParkAnchor: pure helper --------------------------------------------------------------
+
+// ---- countRepeatedParks: the loop-breaker's own counting rule ---------------------------------
+
+test('countRepeatedParks: counts consecutive identical parks (most recent first), stops at the first that differs', () => {
+  const targetDetail = { branch: 'claude-pipe/card-385', localSha: 'sha1' };
+  const lines = [
+    { event: 'parked', reason: 'worktree-npm-ci-failed', detail: { exit: 1 } }, // oldest -- different reason, breaks any streak reaching this far
+    { event: 'transition', to: 'WORKTREE' },
+    { event: 'parked', reason: 'branch-unmerged-leftover', detail: targetDetail }, // 1st of the streak
+    { event: 'transition', to: 'WORKTREE' },
+    { event: 'parked', reason: 'branch-unmerged-leftover', detail: targetDetail }, // 2nd
+    { event: 'transition', to: 'WORKTREE' },
+    { event: 'parked', reason: 'branch-unmerged-leftover', detail: targetDetail }, // 3rd, most recent
+  ];
+
+  const count = countRepeatedParks(lines, 'branch-unmerged-leftover', targetDetail);
+  assert.equal(count, 3);
+});
+
+test('countRepeatedParks: a differing detail breaks the streak even with a matching reason', () => {
+  const lines = [
+    { event: 'parked', reason: 'branch-unmerged-leftover', detail: { branch: 'x', localSha: 'OLD' } },
+    { event: 'parked', reason: 'branch-unmerged-leftover', detail: { branch: 'x', localSha: 'NEW' } },
+  ];
+
+  const count = countRepeatedParks(lines, 'branch-unmerged-leftover', { branch: 'x', localSha: 'NEW' });
+  assert.equal(count, 1);
+});
+
+test('countRepeatedParks: no parked events at all -> 0', () => {
+  assert.equal(countRepeatedParks([], 'anything', {}), 0);
+});
 
 test('findParkAnchor: null with no park-comment event; the LAST one wins across multiple park cycles', () => {
   assert.equal(findParkAnchor([]), null);

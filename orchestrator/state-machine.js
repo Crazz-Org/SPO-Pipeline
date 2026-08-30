@@ -31,6 +31,7 @@ const { callWithDeadline } = require('./deadline');
 const {
   runScripted,
   sleep,
+  spawnStep,
   realWorktree,
   realCheck,
   realPushPr,
@@ -44,7 +45,7 @@ const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
 const { moveCard } = require('./board');
-const { postParkComment, unparkScan } = require('./park-loop');
+const { postParkComment, unparkScan, countRepeatedParks, readJournalLines } = require('./park-loop');
 const { shouldScanOrphans, orphanScan } = require('./orphan-scan');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
@@ -259,8 +260,8 @@ async function handleImplement(ctx) {
   //     test/board-move.test.js) returns invokeClaudeReal's raw {ok, result, ...} shape, which
   //     never has a files_changed field at all -- that is a different payload shape, not an
   //     empty-implement bug, so it is left alone and still reaches CHECK as before.
-  // A legitimate implement with red tests (non-empty filesChanged, allGreen false) is untouched
-  // by either condition and still reaches CHECK exactly as today.
+  // A legitimate implement with red tests (non-empty filesChanged, allGreen false) still reaches
+  // CHECK, provided the worktree it named actually moved -- see the tree cross-check below.
   if (isRealMode(ctx)) {
     const hasFilesChangedField =
       Object.prototype.hasOwnProperty.call(payload, 'files_changed') ||
@@ -271,6 +272,24 @@ async function handleImplement(ctx) {
       if (!filesChanged || filesChanged.length === 0) {
         appendEvent(ctx.taskDir, 'IMPLEMENT', 'empty-implement', { filesChanged: raw, summary: payload.summary });
         return 'DIAGNOSE';
+      }
+
+      // Card #385: IMPLEMENT declared 30 files_changed while the worktree had not actually
+      // moved -- CHECK then passed on the untouched tree, and PUSH_PR only parked
+      // (push-pr-failed, "nothing to commit") two states later, on a misleading reason. The
+      // guard above only checks the SHAPE of the LLM's claim (present, parses, non-empty); this
+      // cross-checks the claim itself against the tree it says it touched. Deliberately nested
+      // inside the same hasFilesChangedField branch as the guard above, not gated on isRealMode
+      // + worktreePath alone, for the same reason that branch exists in the first place: the
+      // legacy ctx.task.llm.IMPLEMENT override shape (test/board-move.test.js) carries no
+      // files_changed claim at all, so there is nothing here to cross-check against -- this
+      // exempts it exactly as the guard above already does.
+      if (ctx.task.worktreePath) {
+        const status = spawnStep(ctx, ctx.deps, 'IMPLEMENT', 'git', ['-C', ctx.task.worktreePath, 'status', '--porcelain']);
+        if (status.exit === 0 && status.stdout.trim() === '') {
+          appendEvent(ctx.taskDir, 'IMPLEMENT', 'no-worktree-change', { claimedFilesChanged: filesChanged.length });
+          return 'DIAGNOSE';
+        }
       }
     }
   }
@@ -529,6 +548,19 @@ function snapshot(ctx, state) {
 function finalizePark(ctx, lastState, reason, detail) {
   appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
 
+  // Loop breaker for card #385's exact failure mode: branch-unmerged-leftover parked four times
+  // in a row, byte-identical reason and detail every time, because each preserveWorktreeWip
+  // commit advanced the very local branch rule 2 of sweepWorktreeLeftovers could not vouch for --
+  // a maintainer's bare "retry" reply could only ever reproduce the same park, never resolve it.
+  // Count how many parks in a row (most recent first, the one just journaled above included)
+  // share this exact reason+detail fingerprint, and have the park comment say so once that
+  // streak reaches 2 (park-loop.js's countRepeatedParks/buildParkComment). Never blocks retry
+  // itself -- unparkScan is untouched -- this only changes what the comment says.
+  const repeat = countRepeatedParks(readJournalLines(ctx.taskDir), reason, detail);
+  if (repeat >= 2) {
+    appendEvent(ctx.taskDir, lastState, 'park-repeat', { reason, repeat });
+  }
+
   // Any park with a still-existing, still-dirty worktree gets its diff pushed to a durable wip/
   // ref before anything else -- not just the WORKTREE-retry dirty-leftover case sweepWorktreeLeftovers
   // itself already handles. This is what would have saved card #385's 620 lines of stranded
@@ -567,7 +599,7 @@ function finalizePark(ctx, lastState, reason, detail) {
   // moveCard('PARKED') call inside postParkComment skips itself, journaled, when the worktree
   // was never created (a pre-WORKTREE park) -- the gh comment still posts either way.
   if (isRealMode(ctx) && ctx.task && ctx.task.kind === 'card') {
-    postParkComment(ctx, ctx.deps, { reason, detail: mergedDetail, lastState });
+    postParkComment(ctx, ctx.deps, { reason, detail: mergedDetail, lastState, repeat });
   }
 }
 
