@@ -96,8 +96,8 @@ function makeDeps({ claudeReplies, ghResponder, npmResponder, accountsDir }) {
   };
 }
 
-function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1 }) {
-  appendDaemonEvent(journalRoot, 'report-confirmed', { issue, pendingPath, commentId });
+function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1, kind }) {
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue, pendingPath, commentId, kind });
 }
 
 // ---- shouldAutoTriage: pure decision function --------------------------------------------------
@@ -367,4 +367,72 @@ test('runAutoTriage: nothing confirmed -- no claude/gh spawn at all, no journal 
   assert.equal(result.processed, 0);
   assert.equal(spawned, false);
   assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
+});
+
+// ---- kind: 'suggestion' -- mechanical draft, never a triageBugReport call ----------------------
+
+test('runAutoTriage: kind "suggestion" -- never calls triageBugReport, drafts mechanically from the raw issue, files on FILE', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-sugg1-');
+  const journalRoot = mkTmp('spo-autotriage-sugg-journal1-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg1.json');
+  confirmedEntry(journalRoot, { issue: 700, pendingPath, kind: 'suggestion' });
+
+  const seenGh = [];
+  const deps = makeDeps({
+    // Exactly ONE claude reply: reviewCard. triageBugReport must never be called for a
+    // suggestion -- if it were, this single reply would be consumed by the wrong call and the
+    // JSON shape (a review verdict, not a triage outcome) would fail differently.
+    claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' }],
+    ghResponder: (args) => {
+      seenGh.push(args);
+      if (args[0] === 'api') return ok(JSON.stringify({ title: '[suggestion] desktop · Add a slider', body: 'Player asked for a slider instead of typing a number.' }));
+      return ok('');
+    },
+  });
+
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true }, deps, { dry: false });
+
+  assert.equal(result.filed, 1);
+  assert.ok(seenGh.some((a) => a[0] === 'issue' && a[1] === 'edit' && a[2] === '700'));
+  // The mechanical draft's title strips the "[suggestion] " prefix report-card.js adds.
+  const editCall = seenGh.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  const titleIdx = editCall.indexOf('--title');
+  assert.equal(editCall[titleIdx + 1], 'desktop · Add a slider');
+});
+
+test('runAutoTriage: kind "suggestion" -- reviewCard can still DO_NOT_FILE it (HELD, never archived)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-sugg2-');
+  const journalRoot = mkTmp('spo-autotriage-sugg-journal2-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg2.json');
+  confirmedEntry(journalRoot, { issue: 701, pendingPath, kind: 'suggestion' });
+
+  const deps = makeDeps({
+    claudeReplies: [{ verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Already covered by #12.' }],
+    ghResponder: (args) => {
+      if (args[0] === 'api') return ok(JSON.stringify({ title: '[suggestion] desktop · x', body: 'y' }));
+      return ok('');
+    },
+  });
+
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.held, 1);
+  assert.equal(fs.existsSync(pendingPath), true);
+});
+
+test('runAutoTriage: kind "suggestion" -- a fetchIssue failure is a mechanical error, retried next cycle', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-sugg3-');
+  const journalRoot = mkTmp('spo-autotriage-sugg-journal3-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg3.json');
+  confirmedEntry(journalRoot, { issue: 702, pendingPath, kind: 'suggestion' });
+
+  const deps = makeDeps({
+    claudeReplies: [],
+    ghResponder: (args) => (args[0] === 'api' ? { status: 1, stdout: '', stderr: 'boom', signal: null } : ok('')),
+  });
+
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.errors.length, 1);
+  assert.equal(fs.existsSync(pendingPath), true);
 });

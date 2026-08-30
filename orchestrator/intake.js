@@ -336,6 +336,26 @@ function applyMechanicalCorrections(draft, corrections) {
   return { applied, unmechanical };
 }
 
+// fetchIssue(issueNumber, deps) -- `gh api repos/<repo>/issues/<n>`, reduced to {title, body}.
+// Extracted out of amendCard so auto-triage.js's mechanical "suggestion" draft path (a report
+// kind that skips triageBugReport entirely -- see auto-triage.js's own header) can reuse the
+// identical spawn instead of a second implementation. Returns {ok: true, title, body} or
+// {ok: false, error}.
+function fetchIssue(issueNumber, deps = {}) {
+  const ghRepo = deps.ghRepo || config.ghRepo;
+  const result = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${issueNumber}`]);
+  if (normalizeExit(result) !== 0) {
+    return { ok: false, error: `fetchIssue: gh api issues/${issueNumber} exited ${normalizeExit(result)}` };
+  }
+  let issue;
+  try {
+    issue = JSON.parse(result.stdout) || {};
+  } catch {
+    return { ok: false, error: `fetchIssue: gh api issues/${issueNumber} reply was not valid JSON` };
+  }
+  return { ok: true, title: issue.title || '', body: issue.body || '' };
+}
+
 // ---- fileCard -----------------------------------------------------------------------------
 
 function parseIssueNumber(stdout) {
@@ -460,16 +480,11 @@ function amendCard(issueNumber, draft, review, deps = {}) {
   const ghRepo = deps.ghRepo || config.ghRepo;
   const tmpDir = deps.tmpDir || os.tmpdir();
 
-  const original = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${issueNumber}`]);
-  if (normalizeExit(original) !== 0) {
-    return { ok: false, error: `amendCard: gh api issues/${issueNumber} exited ${normalizeExit(original)}` };
+  const original = fetchIssue(issueNumber, deps);
+  if (!original.ok) {
+    return { ok: false, error: `amendCard: ${original.error}` };
   }
-  let originalBody = '';
-  try {
-    originalBody = (JSON.parse(original.stdout) || {}).body || '';
-  } catch {
-    return { ok: false, error: `amendCard: gh api issues/${issueNumber} reply was not valid JSON` };
-  }
+  const originalBody = original.body;
 
   const { applied } = applyMechanicalCorrections(draft, review.corrections);
 
@@ -809,6 +824,7 @@ module.exports = {
   reviewCard,
   fileCard,
   amendCard,
+  fetchIssue,
   postIssueComment,
   triageBugReport,
   pullBoard,

@@ -394,6 +394,20 @@ test('triageBugReport: outcome "not-reproduced" passes through untouched', async
   assert.equal(result.reason, 'no matching log line');
 });
 
+// ---- fetchIssue -----------------------------------------------------------------------------
+
+test('fetchIssue: returns {title, body}, a clear error on a non-zero exit or bad JSON', () => {
+  const okDeps = { spawnSync: fakeSpawnSync(() => ({ status: 0, stdout: JSON.stringify({ title: 't', body: 'b' }), stderr: '', signal: null })) };
+  const okResult = intake.fetchIssue(501, okDeps);
+  assert.deepEqual(okResult, { ok: true, title: 't', body: 'b' });
+
+  const failDeps = { spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: '', stderr: 'boom', signal: null })) };
+  assert.equal(intake.fetchIssue(501, failDeps).ok, false);
+
+  const badJsonDeps = { spawnSync: fakeSpawnSync(() => ({ status: 0, stdout: 'not json', stderr: '', signal: null })) };
+  assert.equal(intake.fetchIssue(501, badJsonDeps).ok, false);
+});
+
 // ---- amendCard: edits the raw-intake issue in place, never creates a second one ----------------
 
 test('amendCard: edits the existing issue, preserves the original body in a <details> block, posts the review comment', () => {
