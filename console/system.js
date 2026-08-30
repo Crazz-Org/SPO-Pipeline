@@ -17,12 +17,22 @@ function cpuTimesBusy(times) {
 
 // createSystemSampler({readCpus, readMem, now}) -- deps are injectable for deterministic tests;
 // production code omits them and gets the real os.* calls.
+const DEFAULT_HISTORY_LEN = 300; // ~5 min at the client's 1s poll cadence
+
 function createSystemSampler({
   readCpus = () => os.cpus(),
   readMem = () => ({ total: os.totalmem(), free: os.freemem() }),
   now = Date.now,
+  historyLen = DEFAULT_HISTORY_LEN,
 } = {}) {
   let prev = readCpus();
+  const cpuHistory = [];
+  const memHistory = [];
+
+  function pushHistory(arr, value) {
+    arr.push(value);
+    if (arr.length > historyLen) arr.shift();
+  }
 
   function sample() {
     const cur = readCpus();
@@ -51,6 +61,14 @@ function createSystemSampler({
 
     const mem = readMem();
     const usedBytes = mem.total - mem.free;
+    const usedPct = mem.total > 0 ? Math.round((usedBytes / mem.total) * 100) : null;
+
+    // A rolling window of overall (all-core) busyPct/usedPct, one point per sample() call --
+    // the live dashboard's CPU/memory trend sparklines (console/render.js). Only ever grows
+    // from repeated /api/system polling; static mode (no --serve) never calls this, so it never
+    // accumulates anywhere the operator would see a stale/empty trend.
+    pushHistory(cpuHistory, busyPct);
+    pushHistory(memHistory, usedPct);
 
     return {
       sampledAt: new Date(now()).toISOString(),
@@ -64,15 +82,18 @@ function createSystemSampler({
         totalBytes: mem.total,
         freeBytes: mem.free,
         usedBytes,
-        usedPct: mem.total > 0 ? Math.round((usedBytes / mem.total) * 100) : null,
+        usedPct,
       },
       loadavg: os.loadavg(),
       uptimeSec: Math.round(os.uptime()),
+      history: { cpu: cpuHistory.slice(), mem: memHistory.slice() },
     };
   }
 
   function reset() {
     prev = readCpus();
+    cpuHistory.length = 0;
+    memHistory.length = 0;
   }
 
   return { sample, reset };
