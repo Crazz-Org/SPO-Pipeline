@@ -233,10 +233,15 @@ Each prompt's `{{placeholder}}` values come from one of two places
   memory for the same run's VALIDATE to read directly; `task-values.js` prefers the in-memory
   value and falls back to the journaled record so a daemon restart between PUSH_PR and VALIDATE
   (`ctx.task` rebuilt from the task file, the in-memory field gone) doesn't silently drop it.
-- `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are named as fixed
-  `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions — nothing writes them yet,
-  since real CHECK/GATE/PUSH_PR execution remains the documented stub described above; naming
-  the path now fixes the contract a future real implementation of those steps must honour.
+- `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are fixed
+  `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions. Action 1.3 made these real:
+  `steps/scripted.js`'s `prepareJudgeInputs` generates `diff.patch` (and, when the bench has a
+  verdict for the current HEAD sha, `gate-report.md`) on entry to DIAGNOSE/VALIDATE in real
+  mode, before the LLM call; `realGate` writes `gate.log` itself, overwriting it on every real
+  gate run so it always holds the LAST run only (unlike `logs/GATE.log`'s own accumulating
+  append). VALIDATE requires `diff.patch` and parks `judge-inputs-missing` if it cannot be
+  produced; DIAGNOSE requires `gate.log` only when it was entered from GATE, never otherwise —
+  see `doc/state-machine-spec.md`'s DIAGNOSE row.
 
 A missing value for any placeholder a prompt's header declares — PLAN called before
 `worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws

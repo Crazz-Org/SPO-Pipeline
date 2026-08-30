@@ -40,6 +40,7 @@ const {
   realMerge,
   realFinish,
   preserveWorktreeWip,
+  prepareJudgeInputs,
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
@@ -377,6 +378,13 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
+  // Action 1.3: generate DIAGNOSE's declared judge inputs (diff.patch / gate.log / gate-report.md)
+  // before the LLM call, real mode only. gate.log is required only when this DIAGNOSE was
+  // entered from GATE (ctx.cameFrom, set by runTask's transition loop below) -- from anywhere
+  // else (a CHECK failure, an empty IMPLEMENT, an unmatched CI_CHECKS) no gate has ever run for
+  // this attempt, and the spec's "CHECK Failure -> DIAGNOSE, never PARKED" must hold regardless.
+  if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' });
+
   const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
   const attemptN = ++ctx.counters.diagnoseAttempts;
   const rootCause = (result && result.rootCause) || `unspecified-cause-${attemptN}`;
@@ -415,6 +423,12 @@ async function handleValidate(ctx) {
   // Kanban piloting: move to "Validation" once per VALIDATE entry, before either LLM call --
   // same reasoning as handleImplement's own moveCard (no realX(ctx, deps) split for an LLM step).
   if (isRealMode(ctx)) moveCard(ctx, ctx.deps, 'VALIDATE');
+
+  // Action 1.3: generate VALIDATE's declared judge inputs (diff.patch / gate-report.md), real
+  // mode only. diff.patch is always required here (VALIDATE only runs post-PUSH_PR, so a commit
+  // and a push have already happened) -- unproducible throws ParkSignal('judge-inputs-missing')
+  // itself, before either LLM call below ever spawns.
+  if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'VALIDATE' });
 
   if (ctx.task.touchesRdoMembers) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
@@ -549,6 +563,16 @@ function buildCtx(id, task, taskDir, config) {
     owner: (config && config.owner) || null,
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
+    // The state runTask's transition loop just came FROM, set fresh by that loop before every
+    // handler call (null for the very first, INTAKE) -- action 1.3's prepareJudgeInputs reads it
+    // to tell "DIAGNOSE entered from GATE" (gate.log required) from every other DIAGNOSE entry
+    // point (gate.log optional). Deliberately NOT part of snapshot()/state.json: a retry always
+    // restarts a task at INTAKE (card #424 -- see steps/scripted.js's sweepWorktreeLeftovers
+    // header), and orphan-scan.js reparks an orphaned task directly through finalizePark without
+    // ever re-entering this loop, so nothing ever resumes runTask mid-state from a persisted
+    // snapshot -- cameFrom has no restart to be durable across in the first place. A direct-unit-
+    // test caller of HANDLERS.DIAGNOSE/VALIDATE that bypasses runTask must set it explicitly.
+    cameFrom: null,
     counters: {
       diagnoseAttempts: 0,
       seenRootCauses: new Set(),
@@ -640,6 +664,7 @@ function finalizePark(ctx, lastState, reason, detail) {
 async function runTask(id, task, taskDir, config) {
   const ctx = buildCtx(id, task, taskDir, config);
   let state = 'INTAKE';
+  ctx.cameFrom = null; // no previous state yet -- see the field's own doc comment on buildCtx/snapshot
   writeState(taskDir, snapshot(ctx, state));
 
   // Runaway guard: a real handler bug that returns a valid-looking but cyclic path (e.g. an
@@ -679,6 +704,9 @@ async function runTask(id, task, taskDir, config) {
       throw err; // a real bug -- surface it, do not disguise it as a park
     }
     appendEvent(taskDir, state, 'transition', { to: next });
+    ctx.cameFrom = state; // the state that just ran, for the NEXT handler to read (e.g.
+    // prepareJudgeInputs' DIAGNOSE-from-GATE rule) -- set from the state variable itself, not
+    // re-derived, so it is exactly what the transition event above just journaled.
     state = next;
     writeState(taskDir, snapshot(ctx, state));
   }

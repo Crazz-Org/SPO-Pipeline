@@ -20,11 +20,14 @@ const {
   realMerge,
   realFinish,
   preserveWorktreeWip,
+  prepareJudgeInputs,
 } = require('../orchestrator/steps/scripted');
-const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
+const { HANDLERS, buildCtx, runTask } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { runLlm } = require('../orchestrator/steps/llm');
+const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
+const { writePoolDir } = require('./helpers');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -1431,4 +1434,608 @@ test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHE
   // Printed for human inspection -- this is the "one line per state" argv sequence.
   console.log('\n--- WORKTREE -> FINISH argv sequence (fictional card-4242) ---');
   for (const line of perStateArgv) console.log(line);
+});
+
+// ---- action 1.3: judge inputs -- diff.patch / gate.log / gate-report.md --------------------
+//
+// task-values.js declares diff_path/gate_log_path/gate_report_path but, before this action, no
+// step ever wrote the files at those paths -- DIAGNOSE and VALIDATE judged against files that
+// did not exist. steps/scripted.js's prepareJudgeInputs is the generator, called from
+// handleDiagnose/handleValidate (state-machine.js) under isRealMode(ctx); realGate (above)
+// writes gate.log itself, overwriting on every real gate run.
+
+function realShapedLlmReply(payload, overrides = {}) {
+  return {
+    status: 0,
+    stdout: JSON.stringify({
+      result: JSON.stringify(payload),
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-judge-inputs',
+      modelUsage: { fable: { costUSD: 0.001 } },
+      terminal_reason: 'success',
+      api_error_status: null,
+      ...overrides,
+    }),
+    stderr: '',
+    signal: null,
+  };
+}
+
+test('prepareJudgeInputs: DIAGNOSE entered from CHECK (nothing committed) -- diff.patch from plain `git diff`, no park despite no gate.log', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-check-wt-');
+  const task = { id: 'card-judge-check', kind: 'card', issue: 500, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-check', task, config });
+  ctx.cameFrom = 'CHECK'; // reachable from a CHECK failure, BEFORE any commit or push
+
+  const sameSha = 'samesha00000000000000000000000000000000';
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${sameSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${sameSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) {
+        throw new Error('must not diff against origin/main...HEAD -- HEAD == origin/main here');
+      }
+      if (args.includes('diff')) return ok('diff --git a/x.ts b/x.ts\n+hello\n');
+      return ok('');
+    },
+  };
+
+  // Must not throw -- the spec's "CHECK Failure -> DIAGNOSE, never PARKED" holds even with no
+  // gate.log, because this DIAGNOSE was never entered from GATE.
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced);
+  assert.ok(!result.gateLogProduced);
+  assert.ok(result.missing.includes('gate.log'));
+
+  const plainDiffCall = calls.find((c) => c.command === 'git' && c.args.includes('diff') && c.args.length === 3);
+  assert.ok(plainDiffCall, 'expected a plain `git diff` (working tree), not origin/main...HEAD');
+
+  const content = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.match(content, /hello/);
+
+  const journal = readJournal(ctx.taskDir);
+  const prepared = journal.find((e) => e.event === 'judge-inputs-prepared');
+  assert.ok(prepared && prepared.produced.includes('diff.patch') && prepared.missing.includes('gate.log'));
+  assert.equal(prepared.cameFrom, 'CHECK');
+});
+
+test('prepareJudgeInputs: DIAGNOSE entered from GATE -- gate.log (written by realGate) is read, diff.patch comes from origin/main...HEAD', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-gate-wt-');
+  const task = { id: 'card-judge-gate', kind: 'card', issue: 501, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-gate', task, config });
+  ctx.cameFrom = 'GATE';
+
+  const headSha = 'headshajudge0000000000000000000000000000';
+  const mainSha = 'mainshajudge0000000000000000000000000000';
+
+  // Simulates realGate having already run earlier in this same task attempt.
+  fs.writeFileSync(gateLogPath(ctx.taskDir), 'gate run output: FAIL on typecheck\n');
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/y.ts b/y.ts\n+committed change\n');
+      if (args.includes('diff')) throw new Error('must not run a plain `git diff` -- HEAD != origin/main here');
+      return ok('');
+    },
+  };
+
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced);
+  assert.ok(result.gateLogProduced);
+
+  const content = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.match(content, /committed change/);
+
+  const gateLogContent = fs.readFileSync(gateLogPath(ctx.taskDir), 'utf8');
+  assert.match(gateLogContent, /FAIL on typecheck/);
+});
+
+test('prepareJudgeInputs: DIAGNOSE entered from GATE with gate.log unproducible -- parks judge-inputs-missing', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-gate-missing-wt-');
+  const task = { id: 'card-judge-gate-missing', kind: 'card', issue: 502, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-gate-missing', task, config });
+  ctx.cameFrom = 'GATE';
+  // No gate.log written -- realGate never ran (or its write failed) for this attempt.
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok('shajudgemissing000000000000000000000000\n');
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('shajudgemissing000000000000000000000000\n');
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff')) return ok('');
+      return ok('');
+    },
+  };
+
+  assert.throws(
+    () => prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' }),
+    (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'DIAGNOSE' && err.detail.missing.includes('gate.log')
+  );
+
+  // Also exercised through the full handler, gated on isRealMode + ctx.cameFrom exactly as
+  // state-machine.js's handleDiagnose wires it -- proves the wiring, not just the unit.
+  const ctx2 = testCtx({ id: 'card-judge-gate-missing-2', task: { ...task, id: 'card-judge-gate-missing-2' }, config });
+  ctx2.cameFrom = 'GATE';
+  return assert.rejects(
+    () => HANDLERS.DIAGNOSE(ctx2),
+    (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'DIAGNOSE'
+  );
+});
+
+test('prepareJudgeInputs: VALIDATE with a producible diff -- diff.patch exists and the subsequent LLM call proceeds', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-validate-ok-wt-');
+  const task = {
+    id: 'card-judge-validate-ok',
+    kind: 'card',
+    issue: 503,
+    title: 't',
+    criterion: 'the thing works',
+    worktreePath,
+    touchesRdoMembers: false,
+    size: 'S',
+  };
+  const ctx = testCtx({ id: 'card-judge-validate-ok', task, config });
+  // VALIDATE's prompt also declares invariants_path/invariant_ids, PLAN's own output -- read
+  // back via task-values.js's lastResultPayload the same way handlePlan's real 'result' event
+  // would supply them. Not this action's concern (the diff is), so a minimal stand-in.
+  appendEvent(ctx.taskDir, 'PLAN', 'result', {
+    payload: { invariants_path: '/tmp/invariants-judge-validate-ok.md', invariant_ids: ['INV-1'] },
+  });
+
+  const headSha = 'headshavalidateok00000000000000000000000';
+  const mainSha = 'mainshavalidateok00000000000000000000000';
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/z.ts b/z.ts\n+validated change\n');
+      return ok('');
+    },
+  };
+
+  // Must not throw.
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'VALIDATE' });
+  assert.ok(result.diffProduced);
+  assert.ok(fs.existsSync(diffPath(ctx.taskDir)));
+
+  // The follow-on LLM call (state-machine.js's handleValidate, same order: prepareJudgeInputs
+  // before either LLM call) actually proceeds -- same direct-runLlm convention as the
+  // CITATION_VERIFIER end-to-end test above, bypassing callLlmStep's account-rotation loop.
+  ctx.account = { name: 'default', configDir: null };
+  let claudeInvoked = false;
+  const llmDeps = {
+    spawnSync: (command) => {
+      claudeInvoked = true;
+      assert.equal(command, 'claude');
+      return realShapedLlmReply({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }, { session_id: 'sess-validate-ok' });
+    },
+  };
+
+  const verdict = await runLlm(ctx, 'VALIDATE', 'llm.VALIDATE', llmDeps);
+  assert.ok(claudeInvoked, 'expected the VALIDATE LLM call to actually spawn');
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.verdict, 'PASS');
+});
+
+test('prepareJudgeInputs: VALIDATE where the diff cannot be produced -- parks judge-inputs-missing, no LLM call', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-validate-missing-wt-');
+  const task = { id: 'card-judge-validate-missing', kind: 'card', issue: 504, title: 't', worktreePath, touchesRdoMembers: false };
+  const ctx = testCtx({ id: 'card-judge-validate-missing', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      // `git rev-parse HEAD` itself fails -- e.g. a corrupted/vanished worktree.
+      if (args.includes('rev-parse') && args.includes('HEAD')) return fail(1, 'fatal: not a git repository');
+      return ok('');
+    },
+  };
+
+  assert.throws(
+    () => prepareJudgeInputs(ctx, deps, { forState: 'VALIDATE' }),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'judge-inputs-missing' &&
+      err.detail.step === 'VALIDATE' &&
+      err.detail.missing.includes('diff.patch')
+  );
+  assert.ok(!fs.existsSync(diffPath(ctx.taskDir)));
+
+  // Through the full handler too: HANDLERS.VALIDATE must park before ever reaching either LLM
+  // call (citation-verifier or change-validator) -- no accounts pool is configured for this ctx
+  // at all, so a real attempt to call callLlmStep would blow up on accounts.pick(), not just on
+  // a park; the fact this rejects cleanly with judge-inputs-missing proves prepareJudgeInputs
+  // runs, and short-circuits, before that ever happens.
+  const ctx2 = testCtx({ id: 'card-judge-validate-missing-2', task: { ...task, id: 'card-judge-validate-missing-2' }, config });
+  await assert.rejects(
+    () => HANDLERS.VALIDATE(ctx2),
+    (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'VALIDATE'
+  );
+});
+
+test('realGate: overwrites gate.log on a second visit -- the file holds the LAST run only, never a concatenation', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-gate-overwrite-wt-');
+  const task = { id: 'card-gate-overwrite', kind: 'card', issue: 505, worktreePath };
+  const ctx = testCtx({ id: 'card-gate-overwrite', task, config });
+
+  const deps1 = {
+    spawnSync: (command, args) => (args.includes('gate') ? fail(1, 'FIRST RUN: gate FAIL on typecheck\n') : ok('')),
+  };
+  const first = await realGate(ctx, deps1);
+  assert.equal(first, 'DIAGNOSE');
+  assert.match(fs.readFileSync(gateLogPath(ctx.taskDir), 'utf8'), /FIRST RUN/);
+
+  const deps2 = {
+    spawnSync: (command, args) => (args.includes('gate') ? ok('SECOND RUN: gate PASS\n') : ok('')),
+  };
+  const second = await realGate(ctx, deps2);
+  assert.equal(second, 'CI_CHECKS');
+
+  const finalContent = fs.readFileSync(gateLogPath(ctx.taskDir), 'utf8');
+  assert.match(finalContent, /SECOND RUN/);
+  assert.doesNotMatch(finalContent, /FIRST RUN/, 'gate.log must be overwritten, never accumulated');
+
+  // logs/GATE.log (appendSpawnLog) is untouched by this fix -- it keeps accumulating across
+  // every visit, unlike gate.log.
+  const spawnLog = fs.readFileSync(path.join(ctx.taskDir, 'logs', 'GATE.log'), 'utf8');
+  assert.match(spawnLog, /FIRST RUN/);
+  assert.match(spawnLog, /SECOND RUN/);
+});
+
+test('prepareJudgeInputs: gate-report.md rendered from the bench verdict when present; absent and not fatal when it is not', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-gatereport-wt-');
+  const headSha = 'headshagatereport00000000000000000000000';
+  const mainSha = 'mainshagatereport00000000000000000000000';
+
+  const diffDeps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/g.ts b/g.ts\n+gate report test\n');
+      return ok('');
+    },
+  };
+
+  // -- present ------------------------------------------------------------------------------
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'PASS',
+    sha: headSha,
+    baseMain: mainSha,
+    summary: 'build + static + L2 drive all green.',
+    findings: ['no findings'],
+    extra: { note: 'kept but not a named field' },
+  });
+
+  const taskA = { id: 'card-judge-gatereport-a', kind: 'card', issue: 506, worktreePath };
+  const ctxA = testCtx({ id: 'card-judge-gatereport-a', task: taskA, config });
+  const resultA = prepareJudgeInputs(ctxA, diffDeps, { forState: 'VALIDATE' });
+  assert.ok(resultA.gateReportProduced);
+  const reportContent = fs.readFileSync(gateReportPath(ctxA.taskDir), 'utf8');
+  assert.match(reportContent, /# Gate report/);
+  assert.match(reportContent, /PASS/);
+  assert.match(reportContent, /build \+ static \+ L2 drive all green\./);
+  assert.ok(
+    !reportContent.trim().startsWith('{'),
+    'must be rendered markdown, not a raw JSON dump'
+  );
+
+  // -- absent -- a different task, no verdict recorded for ITS headSha ----------------------
+  const otherHeadSha = 'otherheadshanoveridict0000000000000000000';
+  const diffDepsNoVerdict = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${otherHeadSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/h.ts b/h.ts\n+no verdict yet\n');
+      return ok('');
+    },
+  };
+  const taskB = { id: 'card-judge-gatereport-b', kind: 'card', issue: 507, worktreePath };
+  const ctxB = testCtx({ id: 'card-judge-gatereport-b', task: taskB, config });
+  const resultB = prepareJudgeInputs(ctxB, diffDepsNoVerdict, { forState: 'VALIDATE' });
+  assert.ok(!resultB.gateReportProduced);
+  assert.ok(!fs.existsSync(gateReportPath(ctxB.taskDir)));
+  assert.ok(resultB.missing.includes('gate-report.md'));
+  assert.ok(resultB.diffProduced, 'a missing gate-report.md must never block the diff/VALIDATE itself');
+});
+
+test('prepareJudgeInputs: untracked files are listed in a clearly-delimited diff.patch trailer, never inside the diff body', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-untracked-wt-');
+  const task = { id: 'card-judge-untracked', kind: 'card', issue: 508, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-untracked', task, config });
+  ctx.cameFrom = 'CHECK';
+
+  const sameSha = 'sameshauntracked0000000000000000000000000';
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${sameSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${sameSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) {
+        return ok('?? scratch/new-file.ts\n M tracked-file.ts\n?? another-new.ts\n');
+      }
+      if (args.includes('diff')) return ok('diff --git a/tracked-file.ts b/tracked-file.ts\n-old\n+new\n');
+      return ok('');
+    },
+  };
+
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced);
+
+  const content = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.match(content, /-old/);
+  assert.match(content, /\+new/);
+  assert.match(content, /----- untracked/);
+  assert.match(content, /\?\? scratch\/new-file\.ts/);
+  assert.match(content, /\?\? another-new\.ts/);
+  // the tracked, modified file must appear only in the diff body, never re-listed as untracked
+  const trailerStart = content.indexOf('----- untracked');
+  const trailer = content.slice(trailerStart);
+  assert.doesNotMatch(trailer, /tracked-file\.ts/);
+});
+
+test('prepareJudgeInputs: an empty diff is still written (the empty-IMPLEMENT case IS a finding) and journaled as diff-empty, never treated as a failure to produce one', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-empty-wt-');
+  const task = { id: 'card-judge-empty', kind: 'card', issue: 511, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-empty', task, config });
+  ctx.cameFrom = 'IMPLEMENT'; // the empty-IMPLEMENT path -- no gate has run, worktree untouched
+
+  const sameSha = 'sameshaempty000000000000000000000000000000';
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${sameSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${sameSha}\n`);
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff')) return ok(''); // nothing changed -- an empty diff
+      return ok('');
+    },
+  };
+
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced, 'an empty diff still counts as produced -- it is itself a finding');
+  assert.ok(fs.existsSync(diffPath(ctx.taskDir)));
+  assert.equal(fs.readFileSync(diffPath(ctx.taskDir), 'utf8'), '');
+
+  const journal = readJournal(ctx.taskDir);
+  const emptyEvent = journal.find((e) => e.event === 'diff-empty');
+  assert.ok(emptyEvent, 'expected a diff-empty event, not a silent missing-input');
+  assert.equal(emptyEvent.committed, false);
+});
+
+// ---- action 1.3 regression: shadow mode and --dry-run must never attempt any of this --------
+
+test('regression: shadow mode never writes diff.patch/gate.log/gate-report.md for DIAGNOSE or VALIDATE', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-shadow-wt-');
+  const taskDiag = {
+    id: 'card-judge-shadow-diag',
+    kind: 'synthetic',
+    worktreePath,
+    shadow: { llm: { DIAGNOSE: { rootCause: 'shadow-cause' } } },
+  };
+  const ctxDiag = buildCtx('card-judge-shadow-diag', taskDiag, mkTmp('spo-judge-shadow-diag-taskdir-'), {
+    ...config,
+    shadowMode: true,
+  });
+
+  const next = await HANDLERS.DIAGNOSE(ctxDiag);
+  assert.equal(next, 'IMPLEMENT');
+  assert.ok(!fs.existsSync(diffPath(ctxDiag.taskDir)), 'shadow mode must never write diff.patch');
+  assert.ok(!fs.existsSync(gateLogPath(ctxDiag.taskDir)), 'shadow mode must never write gate.log');
+  assert.ok(!fs.existsSync(gateReportPath(ctxDiag.taskDir)), 'shadow mode must never write gate-report.md');
+
+  const taskValidate = {
+    id: 'card-judge-shadow-validate',
+    kind: 'synthetic',
+    worktreePath,
+    touchesRdoMembers: false,
+    shadow: { llm: { VALIDATE: { verdict: 'PASS' } } },
+  };
+  const ctxValidate = buildCtx('card-judge-shadow-validate', taskValidate, mkTmp('spo-judge-shadow-validate-taskdir-'), {
+    ...config,
+    shadowMode: true,
+  });
+
+  const nextV = await HANDLERS.VALIDATE(ctxValidate);
+  assert.equal(nextV, 'MERGE');
+  assert.ok(!fs.existsSync(diffPath(ctxValidate.taskDir)), 'shadow mode must never write diff.patch for VALIDATE');
+});
+
+test('regression: --dry-run never writes diff.patch/gate.log/gate-report.md for DIAGNOSE or VALIDATE', async () => {
+  const worktreePath = mkTmp('spo-judge-dryrun-wt-');
+  const accountsDir = mkTmp('spo-judge-dryrun-accts-');
+  writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+  const config = testConfig({ claudeAccountsDir: accountsDir });
+
+  const taskDiag = { id: 'card-judge-dryrun-diag', kind: 'card', issue: 509, worktreePath };
+  const ctxDiag = buildCtx('card-judge-dryrun-diag', taskDiag, mkTmp('spo-judge-dryrun-diag-taskdir-'), {
+    ...config,
+    shadowMode: false,
+    dryRun: true,
+  });
+
+  const next = await HANDLERS.DIAGNOSE(ctxDiag);
+  assert.equal(next, 'IMPLEMENT');
+  assert.ok(!fs.existsSync(diffPath(ctxDiag.taskDir)), '--dry-run must never write diff.patch');
+  assert.ok(!fs.existsSync(gateLogPath(ctxDiag.taskDir)), '--dry-run must never write gate.log');
+
+  const taskValidate = {
+    id: 'card-judge-dryrun-validate',
+    kind: 'card',
+    issue: 510,
+    criterion: 'the thing works',
+    worktreePath,
+    touchesRdoMembers: false,
+  };
+  const ctxValidate = buildCtx('card-judge-dryrun-validate', taskValidate, mkTmp('spo-judge-dryrun-validate-taskdir-'), {
+    ...config,
+    shadowMode: false,
+    dryRun: true,
+  });
+  // Same PLAN-output stand-in as the "producible diff" test above -- VALIDATE's prompt also
+  // declares invariants_path/invariant_ids.
+  appendEvent(ctxValidate.taskDir, 'PLAN', 'result', {
+    payload: { invariants_path: '/tmp/invariants-judge-dryrun.md', invariant_ids: ['INV-1'] },
+  });
+
+  const nextV = await HANDLERS.VALIDATE(ctxValidate);
+  assert.equal(nextV, 'MERGE');
+  assert.ok(!fs.existsSync(diffPath(ctxValidate.taskDir)), '--dry-run must never write diff.patch for VALIDATE');
+});
+
+// ---- action 1.3: runTask's own cameFrom threading ------------------------------------------
+//
+// Every prepareJudgeInputs test above sets ctx.cameFrom by hand, which proves the RULE but not
+// the WIRING -- and the wiring is the fragile half. `ctx.cameFrom = state` sits one line before
+// `state = next` in runTask's loop; writing `next` there instead (the off-by-one) would make
+// every DIAGNOSE report itself as its own cameFrom, and hardcoding 'GATE' would make a DIAGNOSE
+// entered from a CHECK failure demand a gate.log that never existed -- the exact
+// "CHECK Failure -> DIAGNOSE, never PARKED" violation this action exists to prevent. Neither
+// mistake is observable from a hand-set ctx, so these two run the real loop (shadow mode: no
+// spawns, prepareJudgeInputs itself never called) with every handler wrapped to record the
+// cameFrom it was actually handed.
+
+// Wraps every HANDLERS entry to record {state, cameFrom} on entry, runs fn, restores. The
+// wrappers delegate to the untouched originals, so the state machine behaves exactly as it
+// would without them.
+async function recordCameFrom(fn) {
+  const seen = [];
+  const originals = {};
+  for (const name of Object.keys(HANDLERS)) {
+    originals[name] = HANDLERS[name];
+    HANDLERS[name] = (ctx) => {
+      seen.push({ state: name, cameFrom: ctx.cameFrom });
+      return originals[name](ctx);
+    };
+  }
+  try {
+    await fn();
+  } finally {
+    for (const name of Object.keys(originals)) HANDLERS[name] = originals[name];
+  }
+  return seen;
+}
+
+test("runTask: ctx.cameFrom is the state the loop came FROM, never the state about to run (off-by-one guard)", async () => {
+  const taskDir = mkTmp('spo-camefrom-happy-taskdir-');
+  const task = {
+    id: 'card-camefrom-happy',
+    title: 'cameFrom threading',
+    kind: 'synthetic',
+    shadow: { llm: { VALIDATE: { verdict: 'PASS' } } },
+  };
+
+  let finalState;
+  const seen = await recordCameFrom(async () => {
+    finalState = await runTask('card-camefrom-happy', task, taskDir, { shadowMode: true, dryRun: false });
+  });
+  assert.equal(finalState, 'DONE');
+
+  // The first handler call has no predecessor at all.
+  assert.equal(seen[0].state, 'INTAKE');
+  assert.equal(seen[0].cameFrom, null);
+
+  // Every later call was handed exactly the state of the call before it -- this is what both
+  // `cameFrom = next` (which would yield cameFrom === state) and a hardcoded constant break.
+  for (let i = 1; i < seen.length; i++) {
+    assert.equal(
+      seen[i].cameFrom,
+      seen[i - 1].state,
+      `handler #${i} (${seen[i].state}) was handed cameFrom=${seen[i].cameFrom}, expected ${seen[i - 1].state}`
+    );
+    assert.notEqual(seen[i].cameFrom, seen[i].state, `${seen[i].state} must never be its own cameFrom`);
+  }
+});
+
+test("runTask: DIAGNOSE from a CHECK failure is handed cameFrom 'CHECK'; DIAGNOSE from a gate failure is handed 'GATE'", async () => {
+  // (a) CHECK fails once -> DIAGNOSE. No gate has run; prepareJudgeInputs must NOT be able to
+  //     see 'GATE' here, or requirement (d)'s "never PARKED from a CHECK failure" collapses.
+  const checkDir = mkTmp('spo-camefrom-check-taskdir-');
+  const seenCheck = await recordCameFrom(() =>
+    runTask(
+      'card-camefrom-check',
+      {
+        id: 'card-camefrom-check',
+        title: 'diagnose from check',
+        kind: 'synthetic',
+        shadow: {
+          check: [1, 0],
+          llm: { DIAGNOSE: { rootCause: 'check-cause' }, VALIDATE: { verdict: 'PASS' } },
+        },
+      },
+      checkDir,
+      { shadowMode: true, dryRun: false }
+    )
+  );
+  const diagFromCheck = seenCheck.filter((e) => e.state === 'DIAGNOSE');
+  assert.equal(diagFromCheck.length, 1);
+  assert.equal(diagFromCheck[0].cameFrom, 'CHECK');
+
+  // (b) GATE fails once -> DIAGNOSE. Here, and only here, gate.log is a hard requirement.
+  const gateDir = mkTmp('spo-camefrom-gate-taskdir-');
+  const seenGate = await recordCameFrom(() =>
+    runTask(
+      'card-camefrom-gate',
+      {
+        id: 'card-camefrom-gate',
+        title: 'diagnose from gate',
+        kind: 'synthetic',
+        shadow: {
+          gate: [1, 0],
+          prWait: [0],
+          llm: { DIAGNOSE: { rootCause: 'gate-cause' }, VALIDATE: { verdict: 'PASS' } },
+        },
+      },
+      gateDir,
+      { shadowMode: true, dryRun: false }
+    )
+  );
+  const diagFromGate = seenGate.filter((e) => e.state === 'DIAGNOSE');
+  assert.equal(diagFromGate.length, 1);
+  assert.equal(diagFromGate[0].cameFrom, 'GATE');
+
+  // A second DIAGNOSE reached through IMPLEMENT -> CHECK must report CHECK, not the stale GATE
+  // of the first visit -- the retry loop is where a "last seen" cameFrom would rot.
+  const secondDir = mkTmp('spo-camefrom-second-taskdir-');
+  const seenSecond = await recordCameFrom(() =>
+    runTask(
+      'card-camefrom-second',
+      {
+        id: 'card-camefrom-second',
+        title: 'gate fail then check fail',
+        kind: 'synthetic',
+        shadow: {
+          gate: [1, 0],
+          check: [0, 1, 0],
+          prWait: [0],
+          llm: {
+            DIAGNOSE: [{ rootCause: 'first-cause' }, { rootCause: 'second-cause' }],
+            VALIDATE: { verdict: 'PASS' },
+          },
+        },
+      },
+      secondDir,
+      { shadowMode: true, dryRun: false }
+    )
+  );
+  const diagVisits = seenSecond.filter((e) => e.state === 'DIAGNOSE').map((e) => e.cameFrom);
+  assert.deepEqual(diagVisits, ['GATE', 'CHECK']);
 });

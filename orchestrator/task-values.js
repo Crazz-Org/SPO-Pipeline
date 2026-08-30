@@ -18,11 +18,17 @@
 //     in-memory value and falls back to the journal record so a daemon restart between PUSH_PR
 //     and VALIDATE doesn't silently drop it.
 //
-// diff_path / gate_log_path / gate_report_path are named here as fixed, taskDir-relative
-// conventions (journal/<id>/diff.patch, gate.log, gate-report.md) that no scripted step in this
-// build yet writes -- CHECK/GATE/PUSH_PR real execution remains "a documented stub" per
-// orchestrator/README.md "Running shadow mode". Naming the path now fixes the contract a future
-// real implementation of those steps must honour; nothing reads or writes through it today.
+// diff_path / gate_log_path / gate_report_path are fixed, taskDir-relative conventions
+// (journal/<id>/diff.patch, gate.log, gate-report.md). Action 1.3 made these real: on entry to
+// DIAGNOSE/VALIDATE in real mode, state-machine.js's handleDiagnose/handleValidate call
+// steps/scripted.js's prepareJudgeInputs (before the LLM call) to generate diff.patch (from
+// `git diff origin/main...HEAD` once committed, plain `git diff` beforehand) and, when the bench
+// has recorded a verdict for this HEAD sha, gate-report.md. gate.log is written by realGate
+// (overwriting on every real gate run, unlike logs/GATE.log's own accumulating append) and is
+// only ever read back here -- prepareJudgeInputs never runs the gate itself. VALIDATE requires
+// diff.patch (parks 'judge-inputs-missing' if it cannot be produced); DIAGNOSE requires gate.log
+// only when it was entered from GATE (ctx.cameFrom === 'GATE'), never otherwise -- see
+// state-machine.js's runTask and steps/scripted.js's prepareJudgeInputs for the full contract.
 
 const fs = require('fs');
 const path = require('path');
