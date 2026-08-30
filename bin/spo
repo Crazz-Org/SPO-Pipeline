@@ -87,6 +87,7 @@ const defaultConfig = require('../orchestrator/config');
 const intake = require('../orchestrator/intake');
 const autoTriage = require('../orchestrator/auto-triage');
 const reportIntake = require('../orchestrator/report-intake');
+const remoteReportPull = require('../orchestrator/remote-report-pull');
 const { costReport } = require('../orchestrator/cost');
 
 function parseArgs(argv) {
@@ -534,6 +535,43 @@ async function cmdPull(opts, deps = {}) {
   }
 }
 
+// `spo pull-reports` -- stage 0 of the human-first bug-report pipeline: pulls queued reports
+// from a production deployment's own bug-report store over HTTPS
+// (orchestrator/remote-report-pull.js's runRemoteReportPull) into the local queue, where `spo
+// intake` picks them up exactly as a locally-captured report. Requires config.remoteReportUrl
+// (SPO_REMOTE_REPORT_URL) and a readable token file (default ~/.spo-reports/.pull-token,
+// SPO_REPORT_PULL_TOKEN_FILE) -- prints a clear "not configured" message and exits 0 (nothing to
+// do, not a failure) when either is missing. `deps.remoteReportPull`: same test-only override
+// convention as `deps.intake`.
+async function cmdPullReports(opts, deps = {}) {
+  const impl = deps.remoteReportPull || remoteReportPull;
+  const { journalRoot } = resolveDirs(opts);
+
+  const result = await impl.runRemoteReportPull(journalRoot, defaultConfig, {});
+
+  if (!result.ok) {
+    console.error(result.error);
+    process.exitCode = 1;
+    return;
+  }
+  if (result.skipped === 'no-url') {
+    console.log('(SPO_REMOTE_REPORT_URL is not set -- nothing to pull)');
+    return;
+  }
+  if (result.skipped === 'no-token') {
+    console.log(`(no pull token readable at ${defaultConfig.remoteReportTokenFile} -- nothing to pull)`);
+    return;
+  }
+  if (result.skipped === 'queue-ceiling') {
+    console.log('(local report queue is already at its ceiling -- skipped this cycle)');
+    return;
+  }
+
+  console.log(`listed: ${result.listed}  pulled: ${result.pulled}  acked: ${result.acked}  rejected: ${result.rejected}  errors: ${result.errors.length}`);
+  for (const e of result.errors) console.error(`${e.file}: ${e.error}`);
+  if (result.errors.length > 0) process.exitCode = 1;
+}
+
 // `spo intake [--limit N] [--reports-dir <dir>]` -- stage 1 of the human-first bug-report
 // pipeline: mechanically files a RAW card per queued report (zero LLM calls) via
 // orchestrator/report-intake.js's runReportIntake and waits for a maintainer's "confirm"/
@@ -628,7 +666,7 @@ async function cmdTriage(opts, deps = {}) {
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull|intake|reports|triage>',
+      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|ask <text…>|pull|pull-reports|intake|reports|triage>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
       '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
@@ -676,6 +714,7 @@ function main() {
   }
   if (cmd === 'ask') return cmdAsk(opts);
   if (cmd === 'pull') return cmdPull(opts);
+  if (cmd === 'pull-reports') return cmdPullReports(opts);
   if (cmd === 'intake') return cmdIntake(opts);
   if (cmd === 'reports') return cmdReports(opts);
   if (cmd === 'triage') return cmdTriage(opts);
@@ -708,4 +747,4 @@ if (require.main === module) {
   run();
 }
 
-module.exports = { parseArgs, cmdAsk, cmdPull, cmdIntake, cmdReports, cmdTriage, main };
+module.exports = { parseArgs, cmdAsk, cmdPull, cmdPullReports, cmdIntake, cmdReports, cmdTriage, main };

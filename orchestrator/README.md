@@ -561,10 +561,20 @@ captured, before any classification has had a chance to misjudge it -- including
 mobile/visual ergonomics report as "not really a bug" (a mistake `prompts/review-card.md` § 0 and
 `prompts/triage-bug-report.md` § 1 now both call out explicitly and guard against).
 
-**The pipeline, three stages, three independent daemon timers:**
+**The pipeline, four stages, four independent daemon timers:**
 
 ```
-~/.spo-reports/<file>.json
+Production deployment's own ~/.spo-reports (SPO-Deploy-managed durable volume)
+   │  STAGE 0 -- orchestrator/remote-report-pull.js's runRemoteReportPull. The dev box has the
+   │  initiative (doc/environments.md: it is not reachable from outside) and pulls over HTTPS --
+   │  GET /list, GET /fetch?file=, POST /ack against SPO-WebClient's report-pull-endpoint.ts,
+   │  bearer-token gated. A byte mover: never parses report content, only a transport envelope
+   │  (filename/bytes/sha256). Inert until BOTH config.remoteReportUrl and a readable token file
+   │  are set -- unset by default. See remote-report-pull.js's own header for the untrusted-input
+   │  handling (size caps, no redirects, atomic writes, sha256 verification) and the fetch ->
+   │  land -> ack idempotency argument.
+   ▼
+~/.spo-reports/<file>.json (now local, same as a report captured on this machine)
    │  STAGE 1 -- orchestrator/report-intake.js's runReportIntake, MECHANICAL, zero LLM calls.
    │  `npm run report:card` (SPO-WebClient, reads src/shared/bug-report-schema.ts) renders the
    │  report RAW -- no reproduction, no category/size/area. Mechanical anchorKey dedup (a grep,
@@ -610,6 +620,12 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | key | default | why |
 |---|---|---|
 | `spoReportsDir` | `~/.spo-reports` (`SPO_REPORTS_DIR`) | outside any git tree by design (`npm run finish` retires worktrees) |
+| `remoteReportUrl` | unset (`SPO_REMOTE_REPORT_URL`) | stage 0, e.g. `https://starpeace.zz.works/api/report-pull` -- must be `https://`, refused otherwise |
+| `remoteReportTokenFile` | `~/.spo-reports/.pull-token` (`SPO_REPORT_PULL_TOKEN_FILE`) | must match `SPO_REPORT_PULL_TOKEN` pasted into production's `.env` by hand |
+| `remoteReportPullMs` | 5 min (`SPO_REMOTE_REPORT_PULL_MS`) | safe nonzero default -- inert without both the URL and a readable token |
+| `remoteReportPullLimit` | 5 (`SPO_REMOTE_REPORT_PULL_LIMIT`) | production-listed reports fetched per stage-0 cycle |
+| `remoteReportMaxBytes` | 4 MB (`SPO_REMOTE_REPORT_MAX_BYTES`) | transport-level cap on one fetched report, untrusted input |
+| `remoteReportQueueCeiling` | 50 (`SPO_REMOTE_REPORT_QUEUE_CEILING`) | stage 0 skips the cycle once the local queue is already this deep |
 | `autoIntakeMs` | 15 min (`SPO_AUTO_INTAKE_MS`) | stage 1, zero LLM judgement -- same risk class as `autoPullMs` |
 | `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle |
 | `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- not `"Parked"`, see `report-intake.js`'s header on `board-move.sh`'s driver-scope disarm |
@@ -619,13 +635,21 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
 
-Journals: `report-intake` / `report-intake-duplicate` / `report-intake-schema-version` /
-`report-intake-move-failed` (stage 1), `report-confirmed` / `report-discarded` (stage 2),
-`report-triaged` / `report-held` / `auto-triage` (stage 3) -- all to `journal/daemon.jsonl`, the
-same append-only surface `auto-pull` already uses. `orchestrator/auto-triage.js`'s
-`findConfirmedAwaitingTriage` and `report-intake.js`'s `findPendingIntake` both use the same
+Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
+`remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
+`report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
+`report-discarded` (stage 2), `report-triaged` / `report-held` / `auto-triage` (stage 3) -- all to
+`journal/daemon.jsonl`, the same append-only surface `auto-pull` already uses.
+`remote-report-pull.js`'s `ackedFilenames`, `orchestrator/auto-triage.js`'s
+`findConfirmedAwaitingTriage`, and `report-intake.js`'s `findPendingIntake` all use the same
 anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed
 from a per-task `journal.jsonl` to this flat daemon-level log.
+
+**Production-side setup** (SPO-Deploy's scope, not this repo's): a durable volume for the report
+queue (a container-local path does not survive a rebuild), the `SPO_REPORT_PULL_TOKEN` env var
+(generated by hand, `openssl rand -hex 32`, pasted into `.env` and into
+`~/.spo-reports/.pull-token` on THIS machine), and an nginx location for `/api/report-pull/`. See
+SPO-Deploy's `DEPLOY.md` § 5.5 and SPO-WebClient's `src/server/report-pull-endpoint.ts`.
 
 ## Intake
 
@@ -863,6 +887,7 @@ bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disa
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
 bin/spo pull [--limit <n>]                         # write queue/<seq>-issue-<n>.json for the top N claimable board cards
+bin/spo pull-reports                               # STAGE 0: pull queued reports from a production deployment over HTTPS
 bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
@@ -925,12 +950,16 @@ piloting's own tests follow the same convention one layer up: `test/board-move.t
 `test/park-loop.test.js` covers the park comment's content and the PARKED round trip via
 `runTask` directly, plus `unparkScan`'s retry/abandon/idempotency; `test/auto-pull.test.js`
 covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
-enqueued rules; `test/report-intake.test.js` covers stages 1-2 of the human-first bug-report
+enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
+`isSafeReportFilename`/`readPullToken`, the list->fetch->land->ack wiring via an injected
+`deps.http` -- untrusted-input rejection, sha256 verification, the "already-acked filename is
+skipped" and "local-but-unacked file retries the ack only" idempotency cases) -- no real socket is
+ever opened; `test/report-intake.test.js` covers stages 1-2 of the human-first bug-report
 pipeline (`shouldAutoIntake`/`shouldScanConfirms`, `parseCardOutput`, the mechanical dedup, the
 confirm/discard comment scan's anchor logic); `test/auto-triage.test.js` covers stage 3
 (`shouldAutoTriage`, `findConfirmedAwaitingTriage`, `processConfirmedReport`'s outcome routing --
 including the "a negative outcome after confirm is HELD, never archived" rule -- and the dry/real
-split); `test/spo-triage.test.js` covers `cmdIntake`/`cmdReports`/`cmdTriage`'s flag wiring, same
-convention as `test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage (which also covers
+split); `test/spo-triage.test.js` covers `cmdPullReports`/`cmdIntake`/`cmdReports`/`cmdTriage`'s
+flag wiring, same convention as `test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage (which also covers
 `amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). None of them ever touch a real
 `git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.
