@@ -655,7 +655,10 @@ Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-fa
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
 `report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
 `report-discarded` (stage 2), `report-triaged` / `report-held` / `auto-triage` (stage 3) -- all to
-`journal/daemon.jsonl`, the same append-only surface `auto-pull` already uses.
+`journal/daemon.jsonl`, the same append-only surface `auto-pull` already uses. `auto-triage` is
+journaled for a cycle that disposed of at least one report **or** hit at least one mechanical
+error (with `errorIssues`/`firstError`, truncated to 300 chars); a cycle with nothing confirmed
+journals nothing.
 `remote-report-pull.js`'s `ackedFilenames`, `orchestrator/auto-triage.js`'s
 `findConfirmedAwaitingTriage`, and `report-intake.js`'s `findPendingIntake` all use the same
 anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed

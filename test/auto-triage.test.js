@@ -313,7 +313,7 @@ test('runAutoTriage: dry run -- draft+review still happen, but no gh call, repor
   assert.doesNotMatch(daemonLog, /"event":"auto-triage"/);
 });
 
-test('runAutoTriage: a mechanical triageBugReport failure is not journaled as triaged/held (retried next cycle)', async () => {
+test('runAutoTriage: a mechanical triageBugReport failure is journaled as an auto-triage summary, but never as triaged/held (retried next cycle)', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports5-');
   const journalRoot = mkTmp('spo-autotriage-journal5-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_fff.json');
@@ -332,6 +332,35 @@ test('runAutoTriage: a mechanical triageBugReport failure is not journaled as tr
   assert.doesNotMatch(daemonLog, /"event":"report-held"/);
   // still "awaiting triage" next scan
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [222]);
+
+  // An all-errors cycle is no longer invisible (card #449, 2026-08-30).
+  const daemonEvents = daemonLog
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const summary = daemonEvents.find((e) => e.event === 'auto-triage');
+  assert.ok(summary, 'an all-errors cycle is still journaled');
+  assert.equal(summary.errors, 1);
+  assert.equal(summary.filed, 0);
+  assert.deepEqual(summary.errorIssues, [222]);
+  assert.match(summary.firstError, /not valid JSON/);
+});
+
+test('runAutoTriage: an all-errors cycle is journaled, but a cycle with nothing confirmed still is not', async () => {
+  // Nothing confirmed at all -- top.length === 0, disposed === 0, errors === 0 -- stays silent.
+  const emptyJournalRoot = mkTmp('spo-autotriage-journal5b-');
+  await runAutoTriage(emptyJournalRoot, { spoReportsDir: mkTmp('spo-autotriage-reports5b-'), productRepo: '/fake/repo' }, makeDeps({}), { dry: false });
+  assert.equal(fs.existsSync(path.join(emptyJournalRoot, 'daemon.jsonl')), false);
+
+  // Something confirmed, every attempt errors -- disposed === 0, errors > 0 -- journaled.
+  const spoReportsDir = mkTmp('spo-autotriage-reports5c-');
+  const journalRoot = mkTmp('spo-autotriage-journal5c-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_ggg.json');
+  confirmedEntry(journalRoot, { issue: 333, pendingPath });
+  const deps = makeDeps({ claudeReplies: ['not json at all'] });
+  await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"auto-triage"/);
 });
 
 test('runAutoTriage: default limit 3 -- only the top 3 of 5 confirmed reports are processed', async () => {
