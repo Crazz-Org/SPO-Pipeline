@@ -22,6 +22,10 @@
                "size": "S" | "M" | "L",
                "area": "docs" | "rdo" | "bench" | "renderer" | "gateway" | "client" | "e2e" | "shared" | "ci",
                "is_bug_report": true, "confirmed": true } }
+  `draft` is a LITERAL NESTED JSON OBJECT, exactly as shown above — a second JSON object inside
+  the first, never a JSON-encoded STRING. WRONG: "draft": "{\"title\": \"...\"}" (a string that
+  happens to contain JSON). RIGHT: "draft": {"title": "...", ...} (an actual object, no quotes
+  around the braces, no backslash-escaped inner quotes).
 -->
 
 # triage-bug-report
