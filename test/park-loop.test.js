@@ -72,7 +72,7 @@ test('buildParkComment: repeat >= 2 adds the loop-warning block, RETRY_ABANDON_L
     repeat: 3,
   });
 
-  assert.match(body, /Ce park est identique aux 3 derniers/);
+  assert.match(body, /This park is identical to the last 3/);
   assert.match(body, /`branch-unmerged-leftover`/);
   assert.ok(body.includes(RETRY_ABANDON_LINE));
   assert.equal(RETRY_ABANDON_LINE, 'pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to close this attempt.');
