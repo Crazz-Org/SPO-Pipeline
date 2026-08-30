@@ -491,6 +491,11 @@ function buildCtx(id, task, taskDir, config) {
     // park-loop.js's postParkComment (called from inside this file, with no realX split of
     // their own) share it too.
     deps: (config && config.deps) || {},
+    // The daemon process that owns this run, for orphan-scan.js to tell "still running" apart
+    // from "died mid-task" after a restart. null outside daemon.js (tests, --once shadow runs
+    // with no config.owner) -- orphan-scan.js treats an owner-less snapshot as unknown, never
+    // as orphaned, rather than risk a false-positive park on a task with no owner data at all.
+    owner: (config && config.owner) || null,
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
     counters: {
@@ -513,6 +518,7 @@ function snapshot(ctx, state) {
     mainMoveUsed: ctx.counters.mainMoveUsed,
     prNumber: ctx.prNumber || null,
     worktreePath: (ctx.task && ctx.task.worktreePath) || null,
+    owner: ctx.owner || null,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -724,4 +730,6 @@ module.exports = {
   runForever,
   callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
   buildCtx,
+  finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
+  snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it
 };

@@ -52,6 +52,31 @@ module.exports = {
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,
 
+  // ---- crash recovery: orphaned tasks + lock re-verification (orchestrator/orphan-scan.js,
+  // orchestrator/lock.js) -- see doc/daemon-crash-recovery.md for the incident this covers
+  // (2026-08-30, card #385: a daemon that died mid-DIAGNOSE left state.json frozen on a
+  // non-terminal state, invisible to both the queue and unparkScan, requiring a manual fix).
+
+  // How often runForever's real-mode loop re-scans journal/ for a task whose state.json is
+  // non-terminal, has no queue/ entry, and whose recorded owner pid is no longer alive on this
+  // host -- see orphan-scan.js. A crash is also always caught once, unconditionally, at daemon
+  // startup (before this timer's first tick) -- that is the case that matters (crash -> systemd
+  // restart), this timer is the belt-and-suspenders for a daemon that keeps running but somehow
+  // loses track of a task. SPO_ORPHAN_SCAN_MS overrides.
+  orphanScanMs: process.env.SPO_ORPHAN_SCAN_MS !== undefined ? Number(process.env.SPO_ORPHAN_SCAN_MS) : 60 * 1000,
+
+  // How stale state.json's updatedAt must be, on top of a dead owner pid, before a task is
+  // treated as orphaned rather than mid-transition-write. Longer than any legitimate step
+  // (stepDeadlineMs above), short enough that a real orphan does not sit unrecovered for long.
+  // SPO_ORPHAN_GRACE_MS overrides.
+  orphanGraceMs:
+    process.env.SPO_ORPHAN_GRACE_MS !== undefined ? Number(process.env.SPO_ORPHAN_GRACE_MS) : 4 * 60 * 1000,
+
+  // How often the running daemon re-reads its own lock file to confirm it is still the holder
+  // (orchestrator/lock.js's watchLock) -- acquireLock only ever checks once, at startup.
+  // SPO_LOCK_WATCH_MS overrides.
+  lockWatchMs: process.env.SPO_LOCK_WATCH_MS !== undefined ? Number(process.env.SPO_LOCK_WATCH_MS) : 15 * 1000,
+
   // Claude Max account pool directory -- the single source of truth (maintainer decision,
   // 2026-08-29): every subdirectory is one account, plus a machine-written state.json for
   // cooldowns. See orchestrator/accounts.js and doc/setup.md § Accounts. Machine-level by

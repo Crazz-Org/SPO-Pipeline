@@ -186,6 +186,11 @@ async function main() {
     real: !opts.shadow && !opts.dryRun && !!opts.real,
     stepDeadlineMs: opts.deadlineMs || defaultConfig.stepDeadlineMs,
     pollIntervalMs: opts.intervalMs || defaultConfig.pollIntervalMs,
+    // Every state.json snapshot this run writes carries this back (state-machine.js's
+    // buildCtx/snapshot) -- orphan-scan.js's only way, after a restart, to tell "the process
+    // that wrote this is still alive" from "it died mid-task". lockStartedAt disambiguates a
+    // reused pid across successive daemon starts (lock.js's own payload.startedAt).
+    owner: { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
   };
 
   if (opts.once) {

@@ -104,7 +104,7 @@ function acquireLock(journalRoot, mode, deps = {}) {
   // EEXIST after the sweep means somebody else won the stale race fair and square.
   for (let attempt = 0; attempt < 2; attempt++) {
     if (tryCreate(file, payload)) {
-      return { path: file, stale, release: () => releaseLock(file) };
+      return { path: file, stale, holder: payload, release: () => releaseLock(file) };
     }
     const holder = readHolder(file);
     const holderAlive =
