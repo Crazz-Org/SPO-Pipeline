@@ -560,6 +560,12 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // runs, so its own dedup search (prompts/triage-bug-report.md § 3) would otherwise find its own
 // raw card and call the report a duplicate of itself. Every real caller (auto-triage.js's
 // processConfirmedReport) always has this issue number by construction.
+//
+// Retry policy: exactly one retry, same account, same deadline, and only when steps/llm.js
+// reported `timedOut: true` (a deadline kill, not a parsed-reply failure). The result then
+// carries `retriedAfterTimeout: {account, deadlineMs, firstError, retryOk, retryTimedOut}` --
+// auto-triage.js journals it as `report-triage-retry`. See the retry's own inline comment below
+// for why the same account/deadline, not a rotated one.
 async function triageBugReport(reportFile, selfIssue, deps = {}) {
   let account;
   try {
@@ -594,20 +600,49 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
   };
 
-  const raw = await invokeClaudeReal(opts, deps);
+  // ONE retry, and only on a deadline kill (steps/llm.js's `timedOut`, never a parsed-reply
+  // failure). Rationale, 2026-08-30 (report #449): triageBugReport is the one intake step with no
+  // retry at all -- state-machine.js's callLlmStep retries LLM steps on `kind: 'limit'` by
+  // rotating accounts, but nothing covers this path -- and its prompt runs a `curl` against a
+  // third-party game server, so a hang is plausible AND plausibly transient.
+  //
+  // Same account on purpose: a deadline kill says nothing about account health (the account
+  // worked; the prompt hung), cooling it via accounts.markLimit would be factually wrong, and
+  // accounts.pick() has no exclusion parameter anyway. Same deadline and same budget: the cause
+  // is a hang, not structural slowness -- doubling the deadline would let one report hold a whole
+  // `spo triage` cycle for 10 minutes on no measurement at all.
+  //
+  // A malformed reply is NOT retried: that is a prompt/model defect, and re-running it costs
+  // another full budget to reproduce the same defect.
+  let raw = await invokeClaudeReal(opts, deps);
+  let retriedAfterTimeout = null;
+  if (!raw.ok && raw.timedOut === true) {
+    retriedAfterTimeout = {
+      account: account.name,
+      deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
+      firstError: formatLlmFailure('triageBugReport', raw),
+    };
+    raw = await invokeClaudeReal(opts, deps);
+    retriedAfterTimeout.retryOk = raw.ok === true;
+    retriedAfterTimeout.retryTimedOut = raw.timedOut === true;
+  }
+  // Every exit below carries the retry record when there was one, so the case worth diagnosing
+  // -- a retry followed by an unusable reply -- is not the one case that loses the trace.
+  const withRetry = (res) => (retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res);
+
   if (!raw.ok) {
-    return { ok: false, error: formatLlmFailure('triageBugReport', raw) };
+    return withRetry({ ok: false, error: formatLlmFailure('triageBugReport', raw) });
   }
 
   let parsed;
   try {
     parsed = JSON.parse(raw.result);
   } catch {
-    return { ok: false, error: 'triageBugReport: reply was not valid JSON' };
+    return withRetry({ ok: false, error: 'triageBugReport: reply was not valid JSON' });
   }
 
   if (!parsed || typeof parsed !== 'object' || !TRIAGE_OUTCOMES.has(parsed.outcome)) {
-    return { ok: false, error: `triageBugReport: unrecognized outcome "${parsed && parsed.outcome}"` };
+    return withRetry({ ok: false, error: `triageBugReport: unrecognized outcome "${parsed && parsed.outcome}"` });
   }
 
   if (parsed.outcome === 'draft') {
@@ -620,19 +655,21 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
       try {
         parsed.draft = JSON.parse(parsed.draft);
       } catch {
-        return { ok: false, error: 'triageBugReport: draft was a string and not valid JSON either' };
+        return withRetry({ ok: false, error: 'triageBugReport: draft was a string and not valid JSON either' });
       }
     }
     const check = validateDraftContract(parsed.draft);
     if (!check.ok) {
-      return { ok: false, error: `triageBugReport: draft ${check.error}` };
+      return withRetry({ ok: false, error: `triageBugReport: draft ${check.error}` });
     }
   }
   if (parsed.outcome === 'duplicate' && !(Number.isInteger(parsed.issue_number) && parsed.issue_number > 0)) {
-    return { ok: false, error: 'triageBugReport: outcome "duplicate" missing a valid issue_number' };
+    return withRetry({ ok: false, error: 'triageBugReport: outcome "duplicate" missing a valid issue_number' });
   }
 
-  return { ok: true, outcome: parsed.outcome, ...parsed, sessionId: raw.sessionId, costUsd: raw.costUsd };
+  // retriedAfterTimeout is spread AFTER ...parsed on purpose: a model reply that happened to
+  // contain this key by accident must never shadow our own retry record.
+  return withRetry({ ok: true, outcome: parsed.outcome, ...parsed, sessionId: raw.sessionId, costUsd: raw.costUsd });
 }
 
 // ---- pullBoard ------------------------------------------------------------------------------

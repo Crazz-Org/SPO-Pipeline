@@ -394,6 +394,97 @@ test('triageBugReport: outcome "not-reproduced" passes through untouched', async
   assert.equal(result.reason, 'no matching log line');
 });
 
+// ---- triageBugReport: one retry on a deadline timeout, never on a malformed reply -------------
+// Card #449, 2026-08-30: triageBugReport was the one intake LLM step with no retry at all, and
+// its prompt runs a `curl` against a third-party server -- a plausible, plausibly transient hang.
+
+function timeoutSpawnResult() {
+  const err = new Error('spawnSync claude ETIMEDOUT');
+  err.code = 'ETIMEDOUT';
+  return { error: err, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' };
+}
+
+function seqSpawnSync(responses) {
+  let i = 0;
+  return fakeSpawnSync(() => responses[Math.min(i++, responses.length - 1)]);
+}
+
+function okSpawnResult(resultObj) {
+  return { status: 0, stdout: JSON.stringify(realShapedReply(resultObj)), stderr: '', signal: null };
+}
+
+test('triageBugReport: a deadline timeout is retried exactly once, and the retry\'s answer is the result', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: (command, args, opts) => {
+      calls++;
+      return calls === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
+    },
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'draft');
+  assert.equal(result.retriedAfterTimeout.retryOk, true);
+  assert.equal(result.retriedAfterTimeout.retryTimedOut, false);
+});
+
+test('triageBugReport: the retry uses the SAME account and the SAME deadline as the first attempt', async () => {
+  const seenOpts = [];
+  const deps = {
+    accountsDir: poolDir(),
+    deadlineMs: 12345,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' });
+    },
+  };
+  await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(seenOpts.length, 2);
+  assert.equal(seenOpts[0].timeout, 12345);
+  assert.equal(seenOpts[1].timeout, 12345);
+  assert.deepEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR);
+});
+
+test('triageBugReport: two consecutive timeouts -- one retry only, the failure says the call RAN past its deadline', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return timeoutSpawnResult();
+    },
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(calls, 2); // no loop -- exactly one retry attempted, then give up
+  assert.equal(result.ok, false);
+  assert.match(result.error, /exceeded the \d+ms deadline/);
+  assert.equal(result.retriedAfterTimeout.retryTimedOut, true);
+});
+
+test('triageBugReport: a malformed reply is NOT retried', async () => {
+  const deps = { accountsDir: poolDir(), spawnSync: seqSpawnSync([{ status: 0, stdout: 'not json at all', stderr: '', signal: null }, okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT })]) };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(result.ok, false);
+  assert.equal(result.retriedAfterTimeout, undefined);
+});
+
+test('triageBugReport: a retry followed by an unusable reply still carries retriedAfterTimeout', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return calls === 1 ? timeoutSpawnResult() : { status: 0, stdout: 'not json at all', stderr: '', signal: null };
+    },
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not valid JSON/);
+  assert.equal(result.retriedAfterTimeout.retryOk, false);
+});
+
 // ---- fetchIssue -----------------------------------------------------------------------------
 
 test('fetchIssue: returns {title, body}, a clear error on a non-zero exit or bad JSON', () => {

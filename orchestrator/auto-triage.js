@@ -229,6 +229,17 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
   }
 
   const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, deps);
+
+  // Make the retry visible: a step that silently costs twice as long and twice as much is the
+  // kind of thing that only shows up in a bill. Not a terminal event -- findConfirmedAwaitingTriage
+  // only treats `report-triaged`/`report-held` as "handled", so this never suppresses a re-scan.
+  if (!dry && triaged.retriedAfterTimeout) {
+    appendDaemonEvent(journalRoot, 'report-triage-retry', {
+      issue: entry.issue,
+      ...triaged.retriedAfterTimeout,
+    });
+  }
+
   if (!triaged.ok) {
     return { ok: false, error: triaged.error }; // mechanical failure -- retried next cycle, no journal
   }

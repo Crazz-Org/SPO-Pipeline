@@ -73,14 +73,18 @@ const VALID_DRAFT = {
 
 // Sequenced `claude` replies (one per invokeClaudeReal call: triageBugReport, then reviewCard for
 // a "draft" outcome) plus a `gh` responder for amendCard/postIssueComment/board:move.
-function makeDeps({ claudeReplies, ghResponder, npmResponder, accountsDir }) {
+function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, accountsDir }) {
   let claudeCallIdx = 0;
+  // claudeRawReplies, when given, is a sequence of raw spawnSync-shaped results consumed BEFORE
+  // claudeReplies -- {status, stdout, stderr, signal} or {error, ...}, for tests that need to
+  // simulate a deadline kill (timeoutSpawnResult-shaped) rather than a parsed JSON reply.
+  // Additive: no existing caller passes it, so claudeReplies' own behaviour is untouched.
+  const claudeCalls = [...(claudeRawReplies || []), ...(claudeReplies || []).map((r) => ok(JSON.stringify(realShapedReply(r))))];
   return {
     accountsDir: accountsDir || poolDir(),
     spawnSync: (command, args) => {
       if (command === 'claude') {
-        const reply = claudeReplies[claudeCallIdx++];
-        return ok(JSON.stringify(realShapedReply(reply)));
+        return claudeCalls[Math.min(claudeCallIdx++, claudeCalls.length - 1)];
       }
       if (command === 'gh') {
         if (ghResponder) return ghResponder(args);
@@ -94,6 +98,12 @@ function makeDeps({ claudeReplies, ghResponder, npmResponder, accountsDir }) {
       return ok('');
     },
   };
+}
+
+function timeoutSpawnResult() {
+  const err = new Error('spawnSync claude ETIMEDOUT');
+  err.code = 'ETIMEDOUT';
+  return { error: err, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' };
 }
 
 function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1, kind }) {
@@ -361,6 +371,69 @@ test('runAutoTriage: an all-errors cycle is journaled, but a cycle with nothing 
   await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
   const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
   assert.match(daemonLog, /"event":"auto-triage"/);
+});
+
+// ---- report-triage-retry: triageBugReport's own retry, made visible ---------------------------
+
+test('runAutoTriage: a triageBugReport retry after a timeout is journaled as report-triage-retry, and does not count as "handled"', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reports7-');
+  const journalRoot = mkTmp('spo-autotriage-journal7-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_hhh.json');
+  confirmedEntry(journalRoot, { issue: 449, pendingPath });
+
+  const deps = makeDeps({
+    claudeRawReplies: [timeoutSpawnResult()],
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
+    ],
+    ghResponder: (args) => (args[0] === 'api' ? ok(JSON.stringify({ body: 'original raw body' })) : ok('')),
+    npmResponder: () => ok(''),
+  });
+
+  const result = await runAutoTriage(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true },
+    deps,
+    { dry: false }
+  );
+  assert.equal(result.filed, 1);
+
+  const daemonLog = fs
+    .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const retryEvent = daemonLog.find((e) => e.event === 'report-triage-retry');
+  assert.ok(retryEvent, 'expected a report-triage-retry event');
+  assert.equal(retryEvent.issue, 449);
+  assert.equal(retryEvent.retryOk, true);
+  assert.ok(daemonLog.some((e) => e.event === 'report-triaged' && e.issue === 449 && e.outcome === 'filed'));
+
+  // the retry event never blocks the normal "handled" detection
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+});
+
+test('runAutoTriage: dry run -- a retry still happens but is not journaled', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reports8-');
+  const journalRoot = mkTmp('spo-autotriage-journal8-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_iii.json');
+  confirmedEntry(journalRoot, { issue: 450, pendingPath });
+
+  const deps = makeDeps({
+    claudeRawReplies: [timeoutSpawnResult()],
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
+    ],
+  });
+
+  await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
+
+  const daemonLog = fs.existsSync(path.join(journalRoot, 'daemon.jsonl'))
+    ? fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    : '';
+  assert.doesNotMatch(daemonLog, /report-triage-retry/);
 });
 
 test('runAutoTriage: default limit 3 -- only the top 3 of 5 confirmed reports are processed', async () => {
