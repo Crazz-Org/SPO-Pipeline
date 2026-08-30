@@ -122,6 +122,30 @@ async function main() {
       process.exitCode = 1;
       return;
     }
+
+    // Every account directory is its own CLAUDE_CONFIG_DIR, so it is also its own user-settings
+    // tier -- an unsynced account runs steps with no permission rules of its own. Re-apply the
+    // repo's reviewed policy on every --real start so an account added or restored between runs
+    // cannot silently run under a different one. Best-effort: a failure here is a warning, not a
+    // reason to refuse to start, since project-tier rules still cover today's step cwds.
+    try {
+      const source = path.join(__dirname, '..', '.claude', 'settings.json');
+      const settingsText = accounts.stampManagedSettings(
+        fs.readFileSync(source, 'utf8'),
+        '<repo>/.claude/settings.json'
+      );
+      const synced = accounts.syncSettings(defaultConfig.claudeAccountsDir, settingsText);
+      const changed = synced.filter((r) => r.action !== 'unchanged');
+      if (changed.length > 0) {
+        console.log(
+          `orchestrator/daemon.js: account permission policy synced -- ${changed
+            .map((r) => `${r.name} (${r.action})`)
+            .join(', ')}`
+        );
+      }
+    } catch (err) {
+      console.error(`orchestrator/daemon.js: warning -- account permission sync failed: ${err.message}`);
+    }
   }
 
   const repoRoot = path.join(__dirname, '..');

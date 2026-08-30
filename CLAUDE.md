@@ -38,6 +38,9 @@ planifier une carte :
 - DIAGNOSE / VALIDATE / CITATION_VERIFIER tournent depuis la racine du dépôt en
   `permissionMode: 'default'` **sans humain** : ce que `.claude/settings.json` n'autorise pas
   est refusé, pas mis en attente.
+- `.claude/settings.json` est la **source unique** de la politique : il est aussi installé comme
+  couche utilisateur de chaque compte du pool (`spo account sync-settings`, automatique à
+  `account add` et à chaque démarrage `--real`). Après l'avoir édité, resynchroniser.
 
 ## Git
 
