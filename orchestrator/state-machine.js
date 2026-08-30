@@ -38,6 +38,7 @@ const {
   realCiChecks,
   realMerge,
   realFinish,
+  preserveWorktreeWip,
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
@@ -527,11 +528,24 @@ function snapshot(ctx, state) {
 
 function finalizePark(ctx, lastState, reason, detail) {
   appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
+
+  // Any park with a still-existing, still-dirty worktree gets its diff pushed to a durable wip/
+  // ref before anything else -- not just the WORKTREE-retry dirty-leftover case sweepWorktreeLeftovers
+  // itself already handles. This is what would have saved card #385's 620 lines of stranded
+  // IMPLEMENT work: a task orphaned mid-DIAGNOSE (orphan-scan.js) reparks through this exact
+  // function, and its worktree is very likely still sitting there, uncommitted.
+  let mergedDetail = detail;
+  if (isRealMode(ctx)) {
+    const worktreePath = (ctx.task && ctx.task.worktreePath) || (detail && detail.worktreePath) || null;
+    const preserved = preserveWorktreeWip(ctx, ctx.deps, { worktreePath, reason });
+    if (preserved) mergedDetail = { ...detail, wip: preserved };
+  }
+
   const snap = snapshot(ctx, 'PARKED');
   snap.reason = reason;
   snap.lastState = lastState;
   writeState(ctx.taskDir, snap);
-  writeReport(ctx.taskDir, { id: ctx.id, reason, lastState, ts: snap.updatedAt, detail });
+  writeReport(ctx.taskDir, { id: ctx.id, reason, lastState, ts: snap.updatedAt, detail: mergedDetail });
 
   // The daemon-level feed: one `parked` line in <journalRoot>/daemon.jsonl alongside the
   // per-task event above, so daemon.jsonl reads as the single chronological "needs a human"
@@ -553,7 +567,7 @@ function finalizePark(ctx, lastState, reason, detail) {
   // moveCard('PARKED') call inside postParkComment skips itself, journaled, when the worktree
   // was never created (a pre-WORKTREE park) -- the gh comment still posts either way.
   if (isRealMode(ctx) && ctx.task && ctx.task.kind === 'card') {
-    postParkComment(ctx, ctx.deps, { reason, detail, lastState });
+    postParkComment(ctx, ctx.deps, { reason, detail: mergedDetail, lastState });
   }
 }
 

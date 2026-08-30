@@ -289,7 +289,7 @@ test('realWorktree leftover sweep: clean worktree dir + a local branch merged in
   assert.ok(calls.some((c) => c.args.includes('add') && c.args.includes(worktreePath)));
 });
 
-test('realWorktree leftover sweep: a DIRTY leftover worktree parks worktree-dirty-leftover -- nothing is removed', async () => {
+test('realWorktree leftover sweep: a DIRTY leftover worktree whose WIP push fails still parks worktree-dirty-leftover -- nothing is removed', async () => {
   const config = testConfig();
   const task = { id: 'card-retry-b', kind: 'card', issue: 425 };
   const ctx = testCtx({ id: 'card-retry-b', task, config });
@@ -304,6 +304,7 @@ test('realWorktree leftover sweep: a DIRTY leftover worktree parks worktree-dirt
       if (args.includes('worktree') && args.includes('list')) return ok('');
       if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no branch leftovers
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      if (args.includes('push')) return fail(1, 'could not push -- no network'); // WIP preservation fails
       return ok('');
     },
   };
@@ -313,9 +314,46 @@ test('realWorktree leftover sweep: a DIRTY leftover worktree parks worktree-dirt
     (err) => err instanceof ParkSignal && err.reason === 'worktree-dirty-leftover'
   );
 
-  assert.ok(!calls.some((c) => c.args.includes('remove')), 'a dirty leftover must never be removed');
+  assert.ok(!calls.some((c) => c.args.includes('remove')), 'a dirty leftover must never be removed when its WIP could not be saved');
   assert.ok(fs.existsSync(worktreePath), 'the dirty directory itself must still be on disk');
-  assert.ok(!calls.some((c) => c.args.includes('add')), 'worktree add must never run past a dirty-leftover park');
+  assert.ok(!calls.some((c) => c.args.includes('worktree') && c.args.includes('add')), 'worktree add must never run past a dirty-leftover park');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'wip-preserve-failed' && e.step === 'push'));
+});
+
+test('realWorktree leftover sweep: a DIRTY leftover worktree with a WORKING push preserves the WIP, then proceeds (no park)', async () => {
+  const config = testConfig();
+  const task = { id: 'card-retry-b2', kind: 'card', issue: 425 };
+  const ctx = testCtx({ id: 'card-retry-b2', task, config });
+  const worktreePath = path.join(config.pipelineWorktreesDir, 'card-retry-b2');
+  fs.mkdirSync(worktreePath, { recursive: true });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M some-uncommitted-file.ts\n'); // dirty
+      if (args.includes('worktree') && args.includes('list')) return ok('');
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no branch leftovers
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok('wipsha00000000000000000000000000000000\n');
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
+      if (args.includes('board:take')) return ok('claimed\n');
+      return ok(''); // add / commit / push / worktree remove / prune / worktree add -- all succeed
+    },
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN'); // the sweep finished and the add proceeded -- no park
+
+  const pushCall = calls.find((c) => c.args.includes('push') && c.args.some((a) => a.startsWith('HEAD:refs/heads/wip/')));
+  assert.ok(pushCall, 'expected a push to a wip/ ref, not claude-pipe/<id>');
+  assert.ok(calls.some((c) => c.args.includes('remove') && c.args.includes('--force') && c.args.includes(worktreePath)));
+
+  const journal = readJournal(ctx.taskDir);
+  const preserved = journal.find((e) => e.event === 'leftover-wip-preserved');
+  assert.ok(preserved && preserved.ref && preserved.ref.startsWith(`wip/card-retry-b2-`));
+  assert.equal(preserved.sha, 'wipsha00000000000000000000000000000000');
 });
 
 test('realWorktree leftover sweep: a local branch with an unpushed, unmerged tip parks branch-unmerged-leftover -- never deleted', async () => {
