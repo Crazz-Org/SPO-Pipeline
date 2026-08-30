@@ -651,6 +651,22 @@ queue (a container-local path does not survive a rebuild), the `SPO_REPORT_PULL_
 `~/.spo-reports/.pull-token` on THIS machine), and an nginx location for `/api/report-pull/`. See
 SPO-Deploy's `DEPLOY.md` § 5.5 and SPO-WebClient's `src/server/report-pull-endpoint.ts`.
 
+**One-time GitHub setup** (this repo's product board, done once, 2026-08-30): neither of these
+is created automatically by `runReportIntake` -- `gh issue create --label report:raw` and
+`npm run board:move -- <n> Intake` both fail (the first hard, the second retried then given up
+on -- see `moveWithRetry`) if the label or the Status option do not already exist.
+
+```bash
+gh label create "report:raw" --repo Crazz-Org/SPO-WebClient \
+  --description "Raw bug-report card, awaiting a maintainer confirm/discard reply -- not yet judged" \
+  --color "5319E7"
+```
+
+The `"Intake"` Status option on project 1 was added via one `updateProjectV2Field` GraphQL
+mutation (no `gh project field-create` equivalent exists for adding a single option to an
+existing single-select field) -- see this repo's own session history for the exact mutation if
+the option is ever lost and needs recreating.
+
 ## Intake
 
 `orchestrator/intake.js` is the maintainer-facing path from a free-text request to a filed
