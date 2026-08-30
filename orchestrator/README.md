@@ -253,12 +253,20 @@ one missing placeholder blocks the whole call, never a partial substitution.
 A successful reply's `result` string is `JSON.parse`d and checked against the step's
 `outputContract.required` (`in` check, so a legitimately-`null` field like DIAGNOSE's
 `root_cause` still counts as present); a missing key returns the same `{ok: false, kind:
-'error'}` shape `invokeClaudeReal` itself uses for a spawn/parse failure — handled by the same
-existing DIAGNOSE/PARK paths in `state-machine.js`, no new failure category. The validated
-payload is also given a snake_case→camelCase alias of every key (`root_cause` → `rootCause`
-too, additively — this is the one step whose contract key differs from what
-`state-machine.js`'s handlers already read; every other step's key names matched by
-coincidence).
+'error'}` shape `invokeClaudeReal` itself uses for a spawn/parse failure. Action 1.4
+(`state-machine.js`) routes every such transport-shaped failure (`kind: 'error'`, or
+`timedOut: true` from a deadline kill) to its own `ParkSignal('llm-transport-failed:<STEP>',
+...)` — PLAN, IMPLEMENT, DIAGNOSE, and VALIDATE's change-validator each get a distinct reason
+naming the step, so a call that never reached the model is never mistaken for one the model
+answered badly (see `doc/state-machine-spec.md`'s per-step rows). `kind: 'limit'` is excluded —
+that is the account-rotation retry path, unrelated. The validated payload is also given a
+snake_case→camelCase alias of every key (`root_cause` → `rootCause` too, additively — this is
+the one step whose contract key differs from what `state-machine.js`'s handlers already read;
+every other step's key names matched by coincidence). Action 1.5 makes `handleDiagnose` honour
+the `root_cause: null` half of that contract explicitly: a present-but-null `root_cause` means
+"no cause beyond what the ledger already has" and parks `diagnose-no-new-cause` (ledger line
+still written), instead of the old behaviour of silently fabricating a unique
+`unspecified-cause-N` and burning another IMPLEMENT retry on it.
 
 ### --dry-run
 

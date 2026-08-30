@@ -183,6 +183,22 @@ async function handlePlan(ctx) {
   const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
+
+  // Action 1.4: a transport failure (spawn error, non-JSON output, missing required key, a
+  // deadline kill -- classifyFailure's 'error' kind, or timedOut on its own) means PLAN never
+  // produced a verdict at all. Route it to its own park, distinct from 'plan-invalid', which is
+  // reserved for a real reply the model DID produce that fails the plan_markdown/
+  // invariants_markdown contract below. `kind: 'limit'` is deliberately excluded here -- that is
+  // the account-rotation path callLlmStep already retries across accounts; a 'limit' result
+  // reaching this line at all would mean rotation gave up, and is left to plan-invalid/the
+  // generic ok:false branch exactly as before.
+  if (payload && payload.ok === false && (payload.kind === 'error' || payload.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:PLAN', {
+      kind: payload.kind,
+      timedOut: payload.timedOut,
+      error: payload.error,
+    });
+  }
   if (!payload || payload.ok === false) {
     throw new ParkSignal('plan-invalid', { payload });
   }
@@ -241,6 +257,19 @@ async function handleImplement(ctx) {
   const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload });
+
+  // Action 1.4: a transport failure never reached a verdict -- routing it to DIAGNOSE (the old
+  // `!payload || payload.ok === false` branch below) paid a real LLM call to diagnose a failure
+  // that never reached the model at all (issue-452: three Fable diagnoses, $1.75, for a $0 E2BIG
+  // spawn failure). Park directly instead. `kind: 'limit'` is deliberately excluded -- see
+  // handlePlan's own comment on the same guard.
+  if (payload && payload.ok === false && (payload.kind === 'error' || payload.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:IMPLEMENT', {
+      kind: payload.kind,
+      timedOut: payload.timedOut,
+      error: payload.error,
+    });
+  }
   if (!payload || payload.ok === false) return 'DIAGNOSE';
 
   // Transport-level ok:true is not enough to trust CHECK with the worktree: today's real run of
@@ -386,8 +415,72 @@ async function handleDiagnose(ctx) {
   if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' });
 
   const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
+
+  // Action 1.4: a transport failure never produced a verdict at all -- park immediately, before
+  // any attempt is counted or any ledger line written. Previously this fell through to the
+  // rootCause fallback below and got journaled as a fabricated, always-unique
+  // "unspecified-cause-N", which could never trip the duplicate-root-cause guard and paid a full
+  // extra IMPLEMENT attempt for nothing (issue-452: three Fable diagnoses, $1.75, for a $0 E2BIG
+  // spawn failure). `kind: 'limit'` deliberately excluded -- see handlePlan's own comment.
+  if (result && result.ok === false && (result.kind === 'error' || result.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:DIAGNOSE', {
+      kind: result.kind,
+      timedOut: result.timedOut,
+      error: result.error,
+    });
+  }
+
   const attemptN = ++ctx.counters.diagnoseAttempts;
-  const rootCause = (result && result.rootCause) || `unspecified-cause-${attemptN}`;
+
+  // Action 1.5: diagnose.md declares two mutually exclusive reply shapes, and step-contracts.js's
+  // outputContract deliberately treats a PRESENT-but-null root_cause as satisfying the contract
+  // (its own comment: "a present-but-null root_cause [is] satisfied, never ... 'missing'") -- it
+  // means "I have no cause that is not already on the ledger", the documented honest answer, not
+  // "no answer at all". The old `(result && result.rootCause) || fabricated` conflated the two:
+  // null is falsy, so the honest answer was silently replaced by an always-unique fabricated
+  // string that could never trip the duplicate-root-cause guard (issues 213, 428, 452).
+  //
+  // Distinguish PRESENCE of the key from its VALUE, and check both the wire's snake_case
+  // `root_cause` and its camelCase alias: llm.js's withCamelAliases keeps both names on a real
+  // reply, but --dry-run's cannedDryRunPayload returns only `root_cause` (it is never run through
+  // withCamelAliases), and shadow-mode fixtures in this test suite use only `rootCause`.
+  const hasRootCauseKey =
+    !!result &&
+    (Object.prototype.hasOwnProperty.call(result, 'rootCause') ||
+      Object.prototype.hasOwnProperty.call(result, 'root_cause'));
+  const rootCauseValue = hasRootCauseKey
+    ? Object.prototype.hasOwnProperty.call(result, 'rootCause')
+      ? result.rootCause
+      : result.root_cause
+    : undefined;
+
+  if (hasRootCauseKey && rootCauseValue === null) {
+    // The documented "no new cause" answer. Append the ledger line for the attempt first (same
+    // order the rest of this function already follows: journal, then ledger, then park), never
+    // fabricate a cause, never retry IMPLEMENT on it.
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', {
+      attempt: attemptN,
+      payload: { rootCause: null, reason: result.reason || null },
+    });
+    appendLedgerLine(ctx.taskDir, attemptN, '(no new cause)', 'parked (no new cause)');
+    throw new ParkSignal('diagnose-no-new-cause', { attempt: attemptN, reason: result.reason || null });
+  }
+
+  // root_cause absent entirely (neither key present) is not one of diagnose.md's two documented
+  // shapes. On the production `kind: "card"` path it is unreachable past the transport-failure
+  // park above: step-contracts.js's outputContract requires the `root_cause` key, so llm.js's
+  // real-reply path already turns a reply omitting it into {ok: false, kind: 'error', error:
+  // '... missing required key(s): root_cause'}, caught above. It stays reachable on two paths
+  // that bypass that validation -- a shadow-mode fixture that forgot to wire rootCause, and the
+  // legacy ctx.task.llm.DIAGNOSE override, which is real mode but returns invokeClaudeReal's raw
+  // shape with no contract check at all. Kept as the pre-existing "fabricate a unique
+  // placeholder" behaviour: nothing in this change package asks for a different answer here, and
+  // no existing test relies on one. Note the fabricated cause is always unique, so it evades the
+  // duplicate guard below -- the same waste 1.5 removes for the documented null shape.
+  //
+  // A falsy-but-present root_cause (notably "") is deliberately NOT fabricated over: it flows
+  // through as-is, so repeating it trips the duplicate guard instead of evading it.
+  const rootCause = hasRootCauseKey ? rootCauseValue : `unspecified-cause-${attemptN}`;
   const category = (result && result.category) || null;
   const suggestedFix = (result && result.suggestedFix) || null;
   // Journal category/suggestedFix alongside rootCause -- task-values.js's IMPLEMENT derivation
@@ -470,6 +563,20 @@ async function handleValidate(ctx) {
   const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', ctx.deps);
   const verdict = result && result.verdict;
   appendEvent(ctx.taskDir, 'VALIDATE', 'change-validator', { verdict, findings: result && result.findings });
+
+  // Action 1.4: a transport failure on the change-validator previously fell through to the
+  // generic `throw new ParkSignal('validate-unrecognized-verdict', ...)` at the bottom of this
+  // function, blaming the model for a verdict it never rendered. Distinct park, same exclusion
+  // of `kind: 'limit'` as handlePlan/handleImplement. This is the change-validator only -- the
+  // CITATION_VERIFIER branch above keeps its own 'citation-verifier-failed' reason (action 1.1),
+  // deliberately not retargeted to this one.
+  if (result && result.ok === false && (result.kind === 'error' || result.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:VALIDATE', {
+      kind: result.kind,
+      timedOut: result.timedOut,
+      error: result.error,
+    });
+  }
 
   if (verdict === 'PASS' || verdict === 'PASS_WITH_FINDINGS') return 'MERGE';
   if (verdict === 'REJECT') {

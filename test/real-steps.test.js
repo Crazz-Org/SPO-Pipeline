@@ -1872,8 +1872,16 @@ test('regression: --dry-run never writes diff.patch/gate.log/gate-report.md for 
     dryRun: true,
   });
 
-  const next = await HANDLERS.DIAGNOSE(ctxDiag);
-  assert.equal(next, 'IMPLEMENT');
+  // Action 1.5: --dry-run's canned DIAGNOSE payload is {ok: true, root_cause: null, reason:
+  // '[dry-run] diagnose not performed'} (steps/llm.js's cannedDryRunPayload) -- an explicit,
+  // present-but-null root_cause is diagnose.md's documented "no new cause" answer, so this now
+  // parks 'diagnose-no-new-cause' instead of fabricating a cause and returning to IMPLEMENT
+  // (the pre-1.5 behaviour this test used to assert). The file-writing assertions below are this
+  // test's real purpose and are unaffected by which path DIAGNOSE takes.
+  await assert.rejects(
+    () => HANDLERS.DIAGNOSE(ctxDiag),
+    (err) => err instanceof ParkSignal && err.reason === 'diagnose-no-new-cause'
+  );
   assert.ok(!fs.existsSync(diffPath(ctxDiag.taskDir)), '--dry-run must never write diff.patch');
   assert.ok(!fs.existsSync(gateLogPath(ctxDiag.taskDir)), '--dry-run must never write gate.log');
 

@@ -209,6 +209,34 @@ test('reply whose result field is not JSON at all -> {ok:false, kind:"error"}', 
   assert.equal(result.kind, 'error');
 });
 
+// A model can reply with valid JSON that is not an object. Before this guard the required-key
+// filter's `key in parsedPayload` threw a TypeError straight out of runLlm, which runTask
+// rethrows as "a real bug" -- killing the daemon on what is only a malformed reply, and the one
+// transport-shaped failure that escaped state-machine.js's llm-transport-failed guards.
+for (const [label, resultField] of [
+  ['null', 'null'],
+  ['a bare string', '"just a sentence"'],
+  ['a number', '42'],
+]) {
+  test(`reply whose result field is valid JSON but ${label}, not an object -> {ok:false, kind:"error"}, no throw`, async () => {
+    const taskDir = mkTmp('spo-card-nonobject-reply-');
+    const task = { kind: 'card', issue: 4, title: 't', criterion: 'c', worktreePath: '/tmp/worktree-4', size: 'S' };
+
+    const deps = {
+      spawnSync: fakeSpawnSync(() => {
+        const reply = realShapedReply({});
+        reply.result = resultField;
+        return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+      }),
+    };
+
+    const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, 'error');
+    assert.match(result.error, /not an object/);
+  });
+}
+
 // ---- DIAGNOSE's snake_case/camelCase bridge -------------------------------------------------
 
 test('DIAGNOSE reply root_cause is also exposed as rootCause (handleDiagnose reads the camelCase name)', async () => {
