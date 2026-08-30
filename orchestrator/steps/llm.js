@@ -11,9 +11,10 @@
 //
 //   invokeClaudeReal(opts, deps) -- the primitive. Takes exactly the per-call inputs the spec
 //     lists (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
-//     promptText|promptFile, cwd, account, deadlineMs), builds argv, spawns, parses, classifies
-//     failures, and returns {ok, result, sessionId, costUsd, numTurns, raw}. `deps.spawnSync`
-//     is an injection point for tests (and nothing else) -- production code never passes it.
+//     promptText|promptFile, cwd, account, deadlineMs), builds argv, spawns with the resolved
+//     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
+//     sessionId, costUsd, numTurns, raw}. `deps.spawnSync` is an injection point for tests (and
+//     nothing else) -- production code never passes it.
 //
 //   runLlm(ctx, stepName, fixtureKey, deps) -- the existing shadow-mode entry point every state-
 //     machine handler already calls. Its shadow branch is untouched. Its real branch has two
@@ -78,10 +79,13 @@ const NONINTERACTIVE_ENV_DEFAULTS = {
   DISABLE_AUTOUPDATER: '1',
 };
 
-// Builds the argv for `claude`, in the exact flag order the spec gives:
-//   -p <prompt> --model <model> --effort <effort> --output-format json --max-budget-usd <n>
-//   [--allowedTools <tools>] [--permission-mode <mode>] [--json-schema <schema-json>]
-function buildArgv(opts) {
+// Reads opts.promptText/opts.promptFile down to the final prompt string. Split out of
+// buildArgv because the prompt no longer lives in argv (see buildArgv's own comment) but two
+// callers still need the resolved text: invokeClaudeReal (to write it to the child's stdin) and
+// writeDryRunArtifact (to display it). Throws the same "needs promptText or promptFile" error
+// buildArgv used to, and at the same point in the call sequence -- invokeClaudeReal calls this
+// before touching the account/oauth-token file, so a missing prompt still fails first.
+function resolvePromptText(opts) {
   let prompt = opts.promptText;
   if ((prompt === undefined || prompt === null || prompt === '') && opts.promptFile) {
     prompt = fs.readFileSync(opts.promptFile, 'utf8');
@@ -89,8 +93,27 @@ function buildArgv(opts) {
   if (!prompt) {
     throw new Error('llm.js: real-mode call needs promptText or promptFile');
   }
+  return prompt;
+}
 
-  const argv = ['-p', prompt];
+// Builds the argv for `claude`, in the exact flag order the spec gives:
+//   -p --model <model> --effort <effort> --output-format json --max-budget-usd <n>
+//   [--allowedTools <tools>] [--permission-mode <mode>] [--json-schema <schema-json>]
+//
+// The prompt is NOT one of these argv entries -- it goes to the child's stdin instead (see
+// invokeClaudeReal). Linux caps each INDIVIDUAL argv/environ string at MAX_ARG_STRLEN
+// (32 * PAGE_SIZE = 131072 bytes on this machine) -- a distinct, much smaller limit than ARG_MAX
+// (the cumulative argv+environ budget, never remotely approached here). A filled prompt bigger
+// than that made spawnSync fail with E2BIG before `claude` ever started, unconditionally, no
+// matter the model/account/step. Reproduced 2026-08-30 on card #452: its IMPLEMENT prompt was
+// 204826 bytes (a placeholder substituted twice into implement.md -- see that file's own fix);
+// its PLAN prompt, same task, was 105307 bytes and passed with only ~26KB of headroom -- the
+// cliff was one character-count away for every card, not particular to #452's size. `claude
+// --help` documents stdin as a first-class prompt channel ("Input must be provided either
+// through stdin or as a prompt argument when using --print"), and spawnSync's `input` option has
+// no size ceiling of its own (bounded only by `maxBuffer` below, sized generously for this).
+function buildArgv(opts) {
+  const argv = ['-p'];
   if (opts.model) argv.push('--model', opts.model);
   if (opts.effort) argv.push('--effort', opts.effort);
   argv.push('--output-format', 'json');
@@ -134,6 +157,7 @@ function classifyFailure(parsed) {
 // programming error (bad opts) throws.
 async function invokeClaudeReal(opts, deps = {}) {
   const spawnSyncFn = deps.spawnSync || spawnSync;
+  const promptText = resolvePromptText(opts);
   const argv = buildArgv(opts);
 
   const env = { ...process.env, ...NONINTERACTIVE_ENV_DEFAULTS };
@@ -164,6 +188,10 @@ async function invokeClaudeReal(opts, deps = {}) {
     cwd: opts.cwd,
     env,
     encoding: 'utf8',
+    // The prompt goes to the child's stdin, never argv -- see buildArgv's own comment on
+    // MAX_ARG_STRLEN. spawnSync writes `input` into the child's stdin pipe (the default
+    // 'pipe' stdio applies since spawnOpts sets no `stdio` of its own).
+    input: promptText,
     maxBuffer: 64 * 1024 * 1024,
   };
   if (typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0) {
@@ -346,19 +374,18 @@ function cannedDryRunPayload(stepName, contract, ctx) {
 
 // Writes journal/<id>/dryrun-<STATE>.md: the exact argv `claude` would have been spawned with
 // (buildArgv never spawns anything itself), and the filled prompt text, so a --dry-run run can
-// be inspected without ever having called the CLI. The prompt itself (argv[1], the `-p` value)
-// is elided from the "## argv" block and shown once, in full, under "## filled prompt" instead
-// -- otherwise the whole flag line (--model/--effort/--json-schema, the part a reader actually
-// wants to scan) would be buried inside one enormous JSON string.
+// be inspected without ever having called the CLI. No elision needed here any more -- since the
+// prompt travels on stdin, not argv, "## argv" is already just the flag line
+// (--model/--effort/--json-schema) a reader wants to scan; the filled prompt is shown in full
+// underneath, its one and only copy in this file.
 function writeDryRunArtifact(taskDir, stepName, argv, promptText) {
   const file = path.join(taskDir, `dryrun-${stepName}.md`);
-  const displayArgv = argv.map((value, i) => (i === 1 ? '<prompt -- see "## filled prompt" below>' : value));
   const body = [
     `# Dry run -- ${stepName}`,
     '',
     '## argv',
     '```json',
-    JSON.stringify(displayArgv),
+    JSON.stringify(argv),
     '```',
     '',
     '## filled prompt',
@@ -543,6 +570,7 @@ module.exports = {
   runLlm,
   invokeClaudeReal,
   buildArgv,
+  resolvePromptText,
   sumCost,
   classifyFailure,
   withCamelAliases,

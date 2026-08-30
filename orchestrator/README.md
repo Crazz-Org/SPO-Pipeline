@@ -137,9 +137,13 @@ const result = await invokeClaudeReal({
 // -> { ok: true, result: 'ok', sessionId: '...', costUsd: 0.0004, numTurns: 1, raw: 0 }
 ```
 
-It spawns `claude -p <prompt> --model <model> --effort <effort> --output-format json
---max-budget-usd <n>` (plus `--allowedTools`/`--permission-mode`/`--json-schema` when given),
-parses the JSON on stdout, sums `costUSD` across every entry of `modelUsage`, and classifies a
+It spawns `claude -p --model <model> --effort <effort> --output-format json
+--max-budget-usd <n>` (plus `--allowedTools`/`--permission-mode`/`--json-schema` when given) with
+the resolved prompt written to the child's stdin — never as an argv entry, since Linux caps each
+individual argv string at `MAX_ARG_STRLEN` (128KB) and a large filled prompt (a big plan/diff/
+criterion) would fail the spawn with `E2BIG` before `claude` ever started (reproduced on card
+#452's ~200KB IMPLEMENT prompt). It parses the JSON on stdout, sums `costUSD` across every entry
+of `modelUsage`, and classifies a
 failure as `{kind: 'limit'}` (an `api_error_status` of 429, or a message matching
 `/limit|overloaded|rate/i`) or `{kind: 'error'}` (everything else). `deps.spawnSync` is the test
 injection point — production code never passes it, so a real call always spawns the real
@@ -249,9 +253,8 @@ spawning anything**. `runLlm` (steps/llm.js) and `runScripted` (steps/scripted.j
 `ctx.dryRun` immediately before their own spawn point:
 
 - an **LLM step** builds the real prompt and the real argv (via the same `buildArgv` real mode
-  uses), writes both to `journal/<id>/dryrun-<STATE>.md` (the argv with the `-p` prompt elided
-  to a pointer, then the filled prompt in full underneath — otherwise the one line worth
-  scanning for `--model`/`--effort`/`--json-schema` is buried inside one giant JSON string),
+  uses), writes both to `journal/<id>/dryrun-<STATE>.md` (the argv — just the flag line, since
+  the prompt itself travels on stdin, not argv — then the filled prompt in full underneath),
   journals a `dry-run` event (never `llm-call`), and returns a minimal
   `outputContract`-satisfying payload marked `{dryRun: true}` — enough to walk the state machine
   forward, never a stand-in for a real judgement. PLAN's canned `plan_path`/`invariants_path`

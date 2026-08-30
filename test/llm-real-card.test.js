@@ -58,9 +58,11 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   };
 
   let seenArgv = null;
+  let seenInput = null;
   const deps = {
-    spawnSync: fakeSpawnSync((command, argv) => {
+    spawnSync: fakeSpawnSync((command, argv, opts) => {
       seenArgv = argv;
+      seenInput = opts.input;
       const reply = realShapedReply({
         plan_markdown: '# Plan\n\nAdd a widget to the header.\n',
         invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
@@ -83,7 +85,7 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   assert.ok(seenArgv.includes('--effort'));
   assert.ok(seenArgv.includes('low')); // S -> low
   assert.ok(seenArgv.includes('--json-schema'));
-  const promptArg = seenArgv[1];
+  const promptArg = seenInput;
   assert.ok(promptArg.includes('/tmp/worktree-99'));
   assert.ok(promptArg.includes('Add a widget'));
 

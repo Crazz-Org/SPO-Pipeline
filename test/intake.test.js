@@ -58,10 +58,12 @@ const VALID_DRAFT = {
 
 test('draftCard: happy path sends model sonnet / effort medium and returns the validated draft', async () => {
   let seenArgv = null;
+  let seenInput = null;
   const deps = {
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync((command, argv) => {
+    spawnSync: fakeSpawnSync((command, argv, opts) => {
       seenArgv = argv;
+      seenInput = opts.input;
       return { status: 0, stdout: JSON.stringify(realShapedReply(VALID_DRAFT)), stderr: '', signal: null };
     }),
   };
@@ -75,7 +77,7 @@ test('draftCard: happy path sends model sonnet / effort medium and returns the v
   assert.equal(seenArgv[modelIdx + 1], 'sonnet');
   const effortIdx = seenArgv.indexOf('--effort');
   assert.equal(seenArgv[effortIdx + 1], 'medium');
-  assert.ok(seenArgv[1].includes('the header has no connection badge'));
+  assert.ok(seenInput.includes('the header has no connection badge'));
 });
 
 test('draftCard: reply whose result is not valid JSON -> {ok:false, error}', async () => {
@@ -273,8 +275,8 @@ test('reviewCard: deps.humanConfirmed threads {{human_confirmed}} into the promp
   let seenPrompts = [];
   const deps = {
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync((command, argv) => {
-      seenPrompts.push(argv[1]);
+    spawnSync: fakeSpawnSync((command, argv, opts) => {
+      seenPrompts.push(opts.input);
       return { status: 0, stdout: JSON.stringify(realShapedReply({ verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' })), stderr: '', signal: null };
     }),
   };
