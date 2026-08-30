@@ -11,8 +11,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { acquireLock, lockPath, LockHeldError } = require('../orchestrator/lock');
-const { DAEMON, mkTmp, writeTask, runDaemonOnce } = require('./helpers');
+const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('../orchestrator/lock');
+const { runTask } = require('../orchestrator/state-machine');
+const { DAEMON, mkTmp, writeTask, runDaemonOnce, readState } = require('./helpers');
 
 test('acquireLock: clean acquire writes {host, pid, startedAt, mode} and release removes it', () => {
   const root = mkTmp('spo-lock-');
@@ -134,6 +135,129 @@ test('daemon.js: two sequential --once runs on the same journal root both succee
   runDaemonOnce(queueDir, journalDir);
   runDaemonOnce(queueDir, journalDir); // would throw if the first run's lock lingered
   assert.equal(fs.existsSync(lockPath(journalDir)), false);
+});
+
+// ---- watchLock: periodic re-verification, not just at acquisition ---------------------------
+
+test('watchLock: fires onLost once a different holder is read back twice in a row', async () => {
+  const root = mkTmp('spo-lock-watch-');
+  const lock = acquireLock(root, 'real');
+
+  let calls = [];
+  const holders = [
+    { pid: 999999, host: os.hostname(), startedAt: 'other' },
+    { pid: 999999, host: os.hostname(), startedAt: 'other' },
+  ];
+  let i = 0;
+  const watch = watchLock(lock, {
+    intervalMs: 5,
+    onLost: (reason, holder) => calls.push({ reason, holder }),
+    deps: { readHolder: () => holders[Math.min(i++, holders.length - 1)] },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  watch.stop();
+  assert.equal(calls.length, 1); // fires exactly once, not once per remaining tick
+  assert.equal(calls[0].reason, 'taken-over');
+  assert.equal(calls[0].holder.pid, 999999);
+  lock.release();
+});
+
+test('watchLock: a single miss that recovers next read never fires onLost (sweep-retry race window)', async () => {
+  const root = mkTmp('spo-lock-watch-');
+  const lock = acquireLock(root, 'real');
+
+  let calls = 0;
+  let i = 0;
+  const reads = [
+    { pid: 999999, host: os.hostname(), startedAt: 'other' }, // one miss...
+    lock.holder, // ...then back to ours before a second consecutive miss
+    lock.holder,
+    lock.holder,
+  ];
+  const watch = watchLock(lock, {
+    intervalMs: 5,
+    onLost: () => calls++,
+    deps: { readHolder: () => reads[Math.min(i++, reads.length - 1)] },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  watch.stop();
+  assert.equal(calls, 0);
+  lock.release();
+});
+
+test('watchLock: a missing lock file (unlinked, not yet recreated) counts as a miss, fires after two', async () => {
+  const root = mkTmp('spo-lock-watch-');
+  const lock = acquireLock(root, 'real');
+
+  let calls = [];
+  const watch = watchLock(lock, {
+    intervalMs: 5,
+    onLost: (reason, holder) => calls.push({ reason, holder }),
+    deps: { readHolder: () => null },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  watch.stop();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].reason, 'lock-file-missing');
+  assert.equal(calls[0].holder, null);
+  lock.release();
+});
+
+test('daemon.js: another live process taking the lock file over stops the daemon with exit 75 and a lock-lost event', async () => {
+  const queueDir = mkTmp('spo-lock-q-');
+  const journalDir = mkTmp('spo-lock-j-');
+  const { spawn } = require('child_process');
+  const child = spawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir],
+    { stdio: 'ignore', env: { ...process.env, SPO_LOCK_WATCH_MS: '30' } }
+  );
+
+  for (let i = 0; i < 100 && !fs.existsSync(lockPath(journalDir)); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(fs.existsSync(lockPath(journalDir)), true, 'daemon never wrote its lock');
+
+  // Overwrite with a different, alive pid (this test process itself answers process.kill) --
+  // the daemon's watchLock has no isAlive check of its own (identity, not liveness, decides a
+  // takeover), so this is enough to simulate another process winning the lock file.
+  fs.writeFileSync(
+    lockPath(journalDir),
+    JSON.stringify({ host: os.hostname(), pid: process.pid, startedAt: 'someone-else', mode: 'real' }) + '\n'
+  );
+
+  const [code] = await new Promise((resolve) => child.once('exit', (c, s) => resolve([c, s])));
+  assert.equal(code, 75);
+
+  const daemonLog = fs
+    .readFileSync(path.join(journalDir, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.ok(daemonLog.some((e) => e.event === 'lock-lost'));
+  // The takeover's own lock file must survive -- release() only ever removes OUR lock.
+  assert.equal(fs.existsSync(lockPath(journalDir)), true);
+});
+
+// ---- runTask cooperative check: a lost lock stops before another park/write happens ----------
+
+test('runTask: config.lockLost() true throws LockLostError before any handler runs -- no PARKED write', async () => {
+  const journalDir = mkTmp('spo-lock-runtask-');
+  const taskDir = path.join(journalDir, 'lockLostTask');
+  fs.mkdirSync(taskDir, { recursive: true });
+
+  const config = { shadowMode: true, lockLost: () => true, lockLostHolder: () => ({ pid: 1, host: 'x' }) };
+
+  await assert.rejects(
+    () => runTask('lockLostTask', { id: 'lockLostTask', shadow: {} }, taskDir, config),
+    (err) => err instanceof LockLostError
+  );
+
+  const state = readState(journalDir, 'lockLostTask');
+  assert.equal(state.state, 'INTAKE'); // the pre-loop snapshot only -- never overwritten to PARKED
 });
 
 test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook)', async () => {

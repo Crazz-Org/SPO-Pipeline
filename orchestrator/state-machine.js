@@ -26,6 +26,7 @@ const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeRepor
 const { scratchDir } = require('./task-values');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
+const { LockLostError } = require('./lock');
 const { callWithDeadline } = require('./deadline');
 const {
   runScripted,
@@ -576,6 +577,16 @@ async function runTask(id, task, taskDir, config) {
     if (++hops > HOP_LIMIT) {
       finalizePark(ctx, state, 'state-machine-runaway', { hops });
       return 'PARKED';
+    }
+    // Cooperative lock check, between states rather than inside a handler: a handler can be
+    // mid-spawnSync (blocking, single-threaded) when lock.js's watchLock timer fires, so the
+    // timer alone cannot interrupt a running step -- this is the point every step chain passes
+    // through. config.lockLost is set by daemon.js only; absent in every test and in --once
+    // shadow runs, so this is a no-op there. Deliberately NOT caught below (LockLostError is not
+    // a ParkSignal -- see lock.js's own doctrine comment): a park is itself a write to shared
+    // state this process may no longer be the legitimate owner of.
+    if (config.lockLost && config.lockLost()) {
+      throw new LockLostError('lock-lost-mid-task', config.lockLostHolder && config.lockLostHolder());
     }
     const handler = HANDLERS[state];
     if (!handler) {

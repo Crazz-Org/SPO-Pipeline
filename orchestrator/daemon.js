@@ -36,7 +36,7 @@ const path = require('path');
 const defaultConfig = require('./config');
 const { drainQueueOnce, runForever } = require('./state-machine');
 const accounts = require('./accounts');
-const { acquireLock, LockHeldError } = require('./lock');
+const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
 const { appendDaemonEvent } = require('./journal');
 const { orphanScan } = require('./orphan-scan');
 
@@ -194,6 +194,37 @@ async function main() {
     owner: { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
   };
 
+  // Periodic lock re-verification (lock.js's watchLock) -- acquireLock only ever checks liveness
+  // once, at startup; this is the ongoing check for a live daemon that had its lock taken over
+  // (another process started against the same journal root, or won a stale-sweep race against
+  // this one). config.lockLost/lockLostHolder are the flags runTask's cooperative check
+  // (state-machine.js) polls between states; onLost fires at most once and stops the timer, so
+  // there is exactly one exit attempt, never a storm of them.
+  let lockLost = false;
+  let lockLostHolder = null;
+  config.lockLost = () => lockLost;
+  config.lockLostHolder = () => lockLostHolder;
+  const lockWatch = watchLock(lock, {
+    intervalMs: config.lockWatchMs,
+    onLost: (reason, holder) => {
+      lockLost = true;
+      lockLostHolder = holder;
+      appendDaemonEvent(journalRoot, 'lock-lost', { reason, holder, ours: lock.holder });
+      console.error(
+        `orchestrator/daemon.js: lock ${lockPath(journalRoot)} was taken over by another process (${reason}) -- stopping.`
+      );
+      // 75 = EX_TEMPFAIL: a transient condition, not a program error -- systemd's Restart=always
+      // brings this unit back, and the new start either resolves cleanly (the takeover was
+      // itself a legitimate restart racing this one) or refuses normally against the winner's
+      // live lock (LockHeldError above). Never disguised as a park (see LockLostError's own
+      // doctrine comment) -- this process may no longer be the legitimate writer of PARKED
+      // state.json/report.md/board-move/gh-comment.
+      process.exitCode = 75;
+      process.exit(75);
+    },
+  });
+  process.once('exit', lockWatch.stop);
+
   // Unconditional, every start, every mode: a task this journal root's PREVIOUS daemon left
   // mid-run when it died is otherwise invisible forever (not in queue/, not PARKED) -- this is
   // the case that actually matters (crash -> systemd restart); runForever's own periodic scan
@@ -213,6 +244,15 @@ async function main() {
 }
 
 main().catch((err) => {
+  if (err instanceof LockLostError) {
+    // Already logged (and exited 75) by watchLock's onLost handler above -- this only catches
+    // the case where the LockLostError propagated up through runTask/runForever/drainQueueOnce
+    // before that handler's own process.exit(75) landed. One line, no stack: this is an expected
+    // shutdown path, not a crash.
+    console.error(`orchestrator/daemon.js: ${err.message}`);
+    process.exitCode = 75;
+    return;
+  }
   console.error(err);
   process.exitCode = 1;
 });

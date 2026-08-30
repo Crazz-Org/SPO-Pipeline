@@ -46,6 +46,21 @@ class LockHeldError extends Error {
   }
 }
 
+// Thrown by watchLock's onLost handler wiring in daemon.js (never by this module itself) once a
+// running daemon discovers another process now holds its lock -- see watchLock's own header.
+// Deliberately NOT a ParkSignal (park-signal.js's doctrine): this is not an outcome of the task
+// running, it is this process losing the authority to keep writing shared state at all, so
+// state-machine.js's runTask must let it propagate uncaught rather than turn it into a park (a
+// park is itself a write to the state this process may no longer own).
+class LockLostError extends Error {
+  constructor(reason, holder) {
+    super(`lock lost: ${reason}${holder ? ` (now held by pid ${holder.pid} on ${holder.host})` : ''}`);
+    this.name = 'LockLostError';
+    this.reason = reason;
+    this.holder = holder || null;
+  }
+}
+
 function lockPath(journalRoot) {
   return path.join(journalRoot, 'daemon.lock');
 }
@@ -123,6 +138,52 @@ function acquireLock(journalRoot, mode, deps = {}) {
   throw new LockHeldError(winner, file);
 }
 
+// watchLock(lock, {intervalMs, onLost, deps}) -> {stop()}
+//
+// Re-reads the lock file on a timer and calls onLost(reason, holder) the first time it finds a
+// holder that is not this process's own (a live process took the lock file over -- another
+// daemon started, this one's stale-sweep window raced, systemd restarted the unit while the old
+// process was still exiting). acquireLock only ever checks liveness once, at startup; this is
+// the periodic re-check the header's WHY section describes -- see daemon.js for the wiring that
+// turns onLost into a clean, silent process exit (never a park -- see LockLostError above).
+//
+// Two consecutive "not ours" reads are required before firing, not one: unlinkSync followed by a
+// fresh tryCreate (acquireLock's own stale-sweep retry, and this process's own eventual release)
+// each pass through a brief window where the file is briefly absent or briefly holds a
+// transitional value -- see lock.js's own stale-sweep comment on the identical race. A watch on
+// our OWN lock must never fire on that.
+//
+// `deps.readHolder` is the test-only override (same convention as `deps.isAlive`); production
+// never passes it. The timer is unref()'d -- it must never be the reason the process stays alive.
+function watchLock(lock, { intervalMs, onLost, deps = {} } = {}) {
+  const readHolderFn = deps.readHolder || readHolder;
+  let misses = 0;
+  let stopped = false;
+
+  const timer = setInterval(() => {
+    if (stopped) return;
+    const holder = readHolderFn(lock.path);
+    const ours = holder && holder.pid === lock.holder.pid && holder.startedAt === lock.holder.startedAt;
+    if (ours) {
+      misses = 0;
+      return;
+    }
+    misses += 1;
+    if (misses < 2) return; // one miss might just be the sweep-retry race -- wait for a second
+    stopped = true;
+    clearInterval(timer);
+    onLost(holder ? 'taken-over' : 'lock-file-missing', holder);
+  }, intervalMs);
+  timer.unref();
+
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 function releaseLock(file) {
   const holder = readHolder(file);
   if (!holder || holder.pid !== process.pid) return; // not ours (or already gone) -- leave it
@@ -133,4 +194,4 @@ function releaseLock(file) {
   }
 }
 
-module.exports = { acquireLock, lockPath, LockHeldError, processAlive };
+module.exports = { acquireLock, lockPath, LockHeldError, LockLostError, processAlive, watchLock };
