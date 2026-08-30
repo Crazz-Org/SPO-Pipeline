@@ -226,9 +226,52 @@ async function runRemoteReportPull(journalRoot, config, deps = {}) {
   return { ok: true, listed: listed.reports.length, pulled, acked, rejected, errors };
 }
 
+// startRemoteReportPullLoop(journalRoot, config, deps) -- runs runRemoteReportPull on its OWN
+// setTimeout chain, independent of runForever's `for (;;) { await drainQueueOnce(...); ... }`
+// loop. Why: that loop only reaches its timer checks once drainQueueOnce resolves, so a single
+// long-running task (a gate/bench run, say) starves this pull for as long as the task takes --
+// observed live 2026-08-30, a report sitting on production for hours because the daemon's task
+// loop never came up for air. Pulling is deliberately cheap and idempotent (see this file's own
+// header on ordering/dedup), so the fix leans into that: fire once immediately (also covers the
+// post-restart case -- no need to persist lastAt across a restart) and again every
+// remoteReportPullMs after, forever, regardless of what the task loop is doing. An extra pull
+// racing the task loop's own timer-gated call is harmless (ackedFilenames dedups), so this
+// REPLACES that call in runForever rather than running alongside it.
+// Never lets a failure (network, bad JSON, misconfiguration) go unlogged -- state-machine.js's
+// old call site awaited runRemoteReportPull without ever checking `ok`, so a `{ok:false}` was
+// previously silent; this loop journals it every time.
+function startRemoteReportPullLoop(journalRoot, config, deps = {}) {
+  let stopped = false;
+  let timer = null;
+
+  async function tick() {
+    if (stopped) return;
+    try {
+      const result = await runRemoteReportPull(journalRoot, config, deps);
+      if (result && result.ok === false) {
+        appendDaemonEvent(journalRoot, 'remote-report-pull-failed', { error: result.error });
+      }
+    } catch (err) {
+      appendDaemonEvent(journalRoot, 'remote-report-pull-failed', { error: err.message });
+    }
+    if (stopped) return;
+    const delayMs = config.remoteReportPullMs > 0 ? config.remoteReportPullMs : DEFAULT_REMOTE_PULL_MS;
+    timer = setTimeout(tick, delayMs);
+    if (typeof timer.unref === 'function') timer.unref(); // never keeps the process alive on its own
+  }
+
+  tick(); // fire immediately: the same "due since forever" behavior shouldPullRemoteReports(null, ...) gave on restart
+
+  return function stopRemoteReportPullLoop() {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+  };
+}
+
 module.exports = {
   shouldPullRemoteReports,
   runRemoteReportPull,
+  startRemoteReportPullLoop,
   isSafeReportFilename,
   readPullToken,
   ackedFilenames,
