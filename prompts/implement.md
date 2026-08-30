@@ -1,7 +1,7 @@
 <!--
   Step: IMPLEMENT  (state-machine-spec.md § Step contracts)
   Placeholders: {{issue_number}} {{worktree}} {{task_criterion}} {{plan_path}} {{invariants_path}}
-                {{invariant_ids}} {{check_commands}}
+                {{invariant_ids}} {{check_commands}} {{diagnosis}}
   Output — stdout, JSON only, nothing else:
   {
     "summary": "<a few sentences, prose>",
@@ -29,6 +29,7 @@ plan:       {{plan_path}}
 invariants: {{invariants_path}}
 inv_ids:    {{invariant_ids}}
 checks:     {{check_commands}}
+diagnosis:  {{diagnosis}}
 ```
 
 ## What you do
@@ -38,17 +39,24 @@ checks:     {{check_commands}}
    wrong or insufficient for `{{task_criterion}}`, stop and say so in `summary` rather than
    improvising a different design — a plan defect is reported, not silently corrected by you.
    The plan owns the design; you own the execution of it.
-3. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
+3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this
+   step. Any other value means a prior DIAGNOSE pass named a specific, reproducing cause after
+   an earlier attempt's checks/CI failed — treat its `suggested fix` as a required amendment to
+   the plan for *this* attempt, on top of (never instead of) the plan itself. Do not re-verify
+   the plan is already satisfied and stop there if the diagnosed cause is still present in the
+   worktree — that is exactly the loop DIAGNOSE exists to break, and re-declaring the plan
+   "already implemented" without addressing it just re-triggers the same diagnosis next round.
+4. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
    own layout (`module.ts` → `module.test.ts`, same directory; the `unit` / `component` Jest
-   projects) — do not hand-count coverage, run the real tool (step 4).
-4. **Run every command in `{{check_commands}}` yourself**, inside `{{worktree}}`, plus (if not
+   projects) — do not hand-count coverage, run the real tool (step 5).
+5. **Run every command in `{{check_commands}}` yourself**, inside `{{worktree}}`, plus (if not
    already among them) `npm run typecheck`, `npm run lint`, `npm run coverage:changed`. Read
    **exit codes**, never printed banners: a command piped into `tail`/`head`/`grep` reports the
    pipe's exit code, not the command's; a command backgrounded with a trailing `&` is reported
    as the shell's fork, always 0. Redirect to a file and read the status instead. Re-run a
    command after you fix what it flagged — `all_green: true` is only honest if every command in
    `tests_run` exited 0 on its **last** run, not its first.
-5. **Self-check the invariants.** For every id in `{{invariant_ids}}`: read the quote yourself
+6. **Self-check the invariants.** For every id in `{{invariant_ids}}`: read the quote yourself
    from `{{invariants_path}}` — it is never given to you inline — normalize it (strip comment
    markers `#`, `**`, a leading `-` or `*`; collapse all whitespace, line breaks included, to
    single spaces) and check whether that normalized text is still a substring of the same
@@ -57,7 +65,7 @@ checks:     {{check_commands}}
    `CHANGED` row is not a defect you fix by rewriting the comment back into agreement — it means
    your change touched ground the plan told you not to; report it and let the driver decide, do
    not launder it into `HELD`.
-6. **List every file you actually changed**, read from `git status --porcelain` (or the
+7. **List every file you actually changed**, read from `git status --porcelain` (or the
    equivalent) inside `{{worktree}}` — never from memory, never a file you merely opened.
 
 ## Rules
@@ -66,8 +74,10 @@ checks:     {{check_commands}}
   a path outside it — check every path is rooted there before you write to it. If a tool
   refuses a write outside the worktree, that refusal is correct; do not look for another way to
   reach the same path.
-- **Stay inside the plan's scope.** One card, one plan, one attempt — a plan that is wrong is
-  reported in `summary`, not silently expanded around.
+- **Stay inside the plan's scope, amended only by `diagnosis` above.** One card, one plan, one
+  attempt — a plan that is wrong is reported in `summary`, not silently expanded around. The one
+  exception is a non-empty `diagnosis`: DIAGNOSE only ever names a cause that is already blocking
+  this same card (a failing check, a red gate, a CI failure), never new scope of its own.
 - **The RDO wire rule is not your call.** If the plan touches `src/shared/rdo-*`,
   `src/server/rdo.ts`, `rdo-members.ts`, or session-phase code, the caller has already escalated
   this step to Opus 5 per CLAUDE.md's wire rule — you do not choose your own model, and a new

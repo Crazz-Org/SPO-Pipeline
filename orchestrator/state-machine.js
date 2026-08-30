@@ -357,7 +357,22 @@ async function handleDiagnose(ctx) {
   const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
   const attemptN = ++ctx.counters.diagnoseAttempts;
   const rootCause = (result && result.rootCause) || `unspecified-cause-${attemptN}`;
-  appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', { attempt: attemptN, rootCause });
+  const category = (result && result.category) || null;
+  const suggestedFix = (result && result.suggestedFix) || null;
+  // Journal category/suggestedFix alongside rootCause -- task-values.js's IMPLEMENT derivation
+  // (buildPromptValues) reads this same 'result' event back so the next IMPLEMENT attempt
+  // actually sees what DIAGNOSE found, instead of re-reading only the original PLAN and
+  // reporting "already implements this plan exactly" against a cause it never learned about
+  // (see doc/todo-triage-after-hooks-retirement.md's issue-213 case: three IMPLEMENT attempts in
+  // a row went empty because the diagnosed SSRF/untrusted-write cause was never threaded to
+  // IMPLEMENT, only ever written to the ledger).
+  // Nested under `payload`, matching PLAN's/IMPLEMENT's own 'result' event shape -- task-values.js's
+  // lastResultPayload() (the reader every other step's derivation already goes through) only
+  // ever looks at `event.payload`, so a flat shape here would be silently invisible to it.
+  appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', {
+    attempt: attemptN,
+    payload: { rootCause, category, suggestedFix },
+  });
 
   const duplicate = ctx.counters.seenRootCauses.has(rootCause);
   const budgetExhausted = attemptN >= ctx.config.diagnoseBudget;
