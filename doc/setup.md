@@ -2,8 +2,8 @@
 
 **Environment setup is owned by [SPO-Deploy](https://github.com/Crazz-Org/SPO-Deploy) — its
 root README is the authority** (maintainer decision, 2026-08-29): the environment matrix, the
-scripted procedure (`setup.sh dev|prod` + `setup.conf`), what stays manual by design (tokens,
-logins), and the security rules.
+scripted procedure (`deploy.sh setup dev|prod` + `setup.conf`), what stays manual by design
+(tokens, logins), and the security rules.
 
 Start there:
 
@@ -12,7 +12,7 @@ cd ~/SPO-Deploy && cp setup.conf.example setup.conf
 ```
 
 ```bash
-cd ~/SPO-Deploy && ./setup.sh dev
+cd ~/SPO-Deploy && ./deploy.sh setup dev
 ```
 
 ## § Accounts — the one section that stays here
