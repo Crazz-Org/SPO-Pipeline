@@ -31,29 +31,15 @@ const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 
-// Inferred (see file header) -- not sourced from spec or README.
-const BUDGET_BY_SIZE_USD = { S: 2, M: 5, L: 12 };
-// Was $1 -- too tight for review-card: verifying a citation into the sibling repo (product repo
-// cwd, ~SPO-Pipeline code reviewed by intake.js's reviewCard, model fable effort high) makes real
-// tool calls whose cache-read/cache-write tokens alone can clear $1, and the CLI kills the session
-// mid-flight on `--max-budget-usd`. Reproduced twice: sessions died at ~61s with ~18k output +
-// ~840k cache-read + ~125k cache-write tokens. $3 gives headroom without opening this up to
-// PLAN/IMPLEMENT-sized spend -- see BUDGET_BY_SIZE_USD above for that tier.
-const SMALL_BUDGET_USD = 3;
-
-// triage-bug-report (orchestrator/intake.js's triageBugReport, behind `spo triage` /
-// auto-triage.js) does everything reviewCard does (fable, effort high, real cross-repo reads)
-// plus a curl against the model-server log and a `gh issue list --search` dedup call on top --
-// plausibly heavier than SMALL_BUDGET_USD's $3, but unmeasured against a real run (no soak of
-// this step exists yet, unlike SMALL_BUDGET_USD's own history above). $6 is this build's own
-// starting guess, not an empirical figure -- raise or lower it once a real `spo triage` run
-// either dies at this cap or comes in well under it. See orchestrator/README.md § Auto-triage.
-const BUG_REPORT_BUDGET_USD = 6;
+// Per-call $ budget cap (`--max-budget-usd`) is intentionally NOT set anywhere in this file --
+// the maintainer runs a Claude Max subscription with no overage risk, so every LLM step
+// (this table and orchestrator/intake.js's draftCard/reviewCard/triageBugReport) omits the flag
+// entirely and runs unlimited. See steps/llm.js's buildArgv: the flag is only pushed when
+// opts.maxBudgetUsd is a number, so `undefined` here means "no cap", not "cap of undefined".
 
 // config.js's stepDeadlineMs (120000ms) is sized for the daemon's own scripted steps
-// (steps/scripted.js) and is not a fit for a real LLM step: BUDGET_BY_SIZE_USD/SMALL_BUDGET_USD
-// above are the actual spend bound a call is meant to die by, and the deadline must not fire
-// before the budget does. Reproduced 2026-08-29: a real PLAN step (fable) died at the 120s
+// (steps/scripted.js) and is not a fit for a real LLM step, even with the $ cap above removed:
+// a step with no budget still has to stop eventually. Reproduced 2026-08-29: a real PLAN step (fable) died at the 120s
 // wall-clock mark with "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]"
 // (that exact message no longer occurs since the 2026-08-30 fix -- a deadline kill now says
 // "claude ran but exceeded the Xms deadline and was killed", see steps/llm.js's `timedOut`)
@@ -102,18 +88,6 @@ const STEP_CONTRACTS = {
     // here).
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only planning mode; matches the state's own name
-    maxBudgetUsd: 'bySize',
-    // Continuous-daemon soak, 2026-08-29: card issue-232 (size S, BUDGET_BY_SIZE_USD.S = $2) had
-    // its PLAN killed at terminal_reason=budget_exhausted -- $2.0467 spent over 16 turns, over
-    // the S cap before the plan was even done. Card issue-247's PLAN ($1.67) barely fit earlier
-    // the same day. PLAN legitimately explores (reads product code + the Delphi reference)
-    // regardless of the card's size -- S's $2 is too tight for this one step specifically, even
-    // though S is the right size/effort tier for the change itself. Maintainer chose the
-    // surgical fix over raising BUDGET_BY_SIZE_USD.S for every step: PLAN alone gets a $3 floor,
-    // applied in resolveStepContract as max(BUDGET_BY_SIZE_USD[size], budgetFloorUsd) -- M ($5)
-    // and L ($12) already clear $3 and are unaffected by the max; every other step is untouched
-    // (no budgetFloorUsd field, no-op in the max below).
-    budgetFloorUsd: 3,
     cwdKind: 'worktree', // reads {{worktree}}; config.cwdForStep already encodes this split
     outputContract: {
       // plan_path/invariants_path are NOT here: PLAN runs permissionMode: 'plan' (read-only --
@@ -137,7 +111,6 @@ const STEP_CONTRACTS = {
     // Bash to run the check commands, Edit/Write to make the change.
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash', 'Edit', 'Write'],
     permissionMode: 'acceptEdits', // no human in the loop to approve each edit
-    maxBudgetUsd: 'bySize',
     cwdKind: 'worktree',
     outputContract: {
       required: ['summary', 'files_changed', 'invariants', 'tests_run', 'all_green'],
@@ -152,7 +125,6 @@ const STEP_CONTRACTS = {
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Bash'],
     permissionMode: 'default',
-    maxBudgetUsd: 'small',
     cwdKind: 'pipeline', // judges artifacts the orchestrator already produced
     // diagnose.md's header declares two mutually-exclusive shapes; "root_cause" (possibly
     // null) is the one key common to both, so it is the only one whose *presence* is a hard
@@ -175,7 +147,6 @@ const STEP_CONTRACTS = {
     // tool the prompt never actually needs to invoke (it is read-only regardless).
     allowedTools: ['Read', 'Grep'],
     permissionMode: 'default',
-    maxBudgetUsd: 'small',
     cwdKind: 'pipeline',
     outputContract: { required: ['verdict', 'entries'] },
   },
@@ -195,7 +166,6 @@ const STEP_CONTRACTS = {
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'default',
-    maxBudgetUsd: 'small',
     cwdKind: 'pipeline',
     outputContract: { required: ['verdict', 'reasons', 'findings'] },
   },
@@ -228,12 +198,6 @@ function resolveStepContract(stepName, task = {}) {
 
   const size = (task && task.size) || DEFAULT_SIZE;
   const effort = stepDef.effort === 'bySize' ? EFFORT_BY_SIZE[size] || EFFORT_BY_SIZE[DEFAULT_SIZE] : stepDef.effort;
-  // budgetFloorUsd (table-driven, PLAN only today -- see its entry above) raises a 'bySize'
-  // step's resolved budget to at least that floor; a step with no budgetFloorUsd field takes
-  // Math.max(x, undefined) === NaN, so the `|| 0` keeps every other step a no-op here.
-  const bySizeBudget = BUDGET_BY_SIZE_USD[size] || BUDGET_BY_SIZE_USD[DEFAULT_SIZE];
-  const maxBudgetUsd =
-    stepDef.maxBudgetUsd === 'bySize' ? Math.max(bySizeBudget, stepDef.budgetFloorUsd || 0) : SMALL_BUDGET_USD;
 
   return {
     step: stepName,
@@ -243,7 +207,8 @@ function resolveStepContract(stepName, task = {}) {
     effort,
     allowedTools: stepDef.allowedTools,
     permissionMode: stepDef.permissionMode,
-    maxBudgetUsd,
+    // No $ cap: steps/llm.js's buildArgv only passes --max-budget-usd when this is a number.
+    maxBudgetUsd: undefined,
     jsonSchema: { type: 'object', required: stepDef.outputContract.required },
     cwdKind: stepDef.cwdKind,
     outputContract: stepDef.outputContract,
@@ -253,9 +218,6 @@ function resolveStepContract(stepName, task = {}) {
 module.exports = {
   STEP_CONTRACTS,
   EFFORT_BY_SIZE,
-  BUDGET_BY_SIZE_USD,
-  SMALL_BUDGET_USD,
-  BUG_REPORT_BUDGET_USD,
   LLM_STEP_DEADLINE_MS,
   shouldEscalate,
   resolveStepContract,
