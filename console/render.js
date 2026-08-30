@@ -83,13 +83,6 @@ function verdictClass(v) {
   return 'verdict-unknown';
 }
 
-function dotClass(status) {
-  if (status === 'up' || status === 'ok' || status === 'pass') return 'dot-green';
-  if (status === 'busy' || status === 'stale' || status === 'warn') return 'dot-orange';
-  if (status === 'down' || status === 'fail') return 'dot-red';
-  return 'dot-gray';
-}
-
 function fmtAgeMs(ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '—';
   const s = Math.round(ms / 1000);
@@ -182,6 +175,61 @@ const CSS = `
     --shadow-md: 0 4px 14px rgba(20,20,45,0.08), 0 1px 3px rgba(20,20,45,0.05);
     --shadow-glow: 0 0 0 1px rgba(91,69,230,0.08), 0 8px 24px rgba(91,69,230,0.10);
   }
+}
+/* Explicit override from the topbar toggle (LIVE_SCRIPT/THEME_SCRIPT sets data-theme + persists
+   it in localStorage) -- higher specificity than the plain :root/@media rules above, so it wins
+   over the OS preference in either direction once the operator has picked one by hand. */
+:root[data-theme="light"] {
+  --bg: #f4f5f8;
+  --bg-grad: radial-gradient(1200px 600px at 10% -10%, #ece8ff 0%, transparent 55%), #f4f5f8;
+  --card-bg: #ffffff;
+  --surface-2: #eceef3;
+  --surface-hover: #f8f8fc;
+  --border: #dfe2ea;
+  --border-soft: #eaecf2;
+  --fg: #161822;
+  --muted: #5b6072;
+  --faint: #8b90a2;
+  --accent: #5b45e6;
+  --accent-strong: #4633c9;
+  --accent-soft: #efebff;
+  --teal: #0ea5a3;
+  --green: #16a34a;
+  --green-bg: #e7f7ec;
+  --red: #dc2626;
+  --red-bg: #fde8e7;
+  --orange: #d97706;
+  --orange-bg: #fdf1de;
+  --gray-bg: #eceef3;
+  --shadow-sm: 0 1px 2px rgba(20,20,45,0.05), 0 1px 1px rgba(20,20,45,0.03);
+  --shadow-md: 0 4px 14px rgba(20,20,45,0.08), 0 1px 3px rgba(20,20,45,0.05);
+  --shadow-glow: 0 0 0 1px rgba(91,69,230,0.08), 0 8px 24px rgba(91,69,230,0.10);
+}
+:root[data-theme="dark"] {
+  --bg: #0e0f16;
+  --bg-grad: radial-gradient(1200px 600px at 10% -10%, #201a42 0%, transparent 55%), #0e0f16;
+  --card-bg: #171923;
+  --surface-2: #1f2230;
+  --surface-hover: #20222f;
+  --border: #2a2d3c;
+  --border-soft: #23262f;
+  --fg: #eceefc;
+  --muted: #9599b0;
+  --faint: #6b6f85;
+  --accent: #9b8cff;
+  --accent-strong: #b3a6ff;
+  --accent-soft: #241f47;
+  --teal: #4fd9d4;
+  --green: #4ade80;
+  --green-bg: #123322;
+  --red: #ff7a7a;
+  --red-bg: #3a1a1a;
+  --orange: #fbbf59;
+  --orange-bg: #3a2a10;
+  --gray-bg: #23263355;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+  --shadow-glow: 0 0 0 1px rgba(155,140,255,0.15), 0 8px 24px rgba(155,140,255,0.12);
 }
 * { box-sizing: border-box; }
 body {
@@ -332,6 +380,26 @@ details summary:hover { background: var(--surface-hover); }
 body[data-stale="1"] .frag { opacity: 0.55; }
 #offline-banner { display: none; }
 body[data-stale="1"] #offline-banner { display: block; }
+
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.1rem; flex-wrap: wrap; }
+.brand { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+.brand h1 { margin: 0; }
+.brand .stamp { color: var(--faint); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+.topbar-right { display: flex; align-items: center; gap: 0.6rem; }
+.theme-toggle {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  border: 1px solid var(--border); background: var(--card-bg);
+  border-radius: 999px; padding: 0.32rem 0.7rem 0.32rem 0.5rem;
+  font-size: 0.78rem; font-weight: 600; color: var(--muted);
+  cursor: pointer; box-shadow: var(--shadow-sm);
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.theme-toggle:hover { background: var(--surface-hover); }
+.theme-toggle:active { transform: scale(0.97); }
+.theme-toggle .icon { font-size: 0.95rem; }
+
+.section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.65rem; flex-wrap: wrap; gap: 0.4rem; }
+.subgrid-note { color: var(--faint); font-size: 0.78rem; margin-top: 0.4rem; }
 
 @media (max-width: 720px) {
   table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
@@ -484,26 +552,8 @@ function renderSystemFragment(system) {
 
 // ---- 3. comptes Claude ----------------------------------------------------------------------
 
-function accountTokenRows(accountName, tokens) {
-  if (!tokens || !tokens.byAccountModel) return '';
-  const rows = tokens.byAccountModel.filter((r) => r.account === accountName);
-  if (rows.length === 0) return '';
-  const body = rows
-    .map(
-      (r) => `<tr>
-      <td>${escapeHtml(r.model)}</td>
-      <td class="num">${fmtNum(r.Mcr)}</td>
-      <td class="num">${fmtNum(r.Mcc)}</td>
-      <td class="num">${fmtNum(r.Mout)}</td>
-    </tr>`
-    )
-    .join('');
-  return `<table>
-    <thead><tr><th>modèle</th><th class="num">Mtok cache-read</th><th class="num">Mtok cache-write</th><th class="num">Mtok sortie</th></tr></thead>
-    <tbody>${body}</tbody>
-  </table>`;
-}
-
+// Per-account token detail lives in the Tokens section's "par compte" table (renderTokensLive)
+// -- NOT duplicated here as a nested subtable, to avoid showing the same numbers twice.
 function renderAccountsInner(accounts, tokens) {
   const rows = (accounts && accounts.rows) || [];
   if (rows.length === 0) {
@@ -517,16 +567,20 @@ function renderAccountsInner(accounts, tokens) {
       <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '—'}</td>
       <td>${a.hasToken ? 'oui' : 'non'}</td>
       <td>${a.hasCredentials ? 'oui' : 'non'}</td>
-    </tr>${accountTokenRows(a.name, tokens) ? `<tr><td colspan="5">${accountTokenRows(a.name, tokens)}</td></tr>` : ''}`
+    </tr>`
     )
     .join('');
-  const tokensNote = tokens ? '' : '<p class="meta">tokens non mesurés (mode instantané)</p>';
+  const tokensNote = tokens
+    ? '<p class="subgrid-note">détail des tokens par compte disponible dans la section « Tokens » plus bas</p>'
+    : '<p class="meta">tokens non mesurés (mode instantané)</p>';
   return `<h2>Comptes Claude</h2>
-    <table>
-      <thead><tr><th>nom</th><th>activé</th><th>refroidissement jusqu'à</th><th>jeton</th><th>identifiants</th></tr></thead>
-      <tbody>${body}</tbody>
-    </table>
-    ${tokensNote}`;
+    <div class="card">
+      <table>
+        <thead><tr><th>nom</th><th>activé</th><th>refroidissement jusqu'à</th><th>jeton</th><th>identifiants</th></tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+      ${tokensNote}
+    </div>`;
 }
 
 // ---- 4. stats démon -------------------------------------------------------------------------
@@ -570,9 +624,11 @@ function renderReportsInner(reports) {
       ${kpi('en attente de confirmation', fmtInt(r.pendingConfirm))}
       ${kpi('confirmés non triés', fmtInt(r.confirmedAwaitingTriage))}
     </div>
-    ${cycleLine}
-    <p class="meta">24 h : ${escapeHtml(w.triagedFiled || 0)} filés &middot; ${escapeHtml(w.held || 0)} tenus &middot; ${escapeHtml(w.triagedDuplicate || 0)} doublons &middot; ${escapeHtml(w.discarded || 0)} rejetés</p>
-    ${pullLine}`;
+    <div class="card">
+      ${cycleLine}
+      <p class="meta">24 h : ${escapeHtml(w.triagedFiled || 0)} filés &middot; ${escapeHtml(w.held || 0)} tenus &middot; ${escapeHtml(w.triagedDuplicate || 0)} doublons &middot; ${escapeHtml(w.discarded || 0)} rejetés</p>
+      ${pullLine}
+    </div>`;
 }
 
 // ---- 6. version production ------------------------------------------------------------------
@@ -585,13 +641,21 @@ function renderProdInner(prod) {
   const deployed = prod.deployed || {};
   const expected = prod.expected || {};
   const statusLabel = site.status === 'up' ? 'UP' : site.status === 'down' ? 'DOWN' : 'INCONNU';
+  const badgeCls = site.status === 'up' ? 'badge-up' : site.status === 'down' ? 'badge-down' : 'verdict-unknown';
   const driftBadge = prod.drift === 'diverged' ? '<span class="badge badge-drift">écart</span>' : '';
 
   return `<h2>Version production</h2>
-    <p><span class="dot ${dotClass(site.status)}"></span><strong>${escapeHtml(statusLabel)}</strong>${site.latencyMs !== null ? ` &middot; ${escapeHtml(site.latencyMs)} ms` : ''} ${driftBadge}</p>
-    <p class="meta">version attendue (dernière release) : ${expected.version ? `<code>v${escapeHtml(expected.version)}</code>` : '—'}</p>
-    <p class="meta">version déployée : ${deployed.exposed ? `<code>${escapeHtml(deployed.version)}</code>` : 'non exposée'}</p>
-    <p class="meta">dernier contrôle : ${escapeHtml(prod.checkedAt || '—')}</p>`;
+    <div class="card" style="display:flex; flex-wrap:wrap; align-items:center; gap:0.9rem; justify-content:space-between">
+      <div style="display:flex; align-items:center; gap:0.6rem">
+        <span class="badge ${badgeCls}">${escapeHtml(statusLabel)}</span>
+        <span class="meta">${site.latencyMs !== null ? `${escapeHtml(site.latencyMs)} ms &middot; ` : ''}dernier contrôle ${escapeHtml(fmtDateTime(prod.checkedAt))}</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:0.9rem; flex-wrap:wrap">
+        <span class="meta">attendue : ${expected.version ? `<code>v${escapeHtml(expected.version)}</code>` : '—'}</span>
+        <span class="meta">déployée : ${deployed.exposed ? `<code>${escapeHtml(deployed.version)}</code>` : 'non exposée'}</span>
+        ${driftBadge}
+      </div>
+    </div>`;
 }
 
 // ---- 7. tokens par tâche/modèle ---------------------------------------------------------------
@@ -624,19 +688,45 @@ function renderTokensLive(tokens) {
     )
     .join('');
 
+  const acctRows = (tokens.byAccountModel || [])
+    .map(
+      (r) => `<tr>
+      <td>${escapeHtml(r.account)}</td>
+      <td>${escapeHtml(r.model)}</td>
+      <td class="num">${fmtNum(r.Mcr)}</td>
+      <td class="num">${fmtNum(r.Mcc)}</td>
+      <td class="num">${fmtNum(r.Mout)}</td>
+    </tr>`
+    )
+    .join('');
+
   const u = tokens.unattributed || {};
 
-  return `<h2>Tokens par tâche</h2>
-    <table>
-      <thead><tr><th>tâche</th><th>état</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
-      <tbody>${taskRows || '<tr><td colspan="7" class="empty">(aucune)</td></tr>'}</tbody>
-    </table>
-    <p class="meta">non attribué (sessions sans tâche connue) : ${escapeHtml(u.sessions || 0)} sessions, ${fmtNum(u.Mout)} Mtok sortie</p>
-    <h2>Tokens par modèle</h2>
-    <table>
-      <thead><tr><th>modèle</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
-      <tbody>${modelRows || '<tr><td colspan="6" class="empty">(aucun)</td></tr>'}</tbody>
-    </table>`;
+  return `<div class="section-head"><h2>Tokens par tâche / modèle</h2><span class="meta">exploratoire &mdash; repérer les dérives de consommation</span></div>
+    <div class="grid-2">
+      <div class="card">
+        <p class="meta" style="margin:0 0 0.3rem">par tâche (triée par volume)</p>
+        <table>
+          <thead><tr><th>tâche</th><th>état</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
+          <tbody>${taskRows || '<tr><td colspan="7" class="empty">(aucune)</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div class="card">
+        <p class="meta" style="margin:0 0 0.3rem">par modèle</p>
+        <table>
+          <thead><tr><th>modèle</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
+          <tbody>${modelRows || '<tr><td colspan="6" class="empty">(aucun)</td></tr>'}</tbody>
+        </table>
+        <p class="subgrid-note">non attribué (sessions sans tâche connue) : ${escapeHtml(u.sessions || 0)} sessions, ${fmtNum(u.Mout)} Mtok sortie</p>
+      </div>
+    </div>
+    <div class="card" style="margin-top:0.75rem">
+      <p class="meta" style="margin:0 0 0.3rem">par compte</p>
+      <table>
+        <thead><tr><th>compte</th><th>modèle</th><th class="num">Mtok cache-read</th><th class="num">Mtok cache-write</th><th class="num">Mtok sortie</th></tr></thead>
+        <tbody>${acctRows || '<tr><td colspan="5" class="empty">(aucun)</td></tr>'}</tbody>
+      </table>
+    </div>`;
 }
 
 function renderTokensSnapshotFallback(usageSnapshot) {
@@ -768,6 +858,43 @@ function renderDataFragments(data) {
   };
 }
 
+// Always included (static AND live mode) -- a manual light/dark override on top of the
+// dark-by-default / prefers-color-scheme:light CSS rule above. Remembers the operator's last
+// choice in localStorage; with nothing stored, leaves data-theme unset so the pure-CSS default
+// (dark unless the OS prefers light) keeps deciding.
+const THEME_SCRIPT = `
+<script>
+(function () {
+  var root = document.documentElement;
+  var btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  var icon = document.getElementById('theme-icon');
+  var label = document.getElementById('theme-label');
+  var stored = null;
+  try { stored = localStorage.getItem('spo-dashboard-theme'); } catch (e) {}
+
+  function isLight(theme) {
+    if (theme === 'light') return true;
+    if (theme === 'dark') return false;
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+  }
+  function apply(theme) {
+    if (theme) root.setAttribute('data-theme', theme);
+    else root.removeAttribute('data-theme');
+    var light = isLight(theme);
+    icon.textContent = light ? '\\u{1F319}' : '\\u{2600}\\u{FE0F}';
+    label.textContent = light ? 'sombre' : 'clair';
+  }
+  var current = stored;
+  apply(current);
+  btn.addEventListener('click', function () {
+    current = isLight(current) ? 'dark' : 'light';
+    apply(current);
+    try { localStorage.setItem('spo-dashboard-theme', current); } catch (e) {}
+  });
+})();
+</script>`;
+
 const LIVE_SCRIPT = `
 <script>
 (function () {
@@ -846,9 +973,18 @@ ${live ? '' : '<meta http-equiv="refresh" content="30">'}
 </head>
 <body>
 <div id="offline-banner" class="banner verdict-unknown">connexion au serveur perdue &mdash; données figées</div>
-<header>
-  <h1>SPO Pipeline &mdash; generated <span id="frag-stamp">${escapeHtml(generatedAt)}</span> &mdash; spo dashboard</h1>
-</header>
+<div class="topbar">
+  <div class="brand">
+    <h1>SPO Pipeline</h1>
+    <span class="stamp">generated <span id="frag-stamp">${escapeHtml(generatedAt)}</span> &middot; spo dashboard</span>
+  </div>
+  <div class="topbar-right">
+    <button class="theme-toggle" id="theme-toggle" type="button">
+      <span class="icon" id="theme-icon">&#9728;&#65039;</span>
+      <span id="theme-label">clair</span>
+    </button>
+  </div>
+</div>
 <main>
 ${frag('services', renderServicesInner(d.services, d.journalTasks, d.accounts))}
 ${frag('daemon', renderDaemonStatsInner(d.daemonStats))}
@@ -860,6 +996,7 @@ ${frag('accounts', renderAccountsInner(d.accounts, d.tokens))}
 ${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot))}
 ${frag('secondary', renderSecondaryInner(d))}
 </main>
+${THEME_SCRIPT}
 ${live ? LIVE_SCRIPT : ''}
 </body>
 </html>
