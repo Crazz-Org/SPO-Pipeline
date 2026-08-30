@@ -557,6 +557,11 @@ async function realPushPr(ctx, deps = {}) {
       throw new ParkSignal('rdo-citation-missing', { file: 'src/shared/rdo-members.ts' });
     }
     appendEvent(ctx.taskDir, 'PUSH_PR', 'rdo-citation', { citations });
+    // Same in-memory/journal split as touchesRdoMembers above: the journal event is what
+    // survives a daemon restart between this PUSH_PR pass and the VALIDATE that follows it
+    // (task-values.js falls back to it), while this assignment is what lets the SAME process's
+    // VALIDATE -> CITATION_VERIFIER read the citations without a restart in between at all.
+    ctx.task.citations = citations;
   }
 
 

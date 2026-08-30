@@ -198,6 +198,64 @@ test('buildPromptValues: CITATION_VERIFIER defaults spo_original_path to ~/SPO-O
   assert.deepEqual(values.citations, ['X — Y.pas:1 — claim']);
 });
 
+// ---- CITATION_VERIFIER's `citations`: task.citations vs. the journalled PUSH_PR fallback ------
+// realPushPr (orchestrator/steps/scripted.js) journals a {state: 'PUSH_PR', event: 'rdo-citation',
+// citations} record AND sets ctx.task.citations in memory. task.citations covers the common,
+// same-process case; the journal record is what a daemon restart between PUSH_PR and VALIDATE
+// leaves behind once ctx.task is rebuilt from the task file and the in-memory field is gone.
+
+test('buildPromptValues: CITATION_VERIFIER falls back to the journalled rdo-citation event when task.citations is absent', () => {
+  const taskDir = mkTmp('spo-values-citeverify-journal-fallback-');
+  appendEvent(taskDir, 'PUSH_PR', 'rdo-citation', { citations: ['AdmMembersRDO.pas:512 -- new wire member'] });
+
+  const values = buildPromptValues({ taskDir, task: {} }, 'CITATION_VERIFIER');
+  assert.deepEqual(values.citations, ['AdmMembersRDO.pas:512 -- new wire member']);
+});
+
+test('buildPromptValues: CITATION_VERIFIER prefers task.citations over a journalled rdo-citation event', () => {
+  const taskDir = mkTmp('spo-values-citeverify-task-wins-');
+  appendEvent(taskDir, 'PUSH_PR', 'rdo-citation', { citations: ['StaleFile.pas:1 -- from journal'] });
+
+  const values = buildPromptValues(
+    { taskDir, task: { citations: ['FreshFile.pas:2 -- from ctx.task'] } },
+    'CITATION_VERIFIER'
+  );
+  assert.deepEqual(values.citations, ['FreshFile.pas:2 -- from ctx.task']);
+});
+
+test('buildPromptValues: CITATION_VERIFIER leaves citations undefined when neither task.citations nor a journalled event exists, so the missing-placeholder park still fires', () => {
+  const taskDir = mkTmp('spo-values-citeverify-neither-');
+  const values = buildPromptValues({ taskDir, task: {} }, 'CITATION_VERIFIER');
+  assert.equal(values.citations, undefined);
+});
+
+// Both sides of the resolution use a NON-EMPTY test, not a bare truthiness test: [] is truthy in
+// JS, so `task.citations || fallback` would silently skip the journal, and returning a journalled
+// [] would fill the prompt with an empty citation list. prompt-template.js's missing-placeholder
+// test is `=== undefined || === null`, so an empty array is NOT treated as missing -- it would
+// sail past the park and hand CITATION_VERIFIER nothing to verify.
+
+test('buildPromptValues: CITATION_VERIFIER treats an EMPTY task.citations as absent and still reaches the journalled event', () => {
+  const taskDir = mkTmp('spo-values-citeverify-empty-task-');
+  appendEvent(taskDir, 'PUSH_PR', 'rdo-citation', { citations: ['AdmMembersRDO.pas:512 -- new wire member'] });
+
+  const values = buildPromptValues({ taskDir, task: { citations: [] } }, 'CITATION_VERIFIER');
+  assert.deepEqual(values.citations, ['AdmMembersRDO.pas:512 -- new wire member']);
+});
+
+test('buildPromptValues: CITATION_VERIFIER ignores an EMPTY journalled citations array, so the missing-placeholder park still fires', () => {
+  const taskDir = mkTmp('spo-values-citeverify-empty-journal-');
+  appendEvent(taskDir, 'PUSH_PR', 'rdo-citation', { citations: [] });
+
+  const values = buildPromptValues({ taskDir, task: {} }, 'CITATION_VERIFIER');
+  assert.equal(values.citations, undefined);
+
+  assert.throws(
+    () => fillPromptTemplate(path.join(__dirname, '..', 'prompts', 'verify-citations.md'), values),
+    (err) => err instanceof MissingPlaceholderError && err.placeholder === 'citations'
+  );
+});
+
 // ---- prompts/*.md: no unbounded network call ------------------------------------------------
 // Card #449, 2026-08-30: prompts/triage-bug-report.md's server-log curl had no --max-time, so a
 // slow/unresponsive third-party server could hang inside the intake deadline undetected until the
@@ -220,4 +278,15 @@ test('prompts/*.md: every curl call inside a code fence bounds its own time (--m
       }
     }
   }
+});
+
+// Fail-closed, third source: a hand-written task file carrying an EMPTY citations array. This is
+// not reachable through realPushPr (it parks rdo-citation-missing before journaling an empty
+// array), but prompt-template.js's missing test is `=== undefined || === null`, so [] would fill
+// the prompt with an empty list and let CITATION_VERIFIER "verify" nothing. buildPromptValues
+// normalizes it to undefined so the missing-placeholder park fires instead.
+test('buildPromptValues: CITATION_VERIFIER normalizes an empty task.citations array to undefined so the missing-placeholder park still fires', () => {
+  const taskDir = mkTmp('spo-values-cv-empty-array-');
+  const values = buildPromptValues({ taskDir, task: { citations: [] } }, 'CITATION_VERIFIER');
+  assert.equal(values.citations, undefined);
 });

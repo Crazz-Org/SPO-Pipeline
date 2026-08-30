@@ -24,6 +24,7 @@ const {
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
+const { runLlm } = require('../orchestrator/steps/llm');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -779,9 +780,178 @@ test('realPushPr: extracts a citation from the rdo-members.ts diff, writes it in
   const citationEvent = journal.find((e) => e.event === 'rdo-citation');
   assert.ok(citationEvent && citationEvent.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
 
+  // The bug this action fixes: realPushPr used to only journal the citations, never put them on
+  // ctx.task, so CITATION_VERIFIER's own placeholder build (task-values.js) had nothing to read
+  // and every RDO-touching card parked at prompt-missing-placeholder:citations before the
+  // verifier could even spawn.
+  assert.ok(ctx.task.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
+
   const body = fs.readFileSync(path.join(ctx.taskDir, 'pr-body.md'), 'utf8');
   assert.match(body, /### RDO catalogue/);
   assert.match(body, /AdmMembersRDO\.pas:512/);
+});
+
+test('realPushPr: sets ctx.task.citations from the criterion fallback when the diff itself carries no citation', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-criterion-wt-');
+  const task = {
+    id: 'card-rdo-criterion',
+    kind: 'card',
+    issue: 387,
+    title: 't',
+    worktreePath,
+    touchesRdoMembers: true,
+    criterion: 'Add newMember per AdmMembersRDO.pas:512',
+  };
+  const ctx = testCtx({ id: 'card-rdo-criterion', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/shared/rdo-members.ts\n');
+      if (args.includes('diff') && args.includes('-U0')) {
+        // No `//`-commented citation in the diff itself -- forces the criterion fallback.
+        return ok('+  newMember: 99,\n');
+      }
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/387\n');
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+
+  const journal = readJournal(ctx.taskDir);
+  const citationEvent = journal.find((e) => e.event === 'rdo-citation');
+  assert.ok(citationEvent && citationEvent.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
+  assert.ok(ctx.task.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
+});
+
+// ---- End-to-end proof: realPushPr -> CITATION_VERIFIER no longer parks -----------------------
+//
+// Neither --dry-run nor --shadow can demonstrate this fix through the full daemon: PUSH_PR under
+// either mode goes through scripted.js's generic runScripted() fixture/stub (state-machine.js's
+// isRealMode() gates realPushPr to --real only), which never runs the git-diff citation
+// extraction and never journals an 'rdo-citation' event -- so a --dry-run or --shadow card can
+// only reach CITATION_VERIFIER with a resolved `citations` placeholder if the input task JSON
+// already carries `task.citations` verbatim, which the ORIGINAL (buggy) task-values.js already
+// read straight off ctx.task. That would "pass" identically before and after this change and
+// prove nothing.
+//
+// What genuinely depends on this fix -- realPushPr assigning ctx.task.citations, and
+// task-values.js's journal fallback for a rebuilt ctx.task after a restart -- only runs in real
+// mode (steps/scripted.js's realPushPr) and real mode's LLM path (steps/llm.js's runLlm, the
+// same real-card path test/llm-real-card.test.js already exercises directly with a fake `claude`
+// spawnSync). This test drives both, back to back, on one card: realPushPr populates
+// ctx.task.citations from the rdo-members.ts diff (as card #385's real run would), and then the
+// CITATION_VERIFIER call that used to throw `prompt-missing-placeholder:citations` before ever
+// spawning `claude` now builds its prompt and spawns successfully. A second ctx, sharing the same
+// taskDir but rebuilt with no `citations` field (simulating a daemon restart between PUSH_PR and
+// VALIDATE, where ctx.task comes back from the task file with the in-memory field gone), proves
+// the journal fallback keeps it working even then.
+test('end-to-end: realPushPr feeds CITATION_VERIFIER, in-process and after a simulated restart via the journal fallback', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-citeverify-e2e-wt-');
+  const task = {
+    id: 'card-citeverify-e2e',
+    kind: 'card',
+    issue: 388,
+    title: 'Add newMember to the RDO catalogue',
+    worktreePath,
+    touchesRdoMembers: false,
+    size: 'S',
+  };
+  const ctx = testCtx({ id: 'card-citeverify-e2e', task, config });
+
+  const gitDeps = {
+    spawnSync: (command, args) => {
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/shared/rdo-members.ts\n');
+      if (args.includes('diff') && args.includes('-U0')) {
+        return ok('+  // AdmMembersRDO.pas:512 -- new wire member\n+  newMember: 99,\n');
+      }
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/388\n');
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, gitDeps);
+  assert.equal(next, 'GATE');
+  // The bug: before this action, ctx.task.citations was never set here, so the CITATION_VERIFIER
+  // call below would throw ParkSignal('prompt-missing-placeholder:citations') the instant
+  // buildPromptValues/fillPromptTemplate ran, never reaching invokeClaudeReal at all.
+  assert.ok(ctx.task.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
+
+  let seenInput = null;
+  const llmDeps = {
+    spawnSync: (command, argv, opts) => {
+      assert.equal(command, 'claude');
+      seenInput = opts.input;
+      const reply = {
+        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-citeverify-e2e',
+        modelUsage: { fable: { costUSD: 0.001 } },
+        terminal_reason: 'success',
+        api_error_status: null,
+      };
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    },
+  };
+
+  // buildCtx() (state-machine.js) leaves ctx.account null until callLlmStep's account-rotation
+  // loop sets it per-attempt; runLlm's real non-override path reads `account.name` unconditionally
+  // for its own 'llm-call' journal event, so a direct runLlm call (bypassing callLlmStep, same as
+  // test/llm-real-card.test.js's cardCtx convention) needs one set by hand.
+  ctx.account = { name: 'default', configDir: null };
+
+  // Same-process read: CITATION_VERIFIER's runLlm call reads ctx.task.citations directly, no
+  // restart in between.
+  const cv = await runLlm(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', llmDeps);
+  assert.equal(cv.ok, true);
+  assert.equal(cv.verdict, 'PASS');
+  assert.ok(seenInput.includes('AdmMembersRDO.pas:512'), 'expected the filled prompt to carry the citation');
+
+  // Simulated restart: a fresh ctx sharing the same taskDir (so journal.jsonl still has the
+  // 'rdo-citation' record realPushPr appended above), but ctx.task rebuilt from scratch with no
+  // `citations` field at all -- exactly what a daemon restart between PUSH_PR and VALIDATE leaves
+  // task-values.js to work with.
+  const restartedTask = {
+    id: 'card-citeverify-e2e',
+    kind: 'card',
+    issue: 388,
+    title: 'Add newMember to the RDO catalogue',
+    worktreePath,
+    touchesRdoMembers: true,
+    size: 'S',
+  };
+  const restartedCtx = testCtx({ id: 'card-citeverify-e2e', task: restartedTask, config, taskDir: ctx.taskDir });
+  assert.equal(restartedCtx.task.citations, undefined);
+  restartedCtx.account = { name: 'default', configDir: null };
+
+  let seenInputAfterRestart = null;
+  const llmDepsAfterRestart = {
+    spawnSync: (command, argv, opts) => {
+      seenInputAfterRestart = opts.input;
+      const reply = {
+        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-citeverify-e2e-restart',
+        modelUsage: { fable: { costUSD: 0.001 } },
+        terminal_reason: 'success',
+        api_error_status: null,
+      };
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    },
+  };
+
+  const cvAfterRestart = await runLlm(restartedCtx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', llmDepsAfterRestart);
+  assert.equal(cvAfterRestart.ok, true);
+  assert.equal(cvAfterRestart.verdict, 'PASS');
+  assert.ok(
+    seenInputAfterRestart.includes('AdmMembersRDO.pas:512'),
+    'expected the journal-fallback citations to still reach the filled prompt after a simulated restart'
+  );
 });
 
 // A second PUSH_PR pass on the same branch (CI red -> DIAGNOSE -> IMPLEMENT -> CHECK -> back

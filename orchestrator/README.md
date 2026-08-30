@@ -207,7 +207,12 @@ A card task's own fields:
 for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
 PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
 CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
-only when `touchesRdoMembers` is true.
+only when `touchesRdoMembers` is true. `citations` in the JSON above is shown as a hand-set task
+field for illustration, and a maintainer-supplied value there does still win, but in practice
+nothing sets it at intake: `steps/scripted.js`'s `realPushPr` is what actually populates it, from
+the real `git diff` against `origin/main` on `src/shared/rdo-members.ts` (falling back to the
+task's own `criterion` text), the moment PUSH_PR runs — see the placeholder-derivation bullets
+below.
 
 Each prompt's `{{placeholder}}` values come from one of two places
 (`orchestrator/task-values.js`):
@@ -217,12 +222,17 @@ Each prompt's `{{placeholder}}` values come from one of two places
   the task fields above; `{{scratch_dir}}` = `journal/<id>/scratch`; `{{ledger_path}}` =
   `journal/<id>/ledger.md` (the file `journal.js` already owns); `{{spo_original_path}}`
   defaults to `~/SPO-Original`.
-- **unknown at build time** — produced by an *earlier* state's own LLM call and read back from
-  that state's journaled `result` event (`handlePlan` already does
+- **unknown at build time** — produced by an *earlier* state and read back from that state's own
+  journaled event (`handlePlan` already does
   `appendEvent(ctx.taskDir, 'PLAN', 'result', { payload })` — `task-values.js` is the reader
   side of that same record): `{{plan_path}}`/`{{invariants_path}}`/`{{invariant_ids}}`/
   `{{check_commands}}` feed IMPLEMENT, and `{{invariants_path}}`/`{{invariant_ids}}` feed
-  VALIDATE, both from PLAN's own output.
+  VALIDATE, both from PLAN's own LLM output. `{{citations}}` is the same idea one state earlier,
+  from a *scripted* step instead of an LLM call: `realPushPr` journals
+  `{state: 'PUSH_PR', event: 'rdo-citation', citations}` and also sets `ctx.task.citations` in
+  memory for the same run's VALIDATE to read directly; `task-values.js` prefers the in-memory
+  value and falls back to the journaled record so a daemon restart between PUSH_PR and VALIDATE
+  (`ctx.task` rebuilt from the task file, the in-memory field gone) doesn't silently drop it.
 - `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are named as fixed
   `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions — nothing writes them yet,
   since real CHECK/GATE/PUSH_PR execution remains the documented stub described above; naming
