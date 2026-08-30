@@ -43,6 +43,7 @@ const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
 const { moveCard } = require('./board');
 const { postParkComment, unparkScan } = require('./park-loop');
+const { shouldScanOrphans, orphanScan } = require('./orphan-scan');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 const { shouldAutoTriage, runAutoTriage } = require('./auto-triage');
@@ -666,11 +667,20 @@ async function runForever(queueDir, journalRoot, config) {
   let lastAutoIntakeAt = null;
   let lastConfirmScanAt = null;
   let lastAutoTriageAt = null;
+  let lastOrphanScanAt = null;
   for (;;) {
     await drainQueueOnce(queueDir, journalRoot, config);
 
     if (config.real) {
       const deps = config.deps || {};
+
+      // Before unparkScan: an orphan reparked THIS cycle must be visible to a maintainer's
+      // retry/abandon reply starting next cycle, not a full extra poll later.
+      if (shouldScanOrphans(lastOrphanScanAt, Date.now(), config.orphanScanMs)) {
+        lastOrphanScanAt = Date.now();
+        await orphanScan(queueDir, journalRoot, config, deps);
+      }
+
       await unparkScan(queueDir, journalRoot, config, deps);
 
       // Note the ordering above: drainQueueOnce is AWAITED, so a pull only ever happens with

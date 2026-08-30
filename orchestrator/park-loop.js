@@ -263,4 +263,6 @@ module.exports = {
   unparkScan,
   findParkAnchor,
   reEnqueueTask,
+  listTaskIds, // shared with orphan-scan.js -- same journal/<id>/ directory listing, one copy
+  readJsonSafe, // shared with orphan-scan.js
 };

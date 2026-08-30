@@ -38,6 +38,7 @@ const { drainQueueOnce, runForever } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, LockHeldError } = require('./lock');
 const { appendDaemonEvent } = require('./journal');
+const { orphanScan } = require('./orphan-scan');
 
 function parseArgs(argv) {
   const opts = {
@@ -192,6 +193,16 @@ async function main() {
     // reused pid across successive daemon starts (lock.js's own payload.startedAt).
     owner: { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
   };
+
+  // Unconditional, every start, every mode: a task this journal root's PREVIOUS daemon left
+  // mid-run when it died is otherwise invisible forever (not in queue/, not PARKED) -- this is
+  // the case that actually matters (crash -> systemd restart); runForever's own periodic scan
+  // below is the belt-and-suspenders for a daemon that keeps running but loses track of a task
+  // some other way. Cheap even when nothing is orphaned: one readdir + a few small JSON reads.
+  const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);
+  for (const r of recoveredOrphans) {
+    console.error(`orchestrator/daemon.js: recovered orphaned task ${r.id} (${r.reason})`);
+  }
 
   if (opts.once) {
     const results = await drainQueueOnce(queueDir, journalRoot, config);
