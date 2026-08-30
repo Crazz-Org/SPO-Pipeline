@@ -78,6 +78,7 @@ test('buildIntakeComment: contains the CONFIRM_DISCARD_LINE verbatim', () => {
 
 function makeIntakeDeps({ cardExit = 0, cardStdout = CARD_STDOUT, searchHits = [], ghResponder, npmResponder }) {
   return {
+    sleep: async () => {}, // never actually wait in a test -- moveWithRetry's own injection point
     spawnSync: (command, args) => {
       if (command === 'npm') {
         if (npmResponder) return npmResponder(args);
@@ -151,6 +152,53 @@ test('runReportIntake: mechanical anchorKey dedup -- comments on the existing is
   assert.equal(fs.existsSync(reportPath), false);
   const archived = path.join(spoReportsDir, 'archive', path.basename(reportPath));
   assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), /^duplicate: #77 —/);
+});
+
+test('runReportIntake: board move fails once (the GitHub auto-add race) then succeeds on retry -- no move-failed event', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-6-');
+  const journalRoot = mkTmp('spo-reportintake-journal6-');
+  writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_ddd.json');
+
+  let moveAttempts = 0;
+  const deps = makeIntakeDeps({
+    npmResponder: (args) => {
+      if (args.includes('report:card')) return ok(CARD_STDOUT);
+      if (args.includes('board:move')) {
+        moveAttempts++;
+        return moveAttempts === 1 ? { status: 2, stdout: '', stderr: 'not on the board yet', signal: null } : ok('');
+      }
+      return ok('');
+    },
+  });
+
+  const result = await runReportIntake(journalRoot, { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y' }, deps);
+
+  assert.equal(result.filed, 1);
+  assert.equal(moveAttempts, 2);
+  const daemonLog = fs.existsSync(path.join(journalRoot, 'daemon.jsonl')) ? fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8') : '';
+  assert.doesNotMatch(daemonLog, /"event":"report-intake-move-failed"/);
+});
+
+test('runReportIntake: board move exhausts every retry -- journals report-intake-move-failed, alerts, but still files/comments/moves the report', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-7-');
+  const journalRoot = mkTmp('spo-reportintake-journal7-');
+  const reportPath = writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_eee.json');
+
+  const deps = makeIntakeDeps({
+    npmResponder: (args) => {
+      if (args.includes('report:card')) return ok(CARD_STDOUT);
+      if (args.includes('board:move')) return { status: 2, stdout: '', stderr: 'not on the board yet', signal: null };
+      return ok('');
+    },
+  });
+
+  const result = await runReportIntake(journalRoot, { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y' }, deps);
+
+  assert.equal(result.filed, 1); // still filed -- the label guard covers the rest, see this file's header
+  assert.equal(fs.existsSync(reportPath), false); // still moved to pending/
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"report-intake-move-failed"/);
+  assert.match(daemonLog, /"exit":2/);
 });
 
 test('runReportIntake: schema version mismatch -- left in place, never archived, journaled', async () => {

@@ -66,6 +66,26 @@ function runSync(deps, command, args, opts = {}) {
   return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// moveWithRetry -- SPO-WebClient's board's own auto-add GitHub Action (adds a newly-filed issue
+// to the project) runs asynchronously after `gh issue create` returns, so a move attempted
+// immediately can race it: board-move.sh's own exit 2 ("issue is not on the board") is exactly
+// that race, reproduced live 2026-08-30 (issue #443 -- the move failed on the first try, then
+// succeeded seconds later by hand). Retrying a few times with a short delay absorbs that window;
+// deps.sleep is the test-injection point (real code never overrides it).
+async function moveWithRetry(issueNumber, column, deps, opts, retries = 3, delayMs = 3000) {
+  let result;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    result = board.moveIssueToColumn(issueNumber, column, deps, opts);
+    if (result.ok) return result;
+    if (attempt < retries - 1) await (deps.sleep || sleep)(delayMs);
+  }
+  return result;
+}
+
 function normalizeExit(result) {
   if (result && result.error) return -1;
   const status = result && result.status;
@@ -223,18 +243,20 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       '--body-file', bodyFile, '--label', reportIntakeLabel,
     ]);
     if (normalizeExit(createResult) !== 0) {
-      errors.push({ file, error: `gh issue create exited ${normalizeExit(createResult)}` });
-      results.push({ file, outcome: 'error', error: 'gh issue create failed' });
+      const error = `gh issue create exited ${normalizeExit(createResult)}`;
+      errors.push({ file, error });
+      results.push({ file, outcome: 'error', error });
       continue;
     }
     const issueNumber = intake.parseIssueNumber(createResult.stdout);
     if (!issueNumber) {
-      errors.push({ file, error: 'could not parse an issue number from gh issue create output' });
-      results.push({ file, outcome: 'error', error: 'unparsable gh issue create output' });
+      const error = 'could not parse an issue number from gh issue create output';
+      errors.push({ file, error });
+      results.push({ file, outcome: 'error', error });
       continue;
     }
 
-    const moved = board.moveIssueToColumn(issueNumber, reportIntakeColumn, deps, { cwd: productRepo });
+    const moved = await moveWithRetry(issueNumber, reportIntakeColumn, deps, { cwd: productRepo });
     if (!moved.ok) {
       appendDaemonEvent(journalRoot, 'report-intake-move-failed', { issue: issueNumber, column: reportIntakeColumn, exit: moved.exit });
       alertDaemon(config.parkAlertCmd, deps, [String(issueNumber), `failed to move to "${reportIntakeColumn}"`, 'INTAKE']);
