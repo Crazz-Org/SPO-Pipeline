@@ -16,11 +16,16 @@
 //                            steps, or for a bare session id, the same command directly. Never
 //                            executes anything -- see doc/state-machine-spec.md § Observability.
 //   spo dashboard            GENERATES a self-contained static HTML file from the same local
-//                            surfaces (journals, queue, the account pool, ~/.spo-bench/) --
-//                            console/collect.js + console/render.js do the work; this command
-//                            just wires them to disk. --out <path> (default:
+//                            surfaces (journals, queue, the account pool, ~/.spo-bench/,
+//                            ~/.spo-reports) -- console/collect.js + console/render.js do the
+//                            work; this command just wires them to disk. --out <path> (default:
 //                            console/dashboard.html), --watch regenerates every 30s (Ctrl-C to
 //                            stop) instead of running once. Prints the absolute output path.
+//                            --serve [--port 8090] [--host <addr>] [--no-prod] runs a LIVE HTTP
+//                            server instead (console/serve.js): the page polls /api/system (CPU/
+//                            memory, 1s) and /api/data (services, accounts, daemon stats, bug
+//                            reports, production version, tokens; 30s) with no full reload.
+//                            --no-prod disables the outbound starpeace.zz.works/GitHub probe.
 //   spo accounts             Lists every account discovered in the pool directory: name,
 //                            enabled, cooldownUntil (if cooling), whether an oauth-token file
 //                            is present, whether the account's CLAUDE_CONFIG_DIR holds any
@@ -113,6 +118,8 @@ function parseArgs(argv) {
     limit: null,
     reportsDir: null,
     file: false,
+    noProd: false,
+    host: null,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -129,6 +136,8 @@ function parseArgs(argv) {
     else if (a === '--limit') opts.limit = argv[++i];
     else if (a === '--reports-dir') opts.reportsDir = argv[++i];
     else if (a === '--file') opts.file = true;
+    else if (a === '--no-prod') opts.noProd = true;
+    else if (a === '--host') opts.host = argv[++i];
     else opts._.push(a);
   }
   return opts;
@@ -320,23 +329,37 @@ function cmdDashboard(opts) {
   const repoRoot = path.join(__dirname, '..');
   const accountsDir = resolveAccountsDir(opts);
   const benchRoot = path.join(os.homedir(), '.spo-bench');
+  const spoReportsDir = opts.reportsDir ? path.resolve(opts.reportsDir) : defaultConfig.spoReportsDir;
   const outPath = opts.out ? path.resolve(opts.out) : path.join(repoRoot, 'console', 'dashboard.html');
+  const sources = { journalRoot, queueDir, accountsDir, benchRoot, spoReportsDir };
 
-  // --serve: a live HTTP view (fresh collect+render on every GET) instead of a file on disk.
-  // The local/LAN tier of the dashboard; the externally hosted copy is nginx's job
-  // (SPO-Deploy). Default port 8090 -- never 8080, which belongs to the bench worker.
+  // --serve: a live HTTP view -- CPU/memory polled every 1s, everything else every 30s, no
+  // page reload (see console/serve.js). The local/LAN tier of the dashboard; the externally
+  // hosted copy is nginx's job (SPO-Deploy). Default port 8090 -- never 8080, which belongs to
+  // the bench worker. --no-prod disables the starpeace.zz.works probe (console/prod-version.js)
+  // for an offline/dev run. --host binds to a specific interface (default: all).
   if (opts.serve) {
-    const { createDashboardServer } = require('../console/serve');
+    const { createDashboardServer, discoverUsageRoots } = require('../console/serve');
+    const { createSystemSampler } = require('../console/system');
+    const { createProdProbe } = require('../console/prod-version');
+    const { createUsageScanner } = require('../console/usage-scan');
     const port = opts.port ? Number(opts.port) : 8090;
-    const server = createDashboardServer({ journalRoot, queueDir, accountsDir, benchRoot });
-    server.listen(port, () => {
-      console.log(`dashboard: http://localhost:${server.address().port}/  (Ctrl-C to stop)`);
+    const server = createDashboardServer(sources, {
+      systemSampler: createSystemSampler(),
+      prodProbe: opts.noProd ? null : createProdProbe(),
+      usageScanner: createUsageScanner({ roots: discoverUsageRoots(accountsDir) }),
+    });
+    server.listen(port, opts.host || undefined, () => {
+      const addr = server.address();
+      console.log(
+        `dashboard: http://localhost:${addr.port}/  (api: /api/system 1s, /api/data 30s -- Ctrl-C to stop)`
+      );
     });
     return;
   }
 
   function generateOnce() {
-    const data = collectAll({ journalRoot, queueDir, accountsDir, benchRoot });
+    const data = collectAll(sources);
     const html = renderDashboard(data);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, html);

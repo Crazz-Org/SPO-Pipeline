@@ -928,28 +928,59 @@ bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/dr
 ## Dashboard
 
 ```bash
-bin/spo dashboard [--journal <dir>] [--queue <dir>] [--out <path>]   # generate once, default out: console/dashboard.html
+bin/spo dashboard [--journal <dir>] [--queue <dir>] [--out <path>]   # generate once (static), default out: console/dashboard.html
 bin/spo dashboard --watch                                            # regenerate every 30s (setInterval), Ctrl-C to stop
+bin/spo dashboard --serve [--port 8090] [--host <addr>] [--no-prod]  # live server (see below), Ctrl-C to stop
 ```
 
-`console/collect.js` reads the same local surfaces as the rest of `bin/spo` (`journal/<id>/`,
-`queue/`), plus the account pool directory (discovered through `orchestrator/accounts.js`, see
-§ Account registry above) and the read-only `~/.spo-bench/{nightly/latest.json,
-verdicts/*.json}`, and hands the result to
-`console/render.js` -- a pure function that turns that data into one self-contained HTML file:
-inline CSS, no external requests, a 30s `<meta http-equiv="refresh">`, light+dark via
-`prefers-color-scheme`. A missing source (no `claude-accounts/`, no `~/.spo-bench/`, an empty
-`journal/`) renders as an empty section, never a crash -- same "reader, never a second source of
-truth" rule as the rest of the console (see README.md § Observability).
+Two render modes, same underlying data:
+
+- **Static** (default, and `--watch`): `console/collect.js` reads the local surfaces
+  (`journal/<id>/`, `queue/`, the account pool via `orchestrator/accounts.js`, the read-only
+  `~/.spo-bench/{nightly/latest.json, verdicts/*.json}`, and `~/.spo-reports` for the bug-report
+  pipeline counters) and hands the result to `console/render.js`, a pure function producing one
+  self-contained HTML file: inline CSS, no external requests, a 30s `<meta
+  http-equiv="refresh">`, light+dark via `prefers-color-scheme`. Instant and network-free -- the
+  CPU/memory and production-version cards render as "non surveillé" (not monitored) in this
+  mode. A missing source renders as an empty section, never a crash -- same "reader, never a
+  second source of truth" rule as the rest of the console.
+- **Live** (`--serve`): `console/serve.js` wraps the same `collectAll`/`renderDashboard` but adds
+  two JSON routes the page polls client-side (no full reload): `GET /api/system` (CPU-per-core +
+  memory, meant to be polled every 1s -- see `console/system.js`) and `GET /api/data`
+  (everything else -- services, accounts, daemon stats, bug reports, production version, tokens
+  -- meant to be polled every 30s). `--no-prod` disables the outbound starpeace.zz.works /
+  GitHub Releases probe (`console/prod-version.js`) for an offline run. Never binds anywhere but
+  `localhost`/LAN by default; the externally hosted copy (nginx + basic auth) is a
+  `spo dashboard` + rsync concern owned by SPO-Deploy.
 
 Each task card's per-LLM-step table comes straight from the journal's `llm-call` events
-(`step`, `model`, `account`, `costUsd`, `sessionId`) and prints the exact `claude --resume
-<sessionId>` command in a `<code>` block, same convention as `spo resume`.
+(`step`, `model`, `account`, `sessionId`) and prints the exact `claude --resume <sessionId>`
+command in a `<code>` block, same convention as `spo resume`. The dashboard never renders a
+dollar figure -- `spo cost` / `orchestrator/cost.js` own that view instead.
 
-**Usage snapshot (optional):** if `journal/usage-snapshot.json` exists, the dashboard renders
-its `estUsd` total/`byModel` and `byPhase_Mtokens` table. Nothing writes that file
-automatically -- the operator produces it by hand when they want a token-usage view alongside
-the pipeline state:
+**Bug reports card:** counters only (queued/pending/confirmed, last intake cycle, 24h
+filed/held/duplicate, remote-pull health) from `orchestrator/report-intake.js` +
+`auto-triage.js` + `remote-report-pull.js`'s own `daemon.jsonl` events -- never a report's file
+path, URL, token, or free-text `reason`/`error` field (those can carry secrets or a production
+URL). See § Report intake above for the pipeline itself.
+
+**Production version card:** watches `starpeace.zz.works` (SPO-WebClient's production
+deployment) without SSH, via two independent HTTPS probes (`console/prod-version.js`): a root/
+`SPO_PROD_HEALTH_PATH` ping for UP/DOWN + latency (cached `SPO_PROD_URL` default
+`https://starpeace.zz.works`, 120s TTL), and the SPO-WebClient GitHub Releases API for the
+"expected" (latest tag) version (300s TTL, unauthenticated). No `/healthz` endpoint exists on
+production today -- that would be a SPO-WebClient/SPO-Deploy change, outside this repo's scope --
+so "version déployée" shows "non exposée" until one is added; the card always keeps "attendue"
+(expected, from the release tag) and "déployée" (confirmed live) visually distinct.
+
+**Tokens card:** live mode incrementally scans every pool account's own
+`CLAUDE_CONFIG_DIR/projects/` plus `~/.claude/projects` (`console/usage-scan.js`, first pass 2s
+after the server starts, then every 5 minutes, cached by mtime+size so an unchanged transcript
+is never re-read -- see the module's own header on why a naive slurp took a WSL VM down once),
+joins each `sessionId` back to its SPO task via the journal's own `llm-call` events
+(`console/collect.js`'s `buildSessionIndex`), and renders a token table by task and by model.
+Static mode has no live scan; it falls back to an optional, operator-produced
+`journal/usage-snapshot.json`:
 
 ```bash
 node scripts/usage-report.js > journal/usage-snapshot.json
