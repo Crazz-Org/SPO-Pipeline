@@ -37,6 +37,7 @@ const path = require('path');
 
 const OAUTH_TOKEN_FILENAME = 'oauth-token';
 const DISABLED_MARKER_FILENAME = 'disabled';
+const LABELS_FILENAME = 'labels.json';
 // The account directory IS a CLAUDE_CONFIG_DIR, so a settings.json inside it is that account's
 // user-settings tier -- see syncSettings() below for why the pool needs one at all.
 const SETTINGS_FILENAME = 'settings.json';
@@ -113,6 +114,24 @@ const MANAGED_FILENAMES = new Set([OAUTH_TOKEN_FILENAME, DISABLED_MARKER_FILENAM
 function hasCredentials(configDir) {
   if (!configDir || !fs.existsSync(configDir)) return false;
   return fs.readdirSync(configDir).some((entry) => !MANAGED_FILENAMES.has(entry));
+}
+
+// Optional, hand-maintained accountName -> {email, plan} map the operator fills in once, at
+// <poolDir>/labels.json. WHY this has to be hand-maintained: nothing Claude Code itself writes
+// into an account's CLAUDE_CONFIG_DIR carries an email address or subscription tier -- .claude.json
+// holds only a hashed userID (confirmed by inspecting a real pool directory, 2026-08-30), and
+// there is no `claude whoami`-style command to ask for one headlessly. The dashboard's accounts
+// table (console/render.js renderAccountsInner) reads this through collectAccounts to show
+// "email"/"plan" columns instead of just the pool's arbitrary directory name. A missing or
+// unparsable file is not an error, just "nothing labeled yet" -- same posture as readState.
+function readLabels(poolDir) {
+  const p = path.join(poolDir, LABELS_FILENAME);
+  if (!fs.existsSync(p)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return {};
+  }
 }
 
 // Installs one permission policy as the USER-tier settings of every account in the pool.
@@ -238,6 +257,7 @@ module.exports = {
   readState,
   writeState,
   hasCredentials,
+  readLabels,
   syncSettings,
   stampManagedSettings,
   AllAccountsCoolingError,
@@ -245,5 +265,6 @@ module.exports = {
   DEFAULT_COOLDOWN_MS,
   OAUTH_TOKEN_FILENAME,
   DISABLED_MARKER_FILENAME,
+  LABELS_FILENAME,
   SETTINGS_FILENAME,
 };

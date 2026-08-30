@@ -21,7 +21,8 @@
 // JSON response serves the *Inner strings directly (renderDataFragments) -- NEVER the
 // frag()-wrapped string -- so the client's `el.innerHTML = fragments[id]` never nests a second
 // <section id="frag-ID"> inside the first. IDs are a client<->server contract: services, system,
-// accounts, daemon, reports, prod, tokens, secondary, stamp.
+// accounts, daemon, reports, tokens, secondary, stamp. `prod` is folded into the `services` tile
+// row (renderProdTile) rather than being its own fragment -- see § 1 below.
 //
 // Input shape (every field optional -- a missing/empty one renders as an empty section, never
 // throws):
@@ -30,11 +31,20 @@
 //     generatedAt: ISO string,
 //     journalTasks: [{ id, title, kind, state, reason, updatedAt, lastEventTs, lastEventName,
 //                       llmSteps: [{step, model, account, costUsd, sessionId}], totalCostUsd }],
+//                    -- collected for other consumers (daemonStats, token-usage session
+//                       attribution) but NOT rendered here: per-task detail duplicates the
+//                       GitHub Projects board (Kanban), which is the source of truth for task
+//                       state.
 //     queue: { depth, nextIds: [id, ...] },
-//     accounts: { rows: [{ name, enabled, cooldownUntil, cooling, hasToken, hasCredentials }] },
+//     accounts: { rows: [{ name, email, plan, enabled, cooldownUntil, cooling, hasToken,
+//                           hasCredentials }] },
 //     nightly: { verdict, sha, jobId, finishedAt, detail } | null,
 //     verdicts: [{ file, head, verdict, createdAt, jobId, baseMain }],   // newest-first
 //     usageSnapshot: { byModel_Mtokens, byPhase_Mtokens } | null,       // static-mode fallback
+//     trend: { series, lastRecordedDate, kpis } | null,   // console/usage-scan.js buildTrendViews,
+//                                                          // from console/usage-rollups.json -- populated
+//                                                          // in BOTH static and live mode (a cheap read of
+//                                                          // an already-computed file, not a live scan)
 //     services: { daemon, queue, benchWorker, nightly, verdicts },       // console/collect.js
 //     daemonStats: { total, done, parked, week, today, active, imported, inFlight,
 //                     parkingRatePct },
@@ -45,9 +55,10 @@
 //     tokens: TokenViews | null,             // console/usage-scan.js, live server only
 //   }
 //
-// Section titles are French (the operator is French-speaking, README.md "Language"); data
-// values (ids, states, model names, reasons) are rendered as-is. NEVER a dollar figure -- costs
-// are rendered nowhere in this file (spo cost / orchestrator/cost.js own that view instead).
+// UI text is English (repo content is English regardless of what language the maintainer
+// converses in -- README.md "Language"); data values (ids, states, model names, reasons) are
+// rendered as-is. NEVER a dollar figure -- costs are rendered nowhere in this file (spo cost /
+// orchestrator/cost.js own that view instead).
 
 function escapeHtml(value) {
   if (value === null || value === undefined) return '';
@@ -71,12 +82,6 @@ function shortSha(sha) {
   return sha ? String(sha).slice(0, 10) : '?';
 }
 
-function stateClass(state) {
-  if (state === 'DONE') return 'state-done';
-  if (state === 'PARKED') return 'state-parked';
-  return 'state-active';
-}
-
 function verdictClass(v) {
   if (v === 'PASS') return 'verdict-pass';
   if (v === 'FAIL') return 'verdict-fail';
@@ -92,7 +97,7 @@ function fmtAgeMs(ms) {
   const h = Math.round(m / 60);
   if (h < 48) return `${h}h`;
   const d = Math.round(h / 24);
-  return `${d}j`;
+  return `${d}d`;
 }
 
 function fmtDateTime(iso) {
@@ -285,23 +290,6 @@ code {
 .grid-2 { display: grid; grid-template-columns: 1fr; gap: 1rem; }
 @media (min-width: 860px) { .grid-2 { grid-template-columns: 1fr 1fr; } }
 
-.task-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 0.7rem; }
-.task-card { border: 1px solid var(--border); border-radius: var(--radius-md); padding: 0.75rem; background: var(--card-bg); box-shadow: var(--shadow-sm); }
-.task-card > header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem; gap: 0.5rem; }
-.task-id { font-weight: 700; font-family: var(--font-mono); font-size: 0.85rem; }
-.badge {
-  display: inline-flex; align-items: center; gap: 0.3rem;
-  font-size: 0.72rem; padding: 0.15rem 0.55rem; border-radius: 999px; font-weight: 700;
-  letter-spacing: 0.01em; white-space: nowrap;
-}
-.badge::before { content: ""; width: 0.4rem; height: 0.4rem; border-radius: 999px; background: currentColor; }
-.state-done { background: var(--green-bg); color: var(--green); }
-.state-parked { background: var(--red-bg); color: var(--red); }
-.state-active { background: var(--accent-soft); color: var(--accent); }
-.title { margin: 0.25rem 0; font-size: 0.86rem; }
-.reason { color: var(--red); margin: 0.2rem 0; font-size: 0.82rem; }
-table.llm-steps th, table.llm-steps td { font-size: 0.8rem; }
-
 .dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 999px; margin-right: 0.35rem; vertical-align: middle; position: relative; background: currentColor; }
 .dot.pulse::after {
   content: ""; position: absolute; inset: -3px; border-radius: 999px;
@@ -314,7 +302,8 @@ table.llm-steps th, table.llm-steps td { font-size: 0.8rem; }
 .dot-gray { color: var(--muted); background: var(--muted); }
 
 .svc-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.7rem; }
-@media (min-width: 640px) { .svc-tiles { grid-template-columns: repeat(5, 1fr); } }
+@media (min-width: 640px) { .svc-tiles { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 960px) { .svc-tiles { grid-template-columns: repeat(6, 1fr); } }
 .svc-tile {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius-lg);
   box-shadow: var(--shadow-md); padding: 0.85rem 0.9rem;
@@ -343,6 +332,8 @@ table.llm-steps th, table.llm-steps td { font-size: 0.8rem; }
 .kpi.accent strong { color: var(--accent-strong); }
 .kpi strong { display: block; font-family: var(--font-display); font-size: 1.8rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
 .kpi span { color: var(--muted); font-size: 0.78rem; }
+.trend-warn { color: var(--red); font-weight: 700; }
+.trend-good { color: var(--green); font-weight: 700; }
 
 .spark { display: block; width: 100%; height: 34px; }
 .spark polyline.line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
@@ -357,10 +348,6 @@ table.llm-steps th, table.llm-steps td { font-size: 0.8rem; }
 .gauge > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--teal)); transition: width 0.6s cubic-bezier(.4,0,.2,1); }
 .gauge-warn > span { background: linear-gradient(90deg, var(--orange), #f0b429); }
 .gauge-crit > span { background: linear-gradient(90deg, var(--red), #ff8f7a); }
-
-.badge-drift { background: var(--orange-bg); color: var(--orange); }
-.badge-up { background: var(--green-bg); color: var(--green); }
-.badge-down { background: var(--red-bg); color: var(--red); }
 
 details {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius-md);
@@ -408,7 +395,7 @@ body[data-stale="1"] #offline-banner { display: block; }
 
 // ---- 1. services --------------------------------------------------------------------------
 
-const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'CHARGÉE', stale: 'STALE', down: 'DOWN', unknown: 'INCONNU' };
+const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'BACKED UP', stale: 'STALE', down: 'DOWN', unknown: 'UNKNOWN' };
 
 function svcTile({ name, status, cls, big, bigUnit, caption, timestamp }) {
   const pulse = cls === 'tile-green' ? ' pulse' : '';
@@ -423,20 +410,36 @@ function svcTile({ name, status, cls, big, bigUnit, caption, timestamp }) {
   </div>`;
 }
 
-// Only a live PARKED task or a cooling account is worth an at-a-glance banner -- everything
-// else that could be "wrong" already has its own status color in the tiles below it, so
-// surfacing it twice here would just be noise.
-function renderAlertBanner(journalTasks, accounts) {
-  const parked = (journalTasks || []).filter((t) => t.state === 'PARKED');
+// Only a cooling account is worth an at-a-glance banner -- a PARKED count would just repeat the
+// Kanban board, and everything else that could be "wrong" already has its own status color in
+// the tiles below it, so surfacing it twice here would just be noise.
+function renderAlertBanner(accounts) {
   const cooling = ((accounts && accounts.rows) || []).filter((a) => a.cooling);
-  if (parked.length === 0 && cooling.length === 0) return '';
-  const parts = [];
-  if (parked.length) parts.push(`${escapeHtml(parked.length)} tâche${parked.length > 1 ? 's' : ''} PARKED`);
-  if (cooling.length) parts.push(`${escapeHtml(cooling.length)} compte${cooling.length > 1 ? 's' : ''} en refroidissement`);
-  return `<div class="alert-banner"><span class="dot"></span>${parts.join(' &middot; ')}</div>`;
+  if (cooling.length === 0) return '';
+  return `<div class="alert-banner"><span class="dot"></span>${escapeHtml(cooling.length)} account${cooling.length > 1 ? 's' : ''} cooling down</div>`;
 }
 
-function renderServicesInner(services, journalTasks, accounts) {
+// Production version, folded into a services tile rather than its own section further down the
+// page -- the tile format only has room for a status word, one headline value and a short
+// caption, so drift/latency detail that used to live in a dedicated card is compressed into the
+// caption line.
+function renderProdTile(prod) {
+  if (!prod) {
+    return svcTile({ name: 'Prod', status: 'UNKNOWN', cls: 'tile-gray', big: '—', caption: 'not monitored (static mode)' });
+  }
+  const site = prod.site || {};
+  const deployed = prod.deployed || {};
+  const expected = prod.expected || {};
+  const statusLabel = site.status === 'up' ? 'UP' : site.status === 'down' ? 'DOWN' : 'UNKNOWN';
+  const version = deployed.exposed && deployed.version ? deployed.version : expected.version ? `~${expected.version}` : '—';
+  let caption;
+  if (prod.drift === 'diverged') caption = 'diverged from expected';
+  else if (deployed.exposed) caption = typeof site.latencyMs === 'number' ? `${site.latencyMs} ms` : 'deployed version';
+  else caption = expected.version ? 'expected (not exposed)' : 'no data yet';
+  return svcTile({ name: 'Prod', status: statusLabel, cls: tileClass(site.status), big: version, caption });
+}
+
+function renderServicesInner(services, accounts, prod) {
   const s = services || {};
   const daemon = s.daemon || {};
   const queue = s.queue || {};
@@ -444,32 +447,32 @@ function renderServicesInner(services, journalTasks, accounts) {
   const nightly = s.nightly || {};
   const verdicts = s.verdicts || {};
 
-  const nightlyStatus = nightly.verdict === 'PASS' ? 'GREEN' : nightly.verdict === 'FAIL' ? 'RED' : 'INCONNU';
+  const nightlyStatus = nightly.verdict === 'PASS' ? 'GREEN' : nightly.verdict === 'FAIL' ? 'RED' : 'UNKNOWN';
   const nightlyCls = nightlyStatus === 'GREEN' ? 'tile-green' : nightlyStatus === 'RED' ? 'tile-red' : 'tile-gray';
   const passRate = verdicts.recentTotal ? Math.round((verdicts.recentPass / verdicts.recentTotal) * 100) : null;
-  const verdictsStatus = verdicts.status === 'pass' ? 'STABLE' : verdicts.status === 'fail' ? 'INSTABLE' : 'INCONNU';
+  const verdictsStatus = verdicts.status === 'pass' ? 'STABLE' : verdicts.status === 'fail' ? 'UNSTABLE' : 'UNKNOWN';
 
   const tiles = [
     svcTile({
-      name: 'Démon',
-      status: STATUS_WORD[daemon.status] || 'INCONNU',
+      name: 'Daemon',
+      status: STATUS_WORD[daemon.status] || 'UNKNOWN',
       cls: tileClass(daemon.status),
       big: fmtAgeMs(daemon.uptimeMs),
-      caption: 'en service',
+      caption: 'uptime',
     }),
     svcTile({
-      name: 'File',
+      name: 'Queue',
       status: STATUS_WORD[queue.status] || 'OK',
       cls: tileClass(queue.status),
       big: fmtInt(queue.depth),
-      caption: 'tâches en attente',
+      caption: 'tasks queued',
     }),
     svcTile({
       name: 'Bench worker',
-      status: STATUS_WORD[bench.status] || 'INCONNU',
+      status: STATUS_WORD[bench.status] || 'UNKNOWN',
       cls: tileClass(bench.status),
       big: fmtAgeMs(bench.heartbeatAgeMs),
-      caption: 'depuis le dernier battement',
+      caption: 'since last heartbeat',
     }),
     svcTile({
       name: 'Nightly',
@@ -483,26 +486,39 @@ function renderServicesInner(services, journalTasks, accounts) {
       cls: tileClass(verdicts.status),
       big: passRate !== null ? String(passRate) : '—',
       bigUnit: passRate !== null ? '%' : '',
-      caption: verdicts.recentTotal ? `${verdicts.recentPass}/${verdicts.recentTotal} PASS` : 'aucune donnée',
+      caption: verdicts.recentTotal ? `${verdicts.recentPass}/${verdicts.recentTotal} PASS` : 'no data',
     }),
+    renderProdTile(prod),
   ].join('');
 
-  return `${renderAlertBanner(journalTasks, accounts)}<h2>État des services</h2><div class="svc-tiles">${tiles}</div>`;
+  return `${renderAlertBanner(accounts)}<h2>Services status</h2><div class="svc-tiles">${tiles}</div>`;
 }
 
-// ---- 2. system (CPU/mémoire live) ----------------------------------------------------------
+// ---- 2. system (live CPU/memory) ----------------------------------------------------------
 
 // Renders a tiny inline SVG trend line from a rolling window of 0-100 values (console/system.js's
 // history.cpu/history.mem) -- a plain <polyline>, not a smooth curve, to keep this a pure string
 // template with no charting math beyond a linear x/y mapping.
-function renderSparkline(values, extraClass) {
+// opts.auto: scale to the series' own min/max instead of the default 0-100 clamp (CPU/memory
+// history, this function's original callers, are already 0-100 percentages and keep passing
+// nothing). The tokens trend's avgWeightPerSession series has no natural upper bound, so it
+// needs auto-scaling to show a step-change at all -- clamped to 0-100 it would render as a flat
+// line pinned to the top.
+function renderSparkline(values, extraClass, opts = {}) {
   const vals = (values || []).filter((v) => typeof v === 'number');
-  if (vals.length < 2) return '<p class="empty">(historique insuffisant)</p>';
+  if (vals.length < 2) return '<p class="empty">(not enough history yet)</p>';
   const w = 300;
   const h = 34;
   const step = w / (vals.length - 1);
+  let lo = 0;
+  let hi = 100;
+  if (opts.auto) {
+    lo = Math.min(...vals);
+    hi = Math.max(...vals);
+    if (hi === lo) hi = lo + 1; // flat series -- avoid a divide-by-zero
+  }
   const points = vals
-    .map((v, i) => `${(i * step).toFixed(1)},${(h - (Math.max(0, Math.min(100, v)) / 100) * h).toFixed(1)}`)
+    .map((v, i) => `${(i * step).toFixed(1)},${(h - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo)) * h).toFixed(1)}`)
     .join(' ');
   return `<svg class="spark${extraClass ? ' ' + extraClass : ''}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
     <polyline class="area" points="0,${h} ${points} ${w},${h}"></polyline>
@@ -512,7 +528,7 @@ function renderSparkline(values, extraClass) {
 
 function renderSystemInner(system) {
   if (!system) {
-    return `<h2>CPU / Mémoire</h2><p class="empty">non surveillé (instantané &mdash; relancer avec <code>spo dashboard --serve</code>)</p>`;
+    return `<h2>CPU / Memory</h2><p class="empty">not monitored (static mode &mdash; restart with <code>spo dashboard --serve</code>)</p>`;
   }
   const cpu = system.cpu || {};
   const mem = system.memory || {};
@@ -521,7 +537,7 @@ function renderSystemInner(system) {
     .map((c) => {
       const pct = typeof c.busyPct === 'number' ? c.busyPct : 0;
       const label = typeof c.busyPct === 'number' ? `${c.busyPct}%` : '—';
-      return `<div class="bar-row"><span>cœur ${escapeHtml(c.i)}</span><span class="bar"><span style="width:${pct}%"></span></span><span>${label}</span></div>`;
+      return `<div class="bar-row"><span>core ${escapeHtml(c.i)}</span><span class="bar"><span style="width:${pct}%"></span></span><span>${label}</span></div>`;
     })
     .join('');
 
@@ -529,18 +545,18 @@ function renderSystemInner(system) {
   const memClass = memPct >= 90 ? 'gauge-crit' : memPct >= 75 ? 'gauge-warn' : '';
   const memGb = (n) => (typeof n === 'number' ? (n / 1024 / 1024 / 1024).toFixed(1) : '—');
 
-  return `<h2>CPU / Mémoire</h2>
+  return `<h2>CPU / Memory</h2>
     <div class="grid-2">
       <div class="card">
-        <p class="meta" style="margin:0 0 0.6rem">${escapeHtml(cpu.count)} cœurs${cpu.model ? ' · ' + escapeHtml(cpu.model) : ''} &middot; charge moyenne ${(system.loadavg || []).map((n) => n.toFixed(2)).join(' / ')}</p>
+        <p class="meta" style="margin:0 0 0.6rem">${escapeHtml(cpu.count)} cores${cpu.model ? ' · ' + escapeHtml(cpu.model) : ''} &middot; load average ${(system.loadavg || []).map((n) => n.toFixed(2)).join(' / ')}</p>
         ${cores}
-        <p class="meta" style="margin-top:0.7rem">mémoire : ${memGb(mem.usedBytes)} / ${memGb(mem.totalBytes)} Go (${escapeHtml(mem.usedPct)}%)</p>
+        <p class="meta" style="margin-top:0.7rem">memory: ${memGb(mem.usedBytes)} / ${memGb(mem.totalBytes)} GB (${escapeHtml(mem.usedPct)}%)</p>
         <div class="gauge ${memClass}"><span style="width:${memPct}%"></span></div>
       </div>
       <div class="card">
-        <p class="meta" style="margin:0 0 0.3rem">tendance CPU globale (~5 min)</p>
+        <p class="meta" style="margin:0 0 0.3rem">overall CPU trend (~5 min)</p>
         ${renderSparkline(hist.cpu)}
-        <p class="meta" style="margin:0.9rem 0 0.3rem">tendance mémoire (~5 min)</p>
+        <p class="meta" style="margin:0.9rem 0 0.3rem">memory trend (~5 min)</p>
         ${renderSparkline(hist.mem, 'spark-teal')}
       </div>
     </div>`;
@@ -550,40 +566,50 @@ function renderSystemFragment(system) {
   return renderSystemInner(system);
 }
 
-// ---- 3. comptes Claude ----------------------------------------------------------------------
+// ---- 3. Claude accounts ----------------------------------------------------------------------
 
-// Per-account token detail lives in the Tokens section's "par compte" table (renderTokensLive)
+// Per-account token detail lives in the Tokens section's "by account" table (renderTokensBreakdownInner)
 // -- NOT duplicated here as a nested subtable, to avoid showing the same numbers twice.
 function renderAccountsInner(accounts, tokens) {
   const rows = (accounts && accounts.rows) || [];
   if (rows.length === 0) {
-    return `<h2>Comptes Claude</h2><p class="empty">(aucun compte enregistré dans le pool &mdash; voir doc/setup.md § Accounts)</p>`;
+    return `<h2>Claude accounts</h2><p class="empty">(no account registered in the pool &mdash; see doc/setup.md § Accounts)</p>`;
   }
+  const anyLabeled = rows.some((a) => a.email || a.plan);
   const body = rows
     .map(
       (a) => `<tr class="${a.cooling ? 'cooling' : ''}">
       <td>${escapeHtml(a.name)}</td>
-      <td>${a.enabled ? 'oui' : 'non'}</td>
+      <td>${a.email ? escapeHtml(a.email) : '—'}</td>
+      <td>${a.plan ? escapeHtml(a.plan) : '—'}</td>
+      <td>${a.enabled ? 'yes' : 'no'}</td>
       <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '—'}</td>
-      <td>${a.hasToken ? 'oui' : 'non'}</td>
-      <td>${a.hasCredentials ? 'oui' : 'non'}</td>
+      <td>${a.hasToken ? 'yes' : 'no'}</td>
+      <td>${a.hasCredentials ? 'yes' : 'no'}</td>
     </tr>`
     )
     .join('');
   const tokensNote = tokens
-    ? '<p class="subgrid-note">détail des tokens par compte disponible dans la section « Tokens » plus bas</p>'
-    : '<p class="meta">tokens non mesurés (mode instantané)</p>';
-  return `<h2>Comptes Claude</h2>
+    ? '<p class="subgrid-note">per-account token detail is available in the "Tokens" section below</p>'
+    : '<p class="meta">tokens not measured (static mode)</p>';
+  const labelNote = anyLabeled
+    ? ''
+    : `<p class="subgrid-note">email / plan can't be read from the account pool &mdash; Claude Code stores no such
+      info there, only a hashed user id. To show them, add <code>&lt;pool dir&gt;/labels.json</code>, e.g.
+      <code>{"pool1": {"email": "you@example.com", "plan": "Max 20x"}}</code> (see orchestrator/accounts.js
+      readLabels).</p>`;
+  return `<h2>Claude accounts</h2>
     <div class="card">
       <table>
-        <thead><tr><th>nom</th><th>activé</th><th>refroidissement jusqu'à</th><th>jeton</th><th>identifiants</th></tr></thead>
+        <thead><tr><th>name</th><th>email</th><th>plan</th><th>enabled</th><th>cooling until</th><th>token</th><th>credentials</th></tr></thead>
         <tbody>${body}</tbody>
       </table>
       ${tokensNote}
+      ${labelNote}
     </div>`;
 }
 
-// ---- 4. stats démon -------------------------------------------------------------------------
+// ---- 4. daemon stats -------------------------------------------------------------------------
 
 function kpi(label, value, sub, accent) {
   return `<div class="kpi${accent ? ' accent' : ''}"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}${sub ? ` &middot; ${sub}` : ''}</span></div>`;
@@ -593,12 +619,12 @@ function renderDaemonStatsInner(daemonStats) {
   const d = daemonStats || {};
   const week = d.week || {};
   const today = d.today || {};
-  return `<h2>Stats du démon</h2>
+  return `<h2>Daemon stats</h2>
     <div class="kpi-grid">
-      ${kpi('traité au total', fmtInt(d.total), `${escapeHtml(d.done)} done / ${escapeHtml(d.parked)} parked${d.parkingRatePct !== null && d.parkingRatePct !== undefined ? ` · ${escapeHtml(d.parkingRatePct)}% parking` : ''}`, true)}
-      ${kpi('cette semaine (lun→ven)', fmtInt(week.total), `${escapeHtml(week.done)} done / ${escapeHtml(week.parked)} parked`)}
-      ${kpi("aujourd'hui", fmtInt(today.total), `${escapeHtml(today.done)} done / ${escapeHtml(today.parked)} parked`)}
-      ${kpi('en cours + importées', fmtInt(d.inFlight), `${escapeHtml(d.active)} en cours · ${escapeHtml(d.imported)} importées`)}
+      ${kpi('processed total', fmtInt(d.total), `${escapeHtml(d.done)} done / ${escapeHtml(d.parked)} parked${d.parkingRatePct !== null && d.parkingRatePct !== undefined ? ` · ${escapeHtml(d.parkingRatePct)}% parked` : ''}`, true)}
+      ${kpi('this week (Mon→today)', fmtInt(week.total), `${escapeHtml(week.done)} done / ${escapeHtml(week.parked)} parked`)}
+      ${kpi('today', fmtInt(today.total), `${escapeHtml(today.done)} done / ${escapeHtml(today.parked)} parked`)}
+      ${kpi('active + imported', fmtInt(d.inFlight), `${escapeHtml(d.active)} active · ${escapeHtml(d.imported)} imported`)}
     </div>`;
 }
 
@@ -611,56 +637,82 @@ function renderReportsInner(reports) {
   const pull = r.pull || {};
 
   const cycleLine = cycle
-    ? `<p class="meta">dernier cycle d'intake (${escapeHtml(cycle.ts || '?')}) : ${escapeHtml(cycle.processed)} traités, ${escapeHtml(cycle.filed)} filés, ${escapeHtml(cycle.duplicates)} doublons${cycle.errors ? `, <strong>${escapeHtml(cycle.errors)} erreurs</strong>` : ''}</p>`
-    : `<p class="empty">(aucun cycle d'intake enregistré)</p>`;
+    ? `<p class="meta">last intake cycle (${escapeHtml(cycle.ts || '?')}): ${escapeHtml(cycle.processed)} processed, ${escapeHtml(cycle.filed)} filed, ${escapeHtml(cycle.duplicates)} duplicates${cycle.errors ? `, <strong>${escapeHtml(cycle.errors)} errors</strong>` : ''}</p>`
+    : `<p class="empty">(no intake cycle recorded)</p>`;
 
   const pullLine = pull.configured
-    ? `<p class="meta">pull distant : dernier pull ${escapeHtml(pull.lastPulledAt || '?')} &middot; 24h : ${escapeHtml(pull.pulled24h)} récupérés / ${escapeHtml(pull.acked24h)} accusés${pull.ackFailed24h ? ` / <strong>${escapeHtml(pull.ackFailed24h)} échecs d'accusé</strong>` : ''}${pull.rejected24h ? ` / ${escapeHtml(pull.rejected24h)} rejetés${pull.lastRejectReason ? ` (${escapeHtml(pull.lastRejectReason)})` : ''}` : ''}</p>`
-    : `<p class="empty">pull distant non configuré</p>`;
+    ? `<p class="meta">remote pull: last pull ${escapeHtml(pull.lastPulledAt || '?')} &middot; 24h: ${escapeHtml(pull.pulled24h)} pulled / ${escapeHtml(pull.acked24h)} acked${pull.ackFailed24h ? ` / <strong>${escapeHtml(pull.ackFailed24h)} ack failures</strong>` : ''}${pull.rejected24h ? ` / ${escapeHtml(pull.rejected24h)} rejected${pull.lastRejectReason ? ` (${escapeHtml(pull.lastRejectReason)})` : ''}` : ''}</p>`
+    : `<p class="empty">remote pull not configured</p>`;
 
   return `<h2>Bug reports</h2>
     <div class="kpi-grid">
-      ${kpi("en attente d'intake", fmtInt(r.queuedIntake))}
-      ${kpi('en attente de confirmation', fmtInt(r.pendingConfirm))}
-      ${kpi('confirmés non triés', fmtInt(r.confirmedAwaitingTriage))}
+      ${kpi('queued for intake', fmtInt(r.queuedIntake))}
+      ${kpi('pending confirmation', fmtInt(r.pendingConfirm))}
+      ${kpi('confirmed, untriaged', fmtInt(r.confirmedAwaitingTriage))}
     </div>
     <div class="card">
       ${cycleLine}
-      <p class="meta">24 h : ${escapeHtml(w.triagedFiled || 0)} filés &middot; ${escapeHtml(w.held || 0)} tenus &middot; ${escapeHtml(w.triagedDuplicate || 0)} doublons &middot; ${escapeHtml(w.discarded || 0)} rejetés</p>
+      <p class="meta">24h: ${escapeHtml(w.triagedFiled || 0)} filed &middot; ${escapeHtml(w.held || 0)} held &middot; ${escapeHtml(w.triagedDuplicate || 0)} duplicates &middot; ${escapeHtml(w.discarded || 0)} discarded</p>
       ${pullLine}
     </div>`;
 }
 
-// ---- 6. version production ------------------------------------------------------------------
+// ---- 6. tokens / usage trend -----------------------------------------------------------------
 
-function renderProdInner(prod) {
-  if (!prod) {
-    return `<h2>Version production</h2><p class="empty">non surveillée (mode instantané)</p>`;
-  }
-  const site = prod.site || {};
-  const deployed = prod.deployed || {};
-  const expected = prod.expected || {};
-  const statusLabel = site.status === 'up' ? 'UP' : site.status === 'down' ? 'DOWN' : 'INCONNU';
-  const badgeCls = site.status === 'up' ? 'badge-up' : site.status === 'down' ? 'badge-down' : 'verdict-unknown';
-  const driftBadge = prod.drift === 'diverged' ? '<span class="badge badge-drift">écart</span>' : '';
+// Renders a percentage delta with a color only when it crosses a threshold worth flagging --
+// deliberately fixed, legible thresholds (not a fitted statistical model): a solo operator
+// eyeballing a dashboard needs a number they can sanity-check by reading it, not a black box.
+// `warnAt` colors an increase past it red (consumption got worse); the mirrored negative
+// (a comparably large DECREASE) colors green -- a real efficiency win is exactly as worth
+// noticing as a regression.
+function deltaSpan(pct, { warnAt }) {
+  if (pct === null || pct === undefined) return 'not enough sessions to compare';
+  const sign = pct > 0 ? '+' : '';
+  const text = `${sign}${pct}% vs prior`;
+  if (pct >= warnAt) return `<span class="trend-warn">${escapeHtml(text)}</span>`;
+  if (pct <= -warnAt) return `<span class="trend-good">${escapeHtml(text)}</span>`;
+  return escapeHtml(text);
+}
 
-  return `<h2>Version production</h2>
-    <div class="card" style="display:flex; flex-wrap:wrap; align-items:center; gap:0.9rem; justify-content:space-between">
-      <div style="display:flex; align-items:center; gap:0.6rem">
-        <span class="badge ${badgeCls}">${escapeHtml(statusLabel)}</span>
-        <span class="meta">${site.latencyMs !== null ? `${escapeHtml(site.latencyMs)} ms &middot; ` : ''}dernier contrôle ${escapeHtml(fmtDateTime(prod.checkedAt))}</span>
-      </div>
-      <div style="display:flex; align-items:center; gap:0.9rem; flex-wrap:wrap">
-        <span class="meta">attendue : ${expected.version ? `<code>v${escapeHtml(expected.version)}</code>` : '—'}</span>
-        <span class="meta">déployée : ${deployed.exposed ? `<code>${escapeHtml(deployed.version)}</code>` : 'non exposée'}</span>
-        ${driftBadge}
-      </div>
+// The primary tokens view: an operating-cost trend meant to answer "did something I changed
+// make this worse (or better)" at a glance -- see console/usage-scan.js's buildTrendViews for
+// the WEIGHT-based averaging and the cache-write-ratio change signal this renders.
+function renderTokensTrendInner(trend) {
+  const k = trend.kpis || {};
+  const series = trend.series || [];
+  const last14 = series.slice(-14);
+  const maxBar = Math.max(1, ...last14.map((d) => d.avgWeightPerSession));
+
+  const barRows = last14
+    .map((d) => {
+      const pct = maxBar ? Math.round((d.avgWeightPerSession / maxBar) * 100) : 0;
+      const flag = d.cacheChangeFlag
+        ? ` <span title="cache-write ratio spike on this day -- a likely sign a prompt or config changed">&#9888;</span>`
+        : '';
+      const label = escapeHtml(d.date.slice(5)) + (d.partial ? '*' : ''); // MM-DD; * = still accumulating
+      return `<div class="bar-row"><span>${label}</span><span class="bar"><span style="width:${pct}%"></span></span><span>${fmtNum(d.avgWeightPerSession)}${flag}</span></div>`;
+    })
+    .join('');
+
+  return `<h2>Tokens</h2>
+    <div class="section-head"><span class="meta">operating-cost trend, weighted per session (excludes the "local"
+      account) &mdash; &#9888; marks a day where the cache-write ratio spiked, a likely sign a prompt or config
+      changed that day</span></div>
+    <div class="kpi-grid">
+      ${kpi('today (partial)', fmtNum(k.todayAvgWeightPerSession), deltaSpan(k.todayVsLast7Pct, { warnAt: 40 }), true)}
+      ${kpi('last 7 days', fmtNum(k.last7AvgWeightPerSession), deltaSpan(k.last7VsPrev7Pct, { warnAt: 25 }))}
+      ${kpi('last 30 days', fmtNum(k.last30AvgWeightPerSession), 'baseline, no comparison')}
+      ${kpi('today, Mtok out/session', fmtNum(k.todayAvgMoutPerSession), 'plain token count, not weighted')}
+    </div>
+    <div class="card">
+      <p class="meta" style="margin:0 0 0.3rem">weighted Mtok-equivalent per session, last ${series.length} days</p>
+      ${renderSparkline(series.map((d) => d.avgWeightPerSession), '', { auto: true })}
+      <p class="meta" style="margin:0.9rem 0 0.3rem">last 14 days</p>
+      ${barRows || '<p class="empty">(not enough history yet)</p>'}
     </div>`;
 }
 
-// ---- 7. tokens par tâche/modèle ---------------------------------------------------------------
-
-function renderTokensLive(tokens) {
+function renderTokensBreakdownInner(tokens) {
   const taskRows = (tokens.byTask || [])
     .map(
       (t) => `<tr>
@@ -701,32 +753,40 @@ function renderTokensLive(tokens) {
     .join('');
 
   const u = tokens.unattributed || {};
+  const hasLocal = (tokens.byAccountModel || []).some((r) => r.account === 'local');
+  const localNote = hasLocal
+    ? `<p class="subgrid-note">"local" = usage from Claude Code sessions run directly on this machine, outside
+      the account pool (e.g. an operator's own ad-hoc <code>claude</code> session) &mdash; not part of the
+      pipeline's account rotation.</p>`
+    : '';
 
-  return `<div class="section-head"><h2>Tokens par tâche / modèle</h2><span class="meta">exploratoire &mdash; repérer les dérives de consommation</span></div>
+  return `<details id="det-token-breakdown"><summary>Task / model / account breakdown</summary>
     <div class="grid-2">
       <div class="card">
-        <p class="meta" style="margin:0 0 0.3rem">par tâche (triée par volume)</p>
+        <p class="meta" style="margin:0 0 0.3rem">by task (sorted by volume)</p>
         <table>
-          <thead><tr><th>tâche</th><th>état</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
-          <tbody>${taskRows || '<tr><td colspan="7" class="empty">(aucune)</td></tr>'}</tbody>
+          <thead><tr><th>task</th><th>state</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
+          <tbody>${taskRows || '<tr><td colspan="7" class="empty">(none)</td></tr>'}</tbody>
         </table>
       </div>
       <div class="card">
-        <p class="meta" style="margin:0 0 0.3rem">par modèle</p>
+        <p class="meta" style="margin:0 0 0.3rem">by model</p>
         <table>
-          <thead><tr><th>modèle</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
-          <tbody>${modelRows || '<tr><td colspan="6" class="empty">(aucun)</td></tr>'}</tbody>
+          <thead><tr><th>model</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
+          <tbody>${modelRows || '<tr><td colspan="6" class="empty">(none)</td></tr>'}</tbody>
         </table>
-        <p class="subgrid-note">non attribué (sessions sans tâche connue) : ${escapeHtml(u.sessions || 0)} sessions, ${fmtNum(u.Mout)} Mtok sortie</p>
+        <p class="subgrid-note">unattributed (sessions with no known task): ${escapeHtml(u.sessions || 0)} sessions, ${fmtNum(u.Mout)} Mtok out</p>
       </div>
     </div>
     <div class="card" style="margin-top:0.75rem">
-      <p class="meta" style="margin:0 0 0.3rem">par compte</p>
+      <p class="meta" style="margin:0 0 0.3rem">by account</p>
       <table>
-        <thead><tr><th>compte</th><th>modèle</th><th class="num">Mtok cache-read</th><th class="num">Mtok cache-write</th><th class="num">Mtok sortie</th></tr></thead>
-        <tbody>${acctRows || '<tr><td colspan="5" class="empty">(aucun)</td></tr>'}</tbody>
+        <thead><tr><th>account</th><th>model</th><th class="num">Mtok cache-read</th><th class="num">Mtok cache-write</th><th class="num">Mtok out</th></tr></thead>
+        <tbody>${acctRows || '<tr><td colspan="5" class="empty">(none)</td></tr>'}</tbody>
       </table>
-    </div>`;
+      ${localNote}
+    </div>
+  </details>`;
 }
 
 function renderTokensSnapshotFallback(usageSnapshot) {
@@ -745,80 +805,59 @@ function renderTokensSnapshotFallback(usageSnapshot) {
           </tr>`;
         })
         .join('')
-    : `<tr><td colspan="5" class="empty">(aucun)</td></tr>`;
+    : `<tr><td colspan="5" class="empty">(none)</td></tr>`;
 
-  return `<h2>Tokens par modèle</h2>
-    <p class="meta">instantané (journal/usage-snapshot.json) &mdash; pas de vue par tâche hors mode live</p>
+  return `<details id="det-token-breakdown"><summary>Tokens by model (snapshot)</summary>
+    <p class="meta">snapshot (journal/usage-snapshot.json) &mdash; no per-task view outside live mode</p>
     <table>
-      <thead><tr><th>modèle</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok sortie</th></tr></thead>
+      <thead><tr><th>model</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table>
+  </details>`;
 }
 
-function renderTokensInner(tokens, usageSnapshot) {
-  if (tokens) return renderTokensLive(tokens);
-  if (usageSnapshot) return renderTokensSnapshotFallback(usageSnapshot);
-  return `<h2>Tokens</h2><p class="empty">(pas de données &mdash; en mode live, laisser tourner le serveur quelques minutes ; en mode statique, générer avec <code>node scripts/usage-report.js &gt; journal/usage-snapshot.json</code>)</p>`;
-}
+// Trend (renderTokensTrendInner) is the primary view -- see console/usage-scan.js's
+// buildTrendViews header for why: it's the only part of this section that can answer "did
+// something I changed make this worse (or better)", which today/prior static tables cannot.
+// byTask/byModel/byAccountModel detail is demoted into a <details>, not deleted -- it still
+// answers a real, different question ("what's expensive right now"), just not the drift one.
+function renderTokensInner(tokens, usageSnapshot, trend) {
+  const hasTrend = !!(trend && Array.isArray(trend.series) && trend.series.length > 0);
+  const parts = [];
 
-// ---- 8. secondaire / repliable ---------------------------------------------------------------
-
-function renderLlmStepsTable(steps) {
-  if (!steps || steps.length === 0) {
-    return '<p class="empty">(aucun step LLM enregistré)</p>';
+  if (hasTrend) {
+    parts.push(renderTokensTrendInner(trend));
+  } else {
+    parts.push(`<h2>Tokens</h2><p class="empty">(no trend history yet &mdash; <code>spo dashboard --serve</code>
+      records a daily rollup every ~5 min once it's running; none found yet)</p>`);
   }
-  const rows = steps
-    .map(
-      (s) => `<tr>
-      <td>${escapeHtml(s.step)}</td>
-      <td>${escapeHtml(s.model)}</td>
-      <td>${escapeHtml(s.account)}</td>
-      <td>${s.sessionId ? `<code>claude --resume ${escapeHtml(s.sessionId)}</code>` : '—'}</td>
-    </tr>`
-    )
-    .join('');
-  return `<table class="llm-steps">
-    <thead><tr><th>step</th><th>modèle</th><th>compte</th><th>reprendre</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`;
-}
 
-function renderTaskCard(task) {
-  const reasonLine =
-    task.state === 'PARKED'
-      ? `<p class="reason">raison : <strong>${escapeHtml(task.reason || 'unknown')}</strong></p>`
-      : '';
-  return `<article class="task-card">
-    <header>
-      <span class="task-id">${escapeHtml(task.id)}</span>
-      <span class="badge ${stateClass(task.state)}">${escapeHtml(task.state)}</span>
-    </header>
-    <p class="title">${escapeHtml(task.title || '(sans titre)')}</p>
-    <p class="meta">kind : ${escapeHtml(task.kind || '?')} &middot; dernier événement : ${escapeHtml(task.lastEventName || '?')} @ ${escapeHtml(task.lastEventTs || '?')}</p>
-    ${reasonLine}
-    ${renderLlmStepsTable(task.llmSteps)}
-  </article>`;
-}
-
-function renderTasksDetails(tasks) {
-  if (!tasks || tasks.length === 0) {
-    return `<p class="empty">(aucune tâche dans le journal)</p>`;
+  if (tokens) {
+    parts.push(renderTokensBreakdownInner(tokens));
+  } else if (usageSnapshot) {
+    parts.push(renderTokensSnapshotFallback(usageSnapshot));
+  } else if (!hasTrend) {
+    parts.push(`<p class="empty">in static mode, generate a one-shot snapshot with
+      <code>node scripts/usage-report.js &gt; journal/usage-snapshot.json</code></p>`);
   }
-  return `<div class="task-grid">${tasks.map(renderTaskCard).join('\n')}</div>`;
+
+  return parts.join('\n');
 }
+
+// ---- 7. secondary / collapsible ---------------------------------------------------------------
 
 function renderQueueDetails(queue) {
   const q = queue || { depth: 0, nextIds: [] };
   const next =
     q.nextIds && q.nextIds.length
       ? `<ol>${q.nextIds.map((id) => `<li><code>${escapeHtml(id)}</code></li>`).join('')}</ol>`
-      : '<p class="empty">(file vide)</p>';
-  return `<p>profondeur : <strong>${escapeHtml(q.depth)}</strong></p>${next}`;
+      : '<p class="empty">(queue empty)</p>';
+  return `<p>depth: <strong>${escapeHtml(q.depth)}</strong></p>${next}`;
 }
 
 function renderVerdictsDetails(verdicts) {
   if (!verdicts || verdicts.length === 0) {
-    return `<p class="empty">(aucun verdict local &mdash; ~/.spo-bench/verdicts/)</p>`;
+    return `<p class="empty">(no local verdict &mdash; ~/.spo-bench/verdicts/)</p>`;
   }
   const rows = verdicts
     .map(
@@ -837,9 +876,8 @@ function renderVerdictsDetails(verdicts) {
 }
 
 function renderSecondaryInner(d) {
-  return `<details id="det-verdicts"><summary>Verdicts de gate récents</summary>${renderVerdictsDetails(d.verdicts)}</details>
-    <details id="det-queue"><summary>File d'attente</summary>${renderQueueDetails(d.queue)}</details>
-    <details id="det-tasks"><summary>Tâches</summary>${renderTasksDetails(d.journalTasks)}</details>`;
+  return `<details id="det-verdicts"><summary>Recent gate verdicts</summary>${renderVerdictsDetails(d.verdicts)}</details>
+    <details id="det-queue"><summary>Queue</summary>${renderQueueDetails(d.queue)}</details>`;
 }
 
 // ---- assembly -------------------------------------------------------------------------------
@@ -847,12 +885,11 @@ function renderSecondaryInner(d) {
 function renderDataFragments(data) {
   const d = data || {};
   return {
-    services: renderServicesInner(d.services, d.journalTasks, d.accounts),
+    services: renderServicesInner(d.services, d.accounts, d.prod),
     daemon: renderDaemonStatsInner(d.daemonStats),
-    prod: renderProdInner(d.prod),
     reports: renderReportsInner(d.reports),
     accounts: renderAccountsInner(d.accounts, d.tokens),
-    tokens: renderTokensInner(d.tokens, d.usageSnapshot),
+    tokens: renderTokensInner(d.tokens, d.usageSnapshot, d.trend),
     secondary: renderSecondaryInner(d),
     stamp: escapeHtml(d.generatedAt || ''),
   };
@@ -883,7 +920,7 @@ const THEME_SCRIPT = `
     else root.removeAttribute('data-theme');
     var light = isLight(theme);
     icon.textContent = light ? '\\u{1F319}' : '\\u{2600}\\u{FE0F}';
-    label.textContent = light ? 'sombre' : 'clair';
+    label.textContent = light ? 'dark' : 'light';
   }
   var current = stored;
   apply(current);
@@ -963,7 +1000,7 @@ function renderDashboard(data, opts = {}) {
   const generatedAt = d.generatedAt || '';
 
   return `<!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 ${live ? '' : '<meta http-equiv="refresh" content="30">'}
@@ -972,7 +1009,7 @@ ${live ? '' : '<meta http-equiv="refresh" content="30">'}
 <style>${CSS}</style>
 </head>
 <body>
-<div id="offline-banner" class="banner verdict-unknown">connexion au serveur perdue &mdash; données figées</div>
+<div id="offline-banner" class="banner verdict-unknown">connection to the server lost &mdash; data frozen</div>
 <div class="topbar">
   <div class="brand">
     <h1>SPO Pipeline</h1>
@@ -981,19 +1018,18 @@ ${live ? '' : '<meta http-equiv="refresh" content="30">'}
   <div class="topbar-right">
     <button class="theme-toggle" id="theme-toggle" type="button">
       <span class="icon" id="theme-icon">&#9728;&#65039;</span>
-      <span id="theme-label">clair</span>
+      <span id="theme-label">light</span>
     </button>
   </div>
 </div>
 <main>
-${frag('services', renderServicesInner(d.services, d.journalTasks, d.accounts))}
+${frag('services', renderServicesInner(d.services, d.accounts, d.prod))}
 ${frag('daemon', renderDaemonStatsInner(d.daemonStats))}
 ${frag('system', renderSystemInner(d.system))}
-${frag('prod', renderProdInner(d.prod))}
 ${frag('reports', renderReportsInner(d.reports))}
 ${frag('accounts', renderAccountsInner(d.accounts, d.tokens))}
 <hr class="section-divider">
-${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot))}
+${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot, d.trend))}
 ${frag('secondary', renderSecondaryInner(d))}
 </main>
 ${THEME_SCRIPT}
@@ -1013,7 +1049,6 @@ module.exports = {
   renderAccountsInner,
   renderDaemonStatsInner,
   renderReportsInner,
-  renderProdInner,
   renderTokensInner,
   renderSecondaryInner,
 };

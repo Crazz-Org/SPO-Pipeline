@@ -19,6 +19,7 @@ const {
   readDaemonEventsTail,
 } = require('../console/collect');
 const { renderDashboard, renderDataFragments } = require('../console/render');
+const { saveRollups } = require('../console/usage-rollups');
 
 function writeJson(filePath, obj) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -37,15 +38,13 @@ test('renderDashboard with zero sources renders an empty-state document without 
   assert.match(html, /^<!doctype html>/);
   assert.match(html, /SPO Pipeline/);
   assert.match(html, /<meta http-equiv="refresh" content="30">/);
-  assert.match(html, /Tâches/);
-  assert.match(html, /File d'attente/);
-  assert.match(html, /Comptes Claude/);
-  assert.match(html, /Verdicts de gate récents/);
+  assert.match(html, /Queue/);
+  assert.match(html, /Claude accounts/);
+  assert.match(html, /Recent gate verdicts/);
   assert.match(html, /Tokens/);
   // empty-section markers -- no source anywhere means every section says so, not a crash
-  assert.match(html, /aucune tâche dans le journal/);
-  assert.match(html, /aucun compte enregistré dans le pool/);
-  assert.match(html, /aucun verdict local/);
+  assert.match(html, /no account registered in the pool/);
+  assert.match(html, /no local verdict/);
 });
 
 test('renderDashboard also survives a completely undefined input', () => {
@@ -54,7 +53,7 @@ test('renderDashboard also survives a completely undefined input', () => {
   assert.match(html, /<!doctype html>/);
 });
 
-test('a DONE task and a PARKED task render with their ids, states, reason and a costUsd figure', () => {
+test('a DONE task and a PARKED task are collected with their ids, states, reason and llm steps -- NOT rendered in the HTML (per-task detail duplicates the Kanban board, see console/render.js header)', () => {
   const journalRoot = mkTmp('spo-dash-journal-');
 
   writeJournalTask(journalRoot, 'done-task-01', {
@@ -90,14 +89,20 @@ test('a DONE task and a PARKED task render with their ids, states, reason and a 
     jsonlLines: [{ ts: '2026-08-29T00:05:00.000Z', state: 'GATE', event: 'parked', reason: 'gate-dirty-tree', detail: {} }],
   });
 
-  const html = renderDashboard(collectAll({ journalRoot }));
+  const data = collectAll({ journalRoot });
+  const done = data.journalTasks.find((t) => t.id === 'done-task-01');
+  const parked = data.journalTasks.find((t) => t.id === 'parked-task-02');
+  assert.equal(done.state, 'DONE');
+  assert.equal(parked.state, 'PARKED');
+  assert.equal(parked.reason, 'gate-dirty-tree');
+  assert.equal(done.llmSteps[0].sessionId, 'sess-plan-abc');
 
-  assert.match(html, /done-task-01/);
-  assert.match(html, /parked-task-02/);
-  assert.match(html, /class="badge state-done">DONE/);
-  assert.match(html, /class="badge state-parked">PARKED/);
-  assert.match(html, /gate-dirty-tree/);
-  assert.match(html, /claude --resume sess-plan-abc/);
+  // per-task detail is not rendered -- the Kanban board owns that view, see console/render.js's
+  // "journalTasks ... collected for other consumers ... but NOT rendered here" note.
+  const html = renderDashboard(data);
+  assert.doesNotMatch(html, /done-task-01/);
+  assert.doesNotMatch(html, /parked-task-02/);
+  assert.doesNotMatch(html, /gate-dirty-tree/);
   // no dollar figures anywhere -- see console/render.js's header ("NEVER a dollar figure")
   assert.doesNotMatch(html, /\$\d/);
   assert.doesNotMatch(html, /estUsd|totalCostUsd|coût total/);
@@ -363,9 +368,10 @@ test('renderDashboard(data, {live:true}) drops the meta refresh and references /
   assert.match(html, /\/api\/system/);
 });
 
-test('renderDataFragments returns the 8 fragment keys as un-nested HTML strings', () => {
+test('renderDataFragments returns the 7 fragment keys as un-nested HTML strings', () => {
   const fragments = renderDataFragments(collectAll({}));
-  const ids = ['services', 'accounts', 'daemon', 'reports', 'prod', 'tokens', 'secondary', 'stamp'];
+  // 'prod' is not its own fragment -- it's folded into the 'services' tile row (renderProdTile).
+  const ids = ['services', 'accounts', 'daemon', 'reports', 'tokens', 'secondary', 'stamp'];
   assert.deepEqual(Object.keys(fragments).sort(), ids.slice().sort());
   for (const id of ids) {
     assert.equal(typeof fragments[id], 'string');
@@ -373,13 +379,46 @@ test('renderDataFragments returns the 8 fragment keys as un-nested HTML strings'
   }
 });
 
-test('renderDashboard prints "non surveillé" for the three live-only sections when they are null', () => {
+test('renderDashboard prints "not monitored" for the two live-only sections when they are null', () => {
   const data = collectAll({});
   data.system = null;
   data.prod = null;
   data.tokens = null;
   const html = renderDashboard(data);
-  const count = (html.match(/non surveillé/g) || []).length;
-  assert.equal(count, 2); // system + prod; tokens has its own distinct empty message
+  const count = (html.match(/not monitored/g) || []).length;
+  assert.equal(count, 2); // system card + the Prod tile; tokens has its own distinct empty message
   assert.doesNotThrow(() => renderDashboard(data));
+});
+
+// ---- tokens trend (collectAll's static-mode read + renderDashboard) --------------------------
+
+test('collectAll.trend is null when journalRoot is absent, and null when no usage-rollups.json exists', () => {
+  assert.equal(collectAll({}).trend, null);
+  const journalRoot = mkTmp('spo-dash-trend-none-');
+  assert.equal(collectAll({ journalRoot }).trend, null);
+});
+
+test('collectAll reads journal/usage-rollups.json in static mode (no live server needed) and renderDashboard shows the trend KPIs', () => {
+  const journalRoot = mkTmp('spo-dash-trend-');
+  saveRollups(path.join(journalRoot, 'usage-rollups.json'), {
+    '2026-08-01': { sessions: 25, msgs: 25, partial: false, Minp: 5, Mcc: 1, Mcr: 50, Mout: 10, byModel: {} },
+    '2026-08-02': { sessions: 25, msgs: 25, partial: false, Minp: 5, Mcc: 1, Mcr: 50, Mout: 10, byModel: {} },
+  });
+
+  const data = collectAll({ journalRoot });
+  assert.ok(data.trend);
+  assert.equal(data.trend.series.length, 2);
+
+  const html = renderDashboard(data);
+  assert.match(html, /today \(partial\)/);
+  assert.match(html, /last 7 days/);
+  assert.match(html, /last 30 days/);
+  assert.doesNotMatch(html, /no trend history yet/);
+  // still no dollar figures anywhere in this new section
+  assert.doesNotMatch(html, /\$\d/);
+});
+
+test('renderDashboard falls back to the "no trend history yet" message when trend is null', () => {
+  const html = renderDashboard(collectAll({}));
+  assert.match(html, /no trend history yet/);
 });

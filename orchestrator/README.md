@@ -1002,22 +1002,24 @@ Two render modes, same underlying data:
   pipeline counters) and hands the result to `console/render.js`, a pure function producing one
   self-contained HTML file: inline CSS, no external requests, a 30s `<meta
   http-equiv="refresh">`, light+dark via `prefers-color-scheme`. Instant and network-free -- the
-  CPU/memory and production-version cards render as "non surveillé" (not monitored) in this
-  mode. A missing source renders as an empty section, never a crash -- same "reader, never a
-  second source of truth" rule as the rest of the console.
+  CPU/memory card and the Prod tile render as "not monitored" in this mode (the tokens trend is
+  the one exception, see below -- it can still show history in static mode). A missing source
+  renders as an empty section, never a crash -- same "reader, never a second source of truth"
+  rule as the rest of the console.
 - **Live** (`--serve`): `console/serve.js` wraps the same `collectAll`/`renderDashboard` but adds
   two JSON routes the page polls client-side (no full reload): `GET /api/system` (CPU-per-core +
   memory, meant to be polled every 1s -- see `console/system.js`) and `GET /api/data`
-  (everything else -- services, accounts, daemon stats, bug reports, production version, tokens
-  -- meant to be polled every 30s). `--no-prod` disables the outbound starpeace.zz.works /
-  GitHub Releases probe (`console/prod-version.js`) for an offline run. Never binds anywhere but
-  `localhost`/LAN by default; the externally hosted copy (nginx + basic auth) is a
-  `spo dashboard` + rsync concern owned by SPO-Deploy.
+  (everything else -- services (daemon/queue/bench-worker/nightly/verdicts/prod), accounts,
+  daemon stats, bug reports, tokens -- meant to be polled every 30s). `--no-prod` disables the
+  outbound starpeace.zz.works / GitHub Releases probe (`console/prod-version.js`) for an offline
+  run. Never binds anywhere but `localhost`/LAN by default; the externally hosted copy (nginx +
+  basic auth) is a `spo dashboard` + rsync concern owned by SPO-Deploy.
 
-Each task card's per-LLM-step table comes straight from the journal's `llm-call` events
-(`step`, `model`, `account`, `sessionId`) and prints the exact `claude --resume <sessionId>`
-command in a `<code>` block, same convention as `spo resume`. The dashboard never renders a
-dollar figure -- `spo cost` / `orchestrator/cost.js` own that view instead.
+Per-task detail (id, state, reason, per-LLM-step `claude --resume <sessionId>`) is deliberately
+NOT rendered -- it duplicates the GitHub Projects board (Kanban), which owns that view. The
+journal is still read for other consumers (daemon stats, token-usage session attribution). The
+dashboard never renders a dollar figure -- `spo cost` / `orchestrator/cost.js` own that view
+instead.
 
 **Bug reports card:** counters only (queued/pending/confirmed, last intake cycle, 24h
 filed/held/duplicate, remote-pull health) from `orchestrator/report-intake.js` +
@@ -1025,23 +1027,35 @@ filed/held/duplicate, remote-pull health) from `orchestrator/report-intake.js` +
 path, URL, token, or free-text `reason`/`error` field (those can carry secrets or a production
 URL). See § Report intake above for the pipeline itself.
 
-**Production version card:** watches `starpeace.zz.works` (SPO-WebClient's production
-deployment) without SSH, via two independent HTTPS probes (`console/prod-version.js`): a root/
-`SPO_PROD_HEALTH_PATH` ping for UP/DOWN + latency (cached `SPO_PROD_URL` default
-`https://starpeace.zz.works`, 120s TTL), and the SPO-WebClient GitHub Releases API for the
-"expected" (latest tag) version (300s TTL, unauthenticated). No `/healthz` endpoint exists on
-production today -- that would be a SPO-WebClient/SPO-Deploy change, outside this repo's scope --
-so "version déployée" shows "non exposée" until one is added; the card always keeps "attendue"
-(expected, from the release tag) and "déployée" (confirmed live) visually distinct.
+**Prod tile:** watches `starpeace.zz.works` (SPO-WebClient's production deployment) without SSH,
+via two independent HTTPS probes (`console/prod-version.js`): a root/`SPO_PROD_HEALTH_PATH` ping
+for UP/DOWN + latency (cached `SPO_PROD_URL` default `https://starpeace.zz.works`, 120s TTL),
+and the SPO-WebClient GitHub Releases API for the "expected" (latest tag) version (300s TTL,
+unauthenticated). No `/healthz` endpoint exists on production today -- that would be a
+SPO-WebClient/SPO-Deploy change, outside this repo's scope -- so the deployed version shows
+"not exposed" until one is added; a `~v1.2.3` prefix on the tile means that's the expected
+(release-tag) version, unconfirmed live. Rendered as one of the top services tiles, not its own
+section -- see `console/render.js`'s `renderProdTile`.
 
-**Tokens card:** live mode incrementally scans every pool account's own
-`CLAUDE_CONFIG_DIR/projects/` plus `~/.claude/projects` (`console/usage-scan.js`, first pass 2s
-after the server starts, then every 5 minutes, cached by mtime+size so an unchanged transcript
-is never re-read -- see the module's own header on why a naive slurp took a WSL VM down once),
-joins each `sessionId` back to its SPO task via the journal's own `llm-call` events
-(`console/collect.js`'s `buildSessionIndex`), and renders a token table by task and by model.
-Static mode has no live scan; it falls back to an optional, operator-produced
-`journal/usage-snapshot.json`:
+**Tokens card:** two parts. The primary view is an operating-cost **trend**
+(`console/usage-scan.js`'s `buildTrendViews`, fed by `console/usage-rollups.json` -- a small,
+durable daily-rollup file the live server's usage-scan timer writes on the same ~5-minute
+cadence it already scans on, capped at 180 days): a weighted (`WEIGHT()`-formula) average
+Mtok-equivalent per session, with today/7d/30d KPI tiles and week-over-week deltas, a sparkline,
+and a 14-day bar list flagging days where the cache-write ratio spiked (a near-deterministic
+sign a prompt/config file changed that day, since prompt caching invalidates on any change to
+the cached prefix). Because it only reads an already-computed rollup file, this part CAN show
+history in static mode too, as long as a live server has run at least once before. The demoted,
+collapsed **breakdown** (`<details>`, "Task / model / account breakdown") is the old by-task /
+by-model / by-account tables: live mode incrementally scans every pool account's own
+`CLAUDE_CONFIG_DIR/projects/` plus `~/.claude/projects` as the synthetic `local` account
+(`console/usage-scan.js`, first pass 2s after the server starts, then every 5 minutes, cached by
+mtime+size so an unchanged transcript is never re-read -- see the module's own header on why a
+naive slurp took a WSL VM down once; `local` usage is excluded from the trend above, since it's
+ambient/non-pooled and not part of the daemon's own operating cost), joins each `sessionId` back
+to its SPO task via the journal's own `llm-call` events (`console/collect.js`'s
+`buildSessionIndex`). Static mode has no live scan for this part; it falls back to an optional,
+operator-produced `journal/usage-snapshot.json`:
 
 ```bash
 node scripts/usage-report.js > journal/usage-snapshot.json
