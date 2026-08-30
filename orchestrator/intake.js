@@ -594,6 +594,18 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
   }
 
   if (parsed.outcome === 'draft') {
+    // Reproduced live 2026-08-30: fable occasionally double-encodes the nested `draft` object
+    // as a JSON STRING (`"draft": "{\"title\": ...}"`) instead of a literal object, despite the
+    // header's own example showing it unquoted. Recover it rather than discard a real,
+    // well-reproduced finding over a formatting slip -- one JSON.parse, and only when `draft`
+    // is a string in the first place (an already-correct object is untouched).
+    if (typeof parsed.draft === 'string') {
+      try {
+        parsed.draft = JSON.parse(parsed.draft);
+      } catch {
+        return { ok: false, error: 'triageBugReport: draft was a string and not valid JSON either' };
+      }
+    }
     const check = validateDraftContract(parsed.draft);
     if (!check.ok) {
       return { ok: false, error: `triageBugReport: draft ${check.error}` };

@@ -329,6 +329,71 @@ test('fileCard: gh issue create failure -> clear error, never attempts the comme
   assert.equal(spawnCalls.length, 1); // never reached the comment call
 });
 
+// ---- triageBugReport: outcome parsing, including the string-encoded-draft recovery -------------
+
+test('triageBugReport: outcome "draft" with a literal nested object -- accepted as-is', async () => {
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(realShapedReply({ outcome: 'draft', draft: VALID_DRAFT })),
+      stderr: '',
+      signal: null,
+    })),
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.draft, VALID_DRAFT);
+});
+
+test('triageBugReport: outcome "draft" with `draft` double-encoded as a JSON string is recovered, not rejected', async () => {
+  // Reproduced live 2026-08-30: fable occasionally replies {"outcome":"draft","draft":"{...}"}
+  // -- the nested object escaped into a string -- instead of a literal nested object.
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(realShapedReply({ outcome: 'draft', draft: JSON.stringify(VALID_DRAFT) })),
+      stderr: '',
+      signal: null,
+    })),
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.draft, VALID_DRAFT);
+});
+
+test('triageBugReport: `draft` is a string but not valid JSON either -- clear error, never crashes', async () => {
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(realShapedReply({ outcome: 'draft', draft: 'not json at all' })),
+      stderr: '',
+      signal: null,
+    })),
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not valid JSON either/);
+});
+
+test('triageBugReport: outcome "not-reproduced" passes through untouched', async () => {
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(realShapedReply({ outcome: 'not-reproduced', reason: 'no matching log line' })),
+      stderr: '',
+      signal: null,
+    })),
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'not-reproduced');
+  assert.equal(result.reason, 'no matching log line');
+});
+
 // ---- amendCard: edits the raw-intake issue in place, never creates a second one ----------------
 
 test('amendCard: edits the existing issue, preserves the original body in a <details> block, posts the review comment', () => {
