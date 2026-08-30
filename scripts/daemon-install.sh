@@ -81,6 +81,12 @@ fi
 sleep 2
 systemctl --user --no-pager --lines=8 status spo-pipeline-daemon.service || true
 
+# Restart-on-update: a git post-merge hook restarts this unit (and spo-pipeline-dashboard.service
+# if present) right after `git pull`/merge lands new code. Symlinked, not copied, so hook
+# edits made in the repo take effect on the next merge without re-running this script.
+echo "== wiring post-merge hook (restart on git pull)"
+ln -sf "$REPO/scripts/git-hooks/post-merge" "$REPO/.git/hooks/post-merge"
+
 echo ""
 echo "== the daemon is now AUTONOMOUS: --real, auto-pull every 5 min, one card at a time."
 echo "== journals: $REPO/journal/   status: bin/spo status   cost: bin/spo cost"
