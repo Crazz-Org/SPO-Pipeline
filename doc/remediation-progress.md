@@ -88,6 +88,35 @@ C3 added three more, each caught by measuring rather than reasoning:
 - **Untracked spend** — intake steps have no `taskDir`, so `spo tokens` cannot see them at all.
   Not in any chantier; suggest C5.
 
+## The C3 soak's first find: 2.7 broke the retry channel outright
+
+Starting the daemon after merging C3 produced `unpark-scan-failed` for all three parked cards
+within a minute — the exact "journal spam" the soak criterion forbids. It was not spam.
+
+`gh api <path>` is a GET, but **any** `-f`/`-F` field flips it to POST unless `--method`/`-X` says
+otherwise. Action 2.7's pagination passed `-f per_page=100 -f page=N` to
+`repos/<repo>/issues/<n>/comments`, which under POST is the *create an issue comment* endpoint, so
+every scan got `422 "body" wasn't supplied`. Reproduced live on issue 213: the `-f` form exits 1;
+the same call as a query string exits 0 and returns 4 comments.
+
+Three things worth carrying forward:
+
+- **The `retry`/`abandon` channel did not work at all** between 2.7 merging and the fix. Before 2.7
+  the call was a correct one-page GET — the very limitation 2.7 existed to remove. It replaced a
+  working one-page scan with a broken zero-page one.
+- **It failed closed by accident.** The POST was rejected only because no `body` field was
+  supplied; adding one would have had the daemon writing real comments onto live issues.
+- **1164 `unpark-scan-failed` events read as transient `gh` flakiness** — a catalogued, dismissed
+  symptom — which is why a total outage of the channel went unnoticed. The audit had already
+  written those events off as polling noise.
+
+The hermetic suite could not catch it: `runSync` is stubbed everywhere, so a test asserts what argv
+a module *builds*, never what `gh` does with it — and three fakes keyed off `-f page=N`, pinning the
+broken shape. The standing guard is therefore a source sweep (`test/gh-api-argv.test.js`) that fails
+on any `gh api` call site passing `-f`/`-F` without an explicit `--method`/`-X`, `gh api graphql`
+exempted. **Any future real-spawn smoke coverage should start here**, since this is the fifth
+production bug to pass a green hermetic suite.
+
 ## Operational facts that cost time to learn
 
 - **Merging restarts the daemon.** A post-merge hook `systemctl restart`s daemon + dashboard on
