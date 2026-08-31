@@ -89,27 +89,180 @@ function appendSpawnLog(taskDir, state, header, text) {
   fs.appendFileSync(file, `----- ${header} -----\n${text || ''}\n\n`);
 }
 
-// Spawns one real command for `state`, journals {state, argv (first 6 tokens), exit, ms} as a
-// 'spawn' event, appends its stdout (falling back to stderr) to journal/<id>/logs/<STATE>.log,
-// and returns the full result for the caller to interpret. The one place every real command in
-// this file actually runs.
-function spawnStep(ctx, deps, state, command, args, opts = {}) {
+// ---- action 2.1: per-command-class timeouts + timeout-vs-exit-1 disambiguation ------------
+//
+// classifyCommand(command, args) -> one of config.commandTimeoutsMs's keys, or null.
+//
+// Every spawnStep call site in this file passes a LITERAL command string ('git' | 'npm' | 'gh')
+// -- only the args vary, and always as a plain array (never something classification has to
+// evaluate at runtime beyond args[0]/args[1]) -- so this is a pure, total function over the 48
+// call sites as they exist today. `npm run gate` gets its own class (the plan's calibration);
+// every other `npm run <alias>` (typecheck, lint, coverage:changed, board:take, board:move,
+// pr:wait) shares 'npm-run' -- see config.js's own comment on why that default is bounded below
+// by pr:wait's internal budget. An unrecognized (command, args) pair returns null, meaning "no
+// class default" -- spawnStep then arms no timeout unless the caller passed an explicit
+// opts.timeout, exactly like before this action.
+function classifyCommand(command, args) {
+  if (command === 'git') return 'git';
+  if (command === 'gh') return 'gh';
+  if (command === 'npm') {
+    if (args[0] === 'ci') return 'npm-ci';
+    if (args[0] === 'run' && args[1] === 'gate') return 'npm-gate';
+    if (args[0] === 'run') return 'npm-run';
+  }
+  return null;
+}
+
+// The one place classifyCommand's class name becomes a millisecond value -- reads
+// config.commandTimeoutsMs, tolerating a config object built by an older test fixture that
+// predates this action (testConfig() in test/real-steps.test.js does not set this field on
+// every override) rather than throwing on a missing table.
+function classTimeoutMs(config, commandClass) {
+  if (!commandClass) return undefined;
+  const table = config && config.commandTimeoutsMs;
+  return table ? table[commandClass] : undefined;
+}
+
+// One single spawnSync attempt: runs the command, maps the result to {exit, timedOut, ...}, and
+// journals it. Split out of spawnStep (below) so the retry-once policy can call this twice
+// without duplicating the exit-mapping/journal/log logic -- and so a test can see both attempts
+// as two distinct 'spawn' events (attempt: 1, attempt: 2) explaining a park.
+//
+// THE TRAP THIS FUNCTION EXISTS TO CLOSE: spawnSync on a `timeout` kill sets BOTH
+// `result.signal` (the kill signal, SIGTERM here) AND `result.error` (an Error with
+// `.code === 'ETIMEDOUT'`) -- exactly steps/llm.js's invokeClaudeReal already had to learn the
+// hard way (card #449, that file's own comment). The pre-existing code here mapped
+// `status: null` (which a timeout kill also produces) straight to exit 1, indistinguishable
+// from a genuine failure -- so a timeout-killed GATE (exit 1 -> DIAGNOSE) paid a real LLM call
+// to diagnose a hang. `timedOut` is therefore branched FIRST, before the exit mapping, mirroring
+// llm.js's own `killedByDeadline` idiom (not a new third convention). A bare `signal` with NO
+// timeout armed (an operator's kill -9, an OOM kill) is deliberately NOT a timeout -- same
+// `deadlineArmed` guard llm.js uses -- and falls through to the pre-existing `error -> exit -1`
+// / `status: null with no error/signal -> exit 1` branches, unchanged.
+function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, timeoutMs, attempt }) {
   const start = Date.now();
-  const result = runSync(deps, command, args, opts);
+  const result = runSync(deps, command, args, spawnOpts);
   const ms = Date.now() - start;
 
+  const deadlineArmed = typeof spawnOpts.timeout === 'number';
+  const timedOut =
+    deadlineArmed && !!((result && result.error && result.error.code === 'ETIMEDOUT') || (result && result.signal));
+
   let exit;
-  if (result && result.error) exit = -1;
-  else exit = result.status === null || result.status === undefined ? 1 : result.status;
+  if (timedOut) {
+    exit = -1; // never routed on -- callers must check `timedOut` before looking at `exit` at all
+  } else if (result && result.error) {
+    exit = -1;
+  } else {
+    exit = result.status === null || result.status === undefined ? 1 : result.status;
+  }
 
   const stdout = (result && result.stdout) || '';
   const stderr = (result && result.stderr) || '';
   const tail = lastLines(stdout || stderr);
 
-  appendEvent(ctx.taskDir, state, 'spawn', { argv: [command, ...args].slice(0, 6), exit, ms });
+  appendEvent(ctx.taskDir, state, 'spawn', {
+    argv: [command, ...args].slice(0, 6),
+    exit,
+    ms,
+    attempt,
+    commandClass: commandClass || null,
+    timeoutMs: deadlineArmed ? timeoutMs : null,
+    timedOut,
+    signal: (result && result.signal) || null,
+  });
   appendSpawnLog(ctx.taskDir, state, [command, ...args].join(' '), stdout || stderr);
 
-  return { exit, stdout, stderr, stdoutTail: tail, ms };
+  return {
+    exit,
+    stdout,
+    stderr,
+    stdoutTail: tail,
+    ms,
+    timedOut,
+    commandClass: commandClass || null,
+    timeoutMs: deadlineArmed ? timeoutMs : undefined,
+    signal: (result && result.signal) || null,
+  };
+}
+
+// Spawns one real command for `state`. The one place every real command in this file actually
+// runs -- unchanged call signature for all 48 existing call sites.
+//
+// Arms spawnSync's own `timeout` (the only real defence against a hung child -- see this
+// module's header and config.js's commandTimeoutsMs comment): classifyCommand's class default,
+// unless the caller passed an explicit `opts.timeout`, which always wins.
+//
+// Retry-once-then-park (action 2.1(c)): ONLY on a timeout, never on a genuine non-zero exit or
+// spawn error (those return to the caller exactly as before, unretried -- a caller's own routing
+// on exit codes is completely unchanged). Chosen to live HERE, at the single choke point every
+// real command already passes through, rather than as a per-call-site wrapper: duplicating a
+// retry policy at 48 call sites (or worse, at only some of them) is exactly the kind of drift
+// this file's own "one place every real command runs" design already exists to avoid, and every
+// caller already treats spawnStep's return as the final word on one command's outcome.
+//
+// Idempotency of the retried command was audited call-site by call-site rather than assumed:
+//   - Every `git` command here is either read-only (rev-parse/diff/status/list) or naturally
+//     idempotent on a retry (`push` reports "up to date" / fails cleanly on a real divergence
+//     rather than duplicating a ref; `worktree remove`/`branch -D`/`merge-base --is-ancestor`
+//     are all safe to repeat; `commit` on a tree with nothing staged fails harmlessly rather
+//     than double-committing).
+//   - `gh pr create` (PUSH_PR): GitHub itself refuses a second PR for the same head branch
+//     ("A pull request ... already exists") -- a retry after a timeout either creates the ONE
+//     pr (if the first attempt's network call never actually landed) or fails cleanly into the
+//     existing push-pr-failed park (if it did land server-side despite the local hang).
+//   - `npm run board:take` (WORKTREE): SPO-WebClient's board-take.sh is explicitly documented
+//     idempotent -- exit 0 with "(already held)" on a re-run that already succeeded.
+//   - `gh pr merge` (MERGE): re-enqueuing an already-enqueued/merged PR is a GitHub-side no-op
+//     or a clean non-zero exit, never a second merge.
+//   - The one call this audit does NOT fully close: `gh issue comment` (FINISH). Issue comments
+//     have no server-side dedup, so a retry after a timeout whose first attempt's network call
+//     actually succeeded could in principle post a duplicate "Merged via ..." comment. This is
+//     cosmetic (never a second PR, branch, merge, or claim) and journaled like every other
+//     attempt, so it is visible if it ever happens -- but it is a real, not fully eliminated,
+//     residual risk, called out here rather than silently assumed away.
+function spawnStep(ctx, deps, state, command, args, opts = {}) {
+  const config = (ctx && ctx.config) || {};
+  const commandClass = classifyCommand(command, args);
+  const timeoutMs = opts.timeout !== undefined ? opts.timeout : classTimeoutMs(config, commandClass);
+  const spawnOpts = timeoutMs === undefined ? opts : { ...opts, timeout: timeoutMs };
+
+  const first = spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, timeoutMs, attempt: 1 });
+  if (!first.timedOut) return first;
+
+  // `npm run gate` is the one command here that must NOT be retried. It submits a job to the
+  // live bench, and job.ts refuses a second job for the same (worktree, ref) while the first is
+  // still queued -- DuplicateJobError -> cli.ts exit 2 -> realGate's ParkSignal('gate-dirty-tree'),
+  // a reason describing a dirty worktree that is in fact perfectly clean. spawnSync's timeout
+  // kills only the direct child, so the orphaned `node cli.js wait` grandchild keeps the first
+  // job alive and makes that refusal near-certain rather than a race. With npm-gate's timeout now
+  // derived from the bench's own 7200s bound (config.js), reaching this line at all means the
+  // bench itself is wedged -- a retry cannot help, and parking honestly is the better answer.
+  if (commandClass === 'npm-gate') {
+    throw new ParkSignal('npm-gate-timed-out', {
+      state,
+      argv: [command, ...args].slice(0, 6),
+      commandClass,
+      timeoutMs,
+      retried: false,
+      detail: 'not retried: re-running `npm run gate` re-submits a bench job for the same (worktree, ref)',
+    });
+  }
+
+  const second = spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, timeoutMs, attempt: 2 });
+  if (!second.timedOut) return second;
+
+  // Both attempts killed by the same timeout -- a dedicated park reason naming the command
+  // class, never the caller's own failure reason (a caller must not be able to mistake this for
+  // its own domain failure -- e.g. realGate's exit-1 -> DIAGNOSE routing never even sees this,
+  // because spawnStep never returns in this branch). Both 'spawn' events above already journaled
+  // attempt 1 and 2 with timedOut: true, so the journal explains the park on its own.
+  throw new ParkSignal(`${commandClass || 'command'}-timed-out`, {
+    state,
+    argv: [command, ...args].slice(0, 6),
+    commandClass,
+    timeoutMs,
+  });
 }
 
 function readJsonSafe(file) {
@@ -476,7 +629,32 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
 // dirty-leftover sweep call site treats a failed preservation as "fall back to the old
 // park-and-wait behaviour", not as a harder failure. Returns null (no event beyond the failure
 // one, if any) when there is nothing to preserve (no worktree, already clean) or a step failed.
-function preserveWorktreeWip(ctx, deps, { worktreePath, reason, state = 'PARKED' } = {}) {
+//
+// The "never throws" half of that contract is NOT free since action 2.1: every spawnStep below
+// now throws ParkSignal('git-timed-out') when the same git command is killed by its own
+// spawnSync timeout twice in a row. Uncaught, that throw leaves finalizePark (state-machine.js)
+// half-done -- thrown from INSIDE runTask's `catch (ParkSignal)` handler, so state.json is never
+// written, report.md/daemon.jsonl/the park comment never happen, the task stays forever in its
+// last in-flight state, and the error escapes to daemon.js's main().catch, which exits 1. The
+// next start's orphanScan reparks that same task through this same function and dies the same
+// way: a crash loop over a single hung `git status` in a parked card's worktree. A timeout here
+// is therefore just another failed preservation step -- journaled and null-returned, exactly
+// like the non-zero-exit branches below.
+function preserveWorktreeWip(ctx, deps, opts = {}) {
+  try {
+    return preserveWorktreeWipUnguarded(ctx, deps, opts);
+  } catch (err) {
+    if (!(err instanceof ParkSignal)) throw err;
+    appendEvent(ctx.taskDir, opts.state || 'PARKED', 'wip-preserve-failed', {
+      step: 'timed-out',
+      reason: err.reason,
+      argv: err.detail && err.detail.argv,
+    });
+    return null;
+  }
+}
+
+function preserveWorktreeWipUnguarded(ctx, deps, { worktreePath, reason, state = 'PARKED' } = {}) {
   if (!worktreePath || !fs.existsSync(worktreePath)) return null;
 
   const status = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'status', '--porcelain']);
@@ -1128,6 +1306,7 @@ module.exports = {
   sleep,
   lastLines,
   spawnStep,
+  classifyCommand,
   realWorktree,
   realCheck,
   realPushPr,

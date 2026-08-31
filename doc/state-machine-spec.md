@@ -139,12 +139,51 @@ The analysis's top families are mostly **states not to have** rather than branch
 3. **Every step has a wall-clock deadline.** The "sub-agent hadn't returned" family (18
    episodes: list/ping/re-spawn loops, twice a duplicate executor) becomes: spawn once, wait
    with a deadline, on expiry kill → retry once → PARKED. Never two live executors for one
-   task.
+   task. Two independent mechanisms enforce this, because a JS timer cannot preempt a
+   synchronous child: `claude -p` calls (LLM steps) are killed by `spawnSync`'s own `timeout`
+   option inside `steps/llm.js`'s `invokeClaudeReal`, racing `deadline.js`'s `callWithDeadline`
+   as a belt-and-suspenders around the whole call; every `git`/`gh`/`npm` command a scripted step
+   spawns *through `spawnStep`* is killed the same way, per `orchestrator/config.js`'s
+   `commandTimeoutsMs` table (see below) — the commands spawned outside it (`board.js`'s
+   `moveCard`, `park-loop.js`'s park comment and unpark scan) are still unbounded.
+   `callWithDeadline`'s own JS-timer race is a no-op here, since a blocking `spawnSync` never
+   yields the event loop for the timer to fire in. Action 2.1 closed this gap: before it,
+   a hung `gh`/`git`/`npm` child froze the single-threaded daemon forever, holding the task
+   lock, with nothing to recover it.
 4. **Only allowlisted command forms are ever emitted** (58 guard refusals, 26 re-spelling
    episodes measured). The orchestrator's command table is the allowlist; there is nothing to
    re-spell.
 5. **PARK is cheap, stalls are not.** PARK is only 18 % of episodes but ~31 % of wasted
    volume: the machine parks early on queue/infra stalls instead of waiting creatively.
+
+## Scripted-step timeouts (action 2.1)
+
+Every real `git`/`gh`/`npm` command any scripted step spawns (`orchestrator/steps/scripted.js`'s
+`spawnStep`) is classified by command + leading args and armed with `spawnSync`'s own `timeout`
+option, per `orchestrator/config.js`'s `commandTimeoutsMs`:
+
+| Class | Default | Covers |
+|---|---|---|
+| `git` | 120s | every `git` call (local ops + one round-trip against `origin`) |
+| `gh` | 120s | every `gh` call (one REST/GraphQL request — not the CI_CHECKS poll budget above, which bounds the whole loop separately) |
+| `npm-ci` | 600s (10 min) | `npm ci` (WORKTREE — a fresh worktree carries no `node_modules`) |
+| `npm-gate` | 7800s (130 min), never retried | `npm run gate` (GATE — the bench job). Derived from the bench's own `DEFAULT_WAIT_TIMEOUT_MIN = 120` (7200s), which exits 4 into the designed `gate-timeout` park; our kill stays the last resort behind it. Not retried: a second `npm run gate` re-submits a bench job for the same (worktree, ref), which `job.ts` refuses as a duplicate → exit 2 → a false `gate-dirty-tree` park |
+| `npm-run` | 660s (11 min) | every other `npm run <alias>` (`typecheck`, `lint`, `coverage:changed`, `board:take`, `board:move`, `pr:wait`) — bounded below by `pr:wait`'s own internal 600s bound (`scripts/pr-wait.sh`: 20 polls × 30s), so a legitimate "still in the merge queue" `pr:wait` exit is never killed by this timeout first |
+
+An explicit per-call `timeout` always overrides the class default. Every value has an
+`SPO_TIMEOUT_*_MS` env override (see `config.js`).
+
+**Kill → retry once → park, with a class-specific reason.** On a `spawnSync` timeout, Node
+reports `status: null` with both `signal` (e.g. `SIGTERM`) and `error.code === 'ETIMEDOUT'` set
+— this is branched out *before* the exit-code mapping, so a timeout is never misread as exit 1
+(the trap that would otherwise route a hung GATE straight to DIAGNOSE, paying an LLM call to
+diagnose a process the daemon itself killed). The killed command is retried once with the same
+timeout; if the retry also times out, the task PARKS with a dedicated reason naming the command
+class — `git-timed-out` / `gh-timed-out` / `npm-ci-timed-out` / `npm-gate-timed-out` /
+`npm-run-timed-out` — never the calling state's own failure reason (so a timed-out GATE parks
+`npm-gate-timed-out`, distinct from both `gate-timeout`, the *domain* exit-4 reason `npm run
+gate` itself can return, and `DIAGNOSE`, which it never reaches). Both attempts are journaled as
+`spawn` events (`attempt: 1`/`2`, `timedOut: true`), so the journal explains the park on its own.
 
 ## Shadow mode and promotion
 

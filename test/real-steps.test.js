@@ -21,6 +21,8 @@ const {
   realFinish,
   preserveWorktreeWip,
   prepareJudgeInputs,
+  spawnStep,
+  classifyCommand,
 } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx, runTask } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
@@ -40,6 +42,28 @@ function ok(stdout = '') {
 
 function fail(status, stderr = '') {
   return { status, stdout: '', stderr, signal: null };
+}
+
+// action 2.1 -- what Node's real spawnSync actually returns when its own `timeout` option kills
+// the child: BOTH `signal` (the kill signal) AND `error` (an Error with `.code === 'ETIMEDOUT'`)
+// are set, `status` is null. Mirrors steps/llm.js's invokeClaudeReal fixtures for the exact same
+// shape (that file learned this the hard way on card #449).
+function timeoutResult(signal = 'SIGTERM') {
+  const error = new Error(`spawnSync ${signal} ETIMEDOUT`);
+  error.code = 'ETIMEDOUT';
+  return { status: null, stdout: '', stderr: '', signal, error };
+}
+
+// A signalled child with NO deadline armed (an operator's kill -9, an OOM kill) -- must NOT be
+// mistaken for a timeout: no `error`, no ETIMEDOUT code, just a bare signal.
+function killedNoDeadline(signal = 'SIGKILL') {
+  return { status: null, stdout: '', stderr: '', signal, error: null };
+}
+
+// The pre-existing "unknown" case this action must not change: no signal, no error, just a null
+// status (whatever produces that in practice -- action 2.1's own spec calls this out by name).
+function nullStatusNoSignal() {
+  return { status: null, stdout: '', stderr: '', signal: null, error: null };
 }
 
 function testConfig(overrides = {}) {
@@ -2437,3 +2461,357 @@ for (const [label, run] of [
     assert.equal(sleeps.length, 1, 'one sleep between the two polls');
   });
 }
+
+// ---- action 2.1: real spawnSync per-command-class timeouts -------------------------------
+//
+// The spec claimed "every step has a wall-clock deadline"; in real mode that was false --
+// deadline.js's callWithDeadline races a JS timer against a Promise, but every real command
+// here runs through spawnSync, which BLOCKS the event loop, so that timer cannot fire while a
+// git/gh/npm child is stuck. The only real defence is spawnSync's own `timeout` option, armed
+// per call by spawnStep via classifyCommand + config.commandTimeoutsMs.
+
+const TIMEOUT_TABLE = {
+  git: 120000,
+  gh: 120000,
+  'npm-ci': 600000,
+  'npm-gate': 900000,
+  'npm-run': 660000,
+};
+
+function timeoutTestCtx(overrides = {}) {
+  return testCtx({
+    task: { id: 'card-timeout', issue: 55, worktreePath: '/fake/wt' },
+    config: testConfig({ commandTimeoutsMs: TIMEOUT_TABLE, ...overrides }),
+  });
+}
+
+test('classifyCommand: classifies every real call shape used in this file', () => {
+  assert.equal(classifyCommand('git', ['-C', '/x', 'status', '--porcelain']), 'git');
+  assert.equal(classifyCommand('gh', ['pr', 'list']), 'gh');
+  assert.equal(classifyCommand('gh', ['api', 'repos/x/y/pulls/1', '-X', 'PATCH']), 'gh');
+  assert.equal(classifyCommand('npm', ['ci']), 'npm-ci');
+  assert.equal(classifyCommand('npm', ['run', 'gate']), 'npm-gate');
+  assert.equal(classifyCommand('npm', ['run', 'typecheck']), 'npm-run');
+  assert.equal(classifyCommand('npm', ['run', 'board:take', '--', '42']), 'npm-run');
+  assert.equal(classifyCommand('npm', ['run', 'pr:wait', '--', '9']), 'npm-run');
+  assert.equal(classifyCommand('curl', ['https://example.com']), null);
+});
+
+for (const [label, command, args, expectedClass] of [
+  ['git', 'git', ['-C', '/wt', 'status', '--porcelain'], 'git'],
+  ['gh', 'gh', ['pr', 'list'], 'gh'],
+  ['npm ci', 'npm', ['ci'], 'npm-ci'],
+  ['npm run gate', 'npm', ['run', 'gate'], 'npm-gate'],
+  ['npm run <other alias>', 'npm', ['run', 'lint'], 'npm-run'],
+]) {
+  test(`spawnStep: arms spawnSync's own timeout with the ${label} class default`, () => {
+    const ctx = timeoutTestCtx();
+    const seenOpts = [];
+    const deps = {
+      spawnSync: (cmd, a, opts) => {
+        seenOpts.push(opts);
+        return ok('');
+      },
+    };
+    const r = spawnStep(ctx, deps, 'CHECK', command, args);
+    assert.equal(seenOpts.length, 1);
+    assert.equal(seenOpts[0].timeout, TIMEOUT_TABLE[expectedClass]);
+    assert.equal(r.exit, 0);
+    assert.equal(r.timedOut, false);
+  });
+}
+
+test('spawnStep: an explicit opts.timeout always overrides the command class default', () => {
+  const ctx = timeoutTestCtx();
+  const seenOpts = [];
+  const deps = {
+    spawnSync: (cmd, a, opts) => {
+      seenOpts.push(opts);
+      return ok('');
+    },
+  };
+  spawnStep(ctx, deps, 'WORKTREE', 'npm', ['ci'], { timeout: 5000, cwd: '/wt' });
+  assert.equal(seenOpts.length, 1);
+  assert.equal(seenOpts[0].timeout, 5000, 'explicit opts.timeout beats the npm-ci class default');
+  assert.equal(seenOpts[0].cwd, '/wt', 'other opts are still passed through');
+});
+
+test('spawnStep: a timeout-killed command (status: null, signal SIGTERM, error ETIMEDOUT) reports timedOut, never exit 1 -- retried once, second attempt succeeds', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: (cmd, a, opts) => {
+      calls.push({ cmd, args: [...a], timeout: opts.timeout });
+      return calls.length === 1 ? timeoutResult() : ok('all good\n');
+    },
+  };
+
+  const r = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', '/wt', 'status', '--porcelain']);
+
+  assert.equal(calls.length, 2, 'retried exactly once');
+  assert.equal(r.timedOut, false, 'the RETURNED result is the second (successful) attempt');
+  assert.equal(r.exit, 0);
+  assert.equal(r.stdout, 'all good\n');
+
+  const journal = readJournal(ctx.taskDir).filter((e) => e.event === 'spawn');
+  assert.equal(journal.length, 2, 'both attempts journalled');
+  assert.equal(journal[0].attempt, 1);
+  assert.equal(journal[0].timedOut, true);
+  assert.notEqual(journal[0].exit, 1, 'a timeout must never be journalled as a plain exit 1');
+  assert.equal(journal[1].attempt, 2);
+  assert.equal(journal[1].timedOut, false);
+  assert.equal(journal[1].exit, 0);
+});
+
+// The fake MUST key on the command, not on a call counter: realGate's first spawn is moveCard's
+// own `npm run board:move` (board.js's runSync, which swallows every failure by design), so a
+// counter-keyed fake spends the timeout on the kanban move and never times out the gate at all --
+// the test then passes with the whole timeout/retry path deleted (verified by mutation).
+test('spawnStep: a timed-out GATE parks on its own reason and is NEVER retried -- a retry re-submits a bench job', async () => {
+  const worktreePath = mkTmp('spo-gate-timeout-wt-');
+  const config = testConfig({ commandTimeoutsMs: TIMEOUT_TABLE });
+  const task = { id: 'card-gate-timeout-ok', kind: 'card', issue: 91, worktreePath };
+  const ctx = testCtx({ id: 'card-gate-timeout-ok', task, config });
+  let gateRuns = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args[0] === 'run' && args[1] === 'gate') {
+        gateRuns += 1;
+        return timeoutResult();
+      }
+      return ok(''); // moveCard's board:move and anything else
+    },
+  };
+
+  // The property this test exists for: realGate maps exit 1 -> DIAGNOSE, and a timeout-killed
+  // child reports status:null which the pre-2.1 code mapped to exit 1. So without the
+  // timeout/exit disambiguation, a hung gate would buy a real LLM diagnosis of a hang.
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) => {
+      assert.ok(err instanceof ParkSignal);
+      assert.equal(err.reason, 'npm-gate-timed-out');
+      assert.notEqual(err.reason, 'gate-dirty-tree', 'a busy bench must never be reported as a dirty worktree');
+      assert.equal(err.detail.retried, false);
+      return true;
+    }
+  );
+
+  // Exactly once. `npm run gate` submits to the live bench; job.ts refuses a second job for the
+  // same (worktree, ref) with DuplicateJobError -> cli.ts exit 2 -> ParkSignal('gate-dirty-tree'),
+  // and spawnSync kills only the direct child so the orphaned waiter keeps the first job alive.
+  assert.equal(gateRuns, 1, 'the gate command must run exactly once -- a retry re-submits a bench job');
+
+  const gateSpawns = readJournal(ctx.taskDir)
+    .filter((e) => e.event === 'spawn')
+    .filter((e) => e.argv[0] === 'npm' && e.argv[2] === 'gate');
+  assert.deepEqual(
+    gateSpawns.map((e) => [e.attempt, e.timedOut]),
+    [[1, true]],
+    'journalled as a timeout, never as an exit-1 gate failure'
+  );
+  assert.equal(gateSpawns[0].timeoutMs, TIMEOUT_TABLE['npm-gate']);
+});
+
+test('npm-gate timeout exceeds the bench\'s own wait bound, so the bench always renders its verdict first', () => {
+  const config = require('../orchestrator/config.js');
+  // src/e2e/bench/cli.ts: DEFAULT_WAIT_TIMEOUT_MIN = 120 -> bench-submit --wait gives up at
+  // 7200s and exits 4, which realGate maps to the designed ParkSignal('gate-timeout'). Our kill
+  // must stay the last resort behind that, or we destroy a legitimate queue wait. The plan's
+  // stated 900s was eight times too small; this pins the relation so it cannot drift back.
+  const BENCH_WAIT_BOUND_MS = 120 * 60 * 1000;
+  assert.ok(
+    config.commandTimeoutsMs['npm-gate'] > BENCH_WAIT_BOUND_MS,
+    `npm-gate (${config.commandTimeoutsMs['npm-gate']}ms) must exceed the bench's own ${BENCH_WAIT_BOUND_MS}ms bound`
+  );
+});
+
+test('spawnStep: BOTH attempts time out -> PARKED with a dedicated reason naming the command class, never the caller\'s own failure reason', () => {
+  const ctx = timeoutTestCtx();
+  const deps = { spawnSync: () => timeoutResult() };
+
+  assert.throws(
+    () => spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', '/wt', 'push', '-u', 'origin', 'claude-pipe/card-timeout']),
+    (err) => {
+      assert.ok(err instanceof ParkSignal);
+      assert.equal(err.reason, 'git-timed-out');
+      assert.notEqual(err.reason, 'push-pr-failed', "must be spawnStep's own reason, not the caller's");
+      assert.equal(err.detail.commandClass, 'git');
+      assert.equal(err.detail.timeoutMs, TIMEOUT_TABLE.git);
+      return true;
+    }
+  );
+
+  const journal = readJournal(ctx.taskDir).filter((e) => e.event === 'spawn');
+  assert.equal(journal.length, 2, 'both timed-out attempts are journalled, explaining the park');
+  assert.ok(journal.every((e) => e.timedOut === true));
+  assert.deepEqual(journal.map((e) => e.attempt), [1, 2]);
+});
+
+test('spawnStep: a timed-out GATE that ALSO fails on retry parks npm-gate-timed-out -- never reaches DIAGNOSE, never gate-timeout (the domain exit-4 reason)', async () => {
+  const worktreePath = mkTmp('spo-gate-timeout-park-wt-');
+  const config = testConfig({ commandTimeoutsMs: TIMEOUT_TABLE });
+  const task = { id: 'card-gate-timeout-park', kind: 'card', issue: 92, worktreePath };
+  const ctx = testCtx({ id: 'card-gate-timeout-park', task, config });
+  const deps = { spawnSync: () => timeoutResult() };
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'npm-gate-timed-out'
+  );
+});
+
+test('spawnStep: a genuine non-zero exit is never retried and behaves exactly as before (one spawnSync call, one journal line)', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: (cmd, a) => {
+      calls.push([cmd, ...a]);
+      return fail(1, 'lint errors');
+    },
+  };
+
+  const r = spawnStep(ctx, deps, 'CHECK', 'npm', ['run', 'lint']);
+
+  assert.equal(calls.length, 1, 'no retry on a genuine non-zero exit');
+  assert.equal(r.exit, 1);
+  assert.equal(r.timedOut, false);
+});
+
+test('spawnStep: status: null with NO signal and NO error (pre-existing "unknown" case) still maps to exit 1, unretried -- behaviour unchanged by this action', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: () => {
+      calls.push(1);
+      return nullStatusNoSignal();
+    },
+  };
+
+  const r = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', '/wt', 'rev-parse', 'HEAD']);
+
+  assert.equal(calls.length, 1, 'not treated as a timeout, so no retry');
+  assert.equal(r.exit, 1);
+  assert.equal(r.timedOut, false);
+});
+
+test('spawnStep: a bare signal with NO deadline armed (unclassified command, no opts.timeout) is not mistaken for a timeout', () => {
+  const ctx = timeoutTestCtx(); // TIMEOUT_TABLE has no entry for an unrecognized command
+  const calls = [];
+  const deps = {
+    spawnSync: () => {
+      calls.push(1);
+      return killedNoDeadline('SIGKILL');
+    },
+  };
+
+  const r = spawnStep(ctx, deps, 'CHECK', 'some-unclassified-tool', ['--flag']);
+
+  assert.equal(calls.length, 1, 'no timeout was armed, so no retry is triggered by the bare signal');
+  assert.equal(r.timedOut, false);
+  assert.equal(r.exit, 1, 'falls through to the pre-existing null-status default');
+});
+
+test('spawnStep: pre-existing spawn error (e.g. ENOENT, no timeout involved) still maps to exit -1, unretried', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: () => {
+      calls.push(1);
+      const error = new Error('spawnSync git ENOENT');
+      error.code = 'ENOENT';
+      return { status: null, stdout: '', stderr: '', signal: null, error };
+    },
+  };
+
+  const r = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', '/wt', 'status']);
+
+  assert.equal(calls.length, 1, 'ENOENT is not a timeout -- no retry');
+  assert.equal(r.exit, -1);
+  assert.equal(r.timedOut, false);
+});
+
+
+// ---- action 2.1, verifier follow-ups ------------------------------------------------------
+//
+// (a) spawnStep now THROWS from a place that previously always returned, and one of its 48 call
+//     sites sits inside the park path itself: state-machine.js's finalizePark calls
+//     preserveWorktreeWip, whose own header contract is "never blocks or throws". Uncaught, a
+//     `git-timed-out` there is thrown from INSIDE runTask's `catch (ParkSignal)` handler --
+//     state.json is never written, the task never reaches PARKED, and the throw escapes to
+//     daemon.js's main().catch (exit 1), where the next start's orphanScan reparks the same
+//     task through the same function and dies again.
+test('preserveWorktreeWip: a git command killed by its own spawnSync timeout twice returns null, never throws (finalizePark must stay total)', () => {
+  const worktreePath = mkTmp('spo-wip-timeout-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'dirty.txt'), 'x');
+  const ctx = timeoutTestCtx();
+  const deps = { spawnSync: () => timeoutResult() };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'gate-dirty-tree' });
+
+  assert.equal(preserved, null, 'a timed-out preservation step is a failed preservation, not a new park');
+  const failed = readJournal(ctx.taskDir).filter((e) => e.event === 'wip-preserve-failed');
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].step, 'timed-out');
+  assert.equal(failed[0].reason, 'git-timed-out');
+});
+
+test('finalizePark stays total when preserveWorktreeWip times out: PARKED state.json and report.md still written', () => {
+  const { finalizePark } = require('../orchestrator/state-machine');
+  const worktreePath = mkTmp('spo-park-timeout-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'dirty.txt'), 'x');
+  const config = testConfig({ commandTimeoutsMs: TIMEOUT_TABLE });
+  const task = { id: 'card-park-timeout', kind: 'card', issue: 93, worktreePath };
+  const ctx = testCtx({ id: 'card-park-timeout', task, config });
+  const deps = {
+    spawnSync: (command, args) => (command === 'git' && args.includes('status') ? timeoutResult() : ok('')),
+  };
+  ctx.deps = deps;
+
+  finalizePark(ctx, 'GATE', 'gate-dirty-tree', { exit: 2 });
+
+  const state = JSON.parse(fs.readFileSync(path.join(ctx.taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'gate-dirty-tree', 'the ORIGINAL park reason survives a timed-out WIP preservation');
+  assert.ok(fs.existsSync(path.join(ctx.taskDir, 'report.md')));
+});
+
+// (b) The relation this action leaves implicit, pinned so it cannot break silently.
+//     config.stepDeadlineMsByState has no GATE entry, so GATE keeps the generic 120s ceiling
+//     even though npm-gate's spawnSync timeout is 900s. That is only safe because realGate never
+//     yields the event loop: spawnSync BLOCKS, so callWithDeadline's timer cannot fire during the
+//     spawn, and when the (long-expired) timer finally becomes runnable the handler's own
+//     resolution -- a microtask -- has already won the race. Adding a single `await` to realGate
+//     that yields to the macrotask queue breaks it: measured, the deadline then fires
+//     RETROACTIVELY, callWithDeadline re-runs the whole step (a SECOND real bench gate) and parks
+//     step-deadline-exceeded-twice. This test fails the moment that happens.
+test('GATE: a spawn that blocks far past the state deadline still returns its real result -- the deadline never fires retroactively', async () => {
+  const worktreePath = mkTmp('spo-gate-block-wt-');
+  const config = testConfig({ stepDeadlineMs: 15, commandTimeoutsMs: TIMEOUT_TABLE });
+  const task = { id: 'card-gate-block', kind: 'card', issue: 94, worktreePath };
+  const ctx = testCtx({ id: 'card-gate-block', task, config });
+  let gateRuns = 0;
+  ctx.deps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args[0] === 'run' && args[1] === 'gate') {
+        gateRuns += 1;
+        const until = Date.now() + 60; // blocks the event loop past the 15ms step deadline
+        while (Date.now() < until) {
+          /* busy-wait: exactly what a real spawnSync does to the loop */
+        }
+        return ok('gate report\n');
+      }
+      return ok('');
+    },
+  };
+
+  const next = await HANDLERS.GATE(ctx);
+
+  assert.equal(next, 'CI_CHECKS');
+  assert.equal(gateRuns, 1, 'the gate ran ONCE -- a retroactive deadline would re-run the bench job');
+  assert.equal(
+    readJournal(ctx.taskDir).filter((e) => e.event === 'deadline-exceeded').length,
+    0,
+    'no deadline-exceeded event: withTimeout cannot preempt a blocking spawnSync'
+  );
+});

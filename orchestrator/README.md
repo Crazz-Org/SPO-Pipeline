@@ -579,9 +579,67 @@ summed `billableTokens` (every `llm-call` event's `billableTokens` in `journal.j
 input + cache-creation + output, cache-read excluded) and the PR number.
 
 **Every spawn**, across all seven functions, journals one compact `{state, argv (first 6
-tokens), exit, ms}` `'spawn'` event via `appendEvent`, and appends its stdout (falling back to
-stderr) to `journal/<id>/logs/<STATE>.log` — several spawns share one state's log file, in
-call order, each under its own `----- <command> -----` header.
+tokens), exit, ms, attempt, commandClass, timeoutMs, timedOut, signal}` `'spawn'` event via
+`appendEvent`, and appends its stdout (falling back to stderr) to `journal/<id>/logs/<STATE>.log`
+— several spawns share one state's log file, in call order, each under its own `-----
+<command> -----` header.
+
+**Per-command-class timeouts + retry-once-then-park (action 2.1).** `spawnStep` is the single
+choke point every real `git`/`gh`/`npm` command **this file** spawns passes through, and it is
+the ONLY real defence against a hung child: `deadline.js`'s `callWithDeadline` races a JS timer
+against the handler's promise, but `spawnStep` calls `spawnSync`, which **blocks the event
+loop** — that timer cannot fire while a `git`/`gh`/`npm` process is stuck, so a hung command used to freeze the
+single-threaded daemon forever, holding the task lock (GATE was measured running 129–240s past
+its supposedly-enforced 120s deadline before this action). `spawnStep` now classifies each call
+by command + leading args (`classifyCommand`) and arms `spawnSync`'s own `timeout` option from
+`config.commandTimeoutsMs`:
+
+| Class | Default | `SPO_TIMEOUT_*_MS` override |
+|---|---|---|
+| `git` | 120000 | `SPO_TIMEOUT_GIT_MS` |
+| `gh` | 120000 | `SPO_TIMEOUT_GH_MS` |
+| `npm-ci` | 600000 | `SPO_TIMEOUT_NPM_CI_MS` |
+| `npm-gate` | 7800000 | `SPO_TIMEOUT_NPM_GATE_MS` |
+| `npm-run` (every other `npm run <alias>`: `typecheck`, `lint`, `coverage:changed`, `board:take`, `board:move`, `pr:wait`) | 660000 | `SPO_TIMEOUT_NPM_RUN_MS` |
+
+Not covered by any of this, and still able to hang the daemon indefinitely while holding the
+task lock: the real commands spawned OUTSIDE `spawnStep` by their own local `runSync` helpers --
+`board.js`'s `moveCard` (`npm run board:move`, called from inside `realWorktree`/`realGate`/
+`realMerge` and from `postParkComment`), `park-loop.js`'s `gh issue comment`/`gh api` (the park
+comment and the unpark scan), and `report-intake.js`'s `gh` calls. None of them passes a
+`timeout`; only `park-alert.js` sets one of its own. Action 2.1 closed the scripted-step half.
+
+An explicit `opts.timeout` on a call site always wins over the class default. See `config.js`'s
+own comment on `commandTimeoutsMs` for why each value is what it is — in particular, `npm-run`'s
+660s is bounded below by `scripts/pr-wait.sh`'s own internal 600s poll budget, not chosen freely.
+
+The trap this closes: `spawnSync` on a `timeout` kill sets BOTH `signal` (e.g. `SIGTERM`) and
+`error.code === 'ETIMEDOUT'`, same as a bare `status: null` from a genuine "unknown" failure —
+the pre-existing code mapped both to exit 1 indistinguishably, so a timeout-killed GATE (exit 1
+→ DIAGNOSE) used to pay a real LLM call diagnosing a hang the daemon itself caused. `spawnStep`
+now branches on `signal`/`error` **before** the exit-code mapping (mirroring `steps/llm.js`'s
+own `killedByDeadline` idiom for `claude -p` calls, not a third convention), and never returns a
+`timedOut` result to a caller at all — a caller's exit-code routing (`realGate`'s 0/1/2/3/4,
+`realCheck`, `realCiChecks`, `realWorktree`'s claim codes, `realMerge`, `realPushPr`) is
+therefore completely unchanged; it simply never runs on a timeout.
+
+A timed-out command is retried once with the same timeout (both attempts journalled as `spawn`
+events, `attempt: 1`/`2`, `timedOut: true`); if the retry also times out, `spawnStep` itself
+throws `ParkSignal('<class>-timed-out', {state, argv, commandClass, timeoutMs})` — a dedicated
+reason naming the command class, never the calling state's own failure reason (a timed-out GATE
+parks `npm-gate-timed-out`, never `gate-timeout` — that string is the *domain* exit-4 reason
+`npm run gate` itself can return — and never reaches DIAGNOSE). The retry lives inside
+`spawnStep`, not at each of its 48 call sites, so the policy cannot drift between them. Retrying
+after a timeout is not obviously safe for every command — a first attempt that actually
+succeeded server-side before the local process hung could in principle be repeated — but every
+call site was audited: `git push`/`git commit`/`git worktree add`/etc. are all naturally
+idempotent or fail cleanly on a real retry rather than duplicating anything; `gh pr create`
+(PUSH_PR) is protected by GitHub itself refusing a second PR for the same head branch;
+`npm run board:take` (WORKTREE) is explicitly documented idempotent by `scripts/board-take.sh`
+("already held" on a re-run). The one call this audit does not fully close is `gh issue comment`
+(FINISH) — issue comments have no server-side dedup, so a retried timeout whose first attempt's
+network call actually landed could in principle post a duplicate comment. This is cosmetic
+(never a duplicate PR, branch, or merge) and journalled like every other attempt if it happens.
 
 **`--real`** (`daemon.js`) is required for any `kind: "card"` task to leave `INTAKE` once neither
 `--shadow` nor `--dry-run` applies — `state-machine.js`'s `handleIntake` parks a card task with
