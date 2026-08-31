@@ -1229,3 +1229,26 @@ test(
     assert.ok(console_.logs.some((l) => l.includes('#501: skipped')));
   })
 );
+
+// The triage model is a maintainer decision (2026-08-31: fable/high -> opus/medium) with no
+// other pin anywhere -- no doc names it, no other test asserts it -- so a silent revert would be
+// invisible until the report pipeline wedged again. It moved for availability as much as for
+// quality: fable/high stalled every confirmed report for 12.8 hours on a Fable-specific 429,
+// because pickAccount neither rotates nor cools (plan 3.3/3.6, still open).
+test('triageBugReport: runs on opus at medium effort -- the argv the CLI actually receives', async () => {
+  const seenArgs = [];
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: (command, args) => {
+      seenArgs.push(args);
+      return okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
+    },
+  };
+
+  await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(seenArgs.length, 1);
+  const args = seenArgs[0];
+  assert.equal(args[args.indexOf('--model') + 1], 'opus');
+  assert.equal(args[args.indexOf('--effort') + 1], 'medium');
+});
