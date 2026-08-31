@@ -8,7 +8,10 @@
 //   unparkScan -- called once per daemon poll cycle (state-machine.js's runForever, real mode
 //     only): for every journaled task still PARKED with a recorded park-comment anchor, reads
 //     the issue's comments and acts on the first "retry" or "abandon" reply posted after that
-//     anchor.
+//     anchor. An "abandon" match also runs abandonCleanup (action 4.5) -- a best-effort reclaim
+//     of the leaked product worktree, its local/remote claude-pipe/<id> branch, and the open PR
+//     (issue #443, where all three sat leaked indefinitely because ABANDONED used to do nothing
+//     but write state.json).
 //
 // Anchor mechanics: `gh issue comment` prints the created comment's URL,
 // `.../issues/<n>#issuecomment-<id>`. The numeric id is journaled as the park comment's anchor
@@ -287,6 +290,158 @@ function reEnqueueTask(queueDir, taskDir, id) {
   return file;
 }
 
+// action 4.5 -- issue #443, measured: ABANDONED used to write state.json and nothing else, so
+// the product worktree, its claude-pipe/<id> branch (local AND remote), and the open PR all
+// leaked forever -- `spo status`/`spo parked` had no way to even SEE the card once it left
+// PARKED, let alone act on it. abandonCleanup(deps, config, taskDir, id, task, state) is the
+// best-effort reclaim of all three, run by unparkScan strictly AFTER the ABANDONED state.json
+// write, the abandoned-by-maintainer event, and the ack comment above -- never before. That
+// ordering is what makes a crash mid-cleanup safe: state.json is already the durable, terminal
+// fact by the time any `git`/`gh` call below runs, so a daemon restart mid-cleanup finds a card
+// that is correctly ABANDONED with some leftovers still on disk (a nuisance a maintainer can
+// clean up by hand, same as issue #443 itself) rather than a card stuck in an ambiguous
+// half-abandoned state. Every step is independently exit-code-checked and journals its own
+// outcome; nothing here throws on its own, and the caller (unparkScan) wraps the whole call in
+// try/catch anyway as a second line of defence -- one card's cleanup blowing up must never abort
+// the scan for the other parked tasks in the same pass.
+//
+// `id` is unparkScan's own loop variable -- the journal/<id> directory name, i.e. the same
+// taskId realWorktree (steps/scripted.js) builds `claude-pipe/${taskId}` from. task.json on disk
+// is the original queue file moved as-is (state-machine.js's own comment on that rename) and is
+// NEVER rewritten with the runtime `branch` field realWorktree sets on ctx.task in memory -- so
+// `task.branch` read back off disk here is realistically always undefined, and the fallback
+// below is what actually fires. It is spelled out anyway, matching realPushPr's own fallback
+// expression verbatim, so this stays correct even if that assumption about task.json ever stops
+// holding.
+function abandonCleanup(deps, config, taskDir, id, task, state) {
+  const productRepo = config && config.productRepo;
+  const ghRepo = (config && config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const branch = (task && task.branch) || `claude-pipe/${id}`;
+  const journal = (event, detail) => appendEvent(taskDir, 'PARKED', event, detail);
+
+  // 1. Close the PR FIRST, before touching either branch. Real observation, issue #455: deleting
+  // a remote branch on GitHub auto-closes any PR built from it as a side effect -- if the remote
+  // delete (step 4) ran first, the PR would end up closed anyway, but as an unlogged side effect
+  // of a branch cleanup instead of a deliberate action this cleanup made and journalled. Closing
+  // it here, first, and on purpose, is the difference between a recorded decision and a silent
+  // one. An already-closed PR is not treated as an error beyond the journal line -- `gh pr close`
+  // on an already-closed PR still exits 0.
+  if (state.prNumber) {
+    const close = runSync(deps, 'gh', ['pr', 'close', String(state.prNumber), '--repo', ghRepo], {}, config);
+    const exit = normalizeExit(close);
+    if (exit === 0) journal('abandon-pr-closed', { prNumber: state.prNumber });
+    else journal('abandon-cleanup-failed', { step: 'pr-close', prNumber: state.prNumber, exit });
+  }
+
+  // 2. Worktree. A dirty working tree is NEVER destroyed by a cleanup path -- it may be the only
+  // durable copy of uncommitted work, and a maintainer who just typed "abandon" gets to inspect
+  // it by hand rather than lose it silently to a background scan. Same for a `git status` call
+  // that itself fails: an inconclusive answer is treated the same as "dirty", never as "clean".
+  let worktreeRemoved = false;
+  if (state.worktreePath && fs.existsSync(state.worktreePath)) {
+    const status = runSync(deps, 'git', ['-C', state.worktreePath, 'status', '--porcelain'], {}, config);
+    const statusExit = normalizeExit(status);
+    if (statusExit !== 0) {
+      journal('abandon-cleanup-skipped', { step: 'worktree', worktreePath: state.worktreePath, reason: 'status-failed' });
+    } else if (status.stdout.trim() !== '') {
+      journal('abandon-cleanup-skipped', { step: 'worktree', worktreePath: state.worktreePath, reason: 'dirty' });
+    } else {
+      const remove = runSync(deps, 'git', ['-C', productRepo, 'worktree', 'remove', '--force', state.worktreePath], {}, config);
+      const exit = normalizeExit(remove);
+      if (exit === 0) {
+        worktreeRemoved = true;
+        journal('abandon-worktree-removed', { worktreePath: state.worktreePath });
+      } else {
+        journal('abandon-cleanup-failed', { step: 'worktree', exit });
+      }
+    }
+  }
+
+  // 3. Local branch -- reachable only once step 2 actually removed the worktree: git refuses to
+  // delete a branch checked out in a live worktree, and a skipped-dirty worktree deliberately
+  // still holds it (the maintainer needs it there to inspect). The ancestry check below mirrors
+  // steps/scripted.js's sweepWorktreeLeftovers rule 2 verbatim, on purpose -- the maintainer
+  // abandoned the CARD, not the commits, so an unmerged local-only tip is left alone here exactly
+  // as it would be for a retry's own leftover sweep, not force-deleted just because "abandon" is
+  // a terminal word.
+  const localRef = `refs/heads/${branch}`;
+  let localBranchKept = false; // a local claude-pipe/<id> tip this cleanup deliberately left behind
+  if (worktreeRemoved) {
+    const localRevParse = runSync(deps, 'git', ['-C', productRepo, 'rev-parse', '--verify', '--quiet', localRef], {}, config);
+    if (normalizeExit(localRevParse) === 0) {
+      const localSha = localRevParse.stdout.trim();
+      const ancestor = runSync(deps, 'git', ['-C', productRepo, 'merge-base', '--is-ancestor', localRef, 'origin/main'], {}, config);
+      let safe = normalizeExit(ancestor) === 0;
+      let remoteSha = null;
+      if (!safe) {
+        const remoteRevParse = runSync(
+          deps,
+          'git',
+          ['-C', productRepo, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`],
+          {},
+          config
+        );
+        remoteSha = normalizeExit(remoteRevParse) === 0 ? remoteRevParse.stdout.trim() : null;
+        safe = remoteSha !== null && remoteSha === localSha;
+      }
+      if (safe) {
+        const del = runSync(deps, 'git', ['-C', productRepo, 'branch', '-D', branch], {}, config);
+        const exit = normalizeExit(del);
+        if (exit === 0) journal('abandon-branch-deleted', { branch, sha: localSha });
+        else {
+          journal('abandon-cleanup-failed', { step: 'local-branch', exit });
+          localBranchKept = true; // the delete failed -- the tip is still there
+        }
+      } else {
+        journal('abandon-cleanup-skipped', { step: 'local-branch', branch, localSha, remoteSha, reason: 'unmerged' });
+        localBranchKept = true;
+      }
+    }
+  } else {
+    // Step 2 declined (dirty / status-failed / remove-failed), or there was no worktree on disk to
+    // begin with -- so the block above never even asked whether a local tip survives. Ask now:
+    // it's a read-only local rev-parse, and step 4 below needs the answer.
+    const localRevParse = runSync(deps, 'git', ['-C', productRepo, 'rev-parse', '--verify', '--quiet', localRef], {}, config);
+    localBranchKept = normalizeExit(localRevParse) === 0;
+  }
+
+  // 4. Remote branch. Two conditions, not one.
+  //
+  // (a) Step 1 already closed the PR, so the PR closing as GitHub's own side effect of this delete
+  //     is redundant with a decision already made and journalled, not a surprise.
+  //
+  // (b) This cleanup did NOT keep a local claude-pipe/<id> tip. steps/scripted.js gets this second
+  //     condition for free and never had to write it down: its rule 2 THROWS ParkSignal on a tip it
+  //     cannot vouch for, so its rule 3 (this same remote delete) is simply unreachable whenever
+  //     the local branch survives. Nothing here throws -- every step is journalled and execution
+  //     continues -- so the guard has to be explicit, and without it the mirroring of rule 2 stops
+  //     exactly where it matters: a dirty worktree (step 2) or an unvouched tip (step 3) is
+  //     preserved on the grounds that "the maintainer abandoned the CARD, not the commits", and
+  //     then the very next block deletes the only pushed copy of those same commits. That is the
+  //     "never destroy what wasn't first saved somewhere durable" rule (steps/scripted.js's
+  //     dirty-leftover branch, card #385) inverted inside one function. When the local tip is
+  //     kept, the remote one is kept with it and the skip is journalled so the leftover is a
+  //     recorded decision rather than a silent omission.
+  const remoteCheck = runSync(
+    deps,
+    'git',
+    ['-C', productRepo, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`],
+    {},
+    config
+  );
+  if (normalizeExit(remoteCheck) === 0) {
+    const remoteSha = remoteCheck.stdout.trim();
+    if (localBranchKept) {
+      journal('abandon-cleanup-skipped', { step: 'remote-branch', branch, remoteSha, reason: 'local-branch-kept' });
+    } else {
+      const del = runSync(deps, 'git', ['-C', productRepo, 'push', 'origin', '--delete', branch], {}, config);
+      const exit = normalizeExit(del);
+      if (exit === 0) journal('abandon-remote-branch-deleted', { branch, sha: remoteSha });
+      else journal('abandon-cleanup-failed', { step: 'remote-branch', exit });
+    }
+  }
+}
+
 // unparkScan(queueDir, journalRoot, config, deps, scanState) -- one pass over every journaled
 // task. For each PARKED kind:"card" task with a park-comment anchor not yet acted on, comment-
 // scan.js's scanForMatch fetches the issue's comments after that anchor (paginated, allowlisted,
@@ -348,7 +503,11 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
     }
 
     // abandon -- terminal, mark it directly on state.json (no HANDLERS involvement: this task
-    // never re-enters runTask's loop) and ack on the issue, never re-enqueue.
+    // never re-enters runTask's loop) and ack on the issue, never re-enqueue. The state write
+    // happens BEFORE anything else below, including the cleanup a few lines down: once
+    // state.json says ABANDONED, that fact is durable on disk, so a daemon crash at any point
+    // after this line -- mid-ack, mid-cleanup -- resumes into a task that is already correctly
+    // terminal, never one an interrupted write left ambiguous.
     writeState(taskDir, {
       ...state,
       state: 'ABANDONED',
@@ -363,6 +522,18 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
     if (normalizeExit(ack) !== 0) {
       appendEvent(taskDir, 'PARKED', 'abandon-ack-failed', { exit: normalizeExit(ack), timedOut: ack.timedOut === true });
     }
+
+    // action 4.5: reclaim the worktree/branches/PR this attempt leaked (issue #443, measured --
+    // see abandonCleanup's own header). Caught here, on top of every individual step inside
+    // abandonCleanup already being exit-code-checked and non-throwing, because this loop
+    // processes EVERY parked task in one pass -- an unanticipated throw from this one card's
+    // cleanup (a bad path, an unexpected deps.spawnSync shape, ...) must never abort the scan
+    // before the next id in `ids` is even reached.
+    try {
+      abandonCleanup(deps, config, taskDir, id, task, state);
+    } catch (err) {
+      appendEvent(taskDir, 'PARKED', 'abandon-cleanup-failed', { step: 'unexpected', error: String((err && err.message) || err) });
+    }
   }
 }
 
@@ -375,6 +546,7 @@ module.exports = {
   shouldScanUnpark,
   findParkAnchor,
   reEnqueueTask,
+  abandonCleanup,
   countRepeatedParks,
   listTaskIds, // shared with orphan-scan.js -- same journal/<id>/ directory listing, one copy
   readJsonSafe, // shared with orphan-scan.js

@@ -33,7 +33,9 @@ test('spo status and spo task exit 0 and render the produced journals', () => {
   // execFileSync throws on non-zero exit -- reaching these assertions IS the exit-0 proof.
   const statusOut = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
   assert.match(statusOut, /queue depth: 0/);
-  assert.match(statusOut, /active: 0\s+parked: 1\s+done: 1/);
+  // action 4.5: the summary line grew an `abandoned:` counter between `parked:` and `done:` --
+  // this fixture has no ABANDONED task, so it's 0, but the field is always printed.
+  assert.match(statusOut, /active: 0\s+parked: 1\s+abandoned: 0\s+done: 1/);
   assert.match(statusOut, /cli-demo\s+DONE/);
   assert.match(statusOut, /cli-parked\s+PARKED/);
 

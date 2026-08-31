@@ -256,6 +256,7 @@ function cmdStatus(opts) {
   const ids = listTaskDirs(journalRoot);
   let active = 0;
   let parked = 0;
+  let abandoned = 0;
   let done = 0;
   const rows = [];
   for (const id of ids) {
@@ -264,14 +265,20 @@ function cmdStatus(opts) {
     const lines = readJournalLines(dir);
     const last = lines.length ? lines[lines.length - 1] : null;
     const cur = state.state || 'UNKNOWN';
+    // action 4.5: ABANDONED is terminal, same as DONE/PARKED -- it must NOT fall into the `else
+    // active` bucket below, which is otherwise everything still moving through the pipeline. An
+    // abandoned card sits there forever (nothing re-enters it), so counting it as "active" made
+    // the daemon look permanently busier than it was -- issue #443's own card inflated `active`
+    // by one from 2026-08-30 onward with no way to tell from this line alone.
     if (cur === 'DONE') done++;
     else if (cur === 'PARKED') parked++;
+    else if (cur === 'ABANDONED') abandoned++;
     else active++;
     rows.push(`${id}  ${cur}  ${last ? last.event : ''}`);
   }
 
   console.log(`queue depth: ${queueDepth}`);
-  console.log(`active: ${active}  parked: ${parked}  done: ${done}`);
+  console.log(`active: ${active}  parked: ${parked}  abandoned: ${abandoned}  done: ${done}`);
   for (const r of rows) console.log(r);
 }
 
@@ -416,15 +423,30 @@ function cmdParked(opts) {
   const { journalRoot } = resolveDirs(opts);
   const ids = listTaskDirs(journalRoot);
   let any = false;
+  const abandonedRows = [];
   for (const id of ids) {
     const dir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(dir, 'state.json'), {});
     if (state.state === 'PARKED') {
       any = true;
       console.log(`${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}`);
+    } else if (state.state === 'ABANDONED') {
+      // action 4.5: an ABANDONED card used to be invisible here entirely -- `state.state ===
+      // 'PARKED'` is the only filter this command ever had, so once unparkScan marked a card
+      // ABANDONED it dropped off `spo parked` with no trace, even though it's the terminal
+      // outcome of a park. Collected separately and printed under its own heading below rather
+      // than folded into the PARKED rows above: the two ask different questions of a maintainer
+      // ("what still needs a retry/abandon reply" vs. "what did I already close out"), and
+      // `(no parked tasks)` below must keep meaning exactly what it always meant for the PARKED
+      // section -- never silently start covering abandoned ones too.
+      abandonedRows.push(`${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}`);
     }
   }
   if (!any) console.log('(no parked tasks)');
+  if (abandonedRows.length) {
+    console.log('abandoned:');
+    for (const r of abandonedRows) console.log(r);
+  }
 }
 
 // `spo resume <session_id|task-id>` -- resolves the argument as a task id first (a directory

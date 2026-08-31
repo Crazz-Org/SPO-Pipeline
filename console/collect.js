@@ -404,8 +404,15 @@ function collectDaemonStats(journalTasks, queueDepth = 0, { now = Date.now() } =
     total: 0,
     done: 0,
     parked: 0,
-    week: { done: 0, parked: 0, total: 0 },
-    today: { done: 0, parked: 0, total: 0 },
+    // action 4.5: ABANDONED is the third terminal state (DONE/PARKED were the only two this
+    // shape ever knew about) -- issue #443 sat ABANDONED for a full day and the dashboard never
+    // stopped counting it as active/in-flight, because `terminal` below didn't know the state
+    // existed. `abandoned` gets its own counter, mirrored into week/today below exactly like
+    // `done`/`parked` already are, rather than being folded into `parked` (an abandon is not a
+    // park still awaiting a reply -- it's already been replied to and closed out).
+    abandoned: 0,
+    week: { done: 0, parked: 0, abandoned: 0, total: 0 },
+    today: { done: 0, parked: 0, abandoned: 0, total: 0 },
     active: 0,
     imported: queueDepth,
     inFlight: 0,
@@ -413,13 +420,14 @@ function collectDaemonStats(journalTasks, queueDepth = 0, { now = Date.now() } =
   };
 
   for (const t of tasks) {
-    const terminal = t.state === 'DONE' || t.state === 'PARKED';
+    const terminal = t.state === 'DONE' || t.state === 'PARKED' || t.state === 'ABANDONED';
     if (!terminal) {
       stats.active++;
       continue;
     }
     stats.total++;
     if (t.state === 'DONE') stats.done++;
+    else if (t.state === 'ABANDONED') stats.abandoned++;
     else stats.parked++;
 
     const updatedMs = t.updatedAt ? Date.parse(t.updatedAt) : NaN;
@@ -427,17 +435,24 @@ function collectDaemonStats(journalTasks, queueDepth = 0, { now = Date.now() } =
       if (updatedMs >= weekStart) {
         stats.week.total++;
         if (t.state === 'DONE') stats.week.done++;
+        else if (t.state === 'ABANDONED') stats.week.abandoned++;
         else stats.week.parked++;
       }
       if (updatedMs >= dayStart) {
         stats.today.total++;
         if (t.state === 'DONE') stats.today.done++;
+        else if (t.state === 'ABANDONED') stats.today.abandoned++;
         else stats.today.parked++;
       }
     }
   }
 
   stats.inFlight = stats.active + stats.imported;
+  // Denominator is stats.total, i.e. done + parked + abandoned (every terminal task increments
+  // it above regardless of which of the three it is) -- the three-way terminal total the spec
+  // asks for. Numerator stays `parked` alone: this is "of the cards that finished, what share
+  // ended parked", not "what share didn't reach done", so an abandoned card counts toward the
+  // total it's measured against without inflating the parked share itself.
   stats.parkingRatePct = stats.total > 0 ? Math.round((stats.parked / stats.total) * 100) : null;
 
   return stats;

@@ -47,8 +47,8 @@
 //                                                          // in BOTH static and live mode (a cheap read of
 //                                                          // an already-computed file, not a live scan)
 //     services: { daemon, queue, benchWorker, nightly, verdicts },       // console/collect.js
-//     daemonStats: { total, done, parked, week, today, active, imported, inFlight,
-//                     parkingRatePct },
+//     daemonStats: { total, done, parked, abandoned, week, today, active, imported, inFlight,
+//                     parkingRatePct },   // abandoned added action 4.5 -- see console/collect.js
 //     reports: { queuedIntake, pendingConfirm, confirmedAwaitingTriage, lastIntakeCycle,
 //                 last24h, pull },
 //     system: SystemSnapshot | null,        // console/system.js, live server only
@@ -617,15 +617,26 @@ function kpi(label, value, sub, accent) {
   return `<div class="kpi${accent ? ' accent' : ''}"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}${sub ? ` &middot; ${sub}` : ''}</span></div>`;
 }
 
+// action 4.5: `abandoned` only prints when non-zero (`abandonedSuffix`, applied at all three
+// grain levels) -- every existing daemonStats fixture and every day before this action shipped
+// has `abandoned: 0` (or the field missing entirely, `d.abandoned` then reading undefined and
+// falling back to 0 via `|| 0`), and appending "/ 0 abandoned" to every KPI line forever would be
+// noise for a pipeline that has never actually abandoned anything. Once it does, the count is
+// rendered explicitly rather than silently folded into `parked` or dropped -- see
+// console/collect.js's own header on why abandoned is its own bucket, never absorbed into parked.
+function abandonedSuffix(n) {
+  return n ? ` / ${escapeHtml(n)} abandoned` : '';
+}
+
 function renderDaemonStatsInner(daemonStats) {
   const d = daemonStats || {};
   const week = d.week || {};
   const today = d.today || {};
   return `<h2>Daemon stats</h2>
     <div class="kpi-grid">
-      ${kpi('processed total', fmtInt(d.total), `${escapeHtml(d.done)} done / ${escapeHtml(d.parked)} parked${d.parkingRatePct !== null && d.parkingRatePct !== undefined ? ` · ${escapeHtml(d.parkingRatePct)}% parked` : ''}`, true)}
-      ${kpi('this week (Mon→today)', fmtInt(week.total), `${escapeHtml(week.done)} done / ${escapeHtml(week.parked)} parked`)}
-      ${kpi('today', fmtInt(today.total), `${escapeHtml(today.done)} done / ${escapeHtml(today.parked)} parked`)}
+      ${kpi('processed total', fmtInt(d.total), `${escapeHtml(d.done)} done / ${escapeHtml(d.parked)} parked${abandonedSuffix(d.abandoned)}${d.parkingRatePct !== null && d.parkingRatePct !== undefined ? ` · ${escapeHtml(d.parkingRatePct)}% parked` : ''}`, true)}
+      ${kpi('this week (Mon→today)', fmtInt(week.total), `${escapeHtml(week.done)} done / ${escapeHtml(week.parked)} parked${abandonedSuffix(week.abandoned)}`)}
+      ${kpi('today', fmtInt(today.total), `${escapeHtml(today.done)} done / ${escapeHtml(today.parked)} parked${abandonedSuffix(today.abandoned)}`)}
       ${kpi('active + imported', fmtInt(d.inFlight), `${escapeHtml(d.active)} active · ${escapeHtml(d.imported)} imported`)}
     </div>`;
 }
