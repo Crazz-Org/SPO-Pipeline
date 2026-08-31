@@ -246,6 +246,27 @@ bounded as of this action.
 3. Promotion when parking rate < ~15 % over a representative batch; the old path retires
    card-type by card-type.
 
+## Recette: the supervised live harness (action 2.9)
+
+Step 2 above ("real S-sized cards") needs *something real* to have actually run before its
+numbers mean anything -- shadow mode and `--dry-run` only ever prove the state machine's own
+logic against fixtures/canned payloads, never that a real card, run for real, produces the
+journal a judge was supposed to see. `spo recette` (`orchestrator/recette.js`) is that
+something: one trivial, synthetic `kind: "card"` task, driven through the real pipeline
+(`config.real = true`) against a dedicated, distinctly-labelled GitHub issue in the product
+repo, under a wall-clock + LLM-step-count cap, asserted against its own journal (not merely
+"did it reach DONE"), cleaned up unconditionally on every exit path. **This is the standard
+live gate for every chantier from 3 on** -- chantier 7 action 7.2 adds a second scenario to the
+same harness rather than a new tool; scenarios are plain data
+(`orchestrator/recette.js`'s `SCENARIOS`), so the runner never has to change to gain one.
+
+Refuses to run while a live daemon holds its own `journal/daemon.lock` (read-only check,
+`--force` to override) -- there is no product-repo mutex until chantier 6 action 6.4, so this is
+the only guard available today against a recette run colliding with a real card the daemon is
+mid-flight on. See `orchestrator/README.md` § Recette for the full design: isolation, the
+`trivial-doc-log` scenario and why it is docs-only, the cap and what tripping it does, the
+assertion set, and cleanup's own idempotency contract.
+
 ## Open questions (tracked, not blocking shadow mode)
 
 - Bug-report transport production → dev (HTTPS pull vs file pickup) and report schema v1.

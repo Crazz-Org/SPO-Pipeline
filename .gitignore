@@ -3,6 +3,7 @@ journal/
 queue/
 claude-accounts/
 worktrees/
+.recette/
 console/dashboard.html
 *.local.*
 .DS_Store

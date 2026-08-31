@@ -1200,6 +1200,137 @@ commit the pipeline made and saved durably itself, not a mystery local one. Toge
 changes close the loop card #385 hit: four identical `branch-unmerged-leftover` parks, each one
 parking on the WIP commit the previous park's own preservation had just made.
 
+## Recette
+
+`spo recette [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>]
+[--cap-llm-steps <n>]` — ACTION 2.9, `orchestrator/recette.js` — the supervised **live** harness:
+drives one trivial, synthetic `kind: "card"` task through the real pipeline (`config.real = true`,
+the same code path a live `daemon.js --real` uses) against a dedicated GitHub issue in the product
+repo, under a cap, asserted against its own journal, cleaned up unconditionally. **This is the
+standard live gate for every chantier from 3 on** — action 7.2 adds a second scenario to it rather
+than inventing a new tool. Never run against the live daemon's own `journal/`/`queue/` — see
+"Isolation" below.
+
+Why this exists, in one line: shadow mode and `--dry-run` prove the state machine's own logic;
+nothing before this proved that a real card, run for real, actually produces the journal a judge
+was supposed to see.
+
+**Isolation.** Its own journal root and queue directory, `.recette/<runId>/{journal,queue}/`
+(`<runId>` = `<epoch-ms>-<pid>`) — never the live `journal/`/`queue/` the daemon holds
+`daemon.lock` on (orchestrator/lock.js). `.recette/` is gitignored. `--keep` leaves the run
+directory behind for a maintainer to inspect by hand; without it, cleanup removes it.
+
+**The dedicated test issue.** One GitHub issue, created fresh every run, labelled `spo-recette`
+— distinct enough that no human mistakes it for real backlog work. The label does not drive
+cleanup (cleanup always acts on the exact issue number this run just created, in-process, never a
+search) — it is the human safety net for the case cleanup itself does not finish. Create it once,
+by hand, before the first live run:
+
+```bash
+gh label create spo-recette --repo Crazz-Org/SPO-WebClient --color 5319e7 \
+  --description "synthetic card created by spo recette -- never real backlog work"
+```
+
+One risk this build could not verify from a read-only pass of `~/SPO-WebClient`: whether the
+product repo's board automation adds a freshly created issue to the project board at all (the
+same automation `orchestrator/intake.js`'s `fileCard` relies on). If it does not,
+`npm run board:take` (WORKTREE's own claim) can fail `claim-lost`/`claim-unrecognized-exit` on the
+very first live run — a park, not a crash, and cleanup still runs regardless — but worth
+verifying by hand first.
+
+**The scenario.** `trivial-doc-log` (the only one shipped with this action) asks IMPLEMENT to
+append exactly one line to `doc/recette-log.md` in the product repo — a **docs-only** change,
+deliberately: reading `~/SPO-WebClient`'s own scripts (2026-08-31) confirmed `npm run typecheck`
+(four `tsc --noEmit` passes over named project files) and `npm run lint` (`eslint .`, but every
+rule block in `eslint.config.js` is scoped to `src/**` / `scripts/**`) both never look at a `.md`
+file at all, and `npm run coverage:changed` (`scripts/coverage-changed.js`) restricts itself to
+`src/**/*.ts(x)` — a docs-only diff has zero eligible files, so it takes the script's own
+"no eligible source file changed — running the suite, nothing to measure" branch: the full Jest
+suite runs once, and the check passes exactly when that suite is green. GATE receives the same
+diff CHECK already passed — the smallest, least surprising input the bench can be asked to judge.
+See `orchestrator/recette.js`'s own comment above `RECETTE_DOC_FILE` for the full reasoning.
+
+**Scenarios are data.** `recette.js`'s `SCENARIOS` is a plain object, `{name, label, buildCard(ctx),
+assertions: [...]}` per entry — the runner (`runRecette`) is generic over any entry shaped that
+way. Adding a second scenario (action 7.2) means adding a second object literal, never touching
+`runRecette`, `evaluateAssertions`, or the cleanup logic.
+
+**The cap.** The remediation plan's "capped budget" predates this project retiring dollars as a
+metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent, honestly-enforceable
+bounds, both checked at the one choke point every real spawn (scripted **and** `claude -p`, per
+`steps/llm.js`'s `invokeClaudeReal`) already passes through: `deps.spawnSync`.
+
+- **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
+  spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
+  child. Combined with the existing per-command-class timeouts (`config.commandTimeoutsMs`), the
+  true worst-case overrun above the cap is bounded by the single longest command timeout in
+  flight when the cap is crossed (today, `npm-gate`'s 7800s) — this is "abort at the next
+  opportunity", not "abort within `capMs` of the wall clock". It always terminates and always
+  cleans up; it never hangs.
+- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Every real LLM
+  call in this codebase spawns literally `claude`, so this is an exact count, not a heuristic —
+  checked, and enforced, **before** the over-cap call spawns at all. 12 comfortably covers a
+  trivial card's own budgets (`diagnoseBudget` 3, `validateRejectBudget` 3) stacked on the 3-call
+  happy path (PLAN, IMPLEMENT, VALIDATE).
+
+Either bound tripping throws `RecetteCapExceededError` — deliberately **not** a `ParkSignal`
+(state-machine.js's `runTask` only catches `ParkSignal`; anything else propagates, "a real bug —
+surface it, do not disguise it as a park"), so it surfaces straight out of `drainQueueOnce`.
+`runRecette`'s own `try/catch` treats it as a tripped run, never a crash reported to the caller,
+and cleanup runs in the enclosing step regardless.
+
+**The assertions.** Reaching `DONE` proves far less than proving the judges ran on real inputs.
+`trivial-doc-log`'s own assertion set (`orchestrator/recette.js`) checks, against the produced
+journal: no park; `DONE` reached; PLAN actually wrote `plan-<issue>.md`/`invariants-<issue>.md`
+(not the "no fixture" shortcut); IMPLEMENT reported a non-empty `files_changed`; **VALIDATE's own
+judge inputs actually included `diff.patch`** (`judge-inputs-prepared`, action 1.3) — the assertion
+that would catch a judge silently receiving nothing to judge; the change-validator actually
+rendered `PASS`/`PASS_WITH_FINDINGS`; MERGE actually enqueued the PR; FINISH recorded a PR number.
+Each assertion is `{id, description, check(info) -> {ok, detail}}` and never throws — one broken
+event fails only its own assertion, so the report always shows the rest.
+
+**Safety: refuses while a live daemon is running.** There is no product-repo mutex until chantier
+6 action 6.4 (`config.js`'s own note on the 44-worktree/61-branch incident this project already
+paid for once) — the only guard today is refusing to *start* while a live daemon holds **its own**
+lock file, `<repoRoot>/journal/daemon.lock` (`orchestrator/lock.js`). Checked read-only (recette
+reads the lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does —
+it never calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly,
+for a maintainer who has confirmed by hand that nothing is actually running. This is a best-effort
+check, not a mutex: it catches "I forgot the daemon is running", not a daemon that starts a second
+after the check passes.
+
+**`--dry`** resolves the exact same config `--force`-free real run would (one function,
+`buildPlan`, feeds both paths so they cannot structurally diverge), prints it, and returns before
+the safety check, before any issue is created, before any directory is written, before any spawn
+— nothing runs.
+
+**Cleanup runs on every exit path** — success, a park, a thrown error, a tripped cap — never
+throws, and is idempotent (every step tolerates "already gone": `git worktree remove`/`branch -D`/
+`push --delete` against something that never existed, or was already removed by a **successful**
+run's own FINISH step, just report a non-zero exit, never throw). In order: `git worktree remove
+--force` + `git worktree prune`, delete the local branch (`branch -D`), delete the remote branch
+(`push origin --delete`), **delete every `wip/<taskId>-<ts>` ref this run pushed to origin**,
+`gh pr close` (skipped if no PR number was ever recorded), `gh issue close`, remove
+`.recette/<runId>/`. `--keep` skips all of it.
+
+The `wip/` step is not hypothetical bookkeeping: a **park** — the most likely first-live-run
+outcome — makes `steps/scripted.js`'s `preserveWorktreeWip` push the dirty worktree to a durable
+`wip/<taskId>-<ts>` branch **on origin**, in a namespace the `claude-pipe/<taskId>` delete above
+deliberately does not touch (`sweepWorktreeLeftovers` rule 2 depends on that separation). Without
+its own step, every parked recette run would leave one remote branch behind in the product repo,
+permanently — exactly the artifact class `config.js`'s 44-worktree/61-branch note exists to
+prevent. The refs are read back off the run's own journal (`wip-preserved` /
+`leftover-wip-preserved`, both journaled immediately after their push returns 0), because the
+`Date.now()` suffix in the ref name is only knowable there. **On partial failure**: every step
+runs regardless of whether an earlier one failed (`cleanup()`'s own per-step `try/catch`, never a
+short-circuit); the run's own report lists which steps were not clean, by name, so a maintainer
+knows exactly what (if anything) still needs a hand — see `spo recette`'s own printed `cleanup:`
+line.
+
+**Exit code is the verdict** (CLAUDE.md: "Verdict by exit code, never by reading text output") —
+`0` only when the run completed **and** every declared assertion passed; a refusal, a tripped cap,
+a park, or a failed assertion are all `1`.
+
 ## Running as a service
 
 `bash scripts/daemon-install.sh` (run from the checkout that should host the daemon) installs
@@ -1364,6 +1495,7 @@ bin/spo pull-reports                               # STAGE 0: pull queued report
 bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
+bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised live harness -- one trivial synthetic card, real mode (see "Recette" above)
 ```
 
 ## Dashboard
@@ -1486,5 +1618,13 @@ confirm/discard comment scan's anchor logic, and -- same as `test/park-loop.test
 including the "a negative outcome after confirm is HELD, never archived" rule -- and the dry/real
 split); `test/spo-triage.test.js` covers `cmdPullReports`/`cmdIntake`/`cmdReports`/`cmdTriage`'s
 flag wiring, same convention as `test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage (which also covers
-`amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). None of them ever touch a real
+`amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). `test/recette.test.js` covers the
+live harness (action 2.9, "Recette" above) the same way: `--dry`'s zero-side-effects guarantee,
+the daemon-lock refusal and its `--force` override, a full real-mode happy path to `DONE` through
+an injected `spawnSync` covering every git/gh/npm/`claude` call the `trivial-doc-log` scenario
+makes (including recette's own issue creation and cleanup), both caps tripping mid-run and still
+cleaning up, cleanup's idempotency (including when the injected `spawnSync` itself throws), and
+`evaluateAssertions` as a pure function -- including the one that hands it a `DONE` journal
+missing a required event and confirms the assertion set actually catches it, never rubber-stamping
+a run that merely reached `DONE`. None of them ever touch a real
 `git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.
