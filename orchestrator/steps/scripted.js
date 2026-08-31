@@ -889,7 +889,116 @@ async function realPushPr(ctx, deps = {}) {
   if (add.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'add', exit: add.exit });
 
   const commit = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'commit', '-F', messageFile]);
-  if (commit.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit });
+  // `git commit` exits 1 on "nothing to commit", and that is reached from two structurally
+  // different places:
+  //   (1) CI_CHECKS' main-moved path (realCiChecks, ~line 1191 below) already ran
+  //       `git merge origin/main` in the worktree and returned 'CHECK' -- CHECK passes, PUSH_PR
+  //       runs again, but the merge commit is ALREADY committed, so `git add -A` above stages
+  //       nothing and this commit exits 1 over a tip origin has never seen. Parking here would
+  //       strand a perfectly good merge commit, and the retry sweep would then park
+  //       branch-unmerged-leftover on it forever.
+  //   (2) Nothing new was produced this pass -- IMPLEMENT wrote no diff (or wrote one that
+  //       reproduced what a prior pass already committed and pushed). Parking is correct here:
+  //       re-pushing and re-gating a byte-identical sha cannot produce a different CI result.
+  //
+  // The plan for this action (doc/remediation-plan-2026-08.md, action 4.1) said to tell these
+  // apart by HEAD vs origin/main: "clean tree + HEAD != origin/main -> skip the commit, proceed
+  // to push". Measured against the real journal, that condition is wrong. Card #213, run 1
+  // (journal/issue-213/journal.jsonl): PUSH_PR succeeded and created the PR at 19:23:03, CI
+  // failed, DIAGNOSE -> IMPLEMENT produced no diff, and PUSH_PR parked
+  // {"step":"commit","exit":1} at 19:38:02. At that moment HEAD != origin/main -- the branch
+  // already carried its first-pass commits -- so the plan's own condition would have skipped the
+  // park, pushed a no-op, and re-gated an unchanged sha. An unchanged commit cannot produce a
+  // different CI result, so the card would have looped DIAGNOSE -> IMPLEMENT until the diagnose
+  // budget parked it anyway, having burned that budget for nothing. The fact that actually tells
+  // the two cases apart is whether the tip carries work ORIGIN HAS NOT SEEN YET -- case (1)'s
+  // merge commit is unpushed even though HEAD has also moved past origin/main; case #213's
+  // "nothing new" tip was already pushed even though HEAD had also moved past origin/main. So
+  // the comparison below is against origin/<branch> (this branch's own remote tip), not
+  // origin/main.
+  if (commit.exit !== 0) {
+    const status = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'status', '--porcelain']);
+    if (status.exit !== 0) {
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, statusExit: status.exit });
+    }
+    if (status.stdout.trim() !== '') {
+      // A dirty tree after `git add -A; git commit` means the commit failed for a real reason
+      // (hook rejection, a bad `-F` message file, an index lock...), not "nothing to commit" --
+      // there is staged or unstaged work sitting uncommitted. Park exactly as before this action.
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, dirty: true });
+    }
+
+    // Tree is clean, so commit's exit 1 really was "nothing to commit". Resolve HEAD and this
+    // branch's own remote tip to tell case (1) (unpushed work at HEAD) from case (2) (HEAD
+    // already equals what origin has, or nothing was ever implemented).
+    const headRev = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    // Checked, exactly like origin/main below, and for a sharper reason than symmetry: a failing
+    // `git rev-parse <ref>` prints the REF NAME ITSELF to stdout (measured: an orphan/unborn HEAD
+    // gives exit 128, "fatal: ambiguous argument 'HEAD'" on stderr, and the literal `HEAD` on
+    // stdout). Trusting stdout regardless of exit therefore does not fail closed with an empty
+    // string -- it yields the plausible-looking non-sha `"HEAD"`, which equals neither origin/main
+    // nor origin/<branch>, so BOTH parks below are skipped, `commit-skipped-nothing-staged` is
+    // journalled with `head: "HEAD"` (a lie the maintainer and DIAGNOSE both read as a sha), and
+    // the step falls through to a push that can only fail -- parking `{step:'push'}` and
+    // swallowing the real cause two commands later. Same rule as the status check above: a
+    // diagnostic must never bury the failure it was added to explain.
+    if (headRev.exit !== 0) {
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, revParseFailed: 'HEAD' });
+    }
+    const head = headRev.stdout.trim();
+
+    // A never-pushed branch has no refs/remotes/origin/<branch> at all -- rev-parse --verify
+    // --quiet exits non-zero for that, which is an EXPECTED outcome here (first pass, push
+    // below hasn't run yet), never an error. --quiet suppresses the "not a valid ref" stderr
+    // noise that would otherwise pollute the spawn log for the expected case.
+    const remoteBranch = spawnStep(ctx, deps, 'PUSH_PR', 'git', [
+      '-C',
+      worktreePath,
+      'rev-parse',
+      '--verify',
+      '--quiet',
+      `refs/remotes/origin/${branch}`,
+    ]);
+    const remoteBranchSha = remoteBranch.exit === 0 ? remoteBranch.stdout.trim() : null;
+
+    const originMain = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+    if (originMain.exit !== 0) {
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, revParseFailed: 'origin/main' });
+    }
+    const mainSha = originMain.stdout.trim();
+
+    if (head === mainSha) {
+      // HEAD sits exactly on origin/main -- IMPLEMENT never produced a commit on this branch at
+      // all, on this pass or any prior one. There is genuinely nothing to push.
+      throw new ParkSignal('push-pr-failed', {
+        step: 'commit',
+        exit: commit.exit,
+        reason: 'nothing-implemented',
+      });
+    }
+    if (remoteBranchSha !== null && head === remoteBranchSha) {
+      // #213's shape: the remote tip for THIS branch already equals HEAD, so this pass's PR (or
+      // prior push) already carries everything at HEAD -- pushing again would push nothing and
+      // re-gate a sha CI has already judged.
+      throw new ParkSignal('push-pr-failed', {
+        step: 'commit',
+        exit: commit.exit,
+        reason: 'nothing-new-to-push',
+        head,
+      });
+    }
+
+    // Otherwise there IS unpushed work at HEAD -- the main-moved merge commit (case (1) above)
+    // is the motivating example, but this also covers a branch that has simply never been
+    // pushed yet and whose commit failed for a benign "nothing to commit" reason (unusual, but
+    // not this function's problem to rule out). Skip the commit -- there is nothing to add to it
+    // -- and fall through to the push below exactly as if commit.exit had been 0.
+    appendEvent(ctx.taskDir, 'PUSH_PR', 'commit-skipped-nothing-staged', {
+      head,
+      remoteBranchSha,
+      branch,
+    });
+  }
 
   // Order matters: the branch is pushed BEFORE the citation check below, not after. A park
   // thrown between the commit and the push would leave a local-only, unpushed tip on
