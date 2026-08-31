@@ -12,9 +12,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { runTask } = require('../orchestrator/state-machine');
-const { buildParkComment, RETRY_ABANDON_LINE, unparkScan, findParkAnchor, countRepeatedParks } = require('../orchestrator/park-loop');
+const { runTask, buildCtx, finalizePark } = require('../orchestrator/state-machine');
+const { buildParkComment, RETRY_ABANDON_LINE, unparkScan, findParkAnchor, countRepeatedParks, postParkComment } = require('../orchestrator/park-loop');
 const { appendEvent, writeState } = require('../orchestrator/journal');
+const { timeoutResult } = require('./helpers');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -161,7 +162,6 @@ test('runTask (real mode, card): a park AFTER the worktree exists moves the card
 });
 
 test('finalizePark: a dirty worktree still on disk gets its diff pushed to a wip/ ref, named in the park comment (card #385\'s stranded-IMPLEMENT case)', async () => {
-  const { buildCtx, finalizePark } = require('../orchestrator/state-machine');
   const taskDir = mkTmp('spo-park-wip-taskdir-');
   const config = testConfig();
   const worktreePath = path.join(config.pipelineWorktreesDir, 'card-385');
@@ -201,6 +201,46 @@ test('finalizePark: a dirty worktree still on disk gets its diff pushed to a wip
   const bodyFile = commentCall.args[commentCall.args.indexOf('--body-file') + 1];
   const body = fs.readFileSync(bodyFile, 'utf8');
   assert.match(body, /wip\/card-385-/); // the retry-anchoring comment names the ref -- not just local
+});
+
+// ---- action 2.1b: park-loop.js's own spawns are now bounded too ------------------------------
+//
+// postParkComment's `gh issue comment` and unparkScan's `gh api .../comments` / abandon-ack `gh
+// issue comment` used to spawn with no timeout at all. Both run with the task ALREADY TERMINAL
+// (postParkComment, called after state.json/report.md are already written) or with no task in
+// scope at all (unparkScan, a daemon-loop scan) -- so a timeout here must never throw a
+// ParkSignal (there is nothing left to park) and is converted into the failure each call site
+// already models: park-comment-failed / unpark-scan-failed / abandon-ack-failed, journalled with
+// timedOut: true so a hang is not silently indistinguishable from a normal gh failure.
+
+test('postParkComment: action 2.1b -- arms the gh class timeout from ctx.config.commandTimeoutsMs', () => {
+  const taskDir = mkTmp('spo-park-timeout-taskdir-');
+  const ctx = { task: { issue: 960 }, taskDir, config: { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } } };
+  let seenOpts = null;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      seenOpts = opts;
+      return { status: 0, stdout: 'https://github.com/x/y/issues/960#issuecomment-1\n', stderr: '', signal: null };
+    },
+  };
+
+  postParkComment(ctx, deps, { reason: 'x', detail: {}, lastState: 'WORKTREE' });
+
+  assert.equal(seenOpts.timeout, 120000);
+});
+
+test('postParkComment: a timed-out gh issue comment never throws (the task is already terminal) -- journalled as park-comment-failed with timedOut: true', () => {
+  const taskDir = mkTmp('spo-park-timeout-taskdir2-');
+  const ctx = { task: { issue: 961 }, taskDir, config: { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } } };
+  const deps = { spawnSync: () => timeoutResult() };
+
+  assert.doesNotThrow(() => postParkComment(ctx, deps, { reason: 'x', detail: {}, lastState: 'WORKTREE' }));
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'park-comment-failed');
+  assert.ok(failed, 'the timeout must still be reported, not silently swallowed');
+  assert.equal(failed.timedOut, true);
+  assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
 });
 
 // ---- unpark scan: retry / abandon / ignored ---------------------------------------------------
@@ -343,6 +383,76 @@ test('unparkScan: a non-card / non-PARKED / issue-less journal directory is skip
 
   await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
   assert.equal(called, false);
+});
+
+test('unparkScan: action 2.1b -- arms the gh class timeout for the comments fetch', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-arm-');
+  const journalRoot = mkTmp('spo-unpark-journal-arm-');
+  parkedTaskDir(journalRoot, 'card-901', { issue: 901, commentId: 501 });
+
+  let seenOpts = null;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      seenOpts = opts;
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(seenOpts.timeout, 120000);
+});
+
+test('unparkScan: a timed-out gh api comments fetch never throws -- journalled as unpark-scan-failed with timedOut: true, never re-enqueues', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-timeout-');
+  const journalRoot = mkTmp('spo-unpark-journal-timeout-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-900', { issue: 900, commentId: 500 });
+
+  const deps = { spawnSync: () => timeoutResult() };
+
+  await assert.doesNotReject(() =>
+    unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', commandTimeoutsMs: { gh: 120000 } }, deps)
+  );
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'unpark-scan-failed');
+  assert.ok(failed, 'the timeout must still be reported, not silently swallowed');
+  assert.equal(failed.timedOut, true);
+  assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+
+  const queued = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [];
+  assert.equal(queued.length, 0, 'never re-enqueued on a scan failure');
+});
+
+test('unparkScan: a timed-out abandon-ack gh comment never throws -- the task is still marked ABANDONED, journalled as abandon-ack-failed with timedOut: true', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-timeout-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-timeout-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-902', { issue: 902, commentId: 600 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 610, created_at: '2026-08-29T00:00:00Z', body: 'abandon, giving up' }]));
+      }
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        return timeoutResult();
+      }
+      return ok('');
+    },
+  };
+
+  await assert.doesNotReject(() =>
+    unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', commandTimeoutsMs: { gh: 120000 } }, deps)
+  );
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'ABANDONED', 'the terminal transition is not blocked by a failed ack');
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'abandon-ack-failed');
+  assert.ok(failed, 'the timeout must still be reported, not silently swallowed');
+  assert.equal(failed.timedOut, true);
+  assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
 });
 
 // ---- findParkAnchor: pure helper --------------------------------------------------------------

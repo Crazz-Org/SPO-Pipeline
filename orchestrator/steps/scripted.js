@@ -35,6 +35,7 @@ const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { moveCard } = require('../board');
+const { classifyCommand, classTimeoutMs, isSpawnTimeout } = require('../command-timeout');
 const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline } = require('../task-values');
 const { checkRegressions } = require('../invariants');
 
@@ -91,7 +92,15 @@ function appendSpawnLog(taskDir, state, header, text) {
 
 // ---- action 2.1: per-command-class timeouts + timeout-vs-exit-1 disambiguation ------------
 //
-// classifyCommand(command, args) -> one of config.commandTimeoutsMs's keys, or null.
+// classifyCommand(command, args) -> one of config.commandTimeoutsMs's keys, or null -- and
+// classTimeoutMs(config, commandClass) -> the millisecond value for that class. Both now live in
+// ../command-timeout.js (action 2.1b), not here: that action found four OTHER modules
+// (board.js, park-loop.js, report-intake.js, intake.js) that spawn real git/gh/npm commands
+// through their own private runSync instead of this file's spawnStep, and needed the identical
+// classification -- board.js in particular is required BY this file (`../board`, above), so
+// having board.js require the classifier back out of this file would be circular. Re-exported
+// below (`module.exports`) so every existing caller/test of this file's own classifyCommand is
+// unaffected by the move.
 //
 // Every spawnStep call site in this file passes a LITERAL command string ('git' | 'npm' | 'gh')
 // -- only the args vary, and always as a plain array (never something classification has to
@@ -102,26 +111,6 @@ function appendSpawnLog(taskDir, state, header, text) {
 // by pr:wait's internal budget. An unrecognized (command, args) pair returns null, meaning "no
 // class default" -- spawnStep then arms no timeout unless the caller passed an explicit
 // opts.timeout, exactly like before this action.
-function classifyCommand(command, args) {
-  if (command === 'git') return 'git';
-  if (command === 'gh') return 'gh';
-  if (command === 'npm') {
-    if (args[0] === 'ci') return 'npm-ci';
-    if (args[0] === 'run' && args[1] === 'gate') return 'npm-gate';
-    if (args[0] === 'run') return 'npm-run';
-  }
-  return null;
-}
-
-// The one place classifyCommand's class name becomes a millisecond value -- reads
-// config.commandTimeoutsMs, tolerating a config object built by an older test fixture that
-// predates this action (testConfig() in test/real-steps.test.js does not set this field on
-// every override) rather than throwing on a missing table.
-function classTimeoutMs(config, commandClass) {
-  if (!commandClass) return undefined;
-  const table = config && config.commandTimeoutsMs;
-  return table ? table[commandClass] : undefined;
-}
 
 // One single spawnSync attempt: runs the command, maps the result to {exit, timedOut, ...}, and
 // journals it. Split out of spawnStep (below) so the retry-once policy can call this twice
@@ -145,8 +134,7 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
   const ms = Date.now() - start;
 
   const deadlineArmed = typeof spawnOpts.timeout === 'number';
-  const timedOut =
-    deadlineArmed && !!((result && result.error && result.error.code === 'ETIMEDOUT') || (result && result.signal));
+  const timedOut = isSpawnTimeout(result, deadlineArmed);
 
   let exit;
   if (timedOut) {

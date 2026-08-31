@@ -16,6 +16,19 @@ function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// action 2.1b -- what Node's real spawnSync actually returns when its own `timeout` option kills
+// the child: BOTH `signal` (the kill signal) AND `error` (an Error with `.code === 'ETIMEDOUT'`)
+// are set, `status` is null. Same shape steps/scripted.js's spawnOnce and steps/llm.js's
+// invokeClaudeReal both learned to expect the hard way (card #449) -- test/real-steps.test.js
+// keeps its own local copy (predates this helper); every OTHER test file that exercises one of
+// the newly-bounded spawns (board.js/park-loop.js/report-intake.js/intake.js's own runSync)
+// shares this one instead of growing four more near-identical copies.
+function timeoutResult(signal = 'SIGTERM') {
+  const error = new Error(`spawnSync ${signal} ETIMEDOUT`);
+  error.code = 'ETIMEDOUT';
+  return { status: null, stdout: '', stderr: '', signal, error };
+}
+
 function writeTask(queueDir, filename, taskObj) {
   fs.mkdirSync(queueDir, { recursive: true });
   fs.writeFileSync(path.join(queueDir, filename), JSON.stringify(taskObj, null, 2));
@@ -90,4 +103,5 @@ module.exports = {
   readJournal,
   readState,
   readLedger,
+  timeoutResult,
 };

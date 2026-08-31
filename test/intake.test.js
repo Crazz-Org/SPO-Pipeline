@@ -11,10 +11,11 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { mkTmp, writePoolDir } = require('./helpers');
+const { mkTmp, writePoolDir, timeoutResult } = require('./helpers');
 const intake = require('../orchestrator/intake');
 const accounts = require('../orchestrator/accounts');
 const spo = require('../bin/spo');
+const orchestratorConfig = require('../orchestrator/config');
 
 function fakeSpawnSync(responder) {
   return (command, args, opts) => responder(command, args, opts);
@@ -570,6 +571,31 @@ test('fileCard: gh issue create failure -> clear error, never attempts the comme
   assert.equal(spawnCalls.length, 1); // never reached the comment call
 });
 
+// ---- action 2.1b: intake.js's own gh/npm spawns are now bounded too --------------------------
+//
+// fetchIssue/postIssueComment/fileCard/amendCard/pullBoard/makeTask used to spawn `gh`/`npm` with
+// no timeout at all -- the three LLM steps (draftCard/reviewCard/triageBugReport) already have
+// their own deadline via invokeClaudeReal, but the plain gh/npm calls alongside them did not.
+// These are the maintainer-facing `spo ask`/`spo pull` path and auto-triage.js's own driver, not
+// a task step -- a timeout here is reported through the exact {ok: false, ...} shape each
+// function already returns on a plain non-zero exit, tagged `timedOut: true`, never thrown.
+
+test('fileCard: a timed-out gh issue create never throws -- reported as an error with timedOut: true, never attempts the comment', () => {
+  const spawnCalls = [];
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      return timeoutResult();
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.equal(spawnCalls.length, 1);
+});
+
 // ---- triageBugReport: outcome parsing, including the string-encoded-draft recovery -------------
 
 test('triageBugReport: outcome "draft" with a literal nested object -- accepted as-is', async () => {
@@ -938,6 +964,37 @@ test('fetchIssue: returns {title, body}, a clear error on a non-zero exit or bad
   assert.equal(intake.fetchIssue(501, badJsonDeps).ok, false);
 });
 
+test('fetchIssue: action 2.1b -- arms the gh class timeout; a timed-out spawn returns {ok: false, timedOut: true}, never throws', () => {
+  let seenOpts = null;
+  const armDeps = { spawnSync: fakeSpawnSync((c, a, opts) => { seenOpts = opts; return { status: 0, stdout: '{}', stderr: '', signal: null }; }) };
+  intake.fetchIssue(501, armDeps);
+  assert.equal(seenOpts.timeout, orchestratorConfig.commandTimeoutsMs.gh);
+
+  const timeoutDeps = { spawnSync: fakeSpawnSync(() => timeoutResult()) };
+  const result = intake.fetchIssue(501, timeoutDeps);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+});
+
+// ---- postIssueComment ---------------------------------------------------------------------
+
+test('postIssueComment: action 2.1b -- arms the gh class timeout; a timed-out spawn returns {ok: false, timedOut: true}, never throws', () => {
+  let seenOpts = null;
+  const armDeps = {
+    spawnSync: fakeSpawnSync((c, a, opts) => {
+      seenOpts = opts;
+      return { status: 0, stdout: 'https://github.com/x/y/issues/1#issuecomment-1\n', stderr: '', signal: null };
+    }),
+  };
+  intake.postIssueComment(1, 'hello', armDeps);
+  assert.equal(seenOpts.timeout, orchestratorConfig.commandTimeoutsMs.gh);
+
+  const timeoutDeps = { spawnSync: fakeSpawnSync(() => timeoutResult()) };
+  const result = intake.postIssueComment(1, 'hello', timeoutDeps);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+});
+
 // ---- amendCard: edits the raw-intake issue in place, never creates a second one ----------------
 
 test('amendCard: edits the existing issue, preserves the original body in a <details> block, posts the review comment', () => {
@@ -1000,6 +1057,23 @@ test('amendCard: gh issue edit failure -> clear error, never attempts the commen
   assert.equal(spawnCalls.filter((a) => a[0] === 'issue' && a[1] === 'comment').length, 0);
 });
 
+test('amendCard: a timed-out gh issue edit never throws -- reported as an error with timedOut: true, never attempts the comment', () => {
+  const spawnCalls = [];
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'api') return { status: 0, stdout: JSON.stringify({ body: 'x' }), stderr: '', signal: null };
+      return timeoutResult();
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.equal(spawnCalls.filter((a) => a[0] === 'issue' && a[1] === 'comment').length, 0);
+});
+
 // ---- pullBoard: board:claim output parsing -----------------------------------------------------
 
 test('pullBoard: parses candidate lines in order, skips known header/tail noise, warns on garbage', () => {
@@ -1033,6 +1107,21 @@ test('pullBoard: a non-zero exit is reported, never crashes', () => {
   const result = intake.pullBoard(deps);
   assert.equal(result.ok, false);
   assert.match(result.error, /exited 3/);
+});
+
+test('pullBoard: action 2.1b -- arms the npm-run class timeout; a timed-out spawn returns {ok: false, timedOut: true}, never crashes', () => {
+  let seenOpts = null;
+  const armDeps = {
+    productRepo: '/tmp/does-not-matter',
+    spawnSync: fakeSpawnSync((c, a, opts) => { seenOpts = opts; return { status: 0, stdout: '', stderr: '', signal: null }; }),
+  };
+  intake.pullBoard(armDeps);
+  assert.equal(seenOpts.timeout, orchestratorConfig.commandTimeoutsMs['npm-run']);
+
+  const timeoutDeps = { spawnSync: fakeSpawnSync(() => timeoutResult()) };
+  const result = intake.pullBoard(timeoutDeps);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
 });
 
 // ---- extractCriterion: <details> stripping (regression #452) ------------------------------
@@ -1199,6 +1288,17 @@ test('makeTask: writes the expected queue/<seq>-issue-<n>.json shape', () => {
     area: 'client',
     touchesRdoMembers: false,
   });
+});
+
+test('makeTask: a timed-out gh api issues/<n> never throws -- reported as an error with timedOut: true', () => {
+  const queueDir = mkTmp('spo-intake-queue-timeout-');
+  const journalRoot = mkTmp('spo-intake-journal-timeout-');
+  const deps = { queueDir, journalRoot, spawnSync: fakeSpawnSync(() => timeoutResult()) };
+
+  const result = intake.makeTask({ rank: 1, issue: 504, area: 'client', title: 'x' }, deps);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
 });
 
 test('makeTask: area "rdo" sets touchesRdoMembers true even with no explicit mention in the body', () => {

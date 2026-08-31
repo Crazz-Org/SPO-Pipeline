@@ -83,7 +83,7 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
   const claudeCalls = [...(claudeRawReplies || []), ...(claudeReplies || []).map((r) => ok(JSON.stringify(realShapedReply(r))))];
   return {
     accountsDir: accountsDir || poolDir(),
-    spawnSync: (command, args) => {
+    spawnSync: (command, args, opts) => {
       if (command === 'claude') {
         return claudeCalls[Math.min(claudeCallIdx++, claudeCalls.length - 1)];
       }
@@ -93,7 +93,7 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
         return ok('');
       }
       if (command === 'npm') {
-        if (npmResponder) return npmResponder(args);
+        if (npmResponder) return npmResponder(args, opts); // opts: action 2.1b call-site arming
         return ok('');
       }
       return ok('');
@@ -182,6 +182,43 @@ test('findConfirmedAwaitingTriage: a report-held event also counts as handled', 
 });
 
 // ---- processConfirmedReport / runAutoTriage --------------------------------------------------
+
+test('runAutoTriage: action 2.1b -- the promote-to-Todo CALL SITE threads config through, so board:move is bounded too', async () => {
+  // reviewAndFile -> board.moveIssueToColumn is the third moveIssueToColumn call site (alongside
+  // report-intake.js's moveWithRetry). moveIssueToColumn arms NOTHING without an opts.config, by
+  // design, so a call site that forgets to pass it silently leaves this one spawn unbounded while
+  // every other spawn in the daemon is bounded -- exactly the gap action 2.1b exists to close.
+  const spoReportsDir = mkTmp('spo-autotriage-movearm-');
+  const journalRoot = mkTmp('spo-autotriage-movearm-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_marm.json');
+  confirmedEntry(journalRoot, { issue: 999, pendingPath });
+
+  let moveOpts = null;
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
+    ],
+    npmResponder: (args, opts) => {
+      if (args.join(' ') === 'run board:move -- 999 Todo') moveOpts = opts;
+      return ok('');
+    },
+  });
+
+  await runAutoTriage(
+    journalRoot,
+    {
+      spoReportsDir,
+      productRepo: '/fake/repo',
+      autoTriagePromoteToTodo: true,
+      commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 },
+    },
+    deps,
+    { dry: false }
+  );
+
+  assert.equal(moveOpts && moveOpts.timeout, 660000, 'board:move must carry the npm-run class timeout');
+});
 
 test('runAutoTriage: draft -> FILE -> amendCard + move to Todo, report archived, journals one auto-triage event', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports1-');

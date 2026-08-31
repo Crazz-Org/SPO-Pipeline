@@ -591,8 +591,8 @@ against the handler's promise, but `spawnStep` calls `spawnSync`, which **blocks
 loop** — that timer cannot fire while a `git`/`gh`/`npm` process is stuck, so a hung command used to freeze the
 single-threaded daemon forever, holding the task lock (GATE was measured running 129–240s past
 its supposedly-enforced 120s deadline before this action). `spawnStep` now classifies each call
-by command + leading args (`classifyCommand`) and arms `spawnSync`'s own `timeout` option from
-`config.commandTimeoutsMs`:
+by command + leading args (`classifyCommand`, `orchestrator/command-timeout.js`) and arms
+`spawnSync`'s own `timeout` option from `config.commandTimeoutsMs`:
 
 | Class | Default | `SPO_TIMEOUT_*_MS` override |
 |---|---|---|
@@ -600,14 +600,41 @@ by command + leading args (`classifyCommand`) and arms `spawnSync`'s own `timeou
 | `gh` | 120000 | `SPO_TIMEOUT_GH_MS` |
 | `npm-ci` | 600000 | `SPO_TIMEOUT_NPM_CI_MS` |
 | `npm-gate` | 7800000 | `SPO_TIMEOUT_NPM_GATE_MS` |
-| `npm-run` (every other `npm run <alias>`: `typecheck`, `lint`, `coverage:changed`, `board:take`, `board:move`, `pr:wait`) | 660000 | `SPO_TIMEOUT_NPM_RUN_MS` |
+| `npm-run` (every other `npm run <alias>`: `typecheck`, `lint`, `coverage:changed`, `board:take`, `board:move`, `pr:wait`, `report:card`) | 660000 | `SPO_TIMEOUT_NPM_RUN_MS` |
 
-Not covered by any of this, and still able to hang the daemon indefinitely while holding the
-task lock: the real commands spawned OUTSIDE `spawnStep` by their own local `runSync` helpers --
-`board.js`'s `moveCard` (`npm run board:move`, called from inside `realWorktree`/`realGate`/
-`realMerge` and from `postParkComment`), `park-loop.js`'s `gh issue comment`/`gh api` (the park
-comment and the unpark scan), and `report-intake.js`'s `gh` calls. None of them passes a
-`timeout`; only `park-alert.js` sets one of its own. Action 2.1 closed the scripted-step half.
+**Action 2.1b closed the remaining gap.** The real commands spawned OUTSIDE `spawnStep` by their
+own private `runSync` helpers — `board.js`'s `moveCard` (`npm run board:move`, called from inside
+`realWorktree`/`realCheck`/`realGate`/`realMerge` and from `postParkComment`), `park-loop.js`'s
+`gh issue comment`/`gh api` (the park comment, the abandon ack, the unpark scan),
+`report-intake.js`'s `npm run report:card`/`gh issue list`/`gh issue create`/`gh api`/`gh issue
+close` (the two daemon-loop timers), and `intake.js`'s own `gh`/`npm` calls (the maintainer-facing
+`spo ask`/`spo pull` path — its three LLM steps already carry their own `deadlineMs`) — used to
+carry no timeout at all. All four now arm the identical class default above via
+`orchestrator/command-timeout.js`'s `armTimeout`, the same module `spawnStep` itself now delegates
+its own classification to (moved out of this file so `board.js` — required *by* this file — does
+not have to require its classifier back out of it, which would be circular). `park-alert.js` was
+the only pre-existing exception, with its own fixed 10s timeout for the same reason.
+
+Unlike `spawnStep`'s retry-then-`ParkSignal` policy, none of these four retries or throws on a
+timeout: `moveCard` is explicitly best-effort and runs mid-step (a throw would break every
+caller); `park-loop.js`'s park comment/abandon ack run once the task is already terminal (nothing
+left to park); `report-intake.js` and `intake.js` run in the daemon loop or the CLI path, outside
+any task (`ParkSignal` has nothing to attach to). A timeout is instead converted into the failure
+each call site already models (`board-move-failed`, `park-comment-failed`, `unpark-scan-failed`,
+`abandon-ack-failed`, `report-intake`'s and `reportConfirmScan`'s own per-item error entries, and
+every `{ok: false, ...}` `intake.js` already returns), tagged `timedOut: true` so a hang stays
+visibly distinct from a plain non-zero exit. None of the four retries, either: each gets another
+chance on its own next cycle regardless, so a retry here would only double the exposure for no
+gain. Every real spawn in the daemon is bounded as of this action.
+
+One caveat on the `SPO_TIMEOUT_*_MS` overrides: `config.js` parses each with `Number(...)`, so a
+non-numeric or fractional value (`2min`, `10m`, `1.5`) lands as `NaN`/a non-integer — and Node's
+`spawnSync` *validates* its `timeout` option, throwing `ERR_OUT_OF_RANGE` **before** it spawns.
+Handed through, that would be a synchronous throw inside `moveCard`/`postParkComment`, both
+documented "never throws" and both running inside `finalizePark` — the crash-loop shape this
+action exists to prevent. `classTimeoutMs` therefore treats a malformed value as "no class
+default" (that one class runs unbounded, as it did pre-2.1, rather than killing the daemon).
+Check `SPO_TIMEOUT_*_MS` is plain milliseconds before an unattended soak.
 
 An explicit `opts.timeout` on a call site always wins over the class default. See `config.js`'s
 own comment on `commandTimeoutsMs` for why each value is what it is — in particular, `npm-run`'s

@@ -13,9 +13,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { COLUMN_BY_STATE, moveCard, moveIssueToColumn } = require('../orchestrator/board');
+const { COLUMN_BY_STATE, moveCard, moveIssueToColumn, runSync } = require('../orchestrator/board');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
+const { timeoutResult } = require('./helpers');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -134,6 +135,90 @@ test('moveCard: a failing board:move exit is journaled but never blocks (never t
   assert.ok(journal.some((e) => e.event === 'board-move-failed' && e.column === 'Merging' && e.exit === 1));
 });
 
+// ---- action 2.1b: board.js's own spawns are now bounded too ----------------------------------
+//
+// board.js used to spawn `npm run board:move` through its own private runSync with NO timeout at
+// all -- moveCard is called mid-step from INSIDE realWorktree/realCheck/realGate/realMerge
+// (steps/scripted.js), so a hung board:move could freeze the daemon just as effectively as any
+// of the calls action 2.1 already bounded. Unlike spawnStep's own retry-then-ParkSignal policy, a
+// timeout here must stay inside board.js's own "never blocks the task" contract: journalled as
+// board-move-failed (the failure moveCard already models), never thrown, never retried.
+
+test('moveCard: action 2.1b -- arms the npm-run class timeout from ctx.config.commandTimeoutsMs', () => {
+  const worktreePath = mkTmp('spo-board-wt-timeout-');
+  const ctx = { ...ctxFor(4300, worktreePath), config: { commandTimeoutsMs: { 'npm-run': 660000 } } };
+  let seenOpts = null;
+  const deps = { spawnSync: (command, args, opts) => { seenOpts = opts; return ok(''); } };
+
+  moveCard(ctx, deps, 'GATE');
+
+  assert.equal(seenOpts.timeout, 660000);
+});
+
+test('moveCard: no config on ctx -- arms no timeout (pre-2.1b behaviour), never crashes', () => {
+  const worktreePath = mkTmp('spo-board-wt-noconfig-');
+  const ctx = ctxFor(4301, worktreePath); // no .config at all, like every pre-existing test above
+  let seenOpts = null;
+  const deps = { spawnSync: (command, args, opts) => { seenOpts = opts; return ok(''); } };
+
+  moveCard(ctx, deps, 'GATE');
+
+  assert.equal(seenOpts.timeout, undefined);
+});
+
+test('moveCard: a timed-out board:move never throws (board.js\'s "never blocks" contract) and is journalled as board-move-failed with timedOut: true', () => {
+  const worktreePath = mkTmp('spo-board-wt-timeout2-');
+  const ctx = { ...ctxFor(4302, worktreePath), config: { commandTimeoutsMs: { 'npm-run': 660000 } } };
+  const deps = { spawnSync: () => timeoutResult() };
+
+  assert.doesNotThrow(() => moveCard(ctx, deps, 'GATE'));
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'board-move-failed');
+  assert.ok(failed, 'the timeout must still be reported through board-move-failed, not silently swallowed');
+  assert.equal(failed.column, 'Gate');
+  assert.equal(failed.timedOut, true);
+  assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+});
+
+test('moveCard: a timed-out board:move mid-step does not break the caller -- realGate/realWorktree/realMerge see moveCard return normally', async () => {
+  // realGate/realWorktree/realCheck/realMerge all call moveCard as their very first line and
+  // never look at its return value -- the property that matters is simply that moveCard RETURNS
+  // (never throws), which the previous test already proves directly. This test exercises it one
+  // level up, through the real state-machine handler, so a future moveCard call site cannot
+  // silently start propagating a park signal without a test failing here.
+  const { realCheck } = require('../orchestrator/steps/scripted');
+  const worktreePath = mkTmp('spo-board-wt-realcheck-');
+  const ctx = buildCtx(
+    'card-realcheck-timeout',
+    { id: 'card-realcheck-timeout', kind: 'card', issue: 4303, worktreePath },
+    mkTmp('spo-board-taskdir-realcheck-'),
+    { commandTimeoutsMs: { 'npm-run': 660000 }, deps: {} }
+  );
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args.includes('board:move')) return timeoutResult();
+      return ok(''); // typecheck/lint/coverage:changed all pass
+    },
+  };
+
+  const next = await realCheck(ctx, deps);
+
+  assert.equal(next, 'PUSH_PR', 'CHECK still proceeds normally -- the board move never blocked it');
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'board-move-failed' && e.timedOut === true));
+});
+
+test('runSync (board.js): action 2.1b -- an explicit opts.timeout still wins over the class default', () => {
+  let seenOpts = null;
+  const deps = { spawnSync: (command, args, opts) => { seenOpts = opts; return ok(''); } };
+
+  runSync(deps, 'npm', ['run', 'board:move', '--', '1', 'Gate'], { timeout: 5000, cwd: '/wt' }, { commandTimeoutsMs: { 'npm-run': 660000 } });
+
+  assert.equal(seenOpts.timeout, 5000);
+  assert.equal(seenOpts.cwd, '/wt');
+});
+
 // ---- moveIssueToColumn: the ctx/taskDir-free sibling for report-intake.js/auto-triage.js -----
 
 test('moveIssueToColumn: spawns npm run board:move -- <issue> <column> with the given cwd, returns {ok: true}', () => {
@@ -153,6 +238,28 @@ test('moveIssueToColumn: a failing exit returns {ok: false, exit} -- never throw
   const result = moveIssueToColumn(707, 'Intake', deps, { cwd: '/fake/product-repo' });
   assert.equal(result.ok, false);
   assert.equal(result.exit, 4);
+});
+
+test('moveIssueToColumn: action 2.1b -- arms the npm-run class timeout only when opts.config is passed', () => {
+  let seenOpts = null;
+  const deps = { spawnSync: (command, args, opts) => { seenOpts = opts; return ok(''); } };
+
+  moveIssueToColumn(707, 'Intake', deps, { cwd: '/fake/product-repo', config: { commandTimeoutsMs: { 'npm-run': 660000 } } });
+  assert.equal(seenOpts.timeout, 660000);
+
+  moveIssueToColumn(707, 'Intake', deps, { cwd: '/fake/product-repo' }); // no config -- pre-2.1b behaviour
+  assert.equal(seenOpts.timeout, undefined);
+});
+
+test('moveIssueToColumn: a timed-out spawn returns {ok: false, exit: -1, timedOut: true} -- never throws', () => {
+  const deps = { spawnSync: () => timeoutResult() };
+  const result = moveIssueToColumn(707, 'Intake', deps, {
+    cwd: '/fake/product-repo',
+    config: { commandTimeoutsMs: { 'npm-run': 660000 } },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.notEqual(result.exit, 1, 'a timeout must never be reported as a plain exit 1');
 });
 
 // ---- HANDLERS.IMPLEMENT / HANDLERS.VALIDATE, real mode: moveCard fires before the LLM call ---

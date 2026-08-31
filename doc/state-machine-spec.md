@@ -144,12 +144,21 @@ The analysis's top families are mostly **states not to have** rather than branch
    option inside `steps/llm.js`'s `invokeClaudeReal`, racing `deadline.js`'s `callWithDeadline`
    as a belt-and-suspenders around the whole call; every `git`/`gh`/`npm` command a scripted step
    spawns *through `spawnStep`* is killed the same way, per `orchestrator/config.js`'s
-   `commandTimeoutsMs` table (see below) — the commands spawned outside it (`board.js`'s
-   `moveCard`, `park-loop.js`'s park comment and unpark scan) are still unbounded.
-   `callWithDeadline`'s own JS-timer race is a no-op here, since a blocking `spawnSync` never
-   yields the event loop for the timer to fire in. Action 2.1 closed this gap: before it,
-   a hung `gh`/`git`/`npm` child froze the single-threaded daemon forever, holding the task
-   lock, with nothing to recover it.
+   `commandTimeoutsMs` table (see below). `callWithDeadline`'s own JS-timer race is a no-op here,
+   since a blocking `spawnSync` never yields the event loop for the timer to fire in. Action 2.1
+   closed this gap for `spawnStep`'s own call sites: before it, a hung `gh`/`git`/`npm` child
+   froze the single-threaded daemon forever, holding the task lock, with nothing to recover it.
+   Action 2.1b then found and closed the remaining gap: `board.js`'s `moveCard`, `park-loop.js`'s
+   park comment and unpark scan, `report-intake.js`'s report-card/dedup/comment-scan spawns, and
+   `intake.js`'s own `gh`/`npm` calls each spawn through their own private `runSync` instead of
+   `spawnStep`, and used to carry no timeout at all — every one of them now arms the identical
+   class default (`orchestrator/command-timeout.js`, factored out of `spawnStep` for exactly this
+   reuse) too. Their failure handling is deliberately different from `spawnStep`'s own
+   retry-then-park: none of these four is a mid-task step with something left to park (`moveCard`
+   is explicitly best-effort, the other three run in the daemon loop with no task in scope at
+   all), so a timeout there is converted into the failure the caller already models — journalled
+   with `timedOut: true` so it stays visibly distinct from a plain non-zero exit — never retried,
+   never thrown. Every real spawn in the daemon is bounded as of action 2.1b.
 4. **Only allowlisted command forms are ever emitted** (58 guard refusals, 26 re-spelling
    episodes measured). The orchestrator's command table is the allowlist; there is nothing to
    re-spell.
@@ -184,6 +193,44 @@ class — `git-timed-out` / `gh-timed-out` / `npm-ci-timed-out` / `npm-gate-time
 `npm-gate-timed-out`, distinct from both `gate-timeout`, the *domain* exit-4 reason `npm run
 gate` itself can return, and `DIAGNOSE`, which it never reaches). Both attempts are journaled as
 `spawn` events (`attempt: 1`/`2`, `timedOut: true`), so the journal explains the park on its own.
+
+## Daemon-loop and best-effort spawn timeouts (action 2.1b)
+
+Action 2.1's own table above only covers commands a scripted step spawns *through `spawnStep`*.
+Four other modules spawn real `git`/`gh`/`npm` through their own private `runSync`, never through
+`spawnStep`, and used to carry no timeout at all:
+
+| Module | Spawns | Where it runs |
+|---|---|---|
+| `board.js` | `npm run board:move` (`moveCard`) | mid-step, called from inside `realWorktree` / `realCheck` / `realGate` / `realMerge` / `postParkComment` |
+| `park-loop.js` | `gh issue comment` (park comment, abandon ack), `gh api .../comments` (unpark scan) | after the task is already terminal, or the daemon-loop unpark scan (no task in scope) |
+| `report-intake.js` | `npm run report:card`, `gh issue list` (dedup), `gh issue create`, `gh api .../comments` (confirm scan), `gh issue close` | the daemon-loop `autoIntakeMs` / `reportConfirmScanMs` timers (no task in scope) |
+| `intake.js` | `gh api issues/<n>`, `gh issue comment`, `gh issue create`, `gh issue edit`, `npm run board:claim` | the maintainer-facing `spo ask` / `spo pull` path and auto-triage.js's driver (its three LLM steps already carry their own `deadlineMs`) |
+
+All four now arm the identical class default from the same table above, via
+`orchestrator/command-timeout.js`'s `armTimeout` (`classifyCommand` + `classTimeoutMs`, factored
+out of `steps/scripted.js` so board.js — required *by* `steps/scripted.js` — does not have to
+require its classifier back out of it). An explicit per-call `timeout` still wins, same as
+`spawnStep`.
+
+The failure handling is deliberately NOT `spawnStep`'s retry-then-`ParkSignal` policy:
+
+- `board.js`'s `moveCard` is explicitly best-effort ("never blocks the task" is its own
+  documented rule) and runs mid-step — a throw here would break every one of its callers.
+- `park-loop.js`'s park comment and abandon ack run once the task is **already terminal**
+  (`state.json`/`report.md` already written) — there is nothing left to park.
+- `report-intake.js` and `intake.js` run in the daemon loop or the maintainer-facing CLI path,
+  outside any task — `ParkSignal` has no task to attach to.
+
+So in all four, a timeout is converted into the failure the caller already models — the
+non-zero-exit path each site already has (`board-move-failed`, `park-comment-failed`,
+`unpark-scan-failed`, `abandon-ack-failed`, `report-intake`'s own per-report error entries,
+`reportConfirmScan`'s error entries, and every `{ok: false, ...}` return in `intake.js`) — tagged
+`timedOut: true` so a hang stays visibly distinct from a plain non-zero exit rather than reading
+as an ordinary `gh`/`npm` failure. None of the four retries: each is either a best-effort
+side-effect or a daemon-loop scan/CLI call that gets another chance on its own next cycle anyway,
+so a retry here would only double the exposure for no gain. Every real spawn in the daemon is
+bounded as of this action.
 
 ## Shadow mode and promotion
 

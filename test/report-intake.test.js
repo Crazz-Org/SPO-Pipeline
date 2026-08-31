@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { mkTmp } = require('./helpers');
+const { mkTmp, timeoutResult } = require('./helpers');
 const {
   shouldAutoIntake,
   shouldScanConfirms,
@@ -91,9 +91,9 @@ test('buildIntakeComment: contains the CONFIRM_DISCARD_LINE verbatim', () => {
 function makeIntakeDeps({ cardExit = 0, cardStdout = CARD_STDOUT, searchHits = [], ghResponder, npmResponder }) {
   return {
     sleep: async () => {}, // never actually wait in a test -- moveWithRetry's own injection point
-    spawnSync: (command, args) => {
+    spawnSync: (command, args, opts) => {
       if (command === 'npm') {
-        if (npmResponder) return npmResponder(args);
+        if (npmResponder) return npmResponder(args, opts); // opts: action 2.1b call-site arming
         return cardExit === 0 ? ok(cardStdout) : { status: cardExit, stdout: cardStdout, stderr: '', signal: null };
       }
       if (command === 'gh') {
@@ -274,6 +274,121 @@ test('runReportIntake: nothing queued -- no spawn at all', async () => {
   assert.equal(spawned, false);
 });
 
+// ---- action 2.1b: report-intake.js's own spawns are now bounded too ---------------------------
+//
+// runReportIntake's `npm run report:card` / `gh issue list` (dedup search) / `gh issue create`
+// and reportConfirmScan's `gh api .../comments` / `gh issue close` used to spawn with no timeout
+// at all -- a daemon-loop timer with no per-task lock, but every bit as capable of wedging the
+// whole single-threaded daemon as any call action 2.1 already bounded. Never retried, never
+// thrown: this is a daemon-loop scan, not a task step, so a timeout is converted into the same
+// error-array/results-array shape each call site already returns on a plain non-zero exit, tagged
+// `timedOut: true` so a hang is not silently indistinguishable from a normal gh/npm failure.
+
+test('runReportIntake: action 2.1b -- arms the npm-run class timeout for report:card', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-timeout-arm-');
+  const journalRoot = mkTmp('spo-reportintake-timeout-arm-journal-');
+  writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_arm.json');
+
+  let seenOpts = null;
+  const deps = {
+    sleep: async () => {},
+    spawnSync: (command, args, opts) => {
+      if (command === 'npm') seenOpts = opts;
+      return ok(CARD_STDOUT);
+    },
+  };
+
+  await runReportIntake(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 } },
+    deps
+  );
+
+  assert.equal(seenOpts.timeout, 660000);
+});
+
+test('runReportIntake: action 2.1b -- the board:move CALL SITE threads config through, so the move is bounded too', async () => {
+  // The arming itself is proven once in test/command-timeout.test.js; what this pins is the
+  // call site -- runReportIntake -> moveWithRetry -> board.moveIssueToColumn must forward
+  // `config`, or that spawn silently reverts to unbounded while every other spawn stays bounded
+  // (moveIssueToColumn arms nothing without it, by design). Same hazard, same test, as
+  // auto-triage.js's own moveIssueToColumn call site.
+  const spoReportsDir = mkTmp('spo-reportintake-movearm-');
+  const journalRoot = mkTmp('spo-reportintake-movearm-journal-');
+  writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_marm.json');
+
+  let moveOpts = null;
+  const deps = makeIntakeDeps({
+    npmResponder: (args, opts) => {
+      if (args.includes('report:card')) return ok(CARD_STDOUT);
+      moveOpts = opts;
+      return ok('');
+    },
+  });
+
+  await runReportIntake(
+    journalRoot,
+    {
+      spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y',
+      reportIntakeColumn: 'Intake', reportIntakeLabel: 'report:raw', autoIntakeLimit: 3,
+      commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 },
+    },
+    deps
+  );
+
+  assert.equal(moveOpts && moveOpts.timeout, 660000, 'board:move must carry the npm-run class timeout');
+});
+
+test('runReportIntake: a timed-out report:card never throws -- stays queued, reported as an error with timedOut: true', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-timeout-1-');
+  const journalRoot = mkTmp('spo-reportintake-timeout-journal1-');
+  const reportPath = writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_to1.json');
+
+  const deps = { sleep: async () => {}, spawnSync: () => timeoutResult() };
+
+  // Awaited directly, no try/catch: if runReportIntake ever threw on a timeout instead of
+  // reporting it, this `await` would reject and fail the test on its own -- the "never throws"
+  // property doesn't need a separate assertion to be enforced here.
+  const result = await runReportIntake(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', commandTimeoutsMs: { 'npm-run': 660000 } },
+    deps
+  );
+
+  assert.equal(result.filed, 0);
+  assert.equal(fs.existsSync(reportPath), true, 'never archived on a timeout -- retried next cycle');
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+  assert.ok(result.results.some((r) => r.outcome === 'error' && r.timedOut === true));
+});
+
+test('runReportIntake: a timed-out gh issue create never throws -- reported as an error with timedOut: true, report left in place', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-timeout-2-');
+  const journalRoot = mkTmp('spo-reportintake-timeout-journal2-');
+  const reportPath = writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_to2.json');
+
+  const deps = {
+    sleep: async () => {},
+    spawnSync: (command, args) => {
+      if (command === 'npm') return ok(CARD_STDOUT);
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'list') return ok('[]');
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return timeoutResult();
+      return ok('');
+    },
+  };
+
+  const result = await runReportIntake(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 } },
+    deps
+  );
+
+  assert.equal(result.filed, 0);
+  assert.equal(fs.existsSync(reportPath), true);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+});
+
 // ---- reportConfirmScan -----------------------------------------------------------------------
 
 function confirmDeps({ comments = [], closeResponder }) {
@@ -363,4 +478,57 @@ test('reportConfirmScan: already confirmed -- not re-scanned (findPendingIntake 
   appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 44, pendingPath: '/x', commentId: 2 });
 
   assert.deepEqual(findPendingIntake(journalRoot), []);
+});
+
+// ---- action 2.1b: reportConfirmScan's own spawns are now bounded too --------------------------
+
+test('reportConfirmScan: action 2.1b -- arms the gh class timeout for the comments fetch', async () => {
+  const journalRoot = mkTmp('spo-confirmscan-timeout-arm-');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'arm.json', pendingPath: '/x', issue: 50, commentId: 1 });
+
+  let seenOpts = null;
+  const deps = { spawnSync: (command, args, opts) => { seenOpts = opts; return ok('[]'); } };
+
+  await reportConfirmScan(journalRoot, { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(seenOpts.timeout, 120000);
+});
+
+test('reportConfirmScan: a timed-out gh api comments fetch never throws -- reported as an error with timedOut: true, report stays pending', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan-timeout-1-');
+  const journalRoot = mkTmp('spo-confirmscan-timeout-journal1-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'to1.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'to1.json', pendingPath, issue: 55, commentId: 100 });
+
+  const deps = { spawnSync: () => timeoutResult() };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(result.confirmed, 0);
+  assert.equal(result.discarded, 0);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+  assert.equal(fs.existsSync(pendingPath), true, 'still pending -- retried next scan');
+});
+
+test('reportConfirmScan: a timed-out gh issue close (discard path) never throws -- reported as an error with timedOut: true, report stays pending', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan-timeout-2-');
+  const journalRoot = mkTmp('spo-confirmscan-timeout-journal2-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'to2.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'to2.json', pendingPath, issue: 66, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify([{ id: 101, body: 'discard, duplicate of an old one' }]));
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'close') return timeoutResult();
+      return ok('');
+    },
+  };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(result.discarded, 0);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+  assert.equal(fs.existsSync(pendingPath), true, 'never archived on a timeout -- retried next scan');
 });

@@ -18,14 +18,23 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
 
 const { appendEvent, writeState } = require('./journal');
 const { moveCard } = require('./board');
+const { armTimeout } = require('./command-timeout');
 
-function runSync(deps, command, args, opts = {}) {
-  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
-  return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+// action 2.1b: routed through command-timeout.js's armTimeout -- the park comment's own `gh issue
+// comment` (postParkComment) and the unpark scan's `gh api .../comments` + abandon-ack `gh issue
+// comment` (unparkScan) used to spawn with no timeout at all. Both call sites run with the task
+// ALREADY TERMINAL (postParkComment, called from finalizePark after state.json/report.md are
+// already written) or with no task in scope at all (unparkScan, a daemon-loop scan) -- so unlike
+// steps/scripted.js's spawnStep, a timeout here is never retried and never thrown as a
+// ParkSignal: there is nothing left to park, and a retry buys nothing a task that gets scanned
+// again on the next poll cycle wouldn't already get for free. `config` is threaded through from
+// each caller (ctx.config for postParkComment, the existing `config` parameter for unparkScan) --
+// a missing config arms no timeout, same tolerant default as every other armTimeout caller.
+function runSync(deps, command, args, opts = {}, config) {
+  return armTimeout(deps, config, command, args, opts);
 }
 
 function normalizeExit(result) {
@@ -126,10 +135,10 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
 
-  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile]);
+  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
   const exit = normalizeExit(result);
   if (exit !== 0) {
-    appendEvent(ctx.taskDir, 'PARKED', 'park-comment-failed', { exit });
+    appendEvent(ctx.taskDir, 'PARKED', 'park-comment-failed', { exit, timedOut: result.timedOut === true });
     return;
   }
 
@@ -244,9 +253,12 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}) {
     const anchor = findParkAnchor(readJournalLines(taskDir));
     if (!anchor || anchor.alreadyHandled) continue;
 
-    const commentsResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${task.issue}/comments`]);
+    const commentsResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${task.issue}/comments`], {}, config);
     if (normalizeExit(commentsResult) !== 0) {
-      appendEvent(taskDir, 'PARKED', 'unpark-scan-failed', { exit: normalizeExit(commentsResult) });
+      appendEvent(taskDir, 'PARKED', 'unpark-scan-failed', {
+        exit: normalizeExit(commentsResult),
+        timedOut: commentsResult.timedOut === true,
+      });
       continue;
     }
 
@@ -284,9 +296,9 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}) {
 
     const ackFile = path.join(taskDir, 'abandon-ack.md');
     fs.writeFileSync(ackFile, 'Understood -- closing this attempt.\n');
-    const ack = runSync(deps, 'gh', ['issue', 'comment', String(task.issue), '--repo', ghRepo, '--body-file', ackFile]);
+    const ack = runSync(deps, 'gh', ['issue', 'comment', String(task.issue), '--repo', ghRepo, '--body-file', ackFile], {}, config);
     if (normalizeExit(ack) !== 0) {
-      appendEvent(taskDir, 'PARKED', 'abandon-ack-failed', { exit: normalizeExit(ack) });
+      appendEvent(taskDir, 'PARKED', 'abandon-ack-failed', { exit: normalizeExit(ack), timedOut: ack.timedOut === true });
     }
   }
 }

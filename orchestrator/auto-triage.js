@@ -185,9 +185,17 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
   if (!amended.ok) return { ok: false, error: amended.error };
 
   if (config.autoTriagePromoteToTodo !== false) {
-    const moved = board.moveIssueToColumn(entry.issue, 'Todo', deps, { cwd: config.productRepo });
+    // action 2.1b: pass config through so board.js's own armTimeout arms this spawn's class
+    // timeout too -- this is the SAME moveIssueToColumn board.js/report-intake.js's own moves
+    // now bound, and leaving this one caller config-less would silently reopen the exact gap
+    // 2.1b closes for the other two.
+    const moved = board.moveIssueToColumn(entry.issue, 'Todo', deps, { cwd: config.productRepo, config });
     if (!moved.ok) {
-      appendDaemonEvent(journalRoot, 'report-promote-failed', { issue: entry.issue, exit: moved.exit });
+      appendDaemonEvent(journalRoot, 'report-promote-failed', {
+        issue: entry.issue,
+        exit: moved.exit,
+        timedOut: moved.timedOut === true,
+      });
     }
   }
 

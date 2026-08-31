@@ -34,13 +34,13 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawnSync } = require('child_process');
 
 const accounts = require('./accounts');
 const config = require('./config');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
+const { armTimeout } = require('./command-timeout');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 const DRAFT_CARD_PROMPT = path.join(PROMPTS_DIR, 'draft-card.md');
@@ -96,10 +96,18 @@ function formatLlmFailure(prefix, raw) {
 }
 
 // ---- shared spawn primitive (same injection convention as steps/llm.js / steps/scripted.js) ----
-
+//
+// action 2.1b: routed through command-timeout.js's armTimeout -- every `gh`/`npm` call this file
+// makes (fetchIssue, postIssueComment, fileCard, amendCard, pullBoard, makeTask) used to spawn
+// with no timeout at all. The three LLM steps (draftCard/reviewCard/triageBugReport) already have
+// their own deadline via invokeClaudeReal's deadlineMs -- this only covers the plain gh/npm
+// spawns alongside them. Reads config.commandTimeoutsMs directly off the module-level `config`
+// required above (the same static default every other field in this file falls back to, e.g.
+// `deps.productRepo || config.productRepo`) rather than threading a config parameter through
+// every one of this file's public functions -- none of them take one today, and `spo ask`/
+// `spo pull`/auto-triage.js never pass a different orchestrator config into this module.
 function runSync(deps, command, args, opts = {}) {
-  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
-  return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+  return armTimeout(deps, config, command, args, opts);
 }
 
 function normalizeExit(result) {
@@ -475,7 +483,11 @@ function fetchIssue(issueNumber, deps = {}) {
   const ghRepo = deps.ghRepo || config.ghRepo;
   const result = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${issueNumber}`]);
   if (normalizeExit(result) !== 0) {
-    return { ok: false, error: `fetchIssue: gh api issues/${issueNumber} exited ${normalizeExit(result)}` };
+    return {
+      ok: false,
+      error: `fetchIssue: gh api issues/${issueNumber} exited ${normalizeExit(result)}`,
+      timedOut: result.timedOut === true,
+    };
   }
   let issue;
   try {
@@ -524,7 +536,11 @@ function postIssueComment(issueNumber, markdown, deps = {}) {
   ]);
   const commentExit = normalizeExit(commentResult);
   if (commentExit !== 0) {
-    return { ok: false, error: `postIssueComment: gh issue comment exited ${commentExit}` };
+    return {
+      ok: false,
+      error: `postIssueComment: gh issue comment exited ${commentExit}`,
+      timedOut: commentResult.timedOut === true,
+    };
   }
   return { ok: true, commentFile, commentId: parseCommentId(commentResult.stdout) };
 }
@@ -569,7 +585,12 @@ function fileCard(draft, review, deps = {}) {
   ]);
   const createExit = normalizeExit(createResult);
   if (createExit !== 0) {
-    return { ok: false, error: `fileCard: gh issue create exited ${createExit}`, stderr: createResult && createResult.stderr };
+    return {
+      ok: false,
+      error: `fileCard: gh issue create exited ${createExit}`,
+      stderr: createResult && createResult.stderr,
+      timedOut: createResult.timedOut === true,
+    };
   }
 
   const issueNumber = parseIssueNumber(createResult.stdout);
@@ -654,7 +675,12 @@ function amendCard(issueNumber, draft, review, deps = {}) {
   const editResult = runSync(deps, 'gh', editArgs);
   const editExit = normalizeExit(editResult);
   if (editExit !== 0) {
-    return { ok: false, error: `amendCard: gh issue edit exited ${editExit}`, stderr: editResult && editResult.stderr };
+    return {
+      ok: false,
+      error: `amendCard: gh issue edit exited ${editExit}`,
+      stderr: editResult && editResult.stderr,
+      timedOut: editResult.timedOut === true,
+    };
   }
 
   const commented = postIssueComment(issueNumber, review.first_comment_markdown, { ...deps, ghRepo, tmpDir });
@@ -858,7 +884,7 @@ function pullBoard(deps = {}) {
   const stdout = (result && result.stdout) || '';
 
   if (exit !== 0) {
-    return { ok: false, error: `pullBoard: npm run board:claim exited ${exit}`, stdout };
+    return { ok: false, error: `pullBoard: npm run board:claim exited ${exit}`, stdout, timedOut: result.timedOut === true };
   }
 
   const { candidates, warnings } = parseBoardClaimOutput(stdout);
@@ -1006,7 +1032,11 @@ function makeTask(candidate, deps = {}) {
   const apiResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${candidate.issue}`]);
   const apiExit = normalizeExit(apiResult);
   if (apiExit !== 0) {
-    return { ok: false, error: `makeTask: gh api issues/${candidate.issue} exited ${apiExit}` };
+    return {
+      ok: false,
+      error: `makeTask: gh api issues/${candidate.issue} exited ${apiExit}`,
+      timedOut: apiResult.timedOut === true,
+    };
   }
 
   let issue;

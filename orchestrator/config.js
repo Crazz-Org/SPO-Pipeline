@@ -48,6 +48,35 @@ const CI_CHECKS_POLL_INTERVAL_MS =
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
     : 20000;
 
+// A SPO_TIMEOUT_*_MS override, or the default when the variable is absent OR unusable.
+//
+// These five values are the only thing standing between a hung `gh` and a daemon frozen forever
+// holding the lock, so a malformed one must never silently disarm the bound. A bare
+// `Number(process.env.X)` returns NaN for "10m" or "2min" -- and node's spawnSync VALIDATES the
+// timeout option and throws RangeError ERR_OUT_OF_RANGE *before spawning*. That turned a typo in
+// a systemd drop-in into a synchronous throw out of board.js's moveCard and park-loop.js's
+// postParkComment, both documented "never throws" and both running inside finalizePark: the task
+// never reaches PARKED, the daemon exits 1, and orphanScan reparks through the same path on
+// restart. The same crash-loop shape review found in preserveWorktreeWip.
+//
+// So: fall back to the DEFAULT, never to "unbounded". A typo should cost you your override, not
+// the guarantee the override was tuning. command-timeout.js keeps its own guard for a config
+// object assembled by some other caller.
+//
+// The bound must be a POSITIVE integer, which rules out two values that look benign and are not:
+// `Number('')` is 0 and `Number('0')` is 0, and spawnSync reads a timeout of 0 as NO TIMEOUT.
+// An empty or zeroed SPO_TIMEOUT_*_MS would therefore disarm the very guarantee it names, which
+// is worse than the NaN case because it fails silently instead of loudly. There is deliberately
+// no way to disarm a bound through the environment: set an absurdly large value if you need to
+// watch a command run to completion.
+function timeoutFromEnv(name, defaultMs) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultMs;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return defaultMs;
+  return parsed;
+}
+
 module.exports = {
   // Wall-clock deadline for a single step invocation (scripted or llm), in milliseconds.
   // On expiry the step is treated as killed, retried once, and PARKED if it expires again.
@@ -107,8 +136,9 @@ module.exports = {
   // and the daemon (single-threaded, holding the task lock) hangs forever. Measured: GATE
   // observed running 129-240s past its supposedly-enforced 120s. The only real defence is
   // `spawnSync`'s OWN `timeout` option, armed per call by steps/scripted.js's spawnStep --
-  // see that file's classifyCommand for how a call site's (command, args) maps to one of these
-  // keys.
+  // see ./command-timeout.js's classifyCommand for how a call site's (command, args) maps to
+  // one of these keys (action 2.1b moved it there, out of steps/scripted.js, once board.js/
+  // park-loop.js/report-intake.js/intake.js needed the identical mapping for their own spawns).
   //
   // Values, and why:
   //   git      -- 120s. Every git call here is either local (fast) or one round-trip over the
@@ -151,14 +181,11 @@ module.exports = {
   // An explicit `opts.timeout` passed by a spawnStep call site always wins over these defaults
   // (steps/scripted.js). Every value is independently overridable; SPO_TIMEOUT_* env vars.
   commandTimeoutsMs: {
-    git: process.env.SPO_TIMEOUT_GIT_MS !== undefined ? Number(process.env.SPO_TIMEOUT_GIT_MS) : 120000,
-    gh: process.env.SPO_TIMEOUT_GH_MS !== undefined ? Number(process.env.SPO_TIMEOUT_GH_MS) : 120000,
-    'npm-ci':
-      process.env.SPO_TIMEOUT_NPM_CI_MS !== undefined ? Number(process.env.SPO_TIMEOUT_NPM_CI_MS) : 600000,
-    'npm-gate':
-      process.env.SPO_TIMEOUT_NPM_GATE_MS !== undefined ? Number(process.env.SPO_TIMEOUT_NPM_GATE_MS) : 7800000,
-    'npm-run':
-      process.env.SPO_TIMEOUT_NPM_RUN_MS !== undefined ? Number(process.env.SPO_TIMEOUT_NPM_RUN_MS) : 660000,
+    git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
+    gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
+    'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
+    'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
+    'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
   },
 
   // Poll interval for daemon.js when run without --once (queue watch mode).

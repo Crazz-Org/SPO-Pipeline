@@ -35,13 +35,13 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
 
 const intake = require('./intake');
 const board = require('./board');
 const { appendDaemonEvent } = require('./journal');
 const { alertDaemon } = require('./park-alert');
 const { listQueuedReports, moveReportTo } = require('./auto-triage');
+const { armTimeout } = require('./command-timeout');
 
 const DEFAULT_AUTO_INTAKE_MS = 15 * 60 * 1000;
 const DEFAULT_AUTO_INTAKE_LIMIT = 3;
@@ -61,9 +61,19 @@ function shouldScanConfirms(lastAt, nowMs, reportConfirmScanMs) {
   return nowMs - lastAt >= reportConfirmScanMs;
 }
 
-function runSync(deps, command, args, opts = {}) {
-  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
-  return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+// action 2.1b: routed through command-timeout.js's armTimeout -- report:card / gh issue list /
+// gh issue create (stage 1) and gh api comments / gh issue close (stage 2) used to spawn with no
+// timeout at all, in a daemon-loop timer with no per-task lock to hold but every bit as capable of
+// wedging the whole `spo` daemon process as any of the calls 2.1 already bounded (the daemon is
+// single-threaded; a hung spawnSync here blocks auto-pull/auto-triage/the queue drain right along
+// with it). `config` is threaded through from each caller below (runReportIntake/
+// reportConfirmScan both already take it as a parameter) -- a missing config arms no timeout,
+// same tolerant default armTimeout/classTimeoutMs already document. Never retried, never thrown:
+// this is a daemon-loop scan, not a task step -- there is no ParkSignal to throw INTO (no ctx, no
+// task), and every one of these calls gets another chance on the next autoIntakeMs/
+// reportConfirmScanMs tick regardless, so a retry here would only double the exposure for no gain.
+function runSync(deps, command, args, opts = {}, config) {
+  return armTimeout(deps, config, command, args, opts);
 }
 
 function sleep(ms) {
@@ -182,7 +192,7 @@ async function runReportIntake(journalRoot, config, deps = {}) {
   for (const reportPath of top) {
     const file = path.basename(reportPath);
 
-    const cardResult = runSync(deps, 'npm', ['run', 'report:card', '--', reportPath], { cwd: productRepo });
+    const cardResult = runSync(deps, 'npm', ['run', 'report:card', '--', reportPath], { cwd: productRepo }, config);
     const cardExit = normalizeExit(cardResult);
 
     if (cardExit === 3) {
@@ -195,8 +205,9 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       continue; // never archived -- see this file's header
     }
     if (cardExit !== 0) {
-      errors.push({ file, error: `report:card exited ${cardExit}` });
-      results.push({ file, outcome: 'error', error: `report:card exited ${cardExit}` });
+      const timedOut = cardResult.timedOut === true;
+      errors.push({ file, error: `report:card exited ${cardExit}`, timedOut });
+      results.push({ file, outcome: 'error', error: `report:card exited ${cardExit}`, timedOut });
       continue; // stays queued, retried next cycle
     }
 
@@ -213,7 +224,7 @@ async function runReportIntake(journalRoot, config, deps = {}) {
     const searchResult = runSync(deps, 'gh', [
       'issue', 'list', '--repo', ghRepo, '--state', 'all',
       '--search', `anchorKey: ${card.anchorKey} in:body`, '--json', 'number',
-    ]);
+    ], {}, config);
     if (normalizeExit(searchResult) === 0) {
       let hits = [];
       try {
@@ -248,11 +259,12 @@ async function runReportIntake(journalRoot, config, deps = {}) {
     const createResult = runSync(deps, 'gh', [
       'issue', 'create', '--repo', ghRepo, '--title', card.title,
       '--body-file', bodyFile, '--label', reportIntakeLabel,
-    ]);
+    ], {}, config);
     if (normalizeExit(createResult) !== 0) {
       const error = `gh issue create exited ${normalizeExit(createResult)}`;
-      errors.push({ file, error });
-      results.push({ file, outcome: 'error', error });
+      const timedOut = createResult.timedOut === true;
+      errors.push({ file, error, timedOut });
+      results.push({ file, outcome: 'error', error, timedOut });
       continue;
     }
     const issueNumber = intake.parseIssueNumber(createResult.stdout);
@@ -263,9 +275,14 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       continue;
     }
 
-    const moved = await moveWithRetry(issueNumber, reportIntakeColumn, deps, { cwd: productRepo });
+    const moved = await moveWithRetry(issueNumber, reportIntakeColumn, deps, { cwd: productRepo, config });
     if (!moved.ok) {
-      appendDaemonEvent(journalRoot, 'report-intake-move-failed', { issue: issueNumber, column: reportIntakeColumn, exit: moved.exit });
+      appendDaemonEvent(journalRoot, 'report-intake-move-failed', {
+        issue: issueNumber,
+        column: reportIntakeColumn,
+        exit: moved.exit,
+        timedOut: moved.timedOut === true,
+      });
       alertDaemon(config.parkAlertCmd, deps, [String(issueNumber), `failed to move to "${reportIntakeColumn}"`, 'INTAKE']);
       // Continue anyway -- the card exists and carries reportIntakeLabel, which makeTask's own
       // guard also refuses to drain regardless of column. See this file's header.
@@ -342,9 +359,13 @@ async function reportConfirmScan(journalRoot, config, deps = {}) {
   const errors = [];
 
   for (const entry of pending) {
-    const commentsResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${entry.issue}/comments`]);
+    const commentsResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${entry.issue}/comments`], {}, config);
     if (normalizeExit(commentsResult) !== 0) {
-      errors.push({ issue: entry.issue, error: `gh api comments exited ${normalizeExit(commentsResult)}` });
+      errors.push({
+        issue: entry.issue,
+        error: `gh api comments exited ${normalizeExit(commentsResult)}`,
+        timedOut: commentsResult.timedOut === true,
+      });
       continue;
     }
     let comments;
@@ -374,9 +395,13 @@ async function reportConfirmScan(journalRoot, config, deps = {}) {
     }
 
     // discard -- terminal, closes the raw card and archives the report.
-    const closed = runSync(deps, 'gh', ['issue', 'close', String(entry.issue), '--repo', ghRepo, '--reason', 'not planned']);
+    const closed = runSync(deps, 'gh', ['issue', 'close', String(entry.issue), '--repo', ghRepo, '--reason', 'not planned'], {}, config);
     if (normalizeExit(closed) !== 0) {
-      errors.push({ issue: entry.issue, error: `gh issue close exited ${normalizeExit(closed)}` });
+      errors.push({
+        issue: entry.issue,
+        error: `gh issue close exited ${normalizeExit(closed)}`,
+        timedOut: closed.timedOut === true,
+      });
       continue; // stays pending, retried next scan
     }
     moveReportTo(entry.pendingPath, path.join(spoReportsDir, 'archive'), `discarded: #${entry.issue} — ${today}`);
