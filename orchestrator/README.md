@@ -290,6 +290,37 @@ Each prompt's `{{placeholder}}` values come from one of two places
   produced; DIAGNOSE requires `gate.log` only when it was entered from GATE, never otherwise —
   see `doc/state-machine-spec.md`'s DIAGNOSE row.
 
+**Action 3.1 — PLAN reuse on retry.** `handlePlan` is the one LLM step that can skip its own
+`claude -p` call entirely. On a maintainer's `retry` after a park, INTAKE restarts the task from
+scratch and WORKTREE creates a fresh worktree off the current `origin/main` — but the plan and
+invariants files a *previous* run's PLAN wrote under `journal/<id>/scratch/` are still sitting on
+disk, keyed by task id, never cleaned between runs. `decidePlanReuse` (`state-machine.js`) decides
+whether that plan is still safe to reuse instead of paying for PLAN again, checking, in order:
+(0) `isRealMode(ctx)` — shadow mode and `--dry-run` are excluded by an explicit, first check, not
+merely as a side effect of condition 1 never passing without a real `realWorktree` run; (1)
+`ctx.task.baseMainSha` is set — only real mode's `realWorktree` sets it (see "Real scripted steps"
+below); (2)/(3) the journal's last PLAN `files-written` event carries a `baseMainSha` that matches
+this run's — `origin/main` hasn't moved since the plan was written; (4) `planPath`/`invariantsPath`
+from that event still exist on disk, are regular files, and are non-empty — the existence check is
+wrapped so a file vanishing between the check and the stat can never throw out of `decidePlanReuse`
+and kill the daemon; (5) a PLAN `result` event with a payload exists *and that payload is not
+itself a failure* (`payload.ok !== false`) — a transport-failure payload (action 1.4) carries none
+of `plan_path`/`invariants_path`/`invariant_ids`/`check_commands`, so IMPLEMENT/VALIDATE would have
+nothing safe to read even though "a payload exists"; (6) the most recent `parked` event, if any, is
+not one of the six reasons that indict the plan itself (`plan-invalid`,
+`plan-requires-protected-files`, `diagnose-duplicate-root-cause`, `diagnose-no-new-cause`,
+`diagnose-budget-exhausted`, `validate-reject-budget-exhausted`) — every other park reason (a
+transport failure, a gate/CI failure, a lost claim, a merge conflict) is orthogonal to whether the
+plan was right, and does not block reuse. On reuse, PLAN journals `plan-reused`, re-journals
+`files-written` and `result` (the previous payload with `plan_path`/`invariants_path` stamped
+explicitly from what condition 4 just verified on disk — not merely trusted to already be on
+`previousPayload` — plus `reused: true`, so `lastResultPayload`'s "last PLAN result wins"
+convention still resolves to the right paths even after a mid-run daemon restart left an earlier,
+markdown-only `result` event as the one on disk), still rebuilds the action-1.8 invariants baseline
+fresh against the retried worktree (reuse is a bet on the plan *text*, not on which invariants
+currently resolve in a tree nobody has re-checked), and returns `IMPLEMENT` — `callLlmStep` is
+never reached.
+
 A missing value for any placeholder a prompt's header declares — PLAN called before
 `worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws
 `prompt-template.js`'s `MissingPlaceholderError`, caught in `runLlm` and re-thrown as
@@ -441,7 +472,16 @@ the main-moved `baseMain` lookup read local JSON instead of polling GitHub or th
 **WORKTREE, in order — and why claim is last.** `git -C <productRepo> fetch origin`, then `git
 -C <productRepo> rev-parse origin/main` to get the sha the nightly check compares against
 `~/.spo-bench/nightly/latest.json`'s `{verdict, sha}` (a `FAIL` at that exact sha parks
-`nightly-main-red` before anything is created); then `git -C <productRepo> worktree add
+`nightly-main-red` before anything is created). Action 3.1: the rev-parsed sha is journalled
+(`{state: 'WORKTREE', event: 'base-main', sha}`) and set onto `ctx.task.baseMainSha` immediately,
+*before* the nightly check. The `base-main` event itself is a diagnostic record only — "what
+`origin/main` sha did this run cut its worktree from" — journalled ahead of the nightly-red check
+so it exists even on a run that parks right there and never reaches PLAN; nothing ever reads it
+back. `handlePlan`'s `decidePlanReuse` (see "Step contracts + prompt fill" above) does not consult
+it: its actual input is the `baseMainSha` field on PLAN's own `files-written` event (only written
+once PLAN succeeds), compared against `ctx.task.baseMainSha` as set on this same line. A run that
+parks before ever reaching PLAN leaves no PLAN `files-written` event, so there is nothing for a
+later retry to compare against regardless of what `base-main` recorded. Then `git -C <productRepo> worktree add
 <worktreesDir>/<taskId> -b claude-pipe/<taskId> origin/main`; then `npm ci` in the fresh
 worktree (a product worktree carries no `node_modules`); **only then** `npm run board:take --
 <issue>`, also from the fresh worktree. The claim runs last, after the worktree exists, because
@@ -749,8 +789,24 @@ more text) or `abandon`, case-insensitive, decides the outcome; anything else on
 neither word -- is left alone, since a human conversation on the issue is allowed:
 
 - **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/0000-retry-<ts>-<id>.json`
-  with the original `task.json` fields, `worktreePath`/`branch` dropped so WORKTREE derives both
-  fresh, same as a first attempt) and journals `unparked-by-maintainer`. Action 2.8: the `0000-`
+  with the original `task.json` fields, `worktreePath`/`branch`/`baseMainSha` dropped so WORKTREE
+  derives the first two fresh, same as a first attempt, and `realWorktree` re-measures the third
+  against whatever `origin/main` is *now*. Action 3.1: `baseMainSha` is stripped here for the same
+  reason as `worktreePath`/`branch` -- defence-in-depth, not the closing of a live hole.
+  `park-loop.js`'s own header comment on `reEnqueueTask` already establishes why: `task.json` is
+  the original queue file and is never rewritten with runtime fields, so a stale `baseMainSha`
+  (set only in memory, on `ctx.task`, by `realWorktree`) can never actually be sitting in it to
+  strip in the first place -- exactly as true of `worktreePath`/`branch` today. Kept anyway,
+  alongside its two siblings, as a guard against that invariant ever quietly breaking: if some
+  future change did start persisting runtime fields onto `task.json`, a stale `baseMainSha`
+  surviving into a retried task would let `handlePlan`'s `decidePlanReuse` (see "Step contracts +
+  prompt fill" above) mistake "nobody re-measured it this run" for "`origin/main` hasn't moved")
+  and journals `unparked-by-maintainer`. This does NOT by itself cost PLAN's LLM call again: if
+  the plan `reEnqueueTask` left on disk (`journal/<id>/scratch/`, never touched by a retry) is
+  still valid against the freshly-measured `baseMainSha` and the park wasn't one of the six
+  plan-invalidating reasons, PLAN reuses it instead of re-deriving it -- action 3.1's whole point,
+  since a retry restarting at INTAKE would otherwise re-run PLAN from scratch on a plan that was
+  already correct. Action 2.8: the `0000-`
   prefix makes a retry sort BEFORE every fresh `NNNN-issue-...` card in `listQueueFiles`'s
   filename-sort processing order (`intake.js`'s `nextQueueSeq` never hands out a sequence below
   `0001`) -- before this fix the file was named `retry-<ts>-<id>.json`, which sorted BEHIND every

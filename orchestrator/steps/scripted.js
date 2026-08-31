@@ -701,6 +701,19 @@ async function realWorktree(ctx, deps = {}) {
   if (revParse.exit !== 0) throw new ParkSignal('worktree-rev-parse-failed', { exit: revParse.exit });
   const originMainSha = revParse.stdout.trim();
 
+  // Action 3.1: journal the base sha this run is building on, and hand it to ctx.task, before
+  // any park can happen below (including nightly-main-red). This 'base-main' event is a
+  // diagnostic record -- "what origin/main sha did this run cut its worktree from" -- journalled
+  // here, ahead of the nightly-red check, so it exists even for a run that parks right there and
+  // never reaches PLAN. It is NOT what handlePlan's reuse guard (decidePlanReuse,
+  // state-machine.js) reads: that guard's actual input is the baseMainSha field PLAN's own
+  // 'files-written' event carries (only written once PLAN succeeds), compared against
+  // ctx.task.baseMainSha as set on the line right below. A run that parks before ever reaching
+  // PLAN leaves no PLAN 'files-written' event at all, so there is nothing for a later retry to
+  // compare this run's base-main against in the first place.
+  appendEvent(ctx.taskDir, 'WORKTREE', 'base-main', { sha: originMainSha });
+  ctx.task.baseMainSha = originMainSha;
+
   const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
   if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
     throw new ParkSignal('nightly-main-red', { sha: originMainSha });

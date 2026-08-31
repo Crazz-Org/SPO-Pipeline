@@ -270,9 +270,17 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // always wins first), and every other reader of queue/ (bin/spo, orphan-scan.js's `queuedIds`,
 // intake.js's `nextQueueSeq`) only ever checks `.endsWith('.json')` or a leading `\d+-`, both
 // still true here.
+// Action 3.1: `baseMainSha` is stripped alongside worktreePath/branch for the same reason --
+// it is the run's own record of where origin/main sat when IT ran, not a durable task fact.
+// realWorktree (steps/scripted.js) re-derives the current sha on every run and writes it fresh
+// to ctx.task.baseMainSha; if a stale value from the parked run survived into the retried
+// task.json, handlePlan's reuse guard (state-machine.js) would find `ctx.task.baseMainSha`
+// already set from last week and could pass condition (1) on a sha nobody just measured --
+// exactly the "origin/main hasn't moved" check the guard exists to make trustworthy, defeated
+// by its own leftover state.
 function reEnqueueTask(queueDir, taskDir, id) {
   const original = readJsonSafe(path.join(taskDir, 'task.json')) || {};
-  const { worktreePath, branch, ...rest } = original;
+  const { worktreePath, branch, baseMainSha, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
   const file = path.join(queueDir, `0000-retry-${Date.now()}-${id}.json`);
   fs.writeFileSync(file, JSON.stringify({ ...rest, id }, null, 2) + '\n');

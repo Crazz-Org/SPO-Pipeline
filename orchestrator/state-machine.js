@@ -23,7 +23,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
-const { scratchDir } = require('./task-values');
+const { scratchDir, lastResultPayload } = require('./task-values');
 const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
@@ -181,7 +181,166 @@ async function handleWorktree(ctx) {
 // tests unrelated to PLAN rely on it. Once a payload actually exists -- a real LLM reply, an
 // explicit shadow fixture, or --dry-run's own canned payload (steps/llm.js) -- it is held to the
 // real contract.
+// Action 3.1: park reasons that indict the PLAN ITSELF, not just this attempt's execution of it
+// -- a plan invalid on its face, one that named protected files IMPLEMENT structurally cannot
+// touch, IMPLEMENT/DIAGNOSE finding the same root cause a second time (the plan sent it back to
+// the identical failure), DIAGNOSE burning its whole budget without ever clearing IMPLEMENT's
+// failure, or change-validator rejecting the built, gated-green change repeatedly. Reusing the
+// plan that produced any of these on a `retry` would spend a whole remediation cycle to arrive at
+// the identical park -- worse for the budget-exhaustion pair, since without them reuse -> DIAGNOSE
+// burns its budget -> park -> `retry` with `main` unmoved -> identical reuse -> identical cycle,
+// bounded only by a human giving up. Every other park reason -- transport failures, gate/CI
+// failures, claim losses, merge conflicts -- is orthogonal to whether the plan was right, so it
+// does not disqualify reuse.
+const PLAN_INVALIDATING_PARK_REASONS = new Set([
+  'plan-invalid',
+  'plan-requires-protected-files',
+  'diagnose-duplicate-root-cause',
+  'diagnose-no-new-cause',
+  'diagnose-budget-exhausted',
+  'validate-reject-budget-exhausted',
+]);
+
+// Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
+// already on disk from an EARLIER run of this same task -- the case a maintainer's `retry` after
+// a park creates: INTAKE restarts the task from scratch, and without this, PLAN re-derives a plan
+// that already existed and was correct (measured on the real corpus at ~$24, 36% of PLAN spend --
+// see this action's own header in the remediation plan). Reads only journal.jsonl + fs.statSync
+// -- no spawning -- so it is directly unit-testable on its own.
+//
+// Returns `{ planPath, invariantsPath, baseMainSha, previousPayload }` to reuse, or null the
+// moment any ONE of the following seven conditions fails -- null always means "run PLAN
+// normally, exactly as before this action":
+//
+//   0. isRealMode(ctx) -- shadow and --dry-run must never reuse, full stop. This used to be true
+//      only "by construction" (condition 1 below can never pass without a real realWorktree run),
+//      which made it incidental rather than guaranteed: a shadow task.json that happens to carry
+//      a baseMainSha field (hand-built fixture, copy-pasted task.json, ...) would reuse anyway.
+//      Checked explicitly, first, so the exclusion doc/state-machine-spec.md and
+//      orchestrator/README.md both describe as a guarantee actually is one.
+//   1. ctx.task.baseMainSha is a non-empty string. Only realWorktree (steps/scripted.js) sets
+//      it, so a real task that never reached a fresh WORKTREE run this attempt never has one set
+//      either, and so never reaches reuse.
+//   2. journal.jsonl holds at least one PLAN 'files-written' event carrying a baseMainSha field
+//      (a journal written before this action never has one -- that is the backward-compatibility
+//      case, and it must fall through to "run normally", not throw). Take the LAST such event.
+//   3. That event's baseMainSha equals ctx.task.baseMainSha -- origin/main has not moved since
+//      the plan was written; a mismatch means the plan may no longer fit the tree it targets.
+//   4. Both planPath and invariantsPath from that event exist on disk, are regular files, AND are
+//      non-empty -- guards a wiped scratch dir, a directory where a file was expected, or a
+//      truncated write from being reused as though it were intact. Wrapped so a TOCTOU (the file
+//      vanishing between the check and the stat) can never throw out of this function -- see the
+//      try/catch below.
+//   5. A PLAN 'result' event with a payload exists (task-values.js's lastResultPayload contract),
+//      AND that payload is not itself a failure (`ok !== false`) -- IMPLEMENT and VALIDATE read
+//      plan_path/invariants_path/invariant_ids/check_commands from exactly this event, and a
+//      failure payload (action 1.4's transport-failure branch, `{ok:false, kind:'error'}`) never
+//      carries any of them. A run can park on a transport failure (not plan-invalidating) with
+//      the LAST PLAN 'result' event still being that failure -- e.g. a run that PLANned fine, then
+//      parked downstream, then a later retry re-ran PLAN and hit a transport error, then main was
+//      reverted and retried again -- so "a payload exists" alone is not enough; it must be one PLAN
+//      actually produced a verdict for.
+//   6. The most recent 'parked' event in the journal, if any, has a reason that is NOT one of
+//      PLAN_INVALIDATING_PARK_REASONS above.
+function decidePlanReuse(ctx) {
+  if (!isRealMode(ctx)) return null;
+
+  const baseMainSha = ctx.task && ctx.task.baseMainSha;
+  if (typeof baseMainSha !== 'string' || baseMainSha === '') return null;
+
+  const lines = readJournalLines(ctx.taskDir);
+
+  const filesWrittenEvents = lines.filter(
+    (e) => e.state === 'PLAN' && e.event === 'files-written' && typeof e.baseMainSha === 'string'
+  );
+  const lastFilesWritten = filesWrittenEvents[filesWrittenEvents.length - 1];
+  if (!lastFilesWritten || lastFilesWritten.baseMainSha !== baseMainSha) return null;
+
+  const { planPath, invariantsPath } = lastFilesWritten;
+  if (!planPath || !invariantsPath) return null;
+  // Action 3.1 (defect fix): fs.existsSync then fs.statSync is a TOCTOU -- if the file is removed
+  // in the gap between the two calls, statSync's ENOENT propagates out of this function, out of
+  // handlePlan, past runTask's ParkSignal-only catch, and kills the daemon process entirely. That
+  // is strictly worse than the bug this action fixes. One statSync per path, wrapped so ANY error
+  // (ENOENT, EACCES, whatever) is just "not reusable", never a crash; isFile() also rejects a
+  // planPath/invariantsPath that resolved to a directory, which a bare `.size` check would not
+  // have caught (a directory's stat size is non-zero).
+  const isNonEmptyFile = (p) => {
+    try {
+      const st = fs.statSync(p);
+      return st.isFile() && st.size > 0;
+    } catch {
+      return false;
+    }
+  };
+  if (!isNonEmptyFile(planPath) || !isNonEmptyFile(invariantsPath)) return null;
+
+  const previousPayload = lastResultPayload(ctx.taskDir, 'PLAN');
+  if (!previousPayload || previousPayload.ok === false) return null;
+
+  const lastParked = [...lines].reverse().find((e) => e.event === 'parked');
+  if (lastParked && PLAN_INVALIDATING_PARK_REASONS.has(lastParked.reason)) return null;
+
+  return { planPath, invariantsPath, baseMainSha, previousPayload };
+}
+
 async function handlePlan(ctx) {
+  // Action 3.1: a still-valid plan from an earlier run short-circuits everything below, including
+  // the LLM call itself -- that IS the point, not an optimization bolted onto a call that still
+  // happens. See decidePlanReuse's own header for the seven conditions (0-6).
+  const reuse = decidePlanReuse(ctx);
+  if (reuse) {
+    const { planPath, invariantsPath, baseMainSha, previousPayload } = reuse;
+    appendEvent(ctx.taskDir, 'PLAN', 'plan-reused', { planPath, invariantsPath, baseMainSha });
+    // Re-journal 'files-written' so every downstream reader that asserts "PLAN wrote its files
+    // this run" (notably recette.js's assertion set) still finds one, exactly as the normal path
+    // below produces.
+    appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha });
+
+    // The action-1.8 invariants baseline is rebuilt exactly as the normal path does, below --
+    // never reused itself. Reuse is a bet on the PLAN TEXT still being right, not on which
+    // invariants currently resolve in the tree; CHECK's regression check needs a baseline taken
+    // against THIS run's fresh worktree regardless of which path produced the plan it is checking
+    // against. The declared-vs-parsed canary compares against invariant_ids from the reused
+    // payload, since that is the only declaration this run has.
+    if (isRealMode(ctx) && ctx.task.worktreePath) {
+      const baseline = buildBaseline(ctx.task.worktreePath, invariantsPath);
+      appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+      const declaredIds = Array.isArray(previousPayload.invariant_ids) ? previousPayload.invariant_ids : [];
+      const parsedIds = (baseline.invariants || []).map((inv) => inv.id);
+      if (declaredIds.length !== parsedIds.length) {
+        appendEvent(ctx.taskDir, 'PLAN', 'invariants-declared-parsed-mismatch', {
+          declared: declaredIds.length,
+          parsed: parsedIds.length,
+          declaredIds,
+          parsedIds,
+          issues: baseline.issues || [],
+        });
+      }
+    }
+
+    // Action 3.1 (defect fix): stamp plan_path/invariants_path explicitly from `reuse`, rather
+    // than trusting previousPayload to already carry them. It usually does (the normal path below
+    // journals 'result' a second time, at the very end, with the paths added) -- but the normal
+    // path also journals 'result' a FIRST time right after the LLM reply, markdown-only, no paths,
+    // with files-written and buildBaseline in between. A daemon SIGTERM in that window (the
+    // post-merge hook genuinely causes these) leaves journal.jsonl holding a markdown-only
+    // 'result' followed by 'files-written'. orphan-scan.js reparks that as
+    // 'task-orphaned-daemon-restart', which is not plan-invalidating, so a `retry` with `main`
+    // unmoved reaches this branch with a previousPayload that has never had plan_path/
+    // invariants_path added. Copying it forward as-is would hand IMPLEMENT `plan_path: undefined`
+    // -> MissingPlaceholderError -> park; worse, steps/scripted.js's runInvariantCheck treats a
+    // missing invariants_path as "nothing to check" and returns [], so CHECK's invariant gate goes
+    // silently vacuous instead of failing loudly. planPath/invariantsPath here came from the very
+    // 'files-written' event condition 4 just stat'd, so they are more trustworthy than whatever
+    // previousPayload happened to carry -- let them win.
+    appendEvent(ctx.taskDir, 'PLAN', 'result', {
+      payload: { ...previousPayload, plan_path: planPath, invariants_path: invariantsPath, reused: true },
+    });
+    return 'IMPLEMENT';
+  }
+
   const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
@@ -222,7 +381,10 @@ async function handlePlan(ctx) {
   const invariantsPath = path.join(dir, `invariants-${issue}.md`);
   fs.writeFileSync(planPath, planMarkdown);
   fs.writeFileSync(invariantsPath, invariantsMarkdown);
-  appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath });
+  // Action 3.1: baseMainSha rides along so a LATER retry's decidePlanReuse has something to
+  // compare against (condition 2/3) -- ctx.task.baseMainSha is undefined outside real mode
+  // (shadow/dry-run never call realWorktree), which is exactly why reuse never triggers there.
+  appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha: ctx.task.baseMainSha });
 
   // Action 1.8: the PLAN-time invariant baseline. Real mode only (shadow/dry-run never spawn a
   // real worktree for buildBaseline to resolve against, and doc/state-machine-spec.md's
