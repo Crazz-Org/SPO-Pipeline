@@ -232,12 +232,19 @@ module.exports = {
   // The product checkout every WORKTREE/CHECK/PUSH_PR/GATE/CI_CHECKS/MERGE/FINISH real command
   // runs against or from. Always this literal join, never a relative "../SPO-WebClient" --
   // see CLAUDE.md's own warning that ".." resolves differently from inside a worktree.
-  productRepo: path.join(os.homedir(), 'SPO-WebClient'),
+  // SPO_PRODUCT_REPO / SPO_WORKTREES_DIR exist so a test subprocess can be pointed away from the
+  // real product checkout. Without them a test that reaches realWorktree -- which normally it
+  // cannot, but a mutation that makes shadow mode take a real path can -- creates REAL git
+  // worktrees and branches in ~/SPO-WebClient. That happened during a mutation-testing round on
+  // 2026-08-31: 44 fixture-named worktrees and 61 branches landed in the live product repo, and
+  // because `worktrees/` is gitignored, `git status` stayed clean while bare `node --test` walked
+  // into them and reported 12980 failures that had nothing to do with the code under test.
+  productRepo: process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient'),
 
   // Where WORKTREE creates one `git worktree add` per task (<dir>/<taskId>). Gitignored
   // (worktrees/ in .gitignore) -- disposable, FINISH removes its own entry with
   // `git worktree remove --force`.
-  pipelineWorktreesDir: path.join(REPO_ROOT, 'worktrees'),
+  pipelineWorktreesDir: process.env.SPO_WORKTREES_DIR || path.join(REPO_ROOT, 'worktrees'),
 
   // owner/repo for every `gh api` / `gh pr` / `gh issue` real call.
   ghRepo: 'Crazz-Org/SPO-WebClient',

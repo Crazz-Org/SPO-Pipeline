@@ -19,8 +19,11 @@ the design consequences at the bottom.
    hard kill, a lost single-instance lock). `orchestrator/orphan-scan.js` covers it
    *a posteriori* — a `state.json` left on a non-terminal state with no `queue/` entry and a
    dead owner pid is reparked automatically (`task-orphaned-daemon-restart`) through the same
-   `finalizePark` path a normal catch-all park uses, the next time any daemon starts or runs its
-   periodic scan. See `orchestrator/README.md` § Orphan recovery.
+   `finalizePark` path a normal catch-all park uses (including restoring `worktreePath` onto the
+   rebuilt ctx, so a still-dirty worktree is pushed to a `wip/` ref exactly as a live park would),
+   the next time a `--real` daemon starts or runs its periodic scan. A `--shadow`/`--dry-run`
+   start never does real side effects, so it only detects the orphan and journals
+   `orphan-scan-would-repark` — it never parks. See `orchestrator/README.md` § Orphan recovery.
 3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.

@@ -230,9 +230,24 @@ async function main() {
   // the case that actually matters (crash -> systemd restart); runForever's own periodic scan
   // below is the belt-and-suspenders for a daemon that keeps running but loses track of a task
   // some other way. Cheap even when nothing is orphaned: one readdir + a few small JSON reads.
+  //
+  // The call is unconditional, but what it DOES is mode-gated inside orphan-scan.js itself
+  // (isRealMode(ctx), the same test every other real side effect in this codebase gates on):
+  // --real reparks for real, exactly as before this fix. --shadow/--dry-run only ever detect the
+  // orphan and journal an 'orphan-scan-would-repark' daemon.jsonl line -- never a state.json/
+  // report.md write, gh comment, or board move. Before this, a --shadow/--dry-run start against
+  // the LIVE journal root silently turned a real, recoverable orphan into a terminal park with no
+  // board move, no gh comment and no unpark anchor: invisible to the maintainer and to
+  // unparkScan.js forever. See orphan-scan.js's own header for the read-only path's rationale.
   const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);
   for (const r of recoveredOrphans) {
-    console.error(`orchestrator/daemon.js: recovered orphaned task ${r.id} (${r.reason})`);
+    if (r.wouldRepark) {
+      console.error(
+        `orchestrator/daemon.js: ${opts.shadow ? 'shadow' : 'dry-run'} mode -- would have recovered orphaned task ${r.id} (${r.reason}); no park written (see daemon.jsonl: orphan-scan-would-repark)`
+      );
+    } else {
+      console.error(`orchestrator/daemon.js: recovered orphaned task ${r.id} (${r.reason})`);
+    }
   }
 
   if (opts.once) {

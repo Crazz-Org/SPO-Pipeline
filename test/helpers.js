@@ -54,9 +54,25 @@ function writePoolDir(poolDir, entries) {
   return poolDir;
 }
 
+// Every daemon subprocess this suite starts is pointed at a THROWAWAY product repo and worktrees
+// dir. No test should ever reach realWorktree -- but a mutation that makes shadow mode take a
+// real path can, and then the fixture task ids become real git worktrees and branches in the
+// maintainer's live ~/SPO-WebClient. That is not hypothetical: a mutation-testing round on
+// 2026-08-31 left 44 worktrees and 61 branches there, and since `worktrees/` is gitignored it was
+// invisible to `git status` while breaking bare `node --test` with ~13k foreign test failures.
+// Isolation belongs here, in the one place every daemon subprocess goes through, rather than in
+// each test remembering to override two config keys.
+function isolatedEnv() {
+  return {
+    ...process.env,
+    SPO_PRODUCT_REPO: mkTmp('spo-isolated-product-'),
+    SPO_WORKTREES_DIR: mkTmp('spo-isolated-worktrees-'),
+  };
+}
+
 function runDaemonOnce(queueDir, journalDir, extraArgs = []) {
   const args = [DAEMON, '--shadow', '--once', '--queue', queueDir, '--journal', journalDir, ...extraArgs];
-  return execFileSync(process.execPath, args, { encoding: 'utf8' });
+  return execFileSync(process.execPath, args, { encoding: 'utf8', env: isolatedEnv() });
 }
 
 // Same as runDaemonOnce but real-mode semantics without spawning (--dry-run instead of
@@ -64,11 +80,11 @@ function runDaemonOnce(queueDir, journalDir, extraArgs = []) {
 // real `claude` CLI or any scripted command.
 function runDaemonDryRun(queueDir, journalDir, extraArgs = []) {
   const args = [DAEMON, '--dry-run', '--once', '--queue', queueDir, '--journal', journalDir, ...extraArgs];
-  return execFileSync(process.execPath, args, { encoding: 'utf8' });
+  return execFileSync(process.execPath, args, { encoding: 'utf8', env: isolatedEnv() });
 }
 
 function runSpo(args) {
-  return execFileSync(process.execPath, [SPO_BIN, ...args], { encoding: 'utf8' });
+  return execFileSync(process.execPath, [SPO_BIN, ...args], { encoding: 'utf8', env: isolatedEnv() });
 }
 
 function readJournal(journalDir, id) {

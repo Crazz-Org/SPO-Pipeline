@@ -1027,4 +1027,5 @@ module.exports = {
   buildCtx,
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
   snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it
+  isRealMode, // exported for orphan-scan.js -- shadow/dry-run must detect-and-journal only, never park
 };

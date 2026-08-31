@@ -1085,12 +1085,22 @@ comment, so `unparkScan`'s existing round trip picks the task straight back up �
 `state.json`/`journal.jsonl` edit, no fabricated comment, the way recovering card #385 required
 by hand on 2026-08-30.
 
-The scan runs unconditionally once at every daemon startup (the case that actually matters —
-crash, then a systemd restart) and again on its own timer inside `runForever`'s real-mode loop
-(`config.orphanScanMs`, default 60s), ahead of `unparkScan` so a reparked task is retryable the
-very next cycle. An owner-less or foreign-host `state.json` (an older build, or a task genuinely
-owned by another machine) is left alone and logged, never guessed at — a false-positive reparking
-would put two writers on the same task directory, worse than the status quo.
+The scan runs unconditionally once at every daemon startup, in every mode (the case that
+actually matters — crash, then a systemd restart), and again on its own timer inside
+`runForever`'s real-mode loop (`config.orphanScanMs`, default 60s), ahead of `unparkScan` so a
+reparked task is retryable the very next cycle. What the scan *does* is mode-gated, though:
+`isRealMode(ctx)` (the same check `finalizePark`'s other real-only side effects use) decides
+whether a detected orphan is actually reparked. `--real` reparks for real, exactly as described
+above. `--shadow`/`--dry-run` never spawn a real command, so a park they wrote would carry no
+board move, no gh park comment and no unpark anchor — invisible to both the maintainer and
+`unparkScan` forever, silently burying a real card under a developer's local experiment. They
+instead only detect the orphan and journal one `orphan-scan-would-repark` line to
+`daemon.jsonl` (nothing under the task's own `journal/<id>/` is touched, so the task is exactly
+where a `--real` start would still find it) — enough for a `--dry-run` start to report what a
+real start would have recovered, without the risk. An owner-less or foreign-host `state.json`
+(an older build, or a task genuinely owned by another machine) is left alone and logged, never
+guessed at — a false-positive reparking would put two writers on the same task directory, worse
+than the status quo.
 
 A park produced this way also runs through `steps/scripted.js`'s `preserveWorktreeWip` if the
 task's worktree is still on disk and dirty: it commits the tree (`wip(<id>): parked -- <reason>`)
