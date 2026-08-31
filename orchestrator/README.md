@@ -1327,6 +1327,17 @@ short-circuit); the run's own report lists which steps were not clean, by name, 
 knows exactly what (if anything) still needs a hand — see `spo recette`'s own printed `cleanup:`
 line.
 
+**"Already gone" is clean, not a failure.** A cleanup step's job is "this artifact is no longer
+there", not "my command exited 0", and on the SUCCESS path those differ: FINISH has already
+removed the worktree, MERGE has already merged the PR (so `gh pr close` refuses), and the merge
+deleted the remote branch. Three of seven steps therefore exit non-zero on a *perfect* run — the
+first green live run (2026-08-31, issue #469) printed `3 not-clean` having left nothing behind at
+all. Reporting that as failure teaches the reader to ignore the one line that would report a real
+leak, so `classifyStep` recognises the tools' own "there was nothing to do" messages and records
+those steps as `gone`. Anything **unrecognised** stays a failure: the classifier must never
+launder a real error (a `Could not resolve host` on the remote-branch delete leaves a branch
+behind) into silence, and a test pins exactly that.
+
 **Exit code is the verdict** (CLAUDE.md: "Verdict by exit code, never by reading text output") —
 `0` only when the run completed **and** every declared assertion passed; a refusal, a tripped cap,
 a park, or a failed assertion are all `1`.

@@ -369,15 +369,18 @@ test('cleanup is idempotent and never throws when everything is already gone', (
   const config = recette.resolveConfig(baseOpts());
   fs.mkdirSync(config.runDir, { recursive: true }); // journal-dir-remove has something to remove once
 
-  // Every git/gh call reports failure, as it would against an already-cleaned-up worktree/branch/
-  // PR/issue -- cleanup must report each as not-ok, never throw.
-  const deps = { spawnSync: () => fail(1, 'already gone') };
+  // Every git/gh call answers the way the real tools do when the artifact is already gone --
+  // which is exactly the SUCCESS path, where FINISH removed the worktree, MERGE merged the PR
+  // and the merge deleted the remote branch. Those must read as CLEAN, not as failures: the
+  // first green live run (2026-08-31, issue #469) printed "3 not-clean" having left nothing
+  // behind, which trains a maintainer to ignore the one line that would report a real leak.
+  const deps = { spawnSync: () => fail(1, "fatal: 'x' is not a working tree") };
 
   const report = recette.cleanup({ scenario: recette.SCENARIOS['trivial-doc-log'], config, deps, issueNumber: 9001, prNumber: 4242 });
 
-  assert.equal(report.anyFailed, true);
+  assert.equal(report.anyFailed, false, 'already-gone is clean, not a failure');
   assert.ok(report.steps.every((s) => s.ok === true), 'a non-zero exit is recorded via {exit}, never a thrown/caught error');
-  assert.ok(report.steps.some((s) => s.detail && s.detail.exit === 1));
+  assert.ok(report.steps.some((s) => s.gone === true), 'and is marked `gone` so the reason is visible');
   assert.equal(fs.existsSync(config.runDir), false);
 
   // Calling it again (everything already gone, including the run dir) must still never throw.
@@ -616,5 +619,26 @@ test('the scenario card carries its criterion explicitly -- never re-parsed out 
   assert.ok(
     !truncated.includes(`- ${runId} -- synthetic recette card`),
     'extractCriterion truncates at the blank line -- proving why the explicit criterion is needed'
+  );
+});
+
+// The other half of the same contract: the already-gone classifier must never launder a REAL
+// failure into silence. Only messages the tools actually emit for "there was nothing to do"
+// count as clean; anything unrecognised stays a failure, so a non-zero anyFailed is worth
+// reading rather than habitual noise.
+test('cleanup: an UNRECOGNISED failure is still a failure -- the already-gone classifier cannot launder a real error', () => {
+  const config = recette.resolveConfig(baseOpts());
+  fs.mkdirSync(config.runDir, { recursive: true });
+
+  // A genuine problem: no network, permission denied, a hung remote. Nothing about this says
+  // "the artifact is already gone".
+  const deps = { spawnSync: () => fail(1, 'fatal: unable to access https://github.com/: Could not resolve host') };
+
+  const report = recette.cleanup({ scenario: recette.SCENARIOS['trivial-doc-log'], config, deps, issueNumber: 9001, prNumber: 4242 });
+
+  assert.equal(report.anyFailed, true, 'an unrecognised non-zero exit must still be reported');
+  assert.ok(
+    report.steps.some((s) => s.ok === false && s.gone === false),
+    'and named, so the maintainer knows which artifact may have been left behind'
   );
 });
