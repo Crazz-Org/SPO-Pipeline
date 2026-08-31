@@ -48,3 +48,34 @@ test('unknown fixture-injected state -> PARKED via the catch-all', () => {
   assert.equal(state.reason, 'unrecognized-state');
   assert.equal(state.lastState, 'NONSENSE_STATE');
 });
+
+// The invariant that binds action 1.7's bounded in-flight wait to the deadline machinery:
+// CI_CHECKS sleeps ON PURPOSE inside its own invocation, so its deadline must exceed the poll
+// budget it is allowed to spend. When it did not (the generic 120s ceiling against a 30x20s =
+// 600s bound), the deadline fired mid-wait, the card parked step-deadline-exceeded-twice instead
+// of the ci-checks-still-running the action requires, and -- because withTimeout abandons the
+// loser rather than cancelling it -- the overrun invocation kept polling `gh api` and could
+// still reach the main-moved `git merge origin/main` in the worktree of an already-parked card.
+// config.js derives the CI_CHECKS ceiling from the poll budget so the two cannot drift apart;
+// this pins that they never do.
+test('CI_CHECKS deadline covers its own bounded in-flight poll budget, so 1.7 parks on its own reason', () => {
+  const config = require('../orchestrator/config.js');
+  const { deadlineMsFor } = require('../orchestrator/deadline.js');
+
+  const pollBudgetMs = config.ciChecksMaxPolls * config.ciChecksPollIntervalMs;
+  const ciDeadline = deadlineMsFor(config, 'CI_CHECKS');
+
+  assert.ok(
+    ciDeadline > pollBudgetMs,
+    `CI_CHECKS deadline (${ciDeadline}ms) must exceed its poll budget (${pollBudgetMs}ms), ` +
+      'else the in-flight wait parks step-deadline-exceeded-twice and leaks a ghost invocation'
+  );
+
+  // Every other state keeps the generic ceiling -- the override is deliberately narrow.
+  for (const state of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE', 'GATE', 'CHECK', 'PUSH_PR', 'MERGE']) {
+    assert.equal(deadlineMsFor(config, state), config.stepDeadlineMs, `${state} must keep stepDeadlineMs`);
+  }
+
+  // A config with no per-state map at all (every hand-built test ctx in this suite) still works.
+  assert.equal(deadlineMsFor({ stepDeadlineMs: 30000 }, 'CI_CHECKS'), 30000);
+});

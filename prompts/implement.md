@@ -47,12 +47,23 @@ diagnosis:  {{diagnosis}}
    rather than improvising a different design — a plan defect is reported, not silently
    corrected by you. The plan owns the design; you own the execution of it.
 3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this
-   step. Any other value means a prior DIAGNOSE pass named a specific, reproducing cause after
-   an earlier attempt's checks/CI failed — treat its `suggested fix` as a required amendment to
-   the plan for *this* attempt, on top of (never instead of) the plan itself. Do not re-verify
-   the plan is already satisfied and stop there if the diagnosed cause is still present in the
-   worktree — that is exactly the loop DIAGNOSE exists to break, and re-declaring the plan
-   "already implemented" without addressing it just re-triggers the same diagnosis next round.
+   step. Any other value carries one or both of two distinct sources, each labeled, and calling
+   for different work:
+   - `DIAGNOSE (a check/gate/CI failure)`: a prior DIAGNOSE pass named a specific, reproducing
+     cause after an earlier attempt's checks/CI failed — treat its `suggested fix` as a required
+     amendment to the plan for *this* attempt, on top of (never instead of) the plan itself. Do
+     not re-verify the plan is already satisfied and stop there if the diagnosed cause is still
+     present in the worktree — that is exactly the loop DIAGNOSE exists to break, and
+     re-declaring the plan "already implemented" without addressing it just re-triggers the same
+     diagnosis next round.
+   - `VALIDATE REJECT`: the previous attempt's change was actually built, checked, gated, pushed
+     and reached VALIDATE — and the change-validator rejected it, either because the criterion
+     was not genuinely met or because the integration was incoherent with its surrounding code.
+     Its reasons (and any findings) are not a build/test failure to fix — re-running the same
+     checks will not help. Address exactly what the reasons describe before repeating any part
+     of the plan that produced the rejected change.
+   If both are present, the one presented first is the more recent and is what caused *this*
+   attempt; the other is earlier context, still worth reading.
 4. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
    own layout (`module.ts` → `module.test.ts`, same directory; the `unit` / `component` Jest
    projects) — do not hand-count coverage, run the real tool (step 5).
@@ -63,15 +74,18 @@ diagnosis:  {{diagnosis}}
    as the shell's fork, always 0. Redirect to a file and read the status instead. Re-run a
    command after you fix what it flagged — `all_green: true` is only honest if every command in
    `tests_run` exited 0 on its **last** run, not its first.
-6. **Self-check the invariants.** For every id in `{{invariant_ids}}`: read the quote yourself
-   from `{{invariants_path}}` — it is never given to you inline — normalize it (strip comment
-   markers `#`, `**`, a leading `-` or `*`; collapse all whitespace, line breaks included, to
-   single spaces) and check whether that normalized text is still a substring of the same
-   normalization applied to the file at the cited `file:line`/`file:start-end`, **as it now
-   stands** — never the diff. Present → `HELD`. Absent, or the words changed → `CHANGED`. A
+6. **Self-check the invariants.** For every id in `{{invariant_ids}}`: find its block in
+   `{{invariants_path}}` — it is never given to you inline — a `## INV-<n>` header, a `File:
+   <path>:<line>` (or `:<start>-<end>`) line, then the verbatim quote between a `>>> QUOTE` line
+   and a `>>> END QUOTE` line. Take that quote exactly as written, then check it is still present
+   in the cited file **as it now stands** (never the diff) — as an exact substring first; if that
+   fails, collapse whitespace runs (line breaks included) to single spaces on both the quote and
+   the file and check again. Present, either way → `HELD`. Absent under both → `CHANGED`. A
    `CHANGED` row is not a defect you fix by rewriting the comment back into agreement — it means
    your change touched ground the plan told you not to; report it and let the driver decide, do
-   not launder it into `HELD`.
+   not launder it into `HELD`. This mirrors, but does not replace, the mechanical check CHECK
+   itself runs after you: yours is a heads-up so you can react before handing off; CHECK's is
+   what actually decides DIAGNOSE.
 7. **List every file you actually changed**, read from `git status --porcelain` (or the
    equivalent) inside `{{worktree}}` — never from memory, never a file you merely opened.
 
@@ -83,8 +97,10 @@ diagnosis:  {{diagnosis}}
   reach the same path.
 - **Stay inside the plan's scope, amended only by `diagnosis` above.** One card, one plan, one
   attempt — a plan that is wrong is reported in `summary`, not silently expanded around. The one
-  exception is a non-empty `diagnosis`: DIAGNOSE only ever names a cause that is already blocking
-  this same card (a failing check, a red gate, a CI failure), never new scope of its own.
+  exception is a non-empty `diagnosis`: whether it names a DIAGNOSE finding or a VALIDATE
+  REJECT, it only ever describes something already blocking this same card (a failing check, a
+  red gate, a CI failure, or the change-validator's own verdict on the previous attempt), never
+  new scope of its own.
 - **The RDO wire rule is not your call.** If the plan touches `src/shared/rdo-*`,
   `src/server/rdo.ts`, `rdo-members.ts`, or session-phase code, the caller has already escalated
   this step to Opus 5 per CLAUDE.md's wire rule — you do not choose your own model, and a new

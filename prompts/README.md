@@ -41,7 +41,7 @@ executing step needs to know it may be running as Opus rather than assume Sonnet
   list of ids, **never the quotes themselves**. Every step that consumes an invariant re-reads
   its quote from the file at the cited `file:line`/`file:start-end` — this is the mechanism
   `next-task.md` § 3 documents (id, verbatim quote, citation; `HELD`/`CHANGED` rows; the
-  normalize-then-substring check) and every prompt here that touches an invariant follows it
+  exact-then-normalized substring check) and every prompt here that touches an invariant follows it
   unchanged.
 - **`{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` / `{{ledger_path}}`** — file
   paths, not inline content. A step reads them with its own tools; nothing is pasted into a

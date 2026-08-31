@@ -37,10 +37,21 @@ function cwdForStep(stepName, { worktreePath, repoRoot } = {}) {
   return root;
 }
 
+const STEP_DEADLINE_MS = 120000;
+
+// See the stepDeadlineMsByState note below: these two are consts rather than inline literals so
+// the CI_CHECKS deadline can be derived from the poll budget instead of hand-synchronised.
+const CI_CHECKS_MAX_POLLS =
+  process.env.SPO_CI_CHECKS_MAX_POLLS !== undefined ? Number(process.env.SPO_CI_CHECKS_MAX_POLLS) : 30;
+const CI_CHECKS_POLL_INTERVAL_MS =
+  process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS !== undefined
+    ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
+    : 20000;
+
 module.exports = {
   // Wall-clock deadline for a single step invocation (scripted or llm), in milliseconds.
   // On expiry the step is treated as killed, retried once, and PARKED if it expires again.
-  stepDeadlineMs: 120000,
+  stepDeadlineMs: STEP_DEADLINE_MS,
 
   // DIAGNOSE -> IMPLEMENT retry budget: at most this many DIAGNOSE attempts per task,
   // and any root cause seen twice parks immediately even under budget.
@@ -48,6 +59,44 @@ module.exports = {
 
   // VALIDATE (change-validator) REJECT budget: a separate counter from diagnoseBudget.
   validateRejectBudget: 3,
+
+  // CI_CHECKS in-flight bounded wait (steps/scripted.js's realCiChecks) -- action 1.7. A
+  // check-run with `conclusion: null` (still running) or an empty check_runs array (CI has not
+  // even registered yet) is NOT green: the audit measured 8/12 real "green" events with `claude
+  // review` still in progress. ciChecksMaxPolls is the total number of `gh api .../check-runs`
+  // fetches attempted (the first fetch counts as poll 1) before giving up and parking
+  // `ci-checks-still-running` -- never advancing toward MERGE while a run is still in flight.
+  // ciChecksPollIntervalMs is the sleep between polls; the sleep itself goes through
+  // `deps.sleep` (production: the real setTimeout-based one; tests inject a no-op so the suite
+  // never actually waits). SPO_CI_CHECKS_MAX_POLLS / SPO_CI_CHECKS_POLL_INTERVAL_MS override.
+  //
+  // Defaults are deliberately generous (30 x 20s ~ 10 min) and NOT calibrated, because no
+  // calibration data exists: across all 13 real cards in journal/, CI_CHECKS reached
+  // `checks-green` 0.6s after entering the state, every single time -- one API call, in-flight
+  // runs skipped by the very bug this action fixes. The pipeline has therefore never once
+  // waited for CI to actually conclude, so the true distribution is unmeasured. What IS known:
+  // PUSH_PR -> checks-green ran 2-4 min on those same cards, and that clock stopped while
+  // `claude review` was still running, so real conclusion is longer than 4 min.
+  //
+  // Erring long is the cheap direction. Waiting too long costs daemon wall-clock on one card;
+  // parking too early costs a human round trip, and human wait was the measured #1 bottleneck
+  // (77.3h of the 85.5h corpus). Recalibrate from real `checks-in-flight` events once this has
+  // run in production -- that is the first data the pipeline will ever have on the question.
+  ciChecksMaxPolls: CI_CHECKS_MAX_POLLS,
+  ciChecksPollIntervalMs: CI_CHECKS_POLL_INTERVAL_MS,
+
+  // Per-state deadline overrides, consulted by deadline.js before stepDeadlineMs. CI_CHECKS is
+  // the one step that sleeps ON PURPOSE inside its own invocation (the bounded in-flight wait
+  // above), so the generic 120s ceiling would fire mid-wait -- and deadline.js does not cancel
+  // the loser, so the abandoned invocation would keep polling `gh api` and could still run the
+  // main-moved `git merge origin/main` in the worktree of a card that has already parked. Worse,
+  // the park would read `step-deadline-exceeded-twice` instead of `ci-checks-still-running`,
+  // making 1.7's own park unreachable. Derive the ceiling from the bound so the two can never
+  // drift apart again: the full poll budget plus one ordinary step deadline of margin for the
+  // `gh api` calls themselves.
+  stepDeadlineMsByState: {
+    CI_CHECKS: CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS,
+  },
 
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,

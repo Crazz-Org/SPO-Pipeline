@@ -1,54 +1,54 @@
 # CLAUDE.md — SPO-Pipeline
 
-Orchestrateur autonome du backlog SPO-WebClient : une carte GitHub entre en `Todo`, en ressort
-`Done` avec une PR mergée, ou est *parkée* avec un motif. `orchestrator/` est la machine à états,
-`prompts/` les steps LLM, `doc/state-machine-spec.md` la spécification.
+Autonomous orchestrator for the SPO-WebClient backlog: a GitHub card enters `Todo`, comes out
+`Done` with a merged PR, or gets *parked* with a reason. `orchestrator/` is the state machine,
+`prompts/` the LLM steps, `doc/state-machine-spec.md` the spec.
 
-> Ce fichier est chargé à chaque appel LLM dont le `cwd` est la racine du dépôt — DIAGNOSE,
-> VALIDATE, CITATION_VERIFIER (`config.js` → `cwdForStep`). Le garder court est une contrainte
-> de coût, pas un style : y ajouter du contexte, c'est le payer à chaque step.
+> This file is loaded on every LLM call whose `cwd` is the repo root — DIAGNOSE, VALIDATE,
+> CITATION_VERIFIER (`config.js` → `cwdForStep`). Keeping it short is a cost constraint, not a
+> style preference: adding context here means paying for it on every step.
 
-## Conventions `gh` — pièges déjà payés
+## `gh` conventions — traps already paid for
 
-Ne pas les re-découvrir. `gh` est l'outil GitHub natif du projet (compte `Crazz-E`, scopes
-`repo, project, workflow`) ; aucun MCP GitHub n'est configuré et il ne faut pas en ajouter.
+Don't rediscover them. `gh` is the project's native GitHub tool (account `Crazz-E`, scopes
+`repo, project, workflow`); no GitHub MCP is configured and none should be added.
 
-- **`gh pr edit` ne marche pas** sur ce dépôt (board Projects classic) — la commande est en
-  `deny`. Éditer une PR passe par `gh api repos/Crazz-Org/<repo>/pulls/<n> -X PATCH`.
-- **Déplacer une carte sur le board** n'a pas d'équivalent CLI : c'est `gh api graphql` avec une
-  mutation `updateProjectV2ItemFieldValue`. Les ids de champs se lisent avec
-  `gh project field-list 1 --owner Crazz-Org --format json` ; relevé complet dans
+- **`gh pr edit` does not work** on this repo (Projects classic board) — the command is
+  `deny`. Editing a PR goes through `gh api repos/Crazz-Org/<repo>/pulls/<n> -X PATCH`.
+- **Moving a card on the board** has no CLI equivalent: it's `gh api graphql` with a
+  `updateProjectV2ItemFieldValue` mutation. Field ids are read with
+  `gh project field-list 1 --owner Crazz-Org --format json`; full record in
   `doc/board-audit.md`.
-- **Ajouter une option à un champ single-select** : mutation GraphQL également, il n'existe pas
-  de `gh project field-create` pour ça (`orchestrator/README.md`).
-- **Verdict par code de sortie**, jamais par lecture de la sortie texte de `gh`.
-- Les appels `gh` de l'orchestrateur partent de Node en `execFile` — ils ne passent pas par la
-  couche permission de Claude. Un blocage d'autorisation ne concerne donc jamais le daemon,
-  uniquement une session Claude.
+- **Adding an option to a single-select field**: also a GraphQL mutation — no
+  `gh project field-create` exists for that (`orchestrator/README.md`).
+- **Verdict by exit code**, never by reading `gh`'s text output.
+- The orchestrator's `gh` calls go through Node's `execFile` — they never go through Claude's
+  permission layer. A permission block therefore never concerns the daemon, only a Claude
+  session.
 
-## Autorisations
+## Permissions
 
-Politique, mesures et arbitrages : `doc/permissions.md`. Deux points à connaître avant de
-planifier une carte :
+Policy, measures, and trade-offs: `doc/permissions.md`. Two things to know before planning a
+card:
 
-- **`.claude/settings.json` et `.claude/hooks/*.sh` ne sont pas éditables** par un agent : le
-  harness les refuse comme fichiers sensibles, indépendamment des règles du dépôt. Une carte
-  dont le plan exige de les modifier ne peut pas aboutir — la parker avec ce motif plutôt que
-  de la faire échouer en IMPLEMENT.
-- DIAGNOSE / VALIDATE / CITATION_VERIFIER tournent depuis la racine du dépôt en
-  `permissionMode: 'default'` **sans humain** : ce que `.claude/settings.json` n'autorise pas
-  est refusé, pas mis en attente.
-- `.claude/settings.json` est la **source unique** de la politique : il est aussi installé comme
-  couche utilisateur de chaque compte du pool (`spo account sync-settings`, automatique à
-  `account add` et à chaque démarrage `--real`). Après l'avoir édité, resynchroniser.
+- **`.claude/settings.json` and `.claude/hooks/*.sh` cannot be edited** by an agent: the
+  harness refuses them as sensitive files, regardless of the repo's own rules. A card whose
+  plan requires editing them cannot succeed — park it with that reason instead of failing it
+  in IMPLEMENT.
+- DIAGNOSE / VALIDATE / CITATION_VERIFIER run from the repo root in
+  `permissionMode: 'default'` **with no human**: whatever `.claude/settings.json` doesn't
+  allow is refused, not queued.
+- `.claude/settings.json` is the **single source** of policy: it is also installed as the
+  user layer of every account in the pool (`spo account sync-settings`, automatic on
+  `account add` and on every `--real` startup). Resync after editing it.
 
 ## Git
 
-Le dépôt utilise des worktrees pour deux usages distincts :
+The repo uses worktrees for two distinct purposes:
 
-- `worktrees/issue-<n>/` — checkouts **de SPO-WebClient**, créés et détruits par le step
-  WORKTREE. Ne pas y toucher à la main pendant qu'une tâche tourne.
-- `.claude/worktrees/<slug>/` — worktrees de travail sur *ce* dépôt.
+- `worktrees/issue-<n>/` — checkouts **of SPO-WebClient**, created and destroyed by the
+  WORKTREE step. Don't touch them by hand while a task is running.
+- `.claude/worktrees/<slug>/` — working worktrees on *this* repo.
 
-La pile `git stash` est partagée entre tous les worktrees et plusieurs sessions peuvent tourner
-en parallèle : ne jamais utiliser `git stash` / `git stash pop` nus. Préférer un commit WIP.
+The `git stash` stack is shared across all worktrees, and several sessions can run in
+parallel: never use bare `git stash` / `git stash pop`. Prefer a WIP commit.

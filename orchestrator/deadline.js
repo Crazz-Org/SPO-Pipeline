@@ -38,20 +38,34 @@ function withTimeout(fn, ms, label) {
   });
 }
 
+// The deadline for one state: config.stepDeadlineMsByState[state] when the state declares its
+// own, else the generic config.stepDeadlineMs. A state needs an override when it sleeps on
+// purpose inside its own invocation -- CI_CHECKS' bounded in-flight wait is the only one today,
+// and config.js derives its ceiling from that wait's own budget so the two cannot drift apart.
+// A state whose deadline is SHORTER than the work it legitimately does is not merely retried:
+// withTimeout abandons the loser rather than cancelling it, so the overrun invocation keeps
+// running (and keeps spending) alongside its own retry.
+function deadlineMsFor(config, state) {
+  const byState = config.stepDeadlineMsByState;
+  if (byState && byState[state] != null) return byState[state];
+  return config.stepDeadlineMs;
+}
+
 async function callWithDeadline(ctx, state, fn) {
+  const deadlineMs = deadlineMsFor(ctx.config, state);
   try {
-    return await withTimeout(fn, ctx.config.stepDeadlineMs, state);
+    return await withTimeout(fn, deadlineMs, state);
   } catch (err) {
     if (!(err instanceof DeadlineError)) throw err;
-    appendEvent(ctx.taskDir, state, 'deadline-exceeded', { attempt: 1, deadlineMs: ctx.config.stepDeadlineMs });
+    appendEvent(ctx.taskDir, state, 'deadline-exceeded', { attempt: 1, deadlineMs });
     try {
-      return await withTimeout(fn, ctx.config.stepDeadlineMs, state);
+      return await withTimeout(fn, deadlineMs, state);
     } catch (err2) {
       if (!(err2 instanceof DeadlineError)) throw err2;
-      appendEvent(ctx.taskDir, state, 'deadline-exceeded', { attempt: 2, deadlineMs: ctx.config.stepDeadlineMs });
+      appendEvent(ctx.taskDir, state, 'deadline-exceeded', { attempt: 2, deadlineMs });
       throw new ParkSignal('step-deadline-exceeded-twice', { state });
     }
   }
 }
 
-module.exports = { callWithDeadline, withTimeout };
+module.exports = { callWithDeadline, withTimeout, deadlineMsFor };

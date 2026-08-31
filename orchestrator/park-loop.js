@@ -84,9 +84,9 @@ function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
   ];
   if (repeat >= 2) {
     lines.push(
-      `> **Ce park est identique aux ${repeat} derniers** (\`${reason}\`, même détail). Une réponse`,
-      "> `retry` seule ne changera rien : l'état que la machine refuse est inchangé d'une tentative",
-      "> à l'autre. Corrige d'abord ce que le détail ci-dessous nomme.",
+      `> **This park is identical to the last ${repeat}** (\`${reason}\`, same detail). Replying`,
+      '> `retry` on its own will change nothing: the state the machine refuses is the same from one',
+      '> attempt to the next. Fix what the detail below names first.',
       ''
     );
   }

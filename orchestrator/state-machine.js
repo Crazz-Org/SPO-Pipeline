@@ -24,6 +24,7 @@ const path = require('path');
 
 const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
 const { scratchDir } = require('./task-values');
+const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
 const { LockLostError } = require('./lock');
@@ -40,6 +41,7 @@ const {
   realMerge,
   realFinish,
   preserveWorktreeWip,
+  prepareJudgeInputs,
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
@@ -182,6 +184,22 @@ async function handlePlan(ctx) {
   const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
+
+  // Action 1.4: a transport failure (spawn error, non-JSON output, missing required key, a
+  // deadline kill -- classifyFailure's 'error' kind, or timedOut on its own) means PLAN never
+  // produced a verdict at all. Route it to its own park, distinct from 'plan-invalid', which is
+  // reserved for a real reply the model DID produce that fails the plan_markdown/
+  // invariants_markdown contract below. `kind: 'limit'` is deliberately excluded here -- that is
+  // the account-rotation path callLlmStep already retries across accounts; a 'limit' result
+  // reaching this line at all would mean rotation gave up, and is left to plan-invalid/the
+  // generic ok:false branch exactly as before.
+  if (payload && payload.ok === false && (payload.kind === 'error' || payload.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:PLAN', {
+      kind: payload.kind,
+      timedOut: payload.timedOut,
+      error: payload.error,
+    });
+  }
   if (!payload || payload.ok === false) {
     throw new ParkSignal('plan-invalid', { payload });
   }
@@ -204,6 +222,40 @@ async function handlePlan(ctx) {
   fs.writeFileSync(planPath, planMarkdown);
   fs.writeFileSync(invariantsPath, invariantsMarkdown);
   appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath });
+
+  // Action 1.8: the PLAN-time invariant baseline. Real mode only (shadow/dry-run never spawn a
+  // real worktree for buildBaseline to resolve against, and doc/state-machine-spec.md's
+  // invariant substring check is itself a real-mode-only CHECK behaviour -- see realCheck).
+  // Every invariant is resolved against the just-created worktree right now, while it still
+  // reflects nothing but PLAN's own read of it; an invariant that fails to resolve here is a
+  // journalled warning, never a park -- see orchestrator/invariants.js's own header for why
+  // (a misquote must not cost a real remediation cycle). The baseline this produces is the ONLY
+  // thing realCheck (steps/scripted.js) is allowed to fail an invariant on: an id that resolved
+  // here and no longer does at CHECK time.
+  if (isRealMode(ctx) && ctx.task.worktreePath) {
+    const baseline = buildBaseline(ctx.task.worktreePath, invariantsPath);
+    appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+    // Canary against a silent parser/prompt divergence. The whole feature fails OPEN: if the
+    // parser stops recognising what plan.md tells the model to emit, every invariant lands
+    // unresolved, the baseline is empty, CHECK verifies nothing -- and the pipeline looks
+    // perfectly healthy. That is exactly how the CRLF bug in the first cut of invariants.js
+    // behaved. PLAN already declares invariant_ids in its own payload, so a declared-vs-parsed
+    // mismatch is free to detect and is the one signal that would surface such a regression.
+    // Journalled, deliberately never a park: PLAN's prose and its id list disagreeing is not
+    // grounds to fail a card, it is grounds to go look at the parser.
+    const declaredIds = Array.isArray(payload.invariant_ids) ? payload.invariant_ids : [];
+    const parsedIds = (baseline.invariants || []).map((inv) => inv.id);
+    if (declaredIds.length !== parsedIds.length) {
+      appendEvent(ctx.taskDir, 'PLAN', 'invariants-declared-parsed-mismatch', {
+        declared: declaredIds.length,
+        parsed: parsedIds.length,
+        declaredIds,
+        parsedIds,
+        issues: baseline.issues || [],
+      });
+    }
+  }
 
   // Re-journal PLAN's 'result' with plan_path/invariants_path added -- task-values.js's
   // lastResultPayload reads the *last* PLAN 'result' event for IMPLEMENT/VALIDATE's own
@@ -240,6 +292,19 @@ async function handleImplement(ctx) {
   const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload });
+
+  // Action 1.4: a transport failure never reached a verdict -- routing it to DIAGNOSE (the old
+  // `!payload || payload.ok === false` branch below) paid a real LLM call to diagnose a failure
+  // that never reached the model at all (issue-452: three Fable diagnoses, $1.75, for a $0 E2BIG
+  // spawn failure). Park directly instead. `kind: 'limit'` is deliberately excluded -- see
+  // handlePlan's own comment on the same guard.
+  if (payload && payload.ok === false && (payload.kind === 'error' || payload.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:IMPLEMENT', {
+      kind: payload.kind,
+      timedOut: payload.timedOut,
+      error: payload.error,
+    });
+  }
   if (!payload || payload.ok === false) return 'DIAGNOSE';
 
   // Transport-level ok:true is not enough to trust CHECK with the worktree: today's real run of
@@ -377,9 +442,80 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
+  // Action 1.3: generate DIAGNOSE's declared judge inputs (diff.patch / gate.log / gate-report.md)
+  // before the LLM call, real mode only. gate.log is required only when this DIAGNOSE was
+  // entered from GATE (ctx.cameFrom, set by runTask's transition loop below) -- from anywhere
+  // else (a CHECK failure, an empty IMPLEMENT, an unmatched CI_CHECKS) no gate has ever run for
+  // this attempt, and the spec's "CHECK Failure -> DIAGNOSE, never PARKED" must hold regardless.
+  if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' });
+
   const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
+
+  // Action 1.4: a transport failure never produced a verdict at all -- park immediately, before
+  // any attempt is counted or any ledger line written. Previously this fell through to the
+  // rootCause fallback below and got journaled as a fabricated, always-unique
+  // "unspecified-cause-N", which could never trip the duplicate-root-cause guard and paid a full
+  // extra IMPLEMENT attempt for nothing (issue-452: three Fable diagnoses, $1.75, for a $0 E2BIG
+  // spawn failure). `kind: 'limit'` deliberately excluded -- see handlePlan's own comment.
+  if (result && result.ok === false && (result.kind === 'error' || result.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:DIAGNOSE', {
+      kind: result.kind,
+      timedOut: result.timedOut,
+      error: result.error,
+    });
+  }
+
   const attemptN = ++ctx.counters.diagnoseAttempts;
-  const rootCause = (result && result.rootCause) || `unspecified-cause-${attemptN}`;
+
+  // Action 1.5: diagnose.md declares two mutually exclusive reply shapes, and step-contracts.js's
+  // outputContract deliberately treats a PRESENT-but-null root_cause as satisfying the contract
+  // (its own comment: "a present-but-null root_cause [is] satisfied, never ... 'missing'") -- it
+  // means "I have no cause that is not already on the ledger", the documented honest answer, not
+  // "no answer at all". The old `(result && result.rootCause) || fabricated` conflated the two:
+  // null is falsy, so the honest answer was silently replaced by an always-unique fabricated
+  // string that could never trip the duplicate-root-cause guard (issues 213, 428, 452).
+  //
+  // Distinguish PRESENCE of the key from its VALUE, and check both the wire's snake_case
+  // `root_cause` and its camelCase alias: llm.js's withCamelAliases keeps both names on a real
+  // reply, but --dry-run's cannedDryRunPayload returns only `root_cause` (it is never run through
+  // withCamelAliases), and shadow-mode fixtures in this test suite use only `rootCause`.
+  const hasRootCauseKey =
+    !!result &&
+    (Object.prototype.hasOwnProperty.call(result, 'rootCause') ||
+      Object.prototype.hasOwnProperty.call(result, 'root_cause'));
+  const rootCauseValue = hasRootCauseKey
+    ? Object.prototype.hasOwnProperty.call(result, 'rootCause')
+      ? result.rootCause
+      : result.root_cause
+    : undefined;
+
+  if (hasRootCauseKey && rootCauseValue === null) {
+    // The documented "no new cause" answer. Append the ledger line for the attempt first (same
+    // order the rest of this function already follows: journal, then ledger, then park), never
+    // fabricate a cause, never retry IMPLEMENT on it.
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', {
+      attempt: attemptN,
+      payload: { rootCause: null, reason: result.reason || null },
+    });
+    appendLedgerLine(ctx.taskDir, attemptN, '(no new cause)', 'parked (no new cause)');
+    throw new ParkSignal('diagnose-no-new-cause', { attempt: attemptN, reason: result.reason || null });
+  }
+
+  // root_cause absent entirely (neither key present) is not one of diagnose.md's two documented
+  // shapes. On the production `kind: "card"` path it is unreachable past the transport-failure
+  // park above: step-contracts.js's outputContract requires the `root_cause` key, so llm.js's
+  // real-reply path already turns a reply omitting it into {ok: false, kind: 'error', error:
+  // '... missing required key(s): root_cause'}, caught above. It stays reachable on two paths
+  // that bypass that validation -- a shadow-mode fixture that forgot to wire rootCause, and the
+  // legacy ctx.task.llm.DIAGNOSE override, which is real mode but returns invokeClaudeReal's raw
+  // shape with no contract check at all. Kept as the pre-existing "fabricate a unique
+  // placeholder" behaviour: nothing in this change package asks for a different answer here, and
+  // no existing test relies on one. Note the fabricated cause is always unique, so it evades the
+  // duplicate guard below -- the same waste 1.5 removes for the documented null shape.
+  //
+  // A falsy-but-present root_cause (notably "") is deliberately NOT fabricated over: it flows
+  // through as-is, so repeating it trips the duplicate guard instead of evading it.
+  const rootCause = hasRootCauseKey ? rootCauseValue : `unspecified-cause-${attemptN}`;
   const category = (result && result.category) || null;
   const suggestedFix = (result && result.suggestedFix) || null;
   // Journal category/suggestedFix alongside rootCause -- task-values.js's IMPLEMENT derivation
@@ -416,23 +552,98 @@ async function handleValidate(ctx) {
   // same reasoning as handleImplement's own moveCard (no realX(ctx, deps) split for an LLM step).
   if (isRealMode(ctx)) moveCard(ctx, ctx.deps, 'VALIDATE');
 
+  // Action 1.3: generate VALIDATE's declared judge inputs (diff.patch / gate-report.md), real
+  // mode only. diff.patch is always required here (VALIDATE only runs post-PUSH_PR, so a commit
+  // and a push have already happened) -- unproducible throws ParkSignal('judge-inputs-missing')
+  // itself, before either LLM call below ever spawns.
+  if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'VALIDATE' });
+
   if (ctx.task.touchesRdoMembers) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
-    const verdict = (cv && cv.verdict) || 'PASS';
-    appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict });
-    if (verdict === 'REJECT') throw new ParkSignal('citation-false', { verdict });
-    // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
+
+    // Fail-closed judge (2026-08-30 audit): the citation verifier has never actually been
+    // executable in real mode, and the previous `(cv && cv.verdict) || 'PASS'` default meant a
+    // transport error, a timeout, or a malformed payload all silently became a PASS -- the only
+    // branch that has ever run. Every shape cv can take is classified explicitly below; nothing
+    // falls through to PASS by default.
+    if (cv === null && ctx.shadowMode) {
+      // No shadow.llm.CITATION_VERIFIER fixture wired for this task at all (fixture.js returns
+      // the caller's default) -- the pre-existing "trivially ok, nothing to validate" convention
+      // this file already uses (see handlePlan's `result === null` idiom) is kept for this one
+      // case, so shadow mode stays usable as a fixture harness for tasks that don't care about
+      // citation-verifier specifically. Must NOT apply outside shadow mode: a null cv in real
+      // mode or --dry-run means something actually went wrong (see the branch below).
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: 'PASS', source: 'no-fixture' });
+    } else if (!cv || cv.ok === false || typeof cv.verdict !== 'string') {
+      // Transport error ({ok: false, kind: 'error'}), timeout ({ok: false, timedOut: true}), a
+      // payload with no verdict key, or a null cv (real mode/--dry-run) -- none of these is a
+      // verdict the change-validator can be let through on. Park, don't guess.
+      const detail = { ok: cv && cv.ok, kind: cv && cv.kind, timedOut: cv && cv.timedOut, verdict: cv && cv.verdict };
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', detail);
+      throw new ParkSignal('citation-verifier-failed', detail);
+    } else if (cv.verdict === 'REJECT') {
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      throw new ParkSignal('citation-false', { verdict: cv.verdict });
+    } else if (cv.verdict === 'PASS' || cv.verdict === 'DIVERGES') {
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
+    } else {
+      // An unrecognized verdict string -- never continue on a verdict the code doesn't
+      // understand.
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      throw new ParkSignal('citation-verifier-unrecognized-verdict', { verdict: cv.verdict });
+    }
   }
 
   const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', ctx.deps);
   const verdict = result && result.verdict;
   appendEvent(ctx.taskDir, 'VALIDATE', 'change-validator', { verdict, findings: result && result.findings });
 
+  // Action 1.4: a transport failure on the change-validator previously fell through to the
+  // generic `throw new ParkSignal('validate-unrecognized-verdict', ...)` at the bottom of this
+  // function, blaming the model for a verdict it never rendered. Distinct park, same exclusion
+  // of `kind: 'limit'` as handlePlan/handleImplement. This is the change-validator only -- the
+  // CITATION_VERIFIER branch above keeps its own 'citation-verifier-failed' reason (action 1.1),
+  // deliberately not retargeted to this one.
+  if (result && result.ok === false && (result.kind === 'error' || result.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:VALIDATE', {
+      kind: result.kind,
+      timedOut: result.timedOut,
+      error: result.error,
+    });
+  }
+
   if (verdict === 'PASS' || verdict === 'PASS_WITH_FINDINGS') return 'MERGE';
   if (verdict === 'REJECT') {
     ctx.counters.validateRejects += 1;
-    if (ctx.counters.validateRejects >= ctx.config.validateRejectBudget) {
-      throw new ParkSignal('validate-reject-budget-exhausted', { rejects: ctx.counters.validateRejects });
+    const attemptN = ctx.counters.validateRejects;
+
+    // Action 1.6: a REJECT's reasons/findings were previously journaled only as the flat
+    // 'change-validator' event above (verdict + findings, no reasons) and never threaded any
+    // further -- the next IMPLEMENT re-read the original PLAN and its {{diagnosis}} placeholder
+    // and could reproduce the exact change VALIDATE just rejected. Mirror handleDiagnose's own
+    // fix for the same gap (DIAGNOSE -> IMPLEMENT): journal a 'result' event nested under
+    // `payload`, matching DIAGNOSE's/PLAN's/IMPLEMENT's own 'result' shape -- task-values.js's
+    // lastResultPayload (the reader every other step's derivation already goes through) only
+    // ever looks at `event.payload`, so a flat shape here would be silently invisible to it. See
+    // task-values.js's diagnosisSummary for the reader side that now also considers this event.
+    const reasons = Array.isArray(result.reasons) ? result.reasons.filter(Boolean) : [];
+    const findings = Array.isArray(result.findings) ? result.findings : [];
+    appendEvent(ctx.taskDir, 'VALIDATE', 'result', {
+      attempt: attemptN,
+      payload: { reasons, findings },
+    });
+
+    const budgetExhausted = attemptN >= ctx.config.validateRejectBudget;
+    const outcome = budgetExhausted ? 'parked (validate-reject-budget-exhausted)' : 'retry (validate reject)';
+    // Ledger line distinct from a DIAGNOSE attempt's own ("attempt N | ..."): 'validate-reject'
+    // as the line's `kind` (journal.js's appendLedgerLine) so the two are never confused when
+    // both appear in the same ledger.md, per validate-change.md's own instruction that `reasons`
+    // for a REJECT is "the root cause in one line, exactly as it should appear on the ledger".
+    appendLedgerLine(ctx.taskDir, attemptN, reasons.length ? reasons.join('; ') : '(no reason given)', outcome, 'validate-reject');
+
+    if (budgetExhausted) {
+      throw new ParkSignal('validate-reject-budget-exhausted', { rejects: attemptN });
     }
     return 'IMPLEMENT';
   }
@@ -520,6 +731,16 @@ function buildCtx(id, task, taskDir, config) {
     owner: (config && config.owner) || null,
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
+    // The state runTask's transition loop just came FROM, set fresh by that loop before every
+    // handler call (null for the very first, INTAKE) -- action 1.3's prepareJudgeInputs reads it
+    // to tell "DIAGNOSE entered from GATE" (gate.log required) from every other DIAGNOSE entry
+    // point (gate.log optional). Deliberately NOT part of snapshot()/state.json: a retry always
+    // restarts a task at INTAKE (card #424 -- see steps/scripted.js's sweepWorktreeLeftovers
+    // header), and orphan-scan.js reparks an orphaned task directly through finalizePark without
+    // ever re-entering this loop, so nothing ever resumes runTask mid-state from a persisted
+    // snapshot -- cameFrom has no restart to be durable across in the first place. A direct-unit-
+    // test caller of HANDLERS.DIAGNOSE/VALIDATE that bypasses runTask must set it explicitly.
+    cameFrom: null,
     counters: {
       diagnoseAttempts: 0,
       seenRootCauses: new Set(),
@@ -611,6 +832,7 @@ function finalizePark(ctx, lastState, reason, detail) {
 async function runTask(id, task, taskDir, config) {
   const ctx = buildCtx(id, task, taskDir, config);
   let state = 'INTAKE';
+  ctx.cameFrom = null; // no previous state yet -- see the field's own doc comment on buildCtx/snapshot
   writeState(taskDir, snapshot(ctx, state));
 
   // Runaway guard: a real handler bug that returns a valid-looking but cyclic path (e.g. an
@@ -650,6 +872,9 @@ async function runTask(id, task, taskDir, config) {
       throw err; // a real bug -- surface it, do not disguise it as a park
     }
     appendEvent(taskDir, state, 'transition', { to: next });
+    ctx.cameFrom = state; // the state that just ran, for the NEXT handler to read (e.g.
+    // prepareJudgeInputs' DIAGNOSE-from-GATE rule) -- set from the state variable itself, not
+    // re-derived, so it is exactly what the transition event above just journaled.
     state = next;
     writeState(taskDir, snapshot(ctx, state));
   }

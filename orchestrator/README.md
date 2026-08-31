@@ -110,7 +110,14 @@ Two independent counters per task, both journaled and both visible in `state.jso
   cause seen twice for the same task parks immediately, even under budget. One line per
   attempt in `ledger.md`: `attempt N | root cause | outcome`.
 - **VALIDATE REJECT**: `validateRejectBudget` (default 3), separate from the above — a REJECT
-  verdict from `change-validator` retries straight to IMPLEMENT, no DIAGNOSE call.
+  verdict from `change-validator` retries straight to IMPLEMENT, no DIAGNOSE call. Its own
+  ledger line uses a distinct `kind` so it's never confused with a DIAGNOSE attempt:
+  `validate-reject N | <reasons> | outcome`. A REJECT's `reasons`/`findings` are also threaded
+  into the next IMPLEMENT's `{{diagnosis}}` placeholder (action 1.6) — `task-values.js`'s
+  `diagnosisSummary` reads back whichever of a DIAGNOSE finding and a VALIDATE reject was
+  journaled most recently as the primary line, and still shows the other (if any) for context,
+  clearly attributed to its own state so IMPLEMENT can tell "a check/gate/CI failed" apart from
+  "the change was built and the validator rejected it".
 
 ## Real mode
 
@@ -207,7 +214,12 @@ A card task's own fields:
 for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
 PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
 CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
-only when `touchesRdoMembers` is true.
+only when `touchesRdoMembers` is true. `citations` in the JSON above is shown as a hand-set task
+field for illustration, and a maintainer-supplied value there does still win, but in practice
+nothing sets it at intake: `steps/scripted.js`'s `realPushPr` is what actually populates it, from
+the real `git diff` against `origin/main` on `src/shared/rdo-members.ts` (falling back to the
+task's own `criterion` text), the moment PUSH_PR runs — see the placeholder-derivation bullets
+below.
 
 Each prompt's `{{placeholder}}` values come from one of two places
 (`orchestrator/task-values.js`):
@@ -217,16 +229,31 @@ Each prompt's `{{placeholder}}` values come from one of two places
   the task fields above; `{{scratch_dir}}` = `journal/<id>/scratch`; `{{ledger_path}}` =
   `journal/<id>/ledger.md` (the file `journal.js` already owns); `{{spo_original_path}}`
   defaults to `~/SPO-Original`.
-- **unknown at build time** — produced by an *earlier* state's own LLM call and read back from
-  that state's journaled `result` event (`handlePlan` already does
+- **unknown at build time** — produced by an *earlier* state and read back from that state's own
+  journaled event (`handlePlan` already does
   `appendEvent(ctx.taskDir, 'PLAN', 'result', { payload })` — `task-values.js` is the reader
   side of that same record): `{{plan_path}}`/`{{invariants_path}}`/`{{invariant_ids}}`/
   `{{check_commands}}` feed IMPLEMENT, and `{{invariants_path}}`/`{{invariant_ids}}` feed
-  VALIDATE, both from PLAN's own output.
-- `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are named as fixed
-  `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions — nothing writes them yet,
-  since real CHECK/GATE/PUSH_PR execution remains the documented stub described above; naming
-  the path now fixes the contract a future real implementation of those steps must honour.
+  VALIDATE, both from PLAN's own LLM output. `{{citations}}` is the same idea one state earlier,
+  from a *scripted* step instead of an LLM call: `realPushPr` journals
+  `{state: 'PUSH_PR', event: 'rdo-citation', citations}` and also sets `ctx.task.citations` in
+  memory for the same run's VALIDATE to read directly; `task-values.js` prefers the in-memory
+  value and falls back to the journaled record so a daemon restart between PUSH_PR and VALIDATE
+  (`ctx.task` rebuilt from the task file, the in-memory field gone) doesn't silently drop it.
+- `handlePlan` also journals a `{state: 'PLAN', event: 'invariants-baseline', ...}` record right
+  after writing `invariants-<issue>.md` (action 1.8 — see "Invariant substring check" under "Real
+  scripted steps" below for the full contract); it feeds no prompt placeholder, only
+  `steps/scripted.js`'s `realCheck`, which reads it back via `task-values.js`'s
+  `lastInvariantsBaseline`.
+- `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are fixed
+  `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions. Action 1.3 made these real:
+  `steps/scripted.js`'s `prepareJudgeInputs` generates `diff.patch` (and, when the bench has a
+  verdict for the current HEAD sha, `gate-report.md`) on entry to DIAGNOSE/VALIDATE in real
+  mode, before the LLM call; `realGate` writes `gate.log` itself, overwriting it on every real
+  gate run so it always holds the LAST run only (unlike `logs/GATE.log`'s own accumulating
+  append). VALIDATE requires `diff.patch` and parks `judge-inputs-missing` if it cannot be
+  produced; DIAGNOSE requires `gate.log` only when it was entered from GATE, never otherwise —
+  see `doc/state-machine-spec.md`'s DIAGNOSE row.
 
 A missing value for any placeholder a prompt's header declares — PLAN called before
 `worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws
@@ -238,12 +265,20 @@ one missing placeholder blocks the whole call, never a partial substitution.
 A successful reply's `result` string is `JSON.parse`d and checked against the step's
 `outputContract.required` (`in` check, so a legitimately-`null` field like DIAGNOSE's
 `root_cause` still counts as present); a missing key returns the same `{ok: false, kind:
-'error'}` shape `invokeClaudeReal` itself uses for a spawn/parse failure — handled by the same
-existing DIAGNOSE/PARK paths in `state-machine.js`, no new failure category. The validated
-payload is also given a snake_case→camelCase alias of every key (`root_cause` → `rootCause`
-too, additively — this is the one step whose contract key differs from what
-`state-machine.js`'s handlers already read; every other step's key names matched by
-coincidence).
+'error'}` shape `invokeClaudeReal` itself uses for a spawn/parse failure. Action 1.4
+(`state-machine.js`) routes every such transport-shaped failure (`kind: 'error'`, or
+`timedOut: true` from a deadline kill) to its own `ParkSignal('llm-transport-failed:<STEP>',
+...)` — PLAN, IMPLEMENT, DIAGNOSE, and VALIDATE's change-validator each get a distinct reason
+naming the step, so a call that never reached the model is never mistaken for one the model
+answered badly (see `doc/state-machine-spec.md`'s per-step rows). `kind: 'limit'` is excluded —
+that is the account-rotation retry path, unrelated. The validated payload is also given a
+snake_case→camelCase alias of every key (`root_cause` → `rootCause` too, additively — this is
+the one step whose contract key differs from what `state-machine.js`'s handlers already read;
+every other step's key names matched by coincidence). Action 1.5 makes `handleDiagnose` honour
+the `root_cause: null` half of that contract explicitly: a present-but-null `root_cause` means
+"no cause beyond what the ledger already has" and parks `diagnose-no-new-cause` (ledger line
+still written), instead of the old behaviour of silently fabricating a unique
+`unspecified-cause-N` and burning another IMPLEMENT retry on it.
 
 ### --dry-run
 
@@ -384,9 +419,78 @@ or 5 → PARKED `claim-rate-limited`; 6 → PARKED `claim-finished-worktree`; an
 failure parks `worktree-npm-ci-failed` — none of these leave a claimed card behind, since the
 claim is always the last spawn.
 
-**CHECK** runs `npm run typecheck`, `npm run lint`, `npm run coverage:changed` in that order in
-the worktree; the first non-zero exit journals `{event: 'check-failed', alias}` naming which one
-and returns `'DIAGNOSE'` (never PARKED) — the later aliases never run once one has failed.
+**CHECK** runs the invariant substring check FIRST, then `npm run typecheck`, `npm run lint`,
+`npm run coverage:changed` in that order in the worktree; the first non-zero exit (or, for the
+invariant check, the first non-empty `broken` list) journals `{event: 'check-failed', alias}`
+naming which one and returns `'DIAGNOSE'` (never PARKED) — the later aliases never run once one
+has failed. See "Invariant substring check (action 1.8)" below for the invariant check itself,
+run by `steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop.
+
+### Invariant substring check (action 1.8)
+
+`doc/state-machine-spec.md:49` has always promised CHECK runs an "invariant substring check", and
+`prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
+until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
+`fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
+(steps/scripted.js) rather than duplicated between them.
+
+- **Format.** PLAN's `invariants_markdown` (prompts/plan.md's own "Invariant block format"
+  section) is now a precise, parseable per-invariant block:
+
+  ```
+  ## INV-1
+  File: relative/path/to/file.ts:123
+  >>> QUOTE
+  the exact text, byte-for-byte, any length, any number of lines
+  >>> END QUOTE
+  ```
+
+  `parseInvariantsMarkdown` extracts `{id, file, lineSpec, quote}` per block; a block missing its
+  `File:` line or its `>>> END QUOTE` marker is skipped and named in `issues`, never thrown — the
+  rest of the file still parses. Zero recognized blocks is valid (no invariants), not an error.
+  The `>>> QUOTE` / `>>> END QUOTE` delimiter (rather than a triple-backtick fence) is deliberate:
+  a quote is free to contain its own ``` backtick sequences ``` without truncating early.
+- **Matching (`resolveInvariant`).** Two modes, in order: (1) an exact substring of the cited
+  file's contents; (2) a whitespace-normalized fallback (collapse whitespace runs on both sides)
+  so indentation/reflow drift alone never produces a false regression. A cited path outside the
+  worktree (absolute, `../`-escaping, or reached through a symlink that lives inside the worktree
+  but points outside it) is never read — `isInsideWorktree` rejects it before the file is opened,
+  lexically first and then against both sides' `realpathSync` so a symlink escape cannot slip
+  past `path.resolve`'s purely lexical view, and the invariant is reported `unresolved, reason:
+  'outside-worktree'`. The open itself is `O_NONBLOCK`: a FIFO at a cited path would otherwise
+  block `fs.openSync` forever, freezing the event loop and `callWithDeadline`'s own timer with
+  it — a daemon hang in CHECK with no park. The cited
+  file itself is read through a bounded fd read (`readCapped`, capped at 2 MiB) rather than
+  `fs.readFileSync` + slice, so a large file cannot blow up memory regardless of its real size.
+- **PLAN-time baseline (`buildBaseline`).** `handlePlan`, in real mode only, calls this
+  immediately after writing `invariants-<issue>.md`, resolves every invariant against the
+  freshly created worktree, and journals the return value verbatim as `{state: 'PLAN', event:
+  'invariants-baseline', parseError, invariants: [{id, file, resolved, mode}], issues}` —
+  `task-values.js`'s `lastInvariantsBaseline` is the reader side. An invariant that does not
+  resolve here is **never a park and never a reason to re-run PLAN** — it is simply excluded
+  from what CHECK will later verify (only `resolved: true` entries are ever checked again), which
+  is the entire point: a PLAN-time misquote or an uncitable line must not cost a real
+  DIAGNOSE/IMPLEMENT remediation cycle. Zero invariants journals an empty array, not an error.
+  Shadow mode and `--dry-run` never call this at all (`isRealMode(ctx)` gates it, same as every
+  other real-only branch in `handlePlan`/`handleImplement`).
+- **CHECK-time verification (`checkRegressions`, via `realCheck`'s own `runInvariantCheck`).**
+  Re-reads the SAME `invariants-<issue>.md` file (never rewritten after PLAN — no need to
+  duplicate quote text into the journal a second time) and re-resolves every id the baseline
+  marked `resolved: true`, against the worktree as CHECK now finds it. An id that resolved at
+  PLAN and does not resolve now — cited file deleted, or the quote no longer present, in either
+  match mode — is the one and only regression this reports; whitespace drift alone (exact at
+  PLAN, only normalized-matching at CHECK) is explicitly NOT one. Every visit journals `{state:
+  'CHECK', event: 'invariants-checked', parseError, checkedIds, broken}`; a non-empty `broken`
+  journals `{event: 'check-failed', alias: 'invariants', broken}` and returns `'DIAGNOSE'` — never
+  PARKED, same as every other CHECK failure. A missing/unparsable invariants file, or no baseline
+  event at all (PLAN never ran one — a task older than this action, or one whose PLAN pass had no
+  worktree yet), is fail-open: journalled, `broken` stays `[]`, CHECK is never failed over it.
+- **Ordering.** The invariant check runs BEFORE `CHECK_ALIASES` (typecheck/lint/coverage:changed)
+  — deliberately: it is pure `fs` (this module never spawns anything), while every alias below it
+  spawns an `npm run` subprocess, so there is no reason to pay for three spawns before a check
+  that is effectively free. It is also the most surgical signal DIAGNOSE can receive: it names
+  the exact id and file a specific fact regressed in, where a bare typecheck/lint failure is
+  usually already self-explanatory from the tool's own output and gains nothing from going first.
 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
 <file>`, never the message inline on argv) and the PR body — `Closes #<issue>` plus a
@@ -403,7 +507,19 @@ unparsable URL parks `push-pr-failed` (`step: 'pr-number-unparsed'`) rather than
 
 **CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
 <worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to
-`{name, conclusion}` pairs; the first check whose conclusion isn't `success`/`neutral`/`skipped`
+`{name, conclusion}` pairs. Before anything is judged green or failing, a bounded **in-flight
+wait** (action 1.7) treats a check-run with `conclusion: null` (still running) or a completely
+empty `check_runs` array (CI hasn't registered anything yet) as neither: it re-fetches
+(re-running the same `gh api` call through `spawnStep`, so every poll is journalled exactly like
+any other real command) up to `ciChecksMaxPolls` times total (default 30), sleeping
+`ciChecksPollIntervalMs` between polls (default 20000ms, ~10 min total — deliberately generous
+and uncalibrated, since the pipeline has never once waited for CI to conclude; see the note in
+`config.js`) — the sleep itself goes through
+`deps.sleep` (the test injection seam; production always sleeps for real). Each in-flight
+observation is journalled as a `checks-in-flight` event (`attempt`, `totalRuns`, `pendingRuns`).
+Still in flight after the last poll → `PARKED` `ci-checks-still-running`, never advancing toward
+MERGE. Only once nothing is in flight does the pre-existing decision run: the first check whose
+conclusion isn't `success`/`neutral`/`skipped`
 goes through `orchestrator/ci-cause-table.js` — the same lookup table `state-machine.js`'s
 shadow-fixture branch uses, factored out so the two can never drift apart. (b) only if (a) was
 green: `~/.spo-bench/verdicts/<headSha>.json`'s `baseMain` field (no file → treated as "not

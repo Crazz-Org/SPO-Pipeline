@@ -105,7 +105,7 @@ test('a DONE task and a PARKED task are collected with their ids, states, reason
   assert.doesNotMatch(html, /gate-dirty-tree/);
   // no dollar figures anywhere -- see console/render.js's header ("NEVER a dollar figure")
   assert.doesNotMatch(html, /\$\d/);
-  assert.doesNotMatch(html, /estUsd|totalCostUsd|coût total/);
+  assert.doesNotMatch(html, /estUsd|totalCostUsd|total cost/i);
 });
 
 test('a cooling account renders in the accounts table with its cooldown timestamp, token and credentials columns', () => {

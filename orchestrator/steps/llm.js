@@ -543,6 +543,25 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     };
   }
 
+  // `in` throws a TypeError on a non-object, and a model is perfectly capable of replying with
+  // valid JSON that is not an object (`null`, a bare string, a number). That TypeError would
+  // escape runLlm and reach runTask's "a real bug -- surface it" rethrow, killing the daemon on
+  // what is really just a malformed reply. It is the one transport-shaped failure that would
+  // otherwise slip past the llm-transport-failed guards in state-machine.js, so classify it the
+  // same way every other unusable reply is classified. Arrays are objects but can never carry
+  // the required keys, so they fall through to the missing-key branch below on their own.
+  if (parsedPayload === null || typeof parsedPayload !== 'object') {
+    return {
+      ok: false,
+      kind: 'error',
+      error: `llm.js: ${stepName} reply parsed to ${parsedPayload === null ? 'null' : typeof parsedPayload}, not an object`,
+      sessionId: raw.sessionId,
+      costUsd: raw.costUsd,
+      numTurns: raw.numTurns,
+      raw: raw.raw,
+    };
+  }
+
   const missingKeys = contract.outputContract.required.filter((key) => !(key in parsedPayload));
   if (missingKeys.length > 0) {
     return {

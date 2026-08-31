@@ -35,6 +35,8 @@ const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { moveCard } = require('../board');
+const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline } = require('../task-values');
+const { checkRegressions } = require('../invariants');
 
 function lastLines(text, n = 20) {
   if (!text) return '';
@@ -123,6 +125,165 @@ function splitLines(text) {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
+}
+
+// ---- judge inputs: diff.patch / gate.log / gate-report.md (action 1.3) --------------------
+//
+// task-values.js declares three fixed paths (diff_path/gate_log_path/gate_report_path) for the
+// DIAGNOSE and VALIDATE prompts, but until this action no step ever produced the files at those
+// paths -- the judges ran against files that did not exist. prepareJudgeInputs is the one place
+// that now generates them, called from handleDiagnose/handleValidate (state-machine.js) under
+// isRealMode(ctx), before the LLM call.
+
+// Renders a bench verdict JSON (`<spoBenchDir>/verdicts/<headSha>.json`) as small, readable
+// markdown for gate-report.md -- never a raw JSON dump. The verdict's exact shape is an external
+// contract this repo does not itself define (only `.baseMain` is read elsewhere, by
+// realCiChecks); known fields are rendered by name, anything else is kept, verbatim but
+// collapsed into one small fenced block, so a judge never loses a field this function didn't
+// anticipate.
+function renderGateReport(verdict) {
+  const lines = ['# Gate report', ''];
+  const known = new Set(['verdict', 'sha', 'baseMain', 'summary', 'findings']);
+
+  if (verdict.verdict !== undefined) lines.push(`**Verdict:** ${verdict.verdict}`);
+  if (verdict.sha) lines.push(`**SHA:** ${verdict.sha}`);
+  if (verdict.baseMain) lines.push(`**Base main:** ${verdict.baseMain}`);
+  if (lines.length > 2) lines.push('');
+
+  if (typeof verdict.summary === 'string' && verdict.summary.trim() !== '') {
+    lines.push('## Summary', '', verdict.summary.trim(), '');
+  }
+
+  if (Array.isArray(verdict.findings) && verdict.findings.length > 0) {
+    lines.push('## Findings', '');
+    for (const f of verdict.findings) {
+      lines.push(`- ${typeof f === 'string' ? f : JSON.stringify(f)}`);
+    }
+    lines.push('');
+  }
+
+  const rest = Object.keys(verdict).filter((k) => !known.has(k));
+  if (rest.length > 0) {
+    const restObj = {};
+    for (const k of rest) restObj[k] = verdict[k];
+    lines.push('## Other fields', '', '```json', JSON.stringify(restObj, null, 2), '```', '');
+  }
+
+  return lines.join('\n');
+}
+
+// prepareJudgeInputs(ctx, deps, {forState: 'DIAGNOSE' | 'VALIDATE'}) -- real mode only, called
+// under isRealMode(ctx) right before the LLM call for that state.
+//
+// (a) diff.patch: `git diff origin/main...HEAD` once the branch carries a commit HEAD differs
+//     from origin/main (post-PUSH_PR); plain `git diff` (working tree) beforehand -- DIAGNOSE is
+//     reachable from a CHECK failure or an empty IMPLEMENT, both BEFORE any commit, where HEAD
+//     still equals origin/main (the branch was cut from it and nothing has committed yet).
+//     Untracked files never appear in a `git diff` -- a trailing section lists
+//     `git status --porcelain`'s own `??` lines so a judge can see a file was created but never
+//     staged. Written even when the diff itself is empty (the empty-IMPLEMENT case IS a
+//     finding); an empty diff is journaled, not treated as failure to produce one.
+// (b) gate.log: never generated here -- realGate (above) is the only writer, overwriting on
+//     every real gate run. This function only checks whether the file already exists on disk.
+// (c) gate-report.md: rendered from `<spoBenchDir>/verdicts/<headSha>.json` via the same
+//     readJsonSafe idiom realCiChecks already uses for the very same file. Optional: absent when
+//     the bench hasn't recorded a verdict for this HEAD yet, never fatal.
+//
+// Requirement rules (doc/state-machine-spec.md's "CHECK Failure -> DIAGNOSE, never PARKED"):
+//   - VALIDATE always requires diff.patch -- unproducible -> ParkSignal('judge-inputs-missing',
+//     {step: 'VALIDATE', missing: ['diff.patch']}).
+//   - DIAGNOSE requires gate.log ONLY when ctx.cameFrom === 'GATE' (state-machine.js's runTask
+//     threads the previous state through) -- unproducible there ->
+//     ParkSignal('judge-inputs-missing', {step: 'DIAGNOSE', missing: ['gate.log']}). From any
+//     other entry point (CHECK failure, empty IMPLEMENT, CI_CHECKS-unmatched) a missing gate.log
+//     is expected (no gate has run yet) and is journaled, never parked.
+//
+// Every input, produced or absent, is journaled as one 'judge-inputs-prepared' event so a
+// judge's verdict can be audited afterwards against what it could actually see.
+function prepareJudgeInputs(ctx, deps, { forState }) {
+  const config = ctx.config;
+  const worktreePath = ctx.task && ctx.task.worktreePath;
+  const produced = [];
+
+  // -- (a) diff.patch ---------------------------------------------------------------------------
+  let diffProduced = false;
+  let headSha = null;
+  if (worktreePath) {
+    const headRes = spawnStep(ctx, deps, forState, 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    if (headRes.exit === 0) {
+      headSha = headRes.stdout.trim();
+      const mainRes = spawnStep(ctx, deps, forState, 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+      if (mainRes.exit === 0) {
+        // Committed-vs-not by sha comparison. Exact while the daemon drains one task at a
+        // time: origin/main only moves in the shared .git when WORKTREE fetches, so within a
+        // run HEAD == origin/main means "IMPLEMENT has not committed yet". Under chantier 6's
+        // K workers this stops being exact -- a sibling worker's fetch can advance origin/main
+        // while this branch still has no commit of its own, and `diff origin/main...HEAD` would
+        // then resolve merge-base == HEAD and hand the judge an EMPTY patch over a full working
+        // tree. Replace with `git rev-list --count origin/main..HEAD` (0 == not committed),
+        // which is exact regardless of what origin/main does, when 6.4's product-repo mutex
+        // lands. Not changed now: unreachable single-threaded, and it would churn every
+        // judge-input test's fake spawn for a race that does not yet exist.
+        const committed = headSha !== mainRes.stdout.trim();
+        const diffArgs = committed
+          ? ['-C', worktreePath, 'diff', 'origin/main...HEAD']
+          : ['-C', worktreePath, 'diff'];
+        const diffRes = spawnStep(ctx, deps, forState, 'git', diffArgs);
+        if (diffRes.exit === 0) {
+          const isEmpty = (diffRes.stdout || '').trim() === '';
+          let content = diffRes.stdout || '';
+
+          const statusRes = spawnStep(ctx, deps, forState, 'git', ['-C', worktreePath, 'status', '--porcelain']);
+          const untracked =
+            statusRes.exit === 0 ? splitLines(statusRes.stdout).filter((l) => l.startsWith('??')) : [];
+          if (untracked.length > 0) {
+            content +=
+              (content === '' ? '' : content.endsWith('\n') ? '\n' : '\n\n') +
+              '----- untracked (git status --porcelain; NOT part of the diff above) -----\n' +
+              untracked.join('\n') +
+              '\n';
+          }
+
+          fs.writeFileSync(diffPath(ctx.taskDir), content);
+          produced.push('diff.patch');
+          diffProduced = true;
+          if (isEmpty) appendEvent(ctx.taskDir, forState, 'diff-empty', { committed });
+        }
+      }
+    }
+  }
+
+  // -- (b) gate.log -- existence check only, realGate is the sole writer -----------------------
+  const gateLogProduced = fs.existsSync(gateLogPath(ctx.taskDir));
+  if (gateLogProduced) produced.push('gate.log');
+
+  // -- (c) gate-report.md -- optional, from the bench's own verdict for this HEAD sha ----------
+  let gateReportProduced = false;
+  if (headSha && config && config.spoBenchDir) {
+    const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
+    if (verdict) {
+      fs.writeFileSync(gateReportPath(ctx.taskDir), renderGateReport(verdict));
+      produced.push('gate-report.md');
+      gateReportProduced = true;
+    }
+  }
+
+  const missing = ['diff.patch', 'gate.log', 'gate-report.md'].filter((f) => !produced.includes(f));
+  appendEvent(ctx.taskDir, forState, 'judge-inputs-prepared', {
+    forState,
+    cameFrom: ctx.cameFrom || null,
+    produced,
+    missing,
+  });
+
+  if (forState === 'VALIDATE' && !diffProduced) {
+    throw new ParkSignal('judge-inputs-missing', { step: 'VALIDATE', missing: ['diff.patch'] });
+  }
+  if (forState === 'DIAGNOSE' && ctx.cameFrom === 'GATE' && !gateLogProduced) {
+    throw new ParkSignal('judge-inputs-missing', { step: 'DIAGNOSE', missing: ['gate.log'] });
+  }
+
+  return { produced, missing, diffProduced, gateLogProduced, gateReportProduced };
 }
 
 // ---- WORKTREE ------------------------------------------------------------------------------
@@ -419,13 +580,53 @@ async function realWorktree(ctx, deps = {}) {
 
 // ---- CHECK ---------------------------------------------------------------------------------
 //
-// typecheck, lint, coverage:changed, in that order, in the worktree; the first non-zero exit
-// names its own alias and goes to DIAGNOSE (never PARKED -- matches the shadow-mode contract).
+// Action 1.8: the invariant substring check runs FIRST, before typecheck/lint/coverage:changed --
+// deliberately, for two reasons. (1) It is pure `fs` reads (orchestrator/invariants.js -- no
+// spawning at all), while every CHECK_ALIASES entry spawns an `npm run` subprocess; there is no
+// reason to pay for three subprocess spawns before a free check that can already fail the visit.
+// (2) A broken invariant is the single most surgical, most actionable signal this state can hand
+// DIAGNOSE: it names the exact fact ("id X, cited in file Y") IMPLEMENT was told to preserve and
+// broke, whereas a bare typecheck/lint failure is often already self-explanatory from the tool's
+// own output and gains nothing from running first. Then typecheck, lint, coverage:changed, same
+// order as before this action; the first non-zero exit names its own alias and goes to DIAGNOSE
+// (never PARKED -- matches the shadow-mode contract, and doc/state-machine-spec.md's own "CHECK
+// Failure -> DIAGNOSE, never PARKED").
 const CHECK_ALIASES = ['typecheck', 'lint', 'coverage:changed'];
+
+// Re-resolves the PLAN-time invariant baseline (if any -- see task-values.js's
+// lastInvariantsBaseline) against the worktree as CHECK finds it, journals the outcome as
+// 'invariants-checked', and returns the list of broken ids (empty when nothing regressed, when
+// there was no baseline at all, or when the baseline/invariants file itself could not be read --
+// fail-open on parse, per orchestrator/invariants.js's own contract).
+function runInvariantCheck(ctx, deps, worktreePath) {
+  const planPayload = lastResultPayload(ctx.taskDir, 'PLAN') || {};
+  const invariantsPath = planPayload.invariants_path;
+  const baselineEvent = lastInvariantsBaseline(ctx.taskDir);
+  if (!invariantsPath || !baselineEvent) return [];
+
+  const { parseError, broken, checkedIds } = checkRegressions(
+    worktreePath,
+    invariantsPath,
+    baselineEvent.invariants || []
+  );
+  appendEvent(ctx.taskDir, 'CHECK', 'invariants-checked', {
+    parseError: parseError || null,
+    checkedIds,
+    broken,
+  });
+  return broken;
+}
 
 async function realCheck(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
   moveCard(ctx, deps, 'CHECK'); // kanban piloting: "Checks & PR" -- covers PUSH_PR too, no separate move there
+
+  const broken = runInvariantCheck(ctx, deps, worktreePath);
+  if (broken.length > 0) {
+    appendEvent(ctx.taskDir, 'CHECK', 'check-failed', { alias: 'invariants', broken });
+    return 'DIAGNOSE';
+  }
+
   for (const alias of CHECK_ALIASES) {
     const r = spawnStep(ctx, deps, 'CHECK', 'npm', ['run', alias], { cwd: worktreePath });
     if (r.exit !== 0) {
@@ -557,6 +758,11 @@ async function realPushPr(ctx, deps = {}) {
       throw new ParkSignal('rdo-citation-missing', { file: 'src/shared/rdo-members.ts' });
     }
     appendEvent(ctx.taskDir, 'PUSH_PR', 'rdo-citation', { citations });
+    // Same in-memory/journal split as touchesRdoMembers above: the journal event is what
+    // survives a daemon restart between this PUSH_PR pass and the VALIDATE that follows it
+    // (task-values.js falls back to it), while this assignment is what lets the SAME process's
+    // VALIDATE -> CITATION_VERIFIER read the citations without a restart in between at all.
+    ctx.task.citations = citations;
   }
 
 
@@ -647,6 +853,15 @@ async function realGate(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
   moveCard(ctx, deps, 'GATE'); // kanban piloting
   const r = spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate'], { cwd: worktreePath });
+
+  // journal/<id>/gate.log is DIAGNOSE's declared input for "the last gate run's output" -- unlike
+  // appendSpawnLog's own journal/<id>/logs/GATE.log (untouched, above, still accumulates across
+  // every visit to this state), this file is OVERWRITTEN on every real gate run, so a judge
+  // reading it always sees exactly this run and never a concatenation of earlier attempts. See
+  // action 1.3 / prepareJudgeInputs below, which only ever checks this file for existence -- it
+  // never runs the gate itself.
+  fs.writeFileSync(gateLogPath(ctx.taskDir), r.stdout || r.stderr || '');
+
   if (r.exit === 0) return 'CI_CHECKS';
   if (r.exit === 1) return 'DIAGNOSE';
   if (r.exit === 2) throw new ParkSignal('gate-dirty-tree', { exit: r.exit });
@@ -671,12 +886,23 @@ async function gitRevParse(ctx, deps, worktreePath, ref) {
 
 const CI_GREEN_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 
-async function realCiChecks(ctx, deps = {}) {
-  const config = ctx.config;
-  const worktreePath = ctx.task.worktreePath;
+function defaultSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
+// `deps.sleep` is the test injection point for realCiChecks' bounded in-flight poll loop below
+// -- same convention as `deps.spawnSync` (runSync above) -- production code never passes it, so
+// a real run always sleeps for real. Tests inject a no-op (or a recording stub) so the suite
+// never actually waits out ciChecksPollIntervalMs x ciChecksMaxPolls.
+function pollSleep(deps, ms) {
+  const sleepFn = (deps && deps.sleep) || defaultSleep;
+  return sleepFn(ms);
+}
 
+// One `gh api .../check-runs` fetch for `headSha`, parsed down to [{name, conclusion}]. Goes
+// through spawnStep like every other real command here, so every poll in the loop below is
+// journalled the same way a single fetch always was.
+function fetchCheckRuns(ctx, deps, config, headSha) {
   const checkRuns = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
     'api',
     `repos/${config.ghRepo}/commits/${headSha}/check-runs`,
@@ -691,7 +917,53 @@ async function realCiChecks(ctx, deps = {}) {
     }
   })();
   const runs = parsed && Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
-  const checks = runs.map((r) => ({ name: r.name, conclusion: r.conclusion }));
+  return runs.map((r) => ({ name: r.name, conclusion: r.conclusion, status: r.status }));
+}
+
+async function realCiChecks(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+
+  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
+
+  // Action 1.7: `c.conclusion && !CI_GREEN_CONCLUSIONS.has(...)` used to skip a check-run whose
+  // `conclusion` is still `null` (still running) when looking for a failing one -- so a CI run
+  // that had not finished read as green, and an empty `check_runs` array (CI has not even
+  // registered yet) had no failing element either, same silent false-green. The audit measured
+  // 8/12 real "green" events with `claude review` still in progress. Treat both as "in flight":
+  // re-poll, bounded by ciChecksMaxPolls, sleeping ciChecksPollIntervalMs between polls, before
+  // ever applying the failing/green decision below. Only once nothing is in flight does that
+  // pre-existing logic run.
+  const maxPolls = config.ciChecksMaxPolls;
+  const pollIntervalMs = config.ciChecksPollIntervalMs;
+  let checks = [];
+  for (let attempt = 1; attempt <= maxPolls; attempt++) {
+    checks = fetchCheckRuns(ctx, deps, config, headSha);
+    // In flight = anything that has not landed a usable conclusion. `conclusion == null` catches
+    // both null and an absent key, `!c.conclusion` also catches '' -- GitHub happens to always
+    // send `conclusion: null` beside `status: 'queued'|'in_progress'`, but relying on that alone
+    // left the same shape of hole 1.7 exists to close: a run with the key absent, or empty,
+    // counted as neither pending nor failing and read as green. `status !== 'completed'` is the
+    // authoritative signal, so honour it when present rather than inferring from conclusion.
+    const pendingRuns = checks.filter(
+      (c) => !c.conclusion || (c.status !== undefined && c.status !== 'completed')
+    ).length;
+    const inFlight = checks.length === 0 || pendingRuns > 0;
+
+    if (!inFlight) break;
+
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-in-flight', {
+      attempt,
+      totalRuns: checks.length,
+      pendingRuns,
+    });
+
+    if (attempt === maxPolls) {
+      throw new ParkSignal('ci-checks-still-running', { attempts: attempt, totalRuns: checks.length, pendingRuns });
+    }
+    await pollSleep(deps, pollIntervalMs);
+  }
+
   const failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion));
 
   if (failing) {
@@ -859,4 +1131,5 @@ module.exports = {
   realMerge,
   realFinish,
   preserveWorktreeWip,
+  prepareJudgeInputs,
 };

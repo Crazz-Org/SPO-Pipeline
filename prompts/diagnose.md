@@ -31,10 +31,20 @@ ledger:    {{ledger_path}}
 
 ## What you do
 
-1. **Read `{{ledger_path}}` first.** One line per attempt: `attempt N | root cause | outcome`.
-   Every cause already on it is off limits — your task is not to find *a* cause, it is to find
-   one that is not already there in substance, however it was worded.
-2. **Read `{{gate_log_path}}`.** This is a file path, not a live command — never re-run the
+1. **Read `{{ledger_path}}` first.** It carries two kinds of line:
+   - `attempt N | root cause | outcome` — a previous diagnosis of yours. Every cause already
+     there is off limits: your task is not to find *a* cause, it is to find one that is not
+     already there in substance, however it was worded.
+   - `validate-reject N | reasons | outcome` — the change-validator rejecting a built change.
+     This is **not** a diagnosis and is **not** off limits. It is evidence about what was wrong
+     with the work, and the underlying cause may well still be undiagnosed. Never return
+     `root_cause: null` on the grounds that a `validate-reject` line already covers your finding.
+2. **Read `{{gate_log_path}}` if it exists.** It holds the LAST gate run's output only, and it
+   is written only when a gate has actually run: DIAGNOSE is also reached from a failed CHECK or
+   an empty IMPLEMENT, before any gate. A missing file is normal there and is **not** itself a
+   finding — diagnose from the ledger and the diff instead. If the file exists but you were not
+   sent here by the gate, it predates the current diff: treat it as history, not as this
+   attempt's evidence. This is a file path, not a live command — never re-run the
    gate, never probe the live server. Look for the actual failure signal, not a printed banner:
    on this project, a mutation is proven by a `FIVEMODELSERVER/Survival` log line, and its
    **absence** is the failure, not the presence of `success: true` text; a lagging read-back on
