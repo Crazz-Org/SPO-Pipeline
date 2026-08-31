@@ -37,8 +37,24 @@ function appendLedgerLine(taskDir, attemptN, rootCause, outcome, kind = 'attempt
   fs.appendFileSync(path.join(taskDir, 'ledger.md'), `${kind} ${attemptN} | ${rootCause} | ${outcome}\n`);
 }
 
+// Atomic within a filesystem: write to a tmp file in the SAME directory as state.json, then
+// rename over it. A crash or kill -9 mid-write leaves the tmp file behind (harmless, ignored by
+// every reader) but state.json itself is always either the old complete snapshot or the new
+// complete snapshot -- never truncated. orphan-scan.js and every daemon restart depend on that.
 function writeState(taskDir, snapshot) {
-  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify(snapshot, null, 2) + '\n');
+  const target = path.join(taskDir, 'state.json');
+  const tmp = path.join(taskDir, `.state.json.${process.pid}.${Date.now()}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2) + '\n');
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // tmp was never created, or rename already moved it -- nothing to clean up either way.
+    }
+    throw err;
+  }
 }
 
 function writeReport(taskDir, { id, reason, lastState, ts, detail }) {

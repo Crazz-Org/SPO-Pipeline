@@ -92,6 +92,20 @@
 //                            mechanically, or whose reproduction does not confirm it, is HELD
 //                            (commented, never silently dropped) -- see orchestrator/README.md
 //                            § Auto-triage. Defaults to --dry; pass --file to actually act.
+//   spo recette [--scenario <name>] [--keep] [--dry] [--force]
+//                            ACTION 2.9 -- the supervised live harness, and the standard live
+//                            gate this project uses from chantier 3 on: drives ONE trivial
+//                            synthetic `kind: "card"` task through the REAL pipeline
+//                            (config.real=true) against a dedicated, distinctly-labelled GitHub
+//                            issue in the product repo, under a wall-clock + LLM-step-count cap,
+//                            asserts the scenario's declared checks against the produced
+//                            journal, then cleans up unconditionally (worktree, branches, PR,
+//                            issue, its own isolated journal dir under .recette/) -- never the
+//                            live journal/queue. Refuses to run while a live daemon holds
+//                            journal/daemon.lock, unless --force. --dry prints the plan (no
+//                            issue, no worktree, no LLM call, no side effect at all) and exits.
+//                            --keep skips cleanup, for debugging a run by hand. See
+//                            orchestrator/recette.js and orchestrator/README.md § Recette.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
 // Flags (accounts commands + dashboard): --accounts-dir <dir>  (default: the account pool --
@@ -101,6 +115,8 @@
 // Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>
 // Flags (reports): --reports-dir <dir>
 // Flags (triage): --limit <n>  (default 3)  --file (actually act; default dry-run)
+// Flags (recette): --scenario <name> (default trivial-doc-log)  --keep  --dry  --force
+//   --recette-dir <dir> (default <repo>/.recette)  --cap-ms <n>  --cap-llm-steps <n>
 
 const fs = require('fs');
 const path = require('path');
@@ -114,6 +130,7 @@ const autoTriage = require('../orchestrator/auto-triage');
 const reportIntake = require('../orchestrator/report-intake');
 const remoteReportPull = require('../orchestrator/remote-report-pull');
 const { tokenReport } = require('../orchestrator/tokens');
+const recette = require('../orchestrator/recette');
 
 function parseArgs(argv) {
   const opts = {
@@ -131,6 +148,12 @@ function parseArgs(argv) {
     file: false,
     noProd: false,
     host: null,
+    scenario: null,
+    keep: false,
+    force: false,
+    recetteDir: null,
+    capMs: null,
+    capLlmSteps: null,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -149,6 +172,12 @@ function parseArgs(argv) {
     else if (a === '--file') opts.file = true;
     else if (a === '--no-prod') opts.noProd = true;
     else if (a === '--host') opts.host = argv[++i];
+    else if (a === '--scenario') opts.scenario = argv[++i];
+    else if (a === '--keep') opts.keep = true;
+    else if (a === '--force') opts.force = true;
+    else if (a === '--recette-dir') opts.recetteDir = argv[++i];
+    else if (a === '--cap-ms') opts.capMs = Number(argv[++i]);
+    else if (a === '--cap-llm-steps') opts.capLlmSteps = Number(argv[++i]);
     else opts._.push(a);
   }
   return opts;
@@ -824,24 +853,93 @@ async function cmdTriage(opts, deps = {}) {
     else if (r.outcome === 'would-file') console.log(`#${r.issue}: would file -- ${r.draft.title}`);
     else if (r.outcome === 'duplicate' || r.outcome === 'would-duplicate') console.log(`#${r.issue}: duplicate of #${r.issueNumber}`);
     else if (r.outcome === 'error') console.log(`#${r.issue}: error -- ${r.error}`);
+    else if (r.outcome === 'already-claimed') console.log(`#${r.issue}: already claimed by another runner -- skipped`);
     else console.log(`#${r.issue}: held (${r.outcome}) -- ${r.reason || ''}`);
   }
 
   console.log('');
-  console.log(`processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  held: ${result.held}  errors: ${result.errors.length}`);
+  console.log(`processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  held: ${result.held}  already-claimed: ${result.alreadyClaimed || 0}  errors: ${result.errors.length}`);
   if (dry) console.log('(dry run -- nothing filed, nothing archived, nothing commented; pass --file to act)');
 
   if (result.errors.length > 0) process.exitCode = 1;
 }
 
+// `spo recette [--scenario <name>] [--keep] [--dry] [--force]` -- ACTION 2.9, see this file's
+// own usage header and orchestrator/recette.js for the full design. Exit code IS the verdict
+// (CLAUDE.md: "Verdict by exit code, never by reading text output") -- 0 only when the run
+// actually completed AND every one of the scenario's declared assertions passed; a refusal
+// (daemon lock held), a tripped cap, a park, or a failed assertion are all exit 1. `deps.recette`
+// is the test-only override (same convention as `deps.intake`/`deps.autoTriage`).
+async function cmdRecette(opts, deps = {}) {
+  const impl = deps.recette || recette;
+  const result = await impl.runRecette(
+    {
+      scenario: opts.scenario,
+      keep: opts.keep,
+      dry: opts.dry,
+      force: opts.force,
+      recetteDir: opts.recetteDir,
+      accountsDir: opts.accountsDir,
+      capMs: opts.capMs || null,
+      capLlmSteps: opts.capLlmSteps || null,
+    },
+    {}
+  );
+
+  if (result.dry) {
+    console.log(`spo recette --dry -- scenario "${result.scenario}" (nothing runs):`);
+    for (const line of result.plan.steps) console.log(`  - ${line}`);
+    console.log('');
+    console.log(`  journal root:          ${result.plan.journalRoot}`);
+    console.log(`  queue dir:             ${result.plan.queueDir}`);
+    console.log(`  product journal (lock check): ${result.plan.productJournalRoot}`);
+    console.log(`  cap:                   ${result.plan.capMs}ms wall clock / ${result.plan.capLlmSteps} LLM steps`);
+    return;
+  }
+
+  if (result.refused) {
+    console.error(`spo recette: refused (${result.reason}) -- ${JSON.stringify(result.detail)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`spo recette: scenario "${result.scenario}", run ${result.runId}`);
+  if (result.issueNumber) console.log(`  issue:      #${result.issueNumber}  ${result.issueUrl || ''}`);
+  console.log(`  finalState: ${result.finalState}`);
+  console.log(`  elapsed:    ${result.elapsedMs}ms  llmSteps: ${result.llmSteps}`);
+  if (result.capTripped) console.log(`  CAP TRIPPED: ${result.capTripped.reason} -- ${JSON.stringify(result.capTripped)}`);
+  if (result.error) console.error(`  error: ${result.error.name}: ${result.error.message}`);
+
+  if (result.assertions) {
+    for (const a of result.assertions.results) {
+      console.log(`  [${a.ok ? 'ok' : 'FAIL'}] ${a.id} -- ${a.description}${a.ok ? '' : ` (${a.detail})`}`);
+    }
+  } else {
+    console.log('  (no assertions evaluated -- the run did not reach a finalState)');
+  }
+
+  if (result.cleanupReport) {
+    const failed = result.cleanupReport.steps.filter((s) => !s.ok || (s.detail && s.detail.exit !== undefined && s.detail.exit !== 0));
+    console.log(
+      `  cleanup: ${result.cleanupReport.steps.length} step(s), ${failed.length} not-clean` +
+        (failed.length ? ` (${failed.map((s) => s.name).join(', ')} -- see detail above/state left behind)` : '')
+    );
+  } else if (result.kept) {
+    console.log(`  --keep: cleanup skipped -- inspect ${result.plan.runDir}`);
+  }
+
+  process.exitCode = result.ok ? 0 : 1;
+}
+
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage>',
+      'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
       '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
       '            triage: [--limit <n>] [--file]   (defaults to --dry)',
+      '            recette: [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]',
     ].join('\n')
   );
 }
@@ -891,6 +989,7 @@ function main() {
   if (cmd === 'intake') return cmdIntake(opts);
   if (cmd === 'reports') return cmdReports(opts);
   if (cmd === 'triage') return cmdTriage(opts);
+  if (cmd === 'recette') return cmdRecette(opts);
 
   printUsage();
   process.exitCode = 1;
@@ -920,4 +1019,4 @@ if (require.main === module) {
   run();
 }
 
-module.exports = { parseArgs, cmdAsk, cmdPull, cmdPullReports, cmdIntake, cmdReports, cmdTriage, main };
+module.exports = { parseArgs, cmdAsk, cmdPull, cmdPullReports, cmdIntake, cmdReports, cmdTriage, cmdRecette, main };

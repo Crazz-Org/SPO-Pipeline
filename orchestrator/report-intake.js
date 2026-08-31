@@ -7,14 +7,15 @@
 //     mechanically by `anchorKey` (a grep-shaped `gh issue list --search`, not a judgement), files
 //     a raw card labeled config.reportIntakeLabel, moves it to config.reportIntakeColumn, posts
 //     the confirm/discard instructions, and moves the report file to ~/.spo-reports/pending/.
-//   reportConfirmScan  -- (stage 2) for each pending raw card with no reply yet, reads the
-//     issue's comments and acts on the first "confirm" or "discard" reply posted after the
-//     instruction comment -- the exact same anchor/scan idiom park-loop.js's unparkScan already
-//     uses for "retry"/"abandon", transposed from a per-task journal.jsonl to daemon.jsonl (a
-//     pending report belongs to no task). "confirm" hands the report to auto-triage.js (stage
-//     3+, orchestrator/auto-triage.js's runAutoTriage) via a `report-confirmed` daemon event;
-//     "discard" closes the raw issue and archives the report; anything else is left alone -- a
-//     human conversation on the issue is allowed.
+//   reportConfirmScan  -- (stage 2) for each pending raw card with no reply yet, acts on the
+//     first AUTHORIZED "confirm" or "discard" reply posted after the instruction comment --
+//     action 2.7's comment-scan.js's `scanForMatch` owns the fetch/pagination/allowlist/backoff
+//     mechanics shared with park-loop.js's unparkScan (see that module's own header); this file
+//     only supplies the confirm/discard pattern set and journals to daemon.jsonl (a pending
+//     report belongs to no task, unlike unparkScan's per-task journal.jsonl). "confirm" hands
+//     the report to auto-triage.js (stage 3+, orchestrator/auto-triage.js's runAutoTriage) via a
+//     `report-confirmed` daemon event; "discard" closes the raw issue and archives the report;
+//     anything else -- including a non-collaborator's reply -- is left alone.
 //
 // WHY the raw render can't live in this file: putting the report on the board with NO
 // classification is the whole point of the human-first design (a bug that turns out to be "just"
@@ -35,13 +36,14 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
 
 const intake = require('./intake');
 const board = require('./board');
 const { appendDaemonEvent } = require('./journal');
 const { alertDaemon } = require('./park-alert');
 const { listQueuedReports, moveReportTo } = require('./auto-triage');
+const { armTimeout } = require('./command-timeout');
+const commentScan = require('./comment-scan');
 
 const DEFAULT_AUTO_INTAKE_MS = 15 * 60 * 1000;
 const DEFAULT_AUTO_INTAKE_LIMIT = 3;
@@ -61,9 +63,19 @@ function shouldScanConfirms(lastAt, nowMs, reportConfirmScanMs) {
   return nowMs - lastAt >= reportConfirmScanMs;
 }
 
-function runSync(deps, command, args, opts = {}) {
-  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
-  return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+// action 2.1b: routed through command-timeout.js's armTimeout -- report:card / gh issue list /
+// gh issue create (stage 1) and gh api comments / gh issue close (stage 2) used to spawn with no
+// timeout at all, in a daemon-loop timer with no per-task lock to hold but every bit as capable of
+// wedging the whole `spo` daemon process as any of the calls 2.1 already bounded (the daemon is
+// single-threaded; a hung spawnSync here blocks auto-pull/auto-triage/the queue drain right along
+// with it). `config` is threaded through from each caller below (runReportIntake/
+// reportConfirmScan both already take it as a parameter) -- a missing config arms no timeout,
+// same tolerant default armTimeout/classTimeoutMs already document. Never retried, never thrown:
+// this is a daemon-loop scan, not a task step -- there is no ParkSignal to throw INTO (no ctx, no
+// task), and every one of these calls gets another chance on the next autoIntakeMs/
+// reportConfirmScanMs tick regardless, so a retry here would only double the exposure for no gain.
+function runSync(deps, command, args, opts = {}, config) {
+  return armTimeout(deps, config, command, args, opts);
 }
 
 function sleep(ms) {
@@ -182,7 +194,7 @@ async function runReportIntake(journalRoot, config, deps = {}) {
   for (const reportPath of top) {
     const file = path.basename(reportPath);
 
-    const cardResult = runSync(deps, 'npm', ['run', 'report:card', '--', reportPath], { cwd: productRepo });
+    const cardResult = runSync(deps, 'npm', ['run', 'report:card', '--', reportPath], { cwd: productRepo }, config);
     const cardExit = normalizeExit(cardResult);
 
     if (cardExit === 3) {
@@ -195,8 +207,9 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       continue; // never archived -- see this file's header
     }
     if (cardExit !== 0) {
-      errors.push({ file, error: `report:card exited ${cardExit}` });
-      results.push({ file, outcome: 'error', error: `report:card exited ${cardExit}` });
+      const timedOut = cardResult.timedOut === true;
+      errors.push({ file, error: `report:card exited ${cardExit}`, timedOut });
+      results.push({ file, outcome: 'error', error: `report:card exited ${cardExit}`, timedOut });
       continue; // stays queued, retried next cycle
     }
 
@@ -213,7 +226,7 @@ async function runReportIntake(journalRoot, config, deps = {}) {
     const searchResult = runSync(deps, 'gh', [
       'issue', 'list', '--repo', ghRepo, '--state', 'all',
       '--search', `anchorKey: ${card.anchorKey} in:body`, '--json', 'number',
-    ]);
+    ], {}, config);
     if (normalizeExit(searchResult) === 0) {
       let hits = [];
       try {
@@ -248,11 +261,12 @@ async function runReportIntake(journalRoot, config, deps = {}) {
     const createResult = runSync(deps, 'gh', [
       'issue', 'create', '--repo', ghRepo, '--title', card.title,
       '--body-file', bodyFile, '--label', reportIntakeLabel,
-    ]);
+    ], {}, config);
     if (normalizeExit(createResult) !== 0) {
       const error = `gh issue create exited ${normalizeExit(createResult)}`;
-      errors.push({ file, error });
-      results.push({ file, outcome: 'error', error });
+      const timedOut = createResult.timedOut === true;
+      errors.push({ file, error, timedOut });
+      results.push({ file, outcome: 'error', error, timedOut });
       continue;
     }
     const issueNumber = intake.parseIssueNumber(createResult.stdout);
@@ -263,9 +277,14 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       continue;
     }
 
-    const moved = await moveWithRetry(issueNumber, reportIntakeColumn, deps, { cwd: productRepo });
+    const moved = await moveWithRetry(issueNumber, reportIntakeColumn, deps, { cwd: productRepo, config });
     if (!moved.ok) {
-      appendDaemonEvent(journalRoot, 'report-intake-move-failed', { issue: issueNumber, column: reportIntakeColumn, exit: moved.exit });
+      appendDaemonEvent(journalRoot, 'report-intake-move-failed', {
+        issue: issueNumber,
+        column: reportIntakeColumn,
+        exit: moved.exit,
+        timedOut: moved.timedOut === true,
+      });
       alertDaemon(config.parkAlertCmd, deps, [String(issueNumber), `failed to move to "${reportIntakeColumn}"`, 'INTAKE']);
       // Continue anyway -- the card exists and carries reportIntakeLabel, which makeTask's own
       // guard also refuses to drain regardless of column. See this file's header.
@@ -318,51 +337,83 @@ function findPendingIntake(journalRoot) {
   return pending;
 }
 
-function firstLine(text) {
-  return ((text || '').split('\n')[0] || '').trim();
-}
-
+// firstLine matching itself now lives in comment-scan.js's scanForMatch -- CONFIRM_RE/DISCARD_RE
+// stay here because they are reportConfirmScan's OWN vocabulary (park-loop.js has its own,
+// RETRY_RE/ABANDON_RE), threaded into scanForMatch as `patterns` below.
 const CONFIRM_RE = /^confirm\b/i;
 const DISCARD_RE = /^discard\b/i;
+const CONFIRM_PATTERNS = [
+  { name: 'confirm', re: CONFIRM_RE },
+  { name: 'discard', re: DISCARD_RE },
+];
 
-// reportConfirmScan(journalRoot, config, deps) -- one pass over every pending raw card. For each,
-// reads the issue's comments and acts on the first "confirm"/"discard" reply posted after the
-// intake comment (ascending id order, same caveat park-loop.js's unparkScan already documents:
-// `gh api .../comments` reads one page -- fine for a reply posted soon, a very long-lived pending
-// card could in principle need pagination this build does not implement). Anything else on the
-// issue is left alone.
-async function reportConfirmScan(journalRoot, config, deps = {}) {
+// action 2.7: reportConfirmScan's own event names for comment-scan.js's scanForMatch -- see that
+// module's header for what each one means and park-loop.js's own UNPARK_SCAN_EVENTS for the
+// sibling set. Daemon-scoped here (appendDaemonEvent), not task-scoped: a pending raw report has
+// no task directory of its own (it belongs to no `journal/<id>/`, only daemon.jsonl -- see this
+// file's own header), unlike park-loop.js's unparkScan which always has one.
+const CONFIRM_SCAN_EVENTS = {
+  truncated: 'report-confirm-scan-truncated',
+  ignoredAuthor: 'report-confirm-scan-ignored-author',
+  backoffSkip: 'report-confirm-scan-backoff-skip',
+};
+
+// reportConfirmScan(journalRoot, config, deps, scanState) -- one pass over every pending raw
+// card. For each, comment-scan.js's scanForMatch fetches the issue's comments after the intake
+// anchor (paginated, allowlisted, backed off on failure -- see that module's header) and finds
+// the first AUTHORIZED comment whose FIRST LINE is "confirm"/"discard". Anything else on the
+// issue -- a non-collaborator's reply, or a comment matching neither word -- is left alone.
+// `scanState` (comment-scan.js's createScanState()) is a fresh one by default -- state-machine.js's
+// runForever passes one it created once and keeps across cycles, so the collaborator cache and
+// backoff table persist between scans instead of re-paying for both every cycle.
+async function reportConfirmScan(journalRoot, config, deps = {}, scanState = commentScan.createScanState()) {
   const ghRepo = deps.ghRepo || config.ghRepo;
   const spoReportsDir = config.spoReportsDir;
   const today = deps.today || new Date().toISOString().slice(0, 10);
   const pending = findPendingIntake(journalRoot);
+  const nowMs = deps.now !== undefined ? deps.now : Date.now();
 
   let confirmed = 0;
   let discarded = 0;
+  let skipped = 0;
   const errors = [];
 
   for (const entry of pending) {
-    const commentsResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${entry.issue}/comments`]);
-    if (normalizeExit(commentsResult) !== 0) {
-      errors.push({ issue: entry.issue, error: `gh api comments exited ${normalizeExit(commentsResult)}` });
+    const scan = await commentScan.scanForMatch({
+      deps,
+      config,
+      ghRepo,
+      issue: entry.issue,
+      anchorId: entry.commentId,
+      patterns: CONFIRM_PATTERNS,
+      scanState,
+      journalRoot,
+      journal: (event, detail) => appendDaemonEvent(journalRoot, event, { issue: entry.issue, ...detail }),
+      events: CONFIRM_SCAN_EVENTS,
+      scannerKey: 'report-confirm',
+      now: nowMs,
+      maxPages: config && config.commentScanMaxPages,
+    });
+
+    if (!scan.ok) {
+      if (scan.reason === 'backoff') {
+        skipped++;
+        continue; // already journalled by scanForMatch
+      }
+      errors.push({
+        issue: entry.issue,
+        error:
+          scan.reason === 'unparsable'
+            ? 'unparsable comments reply'
+            : `gh api comments exited ${scan.exit}`,
+        timedOut: scan.timedOut === true,
+      });
       continue;
     }
-    let comments;
-    try {
-      comments = JSON.parse(commentsResult.stdout);
-    } catch {
-      errors.push({ issue: entry.issue, error: 'unparsable comments reply' });
-      continue;
-    }
-    if (!Array.isArray(comments)) continue;
+    if (!scan.match) continue;
+    const match = scan.match.comment;
 
-    const after = comments
-      .filter((c) => typeof c.id === 'number' && c.id > entry.commentId)
-      .sort((a, b) => a.id - b.id);
-    const match = after.find((c) => CONFIRM_RE.test(firstLine(c.body)) || DISCARD_RE.test(firstLine(c.body)));
-    if (!match) continue;
-
-    if (CONFIRM_RE.test(firstLine(match.body))) {
+    if (scan.match.name === 'confirm') {
       appendDaemonEvent(journalRoot, 'report-confirmed', {
         issue: entry.issue,
         pendingPath: entry.pendingPath,
@@ -374,9 +425,13 @@ async function reportConfirmScan(journalRoot, config, deps = {}) {
     }
 
     // discard -- terminal, closes the raw card and archives the report.
-    const closed = runSync(deps, 'gh', ['issue', 'close', String(entry.issue), '--repo', ghRepo, '--reason', 'not planned']);
+    const closed = runSync(deps, 'gh', ['issue', 'close', String(entry.issue), '--repo', ghRepo, '--reason', 'not planned'], {}, config);
     if (normalizeExit(closed) !== 0) {
-      errors.push({ issue: entry.issue, error: `gh issue close exited ${normalizeExit(closed)}` });
+      errors.push({
+        issue: entry.issue,
+        error: `gh issue close exited ${normalizeExit(closed)}`,
+        timedOut: closed.timedOut === true,
+      });
       continue; // stays pending, retried next scan
     }
     moveReportTo(entry.pendingPath, path.join(spoReportsDir, 'archive'), `discarded: #${entry.issue} — ${today}`);
@@ -384,7 +439,7 @@ async function reportConfirmScan(journalRoot, config, deps = {}) {
     discarded++;
   }
 
-  return { ok: true, pending: pending.length, confirmed, discarded, errors };
+  return { ok: true, pending: pending.length, confirmed, discarded, skipped, errors };
 }
 
 module.exports = {

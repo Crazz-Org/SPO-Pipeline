@@ -154,6 +154,40 @@ test(
   })
 );
 
+// action 2.6: a report another runner already claimed prints its own line and counts separately
+// from "held" -- it was never actually judged by THIS run, so lumping it into "held" would
+// misreport what happened.
+test(
+  'spo triage: an already-claimed outcome (action 2.6) prints its own line and its own summary count',
+  withExitCodeReset(async () => {
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      runAutoTriage: async () => ({
+        ok: true,
+        processed: 1,
+        filed: 0,
+        duplicates: 0,
+        held: 0,
+        alreadyClaimed: 1,
+        errors: [],
+        results: [{ issue: 44, outcome: 'already-claimed' }],
+      }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--file']);
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+
+    assert.ok(console_.logs.some((l) => l.includes('#44: already claimed by another runner -- skipped')));
+    assert.ok(console_.logs.some((l) => l.includes('already-claimed: 1')));
+    assert.equal(process.exitCode, undefined);
+  })
+);
+
 test(
   'spo triage: a mechanical runAutoTriage failure -> clear error, exit non-zero',
   withExitCodeReset(async () => {

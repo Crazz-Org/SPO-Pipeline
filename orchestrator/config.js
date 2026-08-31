@@ -48,6 +48,35 @@ const CI_CHECKS_POLL_INTERVAL_MS =
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
     : 20000;
 
+// A SPO_TIMEOUT_*_MS override, or the default when the variable is absent OR unusable.
+//
+// These five values are the only thing standing between a hung `gh` and a daemon frozen forever
+// holding the lock, so a malformed one must never silently disarm the bound. A bare
+// `Number(process.env.X)` returns NaN for "10m" or "2min" -- and node's spawnSync VALIDATES the
+// timeout option and throws RangeError ERR_OUT_OF_RANGE *before spawning*. That turned a typo in
+// a systemd drop-in into a synchronous throw out of board.js's moveCard and park-loop.js's
+// postParkComment, both documented "never throws" and both running inside finalizePark: the task
+// never reaches PARKED, the daemon exits 1, and orphanScan reparks through the same path on
+// restart. The same crash-loop shape review found in preserveWorktreeWip.
+//
+// So: fall back to the DEFAULT, never to "unbounded". A typo should cost you your override, not
+// the guarantee the override was tuning. command-timeout.js keeps its own guard for a config
+// object assembled by some other caller.
+//
+// The bound must be a POSITIVE integer, which rules out two values that look benign and are not:
+// `Number('')` is 0 and `Number('0')` is 0, and spawnSync reads a timeout of 0 as NO TIMEOUT.
+// An empty or zeroed SPO_TIMEOUT_*_MS would therefore disarm the very guarantee it names, which
+// is worse than the NaN case because it fails silently instead of loudly. There is deliberately
+// no way to disarm a bound through the environment: set an absurdly large value if you need to
+// watch a command run to completion.
+function timeoutFromEnv(name, defaultMs) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultMs;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return defaultMs;
+  return parsed;
+}
+
 module.exports = {
   // Wall-clock deadline for a single step invocation (scripted or llm), in milliseconds.
   // On expiry the step is treated as killed, retried once, and PARKED if it expires again.
@@ -98,6 +127,67 @@ module.exports = {
     CI_CHECKS: CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS,
   },
 
+  // ---- action 2.1: real spawnSync per-command-class timeouts -----------------------------
+  //
+  // The spec claimed "every step has a wall-clock deadline"; in real mode that was false.
+  // stepDeadlineMsByState above races a JS timer against a Promise (deadline.js's
+  // withTimeout), but every real command in steps/scripted.js runs through `spawnSync`, which
+  // blocks the event loop -- so that timer cannot fire while a `gh`/`git`/`npm` child is stuck,
+  // and the daemon (single-threaded, holding the task lock) hangs forever. Measured: GATE
+  // observed running 129-240s past its supposedly-enforced 120s. The only real defence is
+  // `spawnSync`'s OWN `timeout` option, armed per call by steps/scripted.js's spawnStep --
+  // see ./command-timeout.js's classifyCommand for how a call site's (command, args) maps to
+  // one of these keys (action 2.1b moved it there, out of steps/scripted.js, once board.js/
+  // park-loop.js/report-intake.js/intake.js needed the identical mapping for their own spawns).
+  //
+  // Values, and why:
+  //   git      -- 120s. Every git call here is either local (fast) or one round-trip over the
+  //               network (fetch/push/rev-parse against origin) -- matches the pre-existing
+  //               generic stepDeadlineMs, comfortable margin for a slow link.
+  //   gh       -- 120s. Same reasoning for a single REST/GraphQL call -- this is not the
+  //               bounded CI_CHECKS poll loop (that has its own ciChecksMaxPolls/
+  //               ciChecksPollIntervalMs budget above), just one `gh api`/`gh pr` invocation.
+  //   npm-ci   -- 600s (10 min). A product worktree carries no node_modules (WORKTREE's own
+  //               header comment in scripted.js) -- a full cold install.
+  //   npm-gate -- 7800s (130 min). The remediation plan says 900s; that number is WRONG and is
+  //               corrected here, derived the same way npm-run is derived from pr-wait.sh.
+  //               `npm run gate` -> scripts/bench-gate.sh -> bench-submit.sh --wait ->
+  //               src/e2e/bench/cli.ts, whose DEFAULT_WAIT_TIMEOUT_MIN is 120 -- SEVEN THOUSAND
+  //               TWO HUNDRED seconds, after which it exits 4 on its own and realGate maps that
+  //               to the designed ParkSignal('gate-timeout'). A 900s kill therefore fires
+  //               EIGHT TIMES too early: it destroys a legitimate queue wait, and the retry then
+  //               re-runs `npm run gate`, which re-submits a bench job for the same
+  //               (worktree, ref). job.ts refuses that with DuplicateJobError -> cli.ts returns
+  //               2 -> realGate parks `gate-dirty-tree`. So a merely BUSY bench would have
+  //               parked the card with a reason describing a dirty worktree that is perfectly
+  //               clean. Compounding it: spawnSync's timeout kills only the direct child, so the
+  //               orphaned `node cli.js wait` grandchild survives and keeps the first job alive,
+  //               making the duplicate refusal near-certain rather than a race.
+  //               7800s = the bench's own 7200s bound plus 600s of margin, so the bench always
+  //               gets to render its own verdict first and our kill stays the true last resort.
+  //   npm-run  -- 660s (11 min), the default for every OTHER `npm run <alias>` this file spawns
+  //               (typecheck, lint, coverage:changed, board:take, board:move, pr:wait). Bounded
+  //               BELOW by SPO-WebClient's scripts/pr-wait.sh's own internal bound -- it polls
+  //               at most 20 times at a 30s interval (600s) before exiting 4 ("still open") on
+  //               purpose. Our spawnSync timeout must exceed that bound, or a legitimate
+  //               "still in the merge queue" outcome (which realMerge's own bounded re-wait is
+  //               built to handle) would be killed by US first and misread as a hang. 660s
+  //               gives pr:wait's own worst case a 60s margin; typecheck/lint/coverage:changed/
+  //               board:take/board:move are all far inside it on this codebase's current size.
+  //               Recalibrate down once real per-alias durations are measured -- "erring long
+  //               is the cheap direction" (see ciChecksMaxPolls's own comment above for the
+  //               same philosophy).
+  //
+  // An explicit `opts.timeout` passed by a spawnStep call site always wins over these defaults
+  // (steps/scripted.js). Every value is independently overridable; SPO_TIMEOUT_* env vars.
+  commandTimeoutsMs: {
+    git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
+    gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
+    'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
+    'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
+    'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
+  },
+
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,
 
@@ -113,6 +203,23 @@ module.exports = {
   // restart), this timer is the belt-and-suspenders for a daemon that keeps running but somehow
   // loses track of a task. SPO_ORPHAN_SCAN_MS overrides.
   orphanScanMs: process.env.SPO_ORPHAN_SCAN_MS !== undefined ? Number(process.env.SPO_ORPHAN_SCAN_MS) : 60 * 1000,
+
+  // action 2.7 bullet 4: park-loop.js's unparkScan used to run unconditionally on EVERY
+  // drainQueueOnce cycle (pollIntervalMs, 5s by default) in real mode -- a `gh api .../comments`
+  // call per parked task every 5 seconds, unbounded. This is its own dedicated timer now, same
+  // shape and same default as orphanScanMs above (park-loop.js's shouldScanUnpark). SPO_UNPARK_SCAN_MS
+  // overrides, 0 disables (a parked task then only unparks via a hand-run `spo retry`/equivalent,
+  // never the daemon's own scan).
+  unparkScanMs: process.env.SPO_UNPARK_SCAN_MS !== undefined ? Number(process.env.SPO_UNPARK_SCAN_MS) : 60 * 1000,
+
+  // action 2.7: the sane bound on comment-scan.js's own pagination (`fetchCommentsAfterAnchor`),
+  // shared by park-loop.js's unparkScan and report-intake.js's reportConfirmScan -- see that
+  // module's own header for the full rationale. 20 pages * 100/page = 2000 comments scanned
+  // before a cycle gives up on ONE issue and journals the truncation distinguishably from "no
+  // reply" (unpark-scan-truncated / report-confirm-scan-truncated) rather than looking like
+  // nothing happened. SPO_COMMENT_SCAN_MAX_PAGES overrides.
+  commentScanMaxPages:
+    process.env.SPO_COMMENT_SCAN_MAX_PAGES !== undefined ? Number(process.env.SPO_COMMENT_SCAN_MAX_PAGES) : 20,
 
   // How stale state.json's updatedAt must be, on top of a dead owner pid, before a task is
   // treated as orphaned rather than mid-transition-write. Longer than any legitimate step
@@ -142,12 +249,19 @@ module.exports = {
   // The product checkout every WORKTREE/CHECK/PUSH_PR/GATE/CI_CHECKS/MERGE/FINISH real command
   // runs against or from. Always this literal join, never a relative "../SPO-WebClient" --
   // see CLAUDE.md's own warning that ".." resolves differently from inside a worktree.
-  productRepo: path.join(os.homedir(), 'SPO-WebClient'),
+  // SPO_PRODUCT_REPO / SPO_WORKTREES_DIR exist so a test subprocess can be pointed away from the
+  // real product checkout. Without them a test that reaches realWorktree -- which normally it
+  // cannot, but a mutation that makes shadow mode take a real path can -- creates REAL git
+  // worktrees and branches in ~/SPO-WebClient. That happened during a mutation-testing round on
+  // 2026-08-31: 44 fixture-named worktrees and 61 branches landed in the live product repo, and
+  // because `worktrees/` is gitignored, `git status` stayed clean while bare `node --test` walked
+  // into them and reported 12980 failures that had nothing to do with the code under test.
+  productRepo: process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient'),
 
   // Where WORKTREE creates one `git worktree add` per task (<dir>/<taskId>). Gitignored
   // (worktrees/ in .gitignore) -- disposable, FINISH removes its own entry with
   // `git worktree remove --force`.
-  pipelineWorktreesDir: path.join(REPO_ROOT, 'worktrees'),
+  pipelineWorktreesDir: process.env.SPO_WORKTREES_DIR || path.join(REPO_ROOT, 'worktrees'),
 
   // owner/repo for every `gh api` / `gh pr` / `gh issue` real call.
   ghRepo: 'Crazz-Org/SPO-WebClient',
@@ -254,6 +368,14 @@ module.exports = {
   // look before it becomes eligible for auto-pull. SPO_AUTO_TRIAGE_PROMOTE_TO_TODO overrides
   // ('0'/'false' disables).
   autoTriagePromoteToTodo: !['0', 'false'].includes(String(process.env.SPO_AUTO_TRIAGE_PROMOTE_TO_TODO).toLowerCase()),
+
+  // action 2.6: how stale a claim in spoReportsDir/in-progress/ must be, on top of a dead owner
+  // pid, before auto-triage.js's reclaimStaleClaims treats it as abandoned (a process that died
+  // mid-triage) rather than mid-write -- the exact same role orphanGraceMs plays above for a
+  // crashed task's state.json, reused rather than inventing a second constant for an identical
+  // shape of race. SPO_TRIAGE_CLAIM_GRACE_MS overrides.
+  triageClaimGraceMs:
+    process.env.SPO_TRIAGE_CLAIM_GRACE_MS !== undefined ? Number(process.env.SPO_TRIAGE_CLAIM_GRACE_MS) : 4 * 60 * 1000,
 
   // ---- stage 0: remote report pull (orchestrator/remote-report-pull.js) -------------------
   //

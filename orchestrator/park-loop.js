@@ -18,14 +18,24 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
 
 const { appendEvent, writeState } = require('./journal');
 const { moveCard } = require('./board');
+const { armTimeout } = require('./command-timeout');
+const commentScan = require('./comment-scan');
 
-function runSync(deps, command, args, opts = {}) {
-  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
-  return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+// action 2.1b: routed through command-timeout.js's armTimeout -- the park comment's own `gh issue
+// comment` (postParkComment) and the unpark scan's `gh api .../comments` + abandon-ack `gh issue
+// comment` (unparkScan) used to spawn with no timeout at all. Both call sites run with the task
+// ALREADY TERMINAL (postParkComment, called from finalizePark after state.json/report.md are
+// already written) or with no task in scope at all (unparkScan, a daemon-loop scan) -- so unlike
+// steps/scripted.js's spawnStep, a timeout here is never retried and never thrown as a
+// ParkSignal: there is nothing left to park, and a retry buys nothing a task that gets scanned
+// again on the next poll cycle wouldn't already get for free. `config` is threaded through from
+// each caller (ctx.config for postParkComment, the existing `config` parameter for unparkScan) --
+// a missing config arms no timeout, same tolerant default as every other armTimeout caller.
+function runSync(deps, command, args, opts = {}, config) {
+  return armTimeout(deps, config, command, args, opts);
 }
 
 function normalizeExit(result) {
@@ -126,10 +136,10 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
 
-  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile]);
+  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
   const exit = normalizeExit(result);
   if (exit !== 0) {
-    appendEvent(ctx.taskDir, 'PARKED', 'park-comment-failed', { exit });
+    appendEvent(ctx.taskDir, 'PARKED', 'park-comment-failed', { exit, timedOut: result.timedOut === true });
     return;
   }
 
@@ -139,10 +149,12 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
 
 // ---- unpark scan (daemon, real mode) ---------------------------------------------------------
 //
-// Caveat: `gh api repos/<repo>/issues/<n>/comments` reads one page (GitHub's default, 30
-// comments) -- fine for a fresh park (the maintainer's reply is the newest comment by
-// construction), but a very long-lived parked issue could in principle need pagination this
-// build does not implement.
+// action 2.7: the fetch/pagination/allowlist/backoff work is comment-scan.js's `scanForMatch` --
+// see that module's own header for the full rationale (the one-page cap, the author allowlist
+// and its fail-open/stale decision, per-issue backoff). What stays here: the retry/abandon
+// pattern set, the anchor (`findParkAnchor`, below -- park-loop.js's own park-comment journal
+// entries, unrelated to report-intake.js's daemon.jsonl anchor), and what a match DOES (re-enqueue
+// vs terminal ABANDONED + ack comment).
 
 function listTaskIds(journalRoot) {
   if (!fs.existsSync(journalRoot)) return [];
@@ -199,39 +211,88 @@ function findParkAnchor(lines) {
   return { commentId, alreadyHandled };
 }
 
-function firstLine(text) {
-  return ((text || '').split('\n')[0] || '').trim();
-}
-
+// firstLine matching itself now lives in comment-scan.js's scanForMatch -- RETRY_RE/ABANDON_RE
+// stay here because they are unparkScan's OWN vocabulary (report-intake.js has its own,
+// CONFIRM_RE/DISCARD_RE), threaded into scanForMatch as `patterns` below.
 const RETRY_RE = /^retry\b/i;
 const ABANDON_RE = /^abandon\b/i;
+const UNPARK_PATTERNS = [
+  { name: 'retry', re: RETRY_RE },
+  { name: 'abandon', re: ABANDON_RE },
+];
 
-// Re-enqueues `id` with the ORIGINAL task.json fields (queue/<retry-...>.json) -- unlike
-// intake.makeTask's zero-padded sequence naming (built for `spo pull`'s priority-order batch),
-// a retry only ever concerns one already-known id, so a timestamp is enough for both uniqueness
-// and filename-sort placement among whatever else is in queue/ at the time. worktreePath/branch
-// are dropped even if present (they never are -- task.json is the original queue file, never
-// rewritten with runtime fields -- see journal.js's own header comment) so WORKTREE derives both
-// fresh from config.pipelineWorktreesDir/taskId on the retry, same as a first attempt.
+// action 2.7: unparkScan's own event names for comment-scan.js's scanForMatch -- see that
+// module's header for what each one means. Task-scoped (appendEvent), not daemon-scoped: a
+// truncated scan, an ignored non-collaborator, or a backoff skip are all facts about THIS
+// parked task's own issue, so they belong in journal/<id>/journal.jsonl beside
+// unpark-scan-failed, not buried in daemon.jsonl where a maintainer looking at one task would
+// never think to check.
+const UNPARK_SCAN_EVENTS = {
+  truncated: 'unpark-scan-truncated',
+  ignoredAuthor: 'unpark-scan-ignored-author',
+  backoffSkip: 'unpark-scan-backoff-skip',
+};
+
+// shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) -- pure predicate, same shape as
+// orphan-scan.js's shouldScanOrphans / report-intake.js's shouldScanConfirms. Action 2.7 bullet
+// 4: unparkScan used to run unconditionally on EVERY drainQueueOnce cycle (pollIntervalMs, 5s by
+// default) in real mode -- a `gh api .../comments` call per parked task every 5 seconds is
+// exactly the unbounded-per-cycle-retry shape the plan's own "12.8-hour auto-triage stall"
+// postmortem warns about, just for a different endpoint. A dedicated 60s-by-default timer
+// (config.unparkScanMs, state-machine.js's runForever) gives it the same treatment orphanScan
+// and reportConfirmScan already had.
+function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
+  if (!(unparkScanMs > 0)) return false;
+  if (lastScanAt === null || lastScanAt === undefined) return true;
+  return nowMs - lastScanAt >= unparkScanMs;
+}
+
+// Re-enqueues `id` with the ORIGINAL task.json fields (queue/0000-retry-<ts>-<id>.json) --
+// unlike intake.makeTask's zero-padded sequence naming (built for `spo pull`'s priority-order
+// batch), a retry only ever concerns one already-known id, so a timestamp is enough for both
+// uniqueness and (combined with the `0000-` prefix below) filename-sort placement among whatever
+// else is in queue/ at the time. worktreePath/branch are dropped even if present (they never are
+// -- task.json is the original queue file, never rewritten with runtime fields -- see journal.js's
+// own header comment) so WORKTREE derives both fresh from config.pipelineWorktreesDir/taskId on
+// the retry, same as a first attempt.
+//
+// action 2.8: the `0000-` prefix. `listQueueFiles` (state-machine.js) processes queue/ in plain
+// filename-sort order, and intake.js's `nextQueueSeq` never hands out a fresh card a sequence
+// below `0001` (it starts at 1 for an empty/missing queue dir and only grows from there) -- so
+// `0000-retry-...` sorts strictly before EVERY `NNNN-issue-...` fresh card, unconditionally, by
+// the 4th character alone ('0' < '1'), with no dependence on what follows in either name. Before
+// this fix the file was just `retry-<ts>-<id>.json`, and `'r' > '0'`-`'9'` put every retry BEHIND
+// every fresh card in filename-sort order -- the opposite of both this comment's original intent
+// and the spec's: a maintainer's explicit "retry" should not wait behind newly auto-pulled work.
+// Multiple retries queued at once still sort relative to each other by their own timestamp, same
+// as before. Nothing else parses this filename's shape: `takeNextTask`'s own `path.basename(file,
+// '.json')` id fallback is never reached for a retry (task.json's own `id` field, restored above,
+// always wins first), and every other reader of queue/ (bin/spo, orphan-scan.js's `queuedIds`,
+// intake.js's `nextQueueSeq`) only ever checks `.endsWith('.json')` or a leading `\d+-`, both
+// still true here.
 function reEnqueueTask(queueDir, taskDir, id) {
   const original = readJsonSafe(path.join(taskDir, 'task.json')) || {};
   const { worktreePath, branch, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
-  const file = path.join(queueDir, `retry-${Date.now()}-${id}.json`);
+  const file = path.join(queueDir, `0000-retry-${Date.now()}-${id}.json`);
   fs.writeFileSync(file, JSON.stringify({ ...rest, id }, null, 2) + '\n');
   return file;
 }
 
-// unparkScan(queueDir, journalRoot, config, deps) -- one pass over every journaled task. For
-// each PARKED kind:"card" task with a park-comment anchor not yet acted on, reads the issue's
-// comments and looks only at those posted after the anchor (ascending id order); the first one
-// whose FIRST LINE is `retry` (optionally followed by more text) or `abandon`,
-// case-insensitive, decides the outcome. Anything else on the issue -- including a `retry`
-// posted BEFORE the park comment, or a comment matching neither word -- is left alone; a human
-// conversation on the issue is allowed.
-async function unparkScan(queueDir, journalRoot, config, deps = {}) {
+// unparkScan(queueDir, journalRoot, config, deps, scanState) -- one pass over every journaled
+// task. For each PARKED kind:"card" task with a park-comment anchor not yet acted on, comment-
+// scan.js's scanForMatch fetches the issue's comments after that anchor (paginated, allowlisted,
+// backed off on failure -- see that module's header) and finds the first AUTHORIZED comment
+// whose FIRST LINE is `retry` (optionally followed by more text) or `abandon`, case-insensitive.
+// Anything else on the issue -- including a `retry` posted BEFORE the park comment, one from a
+// non-collaborator, or a comment matching neither word -- is left alone; a human conversation on
+// the issue is allowed. `scanState` (comment-scan.js's createScanState()) is a fresh one by
+// default -- callers that run this repeatedly (state-machine.js's runForever) pass one they
+// created once and keep across cycles, so the collaborator cache and backoff table persist.
+async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = commentScan.createScanState()) {
   const ghRepo = (config && config.ghRepo) || 'Crazz-Org/SPO-WebClient';
   const ids = listTaskIds(journalRoot);
+  const nowMs = deps.now !== undefined ? deps.now : Date.now();
 
   for (const id of ids) {
     const taskDir = path.join(journalRoot, id);
@@ -244,29 +305,35 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}) {
     const anchor = findParkAnchor(readJournalLines(taskDir));
     if (!anchor || anchor.alreadyHandled) continue;
 
-    const commentsResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${task.issue}/comments`]);
-    if (normalizeExit(commentsResult) !== 0) {
-      appendEvent(taskDir, 'PARKED', 'unpark-scan-failed', { exit: normalizeExit(commentsResult) });
+    const scan = await commentScan.scanForMatch({
+      deps,
+      config,
+      ghRepo,
+      issue: task.issue,
+      anchorId: anchor.commentId,
+      patterns: UNPARK_PATTERNS,
+      scanState,
+      journalRoot,
+      journal: (event, detail) => appendEvent(taskDir, 'PARKED', event, detail),
+      events: UNPARK_SCAN_EVENTS,
+      scannerKey: 'unpark',
+      now: nowMs,
+      maxPages: config && config.commentScanMaxPages,
+    });
+
+    if (!scan.ok) {
+      if (scan.reason === 'backoff') continue; // already journalled by scanForMatch
+      appendEvent(taskDir, 'PARKED', 'unpark-scan-failed', {
+        exit: scan.exit,
+        timedOut: scan.timedOut === true,
+        reason: scan.reason === 'unparsable' ? 'unparsable-comments' : undefined,
+      });
       continue;
     }
+    if (!scan.match) continue;
+    const match = scan.match.comment;
 
-    let comments;
-    try {
-      comments = JSON.parse(commentsResult.stdout);
-    } catch {
-      appendEvent(taskDir, 'PARKED', 'unpark-scan-failed', { reason: 'unparsable-comments' });
-      continue;
-    }
-    if (!Array.isArray(comments)) continue;
-
-    const after = comments
-      .filter((c) => typeof c.id === 'number' && c.id > anchor.commentId)
-      .sort((a, b) => a.id - b.id);
-
-    const match = after.find((c) => RETRY_RE.test(firstLine(c.body)) || ABANDON_RE.test(firstLine(c.body)));
-    if (!match) continue;
-
-    if (RETRY_RE.test(firstLine(match.body))) {
+    if (scan.match.name === 'retry') {
       reEnqueueTask(queueDir, taskDir, id);
       appendEvent(taskDir, 'PARKED', 'unparked-by-maintainer', { retryCommentId: match.id });
       continue;
@@ -284,9 +351,9 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}) {
 
     const ackFile = path.join(taskDir, 'abandon-ack.md');
     fs.writeFileSync(ackFile, 'Understood -- closing this attempt.\n');
-    const ack = runSync(deps, 'gh', ['issue', 'comment', String(task.issue), '--repo', ghRepo, '--body-file', ackFile]);
+    const ack = runSync(deps, 'gh', ['issue', 'comment', String(task.issue), '--repo', ghRepo, '--body-file', ackFile], {}, config);
     if (normalizeExit(ack) !== 0) {
-      appendEvent(taskDir, 'PARKED', 'abandon-ack-failed', { exit: normalizeExit(ack) });
+      appendEvent(taskDir, 'PARKED', 'abandon-ack-failed', { exit: normalizeExit(ack), timedOut: ack.timedOut === true });
     }
   }
 }
@@ -297,6 +364,7 @@ module.exports = {
   parseCommentId,
   RETRY_ABANDON_LINE,
   unparkScan,
+  shouldScanUnpark,
   findParkAnchor,
   reEnqueueTask,
   countRepeatedParks,

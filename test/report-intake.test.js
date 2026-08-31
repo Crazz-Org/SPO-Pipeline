@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const { mkTmp } = require('./helpers');
+const { mkTmp, timeoutResult } = require('./helpers');
 const {
   shouldAutoIntake,
   shouldScanConfirms,
@@ -23,6 +23,7 @@ const {
   DEFAULT_AUTO_INTAKE_LIMIT,
 } = require('../orchestrator/report-intake');
 const { appendDaemonEvent } = require('../orchestrator/journal');
+const { createScanState } = require('../orchestrator/comment-scan');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -91,9 +92,9 @@ test('buildIntakeComment: contains the CONFIRM_DISCARD_LINE verbatim', () => {
 function makeIntakeDeps({ cardExit = 0, cardStdout = CARD_STDOUT, searchHits = [], ghResponder, npmResponder }) {
   return {
     sleep: async () => {}, // never actually wait in a test -- moveWithRetry's own injection point
-    spawnSync: (command, args) => {
+    spawnSync: (command, args, opts) => {
       if (command === 'npm') {
-        if (npmResponder) return npmResponder(args);
+        if (npmResponder) return npmResponder(args, opts); // opts: action 2.1b call-site arming
         return cardExit === 0 ? ok(cardStdout) : { status: cardExit, stdout: cardStdout, stderr: '', signal: null };
       }
       if (command === 'gh') {
@@ -274,11 +275,128 @@ test('runReportIntake: nothing queued -- no spawn at all', async () => {
   assert.equal(spawned, false);
 });
 
+// ---- action 2.1b: report-intake.js's own spawns are now bounded too ---------------------------
+//
+// runReportIntake's `npm run report:card` / `gh issue list` (dedup search) / `gh issue create`
+// and reportConfirmScan's `gh api .../comments` / `gh issue close` used to spawn with no timeout
+// at all -- a daemon-loop timer with no per-task lock, but every bit as capable of wedging the
+// whole single-threaded daemon as any call action 2.1 already bounded. Never retried, never
+// thrown: this is a daemon-loop scan, not a task step, so a timeout is converted into the same
+// error-array/results-array shape each call site already returns on a plain non-zero exit, tagged
+// `timedOut: true` so a hang is not silently indistinguishable from a normal gh/npm failure.
+
+test('runReportIntake: action 2.1b -- arms the npm-run class timeout for report:card', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-timeout-arm-');
+  const journalRoot = mkTmp('spo-reportintake-timeout-arm-journal-');
+  writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_arm.json');
+
+  let seenOpts = null;
+  const deps = {
+    sleep: async () => {},
+    spawnSync: (command, args, opts) => {
+      if (command === 'npm') seenOpts = opts;
+      return ok(CARD_STDOUT);
+    },
+  };
+
+  await runReportIntake(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 } },
+    deps
+  );
+
+  assert.equal(seenOpts.timeout, 660000);
+});
+
+test('runReportIntake: action 2.1b -- the board:move CALL SITE threads config through, so the move is bounded too', async () => {
+  // The arming itself is proven once in test/command-timeout.test.js; what this pins is the
+  // call site -- runReportIntake -> moveWithRetry -> board.moveIssueToColumn must forward
+  // `config`, or that spawn silently reverts to unbounded while every other spawn stays bounded
+  // (moveIssueToColumn arms nothing without it, by design). Same hazard, same test, as
+  // auto-triage.js's own moveIssueToColumn call site.
+  const spoReportsDir = mkTmp('spo-reportintake-movearm-');
+  const journalRoot = mkTmp('spo-reportintake-movearm-journal-');
+  writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_marm.json');
+
+  let moveOpts = null;
+  const deps = makeIntakeDeps({
+    npmResponder: (args, opts) => {
+      if (args.includes('report:card')) return ok(CARD_STDOUT);
+      moveOpts = opts;
+      return ok('');
+    },
+  });
+
+  await runReportIntake(
+    journalRoot,
+    {
+      spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y',
+      reportIntakeColumn: 'Intake', reportIntakeLabel: 'report:raw', autoIntakeLimit: 3,
+      commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 },
+    },
+    deps
+  );
+
+  assert.equal(moveOpts && moveOpts.timeout, 660000, 'board:move must carry the npm-run class timeout');
+});
+
+test('runReportIntake: a timed-out report:card never throws -- stays queued, reported as an error with timedOut: true', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-timeout-1-');
+  const journalRoot = mkTmp('spo-reportintake-timeout-journal1-');
+  const reportPath = writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_to1.json');
+
+  const deps = { sleep: async () => {}, spawnSync: () => timeoutResult() };
+
+  // Awaited directly, no try/catch: if runReportIntake ever threw on a timeout instead of
+  // reporting it, this `await` would reject and fail the test on its own -- the "never throws"
+  // property doesn't need a separate assertion to be enforced here.
+  const result = await runReportIntake(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', commandTimeoutsMs: { 'npm-run': 660000 } },
+    deps
+  );
+
+  assert.equal(result.filed, 0);
+  assert.equal(fs.existsSync(reportPath), true, 'never archived on a timeout -- retried next cycle');
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+  assert.ok(result.results.some((r) => r.outcome === 'error' && r.timedOut === true));
+});
+
+test('runReportIntake: a timed-out gh issue create never throws -- reported as an error with timedOut: true, report left in place', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-timeout-2-');
+  const journalRoot = mkTmp('spo-reportintake-timeout-journal2-');
+  const reportPath = writeReport(spoReportsDir, '2026-08-30T10-00-00-000Z_mobile_to2.json');
+
+  const deps = {
+    sleep: async () => {},
+    spawnSync: (command, args) => {
+      if (command === 'npm') return ok(CARD_STDOUT);
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'list') return ok('[]');
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return timeoutResult();
+      return ok('');
+    },
+  };
+
+  const result = await runReportIntake(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 } },
+    deps
+  );
+
+  assert.equal(result.filed, 0);
+  assert.equal(fs.existsSync(reportPath), true);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+});
+
 // ---- reportConfirmScan -----------------------------------------------------------------------
 
 function confirmDeps({ comments = [], closeResponder }) {
   return {
     spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators'))
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
       if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify(comments));
       if (command === 'gh' && args[0] === 'issue' && args[1] === 'close') {
         return closeResponder ? closeResponder(args) : ok('');
@@ -294,7 +412,7 @@ test('reportConfirmScan: "confirm" reply -> journals report-confirmed, report st
   const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'r.json');
   appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'r.json', pendingPath, issue: 11, commentId: 100 });
 
-  const deps = confirmDeps({ comments: [{ id: 101, body: 'confirm, looks real' }] });
+  const deps = confirmDeps({ comments: [{ id: 101, user: { login: 'Crazz-E' }, body: 'confirm, looks real' }] });
   const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
 
   assert.equal(result.confirmed, 1);
@@ -310,7 +428,7 @@ test('reportConfirmScan: copies kind from the report-intake entry into report-co
   const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'r-sugg.json');
   appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'r-sugg.json', pendingPath, issue: 12, commentId: 100, kind: 'suggestion' });
 
-  const deps = confirmDeps({ comments: [{ id: 101, body: 'confirm' }] });
+  const deps = confirmDeps({ comments: [{ id: 101, user: { login: 'Crazz-E' }, body: 'confirm' }] });
   await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
 
   const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
@@ -325,7 +443,7 @@ test('reportConfirmScan: "discard" reply -> closes the issue, archives the repor
 
   let closeCalled = false;
   const deps = confirmDeps({
-    comments: [{ id: 101, body: 'discard, not a real issue' }],
+    comments: [{ id: 101, user: { login: 'Crazz-E' }, body: 'discard, not a real issue' }],
     closeResponder: (args) => { closeCalled = true; return ok(''); },
   });
   const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
@@ -345,8 +463,8 @@ test('reportConfirmScan: a comment before the anchor, or matching neither word, 
 
   const deps = confirmDeps({
     comments: [
-      { id: 99, body: 'confirm' }, // before the anchor -- ignored
-      { id: 102, body: 'looking into it, will decide later' }, // matches neither
+      { id: 99, user: { login: 'Crazz-E' }, body: 'confirm' }, // before the anchor -- ignored
+      { id: 102, user: { login: 'Crazz-E' }, body: 'looking into it, will decide later' }, // matches neither
     ],
   });
   const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
@@ -363,4 +481,236 @@ test('reportConfirmScan: already confirmed -- not re-scanned (findPendingIntake 
   appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 44, pendingPath: '/x', commentId: 2 });
 
   assert.deepEqual(findPendingIntake(journalRoot), []);
+});
+
+// ---- action 2.1b: reportConfirmScan's own spawns are now bounded too --------------------------
+
+test('reportConfirmScan: action 2.1b -- arms the gh class timeout for the comments fetch', async () => {
+  const journalRoot = mkTmp('spo-confirmscan-timeout-arm-');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'arm.json', pendingPath: '/x', issue: 50, commentId: 1 });
+
+  let seenOpts = null;
+  const deps = { spawnSync: (command, args, opts) => { seenOpts = opts; return ok('[]'); } };
+
+  await reportConfirmScan(journalRoot, { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(seenOpts.timeout, 120000);
+});
+
+test('reportConfirmScan: a timed-out gh api comments fetch never throws -- reported as an error with timedOut: true, report stays pending', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan-timeout-1-');
+  const journalRoot = mkTmp('spo-confirmscan-timeout-journal1-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'to1.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'to1.json', pendingPath, issue: 55, commentId: 100 });
+
+  const deps = { spawnSync: () => timeoutResult() };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(result.confirmed, 0);
+  assert.equal(result.discarded, 0);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+  assert.equal(fs.existsSync(pendingPath), true, 'still pending -- retried next scan');
+});
+
+test('reportConfirmScan: a timed-out gh issue close (discard path) never throws -- reported as an error with timedOut: true, report stays pending', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan-timeout-2-');
+  const journalRoot = mkTmp('spo-confirmscan-timeout-journal2-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'to2.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'to2.json', pendingPath, issue: 66, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators'))
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify([{ id: 101, user: { login: 'Crazz-E' }, body: 'discard, duplicate of an old one' }]));
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'close') return timeoutResult();
+      return ok('');
+    },
+  };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } }, deps);
+
+  assert.equal(result.discarded, 0);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].timedOut, true);
+  assert.equal(fs.existsSync(pendingPath), true, 'never archived on a timeout -- retried next scan');
+});
+
+// ---- action 2.7: unified comment-scan rewrite (pagination, allowlist, backoff) -----------------
+
+function daemonEvents(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+test('reportConfirmScan: a "confirm" reply from a COLLABORATOR works exactly as before', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan27-collab-');
+  const journalRoot = mkTmp('spo-confirmscan27-collab-journal-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'c1.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'c1.json', pendingPath, issue: 70, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 101, body: 'confirm, looks real', user: { login: 'maintainer' } }]));
+      }
+      return ok('');
+    },
+  };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
+
+  assert.equal(result.confirmed, 1);
+  assert.ok(daemonEvents(journalRoot).some((e) => e.event === 'report-confirmed' && e.issue === 70));
+});
+
+test('reportConfirmScan: a "confirm" reply from a NON-collaborator is ignored, journalled, and never confirms', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan27-noncollab-');
+  const journalRoot = mkTmp('spo-confirmscan27-noncollab-journal-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'c2.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'c2.json', pendingPath, issue: 71, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 102, body: 'confirm, I am nobody', user: { login: 'rando' } }]));
+      }
+      return ok('');
+    },
+  };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
+
+  assert.equal(result.confirmed, 0);
+  assert.equal(fs.existsSync(pendingPath), true);
+  const events = daemonEvents(journalRoot);
+  assert.ok(!events.some((e) => e.event === 'report-confirmed'));
+  const ignored = events.find((e) => e.event === 'report-confirm-scan-ignored-author');
+  assert.ok(ignored, 'the ignored attempt must still be journalled, not silently dropped');
+  assert.equal(ignored.issue, 71);
+  assert.equal(ignored.author, 'rando');
+});
+
+test('reportConfirmScan: a reply on page 2 of 3 is found -- the one-page bug this action fixes', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan27-page2-');
+  const journalRoot = mkTmp('spo-confirmscan27-page2-journal-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'c3.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'c3.json', pendingPath, issue: 72, commentId: 500 });
+
+  const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, body: 'old chatter' }));
+  const page2 = Array.from({ length: 100 }, (_, i) => ({ id: 501 + i, body: 'old-ish chatter' }));
+  page2[49] = { id: 550, body: 'confirm, reproduced it', user: { login: 'maintainer' } };
+  const page3 = Array.from({ length: 20 }, (_, i) => ({ id: 601 + i, body: 'more chatter' }));
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      const pageArg = args.find((a) => typeof a === 'string' && a.startsWith('page='));
+      const page = pageArg ? Number(pageArg.split('=')[1]) : 1;
+      if (page === 1) return ok(JSON.stringify(page1));
+      if (page === 2) return ok(JSON.stringify(page2));
+      return ok(JSON.stringify(page3));
+    },
+  };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
+
+  assert.equal(result.confirmed, 1, 'a reply on page 2 must be found, not silently missed the way it used to be');
+  const confirmedEvent = daemonEvents(journalRoot).find((e) => e.event === 'report-confirmed');
+  assert.equal(confirmedEvent.commentId, 550);
+});
+
+test('reportConfirmScan: the collaborator list is fetched once per repo and reused across multiple pending reports in the same pass', async () => {
+  const journalRoot = mkTmp('spo-confirmscan27-cache-journal-');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'a.json', pendingPath: '/x/a', issue: 80, commentId: 1 });
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'b.json', pendingPath: '/x/b', issue: 81, commentId: 1 });
+
+  let collabCalls = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        collabCalls++;
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      return ok(JSON.stringify([]));
+    },
+  };
+
+  await reportConfirmScan(journalRoot, { ghRepo: 'x/y' }, deps);
+
+  assert.equal(collabCalls, 1, 'two pending reports sharing a repo must not each pay for their own collaborators fetch');
+});
+
+test('reportConfirmScan: consecutive gh failures on the SAME issue back off, and a subsequent success resets it, and it is journalled', async () => {
+  const journalRoot = mkTmp('spo-confirmscan27-backoff-journal-');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'z.json', pendingPath: '/x/z', issue: 90, commentId: 1 });
+
+  let ghApiCalls = 0;
+  let shouldFail = true;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && !String(args[1]).endsWith('/collaborators')) {
+        ghApiCalls++;
+        if (shouldFail) return { status: 1, stdout: '', stderr: 'boom', signal: null };
+      }
+      return ok('[]');
+    },
+  };
+
+  const scanState = createScanState();
+  await reportConfirmScan(journalRoot, { ghRepo: 'x/y' }, { ...deps, now: 1000 }, scanState); // failure 1
+  await reportConfirmScan(journalRoot, { ghRepo: 'x/y' }, { ...deps, now: 2000 }, scanState); // failure 2 -- now backs off
+
+  const callsBeforeBackoffCheck = ghApiCalls;
+  const backedOffResult = await reportConfirmScan(journalRoot, { ghRepo: 'x/y' }, { ...deps, now: 2500 }, scanState); // still backed off
+  assert.equal(ghApiCalls, callsBeforeBackoffCheck, 'a backed-off cycle must not call gh again');
+  assert.equal(backedOffResult.skipped, 1);
+  assert.ok(daemonEvents(journalRoot).some((e) => e.event === 'report-confirm-scan-backoff-skip'));
+
+  shouldFail = false;
+  await reportConfirmScan(journalRoot, { ghRepo: 'x/y' }, { ...deps, now: 2400000 }, scanState); // well past the backoff window
+  assert.ok(ghApiCalls > callsBeforeBackoffCheck, 'once the backoff window elapses, the scan tries gh again');
+});
+
+test('reportConfirmScan: the page bound being hit is journalled distinguishably from "no reply"', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan27-truncated-');
+  const journalRoot = mkTmp('spo-confirmscan27-truncated-journal-');
+  const pendingPath = writeReport(path.join(spoReportsDir, 'pending'), 'c4.json');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'c4.json', pendingPath, issue: 91, commentId: 0 });
+
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, body: 'chatter' }));
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      return ok(JSON.stringify(fullPage)); // always full -- never a natural end
+    },
+  };
+
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y', commentScanMaxPages: 1 }, deps);
+
+  assert.equal(result.confirmed, 0);
+  const events = daemonEvents(journalRoot);
+  assert.ok(events.some((e) => e.event === 'report-confirm-scan-truncated' && e.issue === 91));
+  assert.ok(!events.some((e) => e.event === 'report-confirmed'));
 });

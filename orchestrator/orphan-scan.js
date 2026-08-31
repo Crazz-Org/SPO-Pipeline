@@ -28,6 +28,16 @@
 // loop picks it up on the next scan with no special-casing. state-machine.js requires this module
 // lazily (inside orphanScan/shouldScanOrphans callers never need it eagerly) to avoid a load-time
 // require cycle -- see the lazy require below.
+//
+// MODE-GATED: daemon.js calls this unconditionally on every start, in every mode (see its own
+// header comment on that call site) -- but only a REAL repark (isRealMode(ctx), same helper
+// finalizePark/moveCard/postParkComment already gate every side effect on) actually calls
+// finalizePark. A --shadow or --dry-run start never does real side effects, so a park it wrote
+// would land with no board move, no gh park comment and no unpark anchor -- invisible to the
+// maintainer and to unparkScan.js forever. Shadow/dry-run therefore only detect the orphan and
+// journal 'orphan-scan-would-repark' to daemon.jsonl (nothing under the task's own taskDir is
+// touched) -- enough for a `--dry-run` start to report what a real start would have done, without
+// burying a real card under a developer's local experiment.
 
 const fs = require('fs');
 const os = require('os');
@@ -71,7 +81,7 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}) {
   // Lazy require: state-machine.js requires this module (to wire the periodic scan into
   // runForever), so a top-level require here would be a load-time cycle. By the time orphanScan
   // actually runs, both modules have long finished loading.
-  const { buildCtx, finalizePark } = require('./state-machine');
+  const { buildCtx, finalizePark, isRealMode } = require('./state-machine');
 
   const recovered = [];
   for (const id of listTaskIds(journalRoot)) {
@@ -97,10 +107,34 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}) {
     // this call's `deps` through so a test's injected spawnSync reaches postParkComment/moveCard
     // exactly as it would for a normal park, instead of falling back to a real spawn.
     const ctx = buildCtx(id, task, taskDir, { ...config, deps: (config && config.deps) || deps });
+    // Restore every runtime-only field the crashed process's ctx.task carried that state.json's
+    // snapshot() (state-machine.js) persisted but task.json never did -- worktreePath is the one
+    // measured gap (assigned only at WORKTREE time, steps/scripted.js's realWorktree). Left
+    // undefined, finalizePark -> preserveWorktreeWip is a guaranteed no-op and a crashed task's
+    // uncommitted work is silently lost instead of pushed to a wip/ ref. `|| null` also covers the
+    // legitimate pre-WORKTREE case (a task that died in INTAKE, before any worktree existed) the
+    // same way buildCtx's own fresh ctx.task would never have set it either.
+    ctx.task.worktreePath = state.worktreePath || null;
     ctx.prNumber = state.prNumber || null;
     ctx.counters.diagnoseAttempts = state.diagnoseAttempts || 0;
     ctx.counters.validateRejects = state.validateRejects || 0;
     ctx.counters.mainMoveUsed = !!state.mainMoveUsed;
+
+    if (!isRealMode(ctx)) {
+      // shadow/dry-run: detect and journal only -- see this file's header note above. Nothing
+      // under taskDir is touched (no state.json/report.md/journal.jsonl write), so this task is
+      // still exactly where a real start would find it: eligible to be reparked for real next
+      // time --real runs against this journal root.
+      appendDaemonEvent(journalRoot, 'orphan-scan-would-repark', {
+        id,
+        reason: 'task-orphaned-daemon-restart',
+        lastState: state.state,
+        owner,
+        lastUpdatedAt: state.updatedAt,
+      });
+      recovered.push({ id, reason: 'task-orphaned-daemon-restart', wouldRepark: true });
+      continue;
+    }
 
     finalizePark(ctx, state.state, 'task-orphaned-daemon-restart', {
       owner,

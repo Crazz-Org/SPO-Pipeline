@@ -47,7 +47,8 @@ const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
 const { moveCard } = require('./board');
-const { postParkComment, unparkScan, countRepeatedParks, readJournalLines } = require('./park-loop');
+const { postParkComment, unparkScan, shouldScanUnpark, countRepeatedParks, readJournalLines } = require('./park-loop');
+const { createScanState } = require('./comment-scan');
 const { shouldScanOrphans, orphanScan } = require('./orphan-scan');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
@@ -949,6 +950,15 @@ async function runForever(queueDir, journalRoot, config) {
   let lastConfirmScanAt = null;
   let lastAutoTriageAt = null;
   let lastOrphanScanAt = null;
+  let lastUnparkScanAt = null;
+
+  // action 2.7: one comment-scan.js scanState PER SCANNER, created ONCE here (not inside the
+  // for(;;) below) so the collaborator-login cache and the per-issue backoff table both survive
+  // across poll cycles -- see comment-scan.js's own header for why either living only as long as
+  // one unparkScan/reportConfirmScan call would defeat their own purpose (a cache that resets
+  // every cycle is not a cache; a backoff that resets every cycle never backs off).
+  const unparkScanState = createScanState();
+  const reportConfirmScanState = createScanState();
 
   // Started once, outside the for(;;) below, on its own setTimeout chain -- see
   // startRemoteReportPullLoop's own header. Unlike the other three report-intake timers right
@@ -973,7 +983,16 @@ async function runForever(queueDir, journalRoot, config) {
         await orphanScan(queueDir, journalRoot, config, deps);
       }
 
-      await unparkScan(queueDir, journalRoot, config, deps);
+      // action 2.7 bullet 4: a dedicated timer (config.unparkScanMs, 60s by default), not
+      // unconditionally on every drainQueueOnce cycle (pollIntervalMs, 5s by default) the way
+      // this used to run -- see park-loop.js's shouldScanUnpark for why. Per the plan, this
+      // guarantees "not more often than config.unparkScanMs" only -- real cadence is not
+      // guaranteed until chantier 6 gives the daemon concurrency, since drainQueueOnce above can
+      // block this loop for as long as a task's own step takes.
+      if (shouldScanUnpark(lastUnparkScanAt, Date.now(), config.unparkScanMs)) {
+        lastUnparkScanAt = Date.now();
+        await unparkScan(queueDir, journalRoot, config, deps, unparkScanState);
+      }
 
       // Note the ordering above: drainQueueOnce is AWAITED, so a pull only ever happens with
       // the daemon idle. config.autoPullLimit is therefore the most cards that can sit off the
@@ -1004,7 +1023,7 @@ async function runForever(queueDir, journalRoot, config) {
       }
       if (shouldScanConfirms(lastConfirmScanAt, now, config.reportConfirmScanMs)) {
         lastConfirmScanAt = now;
-        await reportConfirmScan(journalRoot, config, deps);
+        await reportConfirmScan(journalRoot, config, deps, reportConfirmScanState);
       }
       if (shouldAutoTriage(lastAutoTriageAt, now, config.autoTriageMs)) {
         lastAutoTriageAt = now;
@@ -1027,4 +1046,5 @@ module.exports = {
   buildCtx,
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
   snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it
+  isRealMode, // exported for orphan-scan.js -- shadow/dry-run must detect-and-journal only, never park
 };

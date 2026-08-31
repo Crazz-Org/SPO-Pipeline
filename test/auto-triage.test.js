@@ -20,8 +20,13 @@ const {
   runAutoTriage,
   processConfirmedReport,
   findConfirmedAwaitingTriage,
+  reclaimStaleClaims,
+  claimReport,
+  claimSidecarPath,
   DEFAULT_AUTO_TRIAGE_MS,
   DEFAULT_AUTO_TRIAGE_LIMIT,
+  DEFAULT_TRIAGE_CLAIM_GRACE_MS,
+  IN_PROGRESS_DIRNAME,
 } = require('../orchestrator/auto-triage');
 const { appendDaemonEvent } = require('../orchestrator/journal');
 
@@ -83,7 +88,7 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
   const claudeCalls = [...(claudeRawReplies || []), ...(claudeReplies || []).map((r) => ok(JSON.stringify(realShapedReply(r))))];
   return {
     accountsDir: accountsDir || poolDir(),
-    spawnSync: (command, args) => {
+    spawnSync: (command, args, opts) => {
       if (command === 'claude') {
         return claudeCalls[Math.min(claudeCallIdx++, claudeCalls.length - 1)];
       }
@@ -93,7 +98,7 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
         return ok('');
       }
       if (command === 'npm') {
-        if (npmResponder) return npmResponder(args);
+        if (npmResponder) return npmResponder(args, opts); // opts: action 2.1b call-site arming
         return ok('');
       }
       return ok('');
@@ -182,6 +187,43 @@ test('findConfirmedAwaitingTriage: a report-held event also counts as handled', 
 });
 
 // ---- processConfirmedReport / runAutoTriage --------------------------------------------------
+
+test('runAutoTriage: action 2.1b -- the promote-to-Todo CALL SITE threads config through, so board:move is bounded too', async () => {
+  // reviewAndFile -> board.moveIssueToColumn is the third moveIssueToColumn call site (alongside
+  // report-intake.js's moveWithRetry). moveIssueToColumn arms NOTHING without an opts.config, by
+  // design, so a call site that forgets to pass it silently leaves this one spawn unbounded while
+  // every other spawn in the daemon is bounded -- exactly the gap action 2.1b exists to close.
+  const spoReportsDir = mkTmp('spo-autotriage-movearm-');
+  const journalRoot = mkTmp('spo-autotriage-movearm-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_marm.json');
+  confirmedEntry(journalRoot, { issue: 999, pendingPath });
+
+  let moveOpts = null;
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
+    ],
+    npmResponder: (args, opts) => {
+      if (args.join(' ') === 'run board:move -- 999 Todo') moveOpts = opts;
+      return ok('');
+    },
+  });
+
+  await runAutoTriage(
+    journalRoot,
+    {
+      spoReportsDir,
+      productRepo: '/fake/repo',
+      autoTriagePromoteToTodo: true,
+      commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 },
+    },
+    deps,
+    { dry: false }
+  );
+
+  assert.equal(moveOpts && moveOpts.timeout, 660000, 'board:move must carry the npm-run class timeout');
+});
 
 test('runAutoTriage: draft -> FILE -> amendCard + move to Todo, report archived, journals one auto-triage event', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports1-');
@@ -682,4 +724,416 @@ test('runAutoTriage: kind "suggestion" -- a fetchIssue failure is a mechanical e
 
   assert.equal(result.errors.length, 1);
   assert.equal(fs.existsSync(pendingPath), true);
+});
+
+// ---- action 2.6: the in-progress claim mutex -------------------------------------------------
+// Report #443 was filed AND held 20 seconds apart because nothing stopped the daemon's own
+// autoTriageMs timer and a hand-run `spo triage` from picking up the SAME confirmed report at
+// the same time (PR #447 had to be closed by hand). These tests cover the fix: claimReport's
+// atomic rename into in-progress/ BEFORE any LLM call, restoring/archiving it afterward, and
+// reclaimStaleClaims' crash recovery.
+
+function inProgressPathFor(spoReportsDir, pendingPath) {
+  return path.join(spoReportsDir, IN_PROGRESS_DIRNAME, path.basename(pendingPath));
+}
+
+test('processConfirmedReport: claims the report into in-progress/ BEFORE triageBugReport is called', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-order-');
+  const journalRoot = mkTmp('spo-autotriage-claim-order-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_ord1.json');
+  const claimedPath = inProgressPathFor(spoReportsDir, pendingPath);
+
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
+    ],
+    npmResponder: () => ok(''),
+  });
+  const baseSpawnSync = deps.spawnSync;
+  let sawClaimedWhenCalled = null;
+  deps.spawnSync = (command, args, opts) => {
+    if (command === 'claude' && sawClaimedWhenCalled === null) {
+      // The ordering assertion: by the moment triageBugReport spawns `claude`, the file must
+      // already be gone from pending/ and sitting in in-progress/ -- not just "eventually", at
+      // THIS instant, before the expensive call is even made.
+      sawClaimedWhenCalled = fs.existsSync(claimedPath) && !fs.existsSync(pendingPath);
+    }
+    return baseSpawnSync(command, args, opts);
+  };
+
+  const entry = { issue: 900, pendingPath, commentId: 1, kind: null };
+  const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(sawClaimedWhenCalled, true, 'the file must be claimed before triageBugReport is called, not after');
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'filed');
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"report-triage-claimed"/);
+});
+
+test('processConfirmedReport: a second concurrent runner finds the report already claimed and skips it without calling triageBugReport', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-race-');
+  const journalRoot = mkTmp('spo-autotriage-claim-race-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_race1.json');
+
+  // Simulate a winner that claimed the report a moment before this call -- the exact race
+  // findConfirmedAwaitingTriage cannot see (it only reads daemon.jsonl's terminal events).
+  const claimedPath = inProgressPathFor(spoReportsDir, pendingPath);
+  fs.mkdirSync(path.dirname(claimedPath), { recursive: true });
+  fs.renameSync(pendingPath, claimedPath);
+
+  let spawned = false;
+  const deps = { accountsDir: poolDir(), spawnSync: () => { spawned = true; return ok(''); } };
+
+  const entry = { issue: 901, pendingPath, commentId: 1, kind: null };
+  const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'already-claimed');
+  assert.equal(spawned, false, 'triageBugReport must never be called for an already-claimed report');
+  // The loser must not disturb the winner's claim.
+  assert.equal(fs.existsSync(claimedPath), true);
+});
+
+test('processConfirmedReport: filed/duplicate/held/do-not-file all move the file OUT of in-progress/ to the right destination', async () => {
+  async function runOne(name, claudeReplies) {
+    const spoReportsDir = mkTmp(`spo-autotriage-claim-term-${name}-`);
+    const journalRoot = mkTmp(`spo-autotriage-claim-term-journal-${name}-`);
+    const pendingPath = writePendingReport(spoReportsDir, `2026-08-31T10-00-00-000Z_desktop_${name}.json`);
+    const entry = { issue: 910, pendingPath, commentId: 1, kind: null };
+    const deps = makeDeps({
+      claudeReplies,
+      npmResponder: () => ok(''),
+      ghResponder: (args) => (args[0] === 'api' ? ok(JSON.stringify({ body: 'original raw body' })) : ok('')),
+    });
+
+    const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+    const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+    assert.deepEqual(
+      fs.existsSync(inProgressDir) ? fs.readdirSync(inProgressDir) : [],
+      [],
+      `${name}: nothing must be left stranded in in-progress/`
+    );
+    return { result, spoReportsDir, pendingPath };
+  }
+
+  {
+    const { result, spoReportsDir, pendingPath } = await runOne('filed', [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
+    ]);
+    assert.equal(result.outcome, 'filed');
+    assert.equal(fs.existsSync(pendingPath), false);
+    assert.equal(fs.existsSync(path.join(spoReportsDir, 'archive', path.basename(pendingPath))), true);
+  }
+
+  {
+    const { result, spoReportsDir, pendingPath } = await runOne('duplicate', [
+      { outcome: 'duplicate', issue_number: 55, comment_markdown: 'Also seen elsewhere.' },
+    ]);
+    assert.equal(result.outcome, 'duplicate');
+    assert.equal(fs.existsSync(pendingPath), false);
+    assert.equal(fs.existsSync(path.join(spoReportsDir, 'archive', path.basename(pendingPath))), true);
+  }
+
+  {
+    const { result, pendingPath } = await runOne('held', [{ outcome: 'not-reproduced', reason: 'no journal entries' }]);
+    assert.equal(result.outcome, 'not-reproduced');
+    assert.equal(fs.existsSync(pendingPath), true, 'held reports go back to pending/, never archived');
+  }
+
+  {
+    const { result, pendingPath } = await runOne('donotfile', [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Not a real defect.' },
+    ]);
+    assert.equal(result.outcome, 'do-not-file');
+    assert.equal(fs.existsSync(pendingPath), true, 'DO_NOT_FILE goes back to pending/, never archived');
+  }
+});
+
+test('processConfirmedReport: a mechanical triageBugReport failure leaves the file recoverable in pending/, not stranded in in-progress/', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-mech-');
+  const journalRoot = mkTmp('spo-autotriage-claim-mech-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_mech1.json');
+  const entry = { issue: 920, pendingPath, commentId: 1, kind: null };
+  const deps = makeDeps({ claudeReplies: ['not json at all'] });
+
+  const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.ok, false);
+  assert.equal(fs.existsSync(pendingPath), true);
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  assert.deepEqual(fs.existsSync(inProgressDir) ? fs.readdirSync(inProgressDir) : [], []);
+});
+
+test('processConfirmedReport: a dry run claims nothing -- no in-progress/ directory, no rename, no report-triage-claimed event', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-dry-');
+  const journalRoot = mkTmp('spo-autotriage-claim-dry-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_dry1.json');
+  const entry = { issue: 940, pendingPath, commentId: 1, kind: null };
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
+    ],
+  });
+
+  const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
+
+  assert.equal(result.outcome, 'would-file');
+  assert.equal(fs.existsSync(pendingPath), true, 'the file must never move for a dry run');
+  assert.equal(fs.existsSync(path.join(spoReportsDir, IN_PROGRESS_DIRNAME)), false, 'a dry run must not even create in-progress/');
+  const daemonLog = fs.existsSync(path.join(journalRoot, 'daemon.jsonl'))
+    ? fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    : '';
+  assert.doesNotMatch(daemonLog, /report-triage-claimed/);
+});
+
+test('reclaimStaleClaims: defaults to 4 minutes, same value as orphan-scan.js\'s own grace window', () => {
+  assert.equal(DEFAULT_TRIAGE_CLAIM_GRACE_MS, 4 * 60 * 1000);
+});
+
+test('reclaimStaleClaims: a claim whose owner is still alive is left alone regardless of age', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reclaim-alive-');
+  const journalRoot = mkTmp('spo-autotriage-reclaim-alive-journal-');
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  const file = '2026-08-31T09-00-00-000Z_desktop_alive.json';
+  fs.writeFileSync(path.join(inProgressDir, file), JSON.stringify({ version: 1 }));
+  fs.writeFileSync(
+    claimSidecarPath(path.join(inProgressDir, file)),
+    JSON.stringify({ pid: 123, host: os.hostname(), claimedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+  );
+
+  const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 1000 }, { isAlive: () => true });
+
+  assert.deepEqual(reclaimed, []);
+  assert.equal(fs.existsSync(path.join(inProgressDir, file)), true, 'a live owner\'s claim must never be swept, no matter how old');
+});
+
+test('reclaimStaleClaims: a claim whose owner is dead but still inside the grace window is left alone', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reclaim-grace-');
+  const journalRoot = mkTmp('spo-autotriage-reclaim-grace-journal-');
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  const file = '2026-08-31T09-00-00-000Z_desktop_fresh.json';
+  fs.writeFileSync(path.join(inProgressDir, file), JSON.stringify({ version: 1 }));
+  fs.writeFileSync(
+    claimSidecarPath(path.join(inProgressDir, file)),
+    JSON.stringify({ pid: 999999, host: os.hostname(), claimedAt: new Date().toISOString() })
+  );
+
+  const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 10 * 60 * 1000 }, { isAlive: () => false });
+
+  assert.deepEqual(reclaimed, []);
+  assert.equal(fs.existsSync(path.join(inProgressDir, file)), true);
+});
+
+test('reclaimStaleClaims: a claim whose owner is dead AND past the grace window is swept back to pending/ (crash recovery)', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-reclaim-');
+  const journalRoot = mkTmp('spo-autotriage-claim-reclaim-journal-');
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  const file = '2026-08-31T09-00-00-000Z_desktop_stranded.json';
+  fs.writeFileSync(path.join(inProgressDir, file), JSON.stringify({ version: 1 }));
+  fs.writeFileSync(
+    claimSidecarPath(path.join(inProgressDir, file)),
+    JSON.stringify({ pid: 999999, host: os.hostname(), claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() })
+  );
+
+  const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 4 * 60 * 1000 }, { isAlive: () => false });
+
+  assert.deepEqual(reclaimed, [file]);
+  assert.equal(fs.existsSync(path.join(spoReportsDir, 'pending', file)), true);
+  assert.equal(fs.existsSync(path.join(inProgressDir, file)), false);
+  assert.equal(fs.existsSync(claimSidecarPath(path.join(inProgressDir, file))), false);
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"report-triage-reclaimed"/);
+});
+
+test('reclaimStaleClaims: a claim with no readable sidecar falls back to the file\'s own mtime under the same grace window', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reclaim-nosidecar-');
+  const journalRoot = mkTmp('spo-autotriage-reclaim-nosidecar-journal-');
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  const file = '2026-08-31T09-00-00-000Z_desktop_nosidecar.json';
+  const filePath = path.join(inProgressDir, file);
+  fs.writeFileSync(filePath, JSON.stringify({ version: 1 }));
+  // No sidecar at all -- as if the crash landed between the rename and the sidecar write.
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(filePath, old, old);
+
+  const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 4 * 60 * 1000 }, {});
+
+  assert.deepEqual(reclaimed, [file]);
+  assert.equal(fs.existsSync(path.join(spoReportsDir, 'pending', file)), true);
+});
+
+test('runAutoTriage: a claim stranded by a crash is reclaimed and successfully re-triaged in the same cycle', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-crash-');
+  const journalRoot = mkTmp('spo-autotriage-claim-crash-journal-');
+  const file = '2026-08-31T09-00-00-000Z_desktop_crash1.json';
+  const pendingPath = path.join(spoReportsDir, 'pending', file);
+
+  // The state a hard-killed daemon (or a killed `spo triage --file`) leaves behind: the
+  // report-confirmed event was journaled, a first runner claimed the file and then died before
+  // writing any terminal event at all.
+  confirmedEntry(journalRoot, { issue: 930, pendingPath });
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  fs.writeFileSync(path.join(inProgressDir, file), JSON.stringify({ version: 1 }));
+  fs.writeFileSync(
+    claimSidecarPath(path.join(inProgressDir, file)),
+    JSON.stringify({ pid: 999999, host: os.hostname(), claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() })
+  );
+
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
+    ],
+    npmResponder: () => ok(''),
+  });
+  deps.isAlive = () => false;
+
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.filed, 1, 'the stranded report must be reclaimed to pending/ and re-triaged within the same cycle');
+  assert.equal(fs.existsSync(path.join(spoReportsDir, IN_PROGRESS_DIRNAME, file)), false);
+});
+
+test('runAutoTriage: a dry run never sweeps in-progress/, even when a stale claim is sitting there', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-dry2-');
+  const journalRoot = mkTmp('spo-autotriage-claim-dry2-journal-');
+  const file = '2026-08-31T09-00-00-000Z_desktop_drystale.json';
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  fs.writeFileSync(path.join(inProgressDir, file), JSON.stringify({ version: 1 }));
+  fs.writeFileSync(
+    claimSidecarPath(path.join(inProgressDir, file)),
+    JSON.stringify({ pid: 999999, host: os.hostname(), claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() })
+  );
+
+  await runAutoTriage(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo' },
+    { accountsDir: poolDir(), isAlive: () => false, spawnSync: () => ok('') },
+    { dry: true }
+  );
+
+  assert.equal(fs.existsSync(path.join(inProgressDir, file)), true, 'a dry run must not reclaim a stale in-progress file');
+});
+
+// D1: fs.renameSync PRESERVES mtime, and a report file is named for when the player filed it,
+// then sits in pending/ awaiting a human confirm -- hours or days. So the sidecar-less fallback
+// read that original mtime, judged every fresh claim instantly stale, and could reclaim a LIVE
+// claim during the window between claimReport's rename and its sidecar write -- re-opening the
+// exact double-triage this whole action closes. claimReport now stamps the claim time onto the
+// file.
+test('claimReport: stamps the claimed file\'s mtime, so an OLD report is not instantly stale to the sidecar-less fallback', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-mtime-');
+  const journalRoot = mkTmp('spo-autotriage-claim-mtime-journal-');
+  const pendingDir = path.join(spoReportsDir, 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  const pendingPath = path.join(pendingDir, '2026-08-01T09-00-00-000Z_desktop_old.json');
+  fs.writeFileSync(pendingPath, JSON.stringify({ version: 1 }));
+
+  // The report was filed three days ago and has been waiting for a human ever since.
+  const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(pendingPath, threeDaysAgo, threeDaysAgo);
+
+  const claim = claimReport(spoReportsDir, pendingPath);
+  assert.equal(claim.claimed, true);
+
+  const ageMs = Date.now() - fs.statSync(claim.path).mtimeMs;
+  assert.ok(ageMs < 60 * 1000, `a fresh claim must look fresh, not ${Math.round(ageMs / 1000)}s old`);
+
+  // Now the decisive property: with the sidecar removed (the crash window), a sweep must still
+  // leave this brand-new claim alone.
+  fs.unlinkSync(claimSidecarPath(claim.path));
+  const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 60 * 1000 }, {});
+  assert.deepEqual(reclaimed, [], 'a live claim must not be swept just because the report file is old');
+  assert.equal(fs.existsSync(claim.path), true);
+});
+
+// D3: a claim we can never probe -- a foreign hostname after a WSL/container rebuild -- had no age
+// bound at all, so a report a human explicitly confirmed became permanently invisible. Nothing
+// surfaces that: the eligibility scan reads daemon.jsonl, `spo reports` reads pending/.
+test('reclaimStaleClaims: a foreign-host claim is left alone at first, but reclaimed past the absolute ceiling', () => {
+  const mk = (ageMs) => {
+    const spoReportsDir = mkTmp('spo-autotriage-foreign-');
+    const journalRoot = mkTmp('spo-autotriage-foreign-journal-');
+    const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+    fs.mkdirSync(inProgressDir, { recursive: true });
+    const file = '2026-08-31T09-00-00-000Z_desktop_foreign.json';
+    const claimed = path.join(inProgressDir, file);
+    fs.writeFileSync(claimed, JSON.stringify({ version: 1 }));
+    fs.writeFileSync(
+      claimSidecarPath(claimed),
+      JSON.stringify({ pid: 4242, host: 'a-machine-that-no-longer-exists', claimedAt: new Date(Date.now() - ageMs).toISOString() })
+    );
+    return { spoReportsDir, journalRoot, claimed, file };
+  };
+  const graceMs = 1000;
+
+  const fresh = mk(5 * graceMs);
+  assert.deepEqual(
+    reclaimStaleClaims(fresh.journalRoot, { spoReportsDir: fresh.spoReportsDir, triageClaimGraceMs: graceMs }, {}),
+    [],
+    'not yet at the ceiling -- no evidence either way, so leave it'
+  );
+
+  const ancient = mk(500 * graceMs);
+  const reclaimed = reclaimStaleClaims(ancient.journalRoot, { spoReportsDir: ancient.spoReportsDir, triageClaimGraceMs: graceMs }, {});
+  assert.equal(reclaimed.length, 1, 'past the ceiling it must be reclaimed regardless of host');
+  assert.equal(fs.existsSync(path.join(ancient.spoReportsDir, 'pending', ancient.file)), true);
+  assert.equal(fs.existsSync(ancient.claimed), false);
+});
+
+// D5: an explicit 0 must mean 0, not "fall back to four minutes".
+test('reclaimStaleClaims: triageClaimGraceMs of 0 is honoured, not treated as absent', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-grace-zero-');
+  const journalRoot = mkTmp('spo-autotriage-grace-zero-journal-');
+  const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  const file = '2026-08-31T09-00-00-000Z_desktop_zero.json';
+  const claimed = path.join(inProgressDir, file);
+  fs.writeFileSync(claimed, JSON.stringify({ version: 1 }));
+  fs.writeFileSync(
+    claimSidecarPath(claimed),
+    JSON.stringify({ pid: 4243, host: os.hostname(), claimedAt: new Date().toISOString() })
+  );
+
+  const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 0 }, { isAlive: () => false });
+  assert.equal(reclaimed.length, 1, 'grace 0 + a dead owner reclaims immediately');
+});
+
+// M7: the suggestion path spends an LLM call too -- reviewCard, inside reviewAndFile -- so the
+// claim has to happen BEFORE the kind branch, not merely before triageBugReport. The code was
+// already right, but nothing pinned it: every claim test used kind: null, and the pre-existing
+// suggestion tests only assert the file's final resting place, which is identical whether or not
+// it ever detoured through in-progress/. Moving the claim after the branch survived the suite.
+test('processConfirmedReport: a kind:"suggestion" report is claimed too -- a second runner skips it without spending reviewCard', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-suggestion-');
+  const journalRoot = mkTmp('spo-autotriage-claim-suggestion-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_sugg.json');
+
+  const claimedPath = inProgressPathFor(spoReportsDir, pendingPath);
+  fs.mkdirSync(path.dirname(claimedPath), { recursive: true });
+  fs.renameSync(pendingPath, claimedPath); // a winner got there first
+
+  let spawned = false;
+  const deps = { accountsDir: poolDir(), spawnSync: () => { spawned = true; return ok(''); } };
+
+  const entry = { issue: 902, pendingPath, commentId: 1, kind: 'suggestion' };
+  const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.outcome, 'already-claimed');
+  assert.equal(spawned, false, 'reviewCard must never run for an already-claimed suggestion');
+  assert.equal(fs.existsSync(claimedPath), true, "the loser must not disturb the winner's claim");
 });

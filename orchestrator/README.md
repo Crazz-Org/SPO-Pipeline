@@ -579,9 +579,94 @@ summed `billableTokens` (every `llm-call` event's `billableTokens` in `journal.j
 input + cache-creation + output, cache-read excluded) and the PR number.
 
 **Every spawn**, across all seven functions, journals one compact `{state, argv (first 6
-tokens), exit, ms}` `'spawn'` event via `appendEvent`, and appends its stdout (falling back to
-stderr) to `journal/<id>/logs/<STATE>.log` — several spawns share one state's log file, in
-call order, each under its own `----- <command> -----` header.
+tokens), exit, ms, attempt, commandClass, timeoutMs, timedOut, signal}` `'spawn'` event via
+`appendEvent`, and appends its stdout (falling back to stderr) to `journal/<id>/logs/<STATE>.log`
+— several spawns share one state's log file, in call order, each under its own `-----
+<command> -----` header.
+
+**Per-command-class timeouts + retry-once-then-park (action 2.1).** `spawnStep` is the single
+choke point every real `git`/`gh`/`npm` command **this file** spawns passes through, and it is
+the ONLY real defence against a hung child: `deadline.js`'s `callWithDeadline` races a JS timer
+against the handler's promise, but `spawnStep` calls `spawnSync`, which **blocks the event
+loop** — that timer cannot fire while a `git`/`gh`/`npm` process is stuck, so a hung command used to freeze the
+single-threaded daemon forever, holding the task lock (GATE was measured running 129–240s past
+its supposedly-enforced 120s deadline before this action). `spawnStep` now classifies each call
+by command + leading args (`classifyCommand`, `orchestrator/command-timeout.js`) and arms
+`spawnSync`'s own `timeout` option from `config.commandTimeoutsMs`:
+
+| Class | Default | `SPO_TIMEOUT_*_MS` override |
+|---|---|---|
+| `git` | 120000 | `SPO_TIMEOUT_GIT_MS` |
+| `gh` | 120000 | `SPO_TIMEOUT_GH_MS` |
+| `npm-ci` | 600000 | `SPO_TIMEOUT_NPM_CI_MS` |
+| `npm-gate` | 7800000 | `SPO_TIMEOUT_NPM_GATE_MS` |
+| `npm-run` (every other `npm run <alias>`: `typecheck`, `lint`, `coverage:changed`, `board:take`, `board:move`, `pr:wait`, `report:card`) | 660000 | `SPO_TIMEOUT_NPM_RUN_MS` |
+
+**Action 2.1b closed the remaining gap.** The real commands spawned OUTSIDE `spawnStep` by their
+own private `runSync` helpers — `board.js`'s `moveCard` (`npm run board:move`, called from inside
+`realWorktree`/`realCheck`/`realGate`/`realMerge` and from `postParkComment`), `park-loop.js`'s
+`gh issue comment`/`gh api` (the park comment, the abandon ack, the unpark scan),
+`report-intake.js`'s `npm run report:card`/`gh issue list`/`gh issue create`/`gh api`/`gh issue
+close` (the two daemon-loop timers), and `intake.js`'s own `gh`/`npm` calls (the maintainer-facing
+`spo ask`/`spo pull` path — its three LLM steps already carry their own `deadlineMs`) — used to
+carry no timeout at all. All four now arm the identical class default above via
+`orchestrator/command-timeout.js`'s `armTimeout`, the same module `spawnStep` itself now delegates
+its own classification to (moved out of this file so `board.js` — required *by* this file — does
+not have to require its classifier back out of it, which would be circular). `park-alert.js` was
+the only pre-existing exception, with its own fixed 10s timeout for the same reason.
+
+Unlike `spawnStep`'s retry-then-`ParkSignal` policy, none of these four retries or throws on a
+timeout: `moveCard` is explicitly best-effort and runs mid-step (a throw would break every
+caller); `park-loop.js`'s park comment/abandon ack run once the task is already terminal (nothing
+left to park); `report-intake.js` and `intake.js` run in the daemon loop or the CLI path, outside
+any task (`ParkSignal` has nothing to attach to). A timeout is instead converted into the failure
+each call site already models (`board-move-failed`, `park-comment-failed`, `unpark-scan-failed`,
+`abandon-ack-failed`, `report-intake`'s and `reportConfirmScan`'s own per-item error entries, and
+every `{ok: false, ...}` `intake.js` already returns), tagged `timedOut: true` so a hang stays
+visibly distinct from a plain non-zero exit. None of the four retries, either: each gets another
+chance on its own next cycle regardless, so a retry here would only double the exposure for no
+gain. Every real spawn in the daemon is bounded as of this action.
+
+One caveat on the `SPO_TIMEOUT_*_MS` overrides: `config.js` parses each with `Number(...)`, so a
+non-numeric or fractional value (`2min`, `10m`, `1.5`) lands as `NaN`/a non-integer — and Node's
+`spawnSync` *validates* its `timeout` option, throwing `ERR_OUT_OF_RANGE` **before** it spawns.
+Handed through, that would be a synchronous throw inside `moveCard`/`postParkComment`, both
+documented "never throws" and both running inside `finalizePark` — the crash-loop shape this
+action exists to prevent. `classTimeoutMs` therefore treats a malformed value as "no class
+default" (that one class runs unbounded, as it did pre-2.1, rather than killing the daemon).
+Check `SPO_TIMEOUT_*_MS` is plain milliseconds before an unattended soak.
+
+An explicit `opts.timeout` on a call site always wins over the class default. See `config.js`'s
+own comment on `commandTimeoutsMs` for why each value is what it is — in particular, `npm-run`'s
+660s is bounded below by `scripts/pr-wait.sh`'s own internal 600s poll budget, not chosen freely.
+
+The trap this closes: `spawnSync` on a `timeout` kill sets BOTH `signal` (e.g. `SIGTERM`) and
+`error.code === 'ETIMEDOUT'`, same as a bare `status: null` from a genuine "unknown" failure —
+the pre-existing code mapped both to exit 1 indistinguishably, so a timeout-killed GATE (exit 1
+→ DIAGNOSE) used to pay a real LLM call diagnosing a hang the daemon itself caused. `spawnStep`
+now branches on `signal`/`error` **before** the exit-code mapping (mirroring `steps/llm.js`'s
+own `killedByDeadline` idiom for `claude -p` calls, not a third convention), and never returns a
+`timedOut` result to a caller at all — a caller's exit-code routing (`realGate`'s 0/1/2/3/4,
+`realCheck`, `realCiChecks`, `realWorktree`'s claim codes, `realMerge`, `realPushPr`) is
+therefore completely unchanged; it simply never runs on a timeout.
+
+A timed-out command is retried once with the same timeout (both attempts journalled as `spawn`
+events, `attempt: 1`/`2`, `timedOut: true`); if the retry also times out, `spawnStep` itself
+throws `ParkSignal('<class>-timed-out', {state, argv, commandClass, timeoutMs})` — a dedicated
+reason naming the command class, never the calling state's own failure reason (a timed-out GATE
+parks `npm-gate-timed-out`, never `gate-timeout` — that string is the *domain* exit-4 reason
+`npm run gate` itself can return — and never reaches DIAGNOSE). The retry lives inside
+`spawnStep`, not at each of its 48 call sites, so the policy cannot drift between them. Retrying
+after a timeout is not obviously safe for every command — a first attempt that actually
+succeeded server-side before the local process hung could in principle be repeated — but every
+call site was audited: `git push`/`git commit`/`git worktree add`/etc. are all naturally
+idempotent or fail cleanly on a real retry rather than duplicating anything; `gh pr create`
+(PUSH_PR) is protected by GitHub itself refusing a second PR for the same head branch;
+`npm run board:take` (WORKTREE) is explicitly documented idempotent by `scripts/board-take.sh`
+("already held" on a re-run). The one call this audit does not fully close is `gh issue comment`
+(FINISH) — issue comments have no server-side dedup, so a retried timeout whose first attempt's
+network call actually landed could in principle post a duplicate comment. This is cosmetic
+(never a duplicate PR, branch, or merge) and journalled like every other attempt if it happens.
 
 **`--real`** (`daemon.js`) is required for any `kind: "card"` task to leave `INTAKE` once neither
 `--shadow` nor `--dry-run` applies — `state-machine.js`'s `handleIntake` parks a card task with
@@ -645,23 +730,34 @@ pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to cl
 as the anchor for what comes next -- GitHub comment ids are monotonically increasing site-wide,
 so "posted after the park comment" is exactly "id greater than the anchor", no clock needed.
 
-**`unparkScan`** (`park-loop.js`) runs once per daemon poll cycle, real mode only
+**`unparkScan`** (`park-loop.js`) runs on its own dedicated timer, real mode only
 (`state-machine.js`'s `runForever`, gated on `config.real` the same way everything else real in
-that file is). For every journaled task still `PARKED` with a park-comment anchor not yet acted
-on, it reads the issue's comments (`gh api repos/<repo>/issues/<n>/comments` -- one page,
-GitHub's default 30; a very long-lived parked issue could in principle need pagination this
-build does not implement) and looks only at comments posted after the anchor, oldest first. The
-first one whose **first line** is `retry` (optionally followed by more text) or `abandon`,
-case-insensitive, decides the outcome; anything else on the issue -- a `retry` posted *before*
-the park comment, or a comment matching neither word -- is left alone, since a human
-conversation on the issue is allowed:
+that file is, then further gated on `config.unparkScanMs` -- 60s by default, `shouldScanUnpark`).
+Action 2.7 added that timer: before it, `unparkScan` ran unconditionally on every drain cycle
+(`config.pollIntervalMs`, 5s by default) in real mode -- a `gh api` call per parked task every 5
+seconds, uncapped. For every journaled task still `PARKED` with a park-comment anchor not yet
+acted on, `comment-scan.js`'s `scanForMatch` (shared with `reportConfirmScan` below -- see that
+module's own header for the full design) fetches the issue's comments after the anchor, paginated
+(`per_page=100`, a page loop, a sane bound so a pathological issue can't scan forever -- hitting
+the bound is journalled `unpark-scan-truncated`, distinguishable from "scanned everything, nothing
+matched"), filtered to an AUTHORIZED author (a repo collaborator, per `gh api .../collaborators`,
+cached and re-checked hourly; a non-collaborator's `retry`/`abandon` is ignored and journalled
+`unpark-scan-ignored-author`, never silently dropped), with per-issue backoff on consecutive `gh`
+failures. The first authorized comment whose **first line** is `retry` (optionally followed by
+more text) or `abandon`, case-insensitive, decides the outcome; anything else on the issue -- a
+`retry` posted *before* the park comment, one from a non-collaborator, or a comment matching
+neither word -- is left alone, since a human conversation on the issue is allowed:
 
-- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/retry-<ts>-<id>.json`
+- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/0000-retry-<ts>-<id>.json`
   with the original `task.json` fields, `worktreePath`/`branch` dropped so WORKTREE derives both
-  fresh, same as a first attempt) and journals `unparked-by-maintainer`. `buildCtx`'s fresh
-  `ctx.counters` on the next `runTask` naturally resets the transient DIAGNOSE/VALIDATE-reject
-  counters; the ledger (`journal/<id>/ledger.md`) is untouched, since the retry reuses the same
-  `journal/<id>` directory the ledger already lives in.
+  fresh, same as a first attempt) and journals `unparked-by-maintainer`. Action 2.8: the `0000-`
+  prefix makes a retry sort BEFORE every fresh `NNNN-issue-...` card in `listQueueFiles`'s
+  filename-sort processing order (`intake.js`'s `nextQueueSeq` never hands out a sequence below
+  `0001`) -- before this fix the file was named `retry-<ts>-<id>.json`, which sorted BEHIND every
+  fresh card (`'r' > '0'`-`'9'`), the opposite of a maintainer's explicit retry taking priority
+  over newly auto-pulled work. `buildCtx`'s fresh `ctx.counters` on the next `runTask` naturally
+  resets the transient DIAGNOSE/VALIDATE-reject counters; the ledger (`journal/<id>/ledger.md`) is
+  untouched, since the retry reuses the same `journal/<id>` directory the ledger already lives in.
 - **`abandon`** -- terminal: `state.json`'s `state` is rewritten to `ABANDONED` directly (this
   task never re-enters `runTask`'s loop), journaled `abandoned-by-maintainer`, and a one-line ack
   comment ("Understood -- closing this attempt.") is posted on the issue. The card's *column* is
@@ -738,13 +834,18 @@ Production deployment's own ~/.spo-reports (SPO-Deploy-managed durable volume)
    │  class as auto-pull, since nothing here judges anything).
    ▼
 GitHub issue, column "Intake", label report:raw, body = the report exactly as captured
-   │  STAGE 2 -- reportConfirmScan, the SAME retry/abandon comment-scan idiom park-loop.js's
-   │  unparkScan already uses. A maintainer replies "confirm" or "discard" on the issue.
-   │  config.reportConfirmScanMs (nonzero by default).
+   │  STAGE 2 -- reportConfirmScan, built on the SAME comment-scan.js's scanForMatch park-loop.js's
+   │  unparkScan uses (action 2.7: paginated, allowlisted to repo collaborators, backed off on
+   │  consecutive `gh` failures -- see "Park <-> kanban round trip" above for the full mechanics).
+   │  A collaborator replies "confirm" or "discard" on the issue; a non-collaborator's reply is
+   │  ignored and journalled, never acted on. config.reportConfirmScanMs (nonzero by default).
    ▼  "confirm"
-   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Routes
-   │  on `kind` (threaded through from report-card.js's own header via the report-intake/
-   │  report-confirmed journal events):
+   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Claims
+   │  the report FIRST (an atomic rename into `~/.spo-reports/in-progress/`, same primitive
+   │  state-machine.js's takeNextTask uses for queue/) so the daemon's own timer and a hand-run
+   │  `spo triage` can never both pay for and act on the SAME report -- see "The claim mutex"
+   │  below. Routes on `kind` (threaded through from report-card.js's own header via the
+   │  report-intake/report-confirmed journal events):
    │    kind !== 'suggestion' -- intake.triageBugReport (reproduce/route/dedup/draft)
    │    kind === 'suggestion' -- buildSuggestionDraft: NO reproduction, no drafting LLM call at
    │       all -- "this works, but could be better" is not a defect to reproduce, and a
@@ -778,6 +879,63 @@ asked for is not this pipeline's call to make silently. Only `duplicate` and a s
 mechanical failure at any stage (bad account, bad JSON, a failed `gh`/`npm` call) leaves the
 report queued/pending, retried next cycle -- never journaled as triaged or held.
 
+**The claim mutex (action 2.6).** Before this, nothing stopped the daemon's own `autoTriageMs`
+timer and a hand-run `spo triage` from finding the SAME confirmed report at the same time: both
+would spend a full `triageBugReport` reproduction and both would act on the result --
+`findConfirmedAwaitingTriage`'s "confirmed, no later triaged/held" journal scan only sees the
+TERMINAL events, which land after the LLM call returns, so for the whole duration of that call
+(minutes, for a real reproduction) the report still looked eligible to a second scanner.
+Measured: report #443 was filed AND held 20 seconds apart, and the resulting PR #447 had to be
+closed by hand.
+
+The fix is `auto-triage.js`'s `processConfirmedReport`: it claims `entry.pendingPath` with one
+atomic `fs.renameSync` into `~/.spo-reports/in-progress/` -- the identical primitive
+`state-machine.js`'s `takeNextTask` already uses to claim a `queue/` entry -- BEFORE
+`routeConfirmedReport` gets anywhere near an LLM call. `rename()` is atomic: exactly one caller's
+rename succeeds, every other caller racing the same `pendingPath` gets `ENOENT` (its source
+vanished under it) and returns `{ok: true, outcome: 'already-claimed'}` -- no `triageBugReport`
+call, no journal write, no crash. A dry run (`opts.dry`) claims nothing at all, by design: a
+preview must never block the real run. Whatever the routed outcome does NOT archive itself
+(`filed`/`duplicate` move the file to `archive/`; everything else -- `held`, `DO_NOT_FILE`, any
+mechanical failure -- leaves it exactly where it was) is restored to its original `pending/` path
+once `processConfirmedReport` returns, so the "recoverable, not stranded" behaviour the table
+above describes is unchanged; the file is just routed through `in-progress/` on the way.
+
+Every claim is journaled as `report-triage-claimed` (`{issue, path}`) -- a trace in
+`daemon.jsonl` for anyone reading it, though note **no CLI or dashboard surfaces it yet**:
+`spo reports` scans only `pending/`, and `console/collect.js` ignores both new events, so a
+report sitting in `in-progress/` is visible only via `ls ~/.spo-reports/in-progress/`. Surfacing
+it belongs with the `spo status` work in chantier 5. `findConfirmedAwaitingTriage`'s own
+"handled" rule is unchanged (it still only checks `report-triaged`/`report-held`); the claim
+event is purely informational, the rename itself is the real gate.
+
+**Crash recovery.** A process that dies mid-triage (a killed daemon, a killed `spo triage
+--file`) strands its claim in `in-progress/` forever unless something sweeps it back --
+`reclaimStaleClaims` does, once at the top of every REAL `runAutoTriage` cycle (tied to the same
+timer that would otherwise process it, rather than only at daemon startup the way
+`orphan-scan.js` sweeps a crashed task's `state.json` -- this daemon can run for days between
+restarts, so waiting for the next one would leave a confirmed report's claim stuck far longer
+than acceptable). It reuses that exact precedent rather than inventing a third "is this stuck"
+pattern: a `<file>.claim.json` sidecar records `{pid, host, claimedAt}`; a claim is reclaimed
+only once its owner's pid is dead on this host (`lock.js`'s own `processAlive` liveness probe --
+same idiom `orphan-scan.js` already uses) AND `claimedAt` is older than
+`config.triageClaimGraceMs` (default 4 minutes, same value and same purpose as `orphanGraceMs`)
+-- a claim whose owner is merely slow (a real Opus reproduction) is never touched. A sidecar that
+can't be read at all (a crash inside the tiny window between the rename and the sidecar write)
+falls back to the claimed file's own mtime under the identical grace window -- which works only
+because `claimReport` stamps that mtime at claim time. `fs.renameSync` preserves mtime, and a
+report file is named for when the player filed it and then waits in `pending/` for a human
+confirm, so without the stamp every fresh claim would read as instantly stale and a sweep could
+reclaim a LIVE claim out from under its owner, re-opening the double-triage this whole mechanism
+prevents. Above all of that sits an absolute ceiling (15x the grace window): a claim whose pid
+cannot be probed at all -- a foreign hostname after a WSL/container rebuild -- is reclaimed
+regardless, because a report a human explicitly confirmed becoming permanently invisible is a
+worse failure than one duplicated triage. Positive liveness evidence still wins at any age: a
+live pid on this host is never swept. A reclaim is
+journaled as `report-triage-reclaimed` (`{file, owner}`); the report then looks exactly as it did
+before the crash -- still `report-confirmed`, never `report-triaged`/`report-held` -- so the next
+cycle picks it up and retries it normally.
+
 **"The one rule", worked through concretely.** None of `report-intake.js`/`auto-triage.js` ever
 reads report *content* (no `profile`/`anchor`/`journal`/`geometry` field is parsed in this repo).
 Rendering the RAW card -- the one step that necessarily needs that content -- lives beside the
@@ -802,15 +960,22 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- not `"Parked"`, see `report-intake.js`'s header on `board-move.sh`'s driver-scope disarm |
 | `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
+| `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |
+| `commentScanMaxPages` | 20 (`SPO_COMMENT_SCAN_MAX_PAGES`) | action 2.7 -- the sane bound on `comment-scan.js`'s pagination (20 * 100/page = 2000 comments) shared by BOTH `unparkScan` and `reportConfirmScan`; hitting it is journalled distinguishably from "no reply" (`unpark-scan-truncated` / `report-confirm-scan-truncated`) |
 | `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
+| `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs` |
 
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
 `report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
-`report-discarded` (stage 2), `report-triaged` / `report-held` / `auto-triage` /
-`report-triage-retry` / `report-triage-cooldown` (stage 3) -- all to `journal/daemon.jsonl`, the
+`report-discarded` (stage 2 outcomes) / `report-confirm-scan-truncated` / `report-confirm-scan-
+ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan.js facts, action
+2.7 -- `comment-scan-collaborators-unreadable` / `comment-scan-collaborators-stale` are shared
+with `unparkScan` and carry a `scanner` field instead), `report-triaged` / `report-held` / `auto-triage` /
+`report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
+`report-triage-reclaimed` (stage 3) -- all to `journal/daemon.jsonl`, the
 same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
 disposed of at least one report **or** hit at least one mechanical error (with
 `errorIssues`/`firstError`, truncated to 300 chars); a cycle with nothing confirmed journals
@@ -954,10 +1119,14 @@ always spawns the real binaries on `PATH`.
 
 The daemon refuses to start if another daemon already holds the same journal root
 (`orchestrator/lock.js`): one JSON file at `<journalRoot>/daemon.lock` — `{host, pid,
-startedAt, mode}`, created atomically with `open(..., 'wx')` — acquired in `daemon.js` right
-after the directories exist, released on exit and on SIGINT/SIGTERM. A second daemon on the
-same root exits 1 naming the holder; the likely collision is a hand-run
-`node orchestrator/daemon.js --real` while the systemd unit is up.
+startedAt, mode}`, created atomically via write-tmp (same directory) + `link` (exclusive-create:
+`link` fails if the target already exists, the same semantics a bare `open(..., 'wx')` gave
+before action 2.5 — that version created an empty file first and wrote its content in a second
+syscall, so a reader in that window could see an existing-but-unparsable lock and wrongly treat
+a just-created live lock as stale) — acquired in `daemon.js` right after the directories exist,
+released on exit and on SIGINT/SIGTERM. A second daemon on the same root exits 1 naming the
+holder; the likely collision is a hand-run `node orchestrator/daemon.js --real` while the
+systemd unit is up.
 
 Why it exists: `takeNextTask`'s rename is atomic, so a contended task never runs twice — but
 the losing daemon's `fs.renameSync` throws ENOENT, which (per `park-signal.js`'s catch-all
@@ -996,12 +1165,22 @@ comment, so `unparkScan`'s existing round trip picks the task straight back up �
 `state.json`/`journal.jsonl` edit, no fabricated comment, the way recovering card #385 required
 by hand on 2026-08-30.
 
-The scan runs unconditionally once at every daemon startup (the case that actually matters —
-crash, then a systemd restart) and again on its own timer inside `runForever`'s real-mode loop
-(`config.orphanScanMs`, default 60s), ahead of `unparkScan` so a reparked task is retryable the
-very next cycle. An owner-less or foreign-host `state.json` (an older build, or a task genuinely
-owned by another machine) is left alone and logged, never guessed at — a false-positive reparking
-would put two writers on the same task directory, worse than the status quo.
+The scan runs unconditionally once at every daemon startup, in every mode (the case that
+actually matters — crash, then a systemd restart), and again on its own timer inside
+`runForever`'s real-mode loop (`config.orphanScanMs`, default 60s), ahead of `unparkScan` so a
+reparked task is retryable the very next cycle. What the scan *does* is mode-gated, though:
+`isRealMode(ctx)` (the same check `finalizePark`'s other real-only side effects use) decides
+whether a detected orphan is actually reparked. `--real` reparks for real, exactly as described
+above. `--shadow`/`--dry-run` never spawn a real command, so a park they wrote would carry no
+board move, no gh park comment and no unpark anchor — invisible to both the maintainer and
+`unparkScan` forever, silently burying a real card under a developer's local experiment. They
+instead only detect the orphan and journal one `orphan-scan-would-repark` line to
+`daemon.jsonl` (nothing under the task's own `journal/<id>/` is touched, so the task is exactly
+where a `--real` start would still find it) — enough for a `--dry-run` start to report what a
+real start would have recovered, without the risk. An owner-less or foreign-host `state.json`
+(an older build, or a task genuinely owned by another machine) is left alone and logged, never
+guessed at — a false-positive reparking would put two writers on the same task directory, worse
+than the status quo.
 
 A park produced this way also runs through `steps/scripted.js`'s `preserveWorktreeWip` if the
 task's worktree is still on disk and dirty: it commits the tree (`wip(<id>): parked -- <reason>`)
@@ -1020,6 +1199,137 @@ it's an ancestor of one of this task's own `refs/remotes/origin/wip/<id>-*` refs
 commit the pipeline made and saved durably itself, not a mystery local one. Together these two
 changes close the loop card #385 hit: four identical `branch-unmerged-leftover` parks, each one
 parking on the WIP commit the previous park's own preservation had just made.
+
+## Recette
+
+`spo recette [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>]
+[--cap-llm-steps <n>]` — ACTION 2.9, `orchestrator/recette.js` — the supervised **live** harness:
+drives one trivial, synthetic `kind: "card"` task through the real pipeline (`config.real = true`,
+the same code path a live `daemon.js --real` uses) against a dedicated GitHub issue in the product
+repo, under a cap, asserted against its own journal, cleaned up unconditionally. **This is the
+standard live gate for every chantier from 3 on** — action 7.2 adds a second scenario to it rather
+than inventing a new tool. Never run against the live daemon's own `journal/`/`queue/` — see
+"Isolation" below.
+
+Why this exists, in one line: shadow mode and `--dry-run` prove the state machine's own logic;
+nothing before this proved that a real card, run for real, actually produces the journal a judge
+was supposed to see.
+
+**Isolation.** Its own journal root and queue directory, `.recette/<runId>/{journal,queue}/`
+(`<runId>` = `<epoch-ms>-<pid>`) — never the live `journal/`/`queue/` the daemon holds
+`daemon.lock` on (orchestrator/lock.js). `.recette/` is gitignored. `--keep` leaves the run
+directory behind for a maintainer to inspect by hand; without it, cleanup removes it.
+
+**The dedicated test issue.** One GitHub issue, created fresh every run, labelled `spo-recette`
+— distinct enough that no human mistakes it for real backlog work. The label does not drive
+cleanup (cleanup always acts on the exact issue number this run just created, in-process, never a
+search) — it is the human safety net for the case cleanup itself does not finish. Create it once,
+by hand, before the first live run:
+
+```bash
+gh label create spo-recette --repo Crazz-Org/SPO-WebClient --color 5319e7 \
+  --description "synthetic card created by spo recette -- never real backlog work"
+```
+
+One risk this build could not verify from a read-only pass of `~/SPO-WebClient`: whether the
+product repo's board automation adds a freshly created issue to the project board at all (the
+same automation `orchestrator/intake.js`'s `fileCard` relies on). If it does not,
+`npm run board:take` (WORKTREE's own claim) can fail `claim-lost`/`claim-unrecognized-exit` on the
+very first live run — a park, not a crash, and cleanup still runs regardless — but worth
+verifying by hand first.
+
+**The scenario.** `trivial-doc-log` (the only one shipped with this action) asks IMPLEMENT to
+append exactly one line to `doc/recette-log.md` in the product repo — a **docs-only** change,
+deliberately: reading `~/SPO-WebClient`'s own scripts (2026-08-31) confirmed `npm run typecheck`
+(four `tsc --noEmit` passes over named project files) and `npm run lint` (`eslint .`, but every
+rule block in `eslint.config.js` is scoped to `src/**` / `scripts/**`) both never look at a `.md`
+file at all, and `npm run coverage:changed` (`scripts/coverage-changed.js`) restricts itself to
+`src/**/*.ts(x)` — a docs-only diff has zero eligible files, so it takes the script's own
+"no eligible source file changed — running the suite, nothing to measure" branch: the full Jest
+suite runs once, and the check passes exactly when that suite is green. GATE receives the same
+diff CHECK already passed — the smallest, least surprising input the bench can be asked to judge.
+See `orchestrator/recette.js`'s own comment above `RECETTE_DOC_FILE` for the full reasoning.
+
+**Scenarios are data.** `recette.js`'s `SCENARIOS` is a plain object, `{name, label, buildCard(ctx),
+assertions: [...]}` per entry — the runner (`runRecette`) is generic over any entry shaped that
+way. Adding a second scenario (action 7.2) means adding a second object literal, never touching
+`runRecette`, `evaluateAssertions`, or the cleanup logic.
+
+**The cap.** The remediation plan's "capped budget" predates this project retiring dollars as a
+metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent, honestly-enforceable
+bounds, both checked at the one choke point every real spawn (scripted **and** `claude -p`, per
+`steps/llm.js`'s `invokeClaudeReal`) already passes through: `deps.spawnSync`.
+
+- **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
+  spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
+  child. Combined with the existing per-command-class timeouts (`config.commandTimeoutsMs`), the
+  true worst-case overrun above the cap is bounded by the single longest command timeout in
+  flight when the cap is crossed (today, `npm-gate`'s 7800s) — this is "abort at the next
+  opportunity", not "abort within `capMs` of the wall clock". It always terminates and always
+  cleans up; it never hangs.
+- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Every real LLM
+  call in this codebase spawns literally `claude`, so this is an exact count, not a heuristic —
+  checked, and enforced, **before** the over-cap call spawns at all. 12 comfortably covers a
+  trivial card's own budgets (`diagnoseBudget` 3, `validateRejectBudget` 3) stacked on the 3-call
+  happy path (PLAN, IMPLEMENT, VALIDATE).
+
+Either bound tripping throws `RecetteCapExceededError` — deliberately **not** a `ParkSignal`
+(state-machine.js's `runTask` only catches `ParkSignal`; anything else propagates, "a real bug —
+surface it, do not disguise it as a park"), so it surfaces straight out of `drainQueueOnce`.
+`runRecette`'s own `try/catch` treats it as a tripped run, never a crash reported to the caller,
+and cleanup runs in the enclosing step regardless.
+
+**The assertions.** Reaching `DONE` proves far less than proving the judges ran on real inputs.
+`trivial-doc-log`'s own assertion set (`orchestrator/recette.js`) checks, against the produced
+journal: no park; `DONE` reached; PLAN actually wrote `plan-<issue>.md`/`invariants-<issue>.md`
+(not the "no fixture" shortcut); IMPLEMENT reported a non-empty `files_changed`; **VALIDATE's own
+judge inputs actually included `diff.patch`** (`judge-inputs-prepared`, action 1.3) — the assertion
+that would catch a judge silently receiving nothing to judge; the change-validator actually
+rendered `PASS`/`PASS_WITH_FINDINGS`; MERGE actually enqueued the PR; FINISH recorded a PR number.
+Each assertion is `{id, description, check(info) -> {ok, detail}}` and never throws — one broken
+event fails only its own assertion, so the report always shows the rest.
+
+**Safety: refuses while a live daemon is running.** There is no product-repo mutex until chantier
+6 action 6.4 (`config.js`'s own note on the 44-worktree/61-branch incident this project already
+paid for once) — the only guard today is refusing to *start* while a live daemon holds **its own**
+lock file, `<repoRoot>/journal/daemon.lock` (`orchestrator/lock.js`). Checked read-only (recette
+reads the lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does —
+it never calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly,
+for a maintainer who has confirmed by hand that nothing is actually running. This is a best-effort
+check, not a mutex: it catches "I forgot the daemon is running", not a daemon that starts a second
+after the check passes.
+
+**`--dry`** resolves the exact same config `--force`-free real run would (one function,
+`buildPlan`, feeds both paths so they cannot structurally diverge), prints it, and returns before
+the safety check, before any issue is created, before any directory is written, before any spawn
+— nothing runs.
+
+**Cleanup runs on every exit path** — success, a park, a thrown error, a tripped cap — never
+throws, and is idempotent (every step tolerates "already gone": `git worktree remove`/`branch -D`/
+`push --delete` against something that never existed, or was already removed by a **successful**
+run's own FINISH step, just report a non-zero exit, never throw). In order: `git worktree remove
+--force` + `git worktree prune`, delete the local branch (`branch -D`), delete the remote branch
+(`push origin --delete`), **delete every `wip/<taskId>-<ts>` ref this run pushed to origin**,
+`gh pr close` (skipped if no PR number was ever recorded), `gh issue close`, remove
+`.recette/<runId>/`. `--keep` skips all of it.
+
+The `wip/` step is not hypothetical bookkeeping: a **park** — the most likely first-live-run
+outcome — makes `steps/scripted.js`'s `preserveWorktreeWip` push the dirty worktree to a durable
+`wip/<taskId>-<ts>` branch **on origin**, in a namespace the `claude-pipe/<taskId>` delete above
+deliberately does not touch (`sweepWorktreeLeftovers` rule 2 depends on that separation). Without
+its own step, every parked recette run would leave one remote branch behind in the product repo,
+permanently — exactly the artifact class `config.js`'s 44-worktree/61-branch note exists to
+prevent. The refs are read back off the run's own journal (`wip-preserved` /
+`leftover-wip-preserved`, both journaled immediately after their push returns 0), because the
+`Date.now()` suffix in the ref name is only knowable there. **On partial failure**: every step
+runs regardless of whether an earlier one failed (`cleanup()`'s own per-step `try/catch`, never a
+short-circuit); the run's own report lists which steps were not clean, by name, so a maintainer
+knows exactly what (if anything) still needs a hand — see `spo recette`'s own printed `cleanup:`
+line.
+
+**Exit code is the verdict** (CLAUDE.md: "Verdict by exit code, never by reading text output") —
+`0` only when the run completed **and** every declared assertion passed; a refusal, a tripped cap,
+a park, or a failed assertion are all `1`.
 
 ## Running as a service
 
@@ -1158,6 +1468,12 @@ journal/<id>/
   report.md       written once, only if the task ends PARKED
 ```
 
+`state.json` is the file `orphan-scan.js` reads at every daemon startup to decide whether a task
+is orphaned, so `journal.js`'s `writeState` writes it via tmp-file-then-`rename` (same directory,
+atomic within a filesystem) rather than a single `fs.writeFileSync` — a crash or `kill -9`
+mid-write can no longer leave a truncated, unparsable `state.json` behind for a real in-flight
+task (action 2.5).
+
 `bin/spo` reads only these files (plus `queue/` for depth) — it holds no state of its own.
 
 ## CLI
@@ -1179,6 +1495,7 @@ bin/spo pull-reports                               # STAGE 0: pull queued report
 bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
+bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised live harness -- one trivial synthetic card, real mode (see "Recette" above)
 ```
 
 ## Dashboard
@@ -1282,7 +1599,11 @@ piloting's own tests follow the same convention one layer up: `test/board-move.t
 `board.js`'s `moveCard` directly plus `HANDLERS.IMPLEMENT`/`HANDLERS.VALIDATE`'s real-mode move
 (via `buildCtx`'s `config.deps`, since neither state has a `realX(ctx, deps)` split of its own);
 `test/park-loop.test.js` covers the park comment's content and the PARKED round trip via
-`runTask` directly, plus `unparkScan`'s retry/abandon/idempotency; `test/auto-pull.test.js`
+`runTask` directly, plus `unparkScan`'s retry/abandon/idempotency and (action 2.7) its own
+collaborator-allowlist/pagination/backoff integration on top of `comment-scan.js`;
+`test/comment-scan.test.js` covers that shared module directly -- pagination across pages and its
+bound, the collaborator cache's fail-open/stale decisions, and per-issue backoff -- independent of
+either caller; `test/auto-pull.test.js`
 covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
 enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
 `isSafeReportFilename`/`readPullToken`, the list->fetch->land->ack wiring via an injected
@@ -1290,10 +1611,20 @@ enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRem
 skipped" and "local-but-unacked file retries the ack only" idempotency cases) -- no real socket is
 ever opened; `test/report-intake.test.js` covers stages 1-2 of the human-first bug-report
 pipeline (`shouldAutoIntake`/`shouldScanConfirms`, `parseCardOutput`, the mechanical dedup, the
-confirm/discard comment scan's anchor logic); `test/auto-triage.test.js` covers stage 3
+confirm/discard comment scan's anchor logic, and -- same as `test/park-loop.test.js` -- action
+2.7's collaborator-allowlist/pagination/backoff integration on the shared `comment-scan.js`);
+`test/auto-triage.test.js` covers stage 3
 (`shouldAutoTriage`, `findConfirmedAwaitingTriage`, `processConfirmedReport`'s outcome routing --
 including the "a negative outcome after confirm is HELD, never archived" rule -- and the dry/real
 split); `test/spo-triage.test.js` covers `cmdPullReports`/`cmdIntake`/`cmdReports`/`cmdTriage`'s
 flag wiring, same convention as `test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage (which also covers
-`amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). None of them ever touch a real
+`amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). `test/recette.test.js` covers the
+live harness (action 2.9, "Recette" above) the same way: `--dry`'s zero-side-effects guarantee,
+the daemon-lock refusal and its `--force` override, a full real-mode happy path to `DONE` through
+an injected `spawnSync` covering every git/gh/npm/`claude` call the `trivial-doc-log` scenario
+makes (including recette's own issue creation and cleanup), both caps tripping mid-run and still
+cleaning up, cleanup's idempotency (including when the injected `spawnSync` itself throws), and
+`evaluateAssertions` as a pure function -- including the one that hands it a `DONE` journal
+missing a required event and confirms the assertion set actually catches it, never rubber-stamping
+a run that merely reached `DONE`. None of them ever touch a real
 `git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.

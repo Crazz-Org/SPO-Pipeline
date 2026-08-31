@@ -260,6 +260,99 @@ test('runTask: config.lockLost() true throws LockLostError before any handler ru
   assert.equal(state.state, 'INTAKE'); // the pre-loop snapshot only -- never overwritten to PARKED
 });
 
+// ---- action 2.5: atomic create (write-tmp + link, replacing a bare open(..., 'wx')) -----------
+//
+// The bug being fixed: 'wx' creates an EMPTY file, then a second syscall writes the content --
+// a concurrent reader in that window sees a file that EXISTS but does not parse, which
+// readHolder() treats as stale, so a starter could sweep and take over a lock another live
+// daemon had just that instant created. These tests assert the actual observable contract: once
+// the lock file exists at all, it is always complete JSON, and no tmp file is left behind.
+
+test('acquireLock: the lock file, once it exists, always parses (never readable-but-empty)', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  acquireLock(root, 'real');
+  const file = lockPath(root);
+  assert.equal(fs.existsSync(file), true);
+  // Would throw if the file were empty or partial -- this is the actual bug the action fixes.
+  const holder = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(holder.pid, process.pid);
+});
+
+test('acquireLock: no leftover tmp file in the journal root after a clean acquire', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  acquireLock(root, 'real');
+  const leftovers = fs.readdirSync(root).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftovers, []);
+});
+
+test('acquireLock: no leftover tmp file after a stale-sweep takeover (two tryCreate passes)', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  acquireLock(root, 'real', { isAlive: () => true });
+  acquireLock(root, 'real', { isAlive: () => false }); // sweeps the first, creates its own
+  const leftovers = fs.readdirSync(root).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftovers, []);
+});
+
+test('acquireLock: no leftover tmp file when the second acquire loses to a live holder (LockHeldError)', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  acquireLock(root, 'real', { isAlive: () => true });
+  assert.throws(() => acquireLock(root, 'real', { isAlive: () => true }), LockHeldError);
+  const leftovers = fs.readdirSync(root).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftovers, []);
+});
+
+test('acquireLock: exclusive-create still holds -- a second acquire against a live lock fails', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  const first = acquireLock(root, 'real', { isAlive: () => true });
+  assert.throws(
+    () => acquireLock(root, 'real', { isAlive: () => true }),
+    (err) => {
+      assert.ok(err instanceof LockHeldError);
+      assert.equal(err.holder.pid, first.holder.pid);
+      return true;
+    }
+  );
+});
+
+test('acquireLock: the file content is byte-identical to the pre-fix shape (same keys, pretty JSON + trailing newline)', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  acquireLock(root, 'shadow');
+  const raw = fs.readFileSync(lockPath(root), 'utf8');
+  assert.match(raw, /\n$/);
+  const parsed = JSON.parse(raw);
+  assert.deepEqual(Object.keys(parsed).sort(), ['host', 'mode', 'pid', 'startedAt'].sort());
+  // Pretty-printed with 2-space indent, same as JSON.stringify(payload, null, 2) always produced.
+  assert.equal(raw, JSON.stringify(parsed, null, 2) + '\n');
+});
+
+test('acquireLock: link() publishes the name only once the content is already complete, from the same directory', () => {
+  const root = mkTmp('spo-lock-atomic-');
+  // The four tests above assert what is true AFTER acquireLock returns -- which the old
+  // open(..., 'wx') + writeSync implementation also satisfied. This one asserts the property that
+  // actually changed: at the instant the lock NAME appears, the bytes behind it are already
+  // complete JSON. Spying on linkSync is the only way to observe that window without a second
+  // process. It also pins the tmp file to the lock's own directory: linkSync is not cross-device,
+  // so a tmp in os.tmpdir() would throw EXDEV -- and refuse to start the daemon -- on any machine
+  // where /tmp is a separate filesystem, while passing every other test in this file.
+  const origLink = fs.linkSync;
+  const calls = [];
+  fs.linkSync = (src, dest) => {
+    calls.push({ src, dest, srcContent: fs.readFileSync(src, 'utf8'), destExisted: fs.existsSync(dest) });
+    return origLink(src, dest);
+  };
+  try {
+    acquireLock(root, 'real');
+  } finally {
+    fs.linkSync = origLink;
+  }
+
+  assert.equal(calls.length, 1); // 0 here means the exclusive-create is no longer link-based
+  assert.equal(calls[0].dest, lockPath(root));
+  assert.equal(path.dirname(calls[0].src), root); // same filesystem, or link() throws EXDEV
+  assert.equal(calls[0].destExisted, false); // the name did not exist an instant before it did
+  assert.equal(JSON.parse(calls[0].srcContent).pid, process.pid); // complete BEFORE it is named
+});
+
 test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook)', async () => {
   const queueDir = mkTmp('spo-lock-q-');
   const journalDir = mkTmp('spo-lock-j-');

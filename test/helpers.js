@@ -16,6 +16,19 @@ function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// action 2.1b -- what Node's real spawnSync actually returns when its own `timeout` option kills
+// the child: BOTH `signal` (the kill signal) AND `error` (an Error with `.code === 'ETIMEDOUT'`)
+// are set, `status` is null. Same shape steps/scripted.js's spawnOnce and steps/llm.js's
+// invokeClaudeReal both learned to expect the hard way (card #449) -- test/real-steps.test.js
+// keeps its own local copy (predates this helper); every OTHER test file that exercises one of
+// the newly-bounded spawns (board.js/park-loop.js/report-intake.js/intake.js's own runSync)
+// shares this one instead of growing four more near-identical copies.
+function timeoutResult(signal = 'SIGTERM') {
+  const error = new Error(`spawnSync ${signal} ETIMEDOUT`);
+  error.code = 'ETIMEDOUT';
+  return { status: null, stdout: '', stderr: '', signal, error };
+}
+
 function writeTask(queueDir, filename, taskObj) {
   fs.mkdirSync(queueDir, { recursive: true });
   fs.writeFileSync(path.join(queueDir, filename), JSON.stringify(taskObj, null, 2));
@@ -41,9 +54,25 @@ function writePoolDir(poolDir, entries) {
   return poolDir;
 }
 
+// Every daemon subprocess this suite starts is pointed at a THROWAWAY product repo and worktrees
+// dir. No test should ever reach realWorktree -- but a mutation that makes shadow mode take a
+// real path can, and then the fixture task ids become real git worktrees and branches in the
+// maintainer's live ~/SPO-WebClient. That is not hypothetical: a mutation-testing round on
+// 2026-08-31 left 44 worktrees and 61 branches there, and since `worktrees/` is gitignored it was
+// invisible to `git status` while breaking bare `node --test` with ~13k foreign test failures.
+// Isolation belongs here, in the one place every daemon subprocess goes through, rather than in
+// each test remembering to override two config keys.
+function isolatedEnv() {
+  return {
+    ...process.env,
+    SPO_PRODUCT_REPO: mkTmp('spo-isolated-product-'),
+    SPO_WORKTREES_DIR: mkTmp('spo-isolated-worktrees-'),
+  };
+}
+
 function runDaemonOnce(queueDir, journalDir, extraArgs = []) {
   const args = [DAEMON, '--shadow', '--once', '--queue', queueDir, '--journal', journalDir, ...extraArgs];
-  return execFileSync(process.execPath, args, { encoding: 'utf8' });
+  return execFileSync(process.execPath, args, { encoding: 'utf8', env: isolatedEnv() });
 }
 
 // Same as runDaemonOnce but real-mode semantics without spawning (--dry-run instead of
@@ -51,11 +80,11 @@ function runDaemonOnce(queueDir, journalDir, extraArgs = []) {
 // real `claude` CLI or any scripted command.
 function runDaemonDryRun(queueDir, journalDir, extraArgs = []) {
   const args = [DAEMON, '--dry-run', '--once', '--queue', queueDir, '--journal', journalDir, ...extraArgs];
-  return execFileSync(process.execPath, args, { encoding: 'utf8' });
+  return execFileSync(process.execPath, args, { encoding: 'utf8', env: isolatedEnv() });
 }
 
 function runSpo(args) {
-  return execFileSync(process.execPath, [SPO_BIN, ...args], { encoding: 'utf8' });
+  return execFileSync(process.execPath, [SPO_BIN, ...args], { encoding: 'utf8', env: isolatedEnv() });
 }
 
 function readJournal(journalDir, id) {
@@ -90,4 +119,5 @@ module.exports = {
   readJournal,
   readState,
   readLedger,
+  timeoutResult,
 };
