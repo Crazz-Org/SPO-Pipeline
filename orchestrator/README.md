@@ -1039,10 +1039,14 @@ always spawns the real binaries on `PATH`.
 
 The daemon refuses to start if another daemon already holds the same journal root
 (`orchestrator/lock.js`): one JSON file at `<journalRoot>/daemon.lock` — `{host, pid,
-startedAt, mode}`, created atomically with `open(..., 'wx')` — acquired in `daemon.js` right
-after the directories exist, released on exit and on SIGINT/SIGTERM. A second daemon on the
-same root exits 1 naming the holder; the likely collision is a hand-run
-`node orchestrator/daemon.js --real` while the systemd unit is up.
+startedAt, mode}`, created atomically via write-tmp (same directory) + `link` (exclusive-create:
+`link` fails if the target already exists, the same semantics a bare `open(..., 'wx')` gave
+before action 2.5 — that version created an empty file first and wrote its content in a second
+syscall, so a reader in that window could see an existing-but-unparsable lock and wrongly treat
+a just-created live lock as stale) — acquired in `daemon.js` right after the directories exist,
+released on exit and on SIGINT/SIGTERM. A second daemon on the same root exits 1 naming the
+holder; the likely collision is a hand-run `node orchestrator/daemon.js --real` while the
+systemd unit is up.
 
 Why it exists: `takeNextTask`'s rename is atomic, so a contended task never runs twice — but
 the losing daemon's `fs.renameSync` throws ENOENT, which (per `park-signal.js`'s catch-all
@@ -1242,6 +1246,12 @@ journal/<id>/
   state.json      current state + counters, overwritten every transition
   report.md       written once, only if the task ends PARKED
 ```
+
+`state.json` is the file `orphan-scan.js` reads at every daemon startup to decide whether a task
+is orphaned, so `journal.js`'s `writeState` writes it via tmp-file-then-`rename` (same directory,
+atomic within a filesystem) rather than a single `fs.writeFileSync` — a crash or `kill -9`
+mid-write can no longer leave a truncated, unparsable `state.json` behind for a real in-flight
+task (action 2.5).
 
 `bin/spo` reads only these files (plus `queue/` for depth) — it holds no state of its own.
 

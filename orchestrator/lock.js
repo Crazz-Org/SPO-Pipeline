@@ -10,8 +10,9 @@
 // accident is not two systemd units (systemd itself prevents that): it is a hand-run
 // `node orchestrator/daemon.js --real` in a terminal while the unit is up.
 //
-// SHAPE: one JSON file at <journalRoot>/daemon.lock, created with open(..., 'wx') -- atomic:
-// exactly one creator wins -- holding {host, pid, startedAt, mode}. Scoped to the journal
+// SHAPE: one JSON file at <journalRoot>/daemon.lock, created by write-tmp + link() -- atomic:
+// exactly one creator wins, and the name never exists holding anything but the finished JSON
+// (see tryCreate) -- holding {host, pid, startedAt, mode}. Scoped to the journal
 // root, not the process, so the test suite's daemons on fs.mkdtempSync temp dirs never
 // collide with a live daemon on the repo's own journal/.
 //
@@ -19,12 +20,13 @@
 // a lock whose pid is no longer alive on this host is taken over -- same liveness probe as
 // the bench worker's processAlive (SPO-WebClient src/e2e/bench/paths.ts): process.kill(pid, 0).
 // The takeover is returned to the caller (daemon.js journals it as a `lock-stale-taken`
-// daemon event). If two starters race for the same stale lock, the unlink+'wx' retry lets
-// exactly one win; the other sees the winner's fresh, alive lock and refuses normally.
+// daemon event). If two starters race for the same stale lock, the unlink + exclusive-create
+// retry lets exactly one win; the other sees the winner's fresh, alive lock and refuses normally.
 //
 // `deps.isAlive` is the test-only override, same convention as steps/scripted.js's
 // deps.spawnSync: production code never passes it.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -74,19 +76,35 @@ function processAlive(pid) {
   }
 }
 
-// One 'wx' attempt. Returns true when this process created the file.
+// One exclusive-create attempt. Returns true when this process created the file.
+//
+// Was a bare `open(..., 'wx')`: atomic, but it creates an EMPTY file and the content lands in a
+// second syscall -- a concurrent reader in that window sees a file that exists but doesn't parse,
+// which readHolder() below treats as "stale" (line 98's comment), so a starter could sweep and
+// take over a lock another live daemon had just this instant created. Write-tmp-then-link keeps
+// the same exclusive-create semantics (link() fails EEXIST if the target is already there, same
+// as 'wx' did) while making the moment the file becomes visible under `file` the same moment it
+// is already fully-formed JSON: linkSync's target is only ever the finished tmp file's content.
+// The tmp file lives in the SAME directory as `file` (same filesystem -- link() is not atomic
+// across filesystems), named with this process's pid plus a random suffix so two attempts, even
+// from the same process's own stale-sweep retry, never collide.
 function tryCreate(file, payload) {
-  let fd;
+  const dir = path.dirname(file);
+  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  const content = JSON.stringify(payload, null, 2) + '\n';
+  fs.writeFileSync(tmp, content);
   try {
-    fd = fs.openSync(file, 'wx');
+    fs.linkSync(tmp, file);
   } catch (err) {
     if (err && err.code === 'EEXIST') return false;
     throw err;
-  }
-  try {
-    fs.writeSync(fd, JSON.stringify(payload, null, 2) + '\n');
   } finally {
-    fs.closeSync(fd);
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // Already gone (link succeeded and we're cleaning up the now-redundant tmp name), or
+      // never created -- either way there's nothing left to remove.
+    }
   }
   return true;
 }

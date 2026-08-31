@@ -180,3 +180,39 @@ test('hasCredentials: true when the account dir holds any other file (real claud
   writePoolDir(dir, [{ name: 'acct-a', extraFile: '.credentials.json' }]);
   assert.equal(accounts.hasCredentials(path.join(dir, 'acct-a')), true);
 });
+
+// The pool's state.json holds every cooldown. readState treats an unparsable file as "nobody has
+// ever hit a limit yet" and returns {}, so a torn write does NOT fail loudly -- it silently wipes
+// the cooldowns, handing work straight back to a rate-limited account. That is the loop action
+// 3.6 exists to end, and it would resurface as an unexplained rate-limit park. So the write has
+// to be atomic: a reader sees the whole old state or the whole new one, never a truncation.
+test('markLimit: state.json is published by rename, from a tmp inside the pool dir -- never a partial write', () => {
+  const poolDir = mkTmp('spo-accounts-atomic-');
+  writePoolDir(poolDir, [{ name: 'pool1', oauthToken: 'tok' }, { name: 'pool2', oauthToken: 'tok' }]);
+
+  const realRename = fs.renameSync;
+  const seen = [];
+  fs.renameSync = (from, to) => {
+    // At the instant the real state.json appears, the source must already be complete JSON --
+    // that is what makes a concurrent reader safe.
+    seen.push({ from, to, source: fs.readFileSync(from, 'utf8'), targetExisted: fs.existsSync(to) });
+    return realRename(from, to);
+  };
+  try {
+    accounts.markLimit(poolDir, 'pool1');
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.equal(seen.length, 1, 'exactly one rename publishes the state');
+  const [pub] = seen;
+  assert.equal(path.dirname(pub.from), poolDir, 'tmp must sit in the pool dir -- rename is only atomic within a filesystem');
+  assert.equal(pub.to, path.join(poolDir, 'state.json'));
+  assert.doesNotThrow(() => JSON.parse(pub.source), 'the tmp is already complete JSON before the rename');
+  assert.ok(JSON.parse(pub.source).pool1.cooldownUntil > 0);
+
+  // No litter, and the cooldown survives a re-read.
+  const litter = fs.readdirSync(poolDir).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(litter, [], 'no tmp file left behind');
+  assert.equal(accounts.pick(poolDir).name, 'pool2', 'pool1 is cooled, so pick falls through');
+});

@@ -190,9 +190,30 @@ function readState(poolDir) {
   }
 }
 
+// Atomic, for the same reason journal.js's writeState is -- but the consequence here is worse.
+// readState above treats an unparsable file as "nobody has ever hit a limit yet" and returns {},
+// so a kill -9 between open and write does not fail loudly: it SILENTLY WIPES every cooldown in
+// the pool. The next pick then hands work straight back to a rate-limited account, which is
+// exactly the loop action 3.6 was written to end, and it would resurface as an unexplained
+// rate-limit park with nothing in the journal to explain it (lock.js's own header names this
+// failure). tmp + rename means a reader sees either the whole previous state or the whole new
+// one, never a truncated file. The tmp sits in poolDir itself because rename is only atomic
+// within a filesystem.
 function writeState(poolDir, state) {
   fs.mkdirSync(poolDir, { recursive: true });
-  fs.writeFileSync(stateJsonPath(poolDir), JSON.stringify(state, null, 2) + '\n');
+  const target = stateJsonPath(poolDir);
+  const tmp = path.join(poolDir, `.state.json.${process.pid}.${Date.now()}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // tmp was never created, or rename already moved it -- nothing to clean up either way.
+    }
+    throw err;
+  }
 }
 
 // First enabled account (registry order = pick order -- no round robin, no load balancing;
