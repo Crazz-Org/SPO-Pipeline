@@ -13,8 +13,20 @@
 //     lists (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
 //     promptText|promptFile, cwd, account, deadlineMs), builds argv, spawns with the resolved
 //     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
-//     sessionId, costUsd, numTurns, raw}. `deps.spawnSync` is an injection point for tests (and
-//     nothing else) -- production code never passes it.
+//     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
+//     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
+//     numTurns, raw}. `deps.spawnSync` is an injection point for tests (and nothing else) --
+//     production code never passes it.
+//
+//     Token accounting (maintainer decision, 2026-08-31): the pool is Claude Max SUBSCRIPTION
+//     accounts with a quota, never metered API billing, so a dollar figure never meant money
+//     spent -- this build carries no cost/$ fields anywhere, only raw token counts extracted
+//     defensively from modelUsage by extractTokens() below. "billable-weighted" = fresh input +
+//     cache-creation + output; cache-READ is reported separately and never folded into that
+//     total (near-free on a quota plan, and it dominates raw counts by orders of magnitude --
+//     see console/usage-scan.js's own header). tokensSource is 'modelUsage' when at least one
+//     recognized field was found, else null -- so a reader can tell "zero tokens" from "not
+//     reported" (a killed/E2BIG call that never got a modelUsage block at all).
 //
 //   runLlm(ctx, stepName, fixtureKey, deps) -- the existing shadow-mode entry point every state-
 //     machine handler already calls. Its shadow branch is untouched. Its real branch has two
@@ -130,15 +142,118 @@ function buildArgv(opts) {
   return argv;
 }
 
-// Sums costUSD across every model entry in modelUsage -- a call can use more than one model
-// (e.g. a fallback), and the spec asks for the total.
-function sumCost(modelUsage) {
-  if (!modelUsage || typeof modelUsage !== 'object') return 0;
-  let total = 0;
-  for (const usage of Object.values(modelUsage)) {
-    if (usage && typeof usage.costUSD === 'number') total += usage.costUSD;
+// Zero-value shape extractTokens returns when modelUsage is absent or carried nothing
+// recognizable -- kept as one literal so every caller's "no tokens" result is byte-identical.
+const ZERO_TOKENS = Object.freeze({
+  tokensSource: null,
+  freshInputTokens: 0,
+  cacheCreationTokens: 0,
+  cacheReadTokens: 0,
+  outputTokens: 0,
+  billableTokens: 0,
+  cacheCreationEphemeral1h: 0,
+  cacheCreationEphemeral5m: 0,
+});
+
+// pickNumber(obj, ...keys) -- returns the first key present on obj whose value is a number, else
+// 0. The dual-spelling defensive read every field below uses: modelUsage is produced by the
+// `claude` CLI itself, never present in the session JSONL, so its exact key casing has no
+// on-disk fixture to verify against. test/llm-real.test.js's own hand-written fixture is
+// camelCase (inputTokens, cacheCreationInputTokens, ...) -- the strongest evidence available for
+// this build -- but the real per-message usage block (verified from a live session file) is
+// snake_case (input_tokens, cache_creation_input_tokens, ...). Both are accepted; a field this
+// build has never seen at all just contributes 0, never throws.
+function pickNumber(obj, ...keys) {
+  for (const key of keys) {
+    if (obj && typeof obj[key] === 'number') return obj[key];
   }
-  return total;
+  return 0;
+}
+
+// extractTokens(modelUsage) -- sums the four billable-accounting fields (plus, best-effort, the
+// ephemeral cache-creation TTL split) across every model entry in modelUsage -- a call can use
+// more than one model (e.g. a fallback), the same reason the old sumCost summed across entries.
+// Never throws: a missing/malformed field or a missing modelUsage entirely all just read as 0.
+//
+// tokensSource is 'modelUsage' the moment ANY recognized field on ANY entry is a number
+// (including a legitimate 0), and stays null only when nothing recognizable was found at all --
+// that is the "zero tokens" vs "not reported" distinction the maintainer asked for (a killed/
+// E2BIG call, or a `claude` build that stops emitting modelUsage, should never silently read as
+// "this call cost nothing").
+//
+// The ephemeral_1h/5m cache-creation split is a separate, best-effort read nested under
+// modelUsage[model].cache_creation / .cacheCreation. No fixture in this repo has ever shown
+// modelUsage carrying it (see test/llm-real.test.js's fixture -- flat fields only), only the raw
+// session JSONL's message.usage.cache_creation block does. These two fields are captured here
+// anyway, on the chance a future/undocumented modelUsage shape carries them, but read back
+// EXACTLY 0/0 in a real smoke run against the live CLI (2026-08-31: fresh 910, cache-creation
+// 8904, cache-read 21478, output 50 all correct, ephemeral 1h/5m both 0). Treat them as
+// STRUCTURALLY 0 from this source, never as "no ephemeral cache was written" -- nothing
+// downstream consumes them (tokens.js does not read them, `spo tokens` does not print them),
+// and computeLikelyCacheExpiries deliberately does not depend on them. The reliable source for
+// this split is a join against the session JSONL
+// by sessionId (console/usage-scan.js already streams that file for other reasons; see
+// orchestrator/tokens.js's own header for why the join, not this call site, is where that
+// actually matters).
+function extractTokens(modelUsage) {
+  if (!modelUsage || typeof modelUsage !== 'object') return { ...ZERO_TOKENS };
+
+  let found = false;
+  let freshInputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
+  let outputTokens = 0;
+  let cacheCreationEphemeral1h = 0;
+  let cacheCreationEphemeral5m = 0;
+
+  for (const usage of Object.values(modelUsage)) {
+    if (!usage || typeof usage !== 'object') continue;
+    const fi = pickNumber(usage, 'input_tokens', 'inputTokens');
+    const cc = pickNumber(usage, 'cache_creation_input_tokens', 'cacheCreationInputTokens');
+    const cr = pickNumber(usage, 'cache_read_input_tokens', 'cacheReadInputTokens');
+    const out = pickNumber(usage, 'output_tokens', 'outputTokens');
+    if (fi !== 0 || cc !== 0 || cr !== 0 || out !== 0) found = true;
+    freshInputTokens += fi;
+    cacheCreationTokens += cc;
+    cacheReadTokens += cr;
+    outputTokens += out;
+
+    const nested = usage.cache_creation || usage.cacheCreation;
+    if (nested && typeof nested === 'object') {
+      const e1h = pickNumber(nested, 'ephemeral_1h_input_tokens', 'ephemeral1hInputTokens');
+      const e5m = pickNumber(nested, 'ephemeral_5m_input_tokens', 'ephemeral5mInputTokens');
+      if (e1h !== 0 || e5m !== 0) found = true;
+      cacheCreationEphemeral1h += e1h;
+      cacheCreationEphemeral5m += e5m;
+    }
+  }
+
+  return {
+    tokensSource: found ? 'modelUsage' : null,
+    freshInputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    outputTokens,
+    billableTokens: freshInputTokens + cacheCreationTokens + outputTokens,
+    cacheCreationEphemeral1h,
+    cacheCreationEphemeral5m,
+  };
+}
+
+// The token fields alone, lifted off an invokeClaudeReal result (or anything with the same
+// shape) -- used every place below that needs to pass them along (a journal event, an error
+// return) without repeating all eight names at every call site.
+function tokenFieldsFrom(raw) {
+  return {
+    tokensSource: raw.tokensSource,
+    freshInputTokens: raw.freshInputTokens,
+    cacheCreationTokens: raw.cacheCreationTokens,
+    cacheReadTokens: raw.cacheReadTokens,
+    outputTokens: raw.outputTokens,
+    billableTokens: raw.billableTokens,
+    cacheCreationEphemeral1h: raw.cacheCreationEphemeral1h,
+    cacheCreationEphemeral5m: raw.cacheCreationEphemeral5m,
+  };
 }
 
 // limit/429-shaped errors -> 'limit' (caller should cool the account down and retry on the next
@@ -177,7 +292,7 @@ async function invokeClaudeReal(opts, deps = {}) {
         kind: 'error',
         error: `llm.js: cannot read oauthTokenFile for account "${opts.account.name}": ${err.message}`,
         sessionId: null,
-        costUsd: 0,
+        ...ZERO_TOKENS,
         numTurns: undefined,
         raw: null,
       };
@@ -233,7 +348,7 @@ async function invokeClaudeReal(opts, deps = {}) {
         ? `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`
         : `llm.js: claude ran but was killed before it replied (${detail})`,
       sessionId: null,
-      costUsd: 0,
+      ...ZERO_TOKENS,
       numTurns: undefined,
       raw: rawExit,
     };
@@ -246,7 +361,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       kind: 'error',
       error: `llm.js: failed to spawn claude: ${spawnResult.error.message}`,
       sessionId: null,
-      costUsd: 0,
+      ...ZERO_TOKENS,
       numTurns: undefined,
       raw: rawExit,
     };
@@ -258,7 +373,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       kind: 'error',
       error: `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
       sessionId: null,
-      costUsd: 0,
+      ...ZERO_TOKENS,
       numTurns: undefined,
       raw: rawExit,
     };
@@ -279,13 +394,13 @@ async function invokeClaudeReal(opts, deps = {}) {
       kind: 'error',
       error: `llm.js: claude stdout was not valid JSON (exit ${exit})`,
       sessionId: null,
-      costUsd: 0,
+      ...ZERO_TOKENS,
       numTurns: undefined,
       raw: exit,
     };
   }
 
-  const costUsd = sumCost(parsed.modelUsage);
+  const tokens = extractTokens(parsed.modelUsage);
   const sessionId = parsed.session_id || parsed.uuid || null;
   const numTurns = parsed.num_turns;
 
@@ -295,7 +410,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       kind: classifyFailure(parsed),
       result: parsed.result,
       sessionId,
-      costUsd,
+      ...tokens,
       numTurns,
       apiErrorStatus: parsed.api_error_status,
       terminalReason: parsed.terminal_reason,
@@ -303,7 +418,7 @@ async function invokeClaudeReal(opts, deps = {}) {
     };
   }
 
-  return { ok: true, result: parsed.result, sessionId, costUsd, numTurns, raw: exit };
+  return { ok: true, result: parsed.result, sessionId, ...tokens, numTurns, raw: exit };
 }
 
 // snake_case -> camelCase, e.g. "root_cause" -> "rootCause". Used to bridge one real gap: every
@@ -452,7 +567,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       effort: opts.effort,
       account: account && account.name,
       sessionId: result.sessionId,
-      costUsd: result.costUsd,
+      ...tokenFieldsFrom(result),
       numTurns: result.numTurns,
       ok: result.ok,
     });
@@ -521,7 +636,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     effort: opts.effort,
     account: account.name,
     sessionId: raw.sessionId,
-    costUsd: raw.costUsd,
+    ...tokenFieldsFrom(raw),
     numTurns: raw.numTurns,
     ok: raw.ok,
   });
@@ -537,7 +652,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       kind: 'error',
       error: `llm.js: ${stepName} reply was not valid JSON`,
       sessionId: raw.sessionId,
-      costUsd: raw.costUsd,
+      ...tokenFieldsFrom(raw),
       numTurns: raw.numTurns,
       raw: raw.raw,
     };
@@ -556,7 +671,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       kind: 'error',
       error: `llm.js: ${stepName} reply parsed to ${parsedPayload === null ? 'null' : typeof parsedPayload}, not an object`,
       sessionId: raw.sessionId,
-      costUsd: raw.costUsd,
+      ...tokenFieldsFrom(raw),
       numTurns: raw.numTurns,
       raw: raw.raw,
     };
@@ -569,7 +684,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       kind: 'error',
       error: `llm.js: ${stepName} reply missing required key(s): ${missingKeys.join(', ')}`,
       sessionId: raw.sessionId,
-      costUsd: raw.costUsd,
+      ...tokenFieldsFrom(raw),
       numTurns: raw.numTurns,
       raw: raw.raw,
     };
@@ -578,7 +693,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   return {
     ok: true,
     sessionId: raw.sessionId,
-    costUsd: raw.costUsd,
+    ...tokenFieldsFrom(raw),
     numTurns: raw.numTurns,
     raw: raw.raw,
     ...withCamelAliases(parsedPayload),
@@ -590,7 +705,8 @@ module.exports = {
   invokeClaudeReal,
   buildArgv,
   resolvePromptText,
-  sumCost,
+  extractTokens,
+  tokenFieldsFrom,
   classifyFailure,
   withCamelAliases,
   cannedDryRunPayload,

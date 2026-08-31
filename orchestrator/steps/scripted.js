@@ -1063,7 +1063,12 @@ function finalComment(ctx) {
   return lines.join('\n') + '\n';
 }
 
-function sumJournalCost(taskDir) {
+// sumJournalBillableTokens(taskDir) -- the task's total billable-weighted tokens (fresh input +
+// cache-creation + output, cache-read excluded -- see orchestrator/tokens.js's header for why),
+// summed across every `llm-call` event this task's journal recorded. Dollar figures are retired
+// entirely (maintainer decision, 2026-08-31); this replaces the old sumJournalCost, same
+// "journal is the only ledger" reasoning, same defensive read.
+function sumJournalBillableTokens(taskDir) {
   const file = path.join(taskDir, 'journal.jsonl');
   if (!fs.existsSync(file)) return 0;
   let total = 0;
@@ -1071,7 +1076,7 @@ function sumJournalCost(taskDir) {
     if (!line) continue;
     try {
       const event = JSON.parse(line);
-      if (event.event === 'llm-call' && typeof event.costUsd === 'number') total += event.costUsd;
+      if (event.event === 'llm-call' && typeof event.billableTokens === 'number') total += event.billableTokens;
     } catch {
       // malformed line -- skip, never fail FINISH over a journal read
     }
@@ -1112,8 +1117,8 @@ async function realFinish(ctx, deps = {}) {
   ]);
   if (remove.exit !== 0) throw new ParkSignal('finish-failed', { step: 'worktree-remove', exit: remove.exit });
 
-  const costUsd = sumJournalCost(ctx.taskDir);
-  appendEvent(ctx.taskDir, 'FINISH', 'finished', { issue, prNumber: ctx.prNumber || null, costUsd });
+  const billableTokens = sumJournalBillableTokens(ctx.taskDir);
+  appendEvent(ctx.taskDir, 'FINISH', 'finished', { issue, prNumber: ctx.prNumber || null, billableTokens });
 
   return 'DONE';
 }

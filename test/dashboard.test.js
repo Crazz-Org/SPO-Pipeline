@@ -68,7 +68,7 @@ test('a DONE task and a PARKED task are collected with their ids, states, reason
       updatedAt: '2026-08-29T00:00:00.000Z',
     },
     jsonlLines: [
-      { ts: '2026-08-29T00:00:00.100Z', state: 'PLAN', event: 'llm-call', step: 'PLAN', model: 'claude-sonnet-5', effort: 'medium', account: 'default', sessionId: 'sess-plan-abc', costUsd: 0.1234, numTurns: 4, ok: true },
+      { ts: '2026-08-29T00:00:00.100Z', state: 'PLAN', event: 'llm-call', step: 'PLAN', model: 'claude-sonnet-5', effort: 'medium', account: 'default', sessionId: 'sess-plan-abc', billableTokens: 12340, numTurns: 4, ok: true },
       { ts: '2026-08-29T00:00:00.200Z', state: 'DONE', event: 'done' },
     ],
   });

@@ -5,8 +5,9 @@
 // (see orchestrator/README.md "Real mode" / "Tests" for why it deliberately lives outside
 // test/, where bare `node --test` auto-discovers any .js file).
 //
-// Exercises the real llm.js path end to end (argv construction, spawn, JSON parse, cost
-// summing) against a trivial, cheap call: haiku, low effort, a $0.10 budget cap, run from this
+// Exercises the real llm.js path end to end (argv construction, spawn, JSON parse, token
+// extraction) against a trivial, cheap call: haiku, low effort, a $0.10 budget cap (the CLI's
+// own `--max-budget-usd` guardrail, unrelated to this build's token accounting), run from this
 // repo's own root (the orchestration-side cwd policy -- see config.js).
 //
 // The account is a required argument, resolved from the pool (orchestrator/accounts.js) --
@@ -62,11 +63,12 @@ async function main() {
   assert.equal(result.ok, true, `expected ok === true, got ${result.ok} (kind=${result.kind}, error=${result.error})`);
   assert.equal(result.result.trim(), 'ok', `expected result to trim to "ok", got ${JSON.stringify(result.result)}`);
   assert.ok(result.sessionId, `expected a non-empty sessionId, got ${JSON.stringify(result.sessionId)}`);
-  assert.ok(result.costUsd > 0, `expected costUsd > 0, got ${result.costUsd}`);
+  assert.ok(result.billableTokens > 0, `expected billableTokens > 0, got ${result.billableTokens}`);
 
   console.log('\nsmoke-llm: PASS');
   console.log(
-    `  account=${account.name} ok=${result.ok} result=${JSON.stringify(result.result)} sessionId=${result.sessionId} costUsd=${result.costUsd}`
+    `  account=${account.name} ok=${result.ok} result=${JSON.stringify(result.result)} sessionId=${result.sessionId} ` +
+      `billableTokens=${result.billableTokens} (fresh=${result.freshInputTokens} cacheCreation=${result.cacheCreationTokens} cacheRead=${result.cacheReadTokens} output=${result.outputTokens})`
   );
 }
 

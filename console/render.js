@@ -30,11 +30,12 @@
 //   {
 //     generatedAt: ISO string,
 //     journalTasks: [{ id, title, kind, state, reason, updatedAt, lastEventTs, lastEventName,
-//                       llmSteps: [{step, model, account, costUsd, sessionId}], totalCostUsd }],
+//                       llmSteps: [{step, model, account, sessionId}] }],
 //                    -- collected for other consumers (daemonStats, token-usage session
 //                       attribution) but NOT rendered here: per-task detail duplicates the
 //                       GitHub Projects board (Kanban), which is the source of truth for task
-//                       state.
+//                       state. No dollar figure is ever carried here -- see "NEVER a dollar
+//                       figure" below; `orchestrator/tokens.js` / `spo tokens` own that view.
 //     queue: { depth, nextIds: [id, ...] },
 //     accounts: { rows: [{ name, email, plan, enabled, cooldownUntil, cooling, hasToken,
 //                           hasCredentials }] },
@@ -57,8 +58,9 @@
 //
 // UI text is English (repo content is English regardless of what language the maintainer
 // converses in -- README.md "Language"); data values (ids, states, model names, reasons) are
-// rendered as-is. NEVER a dollar figure -- costs are rendered nowhere in this file (spo cost /
-// orchestrator/cost.js own that view instead).
+// rendered as-is. NEVER a dollar figure -- this build carries no cost/$ fields anywhere; token
+// accounting is rendered nowhere in this file either (`spo tokens` / orchestrator/tokens.js own
+// that view instead).
 
 function escapeHtml(value) {
   if (value === null || value === undefined) return '';

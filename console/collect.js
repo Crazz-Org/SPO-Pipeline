@@ -73,7 +73,10 @@ function readJournalLines(taskDir) {
 // state/reason/updatedAt), task.json (title/kind fallback, in case state.json predates a
 // field), and journal.jsonl (last event, and every recorded `llm-call` event -- see
 // orchestrator/steps/llm.js's appendEvent call for the exact shape: {step, model, effort,
-// account, sessionId, costUsd, numTurns, ok}).
+// account, sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
+// outputTokens, billableTokens, numTurns, ok}). No dollar figure is ever collected here -- see
+// console/render.js's header ("NEVER a dollar figure"); `orchestrator/tokens.js` / `spo tokens`
+// own the token-accounting view instead.
 function collectJournalTasks(journalRoot) {
   const ids = listTaskDirs(journalRoot);
   return ids.map((id) => {
@@ -89,11 +92,8 @@ function collectJournalTasks(journalRoot) {
         step: e.step,
         model: e.model,
         account: e.account,
-        costUsd: typeof e.costUsd === 'number' ? e.costUsd : null,
         sessionId: e.sessionId || null,
       }));
-
-    const totalCostUsd = llmSteps.reduce((sum, s) => sum + (typeof s.costUsd === 'number' ? s.costUsd : 0), 0);
 
     return {
       id,
@@ -105,7 +105,6 @@ function collectJournalTasks(journalRoot) {
       lastEventTs: last ? last.ts : null,
       lastEventName: last ? last.event : null,
       llmSteps,
-      totalCostUsd,
     };
   });
 }
@@ -205,7 +204,9 @@ function collectVerdicts(verdictsDir, limit = VERDICTS_LIMIT) {
 
 // journal/usage-snapshot.json -- an optional, operator-produced snapshot: `node
 // scripts/usage-report.js > journal/usage-snapshot.json`. Absent by default; see
-// scripts/usage-report.js for the output shape (estUsd, byPhase_Mtokens, ...). Kept as the
+// scripts/usage-report.js for the output shape (byPhase_Mtokens, cacheRebuilds, ... -- the
+// `estUsd` key that shape once carried was removed with the rest of this build's dollar
+// figures, 2026-08-31). Kept as the
 // static-mode repl fallback for the tokens section -- see console/usage-scan.js for the live
 // equivalent.
 function collectUsageSnapshot(journalRoot) {
