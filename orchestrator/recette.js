@@ -555,12 +555,51 @@ function evaluateAssertions(scenario, info) {
 // original `deps`, never `wrappedDeps`, into this function.
 // ---------------------------------------------------------------------------------------------
 
+// A cleanup step's job is "this artifact is not there any more", not "my command exited 0".
+// Those differ on the SUCCESS path, and the difference is not cosmetic: after a DONE run FINISH
+// has already removed the worktree, MERGE has already merged (so `gh pr close` refuses) and the
+// merge deleted the remote branch -- so three steps exit non-zero on a perfect run. Reporting
+// that as `3 not-clean` teaches the maintainer to ignore the one line that would report a real
+// leak, which is worse than not printing it at all. Measured on the first green live run
+// (2026-08-31, issue #469): 3 of 7 steps "not-clean", nothing actually left behind.
+//
+// So: recognise the tool's own "there was nothing to do" messages and record them as `gone`.
+// Anything unrecognised stays a failure -- this must never launder a real error into silence.
+const ALREADY_GONE_PATTERNS = [
+  /is not a working tree/i, //            git worktree remove, already removed by FINISH
+  /No such file or directory/i, //        git worktree remove, path already gone
+  /not a valid ref|unable to delete|remote ref does not exist/i, // push --delete, already deleted
+  /branch .* not found|error: branch .* not found/i, //           branch -D, already deleted
+  /already merged|Pull request .* is already closed|not open/i, // gh pr close on a merged PR
+  /Could not resolve to a[n]? (PullRequest|Issue)/i, //           already gone entirely
+];
+
+function classifyStep(exit, text) {
+  if (exit === 0) return { ok: true, gone: false };
+  const t = String(text || '');
+  if (ALREADY_GONE_PATTERNS.some((re) => re.test(t))) return { ok: true, gone: true };
+  return { ok: false, gone: false };
+}
+
 function tryStep(steps, name, fn) {
   try {
-    steps.push({ name, ok: true, detail: fn() });
+    const detail = fn();
+    // A step returning {exit, output} is classified; anything else (a plain fs step) is ok.
+    if (detail && typeof detail.exit === 'number') {
+      const { ok, gone } = classifyStep(detail.exit, detail.output);
+      steps.push({ name, ok, gone, detail });
+    } else {
+      steps.push({ name, ok: true, gone: false, detail });
+    }
   } catch (err) {
-    steps.push({ name, ok: false, detail: err && err.message });
+    steps.push({ name, ok: false, gone: false, detail: err && err.message });
   }
+}
+
+// The text a command used to explain itself -- stderr first, since that is where git and gh put
+// "there was nothing to do".
+function outputOf(r) {
+  return `${(r && r.stderr) || ''}\n${(r && r.stdout) || ''}`;
 }
 
 // wipRefsFrom(events) -> the `wip/<taskId>-<ts>` branch names THIS run pushed to origin.
@@ -601,19 +640,19 @@ function cleanup({ scenario, config, deps, issueNumber, prNumber, wipRefs, keepR
     // not "always reports success".
     tryStep(steps, 'worktree-remove', () => {
       const r = armedRunSync(deps, 'git', ['-C', config.productRepo, 'worktree', 'remove', '--force', worktreePath], {}, config);
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
     tryStep(steps, 'worktree-prune', () => {
       const r = armedRunSync(deps, 'git', ['-C', config.productRepo, 'worktree', 'prune'], {}, config);
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
     tryStep(steps, 'branch-delete-local', () => {
       const r = armedRunSync(deps, 'git', ['-C', config.productRepo, 'branch', '-D', branch], {}, config);
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
     tryStep(steps, 'branch-delete-remote', () => {
       const r = armedRunSync(deps, 'git', ['-C', config.productRepo, 'push', 'origin', '--delete', branch], {}, config);
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
   }
 
@@ -623,14 +662,14 @@ function cleanup({ scenario, config, deps, issueNumber, prNumber, wipRefs, keepR
   for (const ref of wipRefs || []) {
     tryStep(steps, `wip-ref-delete:${ref}`, () => {
       const r = armedRunSync(deps, 'git', ['-C', config.productRepo, 'push', 'origin', '--delete', ref], {}, config);
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
   }
 
   if (prNumber) {
     tryStep(steps, 'pr-close', () => {
       const r = armedRunSync(deps, 'gh', ['pr', 'close', String(prNumber), '--repo', config.ghRepo], {}, config);
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
   }
 
@@ -643,7 +682,7 @@ function cleanup({ scenario, config, deps, issueNumber, prNumber, wipRefs, keepR
         {},
         config
       );
-      return { exit: normalizeExit(r) };
+      return { exit: normalizeExit(r), output: outputOf(r) };
     });
   }
 
@@ -667,7 +706,10 @@ function cleanup({ scenario, config, deps, issueNumber, prNumber, wipRefs, keepR
     });
   }
 
-  const anyFailed = steps.some((s) => !s.ok || (s.detail && typeof s.detail.exit === 'number' && s.detail.exit !== 0));
+  // `gone` steps are clean: the artifact is not there, which is the whole point. Only a step we
+  // could not account for counts as a failure -- so a non-zero `anyFailed` means something really
+  // may have been left behind, and is worth reading.
+  const anyFailed = steps.some((st) => !st.ok);
   return { steps, anyFailed };
 }
 

@@ -919,10 +919,19 @@ async function cmdRecette(opts, deps = {}) {
   }
 
   if (result.cleanupReport) {
-    const failed = result.cleanupReport.steps.filter((s) => !s.ok || (s.detail && s.detail.exit !== undefined && s.detail.exit !== 0));
+    // Only genuinely unaccounted-for steps are reported. A step whose artifact was ALREADY gone
+    // is clean -- on the success path FINISH removed the worktree, MERGE merged the PR and the
+    // merge deleted the remote branch, so three steps exit non-zero on a perfect run. Printing
+    // those as failures taught the reader to ignore the one line that reports a real leak.
+    const steps = result.cleanupReport.steps;
+    const failed = steps.filter((s) => !s.ok);
+    const gone = steps.filter((s) => s.gone);
+    const goneNote = gone.length ? `, ${gone.length} already gone` : '';
     console.log(
-      `  cleanup: ${result.cleanupReport.steps.length} step(s), ${failed.length} not-clean` +
-        (failed.length ? ` (${failed.map((s) => s.name).join(', ')} -- see detail above/state left behind)` : '')
+      failed.length
+        ? `  cleanup: ${steps.length} step(s)${goneNote}, ${failed.length} NOT CLEAN` +
+            ` (${failed.map((s) => s.name).join(', ')} -- state may have been left behind)`
+        : `  cleanup: ${steps.length} step(s)${goneNote}, nothing left behind`
     );
   } else if (result.kept) {
     console.log(`  --keep: cleanup skipped -- inspect ${result.plan.runDir}`);
