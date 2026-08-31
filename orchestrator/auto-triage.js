@@ -456,7 +456,7 @@ const VERDICT_STEP_FOR = {
 // true stories to tell -- see PRE_VERDICT_STEPS/VERDICT_STEP_FOR just above. Falls back to the
 // pre-verdict wording for an unrecognized/absent step: that is the safer default (it never claims
 // a verdict was reached when the caller cannot prove one was).
-function buildMechanicalHoldComment(attempts, lastError, step) {
+function buildMechanicalHoldComment(issue, attempts, lastError, step) {
   const verdictStep = VERDICT_STEP_FOR[step];
   if (verdictStep) {
     const isPostComment = typeof step === 'string' && step.startsWith('POST_');
@@ -485,9 +485,10 @@ function buildMechanicalHoldComment(attempts, lastError, step) {
     }
     lines.push(
       '',
-      'Once the mechanical cause above is fixed, re-run `spo triage --retry <issue>` to reset the',
-      'failure count and try again; a plain `spo triage --file` will not pick this report back up',
-      'before then.'
+      `Once the mechanical cause above is fixed, re-run \`spo triage --retry ${issue} --file\` to reset`,
+      `the failure count and try again (the bare \`--retry ${issue}\` only previews the recovery, and a`,
+      'plain `spo triage --file` will not pick this report back up before then -- see',
+      '`spo triage --retry`\'s own usage).'
     );
     return lines.join('\n');
   }
@@ -503,8 +504,9 @@ function buildMechanicalHoldComment(attempts, lastError, step) {
     '',
     'This report is still confirmed and still in the intake column -- nothing was discarded, and no',
     'reproduction was attempted or rejected. Once the mechanical cause above is fixed, re-run',
-    '`spo triage --retry <issue>` to reset the failure count and try again; a plain `spo triage',
-    '--file` will not pick this report back up before then.',
+    `\`spo triage --retry ${issue} --file\` to reset the failure count and try again (the bare`,
+    `\`--retry ${issue}\` only previews the recovery); a plain \`spo triage --file\` will not pick this`,
+    'report back up before then.',
   ];
   return lines.join('\n');
 }
@@ -744,7 +746,7 @@ function handleMechanicalFailure(issue, failure, journalRoot, deps) {
   // vetoing the mechanism. So: journal report-held-mechanical and return `ok: true` REGARDLESS of
   // whether the comment posted, recording whether it did (`commentPosted`) so a maintainer reading
   // the journal can still tell a `gh` outage from a quiet report.
-  const commented = intake.postIssueComment(issue, buildMechanicalHoldComment(attempts, errorStr, step), deps);
+  const commented = intake.postIssueComment(issue, buildMechanicalHoldComment(issue, attempts, errorStr, step), deps);
   appendDaemonEvent(journalRoot, 'report-held-mechanical', {
     issue,
     attempts,
@@ -917,12 +919,199 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   };
 }
 
+// ---- action 3.4: `spo triage --retry <issue>` -- a recovery path for a held report -----------
+//
+// THE GAP this closes: a report that reaches HOLD (report-held -- a real negative verdict, or
+// report-held with outcome 'do-not-file' -- reviewCard said no; report-held-mechanical -- action
+// 3.3's three-strikes cap) is a confirmed dead end today. All three are journalled as handled, so
+// findConfirmedAwaitingTriage never returns the issue again. The report file is still sitting in
+// pending/ (restored there by processConfirmedReport's own `finally`), still confirmed, still in
+// the intake column -- and nothing short of hand-editing daemon.jsonl brings it back. 3.3's own
+// buildMechanicalHoldComment already PROMISES `spo triage --retry <issue>` as the way out; this is
+// what makes that promise true rather than a silent no-op.
+//
+// THE MECHANISM: append a FRESH report-confirmed event for the issue. One event does both jobs,
+// and this is exactly why 3.3 anchored mechanicalFailureHistory on report-confirmed rather than
+// scanning the whole journal: a later report-confirmed makes the issue eligible again
+// (findConfirmedAwaitingTriage's own "no LATER handled event for this issue" scan) AND resets the
+// mechanical-failure budget to zero in the same move (mechanicalFailureHistory only counts
+// report-triage-error events AFTER the most recent anchor). No second mechanism -- 3.3's own test
+// ("a later report-confirmed for the same issue resets the mechanical-failure count") already
+// proved this shape works; this function is what fabricates that event for real instead of a test
+// faking it by hand.
+//
+// PRECONDITIONS, all checked before anything is appended:
+//   1. `issue` must have a report-confirmed event on record at all -- otherwise there is nothing
+//      to re-confirm.
+//   2. Its most recent handled-event (report-triaged / report-held / report-held-mechanical -- the
+//      SAME "handled" vocabulary findConfirmedAwaitingTriage/mechanicalFailureHistory already use)
+//      must actually be a HOLD. Refused if it is report-triaged: the report was already filed or
+//      dispositioned as a duplicate, and re-running would re-file or re-comment on something
+//      already settled. Refused if there is no handled-event at all -- the issue is ALREADY
+//      eligible, and appending a second report-confirmed would put it in `top` TWICE in one cycle,
+//      burning two of three autoTriageLimit slots on one report. processConfirmedReport's claim
+//      mutex degrades that shape safely to `already-claimed` rather than crashing, but a command
+//      whose whole purpose is recovery must never manufacture the waste on its own.
+//   3. The report file recorded on that report-confirmed event must still exist. Held reports are
+//      restored to their ORIGINAL pending/ path by processConfirmedReport's `finally`, so it
+//      should be there -- if it is not, re-confirming anyway would loop straight back to a fresh
+//      mechanical failure (nothing for claimReport to rename), which is exactly the dead end this
+//      command exists to escape, not recreate.
+//
+// The re-confirm is journalled REGARDLESS of whether the courtesy comment posts -- 3.3's D1 lesson
+// (a `gh` outage must never veto a mechanism built to survive `gh` outages) applied here: the hold
+// is the mechanism, the comment is the courtesy, `commentPosted` records the truth without gating
+// on it.
+//
+// opts.dry: same "look, don't touch" contract as runAutoTriage's own -- reports what WOULD be
+// re-injected, appends nothing, comments nothing.
+async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {}) {
+  const dry = !!opts.dry;
+  const lines = readDaemonEvents(journalRoot);
+
+  // Precondition 1: find the most recent report-confirmed anchor for this issue.
+  let anchor = null;
+  let anchorIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].event === 'report-confirmed' && lines[i].issue === issue) {
+      anchor = lines[i];
+      anchorIdx = i;
+      break;
+    }
+  }
+  if (!anchor) {
+    return {
+      ok: false,
+      error: `retryHeldReport: issue #${issue} has no report-confirmed event on record -- nothing to re-confirm`,
+    };
+  }
+
+  // Precondition 2: the LATEST handled-shaped event since that anchor. Normally at most one exists
+  // (a confirmed report is routed exactly once before it becomes eligible again) -- scanning for
+  // the last rather than stopping at the first is defensive against a journal shape this function
+  // has never had to reason about before.
+  const HANDLED_EVENTS = new Set(['report-triaged', 'report-held', 'report-held-mechanical']);
+  let handled = null;
+  for (let i = anchorIdx + 1; i < lines.length; i++) {
+    if (lines[i].issue === issue && HANDLED_EVENTS.has(lines[i].event)) handled = lines[i];
+  }
+
+  if (!handled) {
+    return {
+      ok: false,
+      error:
+        `retryHeldReport: issue #${issue} is already eligible for triage (no handled outcome since ` +
+        'its last report-confirmed) -- re-confirming it again would double-queue it; run `spo triage --file` instead',
+    };
+  }
+  if (handled.event === 'report-triaged') {
+    return {
+      ok: false,
+      error:
+        `retryHeldReport: issue #${issue} was already triaged (outcome: ${handled.outcome || 'unknown'}) -- ` +
+        'filed or dispositioned as a duplicate, not held, so there is nothing to retry',
+    };
+  }
+
+  // handled.event is report-held or report-held-mechanical from here on -- a genuine hold.
+  const retriedFrom = handled.event;
+
+  // Precondition 3: the report file this issue's confirm anchor points at must still be sitting
+  // in pending/ (see this function's own header for why it should be, and why proceeding without
+  // it would just manufacture a fresh mechanical failure). fs.statSync + isFile() rather than
+  // fs.existsSync: existsSync alone returns true for a directory too, and action 3.1 already
+  // fixed the identical existsSync-then-open TOCTOU/directory finding in state-machine.js's
+  // isNonEmptyFile -- same shape here, wrapped so any stat error is just "not there", never a
+  // crash.
+  const pendingPath = anchor.pendingPath;
+  const isFile = (p) => {
+    try {
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (!pendingPath || !isFile(pendingPath)) {
+    // N4: a live daemon can claim this exact file into in-progress/ (claimReport) at any time,
+    // including the gap between another cycle starting and this command running -- that is an
+    // ordinary race, not data loss. Saying "missing ... no longer exists" in that case reads to a
+    // maintainer as their report having been lost, when it is simply mid-cycle. Probe
+    // in-progress/ and say so instead. `config` is guarded at every access (`&&`, no destructuring
+    // that could throw on undefined) so a missing/partial config can never turn this refusal into
+    // a crash -- it just falls through to the original "missing" wording.
+    const spoReportsDir = config && config.spoReportsDir;
+    const claimedPath =
+      spoReportsDir && pendingPath ? path.join(spoReportsDir, IN_PROGRESS_DIRNAME, path.basename(pendingPath)) : null;
+    if (claimedPath && isFile(claimedPath)) {
+      return {
+        ok: false,
+        error:
+          `retryHeldReport: issue #${issue}'s report is currently claimed by a running triage cycle ` +
+          '(it is in `in-progress/`, not lost) -- try again shortly',
+      };
+    }
+    return {
+      ok: false,
+      error:
+        `retryHeldReport: issue #${issue}'s report file is missing from pending/ ` +
+        `(expected at ${pendingPath || '(no pendingPath recorded on the report-confirmed event)'}) -- ` +
+        'cannot re-inject a report that no longer exists',
+    };
+  }
+
+  if (dry) {
+    return { ok: true, dry: true, outcome: 'would-retry', issue, pendingPath, kind: anchor.kind, retriedFrom };
+  }
+
+  // The event is the mechanism; carry forward the exact shape findConfirmedAwaitingTriage/
+  // routeConfirmedReport/processConfirmedReport read off a report-confirmed entry (issue,
+  // pendingPath, kind -- see routeConfirmedReport's own header), plus commentId for parity with
+  // the original event even though nothing downstream reads it back off a retry. retriedFrom/
+  // retriedAt are pure markers for a maintainer reading daemon.jsonl -- neither
+  // findConfirmedAwaitingTriage's event/issue matching nor mechanicalFailureHistory's own scan
+  // look at any field but `event`/`issue`/`ts`, so extra fields on this event cannot break either.
+  appendDaemonEvent(journalRoot, 'report-confirmed', {
+    issue,
+    pendingPath,
+    commentId: anchor.commentId,
+    kind: anchor.kind,
+    retriedFrom,
+    retriedAt: new Date().toISOString(),
+  });
+
+  // The comment is the courtesy: keeps the issue thread a truthful record of what a maintainer
+  // did, but must never be able to veto the mechanism above (3.3's D1 lesson) -- so this call's
+  // result only ever affects `commentPosted`/`commentError` below, never `ok`.
+  const commentBody = [
+    '### Pipeline: report re-injected for triage',
+    '',
+    `A maintainer ran \`spo triage --retry\` to recover this report from ${
+      retriedFrom === 'report-held-mechanical' ? 'a mechanical hold' : 'a hold'
+    } (\`${retriedFrom}\`).`,
+    'It is confirmed and eligible for triage again as of this comment, and the mechanical-failure',
+    'count has been reset to zero.',
+  ].join('\n');
+  const commented = intake.postIssueComment(issue, commentBody, deps);
+
+  return {
+    ok: true,
+    outcome: 'retried',
+    issue,
+    pendingPath,
+    kind: anchor.kind,
+    retriedFrom,
+    commentPosted: commented.ok === true,
+    commentError: commented.ok ? undefined : commented.error,
+  };
+}
+
 module.exports = {
   shouldAutoTriage,
   shouldSkipForTriageBackoff,
   triageBackoffMs,
   runAutoTriage,
   processConfirmedReport,
+  retryHeldReport,
   findConfirmedAwaitingTriage,
   mechanicalFailureHistory,
   buildMechanicalHoldComment,

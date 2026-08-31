@@ -209,6 +209,167 @@ test(
   })
 );
 
+// ---- spo triage --retry <issue> (action 3.4) ------------------------------------------------
+// Exercises bin/spo's cmdTriage/--retry wiring directly against a fake deps.autoTriage module
+// (the same test-only override convention this file already uses for the rest of cmdTriage)
+// rather than through runSpo's real subprocess: `--file` would otherwise reach the real
+// `gh`/`claude` binaries through orchestrator/auto-triage.js's retryHeldReport, which no test in
+// this file should ever do. The mechanism itself (retryHeldReport's preconditions, journalling,
+// dry preview) is covered in test/auto-triage.test.js -- these tests only pin bin/spo's own
+// argument parsing/validation and wiring.
+
+test(
+  'spo triage --retry 449 --file calls retryHeldReport with the right issue and dry:false, exits 0',
+  withExitCodeReset(async () => {
+    let seen = null;
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      retryHeldReport: async (journalRoot, issue, config, deps, opts) => {
+        seen = { issue, dry: opts.dry };
+        return {
+          ok: true,
+          outcome: 'retried',
+          issue,
+          pendingPath: '/fake/p.json',
+          kind: undefined,
+          retriedFrom: 'report-held-mechanical',
+          commentPosted: true,
+        };
+      },
+    };
+    const opts = spo.parseArgs(['--retry', '449', '--file', '--journal', '/fake/journal']);
+    const console_ = captureConsole();
+    try {
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+    assert.deepEqual(seen, { issue: 449, dry: false });
+    assert.equal(process.exitCode, undefined, 'success must not set a non-zero exit code');
+    assert.match(console_.logs.join('\n'), /#449: re-injected \(was report-held-mechanical\)/);
+  })
+);
+
+test(
+  'spo triage --retry #449 accepts the #-prefixed issue a maintainer would paste from GitHub',
+  withExitCodeReset(async () => {
+    let seenIssue = null;
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      retryHeldReport: async (journalRoot, issue) => {
+        seenIssue = issue;
+        return { ok: true, outcome: 'would-retry', dry: true, issue, retriedFrom: 'report-held' };
+      },
+    };
+    const opts = spo.parseArgs(['--retry', '#449', '--journal', '/fake/journal']);
+    const console_ = captureConsole();
+    try {
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(seenIssue, 449, 'the leading # must be stripped before parsing as a number');
+    assert.equal(process.exitCode, undefined);
+  })
+);
+
+test(
+  'spo triage --retry <issue> without --file previews only -- dry:true is passed through, nothing claims to have acted',
+  withExitCodeReset(async () => {
+    let seenOpts = null;
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      retryHeldReport: async (journalRoot, issue, config, deps, opts) => {
+        seenOpts = opts;
+        return { ok: true, outcome: 'would-retry', dry: true, issue, retriedFrom: 'report-held' };
+      },
+    };
+    const opts = spo.parseArgs(['--retry', '449', '--journal', '/fake/journal']);
+    const console_ = captureConsole();
+    try {
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(seenOpts.dry, true, '--file was not given -- --retry must default to dry like every other spo triage invocation');
+    assert.match(console_.logs.join('\n'), /would re-inject/);
+    assert.match(console_.logs.join('\n'), /pass --file to actually act/);
+    assert.equal(process.exitCode, undefined);
+  })
+);
+
+test(
+  'spo triage --retry <non-numeric issue> exits non-zero and never calls retryHeldReport',
+  withExitCodeReset(async () => {
+    let called = false;
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      retryHeldReport: async () => {
+        called = true;
+        return { ok: true };
+      },
+    };
+    const opts = spo.parseArgs(['--retry', 'abc', '--journal', '/fake/journal']);
+    const console_ = captureConsole();
+    try {
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(called, false, 'an invalid issue must be rejected before the mechanism is ever reached');
+    assert.equal(process.exitCode, 1);
+    assert.match(console_.errors.join('\n'), /not a valid issue number/);
+  })
+);
+
+test(
+  'spo triage --retry with no value exits non-zero and never calls retryHeldReport',
+  withExitCodeReset(async () => {
+    let called = false;
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      retryHeldReport: async () => {
+        called = true;
+        return { ok: true };
+      },
+    };
+    // --retry deliberately placed LAST so argv[++i] has nothing to consume -- the "missing value"
+    // shape, distinct from "--retry abc" above (a present but invalid value).
+    const opts = spo.parseArgs(['--journal', '/fake/journal', '--retry']);
+    const console_ = captureConsole();
+    try {
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(called, false);
+    assert.equal(process.exitCode, 1);
+    assert.match(console_.errors.join('\n'), /usage: spo triage --retry/);
+  })
+);
+
+test(
+  'spo triage --retry <issue> --file exits non-zero when retryHeldReport refuses, and prints the refusal',
+  withExitCodeReset(async () => {
+    const fakeAutoTriage = {
+      DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+      retryHeldReport: async () => ({
+        ok: false,
+        error: 'retryHeldReport: issue #449 has no report-confirmed event on record -- nothing to re-confirm',
+      }),
+    };
+    const opts = spo.parseArgs(['--retry', '449', '--file', '--journal', '/fake/journal']);
+    const console_ = captureConsole();
+    try {
+      await spo.cmdTriage(opts, { autoTriage: fakeAutoTriage });
+    } finally {
+      console_.restore();
+    }
+    assert.equal(process.exitCode, 1);
+    assert.match(console_.errors.join('\n'), /has no report-confirmed event on record/);
+  })
+);
+
 // ---- cmdPullReports ---------------------------------------------------------------------------
 
 test(

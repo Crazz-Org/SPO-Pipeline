@@ -1096,9 +1096,9 @@ it journals `report-triage-error` (`{issue, step, error}`, error capped to 300 c
 idiom `findConfirmedAwaitingTriage` already uses, transposed from "handled at all" to "how many
 mechanical failures since the last time a human confirmed this" (`mechanicalFailureHistory`).
 Counting since the anchor, not since the beginning of the journal, is deliberate and
-forward-looking: it is what lets a maintainer's `spo triage --retry <issue>` (action 3.4, shipping
-in the same PR as this) reset the budget later, simply by re-confirming the report and moving the
-anchor forward -- every earlier failure stops counting the moment a fresh `report-confirmed`
+forward-looking: it is what lets a maintainer's `spo triage --retry <issue>` (action 3.4 -- see
+"The recovery path" below) reset the budget later, simply by re-confirming the report and moving
+the anchor forward -- every earlier failure stops counting the moment a fresh `report-confirmed`
 lands.
 
 On the **third** mechanical failure (`MECHANICAL_FAILURE_CAP`, three strikes: enough that one
@@ -1207,7 +1207,10 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
-`report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
+`report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` (also
+reused by action 3.4's `spo triage --retry <issue>` to re-open a held report -- see "The recovery
+path" below; a retried one carries `retriedFrom`/`retriedAt` alongside the usual
+`issue`/`pendingPath`/`kind`/`commentId`, fields no scan anywhere matches on) /
 `report-discarded` (stage 2 outcomes) / `report-confirm-scan-truncated` / `report-confirm-scan-
 ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan.js facts, action
 2.7 -- `comment-scan-collaborators-unreadable` / `comment-scan-collaborators-stale` are shared
@@ -1247,6 +1250,72 @@ ever become frequent enough to matter, the fix belongs in a SEPARATE counter key
 `findConfirmedAwaitingTriage`, and `report-intake.js`'s `findPendingIntake` all use the same
 anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed
 from a per-task `journal.jsonl` to this flat daemon-level log.
+
+**The recovery path (action 3.4): `spo triage --retry <issue>`.** Before this action, a report
+that reached HOLD was a confirmed dead end -- `findConfirmedAwaitingTriage` treats all three hold
+shapes as handled, the report file sits in `pending/` (restored there by
+`processConfirmedReport`'s own `finally`) forever, and nothing short of hand-editing
+`daemon.jsonl` brought it back. The three shapes this recovers: `report-held` with a real negative
+reproduction verdict (`not-reproduced`/`insufficient`/`schema-version`), `report-held` with
+`outcome: 'do-not-file'` (`reviewCard` said no), and `report-held-mechanical` (action 3.3's three
+mechanical strikes). `buildMechanicalHoldComment` already promised `spo triage --retry <issue>` as
+the way out before this action existed to make that promise true.
+
+*The mechanism* (`retryHeldReport` in `auto-triage.js`) is deliberately not a new event type: it
+appends a FRESH `report-confirmed` event for the issue, carrying the same shape
+`findConfirmedAwaitingTriage`/`routeConfirmedReport`/`processConfirmedReport` already read off one
+(`issue`, `pendingPath`, `kind`, `commentId`), plus two marker fields a maintainer reading the
+journal can use to tell a re-injection from the original confirm: `retriedFrom` (the hold outcome
+it recovered -- `report-held` or `report-held-mechanical`) and `retriedAt`. Neither
+`findConfirmedAwaitingTriage`'s matching (`event`/`issue` only) nor `mechanicalFailureHistory`'s
+own anchor scan look at any other field, so the extra markers cannot break either. One event does
+BOTH jobs, and this is exactly why action 3.3 anchored `mechanicalFailureHistory` on
+`report-confirmed` in the first place rather than scanning the whole journal: a later
+`report-confirmed` makes the issue eligible again (no LATER handled event for it) AND resets the
+mechanical-failure budget to zero in the same move (only `report-triage-error` events AFTER the
+most recent anchor count). No second mechanism -- action 3.3's own test already proved this exact
+shape works before 3.4 existed to fabricate the event for real.
+
+*The four refusals*, checked in order before anything is appended:
+1. **No `report-confirmed` event at all** for the issue -- there is nothing to re-confirm.
+2. **The issue is already eligible** (a `report-confirmed` with no handled-event after it) --
+   refused even though nothing is technically broken by it, because appending a second
+   `report-confirmed` would put the issue in `top` TWICE in the same `runAutoTriage` cycle,
+   burning two of three `autoTriageLimit` slots on one report.
+   `processConfirmedReport`'s claim mutex degrades that shape safely to `already-claimed` rather
+   than crashing, but a command whose whole *purpose* is recovery must never manufacture that
+   waste on its own.
+3. **The issue's latest handled-event is `report-triaged`**, not a hold -- it was already filed or
+   dispositioned as a duplicate, and re-running would re-file or re-comment on something already
+   settled.
+4. **The report file recorded on the confirm anchor is missing from `pending/`** -- re-confirming
+   anyway would loop straight back into a fresh mechanical failure (nothing for `claimReport` to
+   rename) instead of the honest, actionable refusal a maintainer can do something about.
+
+Each refusal returns a distinct, legible `error` string naming the issue and the reason -- see the
+body of `retryHeldReport` in `auto-triage.js` (the four `return { ok: false, error: ... }` sites)
+for the exact wording.
+
+*The courtesy comment* records the re-injection on the issue thread so it stays a truthful record,
+but follows action 3.3's D1 lesson exactly: the re-confirm event is journalled **regardless of
+whether the comment posts** (`commentPosted`/`commentError` record the truth without gating on it)
+-- a `gh` outage must never be able to make `--retry` silently do nothing, the same failure mode
+3.3 already had to close once for `report-held-mechanical` itself.
+
+*`bin/spo`'s wiring* (`cmdTriageRetry`): `--retry <issue>` accepts a `#`-prefixed issue (`--retry
+#449`, what a maintainer will actually paste from a GitHub thread) and rejects anything else --
+missing value, non-numeric -- with a legible message and `process.exitCode = 1`, before
+`retryHeldReport` is ever called. Like every other `spo triage` invocation this defaults to
+`--dry`, which previews (`retryHeldReport`'s own `opts.dry`: reports what WOULD be re-injected,
+appends nothing, comments nothing) rather than mutating by default -- `--file` is required to
+actually act, matching this whole CLI's "no maintainer surprise" convention rather than making
+`--retry` the one command that mutates on the bare flag. A refusal from `retryHeldReport` (any of
+the four preconditions above) prints `result.error` and exits non-zero without ever reaching a
+normal triage cycle; a successful re-injection prints the issue, what it was recovered from, and
+whether the courtesy comment posted, and exits 0 (CLAUDE.md: verdict by exit code, never by
+reading text). The bare `--dry` preview is success too, not just the `--file` path: it also exits
+0, having appended and posted nothing -- exit 1 is reserved for a refusal or a bad argument, never
+for "this was only a preview."
 
 **Production-side setup** (SPO-Deploy's scope, not this repo's): a durable volume for the report
 queue (a container-local path does not survive a rebuild), the `SPO_REPORT_PULL_TOKEN` env var
@@ -1763,6 +1832,7 @@ bin/spo pull-reports                               # STAGE 0: pull queued report
 bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
+bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file); defaults to --dry (see "The recovery path" above)
 bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised live harness -- one trivial synthetic card, real mode (see "Recette" above)
 ```
 

@@ -21,6 +21,7 @@ const {
   triageBackoffMs,
   runAutoTriage,
   processConfirmedReport,
+  retryHeldReport,
   findConfirmedAwaitingTriage,
   mechanicalFailureHistory,
   buildMechanicalHoldComment,
@@ -1449,11 +1450,15 @@ test('runAutoTriage: dry run journals none of the new action-3.3 events (report-
 });
 
 test('buildMechanicalHoldComment: text is distinct from buildHoldComment\'s reproduction-verdict wording', () => {
-  const text = buildMechanicalHoldComment(3, 'triageBugReport: claude call failed (limit)');
+  const text = buildMechanicalHoldComment(449, 3, 'triageBugReport: claude call failed (limit)');
   assert.match(text, /mechanical/i);
   assert.match(text, /triageBugReport: claude call failed \(limit\)/);
   assert.doesNotMatch(text, /reproduction did not confirm this report/i);
   assert.match(text, /spo triage --retry/);
+  // N7: the real issue number must be interpolated, never the literal placeholder -- pasted
+  // verbatim into bash, `<issue>` is an input redirect.
+  assert.match(text, /spo triage --retry 449 --file/);
+  assert.doesNotMatch(text, /<issue>/);
 });
 
 // ---- round 2 (verifier findings D1/D2/D4/N1/N2/N3/N4) -------------------------------------
@@ -1575,10 +1580,10 @@ test('D2: a POST_HOLD_COMMENT mechanical failure names the verdict and its own s
   const heldEvent = events.find((e) => e.event === 'report-held-mechanical' && e.issue === 2002);
   assert.ok(heldEvent);
 
-  // buildMechanicalHoldComment(attempts, lastError, step) is what handleMechanicalFailure posts;
-  // reconstruct it directly (the comment itself failed to post in this test, by design) to assert
-  // its wording.
-  const commentText = buildMechanicalHoldComment(heldEvent.attempts, heldEvent.lastError, 'POST_HOLD_COMMENT');
+  // buildMechanicalHoldComment(issue, attempts, lastError, step) is what handleMechanicalFailure
+  // posts; reconstruct it directly (the comment itself failed to post in this test, by design) to
+  // assert its wording.
+  const commentText = buildMechanicalHoldComment(heldEvent.issue, heldEvent.attempts, heldEvent.lastError, 'POST_HOLD_COMMENT');
   assert.doesNotMatch(
     commentText,
     /no verdict was ever reached/i,
@@ -1590,10 +1595,17 @@ test('D2: a POST_HOLD_COMMENT mechanical failure names the verdict and its own s
   // The self-defeating irony: this very comment is posted through the same postIssueComment call
   // that is failing.
   assert.match(commentText, /gh/i);
+  // D5: this is the sole discovery path for the entire retry feature -- a bare `/spo triage
+  // --retry/` match is satisfied by the OLD, no-op `--retry <issue>` wording just as happily as
+  // the new `--retry <issue> --file` wording, so a revert of 3.3's/3.4's comment text would ship
+  // green. Pin the `--file` flag specifically, and the real issue number (N7), in this
+  // post-verdict branch too.
+  assert.match(commentText, /spo triage --retry [^\n]*--file/);
+  assert.match(commentText, /spo triage --retry 2002 --file/);
 });
 
 test('D2: pre-verdict steps (e.g. TRIAGE_BUG_REPORT) keep the original "no verdict was ever reached" wording', () => {
-  const text = buildMechanicalHoldComment(3, 'triageBugReport: reply was not valid JSON', 'TRIAGE_BUG_REPORT');
+  const text = buildMechanicalHoldComment(449, 3, 'triageBugReport: reply was not valid JSON', 'TRIAGE_BUG_REPORT');
   assert.match(text, /no verdict was ever reached/i);
   assert.doesNotMatch(text, /reached a verdict but/i);
 });
@@ -1772,4 +1784,416 @@ test('N4: an Infinity (or astronomically large) backoff ceiling never throws -- 
   const backoffEvent = events.find((e) => e.event === 'report-triage-backoff');
   assert.ok(backoffEvent);
   assert.equal(backoffEvent.nextEligibleAtIso, null, 'clamped rather than an unparseable/thrown value');
+});
+
+// ---- action 3.4: retryHeldReport / `spo triage --retry <issue>` --------------------------------
+//
+// The recovery path for a report stuck at HOLD. One fresh report-confirmed event both re-opens
+// the report (findConfirmedAwaitingTriage) and resets its mechanical-failure budget
+// (mechanicalFailureHistory) -- the same anchor 3.3's own "a later report-confirmed... resets the
+// mechanical-failure count" test already proved works; these tests exercise the function that
+// fabricates that event for real, plus the three refusals that keep it from firing when it would
+// do the wrong thing (already filed, already eligible, or the report file itself is gone).
+
+test('retryHeldReport: re-injects a report-held-mechanical issue -- eligible again, mechanical count back to 0', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-mech-');
+  const journalRoot = mkTmp('spo-autotriage-retry-mech-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-mech.json');
+  confirmedEntry(journalRoot, { issue: 3001, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo', autoTriageBackoffBaseMs: 0 };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false }); // eslint-disable-line no-await-in-loop
+  }
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), [], 'held after three strikes');
+  assert.equal(mechanicalFailureHistory(journalRoot, 3001).count, 3);
+
+  let commentBody = null;
+  let commentIssueArg = null;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        // N1: the courtesy comment must land on THIS issue, not some other one -- postIssueComment
+        // puts the target issue at args[2] (`gh issue comment <issue> --repo ... --body-file
+        // ...`); reading only --body-file and never checking args[2] would ship green even if the
+        // comment posted to anchor.commentId or any other unrelated GitHub issue.
+        commentIssueArg = args[2];
+        const bodyFile = args[args.indexOf('--body-file') + 1];
+        commentBody = fs.readFileSync(bodyFile, 'utf8');
+      }
+      return ok('');
+    },
+  };
+
+  const result = await retryHeldReport(journalRoot, 3001, config, deps, { dry: false });
+  assert.equal(result.ok, true);
+  assert.equal(result.retriedFrom, 'report-held-mechanical');
+  assert.equal(result.commentPosted, true);
+  assert.ok(commentBody, 'expected a recovery comment to be posted');
+  assert.match(commentBody, /re-injected for triage/i);
+  assert.equal(commentIssueArg, '3001', 'the recovery comment must be posted to the retried issue, not anchor.commentId or anything else');
+
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [3001], 'eligible again');
+  assert.equal(mechanicalFailureHistory(journalRoot, 3001).count, 0, 'the anchor moved forward -- prior failures no longer count');
+});
+
+test('retryHeldReport: re-injects a plain report-held issue (negative reproduction verdict)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-held-');
+  const journalRoot = mkTmp('spo-autotriage-retry-held-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-held.json');
+  confirmedEntry(journalRoot, { issue: 3002, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'could not reproduce on latest build' }] }),
+    { dry: false }
+  );
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  const result = await retryHeldReport(journalRoot, 3002, config, { spawnSync: () => ok('') }, { dry: false });
+  assert.equal(result.ok, true);
+  assert.equal(result.retriedFrom, 'report-held');
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [3002]);
+});
+
+test('retryHeldReport: re-injects a report-held do-not-file hold', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-dnf-');
+  const journalRoot = mkTmp('spo-autotriage-retry-dnf-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-dnf.json');
+  confirmedEntry(journalRoot, { issue: 3016, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({
+      claudeReplies: [
+        { outcome: 'draft', draft: VALID_DRAFT },
+        { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Not a real defect.' },
+      ],
+    }),
+    { dry: false }
+  );
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  const result = await retryHeldReport(journalRoot, 3016, config, { spawnSync: () => ok('') }, { dry: false });
+  assert.equal(result.ok, true);
+  assert.equal(result.retriedFrom, 'report-held');
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [3016]);
+});
+
+test('retryHeldReport: refused for an issue that was already triaged (filed)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-filed-');
+  const journalRoot = mkTmp('spo-autotriage-retry-filed-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-filed.json');
+  confirmedEntry(journalRoot, { issue: 3010, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  const filedResult = await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: FILE_REPLIES, npmResponder: () => ok('') }),
+    { dry: false }
+  );
+  assert.equal(filedResult.filed, 1);
+
+  const result = await retryHeldReport(journalRoot, 3010, config, {}, { dry: false });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /already triaged/);
+});
+
+test('retryHeldReport: refused for an issue with no report-confirmed event at all', async () => {
+  const journalRoot = mkTmp('spo-autotriage-retry-none-');
+  const result = await retryHeldReport(journalRoot, 9999, {}, {}, { dry: false });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /has no report-confirmed event on record/);
+});
+
+test('retryHeldReport: refused for an issue that is already eligible (no handled event since its confirm)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-eligible-');
+  const journalRoot = mkTmp('spo-autotriage-retry-eligible-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-eligible.json');
+  confirmedEntry(journalRoot, { issue: 3011, pendingPath });
+
+  const result = await retryHeldReport(journalRoot, 3011, { spoReportsDir }, {}, { dry: false });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /already eligible for triage/);
+});
+
+// N2: the handled-scan at auto-triage.js's `lines[i].issue === issue` guard is what this test
+// exercises directly. An ordinary journal shape -- another issue's report-held landing AFTER this
+// issue's own report-confirmed, simply because it was routed in the same or a later cycle -- is
+// completely unremarkable. Without the guard, the scan would treat that OTHER issue's hold as
+// THIS issue's own handled event, precondition 2 would pass, and an already-eligible report would
+// get double-queued (the exact hazard precondition 2 exists to prevent -- see this function's own
+// header, point 2).
+test('retryHeldReport: an unrelated issue\'s report-held after this issue\'s confirm must not be mistaken for this issue\'s own handled event', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-crosstalk-');
+  const journalRoot = mkTmp('spo-autotriage-retry-crosstalk-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-crosstalk.json');
+  confirmedEntry(journalRoot, { issue: 4001, pendingPath });
+  // A different issue's hold, journaled after 4001's confirm -- ordinary, unrelated traffic.
+  appendDaemonEvent(journalRoot, 'report-held', { issue: 4002, outcome: 'not-reproduced', reason: 'unrelated report' });
+
+  const result = await retryHeldReport(journalRoot, 4001, { spoReportsDir }, {}, { dry: false });
+  assert.equal(result.ok, false, 'issue 4002\'s hold must not be read as issue 4001\'s own handled event');
+  assert.match(result.error, /already eligible for triage/);
+});
+
+test('retryHeldReport: refused when the report file is missing from pending/', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-missing-');
+  const journalRoot = mkTmp('spo-autotriage-retry-missing-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-missing.json');
+  confirmedEntry(journalRoot, { issue: 3012, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'no journal entries' }] }),
+    { dry: false }
+  );
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  fs.unlinkSync(pendingPath); // simulate the file vanishing from pending/ after the hold
+
+  const result = await retryHeldReport(journalRoot, 3012, config, {}, { dry: false });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /report file is missing from pending\//);
+});
+
+// N5: fs.existsSync alone returns true for a DIRECTORY too -- action 3.1 already fixed the
+// identical existsSync-then-open TOCTOU/directory finding elsewhere (state-machine.js's
+// isNonEmptyFile); this pins the same fix here. If pendingPath resolves to a directory,
+// retryHeldReport must refuse it exactly like a missing file, never try to re-inject it.
+test('retryHeldReport: refused when the recorded pendingPath is a directory, not a file (N5)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-dir-');
+  const journalRoot = mkTmp('spo-autotriage-retry-dir-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-dir.json');
+  confirmedEntry(journalRoot, { issue: 3017, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'no journal entries' }] }),
+    { dry: false }
+  );
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  // Replace the file with a same-named directory -- fs.existsSync(pendingPath) would say `true`.
+  fs.unlinkSync(pendingPath);
+  fs.mkdirSync(pendingPath);
+
+  const result = await retryHeldReport(journalRoot, 3017, config, {}, { dry: false });
+  assert.equal(result.ok, false, 'a directory at pendingPath must never be treated as a re-injectable report');
+  assert.match(result.error, /report file is missing from pending\//);
+});
+
+// N4: a live daemon can claim this exact file into in-progress/ (claimReport) at any time -- an
+// ordinary race, not data loss. The old wording ("is missing from pending/ ... cannot re-inject a
+// report that no longer exists") reads to a maintainer racing a live daemon as their report having
+// been lost. Probe in-progress/ and say it is claimed instead.
+test('retryHeldReport: a report claimed into in-progress/ by a live daemon is reported as claimed, not missing/lost (N4)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-claimed-');
+  const journalRoot = mkTmp('spo-autotriage-retry-claimed-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-claimed.json');
+  confirmedEntry(journalRoot, { issue: 3018, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'no journal entries' }] }),
+    { dry: false }
+  );
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  // Simulate a live daemon racing this command: move the restored pending/ file into
+  // in-progress/, exactly what claimReport does at the start of a real cycle.
+  const inProgressDir = path.join(spoReportsDir, 'in-progress');
+  fs.mkdirSync(inProgressDir, { recursive: true });
+  fs.renameSync(pendingPath, path.join(inProgressDir, path.basename(pendingPath)));
+
+  const result = await retryHeldReport(journalRoot, 3018, config, {}, { dry: false });
+  assert.equal(result.ok, false);
+  assert.doesNotMatch(result.error, /no longer exists/, 'a claimed report must never read as data loss');
+  assert.match(result.error, /claimed by a running triage cycle/);
+});
+
+// N4 (config robustness): a missing/partial config must never turn the refusal itself into a
+// crash -- retryHeldReport still has to return a legible {ok:false, error} rather than throwing
+// on `config.spoReportsDir` of an undefined `config`.
+test('retryHeldReport: a missing config does not throw when the report file is absent (N4/N6)', async () => {
+  const journalRoot = mkTmp('spo-autotriage-retry-noconfig-journal-');
+  confirmedEntry(journalRoot, { issue: 3019, pendingPath: '/nonexistent/pending/path.json' });
+  appendDaemonEvent(journalRoot, 'report-held', { issue: 3019, outcome: 'not-reproduced', reason: 'x' });
+
+  await assert.doesNotReject(async () => {
+    const result = await retryHeldReport(journalRoot, 3019, undefined, {}, { dry: false });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /report file is missing from pending\//);
+  });
+});
+
+test('retryHeldReport: journals the re-confirm even when postIssueComment fails, with commentPosted: false', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-commentfail-');
+  const journalRoot = mkTmp('spo-autotriage-retry-commentfail-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-commentfail.json');
+  confirmedEntry(journalRoot, { issue: 3013, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: [{ outcome: 'insufficient', reason: 'no repro steps' }] }),
+    { dry: false }
+  );
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  // Same D1 lesson 3.3 already learned the hard way: a `gh` outage on the courtesy comment must
+  // never veto the mechanism that exists specifically to survive `gh` outages.
+  const failingDeps = { spawnSync: () => ({ status: 1, stdout: '', stderr: 'gh: rate limited', signal: null }) };
+  const result = await retryHeldReport(journalRoot, 3013, config, failingDeps, { dry: false });
+
+  assert.equal(result.ok, true, 'the event must be journalled regardless of the comment outcome');
+  assert.equal(result.commentPosted, false);
+  assert.ok(result.commentError);
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [3013], 'eligible again despite the comment failure');
+});
+
+test('retryHeldReport: opts.dry previews only -- appends nothing, comments nothing', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-dry-');
+  const journalRoot = mkTmp('spo-autotriage-retry-dry-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-dry.json');
+  confirmedEntry(journalRoot, { issue: 3014, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'x' }] }),
+    { dry: false }
+  );
+  const beforeLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+
+  let spawned = false;
+  const deps = {
+    spawnSync: () => {
+      spawned = true;
+      return ok('');
+    },
+  };
+  const result = await retryHeldReport(journalRoot, 3014, config, deps, { dry: true });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.dry, true);
+  assert.equal(result.outcome, 'would-retry');
+  // D4: pin retriedFrom on the DRY return specifically -- a mutation dropping it from just this
+  // branch (as opposed to the non-dry branch, already pinned by the other retryHeldReport tests)
+  // previously survived for want of this assertion.
+  assert.equal(result.retriedFrom, 'report-held');
+  assert.equal(spawned, false, 'a dry preview must never post a comment');
+  const afterLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.equal(afterLog, beforeLog, 'a dry preview must append nothing to the journal');
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), [], 'still held -- the preview changed nothing');
+});
+
+test('retryHeldReport end-to-end: hold mechanically at the cap, re-inject, and the next runAutoTriage cycle files it', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-e2e-');
+  const journalRoot = mkTmp('spo-autotriage-retry-e2e-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-e2e.json');
+  confirmedEntry(journalRoot, { issue: 3015, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true, autoTriageBackoffBaseMs: 0 };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false }); // eslint-disable-line no-await-in-loop
+  }
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), [], 'held after three strikes');
+
+  const retryResult = await retryHeldReport(journalRoot, 3015, config, { spawnSync: () => ok('') }, { dry: false });
+  assert.equal(retryResult.ok, true);
+  assert.equal(retryResult.retriedFrom, 'report-held-mechanical');
+
+  const result = await runAutoTriage(
+    journalRoot,
+    config,
+    makeDeps({ claudeReplies: FILE_REPLIES, npmResponder: () => ok('') }),
+    { dry: false }
+  );
+  assert.equal(result.filed, 1, 'the recovered report reaches filed on the very next cycle');
+});
+
+// D4: dropping `kind` from the synthesized report-confirmed event is undetectable by any test
+// above -- confirmedEntry defaults `kind` to `undefined`, and every 3.4 test so far omits it, so
+// JSON.stringify drops the key entirely and nothing can see whether it survived the round trip.
+// The shipped code IS correct (routeConfirmedReport reads entry.kind straight off the
+// report-confirmed event, and retryHeldReport already carries anchor.kind forward on both the
+// dry and non-dry returns and onto the appended event) -- but the failure this guards against is
+// real: a retried `kind: 'suggestion'` report silently routed down triageBugReport's LLM path
+// (a reproduction attempt) instead of the free mechanical buildSuggestionDraft, costing an LLM
+// call a recovery command should never spend. Pin it end to end: the dry return, the non-dry
+// return, the re-injected journal event, AND the actual LLM-call count on the next real cycle.
+test('retryHeldReport: carries kind forward for a suggestion report, and the retried report still costs exactly one LLM call, never two (D4)', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-suggestion-');
+  const journalRoot = mkTmp('spo-autotriage-retry-suggestion-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-suggestion.json');
+  confirmedEntry(journalRoot, { issue: 3020, pendingPath, kind: 'suggestion' });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true };
+
+  const countClaudeCalls = (baseDeps) => {
+    let calls = 0;
+    const spawnSync = (command, args, opts) => {
+      if (command === 'claude') calls++;
+      return baseDeps.spawnSync(command, args, opts);
+    };
+    return { deps: { ...baseDeps, spawnSync }, count: () => calls };
+  };
+
+  // Reach a hold: kind:'suggestion' skips triageBugReport entirely (buildSuggestionDraft is
+  // mechanical, no LLM call) -- reviewCard is the ONLY claude call in this path, so a DO_NOT_FILE
+  // verdict from it holds the report after exactly one LLM call.
+  const holdBase = makeDeps({ claudeReplies: [{ verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Not a real defect.' }] });
+  const holdCounted = countClaudeCalls(holdBase);
+  await runAutoTriage(journalRoot, config, holdCounted.deps, { dry: false });
+  assert.equal(holdCounted.count(), 1, 'a suggestion hold must cost exactly one LLM call (reviewCard only)');
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  // Dry return: kind and retriedFrom must both be pinned on the dry branch specifically.
+  const dryResult = await retryHeldReport(journalRoot, 3020, config, {}, { dry: true });
+  assert.equal(dryResult.ok, true);
+  assert.equal(dryResult.dry, true);
+  assert.equal(dryResult.kind, 'suggestion', 'kind must be carried on the dry return');
+  assert.equal(dryResult.retriedFrom, 'report-held', 'retriedFrom must be pinned on the dry return');
+
+  // Real retry: kind and retriedFrom must both be pinned on the non-dry return AND on the
+  // re-injected journal event itself -- routeConfirmedReport reads entry.kind straight off
+  // whatever report-confirmed event findConfirmedAwaitingTriage hands it, not off this function's
+  // return value, so the journal event is what actually matters for the next cycle's routing.
+  const result = await retryHeldReport(journalRoot, 3020, config, { spawnSync: () => ok('') }, { dry: false });
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, 'suggestion', 'kind must be carried on the non-dry return');
+  assert.equal(result.retriedFrom, 'report-held', 'retriedFrom must be pinned on the non-dry return');
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  const events = daemonLog.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const reinjected = events.filter((e) => e.event === 'report-confirmed' && e.issue === 3020).pop();
+  assert.ok(reinjected, 'expected a fresh report-confirmed event for the retried issue');
+  assert.equal(reinjected.kind, 'suggestion', 'the re-injected journal event must carry kind forward -- dropping it is the D4 defect');
+  assert.equal(reinjected.retriedFrom, 'report-held', 'the re-injected journal event must record what it was retried from');
+
+  // The decisive assertion: the NEXT real cycle must spend exactly ONE LLM call again
+  // (reviewCard only). Two calls would mean the retried report got routed through
+  // triageBugReport's reproduction path -- proof `kind` was dropped somewhere along the way.
+  const fileBase = makeDeps({
+    claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review\n\n**Verdict:** FILE' }],
+    npmResponder: () => ok(''),
+  });
+  const fileCounted = countClaudeCalls(fileBase);
+  const cycle = await runAutoTriage(journalRoot, config, fileCounted.deps, { dry: false });
+  assert.equal(fileCounted.count(), 1, 'the retried suggestion must cost exactly one LLM call on the next cycle too -- never two');
+  assert.equal(cycle.filed, 1, 'the recovered suggestion reaches filed on the very next cycle');
 });

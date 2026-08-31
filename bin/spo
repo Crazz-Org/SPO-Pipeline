@@ -92,6 +92,22 @@
 //                            mechanically, or whose reproduction does not confirm it, is HELD
 //                            (commented, never silently dropped) -- see orchestrator/README.md
 //                            § Auto-triage. Defaults to --dry; pass --file to actually act.
+//   spo triage --retry <issue> [--file]
+//                            ACTION 3.4 -- the recovery path for a report stuck at HOLD
+//                            (report-held / report-held-mechanical / report-held with outcome
+//                            do-not-file). Appends a fresh report-confirmed event for the issue,
+//                            which both makes it eligible for triage again AND resets its
+//                            mechanical-failure budget to 0 in the same move (see
+//                            orchestrator/auto-triage.js's retryHeldReport). Refuses an issue
+//                            with no report-confirmed event on record at all (nothing to
+//                            re-confirm), one that is already eligible (no held event to recover
+//                            from), one that was already filed/dispositioned (report-triaged), or
+//                            one whose report file is missing from pending/ -- each with its own
+//                            message, exit 1. Accepts a `#`-prefixed issue. Defaults to --dry
+//                            like every other `spo triage` invocation (exit 0, preview only,
+//                            nothing appended or posted); --file is required to actually append
+//                            the event and post the recovery comment. See orchestrator/README.md
+//                            § Report intake.
 //   spo recette [--scenario <name>] [--keep] [--dry] [--force]
 //                            ACTION 2.9 -- the supervised live harness, and the standard live
 //                            gate this project uses from chantier 3 on: drives ONE trivial
@@ -115,6 +131,8 @@
 // Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>
 // Flags (reports): --reports-dir <dir>
 // Flags (triage): --limit <n>  (default 3)  --file (actually act; default dry-run)
+//   --retry <issue>  (action 3.4 -- switches to the single-issue recovery path; --limit is
+//   ignored with --retry; accepts a `#`-prefixed issue; --file still required to act)
 // Flags (recette): --scenario <name> (default trivial-doc-log)  --keep  --dry  --force
 //   --recette-dir <dir> (default <repo>/.recette)  --cap-ms <n>  --cap-llm-steps <n>
 
@@ -146,6 +164,7 @@ function parseArgs(argv) {
     limit: null,
     reportsDir: null,
     file: false,
+    retry: null,
     noProd: false,
     host: null,
     scenario: null,
@@ -170,6 +189,7 @@ function parseArgs(argv) {
     else if (a === '--limit') opts.limit = argv[++i];
     else if (a === '--reports-dir') opts.reportsDir = argv[++i];
     else if (a === '--file') opts.file = true;
+    else if (a === '--retry') opts.retry = argv[++i];
     else if (a === '--no-prod') opts.noProd = true;
     else if (a === '--host') opts.host = argv[++i];
     else if (a === '--scenario') opts.scenario = argv[++i];
@@ -829,9 +849,25 @@ function cmdReports(opts) {
 // `spo ask`/`spo pull` use, then intake.amendCard -- edits the raw card in place). Never runs
 // `daemon.js`. Defaults to --dry. `deps.autoTriage`: same test-only override convention as
 // `deps.intake` (cmdAsk/cmdPull).
+//
+// `--retry <issue>` (action 3.4) switches to a different mode entirely -- see cmdTriageRetry
+// below and orchestrator/auto-triage.js's retryHeldReport for the mechanism. Checked first: a
+// `--retry` and a normal triage cycle are mutually exclusive, and `--limit` has no meaning for a
+// single-issue recovery.
 async function cmdTriage(opts, deps = {}) {
   const autoTriageImpl = deps.autoTriage || autoTriage;
   const { journalRoot } = resolveDirs(opts);
+
+  // opts.retry defaults to `null` (parseArgs) and stays there unless `--retry` was seen at all --
+  // including `--retry` as the LAST argv token, where `argv[++i]` reads past the end and yields
+  // `undefined`, NOT `null`. So the check is `!== null`, deliberately not also excluding
+  // `undefined`: that "flag present, value missing" shape must still route into cmdTriageRetry,
+  // whose own `if (!raw)` guard is what turns it into the legible "usage: ..." refusal -- routing
+  // it into a normal triage cycle instead would silently ignore a maintainer's typo.
+  if (opts.retry !== null) {
+    return cmdTriageRetry(opts, autoTriageImpl, journalRoot);
+  }
+
   const limit = opts.limit ? Number(opts.limit) : autoTriageImpl.DEFAULT_AUTO_TRIAGE_LIMIT;
   const dry = !opts.file;
 
@@ -862,6 +898,54 @@ async function cmdTriage(opts, deps = {}) {
   if (dry) console.log('(dry run -- nothing filed, nothing archived, nothing commented; pass --file to act)');
 
   if (result.errors.length > 0) process.exitCode = 1;
+}
+
+// `spo triage --retry <issue> [--file]` -- action 3.4: the recovery path for a report stuck at
+// HOLD (report-held / report-held-mechanical / report-held with outcome do-not-file). See
+// orchestrator/auto-triage.js's retryHeldReport for the mechanism itself, its three refusals, and
+// why a single fresh report-confirmed event both re-opens the report and resets the mechanical-
+// failure budget in the same move.
+//
+// Accepts a `#`-prefixed issue (`--retry #449` is what a maintainer will actually paste from a
+// GitHub thread) and rejects anything else -- a missing value, a non-numeric one -- with a legible
+// message and a non-zero exit (CLAUDE.md: verdict by exit code, never by reading text).
+//
+// Like every other `spo triage` invocation this defaults to --dry -- a maintainer who runs the
+// bare `--retry <issue>` first (the convention this whole CLI already follows) gets a safe
+// preview that appends and comments nothing; `--file` is required to actually act. `result.error`
+// from retryHeldReport (an unmet precondition) is printed and exits non-zero without ever calling
+// runAutoTriage.
+async function cmdTriageRetry(opts, autoTriageImpl, journalRoot) {
+  const raw = opts.retry;
+  if (!raw) {
+    console.error('usage: spo triage --retry <issue> [--file]');
+    process.exitCode = 1;
+    return;
+  }
+  const issueStr = raw.startsWith('#') ? raw.slice(1) : raw;
+  if (!/^\d+$/.test(issueStr)) {
+    console.error(`spo triage --retry: "${raw}" is not a valid issue number (expected e.g. 449 or #449)`);
+    process.exitCode = 1;
+    return;
+  }
+  const issue = Number(issueStr);
+  const dry = !opts.file;
+
+  const result = await autoTriageImpl.retryHeldReport(journalRoot, issue, defaultConfig, {}, { dry });
+
+  if (!result.ok) {
+    console.error(`#${issue}: ${result.error}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (dry) {
+    console.log(`#${issue}: would re-inject (currently ${result.retriedFrom}) -- dry run, nothing appended or commented; pass --file to actually act`);
+    return;
+  }
+
+  console.log(`#${issue}: re-injected (was ${result.retriedFrom}) -- eligible for triage again, mechanical-failure count reset to 0`);
+  console.log(`  comment posted: ${result.commentPosted ? 'yes' : `no (${result.commentError || 'unknown error'})`}`);
 }
 
 // `spo recette [--scenario <name>] [--keep] [--dry] [--force]` -- ACTION 2.9, see this file's
@@ -947,7 +1031,7 @@ function printUsage() {
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
       '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
-      '            triage: [--limit <n>] [--file]   (defaults to --dry)',
+      '            triage: [--limit <n>] [--file]   (defaults to --dry)   OR   triage --retry <issue> [--file]',
       '            recette: [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]',
     ].join('\n')
   );
