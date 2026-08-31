@@ -141,16 +141,34 @@ const result = await invokeClaudeReal({
   jsonSchema: { type: 'object' }, // optional
   deadlineMs: 120000,             // optional -- see "deadline handling" below
 });
-// -> { ok: true, result: 'ok', sessionId: '...', costUsd: 0.0004, numTurns: 1, raw: 0 }
+// -> { ok: true, result: 'ok', sessionId: '...', tokensSource: 'modelUsage', freshInputTokens: 120,
+//      cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 8, billableTokens: 128,
+//      cacheCreationEphemeral1h: 0, cacheCreationEphemeral5m: 0, numTurns: 1, raw: 0 }
 ```
+
+> **The `cacheCreationEphemeral1h` / `cacheCreationEphemeral5m` split is not available from this
+> source.** It is read best-effort from a nested `cache_creation` object on `modelUsage`, and
+> `modelUsage` has never been observed to carry one — a real smoke run against the live CLI came
+> back `0`/`0` while the flat counts were correct (fresh 910, cache-creation 8904, cache-read
+> 21478, output 50). The **only** place this repo has seen the split is the session JSONL's own
+> `message.usage.cache_creation` block, which would need a join by `sessionId` to reach. Read
+> these two fields as **structurally 0**, not as "no ephemeral cache was written" — nothing in
+> the pipeline consumes them today (`spo tokens` never prints them, `orchestrator/tokens.js`
+> never reads them), and the `likelyCacheExpiry` signal below deliberately does **not** depend on
+> them: it uses the inter-call gap plus the flat cache-creation-vs-cache-read counts, which are
+> real.
 
 It spawns `claude -p --model <model> --effort <effort> --output-format json
 --max-budget-usd <n>` (plus `--allowedTools`/`--permission-mode`/`--json-schema` when given) with
 the resolved prompt written to the child's stdin — never as an argv entry, since Linux caps each
 individual argv string at `MAX_ARG_STRLEN` (128KB) and a large filled prompt (a big plan/diff/
 criterion) would fail the spawn with `E2BIG` before `claude` ever started (reproduced on card
-#452's ~200KB IMPLEMENT prompt). It parses the JSON on stdout, sums `costUSD` across every entry
-of `modelUsage`, and classifies a
+#452's ~200KB IMPLEMENT prompt). It parses the JSON on stdout, extracts token counts (fresh
+input, cache-creation, cache-read, output -- `extractTokens`, defensive across both snake_case
+and camelCase `modelUsage` key spellings, since that field is produced by the `claude` CLI and
+never appears in the session JSONL to verify against) summed across every entry of `modelUsage`
+-- no dollar figure is computed anywhere (maintainer decision, 2026-08-31: the pool is a Claude
+Max quota, never metered API billing) -- and classifies a
 failure as `{kind: 'limit'}` (an `api_error_status` of 429, or a message matching
 `/limit|overloaded|rate/i`) or `{kind: 'error'}` (everything else). `deps.spawnSync` is the test
 injection point — production code never passes it, so a real call always spawns the real
@@ -557,7 +575,8 @@ identical to the shadow-mode bounded-wait logic.
 the worktree — the same "npm aliases need a product cwd" rule as WORKTREE's claim ordering, so
 the board sync must happen while the worktree still exists. Only then `git -C <productRepo>
 worktree remove --force <worktreePath>`. A final `finished` journal event carries the task's
-summed `costUsd` (every `llm-call` event's `costUsd` in `journal.jsonl`) and the PR number.
+summed `billableTokens` (every `llm-call` event's `billableTokens` in `journal.jsonl` -- fresh
+input + cache-creation + output, cache-read excluded) and the PR number.
 
 **Every spawn**, across all seven functions, journals one compact `{state, argv (first 6
 tokens), exit, ms}` `'spawn'` event via `appendEvent`, and appends its stdout (falling back to
@@ -1058,26 +1077,63 @@ Set the phone channel with a drop-in rather than editing the unit:
 `systemctl --user edit spo-pipeline-daemon.service` → `[Service]` /
 `Environment=SPO_PARK_NTFY_URL=https://ntfy.sh/<your-topic>`.
 
-## Spend: what `spo cost` measures, and what it does not
+## Tokens: what `spo tokens` measures, and what it does not
 
-`orchestrator/cost.js` reads what the pipeline has spent back out of the journals — every real
-`claude -p` call already records its own `costUsd` in an `llm-call` event, so there is no
-second ledger to keep in sync. `spo cost` prints it per task (state, calls, cost, park
-reasons), then the aggregate, cost per DONE card and the parking rate — the two numbers
-migration step 3 asks for. Parked-task count and park-*event* count are both shown because
-they answer different questions: card #247 parked six times and still reached DONE.
+Dollars are retired as the headline metric entirely (maintainer decision, 2026-08-31): the
+pool is Claude Max *subscription* accounts with a *quota*, never the metered API, so a dollar
+figure never meant money spent. `orchestrator/tokens.js` reads token efficiency back out of the
+journals instead — every real `claude -p` call already records its own token counts in an
+`llm-call` event (`steps/llm.js`'s `extractTokens`: `tokensSource`, `freshInputTokens`,
+`cacheCreationTokens`, `cacheReadTokens`, `outputTokens`, `billableTokens`), so there is no
+second ledger to keep in sync. `spo tokens` prints it per task (state, calls, the four token
+counts, billable-weighted total, park reasons), then the aggregate, billable-weighted tokens
+per DONE card and the parking rate — the two numbers migration step 3 asks for. Parked-task
+count and park-*event* count are both shown because they answer different questions: card #247
+parked six times and still reached DONE. `spo cost` still works too, as a deprecated alias that
+prints a one-line notice and then the same table (some docs/gates still say "watching `spo
+cost`").
 
-**These dollars are notional.** The pool is Claude Max *subscription* accounts
-(`accounts.js`), not the metered API, so `costUsd` is the API-equivalent of the work, not
-money leaving an account. That makes it an efficiency metric — what the migration plan
-compares against the old driver's baseline — and not a budget.
+**Billable-weighted tokens = fresh input + cache-creation + output.** Cache-*read* tokens are
+reported separately and never folded into that total: on a quota plan a cache read is nearly
+free while fresh input and a cache write are not, and cache-read tokens dominate raw counts by
+orders of magnitude (`console/usage-scan.js`'s own header) — a single "total tokens" number
+would just be measuring cache hit rate, not the thing worth watching. `tokensSource` is
+`'modelUsage'` when at least one recognized field was found there, else `null` — so a reader
+can tell "zero tokens" from "not reported" (a killed/E2BIG call that never got a `modelUsage`
+block at all).
 
-**There is deliberately no cumulative spend ceiling** (maintainer decision, 2026-08-29):
-capping notional dollars would enforce a limit that does not exist. What actually constrains a
-run is the pool — per-account rate limits and the cooldowns `accounts.js` already tracks. The
-**per-step** caps in `step-contracts.js` ($2/$5/$12 by size, $3 small, PLAN floor $3) stay,
-and are not about money either: they cut off a step that has run away, and a PLAN spinning
-past $3 is a broken PLAN whoever pays.
+**"n/a" means not reported, not zero.** `spo tokens` prints `n/a` — never `0` — in the token
+columns of any task whose `llm-call` events carry no `tokensSource`, and closes the report with a
+footer naming how many of the run's calls lacked the fields. Two things land there: journals
+written **before** token capture shipped (2026-08-31), whose events recorded only the retired
+`costUsd`, and a call killed before a `modelUsage` block existed (deadline kill, E2BIG, non-JSON
+stdout — `tokensSource: null`). `billableTokensPerDoneCard` is `null` (rendered `n/a`) whenever
+*no* call reported tokens, because a per-card figure computed off journals with no token data is
+a false measurement rather than a small one. **Every historical journal in this repo is in that
+state** — `spo tokens` over `journal/` reports `n/a` throughout until the current build has run
+some cards. This is also the plan's action 7.4 landing in the reader-facing surface, not just in
+the event shape.
+
+**There is deliberately no cumulative ceiling** (maintainer decision, 2026-08-29, restated
+2026-08-31): there was never a real dollar spend to cap, and capping tokens would enforce a
+limit that does not exist either. What actually constrains a run is the pool — per-account rate
+limits and the cooldowns `accounts.js` already tracks. The **per-step** `--max-budget-usd` caps
+`step-contracts.js`'s own header once described are, today, not actually set anywhere in that
+file — every step (and every `orchestrator/intake.js` LLM call) passes `maxBudgetUsd: undefined`
+and runs uncapped; see that file's own comment for the (still-current) maintainer decision
+behind it.
+
+**Cache-expiry flag (advisory only).** The `claude` CLI's prompt cache has (at least) two
+ephemeral TTL tiers — 5 minutes and 1 hour (`config.js`'s `cacheTtlMs`, currently the observed
+1-hour tier this pipeline's calls land in). When the gap between two calls sharing a cached
+prefix exceeds that TTL, the cache expires and the next call re-pays cache-creation on the whole
+preamble (~40k tokens for a PLAN/IMPLEMENT call) instead of a near-free cache read.
+`orchestrator/tokens.js`'s `computeLikelyCacheExpiries` flags a task's call as a
+`likelyCacheExpiry` when the gap since its task's previous `llm-call` exceeded `cacheTtlMs` AND
+its own cache-creation tokens dominate its cache-read tokens — evidence, never proof (the cache
+could have been evicted earlier, or the two calls might never have shared a prefix at all).
+`spo tokens` surfaces it as a per-task marker and an aggregate count. Reporting only: nothing
+here parks, retries, or otherwise changes pipeline behavior.
 
 ## How much the daemon takes on at once
 
@@ -1110,6 +1166,8 @@ journal/<id>/
 bin/spo status [--journal <dir>] [--queue <dir>]   # queue depth, active/parked/done, per-task state
 bin/spo task <id> [--journal <dir>]                # human-readable timeline from journal.jsonl
 bin/spo parked [--journal <dir>]                   # parked tasks + reasons
+bin/spo tokens [--journal <dir>]                   # per-task + aggregate token accounting, billable/DONE-card, parking rate (see "Tokens" above)
+bin/spo cost [--journal <dir>]                     # DEPRECATED alias for `spo tokens` -- prints a notice, then the same table
 bin/spo resume <id> [--journal <dir>]              # print `claude --resume <sessionId>` for a task's LLM steps
 bin/spo accounts [--accounts-dir <dir>]            # list the account pool: name, enabled, cooldown, token, credentials
 bin/spo account add <name> [--accounts-dir <dir>]  # create the pool slot, print the guided setup steps
@@ -1155,8 +1213,9 @@ Two render modes, same underlying data:
 Per-task detail (id, state, reason, per-LLM-step `claude --resume <sessionId>`) is deliberately
 NOT rendered -- it duplicates the GitHub Projects board (Kanban), which owns that view. The
 journal is still read for other consumers (daemon stats, token-usage session attribution). The
-dashboard never renders a dollar figure -- `spo cost` / `orchestrator/cost.js` own that view
-instead.
+dashboard never renders a dollar figure -- this build carries none anywhere. `spo tokens` /
+`orchestrator/tokens.js` own the token-accounting view instead (`spo cost` stays as a
+deprecated alias).
 
 **Bug reports card:** counters only (queued/pending/confirmed, last intake cycle, 24h
 filed/held/duplicate, remote-pull health) from `orchestrator/report-intake.js` +

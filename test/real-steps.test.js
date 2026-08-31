@@ -1619,15 +1619,15 @@ test('realMerge: pr:wait [4,4] -> PARKED (merge-queue-not-landing), never a thir
 
 // ---- FINISH ---------------------------------------------------------------------------------
 
-test('realFinish: board:move, then gh issue comment, then git worktree remove --force, in order; sums llm costUsd', async () => {
+test('realFinish: board:move, then gh issue comment, then git worktree remove --force, in order; sums llm billableTokens', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-finish-wt-');
   const task = { id: 'card-finish1', kind: 'card', issue: 120, worktreePath };
   const ctx = testCtx({ id: 'card-finish1', task, config });
   ctx.prNumber = 444;
 
-  appendEvent(ctx.taskDir, 'PLAN', 'llm-call', { costUsd: 0.01 });
-  appendEvent(ctx.taskDir, 'IMPLEMENT', 'llm-call', { costUsd: 0.025 });
+  appendEvent(ctx.taskDir, 'PLAN', 'llm-call', { billableTokens: 1000 });
+  appendEvent(ctx.taskDir, 'IMPLEMENT', 'llm-call', { billableTokens: 2500 });
 
   const calls = [];
   const deps = { spawnSync: (command, args) => { calls.push({ command, args: [...args] }); return ok(''); } };
@@ -1653,7 +1653,7 @@ test('realFinish: board:move, then gh issue comment, then git worktree remove --
     .map((l) => JSON.parse(l));
   const finished = journal.find((e) => e.event === 'finished');
   assert.ok(finished);
-  assert.ok(Math.abs(finished.costUsd - 0.035) < 1e-9);
+  assert.equal(finished.billableTokens, 3500);
   assert.equal(finished.prNumber, 444);
 });
 

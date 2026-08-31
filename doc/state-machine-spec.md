@@ -110,13 +110,16 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 Journals are the single source of truth; `~/.spo-bench/` remains the bench's own surface.
 
 - `journal/<task-id>.jsonl` — every event: state transitions, step spawns and results
-  (`{step, model, effort, account, session_id, cost_usd, duration_s, exit, verdict}`),
+  (`{step, model, effort, account, session_id, tokensSource, freshInputTokens,
+  cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, duration_s, exit,
+  verdict}` — no dollar figure anywhere; `orchestrator/tokens.js`'s "billable-weighted" =
+  fresh input + cache-creation + output, cache-read reported separately, never summed in),
   account cooldowns, parkings (with reason), attempts.
 - **Claude session management**: the `session_id` of every step is recorded, so any step can
   be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
   interactively). `claude agents` lists live background sessions.
 - Console CLI (planned order): `spo status` (queue, active tasks + state, bench queue,
-  accounts health, today's spend) · `spo task <id>` (timeline from the journal) ·
+  accounts health, today's token usage) · `spo task <id>` (timeline from the journal) ·
   `spo parked` (parked tasks + reasons) · `spo resume <session_id>` (wraps
   `claude --resume`). A generated static HTML dashboard comes after the CLI, fed by the same
   journals.
@@ -149,7 +152,8 @@ The analysis's top families are mostly **states not to have** rather than branch
    code at least once (kill the worker → 3, dirty tree → 2, timeout → 4).
 2. Real S-sized cards: measure **parking rate** and **weighted tokens per merged card**
    (usage-report) against the experiment's baseline (≈ $12 API-equivalent per session,
-   2026-08 measurement).
+   2026-08 measurement -- dollars are the superseded unit of that historical baseline; the
+   comparison itself is now made in billable-weighted tokens, see `orchestrator/tokens.js`).
 3. Promotion when parking rate < ~15 % over a representative batch; the old path retires
    card-type by card-type.
 

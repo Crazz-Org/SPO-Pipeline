@@ -4,8 +4,7 @@
 // Streams every *.jsonl under each root's *<FILTER>*/ (default root: ~/.claude/projects,
 // default filter: SPO), dedupes assistant messages by message.id (transcripts write one line
 // per content block, so a naive sum double-counts), and aggregates usage by (model,
-// driver|sidechain), by workflow phase, by session type, plus a cache-rebuild count and a
-// weighted USD cost estimate.
+// driver|sidechain), by workflow phase, by session type, plus a cache-rebuild count.
 //
 // Deliberately streaming with O(1) memory per file: a whole-corpus jq slurp took the WSL VM
 // down (tmpfs is RAM — ENOSPC under memory pressure, 2026-08-29). Keep it that way — never
@@ -14,10 +13,15 @@
 // Usage:   node scripts/usage-report.js [filter] [--since=YYYY-MM-DD] [--until=YYYY-MM-DD]
 //                                        [--top=N] [--roots=dir1,dir2]
 // Output:  one JSON document on stdout — totals by model, by phase, by session type,
-//          cache-rebuild count, USD estimate, top sessions, date range.
+//          cache-rebuild count, top sessions, date range. NO dollar figure anywhere (maintainer
+//          decision, 2026-08-31: the pool is a Claude Max quota, never metered API billing, so a
+//          dollar figure never meant money spent -- see orchestrator/tokens.js's header).
 //
 // Baseline (2026-08-20..28, filter SPO): 273 sessions, 19,474 messages, ~3.84B cache-read
-// tokens, ≈ $3,190 API-equivalent, 93% carried by Fable/Opus driver turns.
+// tokens, 93% carried by Fable/Opus driver turns. (This measurement originally also carried a
+// weighted-USD estimate, ≈ $3,190 API-equivalent -- that conversion is retired along with the
+// rest of this file's dollar estimate; the token counts above are the historical fact that
+// survives it.)
 //
 // v1 additions (this file):
 //  - --since / --until / --top / --roots CLI flags (--roots also preps per-account
@@ -29,8 +33,6 @@
 //  - session type: "card" (any Bash command in the file contains board:take) vs "meta"
 //  - cache-rebuild detection: a deduped message (after the file's first) whose
 //    cache_creation_input_tokens exceeds 30% of (cache_creation + cache_read)
-//  - a weighted USD cost estimate from a per-model API-price proxy table; an unmapped model
-//    falls back to the opus rate and is flagged in estUsd.unknownModels
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -91,44 +93,13 @@ function markerPhase(name, input) {
   return null;
 }
 
-// ---- API-price proxy (USD per MTok) --------------------------------------
-const RATES = {
-  'claude-fable-5': [10, 50],
-  'claude-opus-5': [5, 25],
-  'claude-opus-4-8': [5, 25],
-  'claude-opus-4-6': [5, 25],
-  'claude-sonnet-5': [2, 10],
-  'claude-sonnet-4-6': [3, 15],
-  'claude-haiku-4-5': [1, 5], // wildcard base; matches any claude-haiku-4-5* (e.g. dated ids)
-};
-
-function rateFor(model) {
-  if (RATES[model]) return { rIn: RATES[model][0], rOut: RATES[model][1], known: true };
-  if (model.startsWith('claude-haiku-4-5')) {
-    return { rIn: RATES['claude-haiku-4-5'][0], rOut: RATES['claude-haiku-4-5'][1], known: true };
-  }
-  return { rIn: RATES['claude-opus-5'][0], rOut: RATES['claude-opus-5'][1], known: false };
-}
-
-function usdForUsage(model, u) {
-  const { rIn, rOut } = rateFor(model);
-  return (
-    ((u.input_tokens || 0) * rIn +
-      (u.cache_read_input_tokens || 0) * 0.1 * rIn +
-      (u.cache_creation_input_tokens || 0) * 2 * rIn +
-      (u.output_tokens || 0) * rOut) /
-    1e6
-  );
-}
-
 // ---- global accumulators --------------------------------------------------
 const byModel = {}; // model -> side -> sums   (unchanged from v0)
 const byPhase = {}; // phase -> {n, cr, cc, out}
 const sessions = { card: { n: 0, cr: 0, cc: 0, out: 0 }, meta: { n: 0, cr: 0, cc: 0, out: 0 } };
 const cacheRebuilds = { events: 0, ccSum: 0 };
-const costAcc = {}; // model -> {inp, cr, cc, out}  (drives estUsd.byModel)
 const perFile = [];
-const rootStats = {}; // rootPath -> {files, sessionsWithUsage, msgs, dupes, costUsd}
+const rootStats = {}; // rootPath -> {files, sessionsWithUsage, msgs, dupes}
 let files = 0,
   msgs = 0,
   dupes = 0,
@@ -224,14 +195,6 @@ async function doFile(fp, rootPath) {
     ph.cc += cc;
     ph.out += out;
 
-    const ca = (costAcc[model] = costAcc[model] || { inp: 0, cr: 0, cc: 0, out: 0 });
-    ca.inp += u.input_tokens || 0;
-    ca.cr += cr;
-    ca.cc += cc;
-    ca.out += out;
-    const usd = usdForUsage(model, u);
-    if (rs) rs.costUsd += usd;
-
     if (!firstCounted) {
       firstCounted = true; // a file's first counted usage message never counts as a rebuild
     } else {
@@ -264,7 +227,7 @@ async function doFile(fp, rootPath) {
 
 (async () => {
   for (const rootPath of ROOTS) {
-    rootStats[rootPath] = { files: 0, sessionsWithUsage: 0, msgs: 0, dupes: 0, costUsd: 0 };
+    rootStats[rootPath] = { files: 0, sessionsWithUsage: 0, msgs: 0, dupes: 0 };
     let dirEntries;
     try {
       dirEntries = fs.readdirSync(rootPath);
@@ -313,19 +276,6 @@ async function doFile(fp, rootPath) {
 
   const sessionsOut = { card: round(sessions.card), meta: round(sessions.meta) };
 
-  const estByModel = {};
-  const unknownModels = [];
-  let estTotal = 0;
-  for (const m in costAcc) {
-    const c = costAcc[m];
-    const { rIn, rOut, known } = rateFor(m);
-    if (!known) unknownModels.push(m);
-    const usd = (c.inp * rIn + c.cr * 0.1 * rIn + c.cc * 2 * rIn + c.out * rOut) / 1e6;
-    estByModel[m] = +usd.toFixed(2);
-    estTotal += usd;
-  }
-  const estUsd = { total: +estTotal.toFixed(2), byModel: estByModel, unknownModels };
-
   const out = {
     filter: FILTER,
     since: SINCE,
@@ -341,7 +291,6 @@ async function doFile(fp, rootPath) {
     byPhase_Mtokens: bp,
     sessions: sessionsOut,
     cacheRebuilds: { events: cacheRebuilds.events, Mcc_in_rebuilds: +(cacheRebuilds.ccSum / 1e6).toFixed(2) },
-    estUsd,
     topSessions: top,
   };
 
@@ -354,7 +303,6 @@ async function doFile(fp, rootPath) {
         sessionsWithUsage: rs.sessionsWithUsage,
         msgs: rs.msgs,
         dupes: rs.dupes,
-        estUsd: +rs.costUsd.toFixed(2),
       };
     }
   }

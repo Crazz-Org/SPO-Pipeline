@@ -11,7 +11,7 @@ const {
   invokeClaudeReal,
   buildArgv,
   resolvePromptText,
-  sumCost,
+  extractTokens,
   classifyFailure,
 } = require('../orchestrator/steps/llm');
 
@@ -27,7 +27,6 @@ function realShapedPayload(overrides = {}) {
         outputTokens: 20,
         cacheReadInputTokens: 0,
         cacheCreationInputTokens: 0,
-        costUSD: 0.0012,
       },
     },
     terminal_reason: 'success',
@@ -90,20 +89,123 @@ test('resolvePromptText: no promptText or promptFile throws', () => {
   assert.throws(() => resolvePromptText({ model: 'haiku' }), /promptText or promptFile/);
 });
 
-// ---- sumCost / classifyFailure ------------------------------------------------------------
+// ---- extractTokens / classifyFailure ------------------------------------------------------
 
-test('sumCost adds costUSD across every modelUsage entry', () => {
-  const total = sumCost({
-    'model-a': { costUSD: 0.01 },
-    'model-b': { costUSD: 0.0025 },
-    'model-c': {}, // no costUSD -- contributes 0, does not throw
+test('extractTokens: camelCase modelUsage fields (the shape this repo has actually observed)', () => {
+  const tokens = extractTokens({
+    'claude-haiku-4-5': {
+      inputTokens: 100,
+      cacheCreationInputTokens: 50,
+      cacheReadInputTokens: 10,
+      outputTokens: 20,
+    },
   });
-  assert.equal(total, 0.0125);
+  assert.equal(tokens.tokensSource, 'modelUsage');
+  assert.equal(tokens.freshInputTokens, 100);
+  assert.equal(tokens.cacheCreationTokens, 50);
+  assert.equal(tokens.cacheReadTokens, 10);
+  assert.equal(tokens.outputTokens, 20);
+  assert.equal(tokens.billableTokens, 100 + 50 + 20); // NOT + cacheRead
 });
 
-test('sumCost of a missing/empty modelUsage is 0', () => {
-  assert.equal(sumCost(undefined), 0);
-  assert.equal(sumCost({}), 0);
+test('extractTokens: snake_case modelUsage fields (the real per-message usage block\'s spelling)', () => {
+  const tokens = extractTokens({
+    'claude-sonnet-5': {
+      input_tokens: 200,
+      cache_creation_input_tokens: 30,
+      cache_read_input_tokens: 5,
+      output_tokens: 15,
+    },
+  });
+  assert.equal(tokens.tokensSource, 'modelUsage');
+  assert.equal(tokens.freshInputTokens, 200);
+  assert.equal(tokens.cacheCreationTokens, 30);
+  assert.equal(tokens.cacheReadTokens, 5);
+  assert.equal(tokens.outputTokens, 15);
+  assert.equal(tokens.billableTokens, 200 + 30 + 15);
+});
+
+test('extractTokens: mixed casing across two model entries sums correctly and stays defensive per-field', () => {
+  const tokens = extractTokens({
+    'model-a': { inputTokens: 10, output_tokens: 2 }, // camelCase input, snake_case output
+    'model-b': { input_tokens: 5, outputTokens: 1, cacheCreationInputTokens: 3 },
+  });
+  assert.equal(tokens.tokensSource, 'modelUsage');
+  assert.equal(tokens.freshInputTokens, 15);
+  assert.equal(tokens.outputTokens, 3);
+  assert.equal(tokens.cacheCreationTokens, 3);
+  assert.equal(tokens.cacheReadTokens, 0);
+});
+
+test('extractTokens: a model entry with no recognized field contributes 0, never throws', () => {
+  const tokens = extractTokens({
+    'model-a': { inputTokens: 10, outputTokens: 2 },
+    'model-c': {}, // nothing recognizable -- contributes 0
+    'model-d': { someUnrelatedField: 'x' },
+  });
+  assert.equal(tokens.tokensSource, 'modelUsage');
+  assert.equal(tokens.freshInputTokens, 10);
+  assert.equal(tokens.outputTokens, 2);
+});
+
+test('extractTokens: absent/empty/malformed modelUsage -> tokensSource null, every count 0 (never silently "0 cost")', () => {
+  assert.equal(extractTokens(undefined).tokensSource, null);
+  assert.equal(extractTokens(null).tokensSource, null);
+  assert.equal(extractTokens('not an object').tokensSource, null);
+  assert.equal(extractTokens({}).tokensSource, null);
+  // Entries present but carrying nothing recognizable at all -- still null, not a false zero.
+  const tokens = extractTokens({ 'model-a': {}, 'model-b': { someUnrelatedField: 1 } });
+  assert.equal(tokens.tokensSource, null);
+  assert.equal(tokens.freshInputTokens, 0);
+  assert.equal(tokens.cacheCreationTokens, 0);
+  assert.equal(tokens.cacheReadTokens, 0);
+  assert.equal(tokens.outputTokens, 0);
+  assert.equal(tokens.billableTokens, 0);
+});
+
+test('extractTokens: billable-weighted total excludes cache-read even when cache-read dwarfs the rest', () => {
+  const tokens = extractTokens({
+    'claude-fable-5': {
+      inputTokens: 500,
+      cacheCreationInputTokens: 200,
+      cacheReadInputTokens: 40_000_000, // a huge cache hit
+      outputTokens: 100,
+    },
+  });
+  assert.equal(tokens.cacheReadTokens, 40_000_000);
+  assert.equal(tokens.billableTokens, 500 + 200 + 100); // unaffected by the 40M cache-read
+});
+
+test('extractTokens: best-effort ephemeral 1h/5m cache-creation split, read from a nested cache_creation/cacheCreation object when present', () => {
+  const snakeNested = extractTokens({
+    'claude-sonnet-5': {
+      input_tokens: 10,
+      cache_creation_input_tokens: 335,
+      cache_read_input_tokens: 0,
+      output_tokens: 5,
+      cache_creation: { ephemeral_1h_input_tokens: 335, ephemeral_5m_input_tokens: 0 },
+    },
+  });
+  assert.equal(snakeNested.cacheCreationEphemeral1h, 335);
+  assert.equal(snakeNested.cacheCreationEphemeral5m, 0);
+
+  const camelNested = extractTokens({
+    'claude-sonnet-5': {
+      inputTokens: 10,
+      cacheCreationInputTokens: 335,
+      cacheCreation: { ephemeral1hInputTokens: 0, ephemeral5mInputTokens: 335 },
+    },
+  });
+  assert.equal(camelNested.cacheCreationEphemeral5m, 335);
+  assert.equal(camelNested.cacheCreationEphemeral1h, 0);
+});
+
+test('extractTokens: no nested cache_creation/cacheCreation object -- ephemeral split reads back 0, never throws (the documented common case: modelUsage has not been observed to carry this split)', () => {
+  const tokens = extractTokens({
+    'claude-haiku-4-5': { inputTokens: 100, outputTokens: 20 },
+  });
+  assert.equal(tokens.cacheCreationEphemeral1h, 0);
+  assert.equal(tokens.cacheCreationEphemeral5m, 0);
 });
 
 test('classifyFailure: api_error_status 429 -> limit', () => {
@@ -181,11 +283,11 @@ test('invokeClaudeReal: spawns "claude" with cwd passed through', () => {
   });
 });
 
-test('invokeClaudeReal: parses a real-shaped success payload and sums cost', async () => {
+test('invokeClaudeReal: parses a real-shaped success payload and sums tokens across model entries', async () => {
   const payload = realShapedPayload({
     modelUsage: {
-      'claude-haiku-4-5': { costUSD: 0.001 },
-      'claude-fable-5': { costUSD: 0.002 },
+      'claude-haiku-4-5': { inputTokens: 100, outputTokens: 10 },
+      'claude-fable-5': { inputTokens: 50, outputTokens: 5, cacheCreationInputTokens: 20 },
     },
   });
   const deps = {
@@ -201,7 +303,11 @@ test('invokeClaudeReal: parses a real-shaped success payload and sums cost', asy
   assert.equal(result.result, 'ok');
   assert.equal(result.sessionId, 'sess-123');
   assert.equal(result.numTurns, 1);
-  assert.ok(Math.abs(result.costUsd - 0.003) < 1e-9);
+  assert.equal(result.tokensSource, 'modelUsage');
+  assert.equal(result.freshInputTokens, 150);
+  assert.equal(result.cacheCreationTokens, 20);
+  assert.equal(result.outputTokens, 15);
+  assert.equal(result.billableTokens, 150 + 20 + 15);
   assert.equal(result.raw, 0);
 });
 

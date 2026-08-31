@@ -58,7 +58,7 @@ test('spo resume <task-id> lists recorded LLM steps as claude --resume commands,
     effort: 'medium',
     account: 'default',
     sessionId: 'sess-plan-1',
-    costUsd: 0.0123,
+    billableTokens: 1234,
     numTurns: 3,
     ok: true,
   });
@@ -68,7 +68,7 @@ test('spo resume <task-id> lists recorded LLM steps as claude --resume commands,
     effort: 'medium',
     account: 'default',
     sessionId: 'sess-impl-1',
-    costUsd: 0.5,
+    billableTokens: 50000,
     numTurns: 12,
     ok: true,
   });
@@ -76,6 +76,7 @@ test('spo resume <task-id> lists recorded LLM steps as claude --resume commands,
   const out = runSpo(['resume', 'resume-demo', '--journal', journalDir]);
   assert.match(out, /PLAN.*claude --resume sess-plan-1/);
   assert.match(out, /IMPLEMENT.*claude --resume sess-impl-1/);
+  assert.doesNotMatch(out, /\$\d/);
 });
 
 test('spo resume <bare-session-id> just prints the command for an unknown task id', () => {

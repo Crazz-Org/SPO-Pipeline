@@ -5,13 +5,24 @@
 //   spo status              queue depth, active/parked/done counts, per-task state + last event
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl
 //   spo parked              parked tasks + reasons
-//   spo cost                 what the pipeline has spent, read back from the journals' own
-//                            `llm-call` costUsd events (orchestrator/cost.js -- no second
-//                            ledger): per task (state, calls, cost, park reasons), then the
-//                            aggregate, cost per DONE card and parking rate -- the two numbers
-//                            migration step 3 asks for. The dollars are notional (a
-//                            subscription pool, not the metered API): an efficiency metric,
-//                            not a budget.
+//   spo tokens               what the pipeline has spent, in TOKENS, read back from the
+//                            journals' own `llm-call` token events (orchestrator/tokens.js --
+//                            no second ledger): per task (state, calls, the four token counts,
+//                            billable-weighted total, park reasons), then the aggregate,
+//                            billable-weighted tokens per DONE card and parking rate -- the two
+//                            numbers migration step 3 asks for. Billable-weighted = fresh input
+//                            + cache-creation + output; cache-read is reported separately, never
+//                            summed into it (near-free on this project's Claude Max quota plan,
+//                            and it dominates raw counts by orders of magnitude). An efficiency
+//                            metric, not a budget -- there is no dollar figure anywhere here.
+//                            "n/a" in a token column means NOT REPORTED, never zero: journals
+//                            written before token capture shipped (2026-08-31) carry no token
+//                            fields at all, and a killed/E2BIG call journals
+//                            `tokensSource: null` -- a footer names how many calls lacked them.
+//   spo cost                 DEPRECATED alias for `spo tokens` (dollars were retired as the
+//                            headline metric, 2026-08-31) -- prints a one-line notice, then the
+//                            same table. Kept only because some docs/gates still say "watching
+//                            spo cost".
 //   spo resume <id>         PRINTS `claude --resume <sessionId>` for a task's recorded LLM
 //                            steps, or for a bare session id, the same command directly. Never
 //                            executes anything -- see doc/state-machine-spec.md § Observability.
@@ -102,7 +113,7 @@ const intake = require('../orchestrator/intake');
 const autoTriage = require('../orchestrator/auto-triage');
 const reportIntake = require('../orchestrator/report-intake');
 const remoteReportPull = require('../orchestrator/remote-report-pull');
-const { costReport } = require('../orchestrator/cost');
+const { tokenReport } = require('../orchestrator/tokens');
 
 function parseArgs(argv) {
   const opts = {
@@ -234,19 +245,38 @@ function cmdTask(id, opts) {
   }
 }
 
-// `spo cost` -- the soak's read-out: per task, then the two numbers migration step 3 asks for
-// (parking rate and cost per merged card). Everything comes from orchestrator/cost.js, i.e.
-// from the journals' own `llm-call` costUsd events -- there is no second ledger.
+// formatTokenCount(n) -- readable large-number formatting for a terminal table: raw 9-digit
+// integers (cache-read counts routinely run into the millions -- see console/usage-scan.js's
+// own header) are unreadable in a fixed-width column. >=1M -> "12.3M", >=1k -> "215.4k",
+// otherwise the plain integer.
+function formatTokenCount(n) {
+  const v = typeof n === 'number' ? n : 0;
+  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return String(Math.round(v));
+}
+
+// `spo tokens` -- the soak's read-out: per task, then the two numbers migration step 3 asks for
+// (parking rate and billable-weighted tokens per merged card). Everything comes from
+// orchestrator/tokens.js, i.e. from the journals' own `llm-call` token events -- there is no
+// second ledger, and no dollar figure anywhere (maintainer decision, 2026-08-31: the pool is a
+// Claude Max quota, never metered API billing, so a dollar figure never meant money spent).
 //
-// The pool is Claude Max SUBSCRIPTION accounts, so these dollars are the notional
-// API-equivalent of the work, not money spent -- an efficiency metric to compare against the
-// old driver's baseline, not a budget. Nothing caps them.
+// Billable-weighted = fresh input + cache-creation + output; cache-read is shown as its own
+// column, never folded into "billable", since it is near-free on a quota plan and dominates raw
+// counts by orders of magnitude (console/usage-scan.js's own header).
 //
 // Parked-task count and park-EVENT count are both printed because they answer different
 // questions: card #247 parked 6 times and still reached DONE.
-function cmdCost(opts) {
+//
+// "cache expiries" (per task and in aggregate) is orchestrator/tokens.js's advisory
+// `likelyCacheExpiry` signal -- evidence a call's cached prefix had gone cold (the gap since the
+// task's previous llm-call exceeded the platform's observed cache TTL, and the call's own
+// cache-creation tokens dominated its cache-read tokens), never proof, and never something this
+// command or the daemon acts on -- reporting only.
+function cmdTokens(opts) {
   const { journalRoot } = resolveDirs(opts);
-  const report = costReport(journalRoot);
+  const report = tokenReport(journalRoot);
 
   if (report.tasks.length === 0) {
     console.log(`no task journals under ${journalRoot}`);
@@ -254,28 +284,83 @@ function cmdCost(opts) {
   }
 
   const idWidth = Math.max(4, ...report.tasks.map((t) => t.id.length));
-  console.log(`${'task'.padEnd(idWidth)}  ${'state'.padEnd(7)}  ${'calls'.padStart(5)}  ${'cost'.padStart(8)}  parks`);
+  console.log(
+    `${'task'.padEnd(idWidth)}  ${'state'.padEnd(7)}  ${'calls'.padStart(5)}  ${'in'.padStart(7)}  ` +
+      `${'cache-cr'.padStart(8)}  ${'cache-rd'.padStart(8)}  ${'out'.padStart(7)}  ${'billable'.padStart(8)}  ` +
+      `${'exp'.padStart(3)}  parks`
+  );
   for (const t of report.tasks) {
-    const parks = t.parkReasons.length ? `${t.parkReasons.length} [${t.parkReasons.join(', ')}]` : '';
+    // Cache expiries get their OWN column, never the parks column: nothing about a likely cache
+    // expiry parks anything (it is advisory, see orchestrator/tokens.js), and rendering it under
+    // a heading called "parks" reads as though it did.
+    const expiries = t.likelyCacheExpiries.length ? `x${t.likelyCacheExpiries.length}` : '';
+    const parksParts = [];
+    if (t.parkReasons.length) parksParts.push(`${t.parkReasons.length} [${t.parkReasons.join(', ')}]`);
+    // A task whose llm-calls reported NO token fields at all (every journal written before
+    // token capture shipped; a run of killed/E2BIG calls) prints "n/a", never 0 -- a 0 there is
+    // indistinguishable from "this task genuinely used no tokens", which would be a false
+    // measurement rather than a missing one. orchestrator/tokens.js's llmCallsWithTokens (from
+    // each event's own `tokensSource`) is what makes the two distinguishable.
+    const cell = (n) => (t.llmCallsWithTokens === 0 ? 'n/a' : formatTokenCount(n));
     console.log(
       `${t.id.padEnd(idWidth)}  ${t.state.padEnd(7)}  ${String(t.llmCalls).padStart(5)}  ` +
-        `${('$' + t.costUsd.toFixed(2)).padStart(8)}  ${parks}`
+        `${cell(t.freshInputTokens).padStart(7)}  ${cell(t.cacheCreationTokens).padStart(8)}  ` +
+        `${cell(t.cacheReadTokens).padStart(8)}  ${cell(t.outputTokens).padStart(7)}  ` +
+        `${cell(t.billableTokens).padStart(8)}  ${expiries.padStart(3)}  ${parksParts.join('  ')}`
     );
   }
 
   const finished = report.done + report.parked;
+  const anyTokens = report.llmCallsWithTokens > 0;
   console.log('');
-  console.log(`total: $${report.totalUsd.toFixed(2)} over ${report.tasks.length} tasks`);
+  if (anyTokens) {
+    console.log(
+      `total: in ${formatTokenCount(report.freshInputTokens)}  cache-cr ${formatTokenCount(report.cacheCreationTokens)}  ` +
+        `cache-rd ${formatTokenCount(report.cacheReadTokens)}  out ${formatTokenCount(report.outputTokens)}  ` +
+        `billable ${formatTokenCount(report.billableTokens)}  over ${report.tasks.length} tasks`
+    );
+  } else {
+    console.log(`total: n/a -- no token data in any journal, over ${report.tasks.length} tasks`);
+  }
   console.log(`done: ${report.done}  parked: ${report.parked}  park events: ${report.parks}`);
-  if (report.done > 0) {
-    console.log(`cost per DONE card: $${(report.totalUsd / report.done).toFixed(2)}`);
+  if (report.billableTokensPerDoneCard !== null) {
+    console.log(`billable tokens per DONE card: ${formatTokenCount(report.billableTokensPerDoneCard)}`);
+  } else if (report.done > 0) {
+    console.log('billable tokens per DONE card: n/a (no token data)');
   }
   if (finished > 0) {
     // The parking RATE the migration plan asks for: of the cards that reached a terminal
     // state, the share that ended parked rather than done.
     console.log(`parking rate: ${((report.parked / finished) * 100).toFixed(0)}% (${report.parked}/${finished} terminal)`);
   }
+  console.log(`cache expiries (likely, advisory only): ${report.likelyCacheExpiries}`);
 
+  // The footer that keeps this report honest. `llm-call` events written before token capture
+  // shipped (2026-08-31) carry only the retired `costUsd` and no `tokensSource` at all, and a
+  // killed/E2BIG call journals `tokensSource: null` -- both are "not reported", NOT zero. Say so
+  // out loud rather than letting a table of 0s (or n/a) be read as "this pipeline used no
+  // tokens".
+  if (report.llmCallsWithoutTokens > 0) {
+    console.log('');
+    console.log(
+      `note: ${report.llmCallsWithoutTokens} of ${report.llmCalls} llm-call events carry no token data ` +
+        `(no \`tokensSource\`, or \`tokensSource: null\`) and are NOT counted above -- "n/a" means ` +
+        'not reported, not zero. Journals written before token capture shipped (2026-08-31) recorded ' +
+        'only the now-retired dollar figure; a deadline-killed or E2BIG call never gets a token block ' +
+        'at all. Only calls made by the current build report tokens.'
+    );
+  }
+}
+
+// `spo cost` -- DEPRECATED alias for `spo tokens` (dollars retired as the headline metric,
+// 2026-08-31 -- see orchestrator/tokens.js's own header for why). Kept because
+// doc/remediation-plan-2026-08.md's Gate C3 (and possibly other docs) says "watching `spo
+// cost`"; a hard removal would break a documented gate mid-plan. Prints one notice line, then
+// runs the exact same table `spo tokens` does.
+function cmdCostDeprecated(opts) {
+  console.log('spo cost: deprecated -- dollars were retired as the headline metric (2026-08-31). Use `spo tokens`. Printing the same report below:');
+  console.log('');
+  return cmdTokens(opts);
 }
 
 function cmdParked(opts) {
@@ -295,8 +380,8 @@ function cmdParked(opts) {
 
 // `spo resume <session_id|task-id>` -- resolves the argument as a task id first (a directory
 // under journal/); if that exists, lists every recorded LLM step (journal event
-// {event: "llm-call", step, model, costUsd, sessionId} -- see steps/llm.js) and prints the
-// exact `claude --resume <sessionId>` command for each, oldest first. If no such task
+// {event: "llm-call", step, model, billableTokens, sessionId} -- see steps/llm.js) and prints
+// the exact `claude --resume <sessionId>` command for each, oldest first. If no such task
 // directory exists, the argument is treated as a bare session id and the same command is
 // printed once. This only ever prints -- it never spawns `claude` itself.
 function cmdResume(id, opts) {
@@ -310,8 +395,8 @@ function cmdResume(id, opts) {
       return;
     }
     for (const ev of llmCalls) {
-      const cost = typeof ev.costUsd === 'number' ? ev.costUsd.toFixed(4) : '?';
-      console.log(`${String(ev.step).padEnd(18)} model=${ev.model || '?'}  costUsd=${cost}  claude --resume ${ev.sessionId}`);
+      const billable = typeof ev.billableTokens === 'number' ? formatTokenCount(ev.billableTokens) : '?';
+      console.log(`${String(ev.step).padEnd(18)} model=${ev.model || '?'}  billableTokens=${billable}  claude --resume ${ev.sessionId}`);
     }
     return;
   }
@@ -752,7 +837,7 @@ async function cmdTriage(opts, deps = {}) {
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage>',
+      'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
       '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
@@ -776,7 +861,8 @@ function main() {
     return cmdTask(id, opts);
   }
   if (cmd === 'parked') return cmdParked(opts);
-  if (cmd === 'cost') return cmdCost(opts);
+  if (cmd === 'tokens') return cmdTokens(opts);
+  if (cmd === 'cost') return cmdCostDeprecated(opts);
   if (cmd === 'resume') {
     const id = opts._[0];
     if (!id) {

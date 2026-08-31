@@ -307,16 +307,29 @@ module.exports = {
   // (notify-send, ntfy, a reason filter); the daemon only reports. Never blocks a task.
   parkAlertCmd: process.env.SPO_PARK_ALERT_CMD || null,
 
-  // NOTE -- no cumulative spend ceiling, deliberately (maintainer decision, 2026-08-29). The
-  // pool is Claude Max SUBSCRIPTION accounts (accounts.js), not the metered API: the `costUsd`
-  // the CLI reports, and that cost.js sums, is a NOTIONAL API-equivalent figure, not money
-  // leaving an account. It is worth measuring -- it is the migration plan's efficiency metric
-  // against the old driver's baseline, and `spo cost` reports it -- but capping it would be
-  // enforcing a limit that does not exist. What actually constrains a run is the pool itself:
-  // per-account rate limits and the cooldowns accounts.js already tracks.
+  // NOTE -- no cumulative dollar ceiling, deliberately (maintainer decision, 2026-08-29, restated
+  // 2026-08-31: dollars retired as the headline metric entirely). The pool is Claude Max
+  // SUBSCRIPTION accounts (accounts.js) with a quota, never the metered API -- there was never a
+  // real dollar spend to cap. What is worth measuring, and what `spo tokens`
+  // (orchestrator/tokens.js) reports, is TOKEN efficiency: fresh input + cache-creation + output
+  // ("billable-weighted tokens"), cache-read kept separate since it is near-free on a quota plan.
+  // What actually constrains a run is the pool itself: per-account rate limits and the cooldowns
+  // accounts.js already tracks.
   //
-  // The PER-STEP caps in step-contracts.js stay, and are not about money either: they cut off
-  // a step that has run away (a PLAN spinning past $3 is a broken PLAN, whoever pays).
+  // The PER-STEP caps in step-contracts.js stay, and were never about money either: they cut off
+  // a step that has run away, whoever/whatever pays.
+
+  // The observed lifetime of the `claude` CLI's "ephemeral 1h" prompt-cache tier (the real
+  // per-message usage block's `cache_creation.ephemeral_1h_input_tokens`, verified from a live
+  // session file 2026-08-31). This is a property of the Anthropic platform, not something this
+  // project sets or controls -- it is named here only so orchestrator/tokens.js's advisory
+  // "likely cache expiry" signal (a call whose gap since the task's previous llm-call exceeded
+  // this TTL and whose own cache-creation tokens dominate its cache-read tokens) has one place
+  // to read the threshold from, instead of a magic number buried in that module. Purely
+  // informational: nothing in the state machine reads this value, and no behavior (retry, park,
+  // scheduling, account rotation) is ever driven by it. SPO_CACHE_TTL_MS overrides (tests use
+  // this to shorten the TTL rather than fabricating hour-long timestamps).
+  cacheTtlMs: process.env.SPO_CACHE_TTL_MS !== undefined ? Number(process.env.SPO_CACHE_TTL_MS) : 60 * 60 * 1000,
 
   REPO_ROOT,
   cwdForStep,

@@ -38,7 +38,7 @@ const { spawnSync } = require('child_process');
 
 const accounts = require('./accounts');
 const config = require('./config');
-const { invokeClaudeReal } = require('./steps/llm');
+const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
 
@@ -236,7 +236,7 @@ function withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns) {
 
 // draftCard(requestText, deps) -- calls prompts/draft-card.md through invokeClaudeReal (model
 // sonnet, effort medium, small budget, an account from the pool via accounts.pick), then parses
-// and validates the returned contract. Returns {ok: true, draft, sessionId, costUsd} or
+// and validates the returned contract. Returns {ok: true, draft, sessionId, ...tokenFields} or
 // {ok: false, error} -- never throws for a recognized failure (no account available, a spawn
 // failure, invalid JSON, a missing/invalid field): those are all "mechanical failure", the
 // caller's job to report and exit non-zero on, not a crash.
@@ -299,7 +299,7 @@ async function draftCard(requestText, deps = {}) {
     return withRetry({ ok: false, error: `draftCard: ${check.error}` });
   }
 
-  return withRetry({ ok: true, draft: parsed, sessionId: raw.sessionId, costUsd: raw.costUsd });
+  return withRetry({ ok: true, draft: parsed, sessionId: raw.sessionId, ...tokenFieldsFrom(raw) });
 }
 
 // The contract every draft must satisfy, whichever lane produced it: draftCard's own LLM reply,
@@ -359,7 +359,7 @@ function loadDraftFile(filePath) {
 
 // reviewCard(draft, deps) -- fills prompts/review-card.md's existing placeholder names from the
 // draft, calls it the same way (model fable, effort high). Returns {ok: true, review, sessionId,
-// costUsd} where `review` is {verdict, corrections, first_comment_markdown}, or {ok: false,
+// ...tokenFields} where `review` is {verdict, corrections, first_comment_markdown}, or {ok: false,
 // error}.
 //
 // Retry policy: same one-retry-on-`timedOut`-only discipline as triageBugReport (see that
@@ -424,7 +424,7 @@ async function reviewCard(draft, deps = {}) {
     return withRetry({ ok: false, error: `reviewCard: unrecognized verdict "${parsed.verdict}"` });
   }
 
-  return withRetry({ ok: true, review: parsed, sessionId: raw.sessionId, costUsd: raw.costUsd });
+  return withRetry({ ok: true, review: parsed, sessionId: raw.sessionId, ...tokenFieldsFrom(raw) });
 }
 
 // ---- mechanical corrections ---------------------------------------------------------------
@@ -813,7 +813,7 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
 
   // retriedAfterTimeout is spread AFTER ...parsed on purpose: a model reply that happened to
   // contain this key by accident must never shadow our own retry record.
-  return withRetry({ ok: true, outcome: parsed.outcome, ...parsed, sessionId: raw.sessionId, costUsd: raw.costUsd });
+  return withRetry({ ok: true, outcome: parsed.outcome, ...parsed, sessionId: raw.sessionId, ...tokenFieldsFrom(raw) });
 }
 
 // ---- pullBoard ------------------------------------------------------------------------------
