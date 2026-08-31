@@ -119,6 +119,44 @@ Two independent counters per task, both journaled and both visible in `state.jso
   clearly attributed to its own state so IMPLEMENT can tell "a check/gate/CI failed" apart from
   "the change was built and the validator rejected it".
 
+**The bounds this pipeline actually enforces**, beyond the two retry budgets above, are three
+wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
+
+- `config.js`'s `commandTimeoutsMs` (git 120000ms, gh 120000ms, npm-ci 600000ms,
+  npm-gate 7800000ms, npm-run 660000ms) — `spawnSync`'s own `timeout` option, armed per call by
+  `steps/scripted.js`'s `spawnStep`. This is the bound that actually fires against a hung
+  `git`/`gh`/`npm` child; see `doc/state-machine-spec.md`'s design consequence #3 for why two
+  mechanisms exist and how they interact.
+- `config.js`'s `stepDeadlineMs` (default 120000ms / 2min) — `deadline.js`'s `callWithDeadline`,
+  the outer retry-once-then-park bookkeeping race wrapped around every step, scripted or LLM. It
+  is a JS timer, not a process kill, so it cannot preempt a blocking `spawnSync`: it is a no-op
+  against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there)
+  and, in real mode, equally inert around an LLM step (bounded instead by
+  `LLM_STEP_DEADLINE_MS` below). It is live only in shadow mode, where an LLM step has no
+  blocking `spawnSync` underneath it and a fixture delay races this 120s timer instead of the
+  900000ms figure below (`doc/state-machine-spec.md` § Step contracts).
+- `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the `spawnSync` timeout
+  `invokeClaudeReal` arms for every LLM step call (PLAN, IMPLEMENT, DIAGNOSE,
+  CITATION_VERIFIER, VALIDATE), uniformly regardless of task size or model, in real mode.
+- `orchestrator/recette.js`'s supervised live harness carries its own two caps, independent of
+  the daemon's: `--cap-ms` (default 45 minutes wall clock) and `--cap-llm-steps` (default 12),
+  either of which aborts the run rather than let a synthetic card run unbounded.
+
+**A per-call USD cap is deliberately not one of these bounds.** `maxBudgetUsd` exists in the
+plumbing (`step-contracts.js`, `orchestrator/intake.js`, `steps/llm.js`'s conditional
+`--max-budget-usd`), but no daemon or intake path sets it — the only caller that does is the
+hand-run `scripts/smoke-llm.js` (§ Manual smoke test below). Dollars were retired as a spend
+metric on 2026-08-31 in favour of `spo tokens`'s billable-weighted token counts. The runaway that
+motivated the question — `journal/issue-385/journal.jsonl`'s IMPLEMENT step at 134 turns
+(2026-08-29T19:56:12.256Z–20:09:48.785Z, 816s elapsed) — was **not** stopped by
+`LLM_STEP_DEADLINE_MS`: it was stopped by the per-call `--max-budget-usd` cap still in force that
+day (`costUsd: 5.0621632`, `terminalReason: "budget_exhausted"`). `LLM_STEP_DEADLINE_MS` (900s)
+was already armed at the time (commit `3e8104b`, same day) and did not fire — the cap ended the
+call about 84s before the deadline would have taken over. That does not reopen the decision: a
+cap only ever produces `terminalReason: "budget_exhausted"` because `--max-budget-usd` was
+passed, and since no production path sets it any more (the caps were removed the next day,
+commit `2621aad`), that terminal reason cannot recur.
+
 ## Real mode
 
 `orchestrator/steps/llm.js` has a real implementation behind the same interface shadow mode
@@ -132,7 +170,7 @@ const result = await invokeClaudeReal({
   step: 'PLAN',
   model: 'haiku',                 // or a full model name; anything `claude --model` accepts
   effort: 'low',                  // low | medium | high | xhigh | max
-  maxBudgetUsd: 0.10,
+  maxBudgetUsd: 0.10,             // hand-written caller only -- no production path sets this, see § Budgets
   promptText: 'Reply with exactly the single word: ok',
   cwd: '/home/crazz/SPO-Pipeline',
   account: { name: 'default', configDir: null },
@@ -158,8 +196,10 @@ const result = await invokeClaudeReal({
 > them: it uses the inter-call gap plus the flat cache-creation-vs-cache-read counts, which are
 > real.
 
-It spawns `claude -p --model <model> --effort <effort> --output-format json
---max-budget-usd <n>` (plus `--allowedTools`/`--permission-mode`/`--json-schema` when given) with
+It spawns `claude -p --model <model> --effort <effort> --output-format json` (plus
+`--allowedTools`/`--permission-mode`/`--json-schema`/`--max-budget-usd` when given — no daemon
+or intake path supplies `maxBudgetUsd`; the only caller that does is the hand-run
+`scripts/smoke-llm.js`, see § Budgets) with
 the resolved prompt written to the child's stdin — never as an argv entry, since Linux caps each
 individual argv string at `MAX_ARG_STRLEN` (128KB) and a large filled prompt (a big plan/diff/
 criterion) would fail the spawn with `E2BIG` before `claude` ever started (reproduced on card
@@ -280,8 +320,8 @@ A card task's own fields:
 }
 ```
 
-`size` (`S`/`M`/`L`) drives effort and budget for PLAN/IMPLEMENT (`step-contracts.js`'s
-`EFFORT_BY_SIZE`/`BUDGET_BY_SIZE_USD`); `touchesRdoMembers` is the RDO wire-rule escalation flag
+`size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
+`EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
 for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
 PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
 CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
@@ -1871,7 +1911,8 @@ limits and the cooldowns `accounts.js` already tracks. The **per-step** `--max-b
 `step-contracts.js`'s own header once described are, today, not actually set anywhere in that
 file — every step (and every `orchestrator/intake.js` LLM call) passes `maxBudgetUsd: undefined`
 and runs uncapped; see that file's own comment for the (still-current) maintainer decision
-behind it.
+behind it. See § Budgets (above) for what actually is enforced — `stepDeadlineMs`,
+`LLM_STEP_DEADLINE_MS`, the two retry budgets, and recette's own caps.
 
 **Cache-expiry flag (advisory only).** The `claude` CLI's prompt cache has (at least) two
 ephemeral TTL tiers — 5 minutes and 1 hour (`config.js`'s `cacheTtlMs`, currently the observed

@@ -108,9 +108,13 @@ function resolvePromptText(opts) {
   return prompt;
 }
 
-// Builds the argv for `claude`, in the exact flag order the spec gives:
-//   -p --model <model> --effort <effort> --output-format json --max-budget-usd <n>
-//   [--allowedTools <tools>] [--permission-mode <mode>] [--json-schema <schema-json>]
+// Builds the argv for `claude`. Flag order:
+//   -p --model <model> --effort <effort> --output-format json
+//   [--max-budget-usd <n>] [--allowedTools <tools>] [--permission-mode <mode>]
+//   [--json-schema <schema-json>]
+// --max-budget-usd is conditional, like the other three: pushed only when opts.maxBudgetUsd is a
+// number. No daemon or intake path supplies it -- the only caller that does is the hand-run
+// scripts/smoke-llm.js (see doc/state-machine-spec.md / orchestrator/README.md § Budgets).
 //
 // The prompt is NOT one of these argv entries -- it goes to the child's stdin instead (see
 // invokeClaudeReal). Linux caps each INDIVIDUAL argv/environ string at MAX_ARG_STRLEN

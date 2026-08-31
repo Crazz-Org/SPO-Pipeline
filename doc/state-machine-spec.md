@@ -65,17 +65,31 @@ be confused: `validate-reject N | reasons | outcome` (action 1.6).
 
 ## Step contracts
 
-| Step | Model | Effort | Tools | Output | Budget cap |
+| Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
-| PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | per-step USD cap |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on the wire rule** (`src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases) or L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | per-step USD cap |
-| DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | small |
-| VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | small |
-| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | small |
+| PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 900000ms / 15min |
+| IMPLEMENT | Sonnet 5 — **Opus 5 on the wire rule** (`src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases) or L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
+| DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
+| VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+
+The deadline is the same figure for all five rows — `step-contracts.js`'s `LLM_STEP_DEADLINE_MS`,
+the `spawnSync` timeout `invokeClaudeReal` arms for every one of these calls
+(`orchestrator/steps/llm.js`) — but that figure governs real mode only. `state-machine.js` still
+wraps every LLM step in the outer `callWithDeadline` (`deadline.js`) using the generic
+`stepDeadlineMs` (120000ms; no `stepDeadlineMsByState` entry exists for any LLM state), which is
+inert in real mode (a JS timer cannot preempt the blocking `spawnSync` that `LLM_STEP_DEADLINE_MS`
+already bounds) but live in shadow mode, where a fixture delay races that 120s timer instead of
+the 900000ms figure above. There is no per-step or per-size USD budget: `maxBudgetUsd` is plumbed
+end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
+daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
+decision and the bounds that actually are enforced.
 
 Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
-`--json-schema` for the payload, `--max-budget-usd`, `--allowedTools`, `--model`, `--effort`,
-`--permission-mode` per step, run under the account chosen by the scheduler
+`--json-schema` for the payload, `--allowedTools`, `--model`, `--effort`,
+`--permission-mode` per step (plus `--max-budget-usd` when a caller supplies a numeric
+`maxBudgetUsd` — no daemon or intake path does; the only caller that does is the hand-run
+`scripts/smoke-llm.js`), run under the account chosen by the scheduler
 (`CLAUDE_CONFIG_DIR=<account dir>`). Domain context comes from the product worktree's
 (trimmed) `CLAUDE.md` plus the step prompt from `prompts/`.
 

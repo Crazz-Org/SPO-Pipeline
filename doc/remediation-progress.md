@@ -91,9 +91,13 @@ input + cache creation + output, cache reads reported separately). Also, `step-c
 mechanism that does not exist.
 
 The live question is: **is a consumption ceiling needed on top of the existing 15-minute
-`LLM_STEP_DEADLINE_MS`, and in what unit?** The runaway the audit cited (IMPLEMENT at 134 turns)
-would hit that deadline regardless. Cheapest correct slice, whichever way it goes: fix the spec's
-Budget-cap column, which is factually wrong today.
+`LLM_STEP_DEADLINE_MS`, and in what unit?** The runaway the audit cited (IMPLEMENT at 134 turns,
+`journal/issue-385/journal.jsonl`) did **not** hit that deadline: it was stopped by the
+`--max-budget-usd` cap still in force that day (`terminalReason: "budget_exhausted"`, 816s
+elapsed, ~84s inside the 900s `LLM_STEP_DEADLINE_MS`, which was already armed and did not fire).
+That does not reopen the question — a cap only ever produces `budget_exhausted` because
+`--max-budget-usd` is passed, and no production path sets it any more. Cheapest correct slice,
+whichever way it goes: fix the spec's Budget-cap column, which is factually wrong today.
 
 ## Current environment
 
