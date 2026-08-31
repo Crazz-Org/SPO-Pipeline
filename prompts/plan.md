@@ -70,6 +70,14 @@ you are drafting the file content, not a description of it.
      a triple-backtick fence, `>>> QUOTE` / `>>> END QUOTE` never collide with code the quote
      itself might contain.
    - One invariant, one block. Do not nest, do not combine two facts into one quote.
+   - **`invariant_ids` must list exactly the ids of the blocks you wrote**, in the same order —
+     `["INV-1", "INV-2", ...]`, or `[]` only if you wrote no blocks at all. It is a separate
+     field of the reply, not something derived from the markdown for you: VALIDATE is handed the
+     list and checks the change against it, and the driver compares your list against what it
+     actually parsed out of `invariants_markdown`. The two disagreeing is journalled as
+     `invariants-declared-parsed-mismatch` and means one of them is wrong — most often eight
+     well-formed blocks alongside an empty list, which silently tells VALIDATE there is nothing
+     to hold the change to.
 3. **Runnable check commands** — not prose, not "run the tests": commands the driver or the
    IMPLEMENT step execute verbatim and read an **exit code** from, never printed text. In this
    order:
