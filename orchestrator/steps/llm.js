@@ -256,15 +256,87 @@ function tokenFieldsFrom(raw) {
   };
 }
 
-// limit/429-shaped errors -> 'limit' (caller should cool the account down and retry on the next
-// one); anything else -> 'error' (existing failure handling, no account rotation).
+// Action 3.5, replacing a `/limit|overloaded|rate/i` scan over the free text of parsed.result /
+// parsed.terminal_reason (incident: any failure message merely containing "rate" -- "invalid
+// rate parameter", "could not generate", "accurate output required", "corporate" -- was
+// misclassified as a rate limit). The cost of one such false positive is not small:
+// callLlmStep's response to 'limit' is to rotate to the NEXT account and re-pay the ENTIRE step
+// on it, repeating across the whole pool, then cooling EVERY account for hours once exhausted --
+// a single unlucky error message took the pool down.
+//
+// This trades that false positive away for an occasional false negative, deliberately: an
+// unrecognised limit shape now falls through to 'error' and the task PARKS, which is one card a
+// maintainer retries, versus a false positive that re-pays the step on every account in the pool
+// and cools all of them. The failure result already carries `terminalReason` and
+// `apiErrorStatus` (below), and both are journalled alongside the step's `result` payload -- so
+// an unrecognised limit shape leaves exactly the evidence needed to extend the allowlist below.
+// Extend it from THAT journal evidence, never from guesswork about what a message might say.
+//
+// Structured signals only, honestly labelled by how each entry earned its place (R7 -- a repo-
+// wide sweep found this comment previously claimed the allowlist was "seeded from what this repo
+// has actually observed plus the API's documented error type names", which overstated the
+// evidence for more than one entry below):
+//   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
+//     intake.js:711's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
+//   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
+//     observed as a real reply in this repo; included because it is structured (not free text)
+//     and documented, not because it has fired here.
+//   - terminal_reason 'overloaded_error' -- ANTICIPATED: pinned only by a pre-existing
+//     test/llm-real.test.js assertion, not a recorded reply.
+//   - terminal_reason 'rate_limit_error' -- ANTICIPATED: the API's documented error type name
+//     for a 429; the Fable incident above only recorded api_error_status, never this string, so
+//     it has not actually been observed as a terminal_reason value in this repo either.
+//   - terminal_reason 'usage_limit_reached' -- a GUESS, plainly: neither observed in this repo
+//     nor a documented Anthropic error type. Kept anyway because an exact-match entry that never
+//     fires costs nothing, and it's cheap insurance if that turns out to be the real string.
+// terminal_reason is matched exactly against the allowlist (lowercased + trimmed), never a
+// substring test -- extend it from journal evidence (a failure's terminalReason/apiErrorStatus
+// are journalled alongside the step's result) as entries move from anticipated/guessed to
+// actually observed, never from further guesswork about what a message might say.
+// Everything else -> 'error', exactly as before.
+const USAGE_LIMIT_TERMINAL_REASONS = new Set(['rate_limit_error', 'usage_limit_reached']);
+const OVERLOADED_TERMINAL_REASONS = new Set(['overloaded_error']);
+
+// R5 (F5): 429/529 used to be tested separately inside classifyFailure and limitKindForFailure,
+// with nothing keeping the two in sync -- adding a status to one and not the other silently
+// produced kind:'limit' with limitKind: undefined, i.e. the fail-safe long cooldown, exactly the
+// case R2/F2 made visible rather than fixed on its own. One table now, consumed by both, the same
+// way the terminal_reason Sets above are already shared (not duplicated) between the two
+// functions and so cannot drift.
+const LIMIT_STATUSES = new Map([
+  [429, 'usage'],
+  [529, 'overloaded'],
+]);
+
+function normalizedTerminalReason(parsed) {
+  return typeof (parsed && parsed.terminal_reason) === 'string' ? parsed.terminal_reason.trim().toLowerCase() : '';
+}
+
 function classifyFailure(parsed) {
-  if (parsed && parsed.api_error_status === 429) return 'limit';
-  const haystack = [parsed && parsed.result, parsed && parsed.terminal_reason]
-    .filter((s) => typeof s === 'string')
-    .join(' ');
-  if (/limit|overloaded|rate/i.test(haystack)) return 'limit';
+  if (!parsed) return 'error';
+  if (LIMIT_STATUSES.has(parsed.api_error_status)) return 'limit';
+  const reason = normalizedTerminalReason(parsed);
+  if (USAGE_LIMIT_TERMINAL_REASONS.has(reason) || OVERLOADED_TERMINAL_REASONS.has(reason)) return 'limit';
   return 'error';
+}
+
+// Only meaningful once classifyFailure has already returned 'limit' -- splits WHICH kind of
+// limit it was, so the caller (accounts.markLimit) can cool the account for the right amount of
+// time instead of one guess covering both: 'usage' means THIS account's own quota is spent (429
+// / rate_limit_error / usage_limit_reached); 'overloaded' means the SERVER is busy and this
+// account's quota is fine (529 / overloaded_error). Returns undefined for a 'limit'
+// classification that somehow matches neither bucket (cannot happen given LIMIT_STATUSES and the
+// terminal_reason Sets above stay in sync with classifyFailure by construction -- there is
+// nothing left for this function to duplicate -- but accounts.markLimit treats undefined as a
+// fail-safe fallback to the usage tier regardless).
+function limitKindForFailure(parsed) {
+  if (!parsed) return undefined;
+  if (LIMIT_STATUSES.has(parsed.api_error_status)) return LIMIT_STATUSES.get(parsed.api_error_status);
+  const reason = normalizedTerminalReason(parsed);
+  if (USAGE_LIMIT_TERMINAL_REASONS.has(reason)) return 'usage';
+  if (OVERLOADED_TERMINAL_REASONS.has(reason)) return 'overloaded';
+  return undefined;
 }
 
 // The real-mode primitive: spawn `claude -p`, parse its JSON, classify, return. Never throws on
@@ -405,9 +477,14 @@ async function invokeClaudeReal(opts, deps = {}) {
   const numTurns = parsed.num_turns;
 
   if (parsed.is_error || exit !== 0) {
+    const kind = classifyFailure(parsed);
     return {
       ok: false,
-      kind: classifyFailure(parsed),
+      kind,
+      // Only present on a 'limit' classification -- see limitKindForFailure's own comment.
+      // accounts.markLimit treats an absent/unrecognised limitKind as the usage-tier fail-safe,
+      // so omitting the key on a plain 'error' costs nothing.
+      ...(kind === 'limit' ? { limitKind: limitKindForFailure(parsed) } : {}),
       result: parsed.result,
       sessionId,
       ...tokens,

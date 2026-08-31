@@ -169,10 +169,46 @@ and camelCase `modelUsage` key spellings, since that field is produced by the `c
 never appears in the session JSONL to verify against) summed across every entry of `modelUsage`
 -- no dollar figure is computed anywhere (maintainer decision, 2026-08-31: the pool is a Claude
 Max quota, never metered API billing) -- and classifies a
-failure as `{kind: 'limit'}` (an `api_error_status` of 429, or a message matching
-`/limit|overloaded|rate/i`) or `{kind: 'error'}` (everything else). `deps.spawnSync` is the test
-injection point — production code never passes it, so a real call always spawns the real
-`claude` binary on `PATH`.
+failure as `{kind: 'limit'}` or `{kind: 'error'}` via `classifyFailure` (action 3.5, 2026-08-31 —
+replacing a `/limit|overloaded|rate/i` scan over the free text of `result`/`terminal_reason` that
+misclassified any message merely containing "rate" — "invalid rate parameter", "could not
+generate", "accurate output required" — as a rate limit; expensive, because `callLlmStep`'s
+response to `'limit'` is to rotate to the next account, re-paying the whole step, and once the
+pool is exhausted cool *every* account for hours). `'limit'` now requires a **structured**
+signal, never a substring test:
+
+- `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
+  real limit in this repo, `intake.js:711`'s 12.8-hour Fable incident — "You've reached your
+  Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
+  `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
+  observed as a real reply in this repo), or
+- `terminal_reason`, exact match (lowercased + trimmed) against an allowlist: `overloaded_error`
+  (**anticipated** — pinned only by a pre-existing test, not a recorded reply), `rate_limit_error`
+  (**anticipated** — the API's documented error type name for a 429, but that string itself has
+  never been observed here; the Fable incident only ever recorded the numeric status), and
+  `usage_limit_reached` (a plain **guess** — neither observed here nor a documented Anthropic
+  error type, kept because an exact-match entry that never fires costs nothing).
+
+Everything else is `'error'` — including an unrecognised limit-shaped message, which now PARKS
+the task instead of rotating. That trade is deliberate: an unrecognised shape parking is one card
+a maintainer retries, versus a false positive re-paying the step on every account and cooling the
+whole pool. The failure result carries `terminalReason`/`apiErrorStatus` (and, on a `'limit'`
+classification, `limitKind` — see below) and both are journalled with the step's `result`
+payload, so an unrecognised limit shape leaves exactly the evidence needed to extend the
+allowlist above as entries move from anticipated/guessed to actually observed — extend it from
+that journal evidence, never from further guesswork about what a message might say. `deps.spawnSync`
+is the test injection point — production code never passes it, so a real call always spawns the
+real `claude` binary on `PATH`.
+
+A `'limit'` result also carries `limitKind`, splitting *which* kind of limit it was so the
+cooldown can match: `'usage'` (429 / `rate_limit_error` / `usage_limit_reached` — this
+account's own quota is spent) vs. `'overloaded'` (529 / `overloaded_error` — the *server* is
+busy, this account's quota is fine). The 429/529 half of that split is a single table
+(`LIMIT_STATUSES`) consumed by both `classifyFailure` and `limitKindForFailure`, not two
+separately-maintained checks — adding a status to one and not the other used to be possible and
+would silently produce `kind:'limit'` with `limitKind: undefined` (the fail-safe long cooldown,
+indistinguishable in the journal from a genuine limit). See "Account registry" below for what
+each tier costs.
 
 **Deadline handling**: the wall-clock budget is enforced by `spawnSync`'s own `timeout` option
 (set from `deadlineMs`), not by `orchestrator/deadline.js`'s promise-race. That race can't
@@ -475,12 +511,79 @@ dir). Full guided procedure: `doc/setup.md` § Accounts.
   disabled                  optional marker file (content ignored) — its presence disables the
                              account
 <poolDir>/state.json        machine-written, runtime cooldowns: {accountName: {cooldownUntil:
-                             epochMs}}. Disposable — deleting it just clears every cooldown.
+                             epochMs, lastUsageLimitAt?: epochMs, usageLimitStreak?: int}}.
+                             Disposable — deleting it clears every cooldown (and escalation
+                             streak with it).
 ```
 
 A pool directory with zero subdirectories registers zero accounts: `accounts.pick()` throws a
 typed `NoAccountsRegisteredError` (`state-machine.js` maps it to PARKED, same as
 `AllAccountsCoolingError`), and `daemon.js --real` refuses to even start.
+
+**Cooldown duration — an escalating probe, not a flat number (action 3.5, 2026-08-31 redesign).**
+This action's own first cut used a flat 5-hour cooldown for every usage limit. A verifier caught
+why that was wrong before it shipped: the real pool has **2 accounts**
+(`~/.claude-accounts/pool1`, `pool2`), and `daemon.js` has no pool-health gate anywhere — with
+`maxAttempts` equal to the pool size, two usage limits landing inside one window took the *whole
+pool* down for up to 5 hours, parking every card the daemon pulled during that window at its
+first LLM step, each needing a manual `retry` comment. And the figure itself over-waits by
+construction: the Claude Max session window resets 5h after the *session's first message*, not
+after the limit hit, so `now + 5h` sleeps for (5h − the true remaining wait) longer than
+necessary — often 4h+. The problem a long cooldown was solving is real but small: at a 1-hour
+cooldown, an account that comes back gets picked, immediately re-limits (the window hasn't
+actually rolled), and pays one wasted call. That is not worth a 5-hour outage across the whole
+pool to avoid.
+
+So `accounts.markLimit(poolDir, name, limitKind, now)` runs an escalating **probe** instead of
+picking one flat number, and — because the decision now needs the account's own history, which
+only a read of `state.json` can supply — the policy lives entirely inside `markLimit` itself
+(there is no more separate `cooldownMsForLimitKind(limitKind)` pure function; both real call sites
+simplified to `accounts.markLimit(accountsDir, account.name, result.limitKind)`):
+
+- **`'usage'`, first hit (or one outside the escalation window of the account's last usage hit) →
+  1 hour** (`accounts.USAGE_PROBE_COOLDOWN_MS`). A probe, not a claim that the window is over: if
+  it comes back too early, the cost is one wasted call — the same cost the old flat 1-hour default
+  always had.
+- **`'usage'`, landing again within `accounts.ESCALATION_WINDOW_MS` (2 hours) of the account's
+  last usage hit → 5 hours** (`accounts.USAGE_ESCALATED_COOLDOWN_MS`). The probe just proved the
+  session window really is still open, so wait out the real observed Claude Max session window
+  instead of probing hourly into a wall. Two hours, not one, because the earliest a probe can
+  possibly come back and re-limit is right at its own 1-hour expiry (`daemon.js`'s default
+  `pollIntervalMs` is 5s, negligible on its own) — the extra hour absorbs scheduling slack from a
+  busy pool (other queued cards ahead of it, step deadlines, timeout retries) without becoming so
+  wide that a hit on a genuinely fresh session (the same account limiting again the next day, say)
+  gets mistaken for a continuation of the same exhausted one.
+- **`'overloaded'` → 5 minutes** (`accounts.OVERLOADED_COOLDOWN_MS`), flat, **never escalates**,
+  and never touches the usage-escalation fields above. A busy *server* (529 / `overloaded_error`)
+  says nothing about this account's own quota, so nothing about it should compound the way
+  repeated usage hits do.
+- **An absent/unrecognised `limitKind`** (anything that isn't exactly `'usage'` or `'overloaded'`)
+  falls back to the usage flow above (probe or escalated, by the same history check) — fail-safe:
+  cool at least as long as a real usage hit would, rather than risk immediately re-hammering a
+  still-limited account. `state.json` written by pre-3.5 code (bare `{cooldownUntil}`, no
+  `lastUsageLimitAt`/`usageLimitStreak`) reads back the same way: no history on record, so it
+  probes fresh at 1h — never throws, never misbehaves.
+
+The CLI never actually supplies a retry-after hint on any path — `invokeClaudeReal` doesn't set
+one — so there is no "use the server's hint, else default" branch here; it's always the escalation
+decision above. `markLimit`'s returned event payload (journalled as `account-cooldown` by
+`callLlmStep`, or returned on `cooldowns` by `callIntakeStepWithRotation`) is `{account, limitKind,
+cooldownMs, cooldownUntil, cooldownUntilIso, escalated, defaulted}` — `limitKind` is the value
+`markLimit` was called with (`null` when absent, never swallowed), `escalated` is true exactly
+when the 5-hour tier fired, and `defaulted: true` means the value passed as `limitKind` wasn't
+`'usage'` or `'overloaded'` and the usage-tier fail-safe applied. Before this action's R2 fix,
+`cooldownMsForLimitKind` returned a positive number for *every* JS value (`null`, `{}`, `NaN` all
+verified → the long tier), so `defaulted` was structurally always false in production and the
+journalled event carried no `limitKind` at all — the one case the fallback exists for (a limit
+shape `classifyFailure` recognizes that isn't in a `limitKind` bucket) was indistinguishable from
+a genuine 429/529 in the journal. Both are fixed now.
+
+Exhausting the whole pool inside one rotation loop (`callLlmStep`, or `intake.js`'s
+`callIntakeStepWithRotation`) never re-calls `accounts.pick()`, so neither ever sees `pick()`'s own
+`all-accounts-cooling-until-<ISO>` reason on the resulting park/error — both instead carry the
+*last* cooldown event's own `cooldownUntilIso` through explicitly (`callLlmStep`'s `ParkSignal`
+detail; `callIntakeStepWithRotation`'s exhaustion error string), so a maintainer always sees a
+wall-clock retry time, never just an attempt count against a duration that's no longer flat.
 
 **Adding a Claude Max account** — guided, via `bin/spo`, never by hand-editing a registry file:
 

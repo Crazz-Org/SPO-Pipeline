@@ -92,6 +92,13 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
 
   let result;
+  // R6 (F3): with maxAttempts === pool size, exhausting every account inside this loop exits
+  // WITHOUT re-calling pick() -- so the maintainer never sees pick()'s own good
+  // `all-accounts-cooling-until-<ISO>` reason on the park below, only {attempts, lastResult}.
+  // That named a real wall-clock time back when cooldowns were flat; now that R1 makes cooldown
+  // duration escalate per-account, it says nothing at all. Carry the last cooldown event's own
+  // cooldownUntilIso through instead, so the park always names when to retry.
+  let lastCooldownUntilIso = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let account;
     try {
@@ -110,11 +117,16 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
       return result;
     }
 
-    const event = accounts.markLimit(accountsDir, account.name, result.retryAfterMs);
+    const event = accounts.markLimit(accountsDir, account.name, result.limitKind);
+    lastCooldownUntilIso = event.cooldownUntilIso;
     appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
   }
 
-  throw new ParkSignal('all-accounts-cooling-after-retry', { attempts: maxAttempts, lastResult: result });
+  throw new ParkSignal('all-accounts-cooling-after-retry', {
+    attempts: maxAttempts,
+    lastResult: result,
+    cooldownUntilIso: lastCooldownUntilIso,
+  });
 }
 
 // ---- per-state handlers ----------------------------------------------------------------

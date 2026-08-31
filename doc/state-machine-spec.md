@@ -90,9 +90,38 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 - A pool with zero registered accounts is a hard stop for real mode: `orchestrator/accounts.js`'s
   `pick()` throws `NoAccountsRegisteredError`, the state machine parks on it, and
   `daemon.js --real` refuses to even start.
-- The scheduler assigns each step an account; a limit error (5 h window / weekly cap) puts
-  the account in **cooldown** until its window resets and the step retries on the next
-  healthy account. Cooldowns are journal events.
+- The scheduler assigns each step an account; a limit error puts the account in **cooldown**
+  and the step retries on the next healthy account. Cooldowns are journal events.
+  `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:711`'s 12.8-hour Fable
+  incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
+  documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
+  match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
+  (**anticipated**, not recorded reply text), `usage_limit_reached` (a plain **guess**, kept
+  because an exact-match entry that never fires costs nothing) — never a substring scan over
+  free text, since any failure message merely containing "rate" used to be misclassified as a
+  limit. An unrecognised limit shape now falls through to a plain PARK instead of rotating;
+  extend the allowlist from journal evidence (the failure's `terminalReason`/`apiErrorStatus`
+  are journalled with the step's result) as entries move from anticipated/guessed to actually
+  observed, never from further guesswork.
+- **Cooldown duration is an escalating probe, not a flat number** (`orchestrator/accounts.js`'s
+  `markLimit`, action 3.5's 2026-08-31 redesign — this action's own first cut used a flat 5-hour
+  usage cooldown, rejected before it shipped). The real pool has **2 accounts**, and
+  `daemon.js` has no pool-health gate: with `maxAttempts` equal to pool size, two usage limits
+  inside one window would take the *whole pool* down for up to 5 hours, parking every card the
+  daemon pulled in that window. A flat 5h also over-waits by construction — the Claude Max
+  session window resets 5h after the *session's first message*, not after the limit hit, so
+  `now + 5h` sleeps for (5h − the true remaining wait) longer than necessary, often 4h+. So:
+  a first usage limit for an account (`limitKind: 'usage'`, i.e. 429 / `rate_limit_error` /
+  `usage_limit_reached`) cools it for a **1-hour probe**; a usage limit landing again within a
+  **2-hour escalation window** of that account's last one cools it for the real observed
+  **5-hour** Claude Max session window instead (the probe just proved the window is still open).
+  `overloaded` (529 / `overloaded_error`) stays a flat **5 minutes** and never escalates — a busy
+  *server* says nothing about this account's own quota. An absent/unrecognised limit kind falls
+  back to the usage flow (probe or escalated, by the same history check), never a shorter tier.
+  Exhausting the pool inside one rotation pass never re-calls `pick()`, so the resulting park/
+  error carries the last cooldown's own ISO timestamp explicitly rather than relying on `pick()`'s
+  own reason string, which that path never reaches.
 - This rotation rule is not daemon-only: `orchestrator/intake.js`'s three maintainer/auto-triage
   LLM steps (draftCard, reviewCard, triageBugReport) follow it too, via their own
   `callIntakeStepWithRotation` helper — same pick/call/cool/rotate mechanics as

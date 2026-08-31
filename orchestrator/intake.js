@@ -211,14 +211,18 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
       return { raw, account, retriedAfterTimeout, cooldowns };
     }
 
-    const event = accounts.markLimit(accountsDir, account.name, raw.retryAfterMs);
+    const event = accounts.markLimit(accountsDir, account.name, raw.limitKind);
     cooldowns.push({ account: account.name, ...event });
   }
 
+  // R6 (F3): name a wall-clock time in the exhaustion string, not just an account count -- same
+  // fix as state-machine.js's callLlmStep (see its own comment on lastCooldownUntilIso for why
+  // this got worse once R1 made cooldown duration escalate per-account instead of staying flat).
+  const lastCooldown = cooldowns.length > 0 ? cooldowns[cooldowns.length - 1] : null;
   const lastDetail = raw ? `${raw.error || raw.result || raw.kind}` : 'no attempts made';
   return {
     ok: false,
-    error: `${prefix}: all accounts cooling after rotating through ${cooldowns.length} account(s); last result: ${lastDetail}`,
+    error: `${prefix}: all accounts cooling after rotating through ${cooldowns.length} account(s)${lastCooldown ? ` until ${lastCooldown.cooldownUntilIso}` : ''}; last result: ${lastDetail}`,
     cooldowns,
     // Carried on the exhaustion shape too -- see the hoist comment above. Present only when a
     // timeout retry actually fired somewhere in the pass, same "only when it happened"
