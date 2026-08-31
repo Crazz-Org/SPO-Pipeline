@@ -5,8 +5,9 @@ This file is what the plan *turned out to be* once executed: what is done, what 
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
 
-**State as of 2026-08-31.** `main` = `08a91ad`; C3 sits on `claude-crazz/spo-pipeline-remediation-prod-476444`
-(`2114b8c`), unmerged. Suite **892 passing, 0 failing**.
+**State as of 2026-08-31.** `main` = `fe3c88a` (C3 merged as PR #63, the comment-scan hotfix as
+PR #64). Suite **894 passing, 0 failing**. Daemon + dashboard **running** in `--real`; the C3 soak
+is in progress — see § The 24h soak below before touching anything.
 
 ## Progress
 
@@ -14,7 +15,7 @@ chantier.
 |---|---|
 | **C1** — truthful judges | **DONE**, gate green (live card #462) |
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
-| **C3** — token hemorrhage | **DONE**, gate green except the 24h soak (needs the daemon started — maintainer's call) |
+| **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running now** |
 | C4–C7 | not started |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → **892** (end of C3).
@@ -29,6 +30,8 @@ Tests: 454 (plan baseline) → 759 (end of C2) → **892** (end of C3).
 | 3.4 | `a453efb` | `spo triage --retry <issue> --file` re-injects a held report |
 | 3.5 | `7bcd357` | classify a limit from structure, not free text; probe-then-escalate cooldown |
 | 3.7 | `2114b8c` | docs only, per maintainer decision — no cap restored |
+
+Plus, outside the plan, the hotfix the soak immediately forced: `5a6d69a` (`gh api` `-f` is a POST).
 
 ## Corrections to the plan itself
 
@@ -84,7 +87,11 @@ C3 added three more, each caught by measuring rather than reasoning:
 - **New, not in the plan (suggest C4)** — a retry's leftover sweep runs `push origin --delete`
   without checking for an **open PR** on the branch, so a retry silently closes a green,
   merge-ready PR and orphans the commits. Observed on #455; `rescue/issue-455-run1` was tagged
-  locally to save that work.
+  locally to save that work. **Located precisely during C3's C4 prep**:
+  `orchestrator/steps/scripted.js:587`. The asymmetry is the bug — the *local* branch delete
+  immediately above it (`:566-573`) does a full ancestry / wip-ref safety analysis and parks
+  `branch-unmerged-leftover` rather than destroy unmerged work, while the *remote* delete fires on
+  nothing but "the ref exists". Deleting a remote branch on GitHub auto-closes any open PR on it.
 - **Untracked spend** — intake steps have no `taskDir`, so `spo tokens` cannot see them at all.
   Not in any chantier; suggest C5.
 
@@ -116,6 +123,26 @@ broken shape. The standing guard is therefore a source sweep (`test/gh-api-argv.
 on any `gh api` call site passing `-f`/`-F` without an explicit `--method`/`-X`, `gh api graphql`
 exempted. **Any future real-spawn smoke coverage should start here**, since this is the fifth
 production bug to pass a green hermetic suite.
+
+## The 24h soak — running, and what to check
+
+Started **2026-08-31 ~21:53 CEST**, restarted once at ~22:0x when the handoff docs merged (the
+post-merge hook bounces the daemon, so **any merge resets this clock** — do not merge during a soak
+you care about). Baselines to diff against live in the session scratchpad, but the numbers that
+matter are here:
+
+| signal | value at soak start | pass condition |
+|---|---|---|
+| `unpark-scan-failed` (across all `journal/*/journal.jsonl`) | **1179** | **stays 1179.** Any growth = the scan is failing again |
+| daemon `NRestarts` | 0 | stays 0 — C2's hang-proofing is what makes an unattended soak possible |
+| `parked` events | 23 | no new ones without a card actually running |
+| `daemon.jsonl` lines | 135 | grows only with real cycle summaries, never spam |
+
+Measured immediately after the hotfix: **+0 spam over 3 minutes of cycles**, against +3/minute
+before it. That is the criterion the plan's "absence of journal spam" was asking for.
+
+`spo tokens` still reports `n/a` for every task: all 18 journals predate token capture (shipped
+2026-08-31). The first real card after this point is the first one with token data at all.
 
 ## Operational facts that cost time to learn
 
@@ -197,11 +224,15 @@ Two mechanisms the docs named turned out never to have existed at all: `BUDGET_B
 - Parked/abandoned cards holding product worktrees: **213** (`diagnose-duplicate-root-cause`),
   **385** (`prompt-missing-placeholder:citations`), **428** (`diagnose-duplicate-root-cause`),
   **443** (abandoned). Three parked + one abandoned — the plan's "four parked" is wrong.
-- **C3's outstanding gate element is the unattended 24h soak**, which needs the daemon started.
-  Everything else is green: 892/892 replay, `daemon.js --dry-run` drains a synthetic card to DONE
-  leaking no worktree, and the park→retry-without-re-PLAN scenario is pinned by
-  `test/plan-resume.test.js` (notably the two-real-runs test, which exercises the production writer
-  of `baseMainSha` rather than a hand-built journal).
+- **C3's gate**: replay 894/894 ✅; `daemon.js --dry-run --once` drains a synthetic card to DONE
+  leaking no worktree and journalling no spurious `plan-files-undeclared` ✅; the
+  park→retry-without-re-PLAN scenario pinned by `test/plan-resume.test.js` ✅ (notably the
+  two-real-runs test, which exercises the production writer of `baseMainSha` rather than a
+  hand-built journal). The 24h soak is **running** — see § The 24h soak.
+- **C4 anchors, re-resolved against `fe3c88a`** (the plan's line numbers date from the audit and
+  three chantiers have moved them): 4.1 `steps/scripted.js:879` (`realPushPr`, commit at `:892`);
+  4.2 `realGate` `:1031`, `realCiChecks` `:1102`, main-moved reuse at `:1187-1194`; 4.4
+  `spawnStep` `:212`, `claim-rate-limited` `:755`; 4.5 `park-loop.js:354` (ABANDONED write).
 - None of C3 has run against a real card yet. 3.2 changes `prompts/plan.md`, the live LLM contract,
   so the first real PLAN after merge is the one that proves `files_to_change` is emitted; until
   then the guard fails open and journals `plan-files-undeclared`. Grep that event before promoting

@@ -21,6 +21,11 @@ Don't rediscover them. `gh` is the project's native GitHub tool (account `Crazz-
   `doc/board-audit.md`.
 - **Adding an option to a single-select field**: also a GraphQL mutation — no
   `gh project field-create` exists for that (`orchestrator/README.md`).
+- **`gh api` with `-f` is a POST**, not a GET, unless `--method GET` is also passed. Query
+  parameters belong in the path (`...?per_page=100&page=2`). Cost of learning this: `-f` on
+  `issues/<n>/comments` POSTs to *create a comment*, so the unpark scan 422'd on every cycle and
+  the maintainer's `retry` channel was dead for as long as it shipped. `test/gh-api-argv.test.js`
+  now fails any call site that repeats it (`gh api graphql` exempted — POST by definition).
 - **Verdict by exit code**, never by reading `gh`'s text output.
 - The orchestrator's `gh` calls go through Node's `execFile` — they never go through Claude's
   permission layer. A permission block therefore never concerns the daemon, only a Claude
