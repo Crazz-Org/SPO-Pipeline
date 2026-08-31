@@ -268,6 +268,25 @@ function splitLines(text) {
     .filter(Boolean);
 }
 
+// ---- shared: "is origin/main itself red right now" guard (action 4.2) ---------------------
+//
+// Both CI_CHECKS' main-moved path and GATE's own main-moved path (GATE section below) merge
+// `origin/main` into the branch when it has moved during the task -- and both need the identical
+// refusal when `origin/main`'s own tip is currently failing the nightly build: merging a
+// known-red `main` into an otherwise-passing branch would poison the very signal CHECK/GATE
+// exists to produce with a failure that has nothing to do with the task's own code. Before
+// action 4.2 this read-compare-throw existed once, inline in realCiChecks; GATE needed the exact
+// same check for its own main-moved path (a FAIL verdict with no baseMain -- see that section's
+// header comment), and copying the three lines a second time is exactly the kind of drift
+// CLAUDE.md's own `gh api -f` story warns about: one wrong copy can silently outlive a fixed one
+// for months. Factored out so both call sites share one definition of "red".
+function guardNightlyRed(config, originMainSha) {
+  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
+  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+    throw new ParkSignal('main-red-no-merge', {});
+  }
+}
+
 // ---- judge inputs: diff.patch / gate.log / gate-report.md (action 1.3) --------------------
 //
 // task-values.js declares three fixed paths (diff_path/gate_log_path/gate_report_path) for the
@@ -1135,9 +1154,11 @@ async function realPushPr(ctx, deps = {}) {
 
 // ---- GATE -----------------------------------------------------------------------------------
 //
-// `npm run gate`: 0 PASS -> CI_CHECKS, 1 fail -> DIAGNOSE, 2 dirty / 3 worker down / 4 timeout
-// -> PARKED. Mirrors handleGate's own shadow-mode cause table exactly.
+// `npm run gate`: 0 PASS -> CI_CHECKS, 1 fail -> see the exit-1 block below (action 4.2), 2 dirty
+// / 3 worker down / 4 timeout -> PARKED. 0/2/3/4 are unchanged and still mirror handleGate's own
+// shadow-mode cause table exactly; the green path (exit 0) makes no extra call at all.
 async function realGate(ctx, deps = {}) {
+  const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
   moveCard(ctx, deps, 'GATE'); // kanban piloting
   const r = spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate'], { cwd: worktreePath });
@@ -1151,7 +1172,217 @@ async function realGate(ctx, deps = {}) {
   fs.writeFileSync(gateLogPath(ctx.taskDir), r.stdout || r.stderr || '');
 
   if (r.exit === 0) return 'CI_CHECKS';
-  if (r.exit === 1) return 'DIAGNOSE';
+
+  if (r.exit === 1) {
+    // ---- action 4.2: exit 1 is no longer an unconditional route to DIAGNOSE ------------------
+    //
+    // The plan called for deriving `baseMain` from the journaled origin/main sha whenever the
+    // bench's own verdict for HEAD lacks one, then intersecting file lists exactly like
+    // CI_CHECKS' own main-moved test (below). Measurement changed the plan: `baseMain` is not
+    // merely sometimes missing on a FAIL -- it is missing in EXACTLY the case this action exists
+    // to catch, and there is nothing to derive it FROM when it is. `SPO-WebClient/src/e2e/bench/
+    // worker.ts` sets `report.baseMain = deps.resolveRef(request.worktree, 'origin/main')` at
+    // line ~429, AFTER `prepareRef` (line ~369) has already merged `origin/main` into the fetched
+    // checkout -- and when that merge itself conflicts, `prepareRef` returns `finish('FAIL',
+    // '<ref> does not merge cleanly with origin/main (base <sha>)')` at line ~374, before
+    // `baseMain` is ever assigned. So a branch that no longer merges cleanly with `origin/main`
+    // FAILs with no `baseMain` to derive anything from, and the plan's intersection test cannot
+    // run there at all -- it is not implemented here.
+    //
+    // Measured over all 491 files in `~/.spo-bench/verdicts/`, restricted to the 375 `ref`-type
+    // jobs `npm run gate` actually submits (`SPO-WebClient/scripts/bench-gate.sh` -- the other
+    // job types are not what GATE waits on): PASS 359/359 carry `baseMain`; FAIL 14/16 carry
+    // `baseMain` and the 2 that do NOT are the main-moved conflicts. Confirmed end to end on a
+    // real card: `journal/issue-439/journal.jsonl` shows a GATE exit 1 at 2026-08-30T02:12:35Z;
+    // that attempt's DIAGNOSE (attempt 2) root cause reads "The attempt's branch (379ada60, based
+    // on main@5f0f4886) no longer merges cleanly with origin/main: while the task ran, PR #436
+    // (issue-213, merge db3dec5a) landed..."; and
+    // `~/.spo-bench/verdicts/379ada60dd05ab7e95df11d6bba77af2f88b05a0.json` is exactly
+    // `{"verdict":"FAIL"}`, no `baseMain`, written 02:12:33.802Z -- the instant `prepareRef`
+    // discovered the conflict, not a code failure. That card burned all 3 DIAGNOSE attempts (a
+    // judge cannot fix a conflict IMPLEMENT never even saw) and parked `diagnose-budget-
+    // exhausted`; a maintainer's `retry` restarted it at INTAKE from a fresh worktree off the new
+    // `main` and it reached DONE in 19 minutes. That IS the fix this block encodes: recognise the
+    // shape (FAIL, no baseMain) and either merge locally or park honestly for a fresh restart --
+    // never spend a judge call trying to diagnose code that was never actually the problem.
+    //
+    // The mirror-image case matters just as much: a FAIL that DOES carry `baseMain` is a
+    // genuinely different failure, not a smaller version of the main-moved one. The bench had
+    // already merged `origin/main` into the checkout before it ever built, so that run failed
+    // WITH `main` already in the tree -- there is nothing left for a local merge to fix, and
+    // running the intersection test there would risk routing a real failure to CHECK instead of
+    // to a judge. It keeps going to DIAGNOSE, unchanged, at the bottom of this block.
+    //
+    // A third shape a plain "exit 1 -> DIAGNOSE" mapping already missed entirely: worker.ts's
+    // `NON_ATTESTING` set is `{DIRTY, ENVIRONMENT, ABANDONED}`, and verdicts in that set are
+    // deliberately never written to `verdicts/` at all -- yet cli.ts's `wait()` returns
+    // `report.verdict === 'PASS' || 'LEASED' ? 0 : 1`, so all three still reach here as a plain
+    // exit 1, indistinguishable by exit code alone from a real gate failure. A dead gateway, a
+    // lost owner lease, or a failed fetch means NOTHING was learned about the code -- not
+    // "something went wrong reading the verdict file" -- so a MISSING verdict file parks honestly
+    // (`gate-non-attesting`) instead of spending a DIAGNOSE call asking a judge to explain a
+    // failure that was never actually observed. (Action 4.4 adds `gate-non-attesting` to its
+    // transient auto-retry allowlist, so this parks honestly today and self-heals once that
+    // lands -- no retry loop is built here.)
+    const headRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    if (headRes.exit !== 0) {
+      // Never make the diagnostic itself fatal to the card -- an unreadable HEAD sha means the
+      // verdict lookup below cannot even be attempted; fall back to today's behaviour.
+      appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'rev-parse', exit: headRes.exit });
+      return 'DIAGNOSE';
+    }
+    const headSha = headRes.stdout.trim();
+
+    // Exit 0 is necessary but NOT sufficient to trust this string, and the SHAPE has to be
+    // checked too -- action 4.1's own finding, one function up: a failing `git rev-parse <ref>`
+    // prints the REF NAME ITSELF on stdout (measured: an orphan/unborn HEAD gives exit 128,
+    // "fatal: ambiguous argument 'HEAD'" on stderr, and the literal `HEAD` on stdout), so any
+    // path that reads stdout without also pinning down what a sha looks like is one odd git state
+    // away from carrying a plausible-looking non-sha forward. The exit check above catches the
+    // measured case; this catches the class. The cost of NOT catching it is higher here than at
+    // realPushPr's guard: there a bogus sha fell through to a push that could only fail, whereas
+    // here it makes `verdicts/<bogus>.json` miss -- and a miss now PARKS the card
+    // `gate-non-attesting`, i.e. tells a maintainer "the bench attested nothing about your code"
+    // when the truth is that the machine never asked the bench the right question. Anything that
+    // is not a hex object name is therefore treated exactly like a non-zero exit: journalled, and
+    // routed to today's DIAGNOSE. Never park on a failed diagnostic. (7..64 rather than exactly
+    // 40: `--short` output and a future sha-256 repo are both still real object names; the point
+    // of the test is to exclude `HEAD`, an empty string and any error text, not to re-implement
+    // git's own object-name parser.)
+    if (!/^[0-9a-f]{7,64}$/.test(headSha)) {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', {
+        step: 'rev-parse',
+        exit: headRes.exit,
+        headSha,
+      });
+      return 'DIAGNOSE';
+    }
+
+    const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
+    const verdict = readJsonSafe(verdictPath); // same accessor realCiChecks already uses below
+
+    if (!verdict) {
+      // readJsonSafe returns null for TWO different facts, and only one of them is "the run was
+      // non-attesting": the file is not there (the NON_ATTESTING case this block exists for), or
+      // the file IS there and did not parse -- a truncated write (379ada60's verdict landed at
+      // 02:12:33.802Z, 1.2s before the CLI's own exit, so the window is small but real), a
+      // permission error, a half-synced read. The second is a failed LOOKUP, not a verdict, and
+      // parking a card on a failed lookup is exactly the mistake the rev-parse branch above
+      // refuses to make. One `fs.existsSync` separates them.
+      if (fs.existsSync(verdictPath)) {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'verdict-parse', verdictPath });
+        return 'DIAGNOSE';
+      }
+      // `verdictDirExists` is on the event AND on the park detail deliberately: a misconfigured
+      // or unmounted `config.spoBenchDir` makes EVERY failing gate land here, and the two cases a
+      // maintainer has to tell apart -- "the bench genuinely attested nothing" vs "the machine
+      // was looking in the wrong place" -- are otherwise indistinguishable from the park comment
+      // alone. It is a stable boolean, so park-loop's countRepeatedParks fingerprint
+      // (JSON.stringify(detail)) still matches across a repeated park exactly as before.
+      const verdictDirExists = fs.existsSync(path.dirname(verdictPath));
+      appendEvent(ctx.taskDir, 'GATE', 'gate-non-attesting', { headSha, verdictPath, verdictDirExists });
+      throw new ParkSignal('gate-non-attesting', { headSha, verdictDirExists });
+    }
+
+    const baseMain = verdict.baseMain;
+    appendEvent(ctx.taskDir, 'GATE', 'gate-verdict', {
+      headSha,
+      verdict,
+      baseMain: baseMain || null,
+      merged: verdict.merged === true,
+    });
+
+    if (verdict.verdict === 'FAIL' && !baseMain) {
+      // The bench never got past `prepareRef` -- this branch does not merge with origin/main.
+      // Fetch the real remote tip first: the intersection/merge decision below must be made
+      // against it, not a lagging local `origin/main`. A non-zero exit here is not fatal --
+      // continue with what is already local rather than parking on a flaky fetch.
+      const fetch = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'fetch', 'origin', 'main']);
+      if (fetch.exit !== 0) {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-fetch-failed', { exit: fetch.exit });
+      }
+
+      if (ctx.counters.mainMoveUsed) {
+        throw new ParkSignal('main-moved-twice', {});
+      }
+      ctx.counters.mainMoveUsed = true;
+
+      // Same nightly-red refusal CI_CHECKS applies to its own main-moved merge (guardNightlyRed,
+      // above) -- a rev-parse failure here is likewise non-fatal: without a sha to compare, the
+      // guard cannot fire, so this degrades to "not known to be red" rather than parking on what
+      // is, same as the fetch above, an enrichment lookup rather than the merge decision itself.
+      //
+      // That asymmetry with CI_CHECKS (whose gitRevParse throws ParkSignal('ci-checks-rev-parse-
+      // failed') on the very same failure) is deliberate and it is safe, for a reason worth
+      // writing down rather than trusting: skipping the guard cannot let a red `main` be merged,
+      // because the merge two lines below resolves the SAME ref. If `git rev-parse origin/main`
+      // genuinely cannot resolve it, neither can `git merge origin/main` -- measured in a scratch
+      // repo with no remote: rev-parse exits 128 ("unknown revision"), merge exits 1 ("merge:
+      // origin/main - not something we can merge") -- so the card parks `main-moved-conflict`
+      // rather than merging anything. The one residual window is a rev-parse that fails for a
+      // reason unrelated to the ref while the ref itself is fine (an operator's `kill -9` with no
+      // deadline armed, which spawnOnce maps to exit 1): the guard is skipped and a red `main`
+      // could be merged. Accepted rather than closed, on the same principle as the fetch above --
+      // a diagnostic lookup must not become the thing that parks the card -- and a merged red main
+      // costs one CHECK/GATE cycle, where a false park costs a maintainer.
+      const originMainRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+      if (originMainRes.exit === 0) {
+        guardNightlyRed(config, originMainRes.stdout.trim());
+      } else {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-rev-parse-failed', { exit: originMainRes.exit });
+      }
+
+      const merge = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
+      if (merge.exit === 0) {
+        appendEvent(ctx.taskDir, 'GATE', 'main-moved-merge', { from: 'GATE' });
+        return 'CHECK';
+      }
+
+      // Non-zero: abort the failed merge so the worktree is left clean, then park. `merge
+      // --abort` goes through spawnStep like everything else here, so its own exit is already
+      // journalled by the generic 'spawn' event -- a NON-ZERO exit is deliberately not inspected,
+      // because a failed abort must not be allowed to mask the park below.
+      //
+      // "Not inspected" is not the same as "cannot escape", and the try/catch is what makes the
+      // sentence above actually true: since action 2.1, a spawnStep whose command is killed by
+      // its own timeout TWICE does not return at all -- it throws ParkSignal('git-timed-out'),
+      // which would unwind straight past the throw below and park the card under a reason naming
+      // the CLEANUP instead of the cause, taking {headSha, mergeExit} with it. That is action
+      // 4.3's verification finding in a different costume (a lookup documented as "never parks"
+      // parking the card before its own event was written), and this is one of the two call sites
+      // in this block where a spawnStep throw destroys information the rest of the system depends
+      // on: `main-moved-conflict` is the whole output of this action, the reason a maintainer
+      // reads, and the reason action 4.4 keys its transient-retry decision off. Journal the
+      // timeout, then park for the real reason regardless. (The other spawnStep calls here --
+      // rev-parse, fetch, merge -- are deliberately NOT wrapped: a hung git there parks
+      // `git-timed-out` before any routing decision has been made, which is honest and is exactly
+      // what spawnStep's own header prescribes.)
+      //
+      // What a failed abort leaves behind, traced rather than assumed: an unresolved index with
+      // conflict markers. finalizePark then calls preserveWorktreeWip, which does `git status
+      // --porcelain` (non-empty -> proceeds), then `git checkout --detach` -- and git REFUSES
+      // that on an unmerged index ("error: you need to resolve your current index first", exit 1,
+      // measured). preserveWorktreeWip journals `wip-preserve-failed {step:'detach'}` and returns
+      // null, so a conflicted tree is never committed to a `wip/` ref and no branch pointer moves.
+      // Nothing is lost either: the only content in that tree that is not already on the branch is
+      // origin/main's own, and `retry` rebuilds the worktree from scratch anyway.
+      try {
+        spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', '--abort']);
+      } catch (err) {
+        if (!(err instanceof ParkSignal)) throw err;
+        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-abort-failed', { reason: err.reason });
+      }
+      // Parking here is deliberate, not a gap: #439 proves DIAGNOSE cannot fix a conflict
+      // IMPLEMENT never even saw, and a maintainer's `retry` restarts at INTAKE from a fresh
+      // worktree off the new main -- which is what actually resolved it, in 19 minutes.
+      throw new ParkSignal('main-moved-conflict', { headSha, mergeExit: merge.exit });
+    }
+
+    // FAIL carrying baseMain (a real failure -- see the header comment above), or any other
+    // shape (e.g. a PASS verdict recorded against an exit-1 gate) -> DIAGNOSE, unchanged.
+    return 'DIAGNOSE';
+  }
+
   if (r.exit === 2) throw new ParkSignal('gate-dirty-tree', { exit: r.exit });
   if (r.exit === 3) throw new ParkSignal('gate-worker-down', { exit: r.exit });
   if (r.exit === 4) throw new ParkSignal('gate-timeout', { exit: r.exit });
@@ -1380,11 +1611,8 @@ async function realCiChecks(ctx, deps = {}) {
 
   if (!moved) return 'VALIDATE';
 
-  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
   const originMainSha = await gitRevParse(ctx, deps, worktreePath, 'origin/main');
-  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
-    throw new ParkSignal('main-red-no-merge', {});
-  }
+  guardNightlyRed(config, originMainSha); // action 4.2: shared with GATE's own main-moved path
   if (ctx.counters.mainMoveUsed) {
     throw new ParkSignal('main-moved-twice', {});
   }

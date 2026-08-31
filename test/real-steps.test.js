@@ -2106,8 +2106,25 @@ test('realGate: overwrites gate.log on a second visit -- the file holds the LAST
   const task = { id: 'card-gate-overwrite', kind: 'card', issue: 505, worktreePath };
   const ctx = testCtx({ id: 'card-gate-overwrite', task, config });
 
+  // Action 4.2: exit 1 now branches on the bench's own verdict for HEAD -- a FAIL that DOES
+  // carry `baseMain` is a real failure (the bench had already merged origin/main before
+  // building) and still routes straight to DIAGNOSE, same as before this action. Stub a HEAD
+  // sha and a matching verdict file so the first (FAIL) run exercises that branch rather than
+  // the no-verdict-file (`gate-non-attesting`) park this test isn't about -- it only cares about
+  // gate.log's overwrite behaviour.
+  // A VALID 40-char hex object name, not a readable pseudo-sha: realGate shape-checks
+  // `git rev-parse HEAD`'s stdout before using it as a verdict-file key (action 4.1's
+  // `HEAD`-on-stdout measurement), so a non-hex fixture would route through that guard instead of
+  // the FAIL-with-baseMain branch this test means to exercise -- same answer, wrong reason.
+  const headSha1 = 'a7e0be6a11e50f0e5a0d0ba5e0ffee0d0cafe0b1';
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha1}.json`), { verdict: 'FAIL', baseMain: 'somemainsha' });
+
   const deps1 = {
-    spawnSync: (command, args) => (args.includes('gate') ? fail(1, 'FIRST RUN: gate FAIL on typecheck\n') : ok('')),
+    spawnSync: (command, args) => {
+      if (args.includes('gate')) return fail(1, 'FIRST RUN: gate FAIL on typecheck\n');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha1}\n`);
+      return ok('');
+    },
   };
   const first = await realGate(ctx, deps1);
   assert.equal(first, 'DIAGNOSE');

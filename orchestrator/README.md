@@ -802,9 +802,19 @@ PR number is parsed off the `/pull/<n>` URL in `gh pr create`'s stdout and store
 (and from there into every `state.json` snapshot) for MERGE and FINISH to read back; an
 unparsable URL parks `push-pr-failed` (`step: 'pr-number-unparsed'`) rather than guessing.
 
-**GATE** runs `npm run gate` in the worktree; the exit-code table is unchanged from shadow mode
-(0 → `'CI_CHECKS'`, 1 → `'DIAGNOSE'`, 2/3/4 → PARKED `gate-dirty-tree`/`gate-worker-down`/
-`gate-timeout`).
+**GATE** runs `npm run gate` in the worktree. 0 → `'CI_CHECKS'` and 2/3/4 → PARKED
+`gate-dirty-tree`/`gate-worker-down`/`gate-timeout` are still exactly the shadow-mode table
+(`handleGate`, state-machine.js). **Exit 1 is not, since action 4.2** — the real path reads the
+bench's own verdict for HEAD (`<spoBenchDir>/verdicts/<sha>.json`) and splits what the exit code
+alone conflates: no verdict file at all → PARKED `gate-non-attesting` (a `NON_ATTESTING` bench
+verdict is never written to `verdicts/`, so nothing was learned about the code and a DIAGNOSE call
+would be spent on nothing); a `FAIL` with no `baseMain` → the branch no longer merges with
+`origin/main` (the bench merges it itself, before assigning `baseMain`), so fetch + merge
+`origin/main` → `'CHECK'`, or `merge --abort` and PARKED `main-moved-conflict`; anything else,
+including a `FAIL` that does carry `baseMain`, → `'DIAGNOSE'` as before. `main-moved-twice` and
+`main-red-no-merge` are reachable from GATE too, sharing `ctx.counters.mainMoveUsed` and the
+`guardNightlyRed` helper with CI_CHECKS. The shadow-fixture path keeps the old flat table. See
+`doc/state-machine-spec.md`'s GATE row and realGate's own header comment for the measurement.
 
 **CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
 <worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to
