@@ -827,9 +827,12 @@ GitHub issue, column "Intake", label report:raw, body = the report exactly as ca
    │  unparkScan already uses. A maintainer replies "confirm" or "discard" on the issue.
    │  config.reportConfirmScanMs (nonzero by default).
    ▼  "confirm"
-   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Routes
-   │  on `kind` (threaded through from report-card.js's own header via the report-intake/
-   │  report-confirmed journal events):
+   │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Claims
+   │  the report FIRST (an atomic rename into `~/.spo-reports/in-progress/`, same primitive
+   │  state-machine.js's takeNextTask uses for queue/) so the daemon's own timer and a hand-run
+   │  `spo triage` can never both pay for and act on the SAME report -- see "The claim mutex"
+   │  below. Routes on `kind` (threaded through from report-card.js's own header via the
+   │  report-intake/report-confirmed journal events):
    │    kind !== 'suggestion' -- intake.triageBugReport (reproduce/route/dedup/draft)
    │    kind === 'suggestion' -- buildSuggestionDraft: NO reproduction, no drafting LLM call at
    │       all -- "this works, but could be better" is not a defect to reproduce, and a
@@ -863,6 +866,63 @@ asked for is not this pipeline's call to make silently. Only `duplicate` and a s
 mechanical failure at any stage (bad account, bad JSON, a failed `gh`/`npm` call) leaves the
 report queued/pending, retried next cycle -- never journaled as triaged or held.
 
+**The claim mutex (action 2.6).** Before this, nothing stopped the daemon's own `autoTriageMs`
+timer and a hand-run `spo triage` from finding the SAME confirmed report at the same time: both
+would spend a full `triageBugReport` reproduction and both would act on the result --
+`findConfirmedAwaitingTriage`'s "confirmed, no later triaged/held" journal scan only sees the
+TERMINAL events, which land after the LLM call returns, so for the whole duration of that call
+(minutes, for a real reproduction) the report still looked eligible to a second scanner.
+Measured: report #443 was filed AND held 20 seconds apart, and the resulting PR #447 had to be
+closed by hand.
+
+The fix is `auto-triage.js`'s `processConfirmedReport`: it claims `entry.pendingPath` with one
+atomic `fs.renameSync` into `~/.spo-reports/in-progress/` -- the identical primitive
+`state-machine.js`'s `takeNextTask` already uses to claim a `queue/` entry -- BEFORE
+`routeConfirmedReport` gets anywhere near an LLM call. `rename()` is atomic: exactly one caller's
+rename succeeds, every other caller racing the same `pendingPath` gets `ENOENT` (its source
+vanished under it) and returns `{ok: true, outcome: 'already-claimed'}` -- no `triageBugReport`
+call, no journal write, no crash. A dry run (`opts.dry`) claims nothing at all, by design: a
+preview must never block the real run. Whatever the routed outcome does NOT archive itself
+(`filed`/`duplicate` move the file to `archive/`; everything else -- `held`, `DO_NOT_FILE`, any
+mechanical failure -- leaves it exactly where it was) is restored to its original `pending/` path
+once `processConfirmedReport` returns, so the "recoverable, not stranded" behaviour the table
+above describes is unchanged; the file is just routed through `in-progress/` on the way.
+
+Every claim is journaled as `report-triage-claimed` (`{issue, path}`) -- a trace in
+`daemon.jsonl` for anyone reading it, though note **no CLI or dashboard surfaces it yet**:
+`spo reports` scans only `pending/`, and `console/collect.js` ignores both new events, so a
+report sitting in `in-progress/` is visible only via `ls ~/.spo-reports/in-progress/`. Surfacing
+it belongs with the `spo status` work in chantier 5. `findConfirmedAwaitingTriage`'s own
+"handled" rule is unchanged (it still only checks `report-triaged`/`report-held`); the claim
+event is purely informational, the rename itself is the real gate.
+
+**Crash recovery.** A process that dies mid-triage (a killed daemon, a killed `spo triage
+--file`) strands its claim in `in-progress/` forever unless something sweeps it back --
+`reclaimStaleClaims` does, once at the top of every REAL `runAutoTriage` cycle (tied to the same
+timer that would otherwise process it, rather than only at daemon startup the way
+`orphan-scan.js` sweeps a crashed task's `state.json` -- this daemon can run for days between
+restarts, so waiting for the next one would leave a confirmed report's claim stuck far longer
+than acceptable). It reuses that exact precedent rather than inventing a third "is this stuck"
+pattern: a `<file>.claim.json` sidecar records `{pid, host, claimedAt}`; a claim is reclaimed
+only once its owner's pid is dead on this host (`lock.js`'s own `processAlive` liveness probe --
+same idiom `orphan-scan.js` already uses) AND `claimedAt` is older than
+`config.triageClaimGraceMs` (default 4 minutes, same value and same purpose as `orphanGraceMs`)
+-- a claim whose owner is merely slow (a real Opus reproduction) is never touched. A sidecar that
+can't be read at all (a crash inside the tiny window between the rename and the sidecar write)
+falls back to the claimed file's own mtime under the identical grace window -- which works only
+because `claimReport` stamps that mtime at claim time. `fs.renameSync` preserves mtime, and a
+report file is named for when the player filed it and then waits in `pending/` for a human
+confirm, so without the stamp every fresh claim would read as instantly stale and a sweep could
+reclaim a LIVE claim out from under its owner, re-opening the double-triage this whole mechanism
+prevents. Above all of that sits an absolute ceiling (15x the grace window): a claim whose pid
+cannot be probed at all -- a foreign hostname after a WSL/container rebuild -- is reclaimed
+regardless, because a report a human explicitly confirmed becoming permanently invisible is a
+worse failure than one duplicated triage. Positive liveness evidence still wins at any age: a
+live pid on this host is never swept. A reclaim is
+journaled as `report-triage-reclaimed` (`{file, owner}`); the report then looks exactly as it did
+before the crash -- still `report-confirmed`, never `report-triaged`/`report-held` -- so the next
+cycle picks it up and retries it normally.
+
 **"The one rule", worked through concretely.** None of `report-intake.js`/`auto-triage.js` ever
 reads report *content* (no `profile`/`anchor`/`journal`/`geometry` field is parsed in this repo).
 Rendering the RAW card -- the one step that necessarily needs that content -- lives beside the
@@ -890,12 +950,14 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
+| `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs` |
 
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
 `report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
 `report-discarded` (stage 2), `report-triaged` / `report-held` / `auto-triage` /
-`report-triage-retry` / `report-triage-cooldown` (stage 3) -- all to `journal/daemon.jsonl`, the
+`report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
+`report-triage-reclaimed` (stage 3) -- all to `journal/daemon.jsonl`, the
 same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
 disposed of at least one report **or** hit at least one mechanical error (with
 `errorIssues`/`firstError`, truncated to 300 chars); a cycle with nothing confirmed journals

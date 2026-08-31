@@ -824,11 +824,12 @@ async function cmdTriage(opts, deps = {}) {
     else if (r.outcome === 'would-file') console.log(`#${r.issue}: would file -- ${r.draft.title}`);
     else if (r.outcome === 'duplicate' || r.outcome === 'would-duplicate') console.log(`#${r.issue}: duplicate of #${r.issueNumber}`);
     else if (r.outcome === 'error') console.log(`#${r.issue}: error -- ${r.error}`);
+    else if (r.outcome === 'already-claimed') console.log(`#${r.issue}: already claimed by another runner -- skipped`);
     else console.log(`#${r.issue}: held (${r.outcome}) -- ${r.reason || ''}`);
   }
 
   console.log('');
-  console.log(`processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  held: ${result.held}  errors: ${result.errors.length}`);
+  console.log(`processed: ${result.processed}  filed: ${result.filed}  duplicates: ${result.duplicates}  held: ${result.held}  already-claimed: ${result.alreadyClaimed || 0}  errors: ${result.errors.length}`);
   if (dry) console.log('(dry run -- nothing filed, nothing archived, nothing commented; pass --file to act)');
 
   if (result.errors.length > 0) process.exitCode = 1;

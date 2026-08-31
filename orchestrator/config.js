@@ -352,6 +352,14 @@ module.exports = {
   // ('0'/'false' disables).
   autoTriagePromoteToTodo: !['0', 'false'].includes(String(process.env.SPO_AUTO_TRIAGE_PROMOTE_TO_TODO).toLowerCase()),
 
+  // action 2.6: how stale a claim in spoReportsDir/in-progress/ must be, on top of a dead owner
+  // pid, before auto-triage.js's reclaimStaleClaims treats it as abandoned (a process that died
+  // mid-triage) rather than mid-write -- the exact same role orphanGraceMs plays above for a
+  // crashed task's state.json, reused rather than inventing a second constant for an identical
+  // shape of race. SPO_TRIAGE_CLAIM_GRACE_MS overrides.
+  triageClaimGraceMs:
+    process.env.SPO_TRIAGE_CLAIM_GRACE_MS !== undefined ? Number(process.env.SPO_TRIAGE_CLAIM_GRACE_MS) : 4 * 60 * 1000,
+
   // ---- stage 0: remote report pull (orchestrator/remote-report-pull.js) -------------------
   //
   // Pulls queued reports from a production server's own bug-report store over HTTPS (the
