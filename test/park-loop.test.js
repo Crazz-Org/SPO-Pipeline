@@ -12,8 +12,18 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { runTask, buildCtx, finalizePark } = require('../orchestrator/state-machine');
-const { buildParkComment, RETRY_ABANDON_LINE, unparkScan, findParkAnchor, countRepeatedParks, postParkComment } = require('../orchestrator/park-loop');
+const { runTask, buildCtx, finalizePark, listQueueFiles } = require('../orchestrator/state-machine');
+const {
+  buildParkComment,
+  RETRY_ABANDON_LINE,
+  unparkScan,
+  shouldScanUnpark,
+  findParkAnchor,
+  countRepeatedParks,
+  postParkComment,
+  reEnqueueTask,
+} = require('../orchestrator/park-loop');
+const { createScanState } = require('../orchestrator/comment-scan');
 const { appendEvent, writeState } = require('../orchestrator/journal');
 const { timeoutResult } = require('./helpers');
 
@@ -262,11 +272,14 @@ test('unparkScan: a "retry" comment posted AFTER the park comment re-enqueues th
 
   const deps = {
     spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
       if (command === 'gh' && args[0] === 'api') {
         return ok(
           JSON.stringify([
-            { id: 95, created_at: '2026-08-28T00:00:00Z', body: 'retry -- ignored, posted BEFORE the park comment' },
-            { id: 105, created_at: '2026-08-29T00:00:00Z', body: 'retry\nplease requeue, I fixed the lockfile' },
+            { id: 95, user: { login: 'Crazz-E' }, created_at: '2026-08-28T00:00:00Z', body: 'retry -- ignored, posted BEFORE the park comment' },
+            { id: 105, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry\nplease requeue, I fixed the lockfile' },
           ])
         );
       }
@@ -296,8 +309,11 @@ test('unparkScan: idempotent -- a second scan (state.json still PARKED) never re
 
   const deps = {
     spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
       if (command === 'gh' && args[0] === 'api') {
-        return ok(JSON.stringify([{ id: 210, created_at: '2026-08-29T00:00:00Z', body: 'retry' }]));
+        return ok(JSON.stringify([{ id: 210, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }]));
       }
       return ok('');
     },
@@ -319,8 +335,11 @@ test('unparkScan: an "abandon" comment marks the task ABANDONED (terminal) and p
   const ackCalls = [];
   const deps = {
     spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
       if (command === 'gh' && args[0] === 'api') {
-        return ok(JSON.stringify([{ id: 310, created_at: '2026-08-29T00:00:00Z', body: 'abandon, thanks for trying' }]));
+        return ok(JSON.stringify([{ id: 310, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon, thanks for trying' }]));
       }
       if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
         ackCalls.push(args);
@@ -351,8 +370,11 @@ test('unparkScan: a comment matching neither "retry" nor "abandon" is left alone
 
   const deps = {
     spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
       if (command === 'gh' && args[0] === 'api') {
-        return ok(JSON.stringify([{ id: 410, created_at: '2026-08-29T00:00:00Z', body: 'what does worktree-npm-ci-failed mean?' }]));
+        return ok(JSON.stringify([{ id: 410, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'what does worktree-npm-ci-failed mean?' }]));
       }
       return ok('');
     },
@@ -431,8 +453,11 @@ test('unparkScan: a timed-out abandon-ack gh comment never throws -- the task is
 
   const deps = {
     spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
       if (command === 'gh' && args[0] === 'api') {
-        return ok(JSON.stringify([{ id: 610, created_at: '2026-08-29T00:00:00Z', body: 'abandon, giving up' }]));
+        return ok(JSON.stringify([{ id: 610, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon, giving up' }]));
       }
       if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
         return timeoutResult();
@@ -499,4 +524,233 @@ test('findParkAnchor: null with no park-comment event; the LAST one wins across 
   const anchor = findParkAnchor(lines);
   assert.equal(anchor.commentId, 20);
   assert.equal(anchor.alreadyHandled, false);
+});
+
+// ---- action 2.8: retry priority ----------------------------------------------------------------
+
+test('reEnqueueTask: names the file 0000-retry-<ts>-<id>.json -- sorts before any fresh NNNN-issue-... card', () => {
+  const queueDir = mkTmp('spo-retry-priority-queue-');
+  const journalRoot = mkTmp('spo-retry-priority-journal-');
+  const taskDir = path.join(journalRoot, 'card-500');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-500', kind: 'card', issue: 500 }));
+
+  // A fresh auto-pulled card, exactly the shape intake.js's makeTask writes -- the lowest
+  // sequence nextQueueSeq ever hands out is 1, never 0.
+  fs.writeFileSync(path.join(queueDir, '0001-issue-777.json'), JSON.stringify({ id: 'issue-777' }));
+
+  const file = reEnqueueTask(queueDir, taskDir, 'card-500');
+
+  assert.match(path.basename(file), /^0000-retry-\d+-card-500\.json$/);
+
+  const sorted = listQueueFiles(queueDir);
+  assert.deepEqual(sorted, [path.basename(file), '0001-issue-777.json'], 'the retry must sort first');
+});
+
+test('reEnqueueTask: the id stays recoverable both from the written task.json and (as a fallback) the filename', () => {
+  const queueDir = mkTmp('spo-retry-id-queue-');
+  const journalRoot = mkTmp('spo-retry-id-journal-');
+  const taskDir = path.join(journalRoot, 'card-501');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-501', kind: 'card', issue: 501 }));
+
+  const file = reEnqueueTask(queueDir, taskDir, 'card-501');
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(written.id, 'card-501', "takeNextTask's primary path: task.json's own id field");
+
+  // Defense in depth: even ignoring task.json entirely, takeNextTask's basename fallback
+  // (`path.basename(file, '.json')`) still ends in the id, unambiguously.
+  assert.ok(path.basename(file, '.json').endsWith('-card-501'));
+});
+
+test('reEnqueueTask: multiple retries queued at once still sort relative to each other by timestamp', () => {
+  const queueDir = mkTmp('spo-retry-multi-queue-');
+  const journalRoot = mkTmp('spo-retry-multi-journal-');
+  const dirA = path.join(journalRoot, 'card-600');
+  const dirB = path.join(journalRoot, 'card-601');
+  fs.mkdirSync(dirA, { recursive: true });
+  fs.mkdirSync(dirB, { recursive: true });
+  fs.writeFileSync(path.join(dirA, 'task.json'), JSON.stringify({ id: 'card-600' }));
+  fs.writeFileSync(path.join(dirB, 'task.json'), JSON.stringify({ id: 'card-601' }));
+
+  const fileA = reEnqueueTask(queueDir, dirA, 'card-600');
+  const fileB = reEnqueueTask(queueDir, dirB, 'card-601');
+
+  const sorted = listQueueFiles(queueDir);
+  assert.deepEqual(sorted.sort(), [path.basename(fileA), path.basename(fileB)].sort());
+  assert.ok(sorted.every((f) => f.startsWith('0000-retry-')));
+});
+
+test('shouldScanUnpark: disabled at <= 0, fires on first call, then respects the interval -- same shape as shouldScanOrphans', () => {
+  assert.equal(shouldScanUnpark(null, 1000, 0), false);
+  assert.equal(shouldScanUnpark(null, 1000, 60000), true);
+  assert.equal(shouldScanUnpark(1000, 1000 + 59999, 60000), false);
+  assert.equal(shouldScanUnpark(1000, 1000 + 60000, 60000), true);
+});
+
+// ---- action 2.7: unified comment-scan rewrite (pagination, allowlist, backoff) -----------------
+
+test('unparkScan: a "retry" reply from a COLLABORATOR works exactly as before', async () => {
+  const queueDir = mkTmp('spo-unpark27-queue-collab-');
+  const journalRoot = mkTmp('spo-unpark27-journal-collab-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-910', { issue: 910, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 105, body: 'retry -- fixed it', user: { login: 'maintainer' } }]));
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1);
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'unparked-by-maintainer' && e.retryCommentId === 105));
+});
+
+test('unparkScan: a "retry" reply from a NON-collaborator is ignored, journalled, and never re-enqueues', async () => {
+  const queueDir = mkTmp('spo-unpark27-queue-noncollab-');
+  const journalRoot = mkTmp('spo-unpark27-journal-noncollab-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-911', { issue: 911, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 106, body: 'retry -- I am not on the repo', user: { login: 'rando' } }]));
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const queued = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [];
+  assert.equal(queued.length, 0, 'a non-collaborator must never trigger a retry');
+  const journal = readJournal(taskDir);
+  assert.ok(!journal.some((e) => e.event === 'unparked-by-maintainer'));
+  const ignored = journal.find((e) => e.event === 'unpark-scan-ignored-author');
+  assert.ok(ignored, 'the ignored attempt must still be journalled, not silently dropped');
+  assert.equal(ignored.author, 'rando');
+  assert.equal(ignored.matched, 'retry');
+});
+
+test('unparkScan: a reply on page 2 of 3 is found -- the one-page bug this action fixes', async () => {
+  const queueDir = mkTmp('spo-unpark27-queue-page2-');
+  const journalRoot = mkTmp('spo-unpark27-journal-page2-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-912', { issue: 912, commentId: 500 });
+
+  const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, body: 'old chatter' })); // all <= anchor
+  const page2 = Array.from({ length: 100 }, (_, i) => ({ id: 501 + i, body: 'old-ish chatter' }));
+  page2[49] = { id: 550, body: 'retry -- see fix above', user: { login: 'maintainer' } };
+  const page3 = Array.from({ length: 20 }, (_, i) => ({ id: 601 + i, body: 'more chatter' }));
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      const pageArg = args.find((a) => typeof a === 'string' && a.startsWith('page='));
+      const page = pageArg ? Number(pageArg.split('=')[1]) : 1;
+      if (page === 1) return ok(JSON.stringify(page1));
+      if (page === 2) return ok(JSON.stringify(page2));
+      return ok(JSON.stringify(page3));
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const journal = readJournal(taskDir);
+  const unparked = journal.find((e) => e.event === 'unparked-by-maintainer');
+  assert.ok(unparked, 'a reply on page 2 must be found, not silently missed the way it used to be');
+  assert.equal(unparked.retryCommentId, 550);
+});
+
+test('unparkScan: the collaborator list is fetched once per repo and reused across multiple parked tasks in the same pass', async () => {
+  const queueDir = mkTmp('spo-unpark27-queue-cache-');
+  const journalRoot = mkTmp('spo-unpark27-journal-cache-');
+  parkedTaskDir(journalRoot, 'card-920', { issue: 920, commentId: 100 });
+  parkedTaskDir(journalRoot, 'card-921', { issue: 921, commentId: 100 });
+
+  let collabCalls = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        collabCalls++;
+        return ok(JSON.stringify([{ login: 'maintainer' }]));
+      }
+      return ok(JSON.stringify([]));
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  assert.equal(collabCalls, 1, 'two parked tasks sharing a repo must not each pay for their own collaborators fetch');
+});
+
+test('unparkScan: consecutive gh failures on the SAME issue back off, and a subsequent success resets it', async () => {
+  const queueDir = mkTmp('spo-unpark27-queue-backoff-');
+  const journalRoot = mkTmp('spo-unpark27-journal-backoff-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-930', { issue: 930, commentId: 100 });
+
+  let ghApiCalls = 0;
+  let shouldFail = true;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && !String(args[1]).endsWith('/collaborators')) {
+        ghApiCalls++;
+        if (shouldFail) return { status: 1, stdout: '', stderr: 'boom', signal: null };
+      }
+      return ok('[]');
+    },
+  };
+
+  const scanState = createScanState();
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, { ...deps, now: 1000 }, scanState); // failure 1
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, { ...deps, now: 2000 }, scanState); // failure 2 -- now backs off
+
+  const callsBeforeBackoffCheck = ghApiCalls;
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, { ...deps, now: 2500 }, scanState); // still backed off
+  assert.equal(ghApiCalls, callsBeforeBackoffCheck, 'a backed-off cycle must not call gh again');
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'unpark-scan-backoff-skip'));
+
+  shouldFail = false;
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, { ...deps, now: 2400000 }, scanState); // well past the backoff window -- succeeds
+  assert.ok(ghApiCalls > callsBeforeBackoffCheck, 'once the backoff window elapses, the scan tries gh again');
+});
+
+test('unparkScan: the page bound being hit is journalled distinguishably from "no reply"', async () => {
+  const queueDir = mkTmp('spo-unpark27-queue-truncated-');
+  const journalRoot = mkTmp('spo-unpark27-journal-truncated-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-940', { issue: 940, commentId: 0 });
+
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, body: 'chatter' }));
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      return ok(JSON.stringify(fullPage)); // always full -- never a natural end
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', commentScanMaxPages: 1 }, deps);
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'unpark-scan-truncated'), 'must be distinguishable from the silent "nothing matched" case');
+  assert.ok(!journal.some((e) => e.event === 'unparked-by-maintainer'));
 });

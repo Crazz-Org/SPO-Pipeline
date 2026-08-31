@@ -730,23 +730,34 @@ pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to cl
 as the anchor for what comes next -- GitHub comment ids are monotonically increasing site-wide,
 so "posted after the park comment" is exactly "id greater than the anchor", no clock needed.
 
-**`unparkScan`** (`park-loop.js`) runs once per daemon poll cycle, real mode only
+**`unparkScan`** (`park-loop.js`) runs on its own dedicated timer, real mode only
 (`state-machine.js`'s `runForever`, gated on `config.real` the same way everything else real in
-that file is). For every journaled task still `PARKED` with a park-comment anchor not yet acted
-on, it reads the issue's comments (`gh api repos/<repo>/issues/<n>/comments` -- one page,
-GitHub's default 30; a very long-lived parked issue could in principle need pagination this
-build does not implement) and looks only at comments posted after the anchor, oldest first. The
-first one whose **first line** is `retry` (optionally followed by more text) or `abandon`,
-case-insensitive, decides the outcome; anything else on the issue -- a `retry` posted *before*
-the park comment, or a comment matching neither word -- is left alone, since a human
-conversation on the issue is allowed:
+that file is, then further gated on `config.unparkScanMs` -- 60s by default, `shouldScanUnpark`).
+Action 2.7 added that timer: before it, `unparkScan` ran unconditionally on every drain cycle
+(`config.pollIntervalMs`, 5s by default) in real mode -- a `gh api` call per parked task every 5
+seconds, uncapped. For every journaled task still `PARKED` with a park-comment anchor not yet
+acted on, `comment-scan.js`'s `scanForMatch` (shared with `reportConfirmScan` below -- see that
+module's own header for the full design) fetches the issue's comments after the anchor, paginated
+(`per_page=100`, a page loop, a sane bound so a pathological issue can't scan forever -- hitting
+the bound is journalled `unpark-scan-truncated`, distinguishable from "scanned everything, nothing
+matched"), filtered to an AUTHORIZED author (a repo collaborator, per `gh api .../collaborators`,
+cached and re-checked hourly; a non-collaborator's `retry`/`abandon` is ignored and journalled
+`unpark-scan-ignored-author`, never silently dropped), with per-issue backoff on consecutive `gh`
+failures. The first authorized comment whose **first line** is `retry` (optionally followed by
+more text) or `abandon`, case-insensitive, decides the outcome; anything else on the issue -- a
+`retry` posted *before* the park comment, one from a non-collaborator, or a comment matching
+neither word -- is left alone, since a human conversation on the issue is allowed:
 
-- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/retry-<ts>-<id>.json`
+- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/0000-retry-<ts>-<id>.json`
   with the original `task.json` fields, `worktreePath`/`branch` dropped so WORKTREE derives both
-  fresh, same as a first attempt) and journals `unparked-by-maintainer`. `buildCtx`'s fresh
-  `ctx.counters` on the next `runTask` naturally resets the transient DIAGNOSE/VALIDATE-reject
-  counters; the ledger (`journal/<id>/ledger.md`) is untouched, since the retry reuses the same
-  `journal/<id>` directory the ledger already lives in.
+  fresh, same as a first attempt) and journals `unparked-by-maintainer`. Action 2.8: the `0000-`
+  prefix makes a retry sort BEFORE every fresh `NNNN-issue-...` card in `listQueueFiles`'s
+  filename-sort processing order (`intake.js`'s `nextQueueSeq` never hands out a sequence below
+  `0001`) -- before this fix the file was named `retry-<ts>-<id>.json`, which sorted BEHIND every
+  fresh card (`'r' > '0'`-`'9'`), the opposite of a maintainer's explicit retry taking priority
+  over newly auto-pulled work. `buildCtx`'s fresh `ctx.counters` on the next `runTask` naturally
+  resets the transient DIAGNOSE/VALIDATE-reject counters; the ledger (`journal/<id>/ledger.md`) is
+  untouched, since the retry reuses the same `journal/<id>` directory the ledger already lives in.
 - **`abandon`** -- terminal: `state.json`'s `state` is rewritten to `ABANDONED` directly (this
   task never re-enters `runTask`'s loop), journaled `abandoned-by-maintainer`, and a one-line ack
   comment ("Understood -- closing this attempt.") is posted on the issue. The card's *column* is
@@ -823,9 +834,11 @@ Production deployment's own ~/.spo-reports (SPO-Deploy-managed durable volume)
    │  class as auto-pull, since nothing here judges anything).
    ▼
 GitHub issue, column "Intake", label report:raw, body = the report exactly as captured
-   │  STAGE 2 -- reportConfirmScan, the SAME retry/abandon comment-scan idiom park-loop.js's
-   │  unparkScan already uses. A maintainer replies "confirm" or "discard" on the issue.
-   │  config.reportConfirmScanMs (nonzero by default).
+   │  STAGE 2 -- reportConfirmScan, built on the SAME comment-scan.js's scanForMatch park-loop.js's
+   │  unparkScan uses (action 2.7: paginated, allowlisted to repo collaborators, backed off on
+   │  consecutive `gh` failures -- see "Park <-> kanban round trip" above for the full mechanics).
+   │  A collaborator replies "confirm" or "discard" on the issue; a non-collaborator's reply is
+   │  ignored and journalled, never acted on. config.reportConfirmScanMs (nonzero by default).
    ▼  "confirm"
    │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Claims
    │  the report FIRST (an atomic rename into `~/.spo-reports/in-progress/`, same primitive
@@ -947,6 +960,8 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- not `"Parked"`, see `report-intake.js`'s header on `board-move.sh`'s driver-scope disarm |
 | `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
+| `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |
+| `commentScanMaxPages` | 20 (`SPO_COMMENT_SCAN_MAX_PAGES`) | action 2.7 -- the sane bound on `comment-scan.js`'s pagination (20 * 100/page = 2000 comments) shared by BOTH `unparkScan` and `reportConfirmScan`; hitting it is journalled distinguishably from "no reply" (`unpark-scan-truncated` / `report-confirm-scan-truncated`) |
 | `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
@@ -955,7 +970,10 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
 `report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
-`report-discarded` (stage 2), `report-triaged` / `report-held` / `auto-triage` /
+`report-discarded` (stage 2 outcomes) / `report-confirm-scan-truncated` / `report-confirm-scan-
+ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan.js facts, action
+2.7 -- `comment-scan-collaborators-unreadable` / `comment-scan-collaborators-stale` are shared
+with `unparkScan` and carry a `scanner` field instead), `report-triaged` / `report-held` / `auto-triage` /
 `report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
 `report-triage-reclaimed` (stage 3) -- all to `journal/daemon.jsonl`, the
 same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
@@ -1449,7 +1467,11 @@ piloting's own tests follow the same convention one layer up: `test/board-move.t
 `board.js`'s `moveCard` directly plus `HANDLERS.IMPLEMENT`/`HANDLERS.VALIDATE`'s real-mode move
 (via `buildCtx`'s `config.deps`, since neither state has a `realX(ctx, deps)` split of its own);
 `test/park-loop.test.js` covers the park comment's content and the PARKED round trip via
-`runTask` directly, plus `unparkScan`'s retry/abandon/idempotency; `test/auto-pull.test.js`
+`runTask` directly, plus `unparkScan`'s retry/abandon/idempotency and (action 2.7) its own
+collaborator-allowlist/pagination/backoff integration on top of `comment-scan.js`;
+`test/comment-scan.test.js` covers that shared module directly -- pagination across pages and its
+bound, the collaborator cache's fail-open/stale decisions, and per-issue backoff -- independent of
+either caller; `test/auto-pull.test.js`
 covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
 enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
 `isSafeReportFilename`/`readPullToken`, the list->fetch->land->ack wiring via an injected
@@ -1457,7 +1479,9 @@ enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRem
 skipped" and "local-but-unacked file retries the ack only" idempotency cases) -- no real socket is
 ever opened; `test/report-intake.test.js` covers stages 1-2 of the human-first bug-report
 pipeline (`shouldAutoIntake`/`shouldScanConfirms`, `parseCardOutput`, the mechanical dedup, the
-confirm/discard comment scan's anchor logic); `test/auto-triage.test.js` covers stage 3
+confirm/discard comment scan's anchor logic, and -- same as `test/park-loop.test.js` -- action
+2.7's collaborator-allowlist/pagination/backoff integration on the shared `comment-scan.js`);
+`test/auto-triage.test.js` covers stage 3
 (`shouldAutoTriage`, `findConfirmedAwaitingTriage`, `processConfirmedReport`'s outcome routing --
 including the "a negative outcome after confirm is HELD, never archived" rule -- and the dry/real
 split); `test/spo-triage.test.js` covers `cmdPullReports`/`cmdIntake`/`cmdReports`/`cmdTriage`'s

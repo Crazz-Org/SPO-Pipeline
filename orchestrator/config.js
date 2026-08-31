@@ -204,6 +204,23 @@ module.exports = {
   // loses track of a task. SPO_ORPHAN_SCAN_MS overrides.
   orphanScanMs: process.env.SPO_ORPHAN_SCAN_MS !== undefined ? Number(process.env.SPO_ORPHAN_SCAN_MS) : 60 * 1000,
 
+  // action 2.7 bullet 4: park-loop.js's unparkScan used to run unconditionally on EVERY
+  // drainQueueOnce cycle (pollIntervalMs, 5s by default) in real mode -- a `gh api .../comments`
+  // call per parked task every 5 seconds, unbounded. This is its own dedicated timer now, same
+  // shape and same default as orphanScanMs above (park-loop.js's shouldScanUnpark). SPO_UNPARK_SCAN_MS
+  // overrides, 0 disables (a parked task then only unparks via a hand-run `spo retry`/equivalent,
+  // never the daemon's own scan).
+  unparkScanMs: process.env.SPO_UNPARK_SCAN_MS !== undefined ? Number(process.env.SPO_UNPARK_SCAN_MS) : 60 * 1000,
+
+  // action 2.7: the sane bound on comment-scan.js's own pagination (`fetchCommentsAfterAnchor`),
+  // shared by park-loop.js's unparkScan and report-intake.js's reportConfirmScan -- see that
+  // module's own header for the full rationale. 20 pages * 100/page = 2000 comments scanned
+  // before a cycle gives up on ONE issue and journals the truncation distinguishably from "no
+  // reply" (unpark-scan-truncated / report-confirm-scan-truncated) rather than looking like
+  // nothing happened. SPO_COMMENT_SCAN_MAX_PAGES overrides.
+  commentScanMaxPages:
+    process.env.SPO_COMMENT_SCAN_MAX_PAGES !== undefined ? Number(process.env.SPO_COMMENT_SCAN_MAX_PAGES) : 20,
+
   // How stale state.json's updatedAt must be, on top of a dead owner pid, before a task is
   // treated as orphaned rather than mid-transition-write. Longer than any legitimate step
   // (stepDeadlineMs above), short enough that a real orphan does not sit unrecovered for long.

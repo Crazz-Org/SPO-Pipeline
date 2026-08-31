@@ -120,7 +120,9 @@ test('orphanScan -> unparkScan: a maintainer retry on the reparked issue re-enqu
     isAlive: () => false,
     spawnSync: (cmd, args) => {
       if (args.includes('comment')) return ok('https://github.com/x/y/issues/385#issuecomment-100');
-      if (args[0] === 'api') return ok(JSON.stringify([{ id: 101, body: 'retry' }]));
+      if (args[0] === 'api' && String(args[1]).endsWith('/collaborators'))
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      if (args[0] === 'api') return ok(JSON.stringify([{ id: 101, user: { login: 'Crazz-E' }, body: 'retry' }]));
       return ok();
     },
   };
