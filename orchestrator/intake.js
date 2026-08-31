@@ -108,9 +108,128 @@ function normalizeExit(result) {
   return status === null || status === undefined ? 1 : status;
 }
 
-function pickAccount(deps) {
+// ---- shared account-rotation + timeout-retry loop for the intake LLM steps -------------------
+//
+// draftCard/reviewCard/triageBugReport used to call a bare `accounts.pick()` (no rotation, no
+// markLimit) -- incident, 2026-08-30/31: triageBugReport (then on fable) failed 53 consecutive
+// auto-triage cycles over 12.8 hours, 128 attempts, every one re-picking the same rate-limited
+// account, because nothing ever cooled it down. This is the fix, mirroring state-machine.js's
+// callLlmStep (see its own header comment) exactly for the pick/call/cool/retry mechanics --
+// pick a healthy account, call, and on a `{kind: 'limit'}` result cool that account down
+// (accounts.markLimit) and pick again, bounded to one pass over the pool's enabled accounts, so
+// a step can never retry the same account twice for a limit and never spins forever.
+//
+// Two differences from that idiom, both required by intake's own contract (see each caller's
+// header comment for the fuller rationale):
+//
+//   1. Intake never throws for a recognized failure. Exhausting the pool (every account
+//      limited) or finding nothing to try at all (accounts.pick()'s AllAccountsCoolingError /
+//      NoAccountsRegisteredError) becomes {ok: false, error, cooldowns}, never a ParkSignal and
+//      never a throw -- the caller's job is to report and move on, same as every other intake
+//      failure.
+//   2. Intake has no ctx.taskDir, so there is no per-task journal.jsonl to write a cooldown
+//      into. Every cooldown this call causes is collected into `cooldowns` (returned on BOTH
+//      the success and the failure shape) for the CALLER to journal -- auto-triage.js appends
+//      `report-triage-cooldown`. Returning it, rather than swallowing it, is the actual fix for
+//      the 12.8-hour incident: a silent rotation is exactly what made it invisible.
+//
+// Composition with the existing timeout retry (draftCard/reviewCard/triageBugReport's own
+// per-function discipline, unchanged): each account attempt below calls once, and on
+// `timedOut === true` retries ONCE on the SAME account/deadline (a deadline kill says nothing
+// about account health -- see triageBugReport's own comment on why). Only once that inner retry
+// is exhausted does `kind` decide whether to rotate: a `{kind: 'limit'}` result (from either the
+// first call or the timeout retry) cools the account and moves to the next one; anything else
+// returns immediately, rotation never considered. One account attempt therefore costs at most
+// TWO invokeClaudeReal calls, and the whole loop at most `enabled accounts * 2` -- the hard
+// bound that matters for an unattended 15-minute timer against a metered API. Note the two
+// paths do compose in one direction: an account can time out, burn its same-account retry, and
+// have THAT retry come back `{kind: 'limit'}`, which then cools it and rotates. That path costs
+// two calls on the account it gave up on, still inside the same bound, and it keeps its
+// `retriedAfterTimeout` record (see the hoist comment inside the loop).
+//
+// `buildOpts(account)` builds the exact `invokeClaudeReal` opts object the caller already built
+// inline, with `account` now supplied by this loop instead of a single `pickAccount()` call.
+// Returns either {ok: false, error, cooldowns} (pool exhausted or nothing to try), or
+// {raw, account, retriedAfterTimeout, cooldowns} for the caller to finish parsing/validating.
+async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
   const accountsDir = (deps && deps.accountsDir) || config.claudeAccountsDir;
-  return accounts.pick(accountsDir);
+  const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
+
+  const cooldowns = [];
+  let raw = null;
+  // Hoisted OUT of the loop on purpose. A timeout retry costs a second full LLM call, and
+  // auto-triage.js journals it as `report-triage-retry` precisely because "a step that silently
+  // costs twice as long and twice as much is the kind of thing that only shows up in a bill."
+  // The one path that can both retry AND rotate -- account A times out, its same-account retry
+  // comes back `{kind: 'limit'}`, so A is cooled and B is tried -- must not drop A's retry
+  // record on the floor when B answers (or when the pool then runs out): that would make the
+  // single most expensive shape (a duplicate call followed by a rotation) the one shape with no
+  // trace. Last non-null record wins; it names its own `account`, so it stays unambiguous after
+  // a rotation.
+  let retriedAfterTimeout = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let account;
+    try {
+      account = accounts.pick(accountsDir);
+    } catch (err) {
+      if (err instanceof accounts.AllAccountsCoolingError || err instanceof accounts.NoAccountsRegisteredError) {
+        return {
+          ok: false,
+          error: `${prefix}: ${err.message}`,
+          cooldowns,
+          ...(retriedAfterTimeout ? { retriedAfterTimeout } : {}),
+        };
+      }
+      throw err;
+    }
+
+    const opts = buildOpts(account);
+
+    raw = await invokeClaudeReal(opts, deps);
+    if (!raw.ok && raw.timedOut === true) {
+      const record = {
+        account: account.name,
+        deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
+        firstError: formatLlmFailure(prefix, raw),
+      };
+      raw = await invokeClaudeReal(opts, deps);
+      record.retryOk = raw.ok === true;
+      record.retryTimedOut = raw.timedOut === true;
+      retriedAfterTimeout = record;
+    }
+
+    if (!(raw && raw.ok === false && raw.kind === 'limit')) {
+      return { raw, account, retriedAfterTimeout, cooldowns };
+    }
+
+    const event = accounts.markLimit(accountsDir, account.name, raw.retryAfterMs);
+    cooldowns.push({ account: account.name, ...event });
+  }
+
+  const lastDetail = raw ? `${raw.error || raw.result || raw.kind}` : 'no attempts made';
+  return {
+    ok: false,
+    error: `${prefix}: all accounts cooling after rotating through ${cooldowns.length} account(s); last result: ${lastDetail}`,
+    cooldowns,
+    // Carried on the exhaustion shape too -- see the hoist comment above. Present only when a
+    // timeout retry actually fired somewhere in the pass, same "only when it happened"
+    // convention withIntakeRetryAndCooldowns uses.
+    ...(retriedAfterTimeout ? { retriedAfterTimeout } : {}),
+  };
+}
+
+// withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns) -- returns a function that stamps
+// a result with `retriedAfterTimeout` (when the timeout retry fired) and `cooldowns` (when
+// rotation cooled at least one account), same "only present when it happened" convention as the
+// original per-function `withRetry` closures this replaces. Order matters: retriedAfterTimeout
+// is spread before cooldowns, but neither ever collides with the other's key.
+function withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns) {
+  return (res) => {
+    let out = retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res;
+    if (cooldowns && cooldowns.length > 0) out = { ...out, cooldowns };
+    return out;
+  };
 }
 
 // ---- DRAFT_CARD ------------------------------------------------------------------------------
@@ -130,14 +249,12 @@ function pickAccount(deps) {
 // Retry policy: same one-retry-on-`timedOut`-only discipline as triageBugReport (see that
 // function's header for the full rationale) -- same account, same deadline, never on a
 // malformed reply. Result carries `retriedAfterTimeout` on both success and failure.
+//
+// Account rotation: routed through callIntakeStepWithRotation (see its own header) instead of a
+// bare accounts.pick() -- a {kind: 'limit'} result now cools the account and rotates to the next
+// one, bounded to one pass over the pool, instead of re-picking the same limited account forever.
+// Result carries `cooldowns` whenever this call caused at least one.
 async function draftCard(requestText, deps = {}) {
-  let account;
-  try {
-    account = pickAccount(deps);
-  } catch (err) {
-    return { ok: false, error: `draftCard: ${err.message}` };
-  }
-
   const productRepo = deps.productRepo || config.productRepo;
   const today = deps.today || new Date().toISOString().slice(0, 10);
 
@@ -147,7 +264,7 @@ async function draftCard(requestText, deps = {}) {
     today,
   });
 
-  const opts = {
+  const attempt = await callIntakeStepWithRotation('draftCard', deps, (account) => ({
     step: 'DRAFT_CARD',
     model: 'sonnet',
     effort: 'medium',
@@ -159,21 +276,12 @@ async function draftCard(requestText, deps = {}) {
     cwd: productRepo, // needs Read/Grep over the product tree to find file:line references
     account,
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
-  };
+  }));
 
-  let raw = await invokeClaudeReal(opts, deps);
-  let retriedAfterTimeout = null;
-  if (!raw.ok && raw.timedOut === true) {
-    retriedAfterTimeout = {
-      account: account.name,
-      deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
-      firstError: formatLlmFailure('draftCard', raw),
-    };
-    raw = await invokeClaudeReal(opts, deps);
-    retriedAfterTimeout.retryOk = raw.ok === true;
-    retriedAfterTimeout.retryTimedOut = raw.timedOut === true;
-  }
-  const withRetry = (res) => (retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res);
+  if (attempt.ok === false) return attempt; // pool exhausted or nothing to try -- see helper header
+
+  const { raw, retriedAfterTimeout, cooldowns } = attempt;
+  const withRetry = withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns);
 
   if (!raw.ok) {
     return withRetry({ ok: false, error: formatLlmFailure('draftCard', raw) });
@@ -258,13 +366,6 @@ function loadDraftFile(filePath) {
 // function's header for the full rationale) -- same account, same deadline, never on a
 // malformed reply. Result carries `retriedAfterTimeout` on both success and failure.
 async function reviewCard(draft, deps = {}) {
-  let account;
-  try {
-    account = pickAccount(deps);
-  } catch (err) {
-    return { ok: false, error: `reviewCard: ${err.message}` };
-  }
-
   const ghRepo = deps.ghRepo || config.ghRepo;
   const productRepo = deps.productRepo || config.productRepo;
 
@@ -282,7 +383,10 @@ async function reviewCard(draft, deps = {}) {
     human_confirmed: deps.humanConfirmed ? 'yes' : 'no',
   });
 
-  const opts = {
+  // Account rotation: routed through callIntakeStepWithRotation (see its own header) instead of
+  // a bare accounts.pick() -- see draftCard's own comment on why. Result carries `cooldowns`
+  // whenever this call caused at least one.
+  const attempt = await callIntakeStepWithRotation('reviewCard', deps, (account) => ({
     step: 'REVIEW_CARD',
     model: 'fable',
     effort: 'high',
@@ -294,21 +398,12 @@ async function reviewCard(draft, deps = {}) {
     cwd: productRepo, // reads the product tree + `gh issue list --repo {{repo}}`
     account,
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
-  };
+  }));
 
-  let raw = await invokeClaudeReal(opts, deps);
-  let retriedAfterTimeout = null;
-  if (!raw.ok && raw.timedOut === true) {
-    retriedAfterTimeout = {
-      account: account.name,
-      deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
-      firstError: formatLlmFailure('reviewCard', raw),
-    };
-    raw = await invokeClaudeReal(opts, deps);
-    retriedAfterTimeout.retryOk = raw.ok === true;
-    retriedAfterTimeout.retryTimedOut = raw.timedOut === true;
-  }
-  const withRetry = (res) => (retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res);
+  if (attempt.ok === false) return attempt; // pool exhausted or nothing to try -- see helper header
+
+  const { raw, retriedAfterTimeout, cooldowns } = attempt;
+  const withRetry = withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns);
 
   if (!raw.ok) {
     return withRetry({ ok: false, error: formatLlmFailure('reviewCard', raw) });
@@ -587,9 +682,10 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // geometry predicates) rather than doing execution-shaped work like draftCard. Two things moved
 // it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on
 // 2026-08-30/31 -- 53 consecutive auto-triage cycles, 128 attempts across issues 449/455/456,
-// every one dying on "You've reached your Fable 5 limit" (api_error_status=429). pickAccount()
-// below neither rotates nor cools, so each cycle re-picked the one account that could not serve
-// the one model this step asked for. Second, quality: a fable verdict on this project has
+// every one dying on "You've reached your Fable 5 limit" (api_error_status=429). At the time,
+// pickAccount() neither rotated nor cooled, so each cycle re-picked the one account that could
+// not serve the one model this step asked for -- fixed below by callIntakeStepWithRotation
+// (plan action 3.6, 2026-08-31). Second, quality: a fable verdict on this project has
 // repeatedly needed an Opus re-read before it could be acted on, and triage is the step that
 // decides whether a human's bug report becomes a card at all -- a wrong "do-not-file" is
 // invisible and unrecoverable without `spo triage --retry`, which does not exist yet (plan 3.4).
@@ -597,10 +693,9 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // is the stronger judge here, and holding effort at high would raise the per-report cost of a
 // step that runs on every confirmed report for no measured gain.
 //
-// This does NOT fix the underlying loop -- pickAccount still neither rotates nor calls
-// markLimit, so an opus limit on the picked account would wedge exactly the same way. That is
-// plan actions 3.3 (cap + backoff) and 3.6 (intake plays by daemon rules); this change buys
-// headroom, it does not substitute for them.
+// Plan action 3.3 (cap + backoff on classifier false positives) is still separate work; this
+// change (3.6) is what makes an opus limit on the picked account actually rotate instead of
+// wedging the whole pipeline again.
 //
 // Bash is in allowedTools (unlike draftCard's read-only set): step 1's server-log curl and step
 // 3's `gh issue list --search` dedup both need it; permissionMode stays 'plan' regardless --
@@ -617,14 +712,17 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // carries `retriedAfterTimeout: {account, deadlineMs, firstError, retryOk, retryTimedOut}` --
 // auto-triage.js journals it as `report-triage-retry`. See the retry's own inline comment below
 // for why the same account/deadline, not a rotated one.
+//
+// Account rotation (plan action 3.6, 2026-08-31): routed through callIntakeStepWithRotation (see
+// its own header) instead of a bare accounts.pick() -- a {kind: 'limit'} result now cools the
+// account and rotates to the next healthy one, bounded to one pass over the pool, instead of
+// re-picking the same limited account forever (the 12.8-hour incident this fixes). Result
+// carries `cooldowns` whenever this call caused at least one; auto-triage.js journals each as
+// `report-triage-cooldown`. Composes with the timeout retry above WITHOUT conflict: rotation
+// only ever looks at the result AFTER the timeout retry has already run its course on the same
+// account, so a single logical call never both retries-for-timeout AND rotates-for-limit at once
+// -- see callIntakeStepWithRotation's header for the exact ordering.
 async function triageBugReport(reportFile, selfIssue, deps = {}) {
-  let account;
-  try {
-    account = pickAccount(deps);
-  } catch (err) {
-    return { ok: false, error: `triageBugReport: ${err.message}` };
-  }
-
   const productRepo = deps.productRepo || config.productRepo;
   const ghRepo = deps.ghRepo || config.ghRepo;
   const today = deps.today || new Date().toISOString().slice(0, 10);
@@ -636,20 +734,6 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
     today,
     self_issue: String(selfIssue),
   });
-
-  const opts = {
-    step: 'TRIAGE_BUG_REPORT',
-    model: 'opus',
-    effort: 'medium',
-    allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
-    permissionMode: 'plan', // read-only -- triage-bug-report.md: "never file, never post, never move the report"
-    maxBudgetUsd: deps.maxBudgetUsd, // no $ cap by default -- Claude Max subscription, no overage risk
-    jsonSchema: { type: 'object', required: ['outcome'] },
-    promptText,
-    cwd: productRepo, // needs Read/Grep/Bash over the product tree, plus curl/gh
-    account,
-    deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
-  };
 
   // ONE retry, and only on a deadline kill (steps/llm.js's `timedOut`, never a parsed-reply
   // failure). Rationale, 2026-08-30 (report #449): triageBugReport is the one intake step with no
@@ -665,21 +749,30 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
   //
   // A malformed reply is NOT retried: that is a prompt/model defect, and re-running it costs
   // another full budget to reproduce the same defect.
-  let raw = await invokeClaudeReal(opts, deps);
-  let retriedAfterTimeout = null;
-  if (!raw.ok && raw.timedOut === true) {
-    retriedAfterTimeout = {
-      account: account.name,
-      deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
-      firstError: formatLlmFailure('triageBugReport', raw),
-    };
-    raw = await invokeClaudeReal(opts, deps);
-    retriedAfterTimeout.retryOk = raw.ok === true;
-    retriedAfterTimeout.retryTimedOut = raw.timedOut === true;
-  }
+  //
+  // (The retry loop itself now lives inside callIntakeStepWithRotation, called below -- this
+  // comment stays here, next to the call site, since it explains a design decision specific to
+  // this step, not the shared mechanics.)
+  const attempt = await callIntakeStepWithRotation('triageBugReport', deps, (account) => ({
+    step: 'TRIAGE_BUG_REPORT',
+    model: 'opus',
+    effort: 'medium',
+    allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    permissionMode: 'plan', // read-only -- triage-bug-report.md: "never file, never post, never move the report"
+    maxBudgetUsd: deps.maxBudgetUsd, // no $ cap by default -- Claude Max subscription, no overage risk
+    jsonSchema: { type: 'object', required: ['outcome'] },
+    promptText,
+    cwd: productRepo, // needs Read/Grep/Bash over the product tree, plus curl/gh
+    account,
+    deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
+  }));
+
+  if (attempt.ok === false) return attempt; // pool exhausted or nothing to try -- see helper header
+
+  const { raw, retriedAfterTimeout, cooldowns } = attempt;
   // Every exit below carries the retry record when there was one, so the case worth diagnosing
   // -- a retry followed by an unusable reply -- is not the one case that loses the trace.
-  const withRetry = (res) => (retriedAfterTimeout ? { ...res, retriedAfterTimeout } : res);
+  const withRetry = withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns);
 
   if (!raw.ok) {
     return withRetry({ ok: false, error: formatLlmFailure('triageBugReport', raw) });

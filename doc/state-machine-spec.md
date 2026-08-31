@@ -90,6 +90,15 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 - The scheduler assigns each step an account; a limit error (5 h window / weekly cap) puts
   the account in **cooldown** until its window resets and the step retries on the next
   healthy account. Cooldowns are journal events.
+- This rotation rule is not daemon-only: `orchestrator/intake.js`'s three maintainer/auto-triage
+  LLM steps (draftCard, reviewCard, triageBugReport) follow it too, via their own
+  `callIntakeStepWithRotation` helper — same pick/call/cool/rotate mechanics as
+  `state-machine.js`'s `callLlmStep`, bounded to one pass over the pool. Two differences, both
+  required by intake's "never throw for a recognized failure" contract: exhausting the pool
+  becomes `{ok: false, error}` rather than a `ParkSignal`, and — since intake has no per-task
+  journal of its own — a cooldown comes back on the result's `cooldowns` array for the caller to
+  journal (`auto-triage.js` appends `report-triage-cooldown`). See `orchestrator/README.md`'s
+  "Account rotation" section for the full mechanics.
 - **K parallel workers ≤ healthy accounts.** Parallelism scales implementation capacity;
   the gate stays serialized (one live world) — adding an account does not add gate
   throughput.

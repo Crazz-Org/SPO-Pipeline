@@ -13,6 +13,7 @@ const path = require('path');
 
 const { mkTmp, writePoolDir } = require('./helpers');
 const intake = require('../orchestrator/intake');
+const accounts = require('../orchestrator/accounts');
 const spo = require('../bin/spo');
 
 function fakeSpawnSync(responder) {
@@ -35,6 +36,24 @@ function realShapedReply(resultObj, overrides = {}) {
 
 function poolDir() {
   return writePoolDir(mkTmp('spo-intake-pool-'), [{ name: 'acct1' }]);
+}
+
+// A two-account pool for the rotation tests below -- registry order is alphabetical (see
+// accounts.js's readRegistry), so 'acct1' is always picked first, 'acct2' second.
+function twoAccountPoolDir() {
+  return writePoolDir(mkTmp('spo-intake-pool2-'), [{ name: 'acct1' }, { name: 'acct2' }]);
+}
+
+// A {kind: 'limit'} shaped raw spawn result -- api_error_status: 429 is steps/llm.js's own
+// unambiguous classifyFailure rule (see its header comment), so this never depends on the
+// free-text substring branch action 3.5 owns.
+function limitSpawnResult() {
+  return {
+    status: 1,
+    stdout: JSON.stringify(realShapedReply('rate limited', { is_error: true, api_error_status: 429 })),
+    stderr: '',
+    signal: null,
+  };
 }
 
 const VALID_DRAFT = {
@@ -206,6 +225,103 @@ test('draftCard: a malformed reply is NOT retried', async () => {
   const result = await intake.draftCard('anything', deps);
   assert.equal(result.ok, false);
   assert.equal(result.retriedAfterTimeout, undefined);
+});
+
+// ---- draftCard: account rotation on kind:'limit' (plan action 3.6) -----------------------------
+// Incident, 2026-08-30/31: intake's bare accounts.pick() never rotated and never called
+// markLimit, so a rate-limited account was re-picked forever. draftCard is "one other step"
+// alongside triageBugReport's fuller coverage below.
+
+test('draftCard: a kind:\'limit\' failure on the first account rotates to a healthy second, whose result is returned', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const seenOpts = [];
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      if (opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')) return limitSpawnResult();
+      return okSpawnResult(VALID_DRAFT);
+    },
+  };
+
+  const result = await intake.draftCard('anything', deps);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.draft, VALID_DRAFT);
+  assert.equal(seenOpts.length, 2);
+  assert.notEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR, 'must call on two DIFFERENT accounts');
+  assert.ok(seenOpts[0].env.CLAUDE_CONFIG_DIR.endsWith('acct1'));
+  assert.ok(seenOpts[1].env.CLAUDE_CONFIG_DIR.endsWith('acct2'));
+});
+
+test('draftCard: the limited account is actually cooled down (markLimit written to state.json)', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) =>
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? limitSpawnResult() : okSpawnResult(VALID_DRAFT),
+  };
+
+  const result = await intake.draftCard('anything', deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.cooldowns.length, 1);
+  assert.equal(result.cooldowns[0].account, 'acct1');
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1, 'acct1 should be cooling');
+  assert.ok(state.acct1.cooldownUntil > Date.now());
+  assert.ok(!state.acct2, 'acct2 should not be cooling');
+});
+
+test('draftCard: every account limited -> {ok:false, error} naming the exhaustion, never a throw', async () => {
+  const accountsDir = twoAccountPoolDir();
+  let calls = 0;
+  const deps = {
+    accountsDir,
+    spawnSync: () => {
+      calls++;
+      return limitSpawnResult();
+    },
+  };
+
+  const result = await intake.draftCard('anything', deps);
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /draftCard/);
+  assert.match(result.error, /cooling|exhaust/i);
+  assert.equal(calls, 2, 'exactly one attempt per enabled account, never a third');
+  assert.equal(result.cooldowns.length, 2);
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1);
+  assert.ok(state.acct2);
+});
+
+test('draftCard: a normal (non-limit, non-timeout) failure does not rotate at all', async () => {
+  const accountsDir = twoAccountPoolDir();
+  let calls = 0;
+  const deps = {
+    accountsDir,
+    spawnSync: () => {
+      calls++;
+      return {
+        status: 1,
+        stdout: JSON.stringify(realShapedReply('bad schema', { is_error: true, api_error_status: 400 })),
+        stderr: '',
+        signal: null,
+      };
+    },
+  };
+
+  const result = await intake.draftCard('anything', deps);
+
+  assert.equal(calls, 1, 'must not rotate on a non-limit failure');
+  assert.equal(result.ok, false);
+  assert.equal(result.cooldowns, undefined);
+
+  const state = accounts.readState(accountsDir);
+  assert.deepEqual(state, {}, 'no account should be cooled down for a non-limit failure');
 });
 
 // ---- loadDraftFile (the brainstorm lane) -------------------------------------------------------
@@ -608,6 +724,204 @@ test('triageBugReport: a retry followed by an unusable reply still carries retri
   assert.equal(result.ok, false);
   assert.match(result.error, /not valid JSON/);
   assert.equal(result.retriedAfterTimeout.retryOk, false);
+});
+
+// ---- triageBugReport: account rotation on kind:'limit' (plan action 3.6) -----------------------
+// The live incident this responds to, 2026-08-30/31: triageBugReport (then on fable) failed 53
+// consecutive auto-triage cycles over 12.8 hours -- 128 attempts across issues 449/455/456,
+// every one re-picking the same rate-limited account, because pickAccount() never rotated and
+// never called markLimit. callIntakeStepWithRotation (orchestrator/intake.js) is the fix.
+
+test('triageBugReport: a kind:\'limit\' failure on the first account rotates to a healthy second, whose result is returned', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const seenOpts = [];
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      if (opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')) return limitSpawnResult();
+      return okSpawnResult({ outcome: 'not-reproduced', reason: 'no matching log line' });
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'not-reproduced');
+  assert.equal(seenOpts.length, 2);
+  assert.notEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR, 'must call on two DIFFERENT accounts');
+  assert.ok(seenOpts[0].env.CLAUDE_CONFIG_DIR.endsWith('acct1'));
+  assert.ok(seenOpts[1].env.CLAUDE_CONFIG_DIR.endsWith('acct2'));
+});
+
+test('triageBugReport: the limited account is actually cooled down (markLimit written to state.json)', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) =>
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')
+        ? limitSpawnResult()
+        : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' }),
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.cooldowns.length, 1);
+  assert.equal(result.cooldowns[0].account, 'acct1');
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1, 'acct1 should be cooling');
+  assert.ok(state.acct1.cooldownUntil > Date.now());
+  assert.ok(!state.acct2, 'acct2 should not be cooling');
+});
+
+test('triageBugReport: every account limited -> {ok:false, error} naming the exhaustion, never a throw', async () => {
+  const accountsDir = twoAccountPoolDir();
+  let calls = 0;
+  const deps = {
+    accountsDir,
+    spawnSync: () => {
+      calls++;
+      return limitSpawnResult();
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /triageBugReport/);
+  assert.match(result.error, /cooling|exhaust/i);
+  assert.equal(calls, 2, 'exactly one attempt per enabled account, never a third');
+  assert.equal(result.cooldowns.length, 2);
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1);
+  assert.ok(state.acct2);
+});
+
+test('triageBugReport: no accounts registered at all -> {ok:false, error}, never a throw, never spawns', async () => {
+  let called = false;
+  const deps = {
+    accountsDir: mkTmp('spo-intake-empty-pool2-'), // empty pool -- zero registered accounts
+    spawnSync: () => {
+      called = true;
+      return { status: 0, stdout: '{}', stderr: '', signal: null };
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /no-accounts-registered/);
+  assert.equal(called, false);
+});
+
+test('triageBugReport: a normal (non-limit, non-timeout) failure does not rotate at all', async () => {
+  const accountsDir = twoAccountPoolDir();
+  let calls = 0;
+  const deps = {
+    accountsDir,
+    spawnSync: () => {
+      calls++;
+      return {
+        status: 1,
+        stdout: JSON.stringify(realShapedReply('bad schema', { is_error: true, api_error_status: 400 })),
+        stderr: '',
+        signal: null,
+      };
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(calls, 1, 'must not rotate on a non-limit failure');
+  assert.equal(result.ok, false);
+  assert.equal(result.cooldowns, undefined);
+
+  const state = accounts.readState(accountsDir);
+  assert.deepEqual(state, {}, 'no account should be cooled down for a non-limit failure');
+});
+
+// Regression guard: a deadline timeout must retry on the SAME account and must NEVER cool it,
+// even when a second, healthy account is available and rotation would otherwise be possible.
+// This is the deliberate design triageBugReport's own retry-policy comment explains: a deadline
+// kill says nothing about account health (the account worked; the prompt hung).
+test('triageBugReport: a timeout retries on the SAME account (never rotates) and does NOT cool it, even with a second account available', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const seenOpts = [];
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' });
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(seenOpts.length, 2);
+  assert.equal(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR, 'the retry must reuse the SAME account');
+  assert.ok(seenOpts[0].env.CLAUDE_CONFIG_DIR.endsWith('acct1'), 'must never even try acct2 for a timeout');
+  assert.equal(result.cooldowns, undefined, 'a timeout must never cool an account');
+
+  const state = accounts.readState(accountsDir);
+  assert.deepEqual(state, {}, 'no account should be cooled down for a timeout');
+});
+
+// The one shape where the timeout retry and the rotation DO chain: acct1 times out, its
+// same-account retry comes back {kind: 'limit'}, so acct1 is cooled and acct2 answers. That is
+// the most expensive single call the loop can make (two spawns on an account it then gives up
+// on), so it must be the LEAST likely to lose its trace -- `retriedAfterTimeout` has to survive
+// the rotation, or auto-triage.js never journals `report-triage-retry` for a duplicate call that
+// really happened and really got billed.
+test('triageBugReport: a timeout retry that then hits a limit still carries retriedAfterTimeout out through the rotation', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const seenOpts = [];
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) => {
+      seenOpts.push(opts);
+      if (seenOpts.length === 1) return timeoutSpawnResult(); // acct1, first call
+      if (seenOpts.length === 2) return limitSpawnResult(); // acct1, same-account retry -> limit
+      return okSpawnResult({ outcome: 'not-reproduced', reason: 'x' }); // acct2
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(seenOpts.length, 3, 'two calls on acct1 (call + retry), one on acct2');
+  assert.ok(seenOpts[0].env.CLAUDE_CONFIG_DIR.endsWith('acct1'));
+  assert.ok(seenOpts[1].env.CLAUDE_CONFIG_DIR.endsWith('acct1'), 'the timeout retry must stay on acct1');
+  assert.ok(seenOpts[2].env.CLAUDE_CONFIG_DIR.endsWith('acct2'), 'the limit must then rotate to acct2');
+
+  assert.ok(result.retriedAfterTimeout, 'the retry record must survive the rotation');
+  assert.equal(result.retriedAfterTimeout.account, 'acct1', 'and must still name the account it happened on');
+  assert.equal(result.cooldowns.length, 1);
+  assert.equal(result.cooldowns[0].account, 'acct1');
+});
+
+test('triageBugReport: a timeout retry followed by pool exhaustion still carries retriedAfterTimeout', async () => {
+  const accountsDir = twoAccountPoolDir();
+  let calls = 0;
+  const deps = {
+    accountsDir,
+    spawnSync: () => {
+      calls++;
+      return calls === 1 ? timeoutSpawnResult() : limitSpawnResult();
+    },
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, false);
+  assert.equal(calls, 3, 'acct1: timeout + retry(limit); acct2: limit. Never more than accounts * 2');
+  assert.match(result.error, /cooling|exhaust/i);
+  assert.equal(result.cooldowns.length, 2);
+  assert.ok(result.retriedAfterTimeout, 'the exhaustion shape must carry the retry record too');
+  assert.equal(result.retriedAfterTimeout.account, 'acct1');
 });
 
 // ---- fetchIssue -----------------------------------------------------------------------------
@@ -1234,7 +1548,9 @@ test(
 // other pin anywhere -- no doc names it, no other test asserts it -- so a silent revert would be
 // invisible until the report pipeline wedged again. It moved for availability as much as for
 // quality: fable/high stalled every confirmed report for 12.8 hours on a Fable-specific 429,
-// because pickAccount neither rotates nor cools (plan 3.3/3.6, still open).
+// because the account picker neither rotated nor cooled at the time (fixed by plan action 3.6,
+// see callIntakeStepWithRotation's own tests above; plan action 3.3, capping the classifier's
+// false-positive rate, is still open).
 test('triageBugReport: runs on opus at medium effort -- the argv the CLI actually receives', async () => {
   const seenArgs = [];
   const deps = {

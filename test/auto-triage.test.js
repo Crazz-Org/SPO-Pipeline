@@ -14,6 +14,7 @@ const os = require('os');
 const path = require('path');
 
 const { mkTmp, writePoolDir } = require('./helpers');
+const accounts = require('../orchestrator/accounts');
 const {
   shouldAutoTriage,
   runAutoTriage,
@@ -104,6 +105,25 @@ function timeoutSpawnResult() {
   const err = new Error('spawnSync claude ETIMEDOUT');
   err.code = 'ETIMEDOUT';
   return { error: err, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' };
+}
+
+// A {kind: 'limit'} shaped raw spawn result (api_error_status: 429 -- steps/llm.js's own
+// unambiguous classifyFailure rule) for the account-rotation tests below.
+function limitSpawnResult() {
+  return {
+    status: 1,
+    stdout: JSON.stringify({
+      result: 'rate limited',
+      is_error: true,
+      num_turns: 1,
+      session_id: 'sess-triage-limit',
+      modelUsage: {},
+      terminal_reason: 'error',
+      api_error_status: 429,
+    }),
+    stderr: '',
+    signal: null,
+  };
 }
 
 function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1, kind }) {
@@ -434,6 +454,131 @@ test('runAutoTriage: dry run -- a retry still happens but is not journaled', asy
     ? fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
     : '';
   assert.doesNotMatch(daemonLog, /report-triage-retry/);
+});
+
+// ---- report-triage-cooldown: account-rotation made visible (plan action 3.6) -------------------
+// intake.js's triageBugReport/reviewCard have no ctx.taskDir to journal a cooldown into
+// themselves (see intake.js's callIntakeStepWithRotation header) -- they return `cooldowns` on
+// the result instead, and this file is the one place that turns it into a daemon.jsonl event.
+// This is the actual fix for the 2026-08-30/31 incident (53 consecutive auto-triage cycles over
+// 12.8 hours, all silently re-picking the same limited account): a silent rotation used to be
+// invisible; now it is a journal event a maintainer can find.
+
+test('runAutoTriage: a triageBugReport rate-limit rotates accounts and is journaled as report-triage-cooldown', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reports9-');
+  const journalRoot = mkTmp('spo-autotriage-journal9-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_jjj.json');
+  confirmedEntry(journalRoot, { issue: 460, pendingPath });
+
+  const accountsDir = writePoolDir(mkTmp('spo-autotriage-pool2-'), [{ name: 'acct1' }, { name: 'acct2' }]);
+
+  const deps = makeDeps({
+    accountsDir,
+    claudeRawReplies: [limitSpawnResult()],
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
+    ],
+    ghResponder: (args) => (args[0] === 'api' ? ok(JSON.stringify({ body: 'original raw body' })) : ok('')),
+    npmResponder: () => ok(''),
+  });
+
+  const result = await runAutoTriage(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true },
+    deps,
+    { dry: false }
+  );
+  assert.equal(result.filed, 1);
+
+  const daemonLog = fs
+    .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const cooldownEvent = daemonLog.find((e) => e.event === 'report-triage-cooldown');
+  assert.ok(cooldownEvent, 'expected a report-triage-cooldown event');
+  assert.equal(cooldownEvent.issue, 460);
+  assert.equal(cooldownEvent.step, 'TRIAGE_BUG_REPORT');
+  assert.equal(cooldownEvent.account, 'acct1');
+  assert.ok(daemonLog.some((e) => e.event === 'report-triaged' && e.issue === 460 && e.outcome === 'filed'));
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1, 'acct1 should be cooling');
+
+  // the cooldown event never blocks the normal "handled" detection, same as report-triage-retry
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+});
+
+test('runAutoTriage: dry run -- a rate-limit rotation still happens but is not journaled', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reports10-');
+  const journalRoot = mkTmp('spo-autotriage-journal10-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_kkk.json');
+  confirmedEntry(journalRoot, { issue: 461, pendingPath });
+
+  const accountsDir = writePoolDir(mkTmp('spo-autotriage-pool2b-'), [{ name: 'acct1' }, { name: 'acct2' }]);
+
+  const deps = makeDeps({
+    accountsDir,
+    claudeRawReplies: [limitSpawnResult()],
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
+    ],
+  });
+
+  await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
+
+  const daemonLog = fs.existsSync(path.join(journalRoot, 'daemon.jsonl'))
+    ? fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    : '';
+  assert.doesNotMatch(daemonLog, /report-triage-cooldown/);
+});
+
+// The OTHER call site inside reviewAndFile. The 2026-08-31 incident's last cycle died on
+// `reviewCard: claude call failed (limit)`, not on triageBugReport -- so reviewCard's cooldown
+// has to reach daemon.jsonl on its own, with its own `step`, or the second half of the incident
+// stays exactly as invisible as the first. Driven through kind: 'suggestion', which skips
+// triageBugReport entirely, so the only LLM call in the cycle IS reviewCard.
+test('runAutoTriage: a reviewCard rate-limit inside reviewAndFile is journaled as report-triage-cooldown with step REVIEW_CARD', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reports11-');
+  const journalRoot = mkTmp('spo-autotriage-journal11-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_lll.json');
+  confirmedEntry(journalRoot, { issue: 462, pendingPath, kind: 'suggestion' });
+
+  const accountsDir = writePoolDir(mkTmp('spo-autotriage-pool2c-'), [{ name: 'acct1' }, { name: 'acct2' }]);
+
+  const deps = makeDeps({
+    accountsDir,
+    claudeRawReplies: [limitSpawnResult()], // acct1 -> limit, rotate to acct2
+    claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' }],
+    ghResponder: (args) =>
+      args[0] === 'api' ? ok(JSON.stringify({ title: '[suggestion] x', body: 'b' })) : ok(''),
+    npmResponder: () => ok(''),
+  });
+
+  const result = await runAutoTriage(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true },
+    deps,
+    { dry: false }
+  );
+  assert.equal(result.filed, 1);
+
+  const daemonLog = fs
+    .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const cooldownEvent = daemonLog.find((e) => e.event === 'report-triage-cooldown');
+  assert.ok(cooldownEvent, 'expected a report-triage-cooldown event for the reviewCard call');
+  assert.equal(cooldownEvent.issue, 462);
+  assert.equal(cooldownEvent.step, 'REVIEW_CARD');
+  assert.equal(cooldownEvent.account, 'acct1');
+  assert.ok(cooldownEvent.cooldownUntilIso, 'the event must say when acct1 comes back');
+
+  assert.ok(accounts.readState(accountsDir).acct1, 'acct1 should be cooling');
+  assert.equal(findConfirmedAwaitingTriage(journalRoot, 10).length, 0);
 });
 
 test('runAutoTriage: default limit 3 -- only the top 3 of 5 confirmed reports are processed', async () => {
