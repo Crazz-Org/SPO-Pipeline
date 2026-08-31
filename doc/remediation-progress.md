@@ -5,7 +5,8 @@ This file is what the plan *turned out to be* once executed: what is done, what 
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
 
-**State as of 2026-08-31.** `main` = `652bb3b`. Suite **759 passing, 0 failing**.
+**State as of 2026-08-31.** `main` = `08a91ad`; C3 sits on `claude-crazz/spo-pipeline-remediation-prod-476444`
+(`2114b8c`), unmerged. Suite **892 passing, 0 failing**.
 
 ## Progress
 
@@ -13,10 +14,21 @@ chantier.
 |---|---|
 | **C1** — truthful judges | **DONE**, gate green (live card #462) |
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
-| **C3** — token hemorrhage | **3.6 done out of order**; 3.1–3.5, 3.7 open. **3.7 is a DECISION** |
+| **C3** — token hemorrhage | **DONE**, gate green except the 24h soak (needs the daemon started — maintainer's call) |
 | C4–C7 | not started |
 
-Tests: 454 (plan baseline) → 759.
+Tests: 454 (plan baseline) → 759 (end of C2) → **892** (end of C3).
+
+## C3 commits (one per action, in order)
+
+| action | commit | what it does |
+|---|---|---|
+| 3.1 | `129b913` | PLAN reuses a still-valid plan on retry instead of re-deriving it |
+| 3.2 | `1ffc9ae` | park a plan that *declares* a protected file, before IMPLEMENT is paid for |
+| 3.3 | `750d3c3` | cap mechanical triage failures at 3, with exponential backoff |
+| 3.4 | `a453efb` | `spo triage --retry <issue> --file` re-injects a held report |
+| 3.5 | `7bcd357` | classify a limit from structure, not free text; probe-then-escalate cooldown |
+| 3.7 | `2114b8c` | docs only, per maintainer decision — no cap restored |
 
 ## Corrections to the plan itself
 
@@ -37,13 +49,36 @@ against the product source, not by guesswork:
 spawned `gh`/`npm` through private `runSync`s with no timeout, and `board.js`'s `moveCard` is
 called from *inside* the steps 2.1 covered.
 
+C3 added three more, each caught by measuring rather than reasoning:
+
+- **3.2's specified detector had 33% precision and was unshippable.** The plan says to scan
+  `plan_markdown` for `.claude/settings.json` / `.claude/hooks/`. Run over all 17 real plans in
+  `journal/*/scratch/`, that scan fires on three: one true positive (#428) and **two false
+  positives on cards that are DONE today** — issue-418's plan asserts a hook is *absent*,
+  issue-429 *cites* `.claude/settings.json` as evidence. Structural, not unlucky:
+  `prompts/plan.md:94` orders a falsification sweep over `.claude/`, and SPO-WebClient's
+  `CLAUDE.md` — domain context on every PLAN call — names those paths in its own headings. Prose
+  cannot separate "my plan edits this" from "my plan cites this", and the pipeline's own prompt
+  demands citations. Resolved by maintainer decision: PLAN now returns `files_to_change` and the
+  guard scans that declaration instead.
+- **3.5's specified cooldown would have been worse than the bug.** The plan says align the default
+  with the 5h Max session window. The pool is **2 accounts**: two usage limits inside one window
+  take 100% of it down for five hours, and `daemon.js` has no pool-health gate, so every card
+  pulled during that window parks at its first LLM step. The 5h figure also over-waits by
+  construction — the window resets 5h after a session's *first message*, not after the limit hit.
+  Shipped instead as probe-then-escalate: 1h first, 5h only if a second usage limit lands within
+  2h. Overload (529 / `overloaded_error`) is a flat 5min and never escalates.
+- **3.7's own premise was false.** See the decision section below.
+
 ## Live evidence gathered (feeds later chantiers)
 
 - **3.1 (resume after park)** — measured at ~$14 of tokens on ONE card (#455), re-deriving a plan
   that already existed and was correct. Highest-value action in C3.
 - **3.3 (auto-triage cap)** — hit a **12.8-hour** stall (53 cycles, 128 attempts, issues
   449/455/456), longer than the 2.5h incident the plan sized it from.
-- **3.4** — its absence made a held report unrecoverable; there is still no `spo triage --retry`.
+- **3.4** — its absence made a held report unrecoverable. `spo triage --retry <issue> --file` now
+  exists (`a453efb`); it appends one `report-confirmed`, which both re-queues the report and resets
+  3.3's failure budget.
 - **5.3 (PASS_WITH_FINDINGS)** — observed live on #455: a substantive finding (orphaned
   `cachedZonePath` session state) was journalled and then dropped, exactly as the plan predicts.
 - **New, not in the plan (suggest C4)** — a retry's leftover sweep runs `push origin --delete`
@@ -82,21 +117,63 @@ validation; the triage claim's mtime fallback un-claiming live claims; a comment
 bypassable by omitting a field. **Mutation testing repeatedly found tests that passed for the
 wrong reason** — the single highest-value part of the loop.
 
-## Open decision — 3.7, reframed
+C3 held to the same pattern; every action needed a fix pass, and three would have shipped a real
+regression:
 
-The plan asks whether to restore `--max-budget-usd` caps. **That question no longer means
-anything**: dollars were retired this session (`spo tokens`, billable-weighted tokens = fresh
-input + cache creation + output, cache reads reported separately). Also, `step-contracts.js` sets
-`maxBudgetUsd: undefined` everywhere, so the spec's "per-step USD cap" column describes a
-mechanism that does not exist.
+- **3.1** would have handed IMPLEMENT `plan_path: undefined` after a SIGTERM during `buildBaseline`
+  (which the post-merge hook really causes), turning a retry that used to work into a park — and a
+  missing `invariants_path` makes `runInvariantCheck` return `[]`, so CHECK's invariant test goes
+  silently vacuous. Its condition 6 also missed `diagnose-budget-exhausted` /
+  `validate-reject-budget-exhausted`, leaving the exact no-progress loop it exists to prevent.
+- **3.3** gated the mechanical hold on its comment posting. With `gh` failing, 8 cycles produced 8
+  spawns and **zero** holds — the 12.8h incident throttled ~8× and not eliminated. *The hold is the
+  mechanism; the comment is the courtesy, and the courtesy must not veto the mechanism.*
+- **3.5**'s flat 5h cooldown (see corrections above), plus a test named `exact match only` that
+  asserted only positive cases — swapping `Set.has` for `.includes` left all 886 green, though
+  "never a substring test" is the load-bearing claim of that whole action.
 
-The live question is: **is a consumption ceiling needed on top of the existing 15-minute
-`LLM_STEP_DEADLINE_MS`, and in what unit?** The runaway the audit cited (IMPLEMENT at 134 turns)
-would hit that deadline regardless. Cheapest correct slice, whichever way it goes: fix the spec's
-Budget-cap column, which is factually wrong today.
+Two lessons worth carrying into C4. **Measure the specified behaviour against the real corpus
+before building it** — 3.2's detector was killed by running it over 17 real plans, not by review.
+And **a docs-only action still needs adversarial verification**: 3.7 had no code to mutate, and its
+audit still found a confidently-stated counterfactual that the journal flatly contradicts.
+
+## Decision taken — 3.7: no cap, documentation only
+
+The plan asked whether to restore `--max-budget-usd` caps. Maintainer decision, 2026-08-31:
+**no mechanical change.** `2114b8c` corrects the documentation and adds nothing.
+
+The reasoning had to be corrected against the journal, and the correction matters more than the
+decision. The audit's single measured runaway — IMPLEMENT, 134 turns, $5.06 — did **not** hit the
+15-minute deadline. `journal/issue-385/journal.jsonl`: 19:56:12 → 20:09:48, **816s elapsed**,
+`terminalReason: "budget_exhausted"`, with `LLM_STEP_DEADLINE_MS` already armed since `3e8104b`
+earlier that same day and **~84s of margin left**. The `--max-budget-usd` cap is what stopped it;
+the caps were removed the next day in `2621aad`.
+
+The decision stands anyway, for a reason only visible once the premise was fixed: `budget_exhausted`
+is produced *by* `--max-budget-usd`, and no production path sets it, so that terminal reason cannot
+recur — which also removes the mislabelled-park follow-up the plan attached to this action. The
+practical cost of the removed cap is those ~84 seconds.
+
+**If this is ever reopened**, the honest counter-argument is that a deadline bounds *time* while a
+cap bounded *work*: 134 thrashing turns produce garbage either way, and the modern unit would be
+turns or billable tokens, not dollars.
+
+Two mechanisms the docs named turned out never to have existed at all: `BUDGET_BY_SIZE_USD` and
+`task.llmBudgetUsd.<STEP>`. Both are absent repo-wide; only their descriptions survived.
 
 ## Current environment
 
 - Daemon + dashboard **stopped**; bench worker **running** (GATE needs it).
 - Nothing in flight; queue empty.
-- Four parked/abandoned cards hold product worktrees: 213, 385, 428, 443.
+- Parked/abandoned cards holding product worktrees: **213** (`diagnose-duplicate-root-cause`),
+  **385** (`prompt-missing-placeholder:citations`), **428** (`diagnose-duplicate-root-cause`),
+  **443** (abandoned). Three parked + one abandoned — the plan's "four parked" is wrong.
+- **C3's outstanding gate element is the unattended 24h soak**, which needs the daemon started.
+  Everything else is green: 892/892 replay, `daemon.js --dry-run` drains a synthetic card to DONE
+  leaking no worktree, and the park→retry-without-re-PLAN scenario is pinned by
+  `test/plan-resume.test.js` (notably the two-real-runs test, which exercises the production writer
+  of `baseMainSha` rather than a hand-built journal).
+- None of C3 has run against a real card yet. 3.2 changes `prompts/plan.md`, the live LLM contract,
+  so the first real PLAN after merge is the one that proves `files_to_change` is emitted; until
+  then the guard fails open and journals `plan-files-undeclared`. Grep that event before promoting
+  the key to `required`.

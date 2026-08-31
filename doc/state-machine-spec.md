@@ -45,9 +45,9 @@ INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI
 
 | State | Kind | Does | Success → | Failure → |
 |---|---|---|---|---|
-| INTAKE | script | take next task file from `queue/` (priority = file order; sources: board export, `/triage-report`, later in-game reports) | WORKTREE | PARKED |
+| INTAKE | script | take next task file from `queue/` (priority = file order; sources: board export, `/triage-report`, later in-game reports). **Action 3.2:** for a `kind: "card"` task, the criterion and title are scanned for a protected-file mention (`.claude/settings.json`, `.claude/settings.local.json`, anything under `.claude/hooks/` — see `orchestrator/intake.js`'s `detectProtectedFiles`) after the `invalid-task-json`, `shadow.forceState`, and `real-flag-required` checks but before `appendEvent('INTAKE', 'ok')` runs; a hit parks the task at zero cost, since INTAKE never makes an LLM call either way. | WORKTREE | PARKED (also `plan-requires-protected-files`, `{source: 'criterion', matches}`, when the card's own criterion or title names a protected file) |
 | WORKTREE | script | fresh worktree + branch off last green `main`; refuse if nightly says `main` is red (repair task only) | PLAN | PARKED |
-| PLAN | `claude -p` | plan + invariants file + runnable check commands; once written, the driver resolves every invariant against the worktree and journals the result as the CHECK baseline (action 1.8) — an invariant that fails to resolve here is logged and excluded from that baseline, never a park, never a re-run of PLAN | IMPLEMENT | PARKED (plan invalid/not executable; a transport failure — the call never produced a verdict at all — is `llm-transport-failed:PLAN`, distinct from an invalid plan the model DID produce) |
+| PLAN | `claude -p` | plan + invariants file + runnable check commands + `files_to_change` (action 3.2 — the plan's own declared list of files it will change; a sibling `optional` field of the output contract, not `required`, so its absence never parks — see step-contracts.js); once written, the driver resolves every invariant against the worktree and journals the result as the CHECK baseline (action 1.8) — an invariant that fails to resolve here is logged and excluded from that baseline, never a park, never a re-run of PLAN. **Action 3.1:** real mode only — shadow and `--dry-run` never reuse, checked explicitly as the guard's first condition. On a `retry` after a park, PLAN is skipped entirely (no LLM call) when the plan already on disk from the run that parked is still valid: `origin/main` has not moved since it was written, both plan/invariants files are still present, are regular files, and non-empty, the last PLAN `result` payload is not itself a failure (a transport-failure payload carries no `plan_path`/`invariant_ids`/`check_commands` to hand IMPLEMENT), and the park that ended the previous run was not one of the six reasons that indict the plan itself (`plan-invalid`, `plan-requires-protected-files`, `diagnose-duplicate-root-cause`, `diagnose-no-new-cause`, `diagnose-budget-exhausted`, `validate-reject-budget-exhausted`) — every other park reason (transport failures, gate/CI failures, claim losses, merge conflicts) is orthogonal to whether the plan was right. The invariants baseline is still rebuilt fresh against the retried worktree either way; the plan/invariants text and PLAN's own declared `invariant_ids`/`check_commands` are carried forward with `plan_path`/`invariants_path` stamped explicitly (not merely trusted to already be present on the carried-forward payload), journalled as `plan-reused`. See `orchestrator/state-machine.js`'s `decidePlanReuse`. | IMPLEMENT | PARKED (plan invalid/not executable; a transport failure — the call never produced a verdict at all — is `llm-transport-failed:PLAN`, distinct from an invalid plan the model DID produce; **action 3.2:** `plan-requires-protected-files` — `{source: 'files_to_change', matches, declaredFiles}` when an entry of the model's own declared `files_to_change` names a protected file, scanned before any scratch file is written. `plan_markdown` prose is never scanned — measured at 33% precision (2 false positives against 1 true positive across all 17 real plans) and dropped for that reason. When `files_to_change` is absent, `null`, not an array, or contains a non-string entry, PLAN does not park and does not fall back to scanning prose — it journals `plan-files-undeclared` and proceeds normally; an empty array counts as a clean declaration, not an undeclared one) |
 | IMPLEMENT | `claude -p` | write code + tests in the worktree per plan | CHECK | DIAGNOSE (a transport failure is never routed to DIAGNOSE — it PARKS `llm-transport-failed:IMPLEMENT` instead, since there is no answer for DIAGNOSE to diagnose) |
 | CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |
 | PUSH_PR | script | commit, push, open PR (`Closes #N`) — PR precedes gate (CI needs it) | GATE | PARKED |
@@ -65,17 +65,31 @@ be confused: `validate-reject N | reasons | outcome` (action 1.6).
 
 ## Step contracts
 
-| Step | Model | Effort | Tools | Output | Budget cap |
+| Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
-| PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands (`--json-schema` envelope) | per-step USD cap |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on the wire rule** (`src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases) or L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | per-step USD cap |
-| DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | small |
-| VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | small |
-| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | small |
+| PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 900000ms / 15min |
+| IMPLEMENT | Sonnet 5 — **Opus 5 on the wire rule** (`src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases) or L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
+| DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
+| VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+
+The deadline is the same figure for all five rows — `step-contracts.js`'s `LLM_STEP_DEADLINE_MS`,
+the `spawnSync` timeout `invokeClaudeReal` arms for every one of these calls
+(`orchestrator/steps/llm.js`) — but that figure governs real mode only. `state-machine.js` still
+wraps every LLM step in the outer `callWithDeadline` (`deadline.js`) using the generic
+`stepDeadlineMs` (120000ms; no `stepDeadlineMsByState` entry exists for any LLM state), which is
+inert in real mode (a JS timer cannot preempt the blocking `spawnSync` that `LLM_STEP_DEADLINE_MS`
+already bounds) but live in shadow mode, where a fixture delay races that 120s timer instead of
+the 900000ms figure above. There is no per-step or per-size USD budget: `maxBudgetUsd` is plumbed
+end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
+daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
+decision and the bounds that actually are enforced.
 
 Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
-`--json-schema` for the payload, `--max-budget-usd`, `--allowedTools`, `--model`, `--effort`,
-`--permission-mode` per step, run under the account chosen by the scheduler
+`--json-schema` for the payload, `--allowedTools`, `--model`, `--effort`,
+`--permission-mode` per step (plus `--max-budget-usd` when a caller supplies a numeric
+`maxBudgetUsd` — no daemon or intake path does; the only caller that does is the hand-run
+`scripts/smoke-llm.js`), run under the account chosen by the scheduler
 (`CLAUDE_CONFIG_DIR=<account dir>`). Domain context comes from the product worktree's
 (trimmed) `CLAUDE.md` plus the step prompt from `prompts/`.
 
@@ -90,9 +104,38 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 - A pool with zero registered accounts is a hard stop for real mode: `orchestrator/accounts.js`'s
   `pick()` throws `NoAccountsRegisteredError`, the state machine parks on it, and
   `daemon.js --real` refuses to even start.
-- The scheduler assigns each step an account; a limit error (5 h window / weekly cap) puts
-  the account in **cooldown** until its window resets and the step retries on the next
-  healthy account. Cooldowns are journal events.
+- The scheduler assigns each step an account; a limit error puts the account in **cooldown**
+  and the step retries on the next healthy account. Cooldowns are journal events.
+  `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:711`'s 12.8-hour Fable
+  incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
+  documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
+  match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
+  (**anticipated**, not recorded reply text), `usage_limit_reached` (a plain **guess**, kept
+  because an exact-match entry that never fires costs nothing) — never a substring scan over
+  free text, since any failure message merely containing "rate" used to be misclassified as a
+  limit. An unrecognised limit shape now falls through to a plain PARK instead of rotating;
+  extend the allowlist from journal evidence (the failure's `terminalReason`/`apiErrorStatus`
+  are journalled with the step's result) as entries move from anticipated/guessed to actually
+  observed, never from further guesswork.
+- **Cooldown duration is an escalating probe, not a flat number** (`orchestrator/accounts.js`'s
+  `markLimit`, action 3.5's 2026-08-31 redesign — this action's own first cut used a flat 5-hour
+  usage cooldown, rejected before it shipped). The real pool has **2 accounts**, and
+  `daemon.js` has no pool-health gate: with `maxAttempts` equal to pool size, two usage limits
+  inside one window would take the *whole pool* down for up to 5 hours, parking every card the
+  daemon pulled in that window. A flat 5h also over-waits by construction — the Claude Max
+  session window resets 5h after the *session's first message*, not after the limit hit, so
+  `now + 5h` sleeps for (5h − the true remaining wait) longer than necessary, often 4h+. So:
+  a first usage limit for an account (`limitKind: 'usage'`, i.e. 429 / `rate_limit_error` /
+  `usage_limit_reached`) cools it for a **1-hour probe**; a usage limit landing again within a
+  **2-hour escalation window** of that account's last one cools it for the real observed
+  **5-hour** Claude Max session window instead (the probe just proved the window is still open).
+  `overloaded` (529 / `overloaded_error`) stays a flat **5 minutes** and never escalates — a busy
+  *server* says nothing about this account's own quota. An absent/unrecognised limit kind falls
+  back to the usage flow (probe or escalated, by the same history check), never a shorter tier.
+  Exhausting the pool inside one rotation pass never re-calls `pick()`, so the resulting park/
+  error carries the last cooldown's own ISO timestamp explicitly rather than relying on `pick()`'s
+  own reason string, which that path never reaches.
 - This rotation rule is not daemon-only: `orchestrator/intake.js`'s three maintainer/auto-triage
   LLM steps (draftCard, reviewCard, triageBugReport) follow it too, via their own
   `callIntakeStepWithRotation` helper — same pick/call/cool/rotate mechanics as

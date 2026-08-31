@@ -119,6 +119,44 @@ Two independent counters per task, both journaled and both visible in `state.jso
   clearly attributed to its own state so IMPLEMENT can tell "a check/gate/CI failed" apart from
   "the change was built and the validator rejected it".
 
+**The bounds this pipeline actually enforces**, beyond the two retry budgets above, are three
+wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
+
+- `config.js`'s `commandTimeoutsMs` (git 120000ms, gh 120000ms, npm-ci 600000ms,
+  npm-gate 7800000ms, npm-run 660000ms) — `spawnSync`'s own `timeout` option, armed per call by
+  `steps/scripted.js`'s `spawnStep`. This is the bound that actually fires against a hung
+  `git`/`gh`/`npm` child; see `doc/state-machine-spec.md`'s design consequence #3 for why two
+  mechanisms exist and how they interact.
+- `config.js`'s `stepDeadlineMs` (default 120000ms / 2min) — `deadline.js`'s `callWithDeadline`,
+  the outer retry-once-then-park bookkeeping race wrapped around every step, scripted or LLM. It
+  is a JS timer, not a process kill, so it cannot preempt a blocking `spawnSync`: it is a no-op
+  against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there)
+  and, in real mode, equally inert around an LLM step (bounded instead by
+  `LLM_STEP_DEADLINE_MS` below). It is live only in shadow mode, where an LLM step has no
+  blocking `spawnSync` underneath it and a fixture delay races this 120s timer instead of the
+  900000ms figure below (`doc/state-machine-spec.md` § Step contracts).
+- `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the `spawnSync` timeout
+  `invokeClaudeReal` arms for every LLM step call (PLAN, IMPLEMENT, DIAGNOSE,
+  CITATION_VERIFIER, VALIDATE), uniformly regardless of task size or model, in real mode.
+- `orchestrator/recette.js`'s supervised live harness carries its own two caps, independent of
+  the daemon's: `--cap-ms` (default 45 minutes wall clock) and `--cap-llm-steps` (default 12),
+  either of which aborts the run rather than let a synthetic card run unbounded.
+
+**A per-call USD cap is deliberately not one of these bounds.** `maxBudgetUsd` exists in the
+plumbing (`step-contracts.js`, `orchestrator/intake.js`, `steps/llm.js`'s conditional
+`--max-budget-usd`), but no daemon or intake path sets it — the only caller that does is the
+hand-run `scripts/smoke-llm.js` (§ Manual smoke test below). Dollars were retired as a spend
+metric on 2026-08-31 in favour of `spo tokens`'s billable-weighted token counts. The runaway that
+motivated the question — `journal/issue-385/journal.jsonl`'s IMPLEMENT step at 134 turns
+(2026-08-29T19:56:12.256Z–20:09:48.785Z, 816s elapsed) — was **not** stopped by
+`LLM_STEP_DEADLINE_MS`: it was stopped by the per-call `--max-budget-usd` cap still in force that
+day (`costUsd: 5.0621632`, `terminalReason: "budget_exhausted"`). `LLM_STEP_DEADLINE_MS` (900s)
+was already armed at the time (commit `3e8104b`, same day) and did not fire — the cap ended the
+call about 84s before the deadline would have taken over. That does not reopen the decision: a
+cap only ever produces `terminalReason: "budget_exhausted"` because `--max-budget-usd` was
+passed, and since no production path sets it any more (the caps were removed the next day,
+commit `2621aad`), that terminal reason cannot recur.
+
 ## Real mode
 
 `orchestrator/steps/llm.js` has a real implementation behind the same interface shadow mode
@@ -132,7 +170,7 @@ const result = await invokeClaudeReal({
   step: 'PLAN',
   model: 'haiku',                 // or a full model name; anything `claude --model` accepts
   effort: 'low',                  // low | medium | high | xhigh | max
-  maxBudgetUsd: 0.10,
+  maxBudgetUsd: 0.10,             // hand-written caller only -- no production path sets this, see § Budgets
   promptText: 'Reply with exactly the single word: ok',
   cwd: '/home/crazz/SPO-Pipeline',
   account: { name: 'default', configDir: null },
@@ -158,8 +196,10 @@ const result = await invokeClaudeReal({
 > them: it uses the inter-call gap plus the flat cache-creation-vs-cache-read counts, which are
 > real.
 
-It spawns `claude -p --model <model> --effort <effort> --output-format json
---max-budget-usd <n>` (plus `--allowedTools`/`--permission-mode`/`--json-schema` when given) with
+It spawns `claude -p --model <model> --effort <effort> --output-format json` (plus
+`--allowedTools`/`--permission-mode`/`--json-schema`/`--max-budget-usd` when given — no daemon
+or intake path supplies `maxBudgetUsd`; the only caller that does is the hand-run
+`scripts/smoke-llm.js`, see § Budgets) with
 the resolved prompt written to the child's stdin — never as an argv entry, since Linux caps each
 individual argv string at `MAX_ARG_STRLEN` (128KB) and a large filled prompt (a big plan/diff/
 criterion) would fail the spawn with `E2BIG` before `claude` ever started (reproduced on card
@@ -169,10 +209,46 @@ and camelCase `modelUsage` key spellings, since that field is produced by the `c
 never appears in the session JSONL to verify against) summed across every entry of `modelUsage`
 -- no dollar figure is computed anywhere (maintainer decision, 2026-08-31: the pool is a Claude
 Max quota, never metered API billing) -- and classifies a
-failure as `{kind: 'limit'}` (an `api_error_status` of 429, or a message matching
-`/limit|overloaded|rate/i`) or `{kind: 'error'}` (everything else). `deps.spawnSync` is the test
-injection point — production code never passes it, so a real call always spawns the real
-`claude` binary on `PATH`.
+failure as `{kind: 'limit'}` or `{kind: 'error'}` via `classifyFailure` (action 3.5, 2026-08-31 —
+replacing a `/limit|overloaded|rate/i` scan over the free text of `result`/`terminal_reason` that
+misclassified any message merely containing "rate" — "invalid rate parameter", "could not
+generate", "accurate output required" — as a rate limit; expensive, because `callLlmStep`'s
+response to `'limit'` is to rotate to the next account, re-paying the whole step, and once the
+pool is exhausted cool *every* account for hours). `'limit'` now requires a **structured**
+signal, never a substring test:
+
+- `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
+  real limit in this repo, `intake.js:711`'s 12.8-hour Fable incident — "You've reached your
+  Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
+  `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
+  observed as a real reply in this repo), or
+- `terminal_reason`, exact match (lowercased + trimmed) against an allowlist: `overloaded_error`
+  (**anticipated** — pinned only by a pre-existing test, not a recorded reply), `rate_limit_error`
+  (**anticipated** — the API's documented error type name for a 429, but that string itself has
+  never been observed here; the Fable incident only ever recorded the numeric status), and
+  `usage_limit_reached` (a plain **guess** — neither observed here nor a documented Anthropic
+  error type, kept because an exact-match entry that never fires costs nothing).
+
+Everything else is `'error'` — including an unrecognised limit-shaped message, which now PARKS
+the task instead of rotating. That trade is deliberate: an unrecognised shape parking is one card
+a maintainer retries, versus a false positive re-paying the step on every account and cooling the
+whole pool. The failure result carries `terminalReason`/`apiErrorStatus` (and, on a `'limit'`
+classification, `limitKind` — see below) and both are journalled with the step's `result`
+payload, so an unrecognised limit shape leaves exactly the evidence needed to extend the
+allowlist above as entries move from anticipated/guessed to actually observed — extend it from
+that journal evidence, never from further guesswork about what a message might say. `deps.spawnSync`
+is the test injection point — production code never passes it, so a real call always spawns the
+real `claude` binary on `PATH`.
+
+A `'limit'` result also carries `limitKind`, splitting *which* kind of limit it was so the
+cooldown can match: `'usage'` (429 / `rate_limit_error` / `usage_limit_reached` — this
+account's own quota is spent) vs. `'overloaded'` (529 / `overloaded_error` — the *server* is
+busy, this account's quota is fine). The 429/529 half of that split is a single table
+(`LIMIT_STATUSES`) consumed by both `classifyFailure` and `limitKindForFailure`, not two
+separately-maintained checks — adding a status to one and not the other used to be possible and
+would silently produce `kind:'limit'` with `limitKind: undefined` (the fail-safe long cooldown,
+indistinguishable in the journal from a genuine limit). See "Account registry" below for what
+each tier costs.
 
 **Deadline handling**: the wall-clock budget is enforced by `spawnSync`'s own `timeout` option
 (set from `deadlineMs`), not by `orchestrator/deadline.js`'s promise-race. That race can't
@@ -244,8 +320,8 @@ A card task's own fields:
 }
 ```
 
-`size` (`S`/`M`/`L`) drives effort and budget for PLAN/IMPLEMENT (`step-contracts.js`'s
-`EFFORT_BY_SIZE`/`BUDGET_BY_SIZE_USD`); `touchesRdoMembers` is the RDO wire-rule escalation flag
+`size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
+`EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
 for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
 PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
 CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
@@ -289,6 +365,119 @@ Each prompt's `{{placeholder}}` values come from one of two places
   append). VALIDATE requires `diff.patch` and parks `judge-inputs-missing` if it cannot be
   produced; DIAGNOSE requires `gate.log` only when it was entered from GATE, never otherwise —
   see `doc/state-machine-spec.md`'s DIAGNOSE row.
+
+**Action 3.1 — PLAN reuse on retry.** `handlePlan` is the one LLM step that can skip its own
+`claude -p` call entirely. On a maintainer's `retry` after a park, INTAKE restarts the task from
+scratch and WORKTREE creates a fresh worktree off the current `origin/main` — but the plan and
+invariants files a *previous* run's PLAN wrote under `journal/<id>/scratch/` are still sitting on
+disk, keyed by task id, never cleaned between runs. `decidePlanReuse` (`state-machine.js`) decides
+whether that plan is still safe to reuse instead of paying for PLAN again, checking, in order:
+(0) `isRealMode(ctx)` — shadow mode and `--dry-run` are excluded by an explicit, first check, not
+merely as a side effect of condition 1 never passing without a real `realWorktree` run; (1)
+`ctx.task.baseMainSha` is set — only real mode's `realWorktree` sets it (see "Real scripted steps"
+below); (2)/(3) the journal's last PLAN `files-written` event carries a `baseMainSha` that matches
+this run's — `origin/main` hasn't moved since the plan was written; (4) `planPath`/`invariantsPath`
+from that event still exist on disk, are regular files, and are non-empty — the existence check is
+wrapped so a file vanishing between the check and the stat can never throw out of `decidePlanReuse`
+and kill the daemon; (5) a PLAN `result` event with a payload exists *and that payload is not
+itself a failure* (`payload.ok !== false`) — a transport-failure payload (action 1.4) carries none
+of `plan_path`/`invariants_path`/`invariant_ids`/`check_commands`, so IMPLEMENT/VALIDATE would have
+nothing safe to read even though "a payload exists"; (6) the most recent `parked` event, if any, is
+not one of the six reasons that indict the plan itself (`plan-invalid`,
+`plan-requires-protected-files`, `diagnose-duplicate-root-cause`, `diagnose-no-new-cause`,
+`diagnose-budget-exhausted`, `validate-reject-budget-exhausted`) — every other park reason (a
+transport failure, a gate/CI failure, a lost claim, a merge conflict) is orthogonal to whether the
+plan was right, and does not block reuse. On reuse, PLAN journals `plan-reused`, re-journals
+`files-written` and `result` (the previous payload with `plan_path`/`invariants_path` stamped
+explicitly from what condition 4 just verified on disk — not merely trusted to already be on
+`previousPayload` — plus `reused: true`, so `lastResultPayload`'s "last PLAN result wins"
+convention still resolves to the right paths even after a mid-run daemon restart left an earlier,
+markdown-only `result` event as the one on disk), still rebuilds the action-1.8 invariants baseline
+fresh against the retried worktree (reuse is a bet on the plan *text*, not on which invariants
+currently resolve in a tree nobody has re-checked), and returns `IMPLEMENT` — `callLlmStep` is
+never reached.
+
+**Action 3.2 — protected-files guard.** CLAUDE.md documents a hard wall: `.claude/settings.json`
+and anything under `.claude/hooks/` are refused by the harness as sensitive files no matter what
+this repo's own permission rules say, so a plan that requires editing either of them cannot
+succeed. Card #428 proved that the expensive way — a plan whose own text required a hook edit,
+discovered only when IMPLEMENT paid full price attempting it, $12.01 burned before it parked
+anyway. `orchestrator/intake.js`'s `detectProtectedFiles(text)` is the detector: a pure,
+deliberately blunt, case-insensitive, POSIX-only substring scan for `.claude/settings.json`,
+`.claude/settings.local.json`, and any path under `.claude/hooks/`, returning up to 5 matches
+(each `{ path, line }`, both capped at 200 chars — the `path` cap exists because an uncapped match
+goes verbatim into a GitHub comment body via `park-loop.js`'s `JSON.stringify(detail, null, 2)`,
+and GitHub's 65536-char cap would otherwise make `gh issue comment` fail and the card park
+uncommented) rather than throwing or growing unbounded. Every hit parks the single reason
+`plan-requires-protected-files` (already listed among action 3.1's `PLAN_INVALIDATING_PARK_REASONS`
+above, so a plan that trips this guard is never eligible for reuse), distinguished by a `source`
+field in the detail, from **two** call sites in `state-machine.js`:
+
+- **`handleIntake`**, `source: 'criterion'` — for a `kind: "card"` task only, the criterion and
+  title are scanned before anything else in INTAKE runs (after the `invalid-task-json` and
+  `shadow.forceState` checks, and after the `real-flag-required` gate). This is the cheapest
+  possible catch: INTAKE is scripted, so the card parks having spent zero LLM calls, and still
+  gets the full standard park treatment — a park comment on the issue, the kanban move, the
+  maintainer's `retry`/`abandon` path — which refusing to enqueue the card in `intake.js`'s
+  `pullOne` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It
+  is free insurance, not the mechanism that saved #428's $12.01 — #428's own criterion says "both
+  kept hooks" and "the hook script", never a path, so this site scores zero hits (true or false)
+  across all 17 real cards measured.
+- **`handlePlan`, normal path**, `source: 'files_to_change'` — scans `payload.files_to_change`,
+  PLAN's structured declaration of which files it intends to change (`prompts/plan.md`), *before*
+  `scratchDir`/`fs.mkdirSync`/either file write and before the action-1.8 invariants baseline. This
+  is the site the guard exists for: it stops the spend before IMPLEMENT is ever paid for.
+
+**Why not scan `plan_markdown` (the original design).** The first cut of this guard scanned the
+model's free-prose `plan_markdown` at this same site. Measured against all 17 real plans in
+`journal/*/scratch/plan-*.md`, that scan fired 3 times — 1 true positive (#428) and 2 false
+positives, both already-`DONE` cards: issue-418's plan text *asserts* a hook is **absent**
+(`` `.claude/hooks/context-router.sh:117`. That file does not exist ``, with a check command
+`! test -e .../.claude/hooks/context-router.sh`), and issue-429's *cites*
+`` `.claude/settings.json:109-127` `` as evidence, never proposing to touch it. 33% precision, and
+not bad luck — structural: `prompts/plan.md` instructs PLAN to emit "a falsification sweep: one
+search command per claim in `doc/`, `.claude/`, or `CLAUDE.md`", and SPO-WebClient's `CLAUDE.md` —
+fed to every PLAN call as domain context — itself contains matches, including the heading
+``## Automation (`.claude/hooks/`)``. Prose can never distinguish "my plan EDITS this file" from
+"my plan CITES this file", and the pipeline's own prompt demands citations. `files_to_change` is
+the fix: `prompts/plan.md`'s own "which files" statement, lifted out of the prose into a form the
+driver can check mechanically, documented there as files the plan will *change* — never files it
+merely reads, cites as evidence, or asserts the absence of.
+
+`files_to_change` is deliberately declared but **not** `required` in `step-contracts.js` (see that
+file's own comment) — promoting it would park every card whose PLAN reply omits the new key, on a
+live pipeline, before a single real card has exercised it. When the field is absent, `null`, not
+an array, or an array containing a non-string entry, `handlePlan` does **not** park and does
+**not** fall back to scanning `plan_markdown` — that would reinstate the 33%-precision behaviour
+this revision exists to remove. It journals a `PLAN`/`plan-files-undeclared` event instead, with
+what was actually received (type/shape, capped) — the evidence promotion to `required` will
+eventually be made from. An empty array is treated as a real declaration ("this plan changes
+nothing already on record"), not as undeclared: no park, no event.
+
+**What this guard is actually worth — stated honestly.** Nothing cross-checks `files_to_change`
+against reality: a model that declares `[]`, omits the key, or emits a malformed value walks
+straight past the guard with no park and no scrutiny of what it actually intends to touch, and
+`files_to_change` is load-bearing nowhere else in the pipeline — IMPLEMENT's own `files_changed`
+is never compared against it. So this guard does **not** prevent protected-file work; a model that
+wants to touch `.claude/hooks/` and simply doesn't declare it gets straight through. Its real worth
+is narrower: it makes the *honest* case cheap. #428 was honest — its plan's own section headings
+named the two hook paths outright — and a guard scanning the structured declaration catches that
+case before IMPLEMENT spends a cent, which is exactly the $12.01 it would otherwise have cost. Two
+changes would make the guard real rather than best-effort: promoting `files_to_change` to
+`required` once the journal shows PLAN reliably emitting it (see the `plan-files-undeclared`
+evidence-gathering above), and cross-checking IMPLEMENT's own `files_changed` against the plan's
+declaration after the fact. Neither is implemented. Do not oversell this guard's coverage
+elsewhere in these docs either.
+
+There used to be a third call site, on the action-3.1 reuse path (`source: 'plan-file'`, re-reading
+a reused plan already on disk): reuse skips PLAN's LLM call entirely, so it never saw
+`plan_markdown`, and a plan written before the guard existed could in principle be reused straight
+into IMPLEMENT unscanned. It was removed once measured to be unreachable: every journalled PLAN
+`files-written` event in the entire corpus carries `baseMainSha: undefined` (all of them predate
+action 3.1), so `decidePlanReuse`'s condition 2 filters every one of them out before that site
+could ever run — and for any plan written from now on, tripping either remaining site parks
+`plan-requires-protected-files`, itself in `PLAN_INVALIDATING_PARK_REASONS`, which already blocks
+its own reuse.
 
 A missing value for any placeholder a prompt's header declares — PLAN called before
 `worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws
@@ -362,12 +551,79 @@ dir). Full guided procedure: `doc/setup.md` § Accounts.
   disabled                  optional marker file (content ignored) — its presence disables the
                              account
 <poolDir>/state.json        machine-written, runtime cooldowns: {accountName: {cooldownUntil:
-                             epochMs}}. Disposable — deleting it just clears every cooldown.
+                             epochMs, lastUsageLimitAt?: epochMs, usageLimitStreak?: int}}.
+                             Disposable — deleting it clears every cooldown (and escalation
+                             streak with it).
 ```
 
 A pool directory with zero subdirectories registers zero accounts: `accounts.pick()` throws a
 typed `NoAccountsRegisteredError` (`state-machine.js` maps it to PARKED, same as
 `AllAccountsCoolingError`), and `daemon.js --real` refuses to even start.
+
+**Cooldown duration — an escalating probe, not a flat number (action 3.5, 2026-08-31 redesign).**
+This action's own first cut used a flat 5-hour cooldown for every usage limit. A verifier caught
+why that was wrong before it shipped: the real pool has **2 accounts**
+(`~/.claude-accounts/pool1`, `pool2`), and `daemon.js` has no pool-health gate anywhere — with
+`maxAttempts` equal to the pool size, two usage limits landing inside one window took the *whole
+pool* down for up to 5 hours, parking every card the daemon pulled during that window at its
+first LLM step, each needing a manual `retry` comment. And the figure itself over-waits by
+construction: the Claude Max session window resets 5h after the *session's first message*, not
+after the limit hit, so `now + 5h` sleeps for (5h − the true remaining wait) longer than
+necessary — often 4h+. The problem a long cooldown was solving is real but small: at a 1-hour
+cooldown, an account that comes back gets picked, immediately re-limits (the window hasn't
+actually rolled), and pays one wasted call. That is not worth a 5-hour outage across the whole
+pool to avoid.
+
+So `accounts.markLimit(poolDir, name, limitKind, now)` runs an escalating **probe** instead of
+picking one flat number, and — because the decision now needs the account's own history, which
+only a read of `state.json` can supply — the policy lives entirely inside `markLimit` itself
+(there is no more separate `cooldownMsForLimitKind(limitKind)` pure function; both real call sites
+simplified to `accounts.markLimit(accountsDir, account.name, result.limitKind)`):
+
+- **`'usage'`, first hit (or one outside the escalation window of the account's last usage hit) →
+  1 hour** (`accounts.USAGE_PROBE_COOLDOWN_MS`). A probe, not a claim that the window is over: if
+  it comes back too early, the cost is one wasted call — the same cost the old flat 1-hour default
+  always had.
+- **`'usage'`, landing again within `accounts.ESCALATION_WINDOW_MS` (2 hours) of the account's
+  last usage hit → 5 hours** (`accounts.USAGE_ESCALATED_COOLDOWN_MS`). The probe just proved the
+  session window really is still open, so wait out the real observed Claude Max session window
+  instead of probing hourly into a wall. Two hours, not one, because the earliest a probe can
+  possibly come back and re-limit is right at its own 1-hour expiry (`daemon.js`'s default
+  `pollIntervalMs` is 5s, negligible on its own) — the extra hour absorbs scheduling slack from a
+  busy pool (other queued cards ahead of it, step deadlines, timeout retries) without becoming so
+  wide that a hit on a genuinely fresh session (the same account limiting again the next day, say)
+  gets mistaken for a continuation of the same exhausted one.
+- **`'overloaded'` → 5 minutes** (`accounts.OVERLOADED_COOLDOWN_MS`), flat, **never escalates**,
+  and never touches the usage-escalation fields above. A busy *server* (529 / `overloaded_error`)
+  says nothing about this account's own quota, so nothing about it should compound the way
+  repeated usage hits do.
+- **An absent/unrecognised `limitKind`** (anything that isn't exactly `'usage'` or `'overloaded'`)
+  falls back to the usage flow above (probe or escalated, by the same history check) — fail-safe:
+  cool at least as long as a real usage hit would, rather than risk immediately re-hammering a
+  still-limited account. `state.json` written by pre-3.5 code (bare `{cooldownUntil}`, no
+  `lastUsageLimitAt`/`usageLimitStreak`) reads back the same way: no history on record, so it
+  probes fresh at 1h — never throws, never misbehaves.
+
+The CLI never actually supplies a retry-after hint on any path — `invokeClaudeReal` doesn't set
+one — so there is no "use the server's hint, else default" branch here; it's always the escalation
+decision above. `markLimit`'s returned event payload (journalled as `account-cooldown` by
+`callLlmStep`, or returned on `cooldowns` by `callIntakeStepWithRotation`) is `{account, limitKind,
+cooldownMs, cooldownUntil, cooldownUntilIso, escalated, defaulted}` — `limitKind` is the value
+`markLimit` was called with (`null` when absent, never swallowed), `escalated` is true exactly
+when the 5-hour tier fired, and `defaulted: true` means the value passed as `limitKind` wasn't
+`'usage'` or `'overloaded'` and the usage-tier fail-safe applied. Before this action's R2 fix,
+`cooldownMsForLimitKind` returned a positive number for *every* JS value (`null`, `{}`, `NaN` all
+verified → the long tier), so `defaulted` was structurally always false in production and the
+journalled event carried no `limitKind` at all — the one case the fallback exists for (a limit
+shape `classifyFailure` recognizes that isn't in a `limitKind` bucket) was indistinguishable from
+a genuine 429/529 in the journal. Both are fixed now.
+
+Exhausting the whole pool inside one rotation loop (`callLlmStep`, or `intake.js`'s
+`callIntakeStepWithRotation`) never re-calls `accounts.pick()`, so neither ever sees `pick()`'s own
+`all-accounts-cooling-until-<ISO>` reason on the resulting park/error — both instead carry the
+*last* cooldown event's own `cooldownUntilIso` through explicitly (`callLlmStep`'s `ParkSignal`
+detail; `callIntakeStepWithRotation`'s exhaustion error string), so a maintainer always sees a
+wall-clock retry time, never just an attempt count against a duration that's no longer flat.
 
 **Adding a Claude Max account** — guided, via `bin/spo`, never by hand-editing a registry file:
 
@@ -441,7 +697,16 @@ the main-moved `baseMain` lookup read local JSON instead of polling GitHub or th
 **WORKTREE, in order — and why claim is last.** `git -C <productRepo> fetch origin`, then `git
 -C <productRepo> rev-parse origin/main` to get the sha the nightly check compares against
 `~/.spo-bench/nightly/latest.json`'s `{verdict, sha}` (a `FAIL` at that exact sha parks
-`nightly-main-red` before anything is created); then `git -C <productRepo> worktree add
+`nightly-main-red` before anything is created). Action 3.1: the rev-parsed sha is journalled
+(`{state: 'WORKTREE', event: 'base-main', sha}`) and set onto `ctx.task.baseMainSha` immediately,
+*before* the nightly check. The `base-main` event itself is a diagnostic record only — "what
+`origin/main` sha did this run cut its worktree from" — journalled ahead of the nightly-red check
+so it exists even on a run that parks right there and never reaches PLAN; nothing ever reads it
+back. `handlePlan`'s `decidePlanReuse` (see "Step contracts + prompt fill" above) does not consult
+it: its actual input is the `baseMainSha` field on PLAN's own `files-written` event (only written
+once PLAN succeeds), compared against `ctx.task.baseMainSha` as set on this same line. A run that
+parks before ever reaching PLAN leaves no PLAN `files-written` event, so there is nothing for a
+later retry to compare against regardless of what `base-main` recorded. Then `git -C <productRepo> worktree add
 <worktreesDir>/<taskId> -b claude-pipe/<taskId> origin/main`; then `npm ci` in the fresh
 worktree (a product worktree carries no `node_modules`); **only then** `npm run board:take --
 <issue>`, also from the fresh worktree. The claim runs last, after the worktree exists, because
@@ -749,8 +1014,24 @@ more text) or `abandon`, case-insensitive, decides the outcome; anything else on
 neither word -- is left alone, since a human conversation on the issue is allowed:
 
 - **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/0000-retry-<ts>-<id>.json`
-  with the original `task.json` fields, `worktreePath`/`branch` dropped so WORKTREE derives both
-  fresh, same as a first attempt) and journals `unparked-by-maintainer`. Action 2.8: the `0000-`
+  with the original `task.json` fields, `worktreePath`/`branch`/`baseMainSha` dropped so WORKTREE
+  derives the first two fresh, same as a first attempt, and `realWorktree` re-measures the third
+  against whatever `origin/main` is *now*. Action 3.1: `baseMainSha` is stripped here for the same
+  reason as `worktreePath`/`branch` -- defence-in-depth, not the closing of a live hole.
+  `park-loop.js`'s own header comment on `reEnqueueTask` already establishes why: `task.json` is
+  the original queue file and is never rewritten with runtime fields, so a stale `baseMainSha`
+  (set only in memory, on `ctx.task`, by `realWorktree`) can never actually be sitting in it to
+  strip in the first place -- exactly as true of `worktreePath`/`branch` today. Kept anyway,
+  alongside its two siblings, as a guard against that invariant ever quietly breaking: if some
+  future change did start persisting runtime fields onto `task.json`, a stale `baseMainSha`
+  surviving into a retried task would let `handlePlan`'s `decidePlanReuse` (see "Step contracts +
+  prompt fill" above) mistake "nobody re-measured it this run" for "`origin/main` hasn't moved")
+  and journals `unparked-by-maintainer`. This does NOT by itself cost PLAN's LLM call again: if
+  the plan `reEnqueueTask` left on disk (`journal/<id>/scratch/`, never touched by a retry) is
+  still valid against the freshly-measured `baseMainSha` and the park wasn't one of the six
+  plan-invalidating reasons, PLAN reuses it instead of re-deriving it -- action 3.1's whole point,
+  since a retry restarting at INTAKE would otherwise re-run PLAN from scratch on a plan that was
+  already correct. Action 2.8: the `0000-`
   prefix makes a retry sort BEFORE every fresh `NNNN-issue-...` card in `listQueueFiles`'s
   filename-sort processing order (`intake.js`'s `nextQueueSeq` never hands out a sequence below
   `0001`) -- before this fix the file was named `retry-<ts>-<id>.json`, which sorted BEHIND every
@@ -877,7 +1158,10 @@ asked for is not this pipeline's call to make silently. Only `duplicate` and a s
 `draft` → `FILE`/`FILE_AMENDED` dispose of the report file (`~/.spo-reports/pending/` →
 `.../archive/`, the same one-line disposition sidecar `/triage-report` itself writes). A
 mechanical failure at any stage (bad account, bad JSON, a failed `gh`/`npm` call) leaves the
-report queued/pending, retried next cycle -- never journaled as triaged or held.
+report queued/pending, retried next eligible cycle -- never journaled as `report-triaged` or
+`report-held` (so `findConfirmedAwaitingTriage` still treats it as unhandled), though action 3.3
+now journals it as `report-triage-error` and counts it toward a per-report cap and backoff -- see
+"The mechanical-failure cap + backoff" below for what happens once that cap is hit.
 
 **The claim mutex (action 2.6).** Before this, nothing stopped the daemon's own `autoTriageMs`
 timer and a hand-run `spo triage` from finding the SAME confirmed report at the same time: both
@@ -936,6 +1220,101 @@ journaled as `report-triage-reclaimed` (`{file, owner}`); the report then looks 
 before the crash -- still `report-confirmed`, never `report-triaged`/`report-held` -- so the next
 cycle picks it up and retries it normally.
 
+**The mechanical-failure cap + backoff (action 3.3).** A confirmed report whose triage fails
+*mechanically* -- a deadline kill, a spawn failure, account-pool exhaustion, anything that never
+reached a reproduction verdict at all -- used to be retried on every single stage-3 cycle,
+forever: `routeConfirmedReport` returned `{ok: false, error}` with the comment "mechanical
+failure -- retried next cycle, no terminal journal", and `findConfirmedAwaitingTriage` treated
+only `report-triaged`/`report-held` as handled. Nothing bounded it and nothing throttled it. The
+audit sized this from a 2.5-hour incident; the live evidence gathered since was worse -- a
+**12.8-hour** stall (issues 449/455/456, 2026-08-30/31: 53 auto-triage cycles, 128 attempts,
+running the account pool down to exhaustion, every attempt a real `claude -p` reproduction).
+
+*The cap.* Every `{ok: false, error}` return in `routeConfirmedReport`/`reviewAndFile` now also
+carries a `step` tag (`TRIAGE_BUG_REPORT`, `REVIEW_CARD`, `AMEND_CARD`, `POST_HOLD_COMMENT`, …).
+`processConfirmedReport` is the one choke point every one of them funnels through: on `!result.ok`
+it journals `report-triage-error` (`{issue, step, error}`, error capped to 300 chars like
+`firstError` already is), then re-reads how many `report-triage-error` events exist for that issue
+**since its own most recent `report-confirmed` event** -- the identical "anchor + events since"
+idiom `findConfirmedAwaitingTriage` already uses, transposed from "handled at all" to "how many
+mechanical failures since the last time a human confirmed this" (`mechanicalFailureHistory`).
+Counting since the anchor, not since the beginning of the journal, is deliberate and
+forward-looking: it is what lets a maintainer's `spo triage --retry <issue>` (action 3.4 -- see
+"The recovery path" below) reset the budget later, simply by re-confirming the report and moving
+the anchor forward -- every earlier failure stops counting the moment a fresh `report-confirmed`
+lands.
+
+On the **third** mechanical failure (`MECHANICAL_FAILURE_CAP`, three strikes: enough that one
+flaky cycle never holds a report a maintainer is still waiting to see filed, few enough that a
+genuinely broken pool or a wide outage stops spending real reproductions within about **45 to 75
+minutes** with the live defaults -- NOT "minutes rather than hours" as an earlier draft of this
+doc claimed. The real arithmetic, `autoTriageMs`/`autoTriageBackoffBaseMs` at their live 15-minute
+default: the 2nd attempt waits 15 min after the 1st failure, the 3rd waits 30 more after the 2nd
+(the cap trips on the 3rd failure itself, with no further wait), and each retry is additionally
+gated by the next auto-triage cycle boundary -- worst case adding up to one more 15-minute cycle's
+scheduling slack at each step, hence the 45-75 min spread rather than a single number) the report
+is held: a **dedicated** comment (`buildMechanicalHoldComment`) plus a
+`report-held-mechanical` journal event (`{issue, attempts, lastError, commentPosted,
+commentError}`), which `findConfirmedAwaitingTriage` now also treats as handled. That comment is
+deliberately NOT `buildHoldComment`'s text. `buildHoldComment` says "Pipeline: reproduction did
+not confirm this report" -- a *verdict*: a human's `/triage-report`-shaped reasoning ran to
+completion and came back negative. Reusing it here would be a lie for four of `handleMechanicalFailure`'s
+nine possible `step` tags (`TRIAGE_BUG_REPORT`/`REVIEW_CARD`/`FETCH_ISSUE`/`BUILD_SUGGESTION_DRAFT`
+-- the calls that PRODUCE a verdict), since nothing ever reproduced anything there -- the machinery
+failed before a verdict was ever reached. For those, `buildMechanicalHoldComment` says plainly that
+triage failed mechanically N times, names the last error, states the report is still confirmed and
+still in "Intake" with nothing discarded, and points at `spo triage --retry <issue>` to reset the
+count and try again. For the other five step tags -- `POST_HOLD_COMMENT`/`POST_DUPLICATE_COMMENT`/
+`POST_DUPLICATE_CLOSE_COMMENT`/`POST_DO_NOT_FILE_COMMENT`/`AMEND_CARD`, which run AFTER
+`TRIAGE_BUG_REPORT`/`REVIEW_CARD` already produced a real verdict and fail only on the FOLLOW-UP
+`gh`/`npm` call that tries to record it -- the pre-verdict wording would tell the exact same lie
+from the other direction ("no verdict was ever reached" when one plainly was), so
+`buildMechanicalHoldComment` branches on `step` (`VERDICT_STEP_FOR`) and instead names which
+earlier step reached the verdict and which follow-up call is the one that keeps failing.
+
+Posting this comment can itself fail -- for a `POST_*` step this is a real irony worth naming
+explicitly (`buildMechanicalHoldComment` does): the hold comment is posted through the exact same
+`postIssueComment` that just failed three times in a row as that report's own mechanical failure,
+so it will often fail too. `handleMechanicalFailure` journals `report-held-mechanical` and returns
+the held disposition **regardless of whether the comment posted** (`commentPosted: false`,
+`commentError` set, when it did not) -- the hold is the mechanism that stops the loop, the comment
+is only the courtesy of telling a human about it, and an earlier version of this fix let a failed
+courtesy silently veto the mechanism: the comment's own `postIssueComment` call failing meant
+`report-held-mechanical` was never journaled, `findConfirmedAwaitingTriage` never stopped
+surfacing the report, and the exact 12.8-hour incident this action exists to close would recur
+through the one gh outage most likely to trigger it -- the same outage already failing the
+`POST_*` step in the first place. `commentPosted`/`commentError` exist so a maintainer reading
+`daemon.jsonl` can still tell "held, comment landed" from "held, comment silently failed" without
+that distinction being load-bearing for the hold itself.
+
+*The backoff.* The cap alone was not enough: even bounded at three attempts, hammering a broken
+pool or a wide outage once every single stage-3 cycle until the cap trips is still real spend for
+zero chance of success, once the first failure has already shown the cause is mechanical rather
+than reproduction-shaped. Before `runAutoTriage` ever calls `processConfirmedReport` (the function
+that actually calls `claimReport` -- `runAutoTriage` itself never calls `claimReport` directly)
+for a report with N ≥ 1 mechanical failures since its confirm anchor, it checks a pure decision
+helper --
+`shouldSkipForTriageBackoff(lastErrorAtMs, nowMs, errorCount, config)`, same shape as
+`shouldAutoTriage` (no `Date.now()` baked in, driven entirely by its arguments so a test can drive
+it without sleeping) -- against `triageBackoffMs(errorCount, config)`: the wait doubles per
+additional failure (`autoTriageBackoffBaseMs * 2^(errorCount-1)`), capped at
+`autoTriageBackoffCeilingMs`. The check runs **before** `claimReport`, so a skip never renames the
+report into `in-progress/` and never spends an LLM call -- and it is journaled
+(`report-triage-backoff`, `{issue, attempts, nextEligibleAtIso}`) and folded into the `auto-triage`
+summary (`backoffSkipped`) precisely because the 12.8-hour stall stayed invisible partly because an
+all-quiet cycle looked identical to "nothing confirmed" in `daemon.jsonl`; a silent backoff would
+recreate that exact blind spot for the one mechanism built to prevent the incident repeating.
+
+`autoTriageBackoffBaseMs` defaults to `autoTriageMs` itself when that is configured (> 0): the
+first retry then waits exactly one ordinary auto-triage cycle -- the cadence the daemon already
+runs at -- rather than a second hand-picked number that could drift out of sync with it. It falls
+back to 15 minutes (mirroring `DEFAULT_AUTO_TRIAGE_MS`) when `autoTriageMs` is unset/disabled,
+e.g. a hand-run `spo triage --file` with no daemon timer configured at all. `autoTriageBackoffCeilingMs`
+defaults to 2 hours: long enough that a genuinely broken account pool or a wide `claude-code`
+outage is not hammered every cycle while a maintainer is away, short enough that fixing the
+mechanical cause during a normal working day still gets the report retried again that same day
+without needing `spo triage --retry` by hand.
+
 **"The one rule", worked through concretely.** None of `report-intake.js`/`auto-triage.js` ever
 reads report *content* (no `profile`/`anchor`/`journal`/`geometry` field is parsed in this repo).
 Rendering the RAW card -- the one step that necessarily needs that content -- lives beside the
@@ -966,30 +1345,120 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
 | `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs` |
+| `autoTriageBackoffBaseMs` | `autoTriageMs` if > 0, else 15 min (`SPO_AUTO_TRIAGE_BACKOFF_BASE_MS`) | action 3.3 -- wait before the first retry after a mechanical failure, doubled per additional failure since the report's confirm anchor; see "The mechanical-failure cap + backoff" above |
+| `autoTriageBackoffCeilingMs` | 2h (`SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS`) | action 3.3 -- absolute ceiling on the doubling above |
 
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
-`report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
+`report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` (also
+reused by action 3.4's `spo triage --retry <issue>` to re-open a held report -- see "The recovery
+path" below; a retried one carries `retriedFrom`/`retriedAt` alongside the usual
+`issue`/`pendingPath`/`kind`/`commentId`, fields no scan anywhere matches on) /
 `report-discarded` (stage 2 outcomes) / `report-confirm-scan-truncated` / `report-confirm-scan-
 ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan.js facts, action
 2.7 -- `comment-scan-collaborators-unreadable` / `comment-scan-collaborators-stale` are shared
 with `unparkScan` and carry a `scanner` field instead), `report-triaged` / `report-held` / `auto-triage` /
 `report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
-`report-triage-reclaimed` (stage 3) -- all to `journal/daemon.jsonl`, the
+`report-triage-reclaimed` / `report-triage-error` / `report-held-mechanical` /
+`report-triage-backoff` (stage 3) -- all to `journal/daemon.jsonl`, the
 same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
-disposed of at least one report **or** hit at least one mechanical error (with
-`errorIssues`/`firstError`, truncated to 300 chars); a cycle with nothing confirmed journals
-nothing. `report-triage-retry` is informational only -- `intake.js`'s `triageBugReport` retries
-once, same account and deadline, when `steps/llm.js` reports a deadline kill (`timedOut: true`);
-it is never treated as "handled" by `findConfirmedAwaitingTriage`. `report-triage-cooldown`
-(plan action 3.6) is the same kind of informational event for the OTHER retry path: one per
-account `triageBugReport`/`reviewCard` cooled down while rotating past a `{kind: 'limit'}` result
-(`{issue, step, account, cooldownUntil, ...}`, `step` is `TRIAGE_BUG_REPORT` or `REVIEW_CARD`) --
-also never treated as "handled", and never journaled in a dry run.
+disposed of at least one report, hit at least one mechanical error (with
+`errorIssues`/`firstError`, truncated to 300 chars), or (action 3.3) backed off at least one report
+(`backoffSkipped`); a cycle with nothing confirmed journals nothing. `report-triage-retry` is
+informational only -- `intake.js`'s `triageBugReport` retries once, same account and deadline,
+when `steps/llm.js` reports a deadline kill (`timedOut: true`); it is never treated as "handled" by
+`findConfirmedAwaitingTriage`. `report-triage-cooldown` (plan action 3.6) is the same kind of
+informational event for the OTHER retry path: one per account `triageBugReport`/`reviewCard`
+cooled down while rotating past a `{kind: 'limit'}` result (`{issue, step, account, cooldownUntil,
+...}`, `step` is `TRIAGE_BUG_REPORT` or `REVIEW_CARD`) -- also never treated as "handled", and
+never journaled in a dry run. `report-triage-error` / `report-held-mechanical` /
+`report-triage-backoff` (action 3.3, see "The mechanical-failure cap + backoff" above) are all
+skipped in a dry run too. Only `report-triage-error` is actually COUNTED since the report's own
+`report-confirmed` anchor (`mechanicalFailureHistory` scans for that event specifically, per
+issue); `report-held-mechanical` is the terminal disposition the count feeds INTO once it reaches
+`MECHANICAL_FAILURE_CAP`, not itself a thing anything counts -- once one is journaled,
+`findConfirmedAwaitingTriage` stops surfacing the report at all, so there is nothing left to count
+it against until a fresh `report-confirmed` moves the anchor forward regardless.
+
+A hard process kill mid-triage is recovered by `reclaimStaleClaims` (action 2.6, above) and
+journals `report-triage-reclaimed`, NOT `report-triage-error` -- so a daemon crash-loop is
+NEITHER capped NOR backed off by this mechanism. This is a real, reachable path: merging a PR
+restarts the daemon and SIGTERMs whatever card is in flight, including a triage in progress. The
+gap is deliberate, not an oversight: counting a reclaim toward the mechanical-failure cap would
+hold a report after an ordinary daemon restart, punishing it for something that had nothing to do
+with the report itself or with the mechanical health of triage. If daemon restarts during triage
+ever become frequent enough to matter, the fix belongs in a SEPARATE counter keyed off
+`report-triage-reclaimed`, not in silently folding it into this one.
 `remote-report-pull.js`'s `ackedFilenames`, `orchestrator/auto-triage.js`'s
 `findConfirmedAwaitingTriage`, and `report-intake.js`'s `findPendingIntake` all use the same
 anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed
 from a per-task `journal.jsonl` to this flat daemon-level log.
+
+**The recovery path (action 3.4): `spo triage --retry <issue>`.** Before this action, a report
+that reached HOLD was a confirmed dead end -- `findConfirmedAwaitingTriage` treats all three hold
+shapes as handled, the report file sits in `pending/` (restored there by
+`processConfirmedReport`'s own `finally`) forever, and nothing short of hand-editing
+`daemon.jsonl` brought it back. The three shapes this recovers: `report-held` with a real negative
+reproduction verdict (`not-reproduced`/`insufficient`/`schema-version`), `report-held` with
+`outcome: 'do-not-file'` (`reviewCard` said no), and `report-held-mechanical` (action 3.3's three
+mechanical strikes). `buildMechanicalHoldComment` already promised `spo triage --retry <issue>` as
+the way out before this action existed to make that promise true.
+
+*The mechanism* (`retryHeldReport` in `auto-triage.js`) is deliberately not a new event type: it
+appends a FRESH `report-confirmed` event for the issue, carrying the same shape
+`findConfirmedAwaitingTriage`/`routeConfirmedReport`/`processConfirmedReport` already read off one
+(`issue`, `pendingPath`, `kind`, `commentId`), plus two marker fields a maintainer reading the
+journal can use to tell a re-injection from the original confirm: `retriedFrom` (the hold outcome
+it recovered -- `report-held` or `report-held-mechanical`) and `retriedAt`. Neither
+`findConfirmedAwaitingTriage`'s matching (`event`/`issue` only) nor `mechanicalFailureHistory`'s
+own anchor scan look at any other field, so the extra markers cannot break either. One event does
+BOTH jobs, and this is exactly why action 3.3 anchored `mechanicalFailureHistory` on
+`report-confirmed` in the first place rather than scanning the whole journal: a later
+`report-confirmed` makes the issue eligible again (no LATER handled event for it) AND resets the
+mechanical-failure budget to zero in the same move (only `report-triage-error` events AFTER the
+most recent anchor count). No second mechanism -- action 3.3's own test already proved this exact
+shape works before 3.4 existed to fabricate the event for real.
+
+*The four refusals*, checked in order before anything is appended:
+1. **No `report-confirmed` event at all** for the issue -- there is nothing to re-confirm.
+2. **The issue is already eligible** (a `report-confirmed` with no handled-event after it) --
+   refused even though nothing is technically broken by it, because appending a second
+   `report-confirmed` would put the issue in `top` TWICE in the same `runAutoTriage` cycle,
+   burning two of three `autoTriageLimit` slots on one report.
+   `processConfirmedReport`'s claim mutex degrades that shape safely to `already-claimed` rather
+   than crashing, but a command whose whole *purpose* is recovery must never manufacture that
+   waste on its own.
+3. **The issue's latest handled-event is `report-triaged`**, not a hold -- it was already filed or
+   dispositioned as a duplicate, and re-running would re-file or re-comment on something already
+   settled.
+4. **The report file recorded on the confirm anchor is missing from `pending/`** -- re-confirming
+   anyway would loop straight back into a fresh mechanical failure (nothing for `claimReport` to
+   rename) instead of the honest, actionable refusal a maintainer can do something about.
+
+Each refusal returns a distinct, legible `error` string naming the issue and the reason -- see the
+body of `retryHeldReport` in `auto-triage.js` (the four `return { ok: false, error: ... }` sites)
+for the exact wording.
+
+*The courtesy comment* records the re-injection on the issue thread so it stays a truthful record,
+but follows action 3.3's D1 lesson exactly: the re-confirm event is journalled **regardless of
+whether the comment posts** (`commentPosted`/`commentError` record the truth without gating on it)
+-- a `gh` outage must never be able to make `--retry` silently do nothing, the same failure mode
+3.3 already had to close once for `report-held-mechanical` itself.
+
+*`bin/spo`'s wiring* (`cmdTriageRetry`): `--retry <issue>` accepts a `#`-prefixed issue (`--retry
+#449`, what a maintainer will actually paste from a GitHub thread) and rejects anything else --
+missing value, non-numeric -- with a legible message and `process.exitCode = 1`, before
+`retryHeldReport` is ever called. Like every other `spo triage` invocation this defaults to
+`--dry`, which previews (`retryHeldReport`'s own `opts.dry`: reports what WOULD be re-injected,
+appends nothing, comments nothing) rather than mutating by default -- `--file` is required to
+actually act, matching this whole CLI's "no maintainer surprise" convention rather than making
+`--retry` the one command that mutates on the bare flag. A refusal from `retryHeldReport` (any of
+the four preconditions above) prints `result.error` and exits non-zero without ever reaching a
+normal triage cycle; a successful re-injection prints the issue, what it was recovered from, and
+whether the courtesy comment posted, and exits 0 (CLAUDE.md: verdict by exit code, never by
+reading text). The bare `--dry` preview is success too, not just the `--file` path: it also exits
+0, having appended and posted nothing -- exit 1 is reserved for a refusal or a bad argument, never
+for "this was only a preview."
 
 **Production-side setup** (SPO-Deploy's scope, not this repo's): a durable volume for the report
 queue (a container-local path does not survive a rebuild), the `SPO_REPORT_PULL_TOKEN` env var
@@ -1442,7 +1911,8 @@ limits and the cooldowns `accounts.js` already tracks. The **per-step** `--max-b
 `step-contracts.js`'s own header once described are, today, not actually set anywhere in that
 file — every step (and every `orchestrator/intake.js` LLM call) passes `maxBudgetUsd: undefined`
 and runs uncapped; see that file's own comment for the (still-current) maintainer decision
-behind it.
+behind it. See § Budgets (above) for what actually is enforced — `stepDeadlineMs`,
+`LLM_STEP_DEADLINE_MS`, the two retry budgets, and recette's own caps.
 
 **Cache-expiry flag (advisory only).** The `claude` CLI's prompt cache has (at least) two
 ephemeral TTL tiers — 5 minutes and 1 hour (`config.js`'s `cacheTtlMs`, currently the observed
@@ -1506,6 +1976,7 @@ bin/spo pull-reports                               # STAGE 0: pull queued report
 bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
+bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file); defaults to --dry (see "The recovery path" above)
 bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised live harness -- one trivial synthetic card, real mode (see "Recette" above)
 ```
 

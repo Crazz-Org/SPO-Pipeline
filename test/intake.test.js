@@ -45,13 +45,28 @@ function twoAccountPoolDir() {
   return writePoolDir(mkTmp('spo-intake-pool2-'), [{ name: 'acct1' }, { name: 'acct2' }]);
 }
 
-// A {kind: 'limit'} shaped raw spawn result -- api_error_status: 429 is steps/llm.js's own
-// unambiguous classifyFailure rule (see its header comment), so this never depends on the
-// free-text substring branch action 3.5 owns.
+// A {kind: 'limit', limitKind: 'usage'} shaped raw spawn result -- api_error_status: 429 is
+// steps/llm.js's own unambiguous classifyFailure rule (see its header comment): a structured
+// status, never the free-text scan action 3.5 removed.
 function limitSpawnResult() {
   return {
     status: 1,
     stdout: JSON.stringify(realShapedReply('rate limited', { is_error: true, api_error_status: 429 })),
+    stderr: '',
+    signal: null,
+  };
+}
+
+// A {kind: 'limit', limitKind: 'overloaded'} shaped raw spawn result -- api_error_status: 529 is
+// Anthropic's documented "overloaded" status (action 3.5): the SERVER is busy, not this
+// account's own quota, so accounts.markLimit cools it for the flat 5-minute tier, never the
+// usage tiers (1h probe / 5h escalated), no matter how often it recurs.
+function overloadedSpawnResult() {
+  return {
+    status: 1,
+    stdout: JSON.stringify(
+      realShapedReply('overloaded', { is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error' })
+    ),
     stderr: '',
     signal: null,
   };
@@ -268,11 +283,33 @@ test('draftCard: the limited account is actually cooled down (markLimit written 
   assert.equal(result.ok, true);
   assert.equal(result.cooldowns.length, 1);
   assert.equal(result.cooldowns[0].account, 'acct1');
+  // 429 -> limitKind 'usage' -> R1's 1h PROBE tier on a first-ever hit for this account
+  // (fresh pool dir per test), not the escalated 5h tier.
+  assert.equal(result.cooldowns[0].cooldownMs, accounts.USAGE_PROBE_COOLDOWN_MS);
 
   const state = accounts.readState(accountsDir);
   assert.ok(state.acct1, 'acct1 should be cooling');
   assert.ok(state.acct1.cooldownUntil > Date.now());
   assert.ok(!state.acct2, 'acct2 should not be cooling');
+});
+
+test('draftCard: a 529 (overloaded) failure cools the account for the short 5-minute tier, not the 5-hour usage tier', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) =>
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? overloadedSpawnResult() : okSpawnResult(VALID_DRAFT),
+  };
+
+  const result = await intake.draftCard('anything', deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.cooldowns.length, 1);
+  assert.equal(result.cooldowns[0].account, 'acct1');
+  assert.equal(result.cooldowns[0].cooldownMs, accounts.OVERLOADED_COOLDOWN_MS);
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1.cooldownUntil <= Date.now() + accounts.OVERLOADED_COOLDOWN_MS + 5000);
 });
 
 test('draftCard: every account limited -> {ok:false, error} naming the exhaustion, never a throw', async () => {
@@ -795,11 +832,35 @@ test('triageBugReport: the limited account is actually cooled down (markLimit wr
   assert.equal(result.ok, true);
   assert.equal(result.cooldowns.length, 1);
   assert.equal(result.cooldowns[0].account, 'acct1');
+  // 429 -> limitKind 'usage' -> R1's 1h PROBE tier on a first-ever hit for this account
+  // (fresh pool dir per test), not the escalated 5h tier.
+  assert.equal(result.cooldowns[0].cooldownMs, accounts.USAGE_PROBE_COOLDOWN_MS);
 
   const state = accounts.readState(accountsDir);
   assert.ok(state.acct1, 'acct1 should be cooling');
   assert.ok(state.acct1.cooldownUntil > Date.now());
   assert.ok(!state.acct2, 'acct2 should not be cooling');
+});
+
+test('triageBugReport: a 529 (overloaded) failure cools the account for the short 5-minute tier, not the 5-hour usage tier', async () => {
+  const accountsDir = twoAccountPoolDir();
+  const deps = {
+    accountsDir,
+    spawnSync: (command, args, opts) =>
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')
+        ? overloadedSpawnResult()
+        : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' }),
+  };
+
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.cooldowns.length, 1);
+  assert.equal(result.cooldowns[0].account, 'acct1');
+  assert.equal(result.cooldowns[0].cooldownMs, accounts.OVERLOADED_COOLDOWN_MS);
+
+  const state = accounts.readState(accountsDir);
+  assert.ok(state.acct1.cooldownUntil <= Date.now() + accounts.OVERLOADED_COOLDOWN_MS + 5000);
 });
 
 test('triageBugReport: every account limited -> {ok:false, error} naming the exhaustion, never a throw', async () => {

@@ -35,6 +35,11 @@ const STEP_PAYLOADS = {
     invariants_markdown: '# Invariants\n\n(none -- docs-only change)\n',
     invariant_ids: [],
     check_commands: ['typecheck', 'lint', 'coverage:changed'],
+    // Action 3.2/D2: files_to_change is optional, so it never appears in the schema's `required`
+    // key set this fixture is looked up by -- but handlePlan still reads it off the payload. A
+    // clean declaration here keeps this recette run's journal free of a spurious
+    // plan-files-undeclared event, the same evidence-poisoning D2 fixed for --dry-run.
+    files_to_change: ['doc/recette-log.md'],
   },
   'summary,files_changed,invariants,tests_run,all_green': {
     summary: 'Appended one line to doc/recette-log.md.',

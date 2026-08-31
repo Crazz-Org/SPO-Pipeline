@@ -13,10 +13,11 @@
 //
 // Two things below are NOT sourced from either doc, because neither one gives a number or names
 // a CLI permission-mode value per step -- they are this build's own inferred defaults:
-//   - maxBudgetUsd: the spec's "Budget cap" column only ever says "per-step USD cap" (PLAN,
-//     IMPLEMENT) or "small" (DIAGNOSE, CITATION_VERIFIER, VALIDATE) -- never a figure. Scaled
-//     by task.size the same way effort is; override per task via task.llmBudgetUsd.<STEP> is
-//     NOT implemented (no caller needs it yet) but the shape leaves room for one.
+//   - maxBudgetUsd: always undefined below (see the comment above resolveStepContract's own
+//     `maxBudgetUsd: undefined` for the maintainer's reasoning) -- not scaled by task.size the
+//     way effort is, and no per-task override field is read anywhere. state-machine-spec.md's
+//     Step contracts table names the bound that actually exists instead: a uniform per-step
+//     wall-clock deadline (LLM_STEP_DEADLINE_MS below).
 //   - permissionMode: chosen so a step whose contract is "read-only" never needs a human
 //     approval prompt it cannot answer (headless -p), and the one step with edit tools
 //     (IMPLEMENT) auto-accepts them since nothing reviews a diff before the mechanical checks.
@@ -49,9 +50,11 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // equivalent for the daemon's five LLM steps (PLAN, IMPLEMENT, DIAGNOSE, CITATION_VERIFIER,
 // VALIDATE). 900000ms (15 minutes) gives a real call room to finish under even an L-sized
 // $12 budget before the process itself is killed. config.js's stepDeadlineMs is untouched and
-// stays the deadline for scripted steps (steps/scripted.js) and for state-machine.js's outer
-// callWithDeadline retry-once-then-park bookkeeping (deadline.js) -- this constant only changes
-// what invokeClaudeReal's own spawnSync timeout is armed with for an LLM call.
+// stays state-machine.js's outer callWithDeadline retry-once-then-park bookkeeping value
+// (deadline.js) for every step, scripted or LLM -- but that JS timer is a no-op against a
+// scripted step's own blocking spawnSync (steps/scripted.js), which is bounded instead by
+// config.js's commandTimeoutsMs (see that file's action-2.1 comment). This constant only
+// changes what invokeClaudeReal's own spawnSync timeout is armed with for an LLM call.
 const LLM_STEP_DEADLINE_MS = 900000;
 
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
@@ -96,6 +99,15 @@ const STEP_CONTRACTS = {
       // canonical scratch_dir/plan-<issue>.md convention, then journals plan_path/invariants_path
       // itself for task-values.js's IMPLEMENT/VALIDATE placeholder derivation to keep reading.
       required: ['plan_markdown', 'invariants_markdown', 'invariant_ids', 'check_commands'],
+      // Action 3.2: files_to_change is declared but deliberately NOT required. `required` above
+      // drives BOTH llm.js's missing-key validation (~line 680) and the `--json-schema` envelope
+      // built below -- promoting files_to_change into it would park every card whose PLAN reply
+      // omits the new key, on a live pipeline, before a single real card has exercised it.
+      // `optional` is llm.js's own concept to leave alone, not enforce: prompts/plan.md now asks
+      // for the key, handlePlan (state-machine.js) journals a `plan-files-undeclared` event when
+      // it is absent/malformed, and once the journal shows real PLAN calls emitting it reliably,
+      // promoting it to `required` here is a one-line change.
+      optional: ['files_to_change'],
     },
   },
 

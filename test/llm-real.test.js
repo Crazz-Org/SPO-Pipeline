@@ -212,13 +212,60 @@ test('classifyFailure: api_error_status 429 -> limit', () => {
   assert.equal(classifyFailure({ api_error_status: 429, result: 'nope' }), 'limit');
 });
 
-test('classifyFailure: message text matching /limit|overloaded|rate/i -> limit', () => {
-  assert.equal(classifyFailure({ result: 'You have hit the usage limit for this account' }), 'limit');
-  assert.equal(classifyFailure({ terminal_reason: 'overloaded_error' }), 'limit');
+test('classifyFailure: api_error_status 529 (Anthropic "overloaded") -> limit', () => {
+  assert.equal(classifyFailure({ api_error_status: 529, result: 'nope' }), 'limit');
+});
+
+test('classifyFailure: allowlisted terminal_reason values -> limit, exact match only', () => {
+  for (const reason of ['overloaded_error', 'rate_limit_error', 'usage_limit_reached']) {
+    assert.equal(classifyFailure({ terminal_reason: reason }), 'limit', reason);
+    // Case and whitespace insensitive -- compared lowercased + trimmed, never a substring test.
+    assert.equal(classifyFailure({ terminal_reason: reason.toUpperCase() }), 'limit', `${reason} uppercase`);
+    assert.equal(classifyFailure({ terminal_reason: `  ${reason}  ` }), 'limit', `${reason} padded`);
+  }
+});
+
+// R3 (F1): "exact match only" was this test file's own claim, above, but nothing actually
+// pinned it -- every positive case in the loop above ('reason', 'reason.toUpperCase()',
+// ' reason ') also passes under a substring implementation (`.some(r => reason.includes(r))`),
+// so that mutation left the whole suite green. These two are the load-bearing negative cases:
+// each CONTAINS an allowlisted reason as a substring but is not equal to one, so only a true
+// exact-match implementation classifies them as 'error'.
+test('classifyFailure: terminal_reason merely CONTAINING an allowlisted reason is NOT a limit -- exact match, never a substring test', () => {
+  assert.equal(classifyFailure({ terminal_reason: 'was_not_a_rate_limit_error' }), 'error');
+  assert.equal(classifyFailure({ terminal_reason: 'overloaded_error_recovered' }), 'error');
+});
+
+test('classifyFailure: terminal_reason "success" -> error (not a limit shape)', () => {
+  assert.equal(classifyFailure({ terminal_reason: 'success' }), 'error');
+});
+
+// R8 (F7): invokeClaudeReal already guards `!parsed || typeof parsed !== 'object'` before ever
+// calling classifyFailure, so this branch is unreachable from that one real call site -- but
+// classifyFailure is exported and called directly all over this file, so its own defence
+// deserves its own pin rather than relying on an indirect guard elsewhere never slipping.
+test('classifyFailure: null -> error (defends the unreachable-from-invokeClaudeReal case directly)', () => {
+  assert.equal(classifyFailure(null), 'error');
+});
+
+test('classifyFailure: api_error_status 400 -> error', () => {
+  assert.equal(classifyFailure({ api_error_status: 400, result: 'bad request' }), 'error');
 });
 
 test('classifyFailure: anything else -> error', () => {
   assert.equal(classifyFailure({ result: 'invalid tool call' }), 'error');
+});
+
+// The regression this action exists for: a substring scan over free text used to misclassify
+// any failure message merely containing "rate" as a rate limit -- expensive, because
+// callLlmStep's response to 'limit' is to rotate to the next account (re-paying the whole step)
+// and, once the pool is exhausted, cool every account for hours. None of these are limit-shaped
+// (no 429/529, no allowlisted terminal_reason) and must all classify as 'error'.
+test('classifyFailure: free text merely containing "rate"/"generate"/"accurate" is NOT a limit (the regression this action exists for)', () => {
+  assert.equal(classifyFailure({ result: 'invalid rate parameter' }), 'error');
+  assert.equal(classifyFailure({ result: 'could not generate the file' }), 'error');
+  assert.equal(classifyFailure({ result: 'accurate output required' }), 'error');
+  assert.equal(classifyFailure({ terminal_reason: 'error', result: 'rate of change too high' }), 'error');
 });
 
 // ---- invokeClaudeReal -----------------------------------------------------------------------
@@ -334,6 +381,34 @@ test('invokeClaudeReal: is_error + api_error_status 429 -> {ok:false, kind:"limi
   );
   assert.equal(result.ok, false);
   assert.equal(result.kind, 'limit');
+  assert.equal(result.limitKind, 'usage');
+});
+
+test('invokeClaudeReal: is_error + api_error_status 529 -> {ok:false, kind:"limit", limitKind:"overloaded"}', async () => {
+  const payload = realShapedPayload({ is_error: true, api_error_status: 529, result: 'overloaded' });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'limit');
+  assert.equal(result.limitKind, 'overloaded');
+});
+
+test('invokeClaudeReal: a non-limit failure never carries a limitKind at all', async () => {
+  const payload = realShapedPayload({ is_error: true, api_error_status: 400, result: 'invalid json schema' });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.kind, 'error');
+  assert.equal('limitKind' in result, false);
 });
 
 test('invokeClaudeReal: is_error with an unrelated message -> {ok:false, kind:"error"}', async () => {

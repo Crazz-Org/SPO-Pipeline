@@ -48,6 +48,11 @@ const CI_CHECKS_POLL_INTERVAL_MS =
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
     : 20000;
 
+// Hoisted out of the `autoTriageMs` field below (action 3.3) so autoTriageBackoffBaseMs can
+// default off the SAME resolved value rather than re-parsing SPO_AUTO_TRIAGE_MS a second time and
+// risking the two silently drifting apart.
+const AUTO_TRIAGE_MS = process.env.SPO_AUTO_TRIAGE_MS !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_MS) : 0;
+
 // A SPO_TIMEOUT_*_MS override, or the default when the variable is absent OR unusable.
 //
 // These five values are the only thing standing between a hung `gh` and a daemon frozen forever
@@ -74,6 +79,27 @@ function timeoutFromEnv(name, defaultMs) {
   if (raw === undefined) return defaultMs;
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed <= 0) return defaultMs;
+  return parsed;
+}
+
+// N5 fix (verifier finding, action 3.3 round 2): same fallback idiom as timeoutFromEnv just
+// above, minus the integer requirement -- these two feed Date arithmetic
+// (`new Date(lastErrorAtMs + triageBackoffMs(...))` in auto-triage.js), never spawnSync's
+// timeout option, so a fractional override is harmless. The finite/positive requirement is for
+// the identical reason timeoutFromEnv has one: `SPO_AUTO_TRIAGE_BACKOFF_BASE_MS=abc` (or a
+// negative value) must not silently disable the backoff by turning
+// `Math.min(NaN, ceiling)` (triageBackoffMs) into NaN, where `x < NaN` is always false and every
+// report would then be "eligible" immediately, no throttle at all. Excluding non-finite also
+// closes the other half of the same failure mode from the OTHER direction: a ceiling of
+// `Infinity` is what makes `new Date(...)` throw RangeError in runAutoTriage (N4) -- rejecting it
+// here at the config layer means an env override can never reintroduce that crash, only
+// auto-triage.js's own defensive clamp (N4) can still see a raw `Infinity` handed in via a
+// config object assembled by a test or some future caller that bypasses this file entirely.
+function positiveMsFromEnv(name, defaultMs) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultMs;
   return parsed;
 }
 
@@ -355,12 +381,49 @@ module.exports = {
   // flipped in this rewrite -- SPO_AUTO_TRIAGE_MS keeps the exact same name and env var; the
   // live systemd drop-in (SPO_AUTO_TRIAGE_MS=900000) keeps meaning "how often confirmed reports
   // are processed" without needing to change.
-  autoTriageMs:
-    process.env.SPO_AUTO_TRIAGE_MS !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_MS) : 0,
+  autoTriageMs: AUTO_TRIAGE_MS,
 
   // How many CONFIRMED reports one auto-triage cycle processes. SPO_AUTO_TRIAGE_LIMIT overrides.
   autoTriageLimit:
     process.env.SPO_AUTO_TRIAGE_LIMIT !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_LIMIT) : 3,
+
+  // ---- action 3.3: mechanical-failure backoff (orchestrator/auto-triage.js) --------------
+  //
+  // A confirmed report whose triage fails MECHANICALLY (a deadline kill, a spawn failure, pool
+  // exhaustion -- anything that never reached a verdict) used to be retried on every single
+  // auto-triage cycle, forever: the audit sized this from a 2.5h incident, and the live evidence
+  // since was worse -- a 12.8h stall across issues 449/455/456, 53 cycles, 128 attempts, running
+  // the account pool down to exhaustion, every attempt a real `claude -p` reproduction. See
+  // auto-triage.js's MECHANICAL_FAILURE_CAP (three strikes, then held with a dedicated comment)
+  // and shouldSkipForTriageBackoff (this pair of settings).
+  //
+  // autoTriageBackoffBaseMs: the wait before the FIRST retry after a mechanical failure, doubled
+  // per additional failure since the report's own report-confirmed anchor (mechanicalFailureHistory
+  // resets the count on a fresh confirm -- see that function's own header, and note this is the
+  // hook action 3.4's `spo triage --retry <issue>` uses to reset the budget by re-confirming).
+  // Defaults to autoTriageMs ITSELF when that is configured (> 0): the first retry then waits
+  // exactly one ordinary auto-triage cycle -- the cadence the daemon already runs at -- rather
+  // than a second hand-picked number that could drift out of sync with it. Falls back to 15
+  // minutes (auto-triage.js's own DEFAULT_AUTO_TRIAGE_MS, mirrored here as a literal rather than
+  // required in, since config.js and auto-triage.js have never had a require() coupling and one
+  // extra correlated constant is not worth inventing one) when autoTriageMs is unset/disabled (0)
+  // -- e.g. a hand-run `spo triage --file` with no daemon timer configured at all.
+  // SPO_AUTO_TRIAGE_BACKOFF_BASE_MS overrides.
+  autoTriageBackoffBaseMs: positiveMsFromEnv(
+    'SPO_AUTO_TRIAGE_BACKOFF_BASE_MS',
+    AUTO_TRIAGE_MS > 0 ? AUTO_TRIAGE_MS : 15 * 60 * 1000
+  ),
+
+  // Absolute ceiling on the doubling above, regardless of how many mechanical failures have piled
+  // up since the confirm anchor -- unbounded doubling is otherwise a real risk if
+  // MECHANICAL_FAILURE_CAP ever changes (today's cap of 3 keeps the worst case small, but that is
+  // a fact about auto-triage.js, not about this constant, and the two should not have to be kept
+  // in sync by hand). 2 hours: long enough that a genuinely broken account pool or a wide
+  // claude-code outage is not hammered every cycle while a maintainer is away, short enough that
+  // fixing the mechanical cause during a normal working day still gets the report retried again
+  // that same day without needing `spo triage --retry` by hand. SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS
+  // overrides.
+  autoTriageBackoffCeilingMs: positiveMsFromEnv('SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS', 2 * 60 * 60 * 1000),
 
   // Once a confirmed report survives reproduction + review as FILE/FILE_AMENDED, its (single,
   // amended-in-place) card moves straight to Todo -- true by default, since the human already

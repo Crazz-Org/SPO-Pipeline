@@ -581,6 +581,40 @@ test('reEnqueueTask: multiple retries queued at once still sort relative to each
   assert.ok(sorted.every((f) => f.startsWith('0000-retry-')));
 });
 
+// action 3.1: baseMainSha is a run's own record of where origin/main sat when IT ran, same
+// category of runtime fact as worktreePath/branch -- a retry must not carry it forward, or
+// handlePlan's reuse guard (state-machine.js's decidePlanReuse) could find a stale sha already
+// sitting on ctx.task and mistake "nobody re-measured it" for "origin/main hasn't moved".
+test('reEnqueueTask: drops baseMainSha (alongside worktreePath/branch), preserving everything else including id', () => {
+  const queueDir = mkTmp('spo-retry-basesha-queue-');
+  const journalRoot = mkTmp('spo-retry-basesha-journal-');
+  const taskDir = path.join(journalRoot, 'card-700');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(taskDir, 'task.json'),
+    JSON.stringify({
+      id: 'card-700',
+      kind: 'card',
+      issue: 700,
+      title: 'Some card',
+      worktreePath: '/tmp/some-worktree',
+      branch: 'claude-pipe/card-700',
+      baseMainSha: 'deadbeef',
+    })
+  );
+
+  const file = reEnqueueTask(queueDir, taskDir, 'card-700');
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+
+  assert.equal(written.id, 'card-700');
+  assert.equal(written.kind, 'card');
+  assert.equal(written.issue, 700);
+  assert.equal(written.title, 'Some card');
+  assert.equal('worktreePath' in written, false);
+  assert.equal('branch' in written, false);
+  assert.equal('baseMainSha' in written, false, 'a stale sha must not survive into the retried task.json');
+});
+
 test('shouldScanUnpark: disabled at <= 0, fires on first call, then respects the interval -- same shape as shouldScanOrphans', () => {
   assert.equal(shouldScanUnpark(null, 1000, 0), false);
   assert.equal(shouldScanUnpark(null, 1000, 60000), true);
