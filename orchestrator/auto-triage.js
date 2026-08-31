@@ -67,6 +67,53 @@ function shouldAutoTriage(lastTriageAt, nowMs, autoTriageMs) {
   return nowMs - lastTriageAt >= autoTriageMs;
 }
 
+// ---- action 3.3: mechanical-failure backoff -------------------------------------------------
+//
+// The 12.8-hour stall (issues 449/455/456, 53 cycles, 128 attempts, 2026-08-30/31) that motivated
+// this whole action was not just "no cap" -- it was also "no throttle": even bounded at
+// MECHANICAL_FAILURE_CAP attempts, hammering a broken account pool or a wide `claude -p` outage
+// once every auto-triage cycle for however many cycles it takes to reach the cap is still real
+// spend for zero chance of success once the FIRST failure has already shown the cause is
+// mechanical, not reproduction-shaped. These two pure functions are the throttle: doubling wait
+// per additional mechanical failure since the report's own report-confirmed anchor, capped so it
+// never grows unbounded. See config.js's autoTriageBackoffBaseMs/autoTriageBackoffCeilingMs for
+// the defaults and the reasoning behind each -- kept there, not duplicated here, since that is
+// the one place a maintainer tunes them.
+const DEFAULT_TRIAGE_BACKOFF_BASE_MS = DEFAULT_AUTO_TRIAGE_MS; // 15 min -- one ordinary cycle
+const DEFAULT_TRIAGE_BACKOFF_CEILING_MS = 2 * 60 * 60 * 1000; // 2h -- see config.js's own comment
+
+// triageBackoffMs(errorCount, config) -- the wait, in ms, before a report with `errorCount`
+// mechanical failures since its confirm anchor becomes eligible again: base * 2^(errorCount-1),
+// capped at the ceiling. errorCount <= 0 has nothing to back off from, so 0. The DEFAULT_* consts
+// above are only a fallback for a caller that hands in a config missing these two fields entirely
+// (e.g. a partial config in a test) -- production always goes through config.js's own resolved
+// values.
+function triageBackoffMs(errorCount, config) {
+  if (!(errorCount > 0)) return 0;
+  const base =
+    config && config.autoTriageBackoffBaseMs !== undefined
+      ? config.autoTriageBackoffBaseMs
+      : DEFAULT_TRIAGE_BACKOFF_BASE_MS;
+  const ceiling =
+    config && config.autoTriageBackoffCeilingMs !== undefined
+      ? config.autoTriageBackoffCeilingMs
+      : DEFAULT_TRIAGE_BACKOFF_CEILING_MS;
+  const raw = base * Math.pow(2, errorCount - 1);
+  return Math.min(raw, ceiling);
+}
+
+// shouldSkipForTriageBackoff(lastErrorAtMs, nowMs, errorCount, config) -- pure decision function,
+// same shape as shouldAutoTriage just above: no Date.now() baked in, a test drives it with any
+// (lastErrorAtMs, nowMs, errorCount) triple. A report with no recorded failures (errorCount <= 0)
+// or no known last-failure time is never skipped -- there is nothing to back off FROM, and
+// inventing a "some time" would either wrongly skip a report's very first attempt or wrongly
+// never skip one whose history genuinely cannot be read.
+function shouldSkipForTriageBackoff(lastErrorAtMs, nowMs, errorCount, config) {
+  if (!(errorCount > 0)) return false;
+  if (lastErrorAtMs === null || lastErrorAtMs === undefined) return false;
+  return nowMs - lastErrorAtMs < triageBackoffMs(errorCount, config);
+}
+
 // listQueuedReports(spoReportsDir) -- the queue's own top-level *.json files (never `pending/` or
 // `archive/`, which readdirSync's isFile() filter already excludes since they are directory
 // entries, not files), oldest first. SPO-WebClient's doc/bug-reporting.md: filenames are
@@ -303,12 +350,50 @@ function findConfirmedAwaitingTriage(journalRoot, limit) {
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].event !== 'report-confirmed') continue;
     const issue = lines[i].issue;
+    // action 3.3: report-held-mechanical also counts as handled -- without this the mechanical
+    // cap does nothing, since the exact same report would just be picked up again next cycle
+    // regardless of the hold. It deliberately does NOT gate on the backoff/cap machinery being
+    // "correct" -- it is a terminal disposition, same class as report-triaged/report-held, not a
+    // retry signal.
     const handledLater = lines
       .slice(i + 1)
-      .some((e) => (e.event === 'report-triaged' || e.event === 'report-held') && e.issue === issue);
+      .some(
+        (e) =>
+          (e.event === 'report-triaged' || e.event === 'report-held' || e.event === 'report-held-mechanical') &&
+          e.issue === issue
+      );
     if (!handledLater) confirmed.push(lines[i]);
   }
   return confirmed.slice(0, limit);
+}
+
+// mechanicalFailureHistory(journalRoot, issue) -- report-triage-error events for `issue` SINCE
+// its own most recent report-confirmed anchor (the identical "anchor + events since" idiom
+// findConfirmedAwaitingTriage uses just above, transposed from "handled at all" to "how many
+// mechanical failures since the last time a human confirmed this"). Deliberately not "since the
+// beginning of the journal": that is what lets a maintainer's `spo triage --retry <issue>`
+// (action 3.4) reset both the mechanical-failure cap and the backoff budget just by re-confirming
+// the report -- a fresh report-confirmed event moves the anchor forward, so every earlier
+// report-triage-error stops counting. No anchor found (issue never confirmed, or called directly
+// in a context that never journaled one -- see processConfirmedReport's own tests) returns a zero
+// history rather than scanning the whole log: better to under-count than to ever cap/back off a
+// report this function cannot actually place relative to a confirm.
+function mechanicalFailureHistory(journalRoot, issue) {
+  const lines = readDaemonEvents(journalRoot);
+  let anchorIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].event === 'report-confirmed' && lines[i].issue === issue) {
+      anchorIdx = i;
+      break;
+    }
+  }
+  if (anchorIdx === -1) return { count: 0, lastErrorAtMs: null };
+
+  const errors = lines.slice(anchorIdx + 1).filter((e) => e.event === 'report-triage-error' && e.issue === issue);
+  if (errors.length === 0) return { count: 0, lastErrorAtMs: null };
+  const lastTs = errors[errors.length - 1].ts;
+  const lastErrorAtMs = lastTs ? Date.parse(lastTs) : NaN;
+  return { count: errors.length, lastErrorAtMs: Number.isNaN(lastErrorAtMs) ? null : lastErrorAtMs };
 }
 
 // The comment posted on a HELD report -- a negative outcome after a human already confirmed it,
@@ -326,6 +411,100 @@ function buildHoldComment(outcome, detail) {
     'the next `spo triage` cycle will not re-run automatically (this outcome is now held); ask a',
     'maintainer to re-run `spo triage --file` by hand once the report or the reason has been',
     'addressed.',
+  ];
+  return lines.join('\n');
+}
+
+// action 3.3: three strikes. Enough that one flaky cycle (a transient `gh` timeout, one bad
+// `claude -p` spawn) never holds a report a maintainer is still waiting to see filed, few enough
+// that a genuinely broken account pool or a wide claude-code outage stops spending real
+// `claude -p` reproductions -- the 12.8h/128-attempt incident this whole action closes -- within
+// three auto-triage cycles' worth of attempts rather than fifty-three.
+const MECHANICAL_FAILURE_CAP = 3;
+
+// D2 fix (verifier finding, action 3.3 round 2): handleMechanicalFailure is reached for every
+// tagged {ok:false} return in routeConfirmedReport/reviewAndFile -- but not all nine `step` tags
+// mean the same thing. Four of them (below, PRE_VERDICT_STEPS) fail BEFORE any verdict is
+// reached: TRIAGE_BUG_REPORT/REVIEW_CARD/FETCH_ISSUE/BUILD_SUGGESTION_DRAFT are the calls that
+// PRODUCE a verdict, so when one of them fails the pre-verdict wording below ("no verdict was
+// ever reached") is still true. The other five -- POST_HOLD_COMMENT/POST_DUPLICATE_COMMENT/
+// POST_DUPLICATE_CLOSE_COMMENT/POST_DO_NOT_FILE_COMMENT/AMEND_CARD -- run AFTER a verdict was
+// already reached (a duplicate/held/DO_NOT_FILE/FILE outcome from TRIAGE_BUG_REPORT or
+// REVIEW_CARD); they fail only on the FOLLOW-UP `gh`/`npm` call that tries to record it. Using
+// the pre-verdict text for those would tell the exact lie this comment was written to avoid --
+// "No verdict was ever reached" when one plainly was. VERDICT_STEP_FOR maps each post-verdict
+// step back to the step that actually produced the verdict, so the comment can name it; any step
+// NOT in this map (TRIAGE_BUG_REPORT/REVIEW_CARD/FETCH_ISSUE/BUILD_SUGGESTION_DRAFT, or an
+// unrecognized/absent step) falls through to the pre-verdict wording below.
+const VERDICT_STEP_FOR = {
+  POST_HOLD_COMMENT: 'TRIAGE_BUG_REPORT',
+  POST_DUPLICATE_COMMENT: 'TRIAGE_BUG_REPORT',
+  POST_DUPLICATE_CLOSE_COMMENT: 'TRIAGE_BUG_REPORT',
+  POST_DO_NOT_FILE_COMMENT: 'REVIEW_CARD',
+  AMEND_CARD: 'REVIEW_CARD',
+};
+
+// The comment posted once a confirmed report's triage has failed MECHANICALLY
+// MECHANICAL_FAILURE_CAP times in a row -- deliberately NOT buildHoldComment's text. That comment
+// says "Pipeline: reproduction did not confirm this report" and explains a REPRODUCTION VERDICT:
+// a human's `/triage-report` reasoning ran to completion and came back negative. Reusing it here
+// would be a lie -- nothing reproduced anything; the machinery (a deadline kill, a spawn failure,
+// pool exhaustion) never reached a verdict at all. See this file's own header and
+// orchestrator/README.md § Report intake for the 12.8h incident this is written against.
+//
+// `step` (the failing call's own tag, e.g. 'POST_HOLD_COMMENT') selects which of the two
+// true stories to tell -- see PRE_VERDICT_STEPS/VERDICT_STEP_FOR just above. Falls back to the
+// pre-verdict wording for an unrecognized/absent step: that is the safer default (it never claims
+// a verdict was reached when the caller cannot prove one was).
+function buildMechanicalHoldComment(attempts, lastError, step) {
+  const verdictStep = VERDICT_STEP_FOR[step];
+  if (verdictStep) {
+    const isPostComment = typeof step === 'string' && step.startsWith('POST_');
+    const lines = [
+      '### Pipeline: triage reached a verdict but could not record it',
+      '',
+      `Triage for this report already reached a verdict (in \`${verdictStep}\`), but the follow-up`,
+      `step that records it -- \`${step}\` -- has now failed MECHANICALLY ${attempts} times in a`,
+      'row: a deadline kill, a spawn failure, account-pool exhaustion, or a `gh`/`npm` call itself',
+      'failing, never a problem with the verdict. The verdict was real; the pipeline just could not',
+      'act on it.',
+      '',
+      `**Last error:** \`${lastError}\``,
+      '',
+      'This report is still confirmed and still in the intake column -- nothing was discarded.',
+    ];
+    if (isPostComment) {
+      lines.push(
+        '',
+        'Note the irony: this very comment is itself posted through the same `gh` issue-comment call',
+        `that just failed three times as \`${step}\` -- so it will often fail too, and the loop would`,
+        'go on invisibly if this event depended on the comment landing. It does not: this report is',
+        'held (and this cap stops re-attempting it) regardless of whether this comment made it',
+        'through.'
+      );
+    }
+    lines.push(
+      '',
+      'Once the mechanical cause above is fixed, re-run `spo triage --retry <issue>` to reset the',
+      'failure count and try again; a plain `spo triage --file` will not pick this report back up',
+      'before then.'
+    );
+    return lines.join('\n');
+  }
+
+  const lines = [
+    '### Pipeline: triage failed mechanically, not on a verdict',
+    '',
+    `Triage for this report failed for a MECHANICAL reason ${attempts} times in a row -- a deadline`,
+    'kill, a spawn failure, or account-pool exhaustion, never a reproduction attempt that actually',
+    'ran and came back negative. No verdict was ever reached.',
+    '',
+    `**Last error:** \`${lastError}\``,
+    '',
+    'This report is still confirmed and still in the intake column -- nothing was discarded, and no',
+    'reproduction was attempted or rejected. Once the mechanical cause above is fixed, re-run',
+    '`spo triage --retry <issue>` to reset the failure count and try again; a plain `spo triage',
+    '--file` will not pick this report back up before then.',
   ];
   return lines.join('\n');
 }
@@ -359,13 +538,17 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
   // maintainer already confirmed this report before it ever reached here.
   const reviewed = await intake.reviewCard(draft, { ...deps, humanConfirmed: true });
   if (!dry && reviewed.cooldowns) journalCooldowns(journalRoot, entry.issue, 'REVIEW_CARD', reviewed.cooldowns);
-  if (!reviewed.ok) return { ok: false, error: reviewed.error };
+  // Every `step`-tagged {ok:false, error} return in this file is a MECHANICAL failure, never a
+  // verdict -- processConfirmedReport's handleMechanicalFailure (below) is the one place that
+  // turns it into a report-triage-error journal event and counts it toward MECHANICAL_FAILURE_CAP
+  // (action 3.3). The tag says which call failed, for a maintainer reading the journal later.
+  if (!reviewed.ok) return { ok: false, error: reviewed.error, step: 'REVIEW_CARD' };
 
   if (reviewed.review.verdict === 'DO_NOT_FILE') {
     const reason = firstNonBlankLine(reviewed.review.first_comment_markdown);
     if (dry) return { ok: true, outcome: 'would-hold', reason };
     const commented = intake.postIssueComment(entry.issue, reviewed.review.first_comment_markdown, deps);
-    if (!commented.ok) return { ok: false, error: commented.error };
+    if (!commented.ok) return { ok: false, error: commented.error, step: 'POST_DO_NOT_FILE_COMMENT' };
     appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: 'do-not-file', reason });
     return { ok: true, outcome: 'do-not-file', reason };
   }
@@ -375,7 +558,7 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
   }
 
   const amended = intake.amendCard(entry.issue, draft, reviewed.review, deps);
-  if (!amended.ok) return { ok: false, error: amended.error };
+  if (!amended.ok) return { ok: false, error: amended.error, step: 'AMEND_CARD' };
 
   if (config.autoTriagePromoteToTodo !== false) {
     // action 2.1b: pass config through so board.js's own armTimeout arms this spawn's class
@@ -410,7 +593,7 @@ const DEFAULT_SUGGESTION_AREA = 'client';
 // every other source produces. Returns {ok: true, draft} or {ok: false, error}.
 function buildSuggestionDraft(entry, deps) {
   const fetched = intake.fetchIssue(entry.issue, deps);
-  if (!fetched.ok) return { ok: false, error: fetched.error };
+  if (!fetched.ok) return { ok: false, error: fetched.error, step: 'FETCH_ISSUE' };
 
   const title = fetched.title.replace(/^\[suggestion\]\s*/, '');
   const draft = {
@@ -445,7 +628,7 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
 
   if (entry.kind === 'suggestion') {
     const built = buildSuggestionDraft(entry, deps);
-    if (!built.ok) return { ok: false, error: built.error };
+    if (!built.ok) return { ok: false, error: built.error, step: built.step || 'BUILD_SUGGESTION_DRAFT' };
     return reviewAndFile(entry, built.draft, journalRoot, config, deps, opts, today);
   }
 
@@ -466,19 +649,21 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
   if (!dry && triaged.cooldowns) journalCooldowns(journalRoot, entry.issue, 'TRIAGE_BUG_REPORT', triaged.cooldowns);
 
   if (!triaged.ok) {
-    return { ok: false, error: triaged.error }; // mechanical failure -- retried next cycle, no terminal journal
+    // Mechanical failure -- not a terminal journal event by itself (retried next cycle, subject
+    // to action 3.3's cap/backoff in processConfirmedReport's handleMechanicalFailure below).
+    return { ok: false, error: triaged.error, step: 'TRIAGE_BUG_REPORT' };
   }
 
   if (triaged.outcome === 'duplicate') {
     if (dry) return { ok: true, outcome: 'would-duplicate', issueNumber: triaged.issue_number };
     const commented = intake.postIssueComment(triaged.issue_number, triaged.comment_markdown, deps);
-    if (!commented.ok) return { ok: false, error: commented.error };
+    if (!commented.ok) return { ok: false, error: commented.error, step: 'POST_DUPLICATE_COMMENT' };
     const closed = intake.postIssueComment(
       entry.issue,
       `Duplicate of #${triaged.issue_number} -- closing this intake card.`,
       deps
     );
-    if (!closed.ok) return { ok: false, error: closed.error };
+    if (!closed.ok) return { ok: false, error: closed.error, step: 'POST_DUPLICATE_CLOSE_COMMENT' };
     moveReportTo(entry.pendingPath, archiveDir, `duplicate: #${triaged.issue_number} — ${today}`);
     appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'duplicate', duplicateOf: triaged.issue_number });
     return { ok: true, outcome: 'duplicate', issueNumber: triaged.issue_number };
@@ -492,7 +677,7 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
         : `Reason: ${triaged.reason}`;
     if (dry) return { ok: true, outcome: 'would-hold', reason: triaged.reason || detail };
     const commented = intake.postIssueComment(entry.issue, buildHoldComment(triaged.outcome, detail), deps);
-    if (!commented.ok) return { ok: false, error: commented.error };
+    if (!commented.ok) return { ok: false, error: commented.error, step: 'POST_HOLD_COMMENT' };
     appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: triaged.outcome, reason: triaged.reason || detail });
     return { ok: true, outcome: triaged.outcome, reason: triaged.reason || detail };
   }
@@ -521,6 +706,61 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
 // `result.outcome`) is deliberate: it is correct even for an outcome this function has never
 // seen before, and even if routeConfirmedReport throws (the `finally` still runs, though a hard
 // process kill obviously does not -- that is what reclaimStaleClaims is for).
+// handleMechanicalFailure(issue, failure, journalRoot, deps) -- action 3.3. Called by
+// processConfirmedReport for every {ok:false, error, step} routeConfirmedReport/reviewAndFile can
+// return (never for a dry run -- processConfirmedReport's dry branch returns before this is ever
+// reached, matching "skip journaling in dry-run mode" for every event below).
+//
+// Journals report-triage-error unconditionally, then re-reads the count SINCE THE REPORT'S OWN
+// report-confirmed ANCHOR via mechanicalFailureHistory (which is itself now one higher, since the
+// event was just appended) -- see that function's own header for why "since the anchor" and not
+// "since the beginning of the journal" is load-bearing: it is what lets a maintainer's `spo
+// triage --retry <issue>` (action 3.4) reset this count later, by re-confirming the report and
+// moving the anchor forward.
+//
+// Below MECHANICAL_FAILURE_CAP the original failure is returned unchanged -- the report is simply
+// retried next ELIGIBLE cycle (runAutoTriage's own backoff check throttles how soon "next" is). At
+// the cap it posts buildMechanicalHoldComment's dedicated comment (never buildHoldComment's
+// reproduction-verdict wording) and journals report-held-mechanical, which
+// findConfirmedAwaitingTriage now also treats as handled -- turning what would otherwise be a
+// {ok: false} into a normal-looking {ok: true, outcome: 'held-mechanical'} disposition, the same
+// shape every other terminal outcome in this file already has.
+function handleMechanicalFailure(issue, failure, journalRoot, deps) {
+  const step = failure.step || 'TRIAGE';
+  const errorStr = String(failure.error).slice(0, 300);
+  appendDaemonEvent(journalRoot, 'report-triage-error', { issue, step, error: errorStr });
+
+  const { count: attempts } = mechanicalFailureHistory(journalRoot, issue);
+  if (attempts < MECHANICAL_FAILURE_CAP) return failure;
+
+  // D1 fix (verifier finding, action 3.3 round 2): the hold is the mechanism; the comment is the
+  // courtesy. A failed `postIssueComment` here (the SAME kind of `gh` outage or rate-limit this
+  // repo already has precedent handling for -- see park-comment-failed) used to make this
+  // function return the ORIGINAL failure, so report-held-mechanical was never journalled. Since
+  // that event is the ONLY thing findConfirmedAwaitingTriage treats as handled, the report stayed
+  // eligible forever and every cycle spawned a fresh `claude -p` -- `attempts` climbing pinned the
+  // backoff at its 2h ceiling, but never stopped it: 12 spawns/day per report, forever. That is
+  // the exact incident this action exists to close, reintroduced by a courtesy call's failure
+  // vetoing the mechanism. So: journal report-held-mechanical and return `ok: true` REGARDLESS of
+  // whether the comment posted, recording whether it did (`commentPosted`) so a maintainer reading
+  // the journal can still tell a `gh` outage from a quiet report.
+  const commented = intake.postIssueComment(issue, buildMechanicalHoldComment(attempts, errorStr, step), deps);
+  appendDaemonEvent(journalRoot, 'report-held-mechanical', {
+    issue,
+    attempts,
+    lastError: errorStr,
+    commentPosted: commented.ok === true,
+    commentError: commented.ok ? undefined : commented.error,
+  });
+  return {
+    ok: true,
+    outcome: 'held-mechanical',
+    attempts,
+    lastError: errorStr,
+    reason: `mechanical failure x${attempts}: ${errorStr}`,
+  };
+}
+
 async function processConfirmedReport(entry, journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   if (dry) return routeConfirmedReport(entry, journalRoot, config, deps, opts);
@@ -536,7 +776,12 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
 
   const claimedEntry = { ...entry, pendingPath: claim.path };
   try {
-    return await routeConfirmedReport(claimedEntry, journalRoot, config, deps, opts);
+    const result = await routeConfirmedReport(claimedEntry, journalRoot, config, deps, opts);
+    // action 3.3: this is the ONE choke point every mechanical {ok:false, error, step} return in
+    // routeConfirmedReport/reviewAndFile funnels through -- see handleMechanicalFailure's own
+    // header. Called INSIDE the try, before the `finally` restores the claim, so a report that
+    // gets held-mechanical here still goes back to pending/ exactly like every other held outcome.
+    return !result.ok ? handleMechanicalFailure(entry.issue, result, journalRoot, deps) : result;
   } finally {
     // Restore FIRST, unlink the sidecar SECOND. The other order leaves a window in which the
     // file is in in-progress/ with no sidecar, which is exactly the shape reclaimStaleClaims'
@@ -562,12 +807,16 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
 // same "look, don't touch" `spo ask --dry` already gives the fast-lane intake path.
 //
 // Journals exactly one `auto-triage` summary event per REAL (non-dry) call, and only when the
-// cycle actually did something -- disposed of a report, or tried and failed. A cycle with
-// nothing confirmed (top.length === 0) stays silent, same "only journal on real output" rule
-// auto-pull.js's runAutoPull already follows. An all-errors cycle used to be silent too -- that
-// is how report #449 (a triageBugReport deadline kill, 2026-08-30) went invisible in
-// daemon.jsonl for hours; it is now journaled with `errorIssues`/`firstError` so a maintainer
-// scanning the journal can see it without re-running `spo triage` by hand.
+// cycle actually did something -- disposed of a report, tried and failed, or (action 3.3) skipped
+// one for backoff. A cycle with nothing confirmed (top.length === 0) stays silent, same "only
+// journal on real output" rule auto-pull.js's runAutoPull already follows. An all-errors cycle
+// used to be silent too -- that is how report #449 (a triageBugReport deadline kill, 2026-08-30)
+// went invisible in daemon.jsonl for hours; it is now journaled with `errorIssues`/`firstError` so
+// a maintainer scanning the journal can see it without re-running `spo triage` by hand. A cycle
+// that ONLY backed off (no disposal, no error) is journaled for the identical reason: the
+// 12.8-hour stall this action closes stayed invisible partly because nothing distinguished "tried
+// and failed" from "nothing happened" in daemon.jsonl -- a silent backoff would recreate exactly
+// that blind spot for the one mechanism built to prevent the incident from repeating.
 async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   const limit = (config && config.autoTriageLimit) || DEFAULT_AUTO_TRIAGE_LIMIT;
@@ -583,9 +832,45 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   let filed = 0;
   let duplicates = 0;
   let held = 0;
+  let heldMechanical = 0;
   let alreadyClaimed = 0;
+  let backoffSkipped = 0;
 
   for (const entry of top) {
+    // action 3.3: check backoff BEFORE claimReport is ever called -- a skip must not rename the
+    // report into in-progress/ (claimReport does exactly that) and must not spend an LLM call.
+    // Skipped in dry mode: a preview always shows the real verdict regardless of claim/backoff
+    // mechanics, same posture processConfirmedReport's own dry branch already takes.
+    if (!dry) {
+      const { count, lastErrorAtMs } = mechanicalFailureHistory(journalRoot, entry.issue);
+      if (shouldSkipForTriageBackoff(lastErrorAtMs, Date.now(), count, config)) {
+        // N4 fix (verifier finding, action 3.3 round 2): `new Date(ms).toISOString()` throws
+        // RangeError('Invalid time value') once `ms` is outside JS's own valid Date range
+        // (+/-8.64e15 from the epoch -- ECMA-262's own limit, MAX_DATE_MS below) or is
+        // Infinity/NaN. Reachable if a misconfigured autoTriageBackoffCeilingMs is Infinity (or
+        // just huge) and enough mechanical failures have piled up: with ceiling=Infinity,
+        // triageBackoffMs's `Math.min(raw, ceiling)` degenerates to `raw` itself, and `raw` is
+        // STILL a finite JS number (base * 2^(errorCount-1) does not overflow to Infinity until
+        // errorCount is enormous) while already being astronomically past MAX_DATE_MS --
+        // verified: 15min base, errorCount 60 -> ~5.19e23, finite, still throws. So
+        // `Number.isFinite` alone is not enough; the range check is load-bearing. config.js's own
+        // positiveMsFromEnv rejects an env-supplied Infinity, but a config object built any other
+        // way (a test, a future caller) is not guaranteed to go through it -- and runAutoTriage
+        // itself has no try/catch, so an uncaught throw here kills the whole daemon over an
+        // operator typo. Clamp defensively rather than trust the input.
+        const MAX_DATE_MS = 8640000000000000;
+        const nextEligibleAtMs = lastErrorAtMs + triageBackoffMs(count, config);
+        const nextEligibleAtIso =
+          Number.isFinite(nextEligibleAtMs) && Math.abs(nextEligibleAtMs) <= MAX_DATE_MS
+            ? new Date(nextEligibleAtMs).toISOString()
+            : null;
+        appendDaemonEvent(journalRoot, 'report-triage-backoff', { issue: entry.issue, attempts: count, nextEligibleAtIso });
+        backoffSkipped++;
+        results.push({ issue: entry.issue, outcome: 'backoff', attempts: count, reason: `backing off until ${nextEligibleAtIso}`, nextEligibleAtIso });
+        continue;
+      }
+    }
+
     const outcome = await processConfirmedReport(entry, journalRoot, config, deps, { dry });
     if (!outcome.ok) {
       errors.push({ issue: entry.issue, error: outcome.error });
@@ -595,32 +880,52 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
     if (outcome.outcome === 'filed' || outcome.outcome === 'would-file') filed++;
     else if (outcome.outcome === 'duplicate' || outcome.outcome === 'would-duplicate') duplicates++;
     else if (outcome.outcome === 'already-claimed') alreadyClaimed++;
-    else held++;
+    else if (outcome.outcome === 'held-mechanical') {
+      held++;
+      heldMechanical++;
+    } else held++;
     results.push({ issue: entry.issue, ...outcome });
   }
 
   const disposed = filed + duplicates + held;
-  if (!dry && (disposed > 0 || errors.length > 0 || alreadyClaimed > 0)) {
+  if (!dry && (disposed > 0 || errors.length > 0 || alreadyClaimed > 0 || backoffSkipped > 0)) {
     appendDaemonEvent(journalRoot, 'auto-triage', {
       processed: top.length,
       filed,
       duplicates,
       held,
+      heldMechanical,
       alreadyClaimed,
+      backoffSkipped,
       errors: errors.length,
       errorIssues: errors.map((e) => e.issue),
       firstError: errors.length > 0 ? String(errors[0].error).slice(0, 300) : undefined,
     });
   }
 
-  return { ok: true, processed: top.length, filed, duplicates, held, alreadyClaimed, errors, results };
+  return {
+    ok: true,
+    processed: top.length,
+    filed,
+    duplicates,
+    held,
+    heldMechanical,
+    alreadyClaimed,
+    backoffSkipped,
+    errors,
+    results,
+  };
 }
 
 module.exports = {
   shouldAutoTriage,
+  shouldSkipForTriageBackoff,
+  triageBackoffMs,
   runAutoTriage,
   processConfirmedReport,
   findConfirmedAwaitingTriage,
+  mechanicalFailureHistory,
+  buildMechanicalHoldComment,
   listQueuedReports,
   moveReportTo,
   buildSuggestionDraft,
@@ -631,5 +936,8 @@ module.exports = {
   DEFAULT_AUTO_TRIAGE_LIMIT,
   DEFAULT_SUGGESTION_AREA,
   DEFAULT_TRIAGE_CLAIM_GRACE_MS,
+  DEFAULT_TRIAGE_BACKOFF_BASE_MS,
+  DEFAULT_TRIAGE_BACKOFF_CEILING_MS,
+  MECHANICAL_FAILURE_CAP,
   IN_PROGRESS_DIRNAME,
 };

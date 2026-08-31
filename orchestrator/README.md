@@ -1015,7 +1015,10 @@ asked for is not this pipeline's call to make silently. Only `duplicate` and a s
 `draft` → `FILE`/`FILE_AMENDED` dispose of the report file (`~/.spo-reports/pending/` →
 `.../archive/`, the same one-line disposition sidecar `/triage-report` itself writes). A
 mechanical failure at any stage (bad account, bad JSON, a failed `gh`/`npm` call) leaves the
-report queued/pending, retried next cycle -- never journaled as triaged or held.
+report queued/pending, retried next eligible cycle -- never journaled as `report-triaged` or
+`report-held` (so `findConfirmedAwaitingTriage` still treats it as unhandled), though action 3.3
+now journals it as `report-triage-error` and counts it toward a per-report cap and backoff -- see
+"The mechanical-failure cap + backoff" below for what happens once that cap is hit.
 
 **The claim mutex (action 2.6).** Before this, nothing stopped the daemon's own `autoTriageMs`
 timer and a hand-run `spo triage` from finding the SAME confirmed report at the same time: both
@@ -1074,6 +1077,101 @@ journaled as `report-triage-reclaimed` (`{file, owner}`); the report then looks 
 before the crash -- still `report-confirmed`, never `report-triaged`/`report-held` -- so the next
 cycle picks it up and retries it normally.
 
+**The mechanical-failure cap + backoff (action 3.3).** A confirmed report whose triage fails
+*mechanically* -- a deadline kill, a spawn failure, account-pool exhaustion, anything that never
+reached a reproduction verdict at all -- used to be retried on every single stage-3 cycle,
+forever: `routeConfirmedReport` returned `{ok: false, error}` with the comment "mechanical
+failure -- retried next cycle, no terminal journal", and `findConfirmedAwaitingTriage` treated
+only `report-triaged`/`report-held` as handled. Nothing bounded it and nothing throttled it. The
+audit sized this from a 2.5-hour incident; the live evidence gathered since was worse -- a
+**12.8-hour** stall (issues 449/455/456, 2026-08-30/31: 53 auto-triage cycles, 128 attempts,
+running the account pool down to exhaustion, every attempt a real `claude -p` reproduction).
+
+*The cap.* Every `{ok: false, error}` return in `routeConfirmedReport`/`reviewAndFile` now also
+carries a `step` tag (`TRIAGE_BUG_REPORT`, `REVIEW_CARD`, `AMEND_CARD`, `POST_HOLD_COMMENT`, …).
+`processConfirmedReport` is the one choke point every one of them funnels through: on `!result.ok`
+it journals `report-triage-error` (`{issue, step, error}`, error capped to 300 chars like
+`firstError` already is), then re-reads how many `report-triage-error` events exist for that issue
+**since its own most recent `report-confirmed` event** -- the identical "anchor + events since"
+idiom `findConfirmedAwaitingTriage` already uses, transposed from "handled at all" to "how many
+mechanical failures since the last time a human confirmed this" (`mechanicalFailureHistory`).
+Counting since the anchor, not since the beginning of the journal, is deliberate and
+forward-looking: it is what lets a maintainer's `spo triage --retry <issue>` (action 3.4, shipping
+in the same PR as this) reset the budget later, simply by re-confirming the report and moving the
+anchor forward -- every earlier failure stops counting the moment a fresh `report-confirmed`
+lands.
+
+On the **third** mechanical failure (`MECHANICAL_FAILURE_CAP`, three strikes: enough that one
+flaky cycle never holds a report a maintainer is still waiting to see filed, few enough that a
+genuinely broken pool or a wide outage stops spending real reproductions within about **45 to 75
+minutes** with the live defaults -- NOT "minutes rather than hours" as an earlier draft of this
+doc claimed. The real arithmetic, `autoTriageMs`/`autoTriageBackoffBaseMs` at their live 15-minute
+default: the 2nd attempt waits 15 min after the 1st failure, the 3rd waits 30 more after the 2nd
+(the cap trips on the 3rd failure itself, with no further wait), and each retry is additionally
+gated by the next auto-triage cycle boundary -- worst case adding up to one more 15-minute cycle's
+scheduling slack at each step, hence the 45-75 min spread rather than a single number) the report
+is held: a **dedicated** comment (`buildMechanicalHoldComment`) plus a
+`report-held-mechanical` journal event (`{issue, attempts, lastError, commentPosted,
+commentError}`), which `findConfirmedAwaitingTriage` now also treats as handled. That comment is
+deliberately NOT `buildHoldComment`'s text. `buildHoldComment` says "Pipeline: reproduction did
+not confirm this report" -- a *verdict*: a human's `/triage-report`-shaped reasoning ran to
+completion and came back negative. Reusing it here would be a lie for four of `handleMechanicalFailure`'s
+nine possible `step` tags (`TRIAGE_BUG_REPORT`/`REVIEW_CARD`/`FETCH_ISSUE`/`BUILD_SUGGESTION_DRAFT`
+-- the calls that PRODUCE a verdict), since nothing ever reproduced anything there -- the machinery
+failed before a verdict was ever reached. For those, `buildMechanicalHoldComment` says plainly that
+triage failed mechanically N times, names the last error, states the report is still confirmed and
+still in "Intake" with nothing discarded, and points at `spo triage --retry <issue>` to reset the
+count and try again. For the other five step tags -- `POST_HOLD_COMMENT`/`POST_DUPLICATE_COMMENT`/
+`POST_DUPLICATE_CLOSE_COMMENT`/`POST_DO_NOT_FILE_COMMENT`/`AMEND_CARD`, which run AFTER
+`TRIAGE_BUG_REPORT`/`REVIEW_CARD` already produced a real verdict and fail only on the FOLLOW-UP
+`gh`/`npm` call that tries to record it -- the pre-verdict wording would tell the exact same lie
+from the other direction ("no verdict was ever reached" when one plainly was), so
+`buildMechanicalHoldComment` branches on `step` (`VERDICT_STEP_FOR`) and instead names which
+earlier step reached the verdict and which follow-up call is the one that keeps failing.
+
+Posting this comment can itself fail -- for a `POST_*` step this is a real irony worth naming
+explicitly (`buildMechanicalHoldComment` does): the hold comment is posted through the exact same
+`postIssueComment` that just failed three times in a row as that report's own mechanical failure,
+so it will often fail too. `handleMechanicalFailure` journals `report-held-mechanical` and returns
+the held disposition **regardless of whether the comment posted** (`commentPosted: false`,
+`commentError` set, when it did not) -- the hold is the mechanism that stops the loop, the comment
+is only the courtesy of telling a human about it, and an earlier version of this fix let a failed
+courtesy silently veto the mechanism: the comment's own `postIssueComment` call failing meant
+`report-held-mechanical` was never journaled, `findConfirmedAwaitingTriage` never stopped
+surfacing the report, and the exact 12.8-hour incident this action exists to close would recur
+through the one gh outage most likely to trigger it -- the same outage already failing the
+`POST_*` step in the first place. `commentPosted`/`commentError` exist so a maintainer reading
+`daemon.jsonl` can still tell "held, comment landed" from "held, comment silently failed" without
+that distinction being load-bearing for the hold itself.
+
+*The backoff.* The cap alone was not enough: even bounded at three attempts, hammering a broken
+pool or a wide outage once every single stage-3 cycle until the cap trips is still real spend for
+zero chance of success, once the first failure has already shown the cause is mechanical rather
+than reproduction-shaped. Before `runAutoTriage` ever calls `processConfirmedReport` (the function
+that actually calls `claimReport` -- `runAutoTriage` itself never calls `claimReport` directly)
+for a report with N ≥ 1 mechanical failures since its confirm anchor, it checks a pure decision
+helper --
+`shouldSkipForTriageBackoff(lastErrorAtMs, nowMs, errorCount, config)`, same shape as
+`shouldAutoTriage` (no `Date.now()` baked in, driven entirely by its arguments so a test can drive
+it without sleeping) -- against `triageBackoffMs(errorCount, config)`: the wait doubles per
+additional failure (`autoTriageBackoffBaseMs * 2^(errorCount-1)`), capped at
+`autoTriageBackoffCeilingMs`. The check runs **before** `claimReport`, so a skip never renames the
+report into `in-progress/` and never spends an LLM call -- and it is journaled
+(`report-triage-backoff`, `{issue, attempts, nextEligibleAtIso}`) and folded into the `auto-triage`
+summary (`backoffSkipped`) precisely because the 12.8-hour stall stayed invisible partly because an
+all-quiet cycle looked identical to "nothing confirmed" in `daemon.jsonl`; a silent backoff would
+recreate that exact blind spot for the one mechanism built to prevent the incident repeating.
+
+`autoTriageBackoffBaseMs` defaults to `autoTriageMs` itself when that is configured (> 0): the
+first retry then waits exactly one ordinary auto-triage cycle -- the cadence the daemon already
+runs at -- rather than a second hand-picked number that could drift out of sync with it. It falls
+back to 15 minutes (mirroring `DEFAULT_AUTO_TRIAGE_MS`) when `autoTriageMs` is unset/disabled,
+e.g. a hand-run `spo triage --file` with no daemon timer configured at all. `autoTriageBackoffCeilingMs`
+defaults to 2 hours: long enough that a genuinely broken account pool or a wide `claude-code`
+outage is not hammered every cycle while a maintainer is away, short enough that fixing the
+mechanical cause during a normal working day still gets the report retried again that same day
+without needing `spo triage --retry` by hand.
+
 **"The one rule", worked through concretely.** None of `report-intake.js`/`auto-triage.js` ever
 reads report *content* (no `profile`/`anchor`/`journal`/`geometry` field is parsed in this repo).
 Rendering the RAW card -- the one step that necessarily needs that content -- lives beside the
@@ -1104,6 +1202,8 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
 | `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs` |
+| `autoTriageBackoffBaseMs` | `autoTriageMs` if > 0, else 15 min (`SPO_AUTO_TRIAGE_BACKOFF_BASE_MS`) | action 3.3 -- wait before the first retry after a mechanical failure, doubled per additional failure since the report's confirm anchor; see "The mechanical-failure cap + backoff" above |
+| `autoTriageBackoffCeilingMs` | 2h (`SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS`) | action 3.3 -- absolute ceiling on the doubling above |
 
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
@@ -1113,17 +1213,36 @@ ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan
 2.7 -- `comment-scan-collaborators-unreadable` / `comment-scan-collaborators-stale` are shared
 with `unparkScan` and carry a `scanner` field instead), `report-triaged` / `report-held` / `auto-triage` /
 `report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
-`report-triage-reclaimed` (stage 3) -- all to `journal/daemon.jsonl`, the
+`report-triage-reclaimed` / `report-triage-error` / `report-held-mechanical` /
+`report-triage-backoff` (stage 3) -- all to `journal/daemon.jsonl`, the
 same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
-disposed of at least one report **or** hit at least one mechanical error (with
-`errorIssues`/`firstError`, truncated to 300 chars); a cycle with nothing confirmed journals
-nothing. `report-triage-retry` is informational only -- `intake.js`'s `triageBugReport` retries
-once, same account and deadline, when `steps/llm.js` reports a deadline kill (`timedOut: true`);
-it is never treated as "handled" by `findConfirmedAwaitingTriage`. `report-triage-cooldown`
-(plan action 3.6) is the same kind of informational event for the OTHER retry path: one per
-account `triageBugReport`/`reviewCard` cooled down while rotating past a `{kind: 'limit'}` result
-(`{issue, step, account, cooldownUntil, ...}`, `step` is `TRIAGE_BUG_REPORT` or `REVIEW_CARD`) --
-also never treated as "handled", and never journaled in a dry run.
+disposed of at least one report, hit at least one mechanical error (with
+`errorIssues`/`firstError`, truncated to 300 chars), or (action 3.3) backed off at least one report
+(`backoffSkipped`); a cycle with nothing confirmed journals nothing. `report-triage-retry` is
+informational only -- `intake.js`'s `triageBugReport` retries once, same account and deadline,
+when `steps/llm.js` reports a deadline kill (`timedOut: true`); it is never treated as "handled" by
+`findConfirmedAwaitingTriage`. `report-triage-cooldown` (plan action 3.6) is the same kind of
+informational event for the OTHER retry path: one per account `triageBugReport`/`reviewCard`
+cooled down while rotating past a `{kind: 'limit'}` result (`{issue, step, account, cooldownUntil,
+...}`, `step` is `TRIAGE_BUG_REPORT` or `REVIEW_CARD`) -- also never treated as "handled", and
+never journaled in a dry run. `report-triage-error` / `report-held-mechanical` /
+`report-triage-backoff` (action 3.3, see "The mechanical-failure cap + backoff" above) are all
+skipped in a dry run too. Only `report-triage-error` is actually COUNTED since the report's own
+`report-confirmed` anchor (`mechanicalFailureHistory` scans for that event specifically, per
+issue); `report-held-mechanical` is the terminal disposition the count feeds INTO once it reaches
+`MECHANICAL_FAILURE_CAP`, not itself a thing anything counts -- once one is journaled,
+`findConfirmedAwaitingTriage` stops surfacing the report at all, so there is nothing left to count
+it against until a fresh `report-confirmed` moves the anchor forward regardless.
+
+A hard process kill mid-triage is recovered by `reclaimStaleClaims` (action 2.6, above) and
+journals `report-triage-reclaimed`, NOT `report-triage-error` -- so a daemon crash-loop is
+NEITHER capped NOR backed off by this mechanism. This is a real, reachable path: merging a PR
+restarts the daemon and SIGTERMs whatever card is in flight, including a triage in progress. The
+gap is deliberate, not an oversight: counting a reclaim toward the mechanical-failure cap would
+hold a report after an ordinary daemon restart, punishing it for something that had nothing to do
+with the report itself or with the mechanical health of triage. If daemon restarts during triage
+ever become frequent enough to matter, the fix belongs in a SEPARATE counter keyed off
+`report-triage-reclaimed`, not in silently folding it into this one.
 `remote-report-pull.js`'s `ackedFilenames`, `orchestrator/auto-triage.js`'s
 `findConfirmedAwaitingTriage`, and `report-intake.js`'s `findPendingIntake` all use the same
 anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed
