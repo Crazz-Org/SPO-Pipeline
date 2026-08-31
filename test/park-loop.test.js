@@ -27,6 +27,20 @@ const { createScanState } = require('../orchestrator/comment-scan');
 const { appendEvent, writeState } = require('../orchestrator/journal');
 const { timeoutResult } = require('./helpers');
 
+// `gh api` pagination rides in the path's query string, not in `-f page=N` argv elements -- a `-f`
+// field would flip the call from GET to POST against the create-comment endpoint (see
+// orchestrator/comment-scan.js's header and test/gh-api-argv.test.js). These fakes therefore read
+// the page number out of the URL, the same place the real `gh` would.
+function pageParamOf(args) {
+  for (const a of args) {
+    if (typeof a !== 'string') continue;
+    const m = a.match(/[?&]page=(\d+)/);
+    if (m) return m[1];
+  }
+  return undefined;
+}
+
+
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -699,8 +713,8 @@ test('unparkScan: a reply on page 2 of 3 is found -- the one-page bug this actio
       if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
         return ok(JSON.stringify([{ login: 'maintainer' }]));
       }
-      const pageArg = args.find((a) => typeof a === 'string' && a.startsWith('page='));
-      const page = pageArg ? Number(pageArg.split('=')[1]) : 1;
+      const pageArg = pageParamOf(args);
+      const page = pageArg ? Number(pageArg) : 1;
       if (page === 1) return ok(JSON.stringify(page1));
       if (page === 2) return ok(JSON.stringify(page2));
       return ok(JSON.stringify(page3));

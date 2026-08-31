@@ -22,7 +22,7 @@
 //
 // ---- (a) pagination -----------------------------------------------------------------------
 //
-// `fetchCommentsAfterAnchor` pages forward with `-f per_page=100 -f page=N`, collecting every
+// `fetchCommentsAfterAnchor` pages forward with `?per_page=100&page=N` in the path, collecting every
 // comment whose id is greater than the anchor, until a page comes back shorter than 100 (the
 // natural end of the list) or `maxPages` is reached. It does NOT stop early on the first match:
 // simpler and more predictable than trying to reason about "is there an earlier authorized
@@ -138,6 +138,25 @@ function createScanState() {
 // site-wide -- see park-loop.js's own header for why that means "posted after the anchor" needs
 // no timestamp). Stops at the first page shorter than 100 (the true end of the list) or at
 // `maxPages`, whichever comes first.
+//
+// The page/per_page parameters go in the PATH as a query string, never through `gh api -f`.
+// `gh api` defaults to GET, but ANY `-f`/`-F` field flips it to POST unless `--method GET` is
+// also passed -- so the first cut of this function, `['api', '<path>', '-f', 'per_page=100',
+// '-f', 'page=1']`, POSTed to the *create an issue comment* endpoint on every single scan and
+// got `422 "body" wasn't supplied` back, forever. Reproduced live 2026-08-31 against issue 213:
+// the `-f` form exits 1 with that 422; the same call as a query string returns the 4 comments.
+//
+// Two things that made it costly. It failed CLOSED only by accident -- the POST was rejected
+// solely because no `body` field was supplied, so a later edit adding one would have had the
+// daemon posting real comments onto live issues instead of reading them. And every
+// `unpark-scan-failed` event this produced looked exactly like the transient `gh` flakiness the
+// audit had already catalogued as journal spam, which is why 1164 of them read as noise rather
+// than as "the retry channel has never once worked".
+//
+// The hermetic suite cannot catch this class by mocking alone: it stubs `runSync`, so it asserts
+// the argv and never learns what `gh` does with it. The standing guard is therefore a source
+// sweep -- see test/gh-api-argv.test.js, which fails on any `gh api` call site anywhere in the
+// repo that passes `-f`/`-F` without an explicit `--method`/`-X`.
 function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, maxPages }) {
   const bound = Number.isInteger(maxPages) && maxPages > 0 ? maxPages : DEFAULT_MAX_PAGES;
   const collected = [];
@@ -146,7 +165,7 @@ function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, 
     const result = runSync(
       deps,
       'gh',
-      ['api', `repos/${ghRepo}/issues/${issue}/comments`, '-f', `per_page=${PER_PAGE}`, '-f', `page=${page}`],
+      ['api', `repos/${ghRepo}/issues/${issue}/comments?per_page=${PER_PAGE}&page=${page}`],
       {},
       config
     );
