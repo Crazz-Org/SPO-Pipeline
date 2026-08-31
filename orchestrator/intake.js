@@ -986,6 +986,77 @@ function extractCriterion(body) {
   return text.trim();
 }
 
+// ---- Protected-files guard (action 3.2) ----------------------------------------------------
+//
+// CLAUDE.md documents a hard wall this pipeline cannot get around: '.claude/settings.json' and
+// anything under '.claude/hooks/' are refused by the harness as sensitive files, regardless of
+// what this repo's own permission rules say. A plan that requires editing either of them cannot
+// succeed -- card #428 proved it the expensive way, burning $12.01 across PLAN and IMPLEMENT
+// before parking anyway. CLAUDE.md's own instruction is to park a card like that up front rather
+// than fail it mid-IMPLEMENT; state-machine.js's two call sites (INTAKE on the card's own
+// criterion/title, PLAN on the model's structured `files_to_change` declaration) exist to act on
+// this function's verdict and do exactly that.
+//
+// This function is applied to short, targeted strings ONLY: a card's criterion/title, and each
+// entry of a plan's declared files_to_change array -- never to free-form prose such as PLAN's
+// plan_markdown. That is a revision, not the original design: the first cut of this guard scanned
+// plan_markdown directly, on the theory that a false positive is cheap (one park, the offending
+// line quoted verbatim, instantly legible to a maintainer deciding whether to `retry`) next to a
+// false negative's cost (a full PLAN + IMPLEMENT cycle discovering the wall the hard way, exactly
+// like #428). That trade-off has been measured and falsified: run over all 17 real plans in
+// journal/*/scratch/plan-*.md, the prose scan fired 3 times -- 1 true positive (#428) and 2 false
+// positives, both already-DONE cards (issue-418's plan text ASSERTS a hook is ABSENT; issue-429's
+// CITES `.claude/settings.json` as evidence, never proposes touching it). 33% precision, and not
+// bad luck -- structural: prompts/plan.md's own falsification-sweep requirement instructs PLAN to
+// emit "one search command per claim in `doc/`, `.claude/`, or `CLAUDE.md`", and SPO-WebClient's
+// CLAUDE.md -- fed to every PLAN call as domain context -- itself contains matches including the
+// heading ``## Automation (`.claude/hooks/`)``. Prose can never distinguish "my plan EDITS this
+// file" from "my plan CITES this file", and the pipeline's own prompt demands citations. Scanning
+// a structured declaration instead -- a path is either on the list or it isn't -- removes the
+// ambiguity prose could never resolve.
+//
+// Deliberately a blunt, case-insensitive substring scan even so -- not a markdown-aware or
+// path-aware parser -- since the inputs it now sees are already short and structured; a false
+// positive on one of them still costs only one park, with the offending entry quoted verbatim in
+// the park detail below. POSIX separators only -- every path this pipeline itself ever writes
+// (prompts, plans, criteria) is POSIX.
+const PROTECTED_MATCH_CAP = 5;
+const PROTECTED_LINE_MAX_LENGTH = 200;
+
+function detectProtectedFiles(text) {
+  if (typeof text !== 'string' || text === '') return [];
+
+  // A fresh RegExp per call (not a module-level /g one) so there is no lastIndex to leak across
+  // calls -- this function must stay pure. '.claude/hooks/' is followed by a greedy run of
+  // non-delimiter characters so the reported path is the whole token (e.g.
+  // '.claude/hooks/pre-tool-use.sh'), not just the directory prefix; it also matches the bare
+  // directory itself when nothing follows. The settings.local.json alternative is listed first
+  // only for readability -- it can never share a match position with the settings.json
+  // alternative (the two literal strings diverge right after "settings."), so alternation order
+  // does not affect which one wins.
+  const re = /\.claude\/settings\.local\.json|\.claude\/settings\.json|\.claude\/hooks\/[^\s`"'()<>,;]*/gi;
+
+  const matches = [];
+  let match;
+  while (matches.length < PROTECTED_MATCH_CAP && (match = re.exec(text))) {
+    const lineStart = text.lastIndexOf('\n', match.index - 1) + 1;
+    const lineEndIdx = text.indexOf('\n', match.index);
+    const lineEnd = lineEndIdx === -1 ? text.length : lineEndIdx;
+    const line = text.slice(lineStart, lineEnd).trim().slice(0, PROTECTED_LINE_MAX_LENGTH);
+    // Cap the matched path too, not just the line: an adversarial or pathological input (a plan
+    // entry that is itself megabytes long, e.g. '.claude/hooks/' + 1e6 repeated chars) makes
+    // match[0] itself unbounded even though `line` above is capped -- and this `path` goes
+    // verbatim into journal.jsonl and, through park-loop.js's park-comment builder
+    // (JSON.stringify(detail, null, 2)), into the GitHub comment body. GitHub caps comment bodies
+    // at 65536 chars; an uncapped path blows past that, `gh issue comment` exits non-zero, and the
+    // card parks UNCOMMENTED -- silently defeating the maintainer-visibility this whole guard
+    // exists for. Same cap as `line`, for the same reason.
+    const matchedPath = match[0].toLowerCase().slice(0, PROTECTED_LINE_MAX_LENGTH);
+    matches.push({ path: matchedPath, line });
+  }
+  return matches;
+}
+
 function taskAlreadyExists(queueDir, journalRoot, id, issueNumber) {
   if (fs.existsSync(path.join(journalRoot, id))) return true;
   if (!fs.existsSync(queueDir)) return false;
@@ -1102,6 +1173,9 @@ module.exports = {
   applyMechanicalCorrections,
   parseBoardClaimOutput,
   extractCriterion,
+  detectProtectedFiles,
+  PROTECTED_MATCH_CAP,
+  PROTECTED_LINE_MAX_LENGTH,
   parseIssueNumber,
   parseIssueUrl,
   DRAFT_REQUIRED,

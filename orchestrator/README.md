@@ -321,6 +321,88 @@ fresh against the retried worktree (reuse is a bet on the plan *text*, not on wh
 currently resolve in a tree nobody has re-checked), and returns `IMPLEMENT` — `callLlmStep` is
 never reached.
 
+**Action 3.2 — protected-files guard.** CLAUDE.md documents a hard wall: `.claude/settings.json`
+and anything under `.claude/hooks/` are refused by the harness as sensitive files no matter what
+this repo's own permission rules say, so a plan that requires editing either of them cannot
+succeed. Card #428 proved that the expensive way — a plan whose own text required a hook edit,
+discovered only when IMPLEMENT paid full price attempting it, $12.01 burned before it parked
+anyway. `orchestrator/intake.js`'s `detectProtectedFiles(text)` is the detector: a pure,
+deliberately blunt, case-insensitive, POSIX-only substring scan for `.claude/settings.json`,
+`.claude/settings.local.json`, and any path under `.claude/hooks/`, returning up to 5 matches
+(each `{ path, line }`, both capped at 200 chars — the `path` cap exists because an uncapped match
+goes verbatim into a GitHub comment body via `park-loop.js`'s `JSON.stringify(detail, null, 2)`,
+and GitHub's 65536-char cap would otherwise make `gh issue comment` fail and the card park
+uncommented) rather than throwing or growing unbounded. Every hit parks the single reason
+`plan-requires-protected-files` (already listed among action 3.1's `PLAN_INVALIDATING_PARK_REASONS`
+above, so a plan that trips this guard is never eligible for reuse), distinguished by a `source`
+field in the detail, from **two** call sites in `state-machine.js`:
+
+- **`handleIntake`**, `source: 'criterion'` — for a `kind: "card"` task only, the criterion and
+  title are scanned before anything else in INTAKE runs (after the `invalid-task-json` and
+  `shadow.forceState` checks, and after the `real-flag-required` gate). This is the cheapest
+  possible catch: INTAKE is scripted, so the card parks having spent zero LLM calls, and still
+  gets the full standard park treatment — a park comment on the issue, the kanban move, the
+  maintainer's `retry`/`abandon` path — which refusing to enqueue the card in `intake.js`'s
+  `pullOne` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It
+  is free insurance, not the mechanism that saved #428's $12.01 — #428's own criterion says "both
+  kept hooks" and "the hook script", never a path, so this site scores zero hits (true or false)
+  across all 17 real cards measured.
+- **`handlePlan`, normal path**, `source: 'files_to_change'` — scans `payload.files_to_change`,
+  PLAN's structured declaration of which files it intends to change (`prompts/plan.md`), *before*
+  `scratchDir`/`fs.mkdirSync`/either file write and before the action-1.8 invariants baseline. This
+  is the site the guard exists for: it stops the spend before IMPLEMENT is ever paid for.
+
+**Why not scan `plan_markdown` (the original design).** The first cut of this guard scanned the
+model's free-prose `plan_markdown` at this same site. Measured against all 17 real plans in
+`journal/*/scratch/plan-*.md`, that scan fired 3 times — 1 true positive (#428) and 2 false
+positives, both already-`DONE` cards: issue-418's plan text *asserts* a hook is **absent**
+(`` `.claude/hooks/context-router.sh:117`. That file does not exist ``, with a check command
+`! test -e .../.claude/hooks/context-router.sh`), and issue-429's *cites*
+`` `.claude/settings.json:109-127` `` as evidence, never proposing to touch it. 33% precision, and
+not bad luck — structural: `prompts/plan.md` instructs PLAN to emit "a falsification sweep: one
+search command per claim in `doc/`, `.claude/`, or `CLAUDE.md`", and SPO-WebClient's `CLAUDE.md` —
+fed to every PLAN call as domain context — itself contains matches, including the heading
+``## Automation (`.claude/hooks/`)``. Prose can never distinguish "my plan EDITS this file" from
+"my plan CITES this file", and the pipeline's own prompt demands citations. `files_to_change` is
+the fix: `prompts/plan.md`'s own "which files" statement, lifted out of the prose into a form the
+driver can check mechanically, documented there as files the plan will *change* — never files it
+merely reads, cites as evidence, or asserts the absence of.
+
+`files_to_change` is deliberately declared but **not** `required` in `step-contracts.js` (see that
+file's own comment) — promoting it would park every card whose PLAN reply omits the new key, on a
+live pipeline, before a single real card has exercised it. When the field is absent, `null`, not
+an array, or an array containing a non-string entry, `handlePlan` does **not** park and does
+**not** fall back to scanning `plan_markdown` — that would reinstate the 33%-precision behaviour
+this revision exists to remove. It journals a `PLAN`/`plan-files-undeclared` event instead, with
+what was actually received (type/shape, capped) — the evidence promotion to `required` will
+eventually be made from. An empty array is treated as a real declaration ("this plan changes
+nothing already on record"), not as undeclared: no park, no event.
+
+**What this guard is actually worth — stated honestly.** Nothing cross-checks `files_to_change`
+against reality: a model that declares `[]`, omits the key, or emits a malformed value walks
+straight past the guard with no park and no scrutiny of what it actually intends to touch, and
+`files_to_change` is load-bearing nowhere else in the pipeline — IMPLEMENT's own `files_changed`
+is never compared against it. So this guard does **not** prevent protected-file work; a model that
+wants to touch `.claude/hooks/` and simply doesn't declare it gets straight through. Its real worth
+is narrower: it makes the *honest* case cheap. #428 was honest — its plan's own section headings
+named the two hook paths outright — and a guard scanning the structured declaration catches that
+case before IMPLEMENT spends a cent, which is exactly the $12.01 it would otherwise have cost. Two
+changes would make the guard real rather than best-effort: promoting `files_to_change` to
+`required` once the journal shows PLAN reliably emitting it (see the `plan-files-undeclared`
+evidence-gathering above), and cross-checking IMPLEMENT's own `files_changed` against the plan's
+declaration after the fact. Neither is implemented. Do not oversell this guard's coverage
+elsewhere in these docs either.
+
+There used to be a third call site, on the action-3.1 reuse path (`source: 'plan-file'`, re-reading
+a reused plan already on disk): reuse skips PLAN's LLM call entirely, so it never saw
+`plan_markdown`, and a plan written before the guard existed could in principle be reused straight
+into IMPLEMENT unscanned. It was removed once measured to be unreachable: every journalled PLAN
+`files-written` event in the entire corpus carries `baseMainSha: undefined` (all of them predate
+action 3.1), so `decidePlanReuse`'s condition 2 filters every one of them out before that site
+could ever run — and for any plan written from now on, tripping either remaining site parks
+`plan-requires-protected-files`, itself in `PLAN_INVALIDATING_PARK_REASONS`, which already blocks
+its own reuse.
+
 A missing value for any placeholder a prompt's header declares — PLAN called before
 `worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws
 `prompt-template.js`'s `MissingPlaceholderError`, caught in `runLlm` and re-thrown as

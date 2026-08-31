@@ -27,6 +27,7 @@ const { scratchDir, lastResultPayload } = require('./task-values');
 const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
+const { detectProtectedFiles, PROTECTED_MATCH_CAP, PROTECTED_LINE_MAX_LENGTH } = require('./intake');
 const { LockLostError } = require('./lock');
 const { callWithDeadline } = require('./deadline');
 const {
@@ -134,6 +135,32 @@ async function handleIntake(ctx) {
   // rather than a card silently running for real.
   if (ctx.task.kind === 'card' && isRealMode(ctx) && !(ctx.config && ctx.config.real)) {
     throw new ParkSignal('real-flag-required', { kind: ctx.task.kind });
+  }
+  // Action 3.2: the cheapest possible catch for CLAUDE.md's hard wall -- '.claude/settings.json'
+  // and anything under '.claude/hooks/' cannot be edited by an agent no matter what a plan says,
+  // so a card whose own criterion or title already names one of them is doomed before PLAN ever
+  // runs. INTAKE is scripted (no LLM call on this path either way), so parking here costs
+  // literally nothing -- and it still gets the FULL standard park treatment (park comment on the
+  // issue, kanban move, the maintainer's retry/abandon path) that refusing to enqueue the card in
+  // intake.js's pullOne would not: a refusal there would leave the card silently re-scanned every
+  // cycle, uncommented and unmoved on the board, forever. Card-only (a synthetic/test task has no
+  // criterion/title worth scanning) and string-only (detectProtectedFiles already tolerates
+  // anything else, but there is no reason to call it on a non-string field).
+  //
+  // This is NOT what saved #428's $12.01 -- #428's own criterion says "both kept hooks" and "the
+  // hook script", never a path, so this scan scores zero hits (true or false) across all 17 real
+  // cards measured. It earns its place anyway: free insurance with no measured false-positive
+  // risk, for the rare card whose human-written criterion or title does name a path directly.
+  if (ctx.task.kind === 'card') {
+    const criterionMatches = typeof ctx.task.criterion === 'string' ? detectProtectedFiles(ctx.task.criterion) : [];
+    const titleMatches = typeof ctx.task.title === 'string' ? detectProtectedFiles(ctx.task.title) : [];
+    const matches = [...criterionMatches, ...titleMatches];
+    if (matches.length > 0) {
+      // source reflects which field actually matched, not just which one was scanned first: a
+      // criterion-only hit is 'criterion', a title-only hit is 'title' -- see D9 test coverage.
+      const source = criterionMatches.length > 0 ? 'criterion' : 'title';
+      throw new ParkSignal('plan-requires-protected-files', { source, matches });
+    }
   }
   appendEvent(ctx.taskDir, 'INTAKE', 'ok', { title: ctx.task.title, kind: ctx.task.kind });
   return 'WORKTREE';
@@ -372,6 +399,66 @@ async function handlePlan(ctx) {
   if (typeof invariantsMarkdown !== 'string' || invariantsMarkdown.trim() === '') missing.push('invariants_markdown');
   if (missing.length > 0) {
     throw new ParkSignal('plan-invalid', { payload, missing });
+  }
+
+  // Action 3.2, site 2 (revised -- see intake.js's detectProtectedFiles header for the detector's
+  // own rationale). The original design scanned plan_markdown prose; measured against all 17 real
+  // plans in journal/*/scratch/plan-*.md, that scan fired on 3 -- one true positive (#428) and two
+  // false positives, both cards already DONE (issue-418's plan ASSERTS a hook is ABSENT; issue-429
+  // CITES `.claude/settings.json` as evidence). 33% precision, and structural, not bad luck:
+  // prompts/plan.md's own falsification-sweep requirement, plus SPO-WebClient's CLAUDE.md fed to
+  // every PLAN call as domain context, guarantee the prose will keep citing protected paths it has
+  // no intention of touching. Prose cannot tell "my plan EDITS this file" from "my plan CITES this
+  // file" -- so this site now scans `payload.files_to_change` instead: prompts/plan.md's
+  // machine-readable "which files" declaration (documented there as files the plan will CHANGE,
+  // never files it merely reads, cites, or asserts the absence of), never plan_markdown itself.
+  //
+  // files_to_change is deliberately `optional` in step-contracts.js, not `required` (see that
+  // file's own comment on why) -- a reply that omits it, or sends anything other than a clean
+  // array of strings, must NEVER fall back to scanning plan_markdown; that would reinstate the
+  // 33%-precision behaviour this revision exists to remove. Instead it is journalled as
+  // 'plan-files-undeclared' (what was actually received, capped) -- the evidence the eventual
+  // required-key promotion will be made from -- and the run proceeds exactly as it did before this
+  // guard existed. An empty array IS a declaration ("this plan changes nothing already on record"
+  // -- a docs-only or investigation-only plan), so it counts as declared and clean: no event, no
+  // park.
+  const filesToChange = payload.files_to_change;
+  const filesToChangeIsValid =
+    Array.isArray(filesToChange) && filesToChange.every((f) => typeof f === 'string');
+  if (!filesToChangeIsValid) {
+    appendEvent(ctx.taskDir, 'PLAN', 'plan-files-undeclared', {
+      receivedType: Array.isArray(filesToChange) ? 'array-with-non-string-entry' : typeof filesToChange,
+      // String(...) wraps the JSON.stringify call: a function value (unreachable from the wire,
+      // where this payload is always JSON.parse'd, but reachable from a hand-built ctx) makes
+      // JSON.stringify return `undefined`, and `undefined.slice` would throw a TypeError that
+      // escapes handlePlan past runTask's ParkSignal-only catch and kills the daemon. One
+      // character of belt-and-braces against that.
+      receivedSample: String(JSON.stringify(filesToChange === undefined ? null : filesToChange)).slice(0, 200),
+    });
+  } else if (filesToChange.length > 0) {
+    // D1: detectProtectedFiles already caps matches PER CALL (PROTECTED_MATCH_CAP), but this site
+    // flatMaps it across every declared file, so the total is unbounded (N x PROTECTED_MATCH_CAP).
+    // declaredFiles below used to be filesToChange verbatim -- the whole array, uncapped in both
+    // element count and element length. Both go straight into the park detail, which park-loop.js
+    // JSON.stringifies into a GitHub comment body: GitHub caps comment bodies at 65536 chars, and
+    // measured pathological inputs blow past that (a single 70000-char entry alone produces a
+    // 70375-char detail; ~550 protected entries crosses 65536). When that happens `gh issue
+    // comment` exits non-zero, park-loop.js journals park-comment-failed and returns with NO
+    // comment posted -- and, per the pre-existing (not fixed here) null-anchor bug in
+    // findParkAnchor/unparkScan/comment-scan.js, the card also becomes retry/abandon-able by any
+    // historical comment on the issue thread. Cap both the matches (defense in depth -- already
+    // capped per-file, this caps the total across all files) and the declared-files list itself,
+    // and record the true count separately so a truncated list is never mistaken for the whole
+    // one.
+    const protectedMatches = filesToChange.flatMap((f) => detectProtectedFiles(f)).slice(0, PROTECTED_MATCH_CAP);
+    if (protectedMatches.length > 0) {
+      throw new ParkSignal('plan-requires-protected-files', {
+        source: 'files_to_change',
+        matches: protectedMatches,
+        declaredFiles: filesToChange.slice(0, 50).map((f) => f.slice(0, PROTECTED_LINE_MAX_LENGTH)),
+        declaredFileCount: filesToChange.length,
+      });
+    }
   }
 
   const dir = scratchDir(ctx.taskDir);

@@ -173,7 +173,7 @@ test('dry-run demo: WORKTREE-side steps (PLAN, IMPLEMENT) never spawn -- deps.sp
     assert.equal(result.ok, true);
     assert.deepEqual(
       Object.keys(result).sort(),
-      ['check_commands', 'dryRun', 'invariant_ids', 'invariants_markdown', 'ok', 'plan_markdown'].sort()
+      ['check_commands', 'dryRun', 'files_to_change', 'invariant_ids', 'invariants_markdown', 'ok', 'plan_markdown'].sort()
     );
   });
 });

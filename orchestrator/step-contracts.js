@@ -96,6 +96,15 @@ const STEP_CONTRACTS = {
       // canonical scratch_dir/plan-<issue>.md convention, then journals plan_path/invariants_path
       // itself for task-values.js's IMPLEMENT/VALIDATE placeholder derivation to keep reading.
       required: ['plan_markdown', 'invariants_markdown', 'invariant_ids', 'check_commands'],
+      // Action 3.2: files_to_change is declared but deliberately NOT required. `required` above
+      // drives BOTH llm.js's missing-key validation (~line 680) and the `--json-schema` envelope
+      // built below -- promoting files_to_change into it would park every card whose PLAN reply
+      // omits the new key, on a live pipeline, before a single real card has exercised it.
+      // `optional` is llm.js's own concept to leave alone, not enforce: prompts/plan.md now asks
+      // for the key, handlePlan (state-machine.js) journals a `plan-files-undeclared` event when
+      // it is absent/malformed, and once the journal shows real PLAN calls emitting it reliably,
+      // promoting it to `required` here is a one-line change.
+      optional: ['files_to_change'],
     },
   },
 

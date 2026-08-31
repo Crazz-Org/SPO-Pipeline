@@ -13,7 +13,7 @@ read out of order.
 
 | Step | Prompt file | Model | Effort | Tools | Ground |
 |---|---|---|---|---|---|
-| PLAN | `plan.md` | Fable 5 (Opus 5 on the wire rule or as fallback) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}` |
+| PLAN | `plan.md` | Fable 5 (Opus 5 on the wire rule or as fallback) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}`; also returns `files_to_change` (action 3.2 — the repo-relative paths the plan intends to change, distinct from paths it merely reads or cites) |
 | IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on the wire rule — `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases — or an `L`-sized task) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
 | DIAGNOSE | `diagnose.md` | Fable 5 | high | `Read, Grep, Bash(ro)` | reads `{{diff_path}}`, `{{gate_log_path}}`, `{{ledger_path}}` |
 | VALIDATE — citation-verifier | `verify-citations.md` | Fable 5 | high | `Read, Grep` (product + `~/SPO-Original`, read-only) | reads the diff and `{{spo_original_path}}/Rdo/Server/`; runs only when `rdo-members.ts` changed, and always before `validate-change.md` |

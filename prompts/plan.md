@@ -6,7 +6,8 @@
     "plan_markdown": "<the full text of plan.md, as one JSON string>",
     "invariants_markdown": "<the full text of invariants.md, as one JSON string>",
     "invariant_ids": ["INV-1", "INV-2", ...],
-    "check_commands": ["<runnable command>", ...]
+    "check_commands": ["<runnable command>", ...],
+    "files_to_change": ["<absolute path under {{worktree}}>", ...]
   }
 -->
 
@@ -97,6 +98,16 @@ you are drafting the file content, not a description of it.
    Prototype every command against `{{worktree}}` before listing it — a command that fails for
    a reason unrelated to the change (missing tool, typo) is not a usable check, and the driver
    trusts what you hand it.
+4. **`files_to_change`** — an array of path strings, **absolute under `{{worktree}}`** (same
+   convention as every other path you cite — see Rules below): every file this plan intends
+   to create, modify, or delete, and nothing else. This is your own "which files" statement
+   lifted out of `plan_markdown`'s prose into a form the driver can check mechanically before
+   IMPLEMENT ever runs. List **only** files you intend to change. Never list a file just because
+   you read it, cited it as evidence, quoted it in an invariant, or asserted something about its
+   *absence* — a path named in a falsification-sweep check command or an invariant's `File:`
+   line does not belong here unless your plan is also changing that file. Getting this
+   distinction right matters: the driver checks this list — not your prose — before IMPLEMENT
+   runs, and refuses the plan outright if it names a file no agent is allowed to edit.
 
 ## Rules
 

@@ -463,6 +463,13 @@ function cannedDryRunPayload(stepName, contract, ctx) {
         invariants_markdown: `# Invariants (dry run)\n\n[dry-run] no invariants were composed.\n`,
         invariant_ids: [],
         check_commands: [],
+        // D2: files_to_change is optional (step-contracts.js), so this hand-written case -- which
+        // does not go through the generic `required.reduce` default below -- used to omit it
+        // entirely. handlePlan (state-machine.js) then journalled a false 'plan-files-undeclared'
+        // event on EVERY --dry-run PLAN, poisoning the exact evidence (grep -c
+        // plan-files-undeclared) that a real key-absence would be measured from. An empty array
+        // is the clean declaration ("this dry run changes nothing"): no event, no park.
+        files_to_change: [],
       };
     }
     case 'IMPLEMENT':
