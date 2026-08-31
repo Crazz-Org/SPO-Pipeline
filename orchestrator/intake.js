@@ -573,7 +573,7 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // ---- triageBugReport --------------------------------------------------------------------------
 
 // triageBugReport(reportFile, deps) -- calls prompts/triage-bug-report.md through
-// invokeClaudeReal (model fable, effort high, an account from the pool) for ONE report file
+// invokeClaudeReal (model opus, effort medium, an account from the pool) for ONE report file
 // under ~/.spo-reports: reproduces it, routes it (desktop/mobile), dedups by anchorKey, and
 // either drafts a card (never files it -- reviewCard/fileCard do that, same gate every other
 // card gets) or reports why it stopped short. Returns {ok: true, outcome, ...} where the extra
@@ -582,11 +582,29 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // outcome "draft" -- a draft that fails the same validateDraftContract every other draft is
 // checked against). Never throws for a recognized failure, same discipline as draftCard/reviewCard.
 //
-// Model/effort/budget: fable/high, same tier reviewCard runs on -- this step judges evidence
-// (log correlation, geometry predicates) the same way reviewCard judges a citation, not
-// execution-shaped work like draftCard. Bash is in allowedTools (unlike draftCard's read-only
-// set): step 1's server-log curl and step 3's `gh issue list --search` dedup both need it;
-// permissionMode stays 'plan' regardless -- neither of those is a write.
+// Model/effort/budget: opus/medium (maintainer decision, 2026-08-31). It ran fable/high, the
+// tier reviewCard uses, on the reasoning that this step judges evidence (log correlation,
+// geometry predicates) rather than doing execution-shaped work like draftCard. Two things moved
+// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on
+// 2026-08-30/31 -- 53 consecutive auto-triage cycles, 128 attempts across issues 449/455/456,
+// every one dying on "You've reached your Fable 5 limit" (api_error_status=429). pickAccount()
+// below neither rotates nor cools, so each cycle re-picked the one account that could not serve
+// the one model this step asked for. Second, quality: a fable verdict on this project has
+// repeatedly needed an Opus re-read before it could be acted on, and triage is the step that
+// decides whether a human's bug report becomes a card at all -- a wrong "do-not-file" is
+// invisible and unrecoverable without `spo triage --retry`, which does not exist yet (plan 3.4).
+// Effort drops high -> medium with the model change rather than staying pinned: Opus 5 at medium
+// is the stronger judge here, and holding effort at high would raise the per-report cost of a
+// step that runs on every confirmed report for no measured gain.
+//
+// This does NOT fix the underlying loop -- pickAccount still neither rotates nor calls
+// markLimit, so an opus limit on the picked account would wedge exactly the same way. That is
+// plan actions 3.3 (cap + backoff) and 3.6 (intake plays by daemon rules); this change buys
+// headroom, it does not substitute for them.
+//
+// Bash is in allowedTools (unlike draftCard's read-only set): step 1's server-log curl and step
+// 3's `gh issue list --search` dedup both need it; permissionMode stays 'plan' regardless --
+// neither of those is a write.
 //
 // `selfIssue` -- required, not optional: under the human-first design the report has ALREADY
 // been filed as a raw card (orchestrator/report-intake.js's runReportIntake) before this ever
@@ -621,8 +639,8 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
 
   const opts = {
     step: 'TRIAGE_BUG_REPORT',
-    model: 'fable',
-    effort: 'high',
+    model: 'opus',
+    effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only -- triage-bug-report.md: "never file, never post, never move the report"
     maxBudgetUsd: deps.maxBudgetUsd, // no $ cap by default -- Claude Max subscription, no overage risk
