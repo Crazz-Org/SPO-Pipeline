@@ -173,6 +173,23 @@ registry, never a second lap. If `accounts.pick()` finds nothing healthy to begi
 whole pass is exhausted, the task is PARKED (`all-accounts-cooling-until-<iso>` /
 `all-accounts-cooling-after-retry`).
 
+`orchestrator/intake.js`'s three LLM steps (draftCard, reviewCard, triageBugReport) play by the
+same rule, via their own `callIntakeStepWithRotation` helper (plan action 3.6, 2026-08-31; fixes
+the 2026-08-30/31 incident where a bare `accounts.pick()` re-picked the same rate-limited account
+for 53 consecutive auto-triage cycles). Same pick/call/cool/rotate mechanics, bounded to one pass
+over the pool — but intake never throws: exhausting the pool becomes `{ok: false, error}`, never
+a `ParkSignal`, since every intake function's contract is "report a mechanical failure, never
+crash." And since intake has no `ctx.taskDir` to journal into, a cooldown is returned on the
+result's `cooldowns` array instead, for the CALLER to journal — `auto-triage.js` appends one
+`report-triage-cooldown` event per cooled account (see its own header comment). The existing
+one-retry-on-timeout discipline (same account, same deadline — a hang says nothing about account
+health) is unchanged and composes cleanly: rotation only ever looks at the result *after* that
+timeout retry has run its course on the current account. The two can chain in one direction — an
+account times out, its same-account retry comes back `{kind: 'limit'}`, and *that* cools it and
+rotates — so the hard bound on a single intake step is `enabled accounts × 2` `claude` spawns,
+never more. A retry that ends in a rotation still carries its `retriedAfterTimeout` record out
+(named by account), so the most expensive shape is not the one shape without a journal trace.
+
 ### Step contracts + prompt fill (the real `kind: "card"` path)
 
 `runLlm`'s real branch has two sub-paths. If the task supplies `ctx.task.llm.<stepName>`
@@ -774,13 +791,17 @@ Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-fa
 `remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
 `report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` /
 `report-discarded` (stage 2), `report-triaged` / `report-held` / `auto-triage` /
-`report-triage-retry` (stage 3) -- all to `journal/daemon.jsonl`, the same append-only surface
-`auto-pull` already uses. `auto-triage` is journaled for a cycle that disposed of at least one
-report **or** hit at least one mechanical error (with `errorIssues`/`firstError`, truncated to
-300 chars); a cycle with nothing confirmed journals nothing. `report-triage-retry` is
-informational only -- `intake.js`'s `triageBugReport` retries once, same account and deadline,
-when `steps/llm.js` reports a deadline kill (`timedOut: true`); it is never treated as "handled"
-by `findConfirmedAwaitingTriage`.
+`report-triage-retry` / `report-triage-cooldown` (stage 3) -- all to `journal/daemon.jsonl`, the
+same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
+disposed of at least one report **or** hit at least one mechanical error (with
+`errorIssues`/`firstError`, truncated to 300 chars); a cycle with nothing confirmed journals
+nothing. `report-triage-retry` is informational only -- `intake.js`'s `triageBugReport` retries
+once, same account and deadline, when `steps/llm.js` reports a deadline kill (`timedOut: true`);
+it is never treated as "handled" by `findConfirmedAwaitingTriage`. `report-triage-cooldown`
+(plan action 3.6) is the same kind of informational event for the OTHER retry path: one per
+account `triageBugReport`/`reviewCard` cooled down while rotating past a `{kind: 'limit'}` result
+(`{issue, step, account, cooldownUntil, ...}`, `step` is `TRIAGE_BUG_REPORT` or `REVIEW_CARD`) --
+also never treated as "handled", and never journaled in a dry run.
 `remote-report-pull.js`'s `ackedFilenames`, `orchestrator/auto-triage.js`'s
 `findConfirmedAwaitingTriage`, and `report-intake.js`'s `findPendingIntake` all use the same
 anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already established, transposed

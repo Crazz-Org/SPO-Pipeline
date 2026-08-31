@@ -137,6 +137,21 @@ function buildHoldComment(outcome, detail) {
   return lines.join('\n');
 }
 
+// journalCooldowns(journalRoot, issue, step, cooldowns) -- makes an account-rotation cooldown
+// visible in daemon.jsonl. intake.js's draftCard/reviewCard/triageBugReport have no ctx.taskDir
+// of their own (see intake.js's callIntakeStepWithRotation header) -- they return any cooldown
+// their rotation caused on the result's `cooldowns` array instead, and this file is the ONE
+// place that turns it into a journal event, same responsibility split as
+// `report-triage-retry` below for the timeout retry. One event per cooled account, since a
+// single call can in principle cool more than one before landing on a healthy account.
+// Skipped entirely in dry-run mode: a preview run must never journal a terminal-shaped event
+// (same "only journal on real output" rule this file already follows for filed/held/duplicate).
+function journalCooldowns(journalRoot, issue, step, cooldowns) {
+  for (const cooldown of cooldowns || []) {
+    appendDaemonEvent(journalRoot, 'report-triage-cooldown', { issue, step, ...cooldown });
+  }
+}
+
 // reviewAndFile(entry, draft, journalRoot, config, deps, opts, today) -- the tail every draft
 // goes through regardless of how it was produced (triageBugReport's reproduction, or
 // buildSuggestionDraft's mechanical path below): the same reviewCard gate every other card here
@@ -150,6 +165,7 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
   // deps.humanConfirmed: true so review-card.md § 0 does not re-litigate desirability -- a
   // maintainer already confirmed this report before it ever reached here.
   const reviewed = await intake.reviewCard(draft, { ...deps, humanConfirmed: true });
+  if (!dry && reviewed.cooldowns) journalCooldowns(journalRoot, entry.issue, 'REVIEW_CARD', reviewed.cooldowns);
   if (!reviewed.ok) return { ok: false, error: reviewed.error };
 
   if (reviewed.review.verdict === 'DO_NOT_FILE') {
@@ -239,9 +255,13 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
       ...triaged.retriedAfterTimeout,
     });
   }
+  // Same for a rotation cooldown -- see journalCooldowns' own header. Journaled even when
+  // triaged.ok is false (the pool was exhausted): that IS the incident this makes visible, not
+  // something to hide behind the "mechanical failure, no journal" rule just below.
+  if (!dry && triaged.cooldowns) journalCooldowns(journalRoot, entry.issue, 'TRIAGE_BUG_REPORT', triaged.cooldowns);
 
   if (!triaged.ok) {
-    return { ok: false, error: triaged.error }; // mechanical failure -- retried next cycle, no journal
+    return { ok: false, error: triaged.error }; // mechanical failure -- retried next cycle, no terminal journal
   }
 
   if (triaged.outcome === 'duplicate') {
