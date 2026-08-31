@@ -589,3 +589,32 @@ test('RecetteCapExceededError is NOT a ParkSignal -- a cap must propagate, never
   assert.ok(result.capTripped);
   assert.notEqual(result.finalState, 'PARKED', 'a cap trip must abort the run, not park the task');
 });
+
+// The first live run (2026-08-31, issue #467) failed on this. enqueueTask derived the card's
+// criterion with intake.extractCriterion(issue.body), which stops at the first blank line after
+// "## Done means" -- so the task reached IMPLEMENT truncated at "The new line should read
+// exactly:", carrying neither the required text nor "touch nothing under src/". IMPLEMENT
+// invented a line, VALIDATE rejected it, and the run burned a REJECT, an empty IMPLEMENT and a
+// DIAGNOSE before converging. extractCriterion is correct for a human-written card, where the
+// body IS the source of truth; here the harness wrote the card, so re-parsing its own rendered
+// markdown to recover its own intent can only lose information.
+test('the scenario card carries its criterion explicitly -- never re-parsed out of its own rendered body', () => {
+  const runId = 'RUNID-1234';
+  const card = recette.SCENARIOS['trivial-doc-log'].buildCard({ runId });
+
+  assert.ok(card.criterion, 'buildCard must supply a criterion of its own');
+  assert.match(card.criterion, /doc\/recette-log\.md/);
+  assert.ok(
+    card.criterion.includes(`- ${runId} -- synthetic recette card, no product behaviour changed`),
+    'the criterion must carry the EXACT required line -- this is what was lost'
+  );
+  assert.match(card.criterion, /touch nothing under src\//i, 'and the scope instruction');
+
+  // The regression itself: what extractCriterion would have produced from the same body.
+  const intake = require('../orchestrator/intake');
+  const truncated = intake.extractCriterion(card.body);
+  assert.ok(
+    !truncated.includes(`- ${runId} -- synthetic recette card`),
+    'extractCriterion truncates at the blank line -- proving why the explicit criterion is needed'
+  );
+});

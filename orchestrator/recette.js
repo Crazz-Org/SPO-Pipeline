@@ -145,7 +145,26 @@ function trivialDocLogCard({ runId }) {
     '',
     `Source: \`spo recette\`, run ${runId}.`,
   ].join('\n');
-  return { title, body };
+
+  // The criterion is returned EXPLICITLY, not re-derived from the body above. The first live run
+  // (2026-08-31, issue #467) failed because enqueueTask called intake.extractCriterion(body),
+  // which stops at the first blank line after the "## Done means" heading -- so the card reached
+  // IMPLEMENT truncated at "The new line should read exactly:", with neither the required text
+  // nor the "touch nothing under src/" instruction. IMPLEMENT invented a line, VALIDATE rejected
+  // it, and the run burned a REJECT, an empty IMPLEMENT and a DIAGNOSE before converging.
+  // (DIAGNOSE diagnosed it exactly, by reading recette.js itself.)
+  //
+  // extractCriterion is right for a HUMAN-written card, where the body is the only source of
+  // truth. Here the harness authored the card, so re-parsing its own rendered markdown to
+  // recover its own intent is a round trip that can only lose information.
+  const criterion = [
+    `Append exactly one new line to ${RECETTE_DOC_FILE} (create the file with a one-line header`,
+    'if it does not exist yet). The new line must read exactly, byte for byte:',
+    `- ${runId} -- synthetic recette card, no product behaviour changed`,
+    'Touch no other file. In particular, touch nothing under src/.',
+  ].join(' ');
+
+  return { title, body, criterion };
 }
 
 // Each assertion is `{id, description, check(info) -> {ok, detail}}`, never throwing (a thrown
@@ -440,7 +459,7 @@ function makeCap(config, { now = Date.now } = {}) {
 // ---------------------------------------------------------------------------------------------
 
 function createIssue(scenario, config, deps) {
-  const { title, body } = scenario.buildCard({ runId: config.runId });
+  const { title, body, criterion } = scenario.buildCard({ runId: config.runId });
   fs.mkdirSync(config.runDir, { recursive: true });
   const bodyFile = path.join(config.runDir, 'issue-body.md');
   fs.writeFileSync(bodyFile, body);
@@ -461,7 +480,7 @@ function createIssue(scenario, config, deps) {
     throw new RecetteError('gh-issue-create-no-number', { stdout: result.stdout });
   }
   const url = intake.parseIssueUrl(result.stdout) || `https://github.com/${config.ghRepo}/issues/${issueNumber}`;
-  return { issueNumber, url, title, body };
+  return { issueNumber, url, title, body, criterion };
 }
 
 function enqueueTask(config, issue) {
@@ -470,7 +489,10 @@ function enqueueTask(config, issue) {
     kind: 'card',
     issue: issue.issueNumber,
     title: issue.title,
-    criterion: intake.extractCriterion(issue.body),
+    // scenario.buildCard's own criterion when it supplies one -- see trivialDocLogCard for why
+    // re-parsing the rendered body loses information. extractCriterion stays the fallback for a
+    // scenario that only renders a body.
+    criterion: issue.criterion || intake.extractCriterion(issue.body),
     size: 'S',
     area: '',
     touchesRdoMembers: false,
