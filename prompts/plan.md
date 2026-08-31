@@ -41,12 +41,35 @@ you are drafting the file content, not a description of it.
    explicitly — it gates two of the checks below). Inline the check commands (below) as a
    fenced block, so the driver and the IMPLEMENT step read the same text you validated.
 2. **`invariants_markdown`** — the full text of the invariants file. An invariant is a fact
-   about the *existing* code your plan depends on staying true while IMPLEMENT works. For each
-   one: an id (`INV-1`, `INV-2`, …), a **verbatim quote** — copied character-for-character, any
-   length, not limited to one line — and the `file:line` (or `file:start-end` for a multi-line
-   quote) that carries it. Quote only from files under `{{worktree}}`. Zero invariants is valid
-   only when the task adds wholly new ground with nothing existing to depend on — say so in
-   `plan_markdown` if that is the case, rather than inventing one to fill the section.
+   about the *existing* code your plan depends on staying true while IMPLEMENT works. Zero
+   invariants is valid only when the task adds wholly new ground with nothing existing to depend
+   on — say so in `plan_markdown` if that is the case, rather than inventing one to fill the
+   section.
+
+   **Invariant block format** — a script parses this file (`orchestrator/invariants.js`), not a
+   human, so every invariant you list MUST be exactly this shape, one block per invariant, in
+   any surrounding prose you like (headings, an intro paragraph — only the blocks themselves are
+   parsed):
+
+   ```
+   ## INV-1
+   File: relative/path/to/file.ts:123
+   >>> QUOTE
+   the exact text, copied character-for-character, any length, any number of lines
+   >>> END QUOTE
+   ```
+
+   - The header line is exactly `## INV-<n>` — two `#`, one space, nothing else on the line.
+   - The next non-blank line is exactly `File: <path>:<line>` or `File: <path>:<start>-<end>` for
+     a quote spanning several lines. `<path>` is **relative to `{{worktree}}`** (never absolute,
+     never `../`-escaping it — a citation outside the worktree can never be read back and is
+     wasted).
+   - The quote sits between a line that is exactly `>>> QUOTE` and the next line that is exactly
+     `>>> END QUOTE`, copied byte-for-byte — no trimming, no re-indenting, no summarizing. This
+     is what lets the quote safely contain its own ``` backtick fences ``` or blank lines: unlike
+     a triple-backtick fence, `>>> QUOTE` / `>>> END QUOTE` never collide with code the quote
+     itself might contain.
+   - One invariant, one block. Do not nest, do not combine two facts into one quote.
 3. **Runnable check commands** — not prose, not "run the tests": commands the driver or the
    IMPLEMENT step execute verbatim and read an **exit code** from, never printed text. In this
    order:
@@ -79,9 +102,18 @@ you are drafting the file content, not a description of it.
   starts.
 - Never invent a file path or a citation. If a file you expected to cite is not where you
   expected, re-check with your read tools before writing it into the plan or an invariant.
-- Every invariant quote must be exact. The check applied to it downstream is a substring test
-  after whitespace normalization, not a paraphrase test — a wrong quote fails silently, at the
-  worst possible time, mid-IMPLEMENT.
+- Every invariant quote must be exact. The check applied to it downstream is real (action 1.8):
+  right after you hand this off, the driver resolves every invariant against `{{worktree}}` as a
+  baseline — an exact substring of the cited file's contents, or (falling back) the same test
+  after collapsing whitespace runs on both sides, so reflow/indentation drift alone never trips
+  it. **An invariant that fails to resolve at this point is not fatal to your plan** — it is
+  logged and simply excluded from what CHECK will later verify, so a wrong quote costs nothing
+  worse than that one invariant not being checked. What DOES matter: CHECK (after IMPLEMENT)
+  re-resolves every invariant THIS baseline did resolve, and fails the task — one whole
+  DIAGNOSE/IMPLEMENT cycle — if any of them no longer does. So a quote copied loosely, that
+  happens to still resolve today, is worse than an honest miss: it puts a fact on record that
+  IMPLEMENT is now bound to preserve. Quote only what you have actually verified in the file,
+  never a paraphrase and never a guess.
 - A command whose exit code is the thing being judged is never piped into `tail`/`head`/`grep`
   and never backgrounded with a trailing `&` — both destroy the code the driver needs to read.
   If a command's output must be trimmed, redirect to a file and let the reader filter the file,

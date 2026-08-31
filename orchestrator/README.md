@@ -240,6 +240,11 @@ Each prompt's `{{placeholder}}` values come from one of two places
   memory for the same run's VALIDATE to read directly; `task-values.js` prefers the in-memory
   value and falls back to the journaled record so a daemon restart between PUSH_PR and VALIDATE
   (`ctx.task` rebuilt from the task file, the in-memory field gone) doesn't silently drop it.
+- `handlePlan` also journals a `{state: 'PLAN', event: 'invariants-baseline', ...}` record right
+  after writing `invariants-<issue>.md` (action 1.8 — see "Invariant substring check" under "Real
+  scripted steps" below for the full contract); it feeds no prompt placeholder, only
+  `steps/scripted.js`'s `realCheck`, which reads it back via `task-values.js`'s
+  `lastInvariantsBaseline`.
 - `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are fixed
   `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions. Action 1.3 made these real:
   `steps/scripted.js`'s `prepareJudgeInputs` generates `diff.patch` (and, when the bench has a
@@ -414,9 +419,78 @@ or 5 → PARKED `claim-rate-limited`; 6 → PARKED `claim-finished-worktree`; an
 failure parks `worktree-npm-ci-failed` — none of these leave a claimed card behind, since the
 claim is always the last spawn.
 
-**CHECK** runs `npm run typecheck`, `npm run lint`, `npm run coverage:changed` in that order in
-the worktree; the first non-zero exit journals `{event: 'check-failed', alias}` naming which one
-and returns `'DIAGNOSE'` (never PARKED) — the later aliases never run once one has failed.
+**CHECK** runs the invariant substring check FIRST, then `npm run typecheck`, `npm run lint`,
+`npm run coverage:changed` in that order in the worktree; the first non-zero exit (or, for the
+invariant check, the first non-empty `broken` list) journals `{event: 'check-failed', alias}`
+naming which one and returns `'DIAGNOSE'` (never PARKED) — the later aliases never run once one
+has failed. See "Invariant substring check (action 1.8)" below for the invariant check itself,
+run by `steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop.
+
+### Invariant substring check (action 1.8)
+
+`doc/state-machine-spec.md:49` has always promised CHECK runs an "invariant substring check", and
+`prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
+until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
+`fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
+(steps/scripted.js) rather than duplicated between them.
+
+- **Format.** PLAN's `invariants_markdown` (prompts/plan.md's own "Invariant block format"
+  section) is now a precise, parseable per-invariant block:
+
+  ```
+  ## INV-1
+  File: relative/path/to/file.ts:123
+  >>> QUOTE
+  the exact text, byte-for-byte, any length, any number of lines
+  >>> END QUOTE
+  ```
+
+  `parseInvariantsMarkdown` extracts `{id, file, lineSpec, quote}` per block; a block missing its
+  `File:` line or its `>>> END QUOTE` marker is skipped and named in `issues`, never thrown — the
+  rest of the file still parses. Zero recognized blocks is valid (no invariants), not an error.
+  The `>>> QUOTE` / `>>> END QUOTE` delimiter (rather than a triple-backtick fence) is deliberate:
+  a quote is free to contain its own ``` backtick sequences ``` without truncating early.
+- **Matching (`resolveInvariant`).** Two modes, in order: (1) an exact substring of the cited
+  file's contents; (2) a whitespace-normalized fallback (collapse whitespace runs on both sides)
+  so indentation/reflow drift alone never produces a false regression. A cited path outside the
+  worktree (absolute, `../`-escaping, or reached through a symlink that lives inside the worktree
+  but points outside it) is never read — `isInsideWorktree` rejects it before the file is opened,
+  lexically first and then against both sides' `realpathSync` so a symlink escape cannot slip
+  past `path.resolve`'s purely lexical view, and the invariant is reported `unresolved, reason:
+  'outside-worktree'`. The open itself is `O_NONBLOCK`: a FIFO at a cited path would otherwise
+  block `fs.openSync` forever, freezing the event loop and `callWithDeadline`'s own timer with
+  it — a daemon hang in CHECK with no park. The cited
+  file itself is read through a bounded fd read (`readCapped`, capped at 2 MiB) rather than
+  `fs.readFileSync` + slice, so a large file cannot blow up memory regardless of its real size.
+- **PLAN-time baseline (`buildBaseline`).** `handlePlan`, in real mode only, calls this
+  immediately after writing `invariants-<issue>.md`, resolves every invariant against the
+  freshly created worktree, and journals the return value verbatim as `{state: 'PLAN', event:
+  'invariants-baseline', parseError, invariants: [{id, file, resolved, mode}], issues}` —
+  `task-values.js`'s `lastInvariantsBaseline` is the reader side. An invariant that does not
+  resolve here is **never a park and never a reason to re-run PLAN** — it is simply excluded
+  from what CHECK will later verify (only `resolved: true` entries are ever checked again), which
+  is the entire point: a PLAN-time misquote or an uncitable line must not cost a real
+  DIAGNOSE/IMPLEMENT remediation cycle. Zero invariants journals an empty array, not an error.
+  Shadow mode and `--dry-run` never call this at all (`isRealMode(ctx)` gates it, same as every
+  other real-only branch in `handlePlan`/`handleImplement`).
+- **CHECK-time verification (`checkRegressions`, via `realCheck`'s own `runInvariantCheck`).**
+  Re-reads the SAME `invariants-<issue>.md` file (never rewritten after PLAN — no need to
+  duplicate quote text into the journal a second time) and re-resolves every id the baseline
+  marked `resolved: true`, against the worktree as CHECK now finds it. An id that resolved at
+  PLAN and does not resolve now — cited file deleted, or the quote no longer present, in either
+  match mode — is the one and only regression this reports; whitespace drift alone (exact at
+  PLAN, only normalized-matching at CHECK) is explicitly NOT one. Every visit journals `{state:
+  'CHECK', event: 'invariants-checked', parseError, checkedIds, broken}`; a non-empty `broken`
+  journals `{event: 'check-failed', alias: 'invariants', broken}` and returns `'DIAGNOSE'` — never
+  PARKED, same as every other CHECK failure. A missing/unparsable invariants file, or no baseline
+  event at all (PLAN never ran one — a task older than this action, or one whose PLAN pass had no
+  worktree yet), is fail-open: journalled, `broken` stays `[]`, CHECK is never failed over it.
+- **Ordering.** The invariant check runs BEFORE `CHECK_ALIASES` (typecheck/lint/coverage:changed)
+  — deliberately: it is pure `fs` (this module never spawns anything), while every alias below it
+  spawns an `npm run` subprocess, so there is no reason to pay for three spawns before a check
+  that is effectively free. It is also the most surgical signal DIAGNOSE can receive: it names
+  the exact id and file a specific fact regressed in, where a bare typecheck/lint failure is
+  usually already self-explanatory from the tool's own output and gains nothing from going first.
 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
 <file>`, never the message inline on argv) and the PR body — `Closes #<issue>` plus a

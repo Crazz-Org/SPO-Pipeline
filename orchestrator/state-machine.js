@@ -24,6 +24,7 @@ const path = require('path');
 
 const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
 const { scratchDir } = require('./task-values');
+const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
 const { LockLostError } = require('./lock');
@@ -221,6 +222,40 @@ async function handlePlan(ctx) {
   fs.writeFileSync(planPath, planMarkdown);
   fs.writeFileSync(invariantsPath, invariantsMarkdown);
   appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath });
+
+  // Action 1.8: the PLAN-time invariant baseline. Real mode only (shadow/dry-run never spawn a
+  // real worktree for buildBaseline to resolve against, and doc/state-machine-spec.md's
+  // invariant substring check is itself a real-mode-only CHECK behaviour -- see realCheck).
+  // Every invariant is resolved against the just-created worktree right now, while it still
+  // reflects nothing but PLAN's own read of it; an invariant that fails to resolve here is a
+  // journalled warning, never a park -- see orchestrator/invariants.js's own header for why
+  // (a misquote must not cost a real remediation cycle). The baseline this produces is the ONLY
+  // thing realCheck (steps/scripted.js) is allowed to fail an invariant on: an id that resolved
+  // here and no longer does at CHECK time.
+  if (isRealMode(ctx) && ctx.task.worktreePath) {
+    const baseline = buildBaseline(ctx.task.worktreePath, invariantsPath);
+    appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+    // Canary against a silent parser/prompt divergence. The whole feature fails OPEN: if the
+    // parser stops recognising what plan.md tells the model to emit, every invariant lands
+    // unresolved, the baseline is empty, CHECK verifies nothing -- and the pipeline looks
+    // perfectly healthy. That is exactly how the CRLF bug in the first cut of invariants.js
+    // behaved. PLAN already declares invariant_ids in its own payload, so a declared-vs-parsed
+    // mismatch is free to detect and is the one signal that would surface such a regression.
+    // Journalled, deliberately never a park: PLAN's prose and its id list disagreeing is not
+    // grounds to fail a card, it is grounds to go look at the parser.
+    const declaredIds = Array.isArray(payload.invariant_ids) ? payload.invariant_ids : [];
+    const parsedIds = (baseline.invariants || []).map((inv) => inv.id);
+    if (declaredIds.length !== parsedIds.length) {
+      appendEvent(ctx.taskDir, 'PLAN', 'invariants-declared-parsed-mismatch', {
+        declared: declaredIds.length,
+        parsed: parsedIds.length,
+        declaredIds,
+        parsedIds,
+        issues: baseline.issues || [],
+      });
+    }
+  }
 
   // Re-journal PLAN's 'result' with plan_path/invariants_path added -- task-values.js's
   // lastResultPayload reads the *last* PLAN 'result' event for IMPLEMENT/VALIDATE's own

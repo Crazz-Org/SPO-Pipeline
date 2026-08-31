@@ -74,15 +74,18 @@ diagnosis:  {{diagnosis}}
    as the shell's fork, always 0. Redirect to a file and read the status instead. Re-run a
    command after you fix what it flagged — `all_green: true` is only honest if every command in
    `tests_run` exited 0 on its **last** run, not its first.
-6. **Self-check the invariants.** For every id in `{{invariant_ids}}`: read the quote yourself
-   from `{{invariants_path}}` — it is never given to you inline — normalize it (strip comment
-   markers `#`, `**`, a leading `-` or `*`; collapse all whitespace, line breaks included, to
-   single spaces) and check whether that normalized text is still a substring of the same
-   normalization applied to the file at the cited `file:line`/`file:start-end`, **as it now
-   stands** — never the diff. Present → `HELD`. Absent, or the words changed → `CHANGED`. A
+6. **Self-check the invariants.** For every id in `{{invariant_ids}}`: find its block in
+   `{{invariants_path}}` — it is never given to you inline — a `## INV-<n>` header, a `File:
+   <path>:<line>` (or `:<start>-<end>`) line, then the verbatim quote between a `>>> QUOTE` line
+   and a `>>> END QUOTE` line. Take that quote exactly as written, then check it is still present
+   in the cited file **as it now stands** (never the diff) — as an exact substring first; if that
+   fails, collapse whitespace runs (line breaks included) to single spaces on both the quote and
+   the file and check again. Present, either way → `HELD`. Absent under both → `CHANGED`. A
    `CHANGED` row is not a defect you fix by rewriting the comment back into agreement — it means
    your change touched ground the plan told you not to; report it and let the driver decide, do
-   not launder it into `HELD`.
+   not launder it into `HELD`. This mirrors, but does not replace, the mechanical check CHECK
+   itself runs after you: yours is a heads-up so you can react before handing off; CHECK's is
+   what actually decides DIAGNOSE.
 7. **List every file you actually changed**, read from `git status --porcelain` (or the
    equivalent) inside `{{worktree}}` — never from memory, never a file you merely opened.
 

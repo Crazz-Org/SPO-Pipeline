@@ -35,7 +35,8 @@ const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { moveCard } = require('../board');
-const { diffPath, gateLogPath, gateReportPath } = require('../task-values');
+const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline } = require('../task-values');
+const { checkRegressions } = require('../invariants');
 
 function lastLines(text, n = 20) {
   if (!text) return '';
@@ -579,13 +580,53 @@ async function realWorktree(ctx, deps = {}) {
 
 // ---- CHECK ---------------------------------------------------------------------------------
 //
-// typecheck, lint, coverage:changed, in that order, in the worktree; the first non-zero exit
-// names its own alias and goes to DIAGNOSE (never PARKED -- matches the shadow-mode contract).
+// Action 1.8: the invariant substring check runs FIRST, before typecheck/lint/coverage:changed --
+// deliberately, for two reasons. (1) It is pure `fs` reads (orchestrator/invariants.js -- no
+// spawning at all), while every CHECK_ALIASES entry spawns an `npm run` subprocess; there is no
+// reason to pay for three subprocess spawns before a free check that can already fail the visit.
+// (2) A broken invariant is the single most surgical, most actionable signal this state can hand
+// DIAGNOSE: it names the exact fact ("id X, cited in file Y") IMPLEMENT was told to preserve and
+// broke, whereas a bare typecheck/lint failure is often already self-explanatory from the tool's
+// own output and gains nothing from running first. Then typecheck, lint, coverage:changed, same
+// order as before this action; the first non-zero exit names its own alias and goes to DIAGNOSE
+// (never PARKED -- matches the shadow-mode contract, and doc/state-machine-spec.md's own "CHECK
+// Failure -> DIAGNOSE, never PARKED").
 const CHECK_ALIASES = ['typecheck', 'lint', 'coverage:changed'];
+
+// Re-resolves the PLAN-time invariant baseline (if any -- see task-values.js's
+// lastInvariantsBaseline) against the worktree as CHECK finds it, journals the outcome as
+// 'invariants-checked', and returns the list of broken ids (empty when nothing regressed, when
+// there was no baseline at all, or when the baseline/invariants file itself could not be read --
+// fail-open on parse, per orchestrator/invariants.js's own contract).
+function runInvariantCheck(ctx, deps, worktreePath) {
+  const planPayload = lastResultPayload(ctx.taskDir, 'PLAN') || {};
+  const invariantsPath = planPayload.invariants_path;
+  const baselineEvent = lastInvariantsBaseline(ctx.taskDir);
+  if (!invariantsPath || !baselineEvent) return [];
+
+  const { parseError, broken, checkedIds } = checkRegressions(
+    worktreePath,
+    invariantsPath,
+    baselineEvent.invariants || []
+  );
+  appendEvent(ctx.taskDir, 'CHECK', 'invariants-checked', {
+    parseError: parseError || null,
+    checkedIds,
+    broken,
+  });
+  return broken;
+}
 
 async function realCheck(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
   moveCard(ctx, deps, 'CHECK'); // kanban piloting: "Checks & PR" -- covers PUSH_PR too, no separate move there
+
+  const broken = runInvariantCheck(ctx, deps, worktreePath);
+  if (broken.length > 0) {
+    appendEvent(ctx.taskDir, 'CHECK', 'check-failed', { alias: 'invariants', broken });
+    return 'DIAGNOSE';
+  }
+
   for (const alias of CHECK_ALIASES) {
     const r = spawnStep(ctx, deps, 'CHECK', 'npm', ['run', alias], { cwd: worktreePath });
     if (r.exit !== 0) {

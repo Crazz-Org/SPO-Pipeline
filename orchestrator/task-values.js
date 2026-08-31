@@ -116,6 +116,16 @@ function lastJournaledCitations(taskDir) {
   return event ? event.citations : null;
 }
 
+// The most recent {ts, state: 'PLAN', event: 'invariants-baseline', parseError, invariants,
+// issues} record handlePlan journaled (action 1.8, orchestrator/invariants.js's buildBaseline),
+// or null if PLAN never produced one -- a shadow/dry-run task never calls buildBaseline at all
+// (it runs only under isRealMode(ctx)), and neither does a task whose PLAN predates this action.
+// steps/scripted.js's realCheck is the only reader: null means "nothing to verify", never a
+// reason to fail CHECK.
+function lastInvariantsBaseline(taskDir) {
+  return lastMatchingEvent(taskDir, (e) => e.state === 'PLAN' && e.event === 'invariants-baseline');
+}
+
 // The most recent DIAGNOSE finding and/or VALIDATE REJECT, as an IMPLEMENT-facing summary, or a
 // fixed "none yet" string when neither has ever happened for this task (never undefined --
 // fillPromptTemplate treats undefined as a missing placeholder, and IMPLEMENT's very first
@@ -259,6 +269,7 @@ module.exports = {
   lastResultPayload,
   lastResultEvent,
   lastJournaledCitations,
+  lastInvariantsBaseline,
   scratchDir,
   diffPath,
   gateLogPath,

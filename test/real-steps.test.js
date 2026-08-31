@@ -27,6 +27,7 @@ const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
+const { buildBaseline } = require('../orchestrator/invariants');
 const { writePoolDir } = require('./helpers');
 
 function mkTmp(prefix) {
@@ -583,6 +584,195 @@ test('realCheck: all three pass -> PUSH_PR', async () => {
   assert.equal(calls.length, 4);
   assert.deepEqual(calls[0], ['run', 'board:move', '--', '72', 'Checks & PR']);
   assert.deepEqual(calls.slice(1).map((a) => a[1]), ['typecheck', 'lint', 'coverage:changed']);
+});
+
+// ---- realCheck: invariant substring check (action 1.8) ---------------------------------------
+//
+// Same shape a real PLAN pass would have left behind: a journalled PLAN 'result' event carrying
+// invariants_path, and a journalled 'invariants-baseline' event carrying buildBaseline's own
+// return value (orchestrator/invariants.js) -- realCheck's runInvariantCheck reads both back
+// exactly the way task-values.js's lastResultPayload/lastInvariantsBaseline do in production.
+function invariantsBlock(id, fileSpec, quoteLines) {
+  return [`## ${id}`, `File: ${fileSpec}`, '>>> QUOTE', ...quoteLines, '>>> END QUOTE', ''].join('\n');
+}
+
+function seedPlanBaseline(ctx, worktreePath, invariantsMarkdown) {
+  const invariantsPath = path.join(ctx.taskDir, 'scratch', 'invariants-1.md');
+  fs.mkdirSync(path.dirname(invariantsPath), { recursive: true });
+  fs.writeFileSync(invariantsPath, invariantsMarkdown);
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { invariants_path: invariantsPath } });
+  const baseline = buildBaseline(worktreePath, invariantsPath);
+  appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+  return { invariantsPath, baseline };
+}
+
+test('realCheck: a broken invariant (quote no longer present) fails CHECK before any alias spawns, and returns DIAGNOSE', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-inv-broken-wt-');
+  const filePath = path.join(worktreePath, 'foo.js');
+  fs.writeFileSync(filePath, 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-check-inv1', kind: 'card', issue: 80, worktreePath };
+  const ctx = testCtx({ id: 'card-check-inv1', task, config });
+
+  seedPlanBaseline(ctx, worktreePath, invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']));
+
+  // IMPLEMENT rewrote the file after PLAN's baseline was built -- the quote is gone.
+  fs.writeFileSync(filePath, 'function foo() {\n  return 99;\n}\n');
+
+  const calls = [];
+  const deps = { spawnSync: (command, args) => { calls.push(args); return ok(''); } };
+
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'DIAGNOSE');
+  // Only the kanban board:move spawn happens -- typecheck/lint/coverage never run once the
+  // (spawn-free) invariant check has already failed the visit.
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], ['run', 'board:move', '--', '80', 'Checks & PR']);
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const checked = journal.find((e) => e.event === 'invariants-checked');
+  assert.ok(checked);
+  assert.deepEqual(checked.broken, [{ id: 'INV-1', file: 'foo.js' }]);
+  const failed = journal.find((e) => e.event === 'check-failed' && e.alias === 'invariants');
+  assert.ok(failed);
+  assert.deepEqual(failed.broken, [{ id: 'INV-1', file: 'foo.js' }]);
+});
+
+test('realCheck: an invariant baseline that still resolves does not block CHECK_ALIASES -- reaches PUSH_PR', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-inv-ok-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-check-inv2', kind: 'card', issue: 81, worktreePath };
+  const ctx = testCtx({ id: 'card-check-inv2', task, config });
+
+  seedPlanBaseline(ctx, worktreePath, invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']));
+
+  const calls = [];
+  const deps = { spawnSync: (command, args) => { calls.push(args); return ok(''); } };
+
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'PUSH_PR');
+  // board:move, typecheck, lint, coverage:changed -- the invariant check ran (pure fs, no spawn)
+  // and passed, so the alias loop still runs in full.
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls.slice(1).map((a) => a[1]), ['typecheck', 'lint', 'coverage:changed']);
+});
+
+test('realCheck: an invariant that never resolved at PLAN stays excluded -- CHECK passes even though it still does not resolve', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-inv-excluded-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-check-inv3', kind: 'card', issue: 82, worktreePath };
+  const ctx = testCtx({ id: 'card-check-inv3', task, config });
+
+  seedPlanBaseline(ctx, worktreePath, invariantsBlock('INV-1', 'foo.js:99', ['this text was never in foo.js']));
+
+  const deps = { spawnSync: () => ok('') };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'PUSH_PR');
+});
+
+test('realCheck: no PLAN baseline at all (task predates action 1.8, or PLAN never journaled one) -- invariant check is a silent no-op', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-inv-nobaseline-wt-');
+  const task = { id: 'card-check-inv4', kind: 'card', issue: 83, worktreePath };
+  const ctx = testCtx({ id: 'card-check-inv4', task, config });
+
+  const calls = [];
+  const deps = { spawnSync: (command, args) => { calls.push(args); return ok(''); } };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'PUSH_PR');
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(journal.some((e) => e.event === 'invariants-checked'), false);
+});
+
+test('realCheck: the invariants file itself missing/unparsable at CHECK time -> journalled, CHECK still passes (fail-open on parse)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-inv-fileGone-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-check-inv5', kind: 'card', issue: 84, worktreePath };
+  const ctx = testCtx({ id: 'card-check-inv5', task, config });
+
+  const { invariantsPath } = seedPlanBaseline(
+    ctx,
+    worktreePath,
+    invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}'])
+  );
+  // Simulate the invariants file itself having vanished by CHECK time (it never should, in
+  // production, but checkRegressions must not treat this as a regression -- "we cannot know, so
+  // we do not accuse").
+  fs.unlinkSync(invariantsPath);
+
+  const deps = { spawnSync: (command, args) => ok('') };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'PUSH_PR');
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const checked = journal.find((e) => e.event === 'invariants-checked');
+  assert.ok(checked);
+  assert.equal(checked.parseError, 'invariants-file-unreadable');
+  assert.deepEqual(checked.broken, []);
+});
+
+test('regression: --dry-run CHECK never runs the invariant check either', async () => {
+  const taskDir = mkTmp('spo-check-inv-dryrun-taskdir-');
+  const task = { id: 'card-inv-dryrun', kind: 'card', issue: 85, worktreePath: mkTmp('spo-check-inv-dryrun-wt-') };
+  const ctx = buildCtx('card-inv-dryrun', task, taskDir, { shadowMode: false, dryRun: true });
+
+  appendEvent(taskDir, 'PLAN', 'invariants-baseline', {
+    parseError: null,
+    invariants: [{ id: 'INV-1', file: 'foo.js', resolved: true, mode: 'exact' }],
+  });
+
+  const next = await HANDLERS.CHECK(ctx);
+  assert.equal(next, 'PUSH_PR'); // --dry-run's own fixture-free "assumed success", unchanged
+
+  const journal = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(journal.some((e) => e.event === 'invariants-checked'), false);
+});
+
+test('regression: shadow-mode CHECK never runs the invariant check, even if a PLAN invariants-baseline event exists in the journal', async () => {
+  const taskDir = mkTmp('spo-check-inv-shadow-taskdir-');
+  const task = { id: 'synth-inv-shadow', kind: 'synthetic' };
+  const ctx = buildCtx('synth-inv-shadow', task, taskDir, { shadowMode: true, dryRun: false });
+
+  // Hand-journalled as if a real PLAN had run earlier for this task id -- shadow mode must
+  // never read it back at all.
+  appendEvent(taskDir, 'PLAN', 'invariants-baseline', {
+    parseError: null,
+    invariants: [{ id: 'INV-1', file: 'foo.js', resolved: true, mode: 'exact' }],
+  });
+
+  const next = await HANDLERS.CHECK(ctx);
+  assert.equal(next, 'PUSH_PR'); // shadow's own default-exit-0 fixture path, unchanged
+
+  const journal = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(journal.some((e) => e.event === 'invariants-checked'), false);
 });
 
 // ---- PUSH_PR --------------------------------------------------------------------------------
