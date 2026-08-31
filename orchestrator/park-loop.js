@@ -434,9 +434,50 @@ function abandonCleanup(deps, config, taskDir, id, task, state) {
     if (localBranchKept) {
       journal('abandon-cleanup-skipped', { step: 'remote-branch', branch, remoteSha, reason: 'local-branch-kept' });
     } else {
+      // (c) `localBranchKept === false` is not by itself proof that nothing is lost. Step 3 also
+      //     deletes a local tip vouched for ONLY by `localSha === remoteSha` -- pushed work that
+      //     origin/main does not contain. Deleting the remote copy of that is exactly card #455's
+      //     loss, reached through `abandon` instead of through a retry, and it would contradict
+      //     this function's own stated rule one block up. steps/scripted.js's rule 3 (action 4.6)
+      //     answers this by preserving before deleting; do the same here, so `retry` and `abandon`
+      //     cannot disagree about whether the pipeline destroys unmerged pushed commits.
+      //
+      //     A failed preservation SKIPS the delete rather than throwing: abandonCleanup's whole
+      //     contract is that no step throws and none of them can leave the card un-ABANDONED. A
+      //     leftover remote branch is a recorded, recoverable omission; a destroyed one is not.
+      let preservedRef = null;
+      const contained = runSync(
+        deps,
+        'git',
+        ['-C', productRepo, 'merge-base', '--is-ancestor', remoteSha, 'origin/main'],
+        {},
+        config
+      );
+      if (normalizeExit(contained) !== 0) {
+        const ref = `wip/${id}-${Date.now()}`;
+        const save = runSync(
+          deps,
+          'git',
+          ['-C', productRepo, 'push', 'origin', `${remoteSha}:refs/heads/${ref}`],
+          {},
+          config
+        );
+        if (normalizeExit(save) !== 0) {
+          journal('abandon-cleanup-skipped', {
+            step: 'remote-branch',
+            branch,
+            remoteSha,
+            reason: 'preserve-failed',
+            exit: normalizeExit(save),
+          });
+          return;
+        }
+        preservedRef = ref;
+        journal('abandon-remote-preserved', { branch, sha: remoteSha, ref });
+      }
       const del = runSync(deps, 'git', ['-C', productRepo, 'push', 'origin', '--delete', branch], {}, config);
       const exit = normalizeExit(del);
-      if (exit === 0) journal('abandon-remote-branch-deleted', { branch, sha: remoteSha });
+      if (exit === 0) journal('abandon-remote-branch-deleted', { branch, sha: remoteSha, preservedRef });
       else journal('abandon-cleanup-failed', { step: 'remote-branch', exit });
     }
   }

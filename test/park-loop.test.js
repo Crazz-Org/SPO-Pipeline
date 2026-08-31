@@ -510,6 +510,100 @@ test('unparkScan: a timed-out abandon-ack gh comment never throws -- the task is
 // ---- action 4.5: abandon cleanup (issue #443 -- ABANDONED used to leak the worktree, its local
 // AND remote claude-pipe/<id> branch, and the open PR forever) --------------------------------
 
+// Action 4.6's verification found `abandon` and `retry` disagreeing about the same commits.
+// `localBranchKept === false` is not proof that nothing is lost: step 3 also deletes a local tip
+// vouched for ONLY by `localSha === remoteSha` -- pushed work origin/main does not contain -- and
+// step 4 then deleted the remote copy of exactly that. Card #455's loss, reached through
+// `abandon` instead of a retry, and against this function's own "the maintainer abandoned the
+// CARD, not the commits" rule. Both these tests pin the fix.
+function abandonUnmergedDeps(calls, { branch, sha, preserveFails = false }) {
+  return {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 720, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') return ok('#issuecomment-721\n');
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      // The whole point of the fixture: neither tip is contained in origin/main, and the local
+      // tip equals the remote one -- so step 3 deletes the local branch as "vouched" and step 4
+      // is reached with localBranchKept === false over unmerged, pushed commits.
+      if (command === 'git' && args.includes('merge-base') && args.includes('--is-ancestor')) {
+        return { status: 1, stdout: '', stderr: '', signal: null };
+      }
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branch}`) return ok(`${sha}\n`);
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branch}`) return ok(`${sha}\n`);
+      if (command === 'git' && args.includes('branch') && args.includes('-D')) return ok('');
+      if (command === 'git' && args.includes('push') && args.some((a) => String(a).includes('refs/heads/wip/'))) {
+        return preserveFails ? { status: 1, stdout: '', stderr: 'rejected', signal: null } : ok('');
+      }
+      if (command === 'git' && args.includes('push') && args.includes('--delete')) return ok('');
+      return ok('');
+    },
+  };
+}
+
+test('unparkScan: abandon cleanup -- an unmerged remote tip is preserved to wip/<id>-<ts> BEFORE the remote branch is deleted', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-preserve-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-preserve-');
+  const worktreePath = mkTmp('spo-abandon-preserve-wt-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-941', { issue: 941, commentId: 700, worktreePath });
+  const branch = 'claude-pipe/card-941';
+  const sha = 'abc1230000000000000000000000000000000000';
+
+  const calls = [];
+  const before = Date.now();
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, abandonUnmergedDeps(calls, { branch, sha }));
+  const after = Date.now();
+
+  const journal = readJournal(taskDir);
+  const preserved = journal.find((e) => e.event === 'abandon-remote-preserved');
+  assert.ok(preserved, 'the unmerged remote tip must be preserved before it is deleted');
+  assert.equal(preserved.sha, sha);
+  // The timestamp is load-bearing, exactly as in steps/scripted.js's rule 3: a constant ref name
+  // would be rejected non-fast-forward on the second use and no later pass could clear it.
+  const stamp = /^wip\/card-941-(\d+)$/.exec(preserved.ref);
+  assert.ok(stamp, `ref must be wip/<id>-<ts>, got ${preserved.ref}`);
+  assert.ok(Number(stamp[1]) >= before && Number(stamp[1]) <= after);
+
+  const deleted = journal.find((e) => e.event === 'abandon-remote-branch-deleted');
+  assert.ok(deleted && deleted.preservedRef === preserved.ref, 'the delete records what saved the commits');
+
+  const pushIdx = calls.findIndex((c) => c.command === 'git' && c.args.some((a) => String(a).includes('refs/heads/wip/')));
+  const delIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete'));
+  assert.ok(pushIdx >= 0 && delIdx >= 0 && pushIdx < delIdx, 'preserve must precede the delete');
+  assert.deepEqual(calls[pushIdx].args, ['-C', '/fake/product', 'push', 'origin', `${sha}:refs/heads/${preserved.ref}`]);
+});
+
+test('unparkScan: abandon cleanup -- a failed preservation SKIPS the remote delete and never throws', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-preserve-fail-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-preserve-fail-');
+  const worktreePath = mkTmp('spo-abandon-preserve-fail-wt-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-942', { issue: 942, commentId: 700, worktreePath });
+  const branch = 'claude-pipe/card-942';
+  const sha = 'def4560000000000000000000000000000000000';
+
+  const calls = [];
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, abandonUnmergedDeps(calls, { branch, sha, preserveFails: true }));
+
+  // The card is still terminal -- a cleanup failure may never leave it un-ABANDONED.
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'ABANDONED');
+
+  const journal = readJournal(taskDir);
+  const skipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'remote-branch');
+  assert.ok(skipped && skipped.reason === 'preserve-failed');
+  assert.ok(!journal.some((e) => e.event === 'abandon-remote-branch-deleted'));
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete')),
+    'nothing may be deleted once the attempt to save it failed'
+  );
+});
+
 test('unparkScan: abandon cleanup -- prNumber + clean worktree + branch merged into origin/main closes the PR BEFORE deleting the remote branch, journals all four cleanup events', async () => {
   const queueDir = mkTmp('spo-unpark-queue-abandon-cleanup-');
   const journalRoot = mkTmp('spo-unpark-journal-abandon-cleanup-');
