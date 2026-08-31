@@ -513,6 +513,11 @@ test('realWorktree leftover sweep: a pushed remote branch leftover (no local bra
       if (args.includes('rev-parse') && args.includes(`refs/remotes/origin/${branch}`)) return ok(`${remoteSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
       if (args.includes('board:take')) return ok('claimed\n');
+      // Action 4.6: rule 3 now checks for an open PR on the branch before deleting it (see
+      // sweepWorktreeLeftovers). This test is about the delete-before-add ordering, not PR
+      // safety (covered by test/leftover-remote-pr.test.js) -- an empty list keeps that lookup a
+      // clean "no PR", same as it would be with no `gh` calls at all before this action.
+      if (command === 'gh' && args.includes('pr') && args.includes('list')) return ok('[]\n');
       return ok('');
     },
   };

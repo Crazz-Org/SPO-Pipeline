@@ -487,10 +487,16 @@ function worktreeListPaths(porcelainOutput) {
 //      this run never produced and cannot vouch for -- parks branch-unmerged-leftover rather
 //      than guess.
 //   3. Remote branch leftover (origin/claude-pipe/<id>, checked against the fetch this step
-//      already ran): deleted with `push origin --delete`. This is always a prior, superseded
-//      attempt in the pipeline's own namespace, regenerated fresh every pass -- leaving it makes
-//      this attempt's own `push -u origin <branch>` (PUSH_PR) non-fast-forward. If a PR was open
-//      from it, deleting the branch closes that PR; PUSH_PR opens a fresh one on the retry. This
+//      already ran): this is always a prior, superseded attempt in the pipeline's own namespace,
+//      regenerated fresh every pass -- leaving it makes this attempt's own `push -u origin
+//      <branch>` (PUSH_PR) non-fast-forward. Unlike step 2, this rule used to delete on nothing
+//      but "the ref exists", with none of step 2's safety analysis -- action 4.6, card #455: a
+//      remote delete auto-closes any open PR built from that branch as a GitHub side effect, and
+//      a retry silently closed a green, merge-ready PR this way (recovered only by a hand-made
+//      rescue tag). It now vouches for the tip or preserves it to a `wip/<id>-<ts>` ref, closes
+//      any open PR deliberately (`gh pr close`, journalled, never left to the delete's own side
+//      effect), and only then deletes -- see the inline comments right above the code for the
+//      full account, including why a PR *lookup* failure parks while "no PR found" does not. This
 //      step is independent of step 2 (it also runs when there was no local branch left to clean,
 //      or when step 2's own remote-tip lookup already answered the same question -- one call is
 //      redone here rather than threaded through, so each of the three rules stays independently
@@ -593,6 +599,25 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
   }
 
   // -- 3. remote branch -------------------------------------------------------------------------
+  // card #455, live: this rule used to be "the ref exists -> `push origin --delete`", full stop
+  // -- no safety analysis at all, unlike rule 2 immediately above (which will not touch a LOCAL
+  // branch without proving the tip is contained in origin/main, equal to its own remote tip, or
+  // covered by one of this task's own wip/<id>-* refs). That asymmetry is the bug: deleting a
+  // remote branch on GitHub auto-closes any open PR built from it, as a side effect of the
+  // delete rather than a decision anyone made. A retry silently closed a green, merge-ready PR
+  // and orphaned its commits; the work survived only because a `rescue/issue-455-run1` tag was
+  // made by hand after the fact. This rule is always the pipeline's own, disposable
+  // claude-pipe/<id> namespace (see the header above), so the fix is not "never delete" -- it is
+  // "vouch for or preserve the tip, and close any PR on purpose, before the delete can do either
+  // silently". This mirrors abandonCleanup's own PR-before-branch ordering (park-loop.js, action
+  // 4.5) for the exact same GitHub side effect, so the two cleanup paths agree.
+  //
+  // Do NOT park here instead of deleting when an open PR is found: that is the exact deadlock C2
+  // had to fix for rule 2's branch-unmerged-leftover on card #385 -- a maintainer's bare `retry`
+  // could only ever reproduce the same park, forever, because the park itself is what the retry
+  // hits first every time. Preserving the tip and closing the PR deliberately lets the retry
+  // actually make progress (a fresh branch/PR on the next PUSH_PR pass) while destroying nothing
+  // that wasn't first made durable or closed on the record.
   const remoteCheck = spawnStep(ctx, deps, 'WORKTREE', 'git', [
     '-C',
     productRepo,
@@ -603,9 +628,91 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
   ]);
   if (remoteCheck.exit === 0) {
     const remoteSha = remoteCheck.stdout.trim();
+
+    // -- 3a. Vouch for the tip, or preserve it, before anything destructive runs. ----------------
+    // If the tip is already an ancestor of origin/main, nothing can be lost by deleting the ref
+    // that points at it -- the commits live on in main regardless. Otherwise this remote tip
+    // carries work origin/main does not have, and it gets one chance to survive: pushed to this
+    // task's own `wip/<id>-<ts>` namespace, the exact shape preserveWorktreeWip already uses and
+    // rule 2 above already reads back when vouching for a local tip -- reusing it here rather
+    // than inventing a second shape keeps "durable save this pipeline made" a single, recognisable
+    // pattern across both rules. A failed preserve push (no network, origin refuses, ...) must
+    // block the delete entirely: unlike the dirty-worktree case in rule 1, there is no "park and
+    // wait" fallback that keeps the ref alive on its own -- so this throws rather than falling
+    // through, and deletes nothing.
+    let preservedRef = null;
+    const ancestorOfMain = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+      '-C',
+      productRepo,
+      'merge-base',
+      '--is-ancestor',
+      remoteSha,
+      'origin/main',
+    ]);
+    if (ancestorOfMain.exit !== 0) {
+      const wipRef = `wip/${ctx.id}-${Date.now()}`;
+      const preserve = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+        '-C',
+        productRepo,
+        'push',
+        'origin',
+        `${remoteSha}:refs/heads/${wipRef}`,
+      ]);
+      if (preserve.exit !== 0) {
+        throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-preserve', exit: preserve.exit });
+      }
+      preservedRef = wipRef;
+      appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-remote-preserved', { branch, sha: remoteSha, ref: wipRef });
+    }
+
+    // -- 3b. Close any open PR deliberately, before the delete can close it as an invisible side
+    // effect. Same argv shape and JSON-parse defensiveness as realPushPr's own `gh pr list` call
+    // further down this file (a non-zero exit or unparsable output there falls through to `gh pr
+    // create`; here there is nothing to fall through to, because the very thing being checked is
+    // "is it safe to delete" -- so the same two failure shapes must instead refuse the delete).
+    // We cannot prove there is no PR from a failed or unreadable lookup, and guessing "no PR" would
+    // let the delete close one invisibly -- exactly the bug this rule exists to fix -- so both
+    // shapes park rather than proceed.
+    const prList = spawnStep(ctx, deps, 'WORKTREE', 'gh', [
+      'pr',
+      'list',
+      '--repo',
+      ctx.config.ghRepo,
+      '--head',
+      branch,
+      '--state',
+      'open',
+      '--json',
+      'number',
+    ]);
+    let openPrs = null;
+    if (prList.exit === 0) {
+      try {
+        openPrs = JSON.parse(prList.stdout);
+      } catch {
+        openPrs = null;
+      }
+    }
+    if (!Array.isArray(openPrs)) {
+      appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-pr-lookup-failed', { branch, exit: prList.exit });
+      throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-pr-lookup', exit: prList.exit });
+    }
+    let closedPr = null;
+    if (openPrs.length > 0) {
+      const prNumber = openPrs[0].number;
+      const close = spawnStep(ctx, deps, 'WORKTREE', 'gh', ['pr', 'close', String(prNumber), '--repo', ctx.config.ghRepo]);
+      if (close.exit !== 0) {
+        throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-pr-close', prNumber, exit: close.exit });
+      }
+      closedPr = prNumber;
+      appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-pr-closed', { prNumber, branch });
+    }
+
+    // -- 3c. Only now, with the tip vouched-for-or-preserved and any PR closed on purpose, is the
+    // delete itself safe to run.
     const del = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'push', 'origin', '--delete', branch]);
     if (del.exit !== 0) throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-branch-delete', exit: del.exit });
-    appendEvent(ctx.taskDir, 'WORKTREE', 'remote-branch-cleaned', { branch, sha: remoteSha });
+    appendEvent(ctx.taskDir, 'WORKTREE', 'remote-branch-cleaned', { branch, sha: remoteSha, preservedRef, closedPr });
   }
 }
 

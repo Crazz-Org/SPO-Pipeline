@@ -163,6 +163,14 @@ test('runTask (real mode, card): a park AFTER the worktree exists moves the card
       if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
         return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/951#issuecomment-777\n');
       }
+      // Action 4.6: rule 3's remote-branch leftover check now also looks up any open PR on the
+      // branch before deleting it (see steps/scripted.js's sweepWorktreeLeftovers). This
+      // fixture's blanket rev-parse stub above makes the remote-branch-leftover check exit 0 same
+      // as before -- an empty PR list here keeps that lookup answering "no PR" instead of
+      // unparsable, so this test still exercises what it's actually about: a park that happens
+      // AFTER the worktree exists, not rule 3's own PR safety logic (covered separately in
+      // test/leftover-remote-pr.test.js).
+      if (command === 'gh' && args.includes('pr') && args.includes('list')) return ok('[]\n');
       return ok('');
     },
   };
