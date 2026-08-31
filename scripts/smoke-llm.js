@@ -3,7 +3,7 @@
 // smoke-llm.js -- the ONE sanctioned real invocation of the `claude` CLI for this build.
 // Run by hand only: `node scripts/smoke-llm.js <account-name>`. Never part of `node --test`
 // (see orchestrator/README.md "Real mode" / "Tests" for why it deliberately lives outside
-// test/, where bare `node --test` auto-discovers any .js file).
+// test/, where `node --test test/*.test.js` would otherwise pick it up).
 //
 // Exercises the real llm.js path end to end (argv construction, spawn, JSON parse, token
 // extraction) against a trivial, cheap call: haiku, low effort, a $0.10 budget cap (the CLI's

@@ -404,7 +404,7 @@ PLAN/IMPLEMENT/DIAGNOSE/VALIDATE call in a task, that is real, avoidable spend.
 `scripts/smoke-llm.js` makes exactly one real `claude` CLI call, through `invokeClaudeReal`,
 with a trivial haiku/low-effort/$0.10-budget prompt. It is **not** part of `node --test` —
 deliberately kept out of `test/` (any `.js` file directly under a directory literally named
-`test/` is auto-discovered by bare `node --test` on this Node version, even without a `.test.js`
+`test/` is auto-discovered by `node --test` on this Node version, even without a `.test.js`
 suffix, so the only way to keep it out of the automatic suite is to keep it out of that
 directory). It takes a required account-name argument, resolved from the pool (no ambient
 fallback, consistent with the account-pool decision above) — with none given, or an unknown
@@ -1577,14 +1577,22 @@ node scripts/usage-report.js > journal/usage-snapshot.json
 ## Tests
 
 ```bash
-node --test
+node --test test/*.test.js
 ```
 
-Run bare, with no arguments, from the repo root — `node --test test/` does **not** work on
-this machine (Node treats `test/` as a test-name filter rather than a directory to scan, and
-matches nothing: `not ok 1 - test` / `test failed`). The bare form auto-discovers every `.js`
-file directly under `test/`, no `.test.js` suffix required — which is also why
-`scripts/smoke-llm.js` (the one manual real `claude` call) deliberately lives outside `test/`.
+From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, so the
+moment a parked card holds a product worktree under `worktrees/issue-<n>/` it walks into
+SPO-WebClient's own TypeScript suites and reports thousands of foreign failures — 1926 tests /
+1168 failures with four parked cards, none of them this repo's. `worktrees/` is gitignored, so
+`git status` stays clean and the result reads as a catastrophic regression in code that is fine.
+
+`node --test test/` does not work either: Node treats `test/` as a test-name filter rather than a
+directory, matches nothing, and prints `not ok 1 - test`.
+
+The glob loses nothing — verified by diffing test names against bare discovery. The only
+difference is `test/helpers.js`, which bare discovery loads as a test file and counts as one
+passing "test" despite defining none. `scripts/smoke-llm.js` (the one manual real `claude` call)
+still deliberately lives outside `test/`, and now also outside the glob.
 
 All state-machine tests run in `--shadow` mode against `fs.mkdtempSync(os.tmpdir())`
 queue/journal directories — no shared state, no product-repo or bench interaction, no network.
