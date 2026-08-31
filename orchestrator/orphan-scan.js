@@ -118,6 +118,11 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}) {
     ctx.prNumber = state.prNumber || null;
     ctx.counters.diagnoseAttempts = state.diagnoseAttempts || 0;
     ctx.counters.validateRejects = state.validateRejects || 0;
+    // Action 4.3's CI_CHECKS -> IMPLEMENT retry counter, restored for the same reason as the two
+    // above: finalizePark below rewrites state.json through snapshot(), so a counter not restored
+    // here is not merely absent from the park report -- it is overwritten with 0, and the parked
+    // card's record then claims no CI retry ever happened when three may have.
+    ctx.counters.ciImplementRetries = state.ciImplementRetries || 0;
     ctx.counters.mainMoveUsed = !!state.mainMoveUsed;
 
     if (!isRealMode(ctx)) {

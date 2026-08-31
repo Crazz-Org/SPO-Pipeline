@@ -1187,9 +1187,14 @@ function pollSleep(deps, ms) {
   return sleepFn(ms);
 }
 
-// One `gh api .../check-runs` fetch for `headSha`, parsed down to [{name, conclusion}]. Goes
-// through spawnStep like every other real command here, so every poll in the loop below is
-// journalled the same way a single fetch always was.
+// One `gh api .../check-runs` fetch for `headSha`, parsed down to
+// [{name, conclusion, status, id, app}]. Goes through spawnStep like every other real command
+// here, so every poll in the loop below is journalled the same way a single fetch always was.
+// `id` and `app` were added by action 4.3: `id` is `check_run.id`, which -- for a GitHub Actions
+// run -- IS the job id (`gh api repos/<repo>/actions/jobs/<id>` below); `app` is the check's
+// reporting app slug (`r.app && r.app.slug`), which realCiChecks uses to gate that lookup to
+// genuine GitHub Actions check runs only (a third-party check's `id` means nothing to that
+// endpoint).
 function fetchCheckRuns(ctx, deps, config, headSha) {
   const checkRuns = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
     'api',
@@ -1205,7 +1210,13 @@ function fetchCheckRuns(ctx, deps, config, headSha) {
     }
   })();
   const runs = parsed && Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
-  return runs.map((r) => ({ name: r.name, conclusion: r.conclusion, status: r.status }));
+  return runs.map((r) => ({
+    name: r.name,
+    conclusion: r.conclusion,
+    status: r.status,
+    id: r.id,
+    app: r.app && r.app.slug,
+  }));
 }
 
 async function realCiChecks(ctx, deps = {}) {
@@ -1255,9 +1266,91 @@ async function realCiChecks(ctx, deps = {}) {
   const failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion));
 
   if (failing) {
-    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failing.name });
-    const outcome = classifyCiFailure(failing.name);
-    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failing.name });
+    // Action 4.3: `failing.name` is a JOB name (`typecheck + tests`, etc.), never one of the
+    // step names ci-cause-table.js actually classifies on -- see that file's header for the full
+    // measurement. Recover the step by treating `failing.id` as the GitHub Actions job id
+    // (verified on six real failed runs) and fetching that job's `steps[]`. Gate the lookup to
+    // genuine GitHub Actions runs with a numeric id: a third-party check (`app` anything else,
+    // e.g. a bot-reported check with no run behind it) or a shape this code has never seen
+    // degrades straight to `stepName = null` -- no lookup attempted -- rather than spawning a
+    // `gh api` call that cannot possibly resolve to a job.
+    let stepName = null;
+    if (failing.app === 'github-actions' && typeof failing.id === 'number') {
+      // This lookup is best-effort ONLY -- it exists to sharpen a DIAGNOSE-bound classification
+      // into an IMPLEMENT retry or a PARK for the handful of steps ci-cause-table.js recognises.
+      // It must never itself park or throw: a bad exit, an unparsable body, or a missing
+      // `steps` array just degrades to today's behaviour (classify on the check name alone,
+      // which -- see ci-cause-table.js's header -- always resolves to DIAGNOSE). Losing the step
+      // detail must never be the thing that breaks a card.
+      //
+      // THE TRY/CATCH IS LOAD-BEARING, not defensive decoration. spawnStep is NOT a plain
+      // "return a result" call: on a spawnSync timeout it retries once and then THROWS
+      // ParkSignal(`${commandClass}-timed-out`) -- `gh-timed-out` here, since classifyCommand
+      // gives `gh` a class default from config.commandTimeoutsMs. Without this catch, a slow or
+      // hung GitHub API on a call that exists purely to ENRICH the routing would park a card
+      // whose CI failure was perfectly routable to DIAGNOSE, and would do it BEFORE the
+      // `check-failed` event below is written -- so the journal would carry `gh-timed-out` and
+      // no record of the CI failure at all, blinding `spo`, the dashboard and the judges, which
+      // all read `check-failed`. That is the exact shape of bug this action exists to remove
+      // (a CI failure that cannot reach the right next state), reintroduced by its own fix.
+      // Any other throw (a spawnSync argument rejection, a deps stub blowing up) degrades the
+      // same way and for the same reason; it is journalled rather than swallowed, so a real
+      // programming error here is still visible in the ledger instead of merely silent.
+      let jobRes = null;
+      try {
+        jobRes = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
+          'api',
+          `repos/${config.ghRepo}/actions/jobs/${failing.id}`,
+        ]);
+      } catch (err) {
+        appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
+          check: failing.name,
+          exit: null,
+          error: (err && err.reason) || (err && err.message) || String(err),
+        });
+      }
+      if (jobRes) {
+        const jobParsed = (() => {
+          try {
+            return JSON.parse(jobRes.stdout);
+          } catch {
+            return null;
+          }
+        })();
+        // Exit code first, per CLAUDE.md's "verdict by exit code, never by reading `gh`'s text
+        // output": a non-zero `gh api` still prints a body (`{"message":"Not Found",...}`, and
+        // on some failures a stale/partial one), so a parse that happens to succeed must not be
+        // allowed to override the exit code's verdict.
+        if (jobRes.exit !== 0 || !jobParsed || !Array.isArray(jobParsed.steps)) {
+          appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
+            check: failing.name,
+            exit: jobRes.exit,
+          });
+        } else {
+          // FIRST non-success, non-skipped step, never the last: a failing step in ci.yml's
+          // `verify` job is the CAUSE, and the steps after it are its consequences (a `Lint`
+          // failure that leaves `Tests` failing too must route on `Lint` -> IMPLEMENT, not on
+          // `Tests` -> DIAGNOSE). `skipped` is not a failure at all -- GitHub marks every step
+          // after the failing one `skipped` when the job stops there.
+          const failedStep = jobParsed.steps.find(
+            (s) => s.conclusion !== 'success' && s.conclusion !== 'skipped'
+          );
+          stepName = failedStep ? failedStep.name : null;
+        }
+      }
+    }
+
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', {
+      check: failing.name,
+      step: stepName,
+      jobId: failing.id,
+    });
+    const outcome = classifyCiFailure(failing.name, stepName);
+    // `step` in the detail as well as `check`: the park comment is a maintainer's only pointer at
+    // WHICH ci.yml step demanded approval, and the shadow-fixture path emits the same two-field
+    // detail -- park-loop.js's countRepeatedParks fingerprints on JSON.stringify(detail), so the
+    // two paths' shapes have to agree or a repeated park stops being recognised as repeated.
+    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failing.name, step: stepName });
     return outcome.nextState;
   }
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-green', { headSha, checks });

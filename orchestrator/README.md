@@ -383,9 +383,10 @@ and kill the daemon; (5) a PLAN `result` event with a payload exists *and that p
 itself a failure* (`payload.ok !== false`) — a transport-failure payload (action 1.4) carries none
 of `plan_path`/`invariants_path`/`invariant_ids`/`check_commands`, so IMPLEMENT/VALIDATE would have
 nothing safe to read even though "a payload exists"; (6) the most recent `parked` event, if any, is
-not one of the six reasons that indict the plan itself (`plan-invalid`,
+not one of the seven reasons that indict the plan itself (`plan-invalid`,
 `plan-requires-protected-files`, `diagnose-duplicate-root-cause`, `diagnose-no-new-cause`,
-`diagnose-budget-exhausted`, `validate-reject-budget-exhausted`) — every other park reason (a
+`diagnose-budget-exhausted`, `validate-reject-budget-exhausted`, `ci-retry-budget-exhausted`) —
+every other park reason (a
 transport failure, a gate/CI failure, a lost claim, a merge conflict) is orthogonal to whether the
 plan was right, and does not block reuse. On reuse, PLAN journals `plan-reused`, re-journals
 `files-written` and `result` (the previous payload with `plan_path`/`invariants_path` stamped

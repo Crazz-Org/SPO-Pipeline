@@ -115,6 +115,15 @@ module.exports = {
   // VALIDATE (change-validator) REJECT budget: a separate counter from diagnoseBudget.
   validateRejectBudget: 3,
 
+  // CI_CHECKS -> IMPLEMENT retry budget: a separate counter from diagnoseBudget and
+  // validateRejectBudget (action 4.3). Before this action, ci-cause-table.js classified on the
+  // check NAME, which -- see that file's header -- was never one GitHub Actions actually
+  // reports, so CI_CHECKS -> IMPLEMENT had never once fired in production and this budget had
+  // nothing to guard. It ships in the same commit as the fix that makes the path reachable: a
+  // lint/coverage failure IMPLEMENT cannot fix would otherwise bounce CI_CHECKS <-> IMPLEMENT
+  // forever, free and unlogged, the moment the classification bug above is corrected.
+  ciRetryBudget: 3,
+
   // CI_CHECKS in-flight bounded wait (steps/scripted.js's realCiChecks) -- action 1.7. A
   // check-run with `conclusion: null` (still running) or an empty check_runs array (CI has not
   // even registered yet) is NOT green: the audit measured 8/12 real "green" events with `claude

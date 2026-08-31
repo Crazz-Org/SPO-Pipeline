@@ -224,7 +224,8 @@ async function handleWorktree(ctx) {
 // -- a plan invalid on its face, one that named protected files IMPLEMENT structurally cannot
 // touch, IMPLEMENT/DIAGNOSE finding the same root cause a second time (the plan sent it back to
 // the identical failure), DIAGNOSE burning its whole budget without ever clearing IMPLEMENT's
-// failure, or change-validator rejecting the built, gated-green change repeatedly. Reusing the
+// failure, change-validator rejecting the built, gated-green change repeatedly, or (action 4.3)
+// CI failing the same way three times running on retries IMPLEMENT could not clear. Reusing the
 // plan that produced any of these on a `retry` would spend a whole remediation cycle to arrive at
 // the identical park -- worse for the budget-exhaustion pair, since without them reuse -> DIAGNOSE
 // burns its budget -> park -> `retry` with `main` unmoved -> identical reuse -> identical cycle,
@@ -238,6 +239,11 @@ const PLAN_INVALIDATING_PARK_REASONS = new Set([
   'diagnose-no-new-cause',
   'diagnose-budget-exhausted',
   'validate-reject-budget-exhausted',
+  // action 4.3: same shape as the two budget exhaustions above, and added in the same commit that
+  // first makes CI_CHECKS -> IMPLEMENT reachable at all (the cause table had been keyed on step
+  // names GitHub never sends). A retry that reuses the plan sends the identical implementation
+  // back through the identical CI, which fails identically -- three more retries, identical park.
+  'ci-retry-budget-exhausted',
 ]);
 
 // Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
@@ -667,15 +673,49 @@ async function handleGate(ctx) {
 // CI_CHECKS does two things, in order, per state-machine-spec.md's (a)/(b):
 //  (a) map the one failing check name (if any) this visit;
 //  (b) only if (a) was green: the main-moved test, at most one re-merge-and-regate per task.
+//
+// Action 4.3 adds a third thing, after (a)/(b) have both resolved a next state: charge the
+// CI_CHECKS -> IMPLEMENT retry budget. Both branches below are restructured to resolve `next`
+// FIRST and return through the one shared chargeCiImplementRetry() call at the bottom, so the
+// real path (realCiChecks) and the shadow-fixture path (resolveShadowCiChecks) can never charge
+// this budget differently -- the same reason ci-cause-table.js is one shared module rather than
+// two copies.
 async function handleCiChecks(ctx) {
-  if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx, ctx.deps));
-  }
-  const failingCheck = ctx.fixture('ciChecks', null);
-  if (failingCheck) {
-    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failingCheck });
-    const outcome = classifyCiFailure(failingCheck);
-    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failingCheck });
+  const next = isRealMode(ctx)
+    ? await callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx, ctx.deps))
+    : resolveShadowCiChecks(ctx);
+  return chargeCiImplementRetry(ctx, next);
+}
+
+// The shadow-fixture half of CI_CHECKS, unchanged in behaviour from before action 4.3 except
+// that it now returns its resolved next state to handleCiChecks instead of returning directly
+// out of the handler -- see the restructuring note above.
+//
+// The `ciChecks` fixture takes two shapes, and both are load-bearing:
+//   - a bare string ('Something-unknown'), the legacy shape every pre-4.3 fixture uses. It names
+//     a failing CHECK with no step information, which is exactly what the real path sees when
+//     the job lookup degrades -- classifyCiFailure gets one argument, lands on its "no step
+//     info" branch, and resolves to DIAGNOSE for EVERY check name. That is a real behaviour
+//     change for those fixtures (a string 'Lint' used to route straight to IMPLEMENT) and a
+//     deliberate one: see ci-cause-table.js's header for why a real 'Lint' CHECK name could
+//     never have existed in the first place.
+//   - `{check, step}`, added by action 4.3. Shadow mode cannot make the `gh api
+//     .../actions/jobs/<id>` call the real path uses to recover the failing step, so without
+//     this shape shadow mode could no longer reach CI_CHECKS -> IMPLEMENT or the
+//     `pr-rules-needs-approval` park AT ALL -- the two routes this action makes reachable for
+//     the first time would have had zero end-to-end coverage in the only mode the daemon test
+//     suite can drive end to end. The fixture supplies the step the real path looks up; every
+//     line of routing, journalling and budgeting after that point is the shared code.
+function resolveShadowCiChecks(ctx) {
+  const raw = ctx.fixture('ciChecks', null);
+  if (raw) {
+    const failingCheck = typeof raw === 'string' ? raw : raw.check;
+    const failingStep = typeof raw === 'string' ? null : raw.step || null;
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failingCheck, step: failingStep });
+    const outcome = classifyCiFailure(failingCheck, failingStep);
+    if (outcome.kind === 'park') {
+      throw new ParkSignal(outcome.reason, { check: failingCheck, step: failingStep });
+    }
     return outcome.nextState;
   }
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-green', {});
@@ -692,6 +732,40 @@ async function handleCiChecks(ctx) {
   ctx.counters.mainMoveUsed = true;
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'main-moved-merge', {});
   return 'CHECK';
+}
+
+// Action 4.3: charge the CI_CHECKS -> IMPLEMENT retry budget. Out of CI_CHECKS, 'IMPLEMENT' can
+// only mean classifyCiFailure routed a failing check/step there -- VALIDATE, CHECK and DIAGNOSE
+// are all untouched below, on purpose, including the main-moved merge path (which must keep
+// working exactly as it does today).
+//
+// `check`/`step` for the journalled line are read back from the 'check-failed' event
+// realCiChecks/resolveShadowCiChecks just wrote (above), rather than threaded through as a
+// return value: every existing caller of realCiChecks (steps/scripted.js's own test suite)
+// depends on it returning a bare state-name string, and widening that return shape to carry
+// {check, step} everywhere would be a much bigger, unrelated blast radius for a value this one
+// call site needs. The 'check-failed' event was always written before 'IMPLEMENT' can be
+// returned (see ci-cause-table.js: IMPLEMENT only ever comes from a failing check having just
+// been classified), so it is always there to read.
+//
+// Budget itself mirrors handleDiagnose's diagnoseAttempts: the ledger line is written for EVERY
+// attempt, including the one that trips the budget, so ciImplementRetries and the journal can
+// never disagree about how many attempts actually happened.
+function chargeCiImplementRetry(ctx, next) {
+  if (next !== 'IMPLEMENT') return next;
+
+  const lastFailure = readJournalLines(ctx.taskDir)
+    .reverse()
+    .find((e) => e.state === 'CI_CHECKS' && e.event === 'check-failed');
+  const check = lastFailure ? lastFailure.check : null;
+  const step = lastFailure ? lastFailure.step : null;
+
+  const attempt = ++ctx.counters.ciImplementRetries;
+  appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-implement-retry', { attempt, check, step });
+  if (attempt > ctx.config.ciRetryBudget) {
+    throw new ParkSignal('ci-retry-budget-exhausted', { attempts: attempt, check, step });
+  }
+  return next;
 }
 
 // DIAGNOSE budget: at most config.diagnoseBudget attempts, and any root cause seen before
@@ -1008,6 +1082,10 @@ function buildCtx(id, task, taskDir, config) {
       seenRootCauses: new Set(),
       validateRejects: 0,
       mainMoveUsed: false,
+      // Action 4.3's CI_CHECKS -> IMPLEMENT retry budget -- see config.js's ciRetryBudget
+      // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
+      // than reusing one of them.
+      ciImplementRetries: 0,
     },
   };
 }
@@ -1020,6 +1098,7 @@ function snapshot(ctx, state) {
     state,
     diagnoseAttempts: ctx.counters.diagnoseAttempts,
     validateRejects: ctx.counters.validateRejects,
+    ciImplementRetries: ctx.counters.ciImplementRetries,
     mainMoveUsed: ctx.counters.mainMoveUsed,
     prNumber: ctx.prNumber || null,
     worktreePath: (ctx.task && ctx.task.worktreePath) || null,

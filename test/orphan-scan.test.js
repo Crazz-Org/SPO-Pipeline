@@ -265,12 +265,22 @@ test('orphanScan: state.json with no worktreePath (a task that died before WORKT
   );
 });
 
-test('orphanScan: prNumber and the three counters are still restored from state.json onto the reparked snapshot', async () => {
+// Not "carried over" but RESTORED: the repark rewrites state.json through snapshot(), so a
+// counter buildCtx zeroes and this scan does not restore is not merely missing from the park
+// report -- it is overwritten with 0, and the parked card's record then denies attempts that
+// really happened. Action 4.3's ciImplementRetries joined the list for exactly that reason.
+test('orphanScan: prNumber and ALL FOUR counters are still restored from state.json onto the reparked snapshot', async () => {
   const journalRoot = mkTmp('spo-orphan-journal-');
   const queueDir = mkTmp('spo-orphan-queue-');
   const taskDir = seedTask(journalRoot, 'issue-602', {
     state: 'VALIDATE',
-    extra: { prNumber: 42, diagnoseAttempts: 3, validateRejects: 2, mainMoveUsed: true },
+    extra: {
+      prNumber: 42,
+      diagnoseAttempts: 3,
+      validateRejects: 2,
+      ciImplementRetries: 2,
+      mainMoveUsed: true,
+    },
   });
 
   const config = testConfig();
@@ -282,6 +292,7 @@ test('orphanScan: prNumber and the three counters are still restored from state.
   assert.equal(state.prNumber, 42);
   assert.equal(state.diagnoseAttempts, 3);
   assert.equal(state.validateRejects, 2);
+  assert.equal(state.ciImplementRetries, 2);
   assert.equal(state.mainMoveUsed, true);
 });
 
