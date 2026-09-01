@@ -323,11 +323,16 @@ test('postParkComment: a timed-out gh issue comment never throws (the task is al
 // tests below, which need state.json to carry exactly what unparkScan's abandon branch reads:
 // state.worktreePath and state.prNumber, verified present on the real leaked card (issue #443's
 // journal/issue-443/state.json, quoted in the spec this action implements).
-function parkedTaskDir(journalRoot, id, { issue, commentId, worktreePath, prNumber }) {
+// `externallyResolved` (action 5.1b): lets a caller pre-seed a task as already reconciled, so
+// unparkScan's own reconcileExternalClosure guard (`if (state.externallyResolved) return`) short-
+// circuits with no `gh api` call at all -- used by tests that are about the retry/abandon comment
+// scan's OWN behaviour (e.g. its per-issue backoff) and would otherwise conflate their own gh-call
+// counts with reconciliation's separate, unrelated issue read.
+function parkedTaskDir(journalRoot, id, { issue, commentId, worktreePath, prNumber, externallyResolved }) {
   const taskDir = path.join(journalRoot, id);
   fs.mkdirSync(taskDir, { recursive: true });
   fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', issue, title: 'x', criterion: 'y', size: 'S' }));
-  writeState(taskDir, { id, state: 'PARKED', reason: 'worktree-npm-ci-failed', worktreePath, prNumber });
+  writeState(taskDir, { id, state: 'PARKED', reason: 'worktree-npm-ci-failed', worktreePath, prNumber, externallyResolved });
   appendEvent(taskDir, 'WORKTREE', 'parked', { reason: 'worktree-npm-ci-failed' });
   appendEvent(taskDir, 'PARKED', 'park-comment', { commentId, reason: 'worktree-npm-ci-failed' });
   return taskDir;
@@ -546,6 +551,424 @@ test('unparkScan: a timed-out abandon-ack gh comment never throws -- the task is
   assert.ok(failed, 'the timeout must still be reported, not silently swallowed');
   assert.equal(failed.timedOut, true);
   assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+});
+
+// ---- action 5.1b: reconcile a parked/abandoned task against the issue it owns -----------------
+//
+// C5's own re-measurement (2026-09-01, from scratch) found the journal is the stale side on 3 of
+// 18 tasks, and in all three the board was already right (GitHub's own "Item closed" workflow
+// moves the card on issue close -- no pipeline mutation involved):
+//
+//   issue-213, issue-428 -- PARKED (`diagnose-duplicate-root-cause`), closed by a human hours
+//     later, nothing ever told the pipeline.
+//   issue-443 -- ABANDONED (`abandoned-by-maintainer`). `pr:wait` read `closed false` at
+//     13:17:57 and parked `pr-closed-unmerged`; PR #447 actually MERGED 30 seconds later, at
+//     13:18:27, before the maintainer's own `abandon` reply at 13:53.
+//
+// These fixtures exercise `unparkScan`'s own `gh api repos/<repo>/issues/<n>` (and, once that
+// comes back closed with a `prNumber` on the task, `gh api repos/<repo>/pulls/<n>`) reads through
+// the SAME `deps.spawnSync` injection every other test in this file uses -- see this file's own
+// header and test/no-real-spawn.js for why a real spawnSync must never be reachable here.
+
+test('unparkScan: action 5.1b -- a PARKED task whose issue is closed writes externallyResolved (via: issue-closed), journals reconciled-externally, and never touches state.state', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-213-');
+  const journalRoot = mkTmp('spo-reconcile-journal-213-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-213', { issue: 213, commentId: 100 });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/213$/.test(args[1])) {
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T01:50:00Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  // Verdict by exit code / argv shape, never gh's text output -- and the path form, no `-f`/`-F`
+  // (test/gh-api-argv.test.js's own sweep guards this class repo-wide; this pins the one call
+  // site this action adds).
+  const issueCall = calls.find((c) => c.command === 'gh' && c.args[0] === 'api' && /\/issues\/213$/.test(c.args[1]));
+  assert.ok(issueCall, 'must read the issue, by path');
+  assert.deepEqual(issueCall.args, ['api', 'repos/Crazz-Org/SPO-WebClient/issues/213']);
+  assert.ok(!issueCall.args.includes('-f') && !issueCall.args.includes('-F'));
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED', 'record, never overwrite -- the pipeline really did park this task');
+  assert.ok(state.externallyResolved);
+  assert.equal(state.externallyResolved.via, 'issue-closed');
+  assert.equal(state.externallyResolved.closedAt, '2026-08-30T01:50:00Z');
+  assert.equal(state.externallyResolved.prNumber, null);
+  assert.equal(state.externallyResolved.mergedAt, null);
+  assert.ok(state.externallyResolved.at);
+
+  const journal = readJournal(taskDir);
+  const reconciled = journal.find((e) => e.event === 'reconciled-externally');
+  assert.ok(reconciled);
+  assert.equal(reconciled.via, 'issue-closed');
+  assert.equal(reconciled.closedAt, '2026-08-30T01:50:00Z');
+});
+
+test('unparkScan: action 5.1b -- idempotent: once reconciled, the next cycle makes no second issue read at all', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-idem-');
+  const journalRoot = mkTmp('spo-reconcile-journal-idem-');
+  parkedTaskDir(journalRoot, 'issue-214', { issue: 214, commentId: 100 });
+
+  let issueReads = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/214$/.test(args[1])) {
+        issueReads++;
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T01:50:00Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  const config = { ghRepo: 'Crazz-Org/SPO-WebClient' };
+  await unparkScan(queueDir, journalRoot, config, deps);
+  assert.equal(issueReads, 1);
+  await unparkScan(queueDir, journalRoot, config, deps);
+  assert.equal(issueReads, 1, 'state.externallyResolved is itself the guard -- once written, never re-read, ever');
+});
+
+test('unparkScan: action 5.1b -- a still-open issue writes nothing, and IS re-read next cycle (that is how a close ever gets noticed)', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-open-');
+  const journalRoot = mkTmp('spo-reconcile-journal-open-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-385', { issue: 385, commentId: 100 });
+
+  let issueReads = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/385$/.test(args[1])) {
+        issueReads++;
+        return ok(JSON.stringify({ state: 'open' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  const config = { ghRepo: 'Crazz-Org/SPO-WebClient' };
+  await unparkScan(queueDir, journalRoot, config, deps);
+  await unparkScan(queueDir, journalRoot, config, deps);
+
+  assert.equal(issueReads, 2, 'a still-open parked issue is re-checked every cycle unparkScan runs');
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.ok(!state.externallyResolved);
+  const journal = readJournal(taskDir);
+  assert.ok(!journal.some((e) => e.event === 'reconciled-externally'));
+});
+
+test('unparkScan: action 5.1b -- an ABANDONED task reconciles the same way (state.state stays ABANDONED, never re-enqueued)', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-443-abandon-');
+  const journalRoot = mkTmp('spo-reconcile-journal-443-abandon-');
+  const taskDir = path.join(journalRoot, 'issue-443');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'issue-443', kind: 'card', issue: 443, title: 'x' }));
+  writeState(taskDir, { id: 'issue-443', state: 'ABANDONED', reason: 'abandoned-by-maintainer' });
+  appendEvent(taskDir, 'PARKED', 'abandoned-by-maintainer', { abandonCommentId: 1 });
+
+  let issueReads = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/443$/.test(args[1])) {
+        issueReads += 1;
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T13:18:27Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'ABANDONED');
+  assert.ok(state.externallyResolved);
+  assert.equal(state.externallyResolved.via, 'issue-closed');
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'reconciled-externally'));
+
+  const queued = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [];
+  assert.equal(queued.length, 0, 'ABANDONED never re-enters the retry/abandon comment scan, reconciled or not');
+
+  // Idempotence for ABANDONED specifically, and not as a formality: verification found that
+  // narrowing the guard to `state.externallyResolved && state.state !== 'ABANDONED'` survived the
+  // ENTIRE suite, because the ABANDONED case only ever ran one cycle. That regression re-reads
+  // issue-443 every 60 seconds forever and appends one more `reconciled-externally` line to an
+  // append-only journal each time -- the exact opposite of the "at most 2 reads per task, ever"
+  // bound this feature is budgeted on.
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  assert.equal(issueReads, 1, 'a reconciled ABANDONED task must never be read again');
+  assert.equal(
+    readJournal(taskDir).filter((e) => e.event === 'reconciled-externally').length,
+    1,
+    'exactly one reconciled-externally line, ever'
+  );
+});
+
+test('unparkScan: action 5.1b -- an `abandon` reply in the SAME cycle as a reconcile keeps externallyResolved (the abandon write must not spread a stale state.json)', async () => {
+  // The 213/428 shape taken one step further, and it is not hypothetical: a maintainer who fixes
+  // a card by hand and closes its issue may well also reply `abandon` on it. reconcileExternalClosure
+  // runs earlier in the same loop iteration and writes to disk; the abandon branch used to spread
+  // the in-memory snapshot captured before that write, silently dropping the field -- costing a
+  // second issue read and a DUPLICATE journal line on the following cycle.
+  const queueDir = mkTmp('spo-reconcile-queue-abandon-race-');
+  const journalRoot = mkTmp('spo-reconcile-journal-abandon-race-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-race', { issue: 900, commentId: 100 });
+
+  let issueReads = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/900$/.test(args[1])) {
+        issueReads += 1;
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T01:50:23Z' }));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/900\/comments/.test(args[1])) {
+        return ok(JSON.stringify([{ id: 101, body: 'abandon', user: { login: 'Crazz-E' } }]));
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'ABANDONED', 'the abandon still lands');
+  assert.ok(state.externallyResolved, 'and the reconcile written earlier in the same cycle survives it');
+  assert.equal(state.externallyResolved.via, 'issue-closed');
+
+  // The whole point: no second read, no duplicate line, on any later cycle.
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  assert.equal(issueReads, 1, 'a task reconciled and abandoned in one cycle is never re-read');
+  assert.equal(
+    readJournal(taskDir).filter((e) => e.event === 'reconciled-externally').length,
+    1,
+    'exactly one reconciled-externally line, ever'
+  );
+});
+
+test('unparkScan: action 5.1b -- the 443 shape: PARKED with a prNumber, issue closed, PR merged -> via "pr-merged" carrying the PR\'s own merged_at', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-443pr-');
+  const journalRoot = mkTmp('spo-reconcile-journal-443pr-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-443pr', { issue: 443, commentId: 100, prNumber: 447 });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/443$/.test(args[1])) {
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T13:17:59Z' }));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/pulls\/447$/.test(args[1])) {
+        return ok(JSON.stringify({ merged_at: '2026-08-30T13:18:27Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const prCall = calls.find((c) => c.command === 'gh' && c.args[0] === 'api' && /\/pulls\/447$/.test(c.args[1]));
+  assert.ok(prCall, 'the PR is read only once the issue already came back closed');
+  assert.deepEqual(prCall.args, ['api', 'repos/Crazz-Org/SPO-WebClient/pulls/447']);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.externallyResolved.via, 'pr-merged');
+  assert.equal(state.externallyResolved.mergedAt, '2026-08-30T13:18:27Z');
+  assert.equal(state.externallyResolved.closedAt, '2026-08-30T13:17:59Z');
+  assert.equal(state.externallyResolved.prNumber, 447);
+  // The 30-second gap between the (stale) park read and the real merge is legible from these two
+  // fields alone, with no cross-referencing GitHub by hand -- exactly the point of carrying both.
+});
+
+test('unparkScan: action 5.1b -- the 213 shape with a PR attached: issue closed, PR present but NOT merged -> via stays "issue-closed"', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-213pr-');
+  const journalRoot = mkTmp('spo-reconcile-journal-213pr-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-213pr', { issue: 998, commentId: 100, prNumber: 222 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/998$/.test(args[1])) {
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T01:50:00Z' }));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/pulls\/222$/.test(args[1])) {
+        return ok(JSON.stringify({ merged_at: null }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.externallyResolved.via, 'issue-closed');
+  assert.equal(state.externallyResolved.mergedAt, null);
+  assert.equal(state.externallyResolved.prNumber, 222);
+});
+
+test('unparkScan: action 5.1b -- a non-zero exit on the issue read never throws, journals reconcile-scan-failed {step: "issue"}, and reconciles fine next cycle', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-fail-');
+  const journalRoot = mkTmp('spo-reconcile-journal-fail-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-777', { issue: 777, commentId: 100 });
+
+  let shouldFail = true;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/777$/.test(args[1])) {
+        if (shouldFail) return { status: 1, stdout: '', stderr: 'boom', signal: null };
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T00:00:00Z' }));
+      }
+      return ok('[]');
+    },
+  };
+  const config = { ghRepo: 'Crazz-Org/SPO-WebClient' };
+
+  await assert.doesNotReject(() => unparkScan(queueDir, journalRoot, config, deps));
+
+  let journal = readJournal(taskDir);
+  let failed = journal.find((e) => e.event === 'reconcile-scan-failed');
+  assert.ok(failed);
+  assert.equal(failed.step, 'issue');
+  assert.equal(failed.exit, 1);
+  let state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.ok(!state.externallyResolved);
+
+  shouldFail = false;
+  await unparkScan(queueDir, journalRoot, config, deps);
+  state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.ok(state.externallyResolved, 'a scan failure does not brick reconciliation -- the next cycle tries again and succeeds');
+});
+
+test('unparkScan: action 5.1b -- a timed-out issue read never throws, journals reconcile-scan-failed with timedOut: true, never a plain exit 1', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-to-');
+  const journalRoot = mkTmp('spo-reconcile-journal-to-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-778', { issue: 778, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/778$/.test(args[1])) return timeoutResult();
+      return ok('[]');
+    },
+  };
+
+  await assert.doesNotReject(() =>
+    unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', commandTimeoutsMs: { gh: 120000 } }, deps)
+  );
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'reconcile-scan-failed');
+  assert.ok(failed, 'a hung issue read must still be reported, not silently swallowed');
+  assert.equal(failed.timedOut, true);
+  assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+});
+
+test('unparkScan: action 5.1b -- unparsable JSON on the issue read never throws, journals reconcile-scan-failed {reason: "unparsable"}', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-badjson-');
+  const journalRoot = mkTmp('spo-reconcile-journal-badjson-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-779', { issue: 779, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/779$/.test(args[1])) return ok('not json{{{');
+      return ok('[]');
+    },
+  };
+
+  await assert.doesNotReject(() => unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps));
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'reconcile-scan-failed');
+  assert.ok(failed);
+  assert.equal(failed.reason, 'unparsable');
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.ok(!state.externallyResolved);
+});
+
+test('unparkScan: action 5.1b -- a failed PR read (issue already closed) writes nothing, journals reconcile-scan-failed {step: "pr"}, and reconciles fine next cycle', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-prfail-');
+  const journalRoot = mkTmp('spo-reconcile-journal-prfail-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-780', { issue: 780, commentId: 100, prNumber: 448 });
+
+  let prShouldFail = true;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/780$/.test(args[1])) {
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T00:00:00Z' }));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/pulls\/448$/.test(args[1])) {
+        if (prShouldFail) return { status: 1, stdout: '', stderr: 'boom', signal: null };
+        return ok(JSON.stringify({ merged_at: '2026-08-30T00:00:30Z' }));
+      }
+      return ok('[]');
+    },
+  };
+  const config = { ghRepo: 'Crazz-Org/SPO-WebClient' };
+
+  await unparkScan(queueDir, journalRoot, config, deps);
+
+  let journal = readJournal(taskDir);
+  let failed = journal.find((e) => e.event === 'reconcile-scan-failed' && e.step === 'pr');
+  assert.ok(failed, 'the issue read succeeded, but the PR read did not -- the whole reconciliation retries next cycle');
+  let state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.ok(!state.externallyResolved);
+
+  prShouldFail = false;
+  await unparkScan(queueDir, journalRoot, config, deps);
+  state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.externallyResolved.via, 'pr-merged');
+});
+
+test('unparkScan: action 5.1b -- a reconciled PARKED task still gets its retry/abandon comment scan in the SAME cycle (a human can still ask for another attempt)', async () => {
+  const queueDir = mkTmp('spo-reconcile-queue-retry-');
+  const journalRoot = mkTmp('spo-reconcile-journal-retry-');
+  const taskDir = parkedTaskDir(journalRoot, 'issue-781', { issue: 781, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/781$/.test(args[1])) {
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T00:00:00Z' }));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/781\/comments/.test(args[1])) {
+        return ok(JSON.stringify([{ id: 200, user: { login: 'Crazz-E' }, body: 'retry -- have another go even though I closed the issue' }]));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.ok(state.externallyResolved, 'reconciliation must have happened');
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'reconciled-externally'));
+  assert.ok(
+    journal.some((e) => e.event === 'unparked-by-maintainer'),
+    'reconciliation must not skip the retry/abandon comment scan for this same task in this same cycle'
+  );
+
+  const queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1, 'the retry still re-enqueues the task, reconciled or not');
 });
 
 // ---- action 4.5: abandon cleanup (issue #443 -- ABANDONED used to leak the worktree, its local
@@ -1429,7 +1852,15 @@ test('unparkScan: the collaborator list is fetched once per repo and reused acro
 test('unparkScan: consecutive gh failures on the SAME issue back off, and a subsequent success resets it', async () => {
   const queueDir = mkTmp('spo-unpark27-queue-backoff-');
   const journalRoot = mkTmp('spo-unpark27-journal-backoff-');
-  const taskDir = parkedTaskDir(journalRoot, 'card-930', { issue: 930, commentId: 100 });
+  // action 5.1b: pre-seeded as already reconciled so reconcileExternalClosure's own issue read
+  // (an unrelated `gh api repos/.../issues/930` call, no backoff of its own) never fires and
+  // never pollutes this test's own ghApiCalls count -- this test is about the comment-scan's
+  // per-issue backoff, not reconciliation.
+  const taskDir = parkedTaskDir(journalRoot, 'card-930', {
+    issue: 930,
+    commentId: 100,
+    externallyResolved: { via: 'issue-closed', closedAt: '2026-08-01T00:00:00Z', prNumber: null, mergedAt: null, at: '2026-08-01T00:00:00Z' },
+  });
 
   let ghApiCalls = 0;
   let shouldFail = true;

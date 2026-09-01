@@ -12,6 +12,13 @@
 //     of the leaked product worktree, its local/remote claude-pipe/<id> branch, and the open PR
 //     (issue #443, where all three sat leaked indefinitely because ABANDONED used to do nothing
 //     but write state.json).
+//   reconcileExternalClosure -- action 5.1b, called from inside unparkScan's own per-task loop,
+//     BEFORE the retry/abandon comment scan: for a PARKED or ABANDONED task whose owning issue
+//     has since closed OUTSIDE the pipeline (a human fixed it by hand, or -- issue #443's shape --
+//     the pipeline's own PR merged 30 seconds after a false park), records that fact on
+//     `state.json` (`externallyResolved`) and in the journal (`reconciled-externally`) without
+//     ever rewriting `state.state` -- see that function's own header for the full story and the
+//     measured evidence.
 //
 // Anchor mechanics: `gh issue comment` prints the created comment's URL,
 // `.../issues/<n>#issuecomment-<id>`. The numeric id is journaled as the park comment's anchor
@@ -573,6 +580,135 @@ function abandonCleanup(deps, config, taskDir, id, task, state) {
   }
 }
 
+// ---- action 5.1b: reconcile a parked/abandoned task against the issue it owns -----------------
+//
+// The measurement (doc/remediation-progress.md's "C5's own measurement" section, 2026-09-01,
+// re-run from scratch, not carried over from the plan) found the JOURNAL is the stale side on 3
+// of 18 tasks, and the BOARD is already right -- because the project has the built-in "Item
+// closed" workflow enabled (Status -> Done, re-measured live), so closing an issue moves the card
+// by itself with no `gh project` mutation and no human dragging anything. Issue closure is
+// therefore already the signal the board itself trusts; this function invents no new source of
+// truth, it just makes the JOURNAL catch up to what the board already knows:
+//
+//   issue-213, issue-428: PARKED (`diagnose-duplicate-root-cause`), closed 2026-08-30 by a human
+//     who fixed the work by hand and closed the issue -- nothing ever told the pipeline. Today
+//     `spo parked` still lists both as awaiting a `retry`/`abandon` reply that will never come.
+//   issue-443: ABANDONED (`abandoned-by-maintainer`, from a MERGE-step false park). `pr:wait`
+//     read `closed false` at 13:17:57 and parked `pr-closed-unmerged`; PR #447 actually MERGED at
+//     13:18:27, 30 seconds later, with no close/reopen anywhere in its own timeline before that.
+//     The maintainer then read the park comment and replied `abandon` at 13:53 -- abandoning a
+//     change that had already merged. A reconciler would have caught this within one scan
+//     interval instead of never; the MERGE-step defect itself (a single unconfirmed `closed`
+//     read treated as terminal) is filed separately and is NOT this action's to fix.
+//
+// The central design rule, worth restating here because it is the one a future "simplification"
+// will be tempted to undo: RECORD, NEVER OVERWRITE. `state.state` is never rewritten by this
+// function. The task really did park (or really was abandoned) -- the pipeline's own verdict at
+// the time was correct given what it knew, and fabricating a `DONE` the pipeline never actually
+// produced would make the journal lie in the opposite direction from today's staleness. Instead,
+// both facts land on the record side by side: `state.json` gets an `externallyResolved: {via,
+// closedAt, prNumber, mergedAt, at}` field, and `journal.jsonl` gets one `reconciled-externally`
+// event carrying the same detail. `via` is what tells the 213/428 shape (a human closed the
+// issue) apart from the 443 shape (the pipeline's own PR actually merged): 'pr-merged' only when
+// `state.prNumber` is set AND that PR's own `merged_at` is non-null, 'issue-closed' otherwise --
+// carrying the PR's `merged_at` alongside the issue's `closed_at` is what makes 443's 30-second
+// gap legible from the journal alone, without cross-referencing GitHub by hand.
+//
+// Idempotence is the OTHER load-bearing property, and it is enforced by the simplest guard
+// available: `state.externallyResolved` itself. Once written, this function returns immediately
+// on every later call for the same task -- no re-read, ever. That bounds the whole feature to at
+// most 2 extra `gh api` reads per parked task, ever (issue + PR, and the PR read only fires when
+// the issue already came back closed -- never speculatively, per the caller's own contract
+// below). The other side of that bound is deliberate, not an oversight: a task whose issue is
+// STILL open IS re-read every cycle unparkScan runs, because that is the only way a close ever
+// gets noticed. Measured cost: 3 parked tasks in today's corpus, so at most 3 extra `gh api`
+// reads per unparkScan cycle (60s by default, config.unparkScanMs) while any of them stays open
+// and unreconciled -- falling to 0 once all three are reconciled or newly parked ones settle.
+//
+// Same "never blocks, never throws" contract as every other real spawn in this file
+// (command-timeout.js's own header, action 2.1b): a failed read -- non-zero exit, a spawnSync
+// timeout, unparsable JSON, from either the issue read or the PR read -- journals
+// `reconcile-scan-failed {step, exit, timedOut}` and returns without writing anything, so the
+// SAME task is simply re-attempted next cycle, same as an ordinary `unpark-scan-failed`. Nothing
+// here ever throws past its own boundary, and the caller wraps the call in try/catch anyway (same
+// belt-and-suspenders as abandonCleanup's own call site below) so one task's reconciliation
+// blowing up can never abort the scan for every other task in the same pass.
+//
+// Explicitly OUT of scope, on purpose, left for a different action if it's ever wanted:
+//   - a non-terminal task (still PLAN/IMPLEMENT/...) whose issue closes mid-flight -- a stronger
+//     signal ("stop working now") than this function's "the outcome is already settled", but a
+//     different decision with different failure modes, not this one's to make;
+//   - a DONE task whose issue is later reopened;
+//   - moving anything on the board -- the board is already correct in all three measured cases,
+//     there is nothing here to move.
+function reconcileExternalClosure(deps, config, taskDir, task, state) {
+  // The guard IS the idempotence contract -- see header. Once this fires, this function is a
+  // no-op for this task forever, by construction, with no separate "already reconciled" flag to
+  // keep in sync.
+  if (state.externallyResolved) return;
+
+  const ghRepo = (config && config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const journal = (event, detail) => appendEvent(taskDir, state.state, event, detail);
+
+  const issueResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${task.issue}`], {}, config);
+  const issueExit = normalizeExit(issueResult);
+  if (issueExit !== 0) {
+    journal('reconcile-scan-failed', { step: 'issue', exit: issueExit, timedOut: issueResult.timedOut === true });
+    return;
+  }
+
+  let issue;
+  try {
+    issue = JSON.parse(issueResult.stdout);
+  } catch {
+    journal('reconcile-scan-failed', { step: 'issue', exit: issueExit, timedOut: false, reason: 'unparsable' });
+    return;
+  }
+
+  // Still open -- exactly the case that must be re-read next cycle, not journalled as any kind
+  // of failure. No `externallyResolved` is written, so the guard above lets it straight through
+  // again on the next call.
+  if (!issue || issue.state !== 'closed') return;
+
+  const closedAt = (issue && issue.closed_at) || null;
+  let via = 'issue-closed';
+  let mergedAt = null;
+
+  // The PR read only happens here -- prNumber present AND the issue already confirmed closed --
+  // never speculatively (a park/abandon with no PR yet, or one whose issue is still open, never
+  // costs this second read at all).
+  if (state.prNumber) {
+    const prResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/pulls/${state.prNumber}`], {}, config);
+    const prExit = normalizeExit(prResult);
+    if (prExit !== 0) {
+      journal('reconcile-scan-failed', { step: 'pr', exit: prExit, timedOut: prResult.timedOut === true });
+      return; // the issue read succeeded but the PR read didn't -- retry the whole thing next cycle
+    }
+    let pr;
+    try {
+      pr = JSON.parse(prResult.stdout);
+    } catch {
+      journal('reconcile-scan-failed', { step: 'pr', exit: prExit, timedOut: false, reason: 'unparsable' });
+      return;
+    }
+    if (pr && pr.merged_at) {
+      via = 'pr-merged'; // the 443 shape -- the pipeline's own change actually merged
+      mergedAt = pr.merged_at;
+    }
+    // else: a PR exists but never merged -- still the 213/428 shape, `via` stays 'issue-closed'.
+  }
+
+  const externallyResolved = {
+    via,
+    closedAt,
+    prNumber: state.prNumber || null,
+    mergedAt,
+    at: new Date().toISOString(),
+  };
+  writeState(taskDir, { ...state, externallyResolved });
+  journal('reconciled-externally', externallyResolved);
+}
+
 // unparkScan(queueDir, journalRoot, config, deps, scanState) -- one pass over every journaled
 // task. For each PARKED kind:"card" task with a park-comment anchor not yet acted on, comment-
 // scan.js's scanForMatch fetches the issue's comments after that anchor (paginated, allowlisted,
@@ -583,6 +719,19 @@ function abandonCleanup(deps, config, taskDir, id, task, state) {
 // the issue is allowed. `scanState` (comment-scan.js's createScanState()) is a fresh one by
 // default -- callers that run this repeatedly (state-machine.js's runForever) pass one they
 // created once and keep across cycles, so the collaborator cache and backoff table persist.
+//
+// action 5.1b: BEFORE the retry/abandon comment scan below, every PARKED *or* ABANDONED task
+// (readJsonSafe's `state.state`, not this loop's own filter -- an ABANDONED task never reaches
+// the comment-scan section at all, see the `continue` a few lines down) gets a chance at
+// `reconcileExternalClosure` above. It runs first, unconditionally, and its own guard (already
+// reconciled? issue still open? no prNumber?) is what decides whether it actually spends an API
+// call -- NOT any check in this loop, so there is no ordering hazard where a "skip reconciliation
+// this time" decision here could also accidentally skip the comment scan for a still-PARKED task.
+// Wrapped in try/catch on top of reconcileExternalClosure's own internal never-throws contract,
+// same belt-and-suspenders as abandonCleanup's own call site below: this loop runs once per
+// journaled task per cycle, and one task's reconciliation misbehaving must never stop the daemon
+// (a throw out of unparkScan kills it -- state-machine.js's runForever) or skip every task after
+// it in `ids`.
 async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = commentScan.createScanState()) {
   const ghRepo = (config && config.ghRepo) || 'Crazz-Org/SPO-WebClient';
   const ids = listTaskIds(journalRoot);
@@ -591,10 +740,24 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
   for (const id of ids) {
     const taskDir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(taskDir, 'state.json'));
-    if (!state || state.state !== 'PARKED') continue;
+    if (!state || (state.state !== 'PARKED' && state.state !== 'ABANDONED')) continue;
 
     const task = readJsonSafe(path.join(taskDir, 'task.json'));
     if (!task || task.kind !== 'card' || !task.issue) continue;
+
+    try {
+      reconcileExternalClosure(deps, config, taskDir, task, state);
+    } catch (err) {
+      appendEvent(taskDir, state.state, 'reconcile-scan-failed', {
+        step: 'unexpected',
+        error: String((err && err.message) || err),
+      });
+    }
+
+    // ABANDONED is terminal -- it was never part of the retry/abandon comment scan before this
+    // action (the loop's original filter was `state.state !== 'PARKED'`) and reconciling it does
+    // not change that; only reconcileExternalClosure runs for it.
+    if (state.state !== 'PARKED') continue;
 
     const anchor = findParkAnchor(readJournalLines(taskDir));
     if (!anchor || anchor.alreadyHandled) continue;
@@ -639,8 +802,16 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
     // state.json says ABANDONED, that fact is durable on disk, so a daemon crash at any point
     // after this line -- mid-ack, mid-cleanup -- resumes into a task that is already correctly
     // terminal, never one an interrupted write left ambiguous.
+    // Re-read state.json rather than spreading the in-memory `state` captured at the top of this
+    // loop iteration: reconcileExternalClosure runs EARLIER IN THE SAME CYCLE and writes
+    // `externallyResolved` to disk, so spreading the stale snapshot silently drops it. That is
+    // not hypothetical for the shape this reconciler exists for -- a maintainer who fixes a card
+    // by hand and closes its issue may well also reply `abandon` on it (the 213/428 shape), and
+    // the two land in the same cycle. Losing the field costs a second issue read and a DUPLICATE
+    // `reconciled-externally` line in an append-only journal on the next cycle, breaking the
+    // "at most 2 reads per task, ever" bound this feature is budgeted on.
     writeState(taskDir, {
-      ...state,
+      ...(readJsonSafe(path.join(taskDir, 'state.json')) || state),
       state: 'ABANDONED',
       reason: 'abandoned-by-maintainer',
       updatedAt: new Date().toISOString(),
@@ -676,6 +847,7 @@ module.exports = {
   parseCommentId,
   RETRY_ABANDON_LINE,
   unparkScan,
+  reconcileExternalClosure,
   shouldScanUnpark,
   findParkAnchor,
   reEnqueueTask,

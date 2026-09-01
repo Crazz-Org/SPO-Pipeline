@@ -206,6 +206,27 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   the shipped config never produces). A card entering DIAGNOSE for the first time posts one
   comment and journals `diagnose-surfaced` `{attempt, budget}`, or `diagnose-surface-failed`
   `{exit, timedOut}` — never blocking, exactly like a board move.
+- **External reconciliation (action 5.1b)** — the board's `Done` on 213/428/443 was reached
+  without any pipeline involvement (GitHub's built-in "Item closed" workflow moves the card on
+  issue close, re-measured live 2026-09-01), and the JOURNAL was the side that never learned about
+  it: 2 of the 3 were `PARKED` for a fix a human made and closed by hand hours later (213, 428);
+  the third (443) was `ABANDONED` on a false park — `pr:wait` read `closed false` at 13:17:57,
+  parked `pr-closed-unmerged`, and PR #447 actually merged 30 seconds later at 13:18:27, before the
+  maintainer's own `abandon` reply at 13:53. `park-loop.js`'s `reconcileExternalClosure`, called
+  from inside `unparkScan`'s own loop for every `PARKED`/`ABANDONED` task, reads the owning issue
+  and — record, never overwrite — writes `state.json`'s `externallyResolved: {via: 'issue-closed'
+  | 'pr-merged', closedAt, prNumber, mergedAt, at}` and journals `reconciled-externally` with the
+  same detail, **without ever touching `state.state`**: the task really did park/abandon, and
+  fabricating a `DONE` the pipeline never produced would make the journal lie the other way.
+  `via: 'pr-merged'` (carrying the PR's own `merged_at`, legible against `closedAt` for 443's own
+  30-second gap) only when `state.prNumber` is set and that PR actually merged; `'issue-closed'`
+  otherwise (213/428's shape). Idempotent by construction — `state.externallyResolved` itself is
+  the guard, so a reconciled task is never re-read — bounding the feature to at most 2 extra
+  `gh api` reads per parked task, ever; a still-open parked task IS re-read every `unparkScan`
+  cycle (60s by default), 1 read each, 3 today. A failed read (non-zero exit, timeout, unparsable
+  JSON) journals `reconcile-scan-failed {step, exit, timedOut}` and never blocks or throws — same
+  contract as every other real spawn in this file. `spo parked` (`bin/spo`'s `cmdParked`) prints a
+  reconciled row under its own heading, separate from the still-PARKED and still-ABANDONED rows.
 - **Claude session management**: the `session_id` of every step is recorded, so any step can
   be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
   interactively). `claude agents` lists live background sessions.

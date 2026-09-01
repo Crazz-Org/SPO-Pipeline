@@ -1091,6 +1091,84 @@ Idempotent across scans: a task already acted on for its current park cycle (an
 `park-comment` in the journal) is skipped, whether or not the re-enqueued task has been drained
 back out of `PARKED` yet.
 
+**Reconciling against the issue (action 5.1b).** `unparkScan`'s per-task loop, above, runs one
+more thing BEFORE the retry/abandon comment scan: for every journaled task whose `state.json`
+reads `PARKED` or `ABANDONED`, `reconcileExternalClosure` checks whether the issue it owns has
+since closed *outside* the pipeline. This is not a hypothetical — C5's own re-measurement
+(2026-09-01, from scratch, not carried over from the plan) found the journal is the stale side on
+3 of 18 tasks, and in all three the issue was already closed:
+
+| task | journal said | issue closed | board |
+|---|---|---|---|
+| issue-213 | `PARKED` (`diagnose-duplicate-root-cause`) | 2026-08-30 01:50 | `Done` |
+| issue-428 | `PARKED` (`diagnose-duplicate-root-cause`) | 2026-08-30 07:20 | `Done` |
+| issue-443 | `ABANDONED` (`abandoned-by-maintainer`) | 2026-08-30 13:18 | `Done` |
+
+The board already reads `Done` on all three — not because a human dragged a card, but because the
+project has the built-in **"Item closed"** workflow enabled (`Status → Done`, re-measured live):
+closing the issue moves the card by itself. Issue closure is therefore already the signal the
+board itself trusts; `reconcileExternalClosure` invents no new source of truth, it makes the
+journal catch up to what the board already knows.
+
+213 and 428 are the same shape: a human fixed the work by hand and closed the issue, hours after
+the park, with nothing ever telling the pipeline. 443 is a different and sharper shape — a FALSE
+park. `pr:wait` read `closed false` at 13:17:57 and parked `pr-closed-unmerged`; PR #447 actually
+**merged** 30 seconds later, at 13:18:27, with no close or reopen anywhere in its own timeline
+before that. The maintainer then read the park comment and replied `abandon` at 13:53 — abandoning
+a change that had already merged 35 minutes earlier. A reconciler would have caught that within
+one scan interval instead of never; the MERGE-step defect that produced the false park in the
+first place (a single unconfirmed `closed` read treated as terminal) is filed separately and is
+**not** this action's to fix.
+
+**Record, never overwrite** is the rule that makes this safe to build at all: `state.state` is
+never rewritten. The task really did park, or really was abandoned — the pipeline's own verdict
+was correct given what it knew at the time, and writing a `DONE` it never actually produced would
+make the journal lie in the opposite direction from today's staleness. Instead both facts sit on
+the record side by side — `state.json` gains `externallyResolved: {via, closedAt, prNumber,
+mergedAt, at}`, and `journal.jsonl` gains one `reconciled-externally` event carrying the same
+detail. `via` is what tells 213/428 apart from 443: `'pr-merged'` (carrying the PR's own
+`merged_at`, so 443's 30-second gap is legible from the journal alone, no cross-referencing
+GitHub by hand) only when `state.prNumber` is set *and* that PR's own `merged_at` is non-null;
+`'issue-closed'` otherwise — a PR that exists but never merged is still the 213/428 shape. The PR
+read only happens once the issue read has already come back closed, never speculatively.
+
+Idempotent by construction, the same way `state.externallyResolved` guards a re-check as
+`unparked-by-maintainer`/`abandoned-by-maintainer` guards a re-enqueue above: once written, this
+function is a no-op for that task forever, with no separate flag to keep in sync. That bounds the
+whole feature to **at most 2 extra `gh api` reads per parked task, ever** (issue + PR). The other
+side of that bound is deliberate: a task whose issue is still OPEN is re-read every cycle — that
+is how a close ever gets noticed — 1 REST read per open-parked task per `unparkScanMs` (60s by
+default). Measured today: 3 parked/abandoned tasks, so at most 3 extra reads per cycle, falling to
+0 once each is either reconciled or freshly retried. Same never-blocks-never-throws contract as
+every other real spawn in this file (`command-timeout.js`'s own header): a failed read — non-zero
+exit, a `spawnSync` timeout, unparsable JSON, at either the issue or the PR step — journals
+`reconcile-scan-failed {step, exit, timedOut}` and leaves `externallyResolved` unwritten, so the
+same task is simply re-attempted next cycle; the call is wrapped in `try/catch` inside
+`unparkScan`'s loop on top of that internal contract, so one task's reconciliation misbehaving can
+never abort the scan for every other task in the same pass or kill the daemon
+(`state-machine.js`'s `runForever` has nothing to catch a throw from `unparkScan` itself).
+
+Reconciling does **not** short-circuit the retry/abandon comment scan above for a still-`PARKED`
+task — it runs first, unconditionally, and its own guard (already reconciled? issue still open? no
+`prNumber`?) is what decides whether it spends an API call, not any branch in `unparkScan`'s own
+loop. A maintainer can still reply `retry` on an issue that has been reconciled (closed by hand,
+or closed via a merged PR) and get another attempt — closing the issue is not the same decision as
+telling the pipeline to stop, and nothing about reconciliation forecloses it. An `ABANDONED` task
+was never part of the retry/abandon comment scan (that loop's own filter has always been
+`state.state === 'PARKED'`) and reconciling it does not change that — `reconcileExternalClosure`
+is the only thing that runs for it.
+
+`spo parked` (`bin/spo`'s `cmdParked`) prints a reconciled row under its own
+"resolved externally" heading, pulled out of both the still-`PARKED` and still-`ABANDONED`
+sections — the point being a maintainer's actionable list goes from 3 items (213, 428, 443, none
+of which will ever get a human reply) down to 1 (issue-385, genuinely open and genuinely waiting).
+
+Deliberately out of scope, left for a different action if it's ever wanted: a non-terminal task
+(still `PLAN`/`IMPLEMENT`/...) whose issue closes mid-flight — a stronger "stop working now"
+signal than this function's "the outcome is already settled" — and a `DONE` task whose issue is
+later reopened. Neither is this action's to handle, and moving anything on the board is out of
+scope entirely: the board is already correct in all three measured cases.
+
 ### Auto-pull
 
 `daemon.js --real`, when not `--once`, also runs `auto-pull.js`'s `runAutoPull` on a timer

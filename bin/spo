@@ -424,9 +424,31 @@ function cmdParked(opts) {
   const ids = listTaskDirs(journalRoot);
   let any = false;
   const abandonedRows = [];
+  const reconciledRows = [];
   for (const id of ids) {
     const dir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(dir, 'state.json'), {});
+
+    // action 5.1b: a PARKED or ABANDONED card whose ISSUE has since closed OUTSIDE the pipeline
+    // (orchestrator/park-loop.js's reconcileExternalClosure, `state.externallyResolved`) is a
+    // fact worth showing a maintainer, but a different one from "still waiting on a retry/abandon
+    // reply" -- so it is pulled out of both the PARKED and the ABANDONED buckets below and
+    // printed under its own heading instead. Measured 2026-09-01: 3 of 3 parked-or-abandoned
+    // cards in the live corpus (issue-213, issue-428, issue-443) were exactly this shape -- two
+    // closed by a human hours after the park, one (443) a false park whose own PR had actually
+    // merged 30 seconds later -- so before this split `spo parked` read as 3 actionable items when
+    // it was really 1 (issue-385, genuinely open and genuinely waiting). This `continue` has to
+    // run BEFORE the `any`/abandonedRows branches below, or a reconciled row would double-count
+    // into whichever one it started in.
+    if ((state.state === 'PARKED' || state.state === 'ABANDONED') && state.externallyResolved) {
+      const r = state.externallyResolved;
+      const mergedPart = r.mergedAt ? `  mergedAt=${r.mergedAt}` : '';
+      reconciledRows.push(
+        `${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}  via=${r.via}  closedAt=${r.closedAt}${mergedPart}`
+      );
+      continue;
+    }
+
     if (state.state === 'PARKED') {
       any = true;
       console.log(`${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}`);
@@ -446,6 +468,10 @@ function cmdParked(opts) {
   if (abandonedRows.length) {
     console.log('abandoned:');
     for (const r of abandonedRows) console.log(r);
+  }
+  if (reconciledRows.length) {
+    console.log('resolved externally (issue closed outside the pipeline -- see reason for the original park/abandon):');
+    for (const r of reconciledRows) console.log(r);
   }
 }
 

@@ -28,11 +28,11 @@ const { appendEvent, writeState } = require('../orchestrator/journal');
 const { collectDaemonStats } = require('../console/collect');
 const { renderDaemonStatsInner } = require('../console/render');
 
-function makeTaskDir(journalRoot, id, { state, reason, title, lastEvent }) {
+function makeTaskDir(journalRoot, id, { state, reason, title, lastEvent, externallyResolved }) {
   const taskDir = path.join(journalRoot, id);
   fs.mkdirSync(taskDir, { recursive: true });
   fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', title, criterion: 'y', size: 'S' }));
-  writeState(taskDir, { id, state, reason, title });
+  writeState(taskDir, { id, state, reason, title, externallyResolved });
   if (lastEvent) appendEvent(taskDir, state, lastEvent, {});
   return taskDir;
 }
@@ -114,6 +114,96 @@ test('spo parked: with neither PARKED nor ABANDONED cards, only "(no parked task
 
   assert.match(out, /\(no parked tasks\)/);
   assert.ok(!out.includes('abandoned:'), 'no cards abandoned -- the heading must not print at all');
+});
+
+// ---- action 5.1b: reconciled (externally resolved) rows get their own heading, pulled out of
+// both the PARKED and ABANDONED buckets -- the whole point being a maintainer's actionable list
+// goes from 3 (213, 428, 443 -- none of which will ever get a human reply) down to 1 (issue-385,
+// genuinely open and genuinely waiting). See orchestrator/park-loop.js's reconcileExternalClosure
+// and orchestrator/README.md's "Park <-> kanban round trip" for the mechanics that populate
+// `state.externallyResolved` in real operation; this file only asserts what `cmdParked` does with
+// it once it's there, the same convention every other test in this file already follows.
+
+test('spo parked: a PARKED card with externallyResolved (issue-closed, the 213/428 shape) is pulled OUT of the plain parked rows and into its own "resolved externally" heading', () => {
+  const journalDir = mkTmp('spo-reconciled-parked-journal-');
+
+  makeTaskDir(journalDir, 'issue-213', {
+    state: 'PARKED',
+    reason: 'diagnose-duplicate-root-cause',
+    title: 'stale journal, human already fixed it',
+    externallyResolved: { via: 'issue-closed', closedAt: '2026-08-30T01:50:00Z', prNumber: null, mergedAt: null, at: '2026-08-30T02:00:00Z' },
+  });
+  makeTaskDir(journalDir, 'issue-385', { state: 'PARKED', reason: 'prompt-missing-placeholder:citations', title: 'genuinely still waiting' });
+
+  const out = runSpo(['parked', '--journal', journalDir]);
+
+  // issue-385 -- still genuinely waiting -- is the only row under the plain PARKED heading.
+  assert.match(out, /^issue-385\s+reason=prompt-missing-placeholder:citations/m);
+
+  // issue-213 shows up under its own heading, carrying `via` and the timestamp the 30-second
+  // gap analysis (443's own shape) depends on being legible for.
+  assert.match(out, /^resolved externally.*:$/m);
+  assert.match(out, /^issue-213\s+reason=diagnose-duplicate-root-cause.*via=issue-closed.*closedAt=2026-08-30T01:50:00Z/m);
+
+  const headingIdx = out.indexOf('resolved externally');
+  const stillWaitingIdx = out.indexOf('issue-385');
+  const reconciledRowIdx = out.indexOf('issue-213');
+  assert.ok(stillWaitingIdx >= 0 && headingIdx > stillWaitingIdx, 'the reconciled heading comes after the still-waiting section');
+  // issue-213's ONLY appearance in the output is the reconciled row, after the heading -- never a
+  // bare row (no `via=`) printed earlier, alongside issue-385, the way a plain PARKED row would be.
+  assert.equal(reconciledRowIdx, out.indexOf('issue-213', headingIdx), 'issue-213 must appear nowhere before the "resolved externally" heading');
+});
+
+test('spo parked: an ABANDONED card with externallyResolved (pr-merged, the 443 shape) is pulled OUT of the "abandoned:" heading too, carrying mergedAt', () => {
+  const journalDir = mkTmp('spo-reconciled-abandoned-journal-');
+
+  makeTaskDir(journalDir, 'issue-443', {
+    state: 'ABANDONED',
+    reason: 'abandoned-by-maintainer',
+    title: 'false park -- the PR had already merged',
+    externallyResolved: {
+      via: 'pr-merged',
+      closedAt: '2026-08-30T13:18:27Z',
+      prNumber: 447,
+      mergedAt: '2026-08-30T13:18:27Z',
+      at: '2026-08-30T13:20:00Z',
+    },
+  });
+  makeTaskDir(journalDir, 'issue-600', { state: 'ABANDONED', reason: 'abandoned-by-maintainer', title: 'a real abandon, not reconciled' });
+
+  const out = runSpo(['parked', '--journal', journalDir]);
+
+  assert.match(out, /^abandoned:$/m);
+  assert.match(out, /^issue-600\s+reason=abandoned-by-maintainer/m);
+  assert.match(out, /^issue-443\s+reason=abandoned-by-maintainer.*via=pr-merged.*mergedAt=2026-08-30T13:18:27Z/m);
+
+  // issue-443's only appearance is the reconciled row, after the "resolved externally" heading --
+  // never a bare row (no `via=`) sitting under "abandoned:" the way issue-600's genuinely does.
+  const headingIdx = out.indexOf('resolved externally');
+  assert.ok(headingIdx >= 0);
+  assert.equal(out.indexOf('issue-443'), out.indexOf('issue-443', headingIdx), 'issue-443 must appear nowhere before the "resolved externally" heading');
+});
+
+test('spo parked: with every parked/abandoned card reconciled, "(no parked tasks)" and no "abandoned:" heading still print correctly -- only "resolved externally" has rows', () => {
+  const journalDir = mkTmp('spo-reconciled-all-journal-');
+
+  makeTaskDir(journalDir, 'issue-213', {
+    state: 'PARKED',
+    reason: 'diagnose-duplicate-root-cause',
+    title: 'x',
+    externallyResolved: { via: 'issue-closed', closedAt: '2026-08-30T01:50:00Z', prNumber: null, mergedAt: null, at: '2026-08-30T02:00:00Z' },
+  });
+
+  const out = runSpo(['parked', '--journal', journalDir]);
+
+  // action 5.1b must not change what "(no parked tasks)" means for the still-waiting section --
+  // there is a comment at cmdParked's own PARKED branch explaining why (action 4.5's rule,
+  // extended here): a reconciled row is neither "still parked" nor "abandoned", so both those
+  // headings behave exactly as if the reconciled card did not exist.
+  assert.match(out, /\(no parked tasks\)/);
+  assert.ok(!out.includes('abandoned:'), 'no genuinely-abandoned cards -- the heading must not print at all');
+  assert.match(out, /^resolved externally.*:$/m);
+  assert.match(out, /^issue-213\s+reason=diagnose-duplicate-root-cause/m);
 });
 
 // ---- console/collect.js's collectDaemonStats: abandoned is terminal, not active/in-flight -----
