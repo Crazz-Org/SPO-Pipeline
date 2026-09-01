@@ -36,6 +36,11 @@ const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { moveCard } = require('../board');
 const { classifyCommand, classTimeoutMs, isSpawnTimeout } = require('../command-timeout');
+const {
+  acquireProductRepoLock,
+  releaseProductRepoLock,
+  ProductRepoLockTimeoutError,
+} = require('../product-repo-lock');
 const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline } = require('../task-values');
 const { checkRegressions } = require('../invariants');
 const { summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
@@ -813,6 +818,57 @@ function preserveWorktreeWipUnguarded(ctx, deps, { worktreePath, reason, state =
   return preserved;
 }
 
+// ---- action 6.4: product-repo mutex ---------------------------------------------------------
+//
+// withProductRepoLock(ctx, deps, phase, fn) -- runs `fn` (an async thunk) with the product-repo
+// lock held, releasing it in a `finally` on every exit path: a normal return, a ParkSignal thrown
+// by `fn`, or any other throw. See product-repo-lock.js's own header for the full rationale, the
+// WORST_HOLD_MS/MAX_LOCK_AGE_MS derivation, and why realWorktree (setup) and realFinish
+// (teardown), below, share this ONE lock rather than two.
+//
+// `deps.acquireProductRepoLock`/`deps.releaseProductRepoLock` are the test-injection points, same
+// convention as `deps.spawnSync` -- production code never passes them, so a real call always goes
+// through the real lock file. `deps.productRepoLockOpts` is forwarded to the REAL acquire call
+// untouched (isAlive/now/monotonicNowMs/sleep/waitMs/pollMs/filePath) -- the point a test drives
+// the real fs-backed lock with a small waitMs/pollMs or a fake clock without having to fake the
+// whole acquire function.
+//
+// A ProductRepoLockTimeoutError (the wait bound exceeded with the lock never acquired) becomes
+// ParkSignal('product-repo-lock-timeout', {phase, waitedMs, workers}) -- a reason that greps
+// distinctly from a genuine git failure (worktree-fetch-failed, worktree-add-failed,
+// finish-failed/worktree-remove, ...), per the spec's own requirement that a maintainer reading
+// `spo parked` can tell mutex starvation from a real git problem at a glance. `phase` disambiguates
+// which of the two critical sections (setup vs teardown) a park came from without needing a second
+// reason string.
+async function withProductRepoLock(ctx, deps, phase, fn) {
+  const acquireFn = (deps && deps.acquireProductRepoLock) || acquireProductRepoLock;
+  const releaseFn = (deps && deps.releaseProductRepoLock) || releaseProductRepoLock;
+
+  let acquired;
+  try {
+    acquired = await acquireFn(ctx.config, (deps && deps.productRepoLockOpts) || {});
+  } catch (err) {
+    if (err instanceof ProductRepoLockTimeoutError) {
+      throw new ParkSignal('product-repo-lock-timeout', { phase, waitedMs: err.waitedMs, workers: err.workers });
+    }
+    throw err;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    releaseFn(acquired);
+  }
+}
+
+// action 6.4: everything from `fetch` through `npm ci` below mutates config.productRepo's shared
+// `.git` (fetch writes FETCH_HEAD; the leftover sweep and `worktree add` mutate
+// `.git/worktrees/`'s administrative files) or spikes shared disk/CPU (`npm ci`) -- see
+// product-repo-lock.js's own header for the full rationale and the WORST_HOLD_MS arithmetic.
+// `board:take` (npm run, further down) is deliberately OUTSIDE the lock: it only talks to the
+// GitHub project board via `gh`/GraphQL from inside the now-created worktree, never touches
+// config.productRepo, and holding the mutex across it would only add an unrelated network call's
+// latency to every OTHER worker's wait.
 async function realWorktree(ctx, deps = {}) {
   const config = ctx.config;
   const productRepo = config.productRepo;
@@ -822,53 +878,60 @@ async function realWorktree(ctx, deps = {}) {
   const branch = `claude-pipe/${taskId}`;
   const worktreePath = path.join(worktreesDir, taskId);
 
-  const fetch = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'fetch', 'origin']);
-  if (fetch.exit !== 0) throw new ParkSignal('worktree-fetch-failed', { exit: fetch.exit });
-
-  const revParse = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'rev-parse', 'origin/main']);
-  if (revParse.exit !== 0) throw new ParkSignal('worktree-rev-parse-failed', { exit: revParse.exit });
-  const originMainSha = revParse.stdout.trim();
-
-  // Action 3.1: journal the base sha this run is building on, and hand it to ctx.task, before
-  // any park can happen below (including nightly-main-red). This 'base-main' event is a
-  // diagnostic record -- "what origin/main sha did this run cut its worktree from" -- journalled
-  // here, ahead of the nightly-red check, so it exists even for a run that parks right there and
-  // never reaches PLAN. It is NOT what handlePlan's reuse guard (decidePlanReuse,
-  // state-machine.js) reads: that guard's actual input is the baseMainSha field PLAN's own
-  // 'files-written' event carries (only written once PLAN succeeds), compared against
-  // ctx.task.baseMainSha as set on the line right below. A run that parks before ever reaching
-  // PLAN leaves no PLAN 'files-written' event at all, so there is nothing for a later retry to
-  // compare this run's base-main against in the first place.
-  appendEvent(ctx.taskDir, 'WORKTREE', 'base-main', { sha: originMainSha });
-  ctx.task.baseMainSha = originMainSha;
-
-  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
-  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
-    throw new ParkSignal('nightly-main-red', { sha: originMainSha });
-  }
-
-  sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch });
-
+  // Moved up from just before `worktree add` (its pre-6.4 position): the product-repo lock file
+  // (product-repo-lock.js) lives inside worktreesDir and must exist before withProductRepoLock's
+  // first acquire attempt, not just before `worktree add`. Idempotent (recursive: true) on every
+  // run after the first, so moving it earlier changes nothing about worktree add's own behaviour.
   fs.mkdirSync(worktreesDir, { recursive: true });
-  const add = spawnStep(ctx, deps, 'WORKTREE', 'git', [
-    '-C',
-    productRepo,
-    'worktree',
-    'add',
-    worktreePath,
-    '-b',
-    branch,
-    'origin/main',
-  ]);
-  if (add.exit !== 0) throw new ParkSignal('worktree-add-failed', { exit: add.exit });
 
-  // Every later real step (CHECK/PUSH_PR/GATE/... and PLAN/IMPLEMENT via config.cwdForStep)
-  // reads this back off ctx.task -- the one place a fresh worktree's path becomes known.
-  ctx.task.worktreePath = worktreePath;
-  ctx.task.branch = branch;
+  await withProductRepoLock(ctx, deps, 'worktree', async () => {
+    const fetch = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'fetch', 'origin']);
+    if (fetch.exit !== 0) throw new ParkSignal('worktree-fetch-failed', { exit: fetch.exit });
 
-  const ci = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['ci'], { cwd: worktreePath });
-  if (ci.exit !== 0) throw new ParkSignal('worktree-npm-ci-failed', { exit: ci.exit });
+    const revParse = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'rev-parse', 'origin/main']);
+    if (revParse.exit !== 0) throw new ParkSignal('worktree-rev-parse-failed', { exit: revParse.exit });
+    const originMainSha = revParse.stdout.trim();
+
+    // Action 3.1: journal the base sha this run is building on, and hand it to ctx.task, before
+    // any park can happen below (including nightly-main-red). This 'base-main' event is a
+    // diagnostic record -- "what origin/main sha did this run cut its worktree from" -- journalled
+    // here, ahead of the nightly-red check, so it exists even for a run that parks right there and
+    // never reaches PLAN. It is NOT what handlePlan's reuse guard (decidePlanReuse,
+    // state-machine.js) reads: that guard's actual input is the baseMainSha field PLAN's own
+    // 'files-written' event carries (only written once PLAN succeeds), compared against
+    // ctx.task.baseMainSha as set on the line right below. A run that parks before ever reaching
+    // PLAN leaves no PLAN 'files-written' event at all, so there is nothing for a later retry to
+    // compare this run's base-main against in the first place.
+    appendEvent(ctx.taskDir, 'WORKTREE', 'base-main', { sha: originMainSha });
+    ctx.task.baseMainSha = originMainSha;
+
+    const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
+    if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+      throw new ParkSignal('nightly-main-red', { sha: originMainSha });
+    }
+
+    sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch });
+
+    const add = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+      '-C',
+      productRepo,
+      'worktree',
+      'add',
+      worktreePath,
+      '-b',
+      branch,
+      'origin/main',
+    ]);
+    if (add.exit !== 0) throw new ParkSignal('worktree-add-failed', { exit: add.exit });
+
+    // Every later real step (CHECK/PUSH_PR/GATE/... and PLAN/IMPLEMENT via config.cwdForStep)
+    // reads this back off ctx.task -- the one place a fresh worktree's path becomes known.
+    ctx.task.worktreePath = worktreePath;
+    ctx.task.branch = branch;
+
+    const ci = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['ci'], { cwd: worktreePath });
+    if (ci.exit !== 0) throw new ParkSignal('worktree-npm-ci-failed', { exit: ci.exit });
+  });
 
   const claim = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['run', 'board:take', '--', String(issue)], {
     cwd: worktreePath,
@@ -1906,14 +1969,15 @@ async function realFinish(ctx, deps = {}) {
   ]);
   if (comment.exit !== 0) throw new ParkSignal('finish-failed', { step: 'issue-comment', exit: comment.exit });
 
-  const remove = spawnStep(ctx, deps, 'FINISH', 'git', [
-    '-C',
-    config.productRepo,
-    'worktree',
-    'remove',
-    '--force',
-    worktreePath,
-  ]);
+  // action 6.4: `worktree remove` mutates config.productRepo's shared `.git/worktrees/`
+  // administrative files, the same resource realWorktree's setup phase mutex-protects above --
+  // see product-repo-lock.js's own header. board:move and the issue comment above are deliberately
+  // OUTSIDE the lock: neither touches config.productRepo (board:move talks to the GitHub project
+  // board, the comment to the issue), so holding the mutex across them would only add two
+  // unrelated network calls' latency to every other worker's wait for no protective benefit.
+  const remove = await withProductRepoLock(ctx, deps, 'finish', async () =>
+    spawnStep(ctx, deps, 'FINISH', 'git', ['-C', config.productRepo, 'worktree', 'remove', '--force', worktreePath])
+  );
   if (remove.exit !== 0) throw new ParkSignal('finish-failed', { step: 'worktree-remove', exit: remove.exit });
 
   const billableTokens = sumJournalBillableTokens(ctx.taskDir);

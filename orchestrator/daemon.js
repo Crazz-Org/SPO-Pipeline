@@ -77,6 +77,7 @@ const os = require('os');
 const path = require('path');
 
 const defaultConfig = require('./config');
+const productRepoHold = require('./product-repo-hold');
 const { drainQueueOnce, runTask, runForever } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
@@ -374,6 +375,11 @@ async function main() {
     }
   }
 
+  // Action 6.3's own "bad override falls back to the default" posture, resolved ONCE here because
+  // action 6.4's stepDeadlineMsByState entries below are derived from it too -- see there.
+  const effectiveWorkers =
+    Number.isInteger(opts.workers) && opts.workers > 0 ? opts.workers : defaultConfig.workers;
+
   const config = {
     ...defaultConfig,
     shadowMode: !!opts.shadow,
@@ -385,7 +391,29 @@ async function main() {
     // wrong" posture config.js's own positiveIntFromEnv already applies to SPO_WORKERS -- a
     // missing/non-integer/non-positive --workers leaves defaultConfig.workers (env-resolved)
     // untouched rather than coercing to 0 or NaN.
-    workers: Number.isInteger(opts.workers) && opts.workers > 0 ? opts.workers : defaultConfig.workers,
+    workers: effectiveWorkers,
+    // Action 6.4: config.js derived these two from the ENV-time K (SPO_WORKERS, or 1). A
+    // `--workers` flag changes K for THIS process, and both entries are functions of K -- so they
+    // have to be recomputed here or they silently keep a ceiling sized for a smaller K. That is
+    // not cosmetic: at K=2 the WORKTREE entry derived at K=1 (118 min) is SHORTER than the wait
+    // plus work a worker can legitimately perform (232 min), which re-opens exactly the
+    // abandon-the-loser clone-corruption path config.js's own stepDeadlineMsByState comment
+    // documents. Recomputed from the SAME product-repo-hold.js formula, never a second literal.
+    stepDeadlineMsByState: {
+      ...defaultConfig.stepDeadlineMsByState,
+      WORKTREE: productRepoHold.lockedStepDeadlineMs(
+        defaultConfig.commandTimeoutsMs,
+        effectiveWorkers,
+        defaultConfig.stepDeadlineMs,
+        productRepoHold.worstHoldMs(defaultConfig.commandTimeoutsMs)
+      ),
+      FINISH: productRepoHold.lockedStepDeadlineMs(
+        defaultConfig.commandTimeoutsMs,
+        effectiveWorkers,
+        defaultConfig.stepDeadlineMs,
+        productRepoHold.finishHoldMs(defaultConfig.commandTimeoutsMs)
+      ),
+    },
     queueDir,
     // Every state.json snapshot this run writes carries this back (state-machine.js's
     // buildCtx/snapshot) -- orphan-scan.js's only way, after a restart, to tell "the process

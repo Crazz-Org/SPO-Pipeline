@@ -249,3 +249,38 @@ test('daemon.js sets config.queueDir for BOTH modes -- action 4.4 auto-retry is 
     "main()'s config must carry queueDir for BOTH modes: worker mode never goes through drainQueueOnce, which is the only other place it was ever injected, so without it action 4.4's transient auto-retry silently stops re-enqueueing under workers"
   );
 });
+
+test("daemon.js re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K -- a --workers override must move them, or the deadline can fire on a legitimate lock wait", () => {
+  // Standing source guard, same shape and for the same reason as the queueDir guard directly
+  // above: the property is real and load-bearing but not observable from a hermetic run, because
+  // daemon.js runs main() unconditionally (no require.main guard) and so cannot be required.
+  //
+  // What it protects, measured during 6.4's verification: config.js derives
+  // stepDeadlineMsByState.WORKTREE/FINISH from the ENV-time K (SPO_WORKERS, default 1). `--workers`
+  // changes K for THIS process only, and both entries are functions of K. Leave them at the K=1
+  // value and, at K=2, WORKTREE's ceiling (118 min) is SHORTER than the wait plus work a worker can
+  // legitimately perform (232 min) -- so the deadline fires mid-wait, and because deadline.js's
+  // withTimeout ABANDONS the loser rather than cancelling it, TWO realWorktree invocations then run
+  // fetch / the leftover sweep / `git worktree add` against the SHARED product-repo clone for a task
+  // that has already parked. Removing this recompute passed the entire 1301-test suite.
+  const source = fs.readFileSync(DAEMON, 'utf8');
+  const configAt = source.indexOf('const config = {');
+  assert.notEqual(configAt, -1, "main()'s config literal is no longer recognisable -- update this guard");
+  const configLiteral = source.slice(configAt, source.indexOf('\n  };', configAt));
+
+  assert.match(
+    configLiteral,
+    /stepDeadlineMsByState:\s*\{/,
+    "main()'s config must re-derive stepDeadlineMsByState: config.js built it from the env-time K, and --workers changes K for this process"
+  );
+  for (const state of ['WORKTREE', 'FINISH']) {
+    assert.match(
+      configLiteral,
+      new RegExp(`${state}: productRepoHold\\.lockedStepDeadlineMs\\(`),
+      `${state}'s deadline must be recomputed through product-repo-hold.js's own formula, never restated as a literal here`
+    );
+  }
+  // And from the EFFECTIVE K (the --workers-aware value), not defaultConfig.workers.
+  const byState = configLiteral.slice(configLiteral.indexOf('stepDeadlineMsByState:'));
+  assert.match(byState, /effectiveWorkers/, 'the recompute must use the --workers-aware K, not config.js\'s env-time default');
+});

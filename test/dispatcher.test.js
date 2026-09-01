@@ -1146,3 +1146,91 @@ test('readLiveWorkerIds tolerates a missing file (no dispatcher has ever run her
   const journalDir = mkTmp('spo-disp-liveids-missing-j-');
   assert.deepEqual(readLiveWorkerIds(journalDir), new Set());
 });
+
+// ---- action 6.4 (post-verification): WHAT DOES THE CHILD ACTUALLY RESOLVE? -------------------
+//
+// A worker and a scanner resolve their own config from config.js (env) plus the argv this module
+// builds. Nothing else crosses the process boundary except inherited process.env -- so any config
+// key whose value comes from a daemon.js CLI FLAG is silently lost unless it is forwarded here.
+//
+// This has now bitten twice. 6.3's own verification found `--queue` missing from buildScannerArgv
+// (1273 tests passed). 6.4's found `--workers` missing from buildWorkerArgv: a `--workers 2`
+// dispatcher spawned children resolving `config.workers === 1`, which made
+// product-repo-lock.js's waitBoundMs ((K-1) x WORST_HOLD_MS) exactly ZERO -- so the second
+// concurrent card parked `product-repo-lock-timeout` on its first failed acquire instead of
+// waiting. Both were one missing string in an argv array, and both passed the whole suite.
+//
+// So the standing rule is not "forward this one flag", it is: EVERY flag daemon.js accepts is
+// explicitly classified below, for BOTH child kinds. Adding a flag to daemon.js without deciding
+// what a child should do with it fails this test.
+const DAEMON_FLAG_POLICY = {
+  // mode selectors -- forwarded as the single mode flag both builders derive from this config
+  '--shadow': { worker: 'mode', scanner: 'mode' },
+  '--dry-run': { worker: 'mode', scanner: 'mode' },
+  '--real': { worker: 'mode', scanner: 'mode' },
+  // forwarded verbatim: a child that fell back to the repo default queue/journal would drain a
+  // queue nobody fills and journal where nobody reads
+  '--queue': { worker: 'forward', scanner: 'forward' },
+  '--journal': { worker: 'forward', scanner: 'forward' },
+  // forwarded to the worker only: it governs ONE step's deadline, and only a worker runs steps
+  '--deadline-ms': { worker: 'forward', scanner: 'n/a: a scanner never runs a state handler' },
+  // action 6.4: forwarded to the worker because product-repo-lock.js derives its wait bound from K
+  '--workers': { worker: 'forward', scanner: 'n/a: a scanner never takes the product-repo lock' },
+  // NOT forwarded, deliberately: these select what the child IS, and the builders set them
+  '--worker': { worker: 'self', scanner: 'n/a' },
+  '--scanner': { worker: 'n/a', scanner: 'self' },
+  // NOT forwarded, deliberately: pollIntervalMs is read ONLY by dispatcher.js's own supervision
+  // loop. A worker runs one task and exits; a scanner has its own scan cadences.
+  '--interval-ms': { worker: "n/a: dispatcher's own loop cadence", scanner: "n/a: dispatcher's own loop cadence" },
+  // NOT forwarded: --once drains a queue serially in-process, which is the mode the dispatcher
+  // REPLACES; a child is never spawned in it.
+  '--once': { worker: 'n/a: a worker runs exactly one task by construction', scanner: 'n/a' },
+  '--help': { worker: 'n/a', scanner: 'n/a' },
+  '-h': { worker: 'n/a', scanner: 'n/a' },
+};
+
+test('every daemon.js CLI flag is explicitly classified for BOTH child kinds -- a new flag cannot be added without deciding what a child resolves', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'daemon.js'), 'utf8');
+  const parsed = new Set();
+  for (const m of src.matchAll(/a === '(--?[a-z-]+)'/g)) parsed.add(m[1]);
+
+  assert.ok(parsed.size >= 12, `expected daemon.js to parse a dozen-odd flags, found ${parsed.size}`);
+  for (const flag of parsed) {
+    assert.ok(
+      DAEMON_FLAG_POLICY[flag],
+      `daemon.js accepts ${flag} but DAEMON_FLAG_POLICY does not say what a worker/scanner child should resolve for it. ` +
+        `Decide, then add a row -- this is the check that would have caught 6.3's missing --queue and 6.4's missing --workers.`
+    );
+  }
+  for (const flag of Object.keys(DAEMON_FLAG_POLICY)) {
+    assert.ok(parsed.has(flag), `DAEMON_FLAG_POLICY lists ${flag}, which daemon.js no longer accepts -- drop the row`);
+  }
+});
+
+test('buildWorkerArgv: --workers is forwarded, so a worker resolves the SAME K its dispatcher did (product-repo-lock.js derives its wait bound from it)', () => {
+  const { buildWorkerArgv } = require('../orchestrator/dispatcher');
+  const argv = buildWorkerArgv('/t', '/q', '/j', { real: true, workers: 3 });
+  const i = argv.indexOf('--workers');
+  assert.ok(i > 0, 'the worker argv must carry --workers -- without it the child resolves K=1 and waitBoundMs becomes 0');
+  assert.equal(argv[i + 1], '3');
+
+  // And the value must be THIS dispatcher's K, not a constant that happens to look right at K=2.
+  assert.equal(buildWorkerArgv('/t', '/q', '/j', { real: true, workers: 7 })[i + 1], '7');
+
+  // A missing/invalid K omits the flag rather than forwarding NaN -- the child then falls back to
+  // config.js's own default, the same posture daemon.js applies to a bad --workers.
+  assert.equal(buildWorkerArgv('/t', '/q', '/j', { real: true }).includes('--workers'), false);
+  assert.equal(buildWorkerArgv('/t', '/q', '/j', { real: true, workers: 0 }).includes('--workers'), false);
+});
+
+test('a worker child spawned by a --workers K dispatcher resolves K, and therefore a NON-ZERO product-repo lock wait bound', () => {
+  const { buildWorkerArgv } = require('../orchestrator/dispatcher');
+  const argv = buildWorkerArgv('/t', '/q', '/j', { real: true, workers: 2 });
+  // Resolve the child's own config the way daemon.js does: config.js's defaults, then the argv
+  // override. Asserted through product-repo-lock.js's real waitBoundMs, because "K reached the
+  // child" only matters for what the child then DERIVES from it.
+  const { waitBoundMs, WORST_HOLD_MS } = require('../orchestrator/product-repo-lock');
+  const k = Number(argv[argv.indexOf('--workers') + 1]);
+  assert.equal(waitBoundMs({ workers: k }), WORST_HOLD_MS, 'at K=2 a worker must be willing to wait out ONE other worst-case holder');
+  assert.notEqual(waitBoundMs({ workers: k }), 0, 'a zero wait bound is the defect: the card parks instead of waiting');
+});

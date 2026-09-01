@@ -6,6 +6,13 @@
 const path = require('path');
 const os = require('os');
 
+// The ONLY require in this otherwise-inert data module, and deliberately a dependency-free leaf
+// (it requires nothing itself, this file included -- see its header). It owns action 6.4's
+// product-repo mutex arithmetic, which BOTH product-repo-lock.js and this file's own
+// stepDeadlineMsByState below have to derive from. Requiring product-repo-lock.js instead would
+// be a cycle (that file requires this one) and would silently yield NaN deadlines.
+const productRepoHold = require('./product-repo-hold');
+
 const REPO_ROOT = path.join(__dirname, '..');
 
 // cwd policy for real-mode `claude -p` calls (steps/llm.js). Shadow mode never spawns anything,
@@ -47,6 +54,19 @@ const CI_CHECKS_POLL_INTERVAL_MS =
   process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS !== undefined
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
     : 20000;
+
+// Hoisted for the SAME reason CI_CHECKS_MAX_POLLS above is (action 6.4): WORKTREE's and FINISH's
+// stepDeadlineMsByState entries are derived from these two, and a field of the export object
+// cannot be read while that object is still being built. Both are still exported verbatim as
+// `commandTimeoutsMs` / `workers` below -- this only moves the declaration, never the value.
+const COMMAND_TIMEOUTS_MS = {
+  git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
+  gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
+  'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
+  'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
+  'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
+};
+const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
 // Hoisted out of the `autoTriageMs` field below (action 3.3) so autoTriageBackoffBaseMs can
 // default off the SAME resolved value rather than re-parsing SPO_AUTO_TRIAGE_MS a second time and
@@ -198,8 +218,51 @@ module.exports = {
   // making 1.7's own park unreachable. Derive the ceiling from the bound so the two can never
   // drift apart again: the full poll budget plus one ordinary step deadline of margin for the
   // `gh api` calls themselves.
+  //
+  // WORKTREE and FINISH (action 6.4) are the same class of problem for the same reason, and the
+  // history matters because it is the reason anyone would ever revisit these two numbers:
+  //
+  //   THIS TIMER WAS ALWAYS INERT IN REAL MODE. See the commandTimeoutsMs comment below: every
+  //   real command in these steps runs through a BLOCKING spawnSync, so the event loop never
+  //   yields and deadline.js's setTimeout could never fire. 6.4's product-repo mutex introduced
+  //   the first `await` ever placed in that path (its poll loop's `await sleep(pollMs)`), which
+  //   ARMED a timer that had never been live -- it did not expose a latent bug, it created a new
+  //   one. Measured during 6.4's verification: with a holder still inside the critical section,
+  //   WORKTREE parked `step-deadline-exceeded-twice` at 2 x stepDeadlineMs instead of ever
+  //   reaching the mutex's own 116-minute wait bound, which the bound made unreachable dead code.
+  //
+  //   SO THESE ENTRIES ARE DELIBERATELY LARGE ENOUGH NEVER TO FIRE, and that is the correct
+  //   answer rather than a cop-out: it restores the documented status quo. The real protection in
+  //   these two steps is, and always was, spawnSync's own per-command timeouts
+  //   (commandTimeoutsMs below), armed by steps/scripted.js's spawnStep -- never this timer.
+  //
+  //   THE HAZARD IF ONE EVER DOES FIRE, which is why "large enough" is not good enough on its
+  //   own: deadline.js's withTimeout ABANDONS the loser rather than cancelling it (deadline.js
+  //   lines 11-13). Measured, not reasoned about: when the WORKTREE timer fired during a lock
+  //   wait, TWO realWorktree invocations subsequently entered the critical section -- 5ms apart,
+  //   serialized by the mutex but both running fetch / the leftover sweep / `git worktree add`
+  //   against the SHARED clone for a task that had ALREADY PARKED, leaving an orphan worktree and
+  //   branch behind. That is a clone-corruption path opened by the very mutex that exists to
+  //   prevent clone corruption. Shrinking either entry below its derived value reopens it.
+  //
+  // Derived, never literals, from product-repo-hold.js's own arithmetic so a change to
+  // commandTimeoutsMs or to `workers` moves all of these together: the longest legitimate WAIT on
+  // the mutex ((K-1) x worst hold), plus that phase's own longest legitimate WORK, plus one
+  // ordinary step deadline of margin -- the identical shape CI_CHECKS uses above.
   stepDeadlineMsByState: {
     CI_CHECKS: CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS,
+    WORKTREE: productRepoHold.lockedStepDeadlineMs(
+      COMMAND_TIMEOUTS_MS,
+      WORKERS,
+      STEP_DEADLINE_MS,
+      productRepoHold.worstHoldMs(COMMAND_TIMEOUTS_MS)
+    ),
+    FINISH: productRepoHold.lockedStepDeadlineMs(
+      COMMAND_TIMEOUTS_MS,
+      WORKERS,
+      STEP_DEADLINE_MS,
+      productRepoHold.finishHoldMs(COMMAND_TIMEOUTS_MS)
+    ),
   },
 
   // ---- action 2.1: real spawnSync per-command-class timeouts -----------------------------
@@ -255,13 +318,7 @@ module.exports = {
   //
   // An explicit `opts.timeout` passed by a spawnStep call site always wins over these defaults
   // (steps/scripted.js). Every value is independently overridable; SPO_TIMEOUT_* env vars.
-  commandTimeoutsMs: {
-    git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
-    gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
-    'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
-    'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
-    'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
-  },
+  commandTimeoutsMs: COMMAND_TIMEOUTS_MS,
 
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,
@@ -278,7 +335,7 @@ module.exports = {
   // is a routine state, not an edge case: one account sat in a 5-hour cooldown for most of
   // 2026-09-01. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
   // this default rather than to 0 (which would spawn nothing, silently, forever).
-  workers: positiveIntFromEnv('SPO_WORKERS', 1),
+  workers: WORKERS,
 
   // How many CONSECUTIVE worker crashes (dispatcher.js's own classifier: any exit that is
   // neither 0 (DONE) nor 20 (PARKED) -- see daemon.js's --worker header for the full exit-code
@@ -431,6 +488,15 @@ module.exports = {
   // (worktrees/ in .gitignore) -- disposable, FINISH removes its own entry with
   // `git worktree remove --force`.
   pipelineWorktreesDir: process.env.SPO_WORKTREES_DIR || path.join(REPO_ROOT, 'worktrees'),
+
+  // productRepoLockPollMs -- action 6.4's product-repo mutex (orchestrator/product-repo-lock.js):
+  // how often a worker blocked on the lock re-checks whether it has freed up. Same cadence and
+  // same reasoning as accountLeasePollMs above (one small fs read, cheap enough that 1s costs
+  // nothing even with a couple of workers waiting at once) -- the bound this polls inside of is
+  // derived in product-repo-lock.js itself, not here, from commandTimeoutsMs above (see that
+  // file's own header for why a *derived* bound cannot live in this deliberately-inert config
+  // object). SPO_PRODUCT_REPO_LOCK_POLL_MS overrides.
+  productRepoLockPollMs: positiveMsFromEnv('SPO_PRODUCT_REPO_LOCK_POLL_MS', 1000),
 
   // owner/repo for every `gh api` / `gh pr` / `gh issue` real call.
   ghRepo: 'Crazz-Org/SPO-WebClient',

@@ -34,6 +34,7 @@ const {
   finalComment,
 } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx, runTask } = require('../orchestrator/state-machine');
+const { lockFilePath } = require('../orchestrator/product-repo-lock');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { runLlm } = require('../orchestrator/steps/llm');
@@ -1830,6 +1831,222 @@ test('realFinish: the board move is journalled BEFORE the issue comment -- a par
   const moved = journal.find((e) => e.event === 'board-move');
   assert.ok(moved, 'the successful move to Done must already be journalled when the comment parks');
   assert.equal(moved.column, 'Done');
+});
+
+// ---- action 6.4: the product-repo mutex, as wired into realWorktree/realFinish ----------------
+//
+// Real exclusion (two processes can never both be inside the critical section) and the
+// dead-pid/live-in-bound/over-age sweep rules are covered directly against
+// orchestrator/product-repo-lock.js in test/product-repo-lock.test.js -- that file owns the
+// mutex's own behaviour. What belongs HERE, alongside every other realWorktree/realFinish test, is
+// the WIRING: does setup actually acquire-and-release around the right span, does teardown do the
+// same around just `worktree remove`, does a thrown ParkSignal still release (try/finally), does a
+// wait-bound timeout become the documented ParkSignal reason, and do both call sites end up
+// pointed at the SAME lock file for the same config (the empirical half of "one mutex, not two" --
+// product-repo-lock.test.js proves the OTHER half, that two real holders of that file exclude each
+// other, using role-labelled fixture processes).
+
+test('realWorktree (action 6.4): the product-repo lock is released once setup finishes -- the lock file does not survive a successful run', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-ok', kind: 'card', issue: 900, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-ok', task, config });
+  const deps = { spawnSync: noLeftoversSpawnSync([]) };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+  assert.equal(fs.existsSync(lockFilePath(config)), false, 'the lock must be released once the setup phase returns');
+});
+
+test('realWorktree (action 6.4): the product-repo lock is released even when a step inside throws ParkSignal (npm ci failure)', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-park', kind: 'card', issue: 901, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-park', task, config });
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers
+      if (args.includes('rev-parse')) return ok('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n');
+      if (command === 'npm' && args[0] === 'ci') return fail(1);
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realWorktree(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'worktree-npm-ci-failed'
+  );
+  assert.equal(
+    fs.existsSync(lockFilePath(config)),
+    false,
+    'a ParkSignal thrown from inside the locked span must still release the lock (try/finally), not wedge every other worker behind it'
+  );
+});
+
+test('realFinish (action 6.4): the product-repo lock is released after a successful worktree remove', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-ok-');
+  const task = { id: 'card-lock-finish-ok', kind: 'card', issue: 902, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-finish-ok', task, config });
+
+  const next = await realFinish(ctx, { spawnSync: () => ok('') });
+  assert.equal(next, 'DONE');
+  assert.equal(fs.existsSync(lockFilePath(config)), false);
+});
+
+test('realFinish (action 6.4): the product-repo lock is released even when `git worktree remove` itself fails', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-fail-');
+  const task = { id: 'card-lock-finish-fail', kind: 'card', issue: 903, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-finish-fail', task, config });
+  const deps = {
+    spawnSync: (command, args) => (args.includes('remove') ? fail(1) : ok('')),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'worktree-remove'
+  );
+  assert.equal(fs.existsSync(lockFilePath(config)), false, 'the remove call itself failing must still release the lock');
+});
+
+// WHY THESE TWO TESTS OBSERVE FROM INSIDE THE SPAN, and not merely that the lock is gone
+// afterwards. Every action of chantier 6 shipped a central claim that passed the whole suite while
+// being false, and the shape was the same each time: an assertion on the state AFTER the span
+// (which "acquire and immediately drop" satisfies exactly as well as "hold throughout"), or a
+// single-process test standing in for a property that is only meaningful across processes. 6.2's
+// lease-release-before-spawn survived 1223 tests on the first shape; verification of 6.4 measured
+// the same two holes here -- moving `releaseFn(acquired)` to BEFORE `await fn()` (the literal 6.2
+// shape), and shrinking the locked span to `git worktree add` alone so that fetch, the whole
+// leftover sweep and `npm ci` ran unprotected, EACH passed all 1295 tests while two real processes
+// running this very function overlapped inside the critical section 8 times.
+//
+// So: assert the lock is HELD, from inside, at both ENDS of the span -- the first spawn (`fetch`)
+// and the last (`npm ci`) -- and that the holder is THIS process. A lock that is acquired and
+// dropped early fails at `npm ci`; a span that starts late fails at `fetch`; a span that is never
+// taken fails at both.
+function lockHolderDuring(config) {
+  try {
+    return JSON.parse(fs.readFileSync(lockFilePath(config), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+test('realWorktree (action 6.4): the product-repo lock is HELD BY THIS PROCESS at both ends of the span -- observed from inside, at `fetch` and at `npm ci`', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-inside', kind: 'card', issue: 908, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-inside', task, config });
+
+  const seen = {};
+  const deps = {
+    spawnSync: (command, args) => {
+      const argv = [command, ...args].join(' ');
+      if (argv.includes('fetch')) seen.atFetch = lockHolderDuring(config);
+      if (command === 'npm' && args[0] === 'ci') seen.atNpmCi = lockHolderDuring(config);
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1);
+      if (args.includes('rev-parse')) return ok('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n');
+      return ok('');
+    },
+  };
+
+  assert.equal(await realWorktree(ctx, deps), 'PLAN');
+
+  assert.ok(seen.atFetch, 'the lock must already be held at the FIRST spawn of the span (`git fetch`)');
+  assert.equal(seen.atFetch.pid, process.pid, 'and held by THIS process, not merely present on disk');
+  assert.ok(seen.atNpmCi, 'the lock must STILL be held at the LAST spawn of the span (`npm ci`) -- an early release is the 6.2 shape');
+  assert.equal(seen.atNpmCi.pid, process.pid);
+  assert.equal(seen.atFetch.startedAt, seen.atNpmCi.startedAt, 'and it must be the SAME acquisition throughout, never released and retaken mid-span');
+  assert.equal(fs.existsSync(lockFilePath(config)), false, 'and released once the span returns');
+});
+
+test('realFinish (action 6.4): the product-repo lock is HELD BY THIS PROCESS during `git worktree remove` itself', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-inside-');
+  const task = { id: 'card-lock-finish-inside', kind: 'card', issue: 909, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-finish-inside', task, config });
+
+  let atRemove;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('worktree') && args.includes('remove')) atRemove = lockHolderDuring(config);
+      return ok('');
+    },
+  };
+
+  assert.equal(await realFinish(ctx, deps), 'DONE');
+  assert.ok(atRemove, 'the teardown lock must be held DURING the remove, not merely around it');
+  assert.equal(atRemove.pid, process.pid);
+  assert.equal(fs.existsSync(lockFilePath(config)), false);
+});
+
+test('realWorktree (action 6.4): the product-repo lock wait bound exceeded -> ParkSignal(product-repo-lock-timeout), phase "worktree"', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-timeout-wt', kind: 'card', issue: 904, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-timeout-wt', task, config });
+
+  // A LIVE, in-bound holder pre-seeded directly on disk under this test's OWN pid -- genuinely
+  // alive, so acquireProductRepoLock's default isAlive sees it as held and the bounded wait below
+  // must time out rather than sweep it.
+  fs.mkdirSync(path.dirname(lockFilePath(config)), { recursive: true });
+  fs.writeFileSync(lockFilePath(config), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+
+  const deps = { spawnSync: noLeftoversSpawnSync([]), productRepoLockOpts: { waitMs: 40, pollMs: 10 } };
+
+  await assert.rejects(
+    () => realWorktree(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'product-repo-lock-timeout' && err.detail.phase === 'worktree'
+  );
+});
+
+test('realFinish (action 6.4): the product-repo lock wait bound exceeded -> ParkSignal(product-repo-lock-timeout), phase "finish"', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-timeout-');
+  const task = { id: 'card-lock-timeout-fin', kind: 'card', issue: 905, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-timeout-fin', task, config });
+
+  fs.mkdirSync(path.dirname(lockFilePath(config)), { recursive: true });
+  fs.writeFileSync(lockFilePath(config), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+
+  const deps = { spawnSync: () => ok(''), productRepoLockOpts: { waitMs: 40, pollMs: 10 } };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'product-repo-lock-timeout' && err.detail.phase === 'finish'
+  );
+});
+
+test('action 6.4: realWorktree (setup) and realFinish (teardown) acquire the SAME product-repo lock file for the same config -- one mutex, not two', async () => {
+  const config = testConfig();
+  const capturedPaths = [];
+  const spyAcquire = async (cfg, opts) => {
+    const filePath = (opts && opts.filePath) || lockFilePath(cfg);
+    capturedPaths.push(filePath);
+    return { filePath, held: { pid: process.pid, startedAt: new Date().toISOString() } };
+  };
+  const spyRelease = () => {};
+
+  const wtTask = { id: 'card-samefile-wt', kind: 'card', issue: 906, title: 'Add a widget' };
+  const wtCtx = testCtx({ id: 'card-samefile-wt', task: wtTask, config });
+  await realWorktree(wtCtx, {
+    spawnSync: noLeftoversSpawnSync([]),
+    acquireProductRepoLock: spyAcquire,
+    releaseProductRepoLock: spyRelease,
+  });
+
+  const worktreePath = mkTmp('spo-real-finish-samefile-');
+  const finTask = { id: 'card-samefile-fin', kind: 'card', issue: 907, worktreePath };
+  const finCtx = testCtx({ id: 'card-samefile-fin', task: finTask, config });
+  await realFinish(finCtx, {
+    spawnSync: () => ok(''),
+    acquireProductRepoLock: spyAcquire,
+    releaseProductRepoLock: spyRelease,
+  });
+
+  assert.equal(capturedPaths.length, 2);
+  assert.equal(
+    capturedPaths[0],
+    capturedPaths[1],
+    'setup and teardown must resolve to the identical lock file for the same config -- that is what makes them contend on ONE mutex'
+  );
 });
 
 // ---- finalComment (action 5.2: billable tokens, pipeline duration, attempt counts) ------------

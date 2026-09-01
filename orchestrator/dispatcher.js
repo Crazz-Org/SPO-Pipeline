@@ -158,10 +158,29 @@ function classifyWorkerExit(code) {
 // `--worker` parsing already falls back to config.js's default when the flag is absent, so
 // omitting it here when there is nothing non-default to say is not a behaviour change, just less
 // argv.
+//
+// `--workers` IS FORWARDED, and this is a 6.3 defect that only 6.4 could surface. A worker resolves
+// its OWN config from config.js (env) plus this argv -- nothing else crosses the process boundary
+// except inherited process.env. So a `--workers 2` dispatcher used to spawn children that each
+// resolved `config.workers === 1`, and nothing noticed until action 6.4 derived a value from it:
+// product-repo-lock.js's waitBoundMs is (K-1) x WORST_HOLD_MS, which at K=1 is ZERO, so the second
+// concurrent card did not WAIT for the product-repo mutex -- it parked `product-repo-lock-timeout`
+// on its first failed acquire. Measured during 6.4's verification with two real processes at the
+// config a dispatcher-spawned worker actually resolves: one reached PLAN, the other parked
+// instantly. The mutex's entire reason to exist (K > 1) was the exact case it broke.
+//
+// Only SPO_WORKERS in the environment happened to work; the documented CLI flag did not. The
+// clamp to healthy accounts stays dispatcher-side deliberately -- a worker uses K only to size the
+// wait it must be willing to perform, and the honest answer to "how many workers could be ahead of
+// me" is the configured K, not whatever the pool happened to allow at spawn time.
+//
+// See test/dispatcher.test.js's flag-coverage test for the standing rule this is now held to:
+// every flag daemon.js accepts must be explicitly classified as forwarded or deliberately not.
 function buildWorkerArgv(taskDir, queueDir, journalRoot, config) {
   const modeFlag = config.shadowMode ? '--shadow' : config.dryRun ? '--dry-run' : '--real';
   const argv = [DAEMON_PATH, modeFlag, '--worker', taskDir, '--queue', queueDir, '--journal', journalRoot];
   if (config.stepDeadlineMs) argv.push('--deadline-ms', String(config.stepDeadlineMs));
+  if (Number.isInteger(config.workers) && config.workers > 0) argv.push('--workers', String(config.workers));
   return argv;
 }
 
