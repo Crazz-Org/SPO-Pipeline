@@ -1150,3 +1150,101 @@ ordering, which it kills.
 
 Suite: **1182 passing, 0 failing**, green under UTC, Europe/Paris, Pacific/Kiritimati,
 America/Los_Angeles and Asia/Kolkata, and 0 failures across 40 parallel full-suite runs.
+
+## C6 commits (one per action, in order)
+
+| action | commit | what it does |
+|---|---|---|
+| — | `74a5818` | C6's own measurement: the funnel re-derived, and both maintainer decisions |
+| — | `1271f1c` | #480, and the production race it turned out to be hiding |
+| 6.1 | `8f8c599` | `daemon.js --worker` runs one task, takes no lock, and exits a code |
+| 6.2 | `b788463` | per-step account leases; `markLimit` stops losing concurrent cooldowns |
+
+## What C6 corrected in the plan
+
+**The funnel's denominator was wrong by 3–6×, and the conclusion survived anyway.** See C6's
+measurement section above. The gate figure (~2.5 min) is exact; "30–45 min of LLM work per card" is
+really 6.7–10.3 min. Re-derived against card *cycle* time the bench takes 18.6 % of a card per
+worker, not 5.5–8 %, so K=3 gives ρ=56 % rather than the ~20 % the plan implied — feasible, with
+half the headroom it believed. **K=3 is unreachable regardless**: the pool is two accounts.
+
+**6.2's lease granularity inverts the plan's own sentence, on maintainer decision.** Per-task
+leasing would convert a measured 15 %-frequency, 6-second mid-run rotation into a park class that
+has never once fired. Per-step costs nothing (`fable -> sonnet -> fable`, no cross-step cache).
+
+**The plan names one rotation loop; there are two.** `intake.js` has its own, and under C6 it runs
+dispatcher-side — so the dispatcher competes with workers for the same two accounts.
+
+**6.5's counter does not need raising, and the plan's default of 2 is right only at the K it
+happened to pick.** The main-moved test is a file intersection (`realCiChecks`), 10.5 % of merged
+card pairs share a file, and expected sibling merges per card window is K−1. Derived park rate
+under today's boolean: 0.08–0.15 % at K=2. Full derivation above.
+
+### Erratum, and it is the largest one C6 found: the dispatcher's "short calls" are not short
+
+The plan's 6.3 row says the dispatcher's "own short calls (auto-pull, scans) stay spawnSync". The
+scans include `runAutoTriage` → `intake.triageBugReport`/`reviewCard` → `llm.js`'s **blocking**
+`spawnSync('claude', …)`. Measured on the live daemon's own journal, today:
+
+| card | `report-triage-claimed` → `auto-triage` |
+|---|---|
+| #471 | **3 m 24.9 s** |
+| #473 | **3 m 11.5 s** |
+
+And the consequence, A/B'd against the real dispatcher with real worker children and an identical
+3000 ms scan, sync versus async the only difference:
+
+| scan | worker reaping lag | 100 ms timer ticks in ~9 s |
+|---|---|---|
+| blocking `spawnSync` | **2608 ms** | **1** |
+| awaited | 7 ms | 58 |
+
+So for three minutes at a time the dispatcher cannot reap an exit, refill a freed slot, service a
+timer, or honour SIGTERM — and systemd's `TimeoutStopUSec` is 1 min 30 s, so a deploy SIGKILLs it
+and `killAllWorkers` never runs. **A dispatcher built to the plan's premise serializes on intake
+and delivers no parallelism at all.** The hermetic suite cannot see it: every dispatcher test sets
+`real: false`, so the scan cycle returns at its first line.
+
+The obvious fix — a per-cycle scan child — is wrong, and worth recording as a trap: `comment-scan.js`'s
+scan state is documented as needing to survive across cycles ("a cache that resets every cycle is
+not a cache; a backoff that resets every cycle never backs off"), so a fresh child per cycle
+destroys the collaborator cache and action 2.7's per-issue backoff every cycle. Resolved instead
+with a **long-lived scanner sibling process** supervised by the dispatcher — which is also what
+`runForever` becomes, rather than the dead code 6.3's first cut left it as.
+
+### This machine's wall clock jumps backward, and it corrupts mutation verdicts
+
+Measured independently, twice: `Date.now()` moved **−2515 ms across a single 10 ms monotonic
+interval**, once in 2331 samples over 25 s. A WSL2 clock-sync artifact.
+
+Consequences worth carrying forward:
+
+- Every bounded wait loop keyed on `Date.now()` deltas can over-wait by ~2.5 s. That is what makes
+  `test/accounts.test.js`'s state-lock test fail ~1 run in 12.
+- **A flaky suite silently misreports a surviving mutation as killed** — it already did so once in
+  C4, and it did so again here (a mutation appeared killed by an unrelated concurrency test).
+  Screen every mutation round for it.
+- The fix is monotonic (`process.hrtime.bigint()`) for measuring *elapsed durations* only.
+  Timestamps written to disk or compared across processes — lease `startedAt`, `cooldownUntil`,
+  `notBefore`, the orphan grace window — must stay wall-clock, because a monotonic clock is
+  meaningless across processes and reboots.
+
+### What verification cost and bought, per action
+
+The loop is still earning its cost, and in every action the survivor that mattered was **the
+action's own central claim**:
+
+- **6.1** — 6/25 survived. `config.queueDir` deleted passed all 1194 tests; losing it silently
+  disables action 4.4's auto-retry under workers, and the worker exits `20` either way so nothing
+  reports it. Two more were coincidental equality: every fixture had `id === basename(taskDir)`, so
+  BOTH id-derivation branches survived being forced.
+- **6.2** — 4/25 survived. Moving the lease release to before the `claude` spawn passed all 1223
+  tests and then made two real OS processes hand the same `CLAUDE_CONFIG_DIR` to `claude`, 3 runs
+  of 3. The tests only asserted the lease was gone *afterwards*, which "acquire and immediately
+  drop" satisfies equally.
+- **6.3** — 9/22 survived (7 non-equivalent). The worst: **forcing the worker's mode flag to
+  `--shadow` passed all 1249 tests** — a live `--real` daemon would spawn shadow workers and every
+  card would report DONE having touched nothing. Second: dropping `--queue`/`--journal` from the
+  worker argv passed too, and the mutation run proved it by writing a stray `journal/` and `queue/`
+  into the worktree. Both are the same shape as 6.2's: the action's boundary — what argv the child
+  actually receives — was untested in every direction.
