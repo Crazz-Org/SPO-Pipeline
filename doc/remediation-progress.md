@@ -20,7 +20,7 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
 | **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
-| **C5** — a truthful kanban & observability | **DONE**, seven commits |
+| **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); gate: replay, dry-run and board-divergence green — the *supervised* live card is still owed |
 | C6–C7 | not started |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
@@ -685,6 +685,49 @@ So the class is real but now tiny, and nothing currently reaches `Crazz-Org/SPO-
 point: not one of them is load-bearing. Closing the class costs five `deps` injections plus a
 shared killswitch, and it is worth doing **before** 5.1/5.2 touch `board.js` and `park-loop.js`.
 
+## Gate C5 — three halves green, the fourth still owed
+
+The plan's gate is *"replay + (live recette via 2.9) following the board at every transition --
+zero board/journal divergence tolerated on the happy path"*, and § Method defines the parts:
+suite + `daemon.js --dry-run` on a synthetic card + the listed check, with *(live recette)* gates
+requiring **"a real, maintainer-supervised card -- the driver stops and explicitly asks for it."**
+
+| half | result |
+|---|---|
+| replay suite | 1181 passing, 0 failing |
+| `daemon.js --dry-run`, synthetic card | reaches `DONE`, full 11-state path, no park |
+| board/journal divergence, happy path | **zero** — table below |
+| *(live recette)*, supervised | **not run** |
+
+The third was met by something better than a recette, and by accident: issue **#475**, a real
+card, claimed and driven end to end **unattended** on C5 code, 2026-09-01 11:58 → 12:16 UTC.
+Unattended is the catch — it satisfies the divergence check and it is not the supervised card the
+method requires, so the gate is not closed. The dry-run cannot stand in either: `--dry-run` is not
+real mode, so `moveCard` never fires and it writes no `board-move` at all. Only a live card can
+evidence this particular check.
+
+Note for whoever closes it: `spo recette` files a synthetic SPO-WebClient issue, which project 1's
+auto-add drops into the daemon's own queue — against the standing rule that no remediation work
+goes on project 1. A real maintainer-supervised bug report is the cleaner instrument, and it
+exercises intake/confirm/triage besides.
+
+    board-move: Planning · Implementing · Checks & PR · Gate · Validation · Merging · Done
+    duration_s: PLAN 264.052s · IMPLEMENT 262.594s · VALIDATE 90.822s
+    final comment: Billable-weighted tokens: 244.7k / Elapsed (first journal event to now): 17m35s
+
+**Seven `board-move` events, including `FINISH -> Done`** -- the event whose absence left 14 of 18
+journals stopping at `Merging`. Journal and board agree at every transition, which is the gate's
+own wording. Zero `board-move-skipped` (no IMPLEMENT retry occurred, so the dedupe had nothing to
+skip -- that half is pinned by tests, not by this card). No worktree leaked. The enriched Done
+comment rendered real numbers, no parked line on a clean card, and no attempt rows. `duration_s`
+carried the project's first per-step timings.
+
+Better than a recette because it exercised intake, confirm and triage as well -- the stages the
+recette skips, and the stages #477 records as journalling no token data at all.
+
+The one thing this card did NOT cover: a card that parks, retries or diverges. Everything above is
+the happy path, which is what the gate asks for and all it asks for.
+
 ## What C5 hands C6
 
 **All five are filed as backlog cards** (2026-09-01, through `spo ask` with a `review-card`
@@ -692,11 +735,29 @@ verdict on each — the same intake every other card gets):
 
 | card | what |
 |---|---|
-| [#475](https://github.com/Crazz-Org/SPO-WebClient/issues/475) | MERGE parks `pr-closed-unmerged` on a single unconfirmed read |
-| [#476](https://github.com/Crazz-Org/SPO-WebClient/issues/476) | the unpark scan records neither why it failed nor that it recovered |
-| [#477](https://github.com/Crazz-Org/SPO-WebClient/issues/477) | intake/triage spend is captured and dropped |
-| [#478](https://github.com/Crazz-Org/SPO-WebClient/issues/478) | `duration_s` is written and never rendered |
-| [#480](https://github.com/Crazz-Org/SPO-WebClient/issues/480) | two timing-budget flakes in `test/lock.test.js` |
+| card | what | where it lives now |
+|---|---|---|
+| [#475](https://github.com/Crazz-Org/SPO-WebClient/issues/475) | MERGE parks `pr-closed-unmerged` on a single unconfirmed read | **closed, half-fixed** — see below |
+| [#476](https://github.com/Crazz-Org/SPO-WebClient/issues/476) | the unpark scan records neither why it failed nor that it recovered | project 2 |
+| [#477](https://github.com/Crazz-Org/SPO-WebClient/issues/477) | intake/triage spend is captured and dropped | project 2 |
+| [#478](https://github.com/Crazz-Org/SPO-WebClient/issues/478) | `duration_s` is written and never rendered | project 2 |
+| [#480](https://github.com/Crazz-Org/SPO-WebClient/issues/480) | two timing-budget flakes in `test/lock.test.js` | project 2 |
+
+**Filing all five onto project 1 was wrong, and it cost a half-fix within the hour.** The daemon
+claims from project 1's `Todo` and `orchestrator/config.js` hardcodes `productRepo`/`ghRepo` to
+SPO-WebClient, so a pipeline defect filed there gets claimed and fixed only as far as the product
+tree reaches. #475 was claimed unattended and merged PR #479, which fixed the product half
+(`scripts/pr-wait.sh` — a confirming second read plus 195 lines of tests, genuinely good work) and
+left the orchestrator half (`realMerge` in `orchestrator/steps/scripted.js`) untouched. The card
+then reached `Done`. A half-fix that closes its own card.
+
+A second org project now exists for exactly this — **"SPO Factory"**, project 2,
+`PVT_kwDOEyAVD84BiHMr` — and the rule is: **route by where the FIX lands, not where the symptom
+shows.** Fixable in a SPO-WebClient worktree → project 1 (the daemon can do it); fixable in
+SPO-Pipeline or SPO-Deploy → project 2. **No remediation-plan work goes on project 1.** Note that
+`bin/spo ask` files SPO-WebClient issues and project 1's "Auto-add to project" workflow is still
+enabled, so anything the intake produces lands in the daemon's queue by default and has to be
+moved off straight away.
 
 Filing them found two things worth keeping. `review-card` caught a citation of "SPO-Pipeline PR
 #444" for the heartbeat removal — it is **Crazz-Org/SPO-WebClient PR #444**, and it checked both
