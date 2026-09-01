@@ -284,18 +284,37 @@ test('collectServices does NOT mark a fresh nightly stale', () => {
   assert.equal(services.nightly.status, 'pass');
 });
 
-test('collectServices marks the bench verdicts tile "stale" when the LAST verdict is more than 36h old, and renderDashboard shows it', () => {
-  const benchRoot = mkTmp('spo-dash-verdicts-stale-');
+test('collectServices does NOT invent staleness for the bench verdicts tile -- it reports the age and lets the reader judge', () => {
+  // This reverses a change action 5.5 made, on a measurement 5.5 did not take. Gaps between
+  // consecutive verdicts in the real ~/.spo-bench/verdicts (493 files) run 0.0h, 0.1h, 1.1h,
+  // 2.0h, 6.0h, 10.7h, **15.6h** in ordinary weekday operation. The nightly's 36h clock is
+  // meaningful because a nightly is SCHEDULED -- 36 hours means it missed a run. Verdicts are
+  // PUSH-driven, so a quiet weekend clears 36h with nothing wrong, and a tile that goes orange
+  // every Sunday is one a maintainer learns to ignore. `ageMs` stays populated for the caption.
+  const benchRoot = mkTmp('spo-dash-verdicts-old-');
   const now = Date.parse('2026-09-01T12:00:00.000Z');
-  const createdAt = new Date(now - 50 * 60 * 60 * 1000).toISOString(); // 50h old
+  const createdAt = new Date(now - 50 * 60 * 60 * 1000).toISOString(); // 50h old -- a long weekend
   writeJson(path.join(benchRoot, 'verdicts', 'sha-abc.json'), { verdict: 'PASS', createdAt, head: 'abc123', jobId: 'job-1' });
 
   const services = collectServices({ benchRoot, now });
-  assert.equal(services.verdicts.status, 'stale');
+  assert.equal(services.verdicts.status, 'pass', 'a 50h-old PASS is still a PASS, not a fault');
+  assert.ok(services.verdicts.ageMs > 49 * 60 * 60 * 1000, 'the age is still reported');
+});
+
+test('collectServices: a nightly that FAILED stays RED however old it is -- staleness qualifies a PASS, it never softens a RED', () => {
+  // The first cut checked staleness before the verdict, so a nightly that failed and then stopped
+  // running -- the worst state this tile can describe -- was downgraded from RED to ORANGE by the
+  // very fact that nobody had run it since.
+  const benchRoot = mkTmp('spo-dash-nightly-stale-fail-');
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const finishedAt = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString(); // a week old
+  writeJson(path.join(benchRoot, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: 'abc123', finishedAt });
+
+  const services = collectServices({ benchRoot, now });
+  assert.equal(services.nightly.status, 'fail');
 
   const html = renderDashboard({ services, accounts: { rows: [] } });
-  // both the Nightly-adjacent Verdicts tile's caption AND its status word carry it
-  assert.match(html, /STALE/);
+  assert.match(html, /svc-tile tile-red[\s\S]{0,400}?Nightly[\s\S]{0,400}?>RED</, 'a stale FAIL renders red, not orange');
 });
 
 test('collectServices does NOT mark fresh bench verdicts stale', () => {

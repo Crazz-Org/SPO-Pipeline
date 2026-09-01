@@ -443,20 +443,31 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
       const finishedMs = nightly.finishedAt ? Date.parse(nightly.finishedAt) : NaN;
       const ageMs = Number.isFinite(finishedMs) ? now - finishedMs : null;
       services.nightly.ageMs = ageMs;
-      if (ageMs !== null && ageMs > STALE_BENCH_AGE_MS) services.nightly.status = 'stale';
+      // FAIL is checked BEFORE staleness: a failure does not become less true with age. The
+      // first cut checked staleness first, so a nightly that failed and then stopped running --
+      // the worst state this tile can describe -- was downgraded from RED to ORANGE by the very
+      // fact that nobody had run it since. Staleness qualifies a PASS ("this green is old, do not
+      // trust it as current"); it does not soften a RED. The caption carries the age either way.
+      if (nightly.verdict === 'FAIL') services.nightly.status = 'fail';
+      else if (ageMs !== null && ageMs > STALE_BENCH_AGE_MS) services.nightly.status = 'stale';
       else if (nightly.verdict === 'PASS') services.nightly.status = 'pass';
-      else if (nightly.verdict === 'FAIL') services.nightly.status = 'fail';
       else services.nightly.status = 'unknown';
     }
   }
 
-  // verdicts -- action 5.5, item B audit: this used to report ONLY the last verdict's PASS/FAIL,
-  // with `ageMs` computed but never turned into a status a maintainer could see at a glance (the
-  // "Recent gate verdicts" detail table below it does print each row's own date, but the
-  // summary tile above did not say a stale pass rate was stale) -- same defect class as the
-  // nightly tile silently dropping its own staleness (see console/render.js's renderServicesInner
-  // fix, same action). `status` can now also read 'stale', on the SAME STALE_BENCH_AGE_MS clock
-  // nightly uses -- both surfaces come from the one ~/.spo-bench worker.
+  // verdicts -- deliberately NOT stale-flagged, and this reverses a change action 5.5 made.
+  //
+  // 5.5 gave this tile the same 36h staleness clock as the nightly, reasoning that both come from
+  // the one ~/.spo-bench worker. Measured afterwards against the real ~/.spo-bench/verdicts (493
+  // files): the gaps between consecutive verdicts in ordinary operation run 0.0h, 0.1h, 1.1h,
+  // 2.0h, 6.0h, 10.7h, **15.6h** -- and that is an active weekday sample. The nightly's 36h is
+  // meaningful because a nightly is SCHEDULED: 36 hours means it missed a run. Verdicts are
+  // PUSH-driven; a quiet weekend clears 36h with nothing wrong at all, and an orange tile that
+  // fires every Sunday is a tile a maintainer learns to ignore -- which costs more than the
+  // silence it replaced. The age is still reported in the caption, where it informs without
+  // asserting a fault nobody measured.
+  //
+  // `ageMs` and `lastAt` stay populated; only the invented `status: 'stale'` is gone.
   if (benchRoot) {
     const verdicts = collectVerdicts(path.join(benchRoot, 'verdicts'), 20);
     services.verdicts.recentTotal = verdicts.length;
@@ -468,8 +479,7 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
       const lastMs = services.verdicts.lastAt ? Date.parse(services.verdicts.lastAt) : NaN;
       const ageMs = Number.isFinite(lastMs) ? now - lastMs : null;
       services.verdicts.ageMs = ageMs;
-      if (ageMs !== null && ageMs > STALE_BENCH_AGE_MS) services.verdicts.status = 'stale';
-      else services.verdicts.status = last.verdict === 'PASS' ? 'pass' : last.verdict === 'FAIL' ? 'fail' : 'unknown';
+      services.verdicts.status = last.verdict === 'PASS' ? 'pass' : last.verdict === 'FAIL' ? 'fail' : 'unknown';
     }
   }
 
@@ -504,6 +514,9 @@ function isCardKind(t) {
 // The 4 headline daemon numbers. Consumes the ALREADY-collected journalTasks array (never a
 // second disk pass) plus the queue depth already read by the caller.
 function collectDaemonStats(journalTasks, queueDepth = 0, { now = Date.now() } = {}) {
+  // A non-array `journalTasks` yields the zero shape rather than throwing on `.filter`. This is
+  // the panel a maintainer looks at when something is already wrong; it must render.
+  if (!Array.isArray(journalTasks)) journalTasks = [];
   const tasks = (journalTasks || []).filter(isCardKind);
   const dayStart = startOfDay(now);
   const weekStart = startOfWeek(now);
