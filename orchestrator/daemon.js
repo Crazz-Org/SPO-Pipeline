@@ -159,7 +159,33 @@ async function main() {
   // refuse-to-start posture as the account-pool guard above: two daemons on one queue is a
   // startup config error to surface here, not a per-task ENOENT crash to debug later. The
   // suite's temp-dir daemons each lock their own journal root, so they never contend.
-  let lock;
+  // Release on every exit path. SIGINT/SIGTERM need explicit handlers because the default
+  // signal death skips 'exit' handlers entirely -- process.exit() here makes them run.
+  //
+  // Registered BEFORE acquireLock, not after, and that ordering is the whole point. Until a JS
+  // handler for a signal exists, Node applies the OS DEFAULT disposition: SIGTERM terminates the
+  // process immediately, mid-statement, running no 'exit' hooks at all. Registering one changes
+  // the rule to "queue the signal, run the handler at the next event-loop turn" -- which makes
+  // every synchronous statement below, acquireLock's own link() included, uninterruptible.
+  //
+  // Before this, a SIGTERM landing between link()ing the lock file into place and installing
+  // these handlers killed the daemon and left its lock file behind for the next start to
+  // stale-sweep. The post-merge hook SIGTERMs this daemon on every deploy, so that window is a
+  // real production race, not a theoretical one; it is microseconds wide on an idle box and was
+  // measured firing ~2 runs in 44 under a 4x-parallel suite. That is what test/lock.test.js's
+  // SIGTERM case had been catching intermittently all along -- project 2's #480 filed it as a
+  // timing-budget flake in the test, and it was not: it was this.
+  //
+  // `lock` is captured by the exit hook rather than passed to it, so the hook is registered
+  // before there is anything to release and still releases whatever acquireLock assigns.
+  let lock = null;
+  process.once('exit', () => {
+    if (lock) lock.release();
+  });
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143));
+  }
+
   try {
     lock = acquireLock(journalRoot, opts.shadow ? 'shadow' : opts.dryRun ? 'dry-run' : 'real');
   } catch (err) {
@@ -172,12 +198,6 @@ async function main() {
   }
   if (lock.stale) {
     appendDaemonEvent(journalRoot, 'lock-stale-taken', { stale: lock.stale });
-  }
-  // Release on every exit path. SIGINT/SIGTERM need explicit handlers because the default
-  // signal death skips 'exit' handlers entirely -- process.exit() here makes them run.
-  process.once('exit', lock.release);
-  for (const sig of ['SIGINT', 'SIGTERM']) {
-    process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143));
   }
 
   const config = {

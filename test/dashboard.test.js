@@ -7,7 +7,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const { mkTmp, runSpo, writePoolDir } = require('./helpers');
 const {
@@ -141,17 +143,47 @@ test('bin/spo dashboard honors --out, writes the file there, and prints the abso
   assert.match(html, /SPO Pipeline/);
 });
 
-test('bin/spo dashboard with no --out writes to console/dashboard.html under the repo root', () => {
+test('bin/spo dashboard with no --out writes to console/dashboard.html under the repo root', async () => {
   const { REPO_ROOT } = require('./helpers');
   const journalRoot = mkTmp('spo-dash-default-journal-');
   const queueDir = mkTmp('spo-dash-default-queue-');
   const defaultOut = path.join(REPO_ROOT, 'console', 'dashboard.html');
 
-  const printed = runSpo(['dashboard', '--journal', journalRoot, '--queue', queueDir]);
+  // Every other test in this suite writes under its own fs.mkdtempSync dir; this one cannot,
+  // because the repo-global path IS the contract under test. So two concurrent full-suite
+  // processes race on one file: A's rmSync lands between B's write and B's existsSync, and B
+  // fails. Measured at 1 failure in 16 parallel full-suite runs -- exactly the load a mutation
+  // round creates, which is when a false failure costs the most (a surviving mutant scored as
+  // killed). Not part of #480, which names only the two lock.test.js flakes; found while
+  // reproducing those. Serialize on the resource itself: mkdir is atomic on every platform the
+  // suite runs on, and the lock lives in tmpdir keyed by repo root so sibling suite processes
+  // for THIS repo contend and nothing else does.
+  const guard = path.join(os.tmpdir(), `spo-dashboard-default-out-${crypto.createHash('sha1').update(REPO_ROOT).digest('hex').slice(0, 12)}.lock`);
+  const guardDeadline = Date.now() + 60000;
+  for (;;) {
+    try {
+      fs.mkdirSync(guard);
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // A holder that crashed mid-test would otherwise wedge every later run of this file.
+      if (Date.now() > guardDeadline) {
+        fs.rmSync(guard, { recursive: true, force: true });
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
 
-  assert.equal(printed.trim(), defaultOut);
-  assert.ok(fs.existsSync(defaultOut));
-  fs.rmSync(defaultOut, { force: true });
+  try {
+    const printed = runSpo(['dashboard', '--journal', journalRoot, '--queue', queueDir]);
+
+    assert.equal(printed.trim(), defaultOut);
+    assert.ok(fs.existsSync(defaultOut));
+    fs.rmSync(defaultOut, { force: true });
+  } finally {
+    fs.rmSync(guard, { recursive: true, force: true });
+  }
 });
 
 // ---- readDaemonEventsTail --------------------------------------------------------------------

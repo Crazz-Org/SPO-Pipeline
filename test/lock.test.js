@@ -159,7 +159,19 @@ test('watchLock: fires onLost once a different holder is read back twice in a ro
     deps: { readHolder: () => holders[Math.min(i++, holders.length - 1)] },
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  // Wait on the CONDITION, never on a fixed budget. intervalMs is 5, so two ticks is ~10ms --
+  // but under a 4x-parallel full-suite run the event loop starves long enough that a flat 60ms
+  // wait saw fewer than two ticks and read calls.length === 0. That is a harness artifact, not
+  // the behaviour under test: measured at 4 failures in 16 parallel full-suite runs (#480), the
+  // more frequent of that card's two flakes. The "exactly once" half is still asserted below,
+  // after ~20 further intervals -- watchLock clearIntervals itself on the first onLost, so a
+  // regression that removed that stop is what the second assertion catches.
+  const firstCallDeadline = Date.now() + 10000;
+  while (calls.length === 0 && Date.now() < firstCallDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(calls.length, 1, 'onLost never fired within 10s -- the watch timer never ran twice');
+  await new Promise((resolve) => setTimeout(resolve, 100)); // ~20 further 5ms intervals
   watch.stop();
   assert.equal(calls.length, 1); // fires exactly once, not once per remaining tick
   assert.equal(calls[0].reason, 'taken-over');
@@ -357,6 +369,36 @@ test('acquireLock: link() publishes the name only once the content is already co
   assert.equal(JSON.parse(calls[0].srcContent).pid, process.pid); // complete BEFORE it is named
 });
 
+// Deterministic companion to the SIGTERM test below, which can only catch this race by winning
+// it -- measured at ~2 runs in 44 even under a 4x-parallel suite, and 0 in 44 on an idle box. A
+// probabilistic guard is not a guard: the ordering it protects is a one-line edit away from
+// regressing, and the reversal would sit green for weeks. Same standing-guard shape as
+// test/gh-api-argv.test.js, which fails any `gh api` call site that repeats the `-f`-is-a-POST
+// trap rather than waiting to observe the 422.
+test('daemon.js registers its signal handlers BEFORE acquiring the lock (no default-disposition window)', () => {
+  const source = fs.readFileSync(DAEMON, 'utf8');
+
+  const sigtermAt = source.indexOf("process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143))");
+  const acquireAt = source.indexOf('acquireLock(journalRoot');
+  const exitHookAt = source.indexOf("process.once('exit', () => {");
+
+  assert.notEqual(sigtermAt, -1, 'the SIGINT/SIGTERM registration is no longer recognisable -- update this guard');
+  assert.notEqual(acquireAt, -1, 'the acquireLock call is no longer recognisable -- update this guard');
+  assert.notEqual(exitHookAt, -1, 'the lock-releasing exit hook is no longer recognisable -- update this guard');
+
+  // Until a JS handler exists, Node terminates on SIGTERM immediately and runs no 'exit' hooks,
+  // so anything acquired before the handler is installed can leak. Both the exit hook and the
+  // signal handlers must therefore precede acquisition.
+  assert.ok(
+    sigtermAt < acquireAt,
+    'daemon.js acquires the lock before registering its SIGTERM handler -- a signal in that window kills the process on the OS default disposition and leaks the lock file'
+  );
+  assert.ok(
+    exitHookAt < acquireAt,
+    "daemon.js acquires the lock before registering the 'exit' hook that releases it"
+  );
+});
+
 test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook)', async () => {
   const queueDir = mkTmp('spo-lock-q-');
   const journalDir = mkTmp('spo-lock-j-');
@@ -365,11 +407,25 @@ test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook
   const child = spawn(process.execPath, [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir], {
     stdio: 'ignore',
   });
-  // Wait for the lock to appear (daemon startup), then terminate.
-  for (let i = 0; i < 100 && !fs.existsSync(lockPath(journalDir)); i++) {
-    await new Promise((r) => setTimeout(r, 50));
+  // Wait for the lock to appear (daemon startup), then terminate. Deadline-based and generous:
+  // this waits on a real node process booting and requiring the whole orchestrator tree, which
+  // under a 4x-parallel full-suite run takes longer than the 5s the first cut allowed
+  // (100 x 50ms).
+  //
+  // Raising that budget is NOT what fixed this test's intermittent failure, and the distinction
+  // matters. #480 filed it alongside the watchLock case as a second timing-budget flake; it was
+  // not one. This test kills the daemon the instant its lock file appears, which is exactly the
+  // window in which daemon.js had not yet registered a SIGTERM handler -- so the child died on
+  // Node's default disposition, skipping the 'exit' hook that releases the lock, and the final
+  // assertion below correctly reported a leaked lock. The fix is in daemon.js (handlers hoisted
+  // above acquireLock); see its comment. This test was reporting a real production race the
+  // whole time, and it must keep killing the daemon as early as it can in order to keep
+  // reporting it.
+  const bootDeadline = Date.now() + 30000;
+  while (!fs.existsSync(lockPath(journalDir)) && Date.now() < bootDeadline) {
+    await new Promise((r) => setTimeout(r, 25));
   }
-  assert.equal(fs.existsSync(lockPath(journalDir)), true, 'daemon never wrote its lock');
+  assert.equal(fs.existsSync(lockPath(journalDir)), true, 'daemon never wrote its lock within 30s');
   child.kill('SIGTERM');
   await new Promise((resolve) => child.once('exit', resolve));
   assert.equal(fs.existsSync(lockPath(journalDir)), false);

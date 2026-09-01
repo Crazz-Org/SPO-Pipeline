@@ -1097,3 +1097,56 @@ FINISH sends K-1 cards back through CHECK→GATE".
   intersection to bare movement. **The counter becomes configurable and its default stays at
   today's 1**, with the derivation written next to it. Revisit only if a nightly catches a
   cross-card regression.
+
+
+## Before C6's actions: the suite had to be trustworthy first (#480, and two more)
+
+C6's verification loop is mutation testing, and mutation testing is only as good as the suite it
+runs — C4 already had one surviving mutant scored as killed by a flake. So #480 was taken first,
+and reproducing it rather than citing it found two more failures nobody had recorded, one of them
+a real production race.
+
+**Reproduce, don't cite.** 16 parallel full-suite runs in a worktree at `d51041e`:
+
+| failure | rate before | rate after | what it actually was |
+|---|---|---|---|
+| `watchLock: fires onLost once…` | **4/16** | 0/40 | a fixed 60 ms budget for a condition reachable in ~10 ms; under 4× load the event loop starved and it read `calls.length === 0` |
+| `bin/spo dashboard with no --out…` | 1/16 | 0/40 | **not in #480** — the one test whose subject is a repo-global path, so two concurrent suites race: A's `rmSync` lands between B's write and B's `existsSync` |
+| `daemon.js: SIGTERM releases the lock` | 2/44 | 0/40 | **not a flake at all** — see below |
+| `runAutoTriage: the THIRD mechanical failure…` | 1/40 | still open | **not in #480**, newly seen; not reproducible in 48 isolated runs of its own file + `report-intake`, so it needs full-suite load. Filed rather than chased. |
+
+**A first measurement trap worth recording: the first reproduction run was against the wrong
+tree.** `/home/crazz/SPO-Pipeline` is the *live checkout* and it sits at `992b145`, three commits
+behind `main`. Run there, a fourth test failed 12/12 — `spo status: a card in action 4.4 backoff…`,
+on the hardcoded `notBefore: '2026-09-01T13:00:00.000Z'` this document already warns about. It was
+not a flake and not load-related: it is deterministic after 13:00Z, and `c3398a9` had already fixed
+it. Only the deployed checkout still carries it. **The live checkout is docs-only behind main, so
+nothing needs deploying — but measure in the worktree, not in `/home/crazz/SPO-Pipeline`.**
+
+### The SIGTERM case was never a timing-budget flake — it is a production race
+
+#480 filed it next to the `watchLock` one as a second timing budget. Raising its 5 s startup budget
+to 30 s changed nothing; it kept firing at ~2 runs in 44.
+
+`daemon.js` registered its `SIGINT`/`SIGTERM` handlers **after** `acquireLock` linked the lock file
+into place. **Until a JS handler for a signal exists, Node applies the OS default disposition** —
+SIGTERM terminates the process immediately, mid-statement, running no `exit` hooks at all. So a
+SIGTERM landing in the window between `link()` and the handler registration killed the daemon and
+left its lock file behind for the next start to stale-sweep. The test kills the daemon the instant
+its lock file appears, which is precisely that window: **it was reporting a real defect all along,
+and it is the post-merge hook that sends this daemon a SIGTERM on every single deploy.**
+
+The fix is three lines of ordering: register the handlers, and an `exit` hook that releases
+whatever `lock` ends up holding, *before* acquiring. Registering a JS handler changes the rule from
+"terminate now" to "queue the signal, run the handler at the next event-loop turn", which makes
+every synchronous statement after it — `link()` included — uninterruptible. The window does not
+shrink; it closes.
+
+**And a probabilistic guard is not a guard.** The SIGTERM test can only catch this by winning the
+race (0 in 44 on an idle box), so the ordering is one edit from regressing green. It is now pinned
+by a deterministic source-level assertion, the same standing-guard shape as
+`test/gh-api-argv.test.js` — and that assertion was itself mutation-tested by reverting the
+ordering, which it kills.
+
+Suite: **1182 passing, 0 failing**, green under UTC, Europe/Paris, Pacific/Kiritimati,
+America/Los_Angeles and Asia/Kolkata, and 0 failures across 40 parallel full-suite runs.
