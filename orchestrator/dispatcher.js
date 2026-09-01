@@ -401,6 +401,36 @@ function createDispatcher(queueDir, journalRoot, config) {
   // skip in orphanScan race-free rather than merely probabilistic: `live.delete(id)` (and the
   // `publishLiveWorkerIds` call right after it) is the LAST thing this function does, run only
   // after any crash repark this exit warrants has already fully landed on disk.
+  //
+  // `stopReason` IS CHECKED FIRST, exactly as handleScannerExit already checked it, and the
+  // asymmetry between the two was a defect, not a design. Once `stopReason` is set this
+  // dispatcher is shutting down and run() has ALREADY called `killAllChildren('SIGTERM')` on
+  // every live worker -- so those workers exit 143, classifyWorkerExit calls 143 'crashed'
+  // (correctly: it is not 0 and not 20), and the old code then reparked a PERFECTLY HEALTHY
+  // in-flight card as `worker-crashed`. Measured before this check existed: a K=1 dispatcher with
+  // one live worker mid-INTAKE, stopped with `stop({reason:'simulated-shutdown'})`, left
+  // state.json `{"state":"PARKED","reason":"worker-crashed"}` with `detail:{"exitCode":null,
+  // "signal":"SIGTERM"}` -- the dispatcher parking a card for the crime of being killed by that
+  // same dispatcher. This is NOT a race: run()'s shutdown path is `killAllChildren('SIGTERM');
+  // await Promise.allSettled(pending)`, so it deliberately WAITS for every one of these exits to
+  // be handled. Every circuit-breaker trip therefore parked the other, healthy worker's card, and
+  // at K=2 a breaker meant to stop the daemon on ONE broken card took a second, innocent one with
+  // it, every single time.
+  //
+  // NOT reparking here is strictly safer than reparking, not merely quieter. A park is not a
+  // cheap write: finalizePark runs preserveWorktreeWip (a `git` push) plus postParkComment's
+  // board move and `gh` comment, each a bounded-but-slow spawnSync, inside a process systemd has
+  // already SIGTERMed and will SIGKILL at TimeoutStopUSec=1min30s. And finalizePark writes
+  // state.json PARKED BEFORE postParkComment posts the anchor comment, so a SIGKILL landing
+  // between those two leaves a PARKED card with no `park-comment` line in its journal --
+  // park-loop.js's findParkAnchor returns null, unparkScan's `if (!anchor ...) continue` skips it
+  // on every cycle forever, and orphanScan skips it too (PARKED is terminal). A `retry` comment
+  // from the maintainer would never be seen again. Deferring instead costs nothing: a worker
+  // killed at shutdown leaves a NON-TERMINAL state.json with a dead owner, which is precisely the
+  // shape orphan-scan.js exists to find on the next daemon start. Measured: SIGTERM to the whole
+  // process group (systemd's KillMode=control-group) already leaves the card in IMPLEMENT in
+  // 10 runs out of 10 -- the deploy path has always relied on orphanScan, and this makes the
+  // breaker path rely on the same proven recovery instead of a second, worse one.
   function handleExit(id, taskDir, { code, signal, spawnError }) {
     const outcome = spawnError ? 'crashed' : classifyWorkerExit(code);
     appendDaemonEvent(journalRoot, 'worker-exit', {
@@ -409,7 +439,23 @@ function createDispatcher(queueDir, journalRoot, config) {
       signal: signal || null,
       outcome,
       ...(spawnError ? { spawnError: String((spawnError && spawnError.message) || spawnError) } : {}),
+      ...(stopReason && outcome === 'crashed' ? { duringShutdown: true } : {}),
     });
+
+    if (stopReason && outcome === 'crashed') {
+      // Expected, not a crash to count or repark over -- see the header comment above. Counting
+      // it would also let a shutdown's own killAllChildren inflate `consecutiveCrashes` past the
+      // limit and rewrite an already-decided `stopReason` (e.g. a maintainer's `stop()`
+      // reappearing in the logs as a circuit-breaker trip that never happened).
+      appendDaemonEvent(journalRoot, 'worker-exit-during-shutdown', {
+        id,
+        code: code === undefined ? null : code,
+        signal: signal || null,
+      });
+      live.delete(id);
+      publishLiveWorkerIds();
+      return;
+    }
 
     if (outcome === 'done' || outcome === 'parked') {
       // A park is a SUCCESSFUL run of the state machine (the plan's own words) -- it resets the
@@ -528,11 +574,71 @@ function createDispatcher(queueDir, journalRoot, config) {
   // every call -- not once per fillSlots invocation -- so a slot freed by a worker that just
   // finished (removed from `live` inside handleExit, which always completes before this function
   // is called again) is immediately visible.
+  // A pool with ZERO healthy accounts clamps K to 0, and a clamp to 0 is not a smaller degree of
+  // the same thing -- it is the dispatcher deciding to do no work at all, for as long as the
+  // condition lasts. Before this, that decision was made silently on every poll and journalled
+  // nowhere: `if (live.size >= k) return` with k=0 and live.size=0 is simply true, so the queue
+  // just sat there. Pre-C6 the same pool state produced a park naming a `cooldownUntilIso` a
+  // maintainer could read (accounts.js's AllAccountsCoolingError); C6 replaced a loud outcome
+  // with an invisible one. This project has already had a 33-hour silent outage of the retry
+  // channel that nobody noticed, which is the whole argument for not shipping a second failure
+  // mode with no owner and no signal.
+  //
+  // EDGE-TRIGGERED, not level-triggered: one line when the clamp starts biting and one when it
+  // lifts. A line per poll would put ~2 entries a second into daemon.jsonl for the entire length
+  // of a cooldown -- which is not a signal, it is what makes a maintainer stop reading the file.
+  // The detail carries what the pre-C6 park carried (the earliest cooldown expiry, so the reader
+  // knows WHEN this resolves by itself) plus the queue depth, which is what says whether anything
+  // is actually being starved right now.
+  let idleNoHealthyAccounts = false;
+
+  function poolIdleDetail(healthy) {
+    let queued = null;
+    try {
+      queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length;
+    } catch {
+      // queue dir not readable -- report null rather than fail a journal write over it.
+    }
+    let earliestCooldownUntil = null;
+    let enabledAccounts = null;
+    try {
+      const registry = accounts.readRegistry(accountsDir);
+      const state = accounts.readState(accountsDir);
+      enabledAccounts = registry.filter((a) => a.enabled).map((a) => a.name);
+      for (const name of enabledAccounts) {
+        const until = state[name] && state[name].cooldownUntil;
+        if (until && (earliestCooldownUntil === null || until < earliestCooldownUntil)) earliestCooldownUntil = until;
+      }
+    } catch {
+      // an unreadable/absent pool is itself the condition being reported -- see below.
+    }
+    return {
+      healthy,
+      configuredWorkers: resolveWorkerCount(config),
+      queued,
+      enabledAccounts,
+      // null here with zero healthy accounts means "none are COOLING" -- i.e. every account is
+      // disabled, or the pool is empty/unreadable. That is a config error a restart will not
+      // clear, not a cooldown that expires on its own, and the distinction is the first thing a
+      // maintainer needs.
+      earliestCooldownUntil: earliestCooldownUntil === null ? null : new Date(earliestCooldownUntil).toISOString(),
+    };
+  }
+
   function fillSlots() {
     if (stopReason) return;
     for (;;) {
       const healthy = accounts.countHealthyAccounts(accountsDir);
       const k = Math.min(resolveWorkerCount(config), Math.max(healthy, 0));
+
+      if (k === 0 && !idleNoHealthyAccounts) {
+        idleNoHealthyAccounts = true;
+        appendDaemonEvent(journalRoot, 'dispatcher-idle-no-healthy-accounts', poolIdleDetail(healthy));
+      } else if (k > 0 && idleNoHealthyAccounts) {
+        idleNoHealthyAccounts = false;
+        appendDaemonEvent(journalRoot, 'dispatcher-healthy-accounts-returned', poolIdleDetail(healthy));
+      }
+
       if (live.size >= k) return;
       const taken = takeNextTask(queueDir, journalRoot, new Set(live.keys()));
       if (!taken) return;

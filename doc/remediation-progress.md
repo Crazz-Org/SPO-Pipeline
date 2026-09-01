@@ -21,7 +21,8 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
-| C6–C7 | not started |
+| **C6** — pipelined parallelism (K workers) | actions 6.1–6.6 **committed**, cross-action verification done (branch `claude-crazz/c6-pipelined-parallelism`); not yet merged |
+| C7 | not started |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
@@ -1159,6 +1160,47 @@ America/Los_Angeles and Asia/Kolkata, and 0 failures across 40 parallel full-sui
 | — | `1271f1c` | #480, and the production race it turned out to be hiding |
 | 6.1 | `8f8c599` | `daemon.js --worker` runs one task, takes no lock, and exits a code |
 | 6.2 | `b788463` | per-step account leases; `markLimit` stops losing concurrent cooldowns |
+| 6.3 | `19d8789` | the dispatcher, with the scans moved off its thread into a scanner process |
+| 6.4 | `9187f0f` | a product-repo mutex, and the two defects it took to make it work |
+| 6.5 | `f8505d6` | a configurable main-moved budget, and the decision to accept the gap |
+| 6.6 | `c2919aa` | auto-pull fills to a watermark, and the cold-start deadlock that found |
+| — | (this branch) | cross-action verification: six findings, five fixed — see below |
+
+### Cross-action verification (after 6.6)
+
+Defects that per-action verification structurally could not see, because each action was correct
+in isolation. Verified by measurement, then fixed with a mutation-tested assertion each.
+
+| # | defect | verdict | fix |
+|---|---|---|---|
+| F1 | `dispatcher.js` `handleExit` never consulted `stopReason`, so the dispatcher's OWN shutdown parked healthy in-flight cards `worker-crashed` — deterministically on every circuit-breaker trip, since `run()` awaits those exits. `finalizePark` writes `state.json` PARKED *before* `postParkComment`, so a SIGKILL between them strands a card outside the retry channel permanently (`findParkAnchor` → null → `unparkScan` skips it forever). | **HELD** (measured) | `handleExit` checks `stopReason` first, like `handleScannerExit` already did; a shutdown-time exit is journalled `worker-exit-during-shutdown` and left to `orphanScan`, the path a deploy-time group SIGTERM already relied on (measured: 10/10 runs leave the card in IMPLEMENT) |
+| F2 | Both children spawn `stdio: 'ignore'`, so a worker's uncaught error went to a **discarded** stderr and the dispatcher recorded only `{code: 1}`. Measured: a real `TypeError` left `daemon.jsonl` completely empty. | **HELD** (measured) | the worker journals its own crash (`uncaught-error`, with name/message/stack) before exiting; both fields hard-capped (2000/4000 chars) and flagged `truncated`, because a `JSON.parse` failure over up to 64 MiB of `claude` stdout embeds its input in the message |
+| F3 | `takeNextTask` renames the queue file in the **dispatcher**; the worker writes `state.json` only after booting node. Die in that window and `orphanScan`, `unparkScan` and `taskAlreadyExists` all skip the task **forever**. Pre-6.3 the window was one statement in one process; **measured at 71–77 ms, median 74 ms**, on every task. | **HELD** (measured) | `orphanScan` treats "task.json present, state.json absent, not queued, not live-owned, older than the grace window" as an orphan and parks it `task-orphaned-before-start`, aged by the `taken` event's own timestamp |
+| F4 | `accountLeaseWaitMs` was the one C6 bound derived from an **observed** maximum (90–265 s → 5 min) instead of from the bound it waits on. A sibling's legitimate hold is 2 × `LLM_STEP_DEADLINE_MS` = 30 min and is un-sweepable until `MAX_LEASE_AGE_MS` = 31.5 min, so a waiter gave up ~26 min early and parked `all-accounts-leased` — the exact park class per-step leasing exists to avoid. | **HELD** | derived: `accountLeaseWaitMs = MAX_LEASE_AGE_MS`. The constant moved to `step-contracts.js` (which requires nothing local) because `account-lease.js` requires `config.js` and the reverse would be a load-time cycle |
+| F5 | The circuit breaker sits under `Restart=always`. **Worse than reported**: `StartLimitIntervalSec`/`StartLimitBurst` were in `[Service]`, where systemd **ignores** them — its own log says `Unknown key name 'StartLimitIntervalSec' in section 'Service', ignoring`, and `systemctl show` reported the 10 s default, not 300 s. With `RestartSec=5` the burst of 5 was unreachable, so the rate limiter the script's comment promises did not exist and a config error looped forever. | **HELD**, and worse | moved to `[Unit]`; `systemd-analyze verify` A/B warns on the old unit and is silent on the new one. Breaker state deliberately **not** persisted across restarts — see below |
+| F6 | K clamped to 0 healthy accounts idled the dispatcher silently, journalling nothing. Pre-C6 the same pool state parked a card naming a `cooldownUntilIso`. | **HELD** | edge-triggered `dispatcher-idle-no-healthy-accounts` / `dispatcher-healthy-accounts-returned`, carrying the earliest cooldown expiry (null = a config error, not a cooldown) and the queue depth |
+
+**F5, the part deliberately not built.** The breaker does not persist across restarts, and should
+not on this evidence. With F1 fixed a trip parks at most `workerCrashLimit` (3) cards rather than
+4, and with the `[Unit]` fix restarts are genuinely capped at 5 per 300 s — so the worst case is
+bounded at ~15 parks and then a stopped unit, which is a loud, correct outcome. Persisting the
+count across restarts would add cross-process state whose only job is to make a bounded case
+slightly smaller, and would risk a stale counter refusing to start a healthy daemon. Revisit only
+if a real trip is ever observed.
+
+**F7, reported not fixed** (verified, one-line notes):
+- `state-machine.js`'s `callLlmStep` releases the lease in a `finally` (`:158`) **before**
+  `markLimit` (`:165`), so a sibling polling at 1 s can lease the just-limited account and burn a
+  call. **HELD**, and it is the shape the file's own header describes as intended — so it is a
+  design decision to revisit, not a slip, and changing the order touches the 6.2 lease contract.
+- `main-moved-budget.js` does **not** share `orphan-scan.js`'s zero-coercion bug: `:19-22` is a
+  documented `Number.isInteger(n) && n > 0` type guard, and `mainMovedRegateBudget` has no env
+  override at all (`config.js:253` is a bare literal). **DID NOT HOLD.**
+- `product-repo-hold.js`'s "about 52 min ... a 2.4x margin" comment (`:69-75`) contradicts the
+  file's own `SPAWN_ATTEMPTS_PER_CALL = 2`: the real worst hold is 116.0 min against a
+  `MAX_LOCK_AGE_MS` of 127.6 min, so the margin is **1.1x by construction** (127.6 = 116.0 × 1.1),
+  not 2.4x, and the headroom is ~3 extra refs, not ~19. **HELD** — the comment is wrong, the code
+  is right.
 
 ## What C6 corrected in the plan
 

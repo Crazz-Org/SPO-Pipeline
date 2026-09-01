@@ -57,6 +57,28 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // changes what invokeClaudeReal's own spawnSync timeout is armed with for an LLM call.
 const LLM_STEP_DEADLINE_MS = 900000;
 
+// MAX_LEASE_AGE_MS -- the age past which account-lease.js presumes a lease dead and sweeps it
+// regardless of pid liveness. Its full justification (why 2x, why the +10% slack, and the
+// residual SIGTERM-ignoring-child risk it deliberately does not close) lives in
+// account-lease.js's own comment, which re-exports this constant; it is DEFINED here, next to
+// the deadline it is derived from, for one reason: config.js needs it too, and config.js cannot
+// require account-lease.js -- account-lease.js requires config.js, so that direction is a
+// load-time cycle. step-contracts.js requires nothing local, so it is the one place both can
+// read.
+//
+// What config.js needs it for (cross-action defect, C6 verification): accountLeaseWaitMs is how
+// long a worker waits for a sibling's lease before parking `all-accounts-leased`, and it was the
+// single C6 bound derived from an OBSERVED maximum (measured step durations of 90-265s -> a
+// 5-minute wait) instead of from the bound it actually waits on. This constant IS that bound: a
+// lease younger than it is legitimately held and cannot be swept, and a sibling worker's own
+// two-attempt LLM step can legitimately hold one for 2 x LLM_STEP_DEADLINE_MS = 30 minutes. A
+// 5-minute waiter therefore gave up while the holder was still legitimately alive and still
+// un-sweepable for another 26.5 minutes, and parked the exact park class per-step leasing was
+// built to avoid. Deriving the wait from this constant makes the wait outlast every legitimate
+// hold by construction -- the same asymmetry product-repo-lock.js states for its own wait bound:
+// waiting too long only delays a card, giving up too early parks a healthy one.
+const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE_MS / 10);
+
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
 // to `escalatedModel` -- resolved by resolveStepContract() below, per
 // state-machine-spec.md § Step contracts' per-row escalation language:
@@ -231,6 +253,7 @@ module.exports = {
   STEP_CONTRACTS,
   EFFORT_BY_SIZE,
   LLM_STEP_DEADLINE_MS,
+  MAX_LEASE_AGE_MS,
   shouldEscalate,
   resolveStepContract,
 };

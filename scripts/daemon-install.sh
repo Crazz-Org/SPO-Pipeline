@@ -46,16 +46,27 @@ Description=SPO pipeline daemon (orchestrator, --real: drives product cards end 
 # Not a hard dependency -- the daemon parks tasks fine while the bench is down -- but when
 # both start together the worker should be up before GATE steps begin depositing.
 After=spo-bench-worker.service
+# StartLimitIntervalSec/StartLimitBurst are [Unit] directives, NOT [Service] ones. They lived in
+# [Service] until C6 verification, where systemd's own log said so out loud:
+#   "Unknown key name 'StartLimitIntervalSec' in section 'Service', ignoring."
+# and `systemctl --user show` reported StartLimitIntervalUSec=10s -- the DEFAULT, not the 300s
+# this file thought it had set. With RestartSec=5 a crash loop restarts every ~5s, so at most ~2
+# restarts ever land inside a 10s window and the burst of 5 was never reached: the rate limiter
+# described below did not exist, and Restart=always looped on a genuine config error forever.
+# That matters more since C6 than it did before: each restart can park up to workerCrashLimit (3)
+# cards before its circuit breaker trips, so an unbounded restart loop is an unbounded park loop.
+# A refuse-to-start (empty account pool, held single-instance lock) exits 1 immediately; five
+# tries in five minutes then stop, instead of looping on a config error forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 WorkingDirectory=$REPO
 ExecStart=$NODE_BIN orchestrator/daemon.js --real
 Restart=always
 RestartSec=5
-# A refuse-to-start (empty account pool, held single-instance lock) exits 1 immediately;
-# five tries in five minutes then stop, instead of looping on a config error forever.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# The rate limit that bounds this Restart=always lives in [Unit] above -- see the comment there
+# for the measurement that proved it was being silently ignored down here.
 # gh and claude must find their auth; PATH must reach node, npm, gh AND the claude CLI
 # (~/.local/bin -- absent from the systemd user PATH, see the header).
 Environment=HOME=$HOME

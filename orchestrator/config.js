@@ -12,6 +12,9 @@ const os = require('os');
 // stepDeadlineMsByState below have to derive from. Requiring product-repo-lock.js instead would
 // be a cycle (that file requires this one) and would silently yield NaN deadlines.
 const productRepoHold = require('./product-repo-hold');
+// MAX_LEASE_AGE_MS is defined in step-contracts.js (which requires nothing local) rather than in
+// account-lease.js, because account-lease.js requires THIS file -- see its own comment.
+const { MAX_LEASE_AGE_MS } = require('./step-contracts');
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -501,17 +504,36 @@ module.exports = {
   // orchestrator/account-lease.js's leaseHealthyAccount) will WAIT for a healthy account's lease
   // to free up before giving up and parking `all-accounts-leased`. Per-step leasing was chosen
   // over per-task leasing precisely so a worker can wait out a SIBLING's in-flight step rather
-  // than park (doc/remediation-progress.md's C6 decision record) -- which makes the bound's
-  // floor an LLM step's own wall-clock duration: a wait shorter than the longest step that could
-  // be holding the lease is guaranteed to time out under ordinary two-worker contention before
-  // that step ever finishes, defeating the entire point of waiting instead of parking. Measured
-  // step duration (C6 funnel, doc/remediation-progress.md) is 90-265s; 5 minutes clears the
-  // observed ceiling with real margin for the slower end plus this pool's own fs polling. Never
-  // applies to a cooling account -- see accounts.js's AllAccountsLeasedError vs
+  // than park (doc/remediation-progress.md's C6 decision record).
+  //
+  // DERIVED FROM MAX_LEASE_AGE_MS, not from an observed maximum. This was the one C6 bound that
+  // was not, and it was wrong for it (cross-action defect, found in C6 verification). The old
+  // default was 5 minutes, justified against measured step durations of 90-265s -- but what a
+  // waiter must outlast is not the duration a step USUALLY takes, it is the longest a sibling can
+  // LEGITIMATELY hold the lease, and that is a bound this codebase already states:
+  //
+  //   sibling worker, one two-attempt LLM step   2 x LLM_STEP_DEADLINE_MS  = 30   min
+  //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS    = 10   min
+  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS          = 31.5 min
+  //
+  // Against a 5-minute wait every one of those is longer. A worker at K=2 therefore gave up while
+  // the holder was still legitimately alive AND still un-sweepable for up to another 26.5 minutes,
+  // and parked `all-accounts-leased` -- the exact park class per-step leasing exists to avoid. The
+  // real pool is 2 accounts against 3 contenders (2 workers + the scanner), so this is an ordinary
+  // operating point, not an exotic one.
+  //
+  // MAX_LEASE_AGE_MS is the correct derivation because it is the ceiling by CONSTRUCTION: a lease
+  // younger than it may be legitimately held, and one older than it is swept and taken by the very
+  // next poll. A waiter willing to outlast it therefore always terminates in one of two honest
+  // ways -- it gets a lease, or the holder ages out and it takes that one -- instead of parking a
+  // healthy card. Same asymmetry product-repo-lock.js states for its own wait bound: waiting too
+  // long only delays a card, giving up too early parks one that was fine.
+  //
+  // Never applies to a cooling account -- see accounts.js's AllAccountsLeasedError vs
   // AllAccountsCoolingError split; a cooldown is never worth waiting out. SPO_ACCOUNT_LEASE_WAIT_MS
   // overrides (positiveMsFromEnv: a non-positive/non-finite override falls back to this default,
   // never to "wait forever").
-  accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', 5 * 60 * 1000),
+  accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', MAX_LEASE_AGE_MS),
 
   // accountLeasePollMs -- how often the wait above re-checks whether a lease has freed up. Each
   // check is one directory listing plus a few small JSON reads (leasedAccountNames), cheap

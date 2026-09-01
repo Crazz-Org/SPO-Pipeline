@@ -499,3 +499,44 @@ test('leaseHealthyAccount: opts.monotonicNowMs drives the elapsed bound independ
   assert.ok(sleepCalls.length > 0);
   assert.ok(fakeMonotonic >= 200, 'must not give up before the injected MONOTONIC clock reaches the bound, even though `now` never moved');
 });
+
+// ---- CROSS-ACTION defect: the wait bound was the one C6 bound not derived from its deadline ---
+//
+// accountLeaseWaitMs is how long a worker waits for a sibling's lease before parking
+// `all-accounts-leased`. It shipped as 5 minutes, justified against MEASURED step durations
+// (90-265s) rather than against the bound it actually waits on. Every other C6 ceiling is derived
+// from its bound; this one was not, and the gap is not academic: a sibling's own two-attempt LLM
+// step can legitimately hold a lease for 2 x LLM_STEP_DEADLINE_MS = 30 min, and nothing may sweep
+// that lease until MAX_LEASE_AGE_MS = 31.5 min. A 5-minute waiter gave up while the holder was
+// still legitimately alive and still un-sweepable, and parked the exact park class per-step
+// leasing was built to avoid.
+test('accountLeaseWaitMs OUTLASTS every legitimate lease hold -- derived from MAX_LEASE_AGE_MS, not from an observed maximum', () => {
+  const daemonConfig = require('../orchestrator/config');
+  const { INTAKE_DEADLINE_MS } = require('../orchestrator/intake');
+
+  // The derivation itself: the wait IS the sweep floor, not a number that merely resembles it.
+  assert.equal(
+    daemonConfig.accountLeaseWaitMs,
+    MAX_LEASE_AGE_MS,
+    'the wait bound must be derived from MAX_LEASE_AGE_MS, not restated as its own literal'
+  );
+
+  // The relationships that must survive a future edit to EITHER constant -- this is what a
+  // hardcoded 5 minutes failed. A waiter that gives up before a holder can even be swept parks a
+  // card that was never in trouble.
+  assert.ok(
+    daemonConfig.accountLeaseWaitMs >= MAX_LEASE_AGE_MS,
+    `a waiter must outlast the sweep floor (${MAX_LEASE_AGE_MS}ms), got ${daemonConfig.accountLeaseWaitMs}ms: ` +
+      'it would park `all-accounts-leased` while the holder is still legitimately un-sweepable'
+  );
+  assert.ok(
+    daemonConfig.accountLeaseWaitMs > 2 * LLM_STEP_DEADLINE_MS,
+    "a sibling worker's own two-attempt LLM step can hold the lease this long, legitimately"
+  );
+  if (typeof INTAKE_DEADLINE_MS === 'number') {
+    assert.ok(
+      daemonConfig.accountLeaseWaitMs > 2 * INTAKE_DEADLINE_MS,
+      "the scanner's own two-call triage step can hold the lease this long, legitimately"
+    );
+  }
+});

@@ -70,6 +70,33 @@ function queuedIds(queueDir) {
   return ids;
 }
 
+// When a taskDir has NO state.json, there is no `updatedAt` to age it by -- so age it by the
+// 'taken' event takeNextTask journals at the exact instant it renamed the queue file into place
+// (state-machine.js). journal.jsonl is written before the worker is even spawned, so this
+// timestamp is always present for a genuinely-taken task; task.json's own mtime is the fallback
+// for a journal.jsonl that is missing or unparsable, and is within milliseconds of it (the same
+// rename produced both). Returns null when neither is readable -- the caller then skips the task
+// rather than guess an age, since a task with no knowable age can never be proven stale.
+function takenAtMs(taskDir, taskFile) {
+  try {
+    for (const line of fs.readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      const evt = JSON.parse(line);
+      if (evt && evt.event === 'taken' && evt.ts) {
+        const ms = Date.parse(evt.ts);
+        if (!Number.isNaN(ms)) return ms;
+      }
+    }
+  } catch {
+    // unreadable/unparsable journal -- fall through to the mtime fallback below.
+  }
+  try {
+    return fs.statSync(taskFile).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 // orphanScan(queueDir, journalRoot, config, deps, liveWorkerIds) -> [{id, reason}] for every task
 // reparked this pass. `deps.isAlive` is the test-only liveness override (same convention as
 // lock.js's own acquireLock); production never passes it.
@@ -88,7 +115,15 @@ function queuedIds(queueDir) {
 // already completed, synchronously, with no `await` in between.
 async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerIds = null) {
   const isAlive = deps.isAlive || processAlive;
-  const graceMs = (config && config.orphanGraceMs) || DEFAULT_ORPHAN_GRACE_MS;
+  // `|| DEFAULT` would coerce a DELIBERATE 0 back to four minutes, and orphanGraceMs is a live env
+  // knob (config.js: SPO_ORPHAN_GRACE_MS, resolved with Number(), so `SPO_ORPHAN_GRACE_MS=0`
+  // genuinely reaches here as 0). A maintainer setting it to 0 to make a recovery run scan
+  // immediately would silently get the default instead, with nothing to say so -- exactly the
+  // zero-coercion shape action 6.6 already had to fix twice elsewhere. Number.isFinite admits 0
+  // and still rejects undefined/NaN/a non-numeric env string; negatives fall back too, since a
+  // negative grace window is not a faster scan, it is a nonsense one.
+  const rawGrace = config && config.orphanGraceMs;
+  const graceMs = Number.isFinite(rawGrace) && rawGrace >= 0 ? rawGrace : DEFAULT_ORPHAN_GRACE_MS;
   const inQueue = queuedIds(queueDir);
 
   // Lazy require: state-machine.js requires this module (to wire the periodic scan into
@@ -100,7 +135,67 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
   for (const id of listTaskIds(journalRoot)) {
     const taskDir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(taskDir, 'state.json'));
-    if (!state || TERMINAL_STATES.has(state.state)) continue;
+
+    // NO state.json AT ALL is its own orphan shape, and before action 6.3 it was unreachable.
+    // takeNextTask renames the queue file to <taskDir>/task.json and journals 'taken'; runTask
+    // writes the first state.json. Pre-6.3 those two were consecutive statements in ONE process,
+    // microseconds apart. 6.3 put a PROCESS SPAWN between them -- the dispatcher renames, then
+    // `node orchestrator/daemon.js --worker` has to boot and load the module graph before runTask
+    // runs at all. Measured on this box with 8 real workers: 71/73/73/73/74/74/76/77 ms, median
+    // 74 ms. Every task now passes through a ~74 ms window, on every single run.
+    //
+    // If the whole cgroup dies inside it (a deploy SIGKILL after TimeoutStopUSec=1min30s, an OOM
+    // kill, power loss), the task becomes invisible to EVERY recovery path at once, permanently:
+    // this scan used to `continue` on `!state`; unparkScan's own loop skips it for the same
+    // reason (`if (!state || state.state !== 'PARKED' ...) continue`, park-loop.js); and
+    // intake.js's taskAlreadyExists returns true on `fs.existsSync(journalRoot/<id>)` alone, so
+    // auto-pull never re-pulls the card either. Nothing in the system would ever look at it again.
+    //
+    // Guarded exactly as tightly as the ordinary shape below. task.json must be present (an empty
+    // or half-made directory is not a claimed task); the id must not be in queue/ (a re-enqueued
+    // retry that has not been taken yet legitimately has a taskDir from a PREVIOUS run and no
+    // current state.json); it must not be in liveWorkerIds (the dispatcher owns it right now --
+    // that is the 74 ms window itself, and reparking inside it would be the two-writers race this
+    // module's header forbids); and it must be older than the grace window, which is what makes a
+    // worker merely slow to boot -- 74 ms against a 4-minute default -- structurally incapable of
+    // tripping this. There is no owner pid to probe: nothing ever wrote one, which is the whole
+    // point. Age comes from the 'taken' event takeNextTask itself journals (the exact moment the
+    // rename happened), falling back to task.json's mtime when journal.jsonl is unreadable.
+    if (!state) {
+      const taskFile = path.join(taskDir, 'task.json');
+      if (!fs.existsSync(taskFile)) continue;
+      if (inQueue.has(id)) continue;
+      if (liveWorkerIds && liveWorkerIds.has(id)) continue;
+
+      const takenAt = takenAtMs(taskDir, taskFile);
+      if (takenAt === null || Date.now() - takenAt < graceMs) continue;
+
+      const task = readJsonSafe(taskFile) || {};
+      const ctx = buildCtx(id, task, taskDir, { ...config, deps: (config && config.deps) || deps });
+      const detail = { takenAt: new Date(takenAt).toISOString(), recoveredBy: (config && config.owner) || null };
+      if (!isRealMode(ctx)) {
+        // Same detect-and-journal-only posture the ordinary shape uses below, for the same reason
+        // (see this file's header): a shadow/dry-run park has no board move and no gh anchor.
+        appendDaemonEvent(journalRoot, 'orphan-scan-would-repark', {
+          id,
+          reason: 'task-orphaned-before-start',
+          lastState: 'INTAKE',
+          ...detail,
+        });
+        recovered.push({ id, reason: 'task-orphaned-before-start', wouldRepark: true });
+        continue;
+      }
+      // 'INTAKE' is the honest lastState: the task was claimed off the queue and never reached a
+      // single handler, so INTAKE is not a guess, it is where it really stopped. Parking (rather
+      // than silently re-enqueueing) puts it back in the maintainer's retry channel with a park
+      // comment to anchor unparkScan -- a bare `retry` restarts it at intake, which for a task
+      // that never ran is a complete recovery.
+      finalizePark(ctx, 'INTAKE', 'task-orphaned-before-start', detail);
+      recovered.push({ id, reason: 'task-orphaned-before-start' });
+      continue;
+    }
+
+    if (TERMINAL_STATES.has(state.state)) continue;
     if (inQueue.has(id)) continue;
     if (liveWorkerIds && liveWorkerIds.has(id)) continue; // owned by a live worker -- see header above
 

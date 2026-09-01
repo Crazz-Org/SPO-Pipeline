@@ -74,7 +74,20 @@ function spawnExit(code) {
 // Promise.allSettled(pending)` then waits forever on this scanner-stand-in's exit-watch promise,
 // hanging every test that uses this helper. Measured directly during this file's own rewrite.
 function neverExitsSpawn(cmd, args, opts) {
-  return realSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1e6)'], { ...opts, stdio: 'ignore' });
+  // Self-terminating if ORPHANED, using the exact `--parent-pid` technique action 6.6 gave the
+  // real scanner (state-machine.js's runForever): remember the pid that spawned us and exit as
+  // soon as the kernel reparents us away from it. Without this the stand-in is an actual process
+  // leak, not a theoretical one -- it is spawned `detached: true` (its own process group, which
+  // it must be, or killAllChildren's `process.kill(-pid, ...)` cannot reach it), so a SIGKILL to
+  // the TEST RUNNER's process group never reaches this child, and `setInterval(..., 1e6)` then
+  // runs forever with no parent. MEASURED: 5 leaked stand-ins across 6 SIGKILLs timed between
+  // 1.5s and 4.0s into this file, versus 0 with this check. A killed suite must not leave
+  // processes on the box, and the fix is the one the production code already uses.
+  return realSpawn(
+    process.execPath,
+    ['-e', 'const p = process.ppid; setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);'],
+    { ...opts, stdio: 'ignore' }
+  );
 }
 
 function baseConfig(overrides = {}) {
@@ -393,6 +406,223 @@ test('N consecutive crashes trip the circuit breaker; a PARK in between resets t
   assert.equal(stopReasonB.reason, 'worker-crash-circuit-breaker');
   assert.equal(stopReasonB.consecutiveCrashes, 3);
   assert.equal(stopReasonB.crashLimit, 3);
+});
+
+// ---- 6b. A worker killed BY THIS DISPATCHER'S OWN SHUTDOWN is not a crash (cross-action defect)
+
+// handleExit used to ignore `stopReason` entirely, while handleScannerExit checked it first --
+// an asymmetry that made every shutdown park whatever card happened to be in flight. run()'s
+// shutdown path is `killAllChildren('SIGTERM'); await Promise.allSettled(pending)`, so it
+// deliberately WAITS for these exits: 143 is not 0 and not 20, classifyWorkerExit says 'crashed',
+// and a healthy card got `reason: 'worker-crashed'` written over it. Deterministic, not a race.
+//
+// The park is worse than merely wrong. finalizePark writes state.json PARKED BEFORE
+// postParkComment posts the anchor comment, and this all runs inside a process systemd SIGKILLs
+// at TimeoutStopUSec=1min30s -- a kill between those two writes leaves PARKED with no
+// `park-comment` line, park-loop.js's findParkAnchor returns null, and unparkScan skips the card
+// on every cycle FOREVER (orphanScan skips it too: PARKED is terminal). The card leaves the
+// retry channel permanently. Not reparking defers to orphan-scan.js instead, which is the path a
+// deploy-time group SIGTERM has always used anyway.
+test('a worker killed by the dispatcher\'s OWN shutdown is never reparked worker-crashed', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-s.json', { id: 'disp-shutdown', kind: 'synthetic' });
+
+  // A live, healthy, long-running worker: it exits ONLY when killAllChildren signals it.
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'disp-shutdown'));
+  dispatcher.stop({ reason: 'simulated-deploy-shutdown' });
+  const stopped = await runPromise;
+
+  assert.equal(stopped.reason, 'simulated-deploy-shutdown', 'the stop reason must survive -- a counted shutdown exit could rewrite it as a breaker trip');
+
+  // The dispatcher observed the 143/SIGTERM exit it caused...
+  const events = readDaemonEvents(journalDir);
+  const exitEvt = events.find((e) => e.event === 'worker-exit' && e.id === 'disp-shutdown');
+  assert.ok(exitEvt, 'the worker exit was never observed -- this test proves nothing');
+  assert.equal(exitEvt.duringShutdown, true, 'the exit must be recorded as a shutdown exit, not an anonymous crash');
+  assert.ok(
+    events.some((e) => e.event === 'worker-exit-during-shutdown' && e.id === 'disp-shutdown'),
+    'a shutdown-time worker exit must be journalled as such'
+  );
+
+  // ...and must NOT have parked the card. state.json is whatever the worker last wrote (here:
+  // nothing at all, since the stand-in never runs runTask) -- never a dispatcher-written PARKED.
+  let state = null;
+  try {
+    state = readState(journalDir, 'disp-shutdown');
+  } catch {
+    state = null; // no state.json at all is the correct outcome for this stand-in
+  }
+  if (state) {
+    assert.notEqual(state.state, 'PARKED', 'a healthy in-flight card was parked by its own dispatcher shutting down');
+    assert.notEqual(state.reason, 'worker-crashed');
+  }
+  const taskJournal = (() => {
+    try {
+      return readJournal(journalDir, 'disp-shutdown');
+    } catch {
+      return [];
+    }
+  })();
+  assert.equal(
+    taskJournal.some((e) => e.event === 'parked' && e.reason === 'worker-crashed'),
+    false,
+    'the dispatcher parked worker-crashed on a card it killed itself'
+  );
+});
+
+// A circuit-breaker trip must stop the daemon WITHOUT taking the other, healthy worker's card
+// with it. K=2: one slot crashes repeatedly until the breaker trips, the other holds a live
+// healthy worker the whole time. Before the stopReason check in handleExit, that second card was
+// parked `worker-crashed` on every single trip.
+test('a circuit-breaker trip does not park the OTHER, healthy worker\'s card', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  // 0001 is taken first and gets the never-exiting (healthy) worker; the rest crash.
+  writeTask(queueDir, '0001-healthy.json', { id: 'brk-healthy', kind: 'synthetic' });
+  for (let i = 2; i <= 5; i++) writeTask(queueDir, `000${i}-c.json`, { id: `brk-c${i}`, kind: 'synthetic' });
+
+  let call = 0;
+  const spawnFn = (cmd, args, opts) => {
+    call += 1;
+    return call === 1 ? neverExitsSpawn(cmd, args, opts) : spawnExit(7)();
+  };
+
+  const config = baseConfig({
+    workers: 2,
+    workerCrashLimit: 3,
+    claudeAccountsDir: onePoolDir(2),
+    deps: { spawn: spawnFn, spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const stopped = await dispatcher.run(); // returns on its own once the breaker trips
+
+  assert.equal(stopped.reason, 'worker-crash-circuit-breaker');
+  assert.equal(stopped.consecutiveCrashes, 3);
+
+  // Proves this test has teeth: the healthy worker must actually have been ALIVE when the breaker
+  // tripped and been killed by the shutdown. Without this, a healthy worker that had already
+  // exited before the trip would make every assertion below pass for the wrong reason.
+  const brkEvents = readDaemonEvents(journalDir);
+  assert.ok(
+    brkEvents.some((e) => e.event === 'worker-exit-during-shutdown' && e.id === 'brk-healthy'),
+    'the healthy worker was not live at the moment of the trip -- this test proves nothing'
+  );
+
+  // The healthy card was killed by killAllChildren -- and must NOT have been parked for it.
+  let healthy = null;
+  try {
+    healthy = readState(journalDir, 'brk-healthy');
+  } catch {
+    healthy = null;
+  }
+  if (healthy) assert.notEqual(healthy.reason, 'worker-crashed', 'the breaker parked the innocent card too');
+  const healthyJournal = (() => {
+    try {
+      return readJournal(journalDir, 'brk-healthy');
+    } catch {
+      return [];
+    }
+  })();
+  assert.equal(
+    healthyJournal.some((e) => e.event === 'parked'),
+    false,
+    'the healthy worker\'s card was parked by a breaker trip caused entirely by OTHER cards'
+  );
+});
+
+// ---- CROSS-ACTION defect: a clamp to ZERO healthy accounts must not be silent
+
+// K clamped to 0 is the dispatcher deciding to do NO work at all. It used to return silently on
+// every poll and journal nothing -- the queue simply sat there. Pre-C6 the same pool state parked
+// a card naming a cooldownUntilIso a maintainer could read; C6 replaced a loud outcome with an
+// invisible one, in a project that has already had a 33-hour silent outage nobody noticed.
+test('a clamp to ZERO healthy accounts is journalled once, with the cooldown expiry, and again when it lifts', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-i.json', { id: 'idle-a', kind: 'synthetic' });
+
+  // One enabled account, cooling until a known instant -> countHealthyAccounts returns 0.
+  const poolDir = mkTmp('spo-disp-accts-');
+  writePoolDir(poolDir, [{ name: 'acct0' }]);
+  const coolUntil = Date.now() + 60_000;
+  fs.writeFileSync(path.join(poolDir, 'state.json'), JSON.stringify({ acct0: { cooldownUntil: coolUntil } }));
+
+  const config = baseConfig({
+    claudeAccountsDir: poolDir,
+    deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'));
+
+    const idle = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+    assert.equal(idle.healthy, 0);
+    assert.equal(idle.queued, 1, 'the signal must say whether anything is actually being starved');
+    assert.equal(
+      idle.earliestCooldownUntil,
+      new Date(coolUntil).toISOString(),
+      'a maintainer needs to know WHEN this resolves by itself -- the pre-C6 park said so and this must too'
+    );
+    assert.deepEqual(idle.enabledAccounts, ['acct0']);
+
+    // EDGE-triggered: several more poll cycles must not add a second line. A line per poll is
+    // ~2/second for the whole cooldown, which is what stops a maintainer reading daemon.jsonl.
+    await sleep(config.pollIntervalMs * 5);
+    assert.equal(
+      readDaemonEvents(journalDir).filter((e) => e.event === 'dispatcher-idle-no-healthy-accounts').length,
+      1,
+      'the idle signal is level-triggered -- it will flood daemon.jsonl for the length of the cooldown'
+    );
+    // ...and the task must genuinely still be waiting, or this test is asserting about nothing.
+    assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 1);
+
+    // The cooldown expires: the recovery edge fires, and the task finally starts.
+    fs.writeFileSync(path.join(poolDir, 'state.json'), JSON.stringify({ acct0: { cooldownUntil: Date.now() - 1000 } }));
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-healthy-accounts-returned'));
+    const back = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-healthy-accounts-returned');
+    assert.equal(back.healthy, 1);
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'idle-a'));
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// An EMPTY pool is a config error a restart will not clear, not a cooldown that expires on its
+// own -- earliestCooldownUntil null with healthy 0 is exactly that distinction, and it is the
+// first thing a maintainer needs to tell the two apart.
+test('a clamp to zero caused by an empty/disabled pool reports a null cooldown expiry, not a fake one', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-i.json', { id: 'idle-b', kind: 'synthetic' });
+
+  const poolDir = mkTmp('spo-disp-accts-');
+  writePoolDir(poolDir, [{ name: 'acct0', disabled: true }]);
+
+  const config = baseConfig({
+    claudeAccountsDir: poolDir,
+    deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'));
+    const idle = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+    assert.equal(idle.healthy, 0);
+    assert.equal(idle.earliestCooldownUntil, null, 'nothing is cooling -- reporting an expiry would invent one');
+    assert.deepEqual(idle.enabledAccounts, [], 'every account disabled: a config error, not a cooldown');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
 });
 
 // ---- 7. K is clamped to healthy accounts before each spawn
@@ -1237,7 +1467,12 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
   const blockingScanner = (cmd, args, opts) =>
     realSpawn(
       process.execPath,
-      ['-e', `require('child_process').execFileSync('sleep', ['${BLOCK_MS / 1000}']); setInterval(() => {}, 1e6);`],
+      // Same orphan self-exit as neverExitsSpawn above, for the same measured reason.
+      [
+        '-e',
+        `require('child_process').execFileSync('sleep', ['${BLOCK_MS / 1000}']); ` +
+          'const p = process.ppid; setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);',
+      ],
       { ...opts, stdio: 'ignore' }
     );
   const shortWorker = (cmd, args, opts) =>

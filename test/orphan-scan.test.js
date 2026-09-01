@@ -606,3 +606,111 @@ test('helpers: every daemon subprocess is pointed at a throwaway product repo an
     assert.match(body.slice(0, 400), /env: isolatedEnv\(\)/, `${runner} must spawn with isolatedEnv()`);
   }
 });
+
+// ---- CROSS-ACTION defect: the rename -> first-writeState window action 6.3 opened -------------
+//
+// takeNextTask renames queue/<file>.json to <taskDir>/task.json and journals 'taken'; runTask
+// writes the first state.json. Pre-6.3 those were consecutive statements in ONE process. 6.3 put
+// a PROCESS SPAWN between them: measured on this box with 8 real workers at 71-77 ms, median
+// 74 ms. Die inside that window (deploy SIGKILL at TimeoutStopUSec=1min30s, OOM, power) and the
+// task had no state.json -- which made it invisible to orphanScan (`if (!state) continue`),
+// invisible to unparkScan (not PARKED), and un-re-pullable by auto-pull (intake.js's
+// taskAlreadyExists returns true on the taskDir's mere existence). Lost forever, silently.
+
+// Seeds exactly the on-disk shape takeNextTask leaves behind and nothing more: task.json and a
+// journal.jsonl holding only the 'taken' event. No state.json -- that is the whole point.
+function seedTakenButNeverStarted(journalRoot, id, { ageMs = 10_000, task = {} } = {}) {
+  const taskDir = path.join(journalRoot, id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', issue: 385, ...task }, null, 2));
+  fs.writeFileSync(
+    path.join(taskDir, 'journal.jsonl'),
+    JSON.stringify({ ts: new Date(Date.now() - ageMs).toISOString(), state: 'INTAKE', event: 'taken', fromFile: '0001-a.json' }) + '\n'
+  );
+  return taskDir;
+}
+
+test('orphanScan: a task taken off the queue whose worker died before writing state.json is recovered, not lost forever', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-385');
+  assert.equal(fs.existsSync(path.join(taskDir, 'state.json')), false, 'the fixture must have NO state.json -- that is the defect');
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-385', reason: 'task-orphaned-before-start' }]);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'task-orphaned-before-start');
+  assert.equal(state.lastState, 'INTAKE', 'the task never reached a handler -- INTAKE is where it really stopped');
+
+  // The retry channel is what makes this a RECOVERY and not just a louder loss: unparkScan needs
+  // a park-comment anchor (park-loop.js's findParkAnchor) or it skips the card on every cycle.
+  const events = readJournal(taskDir);
+  assert.ok(events.some((e) => e.event === 'parked' && e.reason === 'task-orphaned-before-start'));
+  assert.ok(events.some((e) => e.event === 'park-comment'), 'no anchor -> unparkScan skips this card forever');
+});
+
+test('orphanScan: the never-started shape is guarded as tightly as the ordinary one -- live worker, queue entry, grace window, and a bare directory are all left alone', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+
+  // 1. Owned by a live worker RIGHT NOW -- this IS the 74 ms window; reparking here would be the
+  //    two-writers race the module's header forbids.
+  const liveDir = seedTakenButNeverStarted(journalRoot, 'issue-live');
+  // 2. Still has a queue entry (a re-enqueued retry with a taskDir from a previous run).
+  const queuedDir = seedTakenButNeverStarted(journalRoot, 'issue-queued');
+  fs.writeFileSync(path.join(queueDir, '0009-q.json'), JSON.stringify({ id: 'issue-queued', kind: 'card', issue: 9 }));
+  // 3. Inside the grace window: a worker merely slow to boot (74 ms against a 1000 ms grace).
+  const freshDir = seedTakenButNeverStarted(journalRoot, 'issue-fresh', { ageMs: 74 });
+  // 4. A directory with no task.json at all -- not a claimed task, nothing to recover.
+  const bareDir = path.join(journalRoot, 'issue-bare');
+  fs.mkdirSync(bareDir, { recursive: true });
+  // 5. The genuine control, so a scan that recovered NOTHING cannot pass this test.
+  seedTakenButNeverStarted(journalRoot, 'issue-real');
+
+  const config = testConfig(); // orphanGraceMs: 1000
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/1#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps, new Set(['issue-live']));
+  assert.deepEqual(recovered, [{ id: 'issue-real', reason: 'task-orphaned-before-start' }]);
+
+  for (const [label, dir] of [['live', liveDir], ['queued', queuedDir], ['fresh', freshDir], ['bare', bareDir]]) {
+    assert.equal(fs.existsSync(path.join(dir, 'state.json')), false, `${label}: orphanScan wrote a state.json it had no business writing`);
+  }
+});
+
+test('orphanScan: a shadow/dry-run start only journals the never-started orphan, never parks it', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-385');
+
+  const config = testConfig({ shadowMode: true, dryRun: false, real: false });
+  const recovered = await orphanScan(queueDir, journalRoot, config, { isAlive: () => false });
+  assert.deepEqual(recovered, [{ id: 'issue-385', reason: 'task-orphaned-before-start', wouldRepark: true }]);
+
+  // Nothing under taskDir touched -- a shadow park has no board move and no gh anchor, so it would
+  // bury a real card under a developer's local experiment.
+  assert.equal(fs.existsSync(path.join(taskDir, 'state.json')), false);
+  assert.ok(readDaemonEvents(journalRoot).some((e) => e.event === 'orphan-scan-would-repark' && e.reason === 'task-orphaned-before-start'));
+});
+
+test('orphanScan: orphanGraceMs of 0 means ZERO, not the four-minute default -- SPO_ORPHAN_GRACE_MS is a live env knob', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  // Two milliseconds old: stale under a grace of 0, fresh under the 4-minute default the `||`
+  // coercion used to substitute for it.
+  seedTakenButNeverStarted(journalRoot, 'issue-zero', { ageMs: 2 });
+  seedTask(journalRoot, 'issue-ordinary', { state: 'DIAGNOSE', updatedAt: new Date(Date.now() - 2).toISOString() });
+
+  const config = testConfig({ orphanGraceMs: 0 });
+  assert.equal(config.orphanGraceMs, 0, 'the fixture itself must carry a real 0');
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/1#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  const ids = recovered.map((r) => r.id).sort();
+  assert.deepEqual(ids, ['issue-ordinary', 'issue-zero'], 'a grace of 0 was coerced back to the 4-minute default');
+});

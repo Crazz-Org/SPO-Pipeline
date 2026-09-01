@@ -1219,4 +1219,9 @@ module.exports = {
   VALID_SIZES,
   VALID_AREAS,
   TRIAGE_OUTCOMES,
+  // Exported so config.js's accountLeaseWaitMs bound can be ASSERTED against the scanner's own
+  // worst legitimate lease hold (2 x this, one lease spanning the primary call and its
+  // same-account timeout retry) rather than against a number a comment claims -- see
+  // test/account-lease.test.js's own derivation test.
+  INTAKE_DEADLINE_MS,
 };

@@ -66,13 +66,35 @@ const UNBOUNDED_LOOP_GIT_CALLS = 1;
 // with a dirty or unmergeable leftover and gets retried. Folding it in honestly would require
 // inventing a cap this codebase does not have.
 //
-// QUANTIFIED, because "unbounded" alone would overstate it (verification of 6.4): a legitimate
-// hold is itself capped by spawnStep's own per-call timeouts at about 24 x git + one double
-// timeout ~= 52 min, against a MAX_LOCK_AGE_MS of ~127.6 min -- a 2.4x margin. Pushing a
-// legitimate holder past the age sweep would take roughly 19 wip refs whose
-// `merge-base --is-ancestor` each timed out at 120s against a LOCAL clone, which is a wedged
-// filesystem rather than an operating point. Recorded so the day it happens is a grep, not a
-// rediscovery.
+// QUANTIFIED, because "unbounded" alone would overstate it. CORRECTED in C6's cross-action
+// verification: the figures this paragraph carried until then ("~52 min ... a 2.4x margin ...
+// roughly 19 wip refs") contradicted this file's OWN model and were far too reassuring.
+//
+// They were built from 24 single-attempt git calls plus one doubled one, which silently assumes
+// SPAWN_ATTEMPTS_PER_CALL = 1 at almost every call site and drops `npm ci` (2 x 600s = 20 min)
+// entirely. The file's own constant is 2, and worstHoldMs below applies it to every term. The
+// real arithmetic, from the constants directly above and config.js's shipped commandTimeoutsMs
+// (git/gh 120000, npm-ci 600000):
+//
+//   22 git x 2 x 120s = 5,280,000 ms
+//    2 gh  x 2 x 120s =   480,000 ms
+//    1 npm x 2 x 600s = 1,200,000 ms
+//                     = 6,960,000 ms = 116.0 min   (worstHoldMs, and config.js's own "116-minute
+//                                                   wait bound" agrees)
+//
+// against product-repo-lock.js's MAX_LOCK_AGE_MS = WORST_HOLD_MS + 10% = 127.6 min. So the margin
+// is 1.1x, not 2.4x -- and it is 1.1x BY CONSTRUCTION, since MAX_LOCK_AGE_MS is *defined* as
+// WORST_HOLD_MS x 1.1; no arithmetic here could ever have produced 2.4. The headroom for the
+// unbounded wip-ref term is therefore 127.6 - 116.0 = 11.6 min, i.e. roughly THREE extra refs
+// whose `merge-base --is-ancestor` each burns a doubled 120s timeout (or ~6 at a single timeout),
+// not nineteen.
+//
+// The conclusion the old paragraph drew -- "a wedged filesystem rather than an operating point"
+// -- was resting on ~6x more headroom than exists. It is still probably right, because timing out
+// `merge-base --is-ancestor` against a LOCAL clone at all is already pathological, but it is now
+// three refs of margin rather than nineteen, and that is thin enough that a task id which parks
+// with a dirty leftover many times over should be treated as the real risk here. Recorded so the
+// day it happens is a grep, not a rediscovery.
 
 // worstHoldMs(commandTimeoutsMs) -- the longest ONE holder of the product-repo lock can
 // legitimately keep it during WORKTREE's setup phase. Never restated as a literal anywhere; this

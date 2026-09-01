@@ -51,7 +51,7 @@ const path = require('path');
 const lock = require('./lock');
 const accountsModule = require('./accounts');
 const config = require('./config');
-const { LLM_STEP_DEADLINE_MS } = require('./step-contracts');
+const { MAX_LEASE_AGE_MS } = require('./step-contracts');
 const { monotonicNowMs } = require('./monotonic-clock');
 
 const LEASE_PREFIX = '.lease-';
@@ -92,7 +92,10 @@ const LEASE_SUFFIX = '.json';
 // rather than the D3 one this closes. That is why the bound is generous rather than tight: 31.5
 // minutes is roughly 7x the longest full two-attempt step the C6 funnel actually measured
 // (90-265s per call).
-const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE_MS / 10);
+// The derivation itself now lives in step-contracts.js, beside LLM_STEP_DEADLINE_MS, because
+// config.js needs this same bound to derive accountLeaseWaitMs and cannot require THIS file
+// (account-lease.js requires config.js -- that direction is a load-time cycle). Re-exported
+// below unchanged, so every existing importer and test still reads it from here.
 
 function leaseFilePath(poolDir, name) {
   return path.join(poolDir, `${LEASE_PREFIX}${name}${LEASE_SUFFIX}`);

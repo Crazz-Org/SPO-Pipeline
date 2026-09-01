@@ -284,3 +284,91 @@ test("daemon.js re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K -
   const byState = configLiteral.slice(configLiteral.indexOf('stepDeadlineMsByState:'));
   assert.match(byState, /effectiveWorkers/, 'the recompute must use the --workers-aware K, not config.js\'s env-time default');
 });
+
+// ---- CROSS-ACTION defect: a worker's crash left NO record anywhere ---------------------------
+//
+// dispatcher.js spawns workers with `stdio: 'ignore'`, so a worker's stderr is DISCARDED by the
+// kernel, not merely unread. runTask rethrows non-ParkSignal errors, daemon.js's main().catch
+// printed them with console.error and exited 1, and the dispatcher recorded only `{code: 1}`.
+// Measured before the fix: a worker whose runTask threw a real TypeError exited 1 and left
+// daemon.jsonl completely EMPTY. The crash-circuit-breaker could therefore trip and stop the
+// daemon with nothing, anywhere, saying what threw.
+//
+// Forces a genuine uncaught throw through daemon.js's REAL path (runWorker -> main -> the
+// catch-all) with a --require preload, rather than asserting on a hand-called helper: the whole
+// defect was about which process writes where, so nothing short of a real child proves it.
+function runCrashingWorker(journalDir, taskDir, throwSource) {
+  const { execFileSync } = require('child_process');
+  const preload = path.join(mkTmp('spo-worker-preload-'), 'boom.js');
+  const smPath = path.join(__dirname, '..', 'orchestrator', 'state-machine.js');
+  fs.writeFileSync(
+    preload,
+    `const sm = require(${JSON.stringify(smPath)});\nsm.runTask = async () => { throw ${throwSource}; };\n`
+  );
+  const queueDir = mkTmp('spo-worker-unused-queue-');
+  const args = [DAEMON, '--shadow', '--worker', taskDir, '--queue', queueDir, '--journal', journalDir];
+  try {
+    execFileSync(process.execPath, args, {
+      encoding: 'utf8',
+      timeout: 60000,
+      // stdio 'ignore' for stderr reproduces EXACTLY what the dispatcher does to a worker: if the
+      // fix only worked because execFileSync happened to capture stderr, this test would be
+      // proving the opposite of what it claims.
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: { ...process.env, SPO_ACCOUNTS_DIR: mkTmp('spo-worker-accts-'), NODE_OPTIONS: `--require ${preload}` },
+    });
+    return 0;
+  } catch (err) {
+    return err.status;
+  }
+}
+
+function readDaemonJsonl(journalDir) {
+  return fs
+    .readFileSync(path.join(journalDir, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+test('--worker: an uncaught state-machine error is journalled with its stack, not lost to a discarded stderr', { timeout: 60000 }, () => {
+  const journalDir = mkTmp('spo-worker-journal-');
+  const taskDir = seedWorkerTask(journalDir, 'worker-crash-1', { id: 'worker-crash-1', kind: 'synthetic' });
+
+  const status = runCrashingWorker(journalDir, taskDir, `new TypeError("boom reading 'prNumber'")`);
+  assert.equal(status, 1, 'an uncaught error is still exit 1 -- the contract must not change');
+
+  const evt = readDaemonJsonl(journalDir).find((e) => e.event === 'uncaught-error');
+  assert.ok(evt, 'the crash left no record at all -- the circuit breaker can trip with nothing saying why');
+  assert.equal(evt.mode, 'worker');
+  assert.equal(evt.id, 'worker-crash-1');
+  assert.equal(evt.name, 'TypeError');
+  assert.match(evt.message, /boom reading 'prNumber'/);
+  assert.match(evt.stack, /TypeError: boom reading 'prNumber'/);
+  assert.match(evt.stack, /daemon\.js/, 'a stack with no frames is not a stack');
+  assert.equal(evt.messageTruncated, false);
+});
+
+// An error message here is NOT small by nature: steps/llm.js JSON.parses up to 64 MiB of `claude`
+// stdout, and a SyntaxError from that parse embeds a slice of the input in its own message.
+// Writing it verbatim would put megabytes into daemon.jsonl on every crash -- the unbounded
+// spool this fix exists to avoid.
+test('--worker: a huge crash message is capped and marked truncated, never spooled whole into daemon.jsonl', { timeout: 60000 }, () => {
+  const journalDir = mkTmp('spo-worker-journal-');
+  const taskDir = seedWorkerTask(journalDir, 'worker-crash-2', { id: 'worker-crash-2', kind: 'synthetic' });
+
+  // 5 MiB, the shape a JSON.parse failure over a large `claude` stdout really produces.
+  const status = runCrashingWorker(journalDir, taskDir, `new SyntaxError("x".repeat(5 * 1024 * 1024))`);
+  assert.equal(status, 1);
+
+  const evt = readDaemonJsonl(journalDir).find((e) => e.event === 'uncaught-error');
+  assert.ok(evt);
+  assert.equal(evt.messageTruncated, true, 'a truncated message must SAY it was truncated, not read as if it were whole');
+  assert.ok(evt.message.length <= 2000, `message not capped: ${evt.message.length} chars`);
+  assert.ok(evt.stack.length <= 4000, `stack not capped: ${evt.stack.length} chars`);
+
+  // The whole point of the cap: the journal line stays readable rather than becoming the 5 MiB
+  // blob it is reporting on.
+  const bytes = fs.statSync(path.join(journalDir, 'daemon.jsonl')).size;
+  assert.ok(bytes < 32 * 1024, `daemon.jsonl grew to ${bytes} bytes -- the cap is not holding`);
+});

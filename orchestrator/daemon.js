@@ -4,7 +4,8 @@
 //                                          [--journal <dir>] [--deadline-ms <n>]
 //                                          [--interval-ms <n>]
 //             node orchestrator/daemon.js (--shadow | --dry-run | --real) --worker <taskDir>
-//                                          [--journal <dir>] [--deadline-ms <n>]
+//                                          [--queue <dir>] [--journal <dir>]
+//                                          [--deadline-ms <n>] [--workers <n>]
 //             node orchestrator/daemon.js (--shadow | --dry-run | --real) --scanner
 //                                          [--queue <dir>] [--journal <dir>]
 //
@@ -152,6 +153,9 @@ function printUsage() {
       '  --once            drain the queue serially and exit (default: poll forever)',
       '  --worker <dir>    run the ONE task in <dir>/task.json and exit (see file header for the',
       '                    exit-code contract). Mutually exclusive with --once. Takes no lock.',
+      '                    Also honours --queue (action 4.4\'s transient re-enqueue writes there)',
+      '                    and --workers (see that flag: it sets this worker\'s own',
+      '                    WORKTREE/FINISH deadlines).',
       '  --parent-pid <n>  (with --scanner) the dispatcher pid this scanner must not outlive:',
       '                    the loop exits as soon as it is reparented away from it. Set by',
       '                    dispatcher.js; omit it to run a scanner by hand that never self-exits.',
@@ -163,9 +167,13 @@ function printUsage() {
       '  --deadline-ms <n> per-step wall-clock deadline in ms (default: 120000)',
       '  --interval-ms <n> poll interval in ms, only used without --once (default: 5000)',
       '  --workers <n>     action 6.3: how many workers the dispatcher runs concurrently in',
-      '                    continuous mode (ignored by --once and --worker). Default 1',
-      '                    (config.js\'s workers / SPO_WORKERS), re-clamped to the number of',
-      '                    healthy accounts before every spawn -- see orchestrator/dispatcher.js.',
+      '                    continuous mode. Default 1 (config.js\'s workers / SPO_WORKERS),',
+      '                    re-clamped to the number of healthy accounts before every spawn --',
+      '                    see orchestrator/dispatcher.js. Ignored by --once, but NOT by',
+      '                    --worker or --scanner: action 6.4 derives the WORKTREE/FINISH step',
+      '                    deadlines from K (a worker must not time out on a legitimate',
+      '                    product-repo lock wait) and 6.6 derives the auto-pull watermark from',
+      '                    it (the scanner). Both are forwarded by dispatcher.js.',
     ].join('\n')
   );
 }
@@ -174,8 +182,11 @@ function printUsage() {
 // once, returning the exit code main() should use -- see this file's header comment for the
 // full table. Deliberately the ONLY thing a worker does: no takeNextTask (the dispatcher already
 // moved the task into taskDir before spawning this process), no drainQueueOnce/runForever, no
-// orphanScan, no periodic scans (unpark/auto-pull/report-intake/auto-triage) -- all of those stay
-// dispatcher-side (action 6.3). A missing/unreadable/unparsable task.json is a usage error (2),
+// orphanScan, no periodic scans (unpark/auto-pull/report-intake/auto-triage) -- all of those run
+// in the SCANNER process (`--scanner`, see this file's own header), never here and never in the
+// dispatcher either: 6.3's post-verification correction moved them out of the dispatcher's own
+// loop because auto-triage makes a BLOCKING 3-minute spawnSync that would freeze worker-slot
+// refills and SIGTERM handling. A missing/unreadable/unparsable task.json is a usage error (2),
 // not a crash (1): the dispatcher handed this process a bad path, which is its own bug to fix,
 // not this task's to be reparked over.
 async function runWorker(taskDirArg, config) {
@@ -208,6 +219,67 @@ async function runWorker(taskDirArg, config) {
   if (finalState === 'DONE') return 0;
   if (finalState === 'PARKED') return 20; // an expected outcome, never conflated with a crash
   throw new Error(`orchestrator/daemon.js: --worker: runTask returned unexpected state ${finalState}`);
+}
+
+// ---- action 6.3 cross-action defect: a worker's crash used to leave NO record anywhere --------
+//
+// dispatcher.js spawns both children with `stdio: 'ignore'` (its spawnOne/spawnScanner), so
+// anything this process writes to stderr is discarded by the kernel, not merely unread. runTask
+// rethrows every non-ParkSignal error, main().catch below prints it with console.error and exits
+// 1 -- and the dispatcher records only `{code: 1}`. MEASURED: a worker whose runTask threw a real
+// TypeError exited 1 and left daemon.jsonl completely EMPTY, with only the 'taken' line in the
+// task's own journal.jsonl. Nothing, anywhere, said what threw. Pre-6.3 that stack reached
+// journald through the daemon's own stderr, so the crash-circuit-breaker could trip and stop the
+// daemon with no record of the bug that caused it -- which makes C6's "a state-machine bug stays
+// loud" only "loud that something happened".
+//
+// FIXED HERE, IN THE CHILD, rather than by capturing the child's stderr in the dispatcher. The
+// child is the only process that has the error object at all: it can write ONE structured,
+// bounded journal line, where a `stdio: 'pipe'` parent would have to spool an unbounded stderr
+// stream (and a pipe nobody drains fast enough can block the child that writes it -- a worse
+// failure than the one being fixed). The journal is this project's single source of truth
+// anyway (Principle 5), so a crash belongs there, not only in an OS log.
+//
+// BOUNDED ON PURPOSE. An error message here is NOT small by nature: steps/llm.js JSON.parses up
+// to 64 MiB of `claude` stdout, and a SyntaxError from that parse embeds a slice of the input in
+// its own message. Writing that verbatim would put megabytes into daemon.jsonl on every crash --
+// exactly the unbounded spool this fix exists to avoid. Both fields are hard-capped and marked
+// `truncated: true` when they are cut, so a reader is never silently shown a partial message as
+// if it were whole.
+const CRASH_MESSAGE_CAP = 2000;
+const CRASH_STACK_CAP = 4000;
+
+// Set by main() as soon as the journal root and mode are known, read by main().catch below. A
+// crash BEFORE this point (argv parsing, an unreadable pool) has no journal root to write to and
+// still falls back to console.error alone, which is correct: those are hand-run/startup errors a
+// dispatcher never sees, because a dispatcher-spawned child that fails this early exits 1 or 2
+// before any journal exists to write into.
+let crashContext = null;
+
+function capped(text, cap) {
+  const s = String(text === undefined || text === null ? '' : text);
+  return s.length <= cap ? { text: s, truncated: false } : { text: s.slice(0, cap), truncated: true };
+}
+
+function journalUncaught(err) {
+  if (!crashContext) return;
+  const message = capped((err && err.message) || err, CRASH_MESSAGE_CAP);
+  const stack = capped((err && err.stack) || '', CRASH_STACK_CAP);
+  try {
+    appendDaemonEvent(crashContext.journalRoot, 'uncaught-error', {
+      mode: crashContext.mode,
+      id: crashContext.id || null,
+      taskDir: crashContext.taskDir || null,
+      name: (err && err.name) || null,
+      message: message.text,
+      messageTruncated: message.truncated,
+      stack: stack.text,
+      stackTruncated: stack.truncated,
+    });
+  } catch {
+    // A journal write that itself fails must never replace the original error with its own --
+    // console.error below still runs and is the last resort.
+  }
 }
 
 async function main() {
@@ -305,6 +377,16 @@ async function main() {
   const journalRoot = opts.journal || path.join(repoRoot, 'journal');
   fs.mkdirSync(queueDir, { recursive: true });
   fs.mkdirSync(journalRoot, { recursive: true });
+
+  // Armed as early as the journal root exists, so ANY throw from here down lands in daemon.jsonl
+  // -- see journalUncaught's own comment above for why the child, not the dispatcher, is the one
+  // that has to record this.
+  crashContext = {
+    mode: workerMode ? 'worker' : scannerMode ? 'scanner' : 'dispatcher',
+    journalRoot,
+    taskDir: workerMode ? path.resolve(opts.worker) : null,
+    id: workerMode ? path.basename(path.resolve(opts.worker)) : null,
+  };
 
   // Single-instance lock, scoped to this journal root (orchestrator/lock.js) -- the same
   // refuse-to-start posture as the account-pool guard above: two daemons on one queue is a
@@ -568,6 +650,11 @@ main().catch((err) => {
     process.exitCode = 75;
     return;
   }
+  // Journal FIRST, then print: the print goes to a stderr the dispatcher discards
+  // (`stdio: 'ignore'`), so it is the journal line that actually survives -- see
+  // journalUncaught's own comment. console.error is kept for a hand-run daemon, where stderr is
+  // a terminal and is the fastest thing a maintainer reads.
+  journalUncaught(err);
   console.error(err);
   process.exitCode = 1;
 });
