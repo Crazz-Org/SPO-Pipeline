@@ -20,7 +20,7 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
 | **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
-| **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); gate: replay, dry-run and board-divergence green — the *supervised* live card is still owed |
+| **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
 | C6–C7 | not started |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
@@ -685,31 +685,67 @@ So the class is real but now tiny, and nothing currently reaches `Crazz-Org/SPO-
 point: not one of them is load-bearing. Closing the class costs five `deps` injections plus a
 shared killswitch, and it is worth doing **before** 5.1/5.2 touch `board.js` and `park-loop.js`.
 
-## Gate C5 — three halves green, the fourth still owed
+## Gate C5 — GREEN, closed by supervised live card #473 on 2026-09-01
 
-The plan's gate is *"replay + (live recette via 2.9) following the board at every transition --
-zero board/journal divergence tolerated on the happy path"*, and § Method defines the parts:
-suite + `daemon.js --dry-run` on a synthetic card + the listed check, with *(live recette)* gates
-requiring **"a real, maintainer-supervised card -- the driver stops and explicitly asks for it."**
+The fourth half was run and passed. A real bug report ("the docked minimap still slides right for
+a left panel that no longer exists") was confirmed by the maintainer and followed transition by
+transition, board and journal read against each other at every one.
 
-| half | result |
-|---|---|
-| replay suite | 1181 passing, 0 failing |
-| `daemon.js --dry-run`, synthetic card | reaches `DONE`, full 11-state path, no park |
-| board/journal divergence, happy path | **zero** — table below |
-| *(live recette)*, supervised | **not run** |
+**Seven `board-move` events. Zero failed. Zero skipped. The board matched the journal at all
+seven.**
 
-The third was met by something better than a recette, and by accident: issue **#475**, a real
-card, claimed and driven end to end **unattended** on C5 code, 2026-09-01 11:58 → 12:16 UTC.
-Unattended is the catch — it satisfies the divergence check and it is not the supervised card the
-method requires, so the gate is not closed. The dry-run cannot stand in either: `--dry-run` is not
-real mode, so `moveCard` never fires and it writes no `board-move` at all. Only a live card can
-evidence this particular check.
+| time (UTC) | state | board move | board read back |
+|---|---|---|---|
+| 13:08:18 | WORKTREE | `Planning` | Planning |
+| 13:10:33 | IMPLEMENT | `Implementing` | Implementing |
+| 13:13:22 | CHECK | `Checks & PR` | Checks & PR |
+| 13:14:56 | PUSH_PR | *(none — by design)* | Checks & PR |
+| 13:15:03 | GATE | `Gate` | Gate |
+| 13:18:03 | CI_CHECKS | *(none — by design)* | Gate |
+| 13:18:09 | VALIDATE | `Validation` | Validation |
+| 13:19:55 | MERGE | `Merging` | Merging |
+| 13:22:52 | FINISH | **`Done`** | Done |
 
-Note for whoever closes it: `spo recette` files a synthetic SPO-WebClient issue, which project 1's
-auto-add drops into the daemon's own queue — against the standing rule that no remediation work
-goes on project 1. A real maintainer-supervised bug report is the cleaner instrument, and it
-exercises intake/confirm/triage besides.
+The two silent states are the documented coarsenings, and their silence is a result, not an
+omission: a move at either one would have been the regression. `FINISH -> Done` is the event that
+did not exist before action 5.1a and whose absence left 14 of 18 journals stopping at `Merging`.
+
+**CONFIRM to merged PR: 25m 03s** (12:57:36 -> 13:22:39). Task journal 14m51s. 3 LLM calls,
+**219,229 billable tokens**, 402.6s of model time, all on one account. No worktree leaked.
+
+    PLAN      fable/low    pool2  133.186s   84,603
+    IMPLEMENT sonnet/low   pool2  167.078s   75,299
+    VALIDATE  fable/high   pool2  102.305s   59,327
+
+**Action 5.3 fired in production for the first time, and its erratum paid for itself immediately.**
+VALIDATE returned `PASS_WITH_FINDINGS` with two findings, and the journal recorded
+`validate-findings-shape {shape: "json-string", count: 2}` -- the findings arrived JSON-ENCODED,
+not as an array, exactly as measured across 100% of the corpus. Had 5.3 tested `Array.isArray`
+(as handleValidate's own REJECT path did until this chantier) both would have been dropped
+silently. Instead they reached the card as comment `5494576238`, and the first is worth the whole
+action: the test IMPLEMENT had just written was **vacuous for 2 of its 3 cases**, because
+destroyed mock elements are never removed from `allElements` -- a regression reintroducing
+kind-dependent positioning would have passed it.
+
+Also observed live: C3's 3.5 account rotation fired for the second time in production (pool1 hit a
+usage limit at 13:07:41, `usageLimitStreak: 2` so the cooldown escalated from the 1h probe to 5h;
+triage rotated to pool2 and finished **6 seconds later**), and C3's protected-files guard failed
+open for the **third consecutive live card** -- `plan-files-undeclared {receivedType: "string"}`,
+with absolute paths, still unfiled at the time of writing.
+
+### The earlier, unattended evidence (superseded, kept for the numbers)
+
+The other three halves: replay suite **1181 passing**, `daemon.js --dry-run` on a synthetic card
+reaching `DONE` through the full 11-state path, and the divergence check above. Note the dry-run
+cannot evidence the board at all -- `--dry-run` is not real mode, `moveCard` never fires and it
+writes no `board-move`. Only a live card can.
+
+`spo recette` was deliberately NOT used: it files a synthetic SPO-WebClient issue, which project
+1's auto-add drops into the daemon's own queue, against the standing rule that no remediation work
+goes on project 1. A real maintainer-supervised report is the cleaner instrument and exercises
+intake/confirm/triage besides -- which #473 did: CONFIRM -> `report-confirmed` in 2m04s, triage
+reproducing against the product tree and retitling the card from the reporter's symptom to its
+cause.
 
     board-move: Planning · Implementing · Checks & PR · Gate · Validation · Merging · Done
     duration_s: PLAN 264.052s · IMPLEMENT 262.594s · VALIDATE 90.822s

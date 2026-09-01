@@ -102,10 +102,16 @@ test('spo status: a card in action 4.4 backoff gets a BACKOFF row (attempt + nex
 
   // The queue entry park-loop.js's reEnqueueTask actually writes -- this is what governs the
   // next pickup, and what `spo status` is told to read from (item B's own instruction).
-  writeTask(queueDir, '0000-retry-1-issue-449.json', { id, transientRetries: 1, notBefore: '2026-09-01T13:00:00.000Z' });
+  // notBefore derived from NOW, never a literal. The first cut hardcoded 2026-09-01T13:00:00Z,
+  // which was in the future when it was written and in the past twenty minutes later -- the test
+  // passed, was committed green, and started failing at 13:00:00Z when the sibling "due now"
+  // branch (correctly) took over. A fixture asserting the FUTURE branch has to stay in the future.
+  const notBefore = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  writeTask(queueDir, '0000-retry-1-issue-449.json', { id, transientRetries: 1, notBefore });
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
-  assert.match(out, /issue-449\s+BACKOFF\s+attempt=1\s+next-run=2026-09-01T13:00:00\.000Z/);
+  assert.match(out, new RegExp(`issue-449\\s+BACKOFF\\s+attempt=1\\s+next-run=${notBefore.replace(/[.]/g, '\\.')}`));
+  assert.doesNotMatch(out, /due now/, 'a notBefore in the future is a real backoff, never "due now"');
   // Not active, not parked -- its own bucket, and the summary line's `active` count must be 0,
   // not 1 (the double-count this item exists to close).
   assert.match(out, /active: 0\s+backoff: 1\s+parked: 0\s+abandoned: 0\s+done: 0/);
