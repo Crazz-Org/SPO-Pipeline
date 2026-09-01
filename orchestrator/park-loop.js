@@ -281,12 +281,47 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // already set from last week and could pass condition (1) on a sha nobody just measured --
 // exactly the "origin/main hasn't moved" check the guard exists to make trustworthy, defeated
 // by its own leftover state.
-function reEnqueueTask(queueDir, taskDir, id) {
+// Action 4.4: `transientRetries`/`notBefore` are stripped alongside worktreePath/branch/
+// baseMainSha, for the SAME reason and for both of this function's callers -- unparkScan (a
+// human's `retry` reply) and finalizePark's own bounded auto-retry (state-machine.js). Neither
+// call site duplicates this read/strip/write: finalizePark reuses this exact function and hands
+// its two fields in through `extra`, which is merged into the SAME single write.
+//
+// `extra` exists precisely so that the queue entry is never observable without them, and that is
+// a correctness requirement, not tidiness. 4.4's first cut wrote the file here and then had
+// finalizePark read it back, patch `transientRetries`/`notBefore` on and write it a second time.
+// Between those two writes the entry sat in queue/ carrying NEITHER field, i.e. "eligible right
+// now, zero retries used" -- and the post-merge hook SIGTERMs this daemon routinely
+// (doc/remediation-progress.md), so a death inside that window is not hypothetical. The recovered
+// entry would be taken immediately with a budget reset to 0, hit the same transient reason, and
+// re-enqueue itself again with the budget reset again: an unbounded retry loop, which is the one
+// thing the budget exists to prevent. Same reasoning for the temp-file-then-rename below --
+// `writeFileSync` onto the final name is not atomic, and every OTHER reader of this directory
+// (state-machine.js's takeNextTask/listQueueFiles, orphan-scan.js's queuedIds, console
+// collectQueue, intake.js's nextQueueSeq) keys off `*.json`, so a half-written entry under the
+// real name is a torn read waiting to happen. queuedIds is the sharp one: it falls back to the
+// FILENAME when the JSON does not parse, so a torn `0000-retry-<ts>-<id>.json` is keyed under
+// `0000-retry-<ts>-<id>` instead of `<id>`, the task looks absent from the queue, and orphan-scan
+// reparks a card that is sitting right there waiting out its own backoff. The temp name is
+// dot-prefixed so it matches neither the `*.json` filter nor nextQueueSeq's `^(\d+)-`; the rename
+// is atomic within the directory, so the entry only ever appears complete.
+//
+// The maintainer-facing consequence is the one worth stating in plain language: a human typing
+// `retry` on a parked issue ALWAYS restores the full auto-retry budget and starts immediately,
+// never inheriting a stale `transientRetries` count or a `notBefore` deadline left over from
+// whatever auto-retry attempt (if any) led to this park. That is deliberate, and it is the
+// property that keeps a human always able to make progress: an exhausted transient-retry budget
+// is a fact about how many times THE MACHINE tried unattended, not a ceiling on how many times a
+// human who has now looked at the reason gets to ask for another attempt.
+function reEnqueueTask(queueDir, taskDir, id, extra = {}) {
   const original = readJsonSafe(path.join(taskDir, 'task.json')) || {};
-  const { worktreePath, branch, baseMainSha, ...rest } = original;
+  const { worktreePath, branch, baseMainSha, transientRetries, notBefore, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
-  const file = path.join(queueDir, `0000-retry-${Date.now()}-${id}.json`);
-  fs.writeFileSync(file, JSON.stringify({ ...rest, id }, null, 2) + '\n');
+  const name = `0000-retry-${Date.now()}-${id}.json`;
+  const file = path.join(queueDir, name);
+  const tmp = path.join(queueDir, `.${name}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify({ ...rest, id, ...extra }, null, 2) + '\n');
+  fs.renameSync(tmp, file);
   return file;
 }
 

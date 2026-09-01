@@ -24,13 +24,42 @@ the design consequences at the bottom.
    the next time a `--real` daemon starts or runs its periodic scan. A `--shadow`/`--dry-run`
    start never does real side effects, so it only detects the orphan and journals
    `orphan-scan-would-repark` — it never parks. See `orchestrator/README.md` § Orphan recovery.
+   **Action 4.4:** the catch-all remains the error policy for every park reason except a closed,
+   named allowlist of ones that are facts about the *world at that instant*, not about the card —
+   `claim-rate-limited` (a board-claim rate limit), `gate-non-attesting` (action 4.2's bench-
+   attested-nothing park), and the `llm-transport-failed:<STEP>` family (PLAN/IMPLEMENT/DIAGNOSE/
+   VALIDATE, exact strings — never a prefix match). Those are auto-retried a bounded number of
+   times (`config.transientRetryBudget`, default 2) with a journalled backoff
+   (`config.transientRetryDelaysMs`, 1 min then 5 min, carried as an absolute `notBefore` on the
+   re-queued task rather than a `sleep` — the daemon's drain loop is awaited, so sleeping inside
+   it would stall every other card) before falling through to an ordinary park. A task on this
+   path is never marked `PARKED` and never gets a park comment or board move — it is not parked,
+   it is retrying — and a human's `retry` reply always resets the budget to zero and starts
+   immediately, restoring the "a human can always make progress" guarantee. Everything else,
+   including `push-pr-failed` (measured: every corpus occurrence is a logic failure, never a
+   network one), still goes straight to the catch-all above. One exception inside the exception:
+   a `gate-non-attesting` park whose detail carries `verdictDirExists: false` is a *misconfigured
+   `spoBenchDir`*, not a transient fact — action 4.2 records that as a boolean rather than a
+   distinct reason — so it is never auto-retried; retrying a wrong path costs a full
+   WORKTREE/PLAN/IMPLEMENT/GATE run per attempt and can only look in the same wrong place again.
+   The re-enqueue is one atomic write (`park-loop.js`'s `reEnqueueTask`, temp file + rename, with
+   `transientRetries`/`notBefore` merged in): an entry visible without them would be "eligible
+   now, budget unused", i.e. an unbounded retry loop after a SIGTERM in the gap. If that write
+   fails, the task journals `transient-retry-failed` and takes the ordinary park — the journal
+   never claims a retry that is not really queued. See `orchestrator/state-machine.js`'s
+   `TRANSIENT_RETRY_REASONS`/`isTransientRetryReason`/`finalizePark`.
 3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.
 4. **The jewels are not re-implemented.** The bench, the validators' criteria and the
    blast-radius policy are used as-is.
 5. **Everything is journaled.** One append-only JSONL journal per task; the console renders
-   journals, it never holds state of its own.
+   journals, it never holds state of its own. **Action 4.4:** a task taking the bounded
+   auto-retry path above still journals `transient-retry` (`{reason, attempt, delayMs,
+   notBefore}`) on the state it parked from, even though it never reaches `PARKED` itself — the
+   journal stays the complete record either way. That event is written only once the queue entry
+   is durably on disk; a re-enqueue that fails journals `transient-retry-failed` instead and the
+   task parks normally, so the journal never records a retry the queue does not hold.
 
 ## Task lifecycle
 
@@ -160,7 +189,11 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, duration_s, exit,
   verdict}` — no dollar figure anywhere; `orchestrator/tokens.js`'s "billable-weighted" =
   fresh input + cache-creation + output, cache-read reported separately, never summed in),
-  account cooldowns, parkings (with reason), attempts.
+  account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
+  `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
+  a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
+  `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
+  failed and the task fell through to an ordinary park instead).
 - **Claude session management**: the `session_id` of every step is recorded, so any step can
   be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
   interactively). `claude agents` lists live background sessions.
