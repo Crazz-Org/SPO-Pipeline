@@ -34,6 +34,7 @@ const { spawnSync } = require('child_process');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
+const { resolveMainMovedRegateBudget } = require('../main-moved-budget');
 const { moveCard } = require('../board');
 const { classifyCommand, classTimeoutMs, isSpawnTimeout } = require('../command-timeout');
 const {
@@ -1474,10 +1475,14 @@ async function realGate(ctx, deps = {}) {
         appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-fetch-failed', { exit: fetch.exit });
       }
 
-      if (ctx.counters.mainMoveUsed) {
-        throw new ParkSignal('main-moved-twice', {});
+      // Action 6.5: compare against the configurable budget (default 1, no behaviour change --
+      // see config.js's mainMovedRegateBudget comment for the settled decision and the corpus
+      // this default rests on) rather than a hardcoded "once".
+      const gateBudget = resolveMainMovedRegateBudget(config);
+      if (ctx.counters.mainMoveUsed >= gateBudget) {
+        throw new ParkSignal('main-moved-twice', { mainMoveUsed: ctx.counters.mainMoveUsed, mainMovedRegateBudget: gateBudget });
       }
-      ctx.counters.mainMoveUsed = true;
+      ctx.counters.mainMoveUsed += 1;
 
       // Same nightly-red refusal CI_CHECKS applies to its own main-moved merge (guardNightlyRed,
       // above) -- a rev-parse failure here is likewise non-fatal: without a sha to compare, the
@@ -1785,10 +1790,14 @@ async function realCiChecks(ctx, deps = {}) {
 
   const originMainSha = await gitRevParse(ctx, deps, worktreePath, 'origin/main');
   guardNightlyRed(config, originMainSha); // action 4.2: shared with GATE's own main-moved path
-  if (ctx.counters.mainMoveUsed) {
-    throw new ParkSignal('main-moved-twice', {});
+  // Action 6.5: same configurable-budget comparison GATE's own main-moved path uses above --
+  // see this function's shared counter with realGate (action 4.2) and config.js's
+  // mainMovedRegateBudget comment.
+  const ciChecksBudget = resolveMainMovedRegateBudget(config);
+  if (ctx.counters.mainMoveUsed >= ciChecksBudget) {
+    throw new ParkSignal('main-moved-twice', { mainMoveUsed: ctx.counters.mainMoveUsed, mainMovedRegateBudget: ciChecksBudget });
   }
-  ctx.counters.mainMoveUsed = true;
+  ctx.counters.mainMoveUsed += 1;
 
   const merge = spawnStep(ctx, deps, 'CI_CHECKS', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
   if (merge.exit !== 0) throw new ParkSignal('main-moved-merge-failed', { exit: merge.exit });

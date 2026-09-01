@@ -424,7 +424,7 @@ test('orphanScan: prNumber and ALL FOUR counters are still restored from state.j
       diagnoseAttempts: 3,
       validateRejects: 2,
       ciImplementRetries: 2,
-      mainMoveUsed: true,
+      mainMoveUsed: 3,
     },
   });
 
@@ -438,7 +438,51 @@ test('orphanScan: prNumber and ALL FOUR counters are still restored from state.j
   assert.equal(state.diagnoseAttempts, 3);
   assert.equal(state.validateRejects, 2);
   assert.equal(state.ciImplementRetries, 2);
-  assert.equal(state.mainMoveUsed, true);
+  // Action 6.5 made this a COUNT. It must round-trip like the three counters above and NOT be
+  // flattened back to a boolean -- a `!!` restore here would rewrite this card's record to claim
+  // one main move where it had spent three, which is precisely the understatement this test
+  // exists to forbid for the others.
+  assert.equal(state.mainMoveUsed, 3);
+});
+
+// Action 6.5, the upgrade case: every state.json written before 6.5 holds a BOOLEAN here (all 21
+// real files under journal/*/ did at the time of the change), and the post-merge hook SIGTERMs
+// the daemon on every deploy -- so a card mid-flight across the upgrade is the ordinary case, not
+// an exotic one. A legacy `true` must restore as the 1 the new code would have written, and a
+// legacy `false` as 0, so the field's type in state.json converges on a number instead of
+// alternating with whatever the last writer happened to be.
+test('orphanScan: a PRE-6.5 boolean mainMoveUsed upgrades in place -- true -> 1, never back out as a boolean', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-603', {
+    state: 'VALIDATE',
+    extra: { prNumber: 7, mainMoveUsed: true },
+  });
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  await orphanScan(queueDir, journalRoot, config, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.strictEqual(state.mainMoveUsed, 1, 'a legacy boolean true is the 1 the counter now means');
+});
+
+test('orphanScan: a PRE-6.5 boolean false mainMoveUsed upgrades to 0, not false', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-604', {
+    state: 'VALIDATE',
+    extra: { prNumber: 8, mainMoveUsed: false },
+  });
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  await orphanScan(queueDir, journalRoot, config, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.strictEqual(state.mainMoveUsed, 0);
 });
 
 // ---- action 2.4: orphanScan must not repark outside --real ----------------------------------

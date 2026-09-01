@@ -286,6 +286,60 @@ test('a worker exiting an unrecognized code IS reparked worker-crashed, with the
   assert.equal(parkEvt.detail.exitCode, 7);
 });
 
+// Action 6.5: reparkCrashedWorker restores the same four counters orphan-scan.js does, and for
+// the same reason -- finalizePark rewrites state.json through snapshot(), so a counter not
+// restored here is not merely missing from the park report, it is OVERWRITTEN with 0 and the
+// card's record then denies attempts that really happened. mainMoveUsed is the one that changed
+// shape in 6.5 (boolean -> count), and this path had no test of its own at all: restoring it
+// with `!!` instead of a numeric coercion passed the entire suite. A legacy pre-6.5 boolean is
+// covered here too -- the post-merge hook SIGTERMs this daemon on every deploy, so a card
+// mid-flight across the upgrade is the ordinary case.
+test('a crashed worker\'s repark preserves the COUNT in mainMoveUsed, and upgrades a pre-6.5 boolean instead of flattening it', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-c.json', { id: 'disp-counters', kind: 'synthetic' });
+  writeTask(queueDir, '0002-c.json', { id: 'disp-legacy', kind: 'synthetic' });
+
+  // The state each worker had already written before it died.
+  for (const [id, extra] of [
+    ['disp-counters', { diagnoseAttempts: 3, validateRejects: 2, ciImplementRetries: 2, mainMoveUsed: 3 }],
+    ['disp-legacy', { mainMoveUsed: true }], // written by a pre-6.5 daemon
+  ]) {
+    const dir = path.join(journalDir, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'state.json'),
+      JSON.stringify({ id, state: 'CI_CHECKS', prNumber: 99, ...extra })
+    );
+  }
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => {
+      const a = readState(journalDir, 'disp-counters');
+      const b = readState(journalDir, 'disp-legacy');
+      return a && a.state === 'PARKED' && b && b.state === 'PARKED';
+    });
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const counted = readState(journalDir, 'disp-counters');
+  assert.equal(counted.diagnoseAttempts, 3);
+  assert.equal(counted.validateRejects, 2);
+  assert.equal(counted.ciImplementRetries, 2);
+  assert.strictEqual(counted.mainMoveUsed, 3, 'the count must survive the repark, not collapse to true/1');
+
+  const legacy = readState(journalDir, 'disp-legacy');
+  assert.strictEqual(legacy.mainMoveUsed, 1, 'a pre-6.5 boolean true is the 1 the counter now means');
+});
+
 // ---- 5. N consecutive crashes trip the breaker and the dispatcher exits non-zero; a 0/20 in between resets it
 
 test('N consecutive crashes trip the circuit breaker; a PARK in between resets the count', { timeout: 20000 }, async () => {

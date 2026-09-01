@@ -53,6 +53,7 @@ const {
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
+const { resolveMainMovedRegateBudget } = require('./main-moved-budget');
 const accounts = require('./accounts');
 const { leaseHealthyAccount } = require('./account-lease');
 const { moveCard } = require('./board');
@@ -770,10 +771,17 @@ function resolveShadowCiChecks(ctx) {
   if (ctx.fixture('nightlyMainRed', false)) {
     throw new ParkSignal('main-red-no-merge', {});
   }
-  if (ctx.counters.mainMoveUsed) {
-    throw new ParkSignal('main-moved-twice', {});
+  // Action 6.5: compare against the configurable budget (default 1 -- see config.js's
+  // mainMovedRegateBudget comment), not a hardcoded "once". The reason string stays
+  // `main-moved-twice` even past a raised budget -- it names the EVENT (a move refused because
+  // the budget for this task is spent), not a literal second occurrence, and no code outside
+  // this file's own three throw sites reads the string, so renaming it would only cost every
+  // existing test and journal entry their continuity for no reader anywhere.
+  const budget = resolveMainMovedRegateBudget(ctx.config);
+  if (ctx.counters.mainMoveUsed >= budget) {
+    throw new ParkSignal('main-moved-twice', { mainMoveUsed: ctx.counters.mainMoveUsed, mainMovedRegateBudget: budget });
   }
-  ctx.counters.mainMoveUsed = true;
+  ctx.counters.mainMoveUsed += 1;
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'main-moved-merge', {});
   return 'CHECK';
 }
@@ -1224,7 +1232,14 @@ function buildCtx(id, task, taskDir, config) {
       diagnoseAttempts: 0,
       seenRootCauses: new Set(),
       validateRejects: 0,
-      mainMoveUsed: false,
+      // Action 6.5: a COUNT, not a boolean -- how many main-moved re-gates this task has already
+      // spent, checked against config.mainMovedRegateBudget (default 1, today's behaviour
+      // unchanged) rather than a hardcoded "once". See main-moved-budget.js and config.js's own
+      // mainMovedRegateBudget comment for the settled decision and the corpus this default rests
+      // on. `0` compares identically to the old `false` everywhere it is read with `>=`/truthy
+      // checks (and loose `==`, which snapshot-reading tests still use), so this is not itself a
+      // behaviour change.
+      mainMoveUsed: 0,
       // Action 4.3's CI_CHECKS -> IMPLEMENT retry budget -- see config.js's ciRetryBudget
       // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
       // than reusing one of them.

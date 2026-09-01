@@ -149,7 +149,14 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
     // here is not merely absent from the park report -- it is overwritten with 0, and the parked
     // card's record then claims no CI retry ever happened when three may have.
     ctx.counters.ciImplementRetries = state.ciImplementRetries || 0;
-    ctx.counters.mainMoveUsed = !!state.mainMoveUsed;
+    // Action 6.5 turned this into a COUNT (state-machine.js's buildCtx), so it is restored
+    // like the three counters above -- `Number(...) || 0`, not `!!`. A pre-6.5 state.json
+    // still holds a boolean, and Number(true)/Number(false) are exactly the 1/0 the new
+    // code writes, so old files upgrade in place. `!!` would have re-flattened every count
+    // to true/false: the park report (and the state.json finalizePark rewrites through
+    // snapshot()) would then claim one move where the task had spent three, the same
+    // understatement this block exists to prevent for ciImplementRetries.
+    ctx.counters.mainMoveUsed = Number(state.mainMoveUsed) || 0;
 
     if (!isRealMode(ctx)) {
       // shadow/dry-run: detect and journal only -- see this file's header note above. Nothing

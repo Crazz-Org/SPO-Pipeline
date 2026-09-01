@@ -184,6 +184,61 @@ module.exports = {
   // forever, free and unlogged, the moment the classification bug above is corrected.
   ciRetryBudget: 3,
 
+  // ---- action 6.5: the main-moved re-gate counter (GATE and CI_CHECKS share it -- action 4.2
+  // made that sharing explicit; this action only changes what the counter is compared against).
+  //
+  // THE DECISION THIS DEFAULT RECORDS, settled by the maintainer rather than re-derived here:
+  // the GitHub merge queue serializes LANDING, not semantics -- two merged PRs with disjoint
+  // files but interacting behaviour can both land without either ever being re-gated against the
+  // other, and the main-moved test below (both realGate's and realCiChecks') only catches a
+  // FILE-INTERSECTING move, not a bare one. Two ways to close that gap were considered and both
+  // declined:
+  //   - a dispatcher-held MERGE admission token, measured at +42s/card at K=2 -- and it would
+  //     not even fix the semantics it was built for: card B still merges having never been gated
+  //     against card A, it only stops interleaving, which the GitHub merge queue already does.
+  //   - widening the intersection test to "main moved at all", the one option that WOULD buy the
+  //     semantic safety -- costs ~6-8% more bench load, declined against an unquantified risk
+  //     that already has a backstop (the nightly, which drives every merged main and would catch
+  //     an interaction the pipeline missed).
+  // So: accept the gap explicitly, the nightly is the accepted backstop, and this budget is
+  // exactly what the CI_CHECKS/GATE spec rows now say ("configurable ... once at the default").
+  //
+  // THE NUMBER ITSELF is a MODEL, not a measurement, and is written down as one rather than
+  // dressed up as derived from data that does not exist: the corpus (journal/*/journal.jsonl,
+  // all 20 tasks) contains ZERO `main-moved` events, because today's daemon is single-threaded --
+  // it structurally cannot merge a sibling card's PR while another of its own cards is live, so
+  // K workers do not merely expose this path, they CREATE it. Over one card's own window the
+  // expected count of sibling merges is exactly K-1 (one per other worker, once per cycle).
+  //
+  // The model: sibling merges as Poisson with lambda = (K-1) x exposure x intersectionRate,
+  // "conservative" stated plainly rather than proven -- real sibling merges are quasi-periodic
+  // (each worker's own cycle), so they cluster LESS than a Poisson arrival would, not more.
+  //   exposure    = 39-52% of a card's cycle is GATE-start-to-merge (7.8/14.9 and 6.8/17.6 min
+  //                 on the only two cards with phase timing, #473/#475).
+  //   intersectionRate = 10.5% -- 16 of 153 pairs (C(18,2)) among the 18 merged pipeline PRs
+  //                 share at least one file; concentrated in a few large cards (#213 in 5 pairs,
+  //                 #418 in 5), median card touches 2-4 files and intersects nothing.
+  //   lambda(K=2) = 0.041-0.055, lambda(K=3) = 0.082-0.109.
+  //
+  //           | one re-gate (>=1 intersecting sibling merge) | two (park under budget 1) |
+  //   K=2     | 4.0-5.3% of cards                              | 0.08-0.15%                 |
+  //   K=3     | 7.9-10.3%                                       | 0.33-0.56%                 |
+  //
+  // Today's boolean (equivalent to budget 1) already parks fewer than 1 card in 650 at K=2 and
+  // fewer than 1 in 178 at K=3 -- a raised default would be defending against an event the
+  // pipeline's OWN file-intersection test already makes ~10x rarer than a bare merge count
+  // suggests, and the plan's default of 2 lands on K-1 only at the K=3 the plan happened to
+  // choose, which is a coincidence of that choice, not a derivation. So: DEFAULT STAYS AT 1 --
+  // no behaviour change from today's hard boolean -- and the number is configurable so it is
+  // arguable rather than compiled in.
+  //
+  // What would actually settle this later: a `main-moved-merge` event count against a card
+  // count once K>1 has run in production for a while -- the same "no calibration data exists
+  // yet" honesty ciChecksMaxPolls' own comment above states, and no journal evidence for this
+  // number CAN exist before then. Full derivation: doc/remediation-progress.md, "6.5's counter:
+  // what the corpus says, and what it cannot say".
+  mainMovedRegateBudget: 1,
+
   // CI_CHECKS in-flight bounded wait (steps/scripted.js's realCiChecks) -- action 1.7. A
   // check-run with `conclusion: null` (still running) or an empty check_runs array (CI has not
   // even registered yet) is NOT green: the audit measured 8/12 real "green" events with `claude

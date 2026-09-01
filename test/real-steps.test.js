@@ -90,6 +90,10 @@ function testConfig(overrides = {}) {
     // in-flight tests below (which override them further where a specific bound matters).
     ciChecksMaxPolls: 3,
     ciChecksPollIntervalMs: 1000,
+    // Action 6.5: real config.js's default (1) -- baked in here, not left to
+    // main-moved-budget.js's own fallback, so a test that overrides it is visibly opting OUT of
+    // the default rather than relying on an implicit one.
+    mainMovedRegateBudget: 1,
     ...overrides,
   };
 }
@@ -1413,7 +1417,7 @@ test('realCiChecks: main-moved intersection non-empty -> merges origin/main, ret
 
   const next = await realCiChecks(ctx, deps);
   assert.equal(next, 'CHECK');
-  assert.equal(ctx.counters.mainMoveUsed, true);
+  assert.equal(ctx.counters.mainMoveUsed, 1); // action 6.5: a count now, not a boolean
   assert.ok(calls.some((a) => a.includes('merge') && a.includes('origin/main')));
 
   const journal = fs
@@ -1426,7 +1430,7 @@ test('realCiChecks: main-moved intersection non-empty -> merges origin/main, ret
 
 test('realCiChecks: main already moved once this task -> PARKED (main-moved-twice), no merge spawned', async () => {
   const ctx = ciCtx();
-  ctx.counters.mainMoveUsed = true;
+  ctx.counters.mainMoveUsed = 1; // action 6.5: at the default budget of 1, this task's move is already spent
   const headSha = 'headshaBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
   writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { baseMain: 'basemainsha' });
 
@@ -1448,6 +1452,92 @@ test('realCiChecks: main already moved once this task -> PARKED (main-moved-twic
     (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
   );
   assert.ok(!calls.some((a) => a.includes('merge')));
+});
+
+// ---- action 6.5: the main-moved counter is now compared against config.mainMovedRegateBudget
+// (default 1, unchanged behaviour) instead of a hardcoded "once" -- see main-moved-budget.js and
+// config.js's own mainMovedRegateBudget comment for the settled decision and the corpus this
+// default rests on.
+
+test('realCiChecks: mainMovedRegateBudget raised to 2 -> two re-gates succeed, a third parks main-moved-twice', async () => {
+  const ctx = ciCtx({ config: testConfig({ mainMovedRegateBudget: 2 }) });
+  const headSha = 'headshaDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { baseMain: 'basemainsha' });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+      }
+      if (args.includes('diff')) return ok('shared/file.ts\n');
+      return ok('');
+    },
+  };
+
+  assert.equal(await realCiChecks(ctx, deps), 'CHECK', 'first move: under budget 2');
+  assert.equal(ctx.counters.mainMoveUsed, 1);
+
+  assert.equal(await realCiChecks(ctx, deps), 'CHECK', 'second move: still under budget 2');
+  assert.equal(ctx.counters.mainMoveUsed, 2);
+
+  await assert.rejects(
+    () => realCiChecks(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'main-moved-twice' &&
+      err.detail.mainMoveUsed === 2 &&
+      err.detail.mainMovedRegateBudget === 2,
+    'third move: budget of 2 is spent'
+  );
+});
+
+test('realGate and realCiChecks share ctx.counters.mainMoveUsed -- a move GATE spends counts against CI_CHECKS\' own budget on the same task (action 4.2\'s sharing, still true under action 6.5\'s counter)', async () => {
+  const worktreePath = mkTmp('spo-shared-mainmoved-wt-');
+  const config = testConfig({ mainMovedRegateBudget: 1 });
+  const task = { id: 'card-shared-mm', kind: 'card', issue: 501, worktreePath };
+  const ctx = testCtx({ id: 'card-shared-mm', task, config });
+
+  // realGate (unlike realCiChecks) shape-checks HEAD's rev-parse output against
+  // /^[0-9a-f]{7,64}$/ (action 4.1's measurement) -- must be genuine lowercase hex, not the
+  // readable-but-invalid placeholders realCiChecks' own tests use below.
+  const gateHeadSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${gateHeadSha}.json`), { verdict: 'FAIL' });
+  const gateDeps = {
+    spawnSync: (command, args) => {
+      if (args.includes('run') && args.includes('gate')) return fail(1);
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${gateHeadSha}\n`);
+      if (args.includes('fetch')) return ok('');
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
+      if (args.includes('merge')) return ok('');
+      return ok('');
+    },
+  };
+
+  assert.equal(await realGate(ctx, gateDeps), 'CHECK', 'GATE spends the one move this task has under budget 1');
+  assert.equal(ctx.counters.mainMoveUsed, 1);
+
+  const ciHeadSha = 'cishaEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${ciHeadSha}.json`), { baseMain: 'basemainsha' });
+  const ciDeps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${ciHeadSha}\n`);
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+      }
+      if (args.includes('diff')) return ok('shared/file.ts\n');
+      return ok('');
+    },
+  };
+
+  // CI_CHECKS reads the SAME ctx.counters: GATE already spent this task's one move under budget
+  // 1, so CI_CHECKS' own main-moved test must park rather than merge again -- one shared budget
+  // per task, not one each.
+  await assert.rejects(
+    () => realCiChecks(ctx, ciDeps),
+    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
+  );
+  assert.equal(ctx.counters.mainMoveUsed, 1, 'a refused move must not itself spend any more of the budget');
 });
 
 test('realCiChecks: nightly red at the fetched origin/main sha -> PARKED (main-red-no-merge)', async () => {
@@ -3139,6 +3229,98 @@ test('npm-gate timeout exceeds the bench\'s own wait bound, so the bench always 
     config.commandTimeoutsMs['npm-gate'] > BENCH_WAIT_BOUND_MS,
     `npm-gate (${config.commandTimeoutsMs['npm-gate']}ms) must exceed the bench's own ${BENCH_WAIT_BOUND_MS}ms bound`
   );
+});
+
+// Action 6.5: the plan asked whether npm-gate's timeout covers the WORST-CASE QUEUE WAIT once K
+// workers can all reach GATE at once (plus a nightly caught mid-run on the same single bench
+// worker) -- a distinct question from the bench's own internal 120-min give-up bound the test
+// above pins. Measured before building anything, per this chantier's own habit: at K=2 (this
+// machine's real ceiling) the worst case is ~10.5 min, at K=3 (shadow-only today) ~13.2 min --
+// see orchestrator/bench-queue-wait.js's own header for the three measured constants and where
+// each comes from. Both are dwarfed by npm-gate's existing 7800000ms (130 min), so THE CORRECT
+// OUTPUT OF THIS ACTION IS THIS ASSERTION, not new machinery: no bench-queue-aware timeout, no
+// per-worker submit-time budget, nothing built. This test is what keeps that verdict honest --
+// it fails the moment `workers` is raised far enough, or the measured constants revised far
+// enough, to actually threaten the margin, rather than trusting the arithmetic to stay true
+// forever unchecked.
+test('npm-gate timeout also covers K workers\' worst-case bench queue wait, including a nightly caught mid-run (action 6.5)', () => {
+  const config = require('../orchestrator/config.js');
+  const { benchQueueWaitBoundMs } = require('../orchestrator/bench-queue-wait.js');
+
+  // Asserted at the K values this action actually REASONED about, not only at the K the config
+  // happens to ship (1). Checking only `config.workers` made this assertion vacuous: it was
+  // strictly implied by the 120-min bench-wait test just above, since benchQueueWaitBoundMs(1)
+  // is ~7.9 min and that test already requires npm-gate > 120 min -- it could not have failed
+  // independently below K=44.
+  for (const k of [1, 2, 3]) {
+    const bound = benchQueueWaitBoundMs(k);
+    assert.ok(
+      config.commandTimeoutsMs['npm-gate'] > bound,
+      `npm-gate (${config.commandTimeoutsMs['npm-gate']}ms) must exceed the worst-case K=${k} bench queue wait (${bound}ms)`
+    );
+  }
+
+  // The shipped K itself, so a raise to 2 or 3 stays inside the range checked above.
+  assert.ok(
+    [1, 2, 3].includes(config.workers),
+    `config.workers is ${config.workers}: extend the K list above before raising it further`
+  );
+});
+
+// The three constants benchQueueWaitBoundMs is built from, pinned as LITERALS with their
+// provenance. The derivation test below deliberately recomputes from these same constants (that
+// is what makes it a test of the FORMULA), so it cannot notice one of them changing value --
+// verified by mutation: SIBLING_REF_JOB_MAX_MS 161000 -> 1000, NIGHTLY_JOB_MAX_MS -> 0 and
+// OWN_GATE_JOB_MAX_MS -> 1 each passed the entire suite. That is the same shape as action 6.4's
+// SETUP_GIT_CALLS, where recomputing the expectation from the constant under test let a safety
+// bound be halved against 1303 green tests. The margin assertion above cannot catch it either:
+// shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
+//
+// A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
+// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 217) deletes
+// every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
+// worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
+// all-time records, and re-measuring on a different day legitimately yields a different sample
+// count -- which is exactly what happened between C6's earlier pass and this action's. Revising
+// them upward is expected; this test is here so a revision is a deliberate edit rather than a
+// silent drift, and the margin loop above is what says whether a revision still fits.
+test('bench-queue-wait: the three measured constants are the values action 6.5 derived its verdict from (action 6.5)', () => {
+  const {
+    OWN_GATE_JOB_MAX_MS,
+    SIBLING_REF_JOB_MAX_MS,
+    NIGHTLY_JOB_MAX_MS,
+    benchQueueWaitBoundMs,
+  } = require('../orchestrator/bench-queue-wait.js');
+
+  // 239.9s -- GATE's own client-observed max, n=23 real `npm run gate` spawns across 20 journals.
+  assert.strictEqual(OWN_GATE_JOB_MAX_MS, 239900);
+  // 161s -- max 'ref' service time in ~/.spo-bench/done (123.8/125.4/160.2s), rounded up.
+  assert.strictEqual(SIBLING_REF_JOB_MAX_MS, 161000);
+  // 232s -- max 'nightly' service time in the same spool (212.5/232.0s).
+  assert.strictEqual(NIGHTLY_JOB_MAX_MS, 232000);
+
+  // And the bounds those literals produce, stated independently of the formula, so that neither
+  // a changed constant NOR a changed formula can leave both tests green.
+  assert.strictEqual(benchQueueWaitBoundMs(1), 471900);
+  assert.strictEqual(benchQueueWaitBoundMs(2), 632900);
+  assert.strictEqual(benchQueueWaitBoundMs(3), 793900);
+});
+
+test('benchQueueWaitBoundMs: K=1 has no sibling term, each extra worker adds exactly one sibling-job cost, a non-positive/non-integer K falls back to 1', () => {
+  const {
+    benchQueueWaitBoundMs,
+    OWN_GATE_JOB_MAX_MS,
+    SIBLING_REF_JOB_MAX_MS,
+    NIGHTLY_JOB_MAX_MS,
+  } = require('../orchestrator/bench-queue-wait.js');
+
+  assert.equal(benchQueueWaitBoundMs(1), NIGHTLY_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(2), NIGHTLY_JOB_MAX_MS + SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(3), NIGHTLY_JOB_MAX_MS + 2 * SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(0), benchQueueWaitBoundMs(1), 'a non-positive K must not go negative or drop the floor');
+  assert.equal(benchQueueWaitBoundMs(-5), benchQueueWaitBoundMs(1));
+  assert.equal(benchQueueWaitBoundMs(1.5), benchQueueWaitBoundMs(1), 'a non-integer K falls back to the safe default, same as product-repo-hold.js\'s own workers guard');
+  assert.equal(benchQueueWaitBoundMs(undefined), benchQueueWaitBoundMs(1));
 });
 
 test('spawnStep: BOTH attempts time out -> PARKED with a dedicated reason naming the command class, never the caller\'s own failure reason', () => {

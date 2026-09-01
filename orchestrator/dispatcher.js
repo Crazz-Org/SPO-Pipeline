@@ -251,7 +251,9 @@ function reparkCrashedWorker(id, taskDir, code, signal, queueDir, journalRoot, c
   ctx.counters.diagnoseAttempts = (state && state.diagnoseAttempts) || 0;
   ctx.counters.validateRejects = (state && state.validateRejects) || 0;
   ctx.counters.ciImplementRetries = (state && state.ciImplementRetries) || 0;
-  ctx.counters.mainMoveUsed = !!(state && state.mainMoveUsed);
+  // Action 6.5: a COUNT, not a boolean -- same `Number(...) || 0` restore orphan-scan.js
+  // uses, and for the reason stated there (a pre-6.5 boolean still upgrades in place).
+  ctx.counters.mainMoveUsed = Number(state && state.mainMoveUsed) || 0;
 
   finalizePark(ctx, lastState, 'worker-crashed', { exitCode: code, signal: signal || null });
 }

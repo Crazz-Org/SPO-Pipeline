@@ -43,6 +43,7 @@ function testConfig(overrides = {}) {
     diagnoseBudget: 3,
     validateRejectBudget: 3,
     ciRetryBudget: 3,
+    mainMovedRegateBudget: 1, // action 6.5: real config.js's default
     ...overrides,
   };
 }
@@ -519,7 +520,7 @@ test('handleCiChecks: the main-moved merge path (-> CHECK) is not a CI retry and
   const ctx = buildCtx('card-mainmoved', task, taskDir, { shadowMode: true, dryRun: false, ...testConfig() });
 
   assert.equal(await HANDLERS.CI_CHECKS(ctx), 'CHECK');
-  assert.equal(ctx.counters.mainMoveUsed, true);
+  assert.equal(ctx.counters.mainMoveUsed, 1); // action 6.5: a count now, not a boolean
   assert.equal(ctx.counters.ciImplementRetries, 0);
   assert.ok(!readJournal(taskDir).some((e) => e.event === 'ci-implement-retry'));
 });
