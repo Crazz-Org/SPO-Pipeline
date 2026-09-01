@@ -766,11 +766,9 @@ the happy path, which is what the gate asks for and all it asks for.
 
 ## What C5 hands C6
 
-**All five are filed as backlog cards** (2026-09-01, through `spo ask` with a `review-card`
-verdict on each — the same intake every other card gets):
+**All six are filed as backlog cards** (2026-09-01, through `spo ask` with a `review-card` verdict
+on each — the same intake every other card gets):
 
-| card | what |
-|---|---|
 | card | what | where it lives now |
 |---|---|---|
 | [#475](https://github.com/Crazz-Org/SPO-WebClient/issues/475) | MERGE parks `pr-closed-unmerged` on a single unconfirmed read | **closed, half-fixed** — see below |
@@ -778,6 +776,7 @@ verdict on each — the same intake every other card gets):
 | [#477](https://github.com/Crazz-Org/SPO-WebClient/issues/477) | intake/triage spend is captured and dropped | project 2 |
 | [#478](https://github.com/Crazz-Org/SPO-WebClient/issues/478) | `duration_s` is written and never rendered | project 2 |
 | [#480](https://github.com/Crazz-Org/SPO-WebClient/issues/480) | two timing-budget flakes in `test/lock.test.js` | project 2 |
+| [#482](https://github.com/Crazz-Org/SPO-WebClient/issues/482) | the protected-files guard (action 3.2) has never once run | project 2 |
 
 **Filing all five onto project 1 was wrong, and it cost a half-fix within the hour.** The daemon
 claims from project 1's `Todo` and `orchestrator/config.js` hardcodes `productRepo`/`ghRepo` to
@@ -810,10 +809,13 @@ test **once**. The rarer of the two was the only one the project knew about.
   was deliberately removed (PR #444). Filed.
 - **MERGE treats one unconfirmed `closed false` read as terminal** (`realMerge`, both copies). It
   cost #443 a false park and a maintainer a merged change. Filed.
-- **C3's protected-files guard still fails open on every real card** — `files_to_change` arrives as
-  a JSON-encoded string. `normalizeFindingsPayload` (park-loop.js) is now the repo's parser for
-  exactly this shape and 5.3 used it to fix the same bug in handleValidate's REJECT path; the same
-  one-line treatment is what `handlePlan` needs. Do NOT promote the key to `required` first.
+- **C3's protected-files guard still fails open on every real card** — filed as **#482**, project
+  2. Four live occurrences now (#471, #473, #475, and one earlier), `receivedType: "string"` every
+  time. `normalizeFindingsPayload` (park-loop.js) is the repo's parser for exactly this shape,
+  already imported by state-machine.js, and 5.3 used it to fix the identical bug on the VALIDATE
+  wire. Do NOT promote the key to `required` first. **Overlaps project 2's #31** ("PLAN should park
+  a card whose plan requires editing `.claude/**`") — #31 is the behaviour 3.2 was meant to deliver
+  and #482 is why it does not; close one with the other or they get worked twice.
 - **`duration_s` has no reader.** 5.4 writes it on every `llm-call`; nothing renders it yet. The
   first card run on C5 code will be the first with per-step timings — `spo task <id>` and the
   dashboard are the natural surfaces.
