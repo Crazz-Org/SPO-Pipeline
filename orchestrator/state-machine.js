@@ -50,6 +50,7 @@ const accounts = require('./accounts');
 const { moveCard } = require('./board');
 const {
   postParkComment,
+  postDiagnoseSurfaceComment,
   unparkScan,
   shouldScanUnpark,
   countRepeatedParks,
@@ -785,6 +786,21 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
+  // Action 5.1d: surface DIAGNOSE on the card, first entry only -- see park-loop.js's
+  // postDiagnoseSurfaceComment for the comment mechanics/measurement and this file's own
+  // ctx.counters.diagnoseSurfaced comment (buildCtx) for why the flag is in-memory and per-run.
+  // Set BEFORE calling, not after: "first entry" means first entry regardless of whether the
+  // comment itself lands (real mode/never-blocks policy, same as board.js's moveCard), and the
+  // attempt named in the comment is the one about to run (diagnoseAttempts + 1), not the one
+  // that already ran.
+  if (isRealMode(ctx) && !ctx.counters.diagnoseSurfaced) {
+    ctx.counters.diagnoseSurfaced = true;
+    postDiagnoseSurfaceComment(ctx, ctx.deps, {
+      attempt: ctx.counters.diagnoseAttempts + 1,
+      budget: ctx.config.diagnoseBudget,
+    });
+  }
+
   // Action 1.3: generate DIAGNOSE's declared judge inputs (diff.patch / gate.log / gate-report.md)
   // before the LLM call, real mode only. gate.log is required only when this DIAGNOSE was
   // entered from GATE (ctx.cameFrom, set by runTask's transition loop below) -- from anywhere
@@ -1093,6 +1109,12 @@ function buildCtx(id, task, taskDir, config) {
       // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
       // than reusing one of them.
       ciImplementRetries: 0,
+      // Action 5.1d: whether this task has already posted its one-time "pipeline diagnosing"
+      // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
+      // persisted lifetime as board.js's own 5.1c dedupe memo, and for the same reason: a retry
+      // always restarts a task at INTAKE with a fresh ctx (see this file's own cameFrom comment),
+      // so "first DIAGNOSE entry" is naturally scoped to one run, never carried across a restart.
+      diagnoseSurfaced: false,
     },
   };
 }

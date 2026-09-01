@@ -981,14 +981,44 @@ The maintainer created five kanban columns for this (`Planning`, `Implementing`,
 | FINISH | `Done` | `steps/scripted.js`'s `realFinish` -- unchanged, pre-existing, and still the one move that **blocks** the task on failure |
 | PARKED | `Parked` | `park-loop.js`'s `postParkComment`, called from `finalizePark` |
 
-`CI_CHECKS` is deliberately absent -- it stays under `Gate`, no move. Every move above except
-FINISH's own goes through `board.js`'s `moveCard(ctx, deps, state)`: `npm run board:move --
-<issue> "<Column>"`, cwd = the task's worktree. **A failed move is journaled
-(`board-move-failed`) and never blocks the task** -- board display is best-effort, the journal
-is the truth. Before the worktree exists (a pre-WORKTREE park, e.g. `nightly-main-red`), the
-move is skipped and journaled `board-move-skipped` (`reason: "no worktree"`) instead of
-attempting a `board:move` with no product cwd to run it from; the issue comment (gh needs no
-cwd) still posts either way.
+`CI_CHECKS` is deliberately absent -- it stays under `Gate`, no move. **Action 5.1e weighed a
+sixth column for it and refused**: the columns are deliberately coarser than the states (`Checks
+& PR` already covers CHECK+PUSH_PR), adding a single-select option needs a GraphQL schema
+mutation with no CLI equivalent, and the one live card measured (#471, 2026-09-01) spent 41
+seconds in CI_CHECKS. The window is bounded by the in-flight poll at ~10 minutes, so the board
+can read `Gate` while CI is what runs -- known, and cheaper than a column.
+
+Every move above except FINISH's own goes through `board.js`'s `moveCard(ctx, deps, state)`:
+`npm run board:move -- <issue> "<Column>"`, cwd = the task's worktree. **A failed move is
+journaled (`board-move-failed`) and never blocks the task** -- board display is best-effort, the
+journal is the truth.
+
+Three things action 5.1 changed here, each measured against the 18-task journal corpus:
+
+- **FINISH's move to `Done` is now journalled** (`board-move`, `column: "Done"`, and
+  `board-move-failed` before the `finish-failed` park on a non-zero exit). It was not, and that
+  single missing event is why **14 of 18 tasks' journals stop at `Merging` while the board reads
+  `Done`** -- anything reconciling journal against board read 14 healthy cards as divergent.
+  `Done` still does NOT appear in `COLUMN_BY_STATE`: everything in that table goes through
+  `moveCard`, which never blocks, and FINISH's move is the one move that must.
+- **Before the worktree exists** (a pre-WORKTREE park, e.g. `nightly-main-red`) the move is no
+  longer skipped. `moveCard` falls back to `cwd = config.productRepo` -- the same worktree-free
+  call `report-intake.js` and `auto-triage.js` already make in production -- and journals an
+  ordinary `board-move` carrying `via: "product-repo"` so the fallback stays visible. **6 real
+  `board-move-skipped { reason: "no worktree" }` occurrences** in the corpus (issue-385 x5,
+  issue-247 x1) are what this closes. `board-move-skipped` now means only "neither a worktree nor
+  a product repo", which the shipped config never produces. The plan asked for a direct
+  `gh api graphql updateProjectV2ItemFieldValue` mutation here; it is unnecessary, `board.js`
+  already had the worktree-free mover.
+- **A move to the column the card is already in spawns nothing**, and journals
+  `board-move-skipped` with `reason: "already-in-column"`. **12 redundant consecutive
+  `Implementing -> Implementing` moves across 7 tasks** in the corpus, one per IMPLEMENT retry --
+  each a real GraphQL mutation against the shared hourly budget. The memo is in-memory and
+  per-run (a `WeakMap` keyed on the run's `ctx`), updated only by a move that actually succeeded:
+  a failed move retries, and a restart or a hand-moved card re-asserts the column. Persisting it
+  would let the board drift permanently, which is the failure this whole action exists to prevent.
+
+The issue comment (gh needs no cwd) still posts either way.
 
 ### Park <-> kanban round trip
 
@@ -1347,7 +1377,7 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `remoteReportQueueCeiling` | 50 (`SPO_REMOTE_REPORT_QUEUE_CEILING`) | stage 0 skips the cycle once the local queue is already this deep |
 | `autoIntakeMs` | 15 min (`SPO_AUTO_INTAKE_MS`) | stage 1, zero LLM judgement -- same risk class as `autoPullMs` |
 | `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle |
-| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- not `"Parked"`, see `report-intake.js`'s header on `board-move.sh`'s driver-scope disarm |
+| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- deliberately its own column so a raw report is never confused with a parked pipeline card (the old reason given here, a driver-scope disarm inside `board-move.sh`, is stale -- see `config.js`'s note) |
 | `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
 | `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |

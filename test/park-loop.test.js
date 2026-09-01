@@ -114,7 +114,7 @@ test('buildParkComment: repeat omitted (or 1) carries no loop-warning block -- u
 
 // ---- postParkComment via runTask: the real PARKED -> comment path ------------------------------
 
-test('runTask (real mode, card): a pre-worktree park skips the board move but still posts the comment', async () => {
+test('runTask (real mode, card): a pre-worktree park still moves the card, via config.productRepo (action 5.1b), and posts the comment', async () => {
   const taskDir = mkTmp('spo-park-taskdir-');
   const config = testConfig();
   const originMainSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
@@ -137,7 +137,12 @@ test('runTask (real mode, card): a pre-worktree park skips the board move but st
   const finalState = await runTask('card-950', task, taskDir, { ...config, deps });
 
   assert.equal(finalState, 'PARKED');
-  assert.ok(!calls.some((c) => c.command === 'npm'), 'no board:move -- the worktree never existed');
+  // action 5.1b: no worktree ever existed, but config.productRepo did -- moveCard falls back to
+  // it instead of giving up, so `board:move` DOES spawn here now, cwd = productRepo.
+  const moveCall = calls.find((c) => c.command === 'npm');
+  assert.ok(moveCall, 'board:move must spawn via the product-repo fallback, not be skipped');
+  assert.deepEqual(moveCall.args, ['run', 'board:move', '--', '950', 'Parked']);
+  assert.equal(moveCall.cwd, config.productRepo);
 
   const commentCall = calls.find((c) => c.command === 'gh');
   assert.deepEqual(commentCall.args.slice(0, 4), ['issue', 'comment', '950', '--repo']);
@@ -147,8 +152,40 @@ test('runTask (real mode, card): a pre-worktree park skips the board move but st
   assert.ok(body.includes(RETRY_ABANDON_LINE));
 
   const journal = readJournal(taskDir);
-  assert.ok(journal.some((e) => e.event === 'board-move-skipped' && e.reason === 'no worktree'));
+  const moved = journal.find((e) => e.event === 'board-move' && e.column === 'Parked');
+  assert.ok(moved, 'board-move must be journalled, distinguishable via the `via` marker');
+  assert.equal(moved.via, 'product-repo');
+  assert.ok(!journal.some((e) => e.event === 'board-move-skipped'));
   assert.ok(journal.some((e) => e.event === 'park-comment' && e.commentId === 555));
+});
+
+test('runTask (real mode, card): a pre-worktree park with NO config.productRepo either still skips the board move (unchanged)', async () => {
+  const taskDir = mkTmp('spo-park-taskdir-noproductrepo-');
+  const config = testConfig({ productRepo: undefined });
+  const originMainSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  fs.mkdirSync(path.join(config.spoBenchDir, 'nightly'), { recursive: true });
+  fs.writeFileSync(path.join(config.spoBenchDir, 'nightly', 'latest.json'), JSON.stringify({ verdict: 'FAIL', sha: originMainSha }));
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+      if (args.includes('rev-parse')) return ok(`${originMainSha}\n`);
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/951#issuecomment-556\n');
+      }
+      return ok('');
+    },
+  };
+
+  const task = { id: 'card-951', kind: 'card', issue: 951, title: 'x' };
+  const finalState = await runTask('card-951', task, taskDir, { ...config, deps });
+
+  assert.equal(finalState, 'PARKED');
+  assert.ok(!calls.some((c) => c.command === 'npm'), 'no board:move -- neither a worktree nor a productRepo exists');
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'board-move-skipped' && e.reason === 'no worktree'));
 });
 
 test('runTask (real mode, card): a park AFTER the worktree exists moves the card to "Parked" too', async () => {

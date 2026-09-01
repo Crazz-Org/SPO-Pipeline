@@ -150,6 +150,61 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   appendEvent(ctx.taskDir, 'PARKED', 'park-comment', { commentId, reason });
 }
 
+// ---- action 5.1d: surface DIAGNOSE on the card -------------------------------------------------
+//
+// Measured: 6 tasks entered DIAGNOSE (18 attempts total, 4 ending in a park). DIAGNOSE has no
+// board column at all (see board.js's own COLUMN_BY_STATE header) and, before this, no
+// card-visible trace either -- to a maintainer watching the board, a card in DIAGNOSE looks like a
+// card sitting in "Implementing" doing nothing for however many minutes it spends real LLM budget.
+//
+// Decision (not a driver's free choice, see doc/remediation-progress.md's own C5 write-up): one
+// comment, on the FIRST DIAGNOSE entry per task only, never per attempt. A new column would need a
+// GraphQL single-select option-add mutation (no `gh project field-create` for it --
+// orchestrator/README.md) and would fragment a pipeline view that is deliberately coarse; a
+// comment per attempt would put up to 18 comments on 6 issues for one week's corpus alone. state-
+// machine.js's handleDiagnose calls this exactly once per task (gated on its own
+// ctx.counters.diagnoseSurfaced flag, real mode only), so "first entry" is enforced by the caller,
+// not here -- this function itself always posts when called, same division of labour as moveCard
+// (board.js) taking the column unconditionally and its caller deciding when to call it.
+//
+// Same "never blocks the task" policy as postParkComment above, for the same reason: a maintainer
+// notification is best-effort, and a hung/failing `gh issue comment` here must not stall or park a
+// task that is otherwise diagnosing normally. Journals `diagnose-surfaced {attempt, budget}` on
+// success, `diagnose-surface-failed {exit}` on a non-zero exit (including a timeout, `exit: -1`
+// per normalizeExit, with `timedOut: true` alongside it) -- never throws either way.
+function buildDiagnoseSurfaceComment({ attempt, budget }) {
+  return [
+    '### Pipeline diagnosing',
+    '',
+    `This change failed its checks. The pipeline is diagnosing (attempt ${attempt} of ${budget}).`,
+    '',
+    'No human action is needed unless this card parks.',
+    '',
+  ].join('\n');
+}
+
+function postDiagnoseSurfaceComment(ctx, deps, { attempt, budget }) {
+  const issue = ctx.task && ctx.task.issue;
+  if (!issue) {
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surface-skipped', { reason: 'no issue' });
+    return;
+  }
+
+  const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const body = buildDiagnoseSurfaceComment({ attempt, budget });
+  const commentFile = path.join(ctx.taskDir, 'diagnose-comment.md');
+  fs.writeFileSync(commentFile, body);
+
+  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
+  const exit = normalizeExit(result);
+  if (exit !== 0) {
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surface-failed', { exit, timedOut: result.timedOut === true });
+    return;
+  }
+
+  appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surfaced', { attempt, budget });
+}
+
 // ---- unpark scan (daemon, real mode) ---------------------------------------------------------
 //
 // action 2.7: the fetch/pagination/allowlist/backoff work is comment-scan.js's `scanForMatch` --
@@ -616,6 +671,8 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
 module.exports = {
   buildParkComment,
   postParkComment,
+  buildDiagnoseSurfaceComment,
+  postDiagnoseSurfaceComment,
   parseCommentId,
   RETRY_ABANDON_LINE,
   unparkScan,

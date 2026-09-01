@@ -194,6 +194,18 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
   `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
   failed and the task fell through to an ordinary park instead).
+- **Kanban truth (action 5.1)** — every column change a task causes is journalled, so the board
+  and the journal can be reconciled against each other. `board-move` `{column}` on a successful
+  move, including **FINISH's move to `Done`**, which was previously the one move that changed the
+  board without leaving a record: 14 of the 18 tasks in the corpus have `Merging` as their last
+  journalled move while the board reads `Done`, and that is the whole reason. A move made without
+  a task worktree (a pre-WORKTREE park) runs from the product repo and carries
+  `via: "product-repo"`. `board-move-failed` `{column, exit, timedOut}` on a non-zero exit;
+  `board-move-skipped` `{reason, column}` only for `already-in-column` (the card is already
+  there, no spawn) or the vestigial `no worktree` (neither a worktree nor a product repo, which
+  the shipped config never produces). A card entering DIAGNOSE for the first time posts one
+  comment and journals `diagnose-surfaced` `{attempt, budget}`, or `diagnose-surface-failed`
+  `{exit, timedOut}` — never blocking, exactly like a board move.
 - **Claude session management**: the `session_id` of every step is recorded, so any step can
   be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
   interactively). `claude agents` lists live background sessions.

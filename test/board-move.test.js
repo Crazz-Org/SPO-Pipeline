@@ -58,8 +58,11 @@ test('COLUMN_BY_STATE: the exact column mapping the pilot specifies', () => {
   // CI_CHECKS is deliberately absent -- it stays under "Gate", no move.
   assert.ok(!('CI_CHECKS' in COLUMN_BY_STATE));
   // FINISH is deliberately absent too -- it keeps its own existing (blocking) move to "Done" in
-  // steps/scripted.js's realFinish, never through this shared, non-blocking helper.
+  // steps/scripted.js's realFinish, never through this shared, non-blocking helper. Pinned so
+  // nobody adds a `FINISH: 'Done'` (or `DONE: 'Done'`) entry later and silently arms moveCard's
+  // non-blocking path for the one move that must actually block on failure (action 5.1a).
   assert.ok(!('FINISH' in COLUMN_BY_STATE));
+  assert.ok(!('DONE' in COLUMN_BY_STATE));
 });
 
 for (const [state, column] of Object.entries({
@@ -137,6 +140,163 @@ test('moveCard: a failing board:move exit is journaled but never blocks (never t
 
   const journal = readJournal(ctx.taskDir);
   assert.ok(journal.some((e) => e.event === 'board-move-failed' && e.column === 'Merging' && e.exit === 1));
+});
+
+// ---- action 5.1b: no worktree yet -- fall back to config.productRepo as cwd ------------------
+
+test('moveCard: no worktree but config.productRepo set -- falls back to it, correct argv/cwd, journals board-move with via: "product-repo"', () => {
+  const ctx = ctxFor(385, undefined);
+  ctx.config = { productRepo: '/fake/home/SPO-WebClient' };
+  let call = null;
+  const deps = { spawnSync: (command, args, opts) => { call = { command, args: [...args], cwd: opts && opts.cwd }; return ok(''); } };
+
+  moveCard(ctx, deps, 'PARKED');
+
+  assert.deepEqual(call, { command: 'npm', args: ['run', 'board:move', '--', '385', 'Parked'], cwd: '/fake/home/SPO-WebClient' });
+  const journal = readJournal(ctx.taskDir);
+  const moved = journal.find((e) => e.event === 'board-move');
+  assert.ok(moved);
+  assert.equal(moved.column, 'Parked');
+  assert.equal(moved.via, 'product-repo');
+  assert.ok(!journal.some((e) => e.event === 'board-move-skipped'));
+});
+
+test('moveCard: no worktree AND no config.productRepo -- still skips (reason: no worktree), unchanged', () => {
+  const ctx = ctxFor(386, undefined);
+  ctx.config = {}; // no productRepo
+  let called = false;
+  const deps = { spawnSync: () => { called = true; return ok(''); } };
+
+  moveCard(ctx, deps, 'PARKED');
+
+  assert.equal(called, false);
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'board-move-skipped' && e.reason === 'no worktree'));
+});
+
+test('moveCard: product-repo fallback -- a non-zero exit journals board-move-failed with via: "product-repo", never throws', () => {
+  const ctx = ctxFor(387, undefined);
+  ctx.config = { productRepo: '/fake/home/SPO-WebClient' };
+  const deps = { spawnSync: () => fail(2) };
+
+  assert.doesNotThrow(() => moveCard(ctx, deps, 'PARKED'));
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'board-move-failed');
+  assert.ok(failed);
+  assert.equal(failed.exit, 2);
+  assert.equal(failed.via, 'product-repo');
+});
+
+test('moveCard: product-repo fallback -- a timed-out spawn never throws, journalled failed with via + timedOut', () => {
+  const ctx = ctxFor(388, undefined);
+  ctx.config = { productRepo: '/fake/home/SPO-WebClient', commandTimeoutsMs: { 'npm-run': 660000 } };
+  const deps = { spawnSync: () => timeoutResult() };
+
+  assert.doesNotThrow(() => moveCard(ctx, deps, 'PARKED'));
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'board-move-failed');
+  assert.ok(failed);
+  assert.equal(failed.timedOut, true);
+  assert.equal(failed.via, 'product-repo');
+  assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+});
+
+test('moveCard: a worktree present never carries the via: "product-repo" marker (ordinary path, unchanged)', () => {
+  const worktreePath = mkTmp('spo-board-wt-nomarker-');
+  const ctx = ctxFor(389, worktreePath);
+  ctx.config = { productRepo: '/fake/home/SPO-WebClient' }; // present but irrelevant -- worktree wins
+  const deps = { spawnSync: () => ok('') };
+
+  moveCard(ctx, deps, 'GATE');
+
+  const journal = readJournal(ctx.taskDir);
+  const moved = journal.find((e) => e.event === 'board-move');
+  assert.ok(moved);
+  assert.equal('via' in moved, false);
+});
+
+// ---- action 5.1c: dedupe -- never re-move a card to the column it is already in --------------
+
+test('moveCard: a second move to the SAME column spawns nothing, journals board-move-skipped {reason: "already-in-column"}', () => {
+  const worktreePath = mkTmp('spo-board-wt-dedupe-');
+  const ctx = ctxFor(201, worktreePath);
+  let spawnCount = 0;
+  const deps = { spawnSync: () => { spawnCount += 1; return ok(''); } };
+
+  moveCard(ctx, deps, 'IMPLEMENT');
+  assert.equal(spawnCount, 1);
+
+  moveCard(ctx, deps, 'IMPLEMENT'); // DIAGNOSE -> IMPLEMENT retry, same ctx, same column
+  assert.equal(spawnCount, 1, 'the second move to the same column must not spawn');
+
+  const journal = readJournal(ctx.taskDir);
+  const skipped = journal.filter((e) => e.event === 'board-move-skipped' && e.reason === 'already-in-column');
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].column, 'Implementing');
+  // Exactly one board-move (the first, successful one) -- the dedupe never produces a second.
+  assert.equal(journal.filter((e) => e.event === 'board-move').length, 1);
+});
+
+test('moveCard: a move to a DIFFERENT column still spawns, even right after a successful move', () => {
+  const worktreePath = mkTmp('spo-board-wt-dedupe-diff-');
+  const ctx = ctxFor(202, worktreePath);
+  const calls = [];
+  const deps = { spawnSync: (command, args) => { calls.push(args[args.length - 1]); return ok(''); } };
+
+  moveCard(ctx, deps, 'IMPLEMENT');
+  moveCard(ctx, deps, 'GATE');
+
+  assert.deepEqual(calls, ['Implementing', 'Gate']);
+  const journal = readJournal(ctx.taskDir);
+  assert.equal(journal.filter((e) => e.event === 'board-move').length, 2);
+  assert.ok(!journal.some((e) => e.event === 'board-move-skipped'));
+});
+
+test('moveCard: a FAILED move does not poison the memo -- the next attempt to the same column still spawns', () => {
+  const worktreePath = mkTmp('spo-board-wt-dedupe-fail-');
+  const ctx = ctxFor(203, worktreePath);
+  let spawnCount = 0;
+  let shouldFail = true;
+  const deps = {
+    spawnSync: () => {
+      spawnCount += 1;
+      return shouldFail ? fail(1) : ok('');
+    },
+  };
+
+  moveCard(ctx, deps, 'IMPLEMENT'); // fails
+  assert.equal(spawnCount, 1);
+  shouldFail = false;
+  moveCard(ctx, deps, 'IMPLEMENT'); // must retry, not treat the failed attempt as "already there"
+  assert.equal(spawnCount, 2, 'a failed move must never poison the memo');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.equal(journal.filter((e) => e.event === 'board-move-failed').length, 1);
+  assert.equal(journal.filter((e) => e.event === 'board-move').length, 1);
+  assert.ok(!journal.some((e) => e.event === 'board-move-skipped'));
+});
+
+test('moveCard: a fresh ctx (simulating a daemon restart / retry-at-INTAKE) re-asserts the column -- the memo is never persisted', () => {
+  const worktreePath = mkTmp('spo-board-wt-dedupe-restart-');
+  const ctx1 = ctxFor(204, worktreePath);
+  let spawnCount = 0;
+  const deps = { spawnSync: () => { spawnCount += 1; return ok(''); } };
+
+  moveCard(ctx1, deps, 'IMPLEMENT');
+  assert.equal(spawnCount, 1);
+
+  // A brand-new ctx object -- same task/issue/column, but nothing carried over from ctx1 (no
+  // shared state.json read, no journal read-back): exactly what a retry (always restarts at
+  // INTAKE) or a plain daemon restart produces.
+  const ctx2 = ctxFor(204, worktreePath);
+  moveCard(ctx2, deps, 'IMPLEMENT');
+  assert.equal(spawnCount, 2, 'a fresh ctx must re-assert the column, not inherit ctx1\'s memo');
+
+  const journal2 = readJournal(ctx2.taskDir);
+  assert.ok(journal2.some((e) => e.event === 'board-move'));
+  assert.ok(!journal2.some((e) => e.event === 'board-move-skipped'));
 });
 
 // ---- action 2.1b: board.js's own spawns are now bounded too ----------------------------------

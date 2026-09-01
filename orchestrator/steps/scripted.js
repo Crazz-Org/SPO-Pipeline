@@ -1800,6 +1800,13 @@ function sumJournalBillableTokens(taskDir) {
   return total;
 }
 
+// realFinish's own `board:move -- <issue> Done` is deliberately NOT routed through board.js's
+// moveCard/COLUMN_BY_STATE: moveCard's whole contract is "never blocks the task" (board.js's own
+// header), because a stale board display is cosmetic everywhere else. It is not cosmetic here --
+// a card the daemon cannot mark Done is not actually done, so this is the one board move in the
+// whole system that must block on failure, via spawnStep's own ParkSignal path below, same as it
+// always has. Adding a `FINISH: 'Done'` entry to COLUMN_BY_STATE would silently arm moveCard's
+// non-blocking path for it instead -- see board.js's header for the matching note.
 async function realFinish(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -1808,7 +1815,21 @@ async function realFinish(ctx, deps = {}) {
   const move = spawnStep(ctx, deps, 'FINISH', 'npm', ['run', 'board:move', '--', String(issue), 'Done'], {
     cwd: worktreePath,
   });
-  if (move.exit !== 0) throw new ParkSignal('finish-failed', { step: 'board-move', exit: move.exit });
+  // Action 5.1a: journal this move with board.js's own `board-move`/`board-move-failed`
+  // vocabulary, not just spawnStep's compact {argv, exit, ms} line. Measured: 14 of the 18 tasks
+  // in the journal corpus have `Merging` as their LAST journalled board-move, while the board
+  // itself shows `Done` -- not 14 broken cards, one missing event, because this move has always
+  // gone straight to `gh`/`git` with no appendEvent of its own. Without this, anything
+  // reconciling journal against board reads 14 healthy cards as divergent. The failure branch
+  // journals board-move-failed BEFORE the throw, deliberately: the ParkSignal below is existing
+  // contract (this is the one move in the whole daemon that MUST block -- a card that cannot be
+  // marked Done is not done) and must stay, but the attempt belongs on the record either way,
+  // exactly like every other state's board-move-failed.
+  if (move.exit !== 0) {
+    appendEvent(ctx.taskDir, 'FINISH', 'board-move-failed', { column: 'Done', exit: move.exit });
+    throw new ParkSignal('finish-failed', { step: 'board-move', exit: move.exit });
+  }
+  appendEvent(ctx.taskDir, 'FINISH', 'board-move', { column: 'Done' });
 
   const commentFile = path.join(ctx.taskDir, 'final-comment.md');
   fs.writeFileSync(commentFile, finalComment(ctx));

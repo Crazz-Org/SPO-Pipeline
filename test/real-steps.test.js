@@ -1746,9 +1746,20 @@ test('realFinish: board:move, then gh issue comment, then git worktree remove --
   assert.ok(finished);
   assert.equal(finished.billableTokens, 3500);
   assert.equal(finished.prNumber, 444);
+
+  // Action 5.1a: this move must land its OWN board-move event, not just spawnStep's compact
+  // {argv, exit, ms} 'spawn' line -- measured 14 of 18 corpus tasks had `Merging` as their last
+  // journalled board-move while the board itself showed Done, because this event never existed
+  // before. Not the shared, non-blocking board.js:moveCard vocabulary reused through that
+  // module (FINISH is deliberately absent from COLUMN_BY_STATE -- see board.js's own header),
+  // but the identical event shape, written directly here.
+  const moved = journal.find((e) => e.event === 'board-move');
+  assert.ok(moved, 'FINISH must journal its own board-move event on a successful move to Done');
+  assert.equal(moved.column, 'Done');
+  assert.ok(!journal.some((e) => e.event === 'board-move-failed'));
 });
 
-test('realFinish: board:move failure -> PARKED (finish-failed), worktree never removed', async () => {
+test('realFinish: board:move failure -> PARKED (finish-failed), worktree never removed, board-move-failed journalled BEFORE the throw', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-finish-wt2-');
   const task = { id: 'card-finish2', kind: 'card', issue: 121, worktreePath };
@@ -1769,6 +1780,54 @@ test('realFinish: board:move failure -> PARKED (finish-failed), worktree never r
   );
   assert.equal(calls.length, 1);
   assert.ok(!calls.some((a) => a.includes('remove')));
+
+  // Action 5.1a: even on the exit that immediately throws, the attempt is on the record --
+  // the journal must be able to answer "did FINISH even try to move this card" for a task that
+  // never reached DONE, not just for the ones that did.
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const failed = journal.find((e) => e.event === 'board-move-failed');
+  assert.ok(failed, 'the failed attempt must be journalled before finish-failed is thrown');
+  assert.equal(failed.column, 'Done');
+  assert.equal(failed.exit, 1);
+  assert.ok(!journal.some((e) => e.event === 'board-move'), 'a failed move must never journal a plain board-move too');
+});
+
+test('realFinish: the board move is journalled BEFORE the issue comment -- a park between the two must not lose the record that the card reached Done', async () => {
+  // Verification found this position asserted nowhere: moving the success `board-move` event to
+  // after the `gh issue comment` exit check left the whole suite green. It matters because
+  // FINISH parks on a failed comment, and a card whose column really did reach `Done` with no
+  // journal line saying so is precisely the divergence action 5.1a exists to end -- 14 of the 18
+  // tasks in the corpus were in that state for want of one event.
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-wt3-');
+  const task = { id: 'card-finish3', kind: 'card', issue: 122, worktreePath };
+  const ctx = testCtx({ id: 'card-finish3', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('board:move')) return ok('');
+      if (args.includes('comment')) return fail(1);
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'issue-comment'
+  );
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const moved = journal.find((e) => e.event === 'board-move');
+  assert.ok(moved, 'the successful move to Done must already be journalled when the comment parks');
+  assert.equal(moved.column, 'Done');
 });
 
 // ---- --real gating (state-machine.js's handleIntake) -----------------------------------------
