@@ -50,6 +50,9 @@ const accounts = require('./accounts');
 const { moveCard } = require('./board');
 const {
   postParkComment,
+  postDiagnoseSurfaceComment,
+  normalizeFindingsPayload,
+  postValidateFindingsComment,
   unparkScan,
   shouldScanUnpark,
   countRepeatedParks,
@@ -785,6 +788,21 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
+  // Action 5.1d: surface DIAGNOSE on the card, first entry only -- see park-loop.js's
+  // postDiagnoseSurfaceComment for the comment mechanics/measurement and this file's own
+  // ctx.counters.diagnoseSurfaced comment (buildCtx) for why the flag is in-memory and per-run.
+  // Set BEFORE calling, not after: "first entry" means first entry regardless of whether the
+  // comment itself lands (real mode/never-blocks policy, same as board.js's moveCard), and the
+  // attempt named in the comment is the one about to run (diagnoseAttempts + 1), not the one
+  // that already ran.
+  if (isRealMode(ctx) && !ctx.counters.diagnoseSurfaced) {
+    ctx.counters.diagnoseSurfaced = true;
+    postDiagnoseSurfaceComment(ctx, ctx.deps, {
+      attempt: ctx.counters.diagnoseAttempts + 1,
+      budget: ctx.config.diagnoseBudget,
+    });
+  }
+
   // Action 1.3: generate DIAGNOSE's declared judge inputs (diff.patch / gate.log / gate-report.md)
   // before the LLM call, real mode only. gate.log is required only when this DIAGNOSE was
   // entered from GATE (ctx.cameFrom, set by runTask's transition loop below) -- from anywhere
@@ -901,6 +919,13 @@ async function handleValidate(ctx) {
   // itself, before either LLM call below ever spawns.
   if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'VALIDATE' });
 
+  // Action 5.3: citationVerdict/citationEntries survive past this block so the DIVERGES branch
+  // below (before the 'MERGE' return) can route `entries` into a comment a human actually sees.
+  // Stay at their defaults (null/[]) whenever touchesRdoMembers is false -- the overwhelming
+  // majority of tasks, which never run citation-verifier at all.
+  let citationVerdict = null;
+  let citationEntries = [];
+
   if (ctx.task.touchesRdoMembers) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
 
@@ -928,8 +953,24 @@ async function handleValidate(ctx) {
       appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
       throw new ParkSignal('citation-false', { verdict: cv.verdict });
     } else if (cv.verdict === 'PASS' || cv.verdict === 'DIVERGES') {
-      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
-      // PASS or DIVERGES both continue -- DIVERGES is flagged for a human, not blocking.
+      // Action 5.3 / erratum B: step-contracts.js's CITATION_VERIFIER contract requires
+      // `{verdict, entries}`, but this event used to journal only `{verdict}` -- the single real
+      // DIVERGES in the corpus (issue-462, 2026-08-31T08:35:08Z) recorded exactly
+      // `{"verdict":"DIVERGES"}`, so what actually diverged is unrecoverable today. `entries` is
+      // now carried on BOTH branches, not just DIVERGES: PASS's own entries are dropped by the
+      // exact same discard-by-omission this action exists to fix, and journalling them here costs
+      // nothing (they are already in memory) versus leaving that half of the same bug standing
+      // for whichever future action happens to be measuring PASS instead of DIVERGES. Raw, not
+      // normalized -- same convention the 'change-validator' event below already follows for
+      // `result.findings` -- so the journal is always a faithful record of what the model sent;
+      // normalizeFindingsPayload (park-loop.js) is applied at read time -- at render, and (since the
+      // REJECT-path fix below) wherever a finding is threaded onward.
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict, entries: cv.entries });
+      citationVerdict = cv.verdict;
+      citationEntries = cv.entries;
+      // PASS or DIVERGES both continue -- DIVERGES is not blocking, but IS routed to a human
+      // comment below (action 5.3), replacing the previous "flagged for a human" that named no
+      // actual human-facing surface.
     } else {
       // An unrecognized verdict string -- never continue on a verdict the code doesn't
       // understand.
@@ -956,7 +997,59 @@ async function handleValidate(ctx) {
     });
   }
 
-  if (verdict === 'PASS' || verdict === 'PASS_WITH_FINDINGS') return 'MERGE';
+  if (verdict === 'PASS' || verdict === 'PASS_WITH_FINDINGS') {
+    // Action 5.3: post the judge findings a human would otherwise never see -- BEFORE returning
+    // 'MERGE', so the comment lands while the change is still in flight, not after the card is
+    // already closed. Real mode only (shadow/dry-run never spawn a `gh` call at all, same gate
+    // every other real spawn in this file uses). See park-loop.js's own header on this block
+    // (buildValidateFindingsComment/postValidateFindingsComment) for the full rationale: issue,
+    // not PR; one comment, not two; no auto-filed follow-up card.
+    //
+    // Gated on there being something to say: a PASS_WITH_FINDINGS with an empty/malformed
+    // findings payload, or a citation-verifier verdict that was never DIVERGES, posts nothing --
+    // same "don't manufacture a comment out of nothing" discipline every other best-effort
+    // comment in this file already follows (postDiagnoseSurfaceComment's own budget/attempt
+    // numbers, postParkComment's <details> block only when `detail` is non-empty).
+    if (isRealMode(ctx)) {
+      // Only journal the received shape when there was actually a findings payload to receive --
+      // a plain PASS has nothing to say here, and journalling `{shape: 'null', count: 0}` on
+      // every ordinary merge (the overwhelming majority of VALIDATE outcomes) would be pure
+      // journal noise with no erratum A signal in it.
+      const findingsNorm =
+        verdict === 'PASS_WITH_FINDINGS' ? normalizeFindingsPayload(result && result.findings) : { items: [], shape: null };
+      if (verdict === 'PASS_WITH_FINDINGS') {
+        appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-shape', { shape: findingsNorm.shape, count: findingsNorm.items.length });
+      }
+
+      const diverges = citationVerdict === 'DIVERGES';
+      const hasFindings = findingsNorm.items.length > 0;
+      if (diverges || hasFindings) {
+        // postValidateFindingsComment already has its own never-throws contract (park-loop.js's
+        // own header), same as postParkComment/postDiagnoseSurfaceComment -- this try/catch is a
+        // SECOND line of defence, same belt-and-suspenders park-loop.js's own unparkScan already
+        // applies around reconcileExternalClosure/abandonCleanup: a card reaching this line has
+        // already passed every gate that matters (the merge itself is not in question), so an
+        // unanticipated throw from a best-effort comment must never be what parks -- or crashes
+        // the daemon out from under -- an otherwise-successful card.
+        try {
+          const divergesEntriesNorm = normalizeFindingsPayload(diverges ? citationEntries : null);
+          postValidateFindingsComment(ctx, ctx.deps, {
+            prNumber: ctx.prNumber,
+            findings: findingsNorm.items,
+            diverges,
+            divergesEntries: divergesEntriesNorm.items,
+          });
+        } catch (err) {
+          appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-post-failed', {
+            exit: -1,
+            timedOut: false,
+            error: String((err && err.message) || err),
+          });
+        }
+      }
+    }
+    return 'MERGE';
+  }
   if (verdict === 'REJECT') {
     ctx.counters.validateRejects += 1;
     const attemptN = ctx.counters.validateRejects;
@@ -971,7 +1064,16 @@ async function handleValidate(ctx) {
     // ever looks at `event.payload`, so a flat shape here would be silently invisible to it. See
     // task-values.js's diagnosisSummary for the reader side that now also considers this event.
     const reasons = Array.isArray(result.reasons) ? result.reasons.filter(Boolean) : [];
-    const findings = Array.isArray(result.findings) ? result.findings : [];
+    // normalizeFindingsPayload, not `Array.isArray(...) ? ... : []`, and this is the eighth
+    // production bug of its class in this project. Measured 2026-09-01: ALL 16 `change-validator`
+    // events in the 19-journal corpus carry `findings` as a JSON-ENCODED STRING, never an array --
+    // the same shape that made 3.2's protected-files guard fail open on every real card. So the
+    // `Array.isArray` test here has been false every single time it has ever run, action 1.6's
+    // whole point (thread a REJECT's findings into the next IMPLEMENT so it cannot rebuild the
+    // change VALIDATE just rejected) has never once fired with a finding in it, and the hermetic
+    // suite could not see it because every fixture constructs the array the reading code expects.
+    // The corpus's one real REJECT happened to carry an empty array, so nothing was lost yet.
+    const findings = normalizeFindingsPayload(result.findings).items;
     appendEvent(ctx.taskDir, 'VALIDATE', 'result', {
       attempt: attemptN,
       payload: { reasons, findings },
@@ -1093,6 +1195,12 @@ function buildCtx(id, task, taskDir, config) {
       // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
       // than reusing one of them.
       ciImplementRetries: 0,
+      // Action 5.1d: whether this task has already posted its one-time "pipeline diagnosing"
+      // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
+      // persisted lifetime as board.js's own 5.1c dedupe memo, and for the same reason: a retry
+      // always restarts a task at INTAKE with a fresh ctx (see this file's own cameFrom comment),
+      // so "first DIAGNOSE entry" is naturally scoped to one run, never carried across a restart.
+      diagnoseSurfaced: false,
     },
   };
 }

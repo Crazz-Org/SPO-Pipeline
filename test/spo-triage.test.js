@@ -9,6 +9,12 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
+// `../bin/spo` transitively requires 28 orchestrator modules, `command-timeout.js` among them,
+// so it destructures the real spawnSync at require time exactly like a direct orchestrator
+// require would -- the killswitch has to be installed before this line, not after. See
+// test/no-real-spawn.js's header for the incident that makes this non-negotiable.
+require('./no-real-spawn');
+
 const spo = require('../bin/spo');
 const { mkTmp } = require('./helpers');
 

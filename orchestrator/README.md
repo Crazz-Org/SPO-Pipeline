@@ -847,7 +847,8 @@ run pr:wait -- <n>` in the worktree, with exactly one bounded re-wait on exit 4 
 identical to the shadow-mode bounded-wait logic.
 
 **FINISH** runs `npm run board:move -- <issue> Done` and `gh issue comment <n> --repo <ghRepo>
---body-file <file>` (a 2–4 line comment in `journal/<id>/final-comment.md`) **before** removing
+--body-file <file>` (the comment in `journal/<id>/final-comment.md` — since action 5.2 it also carries billable-weighted
+tokens, elapsed time with the parked share broken out, and any attempt counters) **before** removing
 the worktree — the same "npm aliases need a product cwd" rule as WORKTREE's claim ordering, so
 the board sync must happen while the worktree still exists. Only then `git -C <productRepo>
 worktree remove --force <worktreePath>`. A final `finished` journal event carries the task's
@@ -981,14 +982,44 @@ The maintainer created five kanban columns for this (`Planning`, `Implementing`,
 | FINISH | `Done` | `steps/scripted.js`'s `realFinish` -- unchanged, pre-existing, and still the one move that **blocks** the task on failure |
 | PARKED | `Parked` | `park-loop.js`'s `postParkComment`, called from `finalizePark` |
 
-`CI_CHECKS` is deliberately absent -- it stays under `Gate`, no move. Every move above except
-FINISH's own goes through `board.js`'s `moveCard(ctx, deps, state)`: `npm run board:move --
-<issue> "<Column>"`, cwd = the task's worktree. **A failed move is journaled
-(`board-move-failed`) and never blocks the task** -- board display is best-effort, the journal
-is the truth. Before the worktree exists (a pre-WORKTREE park, e.g. `nightly-main-red`), the
-move is skipped and journaled `board-move-skipped` (`reason: "no worktree"`) instead of
-attempting a `board:move` with no product cwd to run it from; the issue comment (gh needs no
-cwd) still posts either way.
+`CI_CHECKS` is deliberately absent -- it stays under `Gate`, no move. **Action 5.1e weighed a
+sixth column for it and refused**: the columns are deliberately coarser than the states (`Checks
+& PR` already covers CHECK+PUSH_PR), adding a single-select option needs a GraphQL schema
+mutation with no CLI equivalent, and the one live card measured (#471, 2026-09-01) spent 41
+seconds in CI_CHECKS. The window is bounded by the in-flight poll at ~10 minutes, so the board
+can read `Gate` while CI is what runs -- known, and cheaper than a column.
+
+Every move above except FINISH's own goes through `board.js`'s `moveCard(ctx, deps, state)`:
+`npm run board:move -- <issue> "<Column>"`, cwd = the task's worktree. **A failed move is
+journaled (`board-move-failed`) and never blocks the task** -- board display is best-effort, the
+journal is the truth.
+
+Three things action 5.1 changed here, each measured against the 18-task journal corpus:
+
+- **FINISH's move to `Done` is now journalled** (`board-move`, `column: "Done"`, and
+  `board-move-failed` before the `finish-failed` park on a non-zero exit). It was not, and that
+  single missing event is why **14 of 18 tasks' journals stop at `Merging` while the board reads
+  `Done`** -- anything reconciling journal against board read 14 healthy cards as divergent.
+  `Done` still does NOT appear in `COLUMN_BY_STATE`: everything in that table goes through
+  `moveCard`, which never blocks, and FINISH's move is the one move that must.
+- **Before the worktree exists** (a pre-WORKTREE park, e.g. `nightly-main-red`) the move is no
+  longer skipped. `moveCard` falls back to `cwd = config.productRepo` -- the same worktree-free
+  call `report-intake.js` and `auto-triage.js` already make in production -- and journals an
+  ordinary `board-move` carrying `via: "product-repo"` so the fallback stays visible. **6 real
+  `board-move-skipped { reason: "no worktree" }` occurrences** in the corpus (issue-385 x5,
+  issue-247 x1) are what this closes. `board-move-skipped` now means only "neither a worktree nor
+  a product repo", which the shipped config never produces. The plan asked for a direct
+  `gh api graphql updateProjectV2ItemFieldValue` mutation here; it is unnecessary, `board.js`
+  already had the worktree-free mover.
+- **A move to the column the card is already in spawns nothing**, and journals
+  `board-move-skipped` with `reason: "already-in-column"`. **12 redundant consecutive
+  `Implementing -> Implementing` moves across 7 tasks** in the corpus, one per IMPLEMENT retry --
+  each a real GraphQL mutation against the shared hourly budget. The memo is in-memory and
+  per-run (a `WeakMap` keyed on the run's `ctx`), updated only by a move that actually succeeded:
+  a failed move retries, and a restart or a hand-moved card re-asserts the column. Persisting it
+  would let the board drift permanently, which is the failure this whole action exists to prevent.
+
+The issue comment (gh needs no cwd) still posts either way.
 
 ### Park <-> kanban round trip
 
@@ -1060,6 +1091,84 @@ Idempotent across scans: a task already acted on for its current park cycle (an
 `unparked-by-maintainer`/`abandoned-by-maintainer` event already follows the anchor
 `park-comment` in the journal) is skipped, whether or not the re-enqueued task has been drained
 back out of `PARKED` yet.
+
+**Reconciling against the issue (action 5.1b).** `unparkScan`'s per-task loop, above, runs one
+more thing BEFORE the retry/abandon comment scan: for every journaled task whose `state.json`
+reads `PARKED` or `ABANDONED`, `reconcileExternalClosure` checks whether the issue it owns has
+since closed *outside* the pipeline. This is not a hypothetical — C5's own re-measurement
+(2026-09-01, from scratch, not carried over from the plan) found the journal is the stale side on
+3 of 18 tasks, and in all three the issue was already closed:
+
+| task | journal said | issue closed | board |
+|---|---|---|---|
+| issue-213 | `PARKED` (`diagnose-duplicate-root-cause`) | 2026-08-30 01:50 | `Done` |
+| issue-428 | `PARKED` (`diagnose-duplicate-root-cause`) | 2026-08-30 07:20 | `Done` |
+| issue-443 | `ABANDONED` (`abandoned-by-maintainer`) | 2026-08-30 13:18 | `Done` |
+
+The board already reads `Done` on all three — not because a human dragged a card, but because the
+project has the built-in **"Item closed"** workflow enabled (`Status → Done`, re-measured live):
+closing the issue moves the card by itself. Issue closure is therefore already the signal the
+board itself trusts; `reconcileExternalClosure` invents no new source of truth, it makes the
+journal catch up to what the board already knows.
+
+213 and 428 are the same shape: a human fixed the work by hand and closed the issue, hours after
+the park, with nothing ever telling the pipeline. 443 is a different and sharper shape — a FALSE
+park. `pr:wait` read `closed false` at 13:17:57 and parked `pr-closed-unmerged`; PR #447 actually
+**merged** 30 seconds later, at 13:18:27, with no close or reopen anywhere in its own timeline
+before that. The maintainer then read the park comment and replied `abandon` at 13:53 — abandoning
+a change that had already merged 35 minutes earlier. A reconciler would have caught that within
+one scan interval instead of never; the MERGE-step defect that produced the false park in the
+first place (a single unconfirmed `closed` read treated as terminal) is filed separately and is
+**not** this action's to fix.
+
+**Record, never overwrite** is the rule that makes this safe to build at all: `state.state` is
+never rewritten. The task really did park, or really was abandoned — the pipeline's own verdict
+was correct given what it knew at the time, and writing a `DONE` it never actually produced would
+make the journal lie in the opposite direction from today's staleness. Instead both facts sit on
+the record side by side — `state.json` gains `externallyResolved: {via, closedAt, prNumber,
+mergedAt, at}`, and `journal.jsonl` gains one `reconciled-externally` event carrying the same
+detail. `via` is what tells 213/428 apart from 443: `'pr-merged'` (carrying the PR's own
+`merged_at`, so 443's 30-second gap is legible from the journal alone, no cross-referencing
+GitHub by hand) only when `state.prNumber` is set *and* that PR's own `merged_at` is non-null;
+`'issue-closed'` otherwise — a PR that exists but never merged is still the 213/428 shape. The PR
+read only happens once the issue read has already come back closed, never speculatively.
+
+Idempotent by construction, the same way `state.externallyResolved` guards a re-check as
+`unparked-by-maintainer`/`abandoned-by-maintainer` guards a re-enqueue above: once written, this
+function is a no-op for that task forever, with no separate flag to keep in sync. That bounds the
+whole feature to **at most 2 extra `gh api` reads per parked task, ever** (issue + PR). The other
+side of that bound is deliberate: a task whose issue is still OPEN is re-read every cycle — that
+is how a close ever gets noticed — 1 REST read per open-parked task per `unparkScanMs` (60s by
+default). Measured today: 3 parked/abandoned tasks, so at most 3 extra reads per cycle, falling to
+0 once each is either reconciled or freshly retried. Same never-blocks-never-throws contract as
+every other real spawn in this file (`command-timeout.js`'s own header): a failed read — non-zero
+exit, a `spawnSync` timeout, unparsable JSON, at either the issue or the PR step — journals
+`reconcile-scan-failed {step, exit, timedOut}` and leaves `externallyResolved` unwritten, so the
+same task is simply re-attempted next cycle; the call is wrapped in `try/catch` inside
+`unparkScan`'s loop on top of that internal contract, so one task's reconciliation misbehaving can
+never abort the scan for every other task in the same pass or kill the daemon
+(`state-machine.js`'s `runForever` has nothing to catch a throw from `unparkScan` itself).
+
+Reconciling does **not** short-circuit the retry/abandon comment scan above for a still-`PARKED`
+task — it runs first, unconditionally, and its own guard (already reconciled? issue still open? no
+`prNumber`?) is what decides whether it spends an API call, not any branch in `unparkScan`'s own
+loop. A maintainer can still reply `retry` on an issue that has been reconciled (closed by hand,
+or closed via a merged PR) and get another attempt — closing the issue is not the same decision as
+telling the pipeline to stop, and nothing about reconciliation forecloses it. An `ABANDONED` task
+was never part of the retry/abandon comment scan (that loop's own filter has always been
+`state.state === 'PARKED'`) and reconciling it does not change that — `reconcileExternalClosure`
+is the only thing that runs for it.
+
+`spo parked` (`bin/spo`'s `cmdParked`) prints a reconciled row under its own
+"resolved externally" heading, pulled out of both the still-`PARKED` and still-`ABANDONED`
+sections — the point being a maintainer's actionable list goes from 3 items (213, 428, 443, none
+of which will ever get a human reply) down to 1 (issue-385, genuinely open and genuinely waiting).
+
+Deliberately out of scope, left for a different action if it's ever wanted: a non-terminal task
+(still `PLAN`/`IMPLEMENT`/...) whose issue closes mid-flight — a stronger "stop working now"
+signal than this function's "the outcome is already settled" — and a `DONE` task whose issue is
+later reopened. Neither is this action's to handle, and moving anything on the board is out of
+scope entirely: the board is already correct in all three measured cases.
 
 ### Auto-pull
 
@@ -1347,7 +1456,7 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `remoteReportQueueCeiling` | 50 (`SPO_REMOTE_REPORT_QUEUE_CEILING`) | stage 0 skips the cycle once the local queue is already this deep |
 | `autoIntakeMs` | 15 min (`SPO_AUTO_INTAKE_MS`) | stage 1, zero LLM judgement -- same risk class as `autoPullMs` |
 | `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle |
-| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- not `"Parked"`, see `report-intake.js`'s header on `board-move.sh`'s driver-scope disarm |
+| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- deliberately its own column so a raw report is never confused with a parked pipeline card (the old reason given here, a driver-scope disarm inside `board-move.sh`, is stale -- see `config.js`'s note) |
 | `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
 | `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |

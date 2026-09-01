@@ -188,12 +188,76 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   (`{step, model, effort, account, session_id, tokensSource, freshInputTokens,
   cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, duration_s, exit,
   verdict}` — no dollar figure anywhere; `orchestrator/tokens.js`'s "billable-weighted" =
-  fresh input + cache-creation + output, cache-read reported separately, never summed in),
-  account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
+  fresh input + cache-creation + output, cache-read reported separately, never summed in).
+  `duration_s` was documented here well before any code wrote it — action 5.4 measured
+  2026-09-01 that zero of the 19 corpus journals' `llm-call` events carried it, and made it
+  true the same day: `orchestrator/steps/llm.js`'s `invokeClaudeReal` now measures wall-clock
+  seconds around the `claude` spawn itself and reports it on every branch (success, spawn
+  error, external signal, and — the one a maintainer most wants — a deadline timeout, which
+  still burned the full deadline even though it produced no result).
+  Account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
   `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
   failed and the task fell through to an ordinary park instead).
+- **Kanban truth (action 5.1)** — every column change a task causes is journalled, so the board
+  and the journal can be reconciled against each other. `board-move` `{column}` on a successful
+  move, including **FINISH's move to `Done`**, which was previously the one move that changed the
+  board without leaving a record: 14 of the 18 tasks in the corpus have `Merging` as their last
+  journalled move while the board reads `Done`, and that is the whole reason. A move made without
+  a task worktree (a pre-WORKTREE park) runs from the product repo and carries
+  `via: "product-repo"`. `board-move-failed` `{column, exit, timedOut}` on a non-zero exit;
+  `board-move-skipped` `{reason, column}` only for `already-in-column` (the card is already
+  there, no spawn) or the vestigial `no worktree` (neither a worktree nor a product repo, which
+  the shipped config never produces). A card entering DIAGNOSE for the first time posts one
+  comment and journals `diagnose-surfaced` `{attempt, budget}`, or `diagnose-surface-failed`
+  `{exit, timedOut}` — never blocking, exactly like a board move.
+- **External reconciliation (action 5.1b)** — the board's `Done` on 213/428/443 was reached
+  without any pipeline involvement (GitHub's built-in "Item closed" workflow moves the card on
+  issue close, re-measured live 2026-09-01), and the JOURNAL was the side that never learned about
+  it: 2 of the 3 were `PARKED` for a fix a human made and closed by hand hours later (213, 428);
+  the third (443) was `ABANDONED` on a false park — `pr:wait` read `closed false` at 13:17:57,
+  parked `pr-closed-unmerged`, and PR #447 actually merged 30 seconds later at 13:18:27, before the
+  maintainer's own `abandon` reply at 13:53. `park-loop.js`'s `reconcileExternalClosure`, called
+  from inside `unparkScan`'s own loop for every `PARKED`/`ABANDONED` task, reads the owning issue
+  and — record, never overwrite — writes `state.json`'s `externallyResolved: {via: 'issue-closed'
+  | 'pr-merged', closedAt, prNumber, mergedAt, at}` and journals `reconciled-externally` with the
+  same detail, **without ever touching `state.state`**: the task really did park/abandon, and
+  fabricating a `DONE` the pipeline never produced would make the journal lie the other way.
+  `via: 'pr-merged'` (carrying the PR's own `merged_at`, legible against `closedAt` for 443's own
+  30-second gap) only when `state.prNumber` is set and that PR actually merged; `'issue-closed'`
+  otherwise (213/428's shape). Idempotent by construction — `state.externallyResolved` itself is
+  the guard, so a reconciled task is never re-read — bounding the feature to at most 2 extra
+  `gh api` reads per parked task, ever; a still-open parked task IS re-read every `unparkScan`
+  cycle (60s by default), 1 read each, 3 today. A failed read (non-zero exit, timeout, unparsable
+  JSON) journals `reconcile-scan-failed {step, exit, timedOut}` and never blocks or throws — same
+  contract as every other real spawn in this file. `spo parked` (`bin/spo`'s `cmdParked`) prints a
+  reconciled row under its own heading, separate from the still-PARKED and still-ABANDONED rows.
+- **Judge findings, routed instead of lost (action 5.3)** — measured across all 19 journals
+  (2026-09-01): 7 `change-validator PASS_WITH_FINDINGS` events carried a non-empty `findings`
+  array (8 finding objects total) and one `citation-verifier DIVERGES` (issue-462,
+  2026-08-31T08:35:08Z) — every one journalled and never read again; `PASS_WITH_FINDINGS` returned
+  `MERGE` with the findings sitting only in `journal.jsonl`, and `DIVERGES` had nothing recorded
+  beyond the bare verdict (`step-contracts.js`'s CITATION_VERIFIER contract requires
+  `{verdict, entries}`, but the `citation-verifier` event only ever carried `{verdict}`; fixed —
+  `entries` now rides along on both the `PASS` and `DIVERGES` branches). `handleValidate` now
+  posts one structured comment on the **issue** (never the PR — this pipeline auto-merges, so
+  there is no PR reviewer, and the PR closes on merge while the issue does not; the PR number is
+  named inside the body so the link is not lost), before returning `MERGE`: change-validator's
+  findings when the verdict is `PASS_WITH_FINDINGS` with a non-empty array, citation-verifier's
+  `entries` when the verdict was `DIVERGES` — both in the same comment, in clearly-separated
+  sections, when both apply to the same run. `findings` tolerates the same shape divergence
+  `plan-files-undeclared` (action 3.2) already learned to expect — every one of the 8 measured
+  findings arrived as a JSON-encoded STRING, not a real array — parsing either shape and
+  journalling `validate-findings-shape {shape, count}` so a future divergence stays visible rather
+  than silently dropped; a malformed payload (unparsable, `null`, an object, an array of
+  non-object elements) never throws and never blocks the merge. No follow-up card is ever
+  auto-filed on a judge verdict — deliberately: the plan's own "(optionally a follow-up draft
+  card)" is the exact unattended-filing shape C3 gated behind a human `confirm` after the
+  12.8-hour, 128-attempt auto-triage stall, and a comment is reversible where a filed card is not.
+  Journals `validate-findings-posted {count, commentId}` on success,
+  `validate-findings-post-failed {exit, timedOut}` on a non-zero `gh` exit or a timed-out spawn —
+  never blocking, real mode only, same contract as `diagnose-surfaced`/board moves above.
 - **Claude session management**: the `session_id` of every step is recorded, so any step can
   be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
   interactively). `claude agents` lists live background sessions.

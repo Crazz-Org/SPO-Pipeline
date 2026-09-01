@@ -15,30 +15,20 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-// ---- the network killswitch, and why it is the FIRST executable line in this file -------------
+// ---- the network killswitch, and why it is the FIRST require in this file ----------------------
 //
-// Measured, not theorised: the first cut of this file called finalizePark in REAL mode with no
-// injected deps at all for its ordinary-park cases. `deps` then defaults to `{}` (buildCtx),
-// command-timeout.js's armTimeout falls back to the real `spawnSync`, and postParkComment runs
-// `gh issue comment 1 --repo Crazz-Org/SPO-WebClient --body-file <park-comment.md>` with the
-// pool's live credentials. It did not fail closed -- issue #1 of the real SPO-WebClient collected
-// 140 park comments in one hour of running this suite, four per `node --test test/*.test.js`,
-// times every mutation-testing round. This is the same class the C3 soak already logged once
-// ("adding a body field would have had the daemon writing real comments onto live issues"), and
-// the reason the queue/journal isolation in test/helpers.js is not enough: that only covers
-// `spo` SUBPROCESSES, and everything here spawns in-process.
-//
-// `command-timeout.js` destructures `spawnSync` at require time, so this has to be swapped before
-// the orchestrator requires below -- hence the placement, not a style choice. node:test runs each
-// test FILE in its own process, so nothing outside this file is affected. Every test below
-// injects its own deps.spawnSync (buildParkCtx defaults to one); this is the backstop that turns
-// "somebody forgot" from a live GitHub write into a red test.
-require('child_process').spawnSync = (command, args) => {
-  throw new Error(
-    `test/transient-retry.test.js: a test reached the REAL spawnSync -- ${command} ${JSON.stringify(args)}. ` +
-      'Inject deps.spawnSync (see buildParkCtx) instead; this suite must never touch git/gh/npm.'
-  );
-};
+// This file is where the 140-fabricated-park-comments incident was first found and first fixed:
+// the first cut of this file called finalizePark in REAL mode with no injected deps at all for
+// its ordinary-park cases, `deps` defaulted to `{}` (buildCtx), command-timeout.js's armTimeout
+// fell back to the real `spawnSync`, and postParkComment ran an actual `gh issue comment 1 --repo
+// Crazz-Org/SPO-WebClient --body-file <park-comment.md>` with the pool's live credentials -- 140
+// times in one hour of mutation testing. The fix here was later generalised, module and all, into
+// test/no-real-spawn.js (its header carries the full incident writeup plus the repo-wide
+// measurement that found this class in two more files) once action 5.0 asked "is this file-local
+// patch the only one, or the whole class?" -- it was one of two. Every test below still injects
+// its own deps.spawnSync (buildParkCtx defaults to one); this require is only the backstop that
+// turns "somebody forgot" from a live GitHub write into a red test.
+require('./no-real-spawn');
 
 const { buildCtx, finalizePark, takeNextTask, drainQueueOnce } = require('../orchestrator/state-machine');
 const { reEnqueueTask, unparkScan } = require('../orchestrator/park-loop');

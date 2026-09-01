@@ -17,6 +17,7 @@ const {
   collectReportPipeline,
   buildSessionIndex,
   readDaemonEventsTail,
+  usageSnapshotFreshness,
 } = require('../console/collect');
 const { renderDashboard, renderDataFragments } = require('../console/render');
 const { saveRollups } = require('../console/usage-rollups');
@@ -247,6 +248,66 @@ test('collectServices reads a fresh bench heartbeat as up and an old one as stal
   assert.equal(staleServices.benchWorker.status, 'stale');
 });
 
+// ---- action 5.5, item B audit: nightly + bench verdicts staleness (STALE_BENCH_AGE_MS) --------
+
+test('collectServices marks nightly "stale" (not "pass") when its finishedAt is more than 36h old, even though the verdict itself was PASS', () => {
+  const benchRoot = mkTmp('spo-dash-nightly-stale-');
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const finishedAt = new Date(now - 40 * 60 * 60 * 1000).toISOString(); // 40h old
+  writeJson(path.join(benchRoot, 'nightly', 'latest.json'), { verdict: 'PASS', sha: 'abc123', finishedAt });
+
+  const services = collectServices({ benchRoot, now });
+  assert.equal(services.nightly.status, 'stale');
+  assert.equal(services.nightly.verdict, 'PASS'); // the raw verdict is still reported, just not trusted as current
+
+  // Assert the TILE, not the page. A bare page-wide /STALE/ matched `nightlyCaption`, which is a
+  // separate line -- so reverting the tile to re-derive GREEN/RED from `verdict` alone passed all
+  // 1175 tests while rendering a self-contradictory tile: a green, pulsing "GREEN" heading over a
+  // caption reading "verdict PASS, 40h ago -- STALE (>36h)". The tile's colour and word are what a
+  // maintainer reads at a glance; the caption is what they read second.
+  const html = renderDashboard({ services, accounts: { rows: [] } });
+  assert.match(
+    html,
+    /svc-tile tile-orange[\s\S]{0,400}?Nightly[\s\S]{0,400}?>STALE</,
+    'the nightly TILE itself must read STALE and carry the stale class, not just its caption'
+  );
+  assert.doesNotMatch(html, /svc-tile tile-green[\s\S]{0,400}?Nightly/, 'a stale nightly must never render green');
+});
+
+test('collectServices does NOT mark a fresh nightly stale', () => {
+  const benchRoot = mkTmp('spo-dash-nightly-fresh-');
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const finishedAt = new Date(now - 2 * 60 * 60 * 1000).toISOString(); // 2h old
+  writeJson(path.join(benchRoot, 'nightly', 'latest.json'), { verdict: 'PASS', sha: 'abc123', finishedAt });
+
+  const services = collectServices({ benchRoot, now });
+  assert.equal(services.nightly.status, 'pass');
+});
+
+test('collectServices marks the bench verdicts tile "stale" when the LAST verdict is more than 36h old, and renderDashboard shows it', () => {
+  const benchRoot = mkTmp('spo-dash-verdicts-stale-');
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const createdAt = new Date(now - 50 * 60 * 60 * 1000).toISOString(); // 50h old
+  writeJson(path.join(benchRoot, 'verdicts', 'sha-abc.json'), { verdict: 'PASS', createdAt, head: 'abc123', jobId: 'job-1' });
+
+  const services = collectServices({ benchRoot, now });
+  assert.equal(services.verdicts.status, 'stale');
+
+  const html = renderDashboard({ services, accounts: { rows: [] } });
+  // both the Nightly-adjacent Verdicts tile's caption AND its status word carry it
+  assert.match(html, /STALE/);
+});
+
+test('collectServices does NOT mark fresh bench verdicts stale', () => {
+  const benchRoot = mkTmp('spo-dash-verdicts-fresh-');
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const createdAt = new Date(now - 60 * 60 * 1000).toISOString(); // 1h old
+  writeJson(path.join(benchRoot, 'verdicts', 'sha-abc.json'), { verdict: 'PASS', createdAt, head: 'abc123', jobId: 'job-1' });
+
+  const services = collectServices({ benchRoot, now });
+  assert.equal(services.verdicts.status, 'pass');
+});
+
 test('collectServices never leaks the product repo path', () => {
   const benchRoot = mkTmp('spo-dash-services-leak-');
   fs.mkdirSync(benchRoot, { recursive: true });
@@ -260,12 +321,28 @@ test('collectServices never leaks the product repo path', () => {
 // ---- collectDaemonStats -----------------------------------------------------------------------
 
 test('collectDaemonStats buckets tasks by day/week and computes the parking rate', () => {
-  const now = Date.parse('2026-08-30T12:00:00.000Z'); // a Sunday
+  // Everything here is derived from the HOST's own local calendar, because collect.js buckets by
+  // LOCAL midnight and local Monday. A fixture of fixed UTC strings only lands in the intended
+  // buckets for the offsets its author happened to have: `2026-08-30T12:00:00Z` is a Sunday
+  // afternoon at UTC+2 and a Monday morning at UTC+14 -- and on a local Monday there is no room
+  // at all for a task that is "this week but not today", so the fixture's premise, not just its
+  // numbers, depends on the host. `now` is therefore pinned to a local WEDNESDAY, which always
+  // leaves two clear local days behind it inside the same Mon..Sun week.
+  const DAY = 24 * 60 * 60 * 1000;
+  let now = Date.parse('2026-08-30T12:00:00.000Z');
+  while (new Date(now).getDay() !== 3) now += DAY; // 3 = Wednesday, local
+  const at = (ms) => new Date(now - ms).toISOString();
+  // "Today" is anchored to LOCAL midnight, not to a fixed offset back from `now`: at UTC+14 this
+  // Wednesday begins at 02:00 local, so `now - 4h` lands on Tuesday and the task drops out of the
+  // bucket it was written for.
+  const localMidnight = new Date(now);
+  localMidnight.setHours(0, 0, 0, 0);
+  const todayIso = new Date(localMidnight.getTime() + 1000).toISOString();
   const journalTasks = [
-    { state: 'DONE', updatedAt: '2026-08-30T08:00:00.000Z' }, // today
-    { state: 'PARKED', updatedAt: '2026-08-27T08:00:00.000Z' }, // this week, not today
-    { state: 'DONE', updatedAt: '2026-07-01T08:00:00.000Z' }, // long ago
-    { state: 'IMPLEMENT', updatedAt: '2026-08-30T08:00:00.000Z' }, // active, non-terminal
+    { state: 'DONE', updatedAt: todayIso }, // today (local), just after local midnight
+    { state: 'PARKED', updatedAt: at(2 * DAY) }, // local Monday -- this week, not today
+    { state: 'DONE', updatedAt: '2026-07-01T08:00:00.000Z' }, // long ago, no boundary in play
+    { state: 'IMPLEMENT', updatedAt: todayIso }, // active, non-terminal
   ];
 
   const stats = collectDaemonStats(journalTasks, 2, { now });
@@ -284,6 +361,26 @@ test('collectDaemonStats with no tasks returns zeros and a null parking rate', (
   const stats = collectDaemonStats([], 0);
   assert.equal(stats.total, 0);
   assert.equal(stats.parkingRatePct, null);
+});
+
+// ---- action 5.5, item A: synthetic tasks excluded from the daemon-stats denominator ------------
+
+test('collectDaemonStats excludes a kind: "synthetic" task from total/done/parked/parkingRatePct, but a task with NO kind at all is still counted as a card', () => {
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const journalTasks = [
+    // real corpus shape: demo-happy-001, kind: "synthetic", state: DONE -- must NOT count.
+    { kind: 'synthetic', state: 'DONE', updatedAt: '2026-08-29T00:10:10.750Z' },
+    { kind: 'card', state: 'DONE', updatedAt: '2026-09-01T08:00:00.000Z' },
+    // no `kind` field at all (every real task predating the field would look like this) --
+    // must be treated as a card, not silently dropped.
+    { state: 'PARKED', updatedAt: '2026-09-01T08:00:00.000Z' },
+  ];
+
+  const stats = collectDaemonStats(journalTasks, 0, { now });
+  assert.equal(stats.total, 2); // the synthetic task excluded, the kind-less one counted
+  assert.equal(stats.done, 1);
+  assert.equal(stats.parked, 1);
+  assert.equal(stats.parkingRatePct, 50); // 1/2, not 1/3 -- the synthetic never enters the denominator
 });
 
 // ---- collectReportPipeline --------------------------------------------------------------------
@@ -421,4 +518,156 @@ test('collectAll reads journal/usage-rollups.json in static mode (no live server
 test('renderDashboard falls back to the "no trend history yet" message when trend is null', () => {
   const html = renderDashboard(collectAll({}));
   assert.match(html, /no trend history yet/);
+});
+
+// ---- action 5.5, item B audit of journal/usage-rollups.json: the trend's own staleness banner --
+
+test('renderTokensInner shows "recorded through <date>" for a current rollup, and a visible STALE banner (with the day count) for a rollup that missed today entirely', () => {
+  const { buildTrendViews, localDateKey } = require('../console/usage-scan');
+  const { renderTokensInner } = require('../console/render');
+
+  // Day keys derived from `now` via localDateKey, never hard-coded: '2026-09-01' is only "today"
+  // for a host whose local date at 12:00Z is 09-01, which is false at UTC+14 (already 09-02).
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+  const today = localDateKey(now);
+  const fourDaysBefore = localDateKey(now - 4 * DAY);
+  const day = (partial) => ({ sessions: 10, msgs: 10, partial, Minp: 1, Mcc: 1, Mcr: 1, Mout: 1, byModel: {} });
+
+  const currentTrend = buildTrendViews({ [today]: day(true) }, { now });
+  const currentHtml = renderTokensInner(null, null, currentTrend, null);
+  assert.match(currentHtml, new RegExp(`recorded through <strong>${today}</strong>`));
+  assert.doesNotMatch(currentHtml, /STALE/);
+
+  const staleTrend = buildTrendViews({ [fourDaysBefore]: day(false) }, { now });
+  const staleHtml = renderTokensInner(null, null, staleTrend, null);
+  assert.match(staleHtml, /STALE.*no rollup recorded for today yet/s);
+  assert.match(staleHtml, new RegExp(`last recorded day:\\s*${fourDaysBefore},\\s*4 days\\s*behind`));
+  assert.match(staleHtml, /spo dashboard --serve/);
+});
+
+// ---- action 5.5, item B: usageSnapshotFreshness + the snapshot table's staleness marker --------
+
+test('usageSnapshotFreshness: the OBSERVED range end beats a requested `until` -- a --until= flag cannot mint freshness', () => {
+  // scripts/usage-report.js writes `since`/`until` straight from its CLI flags (the window the
+  // operator ASKED for) and `range` from the data's own minTs/maxTs (the window actually
+  // OBSERVED). Preferring `until` therefore let `--until=2026-09-30` report a snapshot whose data
+  // really stops on 09-01, read on 09-15, as `0s old` with no STALE banner -- exactly the silent
+  // staleness item B exists to end, produced by item B's own code.
+  const journalRoot = mkTmp('spo-dash-snapmeta-until-');
+  const snapshotPath = path.join(journalRoot, 'usage-snapshot.json');
+  fs.writeFileSync(snapshotPath, JSON.stringify({ since: null, until: '2026-09-30', range: ['2026-08-20', '2026-09-01'] }));
+  const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+
+  const meta = usageSnapshotFreshness(snapshot, snapshotPath, { now: Date.parse('2026-09-15T12:00:00.000Z') });
+  assert.equal(meta.rangeEnd, '2026-09-01', 'the observed end, never the requested one');
+  assert.equal(meta.stale, true);
+  assert.ok(meta.ageMs > 13 * 24 * 60 * 60 * 1000, 'a two-week-old snapshot must not read as fresh');
+});
+
+test('usageSnapshotFreshness(null, ...) returns null -- no snapshot, nothing to judge', () => {
+  assert.equal(usageSnapshotFreshness(null, '/does/not/matter'), null);
+});
+
+test('usageSnapshotFreshness prefers the snapshot\'s OWN range over the file mtime, and flags it stale past 24h', () => {
+  const journalRoot = mkTmp('spo-dash-snapmeta-range-');
+  const snapshotPath = path.join(journalRoot, 'usage-snapshot.json');
+  writeJson(snapshotPath, { range: ['2026-08-20', '2026-08-29'], since: null, until: null, byModel_Mtokens: {} });
+  // Real measurement, 2026-09-01: range end 2026-08-29, "now" 3 days later -- well past 24h.
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+
+  const meta = usageSnapshotFreshness(snapshot, snapshotPath, { now });
+  assert.equal(meta.source, 'range');
+  assert.equal(meta.rangeStart, '2026-08-20');
+  assert.equal(meta.rangeEnd, '2026-08-29');
+  assert.equal(meta.stale, true);
+  assert.ok(meta.ageMs > 24 * 60 * 60 * 1000);
+});
+
+test('usageSnapshotFreshness is NOT stale when the range end is "now"\'s own day', () => {
+  const journalRoot = mkTmp('spo-dash-snapmeta-fresh-');
+  const snapshotPath = path.join(journalRoot, 'usage-snapshot.json');
+  writeJson(snapshotPath, { range: ['2026-08-20', '2026-09-01'], since: null, until: null, byModel_Mtokens: {} });
+  const now = Date.parse('2026-09-01T12:00:00.000Z');
+  const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+
+  const meta = usageSnapshotFreshness(snapshot, snapshotPath, { now });
+  assert.equal(meta.stale, false);
+});
+
+test('usageSnapshotFreshness falls back to the file mtime when range/since/until are all null', () => {
+  const journalRoot = mkTmp('spo-dash-snapmeta-mtime-');
+  const snapshotPath = path.join(journalRoot, 'usage-snapshot.json');
+  writeJson(snapshotPath, { range: [null, null], since: null, until: null, byModel_Mtokens: {} });
+  const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+
+  const meta = usageSnapshotFreshness(snapshot, snapshotPath, { now: Date.now() });
+  assert.equal(meta.source, 'mtime');
+  assert.ok(meta.ageMs !== null && meta.ageMs < 60000); // just written -- seconds old, not stale
+  assert.equal(meta.stale, false);
+});
+
+test('usageSnapshotFreshness reports "unknown" (never an invented date) when neither range nor a readable mtime exists', () => {
+  const meta = usageSnapshotFreshness({ range: [null, null], since: null, until: null }, '/nonexistent/path/usage-snapshot.json', { now: Date.now() });
+  assert.equal(meta.source, 'unknown');
+  assert.equal(meta.ageMs, null);
+  assert.equal(meta.stale, false);
+});
+
+test('renderDashboard shows the snapshot\'s window and a visible STALE marker for a 3-day-old snapshot, and does NOT mark a fresh one', () => {
+  const staleRoot = mkTmp('spo-dash-snap-stale-');
+  writeJson(path.join(staleRoot, 'usage-snapshot.json'), {
+    range: ['2026-08-20', '2026-08-29'],
+    since: null,
+    until: null,
+    byModel_Mtokens: { 'claude-sonnet-5': { driver: { inp: 0, cc: 10, cr: 500, out: 1 } } },
+  });
+  const staleData = collectAll({ journalRoot: staleRoot });
+  const staleHtml = renderDashboard(staleData);
+  assert.match(staleHtml, /covers.*2026-08-20.*2026-08-29/s);
+  assert.match(staleHtml, /STALE snapshot/);
+
+  const freshRoot = mkTmp('spo-dash-snap-fresh-');
+  const today = new Date().toISOString().slice(0, 10);
+  writeJson(path.join(freshRoot, 'usage-snapshot.json'), {
+    range: ['2026-08-20', today],
+    since: null,
+    until: null,
+    byModel_Mtokens: { 'claude-sonnet-5': { driver: { inp: 0, cc: 10, cr: 500, out: 1 } } },
+  });
+  const freshHtml = renderDashboard(collectAll({ journalRoot: freshRoot }));
+  assert.doesNotMatch(freshHtml, /STALE snapshot/);
+});
+
+test('renderDashboard, collectAll and `spo dashboard` never crash and exit 0 on a malformed snapshot, a missing snapshot, an unparsable state.json, and an empty journal', () => {
+  // malformed usage-snapshot.json (not valid JSON) -- readJsonSafe's fallback (null) must win,
+  // never a thrown JSON.parse error surfacing through collectAll/renderDashboard.
+  const malformedRoot = mkTmp('spo-dash-snap-malformed-');
+  fs.mkdirSync(malformedRoot, { recursive: true });
+  fs.writeFileSync(path.join(malformedRoot, 'usage-snapshot.json'), '{ not valid json');
+  assert.doesNotThrow(() => renderDashboard(collectAll({ journalRoot: malformedRoot })));
+  assert.equal(collectAll({ journalRoot: malformedRoot }).usageSnapshot, null);
+  assert.equal(collectAll({ journalRoot: malformedRoot }).usageSnapshotMeta, null);
+
+  // missing snapshot file entirely (the common case -- most journals never had one written).
+  const missingRoot = mkTmp('spo-dash-snap-missing-');
+  assert.doesNotThrow(() => renderDashboard(collectAll({ journalRoot: missingRoot })));
+
+  // an unparsable state.json for a real task directory.
+  const badStateRoot = mkTmp('spo-dash-badstate-');
+  fs.mkdirSync(path.join(badStateRoot, 'issue-999'), { recursive: true });
+  fs.writeFileSync(path.join(badStateRoot, 'issue-999', 'state.json'), '{ this is not json');
+  assert.doesNotThrow(() => renderDashboard(collectAll({ journalRoot: badStateRoot })));
+
+  // empty journal (directory exists, nothing in it).
+  const emptyRoot = mkTmp('spo-dash-empty-');
+  assert.doesNotThrow(() => renderDashboard(collectAll({ journalRoot: emptyRoot })));
+
+  // the real CLI end to end -- execFileSync throws on a non-zero exit, so a clean return here
+  // IS the "exit 0" proof.
+  const outPath = path.join(mkTmp('spo-dash-crash-out-'), 'dash.html');
+  const printed = runSpo(['dashboard', '--journal', badStateRoot, '--queue', mkTmp('spo-dash-crash-queue-'), '--out', outPath]);
+  assert.equal(printed.trim(), outPath);
+  assert.ok(fs.existsSync(outPath));
 });

@@ -12,6 +12,13 @@
 //     of the leaked product worktree, its local/remote claude-pipe/<id> branch, and the open PR
 //     (issue #443, where all three sat leaked indefinitely because ABANDONED used to do nothing
 //     but write state.json).
+//   reconcileExternalClosure -- action 5.1b, called from inside unparkScan's own per-task loop,
+//     BEFORE the retry/abandon comment scan: for a PARKED or ABANDONED task whose owning issue
+//     has since closed OUTSIDE the pipeline (a human fixed it by hand, or -- issue #443's shape --
+//     the pipeline's own PR merged 30 seconds after a false park), records that fact on
+//     `state.json` (`externallyResolved`) and in the journal (`reconciled-externally`) without
+//     ever rewriting `state.state` -- see that function's own header for the full story and the
+//     measured evidence.
 //
 // Anchor mechanics: `gh issue comment` prints the created comment's URL,
 // `.../issues/<n>#issuecomment-<id>`. The numeric id is journaled as the park comment's anchor
@@ -26,6 +33,8 @@ const { appendEvent, writeState } = require('./journal');
 const { moveCard } = require('./board');
 const { armTimeout } = require('./command-timeout');
 const commentScan = require('./comment-scan');
+const { summarizeTask, formatAttemptLines } = require('./task-summary');
+const { formatTokenCount } = require('./tokens');
 
 // action 2.1b: routed through command-timeout.js's armTimeout -- the park comment's own `gh issue
 // comment` (postParkComment) and the unpark scan's `gh api .../comments` + abandon-ack `gh issue
@@ -84,7 +93,29 @@ function countRepeatedParks(lines, reason, detail) {
 // `repeat` defaults to 1 (a first-time park) for every existing caller/test that doesn't pass it.
 // >= 2 inserts a loop warning just above RETRY_ABANDON_LINE, which stays present verbatim in
 // every case -- unparkScan's retry/abandon parsing and the rest of this suite depend on it.
-function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
+//
+// Action 5.2: `billableTokens`/`hasTokenData`/`parksCount`/`diagnoseAttempts`/`validateRejects`/
+// `ciImplementRetries` are the card's CUMULATIVE totals across every attempt this taskDir has
+// ever made (task-summary.js's summarizeTask -- see its own header for why cumulative, not just
+// this run), computed by postParkComment below and handed in as plain numbers so this function
+// stays pure -- no fs, directly unit-testable with no journal on disk at all, exactly as before.
+// All six default so every pre-5.2 caller/test that doesn't pass them still renders (tokens as
+// "not recorded", no attempt rows, no total-parks line) rather than throwing or printing
+// "undefined". Inserted between RETRY_ABANDON_LINE and the <details> block, never touching either
+// -- both are load-bearing (unparkScan's retry/abandon anchor, the maintainer-facing detail dump)
+// and this only adds to the comment, never reorders or drops what was already there.
+function buildParkComment({
+  reason,
+  detail,
+  lastState,
+  repeat = 1,
+  billableTokens = 0,
+  hasTokenData = false,
+  parksCount = null,
+  diagnoseAttempts,
+  validateRejects,
+  ciImplementRetries,
+}) {
   const lines = [
     '### Pipeline parked',
     '',
@@ -104,6 +135,20 @@ function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
     );
   }
   lines.push(RETRY_ABANDON_LINE, '');
+
+  const tokensText = hasTokenData ? formatTokenCount(billableTokens) : 'not recorded';
+  const parksText =
+    typeof parksCount === 'number' && parksCount > 0
+      ? `, ${parksCount} ${parksCount === 1 ? 'park' : 'parks'} so far (this one included)`
+      : '';
+  lines.push(`**This card so far:** billable-weighted tokens ${tokensText}${parksText}.`, '');
+
+  const attemptLines = formatAttemptLines({ diagnoseAttempts, validateRejects, ciImplementRetries });
+  if (attemptLines.length > 0) {
+    lines.push('Attempts:');
+    lines.push(...attemptLines, '');
+  }
+
   if (detail && Object.keys(detail).length > 0) {
     lines.push(
       '<details><summary>detail</summary>',
@@ -125,6 +170,15 @@ function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
 // already terminal by the time this runs (state-machine.js's finalizePark calls it after the
 // task's own PARKED state.json/report.md are already written). `repeat` defaults to 1, same as
 // buildParkComment's own default, for any caller that doesn't compute a streak.
+//
+// Action 5.2: this is where the card's cumulative totals get COMPUTED (ctx.taskDir -> journal ->
+// task-summary.js's summarizeTask), then handed to buildParkComment as plain numbers -- keeping
+// that function pure, per its own header. Deliberately NOT `ctx.counters`: this function is
+// called with bare `{task, taskDir, config}` fixtures in several tests (no `.counters` at all),
+// and even where a real ctx.counters exists it only ever holds THIS run's attempts (state-
+// machine.js's buildCtx resets it to 0 on every retry) -- reading the journal instead is what
+// makes the totals genuinely cumulative across a card's whole park history, not just its latest
+// attempt.
 function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   moveCard(ctx, deps, 'PARKED');
 
@@ -135,7 +189,19 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   }
 
   const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
-  const body = buildParkComment({ reason, detail, lastState, repeat });
+  const summary = summarizeTask(ctx.taskDir);
+  const body = buildParkComment({
+    reason,
+    detail,
+    lastState,
+    repeat,
+    billableTokens: summary.billableTokens,
+    hasTokenData: summary.hasTokenData,
+    parksCount: summary.parksCount,
+    diagnoseAttempts: summary.diagnoseAttempts,
+    validateRejects: summary.validateRejects,
+    ciImplementRetries: summary.ciImplementRetries,
+  });
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
 
@@ -148,6 +214,339 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
 
   const commentId = parseCommentId(result.stdout);
   appendEvent(ctx.taskDir, 'PARKED', 'park-comment', { commentId, reason });
+}
+
+// ---- action 5.1d: surface DIAGNOSE on the card -------------------------------------------------
+//
+// Measured: 6 tasks entered DIAGNOSE (18 attempts total, 4 ending in a park). DIAGNOSE has no
+// board column at all (see board.js's own COLUMN_BY_STATE header) and, before this, no
+// card-visible trace either -- to a maintainer watching the board, a card in DIAGNOSE looks like a
+// card sitting in "Implementing" doing nothing for however many minutes it spends real LLM budget.
+//
+// Decision (not a driver's free choice, see doc/remediation-progress.md's own C5 write-up): one
+// comment, on the FIRST DIAGNOSE entry per task only, never per attempt. A new column would need a
+// GraphQL single-select option-add mutation (no `gh project field-create` for it --
+// orchestrator/README.md) and would fragment a pipeline view that is deliberately coarse; a
+// comment per attempt would put up to 18 comments on 6 issues for one week's corpus alone. state-
+// machine.js's handleDiagnose calls this exactly once per task (gated on its own
+// ctx.counters.diagnoseSurfaced flag, real mode only), so "first entry" is enforced by the caller,
+// not here -- this function itself always posts when called, same division of labour as moveCard
+// (board.js) taking the column unconditionally and its caller deciding when to call it.
+//
+// Same "never blocks the task" policy as postParkComment above, for the same reason: a maintainer
+// notification is best-effort, and a hung/failing `gh issue comment` here must not stall or park a
+// task that is otherwise diagnosing normally. Journals `diagnose-surfaced {attempt, budget}` on
+// success, `diagnose-surface-failed {exit}` on a non-zero exit (including a timeout, `exit: -1`
+// per normalizeExit, with `timedOut: true` alongside it) -- never throws either way.
+function buildDiagnoseSurfaceComment({ attempt, budget }) {
+  return [
+    '### Pipeline diagnosing',
+    '',
+    `This change failed its checks. The pipeline is diagnosing (attempt ${attempt} of ${budget}).`,
+    '',
+    'No human action is needed unless this card parks.',
+    '',
+  ].join('\n');
+}
+
+function postDiagnoseSurfaceComment(ctx, deps, { attempt, budget }) {
+  const issue = ctx.task && ctx.task.issue;
+  if (!issue) {
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surface-skipped', { reason: 'no issue' });
+    return;
+  }
+
+  const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const body = buildDiagnoseSurfaceComment({ attempt, budget });
+  const commentFile = path.join(ctx.taskDir, 'diagnose-comment.md');
+  fs.writeFileSync(commentFile, body);
+
+  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
+  const exit = normalizeExit(result);
+  if (exit !== 0) {
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surface-failed', { exit, timedOut: result.timedOut === true });
+    return;
+  }
+
+  appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surfaced', { attempt, budget });
+}
+
+// ---- action 5.3: route the judge findings that are journalled and then lost ------------------
+//
+// Measured (2026-09-01, all 19 journals): 7 `change-validator PASS_WITH_FINDINGS` events carry a
+// non-empty `findings` array (8 finding objects total -- issue-456 alone posted two), and one
+// `citation-verifier DIVERGES` (issue-462, 2026-08-31T08:35:08Z). Every one of them was
+// `appendEvent`'d by handleValidate (state-machine.js) and never read again -- PASS_WITH_FINDINGS
+// returns 'MERGE' with the findings sitting only in journal.jsonl, and DIVERGES "is flagged for a
+// human, not blocking" in a comment that names no human-facing surface at all. This is that
+// surface.
+//
+// Posted on the ISSUE, not the PR (contra the plan's "a structured PR comment"): this pipeline
+// auto-merges (VALIDATE -> MERGE has no human gate -- state-machine-spec.md's own state table),
+// so there is no PR reviewer to read a PR comment before it closes on merge. The issue is where
+// every other pipeline comment already lands (postParkComment, postDiagnoseSurfaceComment, the
+// FINISH comment in steps/scripted.js), it is what the board tracks, and it OUTLIVES the PR
+// (which GitHub closes on merge, taking any PR-side comment out of the maintainer's ordinary
+// view). `prNumber` is named inside the body instead, so the link a PR comment would have given
+// for free is not lost.
+//
+// Called from handleValidate BEFORE it returns 'MERGE' (not from a separate MERGE-adjacent hook):
+// the findings/entries only exist in the same call's `result`/`cv` locals, and posting here keeps
+// the comment landing while the change is still in flight, not after the card is already closed.
+//
+// Erratum A -- findings carry `title` XOR `summary`, never both. The 8 measured findings have
+// exactly four key-sets:
+//
+//     9 keys: area, category, detail, failure_scenario, file, line, short_summary, size, title  x1
+//     5 keys: area, category, detail, size, title                                               x2
+//     6 keys: area, category, file, line, size, summary                                         x1
+//     4 keys: area, category, size, summary                                                     x4
+//
+// 4 of 8 have `title` and no `summary`; 4 have `summary` and no `title`. `file`/`line` are present
+// on 2 of 8; `detail`, `failure_scenario`, `short_summary` are sporadic. formatFindingLine below
+// renders whichever of `title`/`summary` is present as the headline and never prints `undefined`
+// for a key that is absent -- see the corpus example inline on that function.
+//
+// Erratum A, second half -- `findings` sometimes arrives as a JSON-ENCODED STRING, not an array.
+// Every one of the 8 measured findings above actually arrived this way (`"findings":"[{...}]"`,
+// not `"findings":[{...}]`) -- the same shape `orchestrator/steps/scripted.js`'s
+// `plan-files-undeclared` incident already learned to expect from `files_to_change`. normalizeFindingsPayload
+// tolerates a string (parses it), an array (uses it as-is), and anything else (null, an object, an
+// unparsable string, absent) by returning an empty list -- never throwing -- while journalling the
+// shape actually received (`validate-findings-shape`) so a future divergence from either shape is
+// visible on the record instead of silently dropped, the exact fate this action exists to end.
+//
+// Erratum B -- `citation-verifier DIVERGES` had nothing to render. `step-contracts.js`'s
+// CITATION_VERIFIER contract requires `{verdict, entries}`, but state-machine.js's own
+// `citation-verifier` journal event carried only `{verdict}` -- the single real DIVERGES in the
+// corpus (issue-462) recorded exactly `{"verdict":"DIVERGES"}`; what actually diverged is
+// unrecoverable today. Fixed at the source in state-machine.js's handleValidate (both branches
+// that already journal a `cv.verdict` now also journal `cv.entries`, PASS included -- see that
+// file's own comment on why PASS gets it too, cheaply, rather than leaving the exact same
+// discard-by-omission bug for a verdict this action didn't happen to be measuring).
+//
+// Decision recorded here, not just in the plan: NO auto-filed follow-up card. The plan floats
+// "(and optionally a follow-up draft card)"; this build does not build it. Unattended filing on a
+// judge's own verdict is the exact class of behaviour C3 gated behind a human `confirm` after the
+// 12.8-hour, 128-attempt auto-triage stall (doc/audit-2026-08-30-remediation-plan.md) -- and a
+// comment is reversible (ignore it, reply, resolve it by hand) where a filed card is not (it sits
+// in the backlog, competing for the same intake budget as everything else, until a human notices
+// and closes it). A comment that names the finding is enough for a maintainer to decide whether it
+// is worth a card at all.
+
+// Small, deliberately generous caps -- not asked for by the corpus (largest measured payload is
+// 2 findings, ~1.5KB of prose) but cheap insurance against the exact failure mode
+// `plan-files-undeclared`'s own header already measured for a different field: GitHub caps a
+// comment body at 65536 chars, and an unbounded model-controlled array/string is the input that
+// blows past it. Rendering stops silently truncating past these caps with a `(+N more)` /
+// `... (truncated)` marker rather than ever producing an oversized body.
+const MAX_RENDERED_ITEMS = 30;
+const MAX_FIELD_LENGTH = 8000;
+// GitHub refuses an issue comment body over 65,536 characters with a 422. 60,000 leaves room for
+// the truncation marker appended below it and for any future preamble line.
+const MAX_BODY_LENGTH = 60000;
+
+function truncateField(value) {
+  return value.length > MAX_FIELD_LENGTH ? `${value.slice(0, MAX_FIELD_LENGTH)}... (truncated)` : value;
+}
+
+// A non-empty string, trimmed -- or null. The one predicate every field below is read through, so
+// `''`, `null`, `undefined`, and a non-string (a stray number/object the model sent where prose
+// was expected) all collapse to the same "nothing to render" outcome instead of five different
+// ad-hoc checks that could each get the falsy cases slightly wrong.
+function str(value) {
+  return typeof value === 'string' && value.trim() !== '' ? truncateField(value.trim()) : null;
+}
+
+// normalizeFindingsPayload(raw) -- tolerates every shape `result.findings` (VALIDATE's
+// change-validator payload) has actually been observed or could plausibly arrive as: a real
+// array (used as-is), a JSON-encoded string (parsed), or anything else -- `null`, `undefined`, an
+// object, an unparsable string -- which becomes an empty list, NEVER a throw. `shape` is what
+// state-machine.js journals alongside the count, per erratum A's second half above: the point is
+// that a future payload shape this function doesn't expect is visible in the journal, not that it
+// crashes or silently renders nothing with no trace.
+function normalizeFindingsPayload(raw) {
+  if (Array.isArray(raw)) return { items: raw, shape: 'array' };
+  if (typeof raw === 'string') {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { items: [], shape: 'unparsable-string' };
+    }
+    if (Array.isArray(parsed)) return { items: parsed, shape: 'json-string' };
+    return { items: [], shape: `json-string-${parsed === null ? 'null' : typeof parsed}` };
+  }
+  if (raw === null) return { items: [], shape: 'null' };
+  if (raw === undefined) return { items: [], shape: 'absent' };
+  return { items: [], shape: typeof raw };
+}
+
+// formatFindingLine(finding, index) -- one change-validator finding, matching erratum A above.
+// Real corpus example (issue-232, the 4-key `summary`-only shape), rendered:
+//
+//   **1. The new `export { server as httpServer }` in src/server/server.ts makes the raw...**
+//
+//   category: `latent-trap` · area: `gateway` · size: `S`
+//
+// A malformed element (not an object -- `null`, a bare string, a number: the "array of nulls"
+// case) renders a one-line placeholder instead of throwing on `finding.title`.
+function formatFindingLine(finding, index) {
+  if (!finding || typeof finding !== 'object') {
+    return `**${index}.** _(malformed finding: ${JSON.stringify(finding === undefined ? null : finding)})_`;
+  }
+  const headline = str(finding.title) || str(finding.summary) || '_(no title or summary given)_';
+  const parts = [`**${index}. ${headline}**`];
+
+  const meta = [];
+  if (str(finding.category)) meta.push(`category: \`${str(finding.category)}\``);
+  if (str(finding.area)) meta.push(`area: \`${str(finding.area)}\``);
+  if (str(finding.size)) meta.push(`size: \`${str(finding.size)}\``);
+  if (str(finding.file)) {
+    const loc = typeof finding.line === 'number' ? `${str(finding.file)}:${finding.line}` : str(finding.file);
+    meta.push(`\`${loc}\``);
+  }
+  if (meta.length > 0) parts.push(meta.join(' · '));
+
+  // `detail` is the prose body when `title` won the headline (the 5-/9-key shapes); when
+  // `summary` won the headline instead (the 4-/6-key shapes) there is no separate body key --
+  // the summary already carried the whole finding. Never render the same string twice.
+  if (str(finding.detail)) parts.push(str(finding.detail));
+  if (str(finding.short_summary) && str(finding.short_summary) !== headline) {
+    parts.push(`_${str(finding.short_summary)}_`);
+  }
+  if (str(finding.failure_scenario)) parts.push(`Failure scenario: ${str(finding.failure_scenario)}`);
+
+  return parts.join('\n\n');
+}
+
+// formatEntryLine(entry, index) -- one citation-verifier entry (`{member, citation, finding}` per
+// verify-citations.md's own output contract). Same malformed-element tolerance as
+// formatFindingLine, for the same reason: `entries` is exactly as model-controlled as `findings`.
+function formatEntryLine(entry, index) {
+  if (!entry || typeof entry !== 'object') {
+    return `**${index}.** _(malformed entry: ${JSON.stringify(entry === undefined ? null : entry)})_`;
+  }
+  const member = str(entry.member) || '_(unnamed member)_';
+  const citation = str(entry.citation) ? ` — \`${str(entry.citation)}\`` : '';
+  const parts = [`**${index}. ${member}${citation}**`];
+  if (str(entry.finding)) parts.push(str(entry.finding));
+  return parts.join('\n\n');
+}
+
+function renderItems(items, formatLine) {
+  const capped = items.slice(0, MAX_RENDERED_ITEMS);
+  const lines = capped.map((item, i) => formatLine(item, i + 1));
+  if (items.length > MAX_RENDERED_ITEMS) {
+    lines.push(`_(+${items.length - MAX_RENDERED_ITEMS} more, not rendered)_`);
+  }
+  return lines;
+}
+
+// buildValidateFindingsComment -- PURE (no fs, no spawn; unit-testable with only in-memory
+// values, same discipline as buildParkComment above). One comment for both sources rather than
+// two: a card can only get here through handleValidate's own MERGE branch, where at most one
+// change-validator verdict and one citation-verifier verdict exist for the run, and posting them
+// separately would put two comments on the same issue seconds apart with no way to tell, from
+// either one alone, that they belong to the same VALIDATE pass. Sections are clearly separated by
+// their own `####` heading instead.
+//
+// `diverges` is a separate boolean from `divergesEntries.length` on purpose: the DIVERGES verdict
+// itself is the human-facing signal (erratum B) -- an empty/malformed `entries` payload is a
+// second, independent defect worth surfacing (via `_(no entries reported)_` below), not a reason
+// to fall silently back to today's "flagged for a human" that names no human-facing surface.
+function buildValidateFindingsComment({ prNumber, findings = [], diverges = false, divergesEntries = [] }) {
+  const lines = ['### Pipeline validation findings', ''];
+  // `PR #N.`, NOT "Merged via #N." -- this comment is posted from handleValidate BEFORE
+  // realMerge runs, and realMerge can still park four ways (pr-merge-enqueue-failed,
+  // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit). Posting before the
+  // merge is deliberate (the findings must land while the card is still moving, not after it
+  // closes), so the wording is what has to be honest: an issue permanently carrying "Merged via
+  // #427." next to a park comment saying the PR closed unmerged is exactly the kind of
+  // board-vs-reality divergence this chantier exists to end. #443 is the corpus proof that the
+  // four park paths are not theoretical.
+  if (typeof prNumber === 'number') lines.push(`PR #${prNumber}.`, '');
+  lines.push(
+    'This did not block the merge -- this pipeline auto-merges once its own checks pass, so',
+    'there is no human reviewer on the PR itself. These are recorded here for you to read, act',
+    'on, or dismiss at your own judgement.',
+    ''
+  );
+
+  if (diverges) {
+    lines.push(
+      '#### Citation verifier: DIVERGES',
+      '',
+      'Every touched citation checked out true, but at least one intentionally diverges from a',
+      'literal reading of the Pascal declaration (verify-citations.md rule 1 or 2) -- correct, but',
+      'flagged for you to confirm the intent, not to fix.',
+      ''
+    );
+    if (Array.isArray(divergesEntries) && divergesEntries.length > 0) {
+      renderItems(divergesEntries, formatEntryLine).forEach((line) => lines.push(line, ''));
+    } else {
+      lines.push('_(no entries reported)_', '');
+    }
+  }
+
+  if (Array.isArray(findings) && findings.length > 0) {
+    lines.push(
+      '#### Change validator: PASS_WITH_FINDINGS',
+      '',
+      'The change passed. These are non-blocking findings from that pass.',
+      ''
+    );
+    renderItems(findings, formatFindingLine).forEach((line) => lines.push(line, ''));
+  }
+
+  // The per-field and per-item caps above bound each PIECE; they do not bound the WHOLE. Measured:
+  // 30 findings each at the 8000-char field cap render a 722,497-character body against GitHub's
+  // 65,536 limit -- 11x over. `gh` would 422, the post would journal
+  // `validate-findings-post-failed`, the merge would proceed, and the findings would be lost
+  // again, which is the exact failure this action exists to end. So the joined body is capped
+  // too, and says so where it cuts rather than ending mid-sentence.
+  const body = lines.join('\n');
+  if (body.length <= MAX_BODY_LENGTH) return body;
+  return (
+    body.slice(0, MAX_BODY_LENGTH) +
+    `\n\n_[truncated: the rendered findings exceeded ${MAX_BODY_LENGTH} characters. The full payload is in this task's journal, under the \`change-validator\` event.]_`
+  );
+}
+
+// postValidateFindingsComment(ctx, deps, {...}) -- same mechanics as postParkComment above: build
+// the body with the pure function, write it to ctx.taskDir, spawn through the timeout-armed
+// runSync, verdict by exit code, journal the outcome. It never BLOCKS -- but the "never throws"
+// half was measured and is false, in exactly the way postParkComment's identical shape is: a
+// `spawnSync` that returns undefined/null or throws outright, an absent or unwritable taskDir,
+// all propagate out (armTimeout assigns `result.commandClass` on the raw return). Real spawnSync
+// does none of those, but a mutation round or a full disk does. The caller therefore owns the
+// catch: handleValidate wraps this call, because a throw here escapes into runTask
+// (state-machine.js) and kills the daemon over a best-effort comment -- the shape C3 already
+// shipped once.
+// Journals `validate-findings-posted {count, commentId}` on success,
+// `validate-findings-post-failed {exit, timedOut}` on a non-zero `gh` exit or a timed-out spawn.
+function postValidateFindingsComment(ctx, deps, { prNumber, findings = [], diverges = false, divergesEntries = [] }) {
+  const issue = ctx.task && ctx.task.issue;
+  if (!issue) {
+    appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-post-skipped', { reason: 'no issue' });
+    return;
+  }
+
+  const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const body = buildValidateFindingsComment({ prNumber, findings, diverges, divergesEntries });
+  const commentFile = path.join(ctx.taskDir, 'validate-findings-comment.md');
+  fs.writeFileSync(commentFile, body);
+
+  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
+  const exit = normalizeExit(result);
+  if (exit !== 0) {
+    appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-post-failed', { exit, timedOut: result.timedOut === true });
+    return;
+  }
+
+  const commentId = parseCommentId(result.stdout);
+  const count = (Array.isArray(findings) ? findings.length : 0) + (Array.isArray(divergesEntries) ? divergesEntries.length : 0);
+  appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-posted', { count, commentId });
 }
 
 // ---- unpark scan (daemon, real mode) ---------------------------------------------------------
@@ -518,6 +917,135 @@ function abandonCleanup(deps, config, taskDir, id, task, state) {
   }
 }
 
+// ---- action 5.1b: reconcile a parked/abandoned task against the issue it owns -----------------
+//
+// The measurement (doc/remediation-progress.md's "C5's own measurement" section, 2026-09-01,
+// re-run from scratch, not carried over from the plan) found the JOURNAL is the stale side on 3
+// of 18 tasks, and the BOARD is already right -- because the project has the built-in "Item
+// closed" workflow enabled (Status -> Done, re-measured live), so closing an issue moves the card
+// by itself with no `gh project` mutation and no human dragging anything. Issue closure is
+// therefore already the signal the board itself trusts; this function invents no new source of
+// truth, it just makes the JOURNAL catch up to what the board already knows:
+//
+//   issue-213, issue-428: PARKED (`diagnose-duplicate-root-cause`), closed 2026-08-30 by a human
+//     who fixed the work by hand and closed the issue -- nothing ever told the pipeline. Today
+//     `spo parked` still lists both as awaiting a `retry`/`abandon` reply that will never come.
+//   issue-443: ABANDONED (`abandoned-by-maintainer`, from a MERGE-step false park). `pr:wait`
+//     read `closed false` at 13:17:57 and parked `pr-closed-unmerged`; PR #447 actually MERGED at
+//     13:18:27, 30 seconds later, with no close/reopen anywhere in its own timeline before that.
+//     The maintainer then read the park comment and replied `abandon` at 13:53 -- abandoning a
+//     change that had already merged. A reconciler would have caught this within one scan
+//     interval instead of never; the MERGE-step defect itself (a single unconfirmed `closed`
+//     read treated as terminal) is filed separately and is NOT this action's to fix.
+//
+// The central design rule, worth restating here because it is the one a future "simplification"
+// will be tempted to undo: RECORD, NEVER OVERWRITE. `state.state` is never rewritten by this
+// function. The task really did park (or really was abandoned) -- the pipeline's own verdict at
+// the time was correct given what it knew, and fabricating a `DONE` the pipeline never actually
+// produced would make the journal lie in the opposite direction from today's staleness. Instead,
+// both facts land on the record side by side: `state.json` gets an `externallyResolved: {via,
+// closedAt, prNumber, mergedAt, at}` field, and `journal.jsonl` gets one `reconciled-externally`
+// event carrying the same detail. `via` is what tells the 213/428 shape (a human closed the
+// issue) apart from the 443 shape (the pipeline's own PR actually merged): 'pr-merged' only when
+// `state.prNumber` is set AND that PR's own `merged_at` is non-null, 'issue-closed' otherwise --
+// carrying the PR's `merged_at` alongside the issue's `closed_at` is what makes 443's 30-second
+// gap legible from the journal alone, without cross-referencing GitHub by hand.
+//
+// Idempotence is the OTHER load-bearing property, and it is enforced by the simplest guard
+// available: `state.externallyResolved` itself. Once written, this function returns immediately
+// on every later call for the same task -- no re-read, ever. That bounds the whole feature to at
+// most 2 extra `gh api` reads per parked task, ever (issue + PR, and the PR read only fires when
+// the issue already came back closed -- never speculatively, per the caller's own contract
+// below). The other side of that bound is deliberate, not an oversight: a task whose issue is
+// STILL open IS re-read every cycle unparkScan runs, because that is the only way a close ever
+// gets noticed. Measured cost: 3 parked tasks in today's corpus, so at most 3 extra `gh api`
+// reads per unparkScan cycle (60s by default, config.unparkScanMs) while any of them stays open
+// and unreconciled -- falling to 0 once all three are reconciled or newly parked ones settle.
+//
+// Same "never blocks, never throws" contract as every other real spawn in this file
+// (command-timeout.js's own header, action 2.1b): a failed read -- non-zero exit, a spawnSync
+// timeout, unparsable JSON, from either the issue read or the PR read -- journals
+// `reconcile-scan-failed {step, exit, timedOut}` and returns without writing anything, so the
+// SAME task is simply re-attempted next cycle, same as an ordinary `unpark-scan-failed`. Nothing
+// here ever throws past its own boundary, and the caller wraps the call in try/catch anyway (same
+// belt-and-suspenders as abandonCleanup's own call site below) so one task's reconciliation
+// blowing up can never abort the scan for every other task in the same pass.
+//
+// Explicitly OUT of scope, on purpose, left for a different action if it's ever wanted:
+//   - a non-terminal task (still PLAN/IMPLEMENT/...) whose issue closes mid-flight -- a stronger
+//     signal ("stop working now") than this function's "the outcome is already settled", but a
+//     different decision with different failure modes, not this one's to make;
+//   - a DONE task whose issue is later reopened;
+//   - moving anything on the board -- the board is already correct in all three measured cases,
+//     there is nothing here to move.
+function reconcileExternalClosure(deps, config, taskDir, task, state) {
+  // The guard IS the idempotence contract -- see header. Once this fires, this function is a
+  // no-op for this task forever, by construction, with no separate "already reconciled" flag to
+  // keep in sync.
+  if (state.externallyResolved) return;
+
+  const ghRepo = (config && config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const journal = (event, detail) => appendEvent(taskDir, state.state, event, detail);
+
+  const issueResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${task.issue}`], {}, config);
+  const issueExit = normalizeExit(issueResult);
+  if (issueExit !== 0) {
+    journal('reconcile-scan-failed', { step: 'issue', exit: issueExit, timedOut: issueResult.timedOut === true });
+    return;
+  }
+
+  let issue;
+  try {
+    issue = JSON.parse(issueResult.stdout);
+  } catch {
+    journal('reconcile-scan-failed', { step: 'issue', exit: issueExit, timedOut: false, reason: 'unparsable' });
+    return;
+  }
+
+  // Still open -- exactly the case that must be re-read next cycle, not journalled as any kind
+  // of failure. No `externallyResolved` is written, so the guard above lets it straight through
+  // again on the next call.
+  if (!issue || issue.state !== 'closed') return;
+
+  const closedAt = (issue && issue.closed_at) || null;
+  let via = 'issue-closed';
+  let mergedAt = null;
+
+  // The PR read only happens here -- prNumber present AND the issue already confirmed closed --
+  // never speculatively (a park/abandon with no PR yet, or one whose issue is still open, never
+  // costs this second read at all).
+  if (state.prNumber) {
+    const prResult = runSync(deps, 'gh', ['api', `repos/${ghRepo}/pulls/${state.prNumber}`], {}, config);
+    const prExit = normalizeExit(prResult);
+    if (prExit !== 0) {
+      journal('reconcile-scan-failed', { step: 'pr', exit: prExit, timedOut: prResult.timedOut === true });
+      return; // the issue read succeeded but the PR read didn't -- retry the whole thing next cycle
+    }
+    let pr;
+    try {
+      pr = JSON.parse(prResult.stdout);
+    } catch {
+      journal('reconcile-scan-failed', { step: 'pr', exit: prExit, timedOut: false, reason: 'unparsable' });
+      return;
+    }
+    if (pr && pr.merged_at) {
+      via = 'pr-merged'; // the 443 shape -- the pipeline's own change actually merged
+      mergedAt = pr.merged_at;
+    }
+    // else: a PR exists but never merged -- still the 213/428 shape, `via` stays 'issue-closed'.
+  }
+
+  const externallyResolved = {
+    via,
+    closedAt,
+    prNumber: state.prNumber || null,
+    mergedAt,
+    at: new Date().toISOString(),
+  };
+  writeState(taskDir, { ...state, externallyResolved });
+  journal('reconciled-externally', externallyResolved);
+}
+
 // unparkScan(queueDir, journalRoot, config, deps, scanState) -- one pass over every journaled
 // task. For each PARKED kind:"card" task with a park-comment anchor not yet acted on, comment-
 // scan.js's scanForMatch fetches the issue's comments after that anchor (paginated, allowlisted,
@@ -528,6 +1056,19 @@ function abandonCleanup(deps, config, taskDir, id, task, state) {
 // the issue is allowed. `scanState` (comment-scan.js's createScanState()) is a fresh one by
 // default -- callers that run this repeatedly (state-machine.js's runForever) pass one they
 // created once and keep across cycles, so the collaborator cache and backoff table persist.
+//
+// action 5.1b: BEFORE the retry/abandon comment scan below, every PARKED *or* ABANDONED task
+// (readJsonSafe's `state.state`, not this loop's own filter -- an ABANDONED task never reaches
+// the comment-scan section at all, see the `continue` a few lines down) gets a chance at
+// `reconcileExternalClosure` above. It runs first, unconditionally, and its own guard (already
+// reconciled? issue still open? no prNumber?) is what decides whether it actually spends an API
+// call -- NOT any check in this loop, so there is no ordering hazard where a "skip reconciliation
+// this time" decision here could also accidentally skip the comment scan for a still-PARKED task.
+// Wrapped in try/catch on top of reconcileExternalClosure's own internal never-throws contract,
+// same belt-and-suspenders as abandonCleanup's own call site below: this loop runs once per
+// journaled task per cycle, and one task's reconciliation misbehaving must never stop the daemon
+// (a throw out of unparkScan kills it -- state-machine.js's runForever) or skip every task after
+// it in `ids`.
 async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = commentScan.createScanState()) {
   const ghRepo = (config && config.ghRepo) || 'Crazz-Org/SPO-WebClient';
   const ids = listTaskIds(journalRoot);
@@ -536,10 +1077,24 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
   for (const id of ids) {
     const taskDir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(taskDir, 'state.json'));
-    if (!state || state.state !== 'PARKED') continue;
+    if (!state || (state.state !== 'PARKED' && state.state !== 'ABANDONED')) continue;
 
     const task = readJsonSafe(path.join(taskDir, 'task.json'));
     if (!task || task.kind !== 'card' || !task.issue) continue;
+
+    try {
+      reconcileExternalClosure(deps, config, taskDir, task, state);
+    } catch (err) {
+      appendEvent(taskDir, state.state, 'reconcile-scan-failed', {
+        step: 'unexpected',
+        error: String((err && err.message) || err),
+      });
+    }
+
+    // ABANDONED is terminal -- it was never part of the retry/abandon comment scan before this
+    // action (the loop's original filter was `state.state !== 'PARKED'`) and reconciling it does
+    // not change that; only reconcileExternalClosure runs for it.
+    if (state.state !== 'PARKED') continue;
 
     const anchor = findParkAnchor(readJournalLines(taskDir));
     if (!anchor || anchor.alreadyHandled) continue;
@@ -584,8 +1139,16 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
     // state.json says ABANDONED, that fact is durable on disk, so a daemon crash at any point
     // after this line -- mid-ack, mid-cleanup -- resumes into a task that is already correctly
     // terminal, never one an interrupted write left ambiguous.
+    // Re-read state.json rather than spreading the in-memory `state` captured at the top of this
+    // loop iteration: reconcileExternalClosure runs EARLIER IN THE SAME CYCLE and writes
+    // `externallyResolved` to disk, so spreading the stale snapshot silently drops it. That is
+    // not hypothetical for the shape this reconciler exists for -- a maintainer who fixes a card
+    // by hand and closes its issue may well also reply `abandon` on it (the 213/428 shape), and
+    // the two land in the same cycle. Losing the field costs a second issue read and a DUPLICATE
+    // `reconciled-externally` line in an append-only journal on the next cycle, breaking the
+    // "at most 2 reads per task, ever" bound this feature is budgeted on.
     writeState(taskDir, {
-      ...state,
+      ...(readJsonSafe(path.join(taskDir, 'state.json')) || state),
       state: 'ABANDONED',
       reason: 'abandoned-by-maintainer',
       updatedAt: new Date().toISOString(),
@@ -616,9 +1179,15 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
 module.exports = {
   buildParkComment,
   postParkComment,
+  buildDiagnoseSurfaceComment,
+  postDiagnoseSurfaceComment,
+  normalizeFindingsPayload,
+  buildValidateFindingsComment,
+  postValidateFindingsComment,
   parseCommentId,
   RETRY_ABANDON_LINE,
   unparkScan,
+  reconcileExternalClosure,
   shouldScanUnpark,
   findParkAnchor,
   reEnqueueTask,

@@ -329,9 +329,14 @@ module.exports = {
   ghRepo: 'Crazz-Org/SPO-WebClient',
 
   // Local surfaces this build reads instead of polling GitHub/the bench for state that already
-  // has one: ~/.spo-bench/nightly/latest.json (WORKTREE's/CI_CHECKS' nightly-red refusal) and
-  // ~/.spo-bench/verdicts/<sha>.json (CI_CHECKS' baseMain, for the main-moved intersection).
-  spoBenchDir: path.join(os.homedir(), '.spo-bench'),
+  // has one: ~/.spo-bench/nightly/latest.json (WORKTREE's/CI_CHECKS' nightly-red refusal),
+  // ~/.spo-bench/verdicts/<sha>.json (CI_CHECKS' baseMain, for the main-moved intersection), and
+  // (action 5.4) ~/.spo-bench/spool + ~/.spo-bench/running for `spo status`'s bench queue depth.
+  // SPO_BENCH_DIR override added by that same action, matching the SPO_ACCOUNTS_DIR /
+  // SPO_WORKTREES_DIR / SPO_PRODUCT_REPO pattern already established below -- the test suite's
+  // isolatedEnv() (test/helpers.js) points this at a throwaway tmp dir for every `spo status`
+  // subprocess it spawns, so no test ever reads the maintainer's real ~/.spo-bench.
+  spoBenchDir: process.env.SPO_BENCH_DIR || path.join(os.homedir(), '.spo-bench'),
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //
@@ -384,11 +389,16 @@ module.exports = {
   // The Status column a raw report's card is filed into -- a human moves it out (by replying
   // "confirm"/"discard" on the issue, per report-intake.js's reportConfirmScan; this is a
   // comment-driven trigger, the card's OWN column never has to move for the pipeline to notice).
-  // Deliberately not "Parked": SPO-WebClient's scripts/board-move.sh disarms the driver-scope
-  // marker of whatever checkout the move runs from on a move to Done/Parked -- this repo has no
-  // task worktree for these moves (cwd = config.productRepo, same as pullBoard/makeTask), and
-  // "Intake"/"Todo" both avoid that branch entirely. A new Status option on the product's
-  // project board -- see orchestrator/README.md § Report intake for the one-time board setup.
+  // Deliberately not "Parked", but NOT for the reason this comment used to give. It claimed
+  // scripts/board-move.sh disarms the driver-scope marker of whatever checkout the move runs
+  // from on a move to Done/Parked. Re-read on 2026-09-01 while verifying action 5.1b, which
+  // moves cards to "Parked" from exactly this cwd: the live SPO-WebClient scripts/board-move.sh
+  // is 125 lines of `gh api graphql` -- resolve the option id, write, re-read to confirm -- with
+  // no git operation, no file write and no disarm branch anywhere in it. The claim is stale,
+  // left over from the retired hook layer. The real reason "Intake" is its own column is that a
+  // raw, unconfirmed report is not a parked pipeline card and a maintainer must not have to tell
+  // them apart. A new Status option on the product's project board -- see
+  // orchestrator/README.md § Report intake for the one-time board setup.
   // SPO_REPORT_INTAKE_COLUMN overrides.
   reportIntakeColumn: process.env.SPO_REPORT_INTAKE_COLUMN || 'Intake',
 

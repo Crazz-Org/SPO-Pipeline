@@ -15,8 +15,11 @@
 //     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
 //     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
 //     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
-//     numTurns, raw}. `deps.spawnSync` is an injection point for tests (and nothing else) --
-//     production code never passes it.
+//     numTurns, durationS, raw}. `deps.spawnSync` is an injection point for tests (and nothing
+//     else) -- production code never passes it. `durationS` (seconds, wall clock measured around
+//     the spawn itself) is journaled as `duration_s` -- doc/state-machine-spec.md's Observability
+//     section already documented that field before any code wrote it (measured 2026-09-01: zero
+//     of the 19 corpus journals' llm-call events carried it); true as of this change.
 //
 //     Token accounting (maintainer decision, 2026-08-31): the pool is Claude Max SUBSCRIPTION
 //     accounts with a quota, never metered API billing, so a dollar figure never meant money
@@ -389,7 +392,19 @@ async function invokeClaudeReal(opts, deps = {}) {
     spawnOpts.timeout = opts.deadlineMs;
   }
 
+  // duration_s (action 5.4, doc/state-machine-spec.md § Observability already documented this
+  // field before any code wrote it -- measured 2026-09-01: zero of the 19 corpus journals'
+  // llm-call events carried it). Measured around the spawn itself, not the whole function
+  // (promptText/argv/env prep above is sub-millisecond and not what a maintainer means by "how
+  // long did this call take"), and captured BEFORE any of the branches below so every one of
+  // them -- success, spawn error, signal kill, deadline timeout, parse failure -- reports the
+  // real wall-clock time this attempt burned. That matters most for exactly the failure a
+  // maintainer is most likely to be staring at: a deadline-killed call still ran for the full
+  // deadline, and previously that cost was invisible (ZERO_TOKENS records tokens as 0, which is
+  // honest, but said nothing about time spent).
+  const startedAt = Date.now();
   const spawnResult = spawnSyncFn('claude', argv, spawnOpts);
+  const durationS = (Date.now() - startedAt) / 1000;
   const rawExit = spawnResult.status === undefined ? null : spawnResult.status;
 
   // Deadline kill FIRST, before the generic `error` branch. When spawnOpts.timeout fires, Node
@@ -426,6 +441,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,
+      durationS,
       raw: rawExit,
     };
   }
@@ -439,6 +455,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,
+      durationS,
       raw: rawExit,
     };
   }
@@ -451,6 +468,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,
+      durationS,
       raw: rawExit,
     };
   }
@@ -472,6 +490,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,
+      durationS,
       raw: exit,
     };
   }
@@ -493,13 +512,14 @@ async function invokeClaudeReal(opts, deps = {}) {
       sessionId,
       ...tokens,
       numTurns,
+      durationS,
       apiErrorStatus: parsed.api_error_status,
       terminalReason: parsed.terminal_reason,
       raw: exit,
     };
   }
 
-  return { ok: true, result: parsed.result, sessionId, ...tokens, numTurns, raw: exit };
+  return { ok: true, result: parsed.result, sessionId, ...tokens, numTurns, durationS, raw: exit };
 }
 
 // snake_case -> camelCase, e.g. "root_cause" -> "rootCause". Used to bridge one real gap: every
@@ -657,6 +677,13 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       sessionId: result.sessionId,
       ...tokenFieldsFrom(result),
       numTurns: result.numTurns,
+      // duration_s: spelled with the underscore doc/state-machine-spec.md's Observability
+      // section already used to describe this event, not tokenFieldsFrom's camelCase convention
+      // -- see invokeClaudeReal's own comment for why it's measured around the spawn and present
+      // on every branch (success, error, signal, deadline timeout) except the one where `claude`
+      // never actually ran (an unreadable oauthTokenFile) -- undefined there, which
+      // JSON.stringify drops from the journal line rather than writing a false "0s".
+      duration_s: result.durationS,
       ok: result.ok,
     });
 
@@ -726,6 +753,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     sessionId: raw.sessionId,
     ...tokenFieldsFrom(raw),
     numTurns: raw.numTurns,
+    duration_s: raw.durationS, // see the override branch above for why this is snake_case
     ok: raw.ok,
   });
 

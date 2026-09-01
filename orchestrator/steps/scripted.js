@@ -38,6 +38,8 @@ const { moveCard } = require('../board');
 const { classifyCommand, classTimeoutMs, isSpawnTimeout } = require('../command-timeout');
 const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline } = require('../task-values');
 const { checkRegressions } = require('../invariants');
+const { summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
+const { formatTokenCount } = require('../tokens');
 
 function lastLines(text, n = 20) {
   if (!text) return '';
@@ -1772,9 +1774,76 @@ async function realMerge(ctx, deps = {}) {
 //
 // Board sync (Done + a short comment) runs from the worktree cwd, exactly like WORKTREE's claim
 // -- the same "npm aliases need a product cwd" rule -- and BEFORE the worktree is removed.
-function finalComment(ctx) {
+// finalComment(ctx, deps) -- action 5.2: enriches the three-line Done comment ("Merged via
+// claude-pipe/<id>.", the PR number, "Pipeline run complete.") with what the card actually cost
+// and how hard it was, because a maintainer closing an issue used to learn neither. Everything
+// below comes from task-summary.js's summarizeTask(ctx.taskDir), the SAME reduction
+// sumJournalBillableTokens (below) and park-loop.js's postParkComment both use -- one read of
+// this task's journal, one set of counting rules, not three independently-maintained ones.
+//
+// Token line: "not recorded" rather than "0" when no `llm-call` in the journal carried a numeric
+// billableTokens at all (107 of 110 events in the corpus this action was measured against --
+// only issue-471's 3 calls postdate token capture shipping, 2026-08-31). A journal whose one real
+// call genuinely reports billableTokens: 0 still renders "0" -- summarizeTask's hasTokenData is
+// keyed off FIELD PRESENCE, never off whether the sum happens to be zero, which is the whole
+// point (see its own header).
+//
+// Duration line: labelled "pipeline time (first journal event to now)", deliberately NOT just
+// "duration" -- measured on issue-471, the journal itself spans 15m12s (first event to `finished`)
+// while the figure recorded everywhere else for that same card is 42 minutes, because report
+// pull, intake, confirm and triage all run before this taskDir's journal.jsonl exists at all. An
+// unlabelled duration here would read as contradicting the project's own record of the same card.
+// The end boundary is "now" (deps.now, same injectable-clock convention unparkScan already uses),
+// not the `finished` event's own timestamp, because that event is appended AFTER this comment is
+// built and written (see realFinish below) -- the two are microseconds apart in practice.
+//
+// Attempts: only counters that are genuinely positive get a row (formatAttemptLines) -- a card
+// that went straight through must not be padded with a row of zeroes, and DIAGNOSE/VALIDATE/CI-
+// implement-retry counts are cumulative across this taskDir's whole history (every retry reuses
+// the same taskDir -- see task-summary.js's own header), not just whichever run happened to
+// finish.
+function finalComment(ctx, deps = {}) {
   const lines = [`Merged via claude-pipe/${ctx.id}.`];
   if (ctx.prNumber) lines.push(`PR #${ctx.prNumber}.`);
+
+  const summary = summarizeTask(ctx.taskDir);
+  lines.push(
+    `Billable-weighted tokens: ${summary.hasTokenData ? formatTokenCount(summary.billableTokens) : 'not recorded'}`
+  );
+
+  // Elapsed, and -- when the card ever parked -- how much of it was spent waiting on a human.
+  // Measured, and the reason the bare number could not ship: on 6 of the 19 corpus tasks the
+  // elapsed span is dominated by parked time, by up to 50x. issue-213 renders 48h44m49s against
+  // about 1h24m of actual machine work across 2 parks; issue-428, 47h30m05s against ~59m.
+  // "Pipeline time: 47h30m05s" with nothing beside it is a worse lie than the one erratum 3
+  // warned about (15m12s vs the 42 minutes recorded for #471) -- same class, opposite direction,
+  // and an order of magnitude bigger. The parked span is summed exactly from the journal, never
+  // from a "gaps longer than N minutes" heuristic.
+  if (summary.firstEventTs) {
+    const nowMs = typeof deps.now === 'number' ? deps.now : Date.now();
+    const duration = formatDuration(nowMs - Date.parse(summary.firstEventTs));
+    if (duration) lines.push(`Elapsed (first journal event to now): ${duration}`);
+
+    if (summary.parksCount > 0) {
+      let parkedMs = summary.parkedMs;
+      // An open park (parked with nothing after it) is closed against this same `now`, so the two
+      // numbers on the card are always read off one clock.
+      if (summary.openParkTs) {
+        const open = nowMs - Date.parse(summary.openParkTs);
+        if (Number.isFinite(open) && open > 0) parkedMs += open;
+      }
+      const parked = formatDuration(parkedMs);
+      const plural = summary.parksCount === 1 ? 'park' : 'parks';
+      if (parked) lines.push(`  of which ${parked} parked waiting for a maintainer, across ${summary.parksCount} ${plural}.`);
+    }
+  }
+
+  const attemptLines = formatAttemptLines(summary);
+  if (attemptLines.length > 0) {
+    lines.push('Attempts:');
+    lines.push(...attemptLines);
+  }
+
   lines.push('Pipeline run complete.');
   return lines.join('\n') + '\n';
 }
@@ -1783,23 +1852,23 @@ function finalComment(ctx) {
 // cache-creation + output, cache-read excluded -- see orchestrator/tokens.js's header for why),
 // summed across every `llm-call` event this task's journal recorded. Dollar figures are retired
 // entirely (maintainer decision, 2026-08-31); this replaces the old sumJournalCost, same
-// "journal is the only ledger" reasoning, same defensive read.
+// "journal is the only ledger" reasoning. Action 5.2 moved the actual read/parse/sum into
+// task-summary.js's summarizeTask (shared with finalComment above and park-loop.js's
+// postParkComment) -- this stays as a thin wrapper, unchanged signature and return type, so the
+// 'finished' event below (and any other existing caller) doesn't have to change shape, and so
+// there remains exactly ONE place that sums a journal's billable tokens, not a second one grown
+// beside it.
 function sumJournalBillableTokens(taskDir) {
-  const file = path.join(taskDir, 'journal.jsonl');
-  if (!fs.existsSync(file)) return 0;
-  let total = 0;
-  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-    if (!line) continue;
-    try {
-      const event = JSON.parse(line);
-      if (event.event === 'llm-call' && typeof event.billableTokens === 'number') total += event.billableTokens;
-    } catch {
-      // malformed line -- skip, never fail FINISH over a journal read
-    }
-  }
-  return total;
+  return summarizeTask(taskDir).billableTokens;
 }
 
+// realFinish's own `board:move -- <issue> Done` is deliberately NOT routed through board.js's
+// moveCard/COLUMN_BY_STATE: moveCard's whole contract is "never blocks the task" (board.js's own
+// header), because a stale board display is cosmetic everywhere else. It is not cosmetic here --
+// a card the daemon cannot mark Done is not actually done, so this is the one board move in the
+// whole system that must block on failure, via spawnStep's own ParkSignal path below, same as it
+// always has. Adding a `FINISH: 'Done'` entry to COLUMN_BY_STATE would silently arm moveCard's
+// non-blocking path for it instead -- see board.js's header for the matching note.
 async function realFinish(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -1808,10 +1877,24 @@ async function realFinish(ctx, deps = {}) {
   const move = spawnStep(ctx, deps, 'FINISH', 'npm', ['run', 'board:move', '--', String(issue), 'Done'], {
     cwd: worktreePath,
   });
-  if (move.exit !== 0) throw new ParkSignal('finish-failed', { step: 'board-move', exit: move.exit });
+  // Action 5.1a: journal this move with board.js's own `board-move`/`board-move-failed`
+  // vocabulary, not just spawnStep's compact {argv, exit, ms} line. Measured: 14 of the 18 tasks
+  // in the journal corpus have `Merging` as their LAST journalled board-move, while the board
+  // itself shows `Done` -- not 14 broken cards, one missing event, because this move has always
+  // gone straight to `gh`/`git` with no appendEvent of its own. Without this, anything
+  // reconciling journal against board reads 14 healthy cards as divergent. The failure branch
+  // journals board-move-failed BEFORE the throw, deliberately: the ParkSignal below is existing
+  // contract (this is the one move in the whole daemon that MUST block -- a card that cannot be
+  // marked Done is not done) and must stay, but the attempt belongs on the record either way,
+  // exactly like every other state's board-move-failed.
+  if (move.exit !== 0) {
+    appendEvent(ctx.taskDir, 'FINISH', 'board-move-failed', { column: 'Done', exit: move.exit });
+    throw new ParkSignal('finish-failed', { step: 'board-move', exit: move.exit });
+  }
+  appendEvent(ctx.taskDir, 'FINISH', 'board-move', { column: 'Done' });
 
   const commentFile = path.join(ctx.taskDir, 'final-comment.md');
-  fs.writeFileSync(commentFile, finalComment(ctx));
+  fs.writeFileSync(commentFile, finalComment(ctx, deps));
   const comment = spawnStep(ctx, deps, 'FINISH', 'gh', [
     'issue',
     'comment',
@@ -1854,4 +1937,6 @@ module.exports = {
   realFinish,
   preserveWorktreeWip,
   prepareJudgeInputs,
+  finalComment,
+  sumJournalBillableTokens,
 };

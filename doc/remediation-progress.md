@@ -5,11 +5,12 @@ This file is what the plan *turned out to be* once executed: what is done, what 
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
 
-**State as of 2026-09-01.** `main` = `dd5a97d` — **C4 is merged** (PR #66, seven commits), on top
-of C3 (PR #63), the comment-scan hotfix (PR #64) and the C3 handoff (PR #65). Suite **1032
-passing, 0 failing** (894 at the start of C4). Daemon + dashboard **running** in `--real` on C4
-code since 2026-09-01 07:40:02 CEST, verified scanning with the fixed `gh api` argv and
-journalling nothing.
+**State as of 2026-09-01.** **C5 is done** (seven commits on `claude-crazz/c5-truthful-kanban`),
+on top of C4 (PR #66), C3 (PR #63), the comment-scan hotfix (PR #64) and the C3 handoff (PR #65).
+Suite **1177 passing, 0 failing** (1032 at the start of C5), and green under UTC, Europe/Paris,
+Asia/Kolkata, America/Los_Angeles and Pacific/Kiritimati — C5 was the first chantier to run the
+suite outside one timezone, and it found five failures past UTC+13, two of them pre-existing.
+Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 
 ## Progress
 
@@ -19,9 +20,11 @@ journalling nothing.
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
 | **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
-| C5–C7 | not started |
+| **C5** — a truthful kanban & observability | **DONE**, seven commits |
+| C6–C7 | not started |
 
-Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → **1032** (end of C4).
+Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
+(end of C5).
 
 ## C3 commits (one per action, in order)
 
@@ -47,6 +50,89 @@ Plus, outside the plan, the hotfix the soak immediately forced: `5a6d69a` (`gh a
 | 4.6 | `4f68385` | the retry's remote-branch delete no longer destroys an open PR |
 | — | `e25e50e` | the same preservation applied to `abandon`, which 4.6's verification caught disagreeing with `retry` |
 | 4.4 | `9cf47f2` | bounded auto-retry for a closed allowlist of transient parks |
+
+## C5 commits (one per action; 5.0 and 5.1b are not in the plan)
+
+| action | commit | what it does |
+|---|---|---|
+| — | `b9c300c` | C5's own measurement: the board, the journal and the plan's framing, re-measured |
+| 5.0 | `ab282e6` | close the class that posted 140 comments to a live issue (killswitch + source sweep) |
+| 5.1 | `526a405` | board moves leave a record, stop repeating themselves, and survive a pre-worktree park |
+| 5.1b | `57944ec` | reconcile a parked task against the issue it owns |
+| 5.2 | `922ba4f` | tokens, elapsed-minus-parked and attempt history on the card |
+| 5.3 | `15dfa59` | the judge findings stop being journalled and lost |
+| 5.4 | `900140c` | `spo status` stops naming the wrong thing on every parked card |
+| 5.5 | `fb28427` | the dashboard stops overstating what it knows |
+
+## What C5 corrected in the plan, and what it added
+
+**5.1's premise was the wrong half.** The plan calls it "missing board moves". Measured: 14 of 18
+tasks' journals stop at `Merging` while the board reads `Done`, because `realFinish` moved the
+card without ever journalling a `board-move`. That single absent event, not fifteen missing moves,
+is the divergence — and it had to close before any reconciler was buildable.
+
+**The plan's prescribed mechanism for 5.1's pre-worktree move was unnecessary.** It asks for a
+direct `gh api graphql updateProjectV2ItemFieldValue` mutation; `board.js` already had a
+worktree-free mover (`moveIssueToColumn`) in production use by two callers.
+
+**5.1b is not in the plan at all**, and the measurement demanded it. Three cards diverge; in all
+three the journal is the stale side; and one of them (#443) is not a human resolution but a **false
+park** — `pr:wait` read `closed false` at 13:17:57 and PR #447 merged at 13:18:27 with no close and
+no reopen in its timeline, after which the maintainer abandoned an already-merged change. Nothing
+in the system would ever have noticed. Filed as a MERGE defect; the reconciler is what catches it.
+
+**5.3's `DIVERGES` could not be rendered at all** until the `citation-verifier` event was extended:
+the contract requires `{verdict, entries}` and the event journalled `{verdict}`. The corpus's one
+real DIVERGES is unrecoverable.
+
+**There is no `spo report` subcommand.** The parking rate lives under `spo tokens`. The
+disagreement the C4 handoff described was real; the command name was not.
+
+**The intake-spend caveat is worse than C4 stated.** It is not that `spo tokens` cannot see intake
+spend for want of a `taskDir` — `journal/daemon.jsonl` holds **zero `llm-call` events of any
+kind**, so that spend is journalled nowhere. Any "today's spend" figure is short by an unknown
+amount, and `spo status` now says so.
+
+**Two production outages surfaced that nothing was reporting.** The unpark scan — the maintainer's
+whole `retry`/`abandon` channel — failed **238 consecutive times over 33 hours** (2026-08-30 10:11
+→ 2026-08-31 19:52) in silence; it has since recovered on its own and the cause is unrecoverable
+because the event never captured stderr. And `usage-snapshot.json` had been three days stale under
+a fresh page timestamp. Both are now visible; the first is also filed.
+
+**The eighth production bug of the JSON-string class.** All 16 `change-validator` events in the
+corpus carry `findings` as a JSON-encoded STRING, so `handleValidate`'s REJECT path
+(`Array.isArray`) has never once threaded a finding into the next IMPLEMENT — the same shape that
+makes C3's protected-files guard fail open. Fixed in passing; the guard itself is still filed.
+
+## What C5's verification found (the loop is still earning its cost)
+
+Every action had a real defect the hermetic suite passed green, and in four cases **the corpus, not
+review, is what found it**:
+
+- **A counting rule that matched no journal in existence.** 5.2 counted validate rejects as a
+  `result` event under VALIDATE — which action 1.6 does append — and returned **zero for all 19
+  tasks**, including the only card ever rejected, whose journal predates 1.6.
+- **"0 tokens" and "not recorded" were the same value.** Every failed LLM call journals
+  `{tokensSource: null, billableTokens: 0}`, so keying on the number printed `0` on a card that
+  burned a transport failure, disagreeing with `spo tokens`'s `n/a` for the same journal.
+- **A feature that would not have surfaced the outage it was built for.** 5.4's failing-scan
+  counter broke on `unpark-scan-backoff-skip`, and the real journal interleaves
+  `failed, skip, …, failed`. It reported the 33-hour, 238-failure outage as "x1 since 19:52:07".
+- **A fix with no test that could detect its own reversal on the machine the bug was measured on.**
+  5.5's local/UTC boundary test probed 23:30 local; at UTC+2 that is the same UTC date, so
+  reverting the fix passed all 1175 tests under both Europe/Paris and a UTC CI. The disagreement is
+  on the other side of midnight.
+
+And three unpinned orderings that shipped green when inverted: the DIAGNOSE notice moved after the
+diagnosis it announces, FINISH's `board-move` moved after the comment that can park (losing the
+record of a card that did reach `Done`), and the `change-validator` verdict moved after the
+findings comment. A page-wide `/STALE/` regex also let a full revert of the nightly-tile fix walk
+through, because a different line contained the word.
+
+Two tests turned out to prove nothing at all: a "stays pure" test with no filesystem spy (a
+defensive `try { read } catch {}` — how anyone would write it in this codebase — survives a
+throwing spy, so the spy has to COUNT), and a "never mistaken for a backoff entry" test whose task
+had no journal directory and therefore produced no row for any implementation.
 
 ## C4's corrections to the plan
 
@@ -489,3 +575,146 @@ Two mechanisms the docs named turned out never to have existed at all: `BUDGET_B
   so the first real PLAN after merge is the one that proves `files_to_change` is emitted; until
   then the guard fails open and journals `plan-files-undeclared`. Grep that event before promoting
   the key to `required`.
+
+## C5's own measurement, 2026-09-01 (re-measured from scratch before writing 5.1)
+
+Everything below was measured against the live board, `journal/*/`, and the product repo's API on
+2026-09-01, not carried over from the section above. Where it corrects that section, it says so.
+
+### The board is truthful; the journal is stale — and the mechanism is a built-in workflow
+
+Last journalled `board-move` vs the live board, all 18 tasks:
+
+| journal state | last `board-move` | board today | count |
+|---|---|---|---|
+| `DONE` | `Merging` | `Done` | **14** |
+| `PARKED` | `Parked` | `Done` | 2 (213, 428) |
+| `ABANDONED` | `Parked` | `Done` | 1 (443) |
+| `PARKED` | `Parked` | `Parked` | 1 (385) |
+
+**14 of 18 cards' journals stop at `Merging`.** That is not four divergences plus noise — it is the
+FINISH gap dominating everything: `realFinish` moves the card to `Done` with its own `spawnStep`
+and never writes a `board-move` event (`orchestrator/steps/scripted.js:1808`). Any reconciler
+keying on `board-move` reads 14 of 18 healthy cards as divergent. **Fix this first in 5.1; without
+it a reconciler is unbuildable.**
+
+The board's `Done` on 213/428/443 was **not** a human dragging a card. The project has the
+built-in **"Item closed"** workflow enabled (`Status → Done`, re-measured live today), so closing
+the issue moves the card by itself. That corrects the earlier section's "a human then resolved it
+by hand": a human closed the *issue*; GitHub moved the *card*. It also means issue closure is the
+same signal the board itself already trusts — a reconciler keying on it is not inventing a source
+of truth, it is reading the one the board uses.
+
+Workflows re-measured today: `Pull request linked to issue` is now **false** (the board audit's
+one functional FIX has landed), `Item closed` and `Item reopened` remain true. The `Status` field
+is clean: 10 options, correct pipeline order, the 3 legacy names gone.
+
+### #443 was not a human resolution at all — it was a false park
+
+| time (2026-08-30) | event |
+|---|---|
+| 13:15:35 | `gh pr merge 447` → `pr-merge-enqueue exit 0`; `added_to_merge_queue` |
+| 13:17:57 | `npm run pr:wait -- 447` exits **1** after 141.5 s → `ParkSignal('pr-closed-unmerged')` |
+| 13:17:59 | card moved to `Parked`; 13:18:00 park comment posted |
+| 13:18:26 | `removed_from_merge_queue` by `github-merge-queue[bot]` |
+| 13:18:27 | **PR #447 merged** (`merged_at` = `closed_at` = 13:18:27Z) |
+| 13:53:53 | maintainer replies `abandon` — on a card whose PR had merged 35 minutes earlier |
+
+PR #447's own timeline records **no close and no reopen before 13:18:27**. `scripts/pr-wait.sh`
+exits 1 only on a literal `closed false` read, so the pipeline turned one inconsistent API read,
+during merge-queue processing, into a terminal verdict — and the park comment then misled the
+maintainer into abandoning a merged change. This is a MERGE-step defect (a single unconfirmed read
+treated as terminal), **not C5's to fix**, and it is filed. It is listed here because it is the
+strongest argument for the reconciler: nothing else in the system would ever have noticed, and the
+reconciler would have noticed within one scan interval instead of never.
+
+### What 5.1's other three sub-items are actually worth (measured, not assumed)
+
+- **Pre-worktree park moves: 6 real occurrences**, all `board-move-skipped {reason: "no worktree"}`
+  — issue-385 ×5, issue-247 ×1. Never a `board-move-failed` in the whole corpus.
+- **Redundant consecutive moves: 12**, across 7 tasks (201, 213, 247, 385, 428, 439, 452) — every
+  one an `Implementing → Implementing` repeat on an IMPLEMENT retry. `Implementing` has 42 moves
+  against `Planning`'s 29; the difference is exactly this.
+- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park.
+  DIAGNOSE has no column and no card-visible trace at all today.
+
+### 5.3's corpus is real, and its payload shape has two traps
+
+**7 `PASS_WITH_FINDINGS` verdicts with non-empty findings, and 1 `citation-verifier: DIVERGES`** —
+all journalled, none ever surfaced. Two errata for whoever writes 5.3:
+
+- Findings carry **`title` XOR `summary`, never both**: 4 of 9 have `title` (with `detail`), 5 have
+  `summary`. A renderer that reads only one key drops half the corpus.
+- The `citation-verifier` event journals **`{verdict}` and nothing else**
+  (`orchestrator/state-machine.js:931`). There is no record of *what* diverged, so 5.3 cannot
+  render a DIVERGES until that event is extended to carry the verifier's payload.
+
+### 5.4: `spo status` names the wrong park reason on every parked card
+
+`bin/spo:277` prints the **last journal event name**, not the park reason:
+
+    issue-213  PARKED  unpark-scan-failed
+    issue-385  PARKED  unpark-scan-failed
+    issue-428  PARKED  unpark-scan-failed
+
+The real reasons, sitting correctly in each `state.json`, are `diagnose-duplicate-root-cause`,
+`prompt-missing-placeholder:citations`, `diagnose-duplicate-root-cause`. The unpark scan appends
+`unpark-scan-failed` forever (238 of them on issue-213 alone), so it buries the one field the line
+exists to show. 3 of 3 parked cards are misnamed today. `DONE` rows read `done` only by
+coincidence — that happens to be the last event's name.
+
+Also confirmed: **there is no `spo report` subcommand.** The parking rate lives in `bin/spo:390`
+under `spo cost`/`spo tokens`, and its denominator is `report.parked + ...` computed there, against
+`console/collect.js:423`'s three-way terminal (`DONE || PARKED || ABANDONED`). The disagreement is
+real; the command name in the C4 handoff is not.
+
+### 5.0: the live-write leak class, measured end to end
+
+The whole suite was re-run under a `spawnSync` probe that logs every in-process real spawn and
+blocks `gh`/`npm`/`git push`/`git worktree`. **1032/1032 still pass, and only 5 real spawns escape,
+from 2 files:**
+
+    command-timeout.test.js   npm run board:move -- 4321 Gate
+    command-timeout.test.js   gh issue comment 4321 --repo x/y --body-file /tmp/ct-park-*/park-comment.md
+    real-steps.test.js        npm run board:move -- 504 Validation
+    real-steps.test.js        git -C /tmp/spo-judge-gate-missing-wt-*     rev-parse HEAD
+    real-steps.test.js        git -C /tmp/spo-judge-validate-missing-wt-* rev-parse HEAD
+
+So the class is real but now tiny, and nothing currently reaches `Crazz-Org/SPO-WebClient` (the
+`gh` call targets the fixture repo `x/y`). That the suite passes with all five blocked is the
+point: not one of them is load-bearing. Closing the class costs five `deps` injections plus a
+shared killswitch, and it is worth doing **before** 5.1/5.2 touch `board.js` and `park-loop.js`.
+
+## What C5 hands C6
+
+**Still open, in the order they will bite:**
+
+- **A successful unpark scan journals nothing**, so "is the retry channel alive?" is unanswerable
+  from the journal — only "when did it last fail". That is why `spo status` renders the AGE of the
+  last failure rather than claiming a card is failing now. Do NOT close this with a heartbeat; one
+  was deliberately removed (PR #444). Filed.
+- **MERGE treats one unconfirmed `closed false` read as terminal** (`realMerge`, both copies). It
+  cost #443 a false park and a maintainer a merged change. Filed.
+- **C3's protected-files guard still fails open on every real card** — `files_to_change` arrives as
+  a JSON-encoded string. `normalizeFindingsPayload` (park-loop.js) is now the repo's parser for
+  exactly this shape and 5.3 used it to fix the same bug in handleValidate's REJECT path; the same
+  one-line treatment is what `handlePlan` needs. Do NOT promote the key to `required` first.
+- **`duration_s` has no reader.** 5.4 writes it on every `llm-call`; nothing renders it yet. The
+  first card run on C5 code will be the first with per-step timings — `spo task <id>` and the
+  dashboard are the natural surfaces.
+- **`test/lock.test.js`'s SIGTERM lock-release flake** is still there, ~1 run in 6–10 under load.
+  It did not fire during C5's verification rounds, but it once scored a surviving mutant as killed.
+
+**Two habits C5 would keep:**
+
+- **Run the suite under more than one timezone.** `TZ=Pacific/Kiritimati node --test test/*.test.js`
+  found five failures nobody knew about, two of them older than this chantier, and one in a file
+  C5 never touched.
+- **Run the built behaviour against `journal/*/` before believing a test.** Four of C5's seven
+  actions shipped a wrong derived number that the hermetic suite passed green, and in every case
+  the real corpus said so in one command. The suite asserts what argv a module builds; it cannot
+  assert that a rule matches any journal that exists.
+
+**Nothing is in flight.** Queue empty, no open PRs from C5's own work, no worktrees left behind.
+Merging this needs a `git pull` in `/home/crazz/SPO-Pipeline` to reach the daemon — the merge alone
+deploys nothing, and the pull SIGTERMs any in-flight card.

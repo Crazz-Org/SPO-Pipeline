@@ -63,10 +63,33 @@ function writePoolDir(poolDir, entries) {
 // Isolation belongs here, in the one place every daemon subprocess goes through, rather than in
 // each test remembering to override two config keys.
 function isolatedEnv() {
+  // action 5.4: `spo status` reads the account pool and the bench directly (folding `spo
+  // accounts`'s own data in, plus ~/.spo-bench/spool + running) whenever a caller doesn't pass
+  // --accounts-dir/--bench-dir. Before this, any test that ran `spo status` through this helper
+  // without those flags silently read the MAINTAINER'S REAL ~/.claude-accounts and ~/.spo-bench
+  // -- caught by test/cli.test.js's own status test suddenly printing this machine's real
+  // "pool1"/"pool2" accounts. SPO_BENCH_DIR is a fresh, always-empty mkdtempSync, which is what
+  // makes "bench idle" the correct default for every test that doesn't set the bench up on
+  // purpose. SPO_ACCOUNTS_DIR is NOT left empty, though: real mode (`--dry-run` included --
+  // state-machine.js's callLlmStep calls accounts.pick() before ctx.dryRun ever short-circuits
+  // the spawn) parks a task immediately on a pool with zero accounts registered
+  // (NoAccountsRegisteredError). Every `runDaemonDryRun` test in this suite was, until this
+  // action, unknowingly depending on the real ~/.claude-accounts pool having at least one
+  // account in it to reach DONE -- caught by test/dry-run-demo.test.js parking the instant the
+  // isolation above was tightened. One harmless, credential-free account (no oauth-token, no
+  // extra files) is registered here so dry-run mode has something to pick without ever touching
+  // real credentials; a test that wants to exercise cooldowns/rotation for real still builds and
+  // passes its own `--accounts-dir` explicitly, which overrides this one (bin/spo's
+  // resolveAccountsDir / config.js's claudeAccountsDir both take the flag over the env var).
+  const accountsDir = mkTmp('spo-isolated-accounts-');
+  writePoolDir(accountsDir, [{ name: 'isolated' }]);
+
   return {
     ...process.env,
     SPO_PRODUCT_REPO: mkTmp('spo-isolated-product-'),
     SPO_WORKTREES_DIR: mkTmp('spo-isolated-worktrees-'),
+    SPO_ACCOUNTS_DIR: accountsDir,
+    SPO_BENCH_DIR: mkTmp('spo-isolated-bench-'),
   };
 }
 

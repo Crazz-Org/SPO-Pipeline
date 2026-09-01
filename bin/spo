@@ -2,7 +2,18 @@
 'use strict';
 // spo -- reads ONLY the journals under journal/<id>/ (never its own state).
 //
-//   spo status              queue depth, active/parked/done counts, per-task state + last event
+//   spo status              queue depth, bench queue depth (~/.spo-bench/spool,running), account
+//                            health + cooldowns, today's billable-weighted spend (with its own
+//                            "not journalled at all" caveat -- see `spo tokens`'s footer for the
+//                            fuller honesty rule this reuses), active/backoff/parked/abandoned/
+//                            done counts, and per-task state + reason. A PARKED/ABANDONED row's
+//                            third column is state.json's OWN `reason` (never the last journal
+//                            event's name -- see action 5.4's own note in cmdStatus for why that
+//                            used to print the unpark scan's retry noise instead), plus, for a
+//                            PARKED row, the unpark scan's own consecutive-failure streak if it
+//                            has one. A card in action 4.4's bounded auto-retry backoff gets its
+//                            own BACKOFF bucket (attempt number + next-run time, read off its
+//                            queue entry) instead of being silently double-counted as `active`.
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl
 //   spo parked              parked tasks + reasons
 //   spo tokens               what the pipeline has spent, in TOKENS, read back from the
@@ -124,8 +135,10 @@
 //                            orchestrator/recette.js and orchestrator/README.md § Recette.
 //
 // Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
-// Flags (accounts commands + dashboard): --accounts-dir <dir>  (default: the account pool --
-//   see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
+// Flags (accounts commands + dashboard + status): --accounts-dir <dir>  (default: the account
+//   pool -- see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
+// Flags (status): --bench-dir <dir>  (default: orchestrator/config.js's spoBenchDir,
+//   ~/.spo-bench -- dashboard's own bench path is separate, see cmdDashboard)
 // Flags (ask): --dry  --draft-file <path>
 // Flags (pull): --limit <n>  (default 5)
 // Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>
@@ -147,7 +160,7 @@ const intake = require('../orchestrator/intake');
 const autoTriage = require('../orchestrator/auto-triage');
 const reportIntake = require('../orchestrator/report-intake');
 const remoteReportPull = require('../orchestrator/remote-report-pull');
-const { tokenReport } = require('../orchestrator/tokens');
+const { tokenReport, todaySpend, formatTokenCount } = require('../orchestrator/tokens');
 const recette = require('../orchestrator/recette');
 
 function parseArgs(argv) {
@@ -159,6 +172,7 @@ function parseArgs(argv) {
     serve: false,
     port: null,
     accountsDir: null,
+    benchDir: null,
     dry: false,
     draftFile: null,
     limit: null,
@@ -184,6 +198,7 @@ function parseArgs(argv) {
     else if (a === '--serve') opts.serve = true;
     else if (a === '--port') opts.port = argv[++i];
     else if (a === '--accounts-dir') opts.accountsDir = argv[++i];
+    else if (a === '--bench-dir') opts.benchDir = argv[++i];
     else if (a === '--dry') opts.dry = true;
     else if (a === '--draft-file') opts.draftFile = argv[++i];
     else if (a === '--limit') opts.limit = argv[++i];
@@ -213,6 +228,10 @@ function resolveDirs(opts) {
 
 function resolveAccountsDir(opts) {
   return opts.accountsDir || defaultConfig.claudeAccountsDir;
+}
+
+function resolveBenchDir(opts) {
+  return opts.benchDir || defaultConfig.spoBenchDir;
 }
 
 function readJsonSafe(p, fallback) {
@@ -249,12 +268,198 @@ function readJournalLines(taskDir) {
     .filter(Boolean);
 }
 
+// ---- action 5.4 helpers -------------------------------------------------------------------
+//
+// Four things measurement (not the plan) added to `spo status`, each with its own header
+// comment at the call site below: (A) the reason column, which read the last JOURNAL EVENT's
+// name instead of state.json's own `reason` -- 3 of 3 parked cards in the live corpus were
+// misnamed by this the day it was measured (`unpark-scan-failed`, the scan's OWN retry noise,
+// on every one). (B) a card in action 4.4's bounded auto-retry backoff, which was invisible AND
+// double-counted (once in queue depth, once in `active`) because it deliberately never writes
+// PARKED. (C) bench queue depth + account health/cooldowns, folded in from the readers `spo
+// accounts`/the dashboard already use rather than re-derived. (D) today's spend, with the C4
+// handoff's caveat re-measured and restated (`orchestrator/tokens.js`'s `todaySpend`). (F) the
+// unpark scan's own failure streak -- it failed 238 consecutive times over 33 hours
+// (2026-08-30T10:11:23Z .. 2026-08-31T19:52:07Z) with nothing anywhere saying so; the
+// maintainer's entire retry/abandon channel was silently dead the whole time.
+
+// countDirEntries(dir) -- a bare readdirSync().length, wrapped so a missing directory (a dev box
+// with no bench at all, or a bench that has never spooled a job) counts as 0 rather than
+// throwing. Item C is explicit that this must not crash on an absent `~/.spo-bench`.
+function countDirEntries(dir) {
+  try {
+    if (!dir || !fs.existsSync(dir)) return 0;
+    return fs.readdirSync(dir).length;
+  } catch {
+    return 0;
+  }
+}
+
+// collectBenchQueueDepth(benchDir) -- ~/.spo-bench/spool (jobs waiting for a worker) and
+// ~/.spo-bench/running (jobs a worker currently holds). Both were empty on this machine when
+// measured (2026-09-01); this reads whatever is actually there, not a fixed shape, since neither
+// directory's file-naming convention is documented anywhere in this repo to assert against.
+function collectBenchQueueDepth(benchDir) {
+  if (!benchDir) return { spool: 0, running: 0 };
+  return {
+    spool: countDirEntries(path.join(benchDir, 'spool')),
+    running: countDirEntries(path.join(benchDir, 'running')),
+  };
+}
+
+// collectAccountsStatus(accountsDir, now) -- the SAME two reads cmdAccounts uses
+// (accounts.readRegistry + accounts.readState), not a second derivation of the pool's on-disk
+// shape. `cooling` is false the moment `cooldownUntil` is in the past -- an EXPIRED cooldown
+// (the live example in this action's own spec: `{"pool1":{"cooldownUntil":1788247210631,...}}`,
+// which is already in the past relative to "today" 2026-09-01) must render as "not cooling", the
+// same rule `spo accounts` and the dashboard's `collectAccounts` both already apply.
+function collectAccountsStatus(accountsDir, now = Date.now()) {
+  let registry;
+  try {
+    registry = accounts.readRegistry(accountsDir);
+  } catch {
+    return [];
+  }
+  if (registry.length === 0) return [];
+  const state = accounts.readState(accountsDir);
+  return registry.map((a) => {
+    const entry = state[a.name];
+    const cooldownUntil = entry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
+    const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
+    return { name: a.name, enabled: a.enabled, cooling, cooldownUntil: cooling ? cooldownUntil : null };
+  });
+}
+
+// formatRemaining(ms) -- "2h13m" style, floor-rounded (never "2h13m45.2s" -- a maintainer
+// glancing at this wants "how much longer", not sub-minute precision on a multi-hour cooldown).
+function formatRemaining(ms) {
+  // Under a minute renders as "<1m", never "0m": this formats the age of the most recent
+  // retry-channel failure, and a failure five seconds old -- the single most alarming case --
+  // otherwise printed as the single least alarming string.
+  const safe = Math.max(0, ms);
+  if (safe < 60000) return safe > 0 ? '<1m' : '0m';
+  const totalMinutes = Math.round(safe / 60000);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+
+// collectBackoffEntries(queueDir) -- id -> {transientRetries, notBefore, file} for every queue
+// entry action 4.4's finalizePark wrote via park-loop.js's reEnqueueTask (recognized by carrying
+// a `notBefore` field -- an ordinary freshly-pulled task never has one). Read from the QUEUE
+// ENTRY itself, not the journal's own `transient-retry` event, because the queue entry is what
+// actually governs when the daemon will pick this card back up (state-machine.js's
+// isEligibleNow reads `notBefore` off the task, not off the journal) -- the two carry the same
+// numbers today, but the queue entry is the one that is actually true if they ever drift.
+function collectBackoffEntries(queueDir) {
+  const map = new Map();
+  if (!queueDir || !fs.existsSync(queueDir)) return map;
+  let files;
+  try {
+    files = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return map;
+  }
+  for (const f of files) {
+    const parsed = readJsonSafe(path.join(queueDir, f), null);
+    if (!parsed || typeof parsed.notBefore !== 'string') continue;
+    const id = parsed.id || f.replace(/\.json$/, '');
+    map.set(id, {
+      transientRetries: typeof parsed.transientRetries === 'number' ? parsed.transientRetries : null,
+      notBefore: parsed.notBefore,
+      file: f,
+    });
+  }
+  return map;
+}
+
+// computeUnparkScanFailureStreak(lines) -- item F: how badly, and for how long, this card's retry
+// channel has been failing. `firstFailedAt` is the EARLIEST ts in the streak (what "failing for N
+// hours" is measured from); `lastFailedAt` is the most recent one.
+//
+// The rule is "count `unpark-scan-failed` back to the last event that is NEITHER a failure NOR an
+// `unpark-scan-backoff-skip`", and each half was measured against the real outage rather than
+// reasoned about:
+//
+//   * A backoff-skip does NOT break the streak. It is a CONSEQUENCE of the failures --
+//     comment-scan.js backs a failing issue off and then journals the skips -- so treating it as
+//     a recovery is exactly backwards. The real tail of journal/issue-213 is
+//     `failed, skip, skip, skip, skip, skip, skip, skip, failed, skip x7, failed`. Breaking on a
+//     skip reported that 33-hour, 238-failure outage as **"FAILING x1 since 19:52:07"** -- one
+//     minute of trouble instead of a day and a half. The feature built to surface the outage
+//     would not have surfaced the outage.
+//   * There is nothing positive to reset against. A SUCCESSFUL unpark scan journals no event at
+//     all (park-loop.js's unparkScan just `continue`s when the scan is ok and matches nothing),
+//     so this cannot distinguish "still failing" from "failed, then recovered silently" -- which
+//     is the live state right now: the scan recovered when the daemon restarted at 07:17Z today,
+//     and the journals' tails are still the old failures. That is why the caller renders the AGE
+//     of the last failure and says what it can and cannot mean, instead of claiming a card is
+//     failing. Making a success legible is filed separately; do NOT close the gap by adding a
+//     heartbeat event, one was deliberately removed (PR #444).
+function computeUnparkScanFailureStreak(lines) {
+  let count = 0;
+  let firstFailedAt = null;
+  let lastFailedAt = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const ev = lines[i];
+    if (!ev) break;
+    if (ev.event === 'unpark-scan-backoff-skip') continue; // part of the same outage, not a recovery
+    if (ev.event !== 'unpark-scan-failed') break;
+    count += 1;
+    if (lastFailedAt === null) lastFailedAt = ev.ts || null;
+    firstFailedAt = ev.ts || firstFailedAt;
+  }
+  return { count, firstFailedAt, lastFailedAt };
+}
+
 function cmdStatus(opts) {
   const { journalRoot, queueDir } = resolveDirs(opts);
+  const accountsDir = resolveAccountsDir(opts);
+  const benchDir = resolveBenchDir(opts);
+  const now = Date.now();
+
   const queueDepth = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length : 0;
+  const backoffEntries = collectBackoffEntries(queueDir);
+
+  console.log(`queue depth: ${queueDepth}`);
+
+  // C: bench queue depth. Read-only, never a crash on an absent ~/.spo-bench (a dev box may
+  // have none at all -- see collectBenchQueueDepth's own comment).
+  const bench = collectBenchQueueDepth(benchDir);
+  console.log(`bench: spool=${bench.spool}  running=${bench.running}`);
+
+  // C: account health + cooldowns, folded in from the same reader `spo accounts` uses.
+  const accountRows = collectAccountsStatus(accountsDir, now);
+  if (accountRows.length === 0) {
+    console.log(`accounts: (none registered in ${accountsDir})`);
+  } else {
+    for (const a of accountRows) {
+      const cooldown = a.cooling ? `cooling, ${formatRemaining(a.cooldownUntil - now)} remaining` : 'none';
+      console.log(`account ${a.name}  enabled=${a.enabled}  cooldown=${cooldown}`);
+    }
+  }
+
+  // D: today's spend. Same billable-weighted definition and the same "n/a means not reported,
+  // never zero" honesty rule as `spo tokens` -- see orchestrator/tokens.js's todaySpend and
+  // cmdTokens's own footer for the fuller text this echoes.
+  const spend = todaySpend(journalRoot, { now });
+  if (spend.llmCallsWithTokens === 0) {
+    console.log('today: n/a -- no token data reported for any call today');
+  } else {
+    console.log(
+      `today: billable ${formatTokenCount(spend.billableTokens)} tokens over ${spend.llmCallsWithTokens} reported call(s)` +
+        (spend.llmCallsWithoutTokens > 0 ? ` (${spend.llmCallsWithoutTokens} more call(s) today reported no token data)` : '')
+    );
+  }
+  // The erratum this line exists to keep surfacing, not fix: intake/triage steps journal into
+  // journal/daemon.jsonl, which -- re-measured 2026-09-01 -- carries ZERO `llm-call` events of
+  // any kind. Their spend is not merely excluded from the figure above; it is not recorded
+  // anywhere yet. Fixing that journalling gap is a different action's work.
+  console.log('  (note: intake/triage steps are not journalled with token data at all -- this figure is short by an unknown amount)');
 
   const ids = listTaskDirs(journalRoot);
   let active = 0;
+  let backoff = 0;
   let parked = 0;
   let abandoned = 0;
   let done = 0;
@@ -265,20 +470,80 @@ function cmdStatus(opts) {
     const lines = readJournalLines(dir);
     const last = lines.length ? lines[lines.length - 1] : null;
     const cur = state.state || 'UNKNOWN';
-    // action 4.5: ABANDONED is terminal, same as DONE/PARKED -- it must NOT fall into the `else
-    // active` bucket below, which is otherwise everything still moving through the pipeline. An
-    // abandoned card sits there forever (nothing re-enters it), so counting it as "active" made
-    // the daemon look permanently busier than it was -- issue #443's own card inflated `active`
-    // by one from 2026-08-30 onward with no way to tell from this line alone.
-    if (cur === 'DONE') done++;
-    else if (cur === 'PARKED') parked++;
-    else if (cur === 'ABANDONED') abandoned++;
-    else active++;
-    rows.push(`${id}  ${cur}  ${last ? last.event : ''}`);
+    const backoffEntry = (cur !== 'DONE' && cur !== 'PARKED' && cur !== 'ABANDONED') ? backoffEntries.get(id) : null;
+
+    // action 4.5 (unchanged): ABANDONED is terminal, same as DONE/PARKED -- it must NOT fall
+    // into the `else active` bucket below, which is otherwise everything still moving through
+    // the pipeline.
+    if (cur === 'DONE') {
+      done++;
+      // A: terminal state, own reason column -- but DONE has nothing TO explain (success needs
+      // no justification the way a park does), so this stays the literal word "done" rather than
+      // state.json's `reason` (which FINISH never writes -- see state-machine.js's own
+      // `snapshot()`; reading it here would print "unknown" on every single DONE row, which is a
+      // regression, not a fix). Previously this line ALSO happened to read "done" -- but only by
+      // coincidence, because "done" is also the name of FINISH's own journal event; that
+      // coincidence is what let a PARKED row get away with printing the totally unrelated
+      // `unpark-scan-failed` event name in the same column.
+      rows.push(`${id}  DONE  done`);
+    } else if (cur === 'PARKED') {
+      parked++;
+      // A: the fix itself -- state.json's OWN `reason` field, not the last journal event's name.
+      // Reproduces the real issue-213/385/428 shape: their last event is `unpark-scan-failed`
+      // (238 of them on issue-213 alone), which is the unpark SCAN's own retry noise, not why the
+      // card parked in the first place.
+      const reason = state.reason || 'unknown';
+      // F: the scan's own failure streak, read off the SAME journal lines already loaded above.
+      const streak = computeUnparkScanFailureStreak(lines);
+      // "last failure Nh ago", not "FAILING": a successful scan journals nothing, so an old
+      // streak in the journal's tail cannot tell a still-broken channel from one that recovered
+      // silently -- and both of those are true of the corpus right now. The AGE is the number a
+      // maintainer can act on either way: minutes old means it is broken now; a day old means
+      // either it is still broken or nobody can tell, and both deserve a look.
+      const ageMs = streak.lastFailedAt ? now - Date.parse(streak.lastFailedAt) : null;
+      const age = Number.isFinite(ageMs) ? formatRemaining(ageMs) : '?';
+      const scanStatus =
+        streak.count > 0
+          ? `${streak.count} failure(s), last ${age} ago (first ${streak.firstFailedAt})`
+          : 'no failures recorded';
+      rows.push(`${id}  PARKED  reason=${reason}  retry-channel: ${scanStatus}`);
+    } else if (cur === 'ABANDONED') {
+      abandoned++;
+      // A: same fix as PARKED -- state.json's `reason` here is 'abandoned-by-maintainer'
+      // (park-loop.js's unparkScan overwrites the original park reason on abandon), which is
+      // itself the honest terminal fact for this row.
+      rows.push(`${id}  ABANDONED  reason=${state.reason || 'unknown'}`);
+    } else if (backoffEntry) {
+      // B: a card in action 4.4's bounded auto-retry -- NOT active (it isn't running right now,
+      // it's waiting out a backoff delay) and NOT parked (finalizePark deliberately never wrote
+      // PARKED for it -- see its own header comment). Its own bucket, sourced from the queue
+      // entry so the "when" is the number that actually governs the next pickup.
+      backoff++;
+      const attempt = backoffEntry.transientRetries === null ? '?' : backoffEntry.transientRetries;
+      // A `notBefore` already in the PAST is not a backoff any more -- the entry is eligible and
+      // is simply waiting for the next drain (state-machine.js's isEligibleNow would take it
+      // now). Saying BACKOFF there would be wrong in the direction that matters: with the daemon
+      // stopped, a queue full of long-past `notBefore` entries would read as "all backing off,
+      // nothing to see" instead of "nothing is draining this queue".
+      const dueAt = Date.parse(backoffEntry.notBefore);
+      const due = Number.isFinite(dueAt) && dueAt <= now;
+      rows.push(
+        due
+          ? `${id}  BACKOFF  attempt=${attempt}  due now (since ${backoffEntry.notBefore})`
+          : `${id}  BACKOFF  attempt=${attempt}  next-run=${backoffEntry.notBefore}`
+      );
+    } else {
+      active++;
+      // A: a non-terminal task has no `reason` of its own -- only PARKED/ABANDONED ever write
+      // one (state-machine.js's finalizePark), and DONE has nothing to explain. The last journal
+      // event's name is still the most useful single fact about "what is this task doing right
+      // now", so it stays here unchanged -- the bug this action fixes is PARKED/DONE reading the
+      // event name where state.json's own reason belongs, not this row.
+      rows.push(`${id}  ${cur}  ${last ? last.event : ''}`);
+    }
   }
 
-  console.log(`queue depth: ${queueDepth}`);
-  console.log(`active: ${active}  parked: ${parked}  abandoned: ${abandoned}  done: ${done}`);
+  console.log(`active: ${active}  backoff: ${backoff}  parked: ${parked}  abandoned: ${abandoned}  done: ${done}`);
   for (const r of rows) console.log(r);
 }
 
@@ -299,17 +564,6 @@ function cmdTask(id, opts) {
     const detailStr = Object.keys(detail).length ? ` ${JSON.stringify(detail)}` : '';
     console.log(`[${ev.ts}] ${String(ev.state).padEnd(12)} ${ev.event}${detailStr}`);
   }
-}
-
-// formatTokenCount(n) -- readable large-number formatting for a terminal table: raw 9-digit
-// integers (cache-read counts routinely run into the millions -- see console/usage-scan.js's
-// own header) are unreadable in a fixed-width column. >=1M -> "12.3M", >=1k -> "215.4k",
-// otherwise the plain integer.
-function formatTokenCount(n) {
-  const v = typeof n === 'number' ? n : 0;
-  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
-  return String(Math.round(v));
 }
 
 // `spo tokens` -- the soak's read-out: per task, then the two numbers migration step 3 asks for
@@ -366,7 +620,15 @@ function cmdTokens(opts) {
     );
   }
 
-  const finished = report.done + report.parked;
+  // action 5.4, item G: denominator now matches console/collect.js's collectDaemonStats, which
+  // action 4.5 already made count ABANDONED as terminal (`stats.total = done + parked +
+  // abandoned`) -- this half was never updated to agree. Measured live 2026-09-01: this line
+  // printed "parking rate: 17% (3/18 terminal)" while the dashboard's own figure for the SAME
+  // corpus was 19. The side that moved is this one, not collect.js: an abandon really is a
+  // terminal outcome (the card is closed out), so it belongs in the denominator; it stays OUT of
+  // the numerator (`report.parked` alone) because it is not a park still awaiting a maintainer's
+  // reply -- see orchestrator/tokens.js's own comment on `abandoned` for the same reasoning.
+  const finished = report.done + report.parked + report.abandoned;
   const anyTokens = report.llmCallsWithTokens > 0;
   console.log('');
   if (anyTokens) {
@@ -378,7 +640,7 @@ function cmdTokens(opts) {
   } else {
     console.log(`total: n/a -- no token data in any journal, over ${report.tasks.length} tasks`);
   }
-  console.log(`done: ${report.done}  parked: ${report.parked}  park events: ${report.parks}`);
+  console.log(`done: ${report.done}  parked: ${report.parked}  abandoned: ${report.abandoned}  park events: ${report.parks}`);
   if (report.billableTokensPerDoneCard !== null) {
     console.log(`billable tokens per DONE card: ${formatTokenCount(report.billableTokensPerDoneCard)}`);
   } else if (report.done > 0) {
@@ -424,9 +686,31 @@ function cmdParked(opts) {
   const ids = listTaskDirs(journalRoot);
   let any = false;
   const abandonedRows = [];
+  const reconciledRows = [];
   for (const id of ids) {
     const dir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(dir, 'state.json'), {});
+
+    // action 5.1b: a PARKED or ABANDONED card whose ISSUE has since closed OUTSIDE the pipeline
+    // (orchestrator/park-loop.js's reconcileExternalClosure, `state.externallyResolved`) is a
+    // fact worth showing a maintainer, but a different one from "still waiting on a retry/abandon
+    // reply" -- so it is pulled out of both the PARKED and the ABANDONED buckets below and
+    // printed under its own heading instead. Measured 2026-09-01: 3 of 3 parked-or-abandoned
+    // cards in the live corpus (issue-213, issue-428, issue-443) were exactly this shape -- two
+    // closed by a human hours after the park, one (443) a false park whose own PR had actually
+    // merged 30 seconds later -- so before this split `spo parked` read as 3 actionable items when
+    // it was really 1 (issue-385, genuinely open and genuinely waiting). This `continue` has to
+    // run BEFORE the `any`/abandonedRows branches below, or a reconciled row would double-count
+    // into whichever one it started in.
+    if ((state.state === 'PARKED' || state.state === 'ABANDONED') && state.externallyResolved) {
+      const r = state.externallyResolved;
+      const mergedPart = r.mergedAt ? `  mergedAt=${r.mergedAt}` : '';
+      reconciledRows.push(
+        `${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}  via=${r.via}  closedAt=${r.closedAt}${mergedPart}`
+      );
+      continue;
+    }
+
     if (state.state === 'PARKED') {
       any = true;
       console.log(`${id}  reason=${state.reason || 'unknown'}  title=${state.title || ''}`);
@@ -446,6 +730,10 @@ function cmdParked(opts) {
   if (abandonedRows.length) {
     console.log('abandoned:');
     for (const r of abandonedRows) console.log(r);
+  }
+  if (reconciledRows.length) {
+    console.log('resolved externally (issue closed outside the pipeline -- see reason for the original park/abandon):');
+    for (const r of reconciledRows) console.log(r);
   }
 }
 

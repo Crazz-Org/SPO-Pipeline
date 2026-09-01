@@ -25,6 +25,18 @@ const VERDICTS_LIMIT = 5;
 const DAEMON_EVENTS_MAX_BYTES = 1024 * 1024;
 const DAEMON_EVENTS_MAX_LINES = 5000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// action 5.5, item B: one shared staleness threshold for BOTH bench-produced surfaces (nightly
+// and verdicts come from the same ~/.spo-bench worker) -- 36h was already nightly's own
+// threshold (a nightly cron that misses one full day plus its own run window); verdicts fire on
+// every push to main, more often than nightly, so a 36h-old *last* verdict is an even stronger
+// signal something upstream (the worker, or pushes themselves) stopped, not weekend noise.
+const STALE_BENCH_AGE_MS = 36 * 60 * 60 * 1000;
+// The manually-produced usage snapshot (journal/usage-snapshot.json, collectUsageSnapshot below)
+// has no automatic refresh at all -- unlike the tokens trend (usage-scan.js's live scanner
+// updates journal/usage-rollups.json every ~5 min), so it is judged stale on a coarser, calendar
+// -day clock: one day old already means it missed a full day of daemon activity, which is the
+// coarsest freshness question a snapshot table can be asked to answer honestly.
+const SNAPSHOT_STALE_MS = DAY_MS;
 
 function readJsonSafe(p, fallback) {
   try {
@@ -214,6 +226,65 @@ function collectUsageSnapshot(journalRoot) {
   return readJsonSafe(path.join(journalRoot, 'usage-snapshot.json'), null);
 }
 
+// usageSnapshotFreshness(snapshot, filePath, {now}) -- action 5.5, item B. Measured live
+// 2026-09-01 against journal/usage-snapshot.json: its own `range` field reads
+// ["2026-08-20","2026-08-29"], `since`/`until` both null, mtime 2026-08-29T22:16 local -- three
+// days behind "today", rendered under a page header that says `generated <now>` with nothing
+// anywhere saying the table below it is old. Every figure in that table (526 Mtok cache-read for
+// sonnet, 1749 for opus, ...) read as current when it was not.
+//
+// The file's OWN `since`/`until`/`range` fields (when present) describe the DATA -- the window
+// the numbers were actually computed over -- and are preferred over the file's mtime, which only
+// describes the WRITE: for an unfiltered scan the two are close, but a `--since=/--until=` run
+// (scripts/usage-report.js's own flags) can be written long after the data's own end date, and
+// the mtime would then UNDERSTATE how stale the numbers are. mtime is only the fallback for an
+// older snapshot shape that predates those fields; "unknown" is returned, never an invented date,
+// when neither is available (an unreadable/missing file, or a range end that fails to parse).
+function usageSnapshotFreshness(snapshot, filePath, { now = Date.now() } = {}) {
+  if (!snapshot) return null;
+  const range = Array.isArray(snapshot.range) ? snapshot.range : [null, null];
+  // `range` FIRST, `since`/`until` only as a fallback -- and the order is the whole point.
+  // scripts/usage-report.js writes `since`/`until` straight from its CLI flags (the window the
+  // operator ASKED for) and `range` from the data's own minTs/maxTs (the window actually
+  // OBSERVED). Preferring `until` therefore lets `--until=2026-09-30` mint perpetual freshness:
+  // a snapshot whose data really stops on 09-01, read on 09-15, reports `0s old` and no STALE
+  // banner. That is precisely the silent-staleness failure this function exists to end, so the
+  // observed end always wins.
+  const rangeStart = range[0] || snapshot.since || null;
+  const rangeEnd = range[1] || snapshot.until || null;
+
+  let asOfMs = null;
+  let source = 'unknown';
+  if (rangeEnd) {
+    // rangeEnd is a calendar day ('YYYY-MM-DD') -- treat it as covering the WHOLE day (its last
+    // instant), not its first, so a snapshot whose data ends "today" is not immediately flagged
+    // stale at 00:00:00 on that same day.
+    const parsed = Date.parse(`${rangeEnd}T23:59:59.999Z`);
+    if (Number.isFinite(parsed)) {
+      asOfMs = parsed;
+      source = 'range';
+    }
+  }
+  if (asOfMs === null) {
+    try {
+      asOfMs = fs.statSync(filePath).mtimeMs;
+      source = 'mtime';
+    } catch {
+      asOfMs = null;
+      source = 'unknown';
+    }
+  }
+
+  const ageMs = asOfMs !== null ? Math.max(0, now - asOfMs) : null;
+  return {
+    rangeStart,
+    rangeEnd,
+    source, // 'range' | 'mtime' | 'unknown'
+    ageMs, // null when source is 'unknown'
+    stale: ageMs !== null && ageMs > SNAPSHOT_STALE_MS,
+  };
+}
+
 // journal/usage-rollups.json -- the tokens trend section's durable daily-rollup store, written
 // by the live server (console/serve.js) on its usage-scan timer. Unlike tokens itself (always
 // null outside --serve, since it needs the live scanner), this file is a small, already-computed
@@ -274,6 +345,10 @@ function readDaemonEventsTail(journalRoot, { maxBytes = DAEMON_EVENTS_MAX_BYTES,
   return events.slice(-maxLines);
 }
 
+// LOCAL midnight -- the anchor for the "ONE 'today' rule" console/usage-scan.js's byDay
+// bucketing and console/serve.js's rollup `todayDate` now also converge on (action 5.5, item C;
+// full rationale lives in usage-scan.js's header, not repeated here). orchestrator/tokens.js's
+// `todaySpend` was pinned to this same LOCAL midnight earlier, action 5.4.
 function startOfDay(now) {
   const d = new Date(now);
   d.setHours(0, 0, 0, 0);
@@ -368,14 +443,20 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
       const finishedMs = nightly.finishedAt ? Date.parse(nightly.finishedAt) : NaN;
       const ageMs = Number.isFinite(finishedMs) ? now - finishedMs : null;
       services.nightly.ageMs = ageMs;
-      if (ageMs !== null && ageMs > 36 * 60 * 60 * 1000) services.nightly.status = 'stale';
+      if (ageMs !== null && ageMs > STALE_BENCH_AGE_MS) services.nightly.status = 'stale';
       else if (nightly.verdict === 'PASS') services.nightly.status = 'pass';
       else if (nightly.verdict === 'FAIL') services.nightly.status = 'fail';
       else services.nightly.status = 'unknown';
     }
   }
 
-  // verdicts
+  // verdicts -- action 5.5, item B audit: this used to report ONLY the last verdict's PASS/FAIL,
+  // with `ageMs` computed but never turned into a status a maintainer could see at a glance (the
+  // "Recent gate verdicts" detail table below it does print each row's own date, but the
+  // summary tile above did not say a stale pass rate was stale) -- same defect class as the
+  // nightly tile silently dropping its own staleness (see console/render.js's renderServicesInner
+  // fix, same action). `status` can now also read 'stale', on the SAME STALE_BENCH_AGE_MS clock
+  // nightly uses -- both surfaces come from the one ~/.spo-bench worker.
   if (benchRoot) {
     const verdicts = collectVerdicts(path.join(benchRoot, 'verdicts'), 20);
     services.verdicts.recentTotal = verdicts.length;
@@ -385,18 +466,45 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
       services.verdicts.lastVerdict = last.verdict || null;
       services.verdicts.lastAt = last.createdAt || last.finishedAt || null;
       const lastMs = services.verdicts.lastAt ? Date.parse(services.verdicts.lastAt) : NaN;
-      services.verdicts.ageMs = Number.isFinite(lastMs) ? now - lastMs : null;
-      services.verdicts.status = last.verdict === 'PASS' ? 'pass' : last.verdict === 'FAIL' ? 'fail' : 'unknown';
+      const ageMs = Number.isFinite(lastMs) ? now - lastMs : null;
+      services.verdicts.ageMs = ageMs;
+      if (ageMs !== null && ageMs > STALE_BENCH_AGE_MS) services.verdicts.status = 'stale';
+      else services.verdicts.status = last.verdict === 'PASS' ? 'pass' : last.verdict === 'FAIL' ? 'fail' : 'unknown';
     }
   }
 
   return services;
 }
 
+// action 5.5, item A: `kind` (never the id prefix -- a "demo-*" id is nowhere assumed or relied
+// on; the field is the only honest discriminator) tells a synthetic/demo task apart from a real
+// backlog card. Measured against the live journal 2026-09-01: 19 task directories, ONE of them
+// (demo-happy-001, kind: "synthetic", state: DONE) inflating "processed total" / done / parked /
+// abandoned / parkingRatePct by one task on every all-time figure -- 5% of the total, silently
+// read by a maintainer as 19 pieces of real work. `spo recette`'s own synthetic cards never reach
+// this filter at all: they journal to `.recette/<runId>/journal/`, never `journalRoot`, so this
+// is the ONLY place a synthetic task can leak into the daemon-stats count -- do not add a second
+// filter for recette's synthetics elsewhere, there is nothing there to filter.
+//
+// A `state.json`/`task.json` with NO `kind` field at all (collectJournalTasks's `t.kind` reads as
+// `''` in that case, its own `state.kind || task.kind || ''` fallback) is treated as a real card,
+// NOT excluded -- every task in today's corpus already has a `kind`, but a state.json written
+// before the field existed would have none, and silently dropping an unknown-kind task from the
+// only panel that counts terminal outcomes is a worse failure than counting one demo. Only a
+// `kind` that is explicitly present AND not `"card"` is excluded.
+function isCardKind(t) {
+  // A DENYLIST, not an allowlist. `kind === 'card'` would also delete any future real kind --
+  // `kind: 'experiment'`, or a stray `'Card'` -- from the ONLY panel that counts terminal
+  // outcomes, which is the same "silently dropping an unknown task" failure the no-`kind` rule
+  // above exists to avoid, just one step further out. Only the kind we know is not real work is
+  // excluded.
+  return t.kind !== 'synthetic';
+}
+
 // The 4 headline daemon numbers. Consumes the ALREADY-collected journalTasks array (never a
 // second disk pass) plus the queue depth already read by the caller.
 function collectDaemonStats(journalTasks, queueDepth = 0, { now = Date.now() } = {}) {
-  const tasks = journalTasks || [];
+  const tasks = (journalTasks || []).filter(isCardKind);
   const dayStart = startOfDay(now);
   const weekStart = startOfWeek(now);
 
@@ -629,6 +737,7 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
       return null;
     }
   })();
+  const usageSnapshot = collectUsageSnapshot(journalRoot);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -637,7 +746,11 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
     accounts: collectAccounts(accountsDir),
     nightly: benchRoot ? collectNightly(path.join(benchRoot, 'nightly', 'latest.json')) : null,
     verdicts: benchRoot ? collectVerdicts(path.join(benchRoot, 'verdicts')) : [],
-    usageSnapshot: collectUsageSnapshot(journalRoot),
+    usageSnapshot,
+    // action 5.5, item B -- freshness metadata for the snapshot table above, computed here (this
+    // module does the fs/time work) and rendered by console/render.js (which stays pure, no
+    // Date.now() of its own). null when there is no snapshot to judge.
+    usageSnapshotMeta: journalRoot ? usageSnapshotFreshness(usageSnapshot, path.join(journalRoot, 'usage-snapshot.json')) : null,
     trend: collectTrend(journalRoot),
     services: collectServices({ journalRoot, queueDir, benchRoot }),
     daemonStats: collectDaemonStats(journalTasks, queue.depth),
@@ -656,9 +769,11 @@ module.exports = {
   collectNightly,
   collectVerdicts,
   collectUsageSnapshot,
+  usageSnapshotFreshness,
   collectTrend,
   collectServices,
   collectDaemonStats,
+  isCardKind,
   collectReportPipeline,
   buildSessionIndex,
   readDaemonEventsTail,

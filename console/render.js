@@ -41,8 +41,11 @@
 //                           hasCredentials }] },
 //     nightly: { verdict, sha, jobId, finishedAt, detail } | null,
 //     verdicts: [{ file, head, verdict, createdAt, jobId, baseMain }],   // newest-first
-//     usageSnapshot: { byModel_Mtokens, byPhase_Mtokens } | null,       // static-mode fallback
-//     trend: { series, lastRecordedDate, kpis } | null,   // console/usage-scan.js buildTrendViews,
+//     usageSnapshot: { byModel_Mtokens, byPhase_Mtokens, range, since, until } | null, // static-mode fallback
+//     usageSnapshotMeta: { rangeStart, rangeEnd, source, ageMs, stale } | null, // console/collect.js's
+//                                                          // usageSnapshotFreshness -- action 5.5, item B
+//     trend: { series, lastRecordedDate, todayLocalDate, stale, staleDays, kpis } | null,
+//                                                          // console/usage-scan.js buildTrendViews,
 //                                                          // from console/usage-rollups.json -- populated
 //                                                          // in BOTH static and live mode (a cheap read of
 //                                                          // an already-computed file, not a live scan)
@@ -449,10 +452,26 @@ function renderServicesInner(services, accounts, prod) {
   const nightly = s.nightly || {};
   const verdicts = s.verdicts || {};
 
-  const nightlyStatus = nightly.verdict === 'PASS' ? 'GREEN' : nightly.verdict === 'FAIL' ? 'RED' : 'UNKNOWN';
-  const nightlyCls = nightlyStatus === 'GREEN' ? 'tile-green' : nightlyStatus === 'RED' ? 'tile-red' : 'tile-gray';
+  // action 5.5, item B audit: `nightly.status`/`verdicts.status` (console/collect.js's
+  // collectServices) already compute a 'stale' value on a 36h clock (STALE_BENCH_AGE_MS there) --
+  // BUT this function used to re-derive its own status label from `nightly.verdict`/
+  // `verdicts.status === 'pass'/'fail'` alone, which never checked age at all, so a nightly run
+  // (or a verdict) from days ago rendered as a confident GREEN/STABLE with only its raw timestamp
+  // (visible, but not called out) as the one clue it was old. Fixed by branching on the
+  // ALREADY-COMPUTED status (which folds staleness in), 'stale' first, instead of re-deriving a
+  // narrower pass/fail-only label here that has no room for it.
+  const NIGHTLY_WORD = { pass: 'GREEN', fail: 'RED', stale: 'STALE', unknown: 'UNKNOWN' };
+  const nightlyStatus = NIGHTLY_WORD[nightly.status] || 'UNKNOWN';
+  const nightlyCls = tileClass(nightly.status);
+  const nightlyCaption = nightly.finishedAt
+    ? `verdict ${nightly.verdict || '?'}, ${fmtAgeMs(nightly.ageMs)} ago${nightly.status === 'stale' ? ' — STALE (>36h)' : ''}`
+    : 'no data yet';
   const passRate = verdicts.recentTotal ? Math.round((verdicts.recentPass / verdicts.recentTotal) * 100) : null;
-  const verdictsStatus = verdicts.status === 'pass' ? 'STABLE' : verdicts.status === 'fail' ? 'UNSTABLE' : 'UNKNOWN';
+  const VERDICTS_WORD = { pass: 'STABLE', fail: 'UNSTABLE', stale: 'STALE', unknown: 'UNKNOWN' };
+  const verdictsStatus = VERDICTS_WORD[verdicts.status] || 'UNKNOWN';
+  const verdictsCaption = verdicts.recentTotal
+    ? `${verdicts.recentPass}/${verdicts.recentTotal} PASS${verdicts.status === 'stale' ? ` — STALE, last ${fmtAgeMs(verdicts.ageMs)} ago` : ''}`
+    : 'no data';
 
   const tiles = [
     svcTile({
@@ -481,6 +500,7 @@ function renderServicesInner(services, accounts, prod) {
       status: nightlyStatus,
       cls: nightlyCls,
       timestamp: fmtDateTime(nightly.finishedAt),
+      caption: nightlyCaption,
     }),
     svcTile({
       name: 'Verdicts',
@@ -488,7 +508,7 @@ function renderServicesInner(services, accounts, prod) {
       cls: tileClass(verdicts.status),
       big: passRate !== null ? String(passRate) : '—',
       bigUnit: passRate !== null ? '%' : '',
-      caption: verdicts.recentTotal ? `${verdicts.recentPass}/${verdicts.recentTotal} PASS` : 'no data',
+      caption: verdictsCaption,
     }),
     renderProdTile(prod),
   ].join('');
@@ -707,10 +727,21 @@ function renderTokensTrendInner(trend) {
     })
     .join('');
 
+  // action 5.5, item B audit of journal/usage-rollups.json: `trend.stale` (usage-scan.js's
+  // buildTrendViews, action 5.5) is true when the last recorded rollup day isn't literally
+  // today -- meaning the "today (partial)" KPI just below is actually showing a PREVIOUS day's
+  // numbers under that label. Called out here rather than silently trusting the KPI title.
+  const staleLine = trend.stale
+    ? `<p class="meta"><span class="trend-warn">STALE &mdash; no rollup recorded for today yet (last recorded day:
+        ${escapeHtml(trend.lastRecordedDate || '?')}, ${escapeHtml(trend.staleDays)} day${trend.staleDays === 1 ? '' : 's'}
+        behind) &mdash; is <code>spo dashboard --serve</code> running?</span></p>`
+    : `<p class="meta">recorded through <strong>${escapeHtml(trend.lastRecordedDate || '?')}</strong></p>`;
+
   return `<h2>Tokens</h2>
     <div class="section-head"><span class="meta">operating-cost trend, weighted per session (excludes the "local"
       account) &mdash; &#9888; marks a day where the cache-write ratio spiked, a likely sign a prompt or config
       changed that day</span></div>
+    ${staleLine}
     <div class="kpi-grid">
       ${kpi('today (partial)', fmtNum(k.todayAvgWeightPerSession), deltaSpan(k.todayVsLast7Pct, { warnAt: 40 }), true)}
       ${kpi('last 7 days', fmtNum(k.last7AvgWeightPerSession), deltaSpan(k.last7VsPrev7Pct, { warnAt: 25 }))}
@@ -802,7 +833,15 @@ function renderTokensBreakdownInner(tokens) {
   </details>`;
 }
 
-function renderTokensSnapshotFallback(usageSnapshot) {
+// action 5.5, item B: this table renders a MANUALLY-produced, point-in-time snapshot (`node
+// scripts/usage-report.js > journal/usage-snapshot.json`) that nothing regenerates on its own --
+// measured live 2026-09-01, its `range` read ["2026-08-20","2026-08-29"] while the page header
+// above it said `generated` today, with nothing in this table saying the two dates disagree.
+// `meta` (console/collect.js's usageSnapshotFreshness) carries the window + age this function
+// renders; `meta` itself can be null (no journalRoot to judge against) or have `source:
+// 'unknown'` (no range/since/until AND no readable mtime) -- both handled without inventing a
+// date, per that function's own header.
+function renderTokensSnapshotFallback(usageSnapshot, meta) {
   const byModel = usageSnapshot.byModel_Mtokens || {};
   const modelKeys = Object.keys(byModel);
   const rows = modelKeys.length
@@ -820,8 +859,27 @@ function renderTokensSnapshotFallback(usageSnapshot) {
         .join('')
     : `<tr><td colspan="5" class="empty">(none)</td></tr>`;
 
+  const m = meta || {};
+  let windowLine;
+  if (m.rangeStart || m.rangeEnd) {
+    windowLine = `<p class="meta">covers <strong>${escapeHtml(m.rangeStart || '?')}</strong> to
+      <strong>${escapeHtml(m.rangeEnd || '?')}</strong>${m.ageMs !== null && m.ageMs !== undefined ? ` &mdash; ${fmtAgeMs(m.ageMs)} old` : ''}</p>`;
+  } else if (m.source === 'mtime') {
+    windowLine = `<p class="meta">no date range recorded in the file &mdash; using its write time instead:
+      ${fmtAgeMs(m.ageMs)} old</p>`;
+  } else {
+    windowLine = `<p class="meta">freshness unknown &mdash; no range/since/until recorded and no readable file
+      write time</p>`;
+  }
+  const staleBanner = m.stale
+    ? `<p class="meta"><span class="trend-warn">STALE snapshot (&gt; 24h old) &mdash; regenerate with
+        <code>node scripts/usage-report.js &gt; journal/usage-snapshot.json</code></span></p>`
+    : '';
+
   return `<details id="det-token-breakdown"><summary>Tokens by model (snapshot)</summary>
     <p class="meta">snapshot (journal/usage-snapshot.json) &mdash; no per-task view outside live mode</p>
+    ${windowLine}
+    ${staleBanner}
     <table>
       <thead><tr><th>model</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
       <tbody>${rows}</tbody>
@@ -834,7 +892,7 @@ function renderTokensSnapshotFallback(usageSnapshot) {
 // something I changed make this worse (or better)", which today/prior static tables cannot.
 // byTask/byModel/byAccountModel detail is demoted into a <details>, not deleted -- it still
 // answers a real, different question ("what's expensive right now"), just not the drift one.
-function renderTokensInner(tokens, usageSnapshot, trend) {
+function renderTokensInner(tokens, usageSnapshot, trend, usageSnapshotMeta) {
   const hasTrend = !!(trend && Array.isArray(trend.series) && trend.series.length > 0);
   const parts = [];
 
@@ -848,7 +906,7 @@ function renderTokensInner(tokens, usageSnapshot, trend) {
   if (tokens) {
     parts.push(renderTokensBreakdownInner(tokens));
   } else if (usageSnapshot) {
-    parts.push(renderTokensSnapshotFallback(usageSnapshot));
+    parts.push(renderTokensSnapshotFallback(usageSnapshot, usageSnapshotMeta));
   } else if (!hasTrend) {
     parts.push(`<p class="empty">in static mode, generate a one-shot snapshot with
       <code>node scripts/usage-report.js &gt; journal/usage-snapshot.json</code></p>`);
@@ -902,7 +960,7 @@ function renderDataFragments(data) {
     daemon: renderDaemonStatsInner(d.daemonStats),
     reports: renderReportsInner(d.reports),
     accounts: renderAccountsInner(d.accounts, d.tokens),
-    tokens: renderTokensInner(d.tokens, d.usageSnapshot, d.trend),
+    tokens: renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta),
     secondary: renderSecondaryInner(d),
     stamp: escapeHtml(d.generatedAt || ''),
   };
@@ -1042,7 +1100,7 @@ ${frag('system', renderSystemInner(d.system))}
 ${frag('reports', renderReportsInner(d.reports))}
 ${frag('accounts', renderAccountsInner(d.accounts, d.tokens))}
 <hr class="section-divider">
-${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot, d.trend))}
+${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta))}
 ${frag('secondary', renderSecondaryInner(d))}
 </main>
 ${THEME_SCRIPT}

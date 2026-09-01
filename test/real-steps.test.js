@@ -11,6 +11,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator requires directly below.
+// This file was one of the two that measurably still leaked a handful of real spawns despite
+// being "every spawn here is a fake" by convention (see the two HANDLERS.DIAGNOSE/VALIDATE(ctx2)
+// fixes below) -- this require is the backstop for the next one.
+require('./no-real-spawn');
+
 const {
   realWorktree,
   realCheck,
@@ -23,11 +31,13 @@ const {
   prepareJudgeInputs,
   spawnStep,
   classifyCommand,
+  finalComment,
 } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx, runTask } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { runLlm } = require('../orchestrator/steps/llm');
+const { formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
 const { buildBaseline } = require('../orchestrator/invariants');
 const { writePoolDir } = require('./helpers');
@@ -1738,9 +1748,20 @@ test('realFinish: board:move, then gh issue comment, then git worktree remove --
   assert.ok(finished);
   assert.equal(finished.billableTokens, 3500);
   assert.equal(finished.prNumber, 444);
+
+  // Action 5.1a: this move must land its OWN board-move event, not just spawnStep's compact
+  // {argv, exit, ms} 'spawn' line -- measured 14 of 18 corpus tasks had `Merging` as their last
+  // journalled board-move while the board itself showed Done, because this event never existed
+  // before. Not the shared, non-blocking board.js:moveCard vocabulary reused through that
+  // module (FINISH is deliberately absent from COLUMN_BY_STATE -- see board.js's own header),
+  // but the identical event shape, written directly here.
+  const moved = journal.find((e) => e.event === 'board-move');
+  assert.ok(moved, 'FINISH must journal its own board-move event on a successful move to Done');
+  assert.equal(moved.column, 'Done');
+  assert.ok(!journal.some((e) => e.event === 'board-move-failed'));
 });
 
-test('realFinish: board:move failure -> PARKED (finish-failed), worktree never removed', async () => {
+test('realFinish: board:move failure -> PARKED (finish-failed), worktree never removed, board-move-failed journalled BEFORE the throw', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-finish-wt2-');
   const task = { id: 'card-finish2', kind: 'card', issue: 121, worktreePath };
@@ -1761,6 +1782,197 @@ test('realFinish: board:move failure -> PARKED (finish-failed), worktree never r
   );
   assert.equal(calls.length, 1);
   assert.ok(!calls.some((a) => a.includes('remove')));
+
+  // Action 5.1a: even on the exit that immediately throws, the attempt is on the record --
+  // the journal must be able to answer "did FINISH even try to move this card" for a task that
+  // never reached DONE, not just for the ones that did.
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const failed = journal.find((e) => e.event === 'board-move-failed');
+  assert.ok(failed, 'the failed attempt must be journalled before finish-failed is thrown');
+  assert.equal(failed.column, 'Done');
+  assert.equal(failed.exit, 1);
+  assert.ok(!journal.some((e) => e.event === 'board-move'), 'a failed move must never journal a plain board-move too');
+});
+
+test('realFinish: the board move is journalled BEFORE the issue comment -- a park between the two must not lose the record that the card reached Done', async () => {
+  // Verification found this position asserted nowhere: moving the success `board-move` event to
+  // after the `gh issue comment` exit check left the whole suite green. It matters because
+  // FINISH parks on a failed comment, and a card whose column really did reach `Done` with no
+  // journal line saying so is precisely the divergence action 5.1a exists to end -- 14 of the 18
+  // tasks in the corpus were in that state for want of one event.
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-wt3-');
+  const task = { id: 'card-finish3', kind: 'card', issue: 122, worktreePath };
+  const ctx = testCtx({ id: 'card-finish3', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('board:move')) return ok('');
+      if (args.includes('comment')) return fail(1);
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'issue-comment'
+  );
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const moved = journal.find((e) => e.event === 'board-move');
+  assert.ok(moved, 'the successful move to Done must already be journalled when the comment parks');
+  assert.equal(moved.column, 'Done');
+});
+
+// ---- finalComment (action 5.2: billable tokens, pipeline duration, attempt counts) ------------
+//
+// Every case below builds a bare ctx-shaped object ({id, taskDir, prNumber}) and calls
+// finalComment directly -- it only ever reads ctx.id/ctx.prNumber/ctx.taskDir, same convention as
+// buildParkComment's own direct-call tests in test/park-loop.test.js.
+
+test('finalComment: real token data renders the summed billable count, formatted', () => {
+  const taskDir = mkTmp('spo-final-comment-tokens-');
+  appendEvent(taskDir, 'PLAN', 'llm-call', { billableTokens: 150000 });
+  appendEvent(taskDir, 'IMPLEMENT', 'llm-call', { billableTokens: 44424 });
+
+  const body = finalComment({ id: 'card-fc1', taskDir, prNumber: 471 });
+
+  // 150000 + 44424 = 194424 -- formatTokenCount renders it as "194.4k".
+  assert.match(body, /Billable-weighted tokens: 194\.4k/);
+  assert.ok(!body.includes('not recorded'));
+});
+
+test('finalComment: a token-less journal (only the retired costUsd, no billableTokens field) says "not recorded", never "0"', () => {
+  const taskDir = mkTmp('spo-final-comment-no-tokens-');
+  appendEvent(taskDir, 'PLAN', 'llm-call', { costUsd: 1.23, numTurns: 4 });
+  appendEvent(taskDir, 'IMPLEMENT', 'llm-call', { costUsd: 0.87, numTurns: 2 });
+
+  const body = finalComment({ id: 'card-fc2', taskDir, prNumber: 213 });
+
+  assert.match(body, /Billable-weighted tokens: not recorded/);
+  assert.ok(!/Billable-weighted tokens: 0\b/.test(body), 'must never render a bare 0 for untracked tokens');
+});
+
+test('finalComment: a journal whose single llm-call genuinely carries billableTokens: 0 still renders 0, not "not recorded"', () => {
+  const taskDir = mkTmp('spo-final-comment-genuine-zero-');
+  appendEvent(taskDir, 'PLAN', 'llm-call', { billableTokens: 0 });
+
+  const body = finalComment({ id: 'card-fc3', taskDir, prNumber: 1 });
+
+  assert.match(body, /Billable-weighted tokens: 0\b/);
+  assert.ok(!body.includes('not recorded'));
+});
+
+test('finalComment: duration renders from the task\'s first journal event to now, labelled as pipeline time', () => {
+  const taskDir = mkTmp('spo-final-comment-duration-');
+  // Written directly (not via appendEvent, which always stamps the real clock) so the gap is
+  // exact and reproducible -- same fixture technique test/tokens.test.js's seedTaskJournal uses.
+  // 06:21:42Z -> 06:36:54Z is issue-471's own measured span, 15m12s.
+  const firstTs = '2026-08-31T06:21:42.000Z';
+  const lines = [
+    JSON.stringify({ ts: firstTs, state: 'WORKTREE', event: 'board-move', column: 'Planning' }),
+    JSON.stringify({ ts: '2026-08-31T06:25:00.000Z', state: 'PLAN', event: 'llm-call', billableTokens: 1000 }),
+  ];
+  fs.writeFileSync(path.join(taskDir, 'journal.jsonl'), lines.join('\n') + '\n');
+
+  const nowMs = Date.parse('2026-08-31T06:36:54.000Z'); // firstTs + 15m12s exactly
+  const body = finalComment({ id: 'card-fc4', taskDir, prNumber: 471 }, { now: nowMs });
+
+  assert.match(body, /Elapsed \(first journal event to now\): 15m12s/);
+  // No dollar figure: costUsd is retired as a metric (2026-08-31) and 107 of the corpus's 110
+  // llm-call events still carry one, so rendering it is always one line of code away.
+  assert.ok(!/\$\s*\d/.test(body), 'a Done comment must never render a dollar figure');
+  // A card that never parked gets no parked line at all -- the second number exists to stop the
+  // first one from lying, and on a clean card there is nothing to correct.
+  assert.ok(!body.includes('parked waiting for a maintainer'));
+});
+
+test('finalComment: an empty/unreadable journal renders no duration line at all (never "NaNm NaNs")', () => {
+  const taskDir = mkTmp('spo-final-comment-no-journal-');
+  // No journal.jsonl written at all.
+  const body = finalComment({ id: 'card-fc5', taskDir, prNumber: 9 }, { now: Date.now() });
+
+  assert.ok(!body.includes('Elapsed'));
+  assert.ok(!body.includes('NaN'));
+});
+
+test('finalComment: a clean card (no diagnose/validate/ci-retry events) shows no Attempts section at all', () => {
+  const taskDir = mkTmp('spo-final-comment-clean-');
+  appendEvent(taskDir, 'PLAN', 'llm-call', { billableTokens: 500 });
+
+  const body = finalComment({ id: 'card-fc6', taskDir, prNumber: 5 });
+
+  assert.ok(!body.includes('Attempts:'), 'a card that went straight through must not be padded with a row of zeroes');
+});
+
+test('finalComment: diagnose attempts and validate rejects each render their own row when present', () => {
+  const taskDir = mkTmp('spo-final-comment-attempts-');
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 1, payload: { rootCause: 'x' } });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 2, payload: { rootCause: 'y' } });
+  // The verdict event is what a validate reject is counted from -- a bare VALIDATE 'result' line
+  // counts for nothing (measured: that rule found zero rejects across all 19 real journals,
+  // including the only card that was ever rejected). Both are written here; only the first counts.
+  appendEvent(taskDir, 'VALIDATE', 'change-validator', { verdict: 'REJECT' });
+  appendEvent(taskDir, 'VALIDATE', 'result', { attempt: 1, payload: { reasons: ['z'] } });
+
+  const body = finalComment({ id: 'card-fc7', taskDir, prNumber: 7 });
+
+  assert.match(body, /Attempts:/);
+  assert.match(body, /- DIAGNOSE attempts: 2/);
+  assert.match(body, /- VALIDATE rejects: 1/);
+  assert.ok(!body.includes('CI-triggered IMPLEMENT retries'), 'no ci-implement-retry events -- no row for it');
+});
+
+test('finalComment: cumulative across a retry -- the SAME taskDir/journal.jsonl carries an earlier attempt\'s DIAGNOSE result too', () => {
+  const taskDir = mkTmp('spo-final-comment-cumulative-');
+  // Simulates a card that parked once after one DIAGNOSE attempt, was retried (same taskDir --
+  // park-loop.js's reEnqueueTask never creates a new one), and diagnosed twice more before
+  // finally reaching FINISH.
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 1, payload: { rootCause: 'first-run-cause' } });
+  appendEvent(taskDir, 'PARKED', 'parked', { reason: 'diagnose-duplicate-root-cause', detail: {} });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 1, payload: { rootCause: 'second-run-cause-a' } });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 2, payload: { rootCause: 'second-run-cause-b' } });
+
+  const body = finalComment({ id: 'card-fc8', taskDir, prNumber: 8 });
+
+  assert.match(body, /- DIAGNOSE attempts: 3/, 'the total must span both runs, not just the last one');
+});
+
+// formatAttemptLines is exported straight off task-summary.js and used by both finalComment and
+// buildParkComment -- pinned here directly, no fs, no ctx at all (errata 4's own null case).
+test('formatAttemptLines: a null ciImplementRetries renders no row (never "0")', () => {
+  const lines = formatAttemptLines({ diagnoseAttempts: 2, validateRejects: 0, ciImplementRetries: null });
+  assert.deepEqual(lines, ['- DIAGNOSE attempts: 2']);
+});
+
+test('formatAttemptLines: a genuine 0 across the board renders no rows at all', () => {
+  const lines = formatAttemptLines({ diagnoseAttempts: 0, validateRejects: 0, ciImplementRetries: 0 });
+  assert.deepEqual(lines, []);
+});
+
+test('formatDuration: hours present -> zero-padded minutes/seconds; hours absent -> unpadded minutes, padded seconds', () => {
+  assert.equal(formatDuration(15 * 60000 + 12000), '15m12s'); // issue-471
+  assert.equal(formatDuration(2 * 3600000 + 48000), '2h00m48s'); // issue-213
+  assert.equal(formatDuration(94 * 60000 + 21000), '1h34m21s'); // issue-452
+  assert.equal(formatDuration(-1), null);
+  assert.equal(formatDuration(NaN), null);
+});
+
+test('finalComment: a malformed journal.jsonl never throws -- FINISH must not fail over a journal read', () => {
+  const taskDir = mkTmp('spo-final-comment-malformed-');
+  fs.writeFileSync(path.join(taskDir, 'journal.jsonl'), '{not json at all\n{"ts": "bad", incomplete');
+
+  assert.doesNotThrow(() => finalComment({ id: 'card-fc9', taskDir, prNumber: 3 }));
+  const body = finalComment({ id: 'card-fc9', taskDir, prNumber: 3 });
+  assert.match(body, /Billable-weighted tokens: not recorded/);
 });
 
 // ---- --real gating (state-machine.js's handleIntake) -----------------------------------------
@@ -2004,8 +2216,13 @@ test('prepareJudgeInputs: DIAGNOSE entered from GATE with gate.log unproducible 
 
   // Also exercised through the full handler, gated on isRealMode + ctx.cameFrom exactly as
   // state-machine.js's handleDiagnose wires it -- proves the wiring, not just the unit.
+  // handleDiagnose reads ctx.deps (not a passed-in argument), so the same spawnSync stub above
+  // has to be threaded onto ctx2 explicitly -- without it this call falls through to buildCtx's
+  // `deps: (config && config.deps) || {}` default and reaches the REAL spawnSync (measured: this
+  // exact call was one of test/no-real-spawn.js's two escaping-file findings).
   const ctx2 = testCtx({ id: 'card-judge-gate-missing-2', task: { ...task, id: 'card-judge-gate-missing-2' }, config });
   ctx2.cameFrom = 'GATE';
+  ctx2.deps = deps;
   return assert.rejects(
     () => HANDLERS.DIAGNOSE(ctx2),
     (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'DIAGNOSE'
@@ -2098,7 +2315,12 @@ test('prepareJudgeInputs: VALIDATE where the diff cannot be produced -- parks ju
   // at all, so a real attempt to call callLlmStep would blow up on accounts.pick(), not just on
   // a park; the fact this rejects cleanly with judge-inputs-missing proves prepareJudgeInputs
   // runs, and short-circuits, before that ever happens.
+  // handleValidate reads ctx.deps (not a passed-in argument) for both its moveCard('VALIDATE')
+  // call and prepareJudgeInputs -- without threading the same stub onto ctx2, both fall through
+  // to the REAL spawnSync (measured: this exact call produced two of test/no-real-spawn.js's
+  // five escaping real spawns, a real `npm run board:move` and a real `git rev-parse HEAD`).
   const ctx2 = testCtx({ id: 'card-judge-validate-missing-2', task: { ...task, id: 'card-judge-validate-missing-2' }, config });
+  ctx2.deps = deps;
   await assert.rejects(
     () => HANDLERS.VALIDATE(ctx2),
     (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'VALIDATE'

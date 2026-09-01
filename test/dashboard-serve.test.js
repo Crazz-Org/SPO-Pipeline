@@ -139,7 +139,13 @@ test('two consecutive /api/data calls within the TTL return the same generatedAt
 
 test('the usage-scan timer merges byDay into journal/usage-rollups.json, and /api/data reflects it in the tokens fragment', async (t) => {
   const journalRoot = mkTmp('spo-serve-journal-rollups-');
-  const today = new Date().toISOString().slice(0, 10);
+  // LOCAL day, not `toISOString().slice(0, 10)` (the UTC one). Action 5.5 item C moved serve.js's
+  // own `todayDate` to the local key so the page's two "today"s mean one day; a fixture still
+  // keyed by UTC then disagrees with the server for the hours where the two dates differ, and at
+  // UTC+14 that is most of the day. This is the cross-module manifestation of the mixed key
+  // scheme -- the test was keying one way and the code the other.
+  const { localDateKey } = require('../console/usage-scan');
+  const today = localDateKey(Date.now());
   const server = await startServer(
     { journalRoot },
     { systemSampler: fakeSystemSampler(), prodProbe: null, usageScanner: fakeUsageScannerWithByDay(today), dataTtlMs: 0 }

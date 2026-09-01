@@ -9,6 +9,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator require(s) below.
+require('./no-real-spawn');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { ParkSignal } = require('../orchestrator/park-signal');
 
@@ -97,6 +101,12 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   const call = journalLines.find((e) => e.event === 'llm-call');
   assert.ok(call);
   assert.equal(call.model, 'fable');
+  // Action 5.4 item E: the field doc/state-machine-spec.md has documented all along. Spelled
+  // `duration_s`, in seconds -- renaming the journalled key to `durationS` passed all 1157 tests
+  // when nothing asserted the spelling, and the spec would have gone on claiming a field the
+  // journals do not have.
+  assert.equal(typeof call.duration_s, 'number', 'the llm-call event carries duration_s');
+  assert.equal(call.durationS, undefined, 'spelled duration_s, not camelCase -- the spec documents duration_s');
 });
 
 test('IMPLEMENT real card path escalates to opus when task.touchesRdoMembers is true', async () => {
