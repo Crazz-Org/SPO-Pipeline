@@ -305,6 +305,61 @@ posts to `Crazz-Org/SPO-WebClient` for real — see the 140-comment incident abo
 every test touching them, and consider closing the class first: it is cheap insurance for a
 chantier that spends its whole time in those two files.
 
+## The first live card on C3+C4 code — issue #471, 2026-09-01
+
+A maintainer bug report filed from the WebClient at 07:54 CEST reached a **merged PR at 08:36**,
+42 minutes later, on one human word (`confirm`). Zero parks, zero human intervention beyond that
+word. This is the first card to run since C3 merged, so it is the first production exercise of
+BOTH C3 and C4.
+
+| stage | time | outcome |
+|---|---|---|
+| remote pull → intake | 07:56 → 08:03 | raw card #471 filed, `report:raw`, `kind: visual` |
+| confirm scan | 08:08 | `report-confirmed` |
+| auto-triage | 08:18 → 08:21 | reproduced, reviewed **FILE**, labelled `cat:feature` `size:S` |
+| PLAN → IMPLEMENT → CHECK | 08:22 → 08:29 | 6/6 invariants held, PR #472 opened |
+| GATE → CI_CHECKS | 08:31 | gate exit 0; in-flight poll caught 1 of 5 runs still pending |
+| VALIDATE → MERGE → DONE | 08:33 → 08:36 | `PASS`, no findings; merged; board Done; no worktree leaked |
+
+**194,424 billable tokens**, 3 LLM calls (PLAN fable/low 71,505 · IMPLEMENT sonnet/low 72,922 ·
+VALIDATE fable/high 49,997). The first card in the project's history with token data at all —
+`spo tokens` had read `n/a` across all 18 previous journals. Note the shape: 1.5M cache-read
+against 10.0k fresh input, which is exactly why dollars were the wrong headline unit.
+
+### What this proved
+
+- **C3's 3.5 fired, and the C3 correction is what saved it.** REVIEW_CARD hit a usage limit on
+  `pool1`: `limitKind: usage`, `cooldownMs: 3600000`, `escalated: false`, `defaulted: false`. The
+  1h probe, not the plan's flat 5h — which on a 2-account pool would have taken half the pool down
+  until 13:20. It rotated to `pool2` and finished the review **6 seconds later**.
+- **C3's 3.3 triage claim ran** (`report-triage-claimed` → in-progress/), the mechanism whose
+  absence produced the 12.8-hour, 128-attempt stall.
+- **C4's 4.3 fetch extension works**: `checks-green` now carries `id` and `app` per check run, and
+  the `app` guard earns itself immediately — `CodeQL` reports as `github-advanced-security`, so its
+  `id` is NOT an Actions job id and must never be fed to `actions/jobs/<id>`.
+- **C4's cost on the green path is zero**, as designed: no job lookup (nothing red), no verdict
+  read at GATE (exit 0), no `commit-skipped-nothing-staged` (real work was staged).
+- `ciImplementRetries` reaches state.json; `baseMainSha` recorded at WORKTREE.
+
+### What it found: the protected-files guard fails open on every real card
+
+`files_to_change` **is** emitted — prompts/plan.md's change works. It arrives as a **JSON-encoded
+string**, not an array:
+
+    "[\"/home/crazz/SPO-Pipeline/worktrees/issue-471/src/client/styles/design-tokens.css\", ...]"
+
+`handlePlan` checks `Array.isArray(...)`, sees a `string`, journals
+`plan-files-undeclared { receivedType: "string" }` and proceeds. So 3.2's guard has never once run
+on a real card, and the open question this doc asked the next session to grep is answered: the key
+is present, the shape is wrong, and it must NOT be promoted to `required` until that is fixed.
+
+Two further notes for whoever fixes it: the paths are **absolute**, not repo-relative (the scan
+still substring-matches `.claude/…`, but verify it), and C3 killed 3.2's original prose detector
+for 33% precision — a guard that starts firing must not start firing wrongly.
+
+**Seventh production bug to pass the hermetic suite green.** Every test constructs the payload as
+a real array; only the live model serialises it.
+
 ## Operational facts that cost time to learn
 
 - **Merging restarts the daemon.** A post-merge hook `systemctl restart`s daemon + dashboard on
