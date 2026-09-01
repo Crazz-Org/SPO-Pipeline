@@ -513,6 +513,11 @@ test('realWorktree leftover sweep: a pushed remote branch leftover (no local bra
       if (args.includes('rev-parse') && args.includes(`refs/remotes/origin/${branch}`)) return ok(`${remoteSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha00000000000000000000000000\n');
       if (args.includes('board:take')) return ok('claimed\n');
+      // Action 4.6: rule 3 now checks for an open PR on the branch before deleting it (see
+      // sweepWorktreeLeftovers). This test is about the delete-before-add ordering, not PR
+      // safety (covered by test/leftover-remote-pr.test.js) -- an empty list keeps that lookup a
+      // clean "no PR", same as it would be with no `gh` calls at all before this action.
+      if (command === 'gh' && args.includes('pr') && args.includes('list')) return ok('[]\n');
       return ok('');
     },
   };
@@ -1249,21 +1254,41 @@ function ciCtx(overrides = {}) {
   return ctx;
 }
 
-test('realCiChecks: extracts {name, conclusion} from gh api and routes "Lint" failure to IMPLEMENT', async () => {
+// Action 4.3: `failing.name` (the check/job name, e.g. 'typecheck + tests') is no longer what
+// classification runs on -- see ci-cause-table.js's header. realCiChecks now makes a SECOND
+// `gh api` call, `repos/<repo>/actions/jobs/<id>` (`id` is `check_run.id`, which for a genuine
+// GitHub Actions run IS the job id), and classifies on that job's failing STEP name instead.
+// This test and the two after it were rewritten for that: routing on a bare check name like
+// 'Lint' (with no `id`/`app` on the check run at all) now falls through to DIAGNOSE every time --
+// exactly the bug this action fixes -- so a positive IMPLEMENT/PARK routing test has to supply
+// `id`/`app: {slug: 'github-actions'}` on the failing check run AND stub the job-lookup response.
+test('realCiChecks: extracts {name, conclusion, id, app} from gh api, looks up the failing job\'s steps, and routes step "Lint" to IMPLEMENT', async () => {
   const ctx = ciCtx();
   const headSha = 'headsha1111111111111111111111111111111';
+  const jobId = 33373038192; // one of the six real failed runs action 4.3 verified this against
 
   const calls = [];
   const deps = {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
-      if (command === 'gh' && args[0] === 'api') {
+      if (command === 'gh' && args[0] === 'api' && args[1].includes('check-runs')) {
         return ok(
           JSON.stringify({
             check_runs: [
-              { name: 'typecheck + tests', conclusion: 'success' },
+              { name: 'analyze', conclusion: 'success' },
+              { name: 'typecheck + tests', conclusion: 'failure', id: jobId, app: { slug: 'github-actions' } },
+            ],
+          })
+        );
+      }
+      if (command === 'gh' && args[0] === 'api' && args[1].includes('/actions/jobs/')) {
+        return ok(
+          JSON.stringify({
+            steps: [
+              { name: 'Checkout', conclusion: 'success' },
               { name: 'Lint', conclusion: 'failure' },
+              { name: 'Typecheck (server + client)', conclusion: 'skipped' },
             ],
           })
         );
@@ -1275,28 +1300,52 @@ test('realCiChecks: extracts {name, conclusion} from gh api and routes "Lint" fa
   const next = await realCiChecks(ctx, deps);
   assert.equal(next, 'IMPLEMENT');
 
-  const apiCall = calls.find((c) => c.command === 'gh');
-  assert.deepEqual(apiCall.args, ['api', `repos/${ctx.config.ghRepo}/commits/${headSha}/check-runs`]);
+  const checkRunsCall = calls.find((c) => c.command === 'gh' && c.args[1].includes('check-runs'));
+  assert.deepEqual(checkRunsCall.args, ['api', `repos/${ctx.config.ghRepo}/commits/${headSha}/check-runs`]);
+  const jobCall = calls.find((c) => c.command === 'gh' && c.args[1].includes('/actions/jobs/'));
+  assert.deepEqual(jobCall.args, ['api', `repos/${ctx.config.ghRepo}/actions/jobs/${jobId}`]);
 });
 
-test('realCiChecks: "PR rules" failure -> PARKED (pr-rules-needs-approval)', async () => {
+test('realCiChecks: step "PR rules (coverage ratchet, RDO citation)" failure -> PARKED (pr-rules-needs-approval)', async () => {
   const ctx = ciCtx();
+  const jobId = 33253561998;
   const deps = {
     spawnSync: (command, args) => {
       if (args.includes('rev-parse')) return ok('sha\n');
-      if (command === 'gh' && args[0] === 'api') {
-        return ok(JSON.stringify({ check_runs: [{ name: 'PR rules', conclusion: 'failure' }] }));
+      if (command === 'gh' && args[0] === 'api' && args[1].includes('check-runs')) {
+        return ok(
+          JSON.stringify({
+            check_runs: [{ name: 'typecheck + tests', conclusion: 'failure', id: jobId, app: { slug: 'github-actions' } }],
+          })
+        );
+      }
+      if (command === 'gh' && args[0] === 'api' && args[1].includes('/actions/jobs/')) {
+        return ok(JSON.stringify({ steps: [{ name: 'PR rules (coverage ratchet, RDO citation)', conclusion: 'failure' }] }));
       }
       return ok('');
     },
   };
   await assert.rejects(
     () => realCiChecks(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'pr-rules-needs-approval'
+    // The detail is asserted, not just the reason: it is the maintainer's only pointer at WHICH
+    // ci.yml step demanded approval, and park-loop.js's countRepeatedParks fingerprints on
+    // JSON.stringify(detail) -- so it must also stay identical in shape to the shadow-fixture
+    // path's own park detail (state-machine.js's resolveShadowCiChecks) or a repeated park stops
+    // being recognised as repeated.
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'pr-rules-needs-approval' &&
+      err.detail.check === 'typecheck + tests' &&
+      err.detail.step === 'PR rules (coverage ratchet, RDO citation)'
   );
 });
 
-test('realCiChecks: an unmapped failing check -> DIAGNOSE', async () => {
+// Unlike the two tests above, this one is unchanged by action 4.3: the check run here carries no
+// `id`/`app` at all (same shape every check run had before this action), so the new job lookup
+// never fires (see the `failing.app === 'github-actions' && typeof failing.id === 'number'`
+// guard) and classification falls straight to the no-step-info branch -- DIAGNOSE, same as
+// before.
+test('realCiChecks: a failing check with no id/app (job lookup never fires) -> DIAGNOSE', async () => {
   const ctx = ciCtx();
   const deps = {
     spawnSync: (command, args) => {
@@ -1523,30 +1572,40 @@ test('realCiChecks: still in flight after the configured max polls -> PARKED ci-
   assert.ok(!journal.some((e) => e.event === 'check-failed'));
 });
 
-test('realCiChecks: a genuinely failing check still routes through the cause table exactly as before, even after an in-flight re-poll', async () => {
+test('realCiChecks: a genuinely failing check still routes through the cause table exactly as before, even after an in-flight re-poll (action 4.3: now via the job-step lookup, same as the non-polling test above)', async () => {
   const config = testConfig({ ciChecksMaxPolls: 4, ciChecksPollIntervalMs: 500 });
   const ctx = ciCtx({ config });
   const headSha = 'headshaFAILAFTERPOLL4444444444444444444444';
-  let apiCalls = 0;
+  const jobId = 33286934385;
+  let checkRunsCalls = 0;
   const sleeps = [];
   const deps = noSleepDeps((command, args) => {
     if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
-    if (command === 'gh' && args[0] === 'api') {
-      apiCalls += 1;
-      if (apiCalls === 1) {
-        return ok(JSON.stringify({ check_runs: [{ name: 'Lint', conclusion: null }] }));
+    if (command === 'gh' && args[0] === 'api' && args[1].includes('check-runs')) {
+      checkRunsCalls += 1;
+      if (checkRunsCalls === 1) {
+        return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: null }] }));
       }
-      return ok(JSON.stringify({ check_runs: [{ name: 'Lint', conclusion: 'failure' }] }));
+      return ok(
+        JSON.stringify({
+          check_runs: [
+            { name: 'typecheck + tests', conclusion: 'failure', id: jobId, app: { slug: 'github-actions' } },
+          ],
+        })
+      );
+    }
+    if (command === 'gh' && args[0] === 'api' && args[1].includes('/actions/jobs/')) {
+      return ok(JSON.stringify({ steps: [{ name: 'Lint', conclusion: 'failure' }] }));
     }
     return ok('');
   }, sleeps);
 
   const next = await realCiChecks(ctx, deps);
-  assert.equal(next, 'IMPLEMENT'); // same "Lint" -> IMPLEMENT routing as the non-polling test above
-  assert.equal(apiCalls, 2);
+  assert.equal(next, 'IMPLEMENT'); // same "Lint" step -> IMPLEMENT routing as the non-polling test above
+  assert.equal(checkRunsCalls, 2);
 
   const journal = readJournal(ctx.taskDir);
-  assert.ok(journal.some((e) => e.event === 'check-failed' && e.check === 'Lint'));
+  assert.ok(journal.some((e) => e.event === 'check-failed' && e.check === 'typecheck + tests' && e.step === 'Lint'));
 });
 
 test('realCiChecks: a genuinely green set on the first fetch decides green in one call, no polling (no bench verdict, so it returns VALIDATE before the main-moved test)', async () => {
@@ -2052,8 +2111,25 @@ test('realGate: overwrites gate.log on a second visit -- the file holds the LAST
   const task = { id: 'card-gate-overwrite', kind: 'card', issue: 505, worktreePath };
   const ctx = testCtx({ id: 'card-gate-overwrite', task, config });
 
+  // Action 4.2: exit 1 now branches on the bench's own verdict for HEAD -- a FAIL that DOES
+  // carry `baseMain` is a real failure (the bench had already merged origin/main before
+  // building) and still routes straight to DIAGNOSE, same as before this action. Stub a HEAD
+  // sha and a matching verdict file so the first (FAIL) run exercises that branch rather than
+  // the no-verdict-file (`gate-non-attesting`) park this test isn't about -- it only cares about
+  // gate.log's overwrite behaviour.
+  // A VALID 40-char hex object name, not a readable pseudo-sha: realGate shape-checks
+  // `git rev-parse HEAD`'s stdout before using it as a verdict-file key (action 4.1's
+  // `HEAD`-on-stdout measurement), so a non-hex fixture would route through that guard instead of
+  // the FAIL-with-baseMain branch this test means to exercise -- same answer, wrong reason.
+  const headSha1 = 'a7e0be6a11e50f0e5a0d0ba5e0ffee0d0cafe0b1';
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha1}.json`), { verdict: 'FAIL', baseMain: 'somemainsha' });
+
   const deps1 = {
-    spawnSync: (command, args) => (args.includes('gate') ? fail(1, 'FIRST RUN: gate FAIL on typecheck\n') : ok('')),
+    spawnSync: (command, args) => {
+      if (args.includes('gate')) return fail(1, 'FIRST RUN: gate FAIL on typecheck\n');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha1}\n`);
+      return ok('');
+    },
   };
   const first = await realGate(ctx, deps1);
   assert.equal(first, 'DIAGNOSE');

@@ -115,6 +115,42 @@ module.exports = {
   // VALIDATE (change-validator) REJECT budget: a separate counter from diagnoseBudget.
   validateRejectBudget: 3,
 
+  // ---- action 4.4: bounded auto-retry for a closed, named allowlist of transient park reasons
+  // (state-machine.js's TRANSIENT_RETRY_REASONS: claim-rate-limited, gate-non-attesting, the
+  // llm-transport-failed:<STEP> family) -- see finalizePark's own header comment for the full
+  // eligibility rule and why these three are facts about the WORLD at that instant rather than
+  // facts about the card. This is a narrow, explicit exception to Principle 2's catch-all
+  // (doc/state-machine-spec.md), never a generic "retry everything" policy -- every other park
+  // reason, including push-pr-failed (measured: all four corpus occurrences are logic failures,
+  // `step: commit`, never a network failure), still goes straight to the ordinary park.
+  //
+  // transientRetryBudget: at most this many auto-retries per task, PER REASON-AGNOSTIC counter
+  // (ctx.task.transientRetries, carried on the re-enqueued task.json) -- the 3rd occurrence of
+  // ANY allowlisted reason, not just three of the SAME one, exhausts it and parks for real. A
+  // human's `retry` reply resets it to 0 (park-loop.js's reEnqueueTask strips the field) -- see
+  // that function's own header for why that is the property that keeps a human always able to
+  // make progress.
+  transientRetryBudget: 2,
+
+  // transientRetryDelaysMs: 1 min, then 5 min. Attempt N (1-indexed) uses index
+  // min(N-1, length-1), so a budget raised past this array's length keeps reusing the LAST
+  // (longest) delay rather than throwing or silently retrying with no delay at all. The delay is
+  // carried on the re-queued task as `notBefore` (an absolute ISO timestamp, not a sleep) and
+  // enforced by takeNextTask -- the daemon's drainQueueOnce loop is awaited by runForever, so a
+  // literal `sleep` here would stall every OTHER card in the queue for the same 1-5 minutes.
+  // Journalled per-attempt (`transient-retry` event) so the attempt number and the wait are both
+  // visible in the journal, not just "retrying".
+  transientRetryDelaysMs: [60 * 1000, 5 * 60 * 1000],
+
+  // CI_CHECKS -> IMPLEMENT retry budget: a separate counter from diagnoseBudget and
+  // validateRejectBudget (action 4.3). Before this action, ci-cause-table.js classified on the
+  // check NAME, which -- see that file's header -- was never one GitHub Actions actually
+  // reports, so CI_CHECKS -> IMPLEMENT had never once fired in production and this budget had
+  // nothing to guard. It ships in the same commit as the fix that makes the path reachable: a
+  // lint/coverage failure IMPLEMENT cannot fix would otherwise bounce CI_CHECKS <-> IMPLEMENT
+  // forever, free and unlogged, the moment the classification bug above is corrected.
+  ciRetryBudget: 3,
+
   // CI_CHECKS in-flight bounded wait (steps/scripted.js's realCiChecks) -- action 1.7. A
   // check-run with `conclusion: null` (still running) or an empty check_runs array (CI has not
   // even registered yet) is NOT green: the audit measured 8/12 real "green" events with `claude

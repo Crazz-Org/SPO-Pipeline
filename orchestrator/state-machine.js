@@ -48,7 +48,14 @@ const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
 const { moveCard } = require('./board');
-const { postParkComment, unparkScan, shouldScanUnpark, countRepeatedParks, readJournalLines } = require('./park-loop');
+const {
+  postParkComment,
+  unparkScan,
+  shouldScanUnpark,
+  countRepeatedParks,
+  readJournalLines,
+  reEnqueueTask,
+} = require('./park-loop');
 const { createScanState } = require('./comment-scan');
 const { shouldScanOrphans, orphanScan } = require('./orphan-scan');
 const { alertPark } = require('./park-alert');
@@ -224,7 +231,8 @@ async function handleWorktree(ctx) {
 // -- a plan invalid on its face, one that named protected files IMPLEMENT structurally cannot
 // touch, IMPLEMENT/DIAGNOSE finding the same root cause a second time (the plan sent it back to
 // the identical failure), DIAGNOSE burning its whole budget without ever clearing IMPLEMENT's
-// failure, or change-validator rejecting the built, gated-green change repeatedly. Reusing the
+// failure, change-validator rejecting the built, gated-green change repeatedly, or (action 4.3)
+// CI failing the same way three times running on retries IMPLEMENT could not clear. Reusing the
 // plan that produced any of these on a `retry` would spend a whole remediation cycle to arrive at
 // the identical park -- worse for the budget-exhaustion pair, since without them reuse -> DIAGNOSE
 // burns its budget -> park -> `retry` with `main` unmoved -> identical reuse -> identical cycle,
@@ -238,6 +246,11 @@ const PLAN_INVALIDATING_PARK_REASONS = new Set([
   'diagnose-no-new-cause',
   'diagnose-budget-exhausted',
   'validate-reject-budget-exhausted',
+  // action 4.3: same shape as the two budget exhaustions above, and added in the same commit that
+  // first makes CI_CHECKS -> IMPLEMENT reachable at all (the cause table had been keyed on step
+  // names GitHub never sends). A retry that reuses the plan sends the identical implementation
+  // back through the identical CI, which fails identically -- three more retries, identical park.
+  'ci-retry-budget-exhausted',
 ]);
 
 // Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
@@ -667,15 +680,49 @@ async function handleGate(ctx) {
 // CI_CHECKS does two things, in order, per state-machine-spec.md's (a)/(b):
 //  (a) map the one failing check name (if any) this visit;
 //  (b) only if (a) was green: the main-moved test, at most one re-merge-and-regate per task.
+//
+// Action 4.3 adds a third thing, after (a)/(b) have both resolved a next state: charge the
+// CI_CHECKS -> IMPLEMENT retry budget. Both branches below are restructured to resolve `next`
+// FIRST and return through the one shared chargeCiImplementRetry() call at the bottom, so the
+// real path (realCiChecks) and the shadow-fixture path (resolveShadowCiChecks) can never charge
+// this budget differently -- the same reason ci-cause-table.js is one shared module rather than
+// two copies.
 async function handleCiChecks(ctx) {
-  if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx, ctx.deps));
-  }
-  const failingCheck = ctx.fixture('ciChecks', null);
-  if (failingCheck) {
-    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failingCheck });
-    const outcome = classifyCiFailure(failingCheck);
-    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failingCheck });
+  const next = isRealMode(ctx)
+    ? await callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx, ctx.deps))
+    : resolveShadowCiChecks(ctx);
+  return chargeCiImplementRetry(ctx, next);
+}
+
+// The shadow-fixture half of CI_CHECKS, unchanged in behaviour from before action 4.3 except
+// that it now returns its resolved next state to handleCiChecks instead of returning directly
+// out of the handler -- see the restructuring note above.
+//
+// The `ciChecks` fixture takes two shapes, and both are load-bearing:
+//   - a bare string ('Something-unknown'), the legacy shape every pre-4.3 fixture uses. It names
+//     a failing CHECK with no step information, which is exactly what the real path sees when
+//     the job lookup degrades -- classifyCiFailure gets one argument, lands on its "no step
+//     info" branch, and resolves to DIAGNOSE for EVERY check name. That is a real behaviour
+//     change for those fixtures (a string 'Lint' used to route straight to IMPLEMENT) and a
+//     deliberate one: see ci-cause-table.js's header for why a real 'Lint' CHECK name could
+//     never have existed in the first place.
+//   - `{check, step}`, added by action 4.3. Shadow mode cannot make the `gh api
+//     .../actions/jobs/<id>` call the real path uses to recover the failing step, so without
+//     this shape shadow mode could no longer reach CI_CHECKS -> IMPLEMENT or the
+//     `pr-rules-needs-approval` park AT ALL -- the two routes this action makes reachable for
+//     the first time would have had zero end-to-end coverage in the only mode the daemon test
+//     suite can drive end to end. The fixture supplies the step the real path looks up; every
+//     line of routing, journalling and budgeting after that point is the shared code.
+function resolveShadowCiChecks(ctx) {
+  const raw = ctx.fixture('ciChecks', null);
+  if (raw) {
+    const failingCheck = typeof raw === 'string' ? raw : raw.check;
+    const failingStep = typeof raw === 'string' ? null : raw.step || null;
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failingCheck, step: failingStep });
+    const outcome = classifyCiFailure(failingCheck, failingStep);
+    if (outcome.kind === 'park') {
+      throw new ParkSignal(outcome.reason, { check: failingCheck, step: failingStep });
+    }
     return outcome.nextState;
   }
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-green', {});
@@ -692,6 +739,40 @@ async function handleCiChecks(ctx) {
   ctx.counters.mainMoveUsed = true;
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'main-moved-merge', {});
   return 'CHECK';
+}
+
+// Action 4.3: charge the CI_CHECKS -> IMPLEMENT retry budget. Out of CI_CHECKS, 'IMPLEMENT' can
+// only mean classifyCiFailure routed a failing check/step there -- VALIDATE, CHECK and DIAGNOSE
+// are all untouched below, on purpose, including the main-moved merge path (which must keep
+// working exactly as it does today).
+//
+// `check`/`step` for the journalled line are read back from the 'check-failed' event
+// realCiChecks/resolveShadowCiChecks just wrote (above), rather than threaded through as a
+// return value: every existing caller of realCiChecks (steps/scripted.js's own test suite)
+// depends on it returning a bare state-name string, and widening that return shape to carry
+// {check, step} everywhere would be a much bigger, unrelated blast radius for a value this one
+// call site needs. The 'check-failed' event was always written before 'IMPLEMENT' can be
+// returned (see ci-cause-table.js: IMPLEMENT only ever comes from a failing check having just
+// been classified), so it is always there to read.
+//
+// Budget itself mirrors handleDiagnose's diagnoseAttempts: the ledger line is written for EVERY
+// attempt, including the one that trips the budget, so ciImplementRetries and the journal can
+// never disagree about how many attempts actually happened.
+function chargeCiImplementRetry(ctx, next) {
+  if (next !== 'IMPLEMENT') return next;
+
+  const lastFailure = readJournalLines(ctx.taskDir)
+    .reverse()
+    .find((e) => e.state === 'CI_CHECKS' && e.event === 'check-failed');
+  const check = lastFailure ? lastFailure.check : null;
+  const step = lastFailure ? lastFailure.step : null;
+
+  const attempt = ++ctx.counters.ciImplementRetries;
+  appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-implement-retry', { attempt, check, step });
+  if (attempt > ctx.config.ciRetryBudget) {
+    throw new ParkSignal('ci-retry-budget-exhausted', { attempts: attempt, check, step });
+  }
+  return next;
 }
 
 // DIAGNOSE budget: at most config.diagnoseBudget attempts, and any root cause seen before
@@ -1008,6 +1089,10 @@ function buildCtx(id, task, taskDir, config) {
       seenRootCauses: new Set(),
       validateRejects: 0,
       mainMoveUsed: false,
+      // Action 4.3's CI_CHECKS -> IMPLEMENT retry budget -- see config.js's ciRetryBudget
+      // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
+      // than reusing one of them.
+      ciImplementRetries: 0,
     },
   };
 }
@@ -1020,6 +1105,7 @@ function snapshot(ctx, state) {
     state,
     diagnoseAttempts: ctx.counters.diagnoseAttempts,
     validateRejects: ctx.counters.validateRejects,
+    ciImplementRetries: ctx.counters.ciImplementRetries,
     mainMoveUsed: ctx.counters.mainMoveUsed,
     prNumber: ctx.prNumber || null,
     worktreePath: (ctx.task && ctx.task.worktreePath) || null,
@@ -1028,8 +1114,141 @@ function snapshot(ctx, state) {
   };
 }
 
+// action 4.4: the closed, named allowlist of park reasons finalizePark auto-retries instead of
+// parking for real -- see that function's own header comment for the eligibility rule and
+// doc/state-machine-spec.md Principle 2 for why this is a narrow exception, not a policy change.
+// Every entry here is transient BY CONSTRUCTION, not by hope:
+//
+//   claim-rate-limited      -- steps/scripted.js's realWorktree throws this on `npm run
+//                               board:take` exit 4/5. A rate limit is transient by definition:
+//                               the same claim will succeed once the window resets, and nothing
+//                               about the CARD is at fault. Measured twice in the journal corpus
+//                               (card #247).
+//   gate-non-attesting      -- action 4.2's realGate throws this when the bench's own verdict
+//                               file for HEAD is missing outright, which worker.ts's
+//                               `NON_ATTESTING` set ({DIRTY, ENVIRONMENT, ABANDONED}) never
+//                               writes. All three of those outcomes mean nothing was learned
+//                               about the code -- a dead gateway, a lost owner lease, a failed
+//                               fetch -- so retrying is asking the SAME bench the SAME question
+//                               again, not asking a judge to explain a failure it never observed.
+//   llm-transport-failed:*  -- state-machine.js's own callLlmStep call sites (PLAN, IMPLEMENT,
+//                               DIAGNOSE, VALIDATE -- the four that actually throw this reason;
+//                               CITATION_VERIFIER's transport failure is deliberately its own
+//                               `citation-verifier-failed`, never this family) throw it when a
+//                               step never produced a verdict at all: a spawn error, a deadline
+//                               kill, non-JSON output. Measured once (card #455, exit 143 -- the
+//                               post-merge hook SIGTERMing an in-flight `claude`). The model
+//                               never ran; there is nothing about THIS card's plan or diff that
+//                               made the transport fail.
+//
+// Built as exact strings from the four step names above, not a prefix/substring match -- C3
+// shipped a bug behind exactly that shortcut (a loose `llm-transport-failed` match), and this
+// action exists partly to not repeat it. `llm-transport-failed` alone and
+// `llm-transport-failed:NOPE` must NOT be on this set.
+//
+// Deliberately NOT on the list: `push-pr-failed`. Every one of its four occurrences in the
+// journal corpus is a logic failure (`step: 'commit'` -- "nothing to commit", i.e. IMPLEMENT
+// produced no diff), never a network failure -- auto-retrying it would re-run an entire card,
+// worktree rebuild and all, to arrive at the identical "nothing to commit" a few minutes later.
+const TRANSIENT_RETRY_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
+const TRANSIENT_RETRY_REASONS = new Set([
+  'claim-rate-limited',
+  'gate-non-attesting',
+  ...TRANSIENT_RETRY_LLM_STEPS.map((step) => `llm-transport-failed:${step}`),
+]);
+
+// Membership in the set above is necessary but not sufficient, for exactly one entry. Action 4.2
+// deliberately did NOT split the misconfigured-bench-directory case out of `gate-non-attesting`
+// into a reason of its own -- it records it as a boolean on the park detail instead
+// (steps/scripted.js's realGate: `verdictDirExists`, "the two cases a maintainer has to tell
+// apart -- the bench genuinely attested nothing vs the machine was looking in the wrong place").
+// So the reason string alone conflates a transient fact about the world (a dead gateway, a lost
+// owner lease, a failed fetch: retrying asks the same bench the same question again) with a
+// PERMANENT fact about this machine's configuration (`config.spoBenchDir` unmounted, moved, or
+// simply wrong). The second is not transient by any construction: retrying it re-runs WORKTREE,
+// PLAN, IMPLEMENT and GATE -- real LLM spend -- to look in the same wrong place twice more, and
+// realGate's own comment says a misconfigured spoBenchDir makes EVERY failing gate land here, so
+// the waste is per-card and repeats for as long as the misconfiguration stands. Auto-retry is
+// therefore refused when the verdicts directory itself is absent; that park goes straight to a
+// human, which is the only thing that can actually fix it. `=== false` and not a falsy test on
+// purpose: a journal written before 4.2, or any other caller of this reason, has no
+// `verdictDirExists` key at all, and "the field is missing" must keep today's transient
+// treatment rather than silently opting every old park out of the retry.
+function isTransientRetryReason(reason, detail) {
+  if (!TRANSIENT_RETRY_REASONS.has(reason)) return false;
+  if (reason === 'gate-non-attesting' && detail && detail.verdictDirExists === false) return false;
+  return true;
+}
+
 function finalizePark(ctx, lastState, reason, detail) {
   appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
+
+  // action 4.4: eligibility for the bounded auto-retry above, checked BEFORE any of the ordinary
+  // park machinery below (the board move, the park comment, the PARKED state.json/report.md) --
+  // a card that takes this branch is not parked and must not look parked to `spo parked`, the
+  // dashboard, or a maintainer reading the issue thread, because none of those writes happen.
+  // Real mode only (isRealMode) -- a dry-run or shadow run must never re-enqueue itself: neither
+  // one has a real queue/ worth writing into, and doing so would leave a synthetic/fixture task
+  // sitting in the REAL queue directory a `--real` daemon polls next. Eligibility also requires
+  // the reason to be on TRANSIENT_RETRY_REASONS above AND the per-task budget
+  // (config.transientRetryBudget, ctx.task.transientRetries so far) not yet exhausted -- once
+  // exhausted, this SAME reason falls straight through to the ordinary park below, unconditionally
+  // (no special-casing needed: the `if` below is simply false and every line after it runs
+  // exactly as it always has).
+  if (isRealMode(ctx) && isTransientRetryReason(reason, detail)) {
+    const budget = (ctx.config && ctx.config.transientRetryBudget) || 0;
+    const priorRetries = (ctx.task && ctx.task.transientRetries) || 0;
+    // A queue directory is not optional here, and its absence must not be discovered by
+    // `path.join(undefined, ...)` throwing. finalizePark is called from INSIDE runTask's own
+    // ParkSignal catch, so anything it throws escapes past that catch, out of drainQueueOnce and
+    // kills the daemon process -- C3 already shipped exactly that shape once (preserveWorktreeWip
+    // throwing inside this function, a crash loop over one hung `git status`). drainQueueOnce
+    // threads queueDir onto the config for every task it runs, but orphan-scan.js builds its own
+    // ctx from runForever's config, which has no queueDir on it: no reason it reparks with
+    // (`task-orphaned-daemon-restart`) is on the allowlist today, so that path cannot reach here
+    // yet -- this guard is what keeps that a safety property rather than a coincidence one future
+    // allowlist entry silently revokes. No queue to write to means no auto-retry; park honestly.
+    const queueDir = ctx.config && ctx.config.queueDir;
+    if (priorRetries < budget && typeof queueDir === 'string' && queueDir !== '') {
+      const attempt = priorRetries + 1;
+      const delays = (ctx.config && ctx.config.transientRetryDelaysMs) || [];
+      // Attempt N (1-indexed) -> index min(N-1, length-1): a budget raised past this array's
+      // length keeps reusing the LAST (longest) delay instead of reading `undefined` off the end
+      // and retrying instantly with no backoff at all.
+      const delayMs = delays.length > 0 ? delays[Math.min(attempt - 1, delays.length - 1)] : 0;
+      const notBefore = new Date(Date.now() + delayMs).toISOString();
+
+      // park-loop.js's reEnqueueTask does the whole write, in ONE atomic step, with this
+      // attempt's two fields handed in through its `extra` parameter -- see its header for why
+      // "write the base entry, then patch it" is a correctness bug and not a style choice. The
+      // `notBefore` deadline lives on the queue ENTRY, never in a `sleep` -- runForever's
+      // drainQueueOnce loop is awaited, so sleeping inside it would stall every other card in the
+      // queue for as long as this one's backoff runs.
+      //
+      // Queue entry first, journal line second, and the return gated on the write having actually
+      // happened: `transient-retry` is the journal's claim that this card IS coming back, and the
+      // journal is the single source of truth (Principle 5). Journalling it first would let a
+      // failed write (a full disk, a queue dir yanked out from under us) leave behind a record of
+      // a retry that does not exist on a card that is also not parked -- invisible to `spo
+      // parked`, invisible to the queue, recoverable only by orphan-scan noticing the stale
+      // state.json much later. Falling through to the ordinary park instead costs one honest park
+      // comment and keeps every reader's view of this card true.
+      let requeuedFile = null;
+      try {
+        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore });
+      } catch (err) {
+        appendEvent(ctx.taskDir, lastState, 'transient-retry-failed', {
+          reason,
+          attempt,
+          error: String((err && err.message) || err),
+        });
+      }
+      if (requeuedFile) {
+        appendEvent(ctx.taskDir, lastState, 'transient-retry', { reason, attempt, delayMs, notBefore });
+        return; // not parked -- see the header comment above; every write below is skipped.
+      }
+    }
+  }
 
   // Loop breaker for card #385's exact failure mode: branch-unmerged-leftover parked four times
   // in a row, byte-identical reason and detail every time, because each preserveWorktreeWip
@@ -1158,22 +1377,58 @@ function listQueueFiles(queueDir) {
     .sort(); // processing order = filename sort
 }
 
-// Takes the earliest task file (by filename sort) out of queue/ and into its own runtime dir,
+// action 4.4: is this queue entry allowed to be taken RIGHT NOW? A missing/empty/unparsable
+// `notBefore` means "eligible now" -- never "skip forever" -- which is also exactly what an
+// __invalid (unparsable JSON) entry gets, unconditionally: it never had a chance to carry a
+// notBefore field in the first place, and today's behaviour (take it immediately, let INTAKE's
+// own `__invalid` handling park it honestly) must not change. `Date.parse` of `undefined` or a
+// garbage string is `NaN`, and `NaN > nowMs` is always `false`, so the single comparison below
+// already covers "no field" and "unparsable field" without a separate typeof check.
+function isQueueEntryEligibleNow(task, nowMs) {
+  if (!task || task.__invalid) return true;
+  const notBeforeMs = task.notBefore ? Date.parse(task.notBefore) : NaN;
+  return !(notBeforeMs > nowMs);
+}
+
+// Takes the earliest ELIGIBLE task file out of queue/ and into its own runtime dir,
 // journal/<id>/task.json -- moving it (not copying) is what makes "queue depth" mean "not yet
 // taken" for `spo status`, and what keeps a polling daemon from reprocessing it.
+//
+// action 4.4: "earliest" used to mean "files[0], unconditionally" -- now it means "the first
+// entry in filename-sort order whose notBefore has passed", so a queue holding both an
+// auto-retry scheduled for five minutes from now and an ordinary fresh card still takes the
+// fresh card immediately, rather than the daemon sitting idle waiting on the scheduled one. The
+// scan itself does not reorder or reshape anything on disk -- it still walks `listQueueFiles`'s
+// existing order (preserving the `0000-retry-` filename-sort priority that ordering already
+// gives a maintainer's manual retry over a fresh auto-pulled card), and it still takes (renames)
+// only the ONE file it selects. `null` is returned when the queue is non-empty but every entry is
+// scheduled for later -- drainQueueOnce's `for (;;)` loop below breaks on a `null` the exact same
+// way it already breaks on an empty queue, so the daemon just polls again next cycle rather than
+// spinning.
 function takeNextTask(queueDir, journalRoot) {
   const files = listQueueFiles(queueDir);
   if (files.length === 0) return null;
-  const file = files[0];
-  const srcPath = path.join(queueDir, file);
-  const raw = fs.readFileSync(srcPath, 'utf8');
 
-  let task;
-  try {
-    task = JSON.parse(raw);
-  } catch {
-    task = { __invalid: true, rawPreview: raw.slice(0, 200) };
+  const nowMs = Date.now();
+  let file = null;
+  let task = null;
+  for (const candidate of files) {
+    const candidateRaw = fs.readFileSync(path.join(queueDir, candidate), 'utf8');
+    let candidateTask;
+    try {
+      candidateTask = JSON.parse(candidateRaw);
+    } catch {
+      candidateTask = { __invalid: true, rawPreview: candidateRaw.slice(0, 200) };
+    }
+    if (isQueueEntryEligibleNow(candidateTask, nowMs)) {
+      file = candidate;
+      task = candidateTask;
+      break;
+    }
   }
+  if (!file) return null; // every entry is scheduled for later -- see the header comment above.
+
+  const srcPath = path.join(queueDir, file);
   const id = task && task.id ? String(task.id) : path.basename(file, '.json');
   const taskDir = path.join(journalRoot, id);
   fs.mkdirSync(taskDir, { recursive: true });
@@ -1183,13 +1438,19 @@ function takeNextTask(queueDir, journalRoot) {
   return { id, task, taskDir };
 }
 
+// action 4.4: `queueDir` is added onto the config every runTask/finalizePark call in this drain
+// sees, alongside whatever the caller already passed -- the ONE plumbing point every real-mode
+// caller of runTask goes through (daemon.js --once calls this directly; --real's runForever
+// awaits it in a loop; recette.js already passes its own queueDir through its own config, so this
+// is a harmless no-op re-assignment there). Without it, finalizePark's auto-retry path
+// (state-machine.js, above) would have no queue directory to write a re-enqueued task.json into.
 async function drainQueueOnce(queueDir, journalRoot, config) {
   const results = [];
   for (;;) {
     const taken = takeNextTask(queueDir, journalRoot);
     if (!taken) break;
     const { id, task, taskDir } = taken;
-    const finalState = await runTask(id, task, taskDir, config);
+    const finalState = await runTask(id, task, taskDir, { ...config, queueDir });
     results.push({ id, finalState });
   }
   return results;

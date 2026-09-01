@@ -271,9 +271,10 @@ test('handlePlan: ctx.task.baseMainSha is the empty string and the journal event
   assert.equal(spawnSync.callCount, 1, 'an empty-string baseMainSha on both sides must still refuse reuse');
 });
 
-// ---- (7) park-reason gate: six invalidating reasons, some that aren't ------------------------
+// ---- (7) park-reason gate: seven invalidating reasons, some that aren't ----------------------
 
 // F3: diagnose-budget-exhausted and validate-reject-budget-exhausted added to the original four.
+// Action 4.3 added ci-retry-budget-exhausted for the identical reason, one budget later.
 // Without these two, reuse -> IMPLEMENT fails -> DIAGNOSE burns config.diagnoseBudget attempts (or
 // change-validator rejects config.validateRejectBudget times) -> park -> retry with main unmoved
 // -> identical reuse -> identical cycle, bounded only by a human giving up.
@@ -284,6 +285,7 @@ const INVALIDATING_REASONS = [
   'diagnose-no-new-cause',
   'diagnose-budget-exhausted',
   'validate-reject-budget-exhausted',
+  'ci-retry-budget-exhausted',
 ];
 
 for (const reason of INVALIDATING_REASONS) {

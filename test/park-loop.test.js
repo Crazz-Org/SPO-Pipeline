@@ -163,6 +163,14 @@ test('runTask (real mode, card): a park AFTER the worktree exists moves the card
       if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
         return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/951#issuecomment-777\n');
       }
+      // Action 4.6: rule 3's remote-branch leftover check now also looks up any open PR on the
+      // branch before deleting it (see steps/scripted.js's sweepWorktreeLeftovers). This
+      // fixture's blanket rev-parse stub above makes the remote-branch-leftover check exit 0 same
+      // as before -- an empty PR list here keeps that lookup answering "no PR" instead of
+      // unparsable, so this test still exercises what it's actually about: a park that happens
+      // AFTER the worktree exists, not rule 3's own PR safety logic (covered separately in
+      // test/leftover-remote-pr.test.js).
+      if (command === 'gh' && args.includes('pr') && args.includes('list')) return ok('[]\n');
       return ok('');
     },
   };
@@ -269,11 +277,16 @@ test('postParkComment: a timed-out gh issue comment never throws (the task is al
 
 // ---- unpark scan: retry / abandon / ignored ---------------------------------------------------
 
-function parkedTaskDir(journalRoot, id, { issue, commentId }) {
+// `worktreePath`/`prNumber` are optional -- undefined for every pre-4.5 caller (retry/ignored/
+// timeout tests never touch abandonCleanup's inputs at all), and only set by the abandon-cleanup
+// tests below, which need state.json to carry exactly what unparkScan's abandon branch reads:
+// state.worktreePath and state.prNumber, verified present on the real leaked card (issue #443's
+// journal/issue-443/state.json, quoted in the spec this action implements).
+function parkedTaskDir(journalRoot, id, { issue, commentId, worktreePath, prNumber }) {
   const taskDir = path.join(journalRoot, id);
   fs.mkdirSync(taskDir, { recursive: true });
   fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', issue, title: 'x', criterion: 'y', size: 'S' }));
-  writeState(taskDir, { id, state: 'PARKED', reason: 'worktree-npm-ci-failed' });
+  writeState(taskDir, { id, state: 'PARKED', reason: 'worktree-npm-ci-failed', worktreePath, prNumber });
   appendEvent(taskDir, 'WORKTREE', 'parked', { reason: 'worktree-npm-ci-failed' });
   appendEvent(taskDir, 'PARKED', 'park-comment', { commentId, reason: 'worktree-npm-ci-failed' });
   return taskDir;
@@ -492,6 +505,627 @@ test('unparkScan: a timed-out abandon-ack gh comment never throws -- the task is
   assert.ok(failed, 'the timeout must still be reported, not silently swallowed');
   assert.equal(failed.timedOut, true);
   assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+});
+
+// ---- action 4.5: abandon cleanup (issue #443 -- ABANDONED used to leak the worktree, its local
+// AND remote claude-pipe/<id> branch, and the open PR forever) --------------------------------
+
+// Action 4.6's verification found `abandon` and `retry` disagreeing about the same commits.
+// `localBranchKept === false` is not proof that nothing is lost: step 3 also deletes a local tip
+// vouched for ONLY by `localSha === remoteSha` -- pushed work origin/main does not contain -- and
+// step 4 then deleted the remote copy of exactly that. Card #455's loss, reached through
+// `abandon` instead of a retry, and against this function's own "the maintainer abandoned the
+// CARD, not the commits" rule. Both these tests pin the fix.
+function abandonUnmergedDeps(calls, { branch, sha, preserveFails = false }) {
+  return {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 720, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') return ok('#issuecomment-721\n');
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      // The whole point of the fixture: neither tip is contained in origin/main, and the local
+      // tip equals the remote one -- so step 3 deletes the local branch as "vouched" and step 4
+      // is reached with localBranchKept === false over unmerged, pushed commits.
+      if (command === 'git' && args.includes('merge-base') && args.includes('--is-ancestor')) {
+        return { status: 1, stdout: '', stderr: '', signal: null };
+      }
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branch}`) return ok(`${sha}\n`);
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branch}`) return ok(`${sha}\n`);
+      if (command === 'git' && args.includes('branch') && args.includes('-D')) return ok('');
+      if (command === 'git' && args.includes('push') && args.some((a) => String(a).includes('refs/heads/wip/'))) {
+        return preserveFails ? { status: 1, stdout: '', stderr: 'rejected', signal: null } : ok('');
+      }
+      if (command === 'git' && args.includes('push') && args.includes('--delete')) return ok('');
+      return ok('');
+    },
+  };
+}
+
+test('unparkScan: abandon cleanup -- an unmerged remote tip is preserved to wip/<id>-<ts> BEFORE the remote branch is deleted', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-preserve-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-preserve-');
+  const worktreePath = mkTmp('spo-abandon-preserve-wt-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-941', { issue: 941, commentId: 700, worktreePath });
+  const branch = 'claude-pipe/card-941';
+  const sha = 'abc1230000000000000000000000000000000000';
+
+  const calls = [];
+  const before = Date.now();
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, abandonUnmergedDeps(calls, { branch, sha }));
+  const after = Date.now();
+
+  const journal = readJournal(taskDir);
+  const preserved = journal.find((e) => e.event === 'abandon-remote-preserved');
+  assert.ok(preserved, 'the unmerged remote tip must be preserved before it is deleted');
+  assert.equal(preserved.sha, sha);
+  // The timestamp is load-bearing, exactly as in steps/scripted.js's rule 3: a constant ref name
+  // would be rejected non-fast-forward on the second use and no later pass could clear it.
+  const stamp = /^wip\/card-941-(\d+)$/.exec(preserved.ref);
+  assert.ok(stamp, `ref must be wip/<id>-<ts>, got ${preserved.ref}`);
+  assert.ok(Number(stamp[1]) >= before && Number(stamp[1]) <= after);
+
+  const deleted = journal.find((e) => e.event === 'abandon-remote-branch-deleted');
+  assert.ok(deleted && deleted.preservedRef === preserved.ref, 'the delete records what saved the commits');
+
+  const pushIdx = calls.findIndex((c) => c.command === 'git' && c.args.some((a) => String(a).includes('refs/heads/wip/')));
+  const delIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete'));
+  assert.ok(pushIdx >= 0 && delIdx >= 0 && pushIdx < delIdx, 'preserve must precede the delete');
+  assert.deepEqual(calls[pushIdx].args, ['-C', '/fake/product', 'push', 'origin', `${sha}:refs/heads/${preserved.ref}`]);
+});
+
+test('unparkScan: abandon cleanup -- a failed preservation SKIPS the remote delete and never throws', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-preserve-fail-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-preserve-fail-');
+  const worktreePath = mkTmp('spo-abandon-preserve-fail-wt-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-942', { issue: 942, commentId: 700, worktreePath });
+  const branch = 'claude-pipe/card-942';
+  const sha = 'def4560000000000000000000000000000000000';
+
+  const calls = [];
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, abandonUnmergedDeps(calls, { branch, sha, preserveFails: true }));
+
+  // The card is still terminal -- a cleanup failure may never leave it un-ABANDONED.
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'ABANDONED');
+
+  const journal = readJournal(taskDir);
+  const skipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'remote-branch');
+  assert.ok(skipped && skipped.reason === 'preserve-failed');
+  assert.ok(!journal.some((e) => e.event === 'abandon-remote-branch-deleted'));
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete')),
+    'nothing may be deleted once the attempt to save it failed'
+  );
+});
+
+test('unparkScan: abandon cleanup -- prNumber + clean worktree + branch merged into origin/main closes the PR BEFORE deleting the remote branch, journals all four cleanup events', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-cleanup-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-cleanup-');
+  const worktreePath = mkTmp('spo-abandon-worktree-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-940', { issue: 940, commentId: 700, worktreePath, prNumber: 447 });
+  const branch = 'claude-pipe/card-940';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 710, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon, closing it' }]));
+      }
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'close') return ok('');
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/940#issuecomment-711\n');
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branch}`) {
+        return ok('localsha0000000000000000000000000000000\n');
+      }
+      if (command === 'git' && args.includes('merge-base') && args.includes('--is-ancestor')) return ok(''); // exit 0 -> ancestor of origin/main
+      if (command === 'git' && args.includes('branch') && args.includes('-D')) return ok('');
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branch}`) {
+        return ok('remotesha000000000000000000000000000000\n');
+      }
+      if (command === 'git' && args.includes('push') && args.includes('--delete')) return ok('');
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'ABANDONED');
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'abandon-pr-closed' && e.prNumber === 447));
+  assert.ok(journal.some((e) => e.event === 'abandon-worktree-removed' && e.worktreePath === worktreePath));
+  assert.ok(journal.some((e) => e.event === 'abandon-branch-deleted' && e.branch === branch));
+  assert.ok(journal.some((e) => e.event === 'abandon-remote-branch-deleted' && e.branch === branch));
+
+  const prCloseIdx = calls.findIndex((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'close');
+  const remoteDeleteIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete'));
+  assert.ok(prCloseIdx >= 0 && remoteDeleteIdx >= 0);
+  assert.ok(prCloseIdx < remoteDeleteIdx, 'gh pr close must run before the remote branch delete (deleting the branch first would auto-close the PR as an unlogged side effect -- issue #455)');
+
+  // The terminal transition is journalled BEFORE any cleanup step -- the observable proxy for
+  // "state.json already says ABANDONED by the time the first git/gh cleanup call runs", which is
+  // what makes a crash mid-cleanup safe. `abandoned-by-maintainer` is appended on the very next
+  // line after writeState, so an implementation that ran the cleanup first would emit the four
+  // abandon-* events ahead of it here.
+  const terminalIdx = journal.findIndex((e) => e.event === 'abandoned-by-maintainer');
+  assert.ok(terminalIdx >= 0);
+  for (const e of journal) {
+    if (!String(e.event).startsWith('abandon-')) continue;
+    assert.ok(
+      journal.indexOf(e) > terminalIdx,
+      `cleanup event ${e.event} must be journalled AFTER abandoned-by-maintainer, never before the terminal state write`
+    );
+  }
+});
+
+test('unparkScan: abandon cleanup -- a `git status --porcelain` that FAILS is treated exactly like dirty, never like clean', async () => {
+  // The mutation this test exists to kill: dropping the `statusExit !== 0` guard so an
+  // inconclusive status falls through to the emptiness check. spawnSync's own timeout kill
+  // returns `{status: null, stdout: '', ...}` (test/helpers.js's timeoutResult, the real shape) --
+  // an empty stdout that would read as "clean" and hand `worktree remove --force` a worktree
+  // nobody ever confirmed was safe to destroy. Both non-zero-exit and timed-out shapes are
+  // covered here for that reason.
+  for (const [label, statusResult] of [
+    ['non-zero exit', { status: 1, stdout: '', stderr: 'fatal: not a git repository', signal: null }],
+    ['timed out', timeoutResult()],
+  ]) {
+    const queueDir = mkTmp('spo-unpark-queue-abandon-statusfail-');
+    const journalRoot = mkTmp('spo-unpark-journal-abandon-statusfail-');
+    const worktreePath = mkTmp('spo-abandon-statusfail-worktree-');
+    const taskDir = parkedTaskDir(journalRoot, 'card-946', { issue: 946, commentId: 1300, worktreePath });
+
+    const calls = [];
+    const deps = {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+          return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+        }
+        if (command === 'gh' && args[0] === 'api') {
+          return ok(JSON.stringify([{ id: 1310, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+        }
+        if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return statusResult;
+        return ok('');
+      },
+    };
+
+    await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+    const journal = readJournal(taskDir);
+    const skipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'worktree');
+    assert.ok(skipped, `${label}: the worktree step must be journalled as skipped`);
+    assert.equal(skipped.reason, 'status-failed', `${label}: reason must distinguish an inconclusive status from a dirty one`);
+    assert.ok(
+      !calls.some((c) => c.command === 'git' && c.args.includes('worktree') && c.args.includes('remove')),
+      `${label}: no \`git worktree remove --force\` argv -- an inconclusive answer is never "clean"`
+    );
+    assert.ok(
+      !calls.some((c) => c.command === 'git' && c.args.includes('branch') && c.args.includes('-D')),
+      `${label}: no \`git branch -D\` argv -- the worktree still holds the branch`
+    );
+  }
+});
+
+test('unparkScan: abandon cleanup -- a `git status --porcelain` output of pure whitespace is clean, not dirty', async () => {
+  // Guards the `.trim()` on the emptiness check (the same one sweepWorktreeLeftovers rule 1
+  // applies). Without it, a status whose only output is a trailing newline reads as dirty and the
+  // leaked worktree this action exists to reclaim would be left behind forever.
+  const queueDir = mkTmp('spo-unpark-queue-abandon-ws-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-ws-');
+  const worktreePath = mkTmp('spo-abandon-ws-worktree-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-947', { issue: 947, commentId: 1400, worktreePath });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 1410, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('\n');
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'abandon-worktree-removed' && e.worktreePath === worktreePath));
+  assert.ok(!journal.some((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'worktree'));
+  assert.ok(calls.some((c) => c.command === 'git' && c.args.includes('worktree') && c.args.includes('remove')));
+});
+
+test('unparkScan: abandon cleanup -- a local branch NOT in origin/main but equal to its remote tip IS vouched for and deleted', async () => {
+  // sweepWorktreeLeftovers rule 2's second vouching clause ("fully pushed, nothing local-only"),
+  // which the first mainline test never reaches: there `merge-base --is-ancestor` already exits 0,
+  // so the whole `if (!safe)` remote-tip comparison is dead code under that fixture. Deleting the
+  // clause outright left the suite green before this test existed.
+  const queueDir = mkTmp('spo-unpark-queue-abandon-pushed-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-pushed-');
+  const worktreePath = mkTmp('spo-abandon-pushed-worktree-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-948', { issue: 948, commentId: 1500, worktreePath });
+  const branch = 'claude-pipe/card-948';
+  const sha = 'aaaabbbbccccddddeeeeffff0000111122223333';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 1510, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branch}`) return ok(`${sha}\n`);
+      // NOT contained in origin/main -- the PR was never merged. The only thing vouching for this
+      // tip is that origin/<branch> points at the very same commit.
+      if (command === 'git' && args.includes('merge-base')) return { status: 1, stdout: '', stderr: '', signal: null };
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branch}`) return ok(`${sha}\n`);
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const journal = readJournal(taskDir);
+  const deleted = journal.find((e) => e.event === 'abandon-branch-deleted');
+  assert.ok(deleted, 'a fully-pushed tip is vouched for by its remote counterpart, exactly as sweepWorktreeLeftovers rule 2 has it');
+  assert.equal(deleted.branch, branch);
+  assert.equal(deleted.sha, sha);
+  assert.ok(calls.some((c) => c.command === 'git' && c.args.includes('branch') && c.args.includes('-D')));
+  assert.ok(!journal.some((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'local-branch'));
+});
+
+test('unparkScan: abandon cleanup -- the remote-tip vouching is full sha EQUALITY, not a prefix match', async () => {
+  // Two shas sharing a prefix are two different commits. A `startsWith`-shaped comparison would
+  // force-delete a local tip whose remote counterpart is a DIFFERENT commit -- the exact "the fix
+  // destroys the commits the maintainer only meant to stop working on" failure this rule exists
+  // to prevent.
+  const queueDir = mkTmp('spo-unpark-queue-abandon-prefix-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-prefix-');
+  const worktreePath = mkTmp('spo-abandon-prefix-worktree-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-949', { issue: 949, commentId: 1600, worktreePath });
+  const branch = 'claude-pipe/card-949';
+  const localSha = 'aaaabbbbccccddddeeeeffff0000111122223333';
+  const remoteSha = 'aaaabbbbccccddddeeeeffff0000111122229999';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 1610, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branch}`) return ok(`${localSha}\n`);
+      if (command === 'git' && args.includes('merge-base')) return { status: 1, stdout: '', stderr: '', signal: null };
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branch}`) return ok(`${remoteSha}\n`);
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const journal = readJournal(taskDir);
+  const skipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'local-branch');
+  assert.ok(skipped);
+  assert.equal(skipped.reason, 'unmerged');
+  assert.ok(!calls.some((c) => c.command === 'git' && c.args.includes('branch') && c.args.includes('-D')));
+});
+
+test('unparkScan: abandon cleanup -- no origin/<branch> means no `push origin --delete` argv at all', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-noremote-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-noremote-');
+  const worktreePath = mkTmp('spo-abandon-noremote-worktree-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-950', { issue: 950, commentId: 1700, worktreePath });
+  const branch = 'claude-pipe/card-950';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 1710, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      // Neither the local nor the remote ref resolves -- the branch simply does not exist here.
+      if (command === 'git' && args.includes('rev-parse') && String(args[args.length - 1]).includes(branch)) {
+        return { status: 1, stdout: '', stderr: '', signal: null };
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete')),
+    'a `push origin --delete` of a branch that does not exist would fail and journal a cleanup failure for nothing'
+  );
+  const journal = readJournal(taskDir);
+  assert.ok(!journal.some((e) => e.event === 'abandon-remote-branch-deleted'));
+  assert.ok(!journal.some((e) => e.event === 'abandon-cleanup-failed' && e.step === 'remote-branch'));
+});
+
+test('unparkScan: abandon cleanup -- a cleanup step that THROWS is caught, journalled, and never aborts the scan for the next parked task', async () => {
+  // Distinct from the "every cleanup command exits non-zero" test above: this is the case that
+  // test never reaches, an exception rather than an exit code (a bad path handed to spawnSync, an
+  // ERR_INVALID_ARG_TYPE from an undefined argv element, an EMFILE...). Without the try/catch
+  // around abandonCleanup, unparkScan's own `for` loop unwinds and card-952 -- parked in the SAME
+  // pass, with a perfectly good `retry` waiting -- is never looked at, this cycle or any other
+  // until the throwing card stops throwing.
+  const queueDir = mkTmp('spo-unpark-queue-abandon-throw-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-throw-');
+  const taskDirA = parkedTaskDir(journalRoot, 'card-951', { issue: 951, commentId: 1800, prNumber: 601 });
+  const taskDirB = parkedTaskDir(journalRoot, 'card-952', { issue: 952, commentId: 1900 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).includes('issues/951/comments')) {
+        return ok(JSON.stringify([{ id: 1810, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).includes('issues/952/comments')) {
+        return ok(JSON.stringify([{ id: 1910, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }]));
+      }
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'close') {
+        throw new TypeError('The "args[1]" argument must be of type string');
+      }
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/951#issuecomment-1820\n');
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const stateA = JSON.parse(fs.readFileSync(path.join(taskDirA, 'state.json'), 'utf8'));
+  assert.equal(stateA.state, 'ABANDONED', 'the terminal transition already happened before the cleanup could throw');
+  const journalA = readJournal(taskDirA);
+  const unexpected = journalA.find((e) => e.event === 'abandon-cleanup-failed' && e.step === 'unexpected');
+  assert.ok(unexpected, 'the throw is journalled, not swallowed silently');
+  assert.match(unexpected.error, /must be of type string/);
+
+  const journalB = readJournal(taskDirB);
+  assert.ok(journalB.some((e) => e.event === 'unparked-by-maintainer'), 'the next parked task in the same pass is still processed');
+  const queued = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [];
+  assert.equal(queued.length, 1);
+});
+
+test('unparkScan: abandon cleanup -- a DIRTY worktree is never destroyed, and the local branch it holds is never force-deleted either', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-dirty-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-dirty-');
+  const worktreePath = mkTmp('spo-abandon-dirty-worktree-');
+  fs.writeFileSync(path.join(worktreePath, 'uncommitted.ts'), 'still here -- never destroyed by a cleanup path');
+  const taskDir = parkedTaskDir(journalRoot, 'card-941', { issue: 941, commentId: 800, worktreePath });
+  const branch = 'claude-pipe/card-941';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 810, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok(' M uncommitted.ts\n');
+      if (command === 'git' && args.includes('rev-parse') && String(args[args.length - 1]).includes(branch)) {
+        return ok('localsha4444444444444444444444444444444\n'); // both refs/heads/<b> and origin/<b> resolve
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const journal = readJournal(taskDir);
+  const skipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'worktree');
+  assert.ok(skipped);
+  assert.equal(skipped.reason, 'dirty');
+  assert.equal(skipped.worktreePath, worktreePath);
+
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('worktree') && c.args.includes('remove')),
+    'no `git worktree remove` argv for a dirty worktree'
+  );
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('branch') && c.args.includes('-D')),
+    'no `git branch -D` argv -- step 3 never runs when step 2 left the worktree in place'
+  );
+
+  // ...and the remote copy of that same kept branch is not destroyed either. steps/scripted.js
+  // gets this for free (its rule 2 throws, so its rule 3 is unreachable once a tip is kept);
+  // here nothing throws, so without an explicit veto the cleanup would preserve the local tip on
+  // the grounds that the maintainer abandoned the card and not the commits, and then delete the
+  // only pushed copy of those very commits two blocks later.
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete')),
+    'no `git push origin --delete` argv -- a kept local branch vetoes the remote delete'
+  );
+  const remoteSkipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'remote-branch');
+  assert.ok(remoteSkipped, 'the skipped remote delete is journalled, not silently omitted');
+  assert.equal(remoteSkipped.reason, 'local-branch-kept');
+  assert.equal(remoteSkipped.branch, branch);
+});
+
+test('unparkScan: abandon cleanup -- a local branch that is neither merged into origin/main nor equal to its remote tip is left alone', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-unmerged-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-unmerged-');
+  const worktreePath = mkTmp('spo-abandon-unmerged-worktree-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-942', { issue: 942, commentId: 900, worktreePath });
+  const branch = 'claude-pipe/card-942';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 910, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) return ok('');
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branch}`) {
+        return ok('localsha1111111111111111111111111111111\n');
+      }
+      if (command === 'git' && args.includes('merge-base') && args.includes('--is-ancestor')) {
+        return { status: 1, stdout: '', stderr: '', signal: null }; // not an ancestor of origin/main
+      }
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branch}`) {
+        return ok('differentsha22222222222222222222222222\n'); // remote tip differs from local -- unvouched
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const journal = readJournal(taskDir);
+  const skipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'local-branch');
+  assert.ok(skipped);
+  assert.equal(skipped.reason, 'unmerged');
+  assert.equal(skipped.localSha, 'localsha1111111111111111111111111111111');
+  assert.equal(skipped.remoteSha, 'differentsha22222222222222222222222222');
+
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('branch') && c.args.includes('-D')),
+    'the maintainer abandoned the card, not the commits -- an unvouched local-only tip is never force-deleted'
+  );
+  // Same reasoning one step further: origin/<branch> here is a DIFFERENT commit from the local
+  // tip, i.e. it carries commits nothing else references. Deleting it while deliberately keeping
+  // the local branch would destroy exactly what the skip above just refused to destroy.
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('--delete')),
+    'a kept local branch vetoes the remote delete too'
+  );
+  const remoteSkipped = journal.find((e) => e.event === 'abandon-cleanup-skipped' && e.step === 'remote-branch');
+  assert.ok(remoteSkipped);
+  assert.equal(remoteSkipped.reason, 'local-branch-kept');
+});
+
+test('unparkScan: abandon cleanup -- every cleanup command failing leaves the card ABANDONED, journals abandon-cleanup-failed per failing step, and the scan still processes the NEXT parked task', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-allfail-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-allfail-');
+  const worktreePath = mkTmp('spo-abandon-allfail-worktree-');
+  const taskDirA = parkedTaskDir(journalRoot, 'card-943', { issue: 943, commentId: 1000, worktreePath, prNumber: 500 });
+  const branchA = 'claude-pipe/card-943';
+  const taskDirB = parkedTaskDir(journalRoot, 'card-944', { issue: 944, commentId: 1100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).includes('issues/943/comments')) {
+        return ok(JSON.stringify([{ id: 1010, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).includes('issues/944/comments')) {
+        return ok(JSON.stringify([{ id: 1110, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }]));
+      }
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'close') return { status: 1, stdout: '', stderr: '', signal: null };
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/943#issuecomment-1020\n');
+      }
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (command === 'git' && args.includes('worktree') && args.includes('remove')) {
+        return { status: 1, stdout: '', stderr: '', signal: null };
+      }
+      // No local claude-pipe/card-943 tip at all -- so nothing this cleanup kept is standing
+      // between the remote-branch step and its (also failing) `push origin --delete`. See the
+      // dirty-worktree test below for the opposite case, where a kept local tip vetoes it.
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/heads/${branchA}`) {
+        return { status: 1, stdout: '', stderr: '', signal: null };
+      }
+      if (command === 'git' && args.includes('rev-parse') && args[args.length - 1] === `refs/remotes/origin/${branchA}`) {
+        return ok('remotesha333333333333333333333333333333\n');
+      }
+      if (command === 'git' && args.includes('push') && args.includes('--delete')) {
+        return { status: 1, stdout: '', stderr: '', signal: null };
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  const stateA = JSON.parse(fs.readFileSync(path.join(taskDirA, 'state.json'), 'utf8'));
+  assert.equal(stateA.state, 'ABANDONED', 'the terminal transition is not blocked by any cleanup failure');
+  const journalA = readJournal(taskDirA);
+  assert.ok(journalA.some((e) => e.event === 'abandoned-by-maintainer'));
+  const failedSteps = journalA.filter((e) => e.event === 'abandon-cleanup-failed').map((e) => e.step).sort();
+  assert.deepEqual(failedSteps, ['pr-close', 'remote-branch', 'worktree']);
+  // step 3 (local-branch) never even runs -- step 2 (worktree) failed, so worktreeRemoved is
+  // false and the local-branch block is never entered, let alone journalled as failed.
+  assert.ok(!journalA.some((e) => e.event === 'abandon-cleanup-failed' && e.step === 'local-branch'));
+
+  // Task B, parked in the SAME pass, is still processed -- one card's cleanup failing must never
+  // abort the scan for the others.
+  const journalB = readJournal(taskDirB);
+  assert.ok(journalB.some((e) => e.event === 'unparked-by-maintainer'));
+  const queued = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [];
+  assert.equal(queued.length, 1, 'task B\'s retry still re-enqueues normally');
+});
+
+test('unparkScan: abandon cleanup -- no prNumber in state.json means no `gh pr close` argv at all', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-abandon-nopr-');
+  const journalRoot = mkTmp('spo-unpark-journal-abandon-nopr-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-945', { issue: 945, commentId: 1200 });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 1210, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'abandon' }]));
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient', productRepo: '/fake/product' }, deps);
+
+  assert.ok(!calls.some((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'close'));
+  const journal = readJournal(taskDir);
+  assert.ok(!journal.some((e) => e.event === 'abandon-pr-closed'));
+  assert.ok(!journal.some((e) => e.event === 'abandon-cleanup-failed' && e.step === 'pr-close'));
 });
 
 // ---- findParkAnchor: pure helper --------------------------------------------------------------

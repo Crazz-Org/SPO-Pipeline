@@ -268,6 +268,25 @@ function splitLines(text) {
     .filter(Boolean);
 }
 
+// ---- shared: "is origin/main itself red right now" guard (action 4.2) ---------------------
+//
+// Both CI_CHECKS' main-moved path and GATE's own main-moved path (GATE section below) merge
+// `origin/main` into the branch when it has moved during the task -- and both need the identical
+// refusal when `origin/main`'s own tip is currently failing the nightly build: merging a
+// known-red `main` into an otherwise-passing branch would poison the very signal CHECK/GATE
+// exists to produce with a failure that has nothing to do with the task's own code. Before
+// action 4.2 this read-compare-throw existed once, inline in realCiChecks; GATE needed the exact
+// same check for its own main-moved path (a FAIL verdict with no baseMain -- see that section's
+// header comment), and copying the three lines a second time is exactly the kind of drift
+// CLAUDE.md's own `gh api -f` story warns about: one wrong copy can silently outlive a fixed one
+// for months. Factored out so both call sites share one definition of "red".
+function guardNightlyRed(config, originMainSha) {
+  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
+  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+    throw new ParkSignal('main-red-no-merge', {});
+  }
+}
+
 // ---- judge inputs: diff.patch / gate.log / gate-report.md (action 1.3) --------------------
 //
 // task-values.js declares three fixed paths (diff_path/gate_log_path/gate_report_path) for the
@@ -468,10 +487,16 @@ function worktreeListPaths(porcelainOutput) {
 //      this run never produced and cannot vouch for -- parks branch-unmerged-leftover rather
 //      than guess.
 //   3. Remote branch leftover (origin/claude-pipe/<id>, checked against the fetch this step
-//      already ran): deleted with `push origin --delete`. This is always a prior, superseded
-//      attempt in the pipeline's own namespace, regenerated fresh every pass -- leaving it makes
-//      this attempt's own `push -u origin <branch>` (PUSH_PR) non-fast-forward. If a PR was open
-//      from it, deleting the branch closes that PR; PUSH_PR opens a fresh one on the retry. This
+//      already ran): this is always a prior, superseded attempt in the pipeline's own namespace,
+//      regenerated fresh every pass -- leaving it makes this attempt's own `push -u origin
+//      <branch>` (PUSH_PR) non-fast-forward. Unlike step 2, this rule used to delete on nothing
+//      but "the ref exists", with none of step 2's safety analysis -- action 4.6, card #455: a
+//      remote delete auto-closes any open PR built from that branch as a GitHub side effect, and
+//      a retry silently closed a green, merge-ready PR this way (recovered only by a hand-made
+//      rescue tag). It now vouches for the tip or preserves it to a `wip/<id>-<ts>` ref, closes
+//      any open PR deliberately (`gh pr close`, journalled, never left to the delete's own side
+//      effect), and only then deletes -- see the inline comments right above the code for the
+//      full account, including why a PR *lookup* failure parks while "no PR found" does not. This
 //      step is independent of step 2 (it also runs when there was no local branch left to clean,
 //      or when step 2's own remote-tip lookup already answered the same question -- one call is
 //      redone here rather than threaded through, so each of the three rules stays independently
@@ -574,6 +599,25 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
   }
 
   // -- 3. remote branch -------------------------------------------------------------------------
+  // card #455, live: this rule used to be "the ref exists -> `push origin --delete`", full stop
+  // -- no safety analysis at all, unlike rule 2 immediately above (which will not touch a LOCAL
+  // branch without proving the tip is contained in origin/main, equal to its own remote tip, or
+  // covered by one of this task's own wip/<id>-* refs). That asymmetry is the bug: deleting a
+  // remote branch on GitHub auto-closes any open PR built from it, as a side effect of the
+  // delete rather than a decision anyone made. A retry silently closed a green, merge-ready PR
+  // and orphaned its commits; the work survived only because a `rescue/issue-455-run1` tag was
+  // made by hand after the fact. This rule is always the pipeline's own, disposable
+  // claude-pipe/<id> namespace (see the header above), so the fix is not "never delete" -- it is
+  // "vouch for or preserve the tip, and close any PR on purpose, before the delete can do either
+  // silently". This mirrors abandonCleanup's own PR-before-branch ordering (park-loop.js, action
+  // 4.5) for the exact same GitHub side effect, so the two cleanup paths agree.
+  //
+  // Do NOT park here instead of deleting when an open PR is found: that is the exact deadlock C2
+  // had to fix for rule 2's branch-unmerged-leftover on card #385 -- a maintainer's bare `retry`
+  // could only ever reproduce the same park, forever, because the park itself is what the retry
+  // hits first every time. Preserving the tip and closing the PR deliberately lets the retry
+  // actually make progress (a fresh branch/PR on the next PUSH_PR pass) while destroying nothing
+  // that wasn't first made durable or closed on the record.
   const remoteCheck = spawnStep(ctx, deps, 'WORKTREE', 'git', [
     '-C',
     productRepo,
@@ -584,9 +628,91 @@ function sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch }
   ]);
   if (remoteCheck.exit === 0) {
     const remoteSha = remoteCheck.stdout.trim();
+
+    // -- 3a. Vouch for the tip, or preserve it, before anything destructive runs. ----------------
+    // If the tip is already an ancestor of origin/main, nothing can be lost by deleting the ref
+    // that points at it -- the commits live on in main regardless. Otherwise this remote tip
+    // carries work origin/main does not have, and it gets one chance to survive: pushed to this
+    // task's own `wip/<id>-<ts>` namespace, the exact shape preserveWorktreeWip already uses and
+    // rule 2 above already reads back when vouching for a local tip -- reusing it here rather
+    // than inventing a second shape keeps "durable save this pipeline made" a single, recognisable
+    // pattern across both rules. A failed preserve push (no network, origin refuses, ...) must
+    // block the delete entirely: unlike the dirty-worktree case in rule 1, there is no "park and
+    // wait" fallback that keeps the ref alive on its own -- so this throws rather than falling
+    // through, and deletes nothing.
+    let preservedRef = null;
+    const ancestorOfMain = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+      '-C',
+      productRepo,
+      'merge-base',
+      '--is-ancestor',
+      remoteSha,
+      'origin/main',
+    ]);
+    if (ancestorOfMain.exit !== 0) {
+      const wipRef = `wip/${ctx.id}-${Date.now()}`;
+      const preserve = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+        '-C',
+        productRepo,
+        'push',
+        'origin',
+        `${remoteSha}:refs/heads/${wipRef}`,
+      ]);
+      if (preserve.exit !== 0) {
+        throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-preserve', exit: preserve.exit });
+      }
+      preservedRef = wipRef;
+      appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-remote-preserved', { branch, sha: remoteSha, ref: wipRef });
+    }
+
+    // -- 3b. Close any open PR deliberately, before the delete can close it as an invisible side
+    // effect. Same argv shape and JSON-parse defensiveness as realPushPr's own `gh pr list` call
+    // further down this file (a non-zero exit or unparsable output there falls through to `gh pr
+    // create`; here there is nothing to fall through to, because the very thing being checked is
+    // "is it safe to delete" -- so the same two failure shapes must instead refuse the delete).
+    // We cannot prove there is no PR from a failed or unreadable lookup, and guessing "no PR" would
+    // let the delete close one invisibly -- exactly the bug this rule exists to fix -- so both
+    // shapes park rather than proceed.
+    const prList = spawnStep(ctx, deps, 'WORKTREE', 'gh', [
+      'pr',
+      'list',
+      '--repo',
+      ctx.config.ghRepo,
+      '--head',
+      branch,
+      '--state',
+      'open',
+      '--json',
+      'number',
+    ]);
+    let openPrs = null;
+    if (prList.exit === 0) {
+      try {
+        openPrs = JSON.parse(prList.stdout);
+      } catch {
+        openPrs = null;
+      }
+    }
+    if (!Array.isArray(openPrs)) {
+      appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-pr-lookup-failed', { branch, exit: prList.exit });
+      throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-pr-lookup', exit: prList.exit });
+    }
+    let closedPr = null;
+    if (openPrs.length > 0) {
+      const prNumber = openPrs[0].number;
+      const close = spawnStep(ctx, deps, 'WORKTREE', 'gh', ['pr', 'close', String(prNumber), '--repo', ctx.config.ghRepo]);
+      if (close.exit !== 0) {
+        throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-pr-close', prNumber, exit: close.exit });
+      }
+      closedPr = prNumber;
+      appendEvent(ctx.taskDir, 'WORKTREE', 'leftover-pr-closed', { prNumber, branch });
+    }
+
+    // -- 3c. Only now, with the tip vouched-for-or-preserved and any PR closed on purpose, is the
+    // delete itself safe to run.
     const del = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'push', 'origin', '--delete', branch]);
     if (del.exit !== 0) throw new ParkSignal('worktree-cleanup-failed', { step: 'remote-branch-delete', exit: del.exit });
-    appendEvent(ctx.taskDir, 'WORKTREE', 'remote-branch-cleaned', { branch, sha: remoteSha });
+    appendEvent(ctx.taskDir, 'WORKTREE', 'remote-branch-cleaned', { branch, sha: remoteSha, preservedRef, closedPr });
   }
 }
 
@@ -889,7 +1015,116 @@ async function realPushPr(ctx, deps = {}) {
   if (add.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'add', exit: add.exit });
 
   const commit = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'commit', '-F', messageFile]);
-  if (commit.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit });
+  // `git commit` exits 1 on "nothing to commit", and that is reached from two structurally
+  // different places:
+  //   (1) CI_CHECKS' main-moved path (realCiChecks, ~line 1191 below) already ran
+  //       `git merge origin/main` in the worktree and returned 'CHECK' -- CHECK passes, PUSH_PR
+  //       runs again, but the merge commit is ALREADY committed, so `git add -A` above stages
+  //       nothing and this commit exits 1 over a tip origin has never seen. Parking here would
+  //       strand a perfectly good merge commit, and the retry sweep would then park
+  //       branch-unmerged-leftover on it forever.
+  //   (2) Nothing new was produced this pass -- IMPLEMENT wrote no diff (or wrote one that
+  //       reproduced what a prior pass already committed and pushed). Parking is correct here:
+  //       re-pushing and re-gating a byte-identical sha cannot produce a different CI result.
+  //
+  // The plan for this action (doc/remediation-plan-2026-08.md, action 4.1) said to tell these
+  // apart by HEAD vs origin/main: "clean tree + HEAD != origin/main -> skip the commit, proceed
+  // to push". Measured against the real journal, that condition is wrong. Card #213, run 1
+  // (journal/issue-213/journal.jsonl): PUSH_PR succeeded and created the PR at 19:23:03, CI
+  // failed, DIAGNOSE -> IMPLEMENT produced no diff, and PUSH_PR parked
+  // {"step":"commit","exit":1} at 19:38:02. At that moment HEAD != origin/main -- the branch
+  // already carried its first-pass commits -- so the plan's own condition would have skipped the
+  // park, pushed a no-op, and re-gated an unchanged sha. An unchanged commit cannot produce a
+  // different CI result, so the card would have looped DIAGNOSE -> IMPLEMENT until the diagnose
+  // budget parked it anyway, having burned that budget for nothing. The fact that actually tells
+  // the two cases apart is whether the tip carries work ORIGIN HAS NOT SEEN YET -- case (1)'s
+  // merge commit is unpushed even though HEAD has also moved past origin/main; case #213's
+  // "nothing new" tip was already pushed even though HEAD had also moved past origin/main. So
+  // the comparison below is against origin/<branch> (this branch's own remote tip), not
+  // origin/main.
+  if (commit.exit !== 0) {
+    const status = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'status', '--porcelain']);
+    if (status.exit !== 0) {
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, statusExit: status.exit });
+    }
+    if (status.stdout.trim() !== '') {
+      // A dirty tree after `git add -A; git commit` means the commit failed for a real reason
+      // (hook rejection, a bad `-F` message file, an index lock...), not "nothing to commit" --
+      // there is staged or unstaged work sitting uncommitted. Park exactly as before this action.
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, dirty: true });
+    }
+
+    // Tree is clean, so commit's exit 1 really was "nothing to commit". Resolve HEAD and this
+    // branch's own remote tip to tell case (1) (unpushed work at HEAD) from case (2) (HEAD
+    // already equals what origin has, or nothing was ever implemented).
+    const headRev = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    // Checked, exactly like origin/main below, and for a sharper reason than symmetry: a failing
+    // `git rev-parse <ref>` prints the REF NAME ITSELF to stdout (measured: an orphan/unborn HEAD
+    // gives exit 128, "fatal: ambiguous argument 'HEAD'" on stderr, and the literal `HEAD` on
+    // stdout). Trusting stdout regardless of exit therefore does not fail closed with an empty
+    // string -- it yields the plausible-looking non-sha `"HEAD"`, which equals neither origin/main
+    // nor origin/<branch>, so BOTH parks below are skipped, `commit-skipped-nothing-staged` is
+    // journalled with `head: "HEAD"` (a lie the maintainer and DIAGNOSE both read as a sha), and
+    // the step falls through to a push that can only fail -- parking `{step:'push'}` and
+    // swallowing the real cause two commands later. Same rule as the status check above: a
+    // diagnostic must never bury the failure it was added to explain.
+    if (headRev.exit !== 0) {
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, revParseFailed: 'HEAD' });
+    }
+    const head = headRev.stdout.trim();
+
+    // A never-pushed branch has no refs/remotes/origin/<branch> at all -- rev-parse --verify
+    // --quiet exits non-zero for that, which is an EXPECTED outcome here (first pass, push
+    // below hasn't run yet), never an error. --quiet suppresses the "not a valid ref" stderr
+    // noise that would otherwise pollute the spawn log for the expected case.
+    const remoteBranch = spawnStep(ctx, deps, 'PUSH_PR', 'git', [
+      '-C',
+      worktreePath,
+      'rev-parse',
+      '--verify',
+      '--quiet',
+      `refs/remotes/origin/${branch}`,
+    ]);
+    const remoteBranchSha = remoteBranch.exit === 0 ? remoteBranch.stdout.trim() : null;
+
+    const originMain = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+    if (originMain.exit !== 0) {
+      throw new ParkSignal('push-pr-failed', { step: 'commit', exit: commit.exit, revParseFailed: 'origin/main' });
+    }
+    const mainSha = originMain.stdout.trim();
+
+    if (head === mainSha) {
+      // HEAD sits exactly on origin/main -- IMPLEMENT never produced a commit on this branch at
+      // all, on this pass or any prior one. There is genuinely nothing to push.
+      throw new ParkSignal('push-pr-failed', {
+        step: 'commit',
+        exit: commit.exit,
+        reason: 'nothing-implemented',
+      });
+    }
+    if (remoteBranchSha !== null && head === remoteBranchSha) {
+      // #213's shape: the remote tip for THIS branch already equals HEAD, so this pass's PR (or
+      // prior push) already carries everything at HEAD -- pushing again would push nothing and
+      // re-gate a sha CI has already judged.
+      throw new ParkSignal('push-pr-failed', {
+        step: 'commit',
+        exit: commit.exit,
+        reason: 'nothing-new-to-push',
+        head,
+      });
+    }
+
+    // Otherwise there IS unpushed work at HEAD -- the main-moved merge commit (case (1) above)
+    // is the motivating example, but this also covers a branch that has simply never been
+    // pushed yet and whose commit failed for a benign "nothing to commit" reason (unusual, but
+    // not this function's problem to rule out). Skip the commit -- there is nothing to add to it
+    // -- and fall through to the push below exactly as if commit.exit had been 0.
+    appendEvent(ctx.taskDir, 'PUSH_PR', 'commit-skipped-nothing-staged', {
+      head,
+      remoteBranchSha,
+      branch,
+    });
+  }
 
   // Order matters: the branch is pushed BEFORE the citation check below, not after. A park
   // thrown between the commit and the push would leave a local-only, unpushed tip on
@@ -1026,9 +1261,11 @@ async function realPushPr(ctx, deps = {}) {
 
 // ---- GATE -----------------------------------------------------------------------------------
 //
-// `npm run gate`: 0 PASS -> CI_CHECKS, 1 fail -> DIAGNOSE, 2 dirty / 3 worker down / 4 timeout
-// -> PARKED. Mirrors handleGate's own shadow-mode cause table exactly.
+// `npm run gate`: 0 PASS -> CI_CHECKS, 1 fail -> see the exit-1 block below (action 4.2), 2 dirty
+// / 3 worker down / 4 timeout -> PARKED. 0/2/3/4 are unchanged and still mirror handleGate's own
+// shadow-mode cause table exactly; the green path (exit 0) makes no extra call at all.
 async function realGate(ctx, deps = {}) {
+  const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
   moveCard(ctx, deps, 'GATE'); // kanban piloting
   const r = spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate'], { cwd: worktreePath });
@@ -1042,7 +1279,217 @@ async function realGate(ctx, deps = {}) {
   fs.writeFileSync(gateLogPath(ctx.taskDir), r.stdout || r.stderr || '');
 
   if (r.exit === 0) return 'CI_CHECKS';
-  if (r.exit === 1) return 'DIAGNOSE';
+
+  if (r.exit === 1) {
+    // ---- action 4.2: exit 1 is no longer an unconditional route to DIAGNOSE ------------------
+    //
+    // The plan called for deriving `baseMain` from the journaled origin/main sha whenever the
+    // bench's own verdict for HEAD lacks one, then intersecting file lists exactly like
+    // CI_CHECKS' own main-moved test (below). Measurement changed the plan: `baseMain` is not
+    // merely sometimes missing on a FAIL -- it is missing in EXACTLY the case this action exists
+    // to catch, and there is nothing to derive it FROM when it is. `SPO-WebClient/src/e2e/bench/
+    // worker.ts` sets `report.baseMain = deps.resolveRef(request.worktree, 'origin/main')` at
+    // line ~429, AFTER `prepareRef` (line ~369) has already merged `origin/main` into the fetched
+    // checkout -- and when that merge itself conflicts, `prepareRef` returns `finish('FAIL',
+    // '<ref> does not merge cleanly with origin/main (base <sha>)')` at line ~374, before
+    // `baseMain` is ever assigned. So a branch that no longer merges cleanly with `origin/main`
+    // FAILs with no `baseMain` to derive anything from, and the plan's intersection test cannot
+    // run there at all -- it is not implemented here.
+    //
+    // Measured over all 491 files in `~/.spo-bench/verdicts/`, restricted to the 375 `ref`-type
+    // jobs `npm run gate` actually submits (`SPO-WebClient/scripts/bench-gate.sh` -- the other
+    // job types are not what GATE waits on): PASS 359/359 carry `baseMain`; FAIL 14/16 carry
+    // `baseMain` and the 2 that do NOT are the main-moved conflicts. Confirmed end to end on a
+    // real card: `journal/issue-439/journal.jsonl` shows a GATE exit 1 at 2026-08-30T02:12:35Z;
+    // that attempt's DIAGNOSE (attempt 2) root cause reads "The attempt's branch (379ada60, based
+    // on main@5f0f4886) no longer merges cleanly with origin/main: while the task ran, PR #436
+    // (issue-213, merge db3dec5a) landed..."; and
+    // `~/.spo-bench/verdicts/379ada60dd05ab7e95df11d6bba77af2f88b05a0.json` is exactly
+    // `{"verdict":"FAIL"}`, no `baseMain`, written 02:12:33.802Z -- the instant `prepareRef`
+    // discovered the conflict, not a code failure. That card burned all 3 DIAGNOSE attempts (a
+    // judge cannot fix a conflict IMPLEMENT never even saw) and parked `diagnose-budget-
+    // exhausted`; a maintainer's `retry` restarted it at INTAKE from a fresh worktree off the new
+    // `main` and it reached DONE in 19 minutes. That IS the fix this block encodes: recognise the
+    // shape (FAIL, no baseMain) and either merge locally or park honestly for a fresh restart --
+    // never spend a judge call trying to diagnose code that was never actually the problem.
+    //
+    // The mirror-image case matters just as much: a FAIL that DOES carry `baseMain` is a
+    // genuinely different failure, not a smaller version of the main-moved one. The bench had
+    // already merged `origin/main` into the checkout before it ever built, so that run failed
+    // WITH `main` already in the tree -- there is nothing left for a local merge to fix, and
+    // running the intersection test there would risk routing a real failure to CHECK instead of
+    // to a judge. It keeps going to DIAGNOSE, unchanged, at the bottom of this block.
+    //
+    // A third shape a plain "exit 1 -> DIAGNOSE" mapping already missed entirely: worker.ts's
+    // `NON_ATTESTING` set is `{DIRTY, ENVIRONMENT, ABANDONED}`, and verdicts in that set are
+    // deliberately never written to `verdicts/` at all -- yet cli.ts's `wait()` returns
+    // `report.verdict === 'PASS' || 'LEASED' ? 0 : 1`, so all three still reach here as a plain
+    // exit 1, indistinguishable by exit code alone from a real gate failure. A dead gateway, a
+    // lost owner lease, or a failed fetch means NOTHING was learned about the code -- not
+    // "something went wrong reading the verdict file" -- so a MISSING verdict file parks honestly
+    // (`gate-non-attesting`) instead of spending a DIAGNOSE call asking a judge to explain a
+    // failure that was never actually observed. (Action 4.4 adds `gate-non-attesting` to its
+    // transient auto-retry allowlist, so this parks honestly today and self-heals once that
+    // lands -- no retry loop is built here.)
+    const headRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    if (headRes.exit !== 0) {
+      // Never make the diagnostic itself fatal to the card -- an unreadable HEAD sha means the
+      // verdict lookup below cannot even be attempted; fall back to today's behaviour.
+      appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'rev-parse', exit: headRes.exit });
+      return 'DIAGNOSE';
+    }
+    const headSha = headRes.stdout.trim();
+
+    // Exit 0 is necessary but NOT sufficient to trust this string, and the SHAPE has to be
+    // checked too -- action 4.1's own finding, one function up: a failing `git rev-parse <ref>`
+    // prints the REF NAME ITSELF on stdout (measured: an orphan/unborn HEAD gives exit 128,
+    // "fatal: ambiguous argument 'HEAD'" on stderr, and the literal `HEAD` on stdout), so any
+    // path that reads stdout without also pinning down what a sha looks like is one odd git state
+    // away from carrying a plausible-looking non-sha forward. The exit check above catches the
+    // measured case; this catches the class. The cost of NOT catching it is higher here than at
+    // realPushPr's guard: there a bogus sha fell through to a push that could only fail, whereas
+    // here it makes `verdicts/<bogus>.json` miss -- and a miss now PARKS the card
+    // `gate-non-attesting`, i.e. tells a maintainer "the bench attested nothing about your code"
+    // when the truth is that the machine never asked the bench the right question. Anything that
+    // is not a hex object name is therefore treated exactly like a non-zero exit: journalled, and
+    // routed to today's DIAGNOSE. Never park on a failed diagnostic. (7..64 rather than exactly
+    // 40: `--short` output and a future sha-256 repo are both still real object names; the point
+    // of the test is to exclude `HEAD`, an empty string and any error text, not to re-implement
+    // git's own object-name parser.)
+    if (!/^[0-9a-f]{7,64}$/.test(headSha)) {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', {
+        step: 'rev-parse',
+        exit: headRes.exit,
+        headSha,
+      });
+      return 'DIAGNOSE';
+    }
+
+    const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
+    const verdict = readJsonSafe(verdictPath); // same accessor realCiChecks already uses below
+
+    if (!verdict) {
+      // readJsonSafe returns null for TWO different facts, and only one of them is "the run was
+      // non-attesting": the file is not there (the NON_ATTESTING case this block exists for), or
+      // the file IS there and did not parse -- a truncated write (379ada60's verdict landed at
+      // 02:12:33.802Z, 1.2s before the CLI's own exit, so the window is small but real), a
+      // permission error, a half-synced read. The second is a failed LOOKUP, not a verdict, and
+      // parking a card on a failed lookup is exactly the mistake the rev-parse branch above
+      // refuses to make. One `fs.existsSync` separates them.
+      if (fs.existsSync(verdictPath)) {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'verdict-parse', verdictPath });
+        return 'DIAGNOSE';
+      }
+      // `verdictDirExists` is on the event AND on the park detail deliberately: a misconfigured
+      // or unmounted `config.spoBenchDir` makes EVERY failing gate land here, and the two cases a
+      // maintainer has to tell apart -- "the bench genuinely attested nothing" vs "the machine
+      // was looking in the wrong place" -- are otherwise indistinguishable from the park comment
+      // alone. It is a stable boolean, so park-loop's countRepeatedParks fingerprint
+      // (JSON.stringify(detail)) still matches across a repeated park exactly as before.
+      const verdictDirExists = fs.existsSync(path.dirname(verdictPath));
+      appendEvent(ctx.taskDir, 'GATE', 'gate-non-attesting', { headSha, verdictPath, verdictDirExists });
+      throw new ParkSignal('gate-non-attesting', { headSha, verdictDirExists });
+    }
+
+    const baseMain = verdict.baseMain;
+    appendEvent(ctx.taskDir, 'GATE', 'gate-verdict', {
+      headSha,
+      verdict,
+      baseMain: baseMain || null,
+      merged: verdict.merged === true,
+    });
+
+    if (verdict.verdict === 'FAIL' && !baseMain) {
+      // The bench never got past `prepareRef` -- this branch does not merge with origin/main.
+      // Fetch the real remote tip first: the intersection/merge decision below must be made
+      // against it, not a lagging local `origin/main`. A non-zero exit here is not fatal --
+      // continue with what is already local rather than parking on a flaky fetch.
+      const fetch = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'fetch', 'origin', 'main']);
+      if (fetch.exit !== 0) {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-fetch-failed', { exit: fetch.exit });
+      }
+
+      if (ctx.counters.mainMoveUsed) {
+        throw new ParkSignal('main-moved-twice', {});
+      }
+      ctx.counters.mainMoveUsed = true;
+
+      // Same nightly-red refusal CI_CHECKS applies to its own main-moved merge (guardNightlyRed,
+      // above) -- a rev-parse failure here is likewise non-fatal: without a sha to compare, the
+      // guard cannot fire, so this degrades to "not known to be red" rather than parking on what
+      // is, same as the fetch above, an enrichment lookup rather than the merge decision itself.
+      //
+      // That asymmetry with CI_CHECKS (whose gitRevParse throws ParkSignal('ci-checks-rev-parse-
+      // failed') on the very same failure) is deliberate and it is safe, for a reason worth
+      // writing down rather than trusting: skipping the guard cannot let a red `main` be merged,
+      // because the merge two lines below resolves the SAME ref. If `git rev-parse origin/main`
+      // genuinely cannot resolve it, neither can `git merge origin/main` -- measured in a scratch
+      // repo with no remote: rev-parse exits 128 ("unknown revision"), merge exits 1 ("merge:
+      // origin/main - not something we can merge") -- so the card parks `main-moved-conflict`
+      // rather than merging anything. The one residual window is a rev-parse that fails for a
+      // reason unrelated to the ref while the ref itself is fine (an operator's `kill -9` with no
+      // deadline armed, which spawnOnce maps to exit 1): the guard is skipped and a red `main`
+      // could be merged. Accepted rather than closed, on the same principle as the fetch above --
+      // a diagnostic lookup must not become the thing that parks the card -- and a merged red main
+      // costs one CHECK/GATE cycle, where a false park costs a maintainer.
+      const originMainRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+      if (originMainRes.exit === 0) {
+        guardNightlyRed(config, originMainRes.stdout.trim());
+      } else {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-rev-parse-failed', { exit: originMainRes.exit });
+      }
+
+      const merge = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
+      if (merge.exit === 0) {
+        appendEvent(ctx.taskDir, 'GATE', 'main-moved-merge', { from: 'GATE' });
+        return 'CHECK';
+      }
+
+      // Non-zero: abort the failed merge so the worktree is left clean, then park. `merge
+      // --abort` goes through spawnStep like everything else here, so its own exit is already
+      // journalled by the generic 'spawn' event -- a NON-ZERO exit is deliberately not inspected,
+      // because a failed abort must not be allowed to mask the park below.
+      //
+      // "Not inspected" is not the same as "cannot escape", and the try/catch is what makes the
+      // sentence above actually true: since action 2.1, a spawnStep whose command is killed by
+      // its own timeout TWICE does not return at all -- it throws ParkSignal('git-timed-out'),
+      // which would unwind straight past the throw below and park the card under a reason naming
+      // the CLEANUP instead of the cause, taking {headSha, mergeExit} with it. That is action
+      // 4.3's verification finding in a different costume (a lookup documented as "never parks"
+      // parking the card before its own event was written), and this is one of the two call sites
+      // in this block where a spawnStep throw destroys information the rest of the system depends
+      // on: `main-moved-conflict` is the whole output of this action, the reason a maintainer
+      // reads, and the reason action 4.4 keys its transient-retry decision off. Journal the
+      // timeout, then park for the real reason regardless. (The other spawnStep calls here --
+      // rev-parse, fetch, merge -- are deliberately NOT wrapped: a hung git there parks
+      // `git-timed-out` before any routing decision has been made, which is honest and is exactly
+      // what spawnStep's own header prescribes.)
+      //
+      // What a failed abort leaves behind, traced rather than assumed: an unresolved index with
+      // conflict markers. finalizePark then calls preserveWorktreeWip, which does `git status
+      // --porcelain` (non-empty -> proceeds), then `git checkout --detach` -- and git REFUSES
+      // that on an unmerged index ("error: you need to resolve your current index first", exit 1,
+      // measured). preserveWorktreeWip journals `wip-preserve-failed {step:'detach'}` and returns
+      // null, so a conflicted tree is never committed to a `wip/` ref and no branch pointer moves.
+      // Nothing is lost either: the only content in that tree that is not already on the branch is
+      // origin/main's own, and `retry` rebuilds the worktree from scratch anyway.
+      try {
+        spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', '--abort']);
+      } catch (err) {
+        if (!(err instanceof ParkSignal)) throw err;
+        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-abort-failed', { reason: err.reason });
+      }
+      // Parking here is deliberate, not a gap: #439 proves DIAGNOSE cannot fix a conflict
+      // IMPLEMENT never even saw, and a maintainer's `retry` restarts at INTAKE from a fresh
+      // worktree off the new main -- which is what actually resolved it, in 19 minutes.
+      throw new ParkSignal('main-moved-conflict', { headSha, mergeExit: merge.exit });
+    }
+
+    // FAIL carrying baseMain (a real failure -- see the header comment above), or any other
+    // shape (e.g. a PASS verdict recorded against an exit-1 gate) -> DIAGNOSE, unchanged.
+    return 'DIAGNOSE';
+  }
+
   if (r.exit === 2) throw new ParkSignal('gate-dirty-tree', { exit: r.exit });
   if (r.exit === 3) throw new ParkSignal('gate-worker-down', { exit: r.exit });
   if (r.exit === 4) throw new ParkSignal('gate-timeout', { exit: r.exit });
@@ -1078,9 +1525,14 @@ function pollSleep(deps, ms) {
   return sleepFn(ms);
 }
 
-// One `gh api .../check-runs` fetch for `headSha`, parsed down to [{name, conclusion}]. Goes
-// through spawnStep like every other real command here, so every poll in the loop below is
-// journalled the same way a single fetch always was.
+// One `gh api .../check-runs` fetch for `headSha`, parsed down to
+// [{name, conclusion, status, id, app}]. Goes through spawnStep like every other real command
+// here, so every poll in the loop below is journalled the same way a single fetch always was.
+// `id` and `app` were added by action 4.3: `id` is `check_run.id`, which -- for a GitHub Actions
+// run -- IS the job id (`gh api repos/<repo>/actions/jobs/<id>` below); `app` is the check's
+// reporting app slug (`r.app && r.app.slug`), which realCiChecks uses to gate that lookup to
+// genuine GitHub Actions check runs only (a third-party check's `id` means nothing to that
+// endpoint).
 function fetchCheckRuns(ctx, deps, config, headSha) {
   const checkRuns = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
     'api',
@@ -1096,7 +1548,13 @@ function fetchCheckRuns(ctx, deps, config, headSha) {
     }
   })();
   const runs = parsed && Array.isArray(parsed.check_runs) ? parsed.check_runs : [];
-  return runs.map((r) => ({ name: r.name, conclusion: r.conclusion, status: r.status }));
+  return runs.map((r) => ({
+    name: r.name,
+    conclusion: r.conclusion,
+    status: r.status,
+    id: r.id,
+    app: r.app && r.app.slug,
+  }));
 }
 
 async function realCiChecks(ctx, deps = {}) {
@@ -1146,9 +1604,91 @@ async function realCiChecks(ctx, deps = {}) {
   const failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion));
 
   if (failing) {
-    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', { check: failing.name });
-    const outcome = classifyCiFailure(failing.name);
-    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failing.name });
+    // Action 4.3: `failing.name` is a JOB name (`typecheck + tests`, etc.), never one of the
+    // step names ci-cause-table.js actually classifies on -- see that file's header for the full
+    // measurement. Recover the step by treating `failing.id` as the GitHub Actions job id
+    // (verified on six real failed runs) and fetching that job's `steps[]`. Gate the lookup to
+    // genuine GitHub Actions runs with a numeric id: a third-party check (`app` anything else,
+    // e.g. a bot-reported check with no run behind it) or a shape this code has never seen
+    // degrades straight to `stepName = null` -- no lookup attempted -- rather than spawning a
+    // `gh api` call that cannot possibly resolve to a job.
+    let stepName = null;
+    if (failing.app === 'github-actions' && typeof failing.id === 'number') {
+      // This lookup is best-effort ONLY -- it exists to sharpen a DIAGNOSE-bound classification
+      // into an IMPLEMENT retry or a PARK for the handful of steps ci-cause-table.js recognises.
+      // It must never itself park or throw: a bad exit, an unparsable body, or a missing
+      // `steps` array just degrades to today's behaviour (classify on the check name alone,
+      // which -- see ci-cause-table.js's header -- always resolves to DIAGNOSE). Losing the step
+      // detail must never be the thing that breaks a card.
+      //
+      // THE TRY/CATCH IS LOAD-BEARING, not defensive decoration. spawnStep is NOT a plain
+      // "return a result" call: on a spawnSync timeout it retries once and then THROWS
+      // ParkSignal(`${commandClass}-timed-out`) -- `gh-timed-out` here, since classifyCommand
+      // gives `gh` a class default from config.commandTimeoutsMs. Without this catch, a slow or
+      // hung GitHub API on a call that exists purely to ENRICH the routing would park a card
+      // whose CI failure was perfectly routable to DIAGNOSE, and would do it BEFORE the
+      // `check-failed` event below is written -- so the journal would carry `gh-timed-out` and
+      // no record of the CI failure at all, blinding `spo`, the dashboard and the judges, which
+      // all read `check-failed`. That is the exact shape of bug this action exists to remove
+      // (a CI failure that cannot reach the right next state), reintroduced by its own fix.
+      // Any other throw (a spawnSync argument rejection, a deps stub blowing up) degrades the
+      // same way and for the same reason; it is journalled rather than swallowed, so a real
+      // programming error here is still visible in the ledger instead of merely silent.
+      let jobRes = null;
+      try {
+        jobRes = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
+          'api',
+          `repos/${config.ghRepo}/actions/jobs/${failing.id}`,
+        ]);
+      } catch (err) {
+        appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
+          check: failing.name,
+          exit: null,
+          error: (err && err.reason) || (err && err.message) || String(err),
+        });
+      }
+      if (jobRes) {
+        const jobParsed = (() => {
+          try {
+            return JSON.parse(jobRes.stdout);
+          } catch {
+            return null;
+          }
+        })();
+        // Exit code first, per CLAUDE.md's "verdict by exit code, never by reading `gh`'s text
+        // output": a non-zero `gh api` still prints a body (`{"message":"Not Found",...}`, and
+        // on some failures a stale/partial one), so a parse that happens to succeed must not be
+        // allowed to override the exit code's verdict.
+        if (jobRes.exit !== 0 || !jobParsed || !Array.isArray(jobParsed.steps)) {
+          appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
+            check: failing.name,
+            exit: jobRes.exit,
+          });
+        } else {
+          // FIRST non-success, non-skipped step, never the last: a failing step in ci.yml's
+          // `verify` job is the CAUSE, and the steps after it are its consequences (a `Lint`
+          // failure that leaves `Tests` failing too must route on `Lint` -> IMPLEMENT, not on
+          // `Tests` -> DIAGNOSE). `skipped` is not a failure at all -- GitHub marks every step
+          // after the failing one `skipped` when the job stops there.
+          const failedStep = jobParsed.steps.find(
+            (s) => s.conclusion !== 'success' && s.conclusion !== 'skipped'
+          );
+          stepName = failedStep ? failedStep.name : null;
+        }
+      }
+    }
+
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', {
+      check: failing.name,
+      step: stepName,
+      jobId: failing.id,
+    });
+    const outcome = classifyCiFailure(failing.name, stepName);
+    // `step` in the detail as well as `check`: the park comment is a maintainer's only pointer at
+    // WHICH ci.yml step demanded approval, and the shadow-fixture path emits the same two-field
+    // detail -- park-loop.js's countRepeatedParks fingerprints on JSON.stringify(detail), so the
+    // two paths' shapes have to agree or a repeated park stops being recognised as repeated.
+    if (outcome.kind === 'park') throw new ParkSignal(outcome.reason, { check: failing.name, step: stepName });
     return outcome.nextState;
   }
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'checks-green', { headSha, checks });
@@ -1178,11 +1718,8 @@ async function realCiChecks(ctx, deps = {}) {
 
   if (!moved) return 'VALIDATE';
 
-  const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
   const originMainSha = await gitRevParse(ctx, deps, worktreePath, 'origin/main');
-  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
-    throw new ParkSignal('main-red-no-merge', {});
-  }
+  guardNightlyRed(config, originMainSha); // action 4.2: shared with GATE's own main-moved path
   if (ctx.counters.mainMoveUsed) {
     throw new ParkSignal('main-moved-twice', {});
   }
