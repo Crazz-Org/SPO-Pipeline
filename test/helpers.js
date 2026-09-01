@@ -106,6 +106,63 @@ function runDaemonDryRun(queueDir, journalDir, extraArgs = []) {
   return execFileSync(process.execPath, args, { encoding: 'utf8', env: isolatedEnv() });
 }
 
+// execFileSync throws on a non-zero exit, and node:test/no-real-spawn.js's repo-wide guard
+// (installed as a side effect of requiring it -- see that module's own header) patches
+// child_process.spawnSync UNCONDITIONALLY in every test file, including this legitimate
+// subprocess-launch use: it does not distinguish "a test reached a real spawnSync in-process"
+// (the incident it exists to close) from "test/helpers.js's own sanctioned real-process
+// boundary happens to use spawnSync instead of execFileSync". So worker-mode tests, which need
+// the exit code from a non-zero run, follow test/lock.test.js's existing precedent (its
+// "refuses to start when a live daemon holds the journal root" test) instead of spawnSync:
+// catch execFileSync's throw and read `.status`/`.stdout`/`.stderr` off the Error object, which
+// Node populates with exactly those fields. Normalized into a {status, stdout, stderr} result
+// either way, so a caller never has to branch on whether the run happened to succeed.
+//
+// `timeout` is not belt-and-braces: every usage-error case below asserts that daemon.js REFUSES
+// and exits, and the way that assertion fails is the daemon NOT refusing -- i.e. falling through
+// to runForever, which polls forever. Without a timeout, execFileSync then blocks the whole
+// `node --test` run indefinitely rather than failing one test, so the regression reports as a
+// hung suite with no failing test name. Measured, not hypothetical: mutating `workerMode` from
+// `opts.worker !== null` to `!!opts.worker` (2026-09-01) made `--shadow --worker` with no path
+// boot a full polling daemon; the suite hung past 600s and had to be killed by hand, and the
+// mutant daemon left a lock file in the repo's own journal/ on the way out.
+function runDaemonWorkerRun(args) {
+  try {
+    const stdout = execFileSync(process.execPath, args, {
+      encoding: 'utf8',
+      env: isolatedEnv(),
+      timeout: 60000,
+    });
+    return { status: 0, stdout, stderr: '' };
+  } catch (err) {
+    // A `timeout` kill sets err.signal and leaves err.status null (see timeoutResult above for
+    // the same shape spawnSync produces) -- surface it as its own status so the assertion says
+    // "expected 2, got 'SIGTERM-timeout'" instead of "expected 2, got null".
+    if (err && err.signal && (err.status === null || err.status === undefined)) {
+      return { status: `timed-out(${err.signal})`, stdout: err.stdout || '', stderr: err.stderr || '' };
+    }
+    return { status: err.status, stdout: err.stdout || '', stderr: err.stderr || '' };
+  }
+}
+
+// Action 6.1: runs `daemon.js --shadow --worker <taskDir>` against a throwaway queue dir (never
+// used by worker mode functionally -- a worker never calls takeNextTask/drainQueueOnce -- but
+// still isolated the same way every other spawn in this file is, so a mutation that made worker
+// mode fall through to the ordinary --queue default (<repo>/queue) would touch a temp dir, not
+// this machine's real one).
+function runDaemonWorker(taskDir, journalDir, extraArgs = []) {
+  const queueDir = mkTmp('spo-worker-unused-queue-');
+  const args = [DAEMON, '--shadow', '--worker', taskDir, '--queue', queueDir, '--journal', journalDir, ...extraArgs];
+  return runDaemonWorkerRun(args);
+}
+
+// Same isolation as every other runner, but the caller supplies the FULL daemon.js argv -- for
+// usage-error tests where runDaemonOnce/runDaemonWorker's fixed shape (queue+journal always
+// present) doesn't fit, e.g. `--worker` as the very last token with no path following it.
+function runDaemonRaw(args) {
+  return runDaemonWorkerRun([DAEMON, ...args]);
+}
+
 function runSpo(args) {
   return execFileSync(process.execPath, [SPO_BIN, ...args], { encoding: 'utf8', env: isolatedEnv() });
 }
@@ -134,10 +191,16 @@ module.exports = {
   DAEMON,
   SPO_BIN,
   mkTmp,
+  isolatedEnv, // exported for the few tests that call child_process.spawn() directly (lock.test.js's
+  // signal/concurrency integration tests) -- they need the SAME throwaway product repo, worktrees
+  // dir, account pool and bench every execFileSync runner above gets. See isolatedEnv's own header
+  // for the incident that isolation closes; a direct spawn() is not exempt from it.
   writeTask,
   writePoolDir,
   runDaemonOnce,
   runDaemonDryRun,
+  runDaemonWorker,
+  runDaemonRaw,
   runSpo,
   readJournal,
   readState,

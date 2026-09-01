@@ -1310,12 +1310,25 @@ function finalizePark(ctx, lastState, reason, detail) {
     // `path.join(undefined, ...)` throwing. finalizePark is called from INSIDE runTask's own
     // ParkSignal catch, so anything it throws escapes past that catch, out of drainQueueOnce and
     // kills the daemon process -- C3 already shipped exactly that shape once (preserveWorktreeWip
-    // throwing inside this function, a crash loop over one hung `git status`). drainQueueOnce
-    // threads queueDir onto the config for every task it runs, but orphan-scan.js builds its own
-    // ctx from runForever's config, which has no queueDir on it: no reason it reparks with
-    // (`task-orphaned-daemon-restart`) is on the allowlist today, so that path cannot reach here
-    // yet -- this guard is what keeps that a safety property rather than a coincidence one future
-    // allowlist entry silently revokes. No queue to write to means no auto-retry; park honestly.
+    // throwing inside this function, a crash loop over one hung `git status`).
+    //
+    // Action 6.1 changed who supplies it, and the change is worth stating plainly because it
+    // removed a belt this comment used to describe as a second one. Before 6.1, drainQueueOnce
+    // was the ONLY injector (`{...config, queueDir}` per task), so orphan-scan.js -- which builds
+    // its own ctx from runForever's config -- structurally could not reach the branch below at
+    // all. 6.1 needed queueDir on the config in worker mode too (a worker never goes through
+    // drainQueueOnce), and set it once in daemon.js's main() for BOTH modes; runForever's config
+    // therefore carries it now, and so does the ctx orphan-scan builds from it. Verified against
+    // this file's own reader: `buildCtx(id, task, taskDir, {...config, deps})` in orphan-scan.js.
+    //
+    // Nothing changes in practice TODAY -- orphan-scan's only park reason
+    // (`task-orphaned-daemon-restart`) is not on TRANSIENT_RETRY_REASONS, so isTransientRetryReason
+    // already rejects it before this line is read. But the allowlist is now the ONLY thing
+    // standing between an orphan repark and an auto-retry: adding that reason to the set would
+    // silently make orphan-scan re-enqueue, where before 6.1 it would still have parked. Anyone
+    // extending TRANSIENT_RETRY_REASONS must decide that on purpose.
+    //
+    // The guard below stays regardless: no queue to write to means no auto-retry; park honestly.
     const queueDir = ctx.config && ctx.config.queueDir;
     if (priorRetries < budget && typeof queueDir === 'string' && queueDir !== '') {
       const attempt = priorRetries + 1;

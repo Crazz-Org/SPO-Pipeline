@@ -17,7 +17,19 @@ const path = require('path');
 require('./no-real-spawn');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('../orchestrator/lock');
 const { runTask } = require('../orchestrator/state-machine');
-const { DAEMON, mkTmp, writeTask, runDaemonOnce, readState } = require('./helpers');
+const { DAEMON, mkTmp, writeTask, runDaemonOnce, runDaemonWorker, readState, isolatedEnv } = require('./helpers');
+
+// Same layout a dispatcher's takeNextTask would leave behind (<taskDir>/task.json, no queue/
+// entry) -- worker mode reads it directly, never through the queue. Shared by both action 6.1
+// tests below; see test/worker-mode.test.js for the fuller worker-mode coverage (exit codes,
+// owner shape, usage errors) -- these two live here instead because what they actually pin is
+// LOCK behaviour: a worker takes none at all.
+function seedWorkerTask(journalDir, id, taskObj) {
+  const taskDir = path.join(journalDir, id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify(taskObj, null, 2));
+  return taskDir;
+}
 
 test('acquireLock: clean acquire writes {host, pid, startedAt, mode} and release removes it', () => {
   const root = mkTmp('spo-lock-');
@@ -429,4 +441,92 @@ test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook
   child.kill('SIGTERM');
   await new Promise((resolve) => child.once('exit', resolve));
   assert.equal(fs.existsSync(lockPath(journalDir)), false);
+});
+
+// ---- action 6.1: --worker takes no lock at all -----------------------------------------------
+
+test('daemon.js --worker: leaves no lock file behind -- the whole point of skipping acquireLock', () => {
+  const journalDir = mkTmp('spo-lock-worker-j-');
+  const taskDir = seedWorkerTask(journalDir, 'worker-no-lock', {
+    id: 'worker-no-lock',
+    kind: 'synthetic',
+    shadow: { forceState: 'DONE' },
+  });
+
+  const result = runDaemonWorker(taskDir, journalDir);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readState(journalDir, 'worker-no-lock').state, 'DONE');
+
+  // A mutation that re-added acquireLock to the --worker path would fail exactly this line: the
+  // lock file would exist right up until the worker's own 'exit' hook released it, and by the
+  // time execFileSync returns here that release has already happened -- so a re-added
+  // acquireLock would be caught by the DAEMON test above ("SIGTERM releases the lock") passing
+  // for the wrong reason, not by a leftover file. What actually distinguishes "never acquired"
+  // from "acquired and released" is the concurrency test directly below: two workers against the
+  // SAME journal root, overlapping in wall-clock time, both succeeding. That is the one a
+  // reintroduced acquireLock cannot fake.
+  assert.equal(fs.existsSync(lockPath(journalDir)), false);
+});
+
+test('daemon.js --worker: two workers run CONCURRENTLY against the SAME journal root and both succeed', async () => {
+  const journalDir = mkTmp('spo-lock-worker-j-');
+  // Same shape as test/citation-verifier.test.js's proven "reaches DONE in shadow mode" fixture
+  // (gate/prWait exit-0 fixtures + a VALIDATE PASS verdict), plus a delays.IMPLEMENT slow enough
+  // that both children are still alive, mid-task, at the same wall-clock instant -- a real
+  // overlap, not two runs that merely didn't happen to collide.
+  const taskDirA = seedWorkerTask(journalDir, 'worker-concurrent-a', {
+    id: 'worker-concurrent-a',
+    kind: 'synthetic',
+    touchesRdoMembers: true,
+    shadow: { gate: [0], prWait: [0], llm: { VALIDATE: { verdict: 'PASS' } }, delays: { IMPLEMENT: 150 } },
+  });
+  const taskDirB = seedWorkerTask(journalDir, 'worker-concurrent-b', {
+    id: 'worker-concurrent-b',
+    kind: 'synthetic',
+    touchesRdoMembers: true,
+    shadow: { gate: [0], prWait: [0], llm: { VALIDATE: { verdict: 'PASS' } }, delays: { IMPLEMENT: 150 } },
+  });
+
+  const queueDirA = mkTmp('spo-lock-worker-q-');
+  const queueDirB = mkTmp('spo-lock-worker-q-');
+  const { spawn } = require('child_process');
+  // isolatedEnv(), not bare process.env: these two children run the real daemon to completion,
+  // and helpers.js's isolatedEnv header says why every daemon subprocess goes through it -- a
+  // mutation that makes a shadow-mode step take a real path turns fixture ids into git worktrees
+  // and branches in the maintainer's live ~/SPO-WebClient (44 of them, on 2026-08-31, invisible
+  // to `git status` because worktrees/ is gitignored). "Shadow mode never reaches realWorktree"
+  // is precisely the invariant a mutation round exists to break, so it cannot also be the reason
+  // this test is allowed to skip the isolation.
+  const spawnOpts = { stdio: 'ignore', env: isolatedEnv() };
+  const childA = spawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--worker', taskDirA, '--queue', queueDirA, '--journal', journalDir],
+    spawnOpts
+  );
+  const childB = spawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--worker', taskDirB, '--queue', queueDirB, '--journal', journalDir],
+    spawnOpts
+  );
+
+  // Both must be alive at the same time for this to actually test concurrency rather than two
+  // sequential runs that merely didn't error. If either has already exited, the delay above
+  // wasn't long enough on this machine and the test would silently stop proving anything.
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(childA.exitCode, null, 'worker A finished before the concurrency window -- raise the IMPLEMENT delay');
+  assert.equal(childB.exitCode, null, 'worker B finished before the concurrency window -- raise the IMPLEMENT delay');
+
+  const [codeA, codeB] = await Promise.all([
+    new Promise((resolve) => childA.once('exit', resolve)),
+    new Promise((resolve) => childB.once('exit', resolve)),
+  ]);
+
+  // Today's non-worker daemon would refuse the second of these with LockHeldError (exit 1) --
+  // that is exactly the contention --worker mode exists to remove. Both reaching DONE (0) proves
+  // neither ever contended for a lock the other held.
+  assert.equal(codeA, 0, 'worker A did not exit 0');
+  assert.equal(codeB, 0, 'worker B did not exit 0');
+  assert.equal(readState(journalDir, 'worker-concurrent-a').state, 'DONE');
+  assert.equal(readState(journalDir, 'worker-concurrent-b').state, 'DONE');
+  assert.equal(fs.existsSync(lockPath(journalDir)), false, 'neither worker may leave a lock file');
 });

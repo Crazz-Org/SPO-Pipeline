@@ -151,6 +151,55 @@ test('orphanScan: owner still alive -> left alone (slow, not orphaned)', async (
   assert.equal(state.state, 'DIAGNOSE');
 });
 
+// ---- action 6.1: orphan-scan must recognise BOTH owner shapes -------------------------------
+// A worker-mode run (daemon.js --worker) writes {host, workerPid, workerStartedAt} instead of
+// the non-worker daemon's {host, pid, lockStartedAt} -- there is no lock holder to borrow
+// pid/startedAt from, since a worker never takes the lock. Every other test in this file already
+// exercises the OLD shape via seedTask's own default owner (line ~79 above); these three pin the
+// NEW shape explicitly, plus one explicit old-shape case side by side so the pairing in the plan
+// spec is visible in one place rather than scattered across the file.
+
+test('orphanScan: OLD owner shape {host, pid, lockStartedAt}, built explicitly, with a dead pid -> reparked', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-900', {
+    owner: { host: os.hostname(), pid: DEAD_PID, lockStartedAt: '2026-08-30T00:00:00.000Z' },
+  });
+
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+  assert.deepEqual(recovered, [{ id: 'issue-900', reason: 'task-orphaned-daemon-restart' }]);
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+});
+
+test('orphanScan: NEW owner shape {host, workerPid, workerStartedAt} with a dead pid -> reparked the same way', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-901', {
+    owner: { host: os.hostname(), workerPid: DEAD_PID, workerStartedAt: '2026-09-01T00:00:00.000Z' },
+  });
+
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+  assert.deepEqual(recovered, [{ id: 'issue-901', reason: 'task-orphaned-daemon-restart' }]);
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+});
+
+test('orphanScan: NEW owner shape with an ALIVE workerPid -> left alone (slow, not orphaned)', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-902', {
+    owner: { host: os.hostname(), workerPid: process.pid, workerStartedAt: 'x' },
+  });
+
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), {});
+  assert.deepEqual(recovered, []);
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'DIAGNOSE');
+});
+
 test('orphanScan: dead owner but recent updatedAt -> left alone (startup-race grace window)', async () => {
   const journalRoot = mkTmp('spo-orphan-journal-');
   const queueDir = mkTmp('spo-orphan-queue-');

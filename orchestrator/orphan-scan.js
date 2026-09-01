@@ -90,14 +90,26 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}) {
     if (!state || TERMINAL_STATES.has(state.state)) continue;
     if (inQueue.has(id)) continue;
 
+    // Action 6.1 added a second owner shape: a worker-mode run (daemon.js --worker) writes
+    // {host, workerPid, workerStartedAt} instead of the daemon's own {host, pid, lockStartedAt},
+    // because there is no lock holder to borrow pid/startedAt from -- a worker never takes the
+    // lock (see daemon.js's own comment on that). Reading `workerPid ?? pid` is load-bearing,
+    // not cosmetic: `jq -c '.owner' journal/*/state.json` against the LIVE journal root
+    // (measured 2026-09-01) shows 7 distinct owners still sitting in the old shape, and the
+    // post-merge hook SIGTERMs the daemon on every deploy -- which leaves an in-flight card's
+    // state.json holding whichever shape was current at the moment of death. The restarted
+    // process's orphanScan is the only thing that ever revisits that file; if it stopped
+    // recognising the old shape, every one of those tasks would be invisible forever, not just
+    // the ones written after this action shipped.
     const owner = state.owner;
-    if (!owner || typeof owner.pid !== 'number') {
+    const ownerPid = owner && (owner.workerPid ?? owner.pid);
+    if (!owner || typeof ownerPid !== 'number') {
       appendDaemonEvent(journalRoot, 'orphan-scan-unknown-owner', { id, state: state.state });
       continue;
     }
     if (owner.host !== os.hostname()) continue; // cannot probe a remote host's pid
-    if (owner.pid === process.pid) continue; // this process itself -- never an orphan of our own scan
-    if (isAlive(owner.pid)) continue; // owner still alive -- slow, not orphaned
+    if (ownerPid === process.pid) continue; // this process itself -- never an orphan of our own scan
+    if (isAlive(ownerPid)) continue; // owner still alive -- slow, not orphaned
 
     const updatedAt = state.updatedAt ? Date.parse(state.updatedAt) : NaN;
     if (Number.isNaN(updatedAt) || Date.now() - updatedAt < graceMs) continue; // startup-race window

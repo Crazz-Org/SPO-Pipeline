@@ -3,10 +3,37 @@
 // entrypoint: node orchestrator/daemon.js (--shadow | --dry-run | --real) --once [--queue <dir>]
 //                                          [--journal <dir>] [--deadline-ms <n>]
 //                                          [--interval-ms <n>]
+//             node orchestrator/daemon.js (--shadow | --dry-run | --real) --worker <taskDir>
+//                                          [--journal <dir>] [--deadline-ms <n>]
 //
 // --once   drains the whole queue serially (filename order) and exits.
 // (absent) polls the queue directory forever, draining whatever has arrived, sleeping
 //          --interval-ms between passes.
+// --worker <taskDir>  action 6.1: runs the ONE task already sitting in <taskDir>/task.json
+//          (runTask) to its terminal state and exits -- never takeNextTask, drainQueueOnce,
+//          runForever, or orphanScan. This is the half of the K-worker design that can exist
+//          before there is a dispatcher (action 6.3 adds that half: the process-group spawn,
+//          the live-worker table, the crash repark, the circuit breaker). A worker does not
+//          take the single-instance lock (lock.js's acquireLock) -- the dispatcher holds that,
+//          once, for the whole journal root; K workers contending for it would defeat the
+//          point of running K of them. Mutually exclusive with --once (both are "how do I not
+//          poll forever", answered two different ways). Exit code is the dispatcher's ONLY
+//          signal (it never re-reads state.json to tell a crash from a park):
+//            0  the task reached DONE
+//            20 the task reached PARKED -- an ordinary outcome, not a crash
+//            2  usage error (no path, unreadable taskDir/task.json)
+//            75 LockLostError propagated (kept for symmetry with the non-worker catch-all
+//               below; unreachable in practice since a worker never wires config.lockLost)
+//            130/143 killed by SIGINT/SIGTERM -- NOT a code runWorker returns, but reachable and
+//               routine, so 6.3 must handle it rather than be surprised by it. The SIGINT/SIGTERM
+//               handlers registered below apply to a worker exactly as they do to a daemon, and
+//               the post-merge deploy hook SIGTERMs this tree on every merge. Measured, not
+//               inferred: SIGTERM to a `--worker` mid-IMPLEMENT exits 143 and leaves state.json
+//               at IMPLEMENT with this worker's own owner stamped on it -- which is precisely
+//               what orphanScan recovers on the next --real start, so the card is not lost.
+//            1  anything else -- an uncaught error; this is what 6.3 reads as "crashed, repark".
+//               6.3's classifier must therefore be "0/20/2/75 by name, EVERYTHING else = crashed"
+//               and not "1 = crashed", or a deploy-time SIGTERM (143) falls through it unhandled.
 //
 // One of --shadow, --dry-run or --real is required:
 //   --shadow    every scripted/LLM step reads task.shadow fixtures. Never spawns a subprocess,
@@ -31,10 +58,11 @@
 //               "Real scripted steps".
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const defaultConfig = require('./config');
-const { drainQueueOnce, runForever } = require('./state-machine');
+const { drainQueueOnce, runForever, runTask } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
 const { appendDaemonEvent } = require('./journal');
@@ -46,6 +74,9 @@ function parseArgs(argv) {
     dryRun: false,
     real: false,
     once: false,
+    // null = --worker not given at all; '' / undefined (falsy, but not null) = given with no
+    // path following it -- main() tells the two apart to print the right usage error.
+    worker: null,
     queue: null,
     journal: null,
     deadlineMs: null,
@@ -58,6 +89,7 @@ function parseArgs(argv) {
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--real') opts.real = true;
     else if (a === '--once') opts.once = true;
+    else if (a === '--worker') opts.worker = argv[++i];
     else if (a === '--queue') opts.queue = argv[++i];
     else if (a === '--journal') opts.journal = argv[++i];
     else if (a === '--deadline-ms') opts.deadlineMs = parseInt(argv[++i], 10);
@@ -85,12 +117,54 @@ function printUsage() {
       '                    -- see doc/setup.md § Accounts / `spo account add <name>`.',
       '  (one of --shadow, --dry-run or --real is required)',
       '  --once            drain the queue serially and exit (default: poll forever)',
+      '  --worker <dir>    run the ONE task in <dir>/task.json and exit (see file header for the',
+      '                    exit-code contract). Mutually exclusive with --once. Takes no lock.',
       '  --queue <dir>     task queue directory (default: <repo>/queue)',
       '  --journal <dir>   per-task runtime/journal root (default: <repo>/journal)',
       '  --deadline-ms <n> per-step wall-clock deadline in ms (default: 120000)',
       '  --interval-ms <n> poll interval in ms, only used without --once (default: 5000)',
     ].join('\n')
   );
+}
+
+// Action 6.1: reads <taskDir>/task.json and runs it through state-machine.js's runTask exactly
+// once, returning the exit code main() should use -- see this file's header comment for the
+// full table. Deliberately the ONLY thing a worker does: no takeNextTask (the dispatcher already
+// moved the task into taskDir before spawning this process), no drainQueueOnce/runForever, no
+// orphanScan, no periodic scans (unpark/auto-pull/report-intake/auto-triage) -- all of those stay
+// dispatcher-side (action 6.3). A missing/unreadable/unparsable task.json is a usage error (2),
+// not a crash (1): the dispatcher handed this process a bad path, which is its own bug to fix,
+// not this task's to be reparked over.
+async function runWorker(taskDirArg, config) {
+  const taskDir = path.resolve(taskDirArg);
+  const taskPath = path.join(taskDir, 'task.json');
+  let raw;
+  try {
+    raw = fs.readFileSync(taskPath, 'utf8');
+  } catch (err) {
+    console.error(`orchestrator/daemon.js: --worker cannot read ${taskPath}: ${err.message}`);
+    return 2;
+  }
+  let task;
+  try {
+    task = JSON.parse(raw);
+  } catch (err) {
+    console.error(`orchestrator/daemon.js: --worker cannot parse ${taskPath}: ${err.message}`);
+    return 2;
+  }
+  // Same id-derivation rule as takeNextTask (state-machine.js): task.id when the payload carries
+  // one, else the directory's own basename. A worker never sees a raw queue FILENAME (the
+  // dispatcher already renamed it into taskDir/task.json), so basename(taskDir) is the right
+  // fallback, not basename(some .json file).
+  const id = task && task.id ? String(task.id) : path.basename(taskDir);
+  const finalState = await runTask(id, task, taskDir, config);
+  // runTask's own while-loop only ever exits on 'DONE' or 'PARKED' (see its header comment) --
+  // anything else here would mean that contract broke, which is itself a bug worth surfacing
+  // loudly (exit 1, via the thrown Error below and main()'s catch-all) rather than silently
+  // mapped to one of the two codes below and mistaken for a normal outcome.
+  if (finalState === 'DONE') return 0;
+  if (finalState === 'PARKED') return 20; // an expected outcome, never conflated with a crash
+  throw new Error(`orchestrator/daemon.js: --worker: runTask returned unexpected state ${finalState}`);
 }
 
 async function main() {
@@ -107,6 +181,23 @@ async function main() {
   if (opts.real && opts.shadow) {
     console.error('orchestrator/daemon.js: --real and --shadow are mutually exclusive (see --help).');
     process.exitCode = 1;
+    return;
+  }
+
+  // Action 6.1: --worker is a different answer to "how do I not poll forever" than --once (one
+  // task vs. the whole queue), so the two together are a usage error, not a precedence rule to
+  // resolve silently -- exit 2, not 1, per this file's own header table: 6.3's dispatcher must
+  // be able to tell "I built a bad argv" (2) apart from "the daemon refused to start" (1) apart
+  // from "the task crashed" (1, but from runWorker, not here).
+  const workerMode = opts.worker !== null;
+  if (workerMode && opts.once) {
+    console.error('orchestrator/daemon.js: --worker and --once are mutually exclusive (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+  if (workerMode && !opts.worker) {
+    console.error('orchestrator/daemon.js: --worker requires a <taskDir> path (see --help).');
+    process.exitCode = 2;
     return;
   }
 
@@ -186,18 +277,29 @@ async function main() {
     process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143));
   }
 
-  try {
-    lock = acquireLock(journalRoot, opts.shadow ? 'shadow' : opts.dryRun ? 'dry-run' : 'real');
-  } catch (err) {
-    if (err instanceof LockHeldError) {
-      console.error(`orchestrator/daemon.js: ${err.message}`);
-      process.exitCode = 1;
-      return;
+  // Action 6.1: a worker never takes the single-instance lock. The dispatcher (action 6.3) holds
+  // it once, for the whole journal root, for as long as it runs; K workers each trying to
+  // acquire it too would either serialize them (defeating the entire point of running K) or
+  // have K-1 of them refuse to start with LockHeldError. Skipping acquireLock means skipping
+  // everything that exists only to service it: watchLock (nothing to watch), config.lockLost /
+  // config.lockLostHolder (runTask's cooperative check below is simply a no-op without them --
+  // see state-machine.js's own `if (config.lockLost && config.lockLost())`), and the
+  // 'lock-stale-taken' daemon event (nothing was taken over). `lock` stays null, so the
+  // process.once('exit', ...) release hook registered above is already correctly a no-op.
+  if (!workerMode) {
+    try {
+      lock = acquireLock(journalRoot, opts.shadow ? 'shadow' : opts.dryRun ? 'dry-run' : 'real');
+    } catch (err) {
+      if (err instanceof LockHeldError) {
+        console.error(`orchestrator/daemon.js: ${err.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
     }
-    throw err;
-  }
-  if (lock.stale) {
-    appendDaemonEvent(journalRoot, 'lock-stale-taken', { stale: lock.stale });
+    if (lock.stale) {
+      appendDaemonEvent(journalRoot, 'lock-stale-taken', { stale: lock.stale });
+    }
   }
 
   const config = {
@@ -207,12 +309,33 @@ async function main() {
     real: !opts.shadow && !opts.dryRun && !!opts.real,
     stepDeadlineMs: opts.deadlineMs || defaultConfig.stepDeadlineMs,
     pollIntervalMs: opts.intervalMs || defaultConfig.pollIntervalMs,
+    queueDir,
     // Every state.json snapshot this run writes carries this back (state-machine.js's
     // buildCtx/snapshot) -- orphan-scan.js's only way, after a restart, to tell "the process
-    // that wrote this is still alive" from "it died mid-task". lockStartedAt disambiguates a
-    // reused pid across successive daemon starts (lock.js's own payload.startedAt).
-    owner: { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
+    // that wrote this is still alive" from "it died mid-task".
+    //
+    // Two shapes, by mode. Non-worker (today's): {host, pid, lockStartedAt} -- pid/startedAt are
+    // the lock holder's own (lock.js's payload), because the lock-holding daemon process IS the
+    // owner. Worker mode (action 6.1): {host, workerPid, workerStartedAt} -- there is no lock
+    // holder to borrow identity from, so the worker stamps its own pid and its own boot time.
+    // workerStartedAt plays the exact role lockStartedAt already plays: disambiguating a REUSED
+    // pid across successive worker processes (a dispatcher spawns many, back to back, against
+    // the same journal root). orphan-scan.js reads BOTH shapes (`owner.workerPid ?? owner.pid`)
+    // -- this is measured, not theoretical: `jq -c '.owner' journal/*/state.json` against the
+    // live journal root (2026-09-01) shows 7 distinct owners still in the old shape, and the
+    // post-merge hook SIGTERMs the daemon on every deploy, which leaves whichever shape was
+    // current at the moment of death sitting in state.json until the next restart's orphanScan
+    // recovers it. If that scan stopped recognising the old shape, every one of those tasks
+    // would be invisible forever.
+    owner: workerMode
+      ? { host: os.hostname(), workerPid: process.pid, workerStartedAt: new Date().toISOString() }
+      : { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
   };
+
+  if (workerMode) {
+    process.exitCode = await runWorker(opts.worker, config);
+    return;
+  }
 
   // Periodic lock re-verification (lock.js's watchLock) -- acquireLock only ever checks liveness
   // once, at startup; this is the ongoing check for a live daemon that had its lock taken over
