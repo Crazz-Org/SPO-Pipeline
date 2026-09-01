@@ -271,6 +271,40 @@ before it. That is the criterion the plan's "absence of journal spam" was asking
 2026-08-31), and **no card ran during the soak** — the queue stayed empty throughout, so C4 has no
 token data either. The first real card after this point is the first one with token data at all.
 
+## What C4 hands C5
+
+C5 is "a truthful kanban & observability". C4 added seven journal events and one park reason that
+**nothing renders yet** — so the board and the dashboard are now less truthful than before, in a
+way C5's own actions are the natural place to fix:
+
+| event / reason | written by | who shows it today |
+|---|---|---|
+| `transient-retry` | `finalizePark` (4.4) | nobody |
+| `ci-implement-retry`, park `ci-retry-budget-exhausted` | `handleCiChecks` (4.3) | nobody |
+| `check-failed` now carries `step` + `jobId` | `realCiChecks` (4.3) | the old `check` field only |
+| `gate-verdict`, `gate-non-attesting`, `main-moved-conflict` | `realGate` (4.2) | nobody |
+| `commit-skipped-nothing-staged` | `realPushPr` (4.1) | nobody |
+| `abandon-*` (7 of them) | `abandonCleanup` (4.5) | `spo parked` shows the state, not the cleanup |
+| `leftover-remote-preserved`, `leftover-pr-closed` | `sweepWorktreeLeftovers` (4.6) | nobody |
+
+Two C4 side effects that are squarely 5.4/5.5's problem, not follow-ups:
+
+- **A card being auto-retried is double-counted** by `spo status` — once in `queue depth`, once as
+  active in its last state. It is deliberately not PARKED (4.4), so nothing else names it either. A
+  maintainer watching the board during a 5-minute backoff sees a card that looks stuck.
+- **`spo report` and the dashboard now disagree** about the parking rate: 4.5 made `collect.js`
+  count ABANDONED as terminal, `bin/spo`'s report still uses `done + parked`.
+
+And the standing 5.4 gap the audit never listed: **intake steps have no `taskDir`, so `spo tokens`
+cannot see their spend at all.** Any "today's spend" figure 5.4 prints is short by that amount
+until intake gets a task directory.
+
+**5.1's and 5.2's surfaces are the ones that leaked to the live repo.** `board.js`'s `moveCard` and
+`park-loop.js`'s comment writers are exactly where an in-process test with no injected `deps`
+posts to `Crazz-Org/SPO-WebClient` for real — see the 140-comment incident above. Inject `deps` in
+every test touching them, and consider closing the class first: it is cheap insurance for a
+chantier that spends its whole time in those two files.
+
 ## Operational facts that cost time to learn
 
 - **Merging restarts the daemon.** A post-merge hook `systemctl restart`s daemon + dashboard on
