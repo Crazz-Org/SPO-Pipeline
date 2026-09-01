@@ -188,8 +188,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   (`{step, model, effort, account, session_id, tokensSource, freshInputTokens,
   cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, duration_s, exit,
   verdict}` — no dollar figure anywhere; `orchestrator/tokens.js`'s "billable-weighted" =
-  fresh input + cache-creation + output, cache-read reported separately, never summed in),
-  account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
+  fresh input + cache-creation + output, cache-read reported separately, never summed in).
+  `duration_s` was documented here well before any code wrote it — action 5.4 measured
+  2026-09-01 that zero of the 19 corpus journals' `llm-call` events carried it, and made it
+  true the same day: `orchestrator/steps/llm.js`'s `invokeClaudeReal` now measures wall-clock
+  seconds around the `claude` spawn itself and reports it on every branch (success, spawn
+  error, external signal, and — the one a maintainer most wants — a deadline timeout, which
+  still burned the full deadline even though it produced no result).
+  Account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
   `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write

@@ -56,7 +56,7 @@ test('spo status: prints a non-zero `abandoned:` count on the summary line and d
 
   // Exactly one still-moving task -> active: 1. If ABANDONED were still falling into the `else
   // active` bucket (the pre-4.5 bug) this would read `active: 2`.
-  assert.match(out, /active: 1\s+parked: 0\s+abandoned: 1\s+done: 0/);
+  assert.match(out, /active: 1\s+backoff: 0\s+parked: 0\s+abandoned: 1\s+done: 0/);
   assert.match(out, /issue-443\s+ABANDONED/);
 });
 
@@ -67,7 +67,7 @@ test('spo status: an install with no abandoned cards at all still prints `abando
   // `--queue` pointed at an empty tmp dir, not the default (the real repo's own `queue/`) --
   // same isolation discipline test/helpers.js's own header documents for every other CLI test.
   const out = runSpo(['status', '--journal', journalDir, '--queue', mkTmp('spo-abandoned-status-queue-')]);
-  assert.match(out, /active: 0\s+parked: 0\s+abandoned: 0\s+done: 1/);
+  assert.match(out, /active: 0\s+backoff: 0\s+parked: 0\s+abandoned: 0\s+done: 1/);
 });
 
 // ---- `spo parked`: abandoned cards get their own heading, separate from the parked rows --------

@@ -208,6 +208,17 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
   const llmCallsWithoutTokens = sum('llmCallsWithoutTokens');
   const done = tasks.filter((t) => t.state === 'DONE').length;
   const parked = tasks.filter((t) => t.state === 'PARKED').length;
+  // action 5.4, item G: ABANDONED is the third terminal state (state-machine.js/park-loop.js
+  // action 4.5) but this module never counted it -- `done`/`parked` were the only two buckets
+  // tokenReport ever had. console/collect.js's collectDaemonStats already made ABANDONED
+  // terminal for the DASHBOARD'S parking rate (its `stats.total = done + parked + abandoned`),
+  // and this half was never updated to match: measured live 2026-09-01, `spo tokens` printed
+  // "parking rate: 17% (3/18 terminal)" while the dashboard's own denominator for the identical
+  // corpus was 19 -- the dashboard counted an abandoned card as terminal and `spo tokens` didn't.
+  // Exposed here so bin/spo's cmdTokens can build the SAME denominator collect.js does (see that
+  // module's own comment for why the numerator stays `parked` alone -- an abandon is a terminal
+  // outcome the card is closed out on, not a park still awaiting a reply).
+  const abandoned = tasks.filter((t) => t.state === 'ABANDONED').length;
   const parks = tasks.reduce((n, t) => n + t.parkReasons.length, 0);
   const likelyCacheExpiries = tasks.reduce((n, t) => n + t.likelyCacheExpiries.length, 0);
 
@@ -223,6 +234,7 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
     llmCallsWithoutTokens,
     done,
     parked,
+    abandoned,
     parks,
     likelyCacheExpiries,
     // The billable spend of the WHOLE run (every task, parked attempts included) over the
@@ -235,4 +247,87 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
   };
 }
 
-module.exports = { tokenReport, readTaskTokens, computeLikelyCacheExpiries, formatTokenCount };
+function startOfDay(now) {
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// todaySpend(journalRoot, {now}) -- action 5.4, item D: `spo status`'s "today's spend" line.
+// Sums the SAME `llm-call` fields tokenReport does (no second ledger, no second definition of
+// "billable"), filtered to events whose `ts` falls on `now`'s local calendar day. Every honesty
+// rule tokenReport/cmdTokens already enforce applies here verbatim: `tokensSource` is the marker
+// for "did this call report tokens at all", never `typeof billableTokens === 'number'` (a
+// killed/E2BIG call journals a numeric `billableTokens: 0` via ZERO_TOKENS, which is not the same
+// fact as "reported zero tokens" -- see steps/llm.js's own header). The caller renders "n/a", not
+// "0", when `llmCallsWithTokens === 0`.
+//
+// Measured erratum, worse than the C4 handoff stated (re-measured 2026-09-01, kept here rather
+// than re-derived by a caller): journal/daemon.jsonl -- where intake/triage steps
+// (report-triaged, auto-triage, report-confirmed) journal their own events -- contains ZERO
+// `llm-call` events of ANY kind, and none of those event types carry a cost or token field at
+// all. So intake/triage spend is not merely invisible to THIS function (it has no taskDir-shaped
+// journal for todaySpend to scan) -- it is not journalled anywhere, by any module, today. Any
+// "today's spend" figure this function returns is short by an unknown amount for that reason.
+// Fixing the journalling gap is out of scope for this action; the caller (bin/spo's cmdStatus)
+// prints this as a caveat alongside the number rather than trying to close the gap here.
+function todaySpend(journalRoot, { now = Date.now() } = {}) {
+  const dayStart = startOfDay(now);
+
+  let freshInputTokens = 0;
+  let cacheCreationTokens = 0;
+  let cacheReadTokens = 0;
+  let outputTokens = 0;
+  let billableTokens = 0;
+  let llmCalls = 0;
+  let llmCallsWithTokens = 0;
+  let llmCallsWithoutTokens = 0;
+
+  for (const id of listTaskIds(journalRoot)) {
+    const file = path.join(journalRoot, id, 'journal.jsonl');
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue; // not a task directory (no journal)
+    }
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue; // a torn final line while the daemon writes -- skip, do not throw
+      }
+      if (event.event !== 'llm-call') continue;
+      const ts = typeof event.ts === 'string' ? Date.parse(event.ts) : NaN;
+      if (!Number.isFinite(ts) || ts < dayStart) continue;
+
+      llmCalls += 1;
+      if (typeof event.tokensSource === 'string' && event.tokensSource) llmCallsWithTokens += 1;
+      else llmCallsWithoutTokens += 1;
+      const fi = typeof event.freshInputTokens === 'number' ? event.freshInputTokens : 0;
+      const cc = typeof event.cacheCreationTokens === 'number' ? event.cacheCreationTokens : 0;
+      const cr = typeof event.cacheReadTokens === 'number' ? event.cacheReadTokens : 0;
+      const out = typeof event.outputTokens === 'number' ? event.outputTokens : 0;
+      freshInputTokens += fi;
+      cacheCreationTokens += cc;
+      cacheReadTokens += cr;
+      outputTokens += out;
+      billableTokens += fi + cc + out;
+    }
+  }
+
+  return {
+    freshInputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    outputTokens,
+    billableTokens,
+    llmCalls,
+    llmCallsWithTokens,
+    llmCallsWithoutTokens,
+  };
+}
+
+module.exports = { tokenReport, readTaskTokens, todaySpend, computeLikelyCacheExpiries, formatTokenCount };

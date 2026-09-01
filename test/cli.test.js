@@ -33,11 +33,25 @@ test('spo status and spo task exit 0 and render the produced journals', () => {
   // execFileSync throws on non-zero exit -- reaching these assertions IS the exit-0 proof.
   const statusOut = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
   assert.match(statusOut, /queue depth: 0/);
-  // action 4.5: the summary line grew an `abandoned:` counter between `parked:` and `done:` --
-  // this fixture has no ABANDONED task, so it's 0, but the field is always printed.
-  assert.match(statusOut, /active: 0\s+parked: 1\s+abandoned: 0\s+done: 1/);
-  assert.match(statusOut, /cli-demo\s+DONE/);
-  assert.match(statusOut, /cli-parked\s+PARKED/);
+  // action 5.4: bench queue depth and account health are now folded into `spo status` (both
+  // isolated to throwaway tmp dirs by test/helpers.js's isolatedEnv -- never the maintainer's
+  // real ~/.spo-bench / ~/.claude-accounts).
+  assert.match(statusOut, /bench: spool=0\s+running=0/);
+  // test/helpers.js's isolatedEnv() seeds one credential-free account ("isolated") into every
+  // daemon/spo subprocess's account pool -- see that function's own comment for why an empty
+  // pool would park real-mode `--dry-run` fixtures elsewhere in this suite.
+  assert.match(statusOut, /account isolated\s+enabled=true\s+cooldown=none/);
+  // action 4.4/5.4: the summary line grew a `backoff:` counter between `active:` and `parked:`
+  // -- this fixture has no card in auto-retry backoff, so it's 0, but the field is always
+  // printed. action 4.5's `abandoned:` counter (between `parked:` and `done:`) is likewise
+  // always printed.
+  assert.match(statusOut, /active: 0\s+backoff: 0\s+parked: 1\s+abandoned: 0\s+done: 1/);
+  assert.match(statusOut, /cli-demo\s+DONE\s+done/);
+  // action 5.4, item A: a PARKED row's third column is state.json's own `reason`
+  // (gate-dirty-tree, from this fixture's shadow.gate: [2]), never the last journal event's
+  // name -- and carries the unpark scan's own failure-streak status (item F), "ok" here since
+  // this fixture never ran the scan at all.
+  assert.match(statusOut, /cli-parked\s+PARKED\s+reason=gate-dirty-tree\s+retry-channel: no failures recorded/);
 
   const taskOut = runSpo(['task', 'cli-demo', '--journal', journalDir]);
   assert.match(taskOut, /INTAKE/);
