@@ -33,6 +33,8 @@ const { appendEvent, writeState } = require('./journal');
 const { moveCard } = require('./board');
 const { armTimeout } = require('./command-timeout');
 const commentScan = require('./comment-scan');
+const { summarizeTask, formatAttemptLines } = require('./task-summary');
+const { formatTokenCount } = require('./tokens');
 
 // action 2.1b: routed through command-timeout.js's armTimeout -- the park comment's own `gh issue
 // comment` (postParkComment) and the unpark scan's `gh api .../comments` + abandon-ack `gh issue
@@ -91,7 +93,29 @@ function countRepeatedParks(lines, reason, detail) {
 // `repeat` defaults to 1 (a first-time park) for every existing caller/test that doesn't pass it.
 // >= 2 inserts a loop warning just above RETRY_ABANDON_LINE, which stays present verbatim in
 // every case -- unparkScan's retry/abandon parsing and the rest of this suite depend on it.
-function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
+//
+// Action 5.2: `billableTokens`/`hasTokenData`/`parksCount`/`diagnoseAttempts`/`validateRejects`/
+// `ciImplementRetries` are the card's CUMULATIVE totals across every attempt this taskDir has
+// ever made (task-summary.js's summarizeTask -- see its own header for why cumulative, not just
+// this run), computed by postParkComment below and handed in as plain numbers so this function
+// stays pure -- no fs, directly unit-testable with no journal on disk at all, exactly as before.
+// All six default so every pre-5.2 caller/test that doesn't pass them still renders (tokens as
+// "not recorded", no attempt rows, no total-parks line) rather than throwing or printing
+// "undefined". Inserted between RETRY_ABANDON_LINE and the <details> block, never touching either
+// -- both are load-bearing (unparkScan's retry/abandon anchor, the maintainer-facing detail dump)
+// and this only adds to the comment, never reorders or drops what was already there.
+function buildParkComment({
+  reason,
+  detail,
+  lastState,
+  repeat = 1,
+  billableTokens = 0,
+  hasTokenData = false,
+  parksCount = null,
+  diagnoseAttempts,
+  validateRejects,
+  ciImplementRetries,
+}) {
   const lines = [
     '### Pipeline parked',
     '',
@@ -111,6 +135,20 @@ function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
     );
   }
   lines.push(RETRY_ABANDON_LINE, '');
+
+  const tokensText = hasTokenData ? formatTokenCount(billableTokens) : 'not recorded';
+  const parksText =
+    typeof parksCount === 'number' && parksCount > 0
+      ? `, ${parksCount} ${parksCount === 1 ? 'park' : 'parks'} so far (this one included)`
+      : '';
+  lines.push(`**This card so far:** billable-weighted tokens ${tokensText}${parksText}.`, '');
+
+  const attemptLines = formatAttemptLines({ diagnoseAttempts, validateRejects, ciImplementRetries });
+  if (attemptLines.length > 0) {
+    lines.push('Attempts:');
+    lines.push(...attemptLines, '');
+  }
+
   if (detail && Object.keys(detail).length > 0) {
     lines.push(
       '<details><summary>detail</summary>',
@@ -132,6 +170,15 @@ function buildParkComment({ reason, detail, lastState, repeat = 1 }) {
 // already terminal by the time this runs (state-machine.js's finalizePark calls it after the
 // task's own PARKED state.json/report.md are already written). `repeat` defaults to 1, same as
 // buildParkComment's own default, for any caller that doesn't compute a streak.
+//
+// Action 5.2: this is where the card's cumulative totals get COMPUTED (ctx.taskDir -> journal ->
+// task-summary.js's summarizeTask), then handed to buildParkComment as plain numbers -- keeping
+// that function pure, per its own header. Deliberately NOT `ctx.counters`: this function is
+// called with bare `{task, taskDir, config}` fixtures in several tests (no `.counters` at all),
+// and even where a real ctx.counters exists it only ever holds THIS run's attempts (state-
+// machine.js's buildCtx resets it to 0 on every retry) -- reading the journal instead is what
+// makes the totals genuinely cumulative across a card's whole park history, not just its latest
+// attempt.
 function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   moveCard(ctx, deps, 'PARKED');
 
@@ -142,7 +189,19 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   }
 
   const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
-  const body = buildParkComment({ reason, detail, lastState, repeat });
+  const summary = summarizeTask(ctx.taskDir);
+  const body = buildParkComment({
+    reason,
+    detail,
+    lastState,
+    repeat,
+    billableTokens: summary.billableTokens,
+    hasTokenData: summary.hasTokenData,
+    parksCount: summary.parksCount,
+    diagnoseAttempts: summary.diagnoseAttempts,
+    validateRejects: summary.validateRejects,
+    ciImplementRetries: summary.ciImplementRetries,
+  });
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
 

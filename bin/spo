@@ -147,7 +147,7 @@ const intake = require('../orchestrator/intake');
 const autoTriage = require('../orchestrator/auto-triage');
 const reportIntake = require('../orchestrator/report-intake');
 const remoteReportPull = require('../orchestrator/remote-report-pull');
-const { tokenReport } = require('../orchestrator/tokens');
+const { tokenReport, formatTokenCount } = require('../orchestrator/tokens');
 const recette = require('../orchestrator/recette');
 
 function parseArgs(argv) {
@@ -299,17 +299,6 @@ function cmdTask(id, opts) {
     const detailStr = Object.keys(detail).length ? ` ${JSON.stringify(detail)}` : '';
     console.log(`[${ev.ts}] ${String(ev.state).padEnd(12)} ${ev.event}${detailStr}`);
   }
-}
-
-// formatTokenCount(n) -- readable large-number formatting for a terminal table: raw 9-digit
-// integers (cache-read counts routinely run into the millions -- see console/usage-scan.js's
-// own header) are unreadable in a fixed-width column. >=1M -> "12.3M", >=1k -> "215.4k",
-// otherwise the plain integer.
-function formatTokenCount(n) {
-  const v = typeof n === 'number' ? n : 0;
-  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
-  return String(Math.round(v));
 }
 
 // `spo tokens` -- the soak's read-out: per task, then the two numbers migration step 3 asks for

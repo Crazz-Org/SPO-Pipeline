@@ -112,6 +112,75 @@ test('buildParkComment: repeat omitted (or 1) carries no loop-warning block -- u
   assert.ok(!body.includes('Ce park est identique'));
 });
 
+// ---- buildParkComment: action 5.2 -- cumulative tokens + attempt history, still pure ----------
+
+test('buildParkComment: stays pure -- no filesystem access at all, callable with only in-memory numbers', () => {
+  // Verification found this test proved nothing: it was named for purity but only asserted on the
+  // rendered text, so a mutant that made buildParkComment read the journal itself survived. The
+  // fs calls are now poisoned for the duration of the call, which is the only way the name can be
+  // true. Purity is what keeps this function unit-testable AND keeps postParkComment the single
+  // place that decides what a park comment costs to build.
+  // COUNTING spies, not throwing ones: a purity break that wraps its own read in a try/catch --
+  // which is exactly how a well-meaning "just peek at the journal" edit would be written in this
+  // codebase, where every journal read is defensive -- swallows a poisoned throw and survives.
+  // Counting sees it regardless.
+  const realRead = fs.readFileSync;
+  const realExists = fs.existsSync;
+  const reached = [];
+  fs.readFileSync = (...args) => {
+    reached.push('readFileSync');
+    return realRead(...args);
+  };
+  fs.existsSync = (...args) => {
+    reached.push('existsSync');
+    return realExists(...args);
+  };
+  let body;
+  try {
+    body = buildParkComment({
+      reason: 'diagnose-budget-exhausted',
+      detail: { attempts: 3 },
+      lastState: 'DIAGNOSE',
+      repeat: 1,
+      billableTokens: 194424,
+      hasTokenData: true,
+      parksCount: 2,
+      diagnoseAttempts: 3,
+      validateRejects: 1,
+      ciImplementRetries: null,
+    });
+  } finally {
+    fs.readFileSync = realRead;
+    fs.existsSync = realExists;
+  }
+  assert.deepEqual(reached, [], `buildParkComment must stay pure; it reached fs.${reached.join(', fs.')}`);
+
+  assert.match(body, /billable-weighted tokens 194\.4k, 2 parks so far \(this one included\)/);
+  // No dollar figure anywhere: costUsd is retired as a metric (2026-08-31) and 107 of the corpus's
+  // 110 llm-call events still carry one, so rendering it is one line of code away at all times.
+  assert.ok(!/\$\s*\d/.test(body), 'a park comment must never render a dollar figure');
+  assert.match(body, /- DIAGNOSE attempts: 3/);
+  assert.match(body, /- VALIDATE rejects: 1/);
+  assert.ok(!body.includes('CI-triggered IMPLEMENT retries'));
+  // Load-bearing parts stay verbatim and in place -- unparkScan's anchor and the maintainer's
+  // detail dump must not be disturbed by adding this section.
+  assert.ok(body.includes(RETRY_ABANDON_LINE));
+  assert.match(body, /<details><summary>detail<\/summary>/);
+  assert.match(body, /"attempts": 3/);
+});
+
+test('buildParkComment: no token data at all -> "not recorded", never "0"', () => {
+  const body = buildParkComment({ reason: 'x', detail: {}, lastState: 'WORKTREE', hasTokenData: false, billableTokens: 0 });
+  assert.match(body, /billable-weighted tokens not recorded/);
+});
+
+test('buildParkComment: every caller/test that omits the new fields still renders (no "undefined" leaking into the comment)', () => {
+  const body = buildParkComment({ reason: 'x', detail: {}, lastState: 'WORKTREE' });
+  assert.ok(!body.includes('undefined'));
+  assert.match(body, /billable-weighted tokens not recorded/);
+  assert.ok(!body.includes('Attempts:'));
+});
+
 // ---- postParkComment via runTask: the real PARKED -> comment path ------------------------------
 
 test('runTask (real mode, card): a pre-worktree park still moves the card, via config.productRepo (action 5.1b), and posts the comment', async () => {
@@ -314,6 +383,64 @@ test('postParkComment: a timed-out gh issue comment never throws (the task is al
   assert.ok(failed, 'the timeout must still be reported, not silently swallowed');
   assert.equal(failed.timedOut, true);
   assert.notEqual(failed.exit, 1, 'a timeout must never be journalled as a plain exit 1');
+});
+
+// ---- postParkComment: action 5.2 -- computes cumulative tokens + attempt history from the
+// taskDir's own journal (never ctx.counters -- see park-loop.js's own header on postParkComment
+// for why: this function is called with bare {task, taskDir, config} ctx objects in several tests
+// above, no `.counters` at all, and even a real ctx.counters only ever holds the CURRENT run's
+// attempts).
+
+test('postParkComment: carries cumulative billable tokens and the attempt history into the posted comment, RETRY_ABANDON_LINE and <details> still present', () => {
+  const taskDir = mkTmp('spo-park-summary-taskdir-');
+  appendEvent(taskDir, 'PLAN', 'llm-call', { billableTokens: 50000 });
+  appendEvent(taskDir, 'IMPLEMENT', 'llm-call', { billableTokens: 20000 });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 1, payload: { rootCause: 'x' } });
+  appendEvent(taskDir, 'DIAGNOSE', 'result', { attempt: 2, payload: { rootCause: 'y' } });
+  appendEvent(taskDir, 'PARKED', 'parked', { reason: 'diagnose-duplicate-root-cause', detail: {} }); // an earlier park
+
+  const ctx = { task: { issue: 970 }, taskDir, config: { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } } };
+  const deps = {
+    spawnSync: () => ({ status: 0, stdout: 'https://github.com/x/y/issues/970#issuecomment-2\n', stderr: '', signal: null }),
+  };
+
+  postParkComment(ctx, deps, { reason: 'diagnose-duplicate-root-cause', detail: { rootCause: 'y' }, lastState: 'DIAGNOSE' });
+
+  const body = fs.readFileSync(path.join(taskDir, 'park-comment.md'), 'utf8');
+  assert.match(body, /billable-weighted tokens 70\.0k, 1 park so far \(this one included\)/);
+  assert.match(body, /- DIAGNOSE attempts: 2/);
+  assert.ok(body.includes(RETRY_ABANDON_LINE));
+  assert.match(body, /<details><summary>detail<\/summary>/);
+  assert.match(body, /"rootCause": "y"/);
+});
+
+test('postParkComment: no billableTokens field anywhere in the journal -> "not recorded" in the posted comment', () => {
+  const taskDir = mkTmp('spo-park-summary-no-tokens-taskdir-');
+  appendEvent(taskDir, 'PLAN', 'llm-call', { costUsd: 2.5 }); // pre-token-capture shape
+
+  const ctx = { task: { issue: 971 }, taskDir, config: { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } } };
+  const deps = {
+    spawnSync: () => ({ status: 0, stdout: 'https://github.com/x/y/issues/971#issuecomment-3\n', stderr: '', signal: null }),
+  };
+
+  postParkComment(ctx, deps, { reason: 'x', detail: {}, lastState: 'WORKTREE' });
+
+  const body = fs.readFileSync(path.join(taskDir, 'park-comment.md'), 'utf8');
+  assert.match(body, /billable-weighted tokens not recorded/);
+});
+
+test('postParkComment: a malformed journal.jsonl never breaks the park comment -- the task is already terminal, this must not throw', () => {
+  const taskDir = mkTmp('spo-park-summary-malformed-taskdir-');
+  fs.writeFileSync(path.join(taskDir, 'journal.jsonl'), '{not json\n{"ts": "x", "event": "llm-call", "billableTok');
+
+  const ctx = { task: { issue: 972 }, taskDir, config: { ghRepo: 'x/y', commandTimeoutsMs: { gh: 120000 } } };
+  const deps = {
+    spawnSync: () => ({ status: 0, stdout: 'https://github.com/x/y/issues/972#issuecomment-4\n', stderr: '', signal: null }),
+  };
+
+  assert.doesNotThrow(() => postParkComment(ctx, deps, { reason: 'x', detail: {}, lastState: 'WORKTREE' }));
+  const body = fs.readFileSync(path.join(taskDir, 'park-comment.md'), 'utf8');
+  assert.match(body, /billable-weighted tokens not recorded/);
 });
 
 // ---- unpark scan: retry / abandon / ignored ---------------------------------------------------

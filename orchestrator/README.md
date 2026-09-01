@@ -847,7 +847,8 @@ run pr:wait -- <n>` in the worktree, with exactly one bounded re-wait on exit 4 
 identical to the shadow-mode bounded-wait logic.
 
 **FINISH** runs `npm run board:move -- <issue> Done` and `gh issue comment <n> --repo <ghRepo>
---body-file <file>` (a 2–4 line comment in `journal/<id>/final-comment.md`) **before** removing
+--body-file <file>` (the comment in `journal/<id>/final-comment.md` — since action 5.2 it also carries billable-weighted
+tokens, elapsed time with the parked share broken out, and any attempt counters) **before** removing
 the worktree — the same "npm aliases need a product cwd" rule as WORKTREE's claim ordering, so
 the board sync must happen while the worktree still exists. Only then `git -C <productRepo>
 worktree remove --force <worktreePath>`. A final `finished` journal event carries the task's

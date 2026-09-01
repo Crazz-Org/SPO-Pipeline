@@ -49,6 +49,22 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 
+// formatTokenCount(n) -- readable large-number formatting: raw 9-digit integers (cache-read
+// counts routinely run into the millions -- see console/usage-scan.js's own header) are
+// unreadable in a fixed-width table column or a GitHub comment alike. >=1M -> "12.3M", >=1k ->
+// "215.4k", otherwise the plain rounded integer. Formerly a private helper duplicated nowhere but
+// living only in bin/spo (cmdTokens/cmdResume) -- action 5.2 needed the exact same formatting for
+// the Done/park comments (steps/scripted.js, park-loop.js) and bin/spo is a CLI entry point, not
+// somewhere those two want to require from, so this moved to tokens.js instead: the module both
+// already read token data FROM, and the natural home for "how a token count is displayed" now
+// that more than one caller needs it. bin/spo re-exports/re-uses this one, not a second copy.
+function formatTokenCount(n) {
+  const v = typeof n === 'number' ? n : 0;
+  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return String(Math.round(v));
+}
+
 // computeLikelyCacheExpiries(calls, cacheTtlMs) -- calls: [{ts, cacheCreationTokens,
 // cacheReadTokens}], in the order they were journaled (never re-sorted -- a re-sort could paper
 // over a genuinely out-of-order write). Returns a same-length boolean array; index 0 is never
@@ -219,4 +235,4 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
   };
 }
 
-module.exports = { tokenReport, readTaskTokens, computeLikelyCacheExpiries };
+module.exports = { tokenReport, readTaskTokens, computeLikelyCacheExpiries, formatTokenCount };
