@@ -128,6 +128,19 @@ function positiveMsFromEnv(name, defaultMs) {
 // override falls back to the default rather than producing 0 (dispatcher.js would then spawn
 // nothing, ever, and the daemon would look alive while doing no work) or a fraction (a K of 1.5
 // worker means nothing).
+// Same posture as positiveIntFromEnv below, for a knob where 0 IS a legal setting ("take no
+// cards off the board") rather than a synonym for "unset". Absent -> the documented default; a
+// non-integer (`Number('abc')` is NaN), a fractional or a negative value -> ALSO the documented
+// default, never something larger: an operator typo must not be able to raise a rate cap above
+// what this file documents. The only way to get a number other than the default is to name it.
+function nonNegativeIntFromEnv(name, defaultN) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultN;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) return defaultN;
+  return parsed;
+}
+
 function positiveIntFromEnv(name, defaultN) {
   const raw = process.env[name];
   if (raw === undefined) return defaultN;
@@ -585,8 +598,10 @@ module.exports = {
   // board. Cards stay on the board -- visible, reorderable, claimable by a human -- until a
   // worker is actually ready for them. Raise it if intake proves to be the bottleneck.
   // SPO_AUTO_PULL_LIMIT overrides.
-  autoPullLimit:
-    process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 1,
+  // SPO_AUTO_PULL_LIMIT=0 means ZERO -- see nonNegativeIntFromEnv above and auto-pull.js's
+  // resolveNonNegativeInt. It used to be `Number(...)` straight through into a `|| DEFAULT`, so
+  // the off switch resolved to 3.
+  autoPullLimit: nonNegativeIntFromEnv('SPO_AUTO_PULL_LIMIT', 1),
 
   // ---- kanban piloting: human-first bug-report intake --------------------------------------
   //

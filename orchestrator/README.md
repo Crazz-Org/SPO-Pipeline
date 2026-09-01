@@ -1175,7 +1175,7 @@ scope entirely: the board is already correct in all three measured cases.
 `daemon.js --real`, when not `--once`, also runs `auto-pull.js`'s `runAutoPull` on a timer
 between drain passes (`state-machine.js`'s `runForever`) -- the exact same `pullBoard` +
 `makeTask` `spo pull` already runs by hand (same dedup: `makeTask` skips an issue already in
-`queue/` or `journal/`), for the top `config.autoPullLimit` (default 3) claimable candidates.
+`queue/` or `journal/`), for the top `config.autoPullLimit` (default 1) claimable candidates.
 `config.autoPullMs` (default 5 minutes, `SPO_AUTO_PULL_MS` env override, `0` disables the timer
 entirely) gates it via `shouldAutoPull(lastPullAt, nowMs, autoPullMs)` -- a pure function with no
 `Date.now()`/`setInterval` baked in, so a test drives it with any clock pair directly. Journals

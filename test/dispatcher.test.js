@@ -26,10 +26,10 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const accounts = require('../orchestrator/accounts');
-const { writeState: writeTaskState, readLiveWorkerIds, liveWorkersPath } = require('../orchestrator/journal');
+const { writeState: writeTaskState, readLiveWorkerIds, writeLiveWorkerIds, liveWorkersPath } = require('../orchestrator/journal');
 const { createDispatcher } = require('../orchestrator/dispatcher');
 const { takeNextTask } = require('../orchestrator/state-machine');
-const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal } = require('./helpers');
+const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, DAEMON } = require('./helpers');
 
 function readDaemonEvents(journalRoot) {
   const p = path.join(journalRoot, 'daemon.jsonl');
@@ -638,6 +638,30 @@ test('buildScannerArgv: the scanner inherits THIS dispatcher\'s own mode -- --re
   assert.equal(modeOf({ shadowMode: true, dryRun: true }), '--shadow');
 });
 
+test('buildScannerArgv: --workers is forwarded -- 6.6 made the scanner a consumer of K', () => {
+  const { buildScannerArgv } = require('../orchestrator/dispatcher');
+  // auto-pull.js's watermark is `in-flight + queued <= K`, computed by computeAutoPullBudget,
+  // which runs IN THE SCANNER. Before this, only SPO_WORKERS in the inherited env reached it: a
+  // `--workers 3` dispatcher paired with a K=1 watermark scanner would hold the queue at one card
+  // with two slots idle. Same shape as 6.4's own `--workers` defect on the worker side.
+  const argv = buildScannerArgv('/q', '/j', { shadowMode: true, workers: 3 });
+  const i = argv.indexOf('--workers');
+  assert.ok(i > 0, `--workers missing from scanner argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], '3');
+  // A missing or invalid K omits the flag rather than forwarding NaN -- the child then resolves
+  // its own config.js default, exactly as buildWorkerArgv does.
+  assert.equal(buildScannerArgv('/q', '/j', { shadowMode: true }).includes('--workers'), false);
+  assert.equal(buildScannerArgv('/q', '/j', { shadowMode: true, workers: 0 }).includes('--workers'), false);
+});
+
+test('buildScannerArgv: --parent-pid carries THIS dispatcher pid -- the scanner must not outlive it', () => {
+  const { buildScannerArgv } = require('../orchestrator/dispatcher');
+  const argv = buildScannerArgv('/q', '/j', { shadowMode: true });
+  const i = argv.indexOf('--parent-pid');
+  assert.ok(i > 0, `--parent-pid missing from scanner argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], String(process.pid));
+});
+
 test('buildScannerArgv: --scanner, --queue and --journal are ALL forwarded -- a scanner never falls back to the repo defaults', () => {
   const { buildScannerArgv } = require('../orchestrator/dispatcher');
   const argv = buildScannerArgv('/my/queue', '/my/journal', { shadowMode: true, stepDeadlineMs: 4242 });
@@ -913,6 +937,149 @@ test('the dispatcher spawns exactly ONE scanner at startup -- never a second one
   }
 });
 
+// ---- live-workers.json is initialised at startup (action 6.6 verification) --------------------
+//
+// auto-pull.js's watermark reads <journalRoot>/live-workers.json for `inFlight`, and reads a
+// MISSING file as `inFlight = K` -- "no dispatcher has ever published here, assume the worst".
+// That posture is right, and it was fatal, because publishLiveWorkerIds was only ever called from
+// spawnOne/handleExit: on a cold start with an EMPTY QUEUE the file was never written at all, and
+// auto-pull is the only thing that puts a card in the queue. No file -> budget 0 -> no queue entry
+// -> no spawn -> no file. A closed loop, with no self-correction and nothing in the suite that
+// could see it, because every budget test wrote the file by hand.
+//
+// Measured before the fix, with a real `--real` dispatcher on an empty queue and
+// SPO_AUTO_PULL_MS=3000: ZERO `npm run board:claim` calls in 20s (~6 due cycles). Writing an
+// empty live-workers.json into the same journal root by hand produced 3 in the next 20s.
+test('the dispatcher publishes an EMPTY live-workers.json at startup, before the first scan can read it', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-lwinit-q-');
+  const journalDir = mkTmp('spo-disp-lwinit-j-');
+  const livePath = path.join(journalDir, 'live-workers.json');
+  assert.equal(fs.existsSync(livePath), false, 'precondition: no file yet');
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    // Empty queue on purpose: no worker is ever spawned, so spawnOne/handleExit never run and the
+    // startup publish is the ONLY thing that can create this file.
+    deps: { spawn: spawnExit(0), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => fs.existsSync(livePath));
+    assert.deepEqual([...readLiveWorkerIds(journalDir)], [], 'an idle dispatcher has zero workers in flight');
+
+    // The consequence, asserted where it actually bites rather than only on the file: at the
+    // SHIPPED config this is the difference between "pull one card" and "pull nothing, forever".
+    const { computeAutoPullBudget } = require('../orchestrator/auto-pull');
+    const budget = computeAutoPullBudget(queueDir, journalDir, defaultConfig);
+    assert.equal(budget.inFlight, 0, 'a published empty table means zero in flight, not K');
+    assert.equal(budget.limit, defaultConfig.autoPullLimit, 'an idle daemon on an empty queue must be able to pull');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('startup CLEARS a stale live-workers.json left by a killed predecessor -- otherwise the watermark never recovers', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-lwstale-q-');
+  const journalDir = mkTmp('spo-disp-lwstale-j-');
+  const livePath = path.join(journalDir, 'live-workers.json');
+  // Exactly what a SIGTERM'd daemon leaves behind: the post-merge hook kills the whole cgroup
+  // mid-card, so whatever was in flight at death stays listed. Nothing ever cleared it, and the
+  // ids name processes that no longer exist.
+  writeLiveWorkerIds(journalDir, ['issue-901', 'issue-902']);
+  assert.equal(readLiveWorkerIds(journalDir).size, 2);
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(0), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readLiveWorkerIds(journalDir).size === 0);
+    // Two dead ids against the shipped K=1 would have meant headroom = 1 - 0 - 2, i.e. permanently
+    // at (past) the watermark: no pull, so no queue entry, so no spawn, so no correction.
+    const { computeAutoPullBudget } = require('../orchestrator/auto-pull');
+    assert.equal(computeAutoPullBudget(queueDir, journalDir, defaultConfig).limit, defaultConfig.autoPullLimit);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// ---- the scanner must not outlive its dispatcher (action 6.6 verification, Task 2) ------------
+//
+// Both children are spawned `detached: true` -- required for a WORKER, so `kill(-pid)` reaches
+// that worker's own `claude` grandchild. The scanner's `for(;;)` never returns on its own, so the
+// same flag lets it survive a dispatcher that dies without killing its group. Measured: SIGKILL a
+// real dispatcher alone and its scanner keeps running, reparented to ppid 1 (four such orphans
+// were found alive 1h22m after the run that spawned them). With `Restart=always`, systemd then
+// starts a new dispatcher that spawns a SECOND scanner against the same journal root.
+//
+// These two spawn the REAL daemon.js --scanner, because the behaviour under test belongs to the
+// scanner process itself, not to any dispatcher stand-in.
+test('a scanner whose --parent-pid is not its parent exits immediately instead of looping forever', { timeout: 20000 }, async (t) => {
+  const queueDir = mkTmp('spo-scanner-orphan-q-');
+  const journalDir = mkTmp('spo-scanner-orphan-j-');
+  // A pid that is emphatically not this process: the scanner's real parent IS this test runner,
+  // so `process.ppid !== parentPid` holds from its very first loop iteration -- the same state an
+  // orphan reaches the instant the kernel reparents it away from a dead dispatcher.
+  const notOurPid = process.pid === 2 ? 3 : 2;
+  const child = realSpawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--scanner', '--queue', queueDir, '--journal', journalDir, '--parent-pid', String(notOurPid)],
+    { stdio: 'ignore', env: isolatedEnv() }
+  );
+  // Teardown registered BEFORE the first await, so this child is reaped on every exit path --
+  // an assertion failure, a node:test timeout, or an interrupted run -- not only the happy one.
+  // The suite must never require manual reaping; a leaked scanner from a failed run is the exact
+  // shape of the defect these two tests exist to pin.
+  t.after(() => child.kill('SIGKILL'));
+  // Bounded, so the way this fails is a NAMED assertion in ~5s rather than the whole file
+  // stalling until node:test's own timeout: an unchecked scanner never exits at all, and "the
+  // suite hung" is a much worse signal than "the scanner did not exit".
+  const TIMEOUT_SENTINEL = Symbol('never-exited');
+  const code = await Promise.race([
+    new Promise((resolve) => child.once('exit', resolve)),
+    sleep(5000).then(() => TIMEOUT_SENTINEL),
+  ]);
+  if (code === TIMEOUT_SENTINEL) {
+    child.kill('SIGKILL');
+    assert.fail('the scanner never exited: an orphan whose parent is gone runs forever (the defect this pins)');
+  }
+  assert.equal(code, 0, 'an orphaned scanner exits cleanly rather than being killed or hanging');
+  const events = readDaemonEvents(journalDir);
+  const exitEvent = events.find((e) => e.event === 'scanner-orphan-exit');
+  assert.ok(exitEvent, `expected a scanner-orphan-exit event, got: ${JSON.stringify(events)}`);
+  assert.equal(exitEvent.parentPid, notOurPid);
+});
+
+test('a scanner whose --parent-pid IS its parent keeps running -- the check must not kill a healthy scanner', { timeout: 20000 }, async (t) => {
+  const queueDir = mkTmp('spo-scanner-live-q-');
+  const journalDir = mkTmp('spo-scanner-live-j-');
+  const child = realSpawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--scanner', '--queue', queueDir, '--journal', journalDir, '--parent-pid', String(process.pid)],
+    { stdio: 'ignore', env: isolatedEnv() }
+  );
+  t.after(() => child.kill('SIGKILL')); // see the sibling test above
+  let exited = null;
+  child.once('exit', (code) => {
+    exited = code;
+  });
+  // Many loop iterations at the shadow poll interval -- an inverted or over-eager check shows up
+  // as an exit here, and this is the assertion that stops the fix from being "always exit".
+  await sleep(1500);
+  const stillAlive = exited === null;
+  child.kill('SIGKILL');
+  assert.ok(stillAlive, `a scanner with a live parent must keep scanning, but it exited ${exited}`);
+  assert.equal(
+    readDaemonEvents(journalDir).some((e) => e.event === 'scanner-orphan-exit'),
+    false
+  );
+});
+
 test('a crashed scanner is respawned immediately, up to its own scannerCrashLimit, then trips a SEPARATE breaker from the worker one', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-scancrash-q-');
   const journalDir = mkTmp('spo-disp-scancrash-j-');
@@ -1116,16 +1283,23 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
   }
 });
 
-test('daemon.js --scanner never acquires the single-instance lock', { timeout: 20000 }, async () => {
+test('daemon.js --scanner never acquires the single-instance lock', { timeout: 20000 }, async (t) => {
   const { lockPath } = require('../orchestrator/lock');
-  const { DAEMON } = require('./helpers');
   const queueDir = mkTmp('spo-disp-scanlock-q-');
   const journalDir = mkTmp('spo-disp-scanlock-j-');
 
-  const scanner = realSpawn(process.execPath, [DAEMON, '--shadow', '--scanner', '--queue', queueDir, '--journal', journalDir], {
-    stdio: 'ignore',
-    env: isolatedEnv(),
-  });
+  // `--parent-pid` names THIS test runner (action 6.6 verification, Task 2). It does not change
+  // what this test asserts -- a scanner still must not write daemon.lock -- but it is what stops
+  // this long-lived real child outliving an interrupted run: measured, a SIGKILL of the runner at
+  // the wrong instant left exactly this scanner alive with ppid 1, and the `finally` below cannot
+  // help, because a killed runner never reaches it. With the flag, the scanner's own liveness
+  // check reaps it within one loop iteration, no matter how the runner died.
+  const scanner = realSpawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--scanner', '--queue', queueDir, '--journal', journalDir, '--parent-pid', String(process.pid)],
+    { stdio: 'ignore', env: isolatedEnv() }
+  );
+  t.after(() => scanner.kill('SIGKILL'));
   try {
     // Give it a real window to have started up and, if it wrongly acquired a lock, to have
     // written one -- polled rather than a single check, since "never appears" can't be proven by
@@ -1139,6 +1313,9 @@ test('daemon.js --scanner never acquires the single-instance lock', { timeout: 2
       stdio: 'ignore',
       env: isolatedEnv(),
     });
+    // A real dispatcher spawns a real scanner of its own; that one already carries the
+    // --parent-pid this dispatcher passes it, so it follows its parent down either way.
+    t.after(() => second.kill('SIGKILL'));
     try {
       await waitFor(() => fs.existsSync(lockPath(journalDir)), 15000);
     } finally {
@@ -1228,11 +1405,22 @@ const DAEMON_FLAG_POLICY = {
   '--journal': { worker: 'forward', scanner: 'forward' },
   // forwarded to the worker only: it governs ONE step's deadline, and only a worker runs steps
   '--deadline-ms': { worker: 'forward', scanner: 'n/a: a scanner never runs a state handler' },
-  // action 6.4: forwarded to the worker because product-repo-lock.js derives its wait bound from K
-  '--workers': { worker: 'forward', scanner: 'n/a: a scanner never takes the product-repo lock' },
+  // action 6.4: forwarded to the worker because product-repo-lock.js derives its wait bound from K.
+  // action 6.6 verification: forwarded to the SCANNER too. The row used to read
+  // "n/a: a scanner never takes the product-repo lock", which was a true statement about the only
+  // consumer of K that existed when 6.4 wrote it -- and became a stale certification the moment
+  // 6.6 made auto-pull.js's watermark (`in-flight + queued <= K`) a second consumer, running in
+  // the scanner. This is the failure mode the table itself exists to catch, arriving from the
+  // other direction: not a new flag nobody classified, but an old classification whose reason
+  // quietly expired. A row's justification is part of the assertion, not a comment.
+  '--workers': { worker: 'forward', scanner: 'forward' },
   // NOT forwarded, deliberately: these select what the child IS, and the builders set them
   '--worker': { worker: 'self', scanner: 'n/a' },
   '--scanner': { worker: 'n/a', scanner: 'self' },
+  // action 6.6 verification (Task 2): the scanner alone is told the dispatcher pid it must not
+  // outlive. A worker needs no such flag -- it runs one task and exits, and the dispatcher awaits
+  // that exit; the scanner's for(;;) is the only child loop that can outlive its parent.
+  '--parent-pid': { worker: 'n/a: a worker exits on its own, and is awaited', scanner: 'forward' },
   // NOT forwarded, deliberately: pollIntervalMs is read ONLY by dispatcher.js's own supervision
   // loop. A worker runs one task and exits; a scanner has its own scan cadences.
   '--interval-ms': { worker: "n/a: dispatcher's own loop cadence", scanner: "n/a: dispatcher's own loop cadence" },

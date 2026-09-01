@@ -190,9 +190,52 @@ function buildWorkerArgv(taskDir, queueDir, journalRoot, config) {
 // dispatcher's workers actually drain, not a throwaway. No taskDir (a scanner has none) and no
 // --deadline-ms (that flag governs a single step's own deadline -- steps run inside a WORKER, a
 // scanner never runs one).
+//
+// `--parent-pid` IS FORWARDED, and it is what stops an orphaned scanner running forever (action
+// 6.6 verification, Task 2). Both children are spawned `detached: true` -- correct and still
+// required for a WORKER, so `process.kill(-pid, ...)` reaches that worker's own `claude`
+// grandchild and a killed card can never leave an LLM call still spending. But a worker is
+// short-lived and awaited; the scanner's `for(;;)` never returns on its own, so `detached` also
+// means it OUTLIVES A DISPATCHER THAT DIES WITHOUT KILLING IT. Measured: SIGKILL the dispatcher
+// alone (not its group) and the scanner keeps running, reparented to ppid 1. systemd's
+// `KillMode=control-group` covers `systemctl stop`, but not a dispatcher CRASH -- and
+// `Restart=always` then starts a NEW dispatcher, which spawns a SECOND scanner, so two scanners
+// run the same timers against the same journal root: duplicate unpark scans, duplicate report
+// intake, and two independent auto-pull watermark computations against one queue.
+//
+// The scanner therefore learns the pid it must not outlive, and state-machine.js's runForever
+// checks `process.ppid !== parentPid` once per loop iteration -- an EXACT test, not a heuristic:
+// the kernel reparents an orphan the instant its parent dies, so a changed ppid means the parent
+// is gone, and an unchanged one means it is not. Immune to pid reuse (the value is compared, not
+// probed with kill(pid, 0)) and correct in a container where the dispatcher is itself pid 1.
+// Absent (a maintainer running `daemon.js --scanner` by hand) the check is skipped entirely.
 function buildScannerArgv(queueDir, journalRoot, config) {
   const modeFlag = config.shadowMode ? '--shadow' : config.dryRun ? '--dry-run' : '--real';
-  return [DAEMON_PATH, modeFlag, '--scanner', '--queue', queueDir, '--journal', journalRoot];
+  const argv = [
+    DAEMON_PATH,
+    modeFlag,
+    '--scanner',
+    '--queue',
+    queueDir,
+    '--journal',
+    journalRoot,
+    '--parent-pid',
+    String(process.pid),
+  ];
+  // `--workers` IS FORWARDED TO THE SCANNER TOO -- action 6.6 verification. It was deliberately
+  // withheld until 6.6, and the reason recorded in test/dispatcher.test.js's own flag-policy
+  // table ("a scanner never takes the product-repo lock") was true at the time: K reached a
+  // child only through product-repo-lock.js's waitBoundMs, which only a worker ever computes.
+  // Action 6.6 gave the scanner a SECOND reason to need K, and nothing updated the table: the
+  // auto-pull watermark is `in-flight + queued <= K`, computed by auto-pull.js's
+  // computeAutoPullBudget, which runs in THIS child. A `--workers 3` dispatcher paired with a
+  // scanner resolving K=1 would hold the queue at one card no matter how many slots were idle --
+  // the daemon would look like it simply refused to parallelise. Only `SPO_WORKERS` in the
+  // inherited env happened to work, which is bug-for-bug the shape 6.4 already found and fixed
+  // on the worker side. Same guard as buildWorkerArgv: a missing or invalid K omits the flag
+  // rather than forwarding NaN, so the child falls back to its own config.js resolution.
+  if (Number.isInteger(config.workers) && config.workers > 0) argv.push('--workers', String(config.workers));
+  return argv;
 }
 
 // Reparks a crashed worker's task through the exact same buildCtx/finalizePark round trip
@@ -503,6 +546,25 @@ function createDispatcher(queueDir, journalRoot, config) {
   // scanner) exiting, or the ordinary poll interval -- neither depends on how long any scan takes,
   // because no scan ever runs here.
   async function run() {
+    // PUBLISH THE (EMPTY) LIVE-WORKER TABLE FIRST, BEFORE THE SCANNER EXISTS -- action 6.6
+    // verification defect. auto-pull.js's computeAutoPullBudget reads a MISSING live-workers.json
+    // as `inFlight = K` ("no dispatcher has ever published here, assume the worst"), which is the
+    // right posture for a scanner with no dispatcher -- but publishLiveWorkerIds was only ever
+    // called from spawnOne/handleExit, so on a cold start with an EMPTY QUEUE the file was never
+    // written at all. That is a deadlock, not a delay: auto-pull is the only thing that puts a
+    // card in the queue, no queue file means no spawnOne, no spawnOne means no file, and no file
+    // means auto-pull's budget is permanently 0. Measured before this line existed: a `--real`
+    // dispatcher on an empty queue with SPO_AUTO_PULL_MS=3000 made ZERO `npm run board:claim`
+    // calls in 20s (~6 due cycles); writing an empty live-workers.json by hand into the same
+    // journal root produced 3 in the next 20s. The daemon would simply never pull a card again.
+    //
+    // Publishing an empty set here is what makes the absent-file rule mean what its own comment
+    // says it means: "absent" now genuinely distinguishes "no dispatcher owns this journal root"
+    // from "a dispatcher owns it and is idle", instead of conflating the two. It must run BEFORE
+    // spawnScanner so the scanner's very first scan cycle -- which is due immediately, every
+    // timer starting at null -- already sees a truthful file rather than racing this write.
+    publishLiveWorkerIds();
+
     spawnScanner(); // exactly one, up front -- see handleScannerExit for the respawn-on-crash loop.
 
     for (;;) {

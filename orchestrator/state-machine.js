@@ -1789,6 +1789,40 @@ async function runForever(queueDir, journalRoot, config) {
   }
 
   for (;;) {
+    // PARENT-LIVENESS (action 6.6 verification, Task 2). dispatcher.js spawns this process
+    // `detached: true` -- required for a WORKER, whose process group must be reachable by
+    // `kill(-pid)` so a killed card never orphans a still-spending `claude` grandchild. For a
+    // scanner the same flag has a second, unwanted consequence: this `for(;;)` never returns on
+    // its own, so a dispatcher that dies WITHOUT killing its group (a crash, not a
+    // `systemctl stop` -- KillMode=control-group covers the unit case) leaves this loop running
+    // unsupervised forever. Measured before this check existed: four such orphans, alive 1h22m
+    // after the run that spawned them, pointed at deleted /tmp roots. Worse than litter, because
+    // the unit is `Restart=always`: systemd starts a new dispatcher, that dispatcher spawns its
+    // own scanner, and now TWO scanners run the same timers against the same journal root --
+    // duplicate unpark scans, duplicate report intake, and two independent auto-pull watermark
+    // computations racing one queue, which is precisely the invariant action 6.6 exists to hold.
+    //
+    // `process.ppid !== parentPid` is an EXACT test of "my parent died", not a heuristic: the
+    // kernel reparents an orphan the instant its parent exits, so the value changes if and only
+    // if the dispatcher is gone. Compared, never probed with `kill(pid, 0)`, so a recycled pid
+    // cannot resurrect a dead parent; and correct where the dispatcher is itself pid 1, which a
+    // bare `process.ppid === 1` test would get backwards. config.parentPid is null for a
+    // hand-run `daemon.js --scanner` (daemon.js only sets it from --parent-pid, which only
+    // dispatcher.js passes), and a null parent is never watched.
+    //
+    // Checked once per iteration, which bounds an orphan's remaining life by ONE scan cycle
+    // rather than by nothing. It cannot be tightened with a timer: runScanCycle reaches
+    // intake.js's blocking `spawnSync('claude', ...)` (measured at 3m24.9s on the live daemon),
+    // and no timer fires in a single-threaded process that is blocked inside a sync call. One
+    // cycle of duplicate scanning is survivable; forever is not.
+    if (Number.isInteger(config.parentPid) && config.parentPid > 0 && process.ppid !== config.parentPid) {
+      appendDaemonEvent(journalRoot, 'scanner-orphan-exit', {
+        parentPid: config.parentPid,
+        ppid: process.ppid,
+      });
+      return;
+    }
+
     await runScanCycle(timers, queueDir, journalRoot, config, scanStates);
     await sleep(config.pollIntervalMs);
   }

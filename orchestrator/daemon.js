@@ -107,6 +107,10 @@ function parseArgs(argv) {
     // own process -- see this file's header. A plain boolean (no path argument, unlike --worker):
     // a scanner needs no per-invocation target, it always scans whatever --queue/--journal name.
     scanner: false,
+    // Action 6.6 verification (Task 2): the dispatcher pid this scanner must not outlive. null
+    // means "not given" -- a hand-run scanner never self-exits. See dispatcher.js's
+    // buildScannerArgv and state-machine.js's runForever for the full reasoning.
+    parentPid: null,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -122,6 +126,7 @@ function parseArgs(argv) {
     else if (a === '--deadline-ms') opts.deadlineMs = parseInt(argv[++i], 10);
     else if (a === '--interval-ms') opts.intervalMs = parseInt(argv[++i], 10);
     else if (a === '--workers') opts.workers = parseInt(argv[++i], 10);
+    else if (a === '--parent-pid') opts.parentPid = parseInt(argv[++i], 10);
     else if (a === '--help' || a === '-h') opts.help = true;
   }
   return opts;
@@ -147,6 +152,9 @@ function printUsage() {
       '  --once            drain the queue serially and exit (default: poll forever)',
       '  --worker <dir>    run the ONE task in <dir>/task.json and exit (see file header for the',
       '                    exit-code contract). Mutually exclusive with --once. Takes no lock.',
+      '  --parent-pid <n>  (with --scanner) the dispatcher pid this scanner must not outlive:',
+      '                    the loop exits as soon as it is reparented away from it. Set by',
+      '                    dispatcher.js; omit it to run a scanner by hand that never self-exits.',
       '  --scanner         run the periodic real-mode scans forever, in this process, never the',
       '                    dispatcher\'s (see file header). Spawned/supervised by the dispatcher.',
       '                    Mutually exclusive with --once and --worker. Takes no lock.',
@@ -415,6 +423,13 @@ async function main() {
       ),
     },
     queueDir,
+    // Action 6.6 verification (Task 2): the dispatcher pid a `--scanner` child must not outlive.
+    // Only ever set for a scanner (the dispatcher's own buildScannerArgv is the only caller that
+    // passes --parent-pid); null everywhere else, which state-machine.js's runForever reads as
+    // "no parent to watch, never self-exit". A non-integer or non-positive value falls back to
+    // null for the same reason --workers does: a bad override must never become a different,
+    // silently wrong pid to compare against.
+    parentPid: Number.isInteger(opts.parentPid) && opts.parentPid > 0 ? opts.parentPid : null,
     // Every state.json snapshot this run writes carries this back (state-machine.js's
     // buildCtx/snapshot) -- orphan-scan.js's only way, after a restart, to tell "the process
     // that wrote this is still alive" from "it died mid-task".
