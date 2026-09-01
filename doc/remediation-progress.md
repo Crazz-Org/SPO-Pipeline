@@ -5,11 +5,11 @@ This file is what the plan *turned out to be* once executed: what is done, what 
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
 
-**State as of 2026-09-01.** `main` = `a68a0b9` (C3 merged as PR #63, the comment-scan hotfix as
-PR #64, the C3 handoff as PR #65). C4 is complete on
-`claude-crazz/spo-pipeline-chantier-4-ae2fb6`, seven commits, **not yet merged**. Suite **1032
-passing, 0 failing** (894 at the start of C4). Daemon + dashboard **running** in `--real`; the C3
-soak has held for 9h+ — see § The 24h soak below before touching anything.
+**State as of 2026-09-01.** `main` = `dd5a97d` — **C4 is merged** (PR #66, seven commits), on top
+of C3 (PR #63), the comment-scan hotfix (PR #64) and the C3 handoff (PR #65). Suite **1032
+passing, 0 failing** (894 at the start of C4). Daemon + dashboard **running** in `--real` on C4
+code since 2026-09-01 07:40:02 CEST, verified scanning with the fixed `gh api` argv and
+journalling nothing.
 
 ## Progress
 
@@ -18,7 +18,7 @@ soak has held for 9h+ — see § The 24h soak below before touching anything.
 | **C1** — truthful judges | **DONE**, gate green (live card #462) |
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
 | **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
-| **C4** — correct remediation loops | **DONE, not merged**; branch `claude-crazz/spo-pipeline-chantier-4-ae2fb6` |
+| **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | C5–C7 | not started |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → **1032** (end of C4).
@@ -118,10 +118,11 @@ bug it was preventing*, and one was a live-world side effect nobody had noticed:
 
 ## Still open after C4
 
-- **142 test-generated comments on `Crazz-Org/SPO-WebClient` issue #1** (140 from 2026-08-31
-  23:16–23:30Z, 2 from 10:24Z from a different, untraced test file). All 142 are `### Pipeline
-  parked` artifacts; the issue had no genuine comments before them. Ids collected but not deleted.
-- **The repo-wide test-isolation guard** for in-process `gh`/`git` spawns (see above).
+- ~~142 test-generated comments on issue #1~~ — **deleted 2026-09-01**, all 142, on the
+  maintainer's decision; the issue is back to 0 comments. Two of them (10:24Z, reason `x`) came
+  from a second test file that was never traced, so that evidence is now gone with them.
+- **The repo-wide test-isolation guard** for in-process `gh`/`git` spawns (see above). This is the
+  one that matters: the file-local killswitch in `9cf47f2` closes one file, not the class.
 - **`test/lock.test.js`'s SIGTERM lock-release test is flaky**, ~1 full-suite run in 6–10 under
   load, pre-existing at `a68a0b9`. It matters because a flaky suite silently misreports a
   surviving mutation as killed — which it did once, during 4.6's verification.
@@ -228,11 +229,20 @@ on any `gh api` call site passing `-f`/`-F` without an explicit `--method`/`-X`,
 exempted. **Any future real-spawn smoke coverage should start here**, since this is the fifth
 production bug to pass a green hermetic suite.
 
-## The 24h soak — 9h+ held, and what to check
+## The 24h soak — 9h23m held, then deliberately reset
 
-Started **2026-08-31 21:35 CEST**, restarted at **22:07:44** when the C3 handoff merged (the
-post-merge hook bounces the daemon, so **any merge resets this clock** — do not merge during a soak
-you care about). At 2026-09-01 07:30 CEST, **9h23m in, all four numbers are unchanged.**
+Started **2026-08-31 21:35 CEST**, restarted at **22:07:44** when the C3 handoff merged, and
+reset again at **2026-09-01 07:40:02** by the `git pull` that deployed C4. Note it is the *pull*
+in the live checkout that fires the post-merge hook, not the merge on GitHub — merging PR #66 left
+the daemon untouched at 22:07:44 and still running C3 code until the pull.
+
+**It held 9h23m with all four numbers unchanged**, and the maintainer chose to reset it there
+rather than wait out the remaining 14h of an empty-queue scan loop (2026-09-01). C3's soak
+criterion is therefore satisfied at 9h23m, not 24h; if a future session wants the full figure it
+must start a fresh clock and not merge across it.
+
+Immediately after the C4 restart, all four numbers were still 1179 / 0 / 24 / 135, and the
+scanner was observed alive on the new code.
 
 Two things to know before reading a green soak as proof:
 
