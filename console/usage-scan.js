@@ -14,6 +14,33 @@ const path = require('path');
 const readline = require('readline');
 
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// ---- the ONE "today" rule (action 5.5, item C) -------------------------------------------------
+//
+// Measured live on this machine (UTC+2) 2026-09-01: console/collect.js's collectDaemonStats
+// buckets by LOCAL midnight (`startOfDay`'s `d.setHours(0,0,0,0)`), while this module's byDay
+// used to key each session by `agg.lastTs.slice(0, 10)` -- the UTC calendar date sliced straight
+// off the ISO timestamp. The two disagree for the two hours between 22:00 UTC and local midnight:
+// an event at 2026-09-01T23:30Z is UTC-dated "2026-09-01" but is already LOCAL "2026-09-02". Same
+// page, same word "today", two different sets of events, for two hours every day.
+//
+// Resolved by CONVERGING ON LOCAL: `localDateKey` below is the one place a timestamp becomes a
+// 'YYYY-MM-DD' day key anywhere in the tokens/trend path (scan()'s byDay here, buildTrendViews's
+// `now` below, and console/serve.js's `todayDate` passed into usage-rollups.js's mergeRollups --
+// see that call site for a one-line pointer back to this comment, not a second copy of it).
+// `Date.prototype.getFullYear/getMonth/getDate` read in the PROCESS's own local timezone, the
+// same primitive collect.js's `startOfDay`/`startOfWeek` already build on -- so this is not a new
+// rule, it is the existing rule applied where it was missing. orchestrator/tokens.js's
+// `todaySpend` was pinned to the same LOCAL midnight for the same reason, action 5.4 -- the
+// dashboard must not become a third, dissenting opinion.
+function localDateKey(input) {
+  const d = input instanceof Date ? input : new Date(input);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 function emptyModelAgg() {
   return { msgs: 0, inp: 0, cc: 0, cr: 0, out: 0 };
@@ -186,7 +213,8 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
         mergeAgg(aModel, m);
       }
 
-      const date = agg.lastTs ? agg.lastTs.slice(0, 10) : null;
+      // LOCAL calendar day, not a UTC slice -- see this file's "the ONE 'today' rule" header.
+      const date = agg.lastTs ? localDateKey(agg.lastTs) : null;
       if (date && agg.account !== 'local') {
         const dEntry = (byDay[date] = byDay[date] || { sessions: 0, msgs: 0, models: {} });
         dEntry.sessions++;
@@ -358,7 +386,22 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
 // spike in cache-creation relative to cache-read, regardless of whether the resulting work
 // itself got more or less expensive -- a near-deterministic fingerprint of "something changed
 // today" that corroborates (or contradicts) the weight trend from a completely different angle.
-function buildTrendViews(rollups, { days = 60, minSessionsForCompare = 20 } = {}) {
+//
+// action 5.5, item B audit of journal/usage-rollups.json: `today` below used to mean "the LAST
+// recorded day in the file", silently equated with the actual calendar today -- if the live
+// server (console/serve.js) that writes this file hasn't run today (or at all in a while), the
+// "today (partial)" KPI would keep showing a PREVIOUS day's numbers under that label with nothing
+// on the page saying so. There is no per-day `scannedAt` persisted in the rollups file to check
+// instead (usage-scan.js's own `scannedAt` on the live index is never written into rollups.json,
+// only `partial` is -- see usage-rollups.js's mergeRollups) -- so freshness here is judged the
+// only way the persisted data allows: comparing `lastRecordedDate` against `now`'s OWN local day
+// (the same `localDateKey` this file's byDay bucketing uses, per the "ONE 'today' rule" header
+// above). `stale: true` whenever the last recorded day isn't literally today -- a day behind
+// already means the scanner missed at least one of its ~5-minute cycles for all of today, which
+// for a source meant to be near-live is worth flagging immediately (contrast with
+// console/collect.js's usageSnapshotFreshness, whose SNAPSHOT_STALE_MS grace period is a full day
+// specifically because that source has NO automatic refresh at all).
+function buildTrendViews(rollups, { days = 60, minSessionsForCompare = 20, now = Date.now() } = {}) {
   const dates = Object.keys(rollups || {}).sort();
   const series = dates.slice(-days).map((date) => {
     const r = rollups[date] || {};
@@ -399,9 +442,18 @@ function buildTrendViews(rollups, { days = 60, minSessionsForCompare = 20 } = {}
 
   const pct = (a, b) => (a !== null && a !== undefined && b ? Math.round(((a - b) / b) * 100) : null);
 
+  const lastRecordedDate = dates.length ? dates[dates.length - 1] : null;
+  const todayLocalDate = localDateKey(now);
+  // Whole-day difference between two 'YYYY-MM-DD' strings, via Date.parse (UTC midnight for
+  // both ends -- the offset cancels, only the day COUNT matters here, not either instant).
+  const staleDays = lastRecordedDate ? Math.round((Date.parse(todayLocalDate) - Date.parse(lastRecordedDate)) / DAY_MS) : null;
+
   return {
     series,
-    lastRecordedDate: dates.length ? dates[dates.length - 1] : null,
+    lastRecordedDate,
+    todayLocalDate,
+    stale: staleDays !== null && staleDays >= 1,
+    staleDays,
     kpis: {
       todayAvgWeightPerSession: today ? today.avgWeightPerSession : null,
       todayAvgMoutPerSession: today ? today.avgMoutPerSession : null,
@@ -437,4 +489,4 @@ function discoverUsageRoots(accountsDir) {
   return roots;
 }
 
-module.exports = { createUsageScanner, buildTokenViews, buildTrendViews, discoverUsageRoots };
+module.exports = { createUsageScanner, buildTokenViews, buildTrendViews, discoverUsageRoots, localDateKey };

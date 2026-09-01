@@ -229,8 +229,13 @@ test('collectDaemonStats: an ABANDONED task counts as terminal (stats.total, sta
 });
 
 test('collectDaemonStats: the abandoned task is also folded into week/today, mirroring done/parked exactly', () => {
-  const now = Date.parse('2026-08-31T12:00:00.000Z'); // a Monday
-  const journalTasks = [{ state: 'ABANDONED', updatedAt: '2026-08-31T08:00:00.000Z' }]; // today AND this week
+  // Anchored to the HOST's local midnight: collect.js buckets by LOCAL day, so a fixed
+  // `2026-08-31T08:00:00Z` is "today" at UTC+2 and the previous local day at UTC+14.
+  const now = Date.parse('2026-08-31T12:00:00.000Z');
+  const localMidnight = new Date(now);
+  localMidnight.setHours(0, 0, 0, 0);
+  const todayIso = new Date(localMidnight.getTime() + 1000).toISOString();
+  const journalTasks = [{ state: 'ABANDONED', updatedAt: todayIso }]; // today AND this week
 
   const stats = collectDaemonStats(journalTasks, 0, { now });
 

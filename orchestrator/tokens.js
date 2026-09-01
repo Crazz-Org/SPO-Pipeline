@@ -142,8 +142,28 @@ function readTaskTokens(journalRoot, id, { cacheTtlMs } = {}) {
   }
 
   let state = 'UNKNOWN';
+  // action 5.5, item A: `kind` read alongside `state` so tokenReport() below can exclude a
+  // synthetic/demo task from its done/parked/abandoned counts the SAME way
+  // console/collect.js's collectDaemonStats does (that module's own `isCardKind` comment has the
+  // full rationale -- not repeated here). '' when the field is absent, same fallback shape
+  // collectJournalTasks uses, so "no kind at all" reads as a real card on both sides.
+  let kind = '';
   try {
-    state = JSON.parse(fs.readFileSync(path.join(journalRoot, id, 'state.json'), 'utf8')).state || 'UNKNOWN';
+    const stateJson = JSON.parse(fs.readFileSync(path.join(journalRoot, id, 'state.json'), 'utf8'));
+    state = stateJson.state || 'UNKNOWN';
+    kind = stateJson.kind || '';
+    // state.json is the primary, but fall back to task.json exactly as collect.js's
+    // collectJournalTasks does (`state.kind || task.kind || ''`). Without the fallback the two
+    // sides can disagree on the same task -- a state.json with no `kind` beside a task.json
+    // saying `synthetic` would be excluded by the dashboard and counted here -- which is the
+    // 5.4 agreement this filter had to preserve, broken by the filter meant to preserve it.
+    if (!kind) {
+      try {
+        kind = JSON.parse(fs.readFileSync(path.join(journalRoot, id, 'task.json'), 'utf8')).kind || '';
+      } catch {
+        /* no task.json, or unreadable -- '' means "a real card", same as collect.js */
+      }
+    }
   } catch {
     // a task taken but not yet snapshotted -- UNKNOWN is the honest answer
   }
@@ -156,6 +176,7 @@ function readTaskTokens(journalRoot, id, { cacheTtlMs } = {}) {
   return {
     id,
     state,
+    kind,
     llmCalls,
     llmCallsWithTokens,
     llmCallsWithoutTokens,
@@ -206,8 +227,20 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
   const llmCalls = sum('llmCalls');
   const llmCallsWithTokens = sum('llmCallsWithTokens');
   const llmCallsWithoutTokens = sum('llmCallsWithoutTokens');
-  const done = tasks.filter((t) => t.state === 'DONE').length;
-  const parked = tasks.filter((t) => t.state === 'PARKED').length;
+  // action 5.5, item A: exclude a synthetic/demo task the same way console/collect.js's
+  // collectDaemonStats does (`isCardKind` there), so this module's done/parked/abandoned
+  // denominator keeps agreeing with the dashboard's -- see the constraint in that module's own
+  // comment: excluding synthetics on one side without the other reopens exactly the
+  // `parking rate` disagreement action 5.4/item G just closed. Not folded into `sum()`'s
+  // freshInputTokens/cacheCreationTokens/etc. totals above -- those answer "what did this run
+  // cost", which a demo run's own (typically negligible) tokens are honestly part of; only the
+  // done/parked/abandoned CLASSIFICATION that feeds the parking-rate ratio needs to match.
+  // Denylist, mirroring console/collect.js's isCardKind exactly -- the two must stay identical or
+  // 5.4's parking-rate agreement breaks. An allowlist would delete any future real kind from both
+  // sides at once, silently.
+  const isCardKindTask = (t) => t.kind !== 'synthetic';
+  const done = tasks.filter((t) => t.state === 'DONE' && isCardKindTask(t)).length;
+  const parked = tasks.filter((t) => t.state === 'PARKED' && isCardKindTask(t)).length;
   // action 5.4, item G: ABANDONED is the third terminal state (state-machine.js/park-loop.js
   // action 4.5) but this module never counted it -- `done`/`parked` were the only two buckets
   // tokenReport ever had. console/collect.js's collectDaemonStats already made ABANDONED
@@ -218,7 +251,7 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
   // Exposed here so bin/spo's cmdTokens can build the SAME denominator collect.js does (see that
   // module's own comment for why the numerator stays `parked` alone -- an abandon is a terminal
   // outcome the card is closed out on, not a park still awaiting a reply).
-  const abandoned = tasks.filter((t) => t.state === 'ABANDONED').length;
+  const abandoned = tasks.filter((t) => t.state === 'ABANDONED' && isCardKindTask(t)).length;
   const parks = tasks.reduce((n, t) => n + t.parkReasons.length, 0);
   const likelyCacheExpiries = tasks.reduce((n, t) => n + t.likelyCacheExpiries.length, 0);
 

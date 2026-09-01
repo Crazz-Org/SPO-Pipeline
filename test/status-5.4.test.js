@@ -359,7 +359,7 @@ test('spo status: a parked task with a successful scan since its failures shows 
 
 // ---- G: the parking rate matches console/collect.js's denominator, same fixture -----------------
 
-test('parking rate: tokenReport/cmdTokens and collect.js\'s collectDaemonStats agree on the terminal denominator', () => {
+test('parking rate: tokenReport/cmdTokens and collect.js\'s collectDaemonStats agree on the terminal denominator, a kind: "synthetic" task included in the fixture but excluded from BOTH sides (action 5.5, item A)', () => {
   const journalRoot = mkTmp('spo-status-parking-rate-');
 
   writeJournalLines(path.join(journalRoot, 'issue-1'), [{ ts: '2026-09-01T00:00:00.000Z', state: 'DONE', event: 'done' }]);
@@ -374,14 +374,22 @@ test('parking rate: tokenReport/cmdTokens and collect.js\'s collectDaemonStats a
   writeJournalLines(path.join(journalRoot, 'issue-4'), [{ ts: '2026-09-01T00:00:00.000Z', state: 'IMPLEMENT', event: 'llm-call' }]);
   writeStateJson(path.join(journalRoot, 'issue-4'), { id: 'issue-4', state: 'IMPLEMENT', updatedAt: '2026-09-01T00:00:00.000Z' });
 
-  // console/collect.js's own denominator: done + parked + abandoned (action 4.5).
+  // action 5.5, item A: a demo-happy-001-shaped synthetic task, terminal (DONE) -- must NOT
+  // enter EITHER side's denominator, or the two would disagree again (exactly the item G
+  // regression this test already exists to guard against, this time from the other direction:
+  // excluding it on only one side).
+  writeJournalLines(path.join(journalRoot, 'demo-happy-001'), [{ ts: '2026-08-29T00:10:10.750Z', state: 'DONE', event: 'done' }]);
+  writeStateJson(path.join(journalRoot, 'demo-happy-001'), { id: 'demo-happy-001', kind: 'synthetic', state: 'DONE', updatedAt: '2026-08-29T00:10:10.750Z' });
+
+  // console/collect.js's own denominator: done + parked + abandoned (action 4.5), synthetics
+  // excluded (action 5.5, item A).
   const journalTasks = collectJournalTasks(journalRoot);
   const daemonStats = collectDaemonStats(journalTasks, 0);
-  assert.equal(daemonStats.total, 3); // issue-1 (done) + issue-2 (parked) + issue-3 (abandoned)
+  assert.equal(daemonStats.total, 3); // issue-1 (done) + issue-2 (parked) + issue-3 (abandoned) -- NOT 4
   assert.equal(daemonStats.parkingRatePct, Math.round((1 / 3) * 100));
 
   // orchestrator/tokens.js / bin/spo's cmdTokens: same three tasks, same denominator now that
-  // item G folds `abandoned` into `finished`.
+  // item G folds `abandoned` into `finished`, and item A excludes the same synthetic task.
   const report = tokenReport(journalRoot);
   const finished = report.done + report.parked + report.abandoned;
   assert.equal(finished, daemonStats.total);

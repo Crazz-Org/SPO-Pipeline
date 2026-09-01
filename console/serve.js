@@ -22,7 +22,7 @@ const http = require('http');
 const { collectAll, buildSessionIndex } = require('./collect');
 const { renderDashboard, renderDataFragments, renderSystemFragment } = require('./render');
 const { createSystemSampler } = require('./system');
-const { createUsageScanner, buildTokenViews, buildTrendViews } = require('./usage-scan');
+const { createUsageScanner, buildTokenViews, buildTrendViews, localDateKey } = require('./usage-scan');
 const { loadRollups, mergeRollups, saveRollups } = require('./usage-rollups');
 
 const DEFAULT_DATA_TTL_MS = 5000;
@@ -139,7 +139,11 @@ function createDashboardServer(sources, opts = {}) {
         .scan()
         .then((idx) => {
           if (!rollupsPath || !idx || !idx.byDay) return;
-          rollups = mergeRollups(rollups, idx.byDay, { todayDate: new Date().toISOString().slice(0, 10) });
+          // LOCAL calendar day, not UTC -- see console/usage-scan.js's "the ONE 'today' rule"
+          // header (action 5.5, item C) for why: this used to be `new
+          // Date().toISOString().slice(0, 10)` (UTC), which disagreed with collect.js's
+          // LOCAL-midnight daemon-stats bucketing for two hours a day on a UTC+2 host.
+          rollups = mergeRollups(rollups, idx.byDay, { todayDate: localDateKey(Date.now()) });
           saveRollups(rollupsPath, rollups);
         })
         .catch(() => {});
