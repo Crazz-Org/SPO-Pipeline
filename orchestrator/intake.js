@@ -37,6 +37,7 @@ const os = require('os');
 
 const accounts = require('./accounts');
 const config = require('./config');
+const { leaseHealthyAccount } = require('./account-lease');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
@@ -127,6 +128,17 @@ function normalizeExit(result) {
 // (accounts.markLimit) and pick again, bounded to one pass over the pool's enabled accounts, so
 // a step can never retry the same account twice for a limit and never spins forever.
 //
+// action 6.2: "pick" is now account-lease.js's leaseHealthyAccount, not a bare accounts.pick().
+// Under C6 this file's callers (draftCard/reviewCard/triageBugReport) run DISPATCHER-side, in
+// runForever's own scan timers -- so the dispatcher competes for the same two-account pool with
+// whatever worker(s) are mid-step on cards at the same time. Leasing (not just cooling) is what
+// stops the dispatcher from handing an account to `claude` while a worker is already using it for
+// its own LLM step; see account-lease.js's header for the full per-step-lease rationale and
+// state-machine.js's callLlmStep for the sibling copy of this same loop shape. The lease is held
+// for exactly one account "attempt" below -- both the primary call AND its same-account timeout
+// retry (never a second account) -- and released in the `finally` before this loop either returns
+// or rotates to the next account.
+//
 // Two differences from that idiom, both required by intake's own contract (see each caller's
 // header comment for the fuller rationale):
 //
@@ -177,11 +189,21 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
   let retriedAfterTimeout = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let account;
+    let leased;
     try {
-      account = accounts.pick(accountsDir);
+      leased = await leaseHealthyAccount(accountsDir, {
+        waitMs: (deps && deps.leaseWaitMs) !== undefined ? deps.leaseWaitMs : config.accountLeaseWaitMs,
+        pollMs: (deps && deps.leasePollMs) !== undefined ? deps.leasePollMs : config.accountLeasePollMs,
+        sleep: deps && deps.leaseSleep,
+        now: deps && deps.leaseNow,
+        isAlive: deps && deps.leaseIsAlive,
+      });
     } catch (err) {
-      if (err instanceof accounts.AllAccountsCoolingError || err instanceof accounts.NoAccountsRegisteredError) {
+      if (
+        err instanceof accounts.AllAccountsCoolingError ||
+        err instanceof accounts.NoAccountsRegisteredError ||
+        err instanceof accounts.AllAccountsLeasedError
+      ) {
         return {
           ok: false,
           error: `${prefix}: ${err.message}`,
@@ -192,19 +214,27 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
       throw err;
     }
 
-    const opts = buildOpts(account);
+    const account = leased.account;
+    try {
+      const opts = buildOpts(account);
 
-    raw = await invokeClaudeReal(opts, deps);
-    if (!raw.ok && raw.timedOut === true) {
-      const record = {
-        account: account.name,
-        deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
-        firstError: formatLlmFailure(prefix, raw),
-      };
       raw = await invokeClaudeReal(opts, deps);
-      record.retryOk = raw.ok === true;
-      record.retryTimedOut = raw.timedOut === true;
-      retriedAfterTimeout = record;
+      if (!raw.ok && raw.timedOut === true) {
+        const record = {
+          account: account.name,
+          deadlineMs: raw.deadlineMs !== undefined ? raw.deadlineMs : opts.deadlineMs,
+          firstError: formatLlmFailure(prefix, raw),
+        };
+        raw = await invokeClaudeReal(opts, deps);
+        record.retryOk = raw.ok === true;
+        record.retryTimedOut = raw.timedOut === true;
+        retriedAfterTimeout = record;
+      }
+    } finally {
+      // One lease covers this whole account "attempt" -- the primary call AND its same-account
+      // timeout retry above -- released the instant both are done, before this loop either
+      // returns or rotates to the next account.
+      leased.release();
     }
 
     if (!(raw && raw.ok === false && raw.kind === 'limit')) {

@@ -212,4 +212,105 @@ function releaseLock(file) {
   }
 }
 
-module.exports = { acquireLock, lockPath, LockHeldError, LockLostError, processAlive, watchLock };
+// ---- short-lived exclusive locks (action 6.2: account.js's per-account leases and its
+// .state.lock around markLimit's read-modify-write) ------------------------------------------
+//
+// A SECOND, deliberately simpler idiom from acquireLock's own tmp+link dance above. That one
+// exists because daemon.lock is read by `watchLock` on a timer for the LIFE of the daemon, so a
+// reader catching it half-written (a bare `wx` create followed by a second write() for the
+// content) is a real, standing risk acquireLock's own header explains. These locks are held for,
+// at most, a handful of milliseconds around one small JSON read+write (a lease around one LLM
+// step call, or the state.json critical section) -- the write is a single writeFileSync call, a
+// SINGLE syscall for a payload this small, so there is no separate "create empty, then fill it"
+// window to race in the first place. Same exclusivity guarantee (the OS's O_EXCL), same
+// pid-liveness staleness idiom (this module's own `processAlive`), same release-only-if-ours
+// doctrine (`pid` AND `startedAt` both have to match) -- just without the extra ceremony a
+// long-lived, frequently-re-read file needs.
+//
+// acquireShortLock(filePath, {isAlive}) -> {pid, startedAt} on success, or null if a LIVE holder
+// already has it (after one stale-sweep retry for a DEAD holder's leftover). Never throws for
+// contention -- only for a real fs error (permissions, disk full, ...), same as acquireLock.
+// holderExpired(holder, maxAgeMs, now) -- whether a short-lock holder is stale purely on AGE,
+// independent of whether its pid is alive. `maxAgeMs` null/undefined disables the rule entirely,
+// which is what markLimit's .state.lock passes: that lock is held for microseconds around one
+// small JSON read+write, so a dead-pid sweep already covers every way it can be orphaned and an
+// age rule would add a second lifecycle for no benefit. Only account-lease.js opts in -- see its
+// MAX_LEASE_AGE_MS for the derivation and for the failure this closes.
+//
+// A `startedAt` that isn't a parseable ISO timestamp is NOT treated as expired: an unreadable or
+// torn payload is already handled by readHolder returning null (the caller sweeps it as stale on
+// the pid rule), and inventing an age for a value we cannot parse would sweep leases we have no
+// evidence about. The same conservatism applies to a holder that appears to come from the future
+// (a clock injected below the lease's own timestamps, as several tests do): `now - startedAt` is
+// negative, so nothing expires. Both directions fail toward "leave it alone", which risks only a
+// slower recovery, never two `claude` processes on one CLAUDE_CONFIG_DIR.
+function holderExpired(holder, maxAgeMs, now = Date.now) {
+  if (maxAgeMs === null || maxAgeMs === undefined) return false;
+  if (!holder || typeof holder.startedAt !== 'string') return false;
+  const startedAt = Date.parse(holder.startedAt);
+  if (!Number.isFinite(startedAt)) return false;
+  return now() - startedAt > maxAgeMs;
+}
+
+function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {
+  const payload = { pid: process.pid, startedAt: new Date().toISOString() };
+  const tryWrite = () => {
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(payload), { flag: 'wx' });
+      return true;
+    } catch (err) {
+      if (err && err.code === 'EEXIST') return false;
+      throw err;
+    }
+  };
+
+  if (tryWrite()) return payload;
+
+  const holder = readHolder(filePath);
+  const holderAlive =
+    holder && typeof holder.pid === 'number' && isAlive(holder.pid) && !holderExpired(holder, maxAgeMs, now);
+  if (holderAlive) return null; // a live process really does hold this -- caller's problem to wait or degrade
+
+  // Dead pid, over-age (when the caller opted into maxAgeMs), or an unreadable/torn file: stale.
+  // Both rules are kept, and the pid rule is NOT subordinate to the age one: a dead pid is swept
+  // immediately because that is the COMMON case (the post-merge deploy hook SIGTERMs this tree,
+  // orphaning any lease mid-step), and making it wait out the age bound would be a plain
+  // regression. Sweep and retry exactly once -- a second EEXIST
+  // here means a racing acquirer won the sweep, and that racer is alive by construction (it just
+  // created the file), so this attempt simply loses, same as the live-holder case above.
+  try {
+    fs.unlinkSync(filePath);
+  } catch (err) {
+    if (!err || err.code !== 'ENOENT') throw err; // already swept by the racer -- fall through to the retry
+  }
+  return tryWrite() ? payload : null;
+}
+
+// releaseShortLock(filePath, held) -- removes the lock IFF it is still ours: both `pid` and
+// `startedAt` must match the payload acquireShortLock returned. Guards the same reused-pid race
+// releaseLock (daemon.lock) and orphan-scan.js's owner check both already guard: a process that
+// died holding this lock, whose pid got recycled by an unrelated process before this lock's
+// original owner's own cleanup runs, must never have its lock torn out from under it by that
+// unrelated process's eventual (unrelated) release call.
+function releaseShortLock(filePath, held) {
+  if (!held) return;
+  const holder = readHolder(filePath);
+  if (!holder || holder.pid !== held.pid || holder.startedAt !== held.startedAt) return;
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // Best-effort, same posture as releaseLock -- a release must never crash the caller.
+  }
+}
+
+module.exports = {
+  acquireLock,
+  lockPath,
+  LockHeldError,
+  LockLostError,
+  processAlive,
+  watchLock,
+  acquireShortLock,
+  releaseShortLock,
+  holderExpired,
+};

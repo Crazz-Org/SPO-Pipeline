@@ -47,6 +47,7 @@ const {
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const accounts = require('./accounts');
+const { leaseHealthyAccount } = require('./account-lease');
 const { moveCard } = require('./board');
 const {
   postParkComment,
@@ -84,15 +85,24 @@ function isRealMode(ctx) {
 //
 // Real mode: one pass over the healthy accounts, per state-machine-spec.md § Account pool ("a
 // limit error ... puts the account in cooldown ... and the step retries on the next healthy
-// account"). accounts.pick() already skips cooling accounts; when a call comes back
-// {kind: 'limit'}, this cools that account down (accounts.markLimit, journaled as
-// 'account-cooldown') and asks pick() again for the next one. The loop is bounded to the number
-// of enabled accounts in the registry, so a step can never retry the same account twice or spin
-// forever: once every account has been tried, or pick() itself finds none healthy
-// (AllAccountsCoolingError), the task is PARKED -- the spec's "then PARKED" for this path. An
-// empty pool (accounts.pick()'s NoAccountsRegisteredError -- no subdirectories under
-// claudeAccountsDir at all) is mapped to PARKED the same way; see also daemon.js, which
-// refuses to even START in --real mode on an empty pool.
+// account"). Each attempt now goes through account-lease.js's leaseHealthyAccount instead of a
+// bare accounts.pick() (action 6.2): it picks a healthy account NOT currently leased by another
+// live process (this daemon's own worker, or the dispatcher's intake.js scan timers, both draw
+// from the same pool -- see account-lease.js's own header for why per-step leasing beats
+// per-task), leases it for the duration of this one call, and releases it in the `finally` below
+// whether the call succeeds, limits, or throws. When a call comes back {kind: 'limit'}, this cools
+// that account down (accounts.markLimit, journaled as 'account-cooldown') and asks for the next
+// one. The loop is bounded to the number of enabled accounts in the registry, so a step can never
+// retry the same account twice for a COOLDOWN or spin forever: once every account has been tried,
+// or leasing itself finds nothing usable, the task is PARKED -- the spec's "then PARKED" for this
+// path, now with three distinct reasons instead of two:
+//   - AllAccountsCoolingError -- every enabled account is cooling. Never waited on (see
+//     account-lease.js) -- parked immediately, same as before this action.
+//   - AllAccountsLeasedError -- every HEALTHY account is leased by another live process.
+//     leaseHealthyAccount already waited up to config.accountLeaseWaitMs for one to free up
+//     before throwing this -- so by the time it's caught here, the wait is already spent.
+//   - NoAccountsRegisteredError -- the pool has zero subdirectories at all. daemon.js additionally
+//     refuses to even START in --real mode on this one.
 async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   if (ctx.shadowMode) {
     return callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
@@ -110,24 +120,41 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   // cooldownUntilIso through instead, so the park always names when to retry.
   let lastCooldownUntilIso = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let account;
+    let leased;
     try {
-      account = accounts.pick(accountsDir);
+      leased = await leaseHealthyAccount(accountsDir, {
+        waitMs: ctx.config.accountLeaseWaitMs,
+        pollMs: ctx.config.accountLeasePollMs,
+        sleep: deps.leaseSleep,
+        now: deps.leaseNow,
+        isAlive: deps.leaseIsAlive,
+      });
     } catch (err) {
-      if (err instanceof accounts.AllAccountsCoolingError || err instanceof accounts.NoAccountsRegisteredError) {
+      if (
+        err instanceof accounts.AllAccountsCoolingError ||
+        err instanceof accounts.NoAccountsRegisteredError ||
+        err instanceof accounts.AllAccountsLeasedError
+      ) {
         throw new ParkSignal(err.reason, err.detail);
       }
       throw err;
     }
 
-    ctx.account = account;
-    result = await callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
+    ctx.account = leased.account;
+    try {
+      result = await callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
+    } finally {
+      // Release the lease the instant this ONE call is done, success or throw -- a per-step
+      // lease held any longer than the call it guards would start re-creating the per-task
+      // contention this action exists to avoid.
+      leased.release();
+    }
 
     if (!(result && result.ok === false && result.kind === 'limit')) {
       return result;
     }
 
-    const event = accounts.markLimit(accountsDir, account.name, result.limitKind);
+    const event = accounts.markLimit(accountsDir, leased.account.name, result.limitKind);
     lastCooldownUntilIso = event.cooldownUntilIso;
     appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
   }

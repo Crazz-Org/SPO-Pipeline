@@ -10,6 +10,13 @@ const { mkTmp, writePoolDir } = require('./helpers');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const accounts = require('../orchestrator/accounts');
+const lock = require('../orchestrator/lock');
+
+// action 6.2's markLimit concurrency test spawns real OS processes via the ASYNC
+// child_process.spawn -- no-real-spawn.js only patches spawnSync (see its own header), so this
+// is deliberately untouched, same precedent as test/lock.test.js's own real-process coverage.
+const { spawn } = require('child_process');
+const MARK_LIMIT_ONCE_FIXTURE = path.join(__dirname, 'fixtures', 'mark-limit-once.js');
 
 test('missing pool directory -> empty registry, pick() throws NoAccountsRegisteredError', () => {
   const dir = mkTmp('spo-accounts-missing-');
@@ -325,4 +332,185 @@ test('markLimit: state.json is published by rename, from a tmp inside the pool d
   const litter = fs.readdirSync(poolDir).filter((f) => f.includes('.tmp'));
   assert.deepEqual(litter, [], 'no tmp file left behind');
   assert.equal(accounts.pick(poolDir).name, 'pool2', 'pool1 is cooled, so pick falls through');
+});
+
+// ---- action 6.2: pick() lease-awareness (opts.excludeAccounts) -----------------------------
+
+test('pick() with no options is byte-for-byte unchanged: first enabled, non-cooling account, no exclusion machinery involved', () => {
+  const dir = mkTmp('spo-accounts-pick-default-');
+  writePoolDir(dir, [{ name: 'acct-a' }, { name: 'acct-b' }]);
+  // Same assertion as the pre-6.2 "pick order" test above, restated explicitly here so a
+  // regression in the new opts-handling branch (e.g. an opts default that isn't `{}`, or an
+  // excludeAccounts check that fires even when unset) has its own dedicated failure, not just a
+  // shared one at the top of the file.
+  assert.equal(accounts.pick(dir).name, 'acct-a');
+  assert.equal(accounts.pick(dir, Date.now(), {}).name, 'acct-a', 'an explicit empty opts object must behave identically to no opts at all');
+});
+
+test('pick() with excludeAccounts skips a leased (excluded) account and returns the next healthy one', () => {
+  const dir = mkTmp('spo-accounts-pick-exclude-');
+  writePoolDir(dir, [{ name: 'acct-a' }, { name: 'acct-b' }]);
+
+  const picked = accounts.pick(dir, Date.now(), { excludeAccounts: new Set(['acct-a']) });
+  assert.equal(picked.name, 'acct-b');
+});
+
+test('pick() with excludeAccounts covering every HEALTHY account throws AllAccountsLeasedError, distinct from AllAccountsCoolingError', () => {
+  const dir = mkTmp('spo-accounts-pick-allleased-');
+  writePoolDir(dir, [{ name: 'acct-a' }, { name: 'acct-b' }]);
+
+  let caught = null;
+  try {
+    accounts.pick(dir, Date.now(), { excludeAccounts: new Set(['acct-a', 'acct-b']) });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof accounts.AllAccountsLeasedError);
+  assert.equal(caught.name, 'AllAccountsLeasedError');
+  assert.equal(caught.reason, 'all-accounts-leased');
+  assert.deepEqual(caught.detail.checkedAccounts.sort(), ['acct-a', 'acct-b']);
+  assert.ok(!(caught instanceof accounts.AllAccountsCoolingError), 'the two error types must stay distinct -- callers branch on which one they got');
+});
+
+test('pick(): one account cooling, the other excluded (leased) -> AllAccountsLeasedError, not AllAccountsCoolingError', () => {
+  // The case the two error types exist to keep apart: SOME healthy candidate exists (acct-b),
+  // it's just not AVAILABLE right now (leased) -- worth a bounded wait, per
+  // orchestrator/account-lease.js. A pool where every enabled account is cooling would instead
+  // mean nothing is healthy at all, which is never worth waiting on.
+  const dir = mkTmp('spo-accounts-pick-mixed-');
+  writePoolDir(dir, [{ name: 'acct-a' }, { name: 'acct-b' }]);
+  accounts.markLimit(dir, 'acct-a', 'overloaded');
+
+  let caught = null;
+  try {
+    accounts.pick(dir, Date.now(), { excludeAccounts: new Set(['acct-b']) });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof accounts.AllAccountsLeasedError, `expected AllAccountsLeasedError, got ${caught && caught.constructor.name}`);
+});
+
+test('pick(): excludeAccounts naming a DISABLED account is a no-op -- a disabled account was never pick()-able anyway', () => {
+  const dir = mkTmp('spo-accounts-pick-exclude-disabled-');
+  writePoolDir(dir, [{ name: 'acct-a', disabled: true }, { name: 'acct-b' }]);
+  assert.equal(accounts.pick(dir, Date.now(), { excludeAccounts: new Set(['acct-a']) }).name, 'acct-b');
+});
+
+// ---- action 6.2: markLimit's .state.lock -- degrade-never-fail, and the flag it stamps --------
+
+test('markLimit: when the state lock cannot be acquired within its bound, it degrades to the unlocked path -- the update still lands, and `degraded: true` is stamped on the returned event', () => {
+  const dir = mkTmp('spo-accounts-marklimit-degrade-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  // Pre-hold the lock ourselves, as a LIVE pid (this test process's own), with a 0ms wait bound
+  // so markLimit gives up on its very first attempt rather than actually blocking the test.
+  const held = lock.acquireShortLock(accounts.stateLockPath(dir));
+  assert.ok(held, 'test setup: must actually hold the lock for this to prove anything');
+
+  try {
+    const event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, { lockWaitMs: 0 });
+    assert.equal(event.degraded, true, 'the lock was held by a live process the whole time -- this call must report it degraded');
+    assert.equal(event.account, 'acct-a');
+
+    // The update itself must still have landed -- "degrade, never fail" means the bookkeeping
+    // still happens, just without the exclusivity guarantee.
+    const state = accounts.readState(dir);
+    assert.equal(state['acct-a'].cooldownUntil, 1000 + accounts.USAGE_PROBE_COOLDOWN_MS);
+  } finally {
+    lock.releaseShortLock(accounts.stateLockPath(dir), held);
+  }
+});
+
+test('markLimit: an ordinary call (no contention) is NOT degraded', () => {
+  const dir = mkTmp('spo-accounts-marklimit-nodegrade-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+  const event = accounts.markLimit(dir, 'acct-a', 'usage', 1000);
+  assert.equal(event.degraded, false);
+});
+
+test('markLimit: a stale (dead-pid) .state.lock is swept, not treated as contention', () => {
+  const dir = mkTmp('spo-accounts-marklimit-stalelock-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+  fs.writeFileSync(accounts.stateLockPath(dir), JSON.stringify({ pid: 999999, startedAt: 'long-dead' }));
+
+  const event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, { lockWaitMs: 0, isAlive: () => false });
+  assert.equal(event.degraded, false, 'a dead-pid lock must be swept and reacquired, not degraded past');
+  assert.equal(fs.existsSync(accounts.stateLockPath(dir)), false, 'the lock is released again once markLimit is done with it');
+});
+
+// The concurrency test the spec explicitly asks NOT to fake: real child processes, real
+// filesystem contention. Before action 6.2, markLimit's read-modify-write was a bare
+// read-state/mutate-one-entry/write-WHOLE-state with no exclusion at all -- two processes
+// updating two DIFFERENT accounts' entries at close to the same instant would each read the
+// SAME stale snapshot of state.json and each write back a full replacement missing the other's
+// update, so whichever process's write lands second silently erases the first one's cooldown.
+// This is exactly what the live pool's `pool1: {usageLimitStreak: 2}` escalation history (cited
+// in this action's own spec) is at risk of losing.
+test('markLimit under real concurrency: 4 processes marking 4 different accounts all survive in state.json', async () => {
+  const dir = mkTmp('spo-accounts-marklimit-concurrency-');
+  const names = ['acct-1', 'acct-2', 'acct-3', 'acct-4'];
+  writePoolDir(dir, names.map((name) => ({ name })));
+
+  // VERIFIER: the four children block on this barrier until all four are up, so they enter
+  // markLimit together. Without it they are serialised by node's own boot time and the race this
+  // test exists to detect is only sampled by luck -- see the fixture's own header for the
+  // measured detection rates.
+  const barrier = path.join(dir, '.barrier');
+  const children = names.map(
+    (name) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [MARK_LIMIT_ONCE_FIXTURE, dir, name, 'usage', barrier], { stdio: 'ignore' });
+        child.once('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${name}: exited ${code}`))));
+        child.once('error', reject);
+      })
+  );
+  await new Promise((r) => setTimeout(r, 300)); // let all four reach the barrier
+  fs.writeFileSync(barrier, 'go');
+  await Promise.all(children);
+
+  const state = accounts.readState(dir);
+  for (const name of names) {
+    assert.ok(state[name], `${name}'s cooldown entry must survive concurrent markLimit calls from other processes -- got ${JSON.stringify(Object.keys(state))}`);
+    assert.ok(state[name].cooldownUntil > 0);
+  }
+});
+
+// ---- VERIFIER (action 6.2): the state-lock wait must actually SLEEP, not busy-spin -----------
+//
+// markLimit's lock wait uses a synchronous sleep (Atomics.wait) between retries. Making that
+// sleep a no-op leaves every observable OUTCOME identical -- same degraded flag, same state.json,
+// same wall time -- so no assertion in the suite notices, while the 2s default bound turns into
+// 2 seconds of hammering the filesystem with create+read attempts, per contended call, per
+// worker. Wall time can't tell the two apart; the number of ACQUIRE ATTEMPTS can, and `isAlive`
+// is called exactly once per attempt that finds the file present.
+test('markLimit: the state-lock wait sleeps between retries -- it does not busy-spin the filesystem', () => {
+  const dir = mkTmp('spo-accounts-marklimit-spin-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  const held = lock.acquireShortLock(accounts.stateLockPath(dir));
+  assert.ok(held, 'test setup: the lock must really be held');
+
+  let attempts = 0;
+  try {
+    const event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, {
+      lockWaitMs: 100,
+      lockPollMs: 10,
+      isAlive: () => {
+        attempts += 1;
+        return true;
+      },
+    });
+    assert.equal(event.degraded, true, 'the lock was held throughout -- this must degrade');
+  } finally {
+    lock.releaseShortLock(accounts.stateLockPath(dir), held);
+  }
+
+  // ~10 attempts at a 10ms cadence over a 100ms bound. A generous ceiling: the point is to
+  // separate "paced by a real sleep" from "spinning as fast as the fs allows" (thousands),
+  // not to pin the exact count against scheduler jitter.
+  assert.ok(attempts >= 2, `expected the wait to retry at all, got ${attempts} attempts`);
+  assert.ok(
+    attempts <= 60,
+    `the lock wait must be paced by a real sleep -- ${attempts} acquire attempts in 100ms is a busy spin, not a poll`
+  );
 });

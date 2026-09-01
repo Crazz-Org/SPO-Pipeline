@@ -306,6 +306,49 @@ module.exports = {
   // NoAccountsRegisteredError, and daemon.js --real refuses to start on that.
   claudeAccountsDir: process.env.SPO_ACCOUNTS_DIR || path.join(os.homedir(), '.claude-accounts'),
 
+  // ---- action 6.2: per-account leases + atomic pool state --------------------------------
+  //
+  // accountLeaseWaitMs -- how long callLlmStep/callIntakeStepWithRotation (via
+  // orchestrator/account-lease.js's leaseHealthyAccount) will WAIT for a healthy account's lease
+  // to free up before giving up and parking `all-accounts-leased`. Per-step leasing was chosen
+  // over per-task leasing precisely so a worker can wait out a SIBLING's in-flight step rather
+  // than park (doc/remediation-progress.md's C6 decision record) -- which makes the bound's
+  // floor an LLM step's own wall-clock duration: a wait shorter than the longest step that could
+  // be holding the lease is guaranteed to time out under ordinary two-worker contention before
+  // that step ever finishes, defeating the entire point of waiting instead of parking. Measured
+  // step duration (C6 funnel, doc/remediation-progress.md) is 90-265s; 5 minutes clears the
+  // observed ceiling with real margin for the slower end plus this pool's own fs polling. Never
+  // applies to a cooling account -- see accounts.js's AllAccountsLeasedError vs
+  // AllAccountsCoolingError split; a cooldown is never worth waiting out. SPO_ACCOUNT_LEASE_WAIT_MS
+  // overrides (positiveMsFromEnv: a non-positive/non-finite override falls back to this default,
+  // never to "wait forever").
+  accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', 5 * 60 * 1000),
+
+  // accountLeasePollMs -- how often the wait above re-checks whether a lease has freed up. Each
+  // check is one directory listing plus a few small JSON reads (leasedAccountNames), cheap
+  // enough that a 1s cadence costs nothing noticeable even with several workers waiting at once,
+  // while still resolving a freed lease promptly relative to the multi-minute bound it polls
+  // inside of. SPO_ACCOUNT_LEASE_POLL_MS overrides.
+  accountLeasePollMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_POLL_MS', 1000),
+
+  // accountStateLockWaitMs -- how long accounts.js's markLimit will wait for <poolDir>/.state.lock
+  // before giving up and falling back to today's UNLOCKED read-modify-write (see markLimit's own
+  // comment for the "degrade, never fail" doctrine: losing a concurrent cooldown update is a
+  // wasted call, failing an LLM step's own already-failed attempt over pool bookkeeping is a
+  // parked card). This runs in the hot path right after a step has already failed with a limit,
+  // so it stays far short of accountLeaseWaitMs above -- but not so short that ordinary
+  // contention (two workers hitting a limit on DIFFERENT accounts in the same instant, each
+  // doing one small JSON read+write under the lock) routinely blows through it and degrades for
+  // no reason: 2s is generous headroom over a lock hold time measured in single-digit
+  // milliseconds, while still trivial next to a 90s+ step. SPO_ACCOUNT_STATE_LOCK_WAIT_MS
+  // overrides.
+  accountStateLockWaitMs: positiveMsFromEnv('SPO_ACCOUNT_STATE_LOCK_WAIT_MS', 2000),
+
+  // accountStateLockPollMs -- retry cadence for the wait above. Short, because the whole point is
+  // a bound that resolves quickly once the other holder's write completes (typically well under
+  // a millisecond of actual critical-section time). SPO_ACCOUNT_STATE_LOCK_POLL_MS overrides.
+  accountStateLockPollMs: positiveMsFromEnv('SPO_ACCOUNT_STATE_LOCK_POLL_MS', 10),
+
   // ---- real-mode scripted steps (steps/scripted.js) --------------------------------------
   //
   // The product checkout every WORKTREE/CHECK/PUSH_PR/GATE/CI_CHECKS/MERGE/FINISH real command
