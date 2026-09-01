@@ -16,6 +16,7 @@ const path = require('path');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('../orchestrator/lock');
+const shortLock = require('../orchestrator/lock'); // acquireShortLock/releaseShortLock -- see the verifier tests at the end of this file
 const { runTask } = require('../orchestrator/state-machine');
 const { DAEMON, mkTmp, writeTask, runDaemonOnce, runDaemonWorker, readState, isolatedEnv } = require('./helpers');
 
@@ -529,4 +530,73 @@ test('daemon.js --worker: two workers run CONCURRENTLY against the SAME journal 
   assert.equal(readState(journalDir, 'worker-concurrent-a').state, 'DONE');
   assert.equal(readState(journalDir, 'worker-concurrent-b').state, 'DONE');
   assert.equal(fs.existsSync(lockPath(journalDir)), false, 'neither worker may leave a lock file');
+});
+
+// ---- VERIFIER (action 6.3): acquireShortLock must never STEAL a live holder's lock -----------
+//
+// The defect these pin, measured during 6.3's verification rather than reasoned about:
+// acquireShortLock created its lock with `fs.writeFileSync(..., {flag:'wx'})`, which is
+// open(O_CREAT|O_EXCL) followed by a SEPARATE write(). In that window the lock file exists at its
+// final name with ZERO BYTES, readHolder() returns null for it, and the stale sweep unlinked it
+// and took it -- from a process that was alive and holding it. Mutual exclusion silently broken,
+// and silently is the operative word: accounts.markLimit's own `degraded` flag stays FALSE,
+// because both processes believe they acquired cleanly.
+//
+// Measured: 53136 of 135923 reads of a 'wx'-created lock file (39%) came back zero-length under
+// create/unlink churn; 16 real processes running markLimit hit the unparseable-holder sweep 158
+// times and lost 119 of 800 cooldown entries, all with degradedCalls == 0 -- i.e. on the LOCKED
+// path, nothing to do with the accountStateLockWaitMs bound or the "degrade, never fail" path
+// that bound governs. After the fix (write-tmp + link, and never sweeping a holder that could not
+// be read) the same probe loses 0 of 800 over five runs, 0 of 960 at 32 processes.
+//
+// Both tests below are deterministic and fail FAST (no hang, no timing dependence): they
+// construct the exact on-disk state the race produces, rather than trying to hit the race.
+
+test('acquireShortLock: a lock file that exists but does not parse is NEVER stolen from a live holder', () => {
+  const dir = mkTmp('spo-shortlock-torn-');
+  const file = path.join(dir, '.state.lock');
+
+  // Exactly what 'wx' leaves on disk between its open() and its write(): the name exists, the
+  // payload is not there yet. The holder is alive and holding.
+  fs.writeFileSync(file, '');
+
+  const held = shortLock.acquireShortLock(file, { isAlive: () => true });
+  assert.strictEqual(
+    held,
+    null,
+    'acquireShortLock stole a lock whose payload was not yet written -- two processes now hold it, and neither is told'
+  );
+  assert.ok(fs.existsSync(file), 'the live holder\'s lock file must still be there -- it was not this caller\'s to delete');
+});
+
+test('acquireShortLock: creating the lock is atomic -- it is never observable as a file that does not parse', () => {
+  const dir = mkTmp('spo-shortlock-atomic-');
+  const file = path.join(dir, '.state.lock');
+
+  const held = shortLock.acquireShortLock(file);
+  assert.ok(held, 'test setup: the lock must be acquired');
+  // The published name carries a COMPLETE payload -- this is what write-tmp+link buys, and what a
+  // bare open('wx') cannot give. A mutation back to 'wx' leaves this assertion passing only
+  // because the write happens to have landed by now, so the previous test is the real guard;
+  // this one pins the payload shape the sweep depends on being readable.
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(onDisk.pid, process.pid);
+  assert.strictEqual(typeof onDisk.startedAt, 'string');
+
+  // No temp files left behind in the lock's own directory.
+  const leftovers = fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+  assert.deepStrictEqual(leftovers, [], `acquireShortLock left temp files behind: ${leftovers.join(', ')}`);
+
+  shortLock.releaseShortLock(file, held);
+  assert.strictEqual(fs.existsSync(file), false, 'release must remove the lock');
+});
+
+test('acquireShortLock: a DEAD holder is still swept -- the fix above must not cost stale recovery', () => {
+  const dir = mkTmp('spo-shortlock-dead-');
+  const file = path.join(dir, '.state.lock');
+  fs.writeFileSync(file, JSON.stringify({ pid: 999999999, startedAt: new Date().toISOString() }));
+
+  const held = shortLock.acquireShortLock(file, { isAlive: () => false });
+  assert.ok(held, 'a lock held by a dead pid must still be swept and taken');
+  assert.strictEqual(held.pid, process.pid);
 });

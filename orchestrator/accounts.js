@@ -49,6 +49,7 @@ const path = require('path');
 // anything that transitively requires it), so this is not a cycle -- see config.js itself.
 const lock = require('./lock');
 const config = require('./config');
+const { monotonicNowMs } = require('./monotonic-clock');
 
 const OAUTH_TOKEN_FILENAME = 'oauth-token';
 const DISABLED_MARKER_FILENAME = 'disabled';
@@ -374,6 +375,32 @@ function pick(poolDir, now = Date.now(), opts = {}) {
   });
 }
 
+// countHealthyAccounts(poolDir, now) -> the number of ENABLED accounts whose cooldownUntil is
+// absent or already past `now` -- the exact same "healthy" test pick()'s own loop applies above,
+// without picking one or throwing when the answer is zero. Action 6.3: the dispatcher clamps K
+// (its worker count) to this number before EVERY spawn (the plan's own "K <= healthy accounts"
+// row, deferred from 6.2 -- 6.2 only ever had one caller in flight at a time, so there was
+// nothing to clamp yet; the dispatcher is the first thing that can actually run K of them).
+//
+// Deliberately blind to account-lease.js's per-step LEASES (as opposed to cooldowns): a lease is
+// a seconds-to-minutes hold around one LLM call, not a fact about the POOL's capacity the way an
+// hours-long cooldown is -- clamping K on lease state too would make K flap on every single LLM
+// call across every worker instead of settling once per cooldown/recovery event, which is not
+// what "K workers" is supposed to mean (K is a concurrency budget, not "accounts idle right now").
+function countHealthyAccounts(poolDir, now = Date.now()) {
+  const registry = readRegistry(poolDir);
+  if (registry.length === 0) return 0;
+  const state = readState(poolDir);
+  let healthy = 0;
+  for (const account of registry) {
+    if (!account.enabled) continue;
+    const entry = state[account.name];
+    const cooldownUntil = entry && entry.cooldownUntil;
+    if (!cooldownUntil || cooldownUntil <= now) healthy += 1;
+  }
+  return healthy;
+}
+
 // Records a limit hit for `name` and decides how long to cool it down for -- unlike the flat
 // tier this replaced, that decision now needs the account's OWN history (its last usage-limit
 // timestamp, to know whether this hit is inside the same escalation window), which only a read
@@ -521,18 +548,35 @@ function sleepSyncMs(ms) {
 // limit into a parked card. `degraded: true` is stamped on the returned event so the caller's
 // journalled `account-cooldown` payload records that this happened, instead of the fallback being
 // silently indistinguishable from a normal locked write.
+// `now` (positional, defaults to Date.now()) is a WALL-CLOCK snapshot -- it flows into
+// computeLimitUpdate's cooldownUntil/lastUsageLimitAt, which land on disk and get compared
+// across processes, so it stays Date.now()-based, unconditionally, exactly as before.
+//
+// The WAIT LOOP below is a different question -- "how long have I been retrying for THIS lock" --
+// and answering it with Date.now() was a bug, not a simplification: this box's wall clock jumps
+// BACKWARD (measured, monotonic-clock.js's own header has the numbers), and a backward jump in
+// `deadline - Date.now()` can only ever ENLARGE `remaining`, silently extending a bounded wait
+// past its configured budget. `monotonicNowMs()` (opts.monotonicNowMs, defaulting to the real
+// one) is immune to that by construction -- see monotonic-clock.js's header for exactly why this
+// must never become a source of TIMESTAMPS, only of ELAPSED-TIME ARITHMETIC.
+// `opts.sleepSyncMs` is the matching test-only override for the loop's own sleep (defaulting to
+// the real, blocking `sleepSyncMs` above) -- a test driving `opts.monotonicNowMs` with a fake,
+// always-advancing counter needs its `sleepSyncMs` to advance that SAME counter, or the loop
+// would spin at real-hrtime granularity waiting for fake time to pass.
 function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
   const waitMs = opts.lockWaitMs !== undefined ? opts.lockWaitMs : config.accountStateLockWaitMs;
   const pollMs = opts.lockPollMs !== undefined ? opts.lockPollMs : config.accountStateLockPollMs;
   const isAlive = opts.isAlive || lock.processAlive;
   const lockFile = stateLockPath(poolDir);
+  const elapsedNowMs = opts.monotonicNowMs || monotonicNowMs;
+  const doSleepSyncMs = opts.sleepSyncMs || sleepSyncMs;
 
-  const deadline = Date.now() + waitMs;
+  const start = elapsedNowMs();
   let held = lock.acquireShortLock(lockFile, { isAlive });
   while (!held) {
-    const remaining = deadline - Date.now();
+    const remaining = waitMs - (elapsedNowMs() - start);
     if (remaining <= 0) break;
-    sleepSyncMs(Math.min(pollMs, remaining));
+    doSleepSyncMs(Math.min(pollMs, remaining));
     held = lock.acquireShortLock(lockFile, { isAlive });
   }
   const degraded = !held;
@@ -549,6 +593,7 @@ function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
 
 module.exports = {
   pick,
+  countHealthyAccounts,
   markLimit,
   readRegistry,
   readState,

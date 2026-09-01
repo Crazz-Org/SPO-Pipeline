@@ -1,9 +1,11 @@
 'use strict';
 // account-lease.js -- per-account, per-step leases (action 6.2), shared by the two rotation
 // loops: state-machine.js's callLlmStep (the daemon worker's real-mode LLM steps) and intake.js's
-// callIntakeStepWithRotation (draftCard/reviewCard/triageBugReport, which under C6 run
-// dispatcher-side, in runForever's scan timers -- so the dispatcher itself competes with workers
-// for the same pool). Both used to call a bare `accounts.pick()`, which is deterministic
+// callIntakeStepWithRotation (draftCard/reviewCard/triageBugReport, which under C6 run in the
+// SCANNER process (state-machine.js's runForever, spawned/supervised by dispatcher.js -- see
+// that file's header for why the scans moved out of the dispatcher's own process) -- so the
+// scanner competes with workers for the same pool). Both used to call a bare `accounts.pick()`,
+// which is deterministic
 // first-fit: two concurrent callers are handed the SAME account every time. That was invisible
 // under the pre-C6 single-threaded daemon (the second account was always idle) and is exactly the
 // bug this file exists to close now that more than one caller can be in-flight at once.
@@ -50,6 +52,7 @@ const lock = require('./lock');
 const accountsModule = require('./accounts');
 const config = require('./config');
 const { LLM_STEP_DEADLINE_MS } = require('./step-contracts');
+const { monotonicNowMs } = require('./monotonic-clock');
 
 const LEASE_PREFIX = '.lease-';
 const LEASE_SUFFIX = '.json';
@@ -169,11 +172,28 @@ function releaseLease(poolDir, name, held) {
 //
 // opts:
 //   waitMs, pollMs  -- override config.js's defaults (tests shrink these to keep the suite fast).
-//   now()           -- clock function, defaults to Date.now. Used for BOTH pick()'s cooldown
-//                       comparison and this function's own wait-bound elapsed-time check, so a
-//                       test can inject a fake clock (paired with a `sleep` that advances it) and
-//                       drive the whole wait/park decision with zero real waiting -- see
-//                       test/account-lease.test.js.
+//   now()           -- WALL-CLOCK clock function, defaults to Date.now. Used for pick()'s cooldown
+//                       comparison and leasedAccountNames'/tryAcquireLease's holder-age (staleness)
+//                       comparisons -- all three land on state written to DISK (cooldownUntil,
+//                       a lease file's `startedAt`) and must therefore stay wall-clock, comparable
+//                       across processes and restarts. A test can inject a fake clock (paired with
+//                       a `sleep` that advances it) and drive the whole wait/park decision with
+//                       zero real waiting -- see test/account-lease.test.js.
+//   monotonicNowMs()  -- action 6.3 (post-verification correction): the SEPARATE clock this
+//                       function's own wait-bound ELAPSED-TIME check below uses -- "how long have
+//                       I been waiting", never written anywhere, never compared across processes.
+//                       Defaults to monotonic-clock.js's real hrtime-based function when NEITHER
+//                       this NOR `now` is supplied (the untouched production path, now immune to
+//                       this box's measured backward Date.now() jumps -- see that module's own
+//                       header for the numbers and for why a monotonic clock must NEVER become a
+//                       source of the wall-clock timestamps `now` still provides). Falls back to
+//                       `opts.now` itself when ONLY `now` was supplied and this was not: an
+//                       existing test that already injects a controlled fake `now`+`sleep` pair
+//                       (see test/account-lease.test.js) has already taken on the responsibility
+//                       of making that clock behave -- reusing it here keeps every such test's
+//                       documented "resolves instantly, no real waiting at all" property intact,
+//                       rather than silently switching those tests onto the real clock and making
+//                       them busy-wait in real time for however long their fake `waitMs` names.
 //   sleep(ms)       -- defaults to a real `setTimeout`-backed Promise. Injectable for the same
 //                       reason as `now` above.
 //   isAlive(pid)    -- defaults to lock.js's processAlive. Lets a test simulate a lease held by a
@@ -185,10 +205,11 @@ async function leaseHealthyAccount(poolDir, opts = {}) {
   const waitMs = opts.waitMs !== undefined ? opts.waitMs : config.accountLeaseWaitMs;
   const pollMs = opts.pollMs !== undefined ? opts.pollMs : config.accountLeasePollMs;
   const now = opts.now || Date.now;
+  const elapsedNowMs = opts.monotonicNowMs || opts.now || monotonicNowMs;
   const sleep = opts.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const isAlive = opts.isAlive || lock.processAlive;
 
-  const start = now();
+  const start = elapsedNowMs();
   for (;;) {
     const excludeAccounts = leasedAccountNames(poolDir, isAlive, now);
     let account = null;
@@ -215,7 +236,7 @@ async function leaseHealthyAccount(poolDir, opts = {}) {
       // for it") are the same event: nothing was actually available at this instant.
     }
 
-    const elapsed = now() - start;
+    const elapsed = elapsedNowMs() - start;
     if (elapsed >= waitMs) {
       // VERIFIER (action 6.2): `waitedMs` is the configured BOUND, not the measured elapsed time,
       // and `excludedAccounts` is sorted. Both for the same reason: park-loop.js's

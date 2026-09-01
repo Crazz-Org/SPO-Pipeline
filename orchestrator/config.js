@@ -103,6 +103,19 @@ function positiveMsFromEnv(name, defaultMs) {
   return parsed;
 }
 
+// Same fallback idiom as timeoutFromEnv/positiveMsFromEnv above, for a plain POSITIVE INTEGER
+// COUNT rather than a duration (action 6.3's SPO_WORKERS / SPO_WORKER_CRASH_LIMIT) -- a bad
+// override falls back to the default rather than producing 0 (dispatcher.js would then spawn
+// nothing, ever, and the daemon would look alive while doing no work) or a fraction (a K of 1.5
+// worker means nothing).
+function positiveIntFromEnv(name, defaultN) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultN;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return defaultN;
+  return parsed;
+}
+
 module.exports = {
   // Wall-clock deadline for a single step invocation (scripted or llm), in milliseconds.
   // On expiry the step is treated as killed, retried once, and PARKED if it expires again.
@@ -253,6 +266,57 @@ module.exports = {
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,
 
+  // ---- action 6.3: the dispatcher (orchestrator/dispatcher.js) --------------------------
+
+  // How many workers the dispatcher runs concurrently. Default 1, deliberately -- this is a
+  // large refactor (queue draining moves from in-process runTask calls to spawned `--worker`
+  // child processes for EVERY task, including at K=1: "one code path, not two", see
+  // dispatcher.js's own header) and the default must not change today's throughput behaviour on
+  // its own; parallelism is opt-in. Re-clamped to accounts.countHealthyAccounts(...) before EVERY
+  // spawn regardless of this value -- see dispatcher.js and account-lease.js's own header for why
+  // the measured ceiling on the real two-account pool is K=2, and why K=1 (one account cooling)
+  // is a routine state, not an edge case: one account sat in a 5-hour cooldown for most of
+  // 2026-09-01. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
+  // this default rather than to 0 (which would spawn nothing, silently, forever).
+  workers: positiveIntFromEnv('SPO_WORKERS', 1),
+
+  // How many CONSECUTIVE worker crashes (dispatcher.js's own classifier: any exit that is
+  // neither 0 (DONE) nor 20 (PARKED) -- see daemon.js's --worker header for the full exit-code
+  // table) trip the dispatcher's circuit breaker and make IT exit non-zero, rather than reparking
+  // forever. "Consecutive" is scoped to the DISPATCHER'S OWN LIFETIME, across every task it has
+  // spawned a worker for, not per-task -- and is reset by ANY worker exiting 0 or 20, because a
+  // park is a successful run of the state machine (an ordinary outcome the plan itself calls out
+  // as "not a crash"), and without that reset an unlucky run of ordinary parked cards would trip
+  // a breaker meant to catch a broken state machine, not a busy one.
+  //
+  // Default 3 is a TUNABLE WITH NO JOURNAL EVIDENCE BEHIND IT, stated plainly rather than dressed
+  // up as derived: there has never been a worker crash in this project's history, because there
+  // have never been workers -- action 6.1 is what first made `--worker` exist at all, and this
+  // config was written the same week. Every other numeric default this remediation has shipped
+  // (diagnoseBudget, ciRetryBudget, the various *Ms timers above) was sized against the real
+  // journal corpus; this one cannot be, and pretending otherwise would be worse than saying so.
+  // What WOULD justify changing it: a `worker-crashed` daemon.jsonl history once workers have
+  // actually run in production for a while -- specifically, whether real crashes cluster (a
+  // handler bug that reliably reproduces, where a LOW limit is correct: stop fast, page a human)
+  // or scatter (transient infrastructure flakiness across otherwise-healthy runs, where a HIGHER
+  // limit avoids a daemon that stops itself on ordinary noise). Recalibrate from that data once it
+  // exists, the same way ciChecksMaxPolls's own comment above describes for CI wait budgets --
+  // this is the same "erring toward a number with no evidence, stated as such" posture, not a
+  // silent guess. SPO_WORKER_CRASH_LIMIT overrides.
+  workerCrashLimit: positiveIntFromEnv('SPO_WORKER_CRASH_LIMIT', 3),
+
+  // How many CONSECUTIVE crashes of the SCANNER child (daemon.js --scanner, spawned/supervised by
+  // dispatcher.js -- action 6.3's post-verification correction, see that file's header) trip a
+  // SEPARATE circuit breaker from workerCrashLimit above -- see dispatcher.js's
+  // handleScannerExit for the justification: a scanner crash (scan/intake machinery) and a worker
+  // crash (state-machine execution) are different failure domains, and sharing one counter would
+  // make the trip detail actively misleading about which one is actually broken. Same posture as
+  // workerCrashLimit on evidence: there has never been a scanner before this action, so this
+  // default (3, matching workerCrashLimit's own) carries the identical "no journal evidence yet"
+  // caveat -- recalibrate once a `scanner-crashed` daemon.jsonl history exists to look at.
+  // SPO_SCANNER_CRASH_LIMIT overrides.
+  scannerCrashLimit: positiveIntFromEnv('SPO_SCANNER_CRASH_LIMIT', 3),
+
   // ---- crash recovery: orphaned tasks + lock re-verification (orchestrator/orphan-scan.js,
   // orchestrator/lock.js) -- see doc/daemon-crash-recovery.md for the incident this covers
   // (2026-08-30, card #385: a daemon that died mid-DIAGNOSE left state.json frozen on a
@@ -383,20 +447,23 @@ module.exports = {
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //
-  // daemon.js --real polls the board on this timer, between drain passes (state-machine.js's
-  // runForever), running the same pullBoard + makeTask `spo pull` already does by hand, for the
-  // top autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
+  // daemon.js --scanner polls the board on this timer (state-machine.js's runForever's scan
+  // cycle), running the same pullBoard + makeTask `spo pull` already does by hand, for the top
+  // autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
   // overrides -- see orchestrator/README.md § Kanban piloting for the GraphQL cost.
-  autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
-  // How many claimable candidates one auto-pull cycle takes off the board. NOT a concurrency
-  // setting -- drainQueueOnce works the queue strictly serially -- but because runForever
-  // AWAITS that drain before pulling again, a pull only ever happens with the daemon idle: so
-  // this is the most cards that can sit off the board, unstarted, at any moment.
   //
-  // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card, finishes it, then
-  // looks again. Cards stay on the board -- visible, reorderable, claimable by a human --
-  // until the daemon is actually ready for them. Raise it if serial intake proves to be the
-  // bottleneck. SPO_AUTO_PULL_LIMIT overrides.
+  // action 6.3 correction: this used to run inside the SAME process (and, pre-dispatcher, the
+  // same serial loop) that drained the queue -- "a pull only ever happens with the daemon idle"
+  // was true then. It is no longer true: the scanner is now its own process, on its own timer,
+  // entirely independent of whether the dispatcher's workers are busy. A pull can now land while
+  // K workers are mid-task; they simply pick the new card up via their own next takeNextTask.
+  autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
+  // How many claimable candidates one auto-pull cycle takes off the board.
+  //
+  // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card at a time off the
+  // board. Cards stay on the board -- visible, reorderable, claimable by a human -- until a
+  // worker is actually ready for them. Raise it if intake proves to be the bottleneck.
+  // SPO_AUTO_PULL_LIMIT overrides.
   autoPullLimit:
     process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 1,
 

@@ -514,3 +514,89 @@ test('markLimit: the state-lock wait sleeps between retries -- it does not busy-
     `the lock wait must be paced by a real sleep -- ${attempts} acquire attempts in 100ms is a busy spin, not a poll`
   );
 });
+
+// ---- action 6.3: markLimit's wait-bound must survive a BACKWARD wall-clock jump ---------------
+//
+// Measured independently (this action's own verification): on this WSL2 box, Date.now() jumps
+// BACKWARD -- -2515ms across a single 10ms monotonic interval, once in 2331 samples over 25s.
+// Before this action, markLimit's wait loop computed `remaining = deadline - Date.now()`, and a
+// backward jump there can only ever ENLARGE `remaining`, silently extending the bound. This test
+// reproduces the exact mechanism deterministically -- monkey-patching the REAL global Date.now
+// (restored in `finally`, never left patched for another test) rather than waiting for the real
+// bug to fire, which is what "inject the clock" means here: the fix under test is that
+// markLimit's own DEFAULT elapsed-time clock is monotonic-clock.js's real hrtime-based function,
+// which this patched Date.now can never reach.
+test('markLimit: a backward Date.now() jump mid-wait does not extend the bound -- the loop uses a monotonic clock, not Date.now()', () => {
+  const dir = mkTmp('spo-accounts-marklimit-clockjump-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  const held = lock.acquireShortLock(accounts.stateLockPath(dir));
+  assert.ok(held, 'test setup: the lock must really be held throughout, so the wait runs its full bound');
+
+  const realDateNow = Date.now;
+  let calls = 0;
+  // Ticks forward normally for the first few reads (so acquireShortLock's own internal timestamps,
+  // if it ever reads Date.now for something other than this loop, still look sane), then jumps
+  // backward hard -- reproducing the measured -2515ms/10ms shape -- and keeps jumping backward on
+  // every subsequent call, which is the worst case: a wall clock that NEVER catches back up within
+  // this wait. If markLimit's loop were still keyed on Date.now(), this would make it wait far
+  // longer than lockWaitMs; with the fix, it must not notice at all.
+  const start = realDateNow();
+  Date.now = () => {
+    calls += 1;
+    if (calls <= 2) return start + calls;
+    return start - 2515 * (calls - 2); // keeps receding -- never lets a Date.now()-keyed loop catch up
+  };
+
+  const before = process.hrtime.bigint();
+  let event;
+  try {
+    event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, { lockWaitMs: 150, lockPollMs: 20 });
+  } finally {
+    Date.now = realDateNow;
+    lock.releaseShortLock(accounts.stateLockPath(dir), held);
+  }
+  const realElapsedMs = Number((process.hrtime.bigint() - before) / 1000000n);
+
+  assert.equal(event.degraded, true, 'the lock was held throughout -- this must degrade');
+  // Generous ceiling (well above the 150ms bound, well below what a Date.now()-keyed loop facing
+  // a receding clock would do -- that shape never terminates on its own budget at all, since
+  // `remaining` only ever grows). This is the assertion a regression back to Date.now() fails:
+  // it would blow straight through this ceiling, or time this test out entirely.
+  assert.ok(
+    realElapsedMs < 2000,
+    `markLimit waited ${realElapsedMs}ms against a 150ms bound while Date.now() receded -- the loop is keyed on Date.now(), not a monotonic clock`
+  );
+});
+
+test('markLimit: opts.monotonicNowMs/opts.sleepSyncMs are honoured -- a fake clock can drive the wait with zero real waiting', () => {
+  const dir = mkTmp('spo-accounts-marklimit-fakeclock-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  const held = lock.acquireShortLock(accounts.stateLockPath(dir));
+  assert.ok(held, 'test setup');
+
+  let fakeMs = 0;
+  const monotonicNowMs = () => fakeMs;
+  const sleepCalls = [];
+  const sleepSyncMs = (ms) => {
+    sleepCalls.push(ms);
+    fakeMs += ms;
+  };
+
+  let event;
+  try {
+    event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, {
+      lockWaitMs: 500,
+      lockPollMs: 50,
+      monotonicNowMs,
+      sleepSyncMs,
+    });
+  } finally {
+    lock.releaseShortLock(accounts.stateLockPath(dir), held);
+  }
+
+  assert.equal(event.degraded, true);
+  assert.ok(sleepCalls.length > 0, 'must have retried at least once');
+  assert.ok(fakeMs >= 500, 'must not give up before the injected clock reaches the configured bound');
+});

@@ -15,7 +15,9 @@ const path = require('path');
 require('./no-real-spawn');
 const { shouldScanOrphans, orphanScan } = require('../orchestrator/orphan-scan');
 const { unparkScan } = require('../orchestrator/park-loop');
-const { appendEvent, writeState } = require('../orchestrator/journal');
+const { appendEvent, writeState, writeLiveWorkerIds } = require('../orchestrator/journal');
+const { runScanCycle, createScanTimers } = require('../orchestrator/state-machine');
+const { createScanState } = require('../orchestrator/comment-scan');
 const { runDaemonOnce, runDaemonDryRun } = require('./helpers');
 
 function mkTmp(prefix) {
@@ -112,6 +114,96 @@ test('orphanScan: dead owner + stale updatedAt + no queue entry -> reparked task
 
   // The retry loop closes: this reparked task now has a park-comment anchor unparkScan can act on.
   assert.ok(events.some((e) => e.event === 'park-comment'));
+});
+
+// ---- action 6.3: the dispatcher's live-worker table -------------------------------------------
+test('orphanScan: skips a task whose id is in liveWorkerIds, even though it looks orphaned by every other check, and still reparks one that is not', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  // Both tasks are byte-for-byte identical shapes -- non-terminal state, dead owner pid, stale
+  // updatedAt, no queue entry -- so the ONLY thing that can explain one being reparked and the
+  // other not is the liveWorkerIds set itself, not some other difference the fixture snuck in.
+  const liveDir = seedTask(journalRoot, 'issue-live', { state: 'IMPLEMENT' });
+  const deadDir = seedTask(journalRoot, 'issue-dead', { state: 'IMPLEMENT' });
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/1#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps, new Set(['issue-live']));
+
+  // The live one: untouched. state.json still says IMPLEMENT, no journal.jsonl 'parked' line, and
+  // orphanScan's own return value never names it.
+  assert.deepEqual(recovered, [{ id: 'issue-dead', reason: 'task-orphaned-daemon-restart' }]);
+  const liveState = JSON.parse(fs.readFileSync(path.join(liveDir, 'state.json'), 'utf8'));
+  assert.equal(liveState.state, 'IMPLEMENT');
+  // orphanScan never even touches a skipped task's journal.jsonl -- seedTask itself never wrote
+  // one (only task.json/state.json), so the file simply not existing IS the proof nothing was
+  // journaled against it.
+  assert.equal(fs.existsSync(path.join(liveDir, 'journal.jsonl')), false);
+
+  // The dead one: reparked exactly as the plain dead-owner test above expects.
+  const deadState = JSON.parse(fs.readFileSync(path.join(deadDir, 'state.json'), 'utf8'));
+  assert.equal(deadState.state, 'PARKED');
+  assert.equal(deadState.reason, 'task-orphaned-daemon-restart');
+});
+
+test('orphanScan: an omitted liveWorkerIds (null, the pre-6.3 default) reparks a dead-owner task exactly as before -- no behaviour change for callers that never pass one', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-no-table', { state: 'CHECK' });
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/1#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-no-table', reason: 'task-orphaned-daemon-restart' }]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8')).state, 'PARKED');
+});
+
+// action 6.3 (post-verification correction): runScanCycle -- the SCANNER's own loop body -- must
+// actually READ <journalRoot>/live-workers.json before every orphanScan call, not just accept a
+// liveWorkerIds parameter someone else remembered to pass. This is the cross-process half of the
+// design (journal.js's writeLiveWorkerIds/readLiveWorkerIds, dispatcher.js's publish side); the
+// tests above already pin orphanScan's OWN handling of a liveWorkerIds Set it is handed directly,
+// which does not exercise the READ at all -- a mutation that replaced runScanCycle's
+// `readLiveWorkerIds(journalRoot)` with `new Set()` passed the entire suite until this test
+// existed (verification round, 2026-09-01: confirmed by mutation, 1266/1266 green with the read
+// disabled). Driven through runScanCycle directly, not the full dispatcher+scanner process pair,
+// so it is fast and deterministic rather than racing real subprocess timing.
+test('runScanCycle reads live-workers.json fresh and protects a listed id from orphanScan, even though it looks orphaned by every other check', async () => {
+  const journalRoot = mkTmp('spo-scancycle-journal-');
+  const queueDir = mkTmp('spo-scancycle-queue-');
+  const taskDir = seedTask(journalRoot, 'scancycle-protected', { state: 'IMPLEMENT' });
+
+  // deps.isAlive: () => false -- the recorded owner pid is "dead" by every other measure, exactly
+  // like every other orphanScan test in this file. runScanCycle reads its deps off config.deps
+  // (the same convention buildCtx/HANDLERS use), not a separate parameter. deps.spawnSync is the
+  // same fake `gh issue comment` success every other real-mode repark test in this file uses --
+  // seedTask's default task is `kind: 'card'`, so the eventual repark's postParkComment really
+  // would reach a live `gh` call without it.
+  const config = testConfig({
+    orphanScanMs: 1000,
+    deps: { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') },
+  });
+  const timers = createScanTimers();
+  const scanStates = { unpark: createScanState(), reportConfirm: createScanState() };
+
+  writeLiveWorkerIds(journalRoot, ['scancycle-protected']);
+  await runScanCycle(timers, queueDir, journalRoot, config, scanStates);
+
+  const protectedState = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(protectedState.state, 'IMPLEMENT', 'runScanCycle reparked a task live-workers.json explicitly protects');
+
+  // Once the file no longer lists it (the dispatcher's own publish, simulated here), the VERY
+  // NEXT scan reparks it normally -- proving the protection is read FRESH, not cached from the
+  // first call, and that the underlying orphan detection was otherwise working correctly all along.
+  writeLiveWorkerIds(journalRoot, []);
+  timers.lastOrphanScanAt = null; // force this second call to be due again, same as a fresh timers object
+  await runScanCycle(timers, queueDir, journalRoot, config, scanStates);
+
+  const reparkedState = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(reparkedState.state, 'PARKED');
+  assert.equal(reparkedState.reason, 'task-orphaned-daemon-restart');
 });
 
 test('orphanScan -> unparkScan: a maintainer retry on the reparked issue re-enqueues it (the full loop #385 needed by hand)', async () => {

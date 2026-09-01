@@ -423,3 +423,79 @@ test('leaseHealthyAccount: an over-age lease on the only healthy account is reco
   assert.equal(leased.account.name, 'acct-a', 'the account held by an over-age lease must become usable again');
   leased.release();
 });
+
+// ---- action 6.3: the wait bound must survive a BACKWARD wall-clock jump -----------------------
+//
+// Same WSL2 finding as accounts.js's markLimit (see that test's own header for the measured
+// numbers): a bounded wait keyed on Date.now() deltas is unreliable here. leaseHealthyAccount's
+// fix is `elapsedNowMs = opts.monotonicNowMs || opts.now || <real hrtime>` -- when NEITHER
+// override is supplied (the untouched production path this test drives), it falls all the way
+// through to the real monotonic clock, which a patched Date.now can never reach.
+test('leaseHealthyAccount: a backward Date.now() jump mid-wait does not extend the bound -- the loop uses a monotonic clock, not Date.now()', async () => {
+  const poolDir = writePoolDir(mkTmp('spo-lease-clockjump-'), [{ name: 'acct-a' }]);
+  fs.writeFileSync(leaseFilePath(poolDir, 'acct-a'), JSON.stringify({ pid: 424242, startedAt: 'held-forever' }));
+
+  const realDateNow = Date.now;
+  let calls = 0;
+  const start = realDateNow();
+  // Same receding-clock shape as accounts.test.js's own equivalent -- see that test's header.
+  // `now` is deliberately left at its own default (Date.now, now patched) here too: the point is
+  // that leaseHealthyAccount's ELAPSED-TIME bound must not be reading it at all once neither
+  // `opts.now` nor `opts.monotonicNowMs` is supplied.
+  Date.now = () => {
+    calls += 1;
+    if (calls <= 2) return start + calls;
+    return start - 2515 * (calls - 2);
+  };
+
+  const before = process.hrtime.bigint();
+  let caught = null;
+  try {
+    await leaseHealthyAccount(poolDir, { isAlive: (pid) => pid === 424242, waitMs: 150, pollMs: 20 });
+  } catch (err) {
+    caught = err;
+  } finally {
+    Date.now = realDateNow;
+  }
+  const realElapsedMs = Number((process.hrtime.bigint() - before) / 1000000n);
+
+  assert.ok(caught instanceof accounts.AllAccountsLeasedError, `expected AllAccountsLeasedError, got ${caught && caught.constructor.name}`);
+  assert.ok(
+    realElapsedMs < 2000,
+    `leaseHealthyAccount waited ${realElapsedMs}ms against a 150ms bound while Date.now() receded -- the loop is keyed on Date.now(), not a monotonic clock`
+  );
+});
+
+test('leaseHealthyAccount: opts.monotonicNowMs drives the elapsed bound independently of opts.now -- both injectable, zero real waiting', async () => {
+  const poolDir = writePoolDir(mkTmp('spo-lease-fakemonotonic-'), [{ name: 'acct-a' }]);
+  fs.writeFileSync(leaseFilePath(poolDir, 'acct-a'), JSON.stringify({ pid: 424242, startedAt: 'held-forever' }));
+
+  // `now` (wall-clock, for pick()/leasedAccountNames()) is FROZEN and never advances --
+  // deliberately, to prove the elapsed bound below is reading monotonicNowMs, not this.
+  const now = () => 1000;
+  let fakeMonotonic = 0;
+  const monotonicNowMs = () => fakeMonotonic;
+  const sleepCalls = [];
+  const sleep = async (ms) => {
+    sleepCalls.push(ms);
+    fakeMonotonic += ms;
+  };
+
+  let caught = null;
+  try {
+    await leaseHealthyAccount(poolDir, {
+      isAlive: (pid) => pid === 424242,
+      waitMs: 200,
+      pollMs: 50,
+      now,
+      monotonicNowMs,
+      sleep,
+    });
+  } catch (err) {
+    caught = err;
+  }
+
+  assert.ok(caught instanceof accounts.AllAccountsLeasedError);
+  assert.ok(sleepCalls.length > 0);
+  assert.ok(fakeMonotonic >= 200, 'must not give up before the injected MONOTONIC clock reaches the bound, even though `now` never moved');
+});

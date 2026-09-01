@@ -1,6 +1,7 @@
 'use strict';
 // auto-pull.js -- the daemon's own periodic pull-and-enqueue, real mode only (state-machine.js's
-// runForever calls this between drain passes). Wraps orchestrator/intake.js's existing
+// runForever calls this from the scanner process's own scan cycle -- action 6.3 moved the scans
+// out of the dispatcher's process; see dispatcher.js's header). Wraps orchestrator/intake.js's existing
 // pullBoard/makeTask -- the exact same read-only `npm run board:claim` scan and per-candidate
 // `gh api` issue fetch `spo pull` already runs by hand -- on a config.autoPullMs timer instead
 // of a human running `spo pull`.

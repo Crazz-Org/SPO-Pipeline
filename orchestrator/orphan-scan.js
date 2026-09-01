@@ -70,10 +70,23 @@ function queuedIds(queueDir) {
   return ids;
 }
 
-// orphanScan(queueDir, journalRoot, config, deps) -> [{id, reason}] for every task reparked this
-// pass. `deps.isAlive` is the test-only liveness override (same convention as lock.js's own
-// acquireLock); production never passes it.
-async function orphanScan(queueDir, journalRoot, config, deps = {}) {
+// orphanScan(queueDir, journalRoot, config, deps, liveWorkerIds) -> [{id, reason}] for every task
+// reparked this pass. `deps.isAlive` is the test-only liveness override (same convention as
+// lock.js's own acquireLock); production never passes it.
+//
+// `liveWorkerIds` (a Set<string>, default null/none) is action 6.3's own live-worker table --
+// dispatcher.js threads its current set of in-flight worker ids through every scan cycle (see
+// state-machine.js's runScanCycle). A task in this set is SKIPPED outright, even if its
+// state.json/owner would otherwise look orphaned to every check below -- see journal.js's own
+// "taskDir single-writer invariant" doc comment for why this has to be a hard skip and not merely
+// a race that resolves itself: the instant a worker process actually exits, its pid genuinely
+// stops answering `isAlive`, so WITHOUT this check this scan would see exactly the same
+// "non-terminal state, dead owner pid" shape the dispatcher's own exit handler is (or is about
+// to be) reparking through finalizePark -- two independent writers racing the same
+// journal.jsonl/state.json. dispatcher.js's own header documents the precise ordering that makes
+// this race-free: it only removes an id from its live table AFTER its own repark (if any) has
+// already completed, synchronously, with no `await` in between.
+async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerIds = null) {
   const isAlive = deps.isAlive || processAlive;
   const graceMs = (config && config.orphanGraceMs) || DEFAULT_ORPHAN_GRACE_MS;
   const inQueue = queuedIds(queueDir);
@@ -89,6 +102,7 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}) {
     const state = readJsonSafe(path.join(taskDir, 'state.json'));
     if (!state || TERMINAL_STATES.has(state.state)) continue;
     if (inQueue.has(id)) continue;
+    if (liveWorkerIds && liveWorkerIds.has(id)) continue; // owned by a live worker -- see header above
 
     // Action 6.1 added a second owner shape: a worker-mode run (daemon.js --worker) writes
     // {host, workerPid, workerStartedAt} instead of the daemon's own {host, pid, lockStartedAt},

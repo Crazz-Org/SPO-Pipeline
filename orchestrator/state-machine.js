@@ -22,7 +22,14 @@
 const fs = require('fs');
 const path = require('path');
 
-const { appendEvent, appendDaemonEvent, appendLedgerLine, writeState, writeReport } = require('./journal');
+const {
+  appendEvent,
+  appendDaemonEvent,
+  appendLedgerLine,
+  writeState,
+  writeReport,
+  readLiveWorkerIds,
+} = require('./journal');
 const { scratchDir, lastResultPayload } = require('./task-values');
 const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
@@ -1553,13 +1560,31 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // scheduled for later -- drainQueueOnce's `for (;;)` loop below breaks on a `null` the exact same
 // way it already breaks on an empty queue, so the daemon just polls again next cycle rather than
 // spinning.
-function takeNextTask(queueDir, journalRoot) {
+// action 6.3: `liveIds` (a Set<string>, default null/none) is the dispatcher's own live-worker
+// table -- the ids currently owned by a worker process it has spawned and not yet seen exit. A
+// candidate whose derived id is in that set is SKIPPED, exactly like a not-yet-eligible
+// `notBefore` entry above: it stays in queue/ for a later pass, never taken now. This is the
+// "never start a queue file whose id matches a live worker" half of the taskDir single-writer
+// invariant (see journal.js's own doc comment for the invariant's full statement) -- without it,
+// a queue entry that happens to carry the SAME id as a task currently running under a worker (a
+// duplicate auto-pull, a maintainer's manual re-file, a retry landing before the original attempt
+// finished) would have this function rename its file straight into
+// `<journalRoot>/<id>/task.json`, silently clobbering the live worker's own copy out from under
+// it mid-run. `null`/omitted (every non-dispatcher caller: drainQueueOnce, recette.js, every
+// pre-6.3 test) is exactly today's behaviour -- `liveIds.has(...)` is never reached when there is
+// no set to check, so this is additive, not a redefinition of "eligible".
+//
+// id derivation moves INSIDE the loop (used to happen once, after the loop picked a file) so this
+// check can run per-candidate before a file is ever chosen -- the loop already reads and parses
+// every candidate up to and including the one it takes, so this costs nothing extra.
+function takeNextTask(queueDir, journalRoot, liveIds = null) {
   const files = listQueueFiles(queueDir);
   if (files.length === 0) return null;
 
   const nowMs = Date.now();
   let file = null;
   let task = null;
+  let id = null;
   for (const candidate of files) {
     const candidateRaw = fs.readFileSync(path.join(queueDir, candidate), 'utf8');
     let candidateTask;
@@ -1568,16 +1593,18 @@ function takeNextTask(queueDir, journalRoot) {
     } catch {
       candidateTask = { __invalid: true, rawPreview: candidateRaw.slice(0, 200) };
     }
-    if (isQueueEntryEligibleNow(candidateTask, nowMs)) {
-      file = candidate;
-      task = candidateTask;
-      break;
-    }
+    if (!isQueueEntryEligibleNow(candidateTask, nowMs)) continue;
+    const candidateId =
+      candidateTask && candidateTask.id ? String(candidateTask.id) : path.basename(candidate, '.json');
+    if (liveIds && liveIds.has(candidateId)) continue; // owned by a live worker right now -- see header above
+    file = candidate;
+    task = candidateTask;
+    id = candidateId;
+    break;
   }
-  if (!file) return null; // every entry is scheduled for later -- see the header comment above.
+  if (!file) return null; // every entry is scheduled for later, or live-owned -- see the header comment above.
 
   const srcPath = path.join(queueDir, file);
-  const id = task && task.id ? String(task.id) : path.basename(file, '.json');
   const taskDir = path.join(journalRoot, id);
   fs.mkdirSync(taskDir, { recursive: true });
   fs.renameSync(srcPath, path.join(taskDir, 'task.json'));
@@ -1604,103 +1631,150 @@ async function drainQueueOnce(queueDir, journalRoot, config) {
   return results;
 }
 
-// Polls the queue directory forever, draining whatever has arrived since the last pass. Used
-// by `daemon.js` when --once is not given; not exercised by the test suite (which always runs
-// --shadow --once against a fully-prepared queue), same as before this function grew four more
-// real-mode-only calls -- park-loop.js's unparkScan (kanban piloting's retry/abandon round
-// trip), auto-pull.js's timed board pull, and the human-first bug-report intake pair
-// (report-intake.js's runReportIntake/reportConfirmScan, auto-triage.js's runAutoTriage), each
-// individually unit-tested against injected deps elsewhere (test/park-loop.test.js,
-// test/auto-pull.test.js, test/report-intake.test.js, test/auto-triage.test.js). config.real
-// gates all of them the same way isRealMode(ctx) gates everything else real in this file;
-// config.deps is the same injection point buildCtx already threads through HANDLERS.
+// ---- periodic real-mode scans (action 6.3) -------------------------------------------------
+//
+// Extracted out of runForever's own for(;;) body (which used to inline all of this) so action
+// 6.3's dispatcher.js can drive the SAME scans from ITS OWN loop -- one that must NOT block on a
+// worker's exit the way runForever blocks on `await drainQueueOnce` below. Action 2.7's own
+// comment on unparkScan already flagged this gap: its dedicated timer only guarantees "not more
+// often than config.unparkScanMs", never a guaranteed floor, because a long task running inside
+// drainQueueOnce starves every timer below it for as long as that task's own step takes. Making
+// the floor real is this action's own deliverable -- see dispatcher.js's header and
+// test/dispatcher.test.js's "scan runs while a worker is still alive" case.
+//
+// createScanTimers() returns the mutable last-ran-at bag runScanCycle reads/writes; callers own
+// its lifetime (one per daemon run, same as runForever's own now-removed local `let`s).
+function createScanTimers() {
+  return {
+    lastAutoPullAt: null,
+    lastAutoIntakeAt: null,
+    lastConfirmScanAt: null,
+    lastAutoTriageAt: null,
+    lastOrphanScanAt: null,
+    lastUnparkScanAt: null,
+  };
+}
+
+// Runs (at most) one pass of every real-mode periodic scan whose own timer has elapsed --
+// orphan scan, unpark scan, auto-pull, and the three report-intake stages -- in the exact same
+// order runForever's inline body always ran them in (orphan before unpark: "an orphan reparked
+// THIS cycle must be visible to a maintainer's retry/abandon reply starting next cycle, not a
+// full extra poll later" -- see the comment that used to sit here, preserved below at each call
+// site). A no-op outside real mode, same as the `if (config.real)` guard this body used to live
+// inside.
+//
+// action 6.3 (post-verification correction): the scan cycle now runs in its OWN process (the
+// scanner, daemon.js --scanner, spawned and supervised by dispatcher.js -- see that file's header
+// for the measured reason: intake's blocking `claude` calls inside auto-triage run 3+ minutes,
+// long enough that running them inside the DISPATCHER's own loop would freeze worker-slot
+// refills, timer service, and SIGTERM handling for that whole window). The scanner's process
+// therefore has no in-memory live-worker table of its own -- that table lives in the dispatcher's
+// memory. journal.js's readLiveWorkerIds reads the dispatcher's own published, atomically-written
+// <journalRoot>/live-workers.json -- see that file's header (the taskDir single-writer invariant
+// section) for the full cross-process design and the staleness reasoning in both directions.
+//
+// Read HERE, fresh, every time this function considers running orphanScan (never cached across
+// cycles, never passed in by a caller) -- this is what keeps a stale read bounded to one cycle:
+// the file might lag the dispatcher's true in-memory state by a few milliseconds at the instant
+// of the read, but never by a whole scan interval. A journal root with no dispatcher running
+// against it at all (a --once run, a --worker-only test, a hand-invoked scan) reads back an empty
+// Set (journal.js's own tolerant-read posture), which is exactly today's "nothing to protect"
+// case -- byte-for-byte the same as passing `null` used to be, before this correction.
+async function runScanCycle(timers, queueDir, journalRoot, config, scanStates) {
+  if (!config.real) return;
+  const deps = config.deps || {};
+
+  // Before unparkScan: an orphan reparked THIS cycle must be visible to a maintainer's
+  // retry/abandon reply starting next cycle, not a full extra poll later.
+  if (shouldScanOrphans(timers.lastOrphanScanAt, Date.now(), config.orphanScanMs)) {
+    timers.lastOrphanScanAt = Date.now();
+    await orphanScan(queueDir, journalRoot, config, deps, readLiveWorkerIds(journalRoot));
+  }
+
+  // action 2.7 bullet 4: a dedicated timer (config.unparkScanMs, 60s by default), not
+  // unconditionally on every drainQueueOnce cycle (pollIntervalMs, 5s by default) the way
+  // this used to run -- see park-loop.js's shouldScanUnpark for why.
+  if (shouldScanUnpark(timers.lastUnparkScanAt, Date.now(), config.unparkScanMs)) {
+    timers.lastUnparkScanAt = Date.now();
+    await unparkScan(queueDir, journalRoot, config, deps, scanStates.unpark);
+  }
+
+  const now = Date.now();
+  if (shouldAutoPull(timers.lastAutoPullAt, now, config.autoPullMs)) {
+    timers.lastAutoPullAt = now;
+    await runAutoPull(queueDir, journalRoot, config, deps);
+  }
+
+  // Human-first bug-report intake, THREE independent timers -- see report-intake.js's own
+  // header, remote-report-pull.js's own header, and orchestrator/README.md § Report intake
+  // for the full design. (A fourth stage, runRemoteReportPull, runs on its own
+  // startRemoteReportPullLoop timer, outside this cycle entirely -- see runForever/dispatcher.js's
+  // own call to startRemoteReportPullLoop, made once, not per-cycle.)
+  //   1. runReportIntake  -- mechanical (zero LLM). Files a RAW card per queued report and
+  //      waits for a maintainer's "confirm"/"discard" reply. Nonzero by default
+  //      (config.autoIntakeMs), same risk class as auto-pull.
+  //   2. reportConfirmScan -- reads that reply. Nonzero by default (reportConfirmScanMs).
+  //   3. runAutoTriage -- reproduction + the reviewCard/fileCard-shaped gate, but ONLY for a
+  //      report reportConfirmScan already marked "confirmed". config.autoTriageMs keeps its
+  //      pre-redesign name/env var (SPO_AUTO_TRIAGE_MS) so the live systemd drop-in needs no
+  //      change; a report filed here becomes an ordinary Todo card the *next* auto-pull
+  //      cycle picks up -- the "player report -> nightly fix" chain README.md's migration
+  //      step 5 names.
+  if (shouldAutoIntake(timers.lastAutoIntakeAt, now, config.autoIntakeMs)) {
+    timers.lastAutoIntakeAt = now;
+    await runReportIntake(journalRoot, config, deps);
+  }
+  if (shouldScanConfirms(timers.lastConfirmScanAt, now, config.reportConfirmScanMs)) {
+    timers.lastConfirmScanAt = now;
+    await reportConfirmScan(journalRoot, config, deps, scanStates.reportConfirm);
+  }
+  if (shouldAutoTriage(timers.lastAutoTriageAt, now, config.autoTriageMs)) {
+    timers.lastAutoTriageAt = now;
+    await runAutoTriage(journalRoot, config, deps);
+  }
+}
+
+// THE SCANNER'S LOOP (action 6.3, post-verification correction). This function used to also
+// drain the queue (`await drainQueueOnce(...)` before the scan cycle, every pass) -- that call is
+// GONE now, on purpose: verification found the plan's premise wrong ("the dispatcher's own short
+// calls (auto-pull, scans) stay spawnSync" -- false about the scans specifically, which reach
+// intake.js's callIntakeStepWithRotation -> a BLOCKING `claude` spawnSync measured at 3-3.5
+// minutes on the live daemon's own journal). Running that inside the DISPATCHER's own loop -- the
+// process that also refills worker slots, services SIGTERM, and holds the single-instance lock --
+// would freeze all three for the whole call. So this function is no longer "drain, then scan" in
+// one process; it is JUST the scan half, run in its OWN process (daemon.js --scanner), spawned
+// and supervised by dispatcher.js exactly like a worker (see that file's header for the
+// supervision/respawn/breaker design). This function therefore now has exactly ONE caller:
+// daemon.js's `--scanner` branch. `queueDir` is still a parameter -- the scans themselves still
+// need it (orphanScan's queued-id check, unparkScan/reEnqueueTask's retry re-enqueue) -- it is
+// only the DRAINING of it that moved out.
+//
+// Never takes the single-instance lock (daemon.js's own --scanner branch skips acquireLock, same
+// posture --worker mode already has for the identical reason: K of these each trying to take it
+// would defeat the point, and here there is exactly one scanner anyway, supervised by the
+// dispatcher that DOES hold it).
 async function runForever(queueDir, journalRoot, config) {
-  let lastAutoPullAt = null;
-  let lastAutoIntakeAt = null;
-  let lastConfirmScanAt = null;
-  let lastAutoTriageAt = null;
-  let lastOrphanScanAt = null;
-  let lastUnparkScanAt = null;
+  const timers = createScanTimers();
 
   // action 2.7: one comment-scan.js scanState PER SCANNER, created ONCE here (not inside the
   // for(;;) below) so the collaborator-login cache and the per-issue backoff table both survive
   // across poll cycles -- see comment-scan.js's own header for why either living only as long as
   // one unparkScan/reportConfirmScan call would defeat their own purpose (a cache that resets
-  // every cycle is not a cache; a backoff that resets every cycle never backs off).
-  const unparkScanState = createScanState();
-  const reportConfirmScanState = createScanState();
+  // every cycle is not a cache; a backoff that resets every cycle never backs off). This survival
+  // is exactly WHY the rejected "spawn a fresh child per scan cycle" fix was wrong: a fresh
+  // process would mean a fresh, empty scanState every cycle, destroying both.
+  const scanStates = { unpark: createScanState(), reportConfirm: createScanState() };
 
   // Started once, outside the for(;;) below, on its own setTimeout chain -- see
-  // startRemoteReportPullLoop's own header. Unlike the other three report-intake timers right
-  // below it, this one must NOT wait on drainQueueOnce: a long-running task in the queue would
-  // otherwise starve it for as long as that task takes, which is exactly the failure mode that
-  // motivated pulling it out. Inert (a cheap no-op tick) until config.remoteReportUrl and a
-  // readable token file are both set, same as before.
+  // startRemoteReportPullLoop's own header. Already independent of the rest of this loop before
+  // this correction (it never waited on drainQueueOnce either), so it needs no change here beyond
+  // living in what is now a dedicated process.
   if (config.real) {
     startRemoteReportPullLoop(journalRoot, config, config.deps || {});
   }
 
   for (;;) {
-    await drainQueueOnce(queueDir, journalRoot, config);
-
-    if (config.real) {
-      const deps = config.deps || {};
-
-      // Before unparkScan: an orphan reparked THIS cycle must be visible to a maintainer's
-      // retry/abandon reply starting next cycle, not a full extra poll later.
-      if (shouldScanOrphans(lastOrphanScanAt, Date.now(), config.orphanScanMs)) {
-        lastOrphanScanAt = Date.now();
-        await orphanScan(queueDir, journalRoot, config, deps);
-      }
-
-      // action 2.7 bullet 4: a dedicated timer (config.unparkScanMs, 60s by default), not
-      // unconditionally on every drainQueueOnce cycle (pollIntervalMs, 5s by default) the way
-      // this used to run -- see park-loop.js's shouldScanUnpark for why. Per the plan, this
-      // guarantees "not more often than config.unparkScanMs" only -- real cadence is not
-      // guaranteed until chantier 6 gives the daemon concurrency, since drainQueueOnce above can
-      // block this loop for as long as a task's own step takes.
-      if (shouldScanUnpark(lastUnparkScanAt, Date.now(), config.unparkScanMs)) {
-        lastUnparkScanAt = Date.now();
-        await unparkScan(queueDir, journalRoot, config, deps, unparkScanState);
-      }
-
-      // Note the ordering above: drainQueueOnce is AWAITED, so a pull only ever happens with
-      // the daemon idle. config.autoPullLimit is therefore the most cards that can sit off the
-      // board at once, not a per-cycle burst on top of work in progress.
-      const now = Date.now();
-      if (shouldAutoPull(lastAutoPullAt, now, config.autoPullMs)) {
-        lastAutoPullAt = now;
-        await runAutoPull(queueDir, journalRoot, config, deps);
-      }
-
-      // Human-first bug-report intake, THREE independent timers -- see report-intake.js's own
-      // header, remote-report-pull.js's own header, and orchestrator/README.md § Report intake
-      // for the full design. (A fourth stage, runRemoteReportPull, runs on its own
-      // startRemoteReportPullLoop timer started above, outside this drainQueueOnce-gated loop.)
-      //   1. runReportIntake  -- mechanical (zero LLM). Files a RAW card per queued report and
-      //      waits for a maintainer's "confirm"/"discard" reply. Nonzero by default
-      //      (config.autoIntakeMs), same risk class as auto-pull.
-      //   2. reportConfirmScan -- reads that reply. Nonzero by default (reportConfirmScanMs).
-      //   3. runAutoTriage -- reproduction + the reviewCard/fileCard-shaped gate, but ONLY for a
-      //      report reportConfirmScan already marked "confirmed". config.autoTriageMs keeps its
-      //      pre-redesign name/env var (SPO_AUTO_TRIAGE_MS) so the live systemd drop-in needs no
-      //      change; a report filed here becomes an ordinary Todo card the *next* auto-pull
-      //      cycle picks up -- the "player report -> nightly fix" chain README.md's migration
-      //      step 5 names.
-      if (shouldAutoIntake(lastAutoIntakeAt, now, config.autoIntakeMs)) {
-        lastAutoIntakeAt = now;
-        await runReportIntake(journalRoot, config, deps);
-      }
-      if (shouldScanConfirms(lastConfirmScanAt, now, config.reportConfirmScanMs)) {
-        lastConfirmScanAt = now;
-        await reportConfirmScan(journalRoot, config, deps, reportConfirmScanState);
-      }
-      if (shouldAutoTriage(lastAutoTriageAt, now, config.autoTriageMs)) {
-        lastAutoTriageAt = now;
-        await runAutoTriage(journalRoot, config, deps);
-      }
-    }
-
+    await runScanCycle(timers, queueDir, journalRoot, config, scanStates);
     await sleep(config.pollIntervalMs);
   }
 }
@@ -1712,6 +1786,8 @@ module.exports = {
   takeNextTask,
   drainQueueOnce,
   runForever,
+  createScanTimers, // exported for dispatcher.js -- action 6.3's own loop drives runScanCycle directly
+  runScanCycle, // exported for dispatcher.js -- see this function's own header
   callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
   buildCtx,
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park

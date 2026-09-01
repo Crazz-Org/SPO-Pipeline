@@ -129,11 +129,12 @@ function normalizeExit(result) {
 // a step can never retry the same account twice for a limit and never spins forever.
 //
 // action 6.2: "pick" is now account-lease.js's leaseHealthyAccount, not a bare accounts.pick().
-// Under C6 this file's callers (draftCard/reviewCard/triageBugReport) run DISPATCHER-side, in
-// runForever's own scan timers -- so the dispatcher competes for the same two-account pool with
-// whatever worker(s) are mid-step on cards at the same time. Leasing (not just cooling) is what
-// stops the dispatcher from handing an account to `claude` while a worker is already using it for
-// its own LLM step; see account-lease.js's header for the full per-step-lease rationale and
+// Under C6 this file's callers (draftCard/reviewCard/triageBugReport) run in the SCANNER process
+// (state-machine.js's runForever's own scan timers -- action 6.3 moved the scans out of the
+// dispatcher's own process into a dedicated, supervised sibling; see dispatcher.js's header) --
+// so the scanner competes for the same two-account pool with whatever worker(s) are mid-step on
+// cards at the same time. Leasing (not just cooling) is what stops the scanner from handing an
+// account to `claude` while a worker is already using it for its own LLM step; see account-lease.js's header for the full per-step-lease rationale and
 // state-machine.js's callLlmStep for the sibling copy of this same loop shape. The lease is held
 // for exactly one account "attempt" below -- both the primary call AND its same-account timeout
 // retry (never a second account) -- and released in the `finally` before this loop either returns

@@ -5,10 +5,25 @@
 //                                          [--interval-ms <n>]
 //             node orchestrator/daemon.js (--shadow | --dry-run | --real) --worker <taskDir>
 //                                          [--journal <dir>] [--deadline-ms <n>]
+//             node orchestrator/daemon.js (--shadow | --dry-run | --real) --scanner
+//                                          [--queue <dir>] [--journal <dir>]
 //
 // --once   drains the whole queue serially (filename order) and exits.
-// (absent) polls the queue directory forever, draining whatever has arrived, sleeping
-//          --interval-ms between passes.
+// (absent) continuous mode: acquires the single-instance lock and runs the K-worker dispatcher
+//          (orchestrator/dispatcher.js) forever -- spawning `--worker` children off the queue,
+//          and ALSO spawning and supervising exactly one `--scanner` child (below). Never itself
+//          runs a scan or a task in-process.
+// --scanner  action 6.3 (post-verification correction): runs the periodic real-mode scans
+//          (orphan/unpark/auto-pull/report-intake -- state-machine.js's runForever) forever, in
+//          THIS process, never the dispatcher's. Spawned and supervised by the dispatcher exactly
+//          like a worker (detached process group, respawned on crash, its own crash-loop
+//          breaker) -- see dispatcher.js's own header for the measurement that forced this split:
+//          one of these scans (auto-triage, via intake.js's callIntakeStepWithRotation) makes a
+//          BLOCKING `claude` spawnSync call measured at 3-3.5 minutes on the live daemon's own
+//          journal, which would freeze worker-slot refills, timer service, and SIGTERM handling
+//          for that whole window if it ran inside the dispatcher's own loop. Takes no lock (same
+//          posture as --worker, and for the same reason: the dispatcher already holds it for the
+//          whole journal root). Mutually exclusive with --once and --worker.
 // --worker <taskDir>  action 6.1: runs the ONE task already sitting in <taskDir>/task.json
 //          (runTask) to its terminal state and exits -- never takeNextTask, drainQueueOnce,
 //          runForever, or orphanScan. This is the half of the K-worker design that can exist
@@ -62,11 +77,12 @@ const os = require('os');
 const path = require('path');
 
 const defaultConfig = require('./config');
-const { drainQueueOnce, runForever, runTask } = require('./state-machine');
+const { drainQueueOnce, runTask, runForever } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
 const { appendDaemonEvent } = require('./journal');
 const { orphanScan } = require('./orphan-scan');
+const { createDispatcher } = require('./dispatcher');
 
 function parseArgs(argv) {
   const opts = {
@@ -81,6 +97,15 @@ function parseArgs(argv) {
     journal: null,
     deadlineMs: null,
     intervalMs: null,
+    // Action 6.3: null means "not given" (config.js's own default -- SPO_WORKERS or 1 -- wins);
+    // same convention parseInt already gives every other numeric flag here (a garbage or missing
+    // value parses to NaN, which main()'s `Number.isInteger(...) && ... > 0` guard below rejects
+    // in favour of the default, exactly like a bad SPO_WORKERS env var already does in config.js).
+    workers: null,
+    // Action 6.3 (post-verification): --scanner runs the scan half of continuous mode, in its
+    // own process -- see this file's header. A plain boolean (no path argument, unlike --worker):
+    // a scanner needs no per-invocation target, it always scans whatever --queue/--journal name.
+    scanner: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -90,10 +115,12 @@ function parseArgs(argv) {
     else if (a === '--real') opts.real = true;
     else if (a === '--once') opts.once = true;
     else if (a === '--worker') opts.worker = argv[++i];
+    else if (a === '--scanner') opts.scanner = true;
     else if (a === '--queue') opts.queue = argv[++i];
     else if (a === '--journal') opts.journal = argv[++i];
     else if (a === '--deadline-ms') opts.deadlineMs = parseInt(argv[++i], 10);
     else if (a === '--interval-ms') opts.intervalMs = parseInt(argv[++i], 10);
+    else if (a === '--workers') opts.workers = parseInt(argv[++i], 10);
     else if (a === '--help' || a === '-h') opts.help = true;
   }
   return opts;
@@ -119,10 +146,17 @@ function printUsage() {
       '  --once            drain the queue serially and exit (default: poll forever)',
       '  --worker <dir>    run the ONE task in <dir>/task.json and exit (see file header for the',
       '                    exit-code contract). Mutually exclusive with --once. Takes no lock.',
+      '  --scanner         run the periodic real-mode scans forever, in this process, never the',
+      '                    dispatcher\'s (see file header). Spawned/supervised by the dispatcher.',
+      '                    Mutually exclusive with --once and --worker. Takes no lock.',
       '  --queue <dir>     task queue directory (default: <repo>/queue)',
       '  --journal <dir>   per-task runtime/journal root (default: <repo>/journal)',
       '  --deadline-ms <n> per-step wall-clock deadline in ms (default: 120000)',
       '  --interval-ms <n> poll interval in ms, only used without --once (default: 5000)',
+      '  --workers <n>     action 6.3: how many workers the dispatcher runs concurrently in',
+      '                    continuous mode (ignored by --once and --worker). Default 1',
+      '                    (config.js\'s workers / SPO_WORKERS), re-clamped to the number of',
+      '                    healthy accounts before every spawn -- see orchestrator/dispatcher.js.',
     ].join('\n')
   );
 }
@@ -201,6 +235,23 @@ async function main() {
     return;
   }
 
+  // Action 6.3: --scanner is a third answer to "how do I not poll forever", alongside --once and
+  // --worker -- mutually exclusive with both, same exit-2 usage-error posture as the --worker/
+  // --once pair above (a bad argv combination the dispatcher itself should never produce, but a
+  // human or a future caller building one by hand should be told plainly, not silently
+  // reinterpreted).
+  const scannerMode = opts.scanner === true;
+  if (scannerMode && opts.once) {
+    console.error('orchestrator/daemon.js: --scanner and --once are mutually exclusive (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+  if (scannerMode && workerMode) {
+    console.error('orchestrator/daemon.js: --scanner and --worker are mutually exclusive (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+
   // --real is the one mode that actually calls the `claude` CLI (steps/llm.js's account-
   // rotation loop) -- refuse to even start if the pool has nothing registered, rather than let
   // every task park one at a time on the same NoAccountsRegisteredError. See doc/setup.md
@@ -269,8 +320,24 @@ async function main() {
   //
   // `lock` is captured by the exit hook rather than passed to it, so the hook is registered
   // before there is anything to release and still releases whatever acquireLock assigns.
+  //
+  // Action 6.3: `dispatcherHandle` is the same deferred-capture pattern as `lock` above --
+  // declared null here, assigned later (only in the non-once, non-worker, non-scanner branch,
+  // once createDispatcher(...) actually exists), and read by this SAME exit hook via closure. On
+  // any exit -- SIGINT/SIGTERM below, or the circuit-breaker return path further down this
+  // function -- every live worker's AND the scanner's process group is signalled (killAllChildren)
+  // BEFORE the lock is released, so a fresh daemon starting right after this one exits never races
+  // a still-shutting-down predecessor's children for taskDir ownership or a second live scanner.
+  // Killing is fire-and-forget here (an 'exit' handler must be synchronous, so this cannot wait
+  // for the children to actually die) -- a worker that does not die before its own taskDir is next
+  // examined is recovered exactly like any other crash: orphanScan on the next daemon start
+  // (state.json non-terminal, owner pid dead). A scanner that does not die before the next start
+  // simply becomes a second live one until it does -- harmless (it takes no lock, owns no taskDir)
+  // but not free, so the signal is still sent rather than left to whichever exit path is slower.
   let lock = null;
+  let dispatcherHandle = null;
   process.once('exit', () => {
+    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');
     if (lock) lock.release();
   });
   for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -286,7 +353,12 @@ async function main() {
   // see state-machine.js's own `if (config.lockLost && config.lockLost())`), and the
   // 'lock-stale-taken' daemon event (nothing was taken over). `lock` stays null, so the
   // process.once('exit', ...) release hook registered above is already correctly a no-op.
-  if (!workerMode) {
+  //
+  // Action 6.3: --scanner joins --worker in never taking the lock, same reasoning -- the
+  // dispatcher that spawns and supervises it already holds one for the whole journal root, and a
+  // second lock-holder (the scanner itself) would be exactly the two-daemons-on-one-queue
+  // collision this lock exists to prevent, not a legitimate second instance.
+  if (!workerMode && !scannerMode) {
     try {
       lock = acquireLock(journalRoot, opts.shadow ? 'shadow' : opts.dryRun ? 'dry-run' : 'real');
     } catch (err) {
@@ -309,6 +381,11 @@ async function main() {
     real: !opts.shadow && !opts.dryRun && !!opts.real,
     stepDeadlineMs: opts.deadlineMs || defaultConfig.stepDeadlineMs,
     pollIntervalMs: opts.intervalMs || defaultConfig.pollIntervalMs,
+    // Action 6.3: same "bad override falls back to the default, never to something silently
+    // wrong" posture config.js's own positiveIntFromEnv already applies to SPO_WORKERS -- a
+    // missing/non-integer/non-positive --workers leaves defaultConfig.workers (env-resolved)
+    // untouched rather than coercing to 0 or NaN.
+    workers: Number.isInteger(opts.workers) && opts.workers > 0 ? opts.workers : defaultConfig.workers,
     queueDir,
     // Every state.json snapshot this run writes carries this back (state-machine.js's
     // buildCtx/snapshot) -- orphan-scan.js's only way, after a restart, to tell "the process
@@ -327,13 +404,38 @@ async function main() {
     // current at the moment of death sitting in state.json until the next restart's orphanScan
     // recovers it. If that scan stopped recognising the old shape, every one of those tasks
     // would be invisible forever.
+    // Action 6.3: a THIRD shape for --scanner -- `null`. A scanner never calls buildCtx to run a
+    // task of its own (orphanScan's own per-orphan buildCtx call restores that CRASHED task's
+    // owner from ITS OWN state.json, never from this config), so there is no identity this field
+    // needs to carry -- and, unlike the non-worker branch below, there is no `lock.holder` to read
+    // it from in the first place (the scanner never acquires one). buildCtx's own
+    // `(config && config.owner) || null` fallback already treats a missing owner as "unknown,
+    // never orphaned" for any ctx built off this config, which is exactly correct here.
     owner: workerMode
       ? { host: os.hostname(), workerPid: process.pid, workerStartedAt: new Date().toISOString() }
-      : { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
+      : scannerMode
+        ? null
+        : { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
   };
 
   if (workerMode) {
     process.exitCode = await runWorker(opts.worker, config);
+    return;
+  }
+
+  // Action 6.3: --scanner runs state-machine.js's runForever -- now JUST the scan loop (timers +
+  // runScanCycle, no queue draining -- see that function's own header) -- forever, in this
+  // process. Never resolves under normal operation; the dispatcher that spawned this process
+  // stops it with a signal (see dispatcher.js's killAllChildren), at which point the SIGINT/
+  // SIGTERM handlers registered above turn that into a clean process.exit(130/143) -- the
+  // process.once('exit', ...) hook runs too, but both `lock` and `dispatcherHandle` are still
+  // null here, so it is correctly a no-op. `return` below is therefore unreachable in practice,
+  // kept only so this function has an honest final statement rather than an implicit
+  // fall-through into the lock-watch/orphanScan/dispatcher code below, none of which a scanner
+  // may touch (no lock to watch, and the dispatcher -- not the scanner -- is the one process that
+  // does the startup orphanScan pass and drives continuous mode).
+  if (scannerMode) {
+    await runForever(queueDir, journalRoot, config);
     return;
   }
 
@@ -397,7 +499,19 @@ async function main() {
     const results = await drainQueueOnce(queueDir, journalRoot, config);
     for (const r of results) console.log(`${r.id}  ${r.finalState}`);
   } else {
-    await runForever(queueDir, journalRoot, config); // never resolves
+    // Action 6.3: continuous mode is driven by the dispatcher (K-worker spawning + the scan
+    // cycle serviced on its own schedule -- see dispatcher.js's own header), not
+    // state-machine.js's runForever/drainQueueOnce. --once above and recette.js both still go
+    // straight through drainQueueOnce, unaffected -- see CLAUDE.md's own instruction not to
+    // touch either without checking every caller.
+    const dispatcher = createDispatcher(queueDir, journalRoot, config);
+    dispatcherHandle = dispatcher; // read by the exit hook registered above, via closure
+    const stopReason = await dispatcher.run(); // resolves ONLY if the crash circuit breaker trips
+    console.error(
+      `orchestrator/daemon.js: dispatcher stopped itself -- ${JSON.stringify(stopReason)} -- ` +
+        'exiting non-zero rather than repark-looping (see dispatcher.js\'s workerCrashLimit/scannerCrashLimit).'
+    );
+    process.exitCode = 1;
   }
 }
 
