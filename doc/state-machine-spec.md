@@ -227,6 +227,31 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   JSON) journals `reconcile-scan-failed {step, exit, timedOut}` and never blocks or throws — same
   contract as every other real spawn in this file. `spo parked` (`bin/spo`'s `cmdParked`) prints a
   reconciled row under its own heading, separate from the still-PARKED and still-ABANDONED rows.
+- **Judge findings, routed instead of lost (action 5.3)** — measured across all 19 journals
+  (2026-09-01): 7 `change-validator PASS_WITH_FINDINGS` events carried a non-empty `findings`
+  array (8 finding objects total) and one `citation-verifier DIVERGES` (issue-462,
+  2026-08-31T08:35:08Z) — every one journalled and never read again; `PASS_WITH_FINDINGS` returned
+  `MERGE` with the findings sitting only in `journal.jsonl`, and `DIVERGES` had nothing recorded
+  beyond the bare verdict (`step-contracts.js`'s CITATION_VERIFIER contract requires
+  `{verdict, entries}`, but the `citation-verifier` event only ever carried `{verdict}`; fixed —
+  `entries` now rides along on both the `PASS` and `DIVERGES` branches). `handleValidate` now
+  posts one structured comment on the **issue** (never the PR — this pipeline auto-merges, so
+  there is no PR reviewer, and the PR closes on merge while the issue does not; the PR number is
+  named inside the body so the link is not lost), before returning `MERGE`: change-validator's
+  findings when the verdict is `PASS_WITH_FINDINGS` with a non-empty array, citation-verifier's
+  `entries` when the verdict was `DIVERGES` — both in the same comment, in clearly-separated
+  sections, when both apply to the same run. `findings` tolerates the same shape divergence
+  `plan-files-undeclared` (action 3.2) already learned to expect — every one of the 8 measured
+  findings arrived as a JSON-encoded STRING, not a real array — parsing either shape and
+  journalling `validate-findings-shape {shape, count}` so a future divergence stays visible rather
+  than silently dropped; a malformed payload (unparsable, `null`, an object, an array of
+  non-object elements) never throws and never blocks the merge. No follow-up card is ever
+  auto-filed on a judge verdict — deliberately: the plan's own "(optionally a follow-up draft
+  card)" is the exact unattended-filing shape C3 gated behind a human `confirm` after the
+  12.8-hour, 128-attempt auto-triage stall, and a comment is reversible where a filed card is not.
+  Journals `validate-findings-posted {count, commentId}` on success,
+  `validate-findings-post-failed {exit, timedOut}` on a non-zero `gh` exit or a timed-out spawn —
+  never blocking, real mode only, same contract as `diagnose-surfaced`/board moves above.
 - **Claude session management**: the `session_id` of every step is recorded, so any step can
   be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
   interactively). `claude agents` lists live background sessions.

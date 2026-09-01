@@ -271,6 +271,284 @@ function postDiagnoseSurfaceComment(ctx, deps, { attempt, budget }) {
   appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-surfaced', { attempt, budget });
 }
 
+// ---- action 5.3: route the judge findings that are journalled and then lost ------------------
+//
+// Measured (2026-09-01, all 19 journals): 7 `change-validator PASS_WITH_FINDINGS` events carry a
+// non-empty `findings` array (8 finding objects total -- issue-456 alone posted two), and one
+// `citation-verifier DIVERGES` (issue-462, 2026-08-31T08:35:08Z). Every one of them was
+// `appendEvent`'d by handleValidate (state-machine.js) and never read again -- PASS_WITH_FINDINGS
+// returns 'MERGE' with the findings sitting only in journal.jsonl, and DIVERGES "is flagged for a
+// human, not blocking" in a comment that names no human-facing surface at all. This is that
+// surface.
+//
+// Posted on the ISSUE, not the PR (contra the plan's "a structured PR comment"): this pipeline
+// auto-merges (VALIDATE -> MERGE has no human gate -- state-machine-spec.md's own state table),
+// so there is no PR reviewer to read a PR comment before it closes on merge. The issue is where
+// every other pipeline comment already lands (postParkComment, postDiagnoseSurfaceComment, the
+// FINISH comment in steps/scripted.js), it is what the board tracks, and it OUTLIVES the PR
+// (which GitHub closes on merge, taking any PR-side comment out of the maintainer's ordinary
+// view). `prNumber` is named inside the body instead, so the link a PR comment would have given
+// for free is not lost.
+//
+// Called from handleValidate BEFORE it returns 'MERGE' (not from a separate MERGE-adjacent hook):
+// the findings/entries only exist in the same call's `result`/`cv` locals, and posting here keeps
+// the comment landing while the change is still in flight, not after the card is already closed.
+//
+// Erratum A -- findings carry `title` XOR `summary`, never both. The 8 measured findings have
+// exactly four key-sets:
+//
+//     9 keys: area, category, detail, failure_scenario, file, line, short_summary, size, title  x1
+//     5 keys: area, category, detail, size, title                                               x2
+//     6 keys: area, category, file, line, size, summary                                         x1
+//     4 keys: area, category, size, summary                                                     x4
+//
+// 4 of 8 have `title` and no `summary`; 4 have `summary` and no `title`. `file`/`line` are present
+// on 2 of 8; `detail`, `failure_scenario`, `short_summary` are sporadic. formatFindingLine below
+// renders whichever of `title`/`summary` is present as the headline and never prints `undefined`
+// for a key that is absent -- see the corpus example inline on that function.
+//
+// Erratum A, second half -- `findings` sometimes arrives as a JSON-ENCODED STRING, not an array.
+// Every one of the 8 measured findings above actually arrived this way (`"findings":"[{...}]"`,
+// not `"findings":[{...}]`) -- the same shape `orchestrator/steps/scripted.js`'s
+// `plan-files-undeclared` incident already learned to expect from `files_to_change`. normalizeFindingsPayload
+// tolerates a string (parses it), an array (uses it as-is), and anything else (null, an object, an
+// unparsable string, absent) by returning an empty list -- never throwing -- while journalling the
+// shape actually received (`validate-findings-shape`) so a future divergence from either shape is
+// visible on the record instead of silently dropped, the exact fate this action exists to end.
+//
+// Erratum B -- `citation-verifier DIVERGES` had nothing to render. `step-contracts.js`'s
+// CITATION_VERIFIER contract requires `{verdict, entries}`, but state-machine.js's own
+// `citation-verifier` journal event carried only `{verdict}` -- the single real DIVERGES in the
+// corpus (issue-462) recorded exactly `{"verdict":"DIVERGES"}`; what actually diverged is
+// unrecoverable today. Fixed at the source in state-machine.js's handleValidate (both branches
+// that already journal a `cv.verdict` now also journal `cv.entries`, PASS included -- see that
+// file's own comment on why PASS gets it too, cheaply, rather than leaving the exact same
+// discard-by-omission bug for a verdict this action didn't happen to be measuring).
+//
+// Decision recorded here, not just in the plan: NO auto-filed follow-up card. The plan floats
+// "(and optionally a follow-up draft card)"; this build does not build it. Unattended filing on a
+// judge's own verdict is the exact class of behaviour C3 gated behind a human `confirm` after the
+// 12.8-hour, 128-attempt auto-triage stall (doc/audit-2026-08-30-remediation-plan.md) -- and a
+// comment is reversible (ignore it, reply, resolve it by hand) where a filed card is not (it sits
+// in the backlog, competing for the same intake budget as everything else, until a human notices
+// and closes it). A comment that names the finding is enough for a maintainer to decide whether it
+// is worth a card at all.
+
+// Small, deliberately generous caps -- not asked for by the corpus (largest measured payload is
+// 2 findings, ~1.5KB of prose) but cheap insurance against the exact failure mode
+// `plan-files-undeclared`'s own header already measured for a different field: GitHub caps a
+// comment body at 65536 chars, and an unbounded model-controlled array/string is the input that
+// blows past it. Rendering stops silently truncating past these caps with a `(+N more)` /
+// `... (truncated)` marker rather than ever producing an oversized body.
+const MAX_RENDERED_ITEMS = 30;
+const MAX_FIELD_LENGTH = 8000;
+// GitHub refuses an issue comment body over 65,536 characters with a 422. 60,000 leaves room for
+// the truncation marker appended below it and for any future preamble line.
+const MAX_BODY_LENGTH = 60000;
+
+function truncateField(value) {
+  return value.length > MAX_FIELD_LENGTH ? `${value.slice(0, MAX_FIELD_LENGTH)}... (truncated)` : value;
+}
+
+// A non-empty string, trimmed -- or null. The one predicate every field below is read through, so
+// `''`, `null`, `undefined`, and a non-string (a stray number/object the model sent where prose
+// was expected) all collapse to the same "nothing to render" outcome instead of five different
+// ad-hoc checks that could each get the falsy cases slightly wrong.
+function str(value) {
+  return typeof value === 'string' && value.trim() !== '' ? truncateField(value.trim()) : null;
+}
+
+// normalizeFindingsPayload(raw) -- tolerates every shape `result.findings` (VALIDATE's
+// change-validator payload) has actually been observed or could plausibly arrive as: a real
+// array (used as-is), a JSON-encoded string (parsed), or anything else -- `null`, `undefined`, an
+// object, an unparsable string -- which becomes an empty list, NEVER a throw. `shape` is what
+// state-machine.js journals alongside the count, per erratum A's second half above: the point is
+// that a future payload shape this function doesn't expect is visible in the journal, not that it
+// crashes or silently renders nothing with no trace.
+function normalizeFindingsPayload(raw) {
+  if (Array.isArray(raw)) return { items: raw, shape: 'array' };
+  if (typeof raw === 'string') {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { items: [], shape: 'unparsable-string' };
+    }
+    if (Array.isArray(parsed)) return { items: parsed, shape: 'json-string' };
+    return { items: [], shape: `json-string-${parsed === null ? 'null' : typeof parsed}` };
+  }
+  if (raw === null) return { items: [], shape: 'null' };
+  if (raw === undefined) return { items: [], shape: 'absent' };
+  return { items: [], shape: typeof raw };
+}
+
+// formatFindingLine(finding, index) -- one change-validator finding, matching erratum A above.
+// Real corpus example (issue-232, the 4-key `summary`-only shape), rendered:
+//
+//   **1. The new `export { server as httpServer }` in src/server/server.ts makes the raw...**
+//
+//   category: `latent-trap` · area: `gateway` · size: `S`
+//
+// A malformed element (not an object -- `null`, a bare string, a number: the "array of nulls"
+// case) renders a one-line placeholder instead of throwing on `finding.title`.
+function formatFindingLine(finding, index) {
+  if (!finding || typeof finding !== 'object') {
+    return `**${index}.** _(malformed finding: ${JSON.stringify(finding === undefined ? null : finding)})_`;
+  }
+  const headline = str(finding.title) || str(finding.summary) || '_(no title or summary given)_';
+  const parts = [`**${index}. ${headline}**`];
+
+  const meta = [];
+  if (str(finding.category)) meta.push(`category: \`${str(finding.category)}\``);
+  if (str(finding.area)) meta.push(`area: \`${str(finding.area)}\``);
+  if (str(finding.size)) meta.push(`size: \`${str(finding.size)}\``);
+  if (str(finding.file)) {
+    const loc = typeof finding.line === 'number' ? `${str(finding.file)}:${finding.line}` : str(finding.file);
+    meta.push(`\`${loc}\``);
+  }
+  if (meta.length > 0) parts.push(meta.join(' · '));
+
+  // `detail` is the prose body when `title` won the headline (the 5-/9-key shapes); when
+  // `summary` won the headline instead (the 4-/6-key shapes) there is no separate body key --
+  // the summary already carried the whole finding. Never render the same string twice.
+  if (str(finding.detail)) parts.push(str(finding.detail));
+  if (str(finding.short_summary) && str(finding.short_summary) !== headline) {
+    parts.push(`_${str(finding.short_summary)}_`);
+  }
+  if (str(finding.failure_scenario)) parts.push(`Failure scenario: ${str(finding.failure_scenario)}`);
+
+  return parts.join('\n\n');
+}
+
+// formatEntryLine(entry, index) -- one citation-verifier entry (`{member, citation, finding}` per
+// verify-citations.md's own output contract). Same malformed-element tolerance as
+// formatFindingLine, for the same reason: `entries` is exactly as model-controlled as `findings`.
+function formatEntryLine(entry, index) {
+  if (!entry || typeof entry !== 'object') {
+    return `**${index}.** _(malformed entry: ${JSON.stringify(entry === undefined ? null : entry)})_`;
+  }
+  const member = str(entry.member) || '_(unnamed member)_';
+  const citation = str(entry.citation) ? ` — \`${str(entry.citation)}\`` : '';
+  const parts = [`**${index}. ${member}${citation}**`];
+  if (str(entry.finding)) parts.push(str(entry.finding));
+  return parts.join('\n\n');
+}
+
+function renderItems(items, formatLine) {
+  const capped = items.slice(0, MAX_RENDERED_ITEMS);
+  const lines = capped.map((item, i) => formatLine(item, i + 1));
+  if (items.length > MAX_RENDERED_ITEMS) {
+    lines.push(`_(+${items.length - MAX_RENDERED_ITEMS} more, not rendered)_`);
+  }
+  return lines;
+}
+
+// buildValidateFindingsComment -- PURE (no fs, no spawn; unit-testable with only in-memory
+// values, same discipline as buildParkComment above). One comment for both sources rather than
+// two: a card can only get here through handleValidate's own MERGE branch, where at most one
+// change-validator verdict and one citation-verifier verdict exist for the run, and posting them
+// separately would put two comments on the same issue seconds apart with no way to tell, from
+// either one alone, that they belong to the same VALIDATE pass. Sections are clearly separated by
+// their own `####` heading instead.
+//
+// `diverges` is a separate boolean from `divergesEntries.length` on purpose: the DIVERGES verdict
+// itself is the human-facing signal (erratum B) -- an empty/malformed `entries` payload is a
+// second, independent defect worth surfacing (via `_(no entries reported)_` below), not a reason
+// to fall silently back to today's "flagged for a human" that names no human-facing surface.
+function buildValidateFindingsComment({ prNumber, findings = [], diverges = false, divergesEntries = [] }) {
+  const lines = ['### Pipeline validation findings', ''];
+  // `PR #N.`, NOT "Merged via #N." -- this comment is posted from handleValidate BEFORE
+  // realMerge runs, and realMerge can still park four ways (pr-merge-enqueue-failed,
+  // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit). Posting before the
+  // merge is deliberate (the findings must land while the card is still moving, not after it
+  // closes), so the wording is what has to be honest: an issue permanently carrying "Merged via
+  // #427." next to a park comment saying the PR closed unmerged is exactly the kind of
+  // board-vs-reality divergence this chantier exists to end. #443 is the corpus proof that the
+  // four park paths are not theoretical.
+  if (typeof prNumber === 'number') lines.push(`PR #${prNumber}.`, '');
+  lines.push(
+    'This did not block the merge -- this pipeline auto-merges once its own checks pass, so',
+    'there is no human reviewer on the PR itself. These are recorded here for you to read, act',
+    'on, or dismiss at your own judgement.',
+    ''
+  );
+
+  if (diverges) {
+    lines.push(
+      '#### Citation verifier: DIVERGES',
+      '',
+      'Every touched citation checked out true, but at least one intentionally diverges from a',
+      'literal reading of the Pascal declaration (verify-citations.md rule 1 or 2) -- correct, but',
+      'flagged for you to confirm the intent, not to fix.',
+      ''
+    );
+    if (Array.isArray(divergesEntries) && divergesEntries.length > 0) {
+      renderItems(divergesEntries, formatEntryLine).forEach((line) => lines.push(line, ''));
+    } else {
+      lines.push('_(no entries reported)_', '');
+    }
+  }
+
+  if (Array.isArray(findings) && findings.length > 0) {
+    lines.push(
+      '#### Change validator: PASS_WITH_FINDINGS',
+      '',
+      'The change passed. These are non-blocking findings from that pass.',
+      ''
+    );
+    renderItems(findings, formatFindingLine).forEach((line) => lines.push(line, ''));
+  }
+
+  // The per-field and per-item caps above bound each PIECE; they do not bound the WHOLE. Measured:
+  // 30 findings each at the 8000-char field cap render a 722,497-character body against GitHub's
+  // 65,536 limit -- 11x over. `gh` would 422, the post would journal
+  // `validate-findings-post-failed`, the merge would proceed, and the findings would be lost
+  // again, which is the exact failure this action exists to end. So the joined body is capped
+  // too, and says so where it cuts rather than ending mid-sentence.
+  const body = lines.join('\n');
+  if (body.length <= MAX_BODY_LENGTH) return body;
+  return (
+    body.slice(0, MAX_BODY_LENGTH) +
+    `\n\n_[truncated: the rendered findings exceeded ${MAX_BODY_LENGTH} characters. The full payload is in this task's journal, under the \`change-validator\` event.]_`
+  );
+}
+
+// postValidateFindingsComment(ctx, deps, {...}) -- same mechanics as postParkComment above: build
+// the body with the pure function, write it to ctx.taskDir, spawn through the timeout-armed
+// runSync, verdict by exit code, journal the outcome. It never BLOCKS -- but the "never throws"
+// half was measured and is false, in exactly the way postParkComment's identical shape is: a
+// `spawnSync` that returns undefined/null or throws outright, an absent or unwritable taskDir,
+// all propagate out (armTimeout assigns `result.commandClass` on the raw return). Real spawnSync
+// does none of those, but a mutation round or a full disk does. The caller therefore owns the
+// catch: handleValidate wraps this call, because a throw here escapes into runTask
+// (state-machine.js) and kills the daemon over a best-effort comment -- the shape C3 already
+// shipped once.
+// Journals `validate-findings-posted {count, commentId}` on success,
+// `validate-findings-post-failed {exit, timedOut}` on a non-zero `gh` exit or a timed-out spawn.
+function postValidateFindingsComment(ctx, deps, { prNumber, findings = [], diverges = false, divergesEntries = [] }) {
+  const issue = ctx.task && ctx.task.issue;
+  if (!issue) {
+    appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-post-skipped', { reason: 'no issue' });
+    return;
+  }
+
+  const ghRepo = (ctx.config && ctx.config.ghRepo) || 'Crazz-Org/SPO-WebClient';
+  const body = buildValidateFindingsComment({ prNumber, findings, diverges, divergesEntries });
+  const commentFile = path.join(ctx.taskDir, 'validate-findings-comment.md');
+  fs.writeFileSync(commentFile, body);
+
+  const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
+  const exit = normalizeExit(result);
+  if (exit !== 0) {
+    appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-post-failed', { exit, timedOut: result.timedOut === true });
+    return;
+  }
+
+  const commentId = parseCommentId(result.stdout);
+  const count = (Array.isArray(findings) ? findings.length : 0) + (Array.isArray(divergesEntries) ? divergesEntries.length : 0);
+  appendEvent(ctx.taskDir, 'VALIDATE', 'validate-findings-posted', { count, commentId });
+}
+
 // ---- unpark scan (daemon, real mode) ---------------------------------------------------------
 //
 // action 2.7: the fetch/pagination/allowlist/backoff work is comment-scan.js's `scanForMatch` --
@@ -903,6 +1181,9 @@ module.exports = {
   postParkComment,
   buildDiagnoseSurfaceComment,
   postDiagnoseSurfaceComment,
+  normalizeFindingsPayload,
+  buildValidateFindingsComment,
+  postValidateFindingsComment,
   parseCommentId,
   RETRY_ABANDON_LINE,
   unparkScan,
