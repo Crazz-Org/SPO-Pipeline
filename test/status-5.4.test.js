@@ -111,6 +111,28 @@ test('spo status: a card in action 4.4 backoff gets a BACKOFF row (attempt + nex
   assert.match(out, /active: 0\s+backoff: 1\s+parked: 0\s+abandoned: 0\s+done: 0/);
 });
 
+test('spo status: a backoff entry is NOT folded into `queue depth` -- it is counted once, in its own bucket', () => {
+  // The other half of item B's double-count. A card waiting out a backoff is not queued WORK:
+  // nothing will pick it up until its notBefore passes, so counting it as queue depth makes the
+  // queue look busier than it is at exactly the moment a maintainer is asking why nothing moves.
+  const journalDir = mkTmp('spo-status-backoff-depth-journal-');
+  const queueDir = mkTmp('spo-status-backoff-depth-queue-');
+
+  const backoffDir = path.join(journalDir, 'issue-449');
+  writeJournalLines(backoffDir, [{ ts: '2026-09-01T09:00:00.000Z', state: 'IMPLEMENT', event: 'llm-call' }]);
+  writeStateJson(backoffDir, { id: 'issue-449', state: 'IMPLEMENT' });
+  writeTask(queueDir, '0000-retry-1-issue-449.json', { id: 'issue-449', transientRetries: 1, notBefore: '2099-01-01T00:00:00.000Z' });
+
+  const readyDir = path.join(journalDir, 'issue-500');
+  writeJournalLines(readyDir, [{ ts: '2026-09-01T09:00:00.000Z', state: 'IMPLEMENT', event: 'llm-call' }]);
+  writeStateJson(readyDir, { id: 'issue-500', state: 'IMPLEMENT' });
+  writeTask(queueDir, '001-fresh.json', { id: 'issue-500', title: 'fresh task' });
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.match(out, /queue depth: 1\s+\(\+1 in backoff, counted below\)/, 'two files on disk, one of them queued work');
+  assert.match(out, /backoff: 1/);
+});
+
 test('spo status: a backoff entry whose notBefore has already passed reads "due now", not a future next-run', () => {
   // An eligible entry is waiting for a DRAIN, not backing off. With the daemon stopped, a queue
   // of long-past notBefore entries reading "all backing off" instead of "nothing is draining
@@ -355,6 +377,54 @@ test('spo status: a parked task with a successful scan since its failures shows 
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', mkTmp('spo-status-scan-ok-queue-')]);
   assert.match(out, /issue-385\s+PARKED\s+reason=branch-unmerged-leftover\s+retry-channel: no failures recorded/);
+});
+
+test('spo status: an unrelated event after the failures does NOT clear the streak -- only a park ending, or proof the scan worked', () => {
+  // Measured LIVE, an hour after 5.4 shipped. Action 5.1b's reconciler appended one
+  // `reconciled-externally` line to issue-213 and issue-428 on the daemon's first cycle on C5
+  // code, and this line went from "238 failure(s), last 14h50m ago" to "no failures recorded".
+  // The 238 failures had not gone anywhere. The fixture below is that exact journal shape.
+  const journalDir = mkTmp('spo-status-scan-unrelated-');
+  const id = 'issue-213';
+  const dir = path.join(journalDir, id);
+  writeJournalLines(dir, [
+    { ts: '2026-08-29T21:08:09.000Z', state: 'PARKED', event: 'park-comment', commentId: 1 },
+    { ts: '2026-08-30T10:11:23.997Z', state: 'PARKED', event: 'unpark-scan-failed', exit: 1, timedOut: false },
+    { ts: '2026-08-31T19:50:01.000Z', state: 'PARKED', event: 'unpark-scan-backoff-skip' },
+    { ts: '2026-08-31T19:52:07.585Z', state: 'PARKED', event: 'unpark-scan-failed', exit: 1, timedOut: false },
+    // The reconciler's own line -- newer than the failures, and evidence of nothing about the scan.
+    {
+      ts: '2026-09-01T11:37:59.785Z',
+      state: 'PARKED',
+      event: 'reconciled-externally',
+      via: 'pr-merged',
+      closedAt: '2026-08-30T01:50:23Z',
+    },
+  ]);
+  writeStateJson(dir, { id, state: 'PARKED', reason: 'diagnose-duplicate-root-cause' });
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', mkTmp('spo-status-scan-unrelated-queue-')]);
+  assert.match(out, /retry-channel: 2 failure\(s\), last .+ ago \(first 2026-08-30T10:11:23\.997Z\)/);
+  assert.doesNotMatch(out, /no failures recorded/);
+});
+
+test('spo status: an `unpark-scan-ignored-author` after the failures DOES clear the streak -- it proves gh answered', () => {
+  // The other half of the rule. A successful scan that matches nothing journals no event at all,
+  // so `unpark-scan-truncated` and `unpark-scan-ignored-author` are the only lines a WORKING scan
+  // ever leaves. Both must end the streak, or a channel that recovered would report an outage
+  // forever.
+  const journalDir = mkTmp('spo-status-scan-recovered-');
+  const id = 'issue-900';
+  const dir = path.join(journalDir, id);
+  writeJournalLines(dir, [
+    { ts: '2026-08-30T09:00:00.000Z', state: 'WORKTREE', event: 'parked', reason: 'x' },
+    { ts: '2026-08-30T10:00:00.000Z', state: 'PARKED', event: 'unpark-scan-failed', exit: 1, timedOut: false },
+    { ts: '2026-08-30T11:00:00.000Z', state: 'PARKED', event: 'unpark-scan-ignored-author', login: 'someone' },
+  ]);
+  writeStateJson(dir, { id, state: 'PARKED', reason: 'x' });
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', mkTmp('spo-status-scan-recovered-queue-')]);
+  assert.match(out, /retry-channel: no failures recorded/);
 });
 
 // ---- G: the parking rate matches console/collect.js's denominator, same fixture -----------------

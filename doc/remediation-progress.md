@@ -687,6 +687,24 @@ shared killswitch, and it is worth doing **before** 5.1/5.2 touch `board.js` and
 
 ## What C5 hands C6
 
+**All five are filed as backlog cards** (2026-09-01, through `spo ask` with a `review-card`
+verdict on each — the same intake every other card gets):
+
+| card | what |
+|---|---|
+| [#475](https://github.com/Crazz-Org/SPO-WebClient/issues/475) | MERGE parks `pr-closed-unmerged` on a single unconfirmed read |
+| [#476](https://github.com/Crazz-Org/SPO-WebClient/issues/476) | the unpark scan records neither why it failed nor that it recovered |
+| [#477](https://github.com/Crazz-Org/SPO-WebClient/issues/477) | intake/triage spend is captured and dropped |
+| [#478](https://github.com/Crazz-Org/SPO-WebClient/issues/478) | `duration_s` is written and never rendered |
+| [#480](https://github.com/Crazz-Org/SPO-WebClient/issues/480) | two timing-budget flakes in `test/lock.test.js` |
+
+Filing them found two things worth keeping. `review-card` caught a citation of "SPO-Pipeline PR
+#444" for the heartbeat removal — it is **Crazz-Org/SPO-WebClient PR #444**, and it checked both
+repos to say so. And drafting #480 meant reproducing the flake rather than citing it, which turned
+up a **second, more frequent one nobody had recorded**: under 4× parallel full-suite load, 14 runs
+of `test/lock.test.js` failed `watchLock: fires onLost once…` **4 times** and the known SIGTERM
+test **once**. The rarer of the two was the only one the project knew about.
+
 **Still open, in the order they will bite:**
 
 - **A successful unpark scan journals nothing**, so "is the retry channel alive?" is unanswerable
@@ -704,6 +722,32 @@ shared killswitch, and it is worth doing **before** 5.1/5.2 touch `board.js` and
   dashboard are the natural surfaces.
 - **`test/lock.test.js`'s SIGTERM lock-release flake** is still there, ~1 run in 6–10 under load.
   It did not fire during C5's verification rounds, but it once scored a surviving mutant as killed.
+
+## The follow-up pass, 2026-09-01 — five things C5 itself got wrong
+
+C5 shipped, and the first live cycle on the new code exposed a defect in the observability C5 had
+just added. `spo status` went from `238 failure(s), last 14h50m ago` to `no failures recorded` on
+issue-213 and issue-428, because action 5.1b's reconciler appended one `reconciled-externally`
+line and the failure-streak walk broke on it. **The outage indicator became an all-clear**, on a
+channel nothing had proven healthy — the same class as the backoff-skip bug that walk already
+carried a comment about, one layer out. Two exceptions in a row is the signal to stop enumerating
+what does not end a streak and name what does: it now breaks only on a park cycle ending, or on
+positive proof the scan worked.
+
+Four more, from verification notes C5 had accepted at the time and should not have:
+
+- **A nightly that FAILED was downgraded RED → ORANGE** by the very fact that nobody had run it
+  since. Staleness qualifies a PASS; it must never soften a RED.
+- **The verdicts tile's staleness is removed** — unrequested scope on an unmeasured threshold.
+  Measured afterwards against the real 493-file `~/.spo-bench/verdicts`: ordinary weekday gaps run
+  up to **15.6h**, so a 36h clock fires on any quiet weekend. The nightly's 36h means something
+  because a nightly is scheduled; verdicts are push-driven.
+- **The other half of 5.4's double-count**: a backoff entry was still folded into `queue depth`.
+- `collectDaemonStats` no longer throws on a non-array.
+
+The lesson is the one C5 already wrote down, arriving one more time: **run it against the real
+thing.** Four of the seven actions shipped a wrong derived number the suite passed green, and this
+sixth one was caught by the production journal within minutes of deploying.
 
 **Two habits C5 would keep:**
 

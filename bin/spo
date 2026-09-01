@@ -396,6 +396,20 @@ function collectBackoffEntries(queueDir) {
 //     of the last failure and says what it can and cannot mean, instead of claiming a card is
 //     failing. Making a success legible is filed separately; do NOT close the gap by adding a
 //     heartbeat event, one was deliberately removed (PR #444).
+// The two, and only two, kinds of event that end the failure streak below.
+//
+// A park cycle ENDING or RESTARTING: `parked` is a fresh park, so the previous cycle's failures
+// belong to a park that no longer exists (this is why issue-385 correctly reports 8 failures
+// where issue-213 reports 238, on the same outage); `unparked-by-maintainer` and
+// `abandoned-by-maintainer` are the two ways a human ends one.
+const PARK_CYCLE_ENDING_EVENTS = new Set(['parked', 'unparked-by-maintainer', 'abandoned-by-maintainer']);
+
+// Or POSITIVE EVIDENCE that the scan itself succeeded. A successful scan that matches nothing
+// journals no event at all (park-loop.js's unparkScan just `continue`s), so these two are the
+// only lines a working scan ever leaves behind: it paginated to its bound, or it found a comment
+// and rejected the author. Either one proves `gh` answered.
+const UNPARK_SCAN_SUCCESS_EVENTS = new Set(['unpark-scan-truncated', 'unpark-scan-ignored-author']);
+
 function computeUnparkScanFailureStreak(lines) {
   let count = 0;
   let firstFailedAt = null;
@@ -403,8 +417,19 @@ function computeUnparkScanFailureStreak(lines) {
   for (let i = lines.length - 1; i >= 0; i--) {
     const ev = lines[i];
     if (!ev) break;
-    if (ev.event === 'unpark-scan-backoff-skip') continue; // part of the same outage, not a recovery
-    if (ev.event !== 'unpark-scan-failed') break;
+    // The walk breaks ONLY on the two named sets above -- a park that ended, or proof the scan
+    // worked. Everything else is ignored, including events that merely happen to be newer.
+    //
+    // Measured live, an hour after this shipped: action 5.1b's reconciler appended one
+    // `reconciled-externally` line to issue-213 and issue-428 on the daemon's first cycle, and
+    // this line went from "238 failure(s), last 14h50m ago" to "no failures recorded". The 238
+    // failures had not gone anywhere -- an unrelated event landed after them, the walk broke on
+    // it, and an outage indicator became an all-clear about a channel nothing had proven healthy.
+    // Same class as the backoff-skip bug this walk already carries a comment about, one layer
+    // out. Two exceptions in a row is the signal to stop enumerating what does NOT end a streak
+    // and name what does.
+    if (PARK_CYCLE_ENDING_EVENTS.has(ev.event) || UNPARK_SCAN_SUCCESS_EVENTS.has(ev.event)) break;
+    if (ev.event !== 'unpark-scan-failed') continue;
     count += 1;
     if (lastFailedAt === null) lastFailedAt = ev.ts || null;
     firstFailedAt = ev.ts || firstFailedAt;
@@ -421,7 +446,14 @@ function cmdStatus(opts) {
   const queueDepth = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length : 0;
   const backoffEntries = collectBackoffEntries(queueDir);
 
-  console.log(`queue depth: ${queueDepth}`);
+  // Action 5.4 item B named the double-count as "queue depth + active" and closed the `active`
+  // half. This closes the other one: a card in an auto-retry backoff is not queued WORK -- nothing
+  // will pick it up until its `notBefore` passes -- so folding it into `queue depth` makes the
+  // queue look busier than it is at exactly the moment a maintainer is asking why nothing is
+  // moving. It is counted once, under `backoff:` on the summary line, with its own row.
+  const readyDepth = queueDepth - backoffEntries.size;
+  const backoffNote = backoffEntries.size > 0 ? `  (+${backoffEntries.size} in backoff, counted below)` : '';
+  console.log(`queue depth: ${readyDepth < 0 ? queueDepth : readyDepth}${backoffNote}`);
 
   // C: bench queue depth. Read-only, never a crash on an absent ~/.spo-bench (a dev box may
   // have none at all -- see collectBenchQueueDepth's own comment).
