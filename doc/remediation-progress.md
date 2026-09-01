@@ -861,3 +861,239 @@ sixth one was caught by the production journal within minutes of deploying.
 **Nothing is in flight.** Queue empty, no open PRs from C5's own work, no worktrees left behind.
 Merging this needs a `git pull` in `/home/crazz/SPO-Pipeline` to reach the daemon — the merge alone
 deploys nothing, and the pull SIGTERMs any in-flight card.
+
+## C6's own measurement — the funnel re-derived, 2026-09-01
+
+C6 is the first chantier whose premise is measurable, because C5 shipped `duration_s` on every
+`llm-call` and the corpus now holds two cards that carry it. Measured before building anything,
+per the habit C3–C5 established. **The plan's funnel argument is wrong in its inputs, right in its
+conclusion, and silent about the two things that actually bound K.**
+
+### The plan's gate figure is correct. Its denominator is not.
+
+The plan says: "at ~2.5 min per gate against **30–45 min of LLM work per card**, K=3 workers target
+~3× throughput".
+
+| quantity | plan | measured | source |
+|---|---|---|---|
+| gate service time | ~2.5 min | **mean 151.3 s** (p50 130.5, p90 212.2, max 239.9) | n=23 real `npm run gate` spawns across 20 journals |
+| LLM work per card | 30–45 min | **6.7 min** (#473) / **10.3 min** (#475) | the only two cards with `duration_s` |
+
+So the gate number is right to within a second, and **the model-time denominator is overstated by
+3–6×**. Three LLM calls per card, not the dozen the plan's figure implies: PLAN (fable), IMPLEMENT
+(sonnet), VALIDATE (fable). DIAGNOSE and CITATION_VERIFIER cost nothing on a green card because
+they never run.
+
+### But model time is the wrong denominator too, and re-derived properly the conclusion survives
+
+A serialized resource's utilisation is set by the card's **cycle time**, not by the part of the
+cycle that happens to be model work. Full decomposition, from `transition` events (seconds):
+
+| phase | #473 | #475 | what it is |
+|---|---|---|---|
+| WORKTREE | 16.7 | 20.5 | fetch, `worktree add`, `npm ci` (11.9/14.7), `board:take` |
+| PLAN | 133.2 | 264.1 | LLM (fable) |
+| IMPLEMENT | 169.4 | 264.8 | LLM (sonnet) |
+| CHECK | 95.3 | 91.0 | typecheck 43.9/42.4 + lint 16.9/16.9 + coverage 32.5/31.9 |
+| PUSH_PR | 5.8 | 4.9 | commit, push, `gh pr create` |
+| **GATE** | **127.0** | **165.9** | **the serialized bench** |
+| CI_CHECKS | 60.6 | 0.6 | GitHub check-run polling |
+| VALIDATE | 104.0 | 92.8 | LLM (fable) |
+| MERGE | 177.4 | 149.3 | `gh pr merge` + **`npm run pr:wait`** (173.5/145.1) |
+| FINISH | 4.4 | 4.1 | board move, comment, worktree remove |
+| **total** | **893.8 (14.9 min)** | **1058.0 (17.6 min)** | |
+
+Median wall clock over all 13 cards that ran without parking: **20.7 min**.
+
+Bench load per card = mean gate 151.3 s × mean gates/card 1.2 (24 gates / 20 cards) = **181.6 s**,
+against a ~976 s card: **18.6 % of a card per worker**, not the 5.5–8 % the plan's ratio implies.
+
+    rho_bench(K=2) = 37 %     rho_bench(K=3) = 56 %
+
+M/D/1 mean queue wait `rho*S/(2(1-rho))`: **+44 s per gate at K=2** (+4.5 % per card), **+96 s at
+K=3** (+10 %). So the bench still does not saturate at K=3 — **but with about half the headroom the
+plan believed.** The plan reached a sound conclusion through a wrong number: it understated the
+gate's share of a card and overstated the card's length, and the two errors pointed the same way
+and partly cancelled.
+
+### Three things the funnel does not model, all measured
+
+**1. The bench worker is co-resident on this 8-core box.** `~/.spo-bench/worker.json` → pid 270,
+`node dist/e2e/bench/worker.js`, repo `/home/crazz/SPO-WebClient`, port 8080, up since 2026-08-28;
+`nproc` = 8. "The bench serializes itself" is true and incomplete: its 123–161 s of work is **local
+CPU on the same machine as the K workers**, competing with each card's CHECK (93 s of
+typecheck+lint+coverage) and `npm ci`. Action 6.4's mutex covers WORKTREE-setup and
+FINISH-teardown only. **Gate service time is therefore not independent of K, and every rho above is
+a lower bound.** It already varies without any parallelism: two gates on green code 90 minutes
+apart measured 125.0 s and 164.0 s (+31 %).
+
+**2. The nightly is a competing consumer of that same single worker.** `~/.spo-bench/done` (n=8):
+`ref` jobs 123/123/124/125/161 s, `nightly` jobs **213/213/232 s** — ~1.7× a gate. A nightly landing
+mid-batch is a ~220 s head-of-line block on whichever card gates next. The plan never names it.
+
+**3. A third of a card is pure GitHub I/O wait, and this — not the bench — is the strongest real
+argument for K>1.** `npm run pr:wait` alone is 149–177 s (15–20 % of the card); CI_CHECKS adds
+0.6–60.6 s. That time holds a worker slot and, today, an account, while consuming zero local CPU
+and zero tokens. Counting WORKTREE/PUSH_PR/FINISH with it, **41–55 % of a card is not an LLM call
+at all.**
+
+### The binding constraint is the account pool: 2 wide, 1 healthy
+
+`~/.claude-accounts/` holds exactly two accounts, `pool1` and `pool2`. At 13:42:05Z on 2026-09-01
+`state.json` read `pool1: {cooldownUntil: 18:06:40Z, usageLimitStreak: 2, lastUsageLimitAt:
+13:06:40Z}` — a 5-hour escalated cooldown. `spo status` agrees: `pool1 cooling, 4h22m remaining`.
+All nine LLM calls across #471, #473 and #475 ran on `pool2`. That 13:06:40Z limit appears in **no
+journal at all** — it fell in an intake step, which is #477's gap; the pool state file is the only
+record it happened.
+
+6.2 gates K on healthy accounts. So on this machine **K=3 is not reachable, K=2 is the ceiling, and
+K=1 is a routine state rather than an edge case.** Gate C6's "shadow K=3 with one healthy account"
+is fine as written (it is shadow); its "supervised parallel batch of 2 S-sized cards" needs two
+healthy accounts and must not be requested while pool1 is cooling.
+
+**C6's target should be stated as K=2, with K=3 shadow-tested — not "K=3 targets ~3×".**
+
+### `accounts.pick()` is deterministic first-fit, which is a stronger case for 6.2 than the plan makes
+
+`pick()` returns **the first enabled, non-cooling account in registry order**. No rotation, no
+lease, no load awareness. The plan names `markLimit`'s unlocked read-modify-write; that is the
+*second* bug. The first is that **two concurrent workers are handed the same account, every time**,
+until one of them limits it. A lease is not an optimisation here, it is the only thing standing
+between K workers and a self-inflicted usage limit.
+
+### The measurement that inverts 6.2: K=2 on a 2-account pool has zero rotation headroom
+
+This is the finding that changes an action rather than its framing, and it only appears if you
+count mid-card account limits in the corpus rather than reasoning about the pool's size.
+
+**Three of twenty cards (15 %) hit a usage limit mid-run and rotated out of it**, journalled as
+`account-cooldown`:
+
+| card | step | when |
+|---|---|---|
+| #201 | PLAN | 2026-08-30 16:37:14Z |
+| #385 | PLAN | 2026-08-29 19:49:31Z |
+| #385 | PLAN | 2026-08-30 20:00:42Z |
+| #455 | VALIDATE | 2026-08-31 08:02:42Z |
+
+Every one on `pool1`. Every one rotated to `pool2` and continued — **`all-accounts-cooling` has
+never once been parked, in 20 cards.** #471 is the documented case: limit on `pool1`, rotation to
+`pool2`, review finished **6 seconds later**.
+
+That worked because the daemon is single-threaded, so the second account was always idle. **At K=2
+on a 2-account pool it is not idle — the sibling worker holds it.** Under 6.2 as written ("the
+worker leases the next healthy unleased account, parks `all-accounts-cooling` only when none
+exists"), card A limits on `pool1`, finds `pool2` leased by card B, and **parks**. Its plan, its
+worktree and its PR are lost until a retry.
+
+So 6.2 as specified converts a **15–20 %-frequency, 6-second, zero-cost event into a park class
+that has never fired in the project's history.** That is a regression C6 would introduce, and it is
+measured, not modelled.
+
+It also makes the lease granularity a live question rather than a preference. At `K <= healthy
+accounts` the two designs are identical *until an account cools*, which is exactly when they
+diverge:
+
+| | card A limits mid-run at K=2 |
+|---|---|
+| **per-task lease** (plan as written) | A parks `all-accounts-cooling`; ~15–20 % of cards |
+| **per-step lease + bounded wait** | A waits for B's current step (median LLM step ~2 min), takes the account, continues |
+
+And the load itself changes: two workers on two accounts drive each account at roughly the serial
+rate but twice as often overall, so usage limits should be expected **more** frequently at K=2,
+not less. The 15 % figure is a floor.
+
+### Accounts are already leased per STEP, and rotating between steps costs no prompt cache
+
+`callLlmStep` (`orchestrator/state-machine.js:97`) calls `accounts.pick()` on **every LLM step**,
+not once per task. And a card's three calls run `fable -> sonnet -> fable`, so **there is no
+cross-step prompt cache for a rotation to lose**: the 0.4–1.6 M `cacheReadTokens` per call is
+intra-call reuse across 10–27 turns (4–8 turns/min), not carried between steps.
+
+This bears directly on 6.2's design. The plan's wording — "the worker leases the next healthy
+unleased account" — reads as a **per-task** lease. Per task, a 2-account pool hard-caps K at 2 and
+idles the pool for the 41–55 % of each card that is not an LLM call. Per step, K=3 stays viable on
+2 accounts, blocking only inside LLM steps. **Measured, per-step leasing costs nothing in cache
+terms.** This is a design choice with a measured price and it should be settled before 6.2 is
+built, not discovered inside it.
+
+### 6.5's counter: what the corpus says, and what it cannot say
+
+**The corpus contains zero `main-moved` events.** Not one, across all 20 journals. The plan already
+says 6.5's default of 2 is "a tunable with no journal evidence"; that is confirmed, and the reason
+is structural rather than lucky.
+
+For every card, the number of foreign merges that landed on `origin/main` inside its own window:
+
+| card windows | live cards (window <= 95 min) | parked cards (window 6 h – 2.7 d) |
+|---|---|---|
+| n | 13 | 7 |
+| foreign main merges | **0, in all 13** | 1–22 |
+
+**0 main moves across 341 minutes of live card time.** The nonzero counts all belong to cards
+sitting *parked* for days, which is not a card running. The cause is that today the pipeline is the
+only writer of main during its own runs — the daemon is single-threaded, so it never merges while
+another card is live, and the maintainer's hand-made PRs cluster in maintainer sessions.
+
+**Which means K workers do not merely expose the main-moved path — they create it.** In steady
+state each of the other K−1 workers merges once per card cycle, so over one card's own window the
+expected number of sibling merges is exactly **K−1**. The plan's default of 2 lands on the right
+number *only at K=3*, and by coincidence of the K it chose.
+
+The re-gate-forcing exposure is narrower than the full card — GATE-start to merge, 7.8 min of 14.9
+(#473) and 6.8 min of 17.6 (#475), i.e. 39–52 % of the cycle. **And a sibling merge only counts if
+it touches a file the card touches**: `realCiChecks` (`orchestrator/steps/scripted.js:1717`)
+computes `filesBranch.some(f => filesMain.has(f))` over `baseMain..origin/main` vs
+`origin/main...HEAD`. So the counter increments on *intersecting* moves, not on moves.
+
+Measured over the 18 merged pipeline PRs, pairwise: **16 of 153 card pairs (10.5 %) share at least
+one file.** The overlap is concentrated in the few large cards — #213 (20 files) appears in 5 of
+the 16 pairs, #418 in 5 — while the median card touches 2–4 files and intersects nothing.
+
+Taking sibling merges as Poisson with `lambda = (K-1) x exposure x 0.105` (conservative: real
+sibling merges are quasi-periodic, so they cluster *less* than Poisson):
+
+| | K=2 (lambda 0.041–0.055) | K=3 (lambda 0.082–0.109) |
+|---|---|---|
+| one intersecting sibling merge → re-gate | 4.0–5.3 % of cards | 7.9–10.3 % |
+| **two** → park `main-moved-twice` under today's boolean | **0.08–0.15 %** | **0.33–0.56 %** |
+
+**So 6.5's counter does not need raising.** Today's boolean already parks fewer than 1 card in 178
+at K=3 and fewer than 1 in 650 at K=2. The plan's default of 2 is defence against an event its own
+file-intersection test makes ~10× rarer than a bare merge count suggests. This is a derivation from
+a measured cycle decomposition, a measured file-overlap rate and a stated arrival model — **it is
+not journal evidence, and none can exist until K>1 has run.** The honest form of 6.5 is therefore:
+make the counter configurable (so the number is arguable rather than compiled in), **leave the
+default at today's 1**, and write the derivation next to it instead of a confident comment around
+a 2. The measured re-gate churn the plan's funnel warns about is ~4–10 % of cards, not "every
+FINISH sends K-1 cards back through CHECK→GATE".
+
+### What this changes for C6
+
+- Build for **K=2**, shadow K=3. Do not restate the "~3×" target.
+- **6.2 must settle per-step vs per-task leasing** before it is built. Per-step is free in cache
+  terms and is the only one of the two that does not turn a 15–20 %-frequency rotation into a
+  park. **This is a maintainer decision — it changes what the plan's own sentence says.**
+- **6.4's mutex is sized for the wrong contention.** `npm ci` is 12–15 s; CHECK is 93 s and the
+  bench's own 123–161 s runs on the same 8 cores. Whether CHECK needs admission control is
+  unmeasured and only a real K=2 batch can answer it.
+- **6.5's GATE timeout** must cover `K x` gate service *plus* a possible ~220 s nightly ahead of it
+  in the queue. This, not the counter, is 6.5's real content.
+- **6.5's counter: recommend leaving the default at 1** and making it configurable. See above.
+- `duration_s` (#478) is the instrument this whole section had to be hand-derived from. Rendering
+  it turns every future funnel question into one command.
+
+### The two decisions C6 put to the maintainer, settled 2026-09-01
+
+- **6.2 lease granularity: per-step lease + bounded wait.** A worker leases an account for one LLM
+  step and releases it after; on a mid-run cooldown it waits for a sibling's step to finish rather
+  than parking. This is an erratum to the plan's own sentence ("the worker leases the next healthy
+  unleased account"), on the measurement above: per-task leasing converts a 15 %-frequency,
+  6-second rotation into a park class that has never fired in 20 cards, and per-step leasing costs
+  nothing in cache because a card's models are `fable -> sonnet -> fable`.
+- **6.5 merge policy: accept explicitly, the nightly is the backstop.** No MERGE admission token
+  (measured +42 s/card at K=2 and it does not fix the semantics it would be built for — B still
+  merges never having been gated against A), and no widening of the main-moved test from file
+  intersection to bare movement. **The counter becomes configurable and its default stays at
+  today's 1**, with the derivation written next to it. Revisit only if a nightly catches a
+  cross-card regression.
