@@ -11,6 +11,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator requires directly below.
+// This file was one of the two that measurably still leaked a handful of real spawns despite
+// being "every spawn here is a fake" by convention (see the two HANDLERS.DIAGNOSE/VALIDATE(ctx2)
+// fixes below) -- this require is the backstop for the next one.
+require('./no-real-spawn');
+
 const {
   realWorktree,
   realCheck,
@@ -2004,8 +2012,13 @@ test('prepareJudgeInputs: DIAGNOSE entered from GATE with gate.log unproducible 
 
   // Also exercised through the full handler, gated on isRealMode + ctx.cameFrom exactly as
   // state-machine.js's handleDiagnose wires it -- proves the wiring, not just the unit.
+  // handleDiagnose reads ctx.deps (not a passed-in argument), so the same spawnSync stub above
+  // has to be threaded onto ctx2 explicitly -- without it this call falls through to buildCtx's
+  // `deps: (config && config.deps) || {}` default and reaches the REAL spawnSync (measured: this
+  // exact call was one of test/no-real-spawn.js's two escaping-file findings).
   const ctx2 = testCtx({ id: 'card-judge-gate-missing-2', task: { ...task, id: 'card-judge-gate-missing-2' }, config });
   ctx2.cameFrom = 'GATE';
+  ctx2.deps = deps;
   return assert.rejects(
     () => HANDLERS.DIAGNOSE(ctx2),
     (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'DIAGNOSE'
@@ -2098,7 +2111,12 @@ test('prepareJudgeInputs: VALIDATE where the diff cannot be produced -- parks ju
   // at all, so a real attempt to call callLlmStep would blow up on accounts.pick(), not just on
   // a park; the fact this rejects cleanly with judge-inputs-missing proves prepareJudgeInputs
   // runs, and short-circuits, before that ever happens.
+  // handleValidate reads ctx.deps (not a passed-in argument) for both its moveCard('VALIDATE')
+  // call and prepareJudgeInputs -- without threading the same stub onto ctx2, both fall through
+  // to the REAL spawnSync (measured: this exact call produced two of test/no-real-spawn.js's
+  // five escaping real spawns, a real `npm run board:move` and a real `git rev-parse HEAD`).
   const ctx2 = testCtx({ id: 'card-judge-validate-missing-2', task: { ...task, id: 'card-judge-validate-missing-2' }, config });
+  ctx2.deps = deps;
   await assert.rejects(
     () => HANDLERS.VALIDATE(ctx2),
     (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'VALIDATE'

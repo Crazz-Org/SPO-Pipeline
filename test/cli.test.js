@@ -53,6 +53,10 @@ test('spo resume <task-id> lists recorded LLM steps as claude --resume commands,
   const path = require('path');
   const taskDir = path.join(journalDir, 'resume-demo');
   fs.mkdirSync(taskDir, { recursive: true });
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator require(s) below.
+require('./no-real-spawn');
   const { appendEvent } = require('../orchestrator/journal');
   appendEvent(taskDir, 'PLAN', 'llm-call', {
     step: 'PLAN',

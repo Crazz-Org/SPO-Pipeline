@@ -12,6 +12,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator require directly below.
+require('./no-real-spawn');
+
 const { classifyCommand, classTimeoutMs, isSpawnTimeout, armTimeout } = require('../orchestrator/command-timeout');
 const { timeoutResult, mkTmp } = require('./helpers');
 
@@ -54,22 +59,46 @@ test('classTimeoutMs: a malformed SPO_TIMEOUT_*_MS override degrades to "no clas
   assert.equal(classTimeoutMs({ commandTimeoutsMs: { gh: Infinity } }, 'gh'), undefined);
 });
 
-test('moveCard/postParkComment: a malformed timeout override never throws -- the REAL spawnSync, no injected stub', () => {
-  // Deliberately uses the real child_process.spawnSync (no deps.spawnSync): the throw under test
-  // is spawnSync's OWN option validation, which a stub would hide entirely.
+test('moveCard/postParkComment: a malformed timeout override never throws', () => {
+  // Once classTimeoutMs's own guard is in place (see its "a malformed SPO_TIMEOUT_*_MS override"
+  // test above), a NaN/negative/fractional commandTimeoutsMs entry degrades to "no class default"
+  // BEFORE it ever reaches spawnSync's opts -- so the real spawnSync's option-validation throw
+  // this test originally meant to dodge is never actually reached at all: with no `timeout` key
+  // in opts, moveCard/postParkComment fall through to an ordinary, un-timed spawn. That ordinary
+  // spawn is still a REAL `npm run board:move` / `gh issue comment`, which is exactly the class
+  // test/no-real-spawn.js exists to catch -- so this test injects deps.spawnSync like every other
+  // caller in this suite, and asserts doesNotThrow purely over the malformed-config path (the
+  // option-validation guarantee itself is already pinned, directly, by classTimeoutMs's own
+  // tests above).
   const { moveCard } = require('../orchestrator/board');
   const { postParkComment } = require('../orchestrator/park-loop');
   const badConfig = { ghRepo: 'x/y', commandTimeoutsMs: { gh: NaN, 'npm-run': NaN } };
+  // The stub ASSERTS on opts rather than ignoring it, and that assertion is the whole point of
+  // the test: with a plain `() => ok('')` stub, a regression where armTimeout reads
+  // config.commandTimeoutsMs directly instead of going through classTimeoutMs's guard survives
+  // the entire suite green -- and that regression hands `timeout: NaN` to the real spawnSync,
+  // which throws ERR_OUT_OF_RANGE synchronously inside moveCard/postParkComment, the two
+  // functions this repo documents as "never throws", both reached from finalizePark. Pinning
+  // classTimeoutMs's guard in isolation (the test above) does not pin the composition.
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      assert.ok(
+        !(opts && 'timeout' in opts),
+        `a malformed override reached spawnSync's opts: timeout=${opts && opts.timeout}`
+      );
+      return ok('');
+    },
+  };
 
   const taskDir = mkTmp('ct-move-');
   const worktreePath = mkTmp('ct-wt-');
   assert.doesNotThrow(() =>
-    moveCard({ task: { issue: 4321, worktreePath }, taskDir, config: badConfig }, {}, 'GATE')
+    moveCard({ task: { issue: 4321, worktreePath }, taskDir, config: badConfig }, deps, 'GATE')
   );
 
   const parkDir = mkTmp('ct-park-');
   assert.doesNotThrow(() =>
-    postParkComment({ task: { issue: 4321 }, taskDir: parkDir, config: badConfig }, {}, {
+    postParkComment({ task: { issue: 4321 }, taskDir: parkDir, config: badConfig }, deps, {
       reason: 'x',
       detail: 'y',
       lastState: 'GATE',

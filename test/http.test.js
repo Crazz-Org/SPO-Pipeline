@@ -26,6 +26,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const https = require('https');
 
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator require(s) below.
+require('./no-real-spawn');
 const { httpRequest } = require('../orchestrator/http');
 
 // Self-signed fixture cert/key, CN=localhost, SAN DNS:localhost + IP:127.0.0.1, valid 2026-2036.
