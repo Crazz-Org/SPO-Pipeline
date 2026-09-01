@@ -5,9 +5,11 @@ This file is what the plan *turned out to be* once executed: what is done, what 
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
 
-**State as of 2026-08-31.** `main` = `fe3c88a` (C3 merged as PR #63, the comment-scan hotfix as
-PR #64). Suite **894 passing, 0 failing**. Daemon + dashboard **running** in `--real`; the C3 soak
-is in progress — see § The 24h soak below before touching anything.
+**State as of 2026-09-01.** `main` = `a68a0b9` (C3 merged as PR #63, the comment-scan hotfix as
+PR #64, the C3 handoff as PR #65). C4 is complete on
+`claude-crazz/spo-pipeline-chantier-4-ae2fb6`, seven commits, **not yet merged**. Suite **1032
+passing, 0 failing** (894 at the start of C4). Daemon + dashboard **running** in `--real`; the C3
+soak has held for 9h+ — see § The 24h soak below before touching anything.
 
 ## Progress
 
@@ -15,10 +17,11 @@ is in progress — see § The 24h soak below before touching anything.
 |---|---|
 | **C1** — truthful judges | **DONE**, gate green (live card #462) |
 | **C2** — daemon robustness + live harness | **DONE**, gate green (live recette #469) |
-| **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running now** |
-| C4–C7 | not started |
+| **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
+| **C4** — correct remediation loops | **DONE, not merged**; branch `claude-crazz/spo-pipeline-chantier-4-ae2fb6` |
+| C5–C7 | not started |
 
-Tests: 454 (plan baseline) → 759 (end of C2) → **892** (end of C3).
+Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → **1032** (end of C4).
 
 ## C3 commits (one per action, in order)
 
@@ -32,6 +35,107 @@ Tests: 454 (plan baseline) → 759 (end of C2) → **892** (end of C3).
 | 3.7 | `2114b8c` | docs only, per maintainer decision — no cap restored |
 
 Plus, outside the plan, the hotfix the soak immediately forced: `5a6d69a` (`gh api` `-f` is a POST).
+
+## C4 commits (one per action; 4.6 and the abandon follow-up are not in the plan)
+
+| action | commit | what it does |
+|---|---|---|
+| 4.1 | `c1139ea` | a main-moved merge commit is no longer read as "nothing to commit" at PUSH_PR |
+| 4.5 | `9d18c84` | ABANDONED cleans up after itself (worktree, branches, PR) and is visible everywhere |
+| 4.3 | `db413bd` | classify a CI failure on the failing STEP, not the job name; budget the CI-driven IMPLEMENT retry |
+| 4.2 | `421e83a` | route a GATE failure on what the bench actually attested |
+| 4.6 | `4f68385` | the retry's remote-branch delete no longer destroys an open PR |
+| — | `e25e50e` | the same preservation applied to `abandon`, which 4.6's verification caught disagreeing with `retry` |
+| 4.4 | `9cf47f2` | bounded auto-retry for a closed allowlist of transient parks |
+
+## C4's corrections to the plan
+
+Five more specified behaviours were wrong, and every one was caught by running it against the
+real corpus before building it — none by review. The pattern from C3 held exactly.
+
+- **4.1's condition was wrong.** The plan says `commit exit != 0` + clean tree + `HEAD !=
+  origin/main` → skip the commit and push. Measured against issue-213 run 1: it created its PR at
+  19:23:03 and parked `commit exit 1` at 19:38:02 with `HEAD != origin/main`, because the branch
+  already carried its first-pass commits. That rule would have pushed a no-op and re-gated a
+  byte-identical sha, looping DIAGNOSE→IMPLEMENT until the diagnose budget parked it anyway. The
+  real discriminator is whether origin already has this tip (`HEAD` vs `origin/<branch>`).
+- **4.2's pre-check is answered, and it inverts the action.** The bench DOES write a verdict for a
+  failed run — but `SPO-WebClient/src/e2e/bench/worker.ts` assigns `report.baseMain` only AFTER
+  `prepareRef`, and `prepareRef` is what detects "does not merge cleanly with origin/main". So
+  `baseMain` is absent in *exactly* the case 4.2 exists to catch, and the plan's "derive baseMain
+  and intersect the file lists" cannot run there at all. Measured over the 375 real `ref`-type
+  gates in `~/.spo-bench/verdicts`: 359/359 PASS carry `baseMain`, 14/16 FAIL do, and the 2 that
+  don't are the conflicts. One is `379ada60` — issue-439's own gate, written 1.7s before it
+  exited 1, and its DIAGNOSE attempt 2 says so in prose.
+- **The intersection test is not needed at GATE at all.** The bench merges `origin/main` itself,
+  so a FAIL that carries `baseMain` already failed *with main in the tree*. It is a real failure
+  and belongs to a judge.
+- **4.3's cause table had never fired, once.** `Coverage of changed lines` / `Lint` / `PR rules`
+  are STEP names inside ci.yml's `verify` job; `gh api .../check-runs` only ever returns JOB
+  names (`typecheck + tests`, `claude review`, `analyze`, `CodeQL`, `label`, `release`, `orphan
+  watch`, `Dependabot`). Every CI failure the pipeline has ever seen fell through to DIAGNOSE.
+  Recoverable because **`check_run.id` IS the Actions job id** — verified on six real failed runs,
+  which return exactly the names the audit wrote the table against.
+- **4.4's allowlist named a park reason that does not exist.**
+  `llm-transport-failed:CITATION_VERIFIER` is never thrown; `handleValidate` routes that to
+  `citation-verifier-failed` deliberately.
+
+Also measured and deliberately NOT built, because the evidence refused it: an ignore-list for
+repo-level CI checks. `Release` and CI's `push` trigger are both `branches: [main]`, so on a
+`claude-pipe/<id>` head sha only `pull_request`-triggered runs appear.
+
+## What C4's verification found (the loop is still earning its cost)
+
+Every action had a real defect or a serious coverage gap. Three were again *the fix creating the
+bug it was preventing*, and one was a live-world side effect nobody had noticed:
+
+- **The suite was writing to the live product repo.** `finalizePark` in real mode with no injected
+  `deps` falls back to the real `spawnSync`, and `ghRepo` defaults to `Crazz-Org/SPO-WebClient`,
+  so `postParkComment` ran `gh issue comment` for real — 140 fabricated "Pipeline parked" comments
+  on issue #1 in one night, four per full-suite run across every mutation round. `test/helpers.js`
+  isolates `spo` SUBPROCESSES; nothing isolated an in-process call. Fixed file-locally in
+  `9cf47f2` (that file went from 15.9s to 0.31s — the gap was all network); **the repo-wide guard
+  and the second, untraced leaking file are still open.**
+- **`spawnStep` is not a plain call**, and two actions in a row shipped the same bug on it: it
+  retries a timed-out command once and then THROWS `ParkSignal('<class>-timed-out')`. 4.3's job
+  lookup, documented as "never parks", parked the card *before* `check-failed` was written —
+  erasing the record of the CI failure that `spo`, the dashboard and the judges all read. 4.2's
+  `merge --abort` could unwind past the `main-moved-conflict` park it was cleaning up for.
+- **4.5's cleanup inverted its own principle.** It skipped deleting a local branch it could not
+  vouch for, then deleted that same branch on the remote two blocks later, PR already closed.
+  `sweepWorktreeLeftovers` never had this hole because its rule 2 *throws*, making its own remote
+  delete unreachable; `abandonCleanup` deliberately never throws, so the mirror stopped exactly
+  where it mattered.
+- **4.4's queue write was two steps** — entry first, `transientRetries`/`notBefore` patched on
+  second. A death in that window (the post-merge hook SIGTERMs this daemon routinely) restarts the
+  card with the budget reset: the unbounded loop the budget exists to prevent. Now one atomic
+  write via temp file + rename.
+- **Mutation testing again found tests passing for the wrong reason**, at a rate that has not
+  fallen: 4/17, 8/24, 14/48, 8/37, 6/10, 4/26. The two most dangerous both looked fine: dropping
+  `--head <branch>` from 4.6's `gh pr list` (the lookup then answers with the repo's oldest open
+  PR on ANY branch, and that number goes to `gh pr close`), and replacing 4.6's `wip/<id>-<ts>`
+  with a constant ref name (a non-fast-forward deadlock no retry can clear).
+
+## Still open after C4
+
+- **142 test-generated comments on `Crazz-Org/SPO-WebClient` issue #1** (140 from 2026-08-31
+  23:16–23:30Z, 2 from 10:24Z from a different, untraced test file). All 142 are `### Pipeline
+  parked` artifacts; the issue had no genuine comments before them. Ids collected but not deleted.
+- **The repo-wide test-isolation guard** for in-process `gh`/`git` spawns (see above).
+- **`test/lock.test.js`'s SIGTERM lock-release test is flaky**, ~1 full-suite run in 6–10 under
+  load, pre-existing at `a68a0b9`. It matters because a flaky suite silently misreports a
+  surviving mutation as killed — which it did once, during 4.6's verification.
+- **`spo report` still uses `done + parked`** as its terminal denominator, so it now disagrees
+  with the dashboard that 4.5 fixed.
+- **`<class>-timed-out` reasons are not on 4.4's allowlist.** Probably they belong there, but each
+  timeout-prone call site needs an audit of what half-mutated state it can leave behind first, and
+  there is no corpus evidence yet — those reasons are themselves new.
+- **`main-moved-twice` is strictly more reachable**: `mainMoveUsed` is now shared between GATE and
+  CI_CHECKS, so a GATE-level merge spends the single budget.
+- **A card being auto-retried is double-counted** by `spo status` — once in `queue depth`, once as
+  active in its last state. A consequence of 4.4's design, not drift.
+- `wip/<id>-<ts>` is now built inline in three places. CLAUDE.md's own `gh api -f` story is about
+  exactly this shape of duplication.
 
 ## Corrections to the plan itself
 
@@ -124,25 +228,38 @@ on any `gh api` call site passing `-f`/`-F` without an explicit `--method`/`-X`,
 exempted. **Any future real-spawn smoke coverage should start here**, since this is the fifth
 production bug to pass a green hermetic suite.
 
-## The 24h soak — running, and what to check
+## The 24h soak — 9h+ held, and what to check
 
-Started **2026-08-31 ~21:53 CEST**, restarted once at ~22:0x when the handoff docs merged (the
+Started **2026-08-31 21:35 CEST**, restarted at **22:07:44** when the C3 handoff merged (the
 post-merge hook bounces the daemon, so **any merge resets this clock** — do not merge during a soak
-you care about). Baselines to diff against live in the session scratchpad, but the numbers that
-matter are here:
+you care about). At 2026-09-01 07:30 CEST, **9h23m in, all four numbers are unchanged.**
+
+Two things to know before reading a green soak as proof:
+
+- **`NRestarts` is a weak signal here.** systemd only counts *automatic* restarts; the post-merge
+  hook's explicit `systemctl restart` never increments it. `journalctl --user -u
+  spo-pipeline-daemon` is the honest record.
+- **Silence is ambiguous.** A *successful* unpark scan journals nothing, so "no new
+  `unpark-scan-failed`" reads identically to a dead scanner. Check positively: sample the daemon's
+  children (`ps --ppid $(systemctl --user show spo-pipeline-daemon -p ExecMainPID --value)`) over
+  ~90s and you should catch `gh api repos/.../issues/<n>/comments?per_page=100&page=1` — the
+  query-string GET, no `-f`. Done on 2026-08-31 at 22:40 for issues 213/385/428.
+
+The numbers that matter:
 
 | signal | value at soak start | pass condition |
 |---|---|---|
 | `unpark-scan-failed` (across all `journal/*/journal.jsonl`) | **1179** | **stays 1179.** Any growth = the scan is failing again |
 | daemon `NRestarts` | 0 | stays 0 — C2's hang-proofing is what makes an unattended soak possible |
-| `parked` events | 23 | no new ones without a card actually running |
+| `parked` events | **24** | no new ones without a card actually running. *(This row said 23 at handoff; the live count was already 24 and has stayed there. The newest park event is `2026-08-31T07:16:48Z`, 12.6h before the soak began — the discrepancy was a counting artifact, not a park. Don't chase it.)* |
 | `daemon.jsonl` lines | 135 | grows only with real cycle summaries, never spam |
 
 Measured immediately after the hotfix: **+0 spam over 3 minutes of cycles**, against +3/minute
 before it. That is the criterion the plan's "absence of journal spam" was asking for.
 
 `spo tokens` still reports `n/a` for every task: all 18 journals predate token capture (shipped
-2026-08-31). The first real card after this point is the first one with token data at all.
+2026-08-31), and **no card ran during the soak** — the queue stayed empty throughout, so C4 has no
+token data either. The first real card after this point is the first one with token data at all.
 
 ## Operational facts that cost time to learn
 
@@ -219,7 +336,8 @@ Two mechanisms the docs named turned out never to have existed at all: `BUDGET_B
 
 ## Current environment
 
-- Daemon + dashboard **stopped**; bench worker **running** (GATE needs it).
+- Daemon + dashboard **running** since 2026-08-31 22:07:44 CEST (the C3 soak); bench worker
+  **running** (GATE needs it).
 - Nothing in flight; queue empty.
 - Parked/abandoned cards holding product worktrees: **213** (`diagnose-duplicate-root-cause`),
   **385** (`prompt-missing-placeholder:citations`), **428** (`diagnose-duplicate-root-cause`),
@@ -229,10 +347,8 @@ Two mechanisms the docs named turned out never to have existed at all: `BUDGET_B
   park→retry-without-re-PLAN scenario pinned by `test/plan-resume.test.js` ✅ (notably the
   two-real-runs test, which exercises the production writer of `baseMainSha` rather than a
   hand-built journal). The 24h soak is **running** — see § The 24h soak.
-- **C4 anchors, re-resolved against `fe3c88a`** (the plan's line numbers date from the audit and
-  three chantiers have moved them): 4.1 `steps/scripted.js:879` (`realPushPr`, commit at `:892`);
-  4.2 `realGate` `:1031`, `realCiChecks` `:1102`, main-moved reuse at `:1187-1194`; 4.4
-  `spawnStep` `:212`, `claim-rate-limited` `:755`; 4.5 `park-loop.js:354` (ABANDONED write).
+- **C4 anchors are spent.** `steps/scripted.js` moved under four of C4's seven commits; re-resolve
+  from scratch for C5 rather than trusting any line number written before `9cf47f2`.
 - None of C3 has run against a real card yet. 3.2 changes `prompts/plan.md`, the live LLM contract,
   so the first real PLAN after merge is the one that proves `files_to_change` is emitted; until
   then the guard fails open and journals `plan-files-undeclared`. Grep that event before promoting
