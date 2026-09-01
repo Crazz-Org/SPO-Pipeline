@@ -287,6 +287,43 @@ way C5's own actions are the natural place to fix:
 | `abandon-*` (7 of them) | `abandonCleanup` (4.5) | `spo parked` shows the state, not the cleanup |
 | `leftover-remote-preserved`, `leftover-pr-closed` | `sweepWorktreeLeftovers` (4.6) | nobody |
 
+### Measured 2026-09-01, after the first live card — read this before writing 5.1
+
+**The happy path's board moves are proven, and the plan's framing of the gap is wrong.**
+
+Issue #471 entered 11 states and produced **6** `board-move` events:
+
+    WORKTREE -> Planning · IMPLEMENT -> Implementing · CHECK -> Checks & PR
+    GATE -> Gate · VALIDATE -> Validation · MERGE -> Merging
+
+That is not five missing moves. The columns are deliberately coarser than the states: "Checks &
+PR" covers CHECK+PUSH_PR, "Gate" covers GATE+CI_CHECKS. Two real gaps remain, and they are small:
+
+- **During CI_CHECKS the board says `Gate`.** The gate has finished; CI is what is running. On
+  #471 that was 41 seconds, but the in-flight poll is bounded at ~10 minutes.
+- **FINISH's move to `Done` is not journalled as a `board-move` event at all.** It happens (the
+  board shows Done) via FINISH's own board sync, so the journal cannot tell a maintainer when the
+  card reached Done, and any journal-vs-board reconciler that keys on `board-move` will read the
+  final transition as missing.
+
+**The three standing divergences are the journal being stale, NOT the board.** Measured:
+
+| issue | last pipeline `board-move` | GitHub issue closed | journal today | board today |
+|---|---|---|---|---|
+| 213 | 2026-08-29 21:08 → `Parked` | 2026-08-30 01:50 | `PARKED` | `Done` |
+| 428 | 2026-08-29 20:52 → `Parked` | 2026-08-30 07:20 | `PARKED` | `Done` |
+| 443 | 2026-08-30 13:17 → `Parked` | 2026-08-30 13:18 | `ABANDONED` | `Done` |
+
+In every case the pipeline moved the card to `Parked` correctly, a human then resolved it by hand
+outside the pipeline, and **nothing ever reconciled the journal**. So 5.1's premise — "missing
+board moves" — describes the wrong half of today's actual divergence. The board is right; the
+journal is three days stale. Whatever 5.1 builds, a *reconciler* that notices "the issue this task
+owns has been closed while the task sits PARKED" is the thing that would have fixed all three, and
+it is not in the plan.
+
+(#443 also raises a column question with no answer today: ABANDONED has no board column, so a
+human put it in `Done`.)
+
 Two C4 side effects that are squarely 5.4/5.5's problem, not follow-ups:
 
 - **A card being auto-retried is double-counted** by `spo status` — once in `queue depth`, once as
