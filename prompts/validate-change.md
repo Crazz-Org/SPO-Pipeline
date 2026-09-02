@@ -29,11 +29,13 @@ task's criterion, and does it sit coherently in the code it was inserted into?"*
 delegated surface that asks it, the last moment before the merge, the point the work actually
 leaves its isolation and lands in `main`.
 
-Effort is **high regardless of task size** — the mission is not proportional to diff size. The
-caller escalates you to Opus 5 when the diff touches the RDO wire (`src/shared/rdo-*`,
-`src/server/rdo.ts`, `rdo-members.ts`, session phases) or when Fable is unavailable — you never
-run as Sonnet 5: Sonnet is the executor, and a same-model judge tends to ratify precisely the
-misunderstandings its author had.
+Effort is **high regardless of task size** — the mission is not proportional to diff size. By the
+time you run, PUSH_PR has re-derived `task.touchesRdoMembers` from the real diff (specifically,
+whether `src/shared/rdo-members.ts` changed — not the fuller wire-rule set of
+`src/shared/rdo-*`/`src/server/rdo.ts`/session-phase code, which intake's own narrower check at
+card intake may also have caught from the issue text); the caller escalates you to Opus 5 on that
+flag or when Fable is unavailable — you never run as Sonnet 5: Sonnet is the executor, and a
+same-model judge tends to ratify precisely the misunderstandings its author had.
 
 ## Payload
 

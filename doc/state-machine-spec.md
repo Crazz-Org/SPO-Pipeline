@@ -114,7 +114,7 @@ be confused: `validate-reject N | reasons | outcome` (action 1.6).
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
 | PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 900000ms / 15min |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on the wire rule** (`src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases) or L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
+| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
 | DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
 | VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
@@ -130,6 +130,15 @@ the 900000ms figure above. There is no per-step or per-size USD budget: `maxBudg
 end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
+
+[^rdo-wire]: `task.touchesRdoMembers` (`intake.js:1174`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
+    stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
+    `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session-phase code — but only
+    detects a slice of it, and is set once at intake, before a plan exists. IMPLEMENT never sees
+    a rederivation against the plan or the real diff; PUSH_PR (`steps/scripted.js`) does
+    re-derive the flag from the real diff, but only for the literal file
+    `src/shared/rdo-members.ts`, and only in time to escalate the change-validator that follows
+    IMPLEMENT, not IMPLEMENT itself.
 
 Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 `--json-schema` for the payload, `--allowedTools`, `--model`, `--effort`,
@@ -153,7 +162,7 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:711`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:744-746`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`

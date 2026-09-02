@@ -87,24 +87,27 @@ const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE
 //                            change-validator (prompts/README.md), meaning "when Fable is
 //                            unavailable" -- this build has no way to detect that at the CLI
 //                            layer, so a task-level override flag stands in for it.
-//   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, the RDO wire rule (CLAUDE.md's
-//                            "the RDO wire ... src/shared/rdo-*, src/server/rdo.ts,
-//                            rdo-members.ts, session phases"). Per the spec's own Step
+//   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, standing in for the RDO wire rule
+//                            stated in SPO-WebClient/doc/kanban-workflow.md (not this repo's
+//                            CLAUDE.md, which has no RDO rule) -- "src/shared/rdo-*,
+//                            src/server/rdo.ts, rdo-members.ts, session phases". intake.js:1174
+//                            only detects a slice of that (area === 'rdo' or a literal
+//                            "rdo-members.ts" mention), once at intake, before a plan exists.
+//                            Per the spec's own Step
 //                            contracts table this applies to IMPLEMENT and to VALIDATE's
 //                            change-validator (its escalation is stated explicitly in the
 //                            prompt file validate-change.md itself, not just the table) --
-//                            NOT to PLAN. See the DIVERGENCE note on the PLAN entry below.
+//                            NOT to PLAN. See the note on the PLAN entry below.
 //   - 'lSize'             -- task.size === 'L', IMPLEMENT only ("... or L-sized task").
 const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
     baseModel: 'fable',
     escalatedModel: 'opus',
-    // DIVERGENCE: prompts/README.md's own step table reads "Fable 5 (Opus 5 on the wire rule
-    // or as fallback)" for PLAN -- but state-machine-spec.md's Step contracts row for PLAN
-    // reads only "Fable 5 (Opus 5 fallback)", with no wire-rule clause. The spec wins per the
-    // task brief, so PLAN escalates on the generic fallback flag only, never on
-    // task.touchesRdoMembers.
+    // prompts/README.md's own step table now agrees with state-machine-spec.md's Step
+    // contracts row for PLAN -- both read "Fable 5 (Opus 5 fallback only ... deliberately NOT
+    // PLAN)", no wire-rule clause (fixed in commit 0e84bac, which used to diverge from the spec
+    // here). PLAN escalates on the generic fallback flag only, never on task.touchesRdoMembers.
     escalatesOn: ['escalateFlag'],
     effort: 'bySize',
     // Spec + README table both say "Read, Grep, Glob, Bash(ro)" -- the "(ro)" is enforced by

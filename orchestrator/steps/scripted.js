@@ -193,7 +193,7 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
 // spawn error (those return to the caller exactly as before, unretried -- a caller's own routing
 // on exit codes is completely unchanged). Chosen to live HERE, at the single choke point every
 // real command already passes through, rather than as a per-call-site wrapper: duplicating a
-// retry policy at 48 call sites (or worse, at only some of them) is exactly the kind of drift
+// retry policy at every call site (62 and counting; or worse, at only some of them) is exactly the kind of drift
 // this file's own "one place every real command runs" design already exists to avoid, and every
 // caller already treats spawnStep's return as the final word on one command's outcome.
 //
@@ -1211,7 +1211,7 @@ async function realPushPr(ctx, deps = {}) {
   if (changed.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'diff-name-only', exit: changed.exit });
   const touchesCatalogue = splitLines(changed.stdout).includes('src/shared/rdo-members.ts');
 
-  // The diff is ground truth; intake.js:927 only ever infers touchesRdoMembers from the issue's
+  // The diff is ground truth; intake.js:1174 only ever infers touchesRdoMembers from the issue's
   // OWN TEXT (area === 'rdo' or a literal "rdo-members.ts" mention). Card #385 touched the
   // catalogue with neither, so this stayed false all the way through VALIDATE and
   // handleValidate's CITATION_VERIFIER step never ran. Correct it the moment the real diff

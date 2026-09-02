@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 'use strict';
-// spo -- reads ONLY the journals under journal/<id>/ (never its own state).
+// spo -- the read-only subcommands (status/task/parked/resume/tokens/reports) read ONLY the
+// journals under journal/<id>/ and never touch state.json. Several other subcommands DO write:
+// `account add`/`account sync-settings` mkdir and sync local settings; `account enable`/
+// `account disable` write marker files; `account clear-cooldown` rewrites state.json and appends
+// to daemon.jsonl; `dashboard` writes a file or binds a listener; `ask`/`pull`/`intake`/
+// `triage --file` file real GitHub issues; `recette` creates and deletes real issues, branches,
+// PRs and worktrees.
 //
 //   spo status              queue depth, bench queue depth (~/.spo-bench/spool,running), account
 //                            health + cooldowns, today's billable-weighted spend (with its own
@@ -122,8 +128,13 @@
 //                            "Intake" board column, and posts confirm/discard instructions. See
 //                            orchestrator/report-intake.js.
 //   spo reports [--reports-dir <dir>]
-//                            Lists what is waiting in <reports-dir>/pending/ for a maintainer's
-//                            "confirm"/"discard" reply -- the intake analogue of `spo parked`.
+//                            Lists everything in <reports-dir>/pending/ -- the intake analogue
+//                            of `spo parked`. NOT one population: a raw card can be there
+//                            awaiting its FIRST "confirm"/"discard" reply, already confirmed and
+//                            awaiting auto-triage, or HELD -- already triaged with a negative
+//                            verdict and restored to pending/ by auto-triage.js so a human still
+//                            sees it (never archived unseen). All three render identically; the
+//                            remedy differs per population.
 //   spo triage [--limit N] [--file]
 //                            Stage 3+: reproduces/routes/drafts every report already replied
 //                            "confirm" to, via orchestrator/intake.js's triageBugReport, then the
@@ -150,15 +161,19 @@
 //                            § Report intake.
 //   spo recette [--scenario <name>] [--keep] [--dry] [--force]
 //                            ACTION 2.9 -- the supervised live harness, and the standard live
-//                            gate this project uses from chantier 3 on: drives ONE trivial
-//                            synthetic `kind: "card"` task through the REAL pipeline
-//                            (config.real=true) against a dedicated, distinctly-labelled GitHub
-//                            issue in the product repo, under a wall-clock + LLM-step-count cap,
-//                            asserts the scenario's declared checks against the produced
-//                            journal, then cleans up unconditionally (worktree, branches, PR,
-//                            issue, its own isolated journal dir under .recette/) -- never the
-//                            live journal/queue. Refuses to run while a live daemon holds
-//                            journal/daemon.lock, unless --force. --dry prints the plan (no
+//                            gate this project uses from chantier 3 on: drives one or more
+//                            trivial synthetic `kind: "card"` task(s) through the REAL pipeline
+//                            (config.real=true) against dedicated, distinctly-labelled GitHub
+//                            issue(s) in the product repo, under a wall-clock + LLM-step-count
+//                            cap, asserts the scenario's declared checks against the produced
+//                            journal(s), then cleans up unconditionally (worktree(s), branches,
+//                            PR(s), issue(s), its own isolated journal dir under .recette/) --
+//                            never the live journal/queue. The default scenario (trivial-doc-log)
+//                            is ONE task against ONE issue; `parallel-doc-log`
+//                            (`driver: 'dispatcher', k: 2`) files TWO live issues and spawns a
+//                            real worker/scanner tree, not the single-issue single-process shape
+//                            this once described uniformly. Refuses to run while a live daemon
+//                            holds journal/daemon.lock, unless --force. --dry prints the plan (no
 //                            issue, no worktree, no LLM call, no side effect at all) and exits.
 //                            --keep skips cleanup, for debugging a run by hand. See
 //                            orchestrator/recette.js and orchestrator/README.md § Recette.
@@ -1120,7 +1135,7 @@ function cmdDashboard(opts) {
 // account -- see orchestrator/accounts.js): name, enabled, cooldownUntil (only shown while
 // actually cooling), whether an oauth-token file is present, and whether the account's
 // CLAUDE_CONFIG_DIR holds any credentials file of its own (anything besides oauth-token/
-// disabled). Same fields the dashboard's "Comptes Claude" section shows.
+// disabled). Same fields the dashboard's "Claude accounts" section shows.
 function cmdAccounts(opts) {
   const accountsDir = resolveAccountsDir(opts);
   const registry = accounts.readRegistry(accountsDir);
@@ -1503,9 +1518,12 @@ async function cmdIntake(opts, deps = {}) {
   if (result.errors.length > 0) process.exitCode = 1;
 }
 
-// `spo reports [--reports-dir <dir>]` -- lists what is waiting in <reports-dir>/pending/ (raw
-// cards already filed, awaiting a "confirm"/"discard" reply) -- the intake analogue of
-// `spo parked`. Reads only the filesystem, no `gh` call.
+// `spo reports [--reports-dir <dir>]` -- lists everything in <reports-dir>/pending/ -- the
+// intake analogue of `spo parked`. Reads only the filesystem, no `gh` call. Three populations
+// render identically here: awaiting a first "confirm"/"discard" reply, already confirmed and
+// awaiting auto-triage, and HELD (auto-triage.js restores a negative-verdict report to its
+// original pending/ path rather than archiving it unseen -- see processConfirmedReport's
+// `finally`).
 function cmdReports(opts) {
   const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
   const pendingDir = path.join(reportsDir, 'pending');

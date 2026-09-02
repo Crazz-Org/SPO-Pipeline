@@ -1,8 +1,11 @@
 'use strict';
 // console/usage-scan.js -- incremental, streaming token-usage scanner for the live dashboard's
 // "tokens per task/model" section. A SELECTIVE extraction of scripts/usage-report.js's file
-// walk + message.id dedup (that script is untouched -- it stays the offline analysis tool with
-// its own $$$ estimate; this module carries NO dollar figures at all, only raw token counts).
+// walk + message.id dedup (that script is untouched -- it stays the offline analysis tool).
+// Neither script carries a dollar figure anywhere: usage-report.js's own header records the
+// 2026-08-31 maintainer decision retiring its $$$ estimate (the pool is a Claude Max quota, not
+// metered API billing, so a dollar figure never meant money spent -- see
+// orchestrator/tokens.js's header) -- only raw token counts survive in either place.
 //
 // Incremental by design: a whole-corpus slurp took a WSL VM down once (see
 // scripts/usage-report.js's own header) -- this module never re-reads a file whose mtime+size

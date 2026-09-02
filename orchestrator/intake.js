@@ -63,7 +63,8 @@ const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'cli
 // maintainer-facing `spo ask`/`spo pull` path, not the daemon loop: reviewCard in particular runs
 // fable at effort high verifying citations into the sibling product repo, real cross-repo file
 // reads that legitimately run long. Reproduced 2026-08-29 with the review budget already fixed to
-// $3 (see step-contracts.js's SMALL_BUDGET_USD, PR #13): a real review still died at the 120s
+// $3 (a prior maxBudgetUsd cap in step-contracts.js, since removed -- it is `undefined`/no cap
+// today, PR #13): a real review still died at the 120s
 // wall-clock mark with "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]" --
 // (that exact message no longer occurs since the 2026-08-30 fix -- a deadline kill now says
 // "claude ran but exceeded the Xms deadline and was killed", see steps/llm.js's `timedOut`) --

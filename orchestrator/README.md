@@ -1,4 +1,4 @@
-# orchestrator — v2 skeleton, shadow mode
+# orchestrator — v2, real mode shipped
 
 Implements the lifecycle table in [../doc/state-machine-spec.md](../doc/state-machine-spec.md)
 (v1.1): INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI_CHECKS → VALIDATE →
@@ -24,10 +24,13 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
   `realPushPr`/`realGate`/`realCiChecks`/`realMerge`/`realFinish`) run for real — see "Real
   scripted steps" below. `--real` and `--shadow` are mutually exclusive (daemon.js refuses to
   start); if `--dry-run` is also given, `--dry-run` wins, same precedence as `--shadow` winning
-  over `--dry-run`. Nothing in the `node --test` suite ever spawns a real `git`/`npm`/`gh`/
-  `claude` process — every real-mode test (`test/llm-real*.test.js`,
+  over `--dry-run`. No test that runs the real-mode functions in-process spawns a real
+  `git`/`npm`/`gh`/`claude` process — every real-mode test (`test/llm-real*.test.js`,
   `test/account-rotation.test.js`, `test/real-steps.test.js`) injects `deps.spawnSync` and calls
-  the real-mode functions directly, never through `daemon.js`'s own child-process dispatch.
+  the real-mode functions directly, never through `daemon.js`'s own child-process dispatch. That
+  guarantee stops at a process boundary, though: a test that spawns a real `daemon.js
+  --worker`/`--scanner` child reaches the real, unpatched `spawnSync` inside that child — see
+  "The hermeticity guarantee stops at a process boundary" below.
 - Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
   missing). Point both at a temp dir to run an isolated batch — this is how the test suite
   works.
@@ -76,14 +79,15 @@ Recognized keys:
 | `nightlyMainRed` | refuse WORKTREE / refuse a main-moved merge | boolean |
 | `worktree`, `check`, `pushPr`, `finish`, `prMergeEnqueue` | exit code for that scripted step | number (0 = success) |
 | `gate` | `npm run gate` exit code: 0 PASS · 1 fail · 2 dirty · 3 worker down · 4 timeout | number |
-| `ciChecks` | the one failing CI check name this CI_CHECKS visit, or falsy for green | string \| null |
+| `ciChecks` | the one failing CI check name this CI_CHECKS visit, or falsy for green. Two shapes, both live: a bare string (legacy; routes EVERY check name to DIAGNOSE, since it carries no step info) or `{check, step}` (action 4.3, `state-machine.js`'s `resolveShadowCiChecks`; the step is what actually lets routing reach `IMPLEMENT` or `pr-rules-needs-approval` at all) | string \| null \| `{check, step}` |
 | `mainMoved` | whether `origin/main` touched the branch's files this CI_CHECKS visit | boolean |
 | `prWait` | `pr:wait` exit code: 0 merged · 1 closed unmerged · 4 still open (bounded re-wait) | number |
 | `llm.PLAN`, `llm.IMPLEMENT` | step payload; any object with `ok !== false` succeeds | object |
 | `llm.DIAGNOSE` | `{ "rootCause": "…" }` | object |
 | `llm.CITATION_VERIFIER` | `{ "verdict": "PASS" \| "REJECT" \| "DIVERGES" }` (only consulted when `task.touchesRdoMembers` is true) | object |
 | `llm.VALIDATE` | `{ "verdict": "PASS" \| "PASS_WITH_FINDINGS" \| "REJECT" }` | object |
-| `delays.<STATE>` | artificial ms delay before that step returns, for the deadline test | number |
+| `delays.<STATE>` | artificial ms delay before an LLM step returns (`delays.PLAN`, `delays.IMPLEMENT`, `delays.DIAGNOSE`, `delays.CITATION_VERIFIER`, `delays.VALIDATE`), for the deadline test | number |
+| `delays.<fixtureKey>` | same mechanism for a **scripted** step, but keyed on its fixture key, not its state name: `delays.worktree`, `delays.check`, `delays.pushPr`, `delays.gate`, `delays.prMergeEnqueue`, `delays.prWait`, `delays.finish` — `delays.WORKTREE`/`delays.CHECK`/`delays.PUSH_PR`/etc. are silently ignored (`steps/scripted.js` reads `delays.${fixtureKey}`, never the state name) | number |
 | `forceState` | INTAKE returns this state name instead of `WORKTREE` — a test-only hook for exercising the unrecognized-state catch-all | string |
 
 Example (from the spec):
@@ -104,7 +108,9 @@ Example (from the spec):
 
 ## Budgets
 
-Two independent counters per task, both journaled and both visible in `state.json`:
+`config.js` ships five budget counters in total (`diagnoseBudget`, `validateRejectBudget`,
+`transientRetryBudget`, `ciRetryBudget`, `mainMovedRegateBudget`); the two below are the
+per-task retry budgets this section is about, both journaled and both visible in `state.json`:
 
 - **DIAGNOSE → IMPLEMENT retries**: `diagnoseBudget` (default 3) attempts total; any root
   cause seen twice for the same task parks immediately, even under budget. One line per
@@ -132,9 +138,21 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
   is a JS timer, not a process kill, so it cannot preempt a blocking `spawnSync`: it is a no-op
   against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there)
   and, in real mode, equally inert around an LLM step (bounded instead by
-  `LLM_STEP_DEADLINE_MS` below). It is live only in shadow mode, where an LLM step has no
-  blocking `spawnSync` underneath it and a fixture delay races this 120s timer instead of the
-  900000ms figure below (`doc/state-machine-spec.md` § Step contracts).
+  `LLM_STEP_DEADLINE_MS` below). The generic 120000ms default is live only in shadow mode, where
+  an LLM step has no blocking `spawnSync` underneath it and a fixture delay races this 120s timer
+  instead of the 900000ms figure below (`doc/state-machine-spec.md` § Step contracts) — but
+  `deadline.js`'s `deadlineMsFor` consults `config.stepDeadlineMsByState[state]` before falling
+  back to this default, and that override IS live in real mode: `config.js` gives `CI_CHECKS`,
+  `WORKTREE` and `FINISH` their own, much larger entries (derived from the in-flight poll budget
+  and the product-repo mutex's own worst-case wait). `WORKTREE`/`FINISH`'s overrides were sized
+  "large enough never to fire" against a purely-synchronous `spawnSync` body, but 6.4's
+  product-repo mutex added the first `await` in that path (its poll loop's `await sleep(pollMs)`)
+  — which armed a timer that had never been live before. Measured during 6.4's own verification:
+  with a holder still inside the critical section, the timer fired for real, parking
+  `step-deadline-exceeded-twice` and leaving an orphan worktree behind (`deadline.js`'s
+  `withTimeout` abandons the loser rather than cancelling it, so the abandoned invocation kept
+  running alongside its own retry). See `config.js`'s own comment on `stepDeadlineMsByState` for
+  the full incident and the derivation.
 - `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the `spawnSync` timeout
   `invokeClaudeReal` arms for every LLM step call (PLAN, IMPLEMENT, DIAGNOSE,
   CITATION_VERIFIER, VALIDATE), uniformly regardless of task size or model, in real mode.
@@ -218,7 +236,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:711`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:744-746`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -322,7 +340,7 @@ A card task's own fields:
 
 `size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
 `EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
-for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
+for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
 PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
 CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
 only when `touchesRdoMembers` is true. `citations` in the JSON above is shown as a hand-set task
@@ -725,9 +743,9 @@ real binary on `PATH`). Each function is judged on exit codes only (principle 1,
 doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure, or returns the
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
-**Where the commands run.** `config.productRepo` is always `path.join(os.homedir(),
-'SPO-WebClient')` — the product checkout, never a relative `../SPO-WebClient` (a session
-worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
+**Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:615`) — the product checkout,
+never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
 `config.cwdForStep`) reads that path back off `ctx.task.worktreePath`, set once WORKTREE
@@ -769,7 +787,7 @@ run by `steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:49` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:98` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -973,7 +991,8 @@ throws `ParkSignal('<class>-timed-out', {state, argv, commandClass, timeoutMs})`
 reason naming the command class, never the calling state's own failure reason (a timed-out GATE
 parks `npm-gate-timed-out`, never `gate-timeout` — that string is the *domain* exit-4 reason
 `npm run gate` itself can return — and never reaches DIAGNOSE). The retry lives inside
-`spawnStep`, not at each of its 48 call sites, so the policy cannot drift between them. Retrying
+`spawnStep`, not at each of its 62 call sites (`grep -c 'spawnStep(ctx'` finds 63 matches across
+`orchestrator/`; one is the function's own definition), so the policy cannot drift between them. Retrying
 after a timeout is not obviously safe for every command — a first attempt that actually
 succeeded server-side before the local process hung could in principle be repeated — but every
 call site was audited: `git push`/`git commit`/`git worktree add`/etc. are all naturally
@@ -992,9 +1011,11 @@ independent of the CLI flag (so a caller that builds `ctx.config` by hand gets t
 refusal). `--real` and `--shadow` are mutually exclusive at the CLI (`daemon.js` refuses to
 start with both); a non-`"card"` (e.g. `"synthetic"`) task is never gated by `--real` at all.
 
-**First live run is maintainer-supervised.** Nothing in `node --test` ever spawns a real
-`git`/`npm`/`gh` process — every test in `test/real-steps.test.js` injects `deps.spawnSync` and
-calls `realWorktree`/`realCheck`/... directly. The first time `daemon.js --real` actually drives
+**First live run is maintainer-supervised.** No in-process test spawns a real `git`/`npm`/`gh`
+process — every test in `test/real-steps.test.js` injects `deps.spawnSync` and calls
+`realWorktree`/`realCheck`/... directly; that guarantee does not extend to tests that spawn a
+real `daemon.js --worker`/`--scanner` child (see "The hermeticity guarantee stops at a process
+boundary" below). The first time `daemon.js --real` actually drives
 a `kind: "card"` task against the real product repo and a real GitHub PR, a maintainer should be
 watching: it worktree-adds off `origin/main`, runs `npm ci`, claims a real board card, pushes a
 real branch, opens a real PR, and — on the happy path — merges it and removes its own worktree.
@@ -1061,9 +1082,28 @@ Three things action 5.1 changed here, each measured against the 18-task journal 
 
 The issue comment (gh needs no cwd) still posts either way.
 
+### Action 4.4: bounded auto-retry never reaches the board at all
+
+Everything below this heading describes what happens when a task actually parks. `finalizePark`
+(`state-machine.js`) checks one thing FIRST, before any of it: whether `ctx.config.real` is set
+and the reason is one of a closed allowlist -- `claim-rate-limited`, `gate-non-attesting` (unless
+its detail says the bench's verdicts directory itself is missing, which is a permanent
+misconfiguration, not a transient fault) and the four `llm-transport-failed:*` reasons -- with
+the per-task `transientRetries` counter still under `config.transientRetryBudget` (default **2**).
+If so, the task is silently re-enqueued instead of parked: no board move, no `Parked` comment, no
+`state.json` PARKED write -- nothing the rest of this section describes happens. It waits
+`config.transientRetryDelaysMs` (default `[60s, 5min]`, indexed by attempt) before it is eligible
+to run again, journalled as `transient-retry` (or `transient-retry-failed` if the re-enqueue
+write itself fails, which falls through to an ordinary park). Only once the budget is exhausted
+does the SAME reason fall through to the ordinary park machinery below. The comment in
+`finalizePark` itself is explicit about why this matters: a card taking this branch "must not
+look parked to `spo parked`, the dashboard, or a maintainer reading the issue thread" -- none of
+those three surfaces has anything to show for it while the retry budget still has room.
+
 ### Park <-> kanban round trip
 
-When a real, `kind: "card"` task parks, `state-machine.js`'s `finalizePark` calls
+When a real, `kind: "card"` task actually parks -- the action 4.4 branch above did not apply, or
+its budget is exhausted -- `state-machine.js`'s `finalizePark` calls
 `park-loop.js`'s `postParkComment`: moves the card to `Parked` (never blocks, see above) and
 posts a structured comment on the issue -- the reason, what the machine expects from the
 maintainer, and this literal line:
@@ -1110,7 +1150,7 @@ neither word -- is left alone, since a human conversation on the issue is allowe
   prompt fill" above) mistake "nobody re-measured it this run" for "`origin/main` hasn't moved")
   and journals `unparked-by-maintainer`. This does NOT by itself cost PLAN's LLM call again: if
   the plan `reEnqueueTask` left on disk (`journal/<id>/scratch/`, never touched by a retry) is
-  still valid against the freshly-measured `baseMainSha` and the park wasn't one of the six
+  still valid against the freshly-measured `baseMainSha` and the park wasn't one of the seven
   plan-invalidating reasons, PLAN reuses it instead of re-deriving it -- action 3.1's whole point,
   since a retry restarting at INTAKE would otherwise re-run PLAN from scratch on a plan that was
   already correct. Action 2.8: the `0000-`
@@ -1726,8 +1766,9 @@ the full correction text still reaches the maintainer, since `review-card`'s own
 create` + `gh issue comment`, `orchestrator/intake.js`).
 
 **Cost**: `spo ask` makes about two real `claude -p` calls per request -- one DRAFT_CARD (skipped
-entirely in the brainstorm lane) and one review-card -- both at `SMALL_BUDGET_USD`
-(`step-contracts.js`), an order of magnitude cheaper than a single PLAN/IMPLEMENT call.
+entirely in the brainstorm lane) and one review-card -- both with `maxBudgetUsd: undefined`
+(no cap; `step-contracts.js` -- no `SMALL_BUDGET_USD` constant exists in this build), an order
+of magnitude cheaper in practice than a single PLAN/IMPLEMENT call by task shape alone.
 
 **`spo pull`** never claims a card and never writes the board -- it only spawns
 `npm run board:claim` (cwd = the product repo, the cheap ~2-point GraphQL read
@@ -2213,7 +2254,12 @@ atomic within a filesystem) rather than a single `fs.writeFileSync` — a crash 
 mid-write can no longer leave a truncated, unparsable `state.json` behind for a real in-flight
 task (action 2.5).
 
-`bin/spo` reads only these files (plus `queue/` for depth) — it holds no state of its own.
+`bin/spo`'s read-only subcommands (`status`/`task`/`parked`/`resume`/`tokens`/`reports`) read
+only these files (plus `queue/` for depth, and the account pool, `~/.spo-bench`,
+`~/.spo-reports` for their own sections) — they hold no state of their own. Several other
+subcommands DO write local or live state: `account add`/`account enable`/`account disable`/
+`account clear-cooldown` touch the account pool and `state.json`/`daemon.jsonl`; `ask`/`pull`/
+`intake`/`triage --file`/`recette` write to real GitHub. See `bin/spo`'s own header comment.
 
 ## CLI
 
@@ -2265,8 +2311,12 @@ Two render modes, same underlying data:
   (everything else -- services (daemon/queue/bench-worker/nightly/verdicts/prod), accounts,
   daemon stats, bug reports, tokens -- meant to be polled every 30s). `--no-prod` disables the
   outbound starpeace.zz.works / GitHub Releases probe (`console/prod-version.js`) for an offline
-  run. Never binds anywhere but `localhost`/LAN by default; the externally hosted copy (nginx +
-  basic auth) is a `spo dashboard` + rsync concern owned by SPO-Deploy.
+  run. **Binds all interfaces by default, with no authentication of its own**: `bin/spo`'s
+  `server.listen(port, opts.host || undefined, …)` binds `::`/`0.0.0.0` unless `--host` names a
+  specific interface, and `console/serve.js` has no auth layer at all -- the externally hosted
+  copy's nginx + basic auth (a `spo dashboard` + rsync concern owned by SPO-Deploy) is the only
+  access control in front of it. Run `--serve` with an explicit `--host localhost` (or behind a
+  firewall) unless you mean to expose it.
 
 Per-task detail (id, state, reason, per-LLM-step `claude --resume <sessionId>`) is deliberately
 NOT rendered -- it duplicates the GitHub Projects board (Kanban), which owns that view. The
@@ -2292,7 +2342,7 @@ SPO-WebClient/SPO-Deploy change, outside this repo's scope -- so the deployed ve
 section -- see `console/render.js`'s `renderProdTile`.
 
 **Tokens card:** two parts. The primary view is an operating-cost **trend**
-(`console/usage-scan.js`'s `buildTrendViews`, fed by `console/usage-rollups.json` -- a small,
+(`console/usage-scan.js`'s `buildTrendViews`, fed by `<journalRoot>/usage-rollups.json` -- a small,
 durable daily-rollup file the live server's usage-scan timer writes on the same ~5-minute
 cadence it already scans on, capped at 180 days): a weighted (`WEIGHT()`-formula) average
 Mtok-equivalent per session, with today/7d/30d KPI tiles and week-over-week deltas, a sparkline,
@@ -2382,7 +2432,10 @@ cleaning up, cleanup's idempotency (including when the injected `spawnSync` itse
 `evaluateAssertions` as a pure function -- including the one that hands it a `DONE` journal
 missing a required event and confirms the assertion set actually catches it, never rubber-stamping
 a run that merely reached `DONE`. None of them ever touch a real
-`git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.
+`git`, `npm`, `gh` or `claude` process in-process -- but that is not the same as "the whole suite
+never spawns one for real": a test that spawns a real `daemon.js --worker`/`--scanner` child
+reaches the real `spawnSync` inside that child, unpatched. See "The hermeticity guarantee stops
+at a process boundary" immediately below.
 
 **The hermeticity guarantee stops at a process boundary.** `test/no-real-spawn.js` (the killswitch
 above) patches `child_process.spawnSync` in the parent test process only — it protects every call

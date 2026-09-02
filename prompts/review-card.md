@@ -1,7 +1,10 @@
 <!--
-  Step: review-card  (intake path, not yet a state-machine-spec.md row — used wherever a card
-  is drafted before filing: change-validator findings, hook-hardening candidates, the split
-  card of a task that turned out to be two)
+  Step: review-card  (intake path, not yet a state-machine-spec.md row — reviewCard has exactly
+  two callers: `spo ask` (bin/spo, a maintainer's own brainstorm, interactive or via the
+  /SPO-Draft slash command) and the bug-report queue (`auto-triage.js`'s `processConfirmedReport`,
+  a player-filed report a human has already confirmed). Neither input is a change-validator
+  finding or a hook-hardening candidate — this card is judged on its own merits, not on where
+  the idea came from)
   Adapted from SPO-WebClient/.claude/agents/card-reviewer.md — same neutrality rules and four
   checks, JSON output instead of a prose block.
   Placeholders: {{card_title}} {{card_body}} {{card_category}} {{card_size}} {{card_area}}

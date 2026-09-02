@@ -14,11 +14,11 @@ read out of order.
 | Step | Prompt file | Model | Effort | Tools | Ground |
 |---|---|---|---|---|---|
 | PLAN | `plan.md` | Fable 5 (Opus 5 fallback only — `step-contracts.js:108`: the wire rule escalates IMPLEMENT and change-validator, deliberately NOT PLAN) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}`; also returns `files_to_change` (action 3.2 — **absolute** paths under `{{worktree}}`, `plan.md:103`, distinct from paths it merely reads or cites) |
-| IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on the wire rule — `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases — or an `L`-sized task) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
+| IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on `task.touchesRdoMembers`, set once at intake from the issue's Area field or a literal `rdo-members.ts` mention in its body — narrower than the full wire rule's `src/shared/rdo-*`/`src/server/rdo.ts`/session-phase set, and never rederived from the plan's actual files — or an `L`-sized task) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
 | DIAGNOSE | `diagnose.md` | Fable 5 | high | `Read, Grep, Bash(ro)` | reads `{{diff_path}}`, `{{gate_log_path}}`, `{{ledger_path}}` |
 | VALIDATE — citation-verifier | `verify-citations.md` | Fable 5 | high | `Read, Grep` (product + `~/SPO-Original`, read-only) | reads the diff and `{{spo_original_path}}/Rdo/Server/`; runs only when `rdo-members.ts` changed, and always before `validate-change.md` |
 | VALIDATE — change-validator | `validate-change.md` | Fable 5 — never Sonnet 5 (the executor may not judge itself); Opus 5 on the wire rule or as fallback | high | `Read, Grep, Glob, Bash(ro)` | reads `{{diff_path}}`, `{{invariants_path}}`, `{{gate_report_path}}` |
-| review-card (intake path — findings, hook-hardening candidates, split cards) | `review-card.md` | Fable 5 | high (`intake.js:435`; not yet a state-machine-spec.md row) | `Read, Grep, Glob, Bash(ro)` | reads the product tree and `gh issue list --repo {{repo}}`, read-only |
+| review-card (intake path — its two callers are `spo ask`'s maintainer brainstorm and `auto-triage.js`'s confirmed bug-report queue) | `review-card.md` | Fable 5 | high (`intake.js:435`; not yet a state-machine-spec.md row) | `Read, Grep, Glob, Bash(ro)` | reads the product tree and `gh issue list --repo {{repo}}`, read-only |
 
 Every "high"/"low"/"medium" effort and every model choice above is what the *caller* passes as
 `--model` / `--effort` on the `claude -p` invocation — nothing in a prompt file selects its own
@@ -40,9 +40,9 @@ executing step needs to know it may be running as Opus rather than assume Sonnet
 - **`{{invariants_path}}` / `{{invariant_ids}}`** — the invariant file's path travels with the
   list of ids, **never the quotes themselves**. Every step that consumes an invariant re-reads
   its quote from the file at the cited `file:line`/`file:start-end` — this is the mechanism
-  `next-task.md` § 3 documents (id, verbatim quote, citation; `HELD`/`CHANGED` rows; the
-  exact-then-normalized substring check) and every prompt here that touches an invariant follows it
-  unchanged.
+  `implement.md` § 6 documents (id, verbatim quote, citation; `HELD`/`CHANGED` rows; the
+  exact-then-normalized substring check — `next-task.md` is not a file this repo or
+  SPO-WebClient tracks) and every prompt here that touches an invariant follows it unchanged.
 - **`{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` / `{{ledger_path}}`** — file
   paths, not inline content. A step reads them with its own tools; nothing is pasted into a
   prompt as a blob, so a large diff or log never inflates the call.
@@ -67,10 +67,12 @@ substance is the same everywhere:
    evidence, a diagnosis's suggested fix. A conclusion with no citation is not usable by the next
    step, which has no chat history to fall back on.
 4. **Read-only unless the contract says otherwise.** Only IMPLEMENT holds edit tools, and only
-   inside `{{worktree}}`; every other step is `Read`/`Grep`/`Glob`/`Bash(ro)` and reports data,
-   it does not act — none of them ever runs `gh issue create`, `gh issue comment`, `git commit`,
-   or any other write verb, `review-card` included (it returns the comment text; the driver
-   posts it).
+   inside `{{worktree}}`; every other step reports data, it does not act — none of them ever
+   runs `gh issue create`, `gh issue comment`, `git commit`, or any other write verb,
+   `review-card` included (it returns the comment text; the driver posts it). Their read-only
+   tool sets are not all the same, though: `Read`/`Grep`/`Glob`/`Bash(ro)` for PLAN, DIAGNOSE
+   (`Bash(ro)`, no `Glob`), change-validator and review-card, but citation-verifier holds only
+   `Read`/`Grep` — see the table above, the actual per-step source.
 5. **Operational traps, only where the step actually meets them:**
    - **Verdicts are exit codes, never printed text** — relevant to PLAN (the check commands it
      emits), IMPLEMENT (running those commands and the verification aliases itself), and
