@@ -22,7 +22,7 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
 | **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
-| C7 | not started |
+| **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured (see "C7 — its own measurement") |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
@@ -1502,3 +1502,140 @@ replay holes predates all of it.
   parallelism is opt-in and deleting that drop-in is the safe rollback.
 - **Deploying still restarts the daemon by itself** — the `git pull` fires the post-merge hook, not
   the merge. Check for in-flight tasks first; a docs-only merge needs no pull.
+
+---
+
+## C7 — its own measurement, before any of it was built
+
+C6's handoff said three of C7's four remaining rows were written against a daemon that no longer
+exists. That was right, and measuring found more: **two of 7.1's five named holes are already
+closed**, 7.2's blocker is not the one the handoff named, and 7.3 has a genuinely flaky test in
+the file that was supposed to close it.
+
+### Baseline
+
+`node --test --test-timeout=30000 test/*.test.js` at `f7cf9da`: **1382 passing, 0 failing**, twice
+in a row. Wall clock ~17 s.
+
+**`--experimental-test-coverage` is not usable on the whole suite**, two ways:
+
+- The aggregated report is discarded — `Warning: Could not report code coverage. SyntaxError:
+  Unexpected end of JSON input`. A test that kills a child process truncates that child's V8
+  coverage file, and one truncated file kills the entire report. Excluding
+  `dispatcher.test.js`, `worker-mode.test.js` and `journal-concurrent-append.test.js` brings the
+  report back.
+- Under coverage, `dispatcher.test.js:161` ("K=1: a task runs to DONE through a real spawned
+  worker") **fails**: `exitEvt.code` is `null`, not `0`. See the flake below — coverage did not
+  cause it, it exposed it.
+
+So the coverage measurement below is the **intersection** of two runs (everything-but-those-three,
+and those-three-alone): a line is reported as a hole only when *neither* run covered it.
+
+### 7.1 — the hole list is two-fifths stale, and coverage is far higher than when it was written
+
+Measured, all files, intersection of both runs: **97.53 % lines, 90.97 % branch, 96.43 % funcs.**
+
+Of the five holes 7.1 names, **two are already closed**:
+
+- **the `oauthTokenFile` branch** — `llm.js:376-383` (env injection *and* the unreadable-file
+  error leg) is covered. The row was written when only `accounts.js`'s discovery was tested.
+- **park-reason assertions in the account-rotation test** — `test/account-rotation.test.js` now
+  asserts `caught.reason` on `all-accounts-cooling-after-retry`, `all-accounts-cooling-until-*`,
+  `no-accounts-registered` and `all-accounts-leased`. Nothing left to add.
+
+What is genuinely still uncovered:
+
+| file | lines | what it is |
+|---|---|---|
+| `state-machine.js` | 181-182 | `invalid-task-json` — 7.1's own named catch-all |
+| | 228-229 | `main-red-refuse-worktree` (the `nightlyMainRed` fixture at WORKTREE) |
+| | 250 | `worktree-failed` shadow exit — 7.1's "worktree" |
+| | 597 | `parseFilesChanged` on unparsable JSON |
+| | 699 | `push-pr-failed` shadow exit — 7.1's "pushPr" |
+| | 715 | `gate-unrecognized-exit` |
+| | 772-773 | `main-red-no-merge` |
+| | 828-831 | `diagnose-budget-exhausted` (marked defensive/unreachable in its own comment) |
+| | 1160 | `pr-wait-unrecognized-exit` — 7.1's "prWait 1" |
+| | 1172 | `finish-failed` — 7.1's "finish" |
+| | 1433-1434 | the `park-repeat` event at repeat ≥ 2 |
+| | 1497-1499 | `state-machine-runaway` — 7.1's own named catch-all |
+| | 1747-1749 | `runScanCycle`'s `runAutoTriage` timer leg |
+| | 1828 | `runForever`'s loop tail |
+| `scripted.js` | 72-79 | the "no real command configured" throw |
+| | 784-807 | **`preserveWorktreeWip`'s four error legs** (status/detach/add/commit → `wip-preserve-failed`) |
+| | 1617-1618 | check-runs JSON unparsable → `null` — 7.1's "check-runs" |
+| | 1842 | `pr-wait-unrecognized-exit` |
+| `llm.js` | 354-357 | `limitKindForFailure`'s classification branches |
+| | 599, 603-605 | the CITATION_VERIFIER / VALIDATE / default dry-run stubs |
+| `account-lease.js` | 123-124 | the unreadable/torn lease-file catch |
+| `orphan-scan.js` | 90-97 | the mtime fallback when the journal is unreadable |
+| `journal.js` | 196-202 | the atomic-write rollback (unlink the tmp, rethrow) |
+
+`preserveWorktreeWip`'s error legs are the notable one: it is a **C6 feature**, so 7.1's list
+could not have named it. `product-repo-lock.js`, `product-repo-hold.js`, `worker-status.js`,
+`main-moved-budget.js`, `bench-queue-wait.js` and `monotonic-clock.js` — the rest of what C6 added
+— are fully covered.
+
+### 7.2 — the blocker is the cap, not the drain
+
+The handoff is right that `spo recette` drives `drainQueueOnce` and that production drives the
+dispatcher. But the reason that is hard to change is one level down: **the cap is a `deps.spawnSync`
+wrapper** (`makeCap`), counting `claude` invocations and enforcing wall clock *inside the same
+process as the pipeline*. `drainQueueOnce` runs `runTask` in-process, so the wrapper sees every
+spawn. A dispatcher runs its workers as **separate processes** — `createDispatcher` injects
+`config.deps.spawn` (the child spawn), never the worker's own `spawnSync` — so the existing cap
+cannot survive the move at all.
+
+A dispatcher-driven scenario therefore needs an **out-of-process cap**: a wall-clock watchdog
+calling `stop()` + `killAllChildren()`, and an LLM-step count read from the workers' journals
+(`llm.js` appends an `llm-call` event per call to the taskDir, so the count is available to a
+poller). That is the design decision 7.2 has to make before any scenario is written; it is not a
+matter of swapping one function for another.
+
+Also measured: `SCENARIOS` still holds exactly **one** entry, `trivial-doc-log`. Gate C7's "all
+scenarios" is, today, one scenario.
+
+### 7.3 — most of it exists, and the file that holds it has a real flake
+
+`test/dispatcher.test.js` (42 tests) already covers, under names of its own:
+
+- **double daemon** → "a second instance against the same journal root is refused"; plus the two
+  scanner cases (`--parent-pid` mismatch exits; exactly one scanner at startup).
+- **timers under a drain** → the row's own premise is gone, but its intent is covered twice: "a
+  periodic scan runs in the scanner process while a worker is still alive" and "a BLOCKING scan in
+  the scanner process does not stall the dispatcher".
+
+**New finding — `test/dispatcher.test.js:161` is racy.** It waits for `state.json` to read `DONE`,
+then calls `dispatcher.stop()`; `run()` kills the children on its way out. The worker writes
+`state.json` *before* it exits, so a worker that has not yet reached exit is SIGTERMed — and the
+journalled `worker-exit` carries `code: null`, not `0`. Asserting `exitEvt.code === 0` therefore
+depends on winning a race the test does nothing to arbitrate. It passes 3/3 in isolation and
+failed under whole-suite coverage load; the trap list's own warning that "a flaky suite silently
+misreports a surviving mutation as killed" applies directly to the file C7 is meant to extend.
+
+**daemon + CLI concurrently** is the part with no coverage, and it is wider than the `#443` seam
+the row cites (that one, the triage `pending/` → `in-progress/` rename, was closed by 2.6): C6 put
+the dispatcher's crash-repark and the scanner's `orphanScan`/`unparkScan`/reconciler in *different
+processes* from the workers, all reaching for the same taskDir.
+
+### 7.5 — the spec no longer describes the daemon it specifies
+
+Vocabulary count over the whole of `doc/state-machine-spec.md` (416 lines):
+
+| term | occurrences |
+|---|---|
+| `scanner` | **0** |
+| `lease` | **0** |
+| `live-workers` | **0** |
+| `bench-queue` | **0** |
+| `K workers` | **0** |
+| `dispatcher` | **1** |
+| `worker` | 3 |
+
+C6 amended exactly one row (CI_CHECKS, in `f8505d6`) and added a decision record. The two-process
+model, the account lease, the product-repo mutex and the live-worker table — the whole of what C6
+shipped — are absent. Gate C7's "zero uncommented divergences" is an authoring job, not a re-read.
+
+Of the plan's five named 7.5 items, one is confirmed live and precise: **`prompts/verify-citations.md`
+says twice that the step holds `Read, Grep, Bash`; `step-contracts.js` grants `['Read', 'Grep']`**
+and flags the disagreement in a `DIVERGENCE` comment rather than resolving it.
