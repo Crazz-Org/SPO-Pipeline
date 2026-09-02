@@ -1748,76 +1748,118 @@ window escalates straight to the 5 h tier. Measured against the real code: limit
 limit #2 ten minutes later → **18000000**, clear, limit #3 → 3600000.
 
 ---
+## What C7 hands the next session — written 2026-09-02, at commit `3d7a0b7`
 
-## What C7 hands the next session
+**Branch `claude-crazz/c7-truthfulness-docs`, 23 commits on `f7cf9da`. Suite 1562 passing, 0
+failing, 0 cancelled.** **Not yet merged.** The daemon is **stopped** (stopped for the live gate
+run; restart it after merge). Every operational fact in this section is true as of the commit
+named in the heading and nowhere re-verified since — that is what the file's status header means.
 
-**Branch `claude-crazz/c7-truthfulness-docs`, 17 commits on `f7cf9da`. Suite 1529 passing, 0
-failing, 0 cancelled**, green under UTC, `Pacific/Niue` and `Pacific/Kiritimati`. **Not yet
-merged.** The daemon is **stopped** (I stopped it for the live gate run; restart it after merge).
+### Gate C7 — all three conjuncts
 
-### Where C7 actually stands
+**1. Full suite green.** 1562 tests at `3d7a0b7`.
 
-Gate C7's first two conjuncts are met: the suite is green, and **`spo recette` passed live on
-both scenarios today** — `trivial-doc-log`, and a K=2 `parallel-doc-log` with real parallelism
-(two workers 5 ms apart on `pool1` and `pool2`, PRs #636 and #637 both **merged**, board Todo
-unchanged at 142, zero `auto-pull` events, all seven scan timers confirmed `0` in the scanner
-child's own `/proc` environ).
+**2. `spo recette`, all scenarios.** Passed live: `trivial-doc-log`, and a K=2 `parallel-doc-log`
+with real parallelism (two workers 5 ms apart on `pool1`/`pool2`, PRs #636 and #637 both merged,
+board Todo unchanged at 142, zero `auto-pull` events, all seven scan timers confirmed `0` in the
+scanner child's own `/proc` environ).
 
-The third conjunct was rewritten. It could not close as worded — see "Chantier 7 bis" in the
-plan for the argument and the numbers. **Three of its six actions remain:**
+**3. The three certifications** that replaced the original clause (see "Chantier 7 bis" in the
+plan for why the clause was unclosable by scope rather than by bar):
 
 | | |
 |---|---|
-| **7bis.2** prompt-contract sweep | not started; unblocked now 7bis.4 has settled the prose |
-| **7bis.5** accepted-gap register | not started; Gate C7's "declared" certification rests on it |
-| **7bis.6** execution rule | not started; one paragraph in the plan's execution rules |
+| **Enforced** | 7bis.1 park-reason sweep, 7bis.2 prompt-contract sweep, 7bis.3 documented-constant sweep. Both halves of 7bis.2 are now pinned to their ground truth: a sixth `STEP_CONTRACTS` entry and a fourth intake prompt each turn the sweep red. |
+| **Exhaustive** | 7bis.4 — all 8 files under `prompts/` read line by line. Verification spot-checked 5 of the 8 against `step-contracts.js` / `task-values.js` / the state-machine branch reading each verdict and found nothing a line-by-line read should have caught. |
+| **Declared** | `doc/accepted-gaps.md` — the partition, pinned to `bb35942`. Corpus **17,978** lines, retired **2,464**, accepted gap **14,368** across 65 files. Both figures supersede the plan's ~16,800 / ~2,290. |
 
-**And one gap in the driver loop itself**: 7bis.1, 7bis.3 and 7bis.4 were canaried by the driver
-but never got the full **Opus adversarial pass with mutation testing** that every other C7 action
-received. The gate now rests on those three. Do that before merging.
+### What verification actually found, and why it mattered
+
+7bis.1, 7bis.3 and 7bis.4 shipped on a driver canary alone. The Opus pass with mutation testing
+returned **seven mutants that survived the full suite**, and the C6/C7 pattern held for the fifth
+time: **what survived was each action's own central claim.**
+
+The structural one is worth carrying forward. `new ParkSignal(...)` is the **throw** site;
+`finalizePark(...)` is the **sink**, and `state-machine.js:1527` is
+`finalizePark(ctx, state, err.reason, err.detail)`. The sweep scanned throws and never the sink,
+which carries six literal reasons no `ParkSignal` throws — four documented nowhere. One of them,
+`abandoned-by-maintainer`, is written straight to `state.json.reason`, so a maintainer grepping
+for `ParkSignal` would never have found it. **The sweep's headline claim was false while the
+sweep was green.**
+
+The rest were sweeps failing to guard themselves: `blankComments` could be reduced to a no-op and
+stay green, because the fixture naming it omitted the `new` its own scanner requires; the floors
+sat *below* the level at which four resolver families could be deleted; both allowlists were
+unpinned, so one edit could exempt a reason forever; 29 % of `PINS` was deletable. In 7bis.2, the
+prose tool-grant check read only the **first** statement — and `verify-citations.md` states its
+grant twice, the second time under a heading titled *"repeated because it is the invariant that
+matters most"*, in the one prompt that *reasons* from its grant.
+
+**The lesson to carry into C8 and C9 is not "run more passes" — it is that for a sweep, green is
+its normal state, so a scanner mutated into a no-op is indistinguishable from one that works.**
+Only mutation testing separates them. Every sweep this chantier shipped now names the specific
+resolver that died rather than reporting a smaller number.
+
+### The register was caught undercounting three times
+
+Each time by someone **re-deriving its numbers**, never by reading it: `bench-queue-wait.js`
+missing from a table whose own subtotal was right (and the one file dropped from the accepted-gap
+register was the bench file); the register's own 345 lines in no bucket; and `scripts/` —
+6 tracked files, 177 comment lines across 665 — in neither the in-scope nor the out-of-scope list.
+Its §7 also asserted a clean sibling grep that its own quoted command contradicts: `~16,800` is at
+`doc/remediation-plan-2026-08.md:259`, in the chantier 7 bis preamble, present tense, as the
+load-bearing premise of the whole scope argument — not in the 7bis.5 row as claimed.
+
+**Root cause of the `scripts/` omission, and it is not local to the register:** the corpus
+definition was inherited from execution rule 6's grep scope list, **which has the same blind
+spot**. Rule 6's list should gain `scripts/` and `accounts/`.
 
 ### The two things a fresh session will get wrong
 
-1. **An isolated worktree is not necessarily on the branch you named.** Three agents this session
-   were provisioned at `f7cf9da` — the *pre-C7* base — while being told they were on the branch
-   HEAD. Two noticed (one only because the suite reported 1396 tests instead of 1513) and fixed
-   their own base; one did not and had to be corrected mid-flight. **Make every builder's first
-   act `git rev-parse HEAD` against the base it was told to expect.**
+1. **An isolated worktree is not necessarily on the branch you named.** **Nine** agents across this
+   chantier were provisioned at `f7cf9da` — the *pre-C7* base — while being told they were on the
+   branch HEAD. **Make every subagent's first act `git rev-parse HEAD` against the base it was told
+   to expect**, and give it a suite count to check against. Note `git reset --hard` is refused by
+   the permission layer for subagents; `git checkout <sha>` from a clean tree is the fallback that
+   works.
 2. **`git checkout -- <file>` is not a mutation-testing restore, and `git stash` is forbidden.**
-   Copy to `/tmp` and back. This is in the traps list and was still nearly re-learned.
+   Copy to `/tmp` and back, and verify with `git diff --stat` between mutants.
 
 ### The bench, and why C8's shape changed before C8 started
 
 `doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` are 8.1's two
-deliverables, produced early (in parallel with C7 bis, read-only, on the maintainer's decision).
+deliverables, produced early (read-only, in parallel with C7 bis, on the maintainer's decision).
 **Everything in them is Fable's and unverified except one finding the driver checked personally:**
 
 > **`bench/gate` has not been a required status check on SPO-WebClient's `main` since
 > 2026-08-29T10:17Z.** Ruleset 21111153 version 47551828 required
 > `["typecheck + tests","bench/gate"]`; version 48039109 requires `["typecheck + tests"]`.
-> Verified via `/rulesets/21111153/history/{version_id}` — note the `?ruleset_version_id=` query
-> form is **silently ignored** and returns current state for every version, which is how this
-> nearly went unconfirmed.
+> Verified via `/rulesets/21111153/history/{version_id}` — the `?ruleset_version_id=` query form
+> is **silently ignored** and returns current state for every version, which is how this nearly
+> went unconfirmed.
 
-That reframes the `--live` defect this session found earlier: the stale worker made the gate
-**silent** from 2026-08-30, but the ruleset had already made it **advisory** a day before. Every
-merge since went on CI alone. `CLAUDE.md`, `doc/bench-worker.md` and `.claude/hooks/pre-push-gate.sh`
-all still promise the opposite, and the pre-push hook dropped its own check on that promise.
+That reframes the `--live` defect: the stale worker made the gate **silent** from 2026-08-30, but
+the ruleset had already made it **advisory** a day earlier. Every merge since went on CI alone.
+`CLAUDE.md`, `doc/bench-worker.md` and `.claude/hooks/pre-push-gate.sh` all still promise the
+opposite, and the pre-push hook dropped its own check on that promise.
 
 **The audit contradicts plan row 8.5: do NOT move the bench into `orchestrator/`** — it reports 0
 of 8 defect classes living at the repo boundary. **Consequence: chantier 9's deferral collapses**,
-because it rested entirely on C8 rewriting `orchestrator/`. C9 should be re-planned as parallel
-from C8b on. Neither change is in the plan yet; make it after Opus verifies the audit.
+since it rested entirely on C8 rewriting `orchestrator/`. C9 should be re-planned as parallel from
+C8b on. **Neither change is in the plan yet — make it after Opus verifies the audit**, which is
+8.1's job and has not been done.
 
-**Two acts the pipeline cannot perform** and which are the maintainer's: restoring `bench/gate` to
-the ruleset, and rebuilding/restarting the bench worker. **Do not rebuild the worker until the
-audit's findings are Opus-verified** — its stale binary is the evidence.
+**Two acts the pipeline cannot perform**, both the maintainer's: restoring `bench/gate` to the
+ruleset, and rebuilding/restarting the bench worker. **Do them together, in that order, and not
+before the audit is verified** — the stale binary is the evidence, and restoring the required
+check while the worker still runs it would re-arm a gate that certifies less than its name
+promises. Confirm one gate artifact shows the live stage actually ran before calling it done.
 
 ### Filed this chantier
 
 SPO-Pipeline **#77-#83** (the five production defects verification found and the maintainer chose
-to file rather than fix in a final chantier), **#84** and **#85** (the GATE→merge-queue window,
-and `merge-queue-not-landing` naming a symptom — both found by the live gate run). SPO-WebClient
+to file rather than fix in a final chantier), **#84** and **#85** (the GATE→merge-queue window, and
+`merge-queue-not-landing` naming a symptom — both found by the live gate run). SPO-WebClient
 **#640** (`CLAUDE.md` names `Rdo/Server/` as the RDO declaration authority; it holds none, and a
 verifier obeying it rejects correct citations). **#77 reproduced live during the gate run**, four
 hours after it was filed.
