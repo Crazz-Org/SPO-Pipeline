@@ -1,6 +1,9 @@
 # Remediation plan — execution state
 
-Companion to `doc/remediation-plan-2026-08.md`, which is the contract and does not change.
+Companion to `doc/remediation-plan-2026-08.md`, which is the contract. It did not change for
+C1-C7. **It was amended once, on 2026-09-02, by the maintainer**: chantier 8 was appended after
+C7 to cover the bench's remediation and migration. That is an addition, not a revision — nothing
+in C1-C7 was rewritten, and the reason is recorded under "The bench" below.
 This file is what the plan *turned out to be* once executed: what is done, what the plan itself
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
@@ -22,7 +25,8 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
 | **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
-| **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured (see "C7 — its own measurement") |
+| **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured; 7.1/7.2/7.3/7.5 built and verified; gate running |
+| **C8** — the bench: remediation, then migration | **not started** — added 2026-09-02, after the bench was measured for the first time |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
@@ -1639,3 +1643,102 @@ shipped — are absent. Gate C7's "zero uncommented divergences" is an authoring
 Of the plan's five named 7.5 items, one is confirmed live and precise: **`prompts/verify-citations.md`
 says twice that the step holds `Read, Grep, Bash`; `step-contracts.js` grants `['Read', 'Grep']`**
 and flags the disagreement in a `DIVERGENCE` comment rather than resolving it.
+
+## C7 commits (one per action; the breaker fix, clear-cooldown and the cross-action pass are not in the plan)
+
+| action | commit | what it does |
+|---|---|---|
+| — | `92ec755` | C7's own measurement: every row re-derived before anything was built |
+| 7.1 | `b27fe32` | the replay holes that are *still* holes, closed (34 tests) |
+| 7.3 | `c8ba6ad` | the concurrency tests, minus the race in the file that held them |
+| — | `0d51d3d` | `consecutiveScannerCrashes` was neither consecutive nor reset |
+| 7.2 | `c0e4bbb` | a recette scenario library, and the process boundary it exposed |
+| — | `eff1928` | `spo account clear-cooldown`, after a live incident |
+| 7.5 | `2a840be` | the spec stops describing a daemon that no longer exists |
+| — | `719d143` | the doc gaps only a cross-action read could see |
+| 7.2 | `740e381` | the gaps between "the assertion passes" and "the run is safe" |
+
+Tests: 454 (plan baseline) → 1032 (C4) → 1177 (C5) → 1382 (C6) → **1511** (end of C7).
+
+### What the re-measurement changed
+
+Every C7 row was re-derived before being built, and the exercise paid for itself again:
+
+- **7.1's list was two-fifths stale.** The `oauthTokenFile` branch and the account-rotation
+  park-reason assertions were already closed; coverage was already 97.53 % lines / 90.97 % branch.
+  What the row could *not* name was `preserveWorktreeWip`'s four error legs — a C6 feature that
+  postdates it.
+- **7.2's blocker was not the one the handoff named.** The handoff said the problem was that
+  recette drives `drainQueueOnce` while production drives the dispatcher. True, but one level
+  down the real obstacle is that the cap is a `deps.spawnSync` wrapper: a dispatcher runs workers
+  as child processes, where that wrapper cannot reach at all.
+- **7.3 was mostly already built**, and the file meant to hold it raced itself.
+- **7.5 was far larger than five inconsistencies.** Two documents described a daemon that no
+  longer existed: the spec said `scanner` **0** times and `lease` **0** times; `orchestrator/README.md`,
+  169 KB of it, said `dispatcher` **0** times and still asserted the daemon "drains **serially**".
+
+### The pattern held: in every action, the mutation that survived was the action's own claim
+
+C6 recorded this six times. C7 recorded it four more, and two of them would have shipped:
+
+| action | the survivor |
+|---|---|
+| 7.1 | a test that read its expectation back out of `statSync`, so `.mtimeMs → .ctimeMs` survived |
+| breaker | the circuit-breaker `stopReason`'s two new field names — both assertion sites tested scenarios where the numbers were **equal**, so a straight swap shipped green twice over 1431 tests |
+| 7.2 | the seven-var forwarding list, pinned only by accident: `SPO_AUTO_TRIAGE_MS` could be dropped and the suite stayed green, because config's own default for it is `0` — while the live drop-in sets `900000` |
+| 7.2 | `scan-timers-disabled` validating the **parent's** config object, which the scanner process never reads |
+
+That last one is the chantier's most important finding and is 6.5's failure exactly: every test
+baked its own value in, so none read what production resolves.
+
+### Three traps added to the standing list
+
+- **Node reports a timed-out test as `cancelled`, not `fail`.** A mutation round reading `# fail`
+  alone sees `# pass 1418 # fail 0` and calls a *killed* mutant a survivor. This compounds with
+  the `--test-timeout=30000` rule: without the flag, mutations hang 100-150 s *and* then report as
+  cancelled. Read `not ok` + `# fail` + `# cancelled` + the exit code, always.
+- **`--experimental-test-coverage` cannot report on the whole suite.** One killed child truncates
+  a V8 coverage file and the entire aggregate report is discarded. Coverage must be taken as the
+  intersection of runs that exclude the child-spawning suites.
+- **`test/no-real-spawn.js` patches `spawnSync` in the PARENT only.** Every hermetic guarantee
+  this suite makes stops at a process boundary. Proved the hard way: a mutation routed tests
+  through real worker children and created a real worktree and branch in `/home/crazz/SPO-WebClient`
+  while the `--real` daemon was running. Cleaned up, nothing pushed — but no guard stopped it.
+
+### Filed rather than fixed — the maintainer's decision, 2026-09-02
+
+Verification found five production defects outside C7's scope. The decision was to fix the
+scanner breaker (a one-line asymmetry with a lying field name) and file the rest with their
+evidence, rather than land concurrency changes in a remediation plan's final chantier.
+
+| # | what | severity |
+|---|---|---|
+| [#77](https://github.com/Crazz-Org/SPO-Pipeline/issues/77) | a failed `gh issue comment` strands a parked card forever — the retry channel dies silently, no race required | **high** |
+| [#78](https://github.com/Crazz-Org/SPO-Pipeline/issues/78) | the crash-repark runs `finalizePark` synchronously in the dispatcher — the starvation class 6.3 moved the scans out for | **high** |
+| [#79](https://github.com/Crazz-Org/SPO-Pipeline/issues/79) | scanner robustness: an unguarded rename kills it, `spo intake` has no daemon guard, and the fixed breaker now only reaches a scanner's first 60 s | **high** |
+| [#80](https://github.com/Crazz-Org/SPO-Pipeline/issues/80) | `takeNextTask` drains a duplicate straight over a terminal taskDir | medium |
+| [#81](https://github.com/Crazz-Org/SPO-Pipeline/issues/81) | twelve `*Ms` config fields read a malformed env override as "disabled" | medium |
+| [#82](https://github.com/Crazz-Org/SPO-Pipeline/issues/82) | `no-real-spawn` is parent-only | medium |
+| [#83](https://github.com/Crazz-Org/SPO-Pipeline/issues/83) | the reconciler's stale snapshot, and `orphanScan`'s inverted read order | low |
+
+### The account cooldown, re-measured on the live pool
+
+The maintainer reported the pipeline calling an account stuck while the dashboard showed under
+100 % on the 5-hour window. Measured, and it is #483 in three parts at once:
+
+- `pick()`'s only health test is `!cooldownUntil || cooldownUntil <= now` — a **locally invented**
+  number compared to the wall clock, with **nothing ever reconciling against the server**.
+- The cooldown key is the **account**, not the account+model. A Fable exhaustion at PLAN cools the
+  account for Sonnet and Opus too, which is exactly why a dashboard can show headroom.
+- 4 of the 7 cooldown events in the live journal carry **`defaulted: true`** — the server supplied
+  no retry-after and the code guessed 1 h or 5 h.
+
+All 7 cooldowns in the whole corpus are `pool1`, never `pool2` (Max 5x vs Max 20x).
+
+Two things fixed on the spot: `~/.claude-accounts/labels.json` was **invalid JSON** (a stray `{`),
+and `readLabels` swallows the parse error and returns `{}` — so the dashboard had been silently
+showing no email/plan columns, degrading the very view being used to diagnose this. And
+`spo account clear-cooldown` now exists, because hand-editing `state.json` takes no lock and
+clears only the visible field: `lastUsageLimitAt` survives, so the next limit inside the 2 h
+window escalates straight to the 5 h tier. Measured against the real code: limit #1 → 3600000,
+limit #2 ten minutes later → **18000000**, clear, limit #3 → 3600000.

@@ -216,6 +216,77 @@ updated spec against the code (zero uncommented divergences).
 
 ---
 
+## Chantier 8 — The bench: remediation, then migration
+
+**Added 2026-09-02, after C7, at the maintainer's request.** Every chantier above treats the
+bench as a working black box that GATE calls — a decision this plan made explicitly at its own
+baseline ("GATE = ~2.5 min/run (0.68h total): **the bench is NOT the current bottleneck**"). That
+scoping was about *throughput*, and it silently carried an assumption about *truthfulness* that
+nobody tested. The first afternoon anyone looked, two defects fell out, one of them live.
+
+**The measured state, 2026-09-02** — 300 gate artifacts under `~/.spo-bench/ref/checkout/report/e2e/`:
+
+- The live drive is **real**: `scripts/verify-gate.js` calls `runLive({flows, branch, capabilities})`
+  from `dist/e2e/run.js` and prints `=== live drive on planitia`. **80 of 300 artifacts record it
+  actually running.** The nightly ran live the same day (`~/.spo-bench/nightly/latest.json`:
+  `"live drive exited 0 (PASS)"`).
+- **But no gate has driven planitia since 2026-08-29 22:34.** From 2026-08-30 07:20 every artifact
+  reads `live.skipped: true, why: "live stage requires --live (worker-only)"` — without exception,
+  including C6's own gate batch (#485/#487 → PRs #628/#629) and C7's K=2 recette.
+- **Root cause: a stale worker binary.** The running worker (pid 270, started 2026-08-28 22:23,
+  `dist/e2e/bench/worker.js` built 2026-08-29 09:39) calls `verify-gate.js` with **no `--live`**;
+  the source gained `--live` in `e180bfb6` (2026-08-29 22:39), a commit titled *"fix: gate:local
+  reaches the live world unguarded"* — it made `--live` mandatory to protect local dev and
+  compensated by giving the worker the flag. The guard shipped; the compensation was never built
+  or restarted.
+- **The pipeline cannot see any of this.** GATE reads an exit code and `verdicts/<sha>.json`, and
+  neither carries whether the live stage ran. A static-only gate attests `PASS` indistinguishably
+  from a full L2 gate. This is the same defect class C1 and C4 removed from the LLM judges,
+  surviving on the product side because it was out of scope.
+
+**The migration is a split, not a move.** Measured surface: `src/e2e/bench/**` (~7.5k lines with
+tests) is *infrastructure* — job queue, lease, worker supervision, verdict attestation,
+fingerprinting, checkout, CI-proof, merge-queue — and is structurally the same problem
+`orchestrator/` already solves (`lock.js`, `product-repo-lock.js`, `journal.js`, `dispatcher.js`).
+`src/e2e/*.ts` (~2.3k lines: `flows.ts` 482, `routing.ts` 227, `ws-driver`, `session`,
+`world-lock`, `capability`, `probe`) is *product knowledge* — what a Starpeace flow is, which
+members route to which flow, how to drive the RDO wire — and must stay in SPO-WebClient, where it
+changes with the product. The boundary between them is the attestation contract.
+
+The migration is already begun and already recorded: `accounts/spo-test-accounts.yml` lives in
+**this** repo since `e0ff083` ("feat: bootstrap the factory"), and its own header says it is "the
+machine-readable source the pipeline's L2/L3 steps consume". `doc/environments.md` names the
+target ("Until the bench migrates here…") without scheduling it. This chantier schedules it.
+
+**Order matters: audit, then remediate, then move.** 8.1 comes first and gates the rest: every
+action below is written from a single afternoon's look at a system nobody has ever measured, and
+should be treated as a hypothesis until 8.1 has re-derived it. Migrating an untruthful gate would
+only produce a truthful-looking pipeline step wrapped around the same silence, so 8.2-8.3 must
+land, and be observed working on a real card, before 8.5 moves any file.
+
+| # | Action | Files |
+|---|---|---|
+| 8.1 | **A full audit of the bench, at the depth of the 2026-08-30 audit that produced this plan — and it runs FIRST, before any other 8.x action, and only once C7 is closed and merged** (maintainer instruction, 2026-09-02). Audit the corpus, never the code's own account of itself: `~/.spo-bench/` holds ~300 gate artifacts, ~2300 stage logs, `verdicts/`, `done/`, `sessions/`, `journals/`, `nightly/`. **Protocol — the one C7 proved, not a fresh invention:** a deep **Fable 5.1** read-only sweep (no edits, no test runs, no git state changes; it reads statically and runs nothing) to find cross-cutting contradictions, then **every finding re-verified by Opus running actual probes** before it is believed — in C7 Fable's line references were accurate throughout while two of its derived conclusions were wrong, one inverted outright, so the re-verification is not a formality. Answer with numbers: how often the live stage really ran, per week; how many verdicts are `reusedFrom` a cached tree rather than computed, and whether tree-equality is a sound basis for reusing a *live-world* attestation at all; what fraction of merged cards were ever driven live; how many `ENVIRONMENT`/`BLOCKED` outcomes a reader downstream collapsed into PASS or FAIL; whether `fingerprintStable` means what it says; what the LOCKED-account and world-lock policy actually enforced versus what it claims. **Deliverable is a measurement doc in the mould of `doc/improvisation-analysis.md`**, and it is expected to re-derive the rows below — C7's own measurement rewrote four of its five, and the bench has never been measured even once. | `doc/`, `~/.spo-bench/` (read-only) |
+| 8.2 | **The attestation stops lying** (blocking, and the reason this chantier exists). `verdicts/<sha>.json` gains what the gate actually did: whether the live stage ran, which flows were routed, which were skipped and why, and the capability evidence read from the server. The pipeline's GATE then **refuses to treat a static-only gate as an L2 attestation** — a card whose diff routes to a live flow and whose verdict says the flow never ran is not green. Same rule the judges got in C1: *evidence over silence, and a skipped stage is never a pass.* | `scripts/verify-gate.js`, `src/e2e/bench/verdict.ts`, `orchestrator/steps/scripted.js` (`realGate`) |
+| 8.3 | **Kill the stale-build class structurally.** A worker running a binary older than the source it was built from silently downgraded every gate for 3.5 days and nothing anywhere noticed. The worker attests its **own** provenance — the sha and build time of the binary it is executing — into every verdict, and refuses to start (or attests `ENVIRONMENT`, never `PASS`) when that is older than the checkout it is gating. A restart discipline documented in a runbook is *not* the fix; the plan already knows what an unenforced rule is worth. | `src/e2e/bench/worker.ts`, `verdict.ts`, `orchestrator/steps/scripted.js` |
+| 8.4 | **Draw and freeze the boundary** before moving code: a versioned contract between bench infrastructure (submit a ref, get an attested verdict) and product knowledge (flows, routing, capability, the RDO wire). The contract is what lets the two halves live in different repos and version independently — and it is what 8.2's honest verdict schema already half-defines. Write it down, with the schema, before any file moves. | `doc/environments.md`, `doc/`, `src/e2e/**` |
+| 8.5 | **Move the infrastructure into `orchestrator/`, reusing what is already here.** The bench re-implements problems this repo has solved and hardened: single-instance locking (`lock.js`), a serialized shared resource (`product-repo-lock.js`), append-only multi-process journaling (`journal.js`), child supervision with circuit breakers (`dispatcher.js`), pid-liveness sweeps, atomic tmp+rename state. Port the *behaviour*, not the code — a second implementation of each is how the two diverge. The product repo keeps `src/e2e/*.ts` and gains a thin submit client. | `orchestrator/`, `src/e2e/bench/**`, `scripts/bench-*.sh` |
+| 8.6 | **The live gate becomes a first-class pipeline step**, with the state machine's own rules: a real timeout per class (C2's 2.1), a park reason that names what actually failed rather than a collapsed FAIL (C4's 4.2 — which already had to reconstruct `baseMain` because the bench did not always write it), retry budgets, and journal events a human can read. GATE's existing `gate-worker-down` / `gate-timeout` / `gate-non-attesting` legs become real states rather than exit-code guesses. | `orchestrator/state-machine.js`, `orchestrator/steps/scripted.js`, `doc/state-machine-spec.md` |
+| 8.7 | **Nightly and main-red re-homed.** The pipeline already consumes `<spoBenchDir>/nightly/latest.json` to refuse a merge onto a red main (`scripted.js`'s `nightlyMainRed`), from a file another repo's cron writes. After 8.5 the nightly is a pipeline schedule with a pipeline journal — and the `main-red-no-merge` / `main-red-refuse-worktree` legs stop depending on a file nobody in this repo produces. | `orchestrator/`, `scripts/nightly-check.sh` |
+
+**Gate C8**: full suite green + a card whose diff **routes to a real flow**, driven end to end,
+whose attestation *proves the live drive ran* (flows named, capability evidence present) — the
+first gate since 2026-08-29 that can be shown to have touched planitia + a **deliberately stale
+worker**, proving the gate refuses or attests ENVIRONMENT rather than silently downgrading to
+static-only + the nightly running from its pipeline schedule.
+
+**Board**: this is factory work — project 2 (**SPO Factory**, `PVT_kwDOEyAVD84BiHMr`), never
+project 1. No new board is needed; project 2 already spans SPO-Pipeline and SPO-Deploy, and the
+bench belongs to the same estate.
+
+---
+
+
 ## Notable findings deliberately NOT addressed here (decisions on record)
 
 - **The ~40k-token PLAN/IMPLEMENT preamble** (the product CLAUDE.md is never trimmed despite
