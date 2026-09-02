@@ -885,6 +885,104 @@ test('parallel-doc-log is registered as driver:"dispatcher", k:2, with its own c
   // Same per-task assertions as trivial-doc-log, reused, not copied -- each of the two cards is
   // itself shaped exactly like a trivial-doc-log card.
   assert.equal(s.assertions, recette.SCENARIOS['trivial-doc-log'].assertions);
+  assert.equal(typeof s.targetFile, 'function', 'a k>1 scenario must expose targetFile(index) -- the single source of truth both the card body and implement-touched-only-the-recette-doc are built from');
+});
+
+// ---------------------------------------------------------------------------------------------
+// POST-INCIDENT (live run, 2026-09-02, issues #630/#631 -> PRs #632/#633): parallel-doc-log's
+// original design had both cards append DISTINCT LINES to the SAME file, reasoning that made the
+// eventual merge "well-defined" -- wrong, because git's merge is hunk-based, not line-content
+// based: both diffs anchor at the same place (the file's tail), so whichever PR lands second
+// against a base that already moved gets a real, guaranteed conflict, regardless of what text
+// either line carries. THE central claim of the fix: no two cards in a K-card scenario may ever
+// target the same file. These tests are built to survive a mutation that reverts JUST that claim
+// (e.g. hard-coding both cards back onto RECETTE_DOC_FILE) even though every other assertion in
+// this suite would still pass -- see this file's own self-mutation verification note in the PR
+// this test landed in.
+// ---------------------------------------------------------------------------------------------
+
+// Structural, not an eyeball of two literals: builds the K cards buildCard would actually
+// produce, for K=2 (parallel-doc-log's own configured k) AND K=3 (a value this scenario has
+// never run at), and reads each card's target file OFF ITS OWN RENDERED BODY -- the exact text
+// an LLM implementing the card would read -- never by calling scenario.targetFile(i) and
+// comparing it to itself (that would recompute the expectation from the constant under test and
+// could never fail). The K=3 case is what proves the file-naming scheme is a general mechanism
+// (letterSuffix/parallelDocFile keyed on `index`), not a hand-fit that happens to produce two
+// different literals for K=2 and would quietly collide again at any other K.
+test('parallel-doc-log: buildCard renders a STRUCTURALLY DISTINCT target file per card index -- holds at K=2 and K=3, proving the scheme generalises rather than merely working for the one K this scenario ships with', () => {
+  const scenario = recette.SCENARIOS['parallel-doc-log'];
+
+  const extractTargetFile = (card) => {
+    // The exact phrase every card body uses (parallelDocLogCard, and trivialDocLogCard before
+    // it): "Append exactly one new line to `<file>` (create the file, ...". Parsing the
+    // RENDERED body, not any internal field, so this test would catch a bug where buildCard's
+    // own targetFile() and its rendered instructions disagree with each other.
+    const m = card.body.match(/Append exactly one new line to `([^`]+)`/);
+    assert.ok(m, `card body must name its target file in backticks; body was:\n${card.body}`);
+    return m[1];
+  };
+
+  for (const k of [2, 3]) {
+    const runId = `RUNID-STRUCT-K${k}`;
+    const files = [];
+    for (let index = 0; index < k; index++) {
+      const card = scenario.buildCard({ runId, index });
+      const file = extractTargetFile(card);
+      files.push(file);
+      // The criterion (the LLM-facing, never-re-parsed source of truth -- see this file's own
+      // "criterion carries its own..." test above) must name the SAME file as the body, not a
+      // second, potentially drifted, answer.
+      assert.ok(card.criterion.includes(file), `K=${k} index=${index}: criterion must name the same file the body does (${file}); criterion was: ${card.criterion}`);
+      // The safety property this whole scenario depends on: every per-card file still lives
+      // under doc/, invisible to typecheck/lint/coverage:changed the same way RECETTE_DOC_FILE
+      // is -- see that constant's own comment. A fix for the conflict bug must not smuggle a
+      // src/ target back in.
+      assert.match(file, /^doc\//, `K=${k} index=${index}: target file must stay under doc/, got ${file}`);
+    }
+
+    const distinct = new Set(files);
+    assert.equal(
+      distinct.size,
+      k,
+      `K=${k}: expected ${k} structurally distinct target files (this is the exact defect the live #630/#631 incident exposed -- two cards appending to the same file is a guaranteed merge conflict for K-1 of them), got ${JSON.stringify(files)}`
+    );
+  }
+});
+
+// The other half of the fix: 'implement-touched-only-the-recette-doc' must catch a card that
+// wrote its SIBLING's own file. Before this fix that scenario was impossible to express (there
+// was only one shared file, so "wrote the sibling's file" and "wrote my own file" were the same
+// event) -- it is now a real, distinct failure mode from writing under src/, and the assertion's
+// own `expectedFile` parameter (threaded per-task by runDispatcherScenario via
+// scenario.targetFile(t.index)) is what makes it catchable.
+test("'implement-touched-only-the-recette-doc': REJECTS a card that wrote its SIBLING's own (valid, doc/) target file -- a distinct failure from src/, and ACCEPTS a card that wrote only its own file", () => {
+  const scenario = recette.SCENARIOS['parallel-doc-log'];
+  const ownFile = scenario.targetFile(0);
+  const siblingFile = scenario.targetFile(1);
+  assert.notEqual(ownFile, siblingFile, 'precondition: the two cards must have distinct target files for this test to mean anything');
+
+  const findCheck = (result) => result.results.find((r) => r.id === 'implement-touched-only-the-recette-doc');
+
+  // Positive control: writing only its own file passes.
+  const passResult = recette.evaluateAssertions(scenario, {
+    events: [{ state: 'IMPLEMENT', event: 'result', payload: { files_changed: [ownFile] } }],
+    finalState: 'DONE',
+    capTripped: null,
+    expectedFile: ownFile,
+  });
+  assert.equal(findCheck(passResult).ok, true, findCheck(passResult).detail);
+
+  // The failure this test exists to prove: card 0 reports writing card 1's own file.
+  const failResult = recette.evaluateAssertions(scenario, {
+    events: [{ state: 'IMPLEMENT', event: 'result', payload: { files_changed: [siblingFile] } }],
+    finalState: 'DONE',
+    capTripped: null,
+    expectedFile: ownFile,
+  });
+  const failCheck = findCheck(failResult);
+  assert.equal(failCheck.ok, false, 'writing a sibling\'s own file must be rejected, not treated as fine because it is still under doc/');
+  assert.match(failCheck.detail, new RegExp(siblingFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the failure detail must name the sibling file actually written');
+  assert.doesNotMatch(failCheck.detail, /\bsrc\//, 'this is a DISTINCT failure from "touched src/" -- the detail must not describe it as an src/ violation');
 });
 
 test('buildPlan reports driver and k for both scenarios', () => {
@@ -2777,17 +2875,28 @@ test(
       // EXACTLY the shortcut trivial-doc-log's own 'plan-wrote-files' assertion exists to catch.
       // Reusing TRIVIAL_DOC_LOG_ASSERTIONS for parallel-doc-log (deliberately, see this file's own
       // scenario-metadata test above) means that catch applies here too.
-      taskOverrides: {
-        shadow: {
-          gate: [0],
-          prWait: [0],
-          llm: {
-            PLAN: STEP_PAYLOADS['plan_markdown,invariants_markdown,invariant_ids,check_commands'],
-            IMPLEMENT: STEP_PAYLOADS['summary,files_changed,invariants,tests_run,all_green'],
-            VALIDATE: STEP_PAYLOADS['verdict,reasons,findings'],
+      //
+      // taskOverrides as a FUNCTION of index (runDispatcherScenario's own per-index seam, added
+      // alongside the same-file-conflict fix): since each card now owns its OWN target file
+      // (scenario.targetFile(index), no longer one shared literal), the shadow IMPLEMENT fixture
+      // must report THAT file too, or 'implement-touched-only-the-recette-doc' correctly flags
+      // the shadow payload as having touched the wrong file. Built from scenario.targetFile
+      // itself (not a second hardcoded 'doc/recette-log-a.md'/'-b.md' pair) so this fixture can
+      // never quietly drift out of step with what parallelDocLogCard actually tells the card.
+      taskOverrides: (index) => {
+        const file = recette.SCENARIOS['parallel-doc-log'].targetFile(index);
+        return {
+          shadow: {
+            gate: [0],
+            prWait: [0],
+            llm: {
+              PLAN: STEP_PAYLOADS['plan_markdown,invariants_markdown,invariant_ids,check_commands'],
+              IMPLEMENT: { ...STEP_PAYLOADS['summary,files_changed,invariants,tests_run,all_green'], summary: `Appended one line to ${file}.`, files_changed: [file] },
+              VALIDATE: STEP_PAYLOADS['verdict,reasons,findings'],
+            },
+            delays: { IMPLEMENT: 50 },
           },
-          delays: { IMPLEMENT: 50 },
-        },
+        };
       },
     };
 

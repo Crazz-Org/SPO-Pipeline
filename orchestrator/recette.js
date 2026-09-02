@@ -347,7 +347,9 @@ const TRIVIAL_DOC_LOG_ASSERTIONS = [
   },
   {
     id: 'implement-touched-only-the-recette-doc',
-    description: `IMPLEMENT changed ${RECETTE_DOC_FILE} and NOTHING else -- nothing under src/`,
+    description:
+      "IMPLEMENT changed only this card's own target file and NOTHING else -- nothing under " +
+      'src/, and nothing that belongs to a sibling card in a k>1 scenario',
     // The assertion that makes this harness safe to point at the real repo. Everything else here
     // asks "did the pipeline work"; this one asks "did it do what we asked". Without it a run
     // that rewrote forty src/ files would satisfy every other assertion and be MERGED INTO
@@ -355,7 +357,16 @@ const TRIVIAL_DOC_LOG_ASSERTIONS = [
     // "Touch no other file. In particular, touch nothing under src/" -- an instruction nothing
     // was checking. Read from IMPLEMENT's own reported list, and cross-checked against the diff
     // the judges were handed, so a model that under-reports what it touched is caught too.
-    check: ({ events }) => {
+    //
+    // `expectedFile` -- threaded in via `info` by the caller (runInlineScenario passes
+    // scenario.targetFile(0); runDispatcherScenario passes scenario.targetFile(t.index) per
+    // task) -- defaults to RECETTE_DOC_FILE so a caller that never supplies it (every existing
+    // trivial-doc-log-only test in this file) keeps its previous, correct behaviour unchanged.
+    // For parallel-doc-log this is what makes "touched a SIBLING's own file" a DISTINCT, caught
+    // failure from "touched src/": a sibling's file is a real, valid recette target under
+    // doc/ -- exactly the kind of thing a same-shape check that only asked "is this under src/"
+    // would miss -- but it is never THIS card's own file, so it lands in `unexpected` too.
+    check: ({ events, expectedFile = RECETTE_DOC_FILE }) => {
       const results = events.filter((ev) => ev.state === 'IMPLEMENT' && ev.event === 'result');
       const last = results[results.length - 1];
       const payload = last && last.payload;
@@ -364,12 +375,12 @@ const TRIVIAL_DOC_LOG_ASSERTIONS = [
       if (!parsed) return { ok: false, detail: 'no parsable files_changed' };
 
       const normalise = (f) => String(f).replace(/^\.\//, '').trim();
-      const unexpected = parsed.map(normalise).filter((f) => f !== RECETTE_DOC_FILE);
+      const unexpected = parsed.map(normalise).filter((f) => f !== expectedFile);
       return {
         ok: unexpected.length === 0,
         detail:
           unexpected.length === 0
-            ? `only ${RECETTE_DOC_FILE}`
+            ? `only ${expectedFile}`
             : `UNEXPECTED files changed (this run would merge them into product main): ${unexpected.join(', ')}`,
       };
     },
@@ -425,16 +436,89 @@ function safeJsonArray(text) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// parallel-doc-log -- driver: 'dispatcher', k: 2. Two synthetic cards, same shape as
-// trivial-doc-log (same file, same "touch nothing under src/" instruction), each appending its
-// OWN distinct line (`index` 0/'a' vs 1/'b', threaded through by createIssue below) -- so a real
-// merge of both is well-defined (two genuinely different lines) rather than two cards racing to
-// write the identical line.
+// parallel-doc-log -- driver: 'dispatcher', k: 2.
+//
+// POST-INCIDENT CORRECTION (live run, 2026-09-02, issues #630/#631 -> PRs #632/#633): this
+// scenario's original design had both cards append their OWN distinct line to the SAME file
+// (RECETTE_DOC_FILE), reasoning that "two genuinely different lines" makes the eventual merge
+// "well-defined". That reasoning was wrong, and the live run proved it the expensive way. PR
+// #632 (card 631) merged at 15:02:22Z. PR #633 (card 630) was already enqueued in the merge
+// queue at that point; GitHub then reported "This branch has conflicts that must be resolved:
+// doc/recette-log.md", `npm run pr:wait 633` returned exit 4 twice, and the card PARKED on
+// 'merge-queue-not-landing'. The distinct LINE TEXT never mattered: both cards' diffs are a
+// hunk anchored at the same place -- the file's tail (or the same "create the file with a
+// one-line header" hunk, if neither line existed yet) -- so whichever PR's base commit is no
+// longer HEAD by the time the second one tries to land has a hunk that cannot apply against the
+// file's new state. This is not a probabilistic flake: for K cards appending at the same anchor
+// in the same file, it is GUARANTEED that K-1 of them cannot land cleanly once the first does.
+// A "parallelism" scenario that guarantees K-1 of its own K cards a merge conflict proves nothing
+// about concurrency -- it proves the opposite of what it set out to.
+//
+// THE FIX: each card gets its OWN target file, one per `index`, drawn from a small FIXED set
+// reused every run (see `parallelDocFile`/`letterSuffix` below) -- `doc/recette-log-a.md` for
+// index 0, `doc/recette-log-b.md` for index 1, and so on. Two cards' diffs then touch entirely
+// disjoint files: there is no shared hunk for git (or GitHub's merge queue) to conflict over,
+// regardless of landing order, regardless of how many lines either file has accumulated by then.
+// This is structural, not timing-dependent -- unlike "make sure the two lines are far enough
+// apart", it does not depend on how large the shared file has grown or on the two PRs' base SHAs
+// lining up.
+//
+// REJECTED ALTERNATIVES:
+//   1. Keep one shared file, distinct lines (the ORIGINAL design). Rejected: proven broken above.
+//   2. One NEW file per RUN (e.g. `doc/recette-log-${runId}-a.md`). Rejected: "bounded repo
+//      footprint" is an explicit constraint here -- these changes merge into SPO-WebClient's real
+//      `main` on every green run, and a design keyed on `runId` accumulates a new pair of files in
+//      doc/ forever. A design keyed on `index` instead stays at exactly `k` files, total, for the
+//      life of the scenario -- the same small, constant footprint RECETTE_DOC_FILE itself already
+//      has (one file, growing one line per run); this is that same shape, times k.
+//   3. One shared file, cards write to different SECTIONS/headings within it (pre-reserved
+//      regions). Rejected: still one file, so still one set of hunks a text-diff has to reconcile,
+//      and the anchor-point problem does not go away -- it just moves from "the file's tail" to
+//      "the boundary of section A vs section B", which shifts every time either section grows.
+//      It is also strictly harder to hand an LLM an unambiguous instruction for ("append after
+//      the third bullet under the second-level heading whose text is exactly...") than "append to
+//      this file, which is yours alone" -- more surface for IMPLEMENT to get subtly wrong, for no
+//      benefit over disjoint files.
+//   4. Random/hash-based filenames per card. Rejected: fails the harness's OWN safety
+//      requirement -- "the per-card target must be derivable by the card itself" (the card's body
+//      is written once, by buildCard, and handed to an LLM; nothing about a random name is
+//      re-derivable or checkable against a second source of truth the way `index` is).
+//
+// Each card is still, on its own, structurally identical to a trivial-doc-log card (append one
+// line to a `doc/` file, touch nothing else) -- see RECETTE_DOC_FILE's own comment for why a
+// `doc/` file is the safest input CHECK/GATE can be handed; every one of those properties
+// (invisible to typecheck/lint/coverage:changed) holds for ANY file under `doc/`, this scenario's
+// per-card files included, not just the one literal path RECETTE_DOC_FILE names.
 // ---------------------------------------------------------------------------------------------
 
+// letterSuffix(index) -- spreadsheet-column style: 0->'a', 1->'b', ..., 25->'z', 26->'aa', ...
+// Deterministic and collision-free for any index >= 0, so the file-naming scheme below scales
+// structurally to any K a scenario's own `k` ever becomes -- it is not a hand-fit for K=2, the
+// only value `parallel-doc-log` happens to use today.
+function letterSuffix(index) {
+  let n = index + 1;
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(97 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+// parallelDocFile(index) -- the ONE file this index's card is allowed to touch. THE single
+// source of truth for that fact: both parallelDocLogCard (what the card is TOLD) and the
+// 'implement-touched-only-the-recette-doc' assertion (what IMPLEMENT is CHECKED against, via
+// scenario.targetFile -- see runInlineScenario/runDispatcherScenario below) call this same
+// function, so the instruction and the check can never quietly drift into two different answers.
+function parallelDocFile(index) {
+  return `doc/recette-log-${letterSuffix(index)}.md`;
+}
+
 function parallelDocLogCard({ runId, index }) {
-  const suffix = index === 0 ? 'a' : 'b';
+  const suffix = letterSuffix(index);
   const cardId = `${runId}-${suffix}`;
+  const file = parallelDocFile(index);
   const title = `[spo-recette] parallel synthetic card ${cardId}`;
   const body = [
     'This issue was created automatically by `spo recette` (orchestrator/recette.js), scenario',
@@ -448,12 +532,14 @@ function parallelDocLogCard({ runId, index }) {
     '',
     '## Done means',
     '',
-    `Append exactly one new line to \`${RECETTE_DOC_FILE}\` (create the file, with a one-line`,
-    'header, if it does not exist yet). The new line should read exactly:',
+    `Append exactly one new line to \`${file}\` (create the file, with a one-line`,
+    'header, if it does not exist yet). This file is this card\'s own -- the sibling card in this',
+    'run targets a different file; do not touch it. The new line should read exactly:',
     '',
     `- ${cardId} -- synthetic parallel recette card, no product behaviour changed`,
     '',
-    'Touch no other file. In particular, touch nothing under `src/`.',
+    `Touch no other file. In particular, touch nothing under \`src/\`, and nothing that belongs`,
+    'to the sibling card.',
     '',
     `Source: \`spo recette\`, scenario parallel-doc-log, run ${runId}, card ${suffix}.`,
   ].join('\n');
@@ -461,10 +547,11 @@ function parallelDocLogCard({ runId, index }) {
   // Explicit, never re-parsed off the body -- see trivialDocLogCard's own comment (issue #467)
   // for why: identical reasoning, identical fix, one card in two.
   const criterion = [
-    `Append exactly one new line to ${RECETTE_DOC_FILE} (create the file with a one-line header`,
+    `Append exactly one new line to ${file} (create the file with a one-line header`,
     'if it does not exist yet). The new line must read exactly, byte for byte:',
     `- ${cardId} -- synthetic parallel recette card, no product behaviour changed`,
-    'Touch no other file. In particular, touch nothing under src/.',
+    'Touch no other file. In particular, touch nothing under src/, and nothing that belongs to',
+    'the sibling card\'s own file.',
   ].join(' ');
 
   return { title, body, criterion };
@@ -660,6 +747,12 @@ const SCENARIOS = {
     driver: 'inline',
     k: 1,
     buildCard: trivialDocLogCard,
+    // targetFile(index) -- the file THIS index's card is allowed to touch; k=1 so `index` is
+    // always 0 and the answer is always the one constant. See parallel-doc-log's own targetFile
+    // just below for why this exists as a per-scenario function rather than a bare constant read
+    // straight off RECETTE_DOC_FILE: runInlineScenario/runDispatcherScenario call it uniformly
+    // for every scenario, never special-casing k=1 vs k>1.
+    targetFile: () => RECETTE_DOC_FILE,
     assertions: TRIVIAL_DOC_LOG_ASSERTIONS,
   },
   'parallel-doc-log': {
@@ -683,6 +776,10 @@ const SCENARIOS = {
     // cards racing inside the same window.
     capLlmSteps: DEFAULT_CAP_LLM_STEPS * 2,
     buildCard: parallelDocLogCard,
+    // targetFile(index) -- see parallelDocFile's own header comment for why this is the single
+    // source of truth both the card body (what a card is TOLD) and
+    // 'implement-touched-only-the-recette-doc' (what IMPLEMENT is CHECKED against) are built from.
+    targetFile: parallelDocFile,
     assertions: TRIVIAL_DOC_LOG_ASSERTIONS,
     crossTaskAssertions: PARALLEL_DOC_LOG_CROSS_ASSERTIONS,
   },
@@ -724,6 +821,22 @@ const SCENARIOS = {
 // harness cannot ever safely drive main-moved for real -- and is left for a future action rather
 // than folded into this one's own already-large surface (a real dispatcher driver, an
 // out-of-process cap, and a corrected scan-timer-forwarding mechanism).
+//
+// UPDATE (post-incident, 2026-09-02, issues #630/#631 -> PRs #632/#633): main-moved is no longer
+// merely a hypothetical this action chose not to build -- the live parallel-doc-log run above
+// REACHED it, unintentionally, at K=2: PR #632 (card 631) merged, moving origin/main, while PR
+// #633 (card 630) was already sitting in the merge queue. That is exactly the intersection window
+// main-moved-doc-log would have been built to exercise on purpose. It is STILL not a scenario
+// here, and the reason has changed: it is not scope/sequencing complexity any more, it is that
+// the pipeline does not yet re-gate that intersection -- card 630 PARKED
+// ('merge-queue-not-landing') instead of being re-gated against the new origin/main. The
+// intersection test that exists (test/gate-main-moved.test.js) runs realGate/realCiChecks at
+// CI_CHECKS, BEFORE a sibling's merge can land; nothing re-runs it in the GATE-to-merge-queue-
+// landing window where this incident actually happened, so the gap that window represents is
+// unprotected today. A scenario whose own documented "done" outcome is a park is not a gate
+// scenario -- shipping one here would either be marked expected-to-fail (useless as a gate) or
+// would need the pipeline fix landed first. That pipeline/product fix is being filed separately,
+// not folded into this action; a live main-moved-doc-log scenario stays future work, gated on it.
 
 function resolveScenario(name) {
   const key = name || 'trivial-doc-log';
@@ -1322,6 +1435,17 @@ function buildPlan(scenario, config) {
     steps: [
       `refuse if a live daemon holds ${lockPath(config.productJournalRoot)} (unless --force)`,
       `create ${k === 1 ? 'a dedicated GitHub issue' : `${k} dedicated GitHub issues`} in ${config.ghRepo}, labelled "${scenario.label}"`,
+      // Named explicitly (post-incident addition, see parallel-doc-log's own header comment for
+      // the #630/#631 incident this responds to): a maintainer reading --dry before a live run
+      // must be able to see, without reading source, that no two cards target the same file --
+      // exactly the property whose absence caused a real merge-queue conflict and a real park.
+      ...(scenario.targetFile
+        ? [
+            k === 1
+              ? `this card's own target file: ${scenario.targetFile(0)}`
+              : `each card's own target file (structurally distinct, never shared -- ${k - 1} of ${k} cards would be a guaranteed merge conflict otherwise): ${Array.from({ length: k }, (_, i) => `card ${i}: ${scenario.targetFile(i)}`).join('; ')}`,
+          ]
+        : []),
       ...driverSteps,
       'clean up: worktree remove+prune, local+remote branch delete, PR close, issue close, remove the run dir (unless --keep)',
     ],
@@ -1437,7 +1561,11 @@ async function runInlineScenario(scenario, config, plan, opts, deps) {
 
   let assertions = null;
   if (!runError && finalState) {
-    assertions = evaluateAssertions(scenario, { events, finalState, capTripped: cap.tripped() });
+    // scenario.targetFile(0) -- the inline driver only ever runs a single, index-0 card. See
+    // 'implement-touched-only-the-recette-doc's own comment for why this is threaded explicitly
+    // rather than left to that check's RECETTE_DOC_FILE default.
+    const expectedFile = scenario.targetFile ? scenario.targetFile(0) : undefined;
+    assertions = evaluateAssertions(scenario, { events, finalState, capTripped: cap.tripped(), expectedFile });
   }
 
   const capTripped = cap.tripped();
@@ -1663,9 +1791,20 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
       // cleanupMultiTask) already has to tolerate "this task never produced a taskId" for the
       // symmetric case of createIssue itself throwing on card 2 while card 1 is already
       // enqueued -- see those call sites' own null-guards.
-      const entry = { issueNumber: issue.issueNumber, issueUrl: issue.url, taskId: null };
+      // `index: i` carried on the entry (not re-derived later) so the per-task assertion loop
+      // below can ask scenario.targetFile(t.index) for THIS task's own file -- the same `i` that
+      // was handed to createIssue/buildCard for this exact card, never a re-guessed position.
+      const entry = { issueNumber: issue.issueNumber, issueUrl: issue.url, taskId: null, index: i };
       tasks.push(entry);
-      const task = enqueueTask(config, issue, i, opts.taskOverrides || {});
+      // opts.taskOverrides may be a plain object (applied identically to every task -- the only
+      // shape this ever had before) OR a function of `index` (TEST-ONLY, same seam as
+      // buildCard's own `index` parameter) -- needed so a hermetic shadow-mode test can hand each
+      // task ITS OWN shadow IMPLEMENT payload (files_changed matching THIS task's own
+      // scenario.targetFile(i), not a single shared literal) now that a k>1 scenario's cards no
+      // longer share one target file. Never reachable from `spo recette`'s own CLI surface --
+      // `opts.taskOverrides` has no flag wiring in bin/spo, only runRecette's own callers reach it.
+      const taskOverrides = typeof opts.taskOverrides === 'function' ? opts.taskOverrides(i) : opts.taskOverrides || {};
+      const task = enqueueTask(config, issue, i, taskOverrides);
       entry.taskId = task.id;
     }
   } catch (err) {
@@ -1846,7 +1985,12 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
   const taskResults = tasks.map((t) => {
     let assertions = null;
     if (!runError && t.finalState) {
-      assertions = evaluateAssertions(scenario, { events: t.events, finalState: t.finalState, capTripped });
+      // scenario.targetFile(t.index) -- THIS task's own file, not a shared constant. For
+      // parallel-doc-log this is what lets 'implement-touched-only-the-recette-doc' catch a card
+      // that wrote its SIBLING's own valid recette file, a distinct failure from writing src/
+      // (see that assertion's own comment).
+      const expectedFile = scenario.targetFile ? scenario.targetFile(t.index) : undefined;
+      assertions = evaluateAssertions(scenario, { events: t.events, finalState: t.finalState, capTripped, expectedFile });
     }
     if (!assertions || !assertions.ok) perTaskOk = false;
     return {
