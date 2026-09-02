@@ -69,6 +69,10 @@ function testConfig(overrides = {}) {
     stepDeadlineMs: 30000,
     ciChecksMaxPolls: 3,
     ciChecksPollIntervalMs: 1000,
+    // Action 6.5: real config.js's default (1) -- baked in here, not left to
+    // main-moved-budget.js's own fallback, so a test that overrides it (see the "raised budget"
+    // tests below) is visibly opting OUT of the default rather than relying on an implicit one.
+    mainMovedRegateBudget: 1,
     ...overrides,
   };
 }
@@ -190,7 +194,7 @@ test('realGate: exit 1, FAIL without baseMain, merge clean -> CHECK, main-moved-
 
   const next = await realGate(ctx, deps);
   assert.equal(next, 'CHECK');
-  assert.equal(ctx.counters.mainMoveUsed, true);
+  assert.equal(ctx.counters.mainMoveUsed, 1); // action 6.5: a count now, not a boolean
 
   const fetchIdx = calls.findIndex((c) => c.args.includes('fetch'));
   const mergeIdx = calls.findIndex((c) => c.args.includes('merge') && !c.args.includes('--abort'));
@@ -237,7 +241,7 @@ test('realGate: exit 1, FAIL without baseMain, merge conflicts -> merge --abort 
 
 test('realGate: exit 1, FAIL without baseMain, mainMoveUsed already true -> PARKED main-moved-twice, no merge argv', async () => {
   const ctx = gateCtx();
-  ctx.counters.mainMoveUsed = true;
+  ctx.counters.mainMoveUsed = 1; // action 6.5: at the default budget of 1, this task's move is already spent
   const headSha = fakeSha('mainmovedtwicehead');
   writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
 
@@ -250,6 +254,85 @@ test('realGate: exit 1, FAIL without baseMain, mainMoveUsed already true -> PARK
   );
 
   assert.ok(!calls.some((c) => c.args.includes('merge')), 'a second move must never even attempt a merge');
+});
+
+// ---- 5b. action 6.5: a raised mainMovedRegateBudget allows N re-gates before parking ----------
+//
+// See config.js's mainMovedRegateBudget comment: the default stays at 1 (test 5 above already
+// covers "no behaviour change at the default"), and this is the codebase's convention for
+// exercising a raised budget directly (ci-cause-step.test.js's own ciRetryBudget tests do the
+// same) rather than through a CLI flag or env var -- none of diagnoseBudget/validateRejectBudget/
+// ciRetryBudget have one either.
+test('realGate: mainMovedRegateBudget raised to 2 -> two re-gates succeed, a third parks main-moved-twice', async () => {
+  const config = testConfig({ mainMovedRegateBudget: 2 });
+  const ctx = gateCtx({ config });
+  const headSha = fakeSha('mainmovedbudget2head');
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+
+  const calls = [];
+  const deps = failNoBaseMainDeps({ headSha, calls });
+
+  assert.equal(await realGate(ctx, deps), 'CHECK', 'first move: under budget 2');
+  assert.equal(ctx.counters.mainMoveUsed, 1);
+
+  assert.equal(await realGate(ctx, deps), 'CHECK', 'second move: still under budget 2');
+  assert.equal(ctx.counters.mainMoveUsed, 2);
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'main-moved-twice' &&
+      err.detail.mainMoveUsed === 2 &&
+      err.detail.mainMovedRegateBudget === 2,
+    'third move: budget of 2 is spent'
+  );
+});
+
+// ---- 5c. action 6.5: the module's own guard, and the SHIPPED default ------------------------
+//
+// Both of these pin things every OTHER test in this suite structurally cannot: each test file's
+// testConfig() bakes in `mainMovedRegateBudget: 1` of its own, so no test above ever reads
+// orchestrator/config.js's real value, and none ever reaches main-moved-budget.js's fallback
+// branch. Verified by mutation: with only the tests above, `mainMovedRegateBudget: 1` -> 0 or ->
+// 2 in the real config, and deleting the module's guard outright, ALL passed the full suite.
+test('resolveMainMovedRegateBudget: a config missing the field falls back to 1, never to the infinite budget a bare >= comparison would give', () => {
+  const { resolveMainMovedRegateBudget } = require('../orchestrator/main-moved-budget.js');
+
+  // The hazard the module exists to close, stated as an executable fact rather than a comment:
+  // `n >= undefined` is false for EVERY n, so a call site comparing straight against a missing
+  // config field would allow main-moved re-gates forever.
+  assert.equal(0 >= undefined, false);
+  assert.equal(999 >= undefined, false);
+
+  // ...and the module refuses to produce that. Every shape that is not a positive integer must
+  // land on today's behaviour (1), not on undefined/NaN/0/negative.
+  for (const bad of [undefined, null, 0, -1, -5, 1.5, NaN, Infinity, '2', true, false, {}]) {
+    assert.equal(
+      resolveMainMovedRegateBudget({ mainMovedRegateBudget: bad }),
+      1,
+      `a ${JSON.stringify(String(bad))} budget must fall back to 1, not grant an unbounded one`
+    );
+  }
+  assert.equal(resolveMainMovedRegateBudget({}), 1, 'a config with no such field at all');
+  assert.equal(resolveMainMovedRegateBudget(undefined), 1, 'no config object at all');
+  assert.equal(resolveMainMovedRegateBudget(null), 1);
+
+  // A genuine positive integer is honoured verbatim -- otherwise the field is decorative.
+  assert.equal(resolveMainMovedRegateBudget({ mainMovedRegateBudget: 2 }), 2);
+  assert.equal(resolveMainMovedRegateBudget({ mainMovedRegateBudget: 7 }), 7);
+});
+
+test('the SHIPPED mainMovedRegateBudget default is 1 -- action 6.5 changed the mechanism, not the behaviour', () => {
+  const realConfig = require('../orchestrator/config.js');
+  const { resolveMainMovedRegateBudget } = require('../orchestrator/main-moved-budget.js');
+
+  // The settled decision (config.js's own comment, doc/state-machine-spec.md's CI_CHECKS row):
+  // default 1 == today's hard "second move parks". Raising or lowering it is a real behaviour
+  // change to the live daemon and must break a test, not slip through green. 0 in particular
+  // would park the FIRST main-moved re-gate -- a path 4 of 16 measured sessions needed.
+  assert.strictEqual(realConfig.mainMovedRegateBudget, 1);
+  assert.strictEqual(resolveMainMovedRegateBudget(realConfig), 1);
 });
 
 // ---- 6. nightly red at the fetched origin/main sha -> main-red-no-merge, no merge argv --------
@@ -435,7 +518,7 @@ test('realGate: exit 1, PASS verdict without baseMain -> DIAGNOSE, never the mai
     !calls.some((c) => c.args.includes('merge') || c.args.includes('fetch')),
     'only a FAIL without baseMain is a main-moved conflict; every other shape belongs to a judge'
   );
-  assert.equal(ctx.counters.mainMoveUsed, false, 'a non-FAIL verdict must not spend the one main move');
+  assert.equal(ctx.counters.mainMoveUsed, 0, 'a non-FAIL verdict must not spend the one main move'); // action 6.5: a count now, not a boolean
 });
 
 // Mutant killed: deleting the `gate-main-moved-fetch-failed` appendEvent. The fetch being

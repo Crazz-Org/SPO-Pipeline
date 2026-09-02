@@ -19,6 +19,7 @@ const os = require('os');
 const path = require('path');
 const accountsModule = require('../orchestrator/accounts');
 const { processAlive } = require('../orchestrator/lock');
+const { describeLiveWorkers } = require('../orchestrator/worker-status');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
@@ -105,6 +106,15 @@ function collectJournalTasks(journalRoot) {
         model: e.model,
         account: e.account,
         sessionId: e.sessionId || null,
+        // action 6.7: `duration_s` (action 5.4) was collected in journal.jsonl but never carried
+        // through this module at all, which is half of why project-2 card #478 called it
+        // "rendered nowhere" -- render.js deliberately does not render per-task llmSteps (see
+        // this file's own header: per-task detail duplicates the GitHub Projects board), but a
+        // future aggregate consumer of this array (or a test measuring against the real corpus)
+        // should not have to re-parse journal.jsonl a second time to get at it. `null`, never
+        // `0`, when the event predates the field -- same "0 is a lie, absence is the truth" rule
+        // task-summary.js's own hasTokenData and bin/spo's cmdTask both already apply.
+        durationS: typeof e.duration_s === 'number' ? e.duration_s : null,
       }));
 
     return {
@@ -364,7 +374,7 @@ function startOfWeek(now) {
   return d.getTime();
 }
 
-// Statuses for the 5 surfaces that compose "the pipeline": no network probe, no spawn --
+// Statuses for the 6 surfaces that compose "the pipeline": no network probe, no spawn --
 // lock file + heartbeat file + mtime only.
 function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } = {}) {
   const services = {
@@ -373,6 +383,14 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
     benchWorker: { status: 'unknown', pid: null, port: null, startedAt: null, heartbeatAt: null, heartbeatAgeMs: null },
     nightly: { status: 'unknown', verdict: null, sha: null, finishedAt: null, ageMs: null },
     verdicts: { status: 'unknown', lastVerdict: null, lastAt: null, ageMs: null, recentPass: 0, recentTotal: 0 },
+    // action 6.7: C6's dispatcher.js/live-workers.json, an AGGREGATE COUNT ONLY -- see this
+    // module's own header ("per-task detail duplicates the GitHub Projects board") for why this
+    // tile never lists per-task rows the way bin/spo's cmdStatus does. `count` is a SUBSET of
+    // daemonStats.active (orchestrator/worker-status.js's describeLiveWorkers classifies every
+    // live-workers.json id against its own task's state.json terminal-or-not, exactly like
+    // bin/spo does), never a second, independently-derived total -- see that module's header for
+    // the double-count hazard this avoids repeating for a second surface.
+    workers: { status: 'unknown', present: false, count: 0, staleCount: 0, trailingCount: 0, updatedAt: null, ageMs: null },
   };
 
   // daemon
@@ -483,6 +501,45 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
     }
   }
 
+  // workers is filled in by collectAll (applyWorkerStats below), not here -- see that function's
+  // own comment for why: it needs `journalTasks` (specifically `isCardKind`) to exclude a
+  // synthetic/demo task from the live count the exact same way collectDaemonStats's own `active`
+  // already excludes one, and collectServices is called by several tests with no journalTasks in
+  // hand at all (test/dashboard.test.js calls it bare). Left at its zeroed/'unknown' default here
+  // so a caller that only ever calls collectServices() still gets an honest, non-crashing shape.
+  return services;
+}
+
+// applyWorkerStats(services, journalRoot, journalTasks, now) -- action 6.7. Mutates
+// `services.workers` in place with the SAME classification bin/spo's cmdStatus renders per row
+// (orchestrator/worker-status.js's describeLiveWorkers), filtered to `isCardKind` tasks only --
+// the same filter collectDaemonStats already applies to its own `active` count (see that
+// function's header on the one real demo/synthetic task in the live corpus). Without this
+// filter, a live worker running a `kind: "synthetic"` task (only reachable today via a test
+// fixture driving the real dispatcher against a demo card outside `spo recette`'s own isolated
+// journal dir -- production traffic never does this) would inflate this tile's count past
+// `daemonStats.active`, which is exactly the kind of "two counts of almost-the-same-set silently
+// disagree" drift action 5.4 item G already had to close once for the parking-rate denominator.
+function applyWorkerStats(services, journalRoot, journalTasks, now) {
+  if (!journalRoot) return services;
+  const kindById = new Map((journalTasks || []).map((t) => [t.id, t]));
+  const worker = describeLiveWorkers(journalRoot, null, now);
+  let live = 0;
+  let stale = 0;
+  for (const [id, info] of worker.perId) {
+    if (info.classification === 'trailing') continue; // never counted -- see worker-status.js
+    const task = kindById.get(id);
+    if (task && !isCardKind(task)) continue; // same exclusion collectDaemonStats applies
+    if (info.classification === 'live') live++;
+    else if (info.classification === 'stale') stale++;
+  }
+  services.workers.present = worker.present;
+  services.workers.count = live;
+  services.workers.staleCount = stale;
+  services.workers.trailingCount = worker.counts.trailing;
+  services.workers.updatedAt = worker.updatedAt;
+  services.workers.ageMs = worker.ageMs;
+  services.workers.status = worker.present ? 'ok' : 'unknown';
   return services;
 }
 
@@ -751,6 +808,11 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
     }
   })();
   const usageSnapshot = collectUsageSnapshot(journalRoot);
+  const now = Date.now();
+  // action 6.7: `applyWorkerStats` needs `journalTasks` (for its own `isCardKind` filter) --
+  // computed here, once, rather than inside collectServices, which several existing tests call
+  // bare (see that function's own comment on `services.workers`).
+  const services = applyWorkerStats(collectServices({ journalRoot, queueDir, benchRoot, now }), journalRoot, journalTasks, now);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -765,7 +827,7 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
     // Date.now() of its own). null when there is no snapshot to judge.
     usageSnapshotMeta: journalRoot ? usageSnapshotFreshness(usageSnapshot, path.join(journalRoot, 'usage-snapshot.json')) : null,
     trend: collectTrend(journalRoot),
-    services: collectServices({ journalRoot, queueDir, benchRoot }),
+    services,
     daemonStats: collectDaemonStats(journalTasks, queue.depth),
     reports: collectReportPipeline(journalRoot, reportsDir),
     system: null,
@@ -790,4 +852,5 @@ module.exports = {
   collectReportPipeline,
   buildSessionIndex,
   readDaemonEventsTail,
+  applyWorkerStats,
 };

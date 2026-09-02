@@ -14,7 +14,30 @@
 //                            has one. A card in action 4.4's bounded auto-retry backoff gets its
 //                            own BACKOFF bucket (attempt number + next-run time, read off its
 //                            queue entry) instead of being silently double-counted as `active`.
-//   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl
+//                            Action 6.7: every ACTIVE row also carries worker detail (account,
+//                            running duration) when C6's dispatcher has a live worker on it, read
+//                            from <journalRoot>/live-workers.json cross-referenced against that
+//                            same task's state.json (orchestrator/worker-status.js) -- this is
+//                            the SAME set `active:` already counts, presented with more detail,
+//                            never a second tally (see that module's own header for the double-
+//                            count hazard this avoids). A `workers: N live` summary line follows
+//                            the bucket-count line; a missing live-workers.json renders as
+//                            "unknown", never as "0 workers", since the two are not the same fact
+//                            (see orchestrator/journal.js's readLiveWorkersRaw). Also new: a
+//                            `dispatcher: IDLE ...` line when the pool has no healthy accounts
+//                            right now (edge-triggered off daemon.jsonl, silent once recovered),
+//                            and an `account-cooldown: N degraded write(s) ...` line naming which
+//                            accounts hit the pool-state-lock fallback (action 6.2) -- both
+//                            omitted entirely when there is nothing to report.
+//   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl. Every
+//                            `llm-call` line also carries an explicit `duration=<n>s` (action
+//                            6.7, closing project-2 card #478 -- action 5.4's own `duration_s`
+//                            was journalled but rendered nowhere until now) or
+//                            `duration=not recorded` for a call that predates the field -- never
+//                            `0s`, which would read as a real, fast call instead of a missing
+//                            measurement (task-summary.js's own `hasTokenData` header names the
+//                            identical 0-vs-missing bug for tokens; this is the same class for
+//                            time). A `step durations:` summary line closes the output.
 //   spo parked              parked tasks + reasons
 //   spo tokens               what the pipeline has spent, in TOKENS, read back from the
 //                            journals' own `llm-call` token events (orchestrator/tokens.js --
@@ -152,9 +175,11 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { collectAll } = require('../console/collect');
+const { collectAll, readDaemonEventsTail } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
 const accounts = require('../orchestrator/accounts');
+const { describeLiveWorkers } = require('../orchestrator/worker-status');
+const { formatDuration } = require('../orchestrator/task-summary');
 const defaultConfig = require('../orchestrator/config');
 const intake = require('../orchestrator/intake');
 const autoTriage = require('../orchestrator/auto-triage');
@@ -437,11 +462,60 @@ function computeUnparkScanFailureStreak(lines) {
   return { count, firstFailedAt, lastFailedAt };
 }
 
+// ---- action 6.7 helpers (worker observability) -------------------------------------------
+
+// readTaskAccount(lines) -- the account this task's journal most recently named, walked
+// backwards over its OWN journal.jsonl lines (already read by cmdStatus's per-task loop, never a
+// second parse). Both `llm-call` (steps/llm.js's appendEvent) and `account-cooldown`
+// (state-machine.js's callLlmStep) events carry `account` under the same field name, so this
+// needs no per-event-type branching -- the most recent line carrying the field at all is the
+// task's current account, whichever kind of event it was.
+function readTaskAccount(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const ev = lines[i];
+    if (ev && typeof ev.account === 'string' && ev.account) return ev.account;
+  }
+  return null;
+}
+
+// computeDispatcherIdleStatus(daemonEvents) -- dispatcher.js's own `dispatcher-idle-no-healthy-
+// accounts` / `dispatcher-healthy-accounts-returned` pair (fillSlots's poolIdleDetail) is EDGE-
+// TRIGGERED: one line when the pool first has zero healthy accounts, one line when it recovers,
+// nothing in between (no matter how many fillSlots passes happen while still idle). So "is the
+// dispatcher idle right now" is answered by walking the tail backwards for whichever of the two
+// event names comes LAST -- an idle event with no later recovery event means still idle; a
+// recovery event, or no matching event at all, means nothing to report. Same "walk backwards to
+// the most recent relevant marker" shape as computeUnparkScanFailureStreak above, for the same
+// reason: this is daemon.jsonl's OWN edge history, not a poll of current pool health (`spo
+// status`'s own account rows already do that separately, from the pool's state.json).
+function computeDispatcherIdleStatus(daemonEvents) {
+  for (let i = daemonEvents.length - 1; i >= 0; i--) {
+    const ev = daemonEvents[i];
+    if (!ev) continue;
+    if (ev.event === 'dispatcher-healthy-accounts-returned') return null;
+    // Verification fix: `dispatcher-start` (dispatcher.js's run(), see its own comment) is a hard
+    // boundary for this walk. The idle flag driving these two events lives in the dispatcher's
+    // MEMORY, so an idle edge written by an earlier process says nothing about the current one --
+    // and because a restart resets that flag to false, the matching `returned` edge is never
+    // written after a restart at all. Without this line, one idle edge plus one restart (this
+    // project restarts the daemon on every merge) made `spo status` claim IDLE forever.
+    if (ev.event === 'dispatcher-start') return null;
+    if (ev.event === 'dispatcher-idle-no-healthy-accounts') return ev;
+  }
+  return null;
+}
+
 function cmdStatus(opts) {
   const { journalRoot, queueDir } = resolveDirs(opts);
   const accountsDir = resolveAccountsDir(opts);
   const benchDir = resolveBenchDir(opts);
   const now = Date.now();
+
+  // action 6.7: cross-references live-workers.json against every task it currently names, ONCE,
+  // before the per-task loop below -- see orchestrator/worker-status.js's own header for why this
+  // is the SAME classification the loop's per-row worker detail and the `workers:` summary line
+  // both read from, never two independent counts.
+  const workerStatus = describeLiveWorkers(journalRoot, null, now);
 
   const queueDepth = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length : 0;
   const backoffEntries = collectBackoffEntries(queueDir);
@@ -496,6 +570,32 @@ function cmdStatus(opts) {
   let abandoned = 0;
   let done = 0;
   const rows = [];
+  // action 6.7: `account-cooldown`'s own `degraded` flag (action 6.2 -- stamped when
+  // accounts.markLimit's short pool-state lock timed out and the write fell back to the
+  // unlocked read-modify-write) had NO surface reading it at all before this action, per this
+  // action's own spec. Scanned across EVERY task below (not just active ones -- a card that
+  // already finished can still have burned a degraded write on its way there), aggregated by
+  // account so a maintainer sees WHICH account's cooldown bookkeeping is under lock contention,
+  // not just a bare count.
+  const degradedCooldowns = new Map(); // account -> count
+  let degradedTotal = 0;
+  // action 6.7: the `workers:` summary line below is built EXCLUSIVELY from these three
+  // counters, each incremented at the exact same place a row is pushed for that classification
+  // -- never from `workerStatus.counts` (orchestrator/worker-status.js's own aggregate) directly.
+  // The difference matters for a case describeLiveWorkers cannot see on its own: a live-workers.json
+  // entry naming an id that THIS loop has bucketed as BACKOFF (a task action 4.4's auto-retry
+  // re-enqueued -- see the `else if (backoffEntry)` branch below, which is not supposed to
+  // coexist with a live worker at all under normal dispatcher operation, since
+  // dispatcher.js's handleExit always calls `live.delete(id)` before a task can re-enter the
+  // queue, but a STALE live-workers.json read could still show one mid-race). Counting straight
+  // from `workerStatus.counts` would silently add that id into `live`/`stale` even though no ROW
+  // anywhere says "worker: ..." for it, which is precisely the "a parallel count can disagree
+  // with what the rows show" failure mode this action's spec calls the hazard that matters most.
+  // Deriving the summary from the SAME increments the rows use makes that impossible by
+  // construction -- see test/status-6.7.test.js's "same fixture, same number" test.
+  let liveWorkerRows = 0;
+  let staleWorkerRows = 0;
+  let trailingWorkerRows = 0;
   for (const id of ids) {
     const dir = path.join(journalRoot, id);
     const state = readJsonSafe(path.join(dir, 'state.json'), {});
@@ -503,6 +603,15 @@ function cmdStatus(opts) {
     const last = lines.length ? lines[lines.length - 1] : null;
     const cur = state.state || 'UNKNOWN';
     const backoffEntry = (cur !== 'DONE' && cur !== 'PARKED' && cur !== 'ABANDONED') ? backoffEntries.get(id) : null;
+    const workerInfo = workerStatus.perId.get(id) || null;
+
+    for (const ev of lines) {
+      if (ev && ev.event === 'account-cooldown' && ev.degraded === true) {
+        degradedTotal++;
+        const acct = typeof ev.account === 'string' ? ev.account : 'unknown';
+        degradedCooldowns.set(acct, (degradedCooldowns.get(acct) || 0) + 1);
+      }
+    }
 
     // action 4.5 (unchanged): ABANDONED is terminal, same as DONE/PARKED -- it must NOT fall
     // into the `else active` bucket below, which is otherwise everything still moving through
@@ -517,7 +626,14 @@ function cmdStatus(opts) {
       // coincidence, because "done" is also the name of FINISH's own journal event; that
       // coincidence is what let a PARKED row get away with printing the totally unrelated
       // `unpark-scan-failed` event name in the same column.
-      rows.push(`${id}  DONE  done`);
+      // action 6.7: a worker can still be listed in live-workers.json for a few milliseconds
+      // after writing this exact DONE snapshot (it has not exited yet) -- state.json's terminal
+      // state wins (see orchestrator/worker-status.js's own header), so this is never counted as
+      // a live/active worker, only noted, and only when it is actually still there.
+      const isTrailing = workerInfo && workerInfo.classification === 'trailing';
+      if (isTrailing) trailingWorkerRows++;
+      const trailingNote = isTrailing ? '  (worker still exiting)' : '';
+      rows.push(`${id}  DONE  done${trailingNote}`);
     } else if (cur === 'PARKED') {
       parked++;
       // A: the fix itself -- state.json's OWN `reason` field, not the last journal event's name.
@@ -538,13 +654,25 @@ function cmdStatus(opts) {
         streak.count > 0
           ? `${streak.count} failure(s), last ${age} ago (first ${streak.firstFailedAt})`
           : 'no failures recorded';
-      rows.push(`${id}  PARKED  reason=${reason}  retry-channel: ${scanStatus}`);
+      // action 6.7: 'worker-crashed', 'all-accounts-leased' and 'product-repo-lock-timeout'
+      // (all three new PARKED reasons this action's own chantier introduced -- dispatcher.js's
+      // reparkCrashedWorker, account-lease.js's leaseHealthyAccount, product-repo-lock.js's
+      // waitBoundMs respectively) need NO new code here: `reason` above already reads
+      // state.json's own field verbatim, whatever string it holds -- see test/status-6.7.test.js
+      // for the fixture proving these three specific reasons render exactly like every other one.
+      const isTrailing = workerInfo && workerInfo.classification === 'trailing';
+      if (isTrailing) trailingWorkerRows++;
+      const trailingNote = isTrailing ? '  (worker still exiting)' : '';
+      rows.push(`${id}  PARKED  reason=${reason}  retry-channel: ${scanStatus}${trailingNote}`);
     } else if (cur === 'ABANDONED') {
       abandoned++;
       // A: same fix as PARKED -- state.json's `reason` here is 'abandoned-by-maintainer'
       // (park-loop.js's unparkScan overwrites the original park reason on abandon), which is
       // itself the honest terminal fact for this row.
-      rows.push(`${id}  ABANDONED  reason=${state.reason || 'unknown'}`);
+      const isTrailing = workerInfo && workerInfo.classification === 'trailing';
+      if (isTrailing) trailingWorkerRows++;
+      const trailingNote = isTrailing ? '  (worker still exiting)' : '';
+      rows.push(`${id}  ABANDONED  reason=${state.reason || 'unknown'}${trailingNote}`);
     } else if (backoffEntry) {
       // B: a card in action 4.4's bounded auto-retry -- NOT active (it isn't running right now,
       // it's waiting out a backoff delay) and NOT parked (finalizePark deliberately never wrote
@@ -571,11 +699,101 @@ function cmdStatus(opts) {
       // event's name is still the most useful single fact about "what is this task doing right
       // now", so it stays here unchanged -- the bug this action fixes is PARKED/DONE reading the
       // event name where state.json's own reason belongs, not this row.
-      rows.push(`${id}  ${cur}  ${last ? last.event : ''}`);
+      //
+      // action 6.7: worker detail appended to the SAME row `active` already counts -- never a
+      // second row, never a second count (see orchestrator/worker-status.js's own header on the
+      // hazard this avoids). `workerInfo` is null when live-workers.json has no entry for this id
+      // at all (no dispatcher running, or this task is active for a reason other than a live
+      // worker owning it right now) -- that renders as no worker suffix, honestly, rather than a
+      // guess either way.
+      let workerNote = '';
+      if (workerInfo && workerInfo.classification === 'stale') {
+        // Direction one of journal.js's own staleness reasoning: the file has not caught up to
+        // the dispatcher's in-memory state yet (or the worker crashed before ever recording an
+        // owner pid). Self-heals within one more spawn/exit publish -- named here, not silently
+        // folded into "live", so a maintainer watching this NOT tick over knows to look deeper.
+        staleWorkerRows++;
+        // Verification fix: this line used to print "(pid ? not alive on this host)" for BOTH
+        // stale causes, which states a liveness check that never ran as though it had failed --
+        // and the no-owner-yet cause fires on EVERY worker spawn, in the window between
+        // dispatcher.js's publishLiveWorkerIds (synchronous, inside spawnOne) and the worker
+        // process writing its first state.json snapshot. A healthy, just-started worker was
+        // therefore rendered as a dead one. See worker-status.js's `staleReason`.
+        workerNote =
+          workerInfo.staleReason === 'no-owner-recorded'
+            ? '  worker: no owner recorded yet (still starting, or it died before its first snapshot -- nothing to probe)'
+            : `  worker: stale live-workers.json entry (pid ${workerInfo.pid} not alive on this host)`;
+      } else if (workerInfo) {
+        liveWorkerRows++;
+        const acct = readTaskAccount(lines) || '(no account picked yet)';
+        const duration = workerInfo.elapsedMs !== null ? formatDuration(workerInfo.elapsedMs) : 'just started';
+        const remoteNote = workerInfo.unverifiable ? `  (pid unverifiable -- owner host ${workerInfo.host})` : '';
+        workerNote = `  worker: account=${acct}  running ${duration}${remoteNote}`;
+      }
+      rows.push(`${id}  ${cur}  ${last ? last.event : ''}${workerNote}`);
     }
   }
 
   console.log(`active: ${active}  backoff: ${backoff}  parked: ${parked}  abandoned: ${abandoned}  done: ${done}`);
+
+  // action 6.7: the worker summary line -- built from `liveWorkerRows`/`staleWorkerRows`/
+  // `trailingWorkerRows`, the SAME counters the rows above just printed from, NEVER from
+  // `workerStatus.counts` (see this loop's own declaration of those three counters for why: a
+  // stray live-workers.json entry on a BACKOFF-bucketed id would inflate `workerStatus.counts`
+  // without a single row anywhere saying so). `liveWorkerRows` is therefore a SUBSET of `active`
+  // above by construction, not merely by intent -- every increment happens inside the exact
+  // branch that also did `active++`, so `liveWorkerRows <= active` always holds and printing
+  // both here is presenting one set with more detail, never a second, competing total (the
+  // double-count hazard this action's own spec names by name).
+  if (!workerStatus.present) {
+    // Absence must not read as "0 workers": that is indistinguishable from "a dispatcher IS
+    // running and genuinely has none spawned right now" -- see journal.js's readLiveWorkersRaw.
+    console.log(`workers: unknown -- no live-workers.json under ${journalRoot} (no dispatcher has published here, or none is running)`);
+  } else {
+    const staleNote = staleWorkerRows > 0 ? `, ${staleWorkerRows} stale entr${staleWorkerRows === 1 ? 'y' : 'ies'} (not counted live)` : '';
+    const trailingNote = trailingWorkerRows > 0 ? `, ${trailingWorkerRows} still exiting (task already terminal)` : '';
+    // Verification fix: `formatDuration` returns NULL for a negative duration (task-summary.js's
+    // own contract -- "never a finite non-negative number"), and `ageMs` IS negative whenever
+    // live-workers.json's `updatedAt` is in the future. That is not hypothetical here: C6's own
+    // errata record that this box's clock jumps BACKWARD, which puts every file written before
+    // the jump into the future for as long as the skew lasts. The unguarded template printed the
+    // literal string "published null ago". Named as skew instead, in the same "say what is
+    // actually known" posture the rest of this line already takes.
+    const publishedNote =
+      workerStatus.ageMs === null
+        ? 'live-workers.json carries no readable updatedAt'
+        : workerStatus.ageMs < 0
+          ? `live-workers.json stamped ${formatDuration(-workerStatus.ageMs)} in the FUTURE -- clock skew, age unknown`
+          : `live-workers.json published ${formatDuration(workerStatus.ageMs)} ago`;
+    console.log(`workers: ${liveWorkerRows} live (subset of active: above)${staleNote}${trailingNote}  (${publishedNote})`);
+  }
+
+  // action 6.7: dispatcher's own idle/recovered edge, read off daemon.jsonl's tail -- see
+  // computeDispatcherIdleStatus's own header. Prints nothing at all when the pool is healthy (or
+  // was never observed to be otherwise) -- an "OK" line for a condition that has never fired
+  // would just be noise on every single healthy status call.
+  const idleEvent = computeDispatcherIdleStatus(readDaemonEventsTail(journalRoot));
+  if (idleEvent) {
+    const idleAgeMs = idleEvent.ts ? now - Date.parse(idleEvent.ts) : null;
+    const idleAge = Number.isFinite(idleAgeMs) ? formatRemaining(idleAgeMs) : '?';
+    const cooldownNote =
+      idleEvent.earliestCooldownUntil ? `, earliest cooldown ${idleEvent.earliestCooldownUntil}`
+        : ', no cooldown known (every account disabled, or the pool is unreadable)';
+    console.log(
+      `dispatcher: IDLE since ${idleAge} ago -- no healthy accounts (queue depth ${idleEvent.queued ?? '?'}${cooldownNote})`
+    );
+  }
+
+  // action 6.7: account-cooldown's own `degraded` flag -- see this loop's own scan above for
+  // why every task's journal is checked, not just active ones. Omitted entirely when zero, same
+  // "earn a line" posture as the dispatcher-idle line above.
+  if (degradedTotal > 0) {
+    const parts = [...degradedCooldowns.entries()].map(([acct, n]) => `${acct} x${n}`).join(', ');
+    console.log(
+      `account-cooldown: ${degradedTotal} degraded write(s) (pool state lock timed out, unlocked fallback used -- accounts.js's markLimit) -- ${parts}`
+    );
+  }
+
   for (const r of rows) console.log(r);
 }
 
@@ -588,13 +806,47 @@ function cmdTask(id, opts) {
     process.exitCode = 1;
     return;
   }
+  // action 6.7: `duration_s` (action 5.4, orchestrator/steps/llm.js) was already technically
+  // present in the raw JSON detail dump below -- but "technically present in a JSON blob nobody
+  // is told to look at" is what project-2 card #478 means by "rendered nowhere". Pulled into its
+  // own `duration=` field, explicitly "not recorded" (never "0s") for a call journalled before
+  // the field shipped -- see task-summary.js's own `hasTokenData` header for the identical
+  // 0-vs-missing bug this mirrors, one field over. A `step durations:` line closes the output so
+  // the funnel shape (which step burned the wall clock) does not require hand-deriving from the
+  // per-line dump, which is exactly what this chantier's own funnel analysis had to do.
+  const stepDurations = []; // [{step, seconds}], journal order, only calls that recorded one
+  let llmCallsSeen = 0;
+  let llmCallsWithDuration = 0;
   for (const ev of lines) {
     const detail = { ...ev };
     delete detail.ts;
     delete detail.state;
     delete detail.event;
+    let durationNote = '';
+    if (ev.event === 'llm-call') {
+      llmCallsSeen++;
+      delete detail.duration_s;
+      if (typeof ev.duration_s === 'number') {
+        llmCallsWithDuration++;
+        durationNote = ` duration=${ev.duration_s.toFixed(1)}s`;
+        stepDurations.push({ step: ev.step || ev.state, seconds: ev.duration_s });
+      } else {
+        durationNote = ' duration=not recorded';
+      }
+    }
     const detailStr = Object.keys(detail).length ? ` ${JSON.stringify(detail)}` : '';
-    console.log(`[${ev.ts}] ${String(ev.state).padEnd(12)} ${ev.event}${detailStr}`);
+    console.log(`[${ev.ts}] ${String(ev.state).padEnd(12)} ${ev.event}${durationNote}${detailStr}`);
+  }
+
+  if (llmCallsSeen > 0) {
+    console.log('');
+    if (stepDurations.length > 0) {
+      const list = stepDurations.map((d) => `${d.step} ${d.seconds.toFixed(1)}s`).join(', ');
+      const totalS = stepDurations.reduce((sum, d) => sum + d.seconds, 0);
+      console.log(`step durations: ${list} (total ${totalS.toFixed(1)}s, ${llmCallsWithDuration}/${llmCallsSeen} llm-call(s) recorded)`);
+    } else {
+      console.log(`step durations: not recorded for any of ${llmCallsSeen} llm-call event(s) (journal predates action 5.4)`);
+    }
   }
 }
 

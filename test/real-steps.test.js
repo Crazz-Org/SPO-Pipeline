@@ -34,6 +34,7 @@ const {
   finalComment,
 } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx, runTask } = require('../orchestrator/state-machine');
+const { lockFilePath } = require('../orchestrator/product-repo-lock');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { runLlm } = require('../orchestrator/steps/llm');
@@ -89,6 +90,10 @@ function testConfig(overrides = {}) {
     // in-flight tests below (which override them further where a specific bound matters).
     ciChecksMaxPolls: 3,
     ciChecksPollIntervalMs: 1000,
+    // Action 6.5: real config.js's default (1) -- baked in here, not left to
+    // main-moved-budget.js's own fallback, so a test that overrides it is visibly opting OUT of
+    // the default rather than relying on an implicit one.
+    mainMovedRegateBudget: 1,
     ...overrides,
   };
 }
@@ -1412,7 +1417,7 @@ test('realCiChecks: main-moved intersection non-empty -> merges origin/main, ret
 
   const next = await realCiChecks(ctx, deps);
   assert.equal(next, 'CHECK');
-  assert.equal(ctx.counters.mainMoveUsed, true);
+  assert.equal(ctx.counters.mainMoveUsed, 1); // action 6.5: a count now, not a boolean
   assert.ok(calls.some((a) => a.includes('merge') && a.includes('origin/main')));
 
   const journal = fs
@@ -1425,7 +1430,7 @@ test('realCiChecks: main-moved intersection non-empty -> merges origin/main, ret
 
 test('realCiChecks: main already moved once this task -> PARKED (main-moved-twice), no merge spawned', async () => {
   const ctx = ciCtx();
-  ctx.counters.mainMoveUsed = true;
+  ctx.counters.mainMoveUsed = 1; // action 6.5: at the default budget of 1, this task's move is already spent
   const headSha = 'headshaBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
   writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { baseMain: 'basemainsha' });
 
@@ -1447,6 +1452,92 @@ test('realCiChecks: main already moved once this task -> PARKED (main-moved-twic
     (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
   );
   assert.ok(!calls.some((a) => a.includes('merge')));
+});
+
+// ---- action 6.5: the main-moved counter is now compared against config.mainMovedRegateBudget
+// (default 1, unchanged behaviour) instead of a hardcoded "once" -- see main-moved-budget.js and
+// config.js's own mainMovedRegateBudget comment for the settled decision and the corpus this
+// default rests on.
+
+test('realCiChecks: mainMovedRegateBudget raised to 2 -> two re-gates succeed, a third parks main-moved-twice', async () => {
+  const ctx = ciCtx({ config: testConfig({ mainMovedRegateBudget: 2 }) });
+  const headSha = 'headshaDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { baseMain: 'basemainsha' });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+      }
+      if (args.includes('diff')) return ok('shared/file.ts\n');
+      return ok('');
+    },
+  };
+
+  assert.equal(await realCiChecks(ctx, deps), 'CHECK', 'first move: under budget 2');
+  assert.equal(ctx.counters.mainMoveUsed, 1);
+
+  assert.equal(await realCiChecks(ctx, deps), 'CHECK', 'second move: still under budget 2');
+  assert.equal(ctx.counters.mainMoveUsed, 2);
+
+  await assert.rejects(
+    () => realCiChecks(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'main-moved-twice' &&
+      err.detail.mainMoveUsed === 2 &&
+      err.detail.mainMovedRegateBudget === 2,
+    'third move: budget of 2 is spent'
+  );
+});
+
+test('realGate and realCiChecks share ctx.counters.mainMoveUsed -- a move GATE spends counts against CI_CHECKS\' own budget on the same task (action 4.2\'s sharing, still true under action 6.5\'s counter)', async () => {
+  const worktreePath = mkTmp('spo-shared-mainmoved-wt-');
+  const config = testConfig({ mainMovedRegateBudget: 1 });
+  const task = { id: 'card-shared-mm', kind: 'card', issue: 501, worktreePath };
+  const ctx = testCtx({ id: 'card-shared-mm', task, config });
+
+  // realGate (unlike realCiChecks) shape-checks HEAD's rev-parse output against
+  // /^[0-9a-f]{7,64}$/ (action 4.1's measurement) -- must be genuine lowercase hex, not the
+  // readable-but-invalid placeholders realCiChecks' own tests use below.
+  const gateHeadSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${gateHeadSha}.json`), { verdict: 'FAIL' });
+  const gateDeps = {
+    spawnSync: (command, args) => {
+      if (args.includes('run') && args.includes('gate')) return fail(1);
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${gateHeadSha}\n`);
+      if (args.includes('fetch')) return ok('');
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
+      if (args.includes('merge')) return ok('');
+      return ok('');
+    },
+  };
+
+  assert.equal(await realGate(ctx, gateDeps), 'CHECK', 'GATE spends the one move this task has under budget 1');
+  assert.equal(ctx.counters.mainMoveUsed, 1);
+
+  const ciHeadSha = 'cishaEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${ciHeadSha}.json`), { baseMain: 'basemainsha' });
+  const ciDeps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${ciHeadSha}\n`);
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+      }
+      if (args.includes('diff')) return ok('shared/file.ts\n');
+      return ok('');
+    },
+  };
+
+  // CI_CHECKS reads the SAME ctx.counters: GATE already spent this task's one move under budget
+  // 1, so CI_CHECKS' own main-moved test must park rather than merge again -- one shared budget
+  // per task, not one each.
+  await assert.rejects(
+    () => realCiChecks(ctx, ciDeps),
+    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
+  );
+  assert.equal(ctx.counters.mainMoveUsed, 1, 'a refused move must not itself spend any more of the budget');
 });
 
 test('realCiChecks: nightly red at the fetched origin/main sha -> PARKED (main-red-no-merge)', async () => {
@@ -1830,6 +1921,222 @@ test('realFinish: the board move is journalled BEFORE the issue comment -- a par
   const moved = journal.find((e) => e.event === 'board-move');
   assert.ok(moved, 'the successful move to Done must already be journalled when the comment parks');
   assert.equal(moved.column, 'Done');
+});
+
+// ---- action 6.4: the product-repo mutex, as wired into realWorktree/realFinish ----------------
+//
+// Real exclusion (two processes can never both be inside the critical section) and the
+// dead-pid/live-in-bound/over-age sweep rules are covered directly against
+// orchestrator/product-repo-lock.js in test/product-repo-lock.test.js -- that file owns the
+// mutex's own behaviour. What belongs HERE, alongside every other realWorktree/realFinish test, is
+// the WIRING: does setup actually acquire-and-release around the right span, does teardown do the
+// same around just `worktree remove`, does a thrown ParkSignal still release (try/finally), does a
+// wait-bound timeout become the documented ParkSignal reason, and do both call sites end up
+// pointed at the SAME lock file for the same config (the empirical half of "one mutex, not two" --
+// product-repo-lock.test.js proves the OTHER half, that two real holders of that file exclude each
+// other, using role-labelled fixture processes).
+
+test('realWorktree (action 6.4): the product-repo lock is released once setup finishes -- the lock file does not survive a successful run', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-ok', kind: 'card', issue: 900, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-ok', task, config });
+  const deps = { spawnSync: noLeftoversSpawnSync([]) };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+  assert.equal(fs.existsSync(lockFilePath(config)), false, 'the lock must be released once the setup phase returns');
+});
+
+test('realWorktree (action 6.4): the product-repo lock is released even when a step inside throws ParkSignal (npm ci failure)', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-park', kind: 'card', issue: 901, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-park', task, config });
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers
+      if (args.includes('rev-parse')) return ok('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n');
+      if (command === 'npm' && args[0] === 'ci') return fail(1);
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realWorktree(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'worktree-npm-ci-failed'
+  );
+  assert.equal(
+    fs.existsSync(lockFilePath(config)),
+    false,
+    'a ParkSignal thrown from inside the locked span must still release the lock (try/finally), not wedge every other worker behind it'
+  );
+});
+
+test('realFinish (action 6.4): the product-repo lock is released after a successful worktree remove', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-ok-');
+  const task = { id: 'card-lock-finish-ok', kind: 'card', issue: 902, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-finish-ok', task, config });
+
+  const next = await realFinish(ctx, { spawnSync: () => ok('') });
+  assert.equal(next, 'DONE');
+  assert.equal(fs.existsSync(lockFilePath(config)), false);
+});
+
+test('realFinish (action 6.4): the product-repo lock is released even when `git worktree remove` itself fails', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-fail-');
+  const task = { id: 'card-lock-finish-fail', kind: 'card', issue: 903, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-finish-fail', task, config });
+  const deps = {
+    spawnSync: (command, args) => (args.includes('remove') ? fail(1) : ok('')),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'worktree-remove'
+  );
+  assert.equal(fs.existsSync(lockFilePath(config)), false, 'the remove call itself failing must still release the lock');
+});
+
+// WHY THESE TWO TESTS OBSERVE FROM INSIDE THE SPAN, and not merely that the lock is gone
+// afterwards. Every action of chantier 6 shipped a central claim that passed the whole suite while
+// being false, and the shape was the same each time: an assertion on the state AFTER the span
+// (which "acquire and immediately drop" satisfies exactly as well as "hold throughout"), or a
+// single-process test standing in for a property that is only meaningful across processes. 6.2's
+// lease-release-before-spawn survived 1223 tests on the first shape; verification of 6.4 measured
+// the same two holes here -- moving `releaseFn(acquired)` to BEFORE `await fn()` (the literal 6.2
+// shape), and shrinking the locked span to `git worktree add` alone so that fetch, the whole
+// leftover sweep and `npm ci` ran unprotected, EACH passed all 1295 tests while two real processes
+// running this very function overlapped inside the critical section 8 times.
+//
+// So: assert the lock is HELD, from inside, at both ENDS of the span -- the first spawn (`fetch`)
+// and the last (`npm ci`) -- and that the holder is THIS process. A lock that is acquired and
+// dropped early fails at `npm ci`; a span that starts late fails at `fetch`; a span that is never
+// taken fails at both.
+function lockHolderDuring(config) {
+  try {
+    return JSON.parse(fs.readFileSync(lockFilePath(config), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+test('realWorktree (action 6.4): the product-repo lock is HELD BY THIS PROCESS at both ends of the span -- observed from inside, at `fetch` and at `npm ci`', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-inside', kind: 'card', issue: 908, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-inside', task, config });
+
+  const seen = {};
+  const deps = {
+    spawnSync: (command, args) => {
+      const argv = [command, ...args].join(' ');
+      if (argv.includes('fetch')) seen.atFetch = lockHolderDuring(config);
+      if (command === 'npm' && args[0] === 'ci') seen.atNpmCi = lockHolderDuring(config);
+      if (args.includes('rev-parse') && args.includes('--verify')) return fail(1);
+      if (args.includes('rev-parse')) return ok('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n');
+      return ok('');
+    },
+  };
+
+  assert.equal(await realWorktree(ctx, deps), 'PLAN');
+
+  assert.ok(seen.atFetch, 'the lock must already be held at the FIRST spawn of the span (`git fetch`)');
+  assert.equal(seen.atFetch.pid, process.pid, 'and held by THIS process, not merely present on disk');
+  assert.ok(seen.atNpmCi, 'the lock must STILL be held at the LAST spawn of the span (`npm ci`) -- an early release is the 6.2 shape');
+  assert.equal(seen.atNpmCi.pid, process.pid);
+  assert.equal(seen.atFetch.startedAt, seen.atNpmCi.startedAt, 'and it must be the SAME acquisition throughout, never released and retaken mid-span');
+  assert.equal(fs.existsSync(lockFilePath(config)), false, 'and released once the span returns');
+});
+
+test('realFinish (action 6.4): the product-repo lock is HELD BY THIS PROCESS during `git worktree remove` itself', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-inside-');
+  const task = { id: 'card-lock-finish-inside', kind: 'card', issue: 909, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-finish-inside', task, config });
+
+  let atRemove;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('worktree') && args.includes('remove')) atRemove = lockHolderDuring(config);
+      return ok('');
+    },
+  };
+
+  assert.equal(await realFinish(ctx, deps), 'DONE');
+  assert.ok(atRemove, 'the teardown lock must be held DURING the remove, not merely around it');
+  assert.equal(atRemove.pid, process.pid);
+  assert.equal(fs.existsSync(lockFilePath(config)), false);
+});
+
+test('realWorktree (action 6.4): the product-repo lock wait bound exceeded -> ParkSignal(product-repo-lock-timeout), phase "worktree"', async () => {
+  const config = testConfig();
+  const task = { id: 'card-lock-timeout-wt', kind: 'card', issue: 904, title: 'Add a widget' };
+  const ctx = testCtx({ id: 'card-lock-timeout-wt', task, config });
+
+  // A LIVE, in-bound holder pre-seeded directly on disk under this test's OWN pid -- genuinely
+  // alive, so acquireProductRepoLock's default isAlive sees it as held and the bounded wait below
+  // must time out rather than sweep it.
+  fs.mkdirSync(path.dirname(lockFilePath(config)), { recursive: true });
+  fs.writeFileSync(lockFilePath(config), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+
+  const deps = { spawnSync: noLeftoversSpawnSync([]), productRepoLockOpts: { waitMs: 40, pollMs: 10 } };
+
+  await assert.rejects(
+    () => realWorktree(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'product-repo-lock-timeout' && err.detail.phase === 'worktree'
+  );
+});
+
+test('realFinish (action 6.4): the product-repo lock wait bound exceeded -> ParkSignal(product-repo-lock-timeout), phase "finish"', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-timeout-');
+  const task = { id: 'card-lock-timeout-fin', kind: 'card', issue: 905, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-timeout-fin', task, config });
+
+  fs.mkdirSync(path.dirname(lockFilePath(config)), { recursive: true });
+  fs.writeFileSync(lockFilePath(config), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+
+  const deps = { spawnSync: () => ok(''), productRepoLockOpts: { waitMs: 40, pollMs: 10 } };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'product-repo-lock-timeout' && err.detail.phase === 'finish'
+  );
+});
+
+test('action 6.4: realWorktree (setup) and realFinish (teardown) acquire the SAME product-repo lock file for the same config -- one mutex, not two', async () => {
+  const config = testConfig();
+  const capturedPaths = [];
+  const spyAcquire = async (cfg, opts) => {
+    const filePath = (opts && opts.filePath) || lockFilePath(cfg);
+    capturedPaths.push(filePath);
+    return { filePath, held: { pid: process.pid, startedAt: new Date().toISOString() } };
+  };
+  const spyRelease = () => {};
+
+  const wtTask = { id: 'card-samefile-wt', kind: 'card', issue: 906, title: 'Add a widget' };
+  const wtCtx = testCtx({ id: 'card-samefile-wt', task: wtTask, config });
+  await realWorktree(wtCtx, {
+    spawnSync: noLeftoversSpawnSync([]),
+    acquireProductRepoLock: spyAcquire,
+    releaseProductRepoLock: spyRelease,
+  });
+
+  const worktreePath = mkTmp('spo-real-finish-samefile-');
+  const finTask = { id: 'card-samefile-fin', kind: 'card', issue: 907, worktreePath };
+  const finCtx = testCtx({ id: 'card-samefile-fin', task: finTask, config });
+  await realFinish(finCtx, {
+    spawnSync: () => ok(''),
+    acquireProductRepoLock: spyAcquire,
+    releaseProductRepoLock: spyRelease,
+  });
+
+  assert.equal(capturedPaths.length, 2);
+  assert.equal(
+    capturedPaths[0],
+    capturedPaths[1],
+    'setup and teardown must resolve to the identical lock file for the same config -- that is what makes them contend on ONE mutex'
+  );
 });
 
 // ---- finalComment (action 5.2: billable tokens, pipeline duration, attempt counts) ------------
@@ -2922,6 +3229,98 @@ test('npm-gate timeout exceeds the bench\'s own wait bound, so the bench always 
     config.commandTimeoutsMs['npm-gate'] > BENCH_WAIT_BOUND_MS,
     `npm-gate (${config.commandTimeoutsMs['npm-gate']}ms) must exceed the bench's own ${BENCH_WAIT_BOUND_MS}ms bound`
   );
+});
+
+// Action 6.5: the plan asked whether npm-gate's timeout covers the WORST-CASE QUEUE WAIT once K
+// workers can all reach GATE at once (plus a nightly caught mid-run on the same single bench
+// worker) -- a distinct question from the bench's own internal 120-min give-up bound the test
+// above pins. Measured before building anything, per this chantier's own habit: at K=2 (this
+// machine's real ceiling) the worst case is ~10.5 min, at K=3 (shadow-only today) ~13.2 min --
+// see orchestrator/bench-queue-wait.js's own header for the three measured constants and where
+// each comes from. Both are dwarfed by npm-gate's existing 7800000ms (130 min), so THE CORRECT
+// OUTPUT OF THIS ACTION IS THIS ASSERTION, not new machinery: no bench-queue-aware timeout, no
+// per-worker submit-time budget, nothing built. This test is what keeps that verdict honest --
+// it fails the moment `workers` is raised far enough, or the measured constants revised far
+// enough, to actually threaten the margin, rather than trusting the arithmetic to stay true
+// forever unchecked.
+test('npm-gate timeout also covers K workers\' worst-case bench queue wait, including a nightly caught mid-run (action 6.5)', () => {
+  const config = require('../orchestrator/config.js');
+  const { benchQueueWaitBoundMs } = require('../orchestrator/bench-queue-wait.js');
+
+  // Asserted at the K values this action actually REASONED about, not only at the K the config
+  // happens to ship (1). Checking only `config.workers` made this assertion vacuous: it was
+  // strictly implied by the 120-min bench-wait test just above, since benchQueueWaitBoundMs(1)
+  // is ~7.9 min and that test already requires npm-gate > 120 min -- it could not have failed
+  // independently below K=44.
+  for (const k of [1, 2, 3]) {
+    const bound = benchQueueWaitBoundMs(k);
+    assert.ok(
+      config.commandTimeoutsMs['npm-gate'] > bound,
+      `npm-gate (${config.commandTimeoutsMs['npm-gate']}ms) must exceed the worst-case K=${k} bench queue wait (${bound}ms)`
+    );
+  }
+
+  // The shipped K itself, so a raise to 2 or 3 stays inside the range checked above.
+  assert.ok(
+    [1, 2, 3].includes(config.workers),
+    `config.workers is ${config.workers}: extend the K list above before raising it further`
+  );
+});
+
+// The three constants benchQueueWaitBoundMs is built from, pinned as LITERALS with their
+// provenance. The derivation test below deliberately recomputes from these same constants (that
+// is what makes it a test of the FORMULA), so it cannot notice one of them changing value --
+// verified by mutation: SIBLING_REF_JOB_MAX_MS 161000 -> 1000, NIGHTLY_JOB_MAX_MS -> 0 and
+// OWN_GATE_JOB_MAX_MS -> 1 each passed the entire suite. That is the same shape as action 6.4's
+// SETUP_GIT_CALLS, where recomputing the expectation from the constant under test let a safety
+// bound be halved against 1303 green tests. The margin assertion above cannot catch it either:
+// shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
+//
+// A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
+// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 217) deletes
+// every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
+// worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
+// all-time records, and re-measuring on a different day legitimately yields a different sample
+// count -- which is exactly what happened between C6's earlier pass and this action's. Revising
+// them upward is expected; this test is here so a revision is a deliberate edit rather than a
+// silent drift, and the margin loop above is what says whether a revision still fits.
+test('bench-queue-wait: the three measured constants are the values action 6.5 derived its verdict from (action 6.5)', () => {
+  const {
+    OWN_GATE_JOB_MAX_MS,
+    SIBLING_REF_JOB_MAX_MS,
+    NIGHTLY_JOB_MAX_MS,
+    benchQueueWaitBoundMs,
+  } = require('../orchestrator/bench-queue-wait.js');
+
+  // 239.9s -- GATE's own client-observed max, n=23 real `npm run gate` spawns across 20 journals.
+  assert.strictEqual(OWN_GATE_JOB_MAX_MS, 239900);
+  // 161s -- max 'ref' service time in ~/.spo-bench/done (123.8/125.4/160.2s), rounded up.
+  assert.strictEqual(SIBLING_REF_JOB_MAX_MS, 161000);
+  // 232s -- max 'nightly' service time in the same spool (212.5/232.0s).
+  assert.strictEqual(NIGHTLY_JOB_MAX_MS, 232000);
+
+  // And the bounds those literals produce, stated independently of the formula, so that neither
+  // a changed constant NOR a changed formula can leave both tests green.
+  assert.strictEqual(benchQueueWaitBoundMs(1), 471900);
+  assert.strictEqual(benchQueueWaitBoundMs(2), 632900);
+  assert.strictEqual(benchQueueWaitBoundMs(3), 793900);
+});
+
+test('benchQueueWaitBoundMs: K=1 has no sibling term, each extra worker adds exactly one sibling-job cost, a non-positive/non-integer K falls back to 1', () => {
+  const {
+    benchQueueWaitBoundMs,
+    OWN_GATE_JOB_MAX_MS,
+    SIBLING_REF_JOB_MAX_MS,
+    NIGHTLY_JOB_MAX_MS,
+  } = require('../orchestrator/bench-queue-wait.js');
+
+  assert.equal(benchQueueWaitBoundMs(1), NIGHTLY_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(2), NIGHTLY_JOB_MAX_MS + SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(3), NIGHTLY_JOB_MAX_MS + 2 * SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(0), benchQueueWaitBoundMs(1), 'a non-positive K must not go negative or drop the floor');
+  assert.equal(benchQueueWaitBoundMs(-5), benchQueueWaitBoundMs(1));
+  assert.equal(benchQueueWaitBoundMs(1.5), benchQueueWaitBoundMs(1), 'a non-integer K falls back to the safe default, same as product-repo-hold.js\'s own workers guard');
+  assert.equal(benchQueueWaitBoundMs(undefined), benchQueueWaitBoundMs(1));
 });
 
 test('spawnStep: BOTH attempts time out -> PARKED with a dedicated reason naming the command class, never the caller\'s own failure reason', () => {

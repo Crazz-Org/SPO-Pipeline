@@ -42,6 +42,15 @@
 const fs = require('fs');
 const path = require('path');
 
+// action 6.2: markLimit's own .state.lock reuses lock.js's short-lock primitive (see that
+// module's own header for why it's a deliberately simpler idiom than daemon.lock's tmp+link
+// dance) rather than re-implementing the same wx-create + pid-liveness-stale-sweep +
+// release-only-if-ours idiom a third time. config.js has no require() on this module (or on
+// anything that transitively requires it), so this is not a cycle -- see config.js itself.
+const lock = require('./lock');
+const config = require('./config');
+const { monotonicNowMs } = require('./monotonic-clock');
+
 const OAUTH_TOKEN_FILENAME = 'oauth-token';
 const DISABLED_MARKER_FILENAME = 'disabled';
 const LABELS_FILENAME = 'labels.json';
@@ -126,8 +135,36 @@ class AllAccountsCoolingError extends Error {
   }
 }
 
+// Thrown by pick() (action 6.2) when opts.excludeAccounts is supplied and every account that
+// would otherwise be pick()-able (enabled, not cooling) is in that set -- i.e. every HEALTHY
+// account is currently leased by another live worker, as opposed to AllAccountsCoolingError
+// (every enabled account has a cooldownUntil in the future). The distinction matters because the
+// two park differently: a cooling account is never worth waiting on (state-machine.js/intake.js
+// never even construct this error's caller with a wait loop for that case), but a leased account
+// legitimately might free up within the bound orchestrator/account-lease.js's leaseHealthyAccount
+// waits -- see that module's own header and doc/remediation-progress.md's C6 decision record for
+// why per-step leasing makes waiting the right default instead of parking immediately the way
+// AllAccountsCoolingError does.
+class AllAccountsLeasedError extends Error {
+  constructor(reason, detail = {}) {
+    super(reason);
+    this.name = 'AllAccountsLeasedError';
+    this.reason = reason;
+    this.detail = detail;
+  }
+}
+
 function stateJsonPath(poolDir) {
   return path.join(poolDir, 'state.json');
+}
+
+// action 6.2: markLimit's short bounded lock around its read-modify-write. A plain file (never a
+// directory, same reasoning as the per-account lease files in account-lease.js) so readRegistry's
+// "every subdirectory is an account, no dot-prefix exclusion" scan can never mistake it for one --
+// it lives alongside state.json/labels.json, dot-prefixed so it reads unambiguously as
+// machine-owned bookkeeping to anyone browsing the pool directory by hand.
+function stateLockPath(poolDir) {
+  return path.join(poolDir, '.state.lock');
 }
 
 // The registry, discovered fresh from disk every call -- one entry per subdirectory of
@@ -271,23 +308,61 @@ function writeState(poolDir, state) {
 // spreading calls across K healthy accounts is a scheduler-level concern, not this module's)
 // whose cooldownUntil is absent or already past `now`. `now` is a parameter, not always
 // Date.now(), so tests can assert cooldown/recovery behaviour without sleeping.
-function pick(poolDir, now = Date.now()) {
+//
+// action 6.2: `opts.excludeAccounts` (a Set<string> of account names, e.g. every account
+// currently held by another live process's per-step lease -- see orchestrator/account-lease.js's
+// leasedAccountNames) is OPT-IN and additive to the cooldown filter above, never a replacement
+// for it: an excluded-but-cooling account was never going to be returned anyway. With no opts (or
+// opts.excludeAccounts omitted/empty), this function is BYTE-FOR-BYTE what it was before this
+// action -- bin/spo and every pre-6.2 test call it bare, and the early `return account` below
+// fires on the very first healthy account exactly as it always did, so the exclusion machinery
+// costs nothing when unused.
+//
+// Distinguishing WHY nothing was returned matters to the two callers (state-machine.js's
+// callLlmStep, intake.js's callIntakeStepWithRotation, both via account-lease.js's
+// leaseHealthyAccount): every enabled account cooling is the existing AllAccountsCoolingError
+// (never worth waiting out); at least one enabled account is healthy but every healthy one is in
+// excludeAccounts is the NEW AllAccountsLeasedError (worth a bounded wait -- a sibling's lease is
+// released in seconds to a couple of minutes, not hours). The two can't be conflated: a pool
+// where one account is cooling and the other is leased must report "leased" (the cooling one was
+// never pick()-able either way, so there IS a healthy candidate, just not an available one),
+// which is why healthyCount is tracked independently of the early return below rather than
+// inferred from whether the loop reached the end.
+function pick(poolDir, now = Date.now(), opts = {}) {
   const registry = readRegistry(poolDir);
   if (registry.length === 0) {
     throw new NoAccountsRegisteredError('no-accounts-registered', { poolDir });
   }
 
   const state = readState(poolDir);
+  const excludeAccounts = opts.excludeAccounts;
 
   let earliestCooldown = null;
+  let healthyCount = 0;
   for (const account of registry) {
     if (!account.enabled) continue;
     const entry = state[account.name];
     const cooldownUntil = entry && entry.cooldownUntil;
-    if (!cooldownUntil || cooldownUntil <= now) return account;
-    if (earliestCooldown === null || cooldownUntil < earliestCooldown) {
-      earliestCooldown = cooldownUntil;
+    const healthy = !cooldownUntil || cooldownUntil <= now;
+    if (!healthy) {
+      if (earliestCooldown === null || cooldownUntil < earliestCooldown) {
+        earliestCooldown = cooldownUntil;
+      }
+      continue;
     }
+    healthyCount += 1;
+    // The default (no excludeAccounts) path returns HERE, on the very first healthy account --
+    // identical to the pre-6.2 loop, never reaching the healthyCount bookkeeping's consumers below.
+    if (!excludeAccounts || !excludeAccounts.has(account.name)) return account;
+  }
+
+  if (healthyCount > 0) {
+    // Every healthy account was excluded (leased by a live sibling) -- distinct from "none were
+    // ever healthy" below. Only reachable when excludeAccounts was actually supplied and non-empty.
+    throw new AllAccountsLeasedError('all-accounts-leased', {
+      checkedAccounts: registry.map((a) => a.name),
+      excludedAccounts: Array.from(excludeAccounts),
+    });
   }
 
   const reason =
@@ -298,6 +373,32 @@ function pick(poolDir, now = Date.now()) {
     earliestCooldownUntil: earliestCooldown,
     checkedAccounts: registry.map((a) => a.name),
   });
+}
+
+// countHealthyAccounts(poolDir, now) -> the number of ENABLED accounts whose cooldownUntil is
+// absent or already past `now` -- the exact same "healthy" test pick()'s own loop applies above,
+// without picking one or throwing when the answer is zero. Action 6.3: the dispatcher clamps K
+// (its worker count) to this number before EVERY spawn (the plan's own "K <= healthy accounts"
+// row, deferred from 6.2 -- 6.2 only ever had one caller in flight at a time, so there was
+// nothing to clamp yet; the dispatcher is the first thing that can actually run K of them).
+//
+// Deliberately blind to account-lease.js's per-step LEASES (as opposed to cooldowns): a lease is
+// a seconds-to-minutes hold around one LLM call, not a fact about the POOL's capacity the way an
+// hours-long cooldown is -- clamping K on lease state too would make K flap on every single LLM
+// call across every worker instead of settling once per cooldown/recovery event, which is not
+// what "K workers" is supposed to mean (K is a concurrency budget, not "accounts idle right now").
+function countHealthyAccounts(poolDir, now = Date.now()) {
+  const registry = readRegistry(poolDir);
+  if (registry.length === 0) return 0;
+  const state = readState(poolDir);
+  let healthy = 0;
+  for (const account of registry) {
+    if (!account.enabled) continue;
+    const entry = state[account.name];
+    const cooldownUntil = entry && entry.cooldownUntil;
+    if (!cooldownUntil || cooldownUntil <= now) healthy += 1;
+  }
+  return healthy;
 }
 
 // Records a limit hit for `name` and decides how long to cool it down for -- unlike the flat
@@ -332,11 +433,14 @@ function pick(poolDir, now = Date.now()) {
 //
 // An entry written by pre-3.5 code (bare `{cooldownUntil}`, no lastUsageLimitAt/usageLimitStreak)
 // reads back fine: both fields are simply absent, which this function reads as "no prior usage
-// hit on record" -- it probes at 1h, exactly like a genuine first-ever hit would. Returns the
-// event payload the caller journals -- this module never writes the journal itself, same
-// separation of concerns scripted.js/llm.js already use.
-function markLimit(poolDir, name, limitKind, now = Date.now()) {
-  const state = readState(poolDir);
+// hit on record" -- it probes at 1h, exactly like a genuine first-ever hit would.
+//
+// Pulled out of markLimit itself (action 6.2) so the lock-acquire/read/merge/write/release
+// wrapper below has one pure function to call on EITHER side of "did we get the lock" -- the
+// computation (and the state.json shape it produces) must be identical whether or not the lock
+// was acquired; only whether a concurrent writer could interleave with it differs. Returns
+// {nextState, event}; never touches disk itself.
+function computeLimitUpdate(state, name, limitKind, now) {
   const entry = state[name] || {};
 
   const overloaded = limitKind === 'overloaded';
@@ -353,20 +457,20 @@ function markLimit(poolDir, name, limitKind, now = Date.now()) {
   }
   const cooldownUntil = now + ms;
 
+  const nextState = { ...state };
   if (overloaded) {
-    state[name] = { ...entry, cooldownUntil };
+    nextState[name] = { ...entry, cooldownUntil };
   } else {
     const prevStreak = typeof entry.usageLimitStreak === 'number' ? entry.usageLimitStreak : 0;
-    state[name] = {
+    nextState[name] = {
       ...entry,
       cooldownUntil,
       lastUsageLimitAt: now,
       usageLimitStreak: escalated ? prevStreak + 1 : 1,
     };
   }
-  writeState(poolDir, state);
 
-  return {
+  const event = {
     account: name,
     limitKind: limitKind ?? null,
     cooldownMs: ms,
@@ -375,10 +479,121 @@ function markLimit(poolDir, name, limitKind, now = Date.now()) {
     escalated,
     defaulted,
   };
+  return { nextState, event };
+}
+
+// Blocking sleep of at most `ms`, used ONLY by markLimit's short lock-wait retry below. A real
+// (non-Promise) sleep, not async: markLimit has been a synchronous function since action 3.5 and
+// every real call site (state-machine.js's callLlmStep, intake.js's callIntakeStepWithRotation)
+// calls it without awaiting -- turning it async here would ripple into both. Atomics.wait on a
+// scratch SharedArrayBuffer is the standard Node idiom for a synchronous, non-busy-spinning sleep
+// on the main thread (it actually blocks the thread rather than burning CPU polling Date.now());
+// it is no more "blocking" than the spawnSync calls this same codebase already makes throughout
+// steps/llm.js and steps/scripted.js for every real gh/npm/claude invocation, and the bound this
+// guards (accountStateLockWaitMs, 2s default) is short enough that blocking here costs nothing
+// next to the 90s+ step that just failed and is about to retry.
+function sleepSyncMs(ms) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Records a limit hit for `name` and decides how long to cool it down for -- unlike the flat
+// tier this replaced, that decision now needs the account's OWN history (its last usage-limit
+// timestamp, to know whether this hit is inside the same escalation window), which only a read
+// of state.json can supply. That is why the old `cooldownMsForLimitKind(limitKind)` pure
+// function is gone rather than kept alongside this: it could not see history, so keeping it
+// would mean every caller still has to remember to call it AND pass the result in, for no benefit
+// now that there is exactly one place (here) that needs the mapping. Both real call sites
+// simplified accordingly, straight to `accounts.markLimit(accountsDir, account.name,
+// result.limitKind)`.
+//
+// `limitKind`:
+//   'overloaded' -- flat OVERLOADED_COOLDOWN_MS (5 min). Never escalates, and never touches (or
+//                   even reads) the usage-escalation fields below -- a busy server says nothing
+//                   about this account's own quota.
+//   'usage', or anything else (undefined/null/an unrecognised string -- fail-safe, see below) --
+//                   USAGE_ESCALATED_COOLDOWN_MS (5h) if `state[name].lastUsageLimitAt` is within
+//                   ESCALATION_WINDOW_MS of `now`, otherwise USAGE_PROBE_COOLDOWN_MS (1h).
+//                   `usageLimitStreak` counts consecutive escalated hits; the decision above
+//                   doesn't consult it, it exists so a maintainer reading state.json by hand can
+//                   see how long an account has been stuck without doing the arithmetic.
+//
+// `defaulted` means exactly what R2 (F2) needed it to mean again: no *recognised* limitKind
+// ('usage' or 'overloaded') was supplied, and the usage fail-safe applied anyway. Before this
+// change cooldownMsForLimitKind returned a positive number for every JS value, so `defaulted`
+// was structurally always false in production, and the journalled event carried no limitKind at
+// all -- the one case the fallback exists for (a limit shape classifyFailure recognizes but that
+// isn't in a limitKind bucket) was indistinguishable from a genuine 429/529 in the journal. Both
+// are fixed here: `limitKind` is always on the returned event (`null` when absent), and
+// `defaulted` is true exactly when that value wasn't 'usage' or 'overloaded'.
+//
+// action 6.2: the read-modify-write above used to run completely unlocked -- two processes each
+// reading state.json, each computing their own account's new entry off that same snapshot, each
+// writing back, and whichever write lands second silently discards the first process's update
+// (still atomic per-write thanks to writeState's tmp+rename, just each write is a full
+// replacement of the WHOLE state object, not a merge). Two workers hitting a limit on two
+// DIFFERENT accounts at close to the same instant now loses one of their cooldowns entirely --
+// exactly the live pool's `pool1: {usageLimitStreak: 2}` escalation history this could clobber.
+// Wrapped here in a short, bounded lock (accountStateLockWaitMs, default 2s) around the
+// read-modify-write: acquire, re-read state INSIDE the lock (a snapshot taken before acquiring
+// could already be stale), compute, write, release. `opts.lockWaitMs`/`opts.lockPollMs`/
+// `opts.isAlive` let tests shrink the bound or force a specific liveness outcome without waiting
+// on config.js's real defaults.
+//
+// Degrade, never fail: if the lock can't be acquired within its bound (another live process holds
+// it past accountStateLockWaitMs -- plausible only under real concurrency, since the critical
+// section itself is microseconds), this falls through to exactly the OLD unlocked behaviour
+// (read, compute, write, no lock) rather than throwing -- losing a cooldown update is a wasted
+// call; failing an LLM step's own error-handling path over pool bookkeeping would turn a rate
+// limit into a parked card. `degraded: true` is stamped on the returned event so the caller's
+// journalled `account-cooldown` payload records that this happened, instead of the fallback being
+// silently indistinguishable from a normal locked write.
+// `now` (positional, defaults to Date.now()) is a WALL-CLOCK snapshot -- it flows into
+// computeLimitUpdate's cooldownUntil/lastUsageLimitAt, which land on disk and get compared
+// across processes, so it stays Date.now()-based, unconditionally, exactly as before.
+//
+// The WAIT LOOP below is a different question -- "how long have I been retrying for THIS lock" --
+// and answering it with Date.now() was a bug, not a simplification: this box's wall clock jumps
+// BACKWARD (measured, monotonic-clock.js's own header has the numbers), and a backward jump in
+// `deadline - Date.now()` can only ever ENLARGE `remaining`, silently extending a bounded wait
+// past its configured budget. `monotonicNowMs()` (opts.monotonicNowMs, defaulting to the real
+// one) is immune to that by construction -- see monotonic-clock.js's header for exactly why this
+// must never become a source of TIMESTAMPS, only of ELAPSED-TIME ARITHMETIC.
+// `opts.sleepSyncMs` is the matching test-only override for the loop's own sleep (defaulting to
+// the real, blocking `sleepSyncMs` above) -- a test driving `opts.monotonicNowMs` with a fake,
+// always-advancing counter needs its `sleepSyncMs` to advance that SAME counter, or the loop
+// would spin at real-hrtime granularity waiting for fake time to pass.
+function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
+  const waitMs = opts.lockWaitMs !== undefined ? opts.lockWaitMs : config.accountStateLockWaitMs;
+  const pollMs = opts.lockPollMs !== undefined ? opts.lockPollMs : config.accountStateLockPollMs;
+  const isAlive = opts.isAlive || lock.processAlive;
+  const lockFile = stateLockPath(poolDir);
+  const elapsedNowMs = opts.monotonicNowMs || monotonicNowMs;
+  const doSleepSyncMs = opts.sleepSyncMs || sleepSyncMs;
+
+  const start = elapsedNowMs();
+  let held = lock.acquireShortLock(lockFile, { isAlive });
+  while (!held) {
+    const remaining = waitMs - (elapsedNowMs() - start);
+    if (remaining <= 0) break;
+    doSleepSyncMs(Math.min(pollMs, remaining));
+    held = lock.acquireShortLock(lockFile, { isAlive });
+  }
+  const degraded = !held;
+
+  try {
+    const state = readState(poolDir);
+    const { nextState, event } = computeLimitUpdate(state, name, limitKind, now);
+    writeState(poolDir, nextState);
+    return { ...event, degraded };
+  } finally {
+    if (held) lock.releaseShortLock(lockFile, held);
+  }
 }
 
 module.exports = {
   pick,
+  countHealthyAccounts,
   markLimit,
   readRegistry,
   readState,
@@ -388,6 +603,7 @@ module.exports = {
   syncSettings,
   stampManagedSettings,
   AllAccountsCoolingError,
+  AllAccountsLeasedError,
   NoAccountsRegisteredError,
   USAGE_PROBE_COOLDOWN_MS,
   USAGE_ESCALATED_COOLDOWN_MS,
@@ -397,4 +613,5 @@ module.exports = {
   DISABLED_MARKER_FILENAME,
   LABELS_FILENAME,
   SETTINGS_FILENAME,
+  stateLockPath,
 };

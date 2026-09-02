@@ -368,6 +368,20 @@ test('autoPullLimit: defaults to 1 (one card off the board at a time); SPO_AUTO_
 
   assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: undefined }), 1);
   assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: '5' }), 5);
+
+  // 0 MEANS ZERO. It used to mean 3: config.js passed `Number(...)` straight through to
+  // auto-pull.js's `(config && config.autoPullLimit) || DEFAULT_AUTO_PULL_LIMIT`, where 0 is
+  // falsy, so the one input an operator would reach for to switch auto-pull off tripled it
+  // instead. The trap is baited by the neighbouring autoPullMs, whose own comment in this same
+  // file says "0 disables the timer entirely".
+  assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: '0' }), 0);
+
+  // A typo resolves to the DOCUMENTED DEFAULT, never to something larger -- `Number('abc')` is
+  // NaN, and the same posture positiveIntFromEnv already applies to SPO_WORKERS. An operator
+  // mistake must not be able to raise a rate cap above what this file documents.
+  assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: 'abc' }), 1);
+  assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: '-2' }), 1);
+  assert.equal(read({ ...process.env, SPO_AUTO_PULL_LIMIT: '1.5' }), 1);
 });
 
 test('cacheTtlMs: defaults to 1 hour; SPO_CACHE_TTL_MS overrides', () => {

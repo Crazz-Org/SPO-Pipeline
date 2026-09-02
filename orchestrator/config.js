@@ -6,6 +6,16 @@
 const path = require('path');
 const os = require('os');
 
+// The ONLY require in this otherwise-inert data module, and deliberately a dependency-free leaf
+// (it requires nothing itself, this file included -- see its header). It owns action 6.4's
+// product-repo mutex arithmetic, which BOTH product-repo-lock.js and this file's own
+// stepDeadlineMsByState below have to derive from. Requiring product-repo-lock.js instead would
+// be a cycle (that file requires this one) and would silently yield NaN deadlines.
+const productRepoHold = require('./product-repo-hold');
+// MAX_LEASE_AGE_MS is defined in step-contracts.js (which requires nothing local) rather than in
+// account-lease.js, because account-lease.js requires THIS file -- see its own comment.
+const { MAX_LEASE_AGE_MS } = require('./step-contracts');
+
 const REPO_ROOT = path.join(__dirname, '..');
 
 // cwd policy for real-mode `claude -p` calls (steps/llm.js). Shadow mode never spawns anything,
@@ -47,6 +57,19 @@ const CI_CHECKS_POLL_INTERVAL_MS =
   process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS !== undefined
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
     : 20000;
+
+// Hoisted for the SAME reason CI_CHECKS_MAX_POLLS above is (action 6.4): WORKTREE's and FINISH's
+// stepDeadlineMsByState entries are derived from these two, and a field of the export object
+// cannot be read while that object is still being built. Both are still exported verbatim as
+// `commandTimeoutsMs` / `workers` below -- this only moves the declaration, never the value.
+const COMMAND_TIMEOUTS_MS = {
+  git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
+  gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
+  'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
+  'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
+  'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
+};
+const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
 // Hoisted out of the `autoTriageMs` field below (action 3.3) so autoTriageBackoffBaseMs can
 // default off the SAME resolved value rather than re-parsing SPO_AUTO_TRIAGE_MS a second time and
@@ -103,6 +126,32 @@ function positiveMsFromEnv(name, defaultMs) {
   return parsed;
 }
 
+// Same fallback idiom as timeoutFromEnv/positiveMsFromEnv above, for a plain POSITIVE INTEGER
+// COUNT rather than a duration (action 6.3's SPO_WORKERS / SPO_WORKER_CRASH_LIMIT) -- a bad
+// override falls back to the default rather than producing 0 (dispatcher.js would then spawn
+// nothing, ever, and the daemon would look alive while doing no work) or a fraction (a K of 1.5
+// worker means nothing).
+// Same posture as positiveIntFromEnv below, for a knob where 0 IS a legal setting ("take no
+// cards off the board") rather than a synonym for "unset". Absent -> the documented default; a
+// non-integer (`Number('abc')` is NaN), a fractional or a negative value -> ALSO the documented
+// default, never something larger: an operator typo must not be able to raise a rate cap above
+// what this file documents. The only way to get a number other than the default is to name it.
+function nonNegativeIntFromEnv(name, defaultN) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultN;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) return defaultN;
+  return parsed;
+}
+
+function positiveIntFromEnv(name, defaultN) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultN;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return defaultN;
+  return parsed;
+}
+
 module.exports = {
   // Wall-clock deadline for a single step invocation (scripted or llm), in milliseconds.
   // On expiry the step is treated as killed, retried once, and PARKED if it expires again.
@@ -151,6 +200,61 @@ module.exports = {
   // forever, free and unlogged, the moment the classification bug above is corrected.
   ciRetryBudget: 3,
 
+  // ---- action 6.5: the main-moved re-gate counter (GATE and CI_CHECKS share it -- action 4.2
+  // made that sharing explicit; this action only changes what the counter is compared against).
+  //
+  // THE DECISION THIS DEFAULT RECORDS, settled by the maintainer rather than re-derived here:
+  // the GitHub merge queue serializes LANDING, not semantics -- two merged PRs with disjoint
+  // files but interacting behaviour can both land without either ever being re-gated against the
+  // other, and the main-moved test below (both realGate's and realCiChecks') only catches a
+  // FILE-INTERSECTING move, not a bare one. Two ways to close that gap were considered and both
+  // declined:
+  //   - a dispatcher-held MERGE admission token, measured at +42s/card at K=2 -- and it would
+  //     not even fix the semantics it was built for: card B still merges having never been gated
+  //     against card A, it only stops interleaving, which the GitHub merge queue already does.
+  //   - widening the intersection test to "main moved at all", the one option that WOULD buy the
+  //     semantic safety -- costs ~6-8% more bench load, declined against an unquantified risk
+  //     that already has a backstop (the nightly, which drives every merged main and would catch
+  //     an interaction the pipeline missed).
+  // So: accept the gap explicitly, the nightly is the accepted backstop, and this budget is
+  // exactly what the CI_CHECKS/GATE spec rows now say ("configurable ... once at the default").
+  //
+  // THE NUMBER ITSELF is a MODEL, not a measurement, and is written down as one rather than
+  // dressed up as derived from data that does not exist: the corpus (journal/*/journal.jsonl,
+  // all 20 tasks) contains ZERO `main-moved` events, because today's daemon is single-threaded --
+  // it structurally cannot merge a sibling card's PR while another of its own cards is live, so
+  // K workers do not merely expose this path, they CREATE it. Over one card's own window the
+  // expected count of sibling merges is exactly K-1 (one per other worker, once per cycle).
+  //
+  // The model: sibling merges as Poisson with lambda = (K-1) x exposure x intersectionRate,
+  // "conservative" stated plainly rather than proven -- real sibling merges are quasi-periodic
+  // (each worker's own cycle), so they cluster LESS than a Poisson arrival would, not more.
+  //   exposure    = 39-52% of a card's cycle is GATE-start-to-merge (7.8/14.9 and 6.8/17.6 min
+  //                 on the only two cards with phase timing, #473/#475).
+  //   intersectionRate = 10.5% -- 16 of 153 pairs (C(18,2)) among the 18 merged pipeline PRs
+  //                 share at least one file; concentrated in a few large cards (#213 in 5 pairs,
+  //                 #418 in 5), median card touches 2-4 files and intersects nothing.
+  //   lambda(K=2) = 0.041-0.055, lambda(K=3) = 0.082-0.109.
+  //
+  //           | one re-gate (>=1 intersecting sibling merge) | two (park under budget 1) |
+  //   K=2     | 4.0-5.3% of cards                              | 0.08-0.15%                 |
+  //   K=3     | 7.9-10.3%                                       | 0.33-0.56%                 |
+  //
+  // Today's boolean (equivalent to budget 1) already parks fewer than 1 card in 650 at K=2 and
+  // fewer than 1 in 178 at K=3 -- a raised default would be defending against an event the
+  // pipeline's OWN file-intersection test already makes ~10x rarer than a bare merge count
+  // suggests, and the plan's default of 2 lands on K-1 only at the K=3 the plan happened to
+  // choose, which is a coincidence of that choice, not a derivation. So: DEFAULT STAYS AT 1 --
+  // no behaviour change from today's hard boolean -- and the number is configurable so it is
+  // arguable rather than compiled in.
+  //
+  // What would actually settle this later: a `main-moved-merge` event count against a card
+  // count once K>1 has run in production for a while -- the same "no calibration data exists
+  // yet" honesty ciChecksMaxPolls' own comment above states, and no journal evidence for this
+  // number CAN exist before then. Full derivation: doc/remediation-progress.md, "6.5's counter:
+  // what the corpus says, and what it cannot say".
+  mainMovedRegateBudget: 1,
+
   // CI_CHECKS in-flight bounded wait (steps/scripted.js's realCiChecks) -- action 1.7. A
   // check-run with `conclusion: null` (still running) or an empty check_runs array (CI has not
   // even registered yet) is NOT green: the audit measured 8/12 real "green" events with `claude
@@ -185,8 +289,51 @@ module.exports = {
   // making 1.7's own park unreachable. Derive the ceiling from the bound so the two can never
   // drift apart again: the full poll budget plus one ordinary step deadline of margin for the
   // `gh api` calls themselves.
+  //
+  // WORKTREE and FINISH (action 6.4) are the same class of problem for the same reason, and the
+  // history matters because it is the reason anyone would ever revisit these two numbers:
+  //
+  //   THIS TIMER WAS ALWAYS INERT IN REAL MODE. See the commandTimeoutsMs comment below: every
+  //   real command in these steps runs through a BLOCKING spawnSync, so the event loop never
+  //   yields and deadline.js's setTimeout could never fire. 6.4's product-repo mutex introduced
+  //   the first `await` ever placed in that path (its poll loop's `await sleep(pollMs)`), which
+  //   ARMED a timer that had never been live -- it did not expose a latent bug, it created a new
+  //   one. Measured during 6.4's verification: with a holder still inside the critical section,
+  //   WORKTREE parked `step-deadline-exceeded-twice` at 2 x stepDeadlineMs instead of ever
+  //   reaching the mutex's own 116-minute wait bound, which the bound made unreachable dead code.
+  //
+  //   SO THESE ENTRIES ARE DELIBERATELY LARGE ENOUGH NEVER TO FIRE, and that is the correct
+  //   answer rather than a cop-out: it restores the documented status quo. The real protection in
+  //   these two steps is, and always was, spawnSync's own per-command timeouts
+  //   (commandTimeoutsMs below), armed by steps/scripted.js's spawnStep -- never this timer.
+  //
+  //   THE HAZARD IF ONE EVER DOES FIRE, which is why "large enough" is not good enough on its
+  //   own: deadline.js's withTimeout ABANDONS the loser rather than cancelling it (deadline.js
+  //   lines 11-13). Measured, not reasoned about: when the WORKTREE timer fired during a lock
+  //   wait, TWO realWorktree invocations subsequently entered the critical section -- 5ms apart,
+  //   serialized by the mutex but both running fetch / the leftover sweep / `git worktree add`
+  //   against the SHARED clone for a task that had ALREADY PARKED, leaving an orphan worktree and
+  //   branch behind. That is a clone-corruption path opened by the very mutex that exists to
+  //   prevent clone corruption. Shrinking either entry below its derived value reopens it.
+  //
+  // Derived, never literals, from product-repo-hold.js's own arithmetic so a change to
+  // commandTimeoutsMs or to `workers` moves all of these together: the longest legitimate WAIT on
+  // the mutex ((K-1) x worst hold), plus that phase's own longest legitimate WORK, plus one
+  // ordinary step deadline of margin -- the identical shape CI_CHECKS uses above.
   stepDeadlineMsByState: {
     CI_CHECKS: CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS,
+    WORKTREE: productRepoHold.lockedStepDeadlineMs(
+      COMMAND_TIMEOUTS_MS,
+      WORKERS,
+      STEP_DEADLINE_MS,
+      productRepoHold.worstHoldMs(COMMAND_TIMEOUTS_MS)
+    ),
+    FINISH: productRepoHold.lockedStepDeadlineMs(
+      COMMAND_TIMEOUTS_MS,
+      WORKERS,
+      STEP_DEADLINE_MS,
+      productRepoHold.finishHoldMs(COMMAND_TIMEOUTS_MS)
+    ),
   },
 
   // ---- action 2.1: real spawnSync per-command-class timeouts -----------------------------
@@ -242,16 +389,61 @@ module.exports = {
   //
   // An explicit `opts.timeout` passed by a spawnStep call site always wins over these defaults
   // (steps/scripted.js). Every value is independently overridable; SPO_TIMEOUT_* env vars.
-  commandTimeoutsMs: {
-    git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
-    gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
-    'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
-    'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
-    'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
-  },
+  commandTimeoutsMs: COMMAND_TIMEOUTS_MS,
 
   // Poll interval for daemon.js when run without --once (queue watch mode).
   pollIntervalMs: 5000,
+
+  // ---- action 6.3: the dispatcher (orchestrator/dispatcher.js) --------------------------
+
+  // How many workers the dispatcher runs concurrently. Default 1, deliberately -- this is a
+  // large refactor (queue draining moves from in-process runTask calls to spawned `--worker`
+  // child processes for EVERY task, including at K=1: "one code path, not two", see
+  // dispatcher.js's own header) and the default must not change today's throughput behaviour on
+  // its own; parallelism is opt-in. Re-clamped to accounts.countHealthyAccounts(...) before EVERY
+  // spawn regardless of this value -- see dispatcher.js and account-lease.js's own header for why
+  // the measured ceiling on the real two-account pool is K=2, and why K=1 (one account cooling)
+  // is a routine state, not an edge case: one account sat in a 5-hour cooldown for most of
+  // 2026-09-01. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
+  // this default rather than to 0 (which would spawn nothing, silently, forever).
+  workers: WORKERS,
+
+  // How many CONSECUTIVE worker crashes (dispatcher.js's own classifier: any exit that is
+  // neither 0 (DONE) nor 20 (PARKED) -- see daemon.js's --worker header for the full exit-code
+  // table) trip the dispatcher's circuit breaker and make IT exit non-zero, rather than reparking
+  // forever. "Consecutive" is scoped to the DISPATCHER'S OWN LIFETIME, across every task it has
+  // spawned a worker for, not per-task -- and is reset by ANY worker exiting 0 or 20, because a
+  // park is a successful run of the state machine (an ordinary outcome the plan itself calls out
+  // as "not a crash"), and without that reset an unlucky run of ordinary parked cards would trip
+  // a breaker meant to catch a broken state machine, not a busy one.
+  //
+  // Default 3 is a TUNABLE WITH NO JOURNAL EVIDENCE BEHIND IT, stated plainly rather than dressed
+  // up as derived: there has never been a worker crash in this project's history, because there
+  // have never been workers -- action 6.1 is what first made `--worker` exist at all, and this
+  // config was written the same week. Every other numeric default this remediation has shipped
+  // (diagnoseBudget, ciRetryBudget, the various *Ms timers above) was sized against the real
+  // journal corpus; this one cannot be, and pretending otherwise would be worse than saying so.
+  // What WOULD justify changing it: a `worker-crashed` daemon.jsonl history once workers have
+  // actually run in production for a while -- specifically, whether real crashes cluster (a
+  // handler bug that reliably reproduces, where a LOW limit is correct: stop fast, page a human)
+  // or scatter (transient infrastructure flakiness across otherwise-healthy runs, where a HIGHER
+  // limit avoids a daemon that stops itself on ordinary noise). Recalibrate from that data once it
+  // exists, the same way ciChecksMaxPolls's own comment above describes for CI wait budgets --
+  // this is the same "erring toward a number with no evidence, stated as such" posture, not a
+  // silent guess. SPO_WORKER_CRASH_LIMIT overrides.
+  workerCrashLimit: positiveIntFromEnv('SPO_WORKER_CRASH_LIMIT', 3),
+
+  // How many CONSECUTIVE crashes of the SCANNER child (daemon.js --scanner, spawned/supervised by
+  // dispatcher.js -- action 6.3's post-verification correction, see that file's header) trip a
+  // SEPARATE circuit breaker from workerCrashLimit above -- see dispatcher.js's
+  // handleScannerExit for the justification: a scanner crash (scan/intake machinery) and a worker
+  // crash (state-machine execution) are different failure domains, and sharing one counter would
+  // make the trip detail actively misleading about which one is actually broken. Same posture as
+  // workerCrashLimit on evidence: there has never been a scanner before this action, so this
+  // default (3, matching workerCrashLimit's own) carries the identical "no journal evidence yet"
+  // caveat -- recalibrate once a `scanner-crashed` daemon.jsonl history exists to look at.
+  // SPO_SCANNER_CRASH_LIMIT overrides.
+  scannerCrashLimit: positiveIntFromEnv('SPO_SCANNER_CRASH_LIMIT', 3),
 
   // ---- crash recovery: orphaned tasks + lock re-verification (orchestrator/orphan-scan.js,
   // orchestrator/lock.js) -- see doc/daemon-crash-recovery.md for the incident this covers
@@ -306,6 +498,68 @@ module.exports = {
   // NoAccountsRegisteredError, and daemon.js --real refuses to start on that.
   claudeAccountsDir: process.env.SPO_ACCOUNTS_DIR || path.join(os.homedir(), '.claude-accounts'),
 
+  // ---- action 6.2: per-account leases + atomic pool state --------------------------------
+  //
+  // accountLeaseWaitMs -- how long callLlmStep/callIntakeStepWithRotation (via
+  // orchestrator/account-lease.js's leaseHealthyAccount) will WAIT for a healthy account's lease
+  // to free up before giving up and parking `all-accounts-leased`. Per-step leasing was chosen
+  // over per-task leasing precisely so a worker can wait out a SIBLING's in-flight step rather
+  // than park (doc/remediation-progress.md's C6 decision record).
+  //
+  // DERIVED FROM MAX_LEASE_AGE_MS, not from an observed maximum. This was the one C6 bound that
+  // was not, and it was wrong for it (cross-action defect, found in C6 verification). The old
+  // default was 5 minutes, justified against measured step durations of 90-265s -- but what a
+  // waiter must outlast is not the duration a step USUALLY takes, it is the longest a sibling can
+  // LEGITIMATELY hold the lease, and that is a bound this codebase already states:
+  //
+  //   sibling worker, one two-attempt LLM step   2 x LLM_STEP_DEADLINE_MS  = 30   min
+  //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS    = 10   min
+  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS          = 31.5 min
+  //
+  // Against a 5-minute wait every one of those is longer. A worker at K=2 therefore gave up while
+  // the holder was still legitimately alive AND still un-sweepable for up to another 26.5 minutes,
+  // and parked `all-accounts-leased` -- the exact park class per-step leasing exists to avoid. The
+  // real pool is 2 accounts against 3 contenders (2 workers + the scanner), so this is an ordinary
+  // operating point, not an exotic one.
+  //
+  // MAX_LEASE_AGE_MS is the correct derivation because it is the ceiling by CONSTRUCTION: a lease
+  // younger than it may be legitimately held, and one older than it is swept and taken by the very
+  // next poll. A waiter willing to outlast it therefore always terminates in one of two honest
+  // ways -- it gets a lease, or the holder ages out and it takes that one -- instead of parking a
+  // healthy card. Same asymmetry product-repo-lock.js states for its own wait bound: waiting too
+  // long only delays a card, giving up too early parks one that was fine.
+  //
+  // Never applies to a cooling account -- see accounts.js's AllAccountsLeasedError vs
+  // AllAccountsCoolingError split; a cooldown is never worth waiting out. SPO_ACCOUNT_LEASE_WAIT_MS
+  // overrides (positiveMsFromEnv: a non-positive/non-finite override falls back to this default,
+  // never to "wait forever").
+  accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', MAX_LEASE_AGE_MS),
+
+  // accountLeasePollMs -- how often the wait above re-checks whether a lease has freed up. Each
+  // check is one directory listing plus a few small JSON reads (leasedAccountNames), cheap
+  // enough that a 1s cadence costs nothing noticeable even with several workers waiting at once,
+  // while still resolving a freed lease promptly relative to the multi-minute bound it polls
+  // inside of. SPO_ACCOUNT_LEASE_POLL_MS overrides.
+  accountLeasePollMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_POLL_MS', 1000),
+
+  // accountStateLockWaitMs -- how long accounts.js's markLimit will wait for <poolDir>/.state.lock
+  // before giving up and falling back to today's UNLOCKED read-modify-write (see markLimit's own
+  // comment for the "degrade, never fail" doctrine: losing a concurrent cooldown update is a
+  // wasted call, failing an LLM step's own already-failed attempt over pool bookkeeping is a
+  // parked card). This runs in the hot path right after a step has already failed with a limit,
+  // so it stays far short of accountLeaseWaitMs above -- but not so short that ordinary
+  // contention (two workers hitting a limit on DIFFERENT accounts in the same instant, each
+  // doing one small JSON read+write under the lock) routinely blows through it and degrades for
+  // no reason: 2s is generous headroom over a lock hold time measured in single-digit
+  // milliseconds, while still trivial next to a 90s+ step. SPO_ACCOUNT_STATE_LOCK_WAIT_MS
+  // overrides.
+  accountStateLockWaitMs: positiveMsFromEnv('SPO_ACCOUNT_STATE_LOCK_WAIT_MS', 2000),
+
+  // accountStateLockPollMs -- retry cadence for the wait above. Short, because the whole point is
+  // a bound that resolves quickly once the other holder's write completes (typically well under
+  // a millisecond of actual critical-section time). SPO_ACCOUNT_STATE_LOCK_POLL_MS overrides.
+  accountStateLockPollMs: positiveMsFromEnv('SPO_ACCOUNT_STATE_LOCK_POLL_MS', 10),
+
   // ---- real-mode scripted steps (steps/scripted.js) --------------------------------------
   //
   // The product checkout every WORKTREE/CHECK/PUSH_PR/GATE/CI_CHECKS/MERGE/FINISH real command
@@ -325,6 +579,15 @@ module.exports = {
   // `git worktree remove --force`.
   pipelineWorktreesDir: process.env.SPO_WORKTREES_DIR || path.join(REPO_ROOT, 'worktrees'),
 
+  // productRepoLockPollMs -- action 6.4's product-repo mutex (orchestrator/product-repo-lock.js):
+  // how often a worker blocked on the lock re-checks whether it has freed up. Same cadence and
+  // same reasoning as accountLeasePollMs above (one small fs read, cheap enough that 1s costs
+  // nothing even with a couple of workers waiting at once) -- the bound this polls inside of is
+  // derived in product-repo-lock.js itself, not here, from commandTimeoutsMs above (see that
+  // file's own header for why a *derived* bound cannot live in this deliberately-inert config
+  // object). SPO_PRODUCT_REPO_LOCK_POLL_MS overrides.
+  productRepoLockPollMs: positiveMsFromEnv('SPO_PRODUCT_REPO_LOCK_POLL_MS', 1000),
+
   // owner/repo for every `gh api` / `gh pr` / `gh issue` real call.
   ghRepo: 'Crazz-Org/SPO-WebClient',
 
@@ -340,22 +603,27 @@ module.exports = {
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //
-  // daemon.js --real polls the board on this timer, between drain passes (state-machine.js's
-  // runForever), running the same pullBoard + makeTask `spo pull` already does by hand, for the
-  // top autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
+  // daemon.js --scanner polls the board on this timer (state-machine.js's runForever's scan
+  // cycle), running the same pullBoard + makeTask `spo pull` already does by hand, for the top
+  // autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
   // overrides -- see orchestrator/README.md § Kanban piloting for the GraphQL cost.
-  autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
-  // How many claimable candidates one auto-pull cycle takes off the board. NOT a concurrency
-  // setting -- drainQueueOnce works the queue strictly serially -- but because runForever
-  // AWAITS that drain before pulling again, a pull only ever happens with the daemon idle: so
-  // this is the most cards that can sit off the board, unstarted, at any moment.
   //
-  // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card, finishes it, then
-  // looks again. Cards stay on the board -- visible, reorderable, claimable by a human --
-  // until the daemon is actually ready for them. Raise it if serial intake proves to be the
-  // bottleneck. SPO_AUTO_PULL_LIMIT overrides.
-  autoPullLimit:
-    process.env.SPO_AUTO_PULL_LIMIT !== undefined ? Number(process.env.SPO_AUTO_PULL_LIMIT) : 1,
+  // action 6.3 correction: this used to run inside the SAME process (and, pre-dispatcher, the
+  // same serial loop) that drained the queue -- "a pull only ever happens with the daemon idle"
+  // was true then. It is no longer true: the scanner is now its own process, on its own timer,
+  // entirely independent of whether the dispatcher's workers are busy. A pull can now land while
+  // K workers are mid-task; they simply pick the new card up via their own next takeNextTask.
+  autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
+  // How many claimable candidates one auto-pull cycle takes off the board.
+  //
+  // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card at a time off the
+  // board. Cards stay on the board -- visible, reorderable, claimable by a human -- until a
+  // worker is actually ready for them. Raise it if intake proves to be the bottleneck.
+  // SPO_AUTO_PULL_LIMIT overrides.
+  // SPO_AUTO_PULL_LIMIT=0 means ZERO -- see nonNegativeIntFromEnv above and auto-pull.js's
+  // resolveNonNegativeInt. It used to be `Number(...)` straight through into a `|| DEFAULT`, so
+  // the off switch resolved to 3.
+  autoPullLimit: nonNegativeIntFromEnv('SPO_AUTO_PULL_LIMIT', 1),
 
   // ---- kanban piloting: human-first bug-report intake --------------------------------------
   //

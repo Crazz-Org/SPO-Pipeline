@@ -60,10 +60,21 @@
 // until spawnSync itself returns. Worse, deadline.js's race explicitly abandons the loser "to
 // finish in the background" (see its own comment), which for a real subprocess would mean an
 // orphaned `claude -p` process still spending budget. spawnSync's `timeout` avoids both problems
-// -- it is enforced by Node itself while the child runs, and it actually kills the child. The
-// state machine still wraps the whole call in callWithDeadline (see callLlmStep) for its
-// existing "retry once, then PARK" bookkeeping; that layer keeps working as before because
-// invokeClaudeReal always returns (never hangs) once its own spawnSync timeout elapses. A call
+// -- it is enforced by Node itself while the child runs, and it signals the child. The state
+// machine still wraps the whole call in callWithDeadline (see callLlmStep) for its existing
+// "retry once, then PARK" bookkeeping.
+//
+// One correction to what this paragraph used to claim, measured during action 6.2's verification
+// rather than reasoned: spawnSync's `timeout` sends `killSignal` (SIGTERM by default) and does
+// NOT escalate to SIGKILL. Measured directly -- an ordinary child returns
+// `signal=SIGTERM status=null error=ETIMEDOUT` after 410ms against a 400ms timeout, while a child
+// that INSTALLS A SIGTERM HANDLER AND IGNORES IT ran to its own completion at 27651ms and returned
+// `signal=null status=0`. So "invokeClaudeReal always returns once its own timeout elapses" is
+// true for a child that dies on SIGTERM, not unconditionally, and the outer callWithDeadline
+// cannot rescue it either (its timer cannot fire while spawnSync blocks the thread -- that is the
+// whole reason this paragraph exists). There is no evidence the `claude` CLI ignores SIGTERM, and
+// nothing here changes killSignal on a guess; this comment is corrected because C6's worker design
+// leans on this doctrine by name, and a doctrine has to say what it actually guarantees. A call
 // killed this way returns `{ok: false, timedOut: true, deadlineMs, error: "... ran but exceeded
 // the Xms deadline and was killed ..."}` -- callers that need to tell a deadline kill apart from
 // a genuine spawn/parse failure (e.g. intake.js's triageBugReport, to decide whether a retry is

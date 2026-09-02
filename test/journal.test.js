@@ -16,7 +16,7 @@ const path = require('path');
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
-const { writeState } = require('../orchestrator/journal');
+const { writeState, writeLiveWorkerIds, readLiveWorkerIds, liveWorkersPath } = require('../orchestrator/journal');
 const { mkTmp } = require('./helpers');
 
 test('writeState: output is byte-identical to the pre-fix shape (pretty JSON + trailing newline)', () => {
@@ -94,4 +94,71 @@ test('writeState: still overwrites on every call (no stale content ever survives
   writeState(dir, { state: 'DONE' });
   const parsed = JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
   assert.equal(parsed.state, 'DONE');
+});
+
+// ---- action 6.3: writeLiveWorkerIds/readLiveWorkerIds -- the cross-process live-worker table ---
+// See journal.js's own header (the taskDir single-writer invariant section) for the full design:
+// the dispatcher publishes its live-worker id set here on every spawn/exit, and the scanner reads
+// it fresh every cycle to protect a task a worker still owns from a concurrent orphan-scan pass.
+
+test('writeLiveWorkerIds: the rename is atomic -- renameSync\'s target never existed before, and the source is already complete JSON', () => {
+  const dir = mkTmp('spo-journal-liveids-atomic-');
+  const origRename = fs.renameSync;
+  const calls = [];
+  fs.renameSync = (src, dest) => {
+    calls.push({ src, dest, srcContent: fs.readFileSync(src, 'utf8'), destExisted: fs.existsSync(dest) });
+    return origRename(src, dest);
+  };
+  try {
+    writeLiveWorkerIds(dir, new Set(['issue-1', 'issue-2']));
+  } finally {
+    fs.renameSync = origRename;
+  }
+
+  assert.equal(calls.length, 1, 'writeLiveWorkerIds must go through exactly one rename -- a direct writeFileSync to the target would call this 0 times');
+  assert.equal(calls[0].dest, liveWorkersPath(dir));
+  assert.equal(path.dirname(calls[0].src), dir, 'tmp file must be in the SAME directory as the target -- renameSync is not atomic across filesystems');
+  assert.equal(calls[0].destExisted, false, 'the target name did not exist an instant before this call');
+  // Complete, parsable JSON already, before the target name is ever visible under it.
+  const parsed = JSON.parse(calls[0].srcContent);
+  assert.deepEqual(parsed.ids, ['issue-1', 'issue-2']);
+});
+
+test('writeLiveWorkerIds: no tmp file left behind after a clean write', () => {
+  const dir = mkTmp('spo-journal-liveids-notmp-');
+  writeLiveWorkerIds(dir, new Set(['a']));
+  assert.deepEqual(fs.readdirSync(dir), ['live-workers.json']);
+});
+
+test('writeLiveWorkerIds/readLiveWorkerIds: round trip, sorted, with an updatedAt timestamp', () => {
+  const dir = mkTmp('spo-journal-liveids-roundtrip-');
+  writeLiveWorkerIds(dir, new Set(['zeta', 'alpha', 'mu']));
+  const raw = JSON.parse(fs.readFileSync(liveWorkersPath(dir), 'utf8'));
+  assert.deepEqual(raw.ids, ['alpha', 'mu', 'zeta']);
+  assert.ok(!Number.isNaN(Date.parse(raw.updatedAt)));
+  assert.deepEqual([...readLiveWorkerIds(dir)].sort(), ['alpha', 'mu', 'zeta']);
+});
+
+test('writeLiveWorkerIds: an empty set writes an empty (not missing) file -- readLiveWorkerIds gives an empty Set, not "unknown"', () => {
+  const dir = mkTmp('spo-journal-liveids-empty-');
+  writeLiveWorkerIds(dir, new Set());
+  assert.ok(fs.existsSync(liveWorkersPath(dir)));
+  assert.deepEqual(readLiveWorkerIds(dir), new Set());
+});
+
+test('readLiveWorkerIds: tolerates a missing file (empty Set, never a throw) and an unparsable one', () => {
+  const missingDir = mkTmp('spo-journal-liveids-missing-');
+  assert.deepEqual(readLiveWorkerIds(missingDir), new Set());
+
+  const garbageDir = mkTmp('spo-journal-liveids-garbage-');
+  fs.mkdirSync(garbageDir, { recursive: true });
+  fs.writeFileSync(liveWorkersPath(garbageDir), '{ not valid json');
+  assert.deepEqual(readLiveWorkerIds(garbageDir), new Set());
+});
+
+test('writeLiveWorkerIds: still overwrites on every call (no stale ids survive an update)', () => {
+  const dir = mkTmp('spo-journal-liveids-overwrite-');
+  writeLiveWorkerIds(dir, new Set(['a', 'b']));
+  writeLiveWorkerIds(dir, new Set(['c']));
+  assert.deepEqual(readLiveWorkerIds(dir), new Set(['c']));
 });

@@ -119,15 +119,22 @@ function usageLineTs(id, model, usage, timestamp) {
 }
 
 test("scan()'s byDay buckets a session by the LOCAL calendar day of its last message, and excludes the 'local' account", async () => {
-  // Both timestamps sit comfortably mid-day UTC (10:00 / 15:00) so they land on the SAME local
-  // calendar day for any realistic host offset -- the near-midnight boundary case (where LOCAL
-  // and UTC disagree) is exercised on its own below, action 5.5 item C, not mixed into this
-  // basic-correctness test.
+  // Both sessions carry the SAME instant, so they land on the same local calendar day at every
+  // host offset without exception. The earlier fixture used 10:00Z and 15:00Z with the comment
+  // "the SAME local calendar day for any realistic host offset" -- which is not true, and this
+  // test failed under TZ=Pacific/Niue (UTC-11), where 10:00Z is Aug 28 local and 15:00Z is
+  // Aug 29 local, producing two byDay buckets instead of one. No pair of DISTINCT instants can
+  // satisfy that claim: the realistic offset range (UTC-12..UTC+14) is 26 hours wide, so some
+  // offset always puts a midnight between them. Identical timestamps is the only offset-proof
+  // fixture, and it costs the test nothing -- what it asserts is "two sessions, one day, and the
+  // 'local' account excluded", none of which needed the two messages to be at different times.
+  // The near-midnight boundary case (where LOCAL and UTC deliberately disagree) is exercised on
+  // its own below, action 5.5 item C.
   const root = mkTmp('spo-usage-root-byday-');
   const pooledRoot = path.join(root, 'pool1');
   const ambientRoot = path.join(root, 'ambient');
   writeSession(path.join(pooledRoot, 'proj'), 'sess-a.jsonl', [usageLineTs('m1', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 10 }, '2026-08-29T10:00:00.000Z')]);
-  writeSession(path.join(pooledRoot, 'proj'), 'sess-b.jsonl', [usageLineTs('m2', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 10 }, '2026-08-29T15:00:00.000Z')]);
+  writeSession(path.join(pooledRoot, 'proj'), 'sess-b.jsonl', [usageLineTs('m2', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 10 }, '2026-08-29T10:00:00.000Z')]);
   writeSession(path.join(ambientRoot, 'proj'), 'sess-c.jsonl', [usageLineTs('m3', 'claude-sonnet-5', { input_tokens: 999, output_tokens: 999 }, '2026-08-29T10:00:00.000Z')]);
 
   const scanner = createUsageScanner({ roots: [{ path: pooledRoot, account: 'pool1' }, { path: ambientRoot, account: 'local' }] });

@@ -16,8 +16,21 @@ const path = require('path');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('../orchestrator/lock');
+const shortLock = require('../orchestrator/lock'); // acquireShortLock/releaseShortLock -- see the verifier tests at the end of this file
 const { runTask } = require('../orchestrator/state-machine');
-const { DAEMON, mkTmp, writeTask, runDaemonOnce, readState } = require('./helpers');
+const { DAEMON, mkTmp, writeTask, runDaemonOnce, runDaemonWorker, readState, isolatedEnv } = require('./helpers');
+
+// Same layout a dispatcher's takeNextTask would leave behind (<taskDir>/task.json, no queue/
+// entry) -- worker mode reads it directly, never through the queue. Shared by both action 6.1
+// tests below; see test/worker-mode.test.js for the fuller worker-mode coverage (exit codes,
+// owner shape, usage errors) -- these two live here instead because what they actually pin is
+// LOCK behaviour: a worker takes none at all.
+function seedWorkerTask(journalDir, id, taskObj) {
+  const taskDir = path.join(journalDir, id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify(taskObj, null, 2));
+  return taskDir;
+}
 
 test('acquireLock: clean acquire writes {host, pid, startedAt, mode} and release removes it', () => {
   const root = mkTmp('spo-lock-');
@@ -159,7 +172,19 @@ test('watchLock: fires onLost once a different holder is read back twice in a ro
     deps: { readHolder: () => holders[Math.min(i++, holders.length - 1)] },
   });
 
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  // Wait on the CONDITION, never on a fixed budget. intervalMs is 5, so two ticks is ~10ms --
+  // but under a 4x-parallel full-suite run the event loop starves long enough that a flat 60ms
+  // wait saw fewer than two ticks and read calls.length === 0. That is a harness artifact, not
+  // the behaviour under test: measured at 4 failures in 16 parallel full-suite runs (#480), the
+  // more frequent of that card's two flakes. The "exactly once" half is still asserted below,
+  // after ~20 further intervals -- watchLock clearIntervals itself on the first onLost, so a
+  // regression that removed that stop is what the second assertion catches.
+  const firstCallDeadline = Date.now() + 10000;
+  while (calls.length === 0 && Date.now() < firstCallDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(calls.length, 1, 'onLost never fired within 10s -- the watch timer never ran twice');
+  await new Promise((resolve) => setTimeout(resolve, 100)); // ~20 further 5ms intervals
   watch.stop();
   assert.equal(calls.length, 1); // fires exactly once, not once per remaining tick
   assert.equal(calls[0].reason, 'taken-over');
@@ -357,6 +382,36 @@ test('acquireLock: link() publishes the name only once the content is already co
   assert.equal(JSON.parse(calls[0].srcContent).pid, process.pid); // complete BEFORE it is named
 });
 
+// Deterministic companion to the SIGTERM test below, which can only catch this race by winning
+// it -- measured at ~2 runs in 44 even under a 4x-parallel suite, and 0 in 44 on an idle box. A
+// probabilistic guard is not a guard: the ordering it protects is a one-line edit away from
+// regressing, and the reversal would sit green for weeks. Same standing-guard shape as
+// test/gh-api-argv.test.js, which fails any `gh api` call site that repeats the `-f`-is-a-POST
+// trap rather than waiting to observe the 422.
+test('daemon.js registers its signal handlers BEFORE acquiring the lock (no default-disposition window)', () => {
+  const source = fs.readFileSync(DAEMON, 'utf8');
+
+  const sigtermAt = source.indexOf("process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143))");
+  const acquireAt = source.indexOf('acquireLock(journalRoot');
+  const exitHookAt = source.indexOf("process.once('exit', () => {");
+
+  assert.notEqual(sigtermAt, -1, 'the SIGINT/SIGTERM registration is no longer recognisable -- update this guard');
+  assert.notEqual(acquireAt, -1, 'the acquireLock call is no longer recognisable -- update this guard');
+  assert.notEqual(exitHookAt, -1, 'the lock-releasing exit hook is no longer recognisable -- update this guard');
+
+  // Until a JS handler exists, Node terminates on SIGTERM immediately and runs no 'exit' hooks,
+  // so anything acquired before the handler is installed can leak. Both the exit hook and the
+  // signal handlers must therefore precede acquisition.
+  assert.ok(
+    sigtermAt < acquireAt,
+    'daemon.js acquires the lock before registering its SIGTERM handler -- a signal in that window kills the process on the OS default disposition and leaks the lock file'
+  );
+  assert.ok(
+    exitHookAt < acquireAt,
+    "daemon.js acquires the lock before registering the 'exit' hook that releases it"
+  );
+});
+
 test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook)', async () => {
   const queueDir = mkTmp('spo-lock-q-');
   const journalDir = mkTmp('spo-lock-j-');
@@ -365,12 +420,183 @@ test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook
   const child = spawn(process.execPath, [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir], {
     stdio: 'ignore',
   });
-  // Wait for the lock to appear (daemon startup), then terminate.
-  for (let i = 0; i < 100 && !fs.existsSync(lockPath(journalDir)); i++) {
-    await new Promise((r) => setTimeout(r, 50));
+  // Wait for the lock to appear (daemon startup), then terminate. Deadline-based and generous:
+  // this waits on a real node process booting and requiring the whole orchestrator tree, which
+  // under a 4x-parallel full-suite run takes longer than the 5s the first cut allowed
+  // (100 x 50ms).
+  //
+  // Raising that budget is NOT what fixed this test's intermittent failure, and the distinction
+  // matters. #480 filed it alongside the watchLock case as a second timing-budget flake; it was
+  // not one. This test kills the daemon the instant its lock file appears, which is exactly the
+  // window in which daemon.js had not yet registered a SIGTERM handler -- so the child died on
+  // Node's default disposition, skipping the 'exit' hook that releases the lock, and the final
+  // assertion below correctly reported a leaked lock. The fix is in daemon.js (handlers hoisted
+  // above acquireLock); see its comment. This test was reporting a real production race the
+  // whole time, and it must keep killing the daemon as early as it can in order to keep
+  // reporting it.
+  const bootDeadline = Date.now() + 30000;
+  while (!fs.existsSync(lockPath(journalDir)) && Date.now() < bootDeadline) {
+    await new Promise((r) => setTimeout(r, 25));
   }
-  assert.equal(fs.existsSync(lockPath(journalDir)), true, 'daemon never wrote its lock');
+  assert.equal(fs.existsSync(lockPath(journalDir)), true, 'daemon never wrote its lock within 30s');
   child.kill('SIGTERM');
   await new Promise((resolve) => child.once('exit', resolve));
   assert.equal(fs.existsSync(lockPath(journalDir)), false);
+});
+
+// ---- action 6.1: --worker takes no lock at all -----------------------------------------------
+
+test('daemon.js --worker: leaves no lock file behind -- the whole point of skipping acquireLock', () => {
+  const journalDir = mkTmp('spo-lock-worker-j-');
+  const taskDir = seedWorkerTask(journalDir, 'worker-no-lock', {
+    id: 'worker-no-lock',
+    kind: 'synthetic',
+    shadow: { forceState: 'DONE' },
+  });
+
+  const result = runDaemonWorker(taskDir, journalDir);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readState(journalDir, 'worker-no-lock').state, 'DONE');
+
+  // A mutation that re-added acquireLock to the --worker path would fail exactly this line: the
+  // lock file would exist right up until the worker's own 'exit' hook released it, and by the
+  // time execFileSync returns here that release has already happened -- so a re-added
+  // acquireLock would be caught by the DAEMON test above ("SIGTERM releases the lock") passing
+  // for the wrong reason, not by a leftover file. What actually distinguishes "never acquired"
+  // from "acquired and released" is the concurrency test directly below: two workers against the
+  // SAME journal root, overlapping in wall-clock time, both succeeding. That is the one a
+  // reintroduced acquireLock cannot fake.
+  assert.equal(fs.existsSync(lockPath(journalDir)), false);
+});
+
+test('daemon.js --worker: two workers run CONCURRENTLY against the SAME journal root and both succeed', async () => {
+  const journalDir = mkTmp('spo-lock-worker-j-');
+  // Same shape as test/citation-verifier.test.js's proven "reaches DONE in shadow mode" fixture
+  // (gate/prWait exit-0 fixtures + a VALIDATE PASS verdict), plus a delays.IMPLEMENT slow enough
+  // that both children are still alive, mid-task, at the same wall-clock instant -- a real
+  // overlap, not two runs that merely didn't happen to collide.
+  const taskDirA = seedWorkerTask(journalDir, 'worker-concurrent-a', {
+    id: 'worker-concurrent-a',
+    kind: 'synthetic',
+    touchesRdoMembers: true,
+    shadow: { gate: [0], prWait: [0], llm: { VALIDATE: { verdict: 'PASS' } }, delays: { IMPLEMENT: 150 } },
+  });
+  const taskDirB = seedWorkerTask(journalDir, 'worker-concurrent-b', {
+    id: 'worker-concurrent-b',
+    kind: 'synthetic',
+    touchesRdoMembers: true,
+    shadow: { gate: [0], prWait: [0], llm: { VALIDATE: { verdict: 'PASS' } }, delays: { IMPLEMENT: 150 } },
+  });
+
+  const queueDirA = mkTmp('spo-lock-worker-q-');
+  const queueDirB = mkTmp('spo-lock-worker-q-');
+  const { spawn } = require('child_process');
+  // isolatedEnv(), not bare process.env: these two children run the real daemon to completion,
+  // and helpers.js's isolatedEnv header says why every daemon subprocess goes through it -- a
+  // mutation that makes a shadow-mode step take a real path turns fixture ids into git worktrees
+  // and branches in the maintainer's live ~/SPO-WebClient (44 of them, on 2026-08-31, invisible
+  // to `git status` because worktrees/ is gitignored). "Shadow mode never reaches realWorktree"
+  // is precisely the invariant a mutation round exists to break, so it cannot also be the reason
+  // this test is allowed to skip the isolation.
+  const spawnOpts = { stdio: 'ignore', env: isolatedEnv() };
+  const childA = spawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--worker', taskDirA, '--queue', queueDirA, '--journal', journalDir],
+    spawnOpts
+  );
+  const childB = spawn(
+    process.execPath,
+    [DAEMON, '--shadow', '--worker', taskDirB, '--queue', queueDirB, '--journal', journalDir],
+    spawnOpts
+  );
+
+  // Both must be alive at the same time for this to actually test concurrency rather than two
+  // sequential runs that merely didn't error. If either has already exited, the delay above
+  // wasn't long enough on this machine and the test would silently stop proving anything.
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(childA.exitCode, null, 'worker A finished before the concurrency window -- raise the IMPLEMENT delay');
+  assert.equal(childB.exitCode, null, 'worker B finished before the concurrency window -- raise the IMPLEMENT delay');
+
+  const [codeA, codeB] = await Promise.all([
+    new Promise((resolve) => childA.once('exit', resolve)),
+    new Promise((resolve) => childB.once('exit', resolve)),
+  ]);
+
+  // Today's non-worker daemon would refuse the second of these with LockHeldError (exit 1) --
+  // that is exactly the contention --worker mode exists to remove. Both reaching DONE (0) proves
+  // neither ever contended for a lock the other held.
+  assert.equal(codeA, 0, 'worker A did not exit 0');
+  assert.equal(codeB, 0, 'worker B did not exit 0');
+  assert.equal(readState(journalDir, 'worker-concurrent-a').state, 'DONE');
+  assert.equal(readState(journalDir, 'worker-concurrent-b').state, 'DONE');
+  assert.equal(fs.existsSync(lockPath(journalDir)), false, 'neither worker may leave a lock file');
+});
+
+// ---- VERIFIER (action 6.3): acquireShortLock must never STEAL a live holder's lock -----------
+//
+// The defect these pin, measured during 6.3's verification rather than reasoned about:
+// acquireShortLock created its lock with `fs.writeFileSync(..., {flag:'wx'})`, which is
+// open(O_CREAT|O_EXCL) followed by a SEPARATE write(). In that window the lock file exists at its
+// final name with ZERO BYTES, readHolder() returns null for it, and the stale sweep unlinked it
+// and took it -- from a process that was alive and holding it. Mutual exclusion silently broken,
+// and silently is the operative word: accounts.markLimit's own `degraded` flag stays FALSE,
+// because both processes believe they acquired cleanly.
+//
+// Measured: 53136 of 135923 reads of a 'wx'-created lock file (39%) came back zero-length under
+// create/unlink churn; 16 real processes running markLimit hit the unparseable-holder sweep 158
+// times and lost 119 of 800 cooldown entries, all with degradedCalls == 0 -- i.e. on the LOCKED
+// path, nothing to do with the accountStateLockWaitMs bound or the "degrade, never fail" path
+// that bound governs. After the fix (write-tmp + link, and never sweeping a holder that could not
+// be read) the same probe loses 0 of 800 over five runs, 0 of 960 at 32 processes.
+//
+// Both tests below are deterministic and fail FAST (no hang, no timing dependence): they
+// construct the exact on-disk state the race produces, rather than trying to hit the race.
+
+test('acquireShortLock: a lock file that exists but does not parse is NEVER stolen from a live holder', () => {
+  const dir = mkTmp('spo-shortlock-torn-');
+  const file = path.join(dir, '.state.lock');
+
+  // Exactly what 'wx' leaves on disk between its open() and its write(): the name exists, the
+  // payload is not there yet. The holder is alive and holding.
+  fs.writeFileSync(file, '');
+
+  const held = shortLock.acquireShortLock(file, { isAlive: () => true });
+  assert.strictEqual(
+    held,
+    null,
+    'acquireShortLock stole a lock whose payload was not yet written -- two processes now hold it, and neither is told'
+  );
+  assert.ok(fs.existsSync(file), 'the live holder\'s lock file must still be there -- it was not this caller\'s to delete');
+});
+
+test('acquireShortLock: creating the lock is atomic -- it is never observable as a file that does not parse', () => {
+  const dir = mkTmp('spo-shortlock-atomic-');
+  const file = path.join(dir, '.state.lock');
+
+  const held = shortLock.acquireShortLock(file);
+  assert.ok(held, 'test setup: the lock must be acquired');
+  // The published name carries a COMPLETE payload -- this is what write-tmp+link buys, and what a
+  // bare open('wx') cannot give. A mutation back to 'wx' leaves this assertion passing only
+  // because the write happens to have landed by now, so the previous test is the real guard;
+  // this one pins the payload shape the sweep depends on being readable.
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(onDisk.pid, process.pid);
+  assert.strictEqual(typeof onDisk.startedAt, 'string');
+
+  // No temp files left behind in the lock's own directory.
+  const leftovers = fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+  assert.deepStrictEqual(leftovers, [], `acquireShortLock left temp files behind: ${leftovers.join(', ')}`);
+
+  shortLock.releaseShortLock(file, held);
+  assert.strictEqual(fs.existsSync(file), false, 'release must remove the lock');
+});
+
+test('acquireShortLock: a DEAD holder is still swept -- the fix above must not cost stale recovery', () => {
+  const dir = mkTmp('spo-shortlock-dead-');
+  const file = path.join(dir, '.state.lock');
+  fs.writeFileSync(file, JSON.stringify({ pid: 999999999, startedAt: new Date().toISOString() }));
+
+  const held = shortLock.acquireShortLock(file, { isAlive: () => false });
+  assert.ok(held, 'a lock held by a dead pid must still be swept and taken');
+  assert.strictEqual(held.pid, process.pid);
 });

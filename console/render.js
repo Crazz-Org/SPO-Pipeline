@@ -30,7 +30,7 @@
 //   {
 //     generatedAt: ISO string,
 //     journalTasks: [{ id, title, kind, state, reason, updatedAt, lastEventTs, lastEventName,
-//                       llmSteps: [{step, model, account, sessionId}] }],
+//                       llmSteps: [{step, model, account, sessionId, durationS}] }],
 //                    -- collected for other consumers (daemonStats, token-usage session
 //                       attribution) but NOT rendered here: per-task detail duplicates the
 //                       GitHub Projects board (Kanban), which is the source of truth for task
@@ -49,7 +49,10 @@
 //                                                          // from console/usage-rollups.json -- populated
 //                                                          // in BOTH static and live mode (a cheap read of
 //                                                          // an already-computed file, not a live scan)
-//     services: { daemon, queue, benchWorker, nightly, verdicts },       // console/collect.js
+//     services: { daemon, queue, benchWorker, nightly, verdicts, workers },  // console/collect.js
+//                    -- `workers` added action 6.7: C6's dispatcher.js live-worker count
+//                       (present/count/staleCount/trailingCount/updatedAt/ageMs), an aggregate
+//                       ONLY -- see console/collect.js's own header on why no per-task rows
 //     daemonStats: { total, done, parked, abandoned, week, today, active, imported, inFlight,
 //                     parkingRatePct },   // abandoned added action 4.5 -- see console/collect.js
 //     reports: { queuedIntake, pendingConfirm, confirmedAwaitingTriage, lastIntakeCycle,
@@ -308,7 +311,9 @@ code {
 
 .svc-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.7rem; }
 @media (min-width: 640px) { .svc-tiles { grid-template-columns: repeat(3, 1fr); } }
-@media (min-width: 960px) { .svc-tiles { grid-template-columns: repeat(6, 1fr); } }
+/* 7 tiles since action 6.7 added Workers (Daemon, Queue, Workers, Bench worker, Nightly,
+   Verdicts, Prod) -- this was still repeat(6), which dropped Prod alone onto a second row. */
+@media (min-width: 960px) { .svc-tiles { grid-template-columns: repeat(7, 1fr); } }
 .svc-tile {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius-lg);
   box-shadow: var(--shadow-md); padding: 0.85rem 0.9rem;
@@ -451,6 +456,7 @@ function renderServicesInner(services, accounts, prod) {
   const bench = s.benchWorker || {};
   const nightly = s.nightly || {};
   const verdicts = s.verdicts || {};
+  const workers = s.workers || {};
 
   // action 5.5, item B audit: `nightly.status`/`verdicts.status` (console/collect.js's
   // collectServices) already compute a 'stale' value on a 36h clock (STALE_BENCH_AGE_MS there) --
@@ -487,6 +493,23 @@ function renderServicesInner(services, accounts, prod) {
       cls: tileClass(queue.status),
       big: fmtInt(queue.depth),
       caption: 'tasks queued',
+    }),
+    // action 6.7: C6's dispatcher.js live-worker count -- an AGGREGATE only (see this module's
+    // own header, "per-task detail duplicates the GitHub Projects board", for why there is no
+    // per-task worker list here the way bin/spo's `spo status` has one). `count` is a SUBSET of
+    // the daemon tile's own in-flight picture, not a second total -- see
+    // orchestrator/worker-status.js's header for the double-count hazard this avoids. `present:
+    // false` (no live-workers.json at all -- no dispatcher has ever published here, or none is
+    // running) renders UNKNOWN, never a reassuring "0" that would be indistinguishable from a
+    // dispatcher that is up and genuinely idle.
+    svcTile({
+      name: 'Workers',
+      status: STATUS_WORD[workers.status] || 'UNKNOWN',
+      cls: tileClass(workers.status),
+      big: workers.present ? fmtInt(workers.count) : '—',
+      caption: workers.present
+        ? `live${workers.staleCount ? `, ${workers.staleCount} stale` : ''}${workers.trailingCount ? `, ${workers.trailingCount} exiting` : ''} — published ${fmtAgeMs(workers.ageMs)} ago`
+        : 'no live-workers.json published',
     }),
     svcTile({
       name: 'Bench worker',

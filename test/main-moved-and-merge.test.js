@@ -24,7 +24,7 @@ test('mainMoved true once -> re-CHECK+re-gate path taken exactly once, then DONE
 
   const state = readState(journalDir, 'main-moved-once');
   assert.equal(state.state, 'DONE');
-  assert.equal(state.mainMoveUsed, true);
+  assert.equal(state.mainMoveUsed, 1); // action 6.5: a count now, not a boolean -- 1 spent of the default budget of 1
 
   const events = readJournal(journalDir, 'main-moved-once');
   const merges = events.filter((e) => e.state === 'CI_CHECKS' && e.event === 'main-moved-merge');

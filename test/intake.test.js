@@ -1733,3 +1733,62 @@ test('triageBugReport: runs on opus at medium effort -- the argv the CLI actuall
   assert.equal(args[args.indexOf('--model') + 1], 'opus');
   assert.equal(args[args.indexOf('--effort') + 1], 'medium');
 });
+
+// ---- VERIFIER (action 6.2): intake's lease must be HELD ACROSS the `claude` spawn ------------
+//
+// intake.js got the same per-step lease wiring as state-machine.js's callLlmStep in action 6.2,
+// and shipped with no test of its own for it: deleting its `finally` release, or moving the
+// release to before the call, both passed the whole suite. Under C6 this file's callers run
+// DISPATCHER-side while workers are mid-step on the same two-account pool, so "the lease covers
+// the call" is exactly as load-bearing here as it is in the worker. Assert it from inside the
+// spawn, the only place that can tell "held across the call" from "acquired and dropped".
+test('draftCard: the account lease is HELD for the whole spawn, and released afterwards', async () => {
+  const dir = writePoolDir(mkTmp('spo-intake-lease-held-'), [{ name: 'acct1' }]);
+  const leaseFile = path.join(dir, '.lease-acct1.json');
+
+  let leaseHeldDuringSpawn = null;
+  let holderDuringSpawn = null;
+  const deps = {
+    accountsDir: dir,
+    spawnSync: fakeSpawnSync((command, args, opts) => {
+      assert.ok(opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1'));
+      leaseHeldDuringSpawn = fs.existsSync(leaseFile);
+      holderDuringSpawn = leaseHeldDuringSpawn ? JSON.parse(fs.readFileSync(leaseFile, 'utf8')) : null;
+      return { status: 0, stdout: JSON.stringify(realShapedReply(VALID_DRAFT)), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await intake.draftCard('the header has no connection badge', deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    leaseHeldDuringSpawn,
+    true,
+    "intake's lease must still be on disk while `claude` is running on that account -- a lease released before the spawn protects nothing"
+  );
+  assert.equal(holderDuringSpawn.pid, process.pid);
+  assert.equal(fs.existsSync(leaseFile), false, 'and released the instant the call is done -- per-step, not per-task');
+});
+
+test('draftCard: an account leased by another LIVE process is skipped -- the other healthy account is used instead', async () => {
+  const dir = twoAccountPoolDir();
+  // A sibling (this test process's own, genuinely live pid) mid-step on acct1.
+  fs.writeFileSync(path.join(dir, '.lease-acct1.json'), JSON.stringify({ pid: process.pid, startedAt: 'sibling-mid-step' }));
+
+  const seen = [];
+  const deps = {
+    accountsDir: dir,
+    spawnSync: fakeSpawnSync((command, args, opts) => {
+      seen.push(path.basename(opts.env.CLAUDE_CONFIG_DIR));
+      return { status: 0, stdout: JSON.stringify(realShapedReply(VALID_DRAFT)), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await intake.draftCard('anything', deps);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(seen, ['acct2'], 'acct1 is leased by a live sibling -- intake must route around it, never call it');
+  assert.ok(fs.existsSync(path.join(dir, '.lease-acct1.json')), "the sibling's lease is not ours to release");
+  assert.equal(fs.existsSync(path.join(dir, '.lease-acct2.json')), false, 'our own lease is released');
+  assert.deepEqual(accounts.readState(dir), {}, 'a leased account is never cooled down -- nothing here was a limit');
+});
