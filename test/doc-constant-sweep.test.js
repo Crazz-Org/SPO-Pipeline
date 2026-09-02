@@ -203,6 +203,36 @@ test('every pinned documented constant matches a literal in both the code and th
   // never trips it, but a large accidental deletion does.
   assert.ok(PINS.length >= 12, `expected at least a dozen pinned constants, found ${PINS.length}`);
 
+  // FINDING 5 (adversarial review, 2026-09-02): the length floor above is a COUNT, and a count
+  // cannot say WHICH pin died -- mutation D5 deleted 5 of the 17 rows (29%) and the >=12 floor
+  // stayed green, because 12 dropped 5 still clears it. Pinned here to the exact set of names
+  // PINS ships with today: deleting a row (or renaming one without updating this list) now fails
+  // by naming exactly which pinned constant is missing, not just reporting a smaller number.
+  assert.deepEqual(
+    PINS.map((p) => p.name).sort(),
+    [
+      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- all five LLM steps',
+      'account cooldown: escalation window (2 hours)',
+      'account cooldown: overloaded (5 minutes, flat, never escalates)',
+      'account cooldown: usage escalated (5 hours)',
+      'account cooldown: usage probe (1 hour)',
+      'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (31.5 min), not a flat 5 min',
+      'autoPullLimit default (1) and the in-flight+queued<=K watermark',
+      'ciChecksMaxPolls default (30)',
+      'ciChecksPollIntervalMs default (20000ms)',
+      'command timeout: gh (120000ms / 120s)',
+      'command timeout: git (120000ms / 120s)',
+      'command timeout: npm-ci (600000ms / 10min)',
+      'command timeout: npm-gate (7800000ms / 130min)',
+      'command timeout: npm-run (660000ms / 11min)',
+      'mainMovedRegateBudget default (1)',
+      'maxBudgetUsd is undefined in the step-contracts table; no SMALL_BUDGET_USD constant exists',
+      "stepDeadlineMs (120000ms) -- the daemon's scripted-step wall clock, distinct from LLM_STEP_DEADLINE_MS",
+    ],
+    'PINS lost or gained a row -- this pin must be updated in the SAME change as any deliberate ' +
+      'addition/removal, naming which pinned constant changed, not just letting the count drift.'
+  );
+
   assert.deepEqual(
     offenders,
     [],
@@ -213,9 +243,23 @@ test('every pinned documented constant matches a literal in both the code and th
 
 // ---- part 2: file:line citation ratchet -----------------------------------------------------
 //
-// Deliberately small: measured 2026-09-02, this check would have caught ZERO of gate C7's pass-3
-// ~52 divergences (none of them were dangling citations) -- it is a ratchet against a citation
-// surviving a future rename/move/deletion, not leverage on the class of bug this file exists for.
+// Deliberately small in LEVERAGE, not in lines: measured 2026-09-02, this check would have
+// caught ZERO of gate C7's pass-3 ~52 divergences (none of them were dangling citations) -- it is
+// a ratchet against a citation surviving a future rename/move/deletion, not leverage on the class
+// of bug this file exists for. The plan (doc/remediation-plan-2026-08.md's action 7bis.3 row,
+// historical and excluded from this file's own sweep by name) budgeted this ratchet at "~10 lines
+// and no more" -- that claim was never true even at the size measured for the adversarial review
+// that flagged it (72 lines / 55 non-comment code lines, a 5.5x overrun), and this action's own
+// fixes (the KNOWN_FICTIONAL pin, the corrected checked-count comment) have grown it further.
+// Correcting the SIZE claim here, not the code: the plan's "10 lines" was wrong from the start,
+// this ratchet has not grown into any leverage the plan denied it, and whether that size is worth
+// trimming is a decision for whoever reviews this action, not this comment.
+//
+// Existence-only by construction, also registered in doc/accepted-gaps.md: a citation repointed
+// to the WRONG line within a file that still has enough lines to satisfy the `end > lineCount`
+// check below is not detected. Not fixed here -- an existence check cannot become a correctness
+// check without actually parsing what each citation claims to be true of the line it names, which
+// is a different, much larger mechanism than this ratchet.
 const CITATION_DOCS = ['doc/state-machine-spec.md', 'orchestrator/README.md'];
 const CITATION_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts)):(\d+)(?:-(\d+))?/g;
 // issue-418's plan once asserted this exact path was absent, and orchestrator/README.md quotes
@@ -254,6 +298,22 @@ function findByBasename(name, dir) {
   return null;
 }
 
+// FINDING 4 (adversarial review, 2026-09-02): KNOWN_FICTIONAL had no ratchet -- adding a second
+// entry to hide a genuinely dangling citation survived the whole suite, since the only thing
+// read from it anywhere was `.has(full)`, never its full contents. Pinned to the exact single
+// entry this file ships with, the same posture as ALLOWLIST in park-reason-doc-sweep.test.js:
+// adding an entry here is a deliberate act (a citation to a real, deliberate absence, not a
+// stale one -- see the comment above KNOWN_FICTIONAL) that needs its own justification and an
+// update to this pin in the same change, not a silent exemption.
+test('KNOWN_FICTIONAL holds exactly the one citation this file explicitly justified -- no more, no fewer', () => {
+  assert.deepEqual(
+    [...KNOWN_FICTIONAL].sort(),
+    ['.claude/hooks/context-router.sh:117'],
+    'KNOWN_FICTIONAL changed size or membership -- update this pin in the same change, with a ' +
+      'named reason next to the new entry, the same way the existing one is justified above.'
+  );
+});
+
 test('every file:line citation in doc/state-machine-spec.md and orchestrator/README.md resolves', () => {
   let checked = 0;
   const offenders = [];
@@ -277,9 +337,18 @@ test('every file:line citation in doc/state-machine-spec.md and orchestrator/REA
     }
   }
 
-  // Measured 2026-09-02: 11 real citations across the two docs. A regex that stopped matching
-  // (a reformat, a renamed backtick style) would pass vacuously -- fail loudly instead, same
-  // posture as this suite's other siteCount/checked floors.
+  // FINDING 6 (adversarial review, 2026-09-02): this comment previously claimed 11 real
+  // citations, measured wrong -- the actual count at the time was 10 (re-derived, not trusted
+  // from the prior comment). This action's own citation fixes changed the true count again:
+  // `intake.js:1174` (the [^rdo-wire] footnote) was re-pointed BY NAME, matching how
+  // step-contracts.js:93 and steps/scripted.js:1214 already cite `intake.js`'s `makeTask` (no
+  // line number at all -- see that footnote), which removes one line-number citation from this
+  // regex's count entirely; the drifted `intake.js:744-746` citations (both docs) were corrected
+  // to `747-749`, which does not change the count. Re-measured after both fixes: 9. A regex that
+  // stopped matching (a reformat, a renamed backtick style) would pass vacuously -- fail loudly
+  // instead, same posture as this suite's other siteCount/checked floors. Existence-only by
+  // construction (registered in doc/accepted-gaps.md): this cannot detect a citation repointed to
+  // a WRONG line within a file that still has enough lines to satisfy it.
   assert.ok(checked >= 8, `expected several file:line citations, found ${checked} -- has the citation style changed?`);
   assert.deepEqual(offenders, [], `dangling citation(s):\n  ${offenders.join('\n  ')}`);
 });

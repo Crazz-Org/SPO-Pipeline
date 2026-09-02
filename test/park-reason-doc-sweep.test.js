@@ -20,15 +20,40 @@
 // code, complete over the ~90-odd `new ParkSignal(...)` call sites that exist today rather than
 // over whatever a reader happened to reach.
 //
-// Re-measured for this action (2026-09-02), not trusted from the plan text that motivated it: 94
-// `new ParkSignal(...)` call sites across orchestrator/** (bin/spo has none today, scanned anyway
-// -- see SCAN_FILES below), collapsing to 55 distinct literal reasons, 1 literal-prefix family
-// (`prompt-missing-placeholder:<name>`), and 2 call sites whose reason is a variable rather than a
-// literal (`err.reason`, `outcome.reason` -- see "dynamic call sites" below). Of the reasons that
-// come out of all of that, 32 had never appeared anywhere in doc/state-machine-spec.md before this
-// action; doc/state-machine-spec.md was extended to name every one of them (what actually produces
-// it, what a maintainer should do about it -- read from the throwing code, never inferred from the
-// name) except one, `command-timed-out`, which is allowlisted below as unreachable.
+// Measured 2026-09-02 for action 7bis.1: 94 `new ParkSignal(...)` call sites across
+// orchestrator/** (bin/spo has none today, scanned anyway -- see SCAN_FILES below), collapsing to
+// 55 distinct literal reasons, 1 literal-prefix family (`prompt-missing-placeholder:<name>`), and
+// 2 call sites whose reason is a variable rather than a literal (`err.reason`, `outcome.reason`
+// -- see "dynamic call sites" below); resolving those two against the code that actually produces
+// their values adds 3 (accounts.js's pool-exhaustion reasons -- 2 literals + 1 prefix family) and
+// 1 (ci-cause-table.js's own `pr-rules-needs-approval`) more, and the `${commandClass}-timed-out`
+// no-prefix template resolves against config.js's own timeout keys to another 5 -- 55 + 1 + 3 + 1
+// + 5 = 65 (this file's own arithmetic error at the time: 66 is correct -- 55 literals + 1 prefix
+// family = 56, + 5 timed-out classes + 4 account-pool reasons + 1 ci-cause reason = 66). Of the
+// 66, 31 (not 32 -- the number this comment previously carried) had never appeared anywhere in
+// doc/state-machine-spec.md before action 7bis.1: 30 were written into the spec (what actually
+// produces each one, what a maintainer should do about it -- read from the throwing code, never
+// inferred from the name), and 1 (`command-timed-out`) is allowlisted below as unreachable.
+//
+// ---- FINDING 1, 2026-09-02: the sink, not just the throw ---------------------------------------
+//
+// The count above is complete over `new ParkSignal(...)` -- the THROW site -- and nothing else.
+// `finalizePark(ctx, lastState, reason, detail)` (state-machine.js) is the SINK every park
+// actually lands at, and three of its own call sites (state-machine.js's own dispatch-loop
+// guards, orphan-scan.js's pre-WORKTREE recovery path) pass a reason literal that was never a
+// `new ParkSignal(...)` anywhere -- a sweep that only scanned throws was structurally blind to
+// them. `finalizeParkSpans` (below) closes that gap the same way `parkSignalSpans` covers the
+// throw side: 6 `finalizePark(...)` call sites across orchestrator/** (state-machine.js ×3,
+// orphan-scan.js ×2, dispatcher.js ×1), one of which (`err.reason`) is a dynamic pass-through
+// already covered by the throw-side scan, leaving 5 new literal reasons -- 2 already documented
+// (`worker-crashed`, `task-orphaned-daemon-restart`), 3 not (`task-orphaned-before-start`,
+// `state-machine-runaway`, `unrecognized-state`). A 7th reason, `abandoned-by-maintainer`, is
+// written directly to `state.json.reason` by park-loop.js's abandon-reply reconciler -- reached
+// through neither a throw nor `finalizePark` at all (`resolveAbandonedByMaintainerReason` below)
+// -- also previously undocumented. Total after this action: 66 + 6 = 72 distinct reasons
+// requiring documentation; 31 + 4 = 35 have needed writing into the spec across the two actions
+// (7bis.1's 30 plus this action's 4: `task-orphaned-before-start`, `state-machine-runaway`,
+// `unrecognized-state`, `abandoned-by-maintainer`); still 1 allowlisted (`command-timed-out`).
 //
 // ---- literal reasons vs. templated reasons vs. dynamic call sites ------------------------------
 //
@@ -113,6 +138,26 @@ const ALLOWLIST = {
   ),
 };
 
+// FINDING 4 (adversarial review, 2026-09-02): the ALLOWLIST above previously had no ratchet at
+// all -- adding an unjustified entry (or, worse, M6: allowlisting a REAL reason like
+// `worktree-add-failed` and deleting its spec line in the same edit) passed the whole suite,
+// because the only thing read from ALLOWLIST anywhere was `hasOwnProperty`, never its full
+// key set. Pinned here to the exact expected set: adding, removing, or renaming an entry now
+// fails this assertion by name, forcing the same kind of named, reasoned justification the
+// entries themselves already carry -- the plan's rule is per-reason, never per-file
+// (test/no-real-spawn-sweep.test.js's own header: a whole-file exemption was itself the gap
+// that hid a real missing killswitch during C7's remediation).
+test('ALLOWLIST holds exactly the reasons this action explicitly justified -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(ALLOWLIST).sort(),
+    ['command-timed-out'],
+    'ALLOWLIST changed size or membership. Adding an entry here is a deliberate act that exempts ' +
+      'a reason from ever needing to appear in doc/state-machine-spec.md, forever -- it needs its ' +
+      'own named, reasoned justification (read from the code, not assumed) the same way ' +
+      "'command-timed-out' has one above, and this pin needs updating in the same change, by name."
+  );
+});
+
 // ---- blankComments: verbatim copy of gh-api-argv.test.js's idiom -------------------------------
 function blankComments(source) {
   const withoutBlocks = source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
@@ -177,6 +222,78 @@ function parkSignalSpans(source) {
     spans.push({ index: m.index, arg });
   }
   return spans;
+}
+
+// finalizeParkSpans(source) -- the SINK, not the throw. `new ParkSignal(...)` is where a handler
+// raises a park; `finalizePark(ctx, lastState, reason, detail)` (state-machine.js) is where every
+// park -- however it got here -- actually lands: the `catch (err instanceof ParkSignal)` branch
+// calls it with `err.reason` (already covered, since that reason was a `new ParkSignal(...)`
+// literal/template caught upstream), but THREE call sites call it directly with their OWN literal
+// reason that no `ParkSignal` ever carries (`state-machine-runaway`, `unrecognized-state` --
+// state-machine.js's own dispatch-loop guards) or (`task-orphaned-before-start` --
+// orphan-scan.js's pre-WORKTREE recovery path; `task-orphaned-daemon-restart` is the same file's
+// sibling branch). `dispatcher.js`'s `worker-crashed` is a fourth. A sweep that only scanned
+// `new ParkSignal(...)` throws was blind to all of these -- this function closes that gap by
+// scanning for the sink's own call sites, the same balanced-paren + top-level-comma-split
+// technique parkSignalSpans uses, just reading the THIRD top-level argument (`reason`) instead of
+// the first. Deliberately excludes `finalizePark`'s own function declaration (`function
+// finalizePark(ctx, lastState, reason, detail) {`), which is not a call site and whose parameter
+// names are not string literals.
+function finalizeParkSpans(source) {
+  const spans = [];
+  const re = /finalizePark\s*\(/g;
+  let m;
+  while ((m = re.exec(source))) {
+    const precedingText = source.slice(Math.max(0, m.index - 12), m.index);
+    if (/function\s*$/.test(precedingText)) continue; // the declaration itself, not a call site
+    const openParen = source.indexOf('(', m.index);
+    let depth = 0;
+    let close = -1;
+    for (let i = openParen; i < source.length; i++) {
+      if (source[i] === '(') depth++;
+      else if (source[i] === ')') {
+        depth--;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close === -1) continue;
+    const inner = source.slice(openParen + 1, close);
+    const args = [];
+    let depth2 = 0;
+    let start = 0;
+    for (let i = 0; i < inner.length; i++) {
+      const c = inner[i];
+      if (c === '(' || c === '[' || c === '{') depth2++;
+      else if (c === ')' || c === ']' || c === '}') depth2--;
+      else if (c === ',' && depth2 === 0) {
+        args.push(inner.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    args.push(inner.slice(start).trim());
+    if (args.length < 3) continue; // not a 4-arg finalizePark(ctx, lastState, reason, detail) call
+    spans.push({ index: m.index, arg: args[2] });
+  }
+  return spans;
+}
+
+// resolveAbandonedByMaintainerReason(parkLoopSource) -- the ONE park reason written directly to
+// `state.json.reason` rather than thrown as a ParkSignal or passed to finalizePark at all: a
+// maintainer's `abandon` reply on a parked issue's thread (park-loop.js's unpark-scan reconciler)
+// terminates the task immediately with `state: 'ABANDONED', reason: 'abandoned-by-maintainer'`,
+// written straight to state.json -- no HANDLERS involvement, no finalizePark round trip, so
+// neither parkSignalSpans nor finalizeParkSpans above can ever see it. Read off the ABANDONED
+// write itself (the literal text of the reason next to the literal text of the terminal state),
+// not hand-copied, so a shape change here fails loudly instead of silently going unresolved.
+function resolveAbandonedByMaintainerReason(source) {
+  const m = /state:\s*'ABANDONED'[\s\S]{0,200}?reason:\s*'([^']+)'/.exec(source);
+  if (!m) {
+    return [{ kind: 'unresolved', value: "park-loop.js: ABANDONED state.json write shape changed -- no adjacent literal reason found" }];
+  }
+  return [{ kind: 'literal', value: m[1] }];
 }
 
 // classifyReasonArg(argText) -> one of:
@@ -283,6 +400,42 @@ function readSource(rel) {
   return fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
 }
 
+// reasonDocumented(spec, reason, isPrefix) -- latent issue flagged by the adversarial review
+// (2026-09-02): plain `spec.includes(reason)` is a SUBSTRING test, so a reason that happens to be
+// a substring of a longer documented reason (e.g. a hypothetical `gate-timeout` would silently
+// "pass" off the back of `gate-timeout-extended` if one ever existed) would never be flagged.
+// Checked against all reasons required as of this action: none is currently a substring of
+// another, but a check that only holds by accident of today's corpus is not a check.
+//
+// First attempt was requiring each reason as a backtick-delimited token (`` `worker-crashed` ``)
+// -- rejected: measured against the real spec, it produces false negatives. `accounts.js`'s own
+// two reasons are written as `` `NoAccountsRegisteredError('no-accounts-registered', ...)` `` and
+// `` `'all-accounts-cooling-unknown'` `` -- single-quoted *inside* a backtick code span, not
+// standing alone between their own backticks, because the surrounding prose is quoting a snippet
+// of the throwing code rather than just naming the reason. A strict backtick-pair requirement
+// would have flagged both as undocumented, which is false.
+//
+// Fixed instead with a delimited-TOKEN test: the reason must appear with no identifier character
+// (letter, digit, `_`, `-`) touching either edge -- so it can sit between backticks, single
+// quotes, parens, commas, or plain prose punctuation, but never as a strict substring of a longer
+// hyphenated reason (a `-` immediately after the match fails the right-edge check, which is
+// exactly the false-negative case above). Verified against every reason required as of this
+// action: all still match. NOT applied to prefix families (`prompt-missing-placeholder:` etc.):
+// those are matched as a substring ON PURPOSE (classifyReasonArg's own comment -- "a maintainer
+// cannot enumerate every possible placeholder name up front, so the doc documents the family"),
+// and the spec's own prose writes that family's prefix embedded inside a larger backtick span
+// alongside the template syntax itself (the PLAN section's `` `ParkSignal(`prompt-missing-
+// placeholder:${err.placeholder}`, ...)` ``) — a delimited-token requirement there would itself
+// produce a false negative, for the same reason the strict backtick-pair attempt did above.
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function reasonDocumented(spec, reason, isPrefix) {
+  if (isPrefix) return spec.includes(reason);
+  const re = new RegExp(`(?<![A-Za-z0-9_-])${escapeRegExp(reason)}(?![A-Za-z0-9_-])`);
+  return re.test(spec);
+}
+
 test('every ParkSignal reason is documented in doc/state-machine-spec.md, or named on the allowlist with a reason', () => {
   const files = [...SCAN_DIRS.flatMap(jsFilesUnder), ...SCAN_FILES];
   let siteCount = 0;
@@ -303,10 +456,35 @@ test('every ParkSignal reason is documented in doc/state-machine-spec.md, or nam
   const ciCauseSource = blankComments(readSource(path.join('orchestrator', 'ci-cause-table.js')));
   const configSource = blankComments(readSource(path.join('orchestrator', 'config.js')));
 
+  // finalizeParkSiteCount: the SINK-side counterpart of siteCount above. dispatcher.js calls
+  // finalizePark directly and never mentions the string "ParkSignal" anywhere in the file -- the
+  // `!source.includes('ParkSignal')` skip below is correct for the THROW scan (it really has no
+  // `new ParkSignal(...)` sites) but would have been silently blind to dispatcher.js's own
+  // finalizePark call too, had this scan reused the same skip. It doesn't: this loop runs on
+  // every file regardless of whether it mentions ParkSignal.
+  let finalizeParkSiteCount = 0;
+
   for (const rel of files) {
     const abs = path.join(REPO_ROOT, rel);
     if (!fs.existsSync(abs)) continue;
     const source = blankComments(fs.readFileSync(abs, 'utf8'));
+
+    for (const span of finalizeParkSpans(source)) {
+      finalizeParkSiteCount += 1;
+      const loc = `${rel}:${lineOf(source, span.index)}`;
+      const c = classifyReasonArg(span.arg);
+      if (c.kind === 'literal' || c.kind === 'prefix') {
+        record(c.value, c.kind === 'prefix', loc);
+      } else if (c.kind === 'dynamic' && c.value === 'err.reason') {
+        // state-machine.js's own `finalizePark(ctx, state, err.reason, err.detail)` -- err.reason
+        // is whatever ParkSignal was caught, already required via the `new ParkSignal(...)` scan
+        // below (or that scan's own dynamic resolvers). Recording it again here would not add
+        // anything the throw-side scan does not already require.
+      } else {
+        unresolvedDynamic.push(`${loc}: finalizePark's reason argument \`${span.arg}\` is neither a literal nor the known err.reason pass-through`);
+      }
+    }
+
     if (!source.includes('ParkSignal')) continue;
 
     for (const span of parkSignalSpans(source)) {
@@ -342,26 +520,85 @@ test('every ParkSignal reason is documented in doc/state-machine-spec.md, or nam
     }
   }
 
+  // resolveAbandonedByMaintainerReason: the one reason that reaches neither scan above -- never
+  // thrown as a ParkSignal, never passed through finalizePark, written straight to
+  // `state.json.reason` by park-loop.js's abandon-reply reconciler. See that function's own
+  // comment.
+  const parkLoopSource = blankComments(readSource(path.join('orchestrator', 'park-loop.js')));
+  for (const r of resolveAbandonedByMaintainerReason(parkLoopSource)) {
+    if (r.kind === 'unresolved') unresolvedDynamic.push(`orchestrator/park-loop.js: ${r.value}`);
+    else record(r.value, false, 'orchestrator/park-loop.js (direct state.json write, not thrown)');
+  }
+
   // Floors, same reasoning as gh-api-argv.test.js's siteCount>=4 and no-real-spawn-sweep.test.js's
   // checked>=40: if either number drops well below what was actually measured for this action
-  // (2026-09-02: 94 call sites, 65 reasons requiring documentation after resolving templates and
-  // dynamic pass-throughs), the sweep has stopped finding real surface -- a renamed convention, a
-  // moved file, a regex that quietly stopped matching -- and a green result downstream would mean
-  // nothing. Set well below the measured figures so ordinary future growth never trips them.
+  // (2026-09-02: 94 `new ParkSignal(...)` call sites, 6 `finalizePark(...)` sink call sites, 70
+  // reasons requiring documentation after resolving templates and dynamic pass-throughs -- see
+  // this file's header for the derivation), the sweep has stopped finding real surface -- a
+  // renamed convention, a moved file, a regex that quietly stopped matching -- and a green result
+  // downstream would mean nothing. Set well below the measured figures so ordinary future growth
+  // never trips them.
   assert.ok(siteCount >= 80, `expected at least 80 \`new ParkSignal(...)\` call sites, found ${siteCount} -- has the call convention changed?`);
-  assert.ok(required.size >= 50, `expected at least 50 distinct reasons requiring documentation, found ${required.size} -- did a resolver stop matching?`);
+  assert.ok(finalizeParkSiteCount >= 4, `expected at least 4 \`finalizePark(...)\` sink call sites, found ${finalizeParkSiteCount} -- has the sink scan stopped matching?`);
+  assert.ok(required.size >= 54, `expected at least 54 distinct reasons requiring documentation, found ${required.size} -- did a resolver stop matching?`);
 
   assert.deepEqual(
     unresolvedDynamic,
     [],
-    `ParkSignal call site(s) this sweep cannot verify automatically -- extend the sweep, do not ignore:\n  ${unresolvedDynamic.join('\n  ')}`
+    `ParkSignal/finalizePark call site(s) this sweep cannot verify automatically -- extend the sweep, do not ignore:\n  ${unresolvedDynamic.join('\n  ')}`
   );
+
+  // FINDING 3 (adversarial verification, 2026-09-02): the dynamic resolvers above -- account
+  // pool, ci-cause, timed-out-class -- are the "sophisticated half" of this sweep the header
+  // spends 60 lines justifying. A mutation that narrows parkSignalSpans's regex to single-quoted
+  // literals only (dropping every template/dynamic call site entirely) still passed both floors
+  // above by shrinking siteCount/required together -- a floor that only checks a COUNT cannot
+  // tell "the corpus grew" from "a resolver died". Assert each dynamic family is actually present
+  // in the resolved set, named individually, so deleting a resolver fails a test that says WHICH
+  // one died rather than just reporting a smaller number.
+  const accountPoolFamily = ['no-accounts-registered', 'all-accounts-leased', 'all-accounts-cooling-unknown'];
+  for (const r of accountPoolFamily) {
+    assert.ok(required.has(r), `account-pool resolver (resolveAccountPoolReasons) did not contribute '${r}' -- has err.reason's resolver stopped running?`);
+  }
+  assert.ok(
+    [...required.keys()].some((r) => r.startsWith('all-accounts-cooling-until-')),
+    "account-pool resolver did not contribute the 'all-accounts-cooling-until-' prefix family"
+  );
+  assert.ok(
+    required.has('pr-rules-needs-approval'),
+    "ci-cause resolver (resolveCiCauseParkReasons) did not contribute 'pr-rules-needs-approval' -- has outcome.reason's resolver stopped running?"
+  );
+  const timedOutClasses = ['git', 'gh', 'npm-ci', 'npm-gate', 'npm-run', 'command'];
+  for (const cls of timedOutClasses) {
+    assert.ok(
+      required.has(`${cls}-timed-out`),
+      `timed-out-class resolver (resolveTimedOutClassReasons) did not contribute '${cls}-timed-out' -- has config.js's COMMAND_TIMEOUTS_MS scan stopped matching?`
+    );
+  }
+  assert.ok(
+    required.has('prompt-missing-placeholder:') && required.get('prompt-missing-placeholder:').isPrefix,
+    "the 'prompt-missing-placeholder:' static-prefix family did not resolve as a prefix requirement"
+  );
+  // FINDING 1: the finalizePark SINK family -- the whole point of this action's fix. Named
+  // individually for the same reason as the dynamic families above: a regression here is exactly
+  // the class of bug this action exists to close, so it must fail loudly and specifically.
+  const finalizeParkSinkFamily = [
+    'worker-crashed',
+    'task-orphaned-daemon-restart',
+    'task-orphaned-before-start',
+    'state-machine-runaway',
+    'unrecognized-state',
+    'abandoned-by-maintainer',
+  ];
+  for (const r of finalizeParkSinkFamily) {
+    assert.ok(required.has(r), `finalizePark sink scan did not contribute '${r}' -- has finalizeParkSpans or resolveAbandonedByMaintainerReason stopped matching?`);
+  }
 
   const spec = fs.readFileSync(SPEC_PATH, 'utf8');
   const offenders = [];
   for (const [reason, info] of required) {
     if (Object.prototype.hasOwnProperty.call(ALLOWLIST, reason)) continue;
-    if (!spec.includes(reason)) {
+    if (!reasonDocumented(spec, reason, info.isPrefix)) {
       offenders.push(`${reason}${info.isPrefix ? ' (prefix)' : ''} -- from ${info.sites.slice(0, 3).join(', ')}${info.sites.length > 3 ? `, +${info.sites.length - 3} more` : ''}`);
     }
   }
@@ -411,19 +648,59 @@ test('classifyReasonArg: bare identifier/member expression is dynamic, not silen
 });
 
 test('parkSignalSpans + blankComments: a reason only named in a comment is never extracted as a call site', () => {
-  const source = blankComments(
-    [
-      "'use strict';",
-      "// see ParkSignal('should-not-count', {}) for context -- this is prose, not code",
-      "function f() {",
-      "  throw new ParkSignal('should-count', { detail: 1 });",
-      "}",
-      '',
-    ].join('\n')
-  );
+  // FINDING 2 (adversarial review, 2026-09-02): the fixture below previously wrote the comment's
+  // mention as `ParkSignal('should-not-count', {})` -- no `new` -- so parkSignalSpans's own regex
+  // (`/new\s+ParkSignal\s*\(/g`) could never match it whether or not blankComments actually
+  // blanked the comment out. The mutation `blankComments(source) { return source; }` -- a
+  // complete no-op -- passed this test either way, which means the test proved nothing about
+  // blankComments itself. Fixed by writing the comment's mention with `new`, the exact shape a
+  // real call site has, so a no-op blankComments produces a SECOND real match and this assertion
+  // catches it.
+  const rawSource = [
+    "'use strict';",
+    "// see new ParkSignal('should-not-count', {}) for context -- this is prose, not code",
+    "function f() {",
+    "  throw new ParkSignal('should-count', { detail: 1 });",
+    "}",
+    '',
+  ].join('\n');
+  const source = blankComments(rawSource);
   const spans = parkSignalSpans(source);
   assert.equal(spans.length, 1, 'a comment mention must not produce a second call site');
   assert.equal(classifyReasonArg(spans[0].arg).value, 'should-count');
+
+  // Mutation proof, inline rather than merely asserted in a commit message: a no-op blankComments
+  // must turn the assertion above red. Re-run the same scan against the UNBLANKED source directly
+  // -- this is exactly what `blankComments(source) { return source; }` would hand parkSignalSpans
+  // -- and confirm it now (correctly) finds two call sites, not one, proving the real
+  // (non-no-op) blankComments above is what makes the count come out to 1.
+  const spansIfBlankCommentsWereANoOp = parkSignalSpans(rawSource);
+  assert.equal(
+    spansIfBlankCommentsWereANoOp.length,
+    2,
+    'sanity check on the fixture itself: with comments left in, the comment-only mention must ' +
+      'also be found (proving blankComments, not the fixture, is what keeps the real count at 1)'
+  );
+});
+
+// Real-corpus guard for the same mutation: FINDING 2 also measured that blankComments matters on
+// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1031 has one genuine
+// commented-out `throw new ParkSignal('validate-unrecognized-verdict', ...)` inside a prose
+// comment (its own header, describing action 1.4's history), and blanking it away is what keeps
+// the reported call-site count from over-counting it as a live site. Pinned to the exact numbers
+// measured 2026-09-02 so a future change to state-machine.js's comment (or a regression in
+// blankComments) is caught by name, not just by a shrinking/growing floor.
+test('blankComments on the real corpus removes exactly the one known commented-out ParkSignal site (state-machine.js:1031)', () => {
+  const rawSource = readSource(path.join('orchestrator', 'state-machine.js'));
+  const blanked = blankComments(rawSource);
+  const blankedCount = parkSignalSpans(blanked).length;
+  const unblankedCount = parkSignalSpans(rawSource).length;
+  assert.equal(unblankedCount, blankedCount + 1, `blankComments should remove exactly one commented-out call site from state-machine.js, found blanked=${blankedCount} unblanked=${unblankedCount}`);
+  // The one extra site the unblanked scan finds must be the specific commented-out reason named
+  // in the header above, not some other drift -- named explicitly so a different comment change
+  // that happens to add/remove a different ParkSignal mention is still caught.
+  const unblankedReasons = parkSignalSpans(rawSource).map((s) => classifyReasonArg(s.arg).value);
+  assert.ok(unblankedReasons.includes('validate-unrecognized-verdict'), 'the commented-out site names validate-unrecognized-verdict');
 });
 
 test('parkSignalSpans: a multi-line ParkSignal(...) call is still found and its reason still extracted', () => {

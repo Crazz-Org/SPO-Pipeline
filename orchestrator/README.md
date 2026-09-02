@@ -236,7 +236,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:744-746`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:747-749`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or

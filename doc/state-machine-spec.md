@@ -34,8 +34,15 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    (`task-orphaned-daemon-restart`) through the same `finalizePark` path (including restoring
    `worktreePath` onto the rebuilt ctx, so a still-dirty worktree is pushed to a `wip/` ref
    exactly as a live park would), the next time a `--real` daemon starts or the scanner runs its
-   periodic scan. A `--shadow`/`--dry-run` start never does real side effects, so it only detects
-   the orphan and journals `orphan-scan-would-repark` — it never parks. `handleExit` also
+   periodic scan. `orphan-scan.js` has a second, narrower shape for the same fallback role: a task
+   claimed off `queue/` (a `task.json` on disk) that never reached even one handler — no
+   `state.json` was ever written, so there is nothing to compare an owner pid against — is parked
+   `task-orphaned-before-start` once it has sat unclaimed-by-any-live-worker for longer than the
+   grace window; `lastState` is recorded as `INTAKE` (honest, not a guess: a task in this shape by
+   definition never got past it) so a bare `retry` reply restarts it from the beginning, a
+   complete recovery for a task that never ran. A `--shadow`/`--dry-run` start never does real
+   side effects, so both shapes only detect the orphan and journal
+   `orphan-scan-would-repark` — neither ever parks. `handleExit` also
    deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
    dispatcher's own shutdown** (`dispatcher.js:485-499`, `stopReason && outcome === 'crashed'`):
    reparking from inside a process already SIGTERMed and about to be SIGKILLed risks a
@@ -71,7 +78,16 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    now, budget unused", i.e. an unbounded retry loop after a SIGTERM in the gap. If that write
    fails, the task journals `transient-retry-failed` and takes the ordinary park — the journal
    never claims a retry that is not really queued. See `orchestrator/state-machine.js`'s
-   `TRANSIENT_RETRY_REASONS`/`isTransientRetryReason`/`finalizePark`.
+   `TRANSIENT_RETRY_REASONS`/`isTransientRetryReason`/`finalizePark`. Two further park reasons sit
+   inside `state-machine.js`'s own dispatch loop rather than inside any handler, and so are never
+   thrown as a `ParkSignal` at all — they call `finalizePark` directly, the same sink every other
+   reason above eventually reaches: a run that hops between states more than `HOP_LIMIT` (200)
+   times parks `state-machine-runaway` (`{hops}`) — the guard against a real handler bug producing
+   a valid-looking but cyclic path (e.g. an infinite DIAGNOSE↔IMPLEMENT loop from a logic error),
+   never tripped by any legitimate path, which completes in well under this many hops; and a
+   `state` value with no entry in `HANDLERS` parks `unrecognized-state` (`{state}`) — defensive
+   only, since every `state.json`/task-journal write in this codebase is produced by the state
+   names this same file defines.
 3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.
@@ -138,7 +154,7 @@ end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-u
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
 
-[^rdo-wire]: `task.touchesRdoMembers` (`intake.js:1174`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
+[^rdo-wire]: `task.touchesRdoMembers` (`intake.js`'s `makeTask`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
     stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
     `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session-phase code — but only
     detects a slice of it, and is set once at intake, before a plan exists. IMPLEMENT never sees
@@ -196,7 +212,7 @@ tokens. Plus the step prompt from `prompts/`.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:744-746`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:747-749`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -307,7 +323,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   it: 2 of the 3 were `PARKED` for a fix a human made and closed by hand hours later (213, 428);
   the third (443) was `ABANDONED` on a false park — `pr:wait` read `closed false` at 13:17:57,
   parked `pr-closed-unmerged`, and PR #447 actually merged 30 seconds later at 13:18:27, before the
-  maintainer's own `abandon` reply at 13:53. `park-loop.js`'s `reconcileExternalClosure`, called
+  maintainer's own `abandon` reply at 13:53. Reaching `ABANDONED` at all is `park-loop.js`'s own
+  unpark-scan reconciler recognizing an `abandon` reply on a `PARKED` task's issue thread: terminal,
+  no re-enqueue, `state.json` written directly as `{state: 'ABANDONED', reason:
+  'abandoned-by-maintainer', ...}` — the one park reason in this codebase that is neither thrown as
+  a `ParkSignal` nor passed through `finalizePark`, because the task is not re-entering
+  `runTask`'s loop at all. The state write happens before the ack comment or any cleanup, so a
+  daemon crash at any point afterward resumes into a task that is already correctly terminal.
+  `park-loop.js`'s `reconcileExternalClosure`, called
   from inside `unparkScan`'s own loop for every `PARKED`/`ABANDONED` task, reads the owning issue
   and — record, never overwrite — writes `state.json`'s `externallyResolved: {via: 'issue-closed'
   | 'pr-merged', closedAt, prNumber, mergedAt, at}` and journals `reconciled-externally` with the

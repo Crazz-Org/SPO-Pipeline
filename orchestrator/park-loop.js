@@ -328,7 +328,7 @@ function postDiagnoseSurfaceComment(ctx, deps, { attempt, budget }) {
 // Decision recorded here, not just in the plan: NO auto-filed follow-up card. The plan floats
 // "(and optionally a follow-up draft card)"; this build does not build it. Unattended filing on a
 // judge's own verdict is the exact class of behaviour C3 gated behind a human `confirm` after the
-// 12.8-hour, 128-attempt auto-triage stall (`intake.js:744-746`; `doc/audit-2026-08-30-
+// 12.8-hour, 128-attempt auto-triage stall (`intake.js:747-749`; `doc/audit-2026-08-30-
 // remediation-plan.md` does not exist in this repo -- the citation was stale) -- and a
 // comment is reversible (ignore it, reply, resolve it by hand) where a filed card is not (it sits
 // in the backlog, competing for the same intake budget as everything else, until a human notices

@@ -339,3 +339,19 @@ does not amend `doc/remediation-plan-2026-08.md`'s own row text (out of this act
 only a one-line header was added to that file), so the plan's original ~16,800/~2,290 estimates
 remain visible there as the historical estimate this register supersedes, not as a live claim
 in need of a second correction elsewhere.
+
+## 8 · Two further found gaps (adversarial review, 2026-09-02)
+
+Found while fixing the two sweeps' own survived mutations; neither is closed here, only named.
+
+1. **The citation ratchet (`test/doc-constant-sweep.test.js` part 2) is existence-only.** It
+   checks that a cited `file:line` exists and that the file has at least that many lines — it
+   does not check that the cited line is actually the one the surrounding prose describes. A
+   citation repointed to the *wrong* line inside a file that still happens to be long enough
+   passes silently. Not fixable without a much larger mechanism (parsing what each citation
+   claims to be true of the line it names); registered instead of attempted.
+2. **`prompts/` is outside 7bis.3's constant-pinning scope.** `prompts/diagnose.md` states
+   `config.diagnoseBudget = three attempts` in prose — a documented constant, unpinned, one
+   directory away from the sweep that would otherwise catch its drift. 7bis.3's own two docs
+   (`doc/state-machine-spec.md`, `orchestrator/README.md`) do not include it, and no other
+   mechanism does either.
