@@ -1160,6 +1160,13 @@ America/Los_Angeles and Asia/Kolkata, and 0 failures across 40 parallel full-sui
 | — | `1271f1c` | #480, and the production race it turned out to be hiding |
 | 6.1 | `8f8c599` | `daemon.js --worker` runs one task, takes no lock, and exits a code |
 | 6.2 | `b788463` | per-step account leases; `markLimit` stops losing concurrent cooldowns |
+| — | `95b635b` | C6's errata: the dispatcher's scans are not short calls; this box's clock jumps backward |
+| 6.3 | `19d8789` | the dispatcher, with the scans moved off its thread into a scanner process |
+| 6.4 | `9187f0f` | a product-repo mutex, and the two defects it took to make it work |
+| 6.5 | `f8505d6` | a configurable main-moved budget, and the decision to accept the gap |
+| 6.6 | `c2919aa` | auto-pull fills to a watermark, and the cold-start deadlock that found |
+| — | `a6b2117` | six cross-action defects no single action's verification could see |
+| 6.7 | `9b77e03` | worker rows that cannot double-count, and readers for what C6 wrote |
 | 6.3 | `19d8789` | the dispatcher, with the scans moved off its thread into a scanner process |
 | 6.4 | `9187f0f` | a product-repo mutex, and the two defects it took to make it work |
 | 6.5 | `f8505d6` | a configurable main-moved budget, and the decision to accept the gap |
@@ -1290,3 +1297,64 @@ action's own central claim**:
   worker argv passed too, and the mutation run proved it by writing a stray `journal/` and `queue/`
   into the worktree. Both are the same shape as 6.2's: the action's boundary — what argv the child
   actually receives — was untested in every direction.
+
+
+## Gate C6 — two of three parts green, measured 2026-09-02
+
+The plan asks for three things. Two are machine-checkable and were run; the third needs the
+maintainer.
+
+### Part 1 — the dispatcher itself, `--dry-run`, K=3, ONE journal root, 3 synthetic cards
+
+Criteria: a single lock, 3 worker exits, zero cross-task writes. **All met.**
+
+| | |
+|---|---|
+| card outcomes | `gate-card-1/2/3` all **DONE** |
+| worker pids | **3 distinct** (1125520, 1125526, 1125528) |
+| `worker-spawn` / `worker-exit` | **3 / 3**, every one `code: 0`, `outcome: done` |
+| lock files, sampled 354 times during the run | **max 1 at any instant** |
+| cross-task writes | **0** |
+
+The spawn/exit timeline is the part worth keeping: spawns at `00:05:22.940 / .944 / .948`, first exit
+at `00:05:23.039`. **All three workers were spawned before any of them exited**, so this is real
+concurrency rather than a serial drain that happens to produce three exits.
+
+### Part 2 — K=3 against ONE healthy account
+
+The plan says "shadow K=3". **Erratum: shadow mode cannot exercise this at all.** `callLlmStep`
+short-circuits on `ctx.shadowMode` before `accounts.pick()` is ever reached, so a shadow run leases
+nothing. `--dry-run` is the mode that runs account rotation and leasing for real while stopping
+short of the spawn — `test/helpers.js`'s own `isolatedEnv` comment already says so. Run in
+`--dry-run`.
+
+A first, uncontended run passed (3 cards through 1 account, no parks, no leaked lease files) but
+proved little: dry-run LLM steps are sub-millisecond, so a 4 ms poll caught the lease **once** in
+the whole run — the workers may simply never have contended.
+
+So contention was **forced**: an outside live process held the only account's lease for 9 s across
+the whole run, in two arms differing only in the wait bound.
+
+| arm | lease wait bound | outcome | progressed while the lease was held |
+|---|---|---|---|
+| short | 3 s (< the 9 s hold) | cards 1 and 2 **PARKED `all-accounts-leased`**; card 3 DONE (spawned after the hold expired) | **none** |
+| long | 60 s (> the 9 s hold) | all three **waited, then DONE** | **none** |
+
+**Both permitted behaviours observed — wait, and park — and sharing observed in neither.** That is
+the criterion exactly: "excess workers wait or park, never share an account". The decisive column is
+the last one: no card got past an LLM step while another process held the account.
+
+### Part 3 — a supervised parallel batch of 2 S-sized cards: PENDING
+
+This needs a real maintainer-supervised run, exactly as C5's gate was closed. Prerequisites now
+met: both pool accounts read `cooldown=none`, so K=2 is reachable for the first time today.
+
+Two things must be sequenced around it, and neither is optional:
+
+- **The merge restarts the daemon by itself.** It is the `git pull` in `/home/crazz/SPO-Pipeline`
+  that fires the post-merge hook, not the merge on GitHub. So deploying C6 brings a `--real`
+  dispatcher up unattended.
+- **Auto-pull is currently disabled by a systemd drop-in** (`auto-pull-off.conf`,
+  `SPO_AUTO_PULL_MS=0`), added because another session is filing many cards into project 1's Todo.
+  The gate needs a *controlled* batch of two, not whatever is topmost on the board, so that drop-in
+  should stay for the gate run and the two cards be fed by hand.
