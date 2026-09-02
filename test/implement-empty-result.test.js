@@ -141,6 +141,74 @@ test('handleImplement (real mode): an unparsable filesChanged string routes to D
   assert.equal(next, 'DIAGNOSE');
 });
 
+// action 7.1: state-machine.js's parseFilesChanged has two ways to produce null for a string --
+// JSON.parse itself throwing (the 'not json' case just above, already covered) and JSON.parse
+// SUCCEEDING but landing on something that isn't an array at all. Both must be treated identically
+// by handleImplement (route to DIAGNOSE, journal empty-implement), but they are genuinely
+// different lines in parseFilesChanged's body, and a mutant that only broke the second one (e.g.
+// `Array.isArray(parsed) ? parsed : null` -> `parsed` unconditionally) would sail through the
+// 'not json' test above unnoticed, since that test never reaches this line at all.
+test('handleImplement (real mode): filesChanged that parses as valid JSON but is NOT an array (an object) routes to DIAGNOSE the same as unparsable JSON', async () => {
+  const task = baseTask(251);
+  const taskDir = mkTmp('spo-implement-jsonnotarray-');
+  const spawnSync = (command) => {
+    if (command === 'claude') {
+      return ok(
+        claudeReply({
+          summary: 'x',
+          files_changed: '{"src/widget.ts":"modified"}', // valid JSON, but an object, not an array
+          invariants: [],
+          tests_run: [],
+          all_green: false,
+        })
+      );
+    }
+    return ok('');
+  };
+  const ctx = realCardCtx(task, taskDir, spawnSync);
+
+  const next = await HANDLERS.IMPLEMENT(ctx);
+
+  assert.equal(next, 'DIAGNOSE');
+  const journal = readJournal(taskDir);
+  const event = journal.find((e) => e.event === 'empty-implement');
+  assert.ok(event, 'expected an empty-implement journal event');
+  assert.equal(event.filesChanged, '{"src/widget.ts":"modified"}', 'the raw claimed value is journalled as-is, not the parsed-then-discarded object');
+});
+
+// action 7.1: parseFilesChanged's OWN final fallback (`return null` after the Array.isArray check
+// and the typeof === 'string' check both fail) -- reached only when files_changed is present but
+// is neither an array nor a string at all, e.g. a bare `null`. Genuinely distinct from both tests
+// above: those exercise the two branches INSIDE the `typeof raw === 'string'` block; this exercises
+// what happens when execution never enters that block in the first place.
+test('handleImplement (real mode): filesChanged present as a bare null (neither array nor string) routes to DIAGNOSE via parseFilesChanged\'s own final fallback', async () => {
+  const task = baseTask(252);
+  const taskDir = mkTmp('spo-implement-filesnull-');
+  const spawnSync = (command) => {
+    if (command === 'claude') {
+      return ok(
+        claudeReply({
+          summary: 'x',
+          files_changed: null,
+          invariants: [],
+          tests_run: [],
+          all_green: false,
+        })
+      );
+    }
+    return ok('');
+  };
+  const ctx = realCardCtx(task, taskDir, spawnSync);
+
+  const next = await HANDLERS.IMPLEMENT(ctx);
+
+  assert.equal(next, 'DIAGNOSE');
+  const journal = readJournal(taskDir);
+  const event = journal.find((e) => e.event === 'empty-implement');
+  assert.ok(event, 'expected an empty-implement journal event');
+  assert.equal(event.filesChanged, null);
+});
+
 test('handleImplement (real mode): a legitimate implement with red tests (non-empty filesChanged, all_green false) still goes to CHECK', async () => {
   const task = baseTask(250);
   const taskDir = mkTmp('spo-implement-redtests-');

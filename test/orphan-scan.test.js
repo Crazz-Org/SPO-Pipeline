@@ -15,7 +15,7 @@ const path = require('path');
 require('./no-real-spawn');
 const { shouldScanOrphans, orphanScan } = require('../orchestrator/orphan-scan');
 const { unparkScan } = require('../orchestrator/park-loop');
-const { appendEvent, writeState, writeLiveWorkerIds } = require('../orchestrator/journal');
+const { appendEvent, appendDaemonEvent, writeState, writeLiveWorkerIds } = require('../orchestrator/journal');
 const { runScanCycle, createScanTimers } = require('../orchestrator/state-machine');
 const { createScanState } = require('../orchestrator/comment-scan');
 const { runDaemonOnce, runDaemonDryRun } = require('./helpers');
@@ -204,6 +204,67 @@ test('runScanCycle reads live-workers.json fresh and protects a listed id from o
   const reparkedState = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
   assert.equal(reparkedState.state, 'PARKED');
   assert.equal(reparkedState.reason, 'task-orphaned-daemon-restart');
+});
+
+// action 7.1: runScanCycle's auto-triage timer (state-machine.js lines 1746-1749) is the one
+// scan in its own body this file's other runScanCycle test never exercises -- every timer above
+// it in the function (orphan/unpark/auto-pull/report-intake/confirm-scan) is disabled here by
+// giving each its own zero-valued *Ms config so ONLY runAutoTriage's own shouldAutoTriage(...)
+// check can fire this cycle, isolating the one call site under test from the five others in the
+// same function. Proven by a real, filesystem-only side effect (auto-triage.js's own
+// runAutoTriage appends a summary 'auto-triage' daemon event whenever it disposes of anything,
+// including an 'already-claimed' outcome for a report-confirmed entry whose pendingPath never
+// existed) rather than by mocking auto-triage.js itself -- see orchestrator/auto-triage.js's
+// claimReport, which turns a missing pendingPath into {claimed:false} -> outcome:'already-claimed'
+// with no spawn of any kind, so this never touches a real claude/gh/npm process.
+test('runScanCycle: calls runAutoTriage when shouldAutoTriage is due, and records timers.lastAutoTriageAt', async () => {
+  const journalRoot = mkTmp('spo-scancycle-autotriage-journal-');
+  const queueDir = mkTmp('spo-scancycle-autotriage-queue-');
+
+  // A confirmed report whose pendingPath was never written -- claimReport's fs.renameSync throws
+  // ENOENT, caught, `{claimed: false}` -> processConfirmedReport returns 'already-claimed' -> the
+  // 'auto-triage' summary event gets appended (alreadyClaimed > 0). No report content is ever
+  // read, and nothing spawns -- see this test's own header comment.
+  appendDaemonEvent(journalRoot, 'report-confirmed', {
+    issue: 9001,
+    pendingPath: path.join(journalRoot, 'nonexistent-pending-report.json'),
+    commentId: 1,
+    kind: null,
+  });
+
+  const config = testConfig({
+    orphanScanMs: 0,
+    unparkScanMs: 0,
+    autoPullMs: 0,
+    autoIntakeMs: 0,
+    reportConfirmScanMs: 0,
+    autoTriageMs: 15 * 60 * 1000,
+    spoReportsDir: mkTmp('spo-scancycle-autotriage-reports-'),
+  });
+  const timers = createScanTimers(); // every lastXAt starts null -- shouldAutoTriage is due immediately
+  const scanStates = { unpark: createScanState(), reportConfirm: createScanState() };
+
+  await runScanCycle(timers, queueDir, journalRoot, config, scanStates);
+
+  // Not a strict [before, after] bracket: this box's wall clock has been measured jumping
+  // backward (2515ms across a 10ms monotonic interval -- see CLAUDE.md), which could put
+  // runScanCycle's own internal Date.now() stamp BELOW a `before` timestamp read a moment
+  // earlier in this very process. What actually matters is that the timer got stamped recently,
+  // not a strict ordering the real wall clock cannot guarantee.
+  const TOLERANCE_MS = 10_000;
+  assert.equal(typeof timers.lastAutoTriageAt, 'number');
+  assert.ok(
+    Math.abs(timers.lastAutoTriageAt - Date.now()) < TOLERANCE_MS,
+    `expected lastAutoTriageAt stamped near now(), got ${timers.lastAutoTriageAt} vs now ${Date.now()}`
+  );
+
+  const summary = readDaemonEvents(journalRoot).find((e) => e.event === 'auto-triage');
+  assert.ok(summary, 'expected runAutoTriage to have actually run and journalled its summary -- proves the call happened, not just the timer check');
+  assert.equal(summary.processed, 1);
+  assert.equal(summary.alreadyClaimed, 1);
+  assert.equal(summary.filed, 0);
+  assert.equal(summary.duplicates, 0);
+  assert.equal(summary.held, 0);
 });
 
 test('orphanScan -> unparkScan: a maintainer retry on the reparked issue re-enqueues it (the full loop #385 needed by hand)', async () => {
@@ -629,6 +690,114 @@ function seedTakenButNeverStarted(journalRoot, id, { ageMs = 10_000, task = {} }
   );
   return taskDir;
 }
+
+// action 7.1: the never-started shape's age normally comes from journal.jsonl's own 'taken'
+// event (see seedTakenButNeverStarted above) -- takenAtMs's fallback to task.json's own mtime is
+// only reached when that read fails entirely, which this fixture forces by never writing
+// journal.jsonl at all: takenAtMs's fs.readFileSync throws ENOENT, its try/catch swallows it (the
+// same catch an unparsable journal would also fall into), and it falls through to
+// fs.statSync(taskFile).mtimeMs. task.json itself must still exist -- see orphanScan's own
+// `if (!fs.existsSync(taskFile)) continue` guard just above the takenAtMs call, which is exactly
+// why takenAtMs's OWN second fallback (a taskFile so far never seen: statSync throwing -> null) is
+// not reachable through this call site at all; see this test's own note below.
+function seedTakenButNeverStartedNoJournal(journalRoot, id, { task = {} } = {}) {
+  const taskDir = path.join(journalRoot, id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', issue: 385, ...task }, null, 2));
+  return taskDir;
+}
+
+test("orphanScan: no state.json AND no journal.jsonl -- takenAtMs falls back to task.json's own mtime, and the task is still recovered with that mtime as takenAt", async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStartedNoJournal(journalRoot, 'issue-mtimefallback');
+  assert.equal(fs.existsSync(path.join(taskDir, 'journal.jsonl')), false, 'the fixture must have NO journal.jsonl -- that is what forces the mtime fallback');
+  const taskFile = path.join(taskDir, 'task.json');
+  // task.json was just created by seedTakenButNeverStartedNoJournal, moments ago in this same
+  // test -- mtime, ctime and birthtime would all read back essentially identical without this,
+  // which would let a mutation swap takenAtMs' `.mtimeMs` read for `.ctimeMs` or `.birthtimeMs`
+  // sail through unnoticed (both survived the full suite before this fix). Force a real mtime,
+  // derived from Date.now() (never a literal timestamp), and confirm it has actually diverged
+  // from the other two stat fields before trusting it as this test's expectation -- calling
+  // utimesSync is itself a metadata change, so it bumps ctime to "now" even while setting mtime
+  // to `past`, and birthtime (file creation time) is untouched by utimesSync at all.
+  const past = new Date(Date.now() - 60_000);
+  fs.utimesSync(taskFile, past, past);
+  const statAfterTouch = fs.statSync(taskFile);
+  assert.notEqual(
+    statAfterTouch.mtimeMs,
+    statAfterTouch.ctimeMs,
+    'fixture bug: mtime must diverge from ctime or this test cannot tell takenAtMs apart from a .ctimeMs mutant'
+  );
+  assert.notEqual(
+    statAfterTouch.mtimeMs,
+    statAfterTouch.birthtimeMs,
+    'fixture bug: mtime must diverge from birthtime or this test cannot tell takenAtMs apart from a .birthtimeMs mutant'
+  );
+  const expectedTakenAtIso = new Date(statAfterTouch.mtimeMs).toISOString();
+
+  // orphanGraceMs: 0, not the default -- task.json was just written by this same test, so its
+  // mtime is "now"; the default 1000ms grace would make this test race real wall-clock time
+  // instead of proving the fallback fires deterministically.
+  const config = testConfig({ orphanGraceMs: 0 });
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-mtimefallback', reason: 'task-orphaned-before-start' }]);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.reason, 'task-orphaned-before-start');
+
+  const events = readJournal(taskDir); // journal.jsonl now exists -- created by finalizePark's own appendEvent
+  const parked = events.find((e) => e.event === 'parked');
+  assert.ok(parked);
+  assert.equal(parked.detail.takenAt, expectedTakenAtIso, "age must come from task.json's own mtime, not be fabricated or left null");
+});
+
+// action 7.1 (round 2, verifier finding): takenAtMs's SECOND try/catch -- fs.statSync(taskFile)
+// throwing -- looks unreachable from orphanScan's own `if (!fs.existsSync(taskFile)) continue`
+// guard just before the call, but existsSync-then-statSync is a classic TOCTOU window, not a
+// closed door: task.json can be unlinked in that gap by a concurrent `spo` command, a cleanup
+// pass, or a maintainer by hand. Without the catch, that race turns a graceful "no knowable age,
+// skip this task for now" into an uncaught throw that aborts the WHOLE scan cycle over one racy
+// task. Reached by monkey-patching fs.statSync to throw for exactly this one taskFile path (same
+// spy-and-restore idiom test/journal.test.js's rename-failure tests use) -- existsSync itself
+// goes through Node's internal stat binding, not the exported fs.statSync function this patches,
+// so the guard above still sees the file as present, exactly like the real race would.
+test("orphanScan: task.json vanishing between the existsSync guard and the mtime read (takenAtMs's own statSync throwing) is treated as \"no knowable age\" -- the scan completes, this task is skipped, never recovered, never crashed", async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStartedNoJournal(journalRoot, 'issue-statthrow');
+  const taskFile = path.join(taskDir, 'task.json');
+
+  const origStatSync = fs.statSync;
+  fs.statSync = (p, ...rest) => {
+    if (p === taskFile) {
+      const err = new Error('simulated: task.json vanished between existsSync and statSync');
+      err.code = 'ENOENT';
+      throw err;
+    }
+    return origStatSync(p, ...rest);
+  };
+
+  const config = testConfig({ orphanGraceMs: 0 });
+  const deps = {
+    isAlive: () => false,
+    spawnSync: () => {
+      throw new Error('must never spawn -- an unknowable-age task is skipped before any park machinery runs');
+    },
+  };
+
+  let recovered;
+  try {
+    recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  } finally {
+    fs.statSync = origStatSync;
+  }
+
+  assert.deepEqual(recovered, [], 'a task whose age cannot be determined must be skipped this cycle, not recovered');
+  assert.equal(fs.existsSync(path.join(taskDir, 'state.json')), false, 'no state.json -- this task was skipped, never parked');
+});
 
 test('orphanScan: a task taken off the queue whose worker died before writing state.json is recovered, not lost forever', async () => {
   const journalRoot = mkTmp('spo-orphan-journal-');

@@ -20,6 +20,7 @@ const path = require('path');
 require('./no-real-spawn');
 
 const {
+  runScripted,
   realWorktree,
   realCheck,
   realPushPr,
@@ -110,6 +111,32 @@ function writeJson(file, obj) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(obj));
 }
+
+// ---- runScripted itself (action 7.1) -----------------------------------------------------------
+//
+// The generic shadow/dry-run/real dispatcher every handleX in state-machine.js's shadow path
+// calls through (runScripted(ctx, fixtureKey, opts)). Its shadow and dry-run branches are
+// exercised end to end by nearly every other test file in this suite; the one branch nothing
+// reaches is real execution with no `command` configured at all -- today that is EVERY caller,
+// since state-machine.js only ever calls runScripted from its shadow-mode handlers (real mode
+// dispatches to the realX(ctx, deps) functions in this same file instead) and no opts.command is
+// ever passed. The comment at the throw site calls this "not implemented in this skeleton" --
+// still true, and still worth pinning: a future caller that reaches real execution without first
+// wiring a command must fail loudly with a message naming the fixture key, not silently spawn
+// nothing.
+test('runScripted: real execution (not shadow, not dry-run) with no command configured rejects with a plain Error naming the fixture key, never a ParkSignal', async () => {
+  const ctx = { shadowMode: false, dryRun: false };
+  // runScripted is declared `async`, so even a throw before its first `await` never escapes
+  // synchronously -- it always surfaces as a rejected promise. assert.rejects, not assert.throws.
+  await assert.rejects(
+    () => runScripted(ctx, 'someUnwiredFixtureKey'),
+    (err) => {
+      assert.ok(!(err instanceof ParkSignal), 'a missing command wiring is a programming error, not a recognized park reason');
+      assert.match(err.message, /no real command configured for "someUnwiredFixtureKey"/);
+      return true;
+    }
+  );
+});
 
 // ---- WORKTREE -------------------------------------------------------------------------------
 
@@ -329,6 +356,149 @@ test('preserveWorktreeWip: detaches HEAD before add -A, so the wip commit never 
   assert.ok(addIdx !== -1, 'expected a git add -A call');
   assert.ok(detachIdx < addIdx, 'checkout --detach must run before add -A');
   assert.deepEqual(gitCalls[detachIdx].args, ['-C', worktreePath, 'checkout', '--detach']);
+});
+
+// action 7.1: the four ORDINARY (non-timeout) error legs preserveWorktreeWipUnguarded can hit, one
+// per git subcommand in its sequence (status -> checkout --detach -> add -A -> commit -F). Each is
+// handled inline -- NOT by preserveWorktreeWip's own outer try/catch, which exists only to catch a
+// ParkSignal from a spawnStep TIMEOUT (see the two-timeout test further below and this function's
+// own header comment) -- by appending 'wip-preserve-failed' with the step name and the exit code,
+// then returning null, short-circuiting before any later command in the sequence runs. Distinct
+// exit codes per case (17/23/29/31) so a mutation that swapped which step's exit gets journalled,
+// or that dropped the step label, cannot pass by accident.
+
+test('preserveWorktreeWip: git status itself fails -> wip-preserve-failed{step:"status"}, returns null, no further git calls', () => {
+  const worktreePath = mkTmp('spo-real-wip-statusfail-wt-');
+  const taskDir = mkTmp('spo-real-wip-statusfail-taskdir-');
+  const ctx = { id: 'card-wip-status', taskDir };
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push([...args]);
+      if (args.includes('status') && args.includes('--porcelain')) return fail(17);
+      return ok('');
+    },
+  };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+  assert.equal(preserved, null);
+  assert.equal(calls.length, 1, 'a failed status must short-circuit before any further git command');
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'wip-preserve-failed');
+  assert.ok(failed, 'expected a wip-preserve-failed event');
+  assert.equal(failed.step, 'status');
+  assert.equal(failed.exit, 17);
+});
+
+test('preserveWorktreeWip: git checkout --detach fails -> wip-preserve-failed{step:"detach"}, returns null, add/commit never attempted', () => {
+  const worktreePath = mkTmp('spo-real-wip-detachfail-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'stray.ts'), 'uncommitted');
+  const taskDir = mkTmp('spo-real-wip-detachfail-taskdir-');
+  const ctx = { id: 'card-wip-detach', taskDir };
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push([...args]);
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M stray.ts\n');
+      if (args.includes('checkout') && args.includes('--detach')) return fail(23);
+      return ok('');
+    },
+  };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+  assert.equal(preserved, null);
+  assert.ok(!calls.some((a) => a.includes('add') && a.includes('-A')), 'add -A must never run after a failed detach');
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'wip-preserve-failed');
+  assert.ok(failed);
+  assert.equal(failed.step, 'detach');
+  assert.equal(failed.exit, 23);
+});
+
+test('preserveWorktreeWip: git add -A fails -> wip-preserve-failed{step:"add"}, returns null, commit never attempted', () => {
+  const worktreePath = mkTmp('spo-real-wip-addfail-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'stray.ts'), 'uncommitted');
+  const taskDir = mkTmp('spo-real-wip-addfail-taskdir-');
+  const ctx = { id: 'card-wip-add', taskDir };
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push([...args]);
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M stray.ts\n');
+      if (args.includes('checkout') && args.includes('--detach')) return ok('');
+      if (args.includes('add') && args.includes('-A')) return fail(29);
+      return ok('');
+    },
+  };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+  assert.equal(preserved, null);
+  assert.ok(!calls.some((a) => a.includes('commit')), 'commit must never run after a failed add -A');
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'wip-preserve-failed');
+  assert.ok(failed);
+  assert.equal(failed.step, 'add');
+  assert.equal(failed.exit, 29);
+});
+
+test('preserveWorktreeWip: git commit -F fails -> wip-preserve-failed{step:"commit"}, returns null, no rev-parse/push follows', () => {
+  const worktreePath = mkTmp('spo-real-wip-commitfail-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'stray.ts'), 'uncommitted');
+  const taskDir = mkTmp('spo-real-wip-commitfail-taskdir-');
+  const ctx = { id: 'card-wip-commit', taskDir };
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push([...args]);
+      if (args.includes('status') && args.includes('--porcelain')) return ok(' M stray.ts\n');
+      if (args.includes('checkout') && args.includes('--detach')) return ok('');
+      if (args.includes('add') && args.includes('-A')) return ok('');
+      if (args.includes('commit') && args.includes('-F')) return fail(31);
+      return ok('');
+    },
+  };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+  assert.equal(preserved, null);
+  assert.ok(!calls.some((a) => a.includes('push')), 'push must never run after a failed commit');
+
+  const journal = readJournal(taskDir);
+  const failed = journal.find((e) => e.event === 'wip-preserve-failed');
+  assert.ok(failed);
+  assert.equal(failed.step, 'commit');
+  assert.equal(failed.exit, 31);
+});
+
+// The negative half of the same contract: a genuinely clean worktree has nothing to preserve and
+// must return null WITHOUT ever writing wip-preserve-failed (or any other event) -- a mutation
+// that turned this early return into "fall through and fail on the very next step anyway" would
+// still pass a bare `assert.equal(preserved, null)`, so this asserts journal.jsonl is never even
+// created, not merely that it lacks the one event name.
+test('preserveWorktreeWip: a clean worktree returns null and writes NO wip-preserve-failed (or wip-preserved) event', () => {
+  const worktreePath = mkTmp('spo-real-wip-clean-wt-');
+  const taskDir = mkTmp('spo-real-wip-clean-taskdir-');
+  const ctx = { id: 'card-wip-clean', taskDir };
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push([...args]);
+      return ok(''); // status --porcelain (and anything else) reports a clean tree
+    },
+  };
+
+  const preserved = preserveWorktreeWip(ctx, deps, { worktreePath, reason: 'leftover', state: 'WORKTREE' });
+  assert.equal(preserved, null);
+  assert.equal(calls.length, 1, 'a clean tree must stop after the single status check');
+  // spawnStep's own bookkeeping ('spawn' events, one per command) is unconditional and unrelated
+  // to this leg -- what must be ABSENT is preserveWorktreeWip's own outcome event. A mutation that
+  // turned the clean-tree early return into "fall through and fail on the very next (nonexistent)
+  // step anyway" would still pass a bare `assert.equal(preserved, null)`.
+  const journal = readJournal(taskDir);
+  assert.ok(!journal.some((e) => e.event === 'wip-preserve-failed'), 'a clean tree must never journal wip-preserve-failed');
+  assert.ok(!journal.some((e) => e.event === 'wip-preserved'), 'a clean tree preserved nothing -- must never journal wip-preserved either');
 });
 
 test('realWorktree leftover sweep: clean worktree dir + a local branch merged into origin/main -- both removed, add proceeds, both cleanups journaled', async () => {
@@ -1639,6 +1809,42 @@ test('realCiChecks: zero check-runs registered -> same bounded in-flight wait as
   assert.ok(journal.some((e) => e.event === 'checks-in-flight' && e.attempt === 1 && e.totalRuns === 0));
 });
 
+// action 7.1: fetchCheckRuns' own try/catch around JSON.parse(checkRuns.stdout) -- `gh api` can
+// return a non-JSON body on a transient GitHub error (a 502 HTML page, a truncated response), and
+// that must degrade to "zero runs" (the same in-flight/re-poll treatment the "zero check-runs
+// registered" case above already exercises), never an uncaught SyntaxError bubbling out of
+// realCiChecks and crashing the task on what is, from the caller's perspective, exactly the same
+// shape of transient hiccup a genuinely-empty check_runs array already handles cleanly.
+test('realCiChecks: gh api check-runs stdout that is not parsable JSON is treated as zero runs (in-flight, re-poll), never an uncaught parse error', async () => {
+  const config = testConfig({ ciChecksMaxPolls: 4, ciChecksPollIntervalMs: 750 });
+  const ctx = ciCtx({ config });
+  const headSha = 'headshaGARBAGEJSON44444444444444444444444';
+  let apiCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    if (command === 'gh' && args[0] === 'api') {
+      apiCalls += 1;
+      // Not JSON at all -- stands in for a 502/proxy-error body `gh api` can hand back verbatim.
+      if (apiCalls === 1) return ok('<html><body>502 Bad Gateway</body></html>');
+      return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
+    }
+    return ok('');
+  }, sleeps);
+
+  const next = await realCiChecks(ctx, deps);
+
+  assert.equal(next, 'VALIDATE', 'an unparsable fetch must never itself abort the call -- it just re-polls');
+  assert.equal(apiCalls, 2, 'the unparsable response must trigger exactly one re-poll, same as an empty check_runs array');
+  assert.deepEqual(sleeps, [750]);
+
+  const journal = readJournal(ctx.taskDir);
+  const inFlight = journal.find((e) => e.event === 'checks-in-flight');
+  assert.ok(inFlight, 'expected the in-flight observation to be journalled on the unparsable fetch');
+  assert.equal(inFlight.totalRuns, 0, 'unparsable JSON must be treated as ZERO check runs, not a crash and not a fabricated count');
+  assert.ok(journal.some((e) => e.event === 'checks-green'), 'the second, parsable poll must still resolve normally');
+});
+
 test('realCiChecks: still in flight after the configured max polls -> PARKED ci-checks-still-running, never reaches MERGE', async () => {
   const config = testConfig({ ciChecksMaxPolls: 3, ciChecksPollIntervalMs: 1000 });
   const ctx = ciCtx({ config });
@@ -1799,6 +2005,35 @@ test('realMerge: pr:wait [4,4] -> PARKED (merge-queue-not-landing), never a thir
     (err) => err instanceof ParkSignal && err.reason === 'merge-queue-not-landing'
   );
   assert.equal(waitCalls, 2);
+});
+
+// action 7.1: the fallthrough below exits 0/1/4 -- an exit realMerge has never seen from `npm run
+// pr:wait` in production, but the fallthrough exists precisely because a script's exit code is not
+// a closed set this code controls. Exit 9 is arbitrary and distinct from every other case in this
+// section (0/1/4) so this cannot pass by accident of matching one of the real branches.
+test('realMerge: pr:wait exit 9 (unrecognized) -> PARKED pr-wait-unrecognized-exit, no bounded re-wait attempted', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-merge-wt4-');
+  const task = { id: 'card-merge4', kind: 'card', issue: 113, worktreePath };
+  const ctx = testCtx({ id: 'card-merge4', task, config });
+  ctx.prNumber = 444;
+
+  let waitCalls = 0;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('pr:wait')) {
+        waitCalls += 1;
+        return fail(9);
+      }
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'pr-wait-unrecognized-exit' && err.detail.exit === 9
+  );
+  assert.equal(waitCalls, 1, 'exit 9 is not exit 4 -- the bounded re-wait is reserved for "still open", never a third state');
 });
 
 // ---- FINISH ---------------------------------------------------------------------------------

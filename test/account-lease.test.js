@@ -250,6 +250,29 @@ test('leasedAccountNames: only names accounts whose lease is held by a LIVE pid'
   assert.deepEqual(Array.from(names).sort(), ['acct-a']);
 });
 
+// action 7.1: readJsonFile (account-lease.js) is not exported -- a deliberately private helper,
+// per its own comment "missing, unreadable, or torn -- treated as 'nobody holds this' by every
+// caller" -- so its catch branch is reached the same way every real caller reaches it:
+// leasedAccountNames reading a `.lease-*.json` file whose bytes are not valid JSON. A torn write
+// (a crash mid fs.writeFileSync, before this module's own tmp+rename atomicity existed for other
+// files) must never throw out of leasedAccountNames and must never count as "held" -- the whole
+// point being that pick()'s exclusion set stays correct even when a lease file is garbage, rather
+// than either crashing the caller or (worse) treating garbage as evidence of a live holder and
+// starving every other process out of an account nobody actually holds.
+test('leasedAccountNames: an unparsable (torn/corrupt) lease file reads as "nobody holds this", not a throw -- the account is excluded from the leased set', () => {
+  const poolDir = writePoolDir(mkTmp('spo-lease-torn-'), [{ name: 'acct-torn' }, { name: 'acct-live' }]);
+  // Deliberately not JSON at all -- stands in for a lease file caught mid-write by a crash, or
+  // hand-corrupted on disk. `{ "pid": 1` (a plausible torn write: valid start, no closing brace)
+  // is used rather than total gibberish, so this cannot be mistaken for "empty file" either.
+  fs.writeFileSync(leaseFilePath(poolDir, 'acct-torn'), '{ "pid": 1');
+  fs.writeFileSync(leaseFilePath(poolDir, 'acct-live'), JSON.stringify({ pid: 111, startedAt: 'live' }));
+
+  assert.doesNotThrow(() => leasedAccountNames(poolDir, (pid) => pid === 111 || pid === 1));
+
+  const names = leasedAccountNames(poolDir, (pid) => pid === 111 || pid === 1);
+  assert.deepEqual(Array.from(names).sort(), ['acct-live'], 'the torn lease must never be counted as held, even though its (unreadable) pid would answer isAlive() true');
+});
+
 // ---- VERIFIER (action 6.2): the release guard needs BOTH halves ------------------------------
 //
 // The release-guard test above varies only `startedAt` (same pid), so it kills a mutant that
