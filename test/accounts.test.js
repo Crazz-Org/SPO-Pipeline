@@ -600,3 +600,164 @@ test('markLimit: opts.monotonicNowMs/opts.sleepSyncMs are honoured -- a fake clo
   assert.ok(sleepCalls.length > 0, 'must have retried at least once');
   assert.ok(fakeMs >= 500, 'must not give up before the injected clock reaches the configured bound');
 });
+
+// ---- action 3.6: clearCooldown, the `spo account clear-cooldown <name>` escape hatch ----------
+//
+// Built after a live incident: the maintainer hand-edited ~/.claude-accounts/state.json twice on
+// 2026-09-02 to unblock pool1, outside markLimit's own lock, and (it is believed) left
+// lastUsageLimitAt armed both times -- clearing cooldownUntil alone is not enough, see
+// clearCooldown's own header in accounts.js. The tests below are written from that incident:
+// each one proves the CONSEQUENCE the maintainer actually cares about, not just a field's value.
+
+test('clearCooldown: an unknown account name is refused (UnknownAccountError), and writes nothing into state.json', () => {
+  const dir = mkTmp('spo-accounts-clear-unknown-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  let caught = null;
+  try {
+    accounts.clearCooldown(dir, 'acct-ghost', 1000);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof accounts.UnknownAccountError, `expected UnknownAccountError, got ${caught && caught.constructor.name}`);
+
+  // The whole point of the guard: a typo'd name must never create an orphan entry that nothing
+  // will ever clean up.
+  assert.equal(fs.existsSync(path.join(dir, 'state.json')), false, 'refusing an unknown name must not write state.json at all');
+});
+
+test('clearCooldown: an account that was never cooling is an honest no-op -- it does not fabricate a state.json entry', () => {
+  const dir = mkTmp('spo-accounts-clear-noop-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  const result = accounts.clearCooldown(dir, 'acct-a', 1000);
+  assert.equal(result.hadEntry, false);
+  assert.equal(result.wasCooling, false);
+  assert.equal(result.cooldownUntil, null);
+  assert.equal(result.cooldownUntilIso, null);
+  assert.equal(result.escalationWasArmed, false);
+  assert.equal(result.cleared, false, 'nothing was on record -- clearCooldown must not report a write it did not make');
+
+  // Never even created state.json, exactly like a markLimit that never ran.
+  assert.equal(fs.existsSync(path.join(dir, 'state.json')), false);
+});
+
+// THE important test (per this action's own spec): clearing a cooldown must remove the
+// escalation state too, proven from INSIDE the behaviour -- clear an account whose
+// lastUsageLimitAt is recent, then call the REAL markLimit again and assert the resulting
+// cooldown lands on the 1h PROBE tier, not the 5h ESCALATED tier. A test that only checks
+// `lastUsageLimitAt === undefined` after clearing would survive a bug that clears cooldownUntil
+// and lastUsageLimitAt but forgets usageLimitStreak (computeLimitUpdate's `escalated` check does
+// not read usageLimitStreak, so that alone wouldn't be caught either -- but a future refactor
+// that keys escalation off streak instead would be, and this test does not care WHICH field a
+// regression forgets, only the observable tier it produces).
+test('clearCooldown really clears the escalation window: a fresh markLimit call right after a clear lands on the 1h probe tier, not the 5h escalated tier', () => {
+  const dir = mkTmp('spo-accounts-clear-escalation-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  const t0 = 1_000_000;
+  // First usage hit: no prior history, so this is itself a probe (1h) -- but it arms
+  // lastUsageLimitAt for whatever comes next, which is exactly the state clearCooldown must undo.
+  const first = accounts.markLimit(dir, 'acct-a', 'usage', t0);
+  assert.equal(first.escalated, false);
+
+  const t1 = t0 + 1000; // shortly after -- well inside ESCALATION_WINDOW_MS (2h), i.e. still armed
+  const before = accounts.clearCooldown(dir, 'acct-a', t1);
+  assert.equal(before.hadEntry, true);
+  assert.equal(before.wasCooling, true, 'the probe cooldown from t0 has not expired yet at t1');
+  assert.equal(before.escalationWasArmed, true, 'lastUsageLimitAt (t0) is 1000ms old at t1 -- well inside the 2h escalation window');
+  assert.equal(before.cleared, true);
+
+  // state.json must have nothing left for this account -- readState/markLimit both read a
+  // missing entry as "nothing on record", the same as an account that never hit a limit.
+  assert.equal(accounts.readState(dir)['acct-a'], undefined);
+
+  // The account re-limits shortly after being cleared -- the realistic shape of the incident
+  // this command exists for (maintainer clears, account gets picked again, hits a limit again
+  // before the OLD 2h escalation window would have expired on its own).
+  const t2 = t1 + 1000;
+  const after = accounts.markLimit(dir, 'acct-a', 'usage', t2);
+  assert.equal(after.escalated, false, 'clearCooldown must have removed lastUsageLimitAt -- this hit has no history to escalate against');
+  // Literal milliseconds, not accounts.USAGE_PROBE_COOLDOWN_MS -- the anti-cheat rule this repo
+  // learned the hard way (C6: cutting a safety constant from 22 to 3 passed 1303 tests because
+  // every assertion recomputed its expectation from the same constant). 1 hour is
+  // USAGE_PROBE_COOLDOWN_MS's literal value, orchestrator/accounts.js line ~93.
+  assert.equal(after.cooldownMs, 60 * 60 * 1000, 'a real regression: escalation state left armed would have produced the 5h tier (18000000ms) instead');
+});
+
+test('clearCooldown on a STALE entry (cooldownUntil already past) still reports wasCooling=false but still clears the escalation state', () => {
+  const dir = mkTmp('spo-accounts-clear-stale-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+
+  const t0 = 1_000_000;
+  accounts.markLimit(dir, 'acct-a', 'usage', t0); // cooldownUntil = t0 + 1h
+
+  // Long after the probe cooldown expired, but still inside the 2h escalation window.
+  const t1 = t0 + 90 * 60 * 1000; // +90min: cooldown (60min) has passed, escalation window (120min) has not
+  const result = accounts.clearCooldown(dir, 'acct-a', t1);
+  assert.equal(result.hadEntry, true);
+  assert.equal(result.wasCooling, false, 'cooldownUntil was 30 minutes in the past at t1 -- not currently cooling');
+  assert.equal(result.escalationWasArmed, true, 'lastUsageLimitAt is 90 minutes old at t1 -- still inside the 2h window even though the cooldown itself expired');
+  assert.equal(result.cleared, true, 'a stale entry still carries the escalation fields and must still be cleared');
+});
+
+// ---- clearCooldown's own .state.lock -- same idiom as markLimit's, proven the same way --------
+
+test('clearCooldown: when the state lock cannot be acquired within its bound, it degrades to the unlocked path -- the clear still lands, and `degraded: true` is stamped on the result', () => {
+  const dir = mkTmp('spo-accounts-clear-degrade-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+  accounts.markLimit(dir, 'acct-a', 'usage', 1000);
+
+  const held = lock.acquireShortLock(accounts.stateLockPath(dir));
+  assert.ok(held, 'test setup: must actually hold the lock for this to prove anything');
+
+  try {
+    const result = accounts.clearCooldown(dir, 'acct-a', 2000, { lockWaitMs: 0 });
+    assert.equal(result.degraded, true, 'the lock was held by a live process the whole time -- this call must report it degraded');
+    assert.equal(result.cleared, true, 'degrade-never-fail: the clear itself must still land, just without the exclusivity guarantee');
+  } finally {
+    lock.releaseShortLock(accounts.stateLockPath(dir), held);
+  }
+
+  // The unlocked fallback still did the real write -- proven independently of the returned flag.
+  assert.equal(accounts.readState(dir)['acct-a'], undefined);
+});
+
+test('clearCooldown: the state-lock wait genuinely retries (proves the lock was actually taken, not silently skipped) -- same isAlive-counting technique as markLimit\'s own spin test', () => {
+  const dir = mkTmp('spo-accounts-clear-lockwait-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+  accounts.markLimit(dir, 'acct-a', 'usage', 1000);
+
+  const held = lock.acquireShortLock(accounts.stateLockPath(dir));
+  assert.ok(held, 'test setup: the lock must really be held');
+
+  let attempts = 0;
+  try {
+    const result = accounts.clearCooldown(dir, 'acct-a', 2000, {
+      lockWaitMs: 100,
+      lockPollMs: 10,
+      isAlive: () => {
+        attempts += 1;
+        return true;
+      },
+    });
+    assert.equal(result.degraded, true, 'the lock was held throughout -- this must degrade');
+  } finally {
+    lock.releaseShortLock(accounts.stateLockPath(dir), held);
+  }
+
+  // If clearCooldown did not really attempt to acquire the lock at all, `isAlive` (only called
+  // when acquireShortLock finds the file present) would never fire.
+  assert.ok(attempts >= 2, `expected the wait to retry against the held lock, got ${attempts} attempts -- the lock was not genuinely taken`);
+});
+
+test('clearCooldown: a stale (dead-pid) .state.lock is swept, not treated as contention', () => {
+  const dir = mkTmp('spo-accounts-clear-stalelock-');
+  writePoolDir(dir, [{ name: 'acct-a' }]);
+  accounts.markLimit(dir, 'acct-a', 'usage', 1000);
+  fs.writeFileSync(accounts.stateLockPath(dir), JSON.stringify({ pid: 999999, startedAt: 'long-dead' }));
+
+  const result = accounts.clearCooldown(dir, 'acct-a', 2000, { lockWaitMs: 0, isAlive: () => false });
+  assert.equal(result.degraded, false, 'a dead-pid lock must be swept and reacquired, not degraded past');
+  assert.equal(fs.existsSync(accounts.stateLockPath(dir)), false, 'the lock is released again once clearCooldown is done with it');
+});

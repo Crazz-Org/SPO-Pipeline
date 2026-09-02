@@ -154,6 +154,20 @@ class AllAccountsLeasedError extends Error {
   }
 }
 
+// Thrown by clearCooldown() (below) when `name` names no subdirectory of poolDir -- i.e. no
+// account this pool actually knows about. Exists to stop a typo'd `spo account clear-cooldown`
+// from silently writing an orphan entry into state.json: nothing ever scans state.json for
+// entries with no matching pool directory, so a mis-typed name would sit there forever, inert
+// but confusing to anyone reading the file by hand.
+class UnknownAccountError extends Error {
+  constructor(reason, detail = {}) {
+    super(reason);
+    this.name = 'UnknownAccountError';
+    this.reason = reason;
+    this.detail = detail;
+  }
+}
+
 function stateJsonPath(poolDir) {
   return path.join(poolDir, 'state.json');
 }
@@ -591,10 +605,125 @@ function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
   }
 }
 
+// clearCooldown(poolDir, name, now = Date.now(), opts = {}) -- the CLI escape hatch this action
+// exists to build: `spo account clear-cooldown <name>`. There was previously no way to clear a
+// cooldown without hand-editing state.json OUTSIDE markLimit's own lock (see this module's own
+// header for why that lock exists) -- a hand `jq`/editor read-modify-write races a live
+// markLimit call exactly the way this function is built not to.
+//
+// THE PART THAT MATTERS: this clears cooldownUntil, lastUsageLimitAt AND usageLimitStreak
+// together -- never cooldownUntil alone. computeLimitUpdate's `escalated` check above reads
+// straight off lastUsageLimitAt; clearing only cooldownUntil leaves it armed, so the very next
+// 'usage' limit on this account within ESCALATION_WINDOW_MS (2h) of the OLD lastUsageLimitAt
+// jumps straight to the 5h escalated tier, as if the account had already burned a probe cooldown
+// it never actually served. An account is usually cleared BECAUSE it just cooled -- the
+// maintainer is unblocking it right after a rate limit -- so lastUsageLimitAt is almost always
+// still inside that window at clear time. That is not a corner case, it is the expected one, and
+// it is believed to be exactly what turned the two manual state.json edits on 2026-09-02 into an
+// account that re-limited straight into the 5h tier instead of a fresh 1h probe.
+//
+// Implemented as one entry DELETION, not three field deletions: state.json's own header
+// documents an account's entry as having ONLY these three fields (cooldownUntil,
+// lastUsageLimitAt?, usageLimitStreak?), so removing the whole key is equivalent to zeroing all
+// three, and there is nothing left for a future field to accidentally survive a clear that only
+// named the three fields explicitly. readState/pick/markLimit already treat "no entry for this
+// account" as "nothing on record" -- the same posture a missing state.json gets.
+//
+// Same lock idiom as markLimit above (see that function's own comment for the full reasoning):
+// acquire stateLockPath(poolDir) via lock.acquireShortLock, poll with a bounded wait keyed off a
+// MONOTONIC clock (never Date.now() -- this box's wall clock has been measured jumping
+// backward), degrade to the unlocked read-modify-write rather than throw if the bound is
+// exceeded (`degraded: true` on the return), release in a `finally`. A hand edit to the SAME
+// file is exactly the unlocked read-modify-write this function exists to make unnecessary --
+// doing the same thing here, just without ever taking the lock at all, would not be progress.
+//
+// Refuses an unknown `name` (no matching subdirectory in poolDir) by throwing
+// UnknownAccountError BEFORE ever taking the lock -- there is nothing to lock for a name that
+// cannot legitimately have a state.json entry. Checked against readRegistry(poolDir) (every
+// subdirectory, enabled or disabled -- clearing a disabled account's cooldown is harmless, and
+// arguably useful ahead of a re-enable, so this does not also require `enabled`).
+//
+// Returns (never throws for the "nothing to do" cases below -- those are honest, common
+// outcomes, not errors):
+//   { name, hadEntry, wasCooling, cooldownUntil, cooldownUntilIso, escalationWasArmed, cleared,
+//     degraded }
+// `hadEntry`   -- state.json had ANY entry for this account (even one whose cooldownUntil had
+//                 already passed).
+// `wasCooling` -- that entry's cooldownUntil was still in the future at `now` (pick()'s own
+//                 "healthy" test, negated).
+// `cooldownUntil`/`cooldownUntilIso` -- what it WAS (null if there was no entry, or the entry
+//                 had no cooldownUntil at all -- both read the same as "not cooling").
+// `escalationWasArmed` -- computeLimitUpdate's own escalation test, evaluated against the entry
+//                 being cleared: would a 'usage' markLimit call made right now (at `now`) have
+//                 landed on the escalated 5h tier because of this entry's lastUsageLimitAt. This
+//                 is the number that answers "did clearing this actually matter beyond the
+//                 visible cooldown" -- the test suite proves the CONSEQUENCE of this field by
+//                 calling the real markLimit afterwards and asserting the resulting tier, not by
+//                 trusting this flag alone.
+// `cleared`    -- true iff state.json was actually rewritten (i.e. `hadEntry` was true). A no-op
+//                 call (nothing on record for this account) never touches state.json -- a
+//                 maintainer clearing an account that was never cooling must not fabricate an
+//                 entry that was never there.
+function clearCooldown(poolDir, name, now = Date.now(), opts = {}) {
+  const known = readRegistry(poolDir).some((a) => a.name === name);
+  if (!known) {
+    throw new UnknownAccountError(`unknown-account-${name}`, { poolDir, name });
+  }
+
+  const waitMs = opts.lockWaitMs !== undefined ? opts.lockWaitMs : config.accountStateLockWaitMs;
+  const pollMs = opts.lockPollMs !== undefined ? opts.lockPollMs : config.accountStateLockPollMs;
+  const isAlive = opts.isAlive || lock.processAlive;
+  const lockFile = stateLockPath(poolDir);
+  const elapsedNowMs = opts.monotonicNowMs || monotonicNowMs;
+  const doSleepSyncMs = opts.sleepSyncMs || sleepSyncMs;
+
+  const start = elapsedNowMs();
+  let held = lock.acquireShortLock(lockFile, { isAlive });
+  while (!held) {
+    const remaining = waitMs - (elapsedNowMs() - start);
+    if (remaining <= 0) break;
+    doSleepSyncMs(Math.min(pollMs, remaining));
+    held = lock.acquireShortLock(lockFile, { isAlive });
+  }
+  const degraded = !held;
+
+  try {
+    const state = readState(poolDir);
+    const entry = state[name];
+    const hadEntry = Boolean(entry);
+    const cooldownUntil = hadEntry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
+    const wasCooling = cooldownUntil !== null && cooldownUntil > now;
+    const lastUsageLimitAt = hadEntry && typeof entry.lastUsageLimitAt === 'number' ? entry.lastUsageLimitAt : null;
+    const escalationWasArmed = lastUsageLimitAt !== null && now - lastUsageLimitAt <= ESCALATION_WINDOW_MS;
+
+    let cleared = false;
+    if (hadEntry) {
+      const nextState = { ...state };
+      delete nextState[name];
+      writeState(poolDir, nextState);
+      cleared = true;
+    }
+
+    return {
+      name,
+      hadEntry,
+      wasCooling,
+      cooldownUntil,
+      cooldownUntilIso: cooldownUntil !== null ? new Date(cooldownUntil).toISOString() : null,
+      escalationWasArmed,
+      cleared,
+      degraded,
+    };
+  } finally {
+    if (held) lock.releaseShortLock(lockFile, held);
+  }
+}
+
 module.exports = {
   pick,
   countHealthyAccounts,
   markLimit,
+  clearCooldown,
   readRegistry,
   readState,
   writeState,
@@ -605,6 +734,7 @@ module.exports = {
   AllAccountsCoolingError,
   AllAccountsLeasedError,
   NoAccountsRegisteredError,
+  UnknownAccountError,
   USAGE_PROBE_COOLDOWN_MS,
   USAGE_ESCALATED_COOLDOWN_MS,
   OVERLOADED_COOLDOWN_MS,

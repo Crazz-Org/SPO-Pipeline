@@ -6,6 +6,12 @@ const path = require('path');
 
 const { execFileSync } = require('child_process');
 const { mkTmp, writeTask, runDaemonOnce, runSpo, SPO_BIN } = require('./helpers');
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
+// live issue) and why this require has to land before the orchestrator require(s) below.
+// (test/no-real-spawn-sweep.test.js enforces this order textually across every test file.)
+require('./no-real-spawn');
+const accounts = require('../orchestrator/accounts');
 
 test('spo status and spo task exit 0 and render the produced journals', () => {
   const queueDir = mkTmp('spo-queue-cli-');
@@ -177,6 +183,73 @@ test('spo account enable/disable on an unknown account name fails loudly instead
   const accountsDir = mkTmp('spo-accts-cli-unknown-');
   assert.throws(() => runSpo(['account', 'disable', 'ghost', '--accounts-dir', accountsDir]));
   assert.equal(fs.existsSync(path.join(accountsDir, 'ghost')), false);
+});
+
+// ---- action 3.6: `spo account clear-cooldown <name>` -- the live-incident escape hatch --------
+//
+// Built after the maintainer hand-edited ~/.claude-accounts/state.json twice on 2026-09-02,
+// outside markLimit's own lock, to unblock a cooling pool. These exercise the CLI wiring on top
+// of accounts.clearCooldown (already covered in depth by test/accounts.test.js) -- the exit code
+// on an unknown name, and that the printed report matches what actually happened.
+
+test('spo account clear-cooldown on an unknown account name exits non-zero and writes nothing', () => {
+  const accountsDir = mkTmp('spo-accts-cli-clear-unknown-');
+  runSpo(['account', 'add', 'pool1', '--accounts-dir', accountsDir]);
+
+  let caught = null;
+  try {
+    execFileSync(process.execPath, [SPO_BIN, 'account', 'clear-cooldown', 'ghost', '--accounts-dir', accountsDir], {
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    caught = err;
+  }
+  // Verdict by exit code, never by reading text output (CLAUDE.md) -- assert the number, not
+  // just that SOMETHING threw.
+  assert.ok(caught, 'an unknown account name must fail the process');
+  assert.equal(caught.status, 1, `expected exit code 1, got ${caught.status}`);
+  assert.match(caught.stderr, /no account "ghost"/);
+  assert.equal(fs.existsSync(path.join(accountsDir, 'state.json')), false, 'refusing an unknown name must never write an orphan state.json entry');
+});
+
+test('spo account clear-cooldown on an account that was never cooling reports the honest no-op, exits 0', () => {
+  const accountsDir = mkTmp('spo-accts-cli-clear-noop-');
+  runSpo(['account', 'add', 'pool1', '--accounts-dir', accountsDir]);
+
+  const out = runSpo(['account', 'clear-cooldown', 'pool1', '--accounts-dir', accountsDir]); // throws on non-zero exit
+  assert.match(out, /pool1: not cooling -- no cooldown state on record, nothing changed/);
+});
+
+test('spo account clear-cooldown on a cooling, escalation-armed account reports both the cooldown and the escalation state cleared, and journals it', () => {
+  const accountsDir = mkTmp('spo-accts-cli-clear-cooling-');
+  const journalDir = mkTmp('spo-journal-cli-clear-cooling-');
+  runSpo(['account', 'add', 'pool1', '--accounts-dir', accountsDir]);
+
+  // Real markLimit (not a hand-built fixture) puts the account in the exact state a live rate
+  // limit produces: cooling, and lastUsageLimitAt freshly armed for the escalation window.
+  const markEvent = accounts.markLimit(accountsDir, 'pool1', 'usage');
+  assert.equal(markEvent.escalated, false, 'test setup: this must be a first-ever probe hit, not already escalated');
+
+  const out = runSpo(['account', 'clear-cooldown', 'pool1', '--accounts-dir', accountsDir, '--journal', journalDir]);
+  assert.match(out, /pool1: cleared -- was cooling until/);
+  assert.match(out, /escalation state WAS armed \(the next usage limit would have jumped straight to the 5h tier\) -- cleared/);
+
+  // The clear must have actually landed in state.json -- the CLI's own report is not the proof.
+  assert.equal(accounts.readState(accountsDir).pool1, undefined);
+
+  // Journalled into daemon.jsonl -- this command has no taskDir, so this is the one place a
+  // manual clear leaves a trace at all (a hand state.json edit leaves none).
+  const daemonLines = fs
+    .readFileSync(path.join(journalDir, 'daemon.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l));
+  const event = daemonLines.find((e) => e.event === 'account-cooldown-cleared');
+  assert.ok(event, 'expected an account-cooldown-cleared event in daemon.jsonl');
+  assert.equal(event.account, 'pool1');
+  assert.equal(event.wasCooling, true);
+  assert.equal(event.escalationWasArmed, true);
+  assert.equal(event.degraded, false);
 });
 
 test('SPO_ACCOUNTS_DIR env var picks the pool directory when --accounts-dir is not given', () => {
