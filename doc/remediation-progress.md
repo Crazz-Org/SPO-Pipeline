@@ -27,9 +27,9 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
 | **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
-| **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured; 7.1/7.2/7.3/7.5 built and verified; gate running |
-| **C7 bis** — what Gate C7 certifies | **in progress** — added 2026-09-02 after three Opus passes on the original clause returned 7, ~11 then ~52 divergences, 80% of the last in territory no pass had reached |
-| **C8** — the bench: audit, remediation, migration | **not started** — added 2026-09-02. 8.1 (the audit) is the only committed row; it produces its own derived plan, and how many chantiers this really needs is 8.1's answer, not this table's |
+| **C7** — truthfulness consolidation & docs | **DONE** — merged 2026-09-02 as PR #86 (merge commit `7af15c0`). Gate C7 green on all three conjuncts |
+| **C7 bis** — what Gate C7 certifies | **DONE** — merged in PR #86. Added 2026-09-02 after three Opus passes on the original clause returned 7, ~11 then ~52 divergences, 80% of the last in territory no pass had reached. All six actions built, and 7bis.1-7bis.5 verified by adversarial Opus passes with mutation testing that returned **ten survivors across the two rounds**, every one of them the action's own central claim |
+| **C8** — the bench: audit, remediation, migration | **NEXT — unblocked, C7 is merged.** Added 2026-09-02. 8.1 (the audit) is the only committed row and runs FIRST; it produces its own derived plan, and how many chantiers this really needs is 8.1's answer, not this table's. Row 8.5 was superseded before C8 began — the migration into `orchestrator/` is demoted to a question 8.1 answers on evidence |
 | **C9** — the documentation corpus | **not started** — **re-planned 2026-09-02 to run in parallel with C8, from C8b on.** Its deferral rested on C8 rewriting `orchestrator/`; row 8.5 is superseded, so that premise is gone. One documentary dependency survives: C9 must not audit `doc/state-machine-spec.md` or `doc/environments.md` until the C8 actions that rewrite them (8.2, 8.4, 8.6) have landed |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
@@ -1751,8 +1751,14 @@ limit #2 ten minutes later → **18000000**, clear, limit #3 → 3600000.
 ## What C7 hands the next session — written 2026-09-02, at commit `3d7a0b7`
 
 **Branch `claude-crazz/c7-truthfulness-docs`, 23 commits on `f7cf9da`. Suite 1562 passing, 0
-failing, 0 cancelled.** **Not yet merged.** The daemon is **stopped** (stopped for the live gate
-run; restart it after merge). Every operational fact in this section is true as of the commit
+failing, 0 cancelled.** **Merged 2026-09-02 as PR #86**, merge commit `7af15c0`.
+
+**The daemon is stopped and must STAY stopped, and this local checkout was deliberately NOT
+pulled** (local `main` is still at `d23a8a3`, C6's merge). That is a maintainer instruction, not
+an oversight: no card is to be processed until the bench is rebuilt and `bench/gate` restored.
+Pulling here fires `post-merge`, which is what restarts the daemon — the merge alone does not.
+**Whoever pulls next is choosing to re-arm the pipeline**, so do it deliberately and only after
+the bench work in C8 is done. Every operational fact in this section is true as of the commit
 named in the heading and nowhere re-verified since — that is what the file's status header means.
 
 ### Gate C7 — all three conjuncts
