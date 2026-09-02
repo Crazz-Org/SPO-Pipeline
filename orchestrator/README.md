@@ -660,7 +660,10 @@ a per-task lease on a 2-account pool would turn that routine rotation into a par
 never fired), and released the instant that call finishes. Lease files live at
 `<poolDir>/.lease-<name>.json` (`{pid, startedAt}`), acquired/released via `lock.js`'s
 `acquireShortLock`/`releaseShortLock` — the same pid-liveness stale-sweep idiom `daemon.lock`
-uses, simpler because a lease never needs the tmp+link dance.
+uses, and, since the measured 39%-torn-read defect (`lock.js:257-288`: 119 of 800 cooldown
+entries lost), the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too
+(`account-lease.js:156` → `lock.js:255` `acquireShortLock` → `:289` `tryCreate`) — a bare `'wx'`
+create is exactly the defect that idiom replaced, not a shortcut this path still takes.
 
 A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
 **bounded wait** (`config.accountLeaseWaitMs`) before parking `all-accounts-leased` — distinct
@@ -1781,7 +1784,20 @@ normally against the winner's now-live lock.
 A task whose owning daemon process dies mid-run (crash, hard kill, a losing race against
 `watchLock` above) leaves `journal/<id>/state.json` frozen on a non-terminal state with no
 `queue/` entry — invisible to a drain pass and to `unparkScan`'s own PARKED-only scan alike.
-`orchestrator/orphan-scan.js` closes that gap: every `state.json` snapshot now carries an
+
+This section covers the **fallback** path only. The **primary** cover, since chantier 6 split the
+daemon into dispatcher/worker/scanner processes, is `dispatcher.js`'s `handleExit` →
+`reparkCrashedWorker`: the dispatcher notices a worker child exit abnormally and reparks it
+immediately, in-process, reason `worker-crashed` — no wait for a scan at all (see
+doc/state-machine-spec.md § Principles, Principle 2). The scanner-based mechanism below exists for
+what the dispatcher itself cannot cover: a worker killed during the dispatcher's OWN shutdown
+(deliberately not reparked in-process, since a park half-written by a process already being
+SIGKILLed can never be recovered later — `dispatcher.js:485-499`) and any owning daemon process
+that simply never comes back to run `handleExit` at all (a hard kill of the whole process tree).
+The shutdown case is this project's most common one in practice: a merge's `git pull` SIGTERMing
+an in-flight card.
+
+`orchestrator/orphan-scan.js` closes that remaining gap: every `state.json` snapshot now carries an
 `owner: {host, pid, lockStartedAt}` (set once, from `daemon.js`'s own lock holder), and a task
 whose owner pid is no longer alive on this host — past a grace window
 (`config.orphanGraceMs`, default 4 min, to avoid racing a transition's own last write) — is

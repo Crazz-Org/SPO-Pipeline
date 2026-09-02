@@ -82,8 +82,10 @@ you are drafting the file content, not a description of it.
 3. **Runnable check commands** — not prose, not "run the tests": commands the driver or the
    IMPLEMENT step execute verbatim and read an **exit code** from, never printed text. In this
    order:
-   - the plan's first command, standalone — the driver runs this once, before spawning
-     IMPLEMENT, purely to confirm the design is executable in this worktree at all;
+   - the plan's first command, chosen so that on its own it confirms the design is executable
+     in this worktree at all — there is no separate driver-side probe: `check_commands` has
+     exactly one consumer, the IMPLEMENT step, which runs every command in this list itself,
+     including this first one, as part of its own self-check (see implement.md);
    - the verification aliases this change needs (`npm run typecheck`, `npm run lint`,
      `npm run coverage:changed`, or `npm run verdict -- <alias>` for one with a long log) —
      never a raw `npm test`, never a piped or backgrounded form (a pipe or a trailing `&`

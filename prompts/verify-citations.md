@@ -64,12 +64,13 @@ rather than silently passed — the two are distinguished by the `verdict` field
 
 ## How to verify one entry
 
-1. **Open the cited file with your `Read` tool, never a raw shell `grep`.** Some files under
-   `{{spo_original_path}}/Rdo/Server/` are ISO-8859-encoded and defeat grep's binary detection —
-   `grep <pattern> some-file.pas` silently returns nothing and exits 1, as if the text were
-   absent (at least `KernelCache.pas`, `rc4.pas`, `MediaNameGenerator.pas`,
-   `PublicFacility.pas`). `Read` renders the file correctly regardless of encoding; if you shell
-   out to search across files, pass `-a` or you will wrongly conclude a name is absent.
+1. **Open the cited file with your `Read` tool.** Some files under
+   `{{spo_original_path}}/Rdo/Server/` are ISO-8859-encoded (at least `KernelCache.pas`,
+   `rc4.pas`, `MediaNameGenerator.pas`, `PublicFacility.pas`); a search that silently comes back
+   empty on one of these is not evidence the text is absent — you have no `Bash` (see below), so
+   there is no shell `grep` to fall back to either way. `Read` renders the file correctly
+   regardless of encoding: when in doubt, open the file and look at the raw text yourself before
+   concluding a name is not present.
 2. **Confirm the citation is real**: at `File.pas:Line`, does that line — or the declaration it
    sits inside — actually say what the catalogue entry and its citation claim? A line number one
    method away, or a line that exists but is unrelated, is a false citation: `REJECT`.
@@ -157,8 +158,9 @@ Output the JSON object in the header above:
   `Read, Grep` and no more.
 - **Never probe the live server.** Every claim is grounded in `{{spo_original_path}}`, cited
   `File.pas:Line`, or marked unresolved in a `finding` — never in a live RDO call.
-- **Never treat the absence of a grep hit on an ISO-8859 file as evidence of absence.** Use
-  `Read`, or `grep -a`, before concluding a name is not present.
+- **Never treat the absence of a search hit on an ISO-8859 file as evidence of absence.** You
+  have no `Bash`, so use `Read` and look at the raw text yourself before concluding a name is not
+  present.
 - **Never rubber-stamp a divergence.** `DIVERGES` requires both a concrete rule and a stated
   reason; anything less is `REJECT`.
 - Your reply is read by a script. Output **only** the JSON object — no preamble, no restatement

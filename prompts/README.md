@@ -13,12 +13,12 @@ read out of order.
 
 | Step | Prompt file | Model | Effort | Tools | Ground |
 |---|---|---|---|---|---|
-| PLAN | `plan.md` | Fable 5 (Opus 5 on the wire rule or as fallback) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}`; also returns `files_to_change` (action 3.2 — the repo-relative paths the plan intends to change, distinct from paths it merely reads or cites) |
+| PLAN | `plan.md` | Fable 5 (Opus 5 fallback only — `step-contracts.js:108`: the wire rule escalates IMPLEMENT and change-validator, deliberately NOT PLAN) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}`; also returns `files_to_change` (action 3.2 — **absolute** paths under `{{worktree}}`, `plan.md:103`, distinct from paths it merely reads or cites) |
 | IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on the wire rule — `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases — or an `L`-sized task) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
 | DIAGNOSE | `diagnose.md` | Fable 5 | high | `Read, Grep, Bash(ro)` | reads `{{diff_path}}`, `{{gate_log_path}}`, `{{ledger_path}}` |
 | VALIDATE — citation-verifier | `verify-citations.md` | Fable 5 | high | `Read, Grep` (product + `~/SPO-Original`, read-only) | reads the diff and `{{spo_original_path}}/Rdo/Server/`; runs only when `rdo-members.ts` changed, and always before `validate-change.md` |
 | VALIDATE — change-validator | `validate-change.md` | Fable 5 — never Sonnet 5 (the executor may not judge itself); Opus 5 on the wire rule or as fallback | high | `Read, Grep, Glob, Bash(ro)` | reads `{{diff_path}}`, `{{invariants_path}}`, `{{gate_report_path}}` |
-| review-card (intake path — findings, hook-hardening candidates, split cards) | `review-card.md` | Fable 5 | analysis (not yet a state-machine-spec.md row; matches `card-reviewer.md`'s own Fable/analysis default) | `Read, Grep, Glob, Bash(ro)` | reads the product tree and `gh issue list --repo {{repo}}`, read-only |
+| review-card (intake path — findings, hook-hardening candidates, split cards) | `review-card.md` | Fable 5 | high (`intake.js:435`; not yet a state-machine-spec.md row) | `Read, Grep, Glob, Bash(ro)` | reads the product tree and `gh issue list --repo {{repo}}`, read-only |
 
 Every "high"/"low"/"medium" effort and every model choice above is what the *caller* passes as
 `--model` / `--effort` on the `claude -p` invocation — nothing in a prompt file selects its own

@@ -129,7 +129,7 @@ row wins). A card that genuinely spans two blocking areas is two cards.
 | `verdict` | Meaning | What happens next |
 |---|---|---|
 | `FILE` | The card holds as written. | Filed unchanged. |
-| `FILE_AMENDED` | The finding is real, the card is not right yet. | The named corrections are applied, then it is filed. |
+| `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:` correction is applied as a `cat:`/`size:` label before filing; a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
 | `DO_NOT_FILE` | There is no card here — not a defect, duplicate of #N, or already fixed at `<sha>`. | Nothing is filed. |
 
 `FILE_AMENDED` must name **exactly** what to change in `corrections` — the corrected `category`,

@@ -64,9 +64,9 @@ today:        {{today}}
 
 ## Rules
 
-- You may `Read`/`Grep`/`Glob` `{{product_repo}}`, read-only, to find supporting `file:line`
-  references or to check whether the described behaviour is really there. You hold no edit tool
-  and never write into it.
+- You may `Read`/`Grep`/`Glob`/`Bash` `{{product_repo}}`, read-only (`permissionMode: 'plan'` —
+  no tool you hold can write), to find supporting `file:line` references or to check whether the
+  described behaviour is really there. You hold no edit tool and never write into it.
 - Never invent a file path or a citation — re-check with your read tools before writing one down.
   A wrong citation fails silently, later, at the worst point in the pipeline (the review step that
   reads this card opens every one you cite).
