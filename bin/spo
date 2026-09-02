@@ -1645,11 +1645,12 @@ async function cmdRecette(opts, deps = {}) {
   // --scenario parallel-doc-log --help` would have filed two live GitHub issues and spawned a
   // real K=2 dispatcher). Same safety contract as `--dry`: zero side effects, nothing spawns.
   if (opts.help) {
-    console.log('usage: spo recette [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]');
+    console.log('usage: spo recette [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--accounts-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]');
     console.log('  --scenario <name>   trivial-doc-log (default, driver: inline) | parallel-doc-log (driver: dispatcher, K=2)');
     console.log('  --dry               print the plan (driver, k, steps) and exit -- no side effects, nothing spawns');
     console.log('  --keep              skip cleanup, leave the run dir + real GitHub artifacts behind for inspection');
     console.log('  --force             override the daemon-lock refusal (only when you have confirmed by hand nothing is running)');
+    console.log('  --accounts-dir <dir> the account pool this run uses -- forwarded to every spawned worker AND scanner too (driver: dispatcher only, via SPO_ACCOUNTS_DIR), not just clamped against in this process');
     console.log('  --help, -h          print this and exit -- never runs the scenario');
     return;
   }

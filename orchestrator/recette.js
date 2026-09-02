@@ -89,8 +89,18 @@ const { monotonicNowMs } = require('./monotonic-clock');
 // that reaches it is its INHERITED process.env at the moment child_process.spawn is called
 // (dispatcher.js's spawnScanner passes no `env` override, so Node clones process.env as it
 // stands right then). These are the seven fields runForever's own scan cycle
-// (state-machine.js's runScanCycle) and remote-report-pull loop (startRemoteReportPullLoop) read
-// on a timer, each with its own env var per config.js:
+// (state-machine.js's runScanCycle) and remote-report-pull loop (startRemoteReportPullLoop) read,
+// each with its own env var per config.js:
+//
+// SIX OF THEM ARE GENUINELY DISABLED BY "0" -- config.js's own should*/shouldScan* predicates
+// (shouldScanOrphans/shouldScanUnpark/shouldAutoPull/shouldAutoIntake/shouldScanConfirms/
+// shouldAutoTriage) all read `!(x > 0)` as "never due". SPO_REMOTE_REPORT_PULL_MS IS NOT: read
+// remote-report-pull.js's own startRemoteReportPullLoop -- its `tick()` runs UNCONDITIONALLY the
+// instant the scanner starts, never gated by remoteReportPullMs at all; that field only sets the
+// RESCHEDULE delay after the first, always-happens pull. Forwarded here anyway (minimising that
+// reschedule delay is still worth doing, and the scan-timers-disabled check below still proves
+// the VALUE is 0), but it is NOT what keeps a dispatcher-driver scenario safe from a real
+// pull+ack -- runRecette's own SPO_REMOTE_REPORT_URL refusal is (see that call site's comment).
 // ---------------------------------------------------------------------------------------------
 const SCANNER_TIMER_ENV_VARS = [
   'SPO_ORPHAN_SCAN_MS',
@@ -101,6 +111,12 @@ const SCANNER_TIMER_ENV_VARS = [
   'SPO_AUTO_TRIAGE_MS',
   'SPO_REMOTE_REPORT_PULL_MS',
 ];
+
+// {SPO_ORPHAN_SCAN_MS: '0', ...} -- the seven timer vars, each mapped to the literal string "0"
+// they are always forwarded as. Built once, here, so runDispatcherScenario's own combined
+// save/restore loop (timers + SPO_ACCOUNTS_DIR, see that function's own A2 comment) can spread it
+// alongside the one non-timer override without repeating the "0" literal seven times.
+const SCANNER_TIMER_ENV_VARS_ZEROED = Object.fromEntries(SCANNER_TIMER_ENV_VARS.map((k) => [k, '0']));
 
 // resolveScannerTimersUnderEnv(envOverrides) -> {orphanScanMs, unparkScanMs, autoPullMs,
 //   autoIntakeMs, reportConfirmScanMs, autoTriageMs, remoteReportPullMs} -- faithfully reproduces
@@ -560,7 +576,7 @@ const PARALLEL_DOC_LOG_CROSS_ASSERTIONS = [
   {
     id: 'scan-timers-disabled',
     description:
-      "the seven scan/report timers actually forwarded to the scanner's own OS process env are all \"0\", and config.js's own (unmodified) parsing of them resolves to 0 too",
+      "the seven scan/report env vars are all forwarded to the scanner's own OS process env as \"0\", and config.js's own (unmodified) parsing of them resolves to 0 too -- NOTE: this proves the timer VALUES, not that every loop is disabled; see this check's own comment on SPO_REMOTE_REPORT_PULL_MS",
     // POST-VERIFICATION CORRECTION -- the first cut of this check inspected `dispatcherConfig`,
     // the JS object runDispatcherScenario builds for createDispatcher. That object is read by
     // THIS process's own createDispatcher (workers/shadowMode/dryRun/stepDeadlineMs -- the fields
@@ -577,19 +593,27 @@ const PARALLEL_DOC_LOG_CROSS_ASSERTIONS = [
     // The channel that actually reaches the scanner is its INHERITED `process.env` at the moment
     // `child_process.spawn` is called (spawnScanner passes no `env` override, so Node clones
     // `process.env` as it stands right then) -- runDispatcherScenario now forwards these SEVEN
-    // env vars (six scan timers plus SPO_REMOTE_REPORT_PULL_MS -- state-machine.js's runForever
-    // starts a remote-report-pull loop on its own timer too, config.js field remoteReportPullMs)
-    // as "0" for the WHOLE span the dispatcher runs, and records that exact snapshot as
+    // env vars as "0" for the WHOLE span the dispatcher runs, and records that exact snapshot as
     // `scannerEnvOverrides` in the info this check reads. Checked in TWO layers, both against
     // real, unmodified production code -- never a copy that could silently drift from it:
     //   1. every one of the seven env vars was actually forwarded as the string "0" (not merely
     //      intended to be -- the literal snapshot recorded at spawn time).
-    //   2. config.js itself -- the exact module the scanner's own process requires, cache-busted
-    //      and re-required here under that exact snapshot (resolveScannerTimersUnderEnv, this
-    //      file) -- resolves all seven fields to the NUMBER 0. This is what actually closes the
-    //      "wrong object" gap: it is config.js's own parsing (env-var name, Number() coercion,
-    //      fallback-on-undefined) being exercised for real, not a hand-rolled duplicate of it.
-    check: ({ scannerEnvOverrides }) => {
+    //   2. config.js itself -- the exact module the scanner's own process requires -- resolves
+    //      all seven fields to the NUMBER 0, via `resolveScannerTimersUnderEnv` (this file,
+    //      cache-busted so it is config.js's own parsing being exercised, never a hand-rolled
+    //      duplicate that could drift from it). `info.resolveScannerTimers` overrides it --
+    //      TEST-ONLY, production never sets it -- so a test can prove this layer is not
+    //      decorative: hand it a fake resolver and confirm the check actually uses its return
+    //      value rather than a hardcoded answer.
+    //
+    // SPO_REMOTE_REPORT_PULL_MS IS THE ONE EXCEPTION TO "0 MEANS DISABLED" (post-verification
+    // finding) -- this check still proves that env var resolves to 0 (true and worth knowing: it
+    // minimises the RESCHEDULE delay), but 0 does NOT disable remote-report-pull.js's own
+    // startRemoteReportPullLoop, whose first `tick()` runs UNCONDITIONALLY on scanner startup,
+    // never gated by remoteReportPullMs at all -- see runRecette's own comment at the
+    // remote-report-url refusal for the full mechanism and why that refusal, not this timer, is
+    // what actually keeps a dispatcher-driver scenario safe against a real pull+ack.
+    check: ({ scannerEnvOverrides, resolveScannerTimers = resolveScannerTimersUnderEnv }) => {
       const required = SCANNER_TIMER_ENV_VARS;
       if (!scannerEnvOverrides) {
         return { ok: false, detail: 'no scannerEnvOverrides in info -- the dispatcher driver never recorded what it forwarded to the scanner' };
@@ -601,14 +625,26 @@ const PARALLEL_DOC_LOG_CROSS_ASSERTIONS = [
           detail: `not forwarded as the string "0": ${notZeroString.map((k) => `${k}=${JSON.stringify(scannerEnvOverrides[k])}`).join(', ')}`,
         };
       }
-      const resolved = resolveScannerTimersUnderEnv(scannerEnvOverrides);
+      const resolved = resolveScannerTimers(scannerEnvOverrides);
       const nonZero = Object.entries(resolved).filter(([, v]) => v !== 0);
       return {
         ok: nonZero.length === 0,
         detail:
           nonZero.length === 0
-            ? `all seven env-forwarded timers, and config.js's own resolution of them, are 0: ${JSON.stringify(resolved)}`
+            ? `all seven env-forwarded timers, and config.js's own resolution of them, are 0 (remoteReportPullMs=0 minimises reschedule delay only -- it does not gate the FIRST pull; see the remote-report-url refusal for that): ${JSON.stringify(resolved)}`
             : `config.js itself resolves a NON-ZERO value despite the "0" env override: ${JSON.stringify(resolved)}`,
+      };
+    },
+  },
+  {
+    id: 'zero-remote-report-activity',
+    description:
+      'the run journalled zero remote-report-pull events -- belt-and-braces evidence that no real HTTPS pull/ack against production bug reports happened (the actual guard is runRecette\'s own SPO_REMOTE_REPORT_URL refusal, checked BEFORE this scenario ever starts; see that refusal\'s own comment for why remoteReportPullMs=0 alone cannot be trusted for this one loop)',
+    check: ({ daemonEvents }) => {
+      const events = (daemonEvents || []).filter((e) => typeof e.event === 'string' && e.event.startsWith('remote-report-'));
+      return {
+        ok: events.length === 0,
+        detail: events.length === 0 ? 'zero remote-report-* events' : `${events.length} remote-report-* event(s): ${JSON.stringify(events)}`,
       };
     },
   },
@@ -1245,13 +1281,22 @@ function buildPlan(scenario, config) {
   const driver = scenario.driver || 'inline';
   const k = Math.max(1, Number(scenario.k) || 1);
 
+  // The exact seven env vars a dispatcher-driver run forwards to its real spawned scanner --
+  // named here individually (post-verification correction: the printed plan used to name six and
+  // say "forced to 0" with no mechanism, which is precisely the vague shape that let the "forced
+  // in the wrong object" ship-blocker go unnoticed). A maintainer reading --dry before a live run
+  // should see WHAT is forwarded and HOW, not a paraphrase.
+  const scannerEnvList = SCANNER_TIMER_ENV_VARS.join(', ');
+
   const driverSteps =
     driver === 'dispatcher'
       ? [
+          `refuse if SPO_REMOTE_REPORT_URL is set in this process's own environment (unless --force) -- see the scanner-env-forwarding step below for why`,
           `enqueue ${k} kind:"card" task(s) into ${config.queueDir}`,
-          `drive them through orchestrator/dispatcher.js's createDispatcher (K=${k} real spawned workers + 1 real spawned scanner) into ${config.journalRoot}, with every scan timer (orphan/unpark/auto-pull/auto-intake/report-confirm/auto-triage) forced to 0`,
+          `drive them through orchestrator/dispatcher.js's createDispatcher (K=${k} real spawned workers + 1 real spawned scanner)`,
+          `force ${scannerEnvList} to the string "0" on THIS process's own env for the whole run, so the scanner (a separate OS process that resolves its own config via process.env, not any object this process builds) inherits them at spawn time -- SPO_REMOTE_REPORT_PULL_MS=0 only minimises a reschedule delay, it does not gate remote-report-pull.js's own unconditional first pull, which is why the refusal above exists`,
           `enforce the cap out of process: a watchdog polls monotonicNowMs() elapsed time and every taskDir's own 'llm-call' journal events, and calls dispatcher.stop()+killAllChildren() the instant either ${config.capMs}ms wall clock or ${config.capLlmSteps} LLM steps is crossed`,
-          "evaluate the scenario's per-task assertions against each task's own journal, plus its crossTaskAssertions against daemon.jsonl and the config actually handed to createDispatcher",
+          "evaluate the scenario's per-task assertions against each task's own journal, plus its crossTaskAssertions against daemon.jsonl and the env actually forwarded to the scanner",
         ]
       : [
           'enqueue one kind:"card" task into ' + config.queueDir,
@@ -1326,6 +1371,34 @@ async function runRecette(opts = {}, deps = {}) {
 
   const driver = scenario.driver || 'inline';
   if (driver === 'dispatcher') {
+    // POST-VERIFICATION FIX: SPO_REMOTE_REPORT_PULL_MS=0 (forwarded by runDispatcherScenario,
+    // see SCANNER_TIMER_ENV_VARS' own header) does NOT disable remote-report-pull.js's own
+    // startRemoteReportPullLoop -- that function's `tick()` runs UNCONDITIONALLY on startup
+    // (state-machine.js's runForever calls it once, outside any should*-style gate), and only
+    // the RESCHEDULE delay after that first, always-happens pull reads remoteReportPullMs at all.
+    // The pull itself is a no-op ONLY because runRemoteReportPull's own early return requires
+    // config.remoteReportUrl -- i.e. SPO_REMOTE_REPORT_URL -- to be set, which today lives solely
+    // in the live daemon's systemd drop-in, never an interactive shell. That is the ONLY thing
+    // stopping a dispatcher-driven scenario's real spawned scanner from making a genuine HTTPS
+    // pull-and-ack against production bug reports into this machine's real ~/.spo-reports the
+    // moment that env var ever DOES reach a shell `spo recette` is run from -- inherited by the
+    // scanner exactly the way the seven scan timers are (spawnScanner passes no `env` override).
+    // Refusing outright, the same shape as the daemon-lock refusal just above, is the cheapest
+    // correct answer: `--force` overrides both, for a maintainer who has confirmed by hand that a
+    // real pull+ack is acceptable.
+    if (!opts.force && process.env.SPO_REMOTE_REPORT_URL) {
+      return {
+        ok: false,
+        refused: true,
+        plan,
+        scenario: scenario.name,
+        reason: 'remote-report-url-set',
+        detail: {
+          message:
+            'SPO_REMOTE_REPORT_URL is set in this process\'s own environment. A dispatcher-driver scenario spawns a real scanner process that inherits it, and remote-report-pull.js\'s own first pull runs unconditionally on scanner startup, regardless of remoteReportPullMs -- see this file\'s own comment at this call site. Unset it before running a dispatcher-driver scenario, or pass --force after confirming by hand that a real pull+ack against ~/.spo-reports is acceptable.',
+        },
+      };
+    }
     return runDispatcherScenario(scenario, config, plan, opts, deps);
   }
   return runInlineScenario(scenario, config, plan, opts, deps);
@@ -1527,8 +1600,19 @@ async function runDispatcherCapWatchdog({
   return { tripped, elapsedMs: mono() - startedAt, llmSteps };
 }
 
+// The reason strings THIS function itself can hand to dispatcher.stop() -- via the watchdog's own
+// trip/complete calls, or the outer finally's own teardown call. Anything else `dispatcher.run()`
+// resolves with means the dispatcher's OWN circuit breaker (worker-crash or scanner-crash) won
+// the race and stopped it first -- see runDispatcherScenario's own A1 fix comment.
+const RECETTE_OWN_STOP_REASONS = new Set([
+  'llm-step-cap-exceeded',
+  'wall-clock-cap-exceeded',
+  'recette-scenario-complete',
+  'recette-scenario-teardown',
+]);
+
 // computeDispatcherOk -- the dispatcher driver's own overall-`ok` decision, pulled out as a pure,
-// standalone function (post-verification correction) specifically so each of its four terms can
+// standalone function (post-verification correction) specifically so each of its terms can
 // be pinned by its own direct unit test: dropping `capTripped` or `crossTaskAssertions.ok` from
 // this expression survived the full suite under the old inline version, because the only test
 // exercising a dispatcher-driven `result.ok` used a fixture where `perTaskOk` was ALREADY false
@@ -1536,8 +1620,13 @@ async function runDispatcherCapWatchdog({
 // with its own fixtures closes that gap directly, independent of how hard an end-to-end run is to
 // steer into isolating any ONE term (capTripped and "every task reached DONE" are close to
 // mutually exclusive by construction -- a trip kills children before they finish).
-function computeDispatcherOk({ runError, capTripped, perTaskOk, crossTaskAssertions }) {
-  return !runError && !capTripped && perTaskOk && (!crossTaskAssertions || crossTaskAssertions.ok);
+//
+// `dispatcherStopReason` (A1 fix) is the SAME shape of term as capTripped -- truthy means "this
+// run did not complete on its own terms" -- but reported and gated SEPARATELY, never folded into
+// capTripped: a circuit-breaker trip is not a cap, and computing `ok` the same way while
+// REPORTING it under the wrong name would still leave a maintainer looking for the wrong cause.
+function computeDispatcherOk({ runError, capTripped, dispatcherStopReason, perTaskOk, crossTaskAssertions }) {
+  return !runError && !capTripped && !dispatcherStopReason && perTaskOk && (!crossTaskAssertions || crossTaskAssertions.ok);
 }
 
 // runDispatcherScenario -- the driver:'dispatcher' counterpart to runInlineScenario. Creates
@@ -1565,8 +1654,19 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
   try {
     for (let i = 0; i < k; i++) {
       const issue = createIssue(scenario, config, deps, i);
+      // Pushed IMMEDIATELY after createIssue succeeds -- post-verification correction. The
+      // original shape pushed only after enqueueTask ALSO succeeded, so a real GitHub issue
+      // created by createIssue (an actual `gh issue create` against the product repo) was
+      // silently stranded -- never closed by cleanup -- if enqueueTask threw for that SAME card
+      // (a queueDir write failure, say). `taskId: null` until enqueueTask fills it in just below;
+      // every downstream reader of `tasks` (the per-task state-read loop, taskResults,
+      // cleanupMultiTask) already has to tolerate "this task never produced a taskId" for the
+      // symmetric case of createIssue itself throwing on card 2 while card 1 is already
+      // enqueued -- see those call sites' own null-guards.
+      const entry = { issueNumber: issue.issueNumber, issueUrl: issue.url, taskId: null };
+      tasks.push(entry);
       const task = enqueueTask(config, issue, i, opts.taskOverrides || {});
-      tasks.push({ issueNumber: issue.issueNumber, issueUrl: issue.url, taskId: task.id });
+      entry.taskId = task.id;
     }
   } catch (err) {
     runError = err;
@@ -1598,6 +1698,10 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
   let elapsedMs = 0;
   let llmSteps = 0;
   let scannerEnvOverrides = null;
+  // A1 fix: the dispatcher's OWN circuit breaker stopReason, when it wins the race against this
+  // run's own watchdog/teardown -- see the try block below for the full mechanism. null on every
+  // ordinary path (ok, capped, or errored the ways this function already reported).
+  let dispatcherStopReason = null;
 
   if (!runError) {
     const dispatcher = createDispatcherFn(config.queueDir, config.journalRoot, dispatcherConfig);
@@ -1613,24 +1717,71 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
     // reads them, so this is harmless for them) -- nothing else in this process reads these
     // SPO_*_MS env vars for anything else, so holding them at "0" here cannot affect anything
     // other than what a freshly-spawned child resolves via its own `require('./config')`.
+    //
+    // POST-VERIFICATION FIX (cross-action sweep, A2) -- the IDENTICAL class of bug, for
+    // SPO_ACCOUNTS_DIR: bin/spo's `--accounts-dir` reaches `config.claudeAccountsDir` in THIS
+    // process (used by fillSlots/accounts.countHealthyAccounts to clamp K against the intended
+    // pool), but buildWorkerArgv/buildScannerArgv forward NO accounts-dir flag or env override of
+    // their own -- every spawned worker AND the scanner resolve their OWN config.claudeAccountsDir
+    // fresh via `require('./config')`, which reads `process.env.SPO_ACCOUNTS_DIR` (falling back
+    // to the real ~/.claude-accounts if unset). Without this, `spo recette --scenario
+    // parallel-doc-log --accounts-dir /tmp/pool` clamps K against /tmp/pool in the parent while
+    // every child leases/markLimit's the REAL pool -- and if that real pool is empty or
+    // misconfigured, `daemon.js --worker`/`--scanner` refuse to start (exit 1) in every child,
+    // which is precisely the crash-loop shape that trips the circuit breaker A1 exists to report
+    // correctly. Same mechanism, same lifecycle, same restore -- forwarded alongside the seven
+    // scan timers in ONE combined save/restore loop.
+    const dispatcherEnvOverrideValues = { ...SCANNER_TIMER_ENV_VARS_ZEROED, SPO_ACCOUNTS_DIR: config.claudeAccountsDir };
     scannerEnvOverrides = {};
     const savedScannerEnv = {};
-    for (const key of SCANNER_TIMER_ENV_VARS) {
+    for (const [key, value] of Object.entries(dispatcherEnvOverrideValues)) {
       savedScannerEnv[key] = process.env[key];
-      process.env[key] = '0';
-      scannerEnvOverrides[key] = '0';
+      process.env[key] = value;
+      scannerEnvOverrides[key] = value;
     }
 
+    // `dispatcher.run()` is called INSIDE this try (post-verification correction) -- the real
+    // createDispatcher's own `run` is an async function and can therefore never throw
+    // SYNCHRONOUSLY to its caller (any error becomes a rejected promise, per ordinary JS async-
+    // function semantics), but `deps.createDispatcher` is a TEST-ONLY injection seam a test
+    // double can hand back anything, including a plain `run: () => { throw ... }` that DOES throw
+    // synchronously. Calling it here, inside the try, is what makes "the env vars are restored
+    // and the dispatcher is torn down regardless of how this span ends" (the finally's own claim)
+    // actually true for every caller of this function, not just the real one.
     let aborted = false;
-    const runPromise = dispatcher.run();
-    // See runDispatcherCapWatchdog's own header on `isAborted`: a rejection here (a bug, never an
-    // expected outcome) must not leave the watchdog polling for up to capMs with nothing left to
-    // coordinate with.
-    runPromise.catch(() => {
-      aborted = true;
-    });
-
     try {
+      const runPromise = dispatcher.run();
+      // THE mechanism that stops the watchdog from polling for up to capMs when run() rejects
+      // (a bug, never an expected outcome) is `isAborted` below, checked once per poll tick --
+      // NOT Promise.allSettled by itself. Proven directly: reverting ONLY Promise.allSettled to
+      // Promise.all while leaving isAborted wired still passes the full suite, because the
+      // watchdog notices the abort flag on its own very next tick regardless of which Promise
+      // combinator the CALLER used to wait for it. Promise.allSettled's own, separate job is
+      // ensuring this function does not RETURN while the watchdog is still mid-poll in the
+      // background (Promise.all fails fast on the first rejection, so a bare Promise.all can let
+      // this function return before the watchdog's own belated dispatcher.stop() call lands,
+      // which is a real but much smaller gap than the capMs-scale one isAborted closes) -- see
+      // this file's own test suite for a fixture that isolates each half.
+      //
+      // POST-VERIFICATION FIX (cross-action sweep, A1): `dispatcher.run()` RESOLVES with its own
+      // `stopReason` when the CIRCUIT BREAKER trips (worker-crash or scanner-crash) -- it never
+      // rejects for that (dispatcher.js's own run(): `killAllChildren('SIGTERM'); await
+      // Promise.allSettled(pending); return stopReason`). A plain `.catch()` therefore never sees
+      // a breaker trip at all, so `aborted` stayed false, and the watchdog had no way to learn
+      // the dispatcher had already stopped ITSELF -- it just kept polling. Worse, a worker killed
+      // during that shutdown is DELIBERATELY never reparked (dispatcher.js's own handleExit
+      // comment: "NOT reparking here is strictly safer"), so state.json stays non-terminal
+      // forever and allTasksTerminal() never becomes true either -- the watchdog's only remaining
+      // exit was capMs itself (45 minutes by default), reporting the misleading
+      // 'wall-clock-cap-exceeded' for a run that actually died to its own circuit breaker in
+      // seconds. `.then()` (not just `.catch()`) now flips `aborted` on ANY resolution, breaker
+      // trip included, so the watchdog notices within one poll tick either way.
+      runPromise.then(() => {
+        aborted = true;
+      }, () => {
+        aborted = true;
+      });
+
       const [runOutcome, watchOutcome] = await Promise.allSettled([
         runPromise,
         runDispatcherCapWatchdog({
@@ -1649,6 +1800,18 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
       capTripped = watchOutcome.value.tripped;
       elapsedMs = watchOutcome.value.elapsedMs;
       llmSteps = watchOutcome.value.llmSteps;
+      // The dispatcher's OWN stopReason -- read regardless of whether it happened to match
+      // allTasksTerminal/capMs timing (Promise.allSettled waits for BOTH promises, so this is
+      // captured correctly whichever one "wins" the underlying race; see the two branches this
+      // fix's own header names). Anything OTHER than a reason THIS function itself could have
+      // produced (RECETTE_OWN_STOP_REASONS, below) means the dispatcher's own circuit breaker
+      // won the race and stopped it before this run's own watchdog/teardown ever called stop() --
+      // surfaced as its OWN distinct verdict, never folded into capTripped (a breaker trip is not
+      // a cap, and reporting it as one would send a maintainer looking at the wrong number).
+      const dispatcherStop = runOutcome.value;
+      if (dispatcherStop && !RECETTE_OWN_STOP_REASONS.has(dispatcherStop.reason)) {
+        dispatcherStopReason = dispatcherStop;
+      }
     } catch (err) {
       runError = err;
     } finally {
@@ -1659,7 +1822,7 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
       // are safe.
       dispatcher.stop({ reason: 'recette-scenario-teardown' });
       dispatcher.killAllChildren('SIGTERM');
-      for (const key of SCANNER_TIMER_ENV_VARS) {
+      for (const key of Object.keys(dispatcherEnvOverrideValues)) {
         if (savedScannerEnv[key] === undefined) delete process.env[key];
         else process.env[key] = savedScannerEnv[key];
       }
@@ -1667,10 +1830,14 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
   }
 
   for (const t of tasks) {
-    const state = readStateSafe(config.journalRoot, t.taskId);
+    // t.taskId is null for a stranded task (createIssue succeeded, enqueueTask then threw for
+    // that SAME card -- see this function's own per-task loop above) -- explicit guard rather
+    // than relying on readStateSafe/readJournalEvents' own try/catch to swallow the TypeError
+    // path.join(..., null, ...) would throw; both already tolerate it, but not by design.
+    const state = t.taskId ? readStateSafe(config.journalRoot, t.taskId) : null;
     t.finalState = state ? state.state : null;
     t.prNumber = (state && state.prNumber) || null;
-    t.events = readJournalEvents(config.journalRoot, t.taskId);
+    t.events = t.taskId ? readJournalEvents(config.journalRoot, t.taskId) : [];
   }
 
   const daemonEvents = readDaemonEvents(config.journalRoot);
@@ -1703,7 +1870,7 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
     });
   }
 
-  const ok = computeDispatcherOk({ runError, capTripped, perTaskOk, crossTaskAssertions });
+  const ok = computeDispatcherOk({ runError, capTripped, dispatcherStopReason, perTaskOk, crossTaskAssertions });
 
   let cleanupReport = null;
   if (!opts.keep) {
@@ -1726,6 +1893,11 @@ async function runDispatcherScenario(scenario, config, plan, opts, deps) {
     tasks: taskResults,
     crossTaskAssertions,
     capTripped,
+    // A1 fix: the dispatcher's OWN circuit breaker stopReason (worker-crash-circuit-breaker /
+    // scanner-crash-circuit-breaker), when it wins the race against this run's own watchdog --
+    // null on every ordinary path. Distinct from capTripped on purpose -- see computeDispatcherOk's
+    // own comment for why folding the two together would misreport the cause.
+    dispatcherStopReason,
     elapsedMs,
     llmSteps,
     cleanupReport,

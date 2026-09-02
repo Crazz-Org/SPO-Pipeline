@@ -326,6 +326,115 @@ test('a lock file whose pid is dead is not a refusal (liveDaemonHolder returns n
 });
 
 // ---------------------------------------------------------------------------------------------
+// SPO_REMOTE_REPORT_URL refusal (Finding 1, post-verification) -- a dispatcher-driver scenario
+// spawns a real scanner process that inherits this process's own env, and
+// remote-report-pull.js's own first pull runs UNCONDITIONALLY on scanner startup, never gated by
+// remoteReportPullMs. This refusal is the ONLY thing standing between a live dispatcher run and a
+// real HTTPS pull-and-ack against production bug reports the day this env var reaches an
+// interactive shell. Dispatcher-driver only -- the inline driver never spawns a scanner at all.
+// ---------------------------------------------------------------------------------------------
+
+test('recette refuses a dispatcher-driver scenario while SPO_REMOTE_REPORT_URL is set in this process\'s own environment', async () => {
+  const saved = process.env.SPO_REMOTE_REPORT_URL;
+  process.env.SPO_REMOTE_REPORT_URL = 'https://reports.example.com';
+  try {
+    let spawnCalled = false;
+    const result = await recette.runRecette(
+      { ...baseOpts(), scenario: 'parallel-doc-log' },
+      { spawnSync: () => { spawnCalled = true; return ok(''); } }
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.refused, true);
+    assert.equal(result.reason, 'remote-report-url-set');
+    assert.equal(spawnCalled, false, 'the refusal must happen before any spawn -- no issue created, no dispatcher started');
+  } finally {
+    if (saved === undefined) delete process.env.SPO_REMOTE_REPORT_URL;
+    else process.env.SPO_REMOTE_REPORT_URL = saved;
+  }
+});
+
+test('recette --force overrides the SPO_REMOTE_REPORT_URL refusal for a dispatcher-driver scenario', { timeout: 20000 }, async () => {
+  const saved = process.env.SPO_REMOTE_REPORT_URL;
+  process.env.SPO_REMOTE_REPORT_URL = 'https://reports.example.com';
+  try {
+    let nextIssue = 9990;
+    const spawnSync = (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${nextIssue++}\n`);
+      if (command === 'git') return fail(1, "fatal: 'x' is not a working tree");
+      if (command === 'gh') return fail(1, 'Could not resolve to a PullRequest');
+      throw new Error(`unhandled fake call: ${command} ${JSON.stringify(args)}`);
+    };
+    const result = await recette.runRecette(
+      {
+        ...baseOpts({ force: true }),
+        scenario: 'parallel-doc-log',
+        configOverrides: {
+          shadowMode: true,
+          real: false,
+          pollIntervalMs: 30,
+          claudeAccountsDir: poolDir(2),
+          pipelineWorktreesDir: mkTmp('spo-recette-remoteurl-force-wt-'),
+          productRepo: mkTmp('spo-recette-remoteurl-force-product-'),
+        },
+      },
+      { spawnSync }
+    );
+    assert.notEqual(result.refused, true, '--force must let the run actually attempt to start');
+  } finally {
+    if (saved === undefined) delete process.env.SPO_REMOTE_REPORT_URL;
+    else process.env.SPO_REMOTE_REPORT_URL = saved;
+  }
+});
+
+test('recette does NOT refuse trivial-doc-log (inline driver) even with SPO_REMOTE_REPORT_URL set -- the inline driver never spawns a scanner at all', async () => {
+  const saved = process.env.SPO_REMOTE_REPORT_URL;
+  process.env.SPO_REMOTE_REPORT_URL = 'https://reports.example.com';
+  try {
+    const opts = baseOpts();
+    const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync() });
+    assert.notEqual(result.refused, true);
+    assert.equal(result.finalState, 'DONE');
+  } finally {
+    if (saved === undefined) delete process.env.SPO_REMOTE_REPORT_URL;
+    else process.env.SPO_REMOTE_REPORT_URL = saved;
+  }
+});
+
+test('recette does not refuse a dispatcher-driver scenario when SPO_REMOTE_REPORT_URL is unset', async () => {
+  const saved = process.env.SPO_REMOTE_REPORT_URL;
+  delete process.env.SPO_REMOTE_REPORT_URL;
+  try {
+    const result = await recette.runRecette({ ...baseOpts(), dry: true, scenario: 'parallel-doc-log' }, {});
+    assert.notEqual(result.refused, true);
+    assert.equal(result.dry, true);
+  } finally {
+    if (saved === undefined) delete process.env.SPO_REMOTE_REPORT_URL;
+    else process.env.SPO_REMOTE_REPORT_URL = saved;
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// 'zero-remote-report-activity' -- belt-and-braces evidence alongside the refusal above.
+// ---------------------------------------------------------------------------------------------
+
+test('parallel-doc-log "zero-remote-report-activity": fails on any remote-report-* event, passes on none', () => {
+  const scenario = recette.SCENARIOS['parallel-doc-log'];
+  const withActivity = recette.evaluateCrossTaskAssertions(scenario, {
+    tasks: twoTerminalTasks(),
+    daemonEvents: [{ event: 'remote-report-pulled', file: 'report-1.json' }],
+    scannerEnvOverrides: zeroedScannerEnvOverrides(),
+  });
+  assert.equal(checkFrom(withActivity, 'zero-remote-report-activity').ok, false);
+
+  const clean = recette.evaluateCrossTaskAssertions(scenario, {
+    tasks: twoTerminalTasks(),
+    daemonEvents: [{ event: 'worker-spawn', id: 'recette-t1' }],
+    scannerEnvOverrides: zeroedScannerEnvOverrides(),
+  });
+  assert.equal(checkFrom(clean, 'zero-remote-report-activity').ok, true);
+});
+
+// ---------------------------------------------------------------------------------------------
 // Happy path: one trivial card, end to end, real mode, fake spawnSync -- DONE, every assertion
 // passes, cleanup runs and reports clean.
 // ---------------------------------------------------------------------------------------------
@@ -789,6 +898,22 @@ test('buildPlan reports driver and k for both scenarios', () => {
   assert.ok(dispPlan.steps.some((s) => s.includes('K=2')), JSON.stringify(dispPlan.steps));
 });
 
+// Finding 6, post-verification correction: --dry used to name only six timers and say "forced to
+// 0" with no mechanism -- exactly the vague shape that let the ship-blocker (forced in the WRONG
+// object, never reaching the scanner) go unnoticed. A maintainer reading --dry before a live run
+// must see all SEVEN vars by name and the actual mechanism (inherited process.env on the
+// scanner's own spawn), plus the new SPO_REMOTE_REPORT_URL refusal step.
+test('buildPlan (dispatcher driver): --dry names all seven scan-timer env vars by name, the inherited-env mechanism, and the remote-report-url refusal', () => {
+  const dispPlan = recette.buildPlan(recette.SCENARIOS['parallel-doc-log'], recette.resolveConfig(baseOpts()));
+  const stepsText = dispPlan.steps.join('\n');
+
+  for (const envVar of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
+    assert.ok(stepsText.includes(envVar), `--dry must name ${envVar} explicitly, not a paraphrase like "orphan/unpark/..."; steps were:\n${stepsText}`);
+  }
+  assert.match(stepsText, /inherit/i, '--dry must say the mechanism is inherited env, not a bare "forced to 0"');
+  assert.match(stepsText, /SPO_REMOTE_REPORT_URL/, '--dry must mention the remote-report-url refusal');
+});
+
 // ---------------------------------------------------------------------------------------------
 // resolveConfig(opts, scenario) -- a scenario's own capMs/capLlmSteps (post-verification
 // correction: DEFAULT_CAP_LLM_STEPS is sized for ONE card; a k=2 scenario summing llm-call
@@ -1074,16 +1199,65 @@ function zeroedDispatcherConfig() {
   return { orphanScanMs: 0, unparkScanMs: 0, autoPullMs: 0, autoIntakeMs: 0, reportConfirmScanMs: 0, autoTriageMs: 0 };
 }
 
+// HARDCODED, NOT derived from recette.SCANNER_TIMER_ENV_VARS -- deliberately (post-verification
+// correction). Deriving the expectation from the very same production array a mutation might
+// shrink makes the mutation invisible to every test built on top of this helper: removing
+// 'SPO_AUTO_TRIAGE_MS' from SCANNER_TIMER_ENV_VARS survived the WHOLE suite the first time,
+// because config.js's own `autoTriageMs` default is already 0 -- a test with nothing set in the
+// environment could never notice its absence, and a test whose own expectation list was built
+// FROM the shrunk array wouldn't even try to check it. Only a baseline that is (a) independent of
+// the production array and (b) NONZERO for every field can catch this -- see the dedicated
+// pin/nonzero-baseline tests below for both halves.
+const ALL_SEVEN_SCANNER_TIMER_ENV_VARS = [
+  'SPO_ORPHAN_SCAN_MS',
+  'SPO_UNPARK_SCAN_MS',
+  'SPO_AUTO_PULL_MS',
+  'SPO_AUTO_INTAKE_MS',
+  'SPO_REPORT_CONFIRM_SCAN_MS',
+  'SPO_AUTO_TRIAGE_MS',
+  'SPO_REMOTE_REPORT_PULL_MS',
+];
+
+// A REALISTIC, PLAUSIBLE nonzero baseline for all seven -- the shape a maintainer's own live
+// systemd drop-in carries. Used throughout this section specifically because config.js's OWN
+// defaults for some of these fields are already 0 (autoTriageMs) or otherwise low-signal against
+// an empty environment -- only a baseline that is nonzero for EVERY field can prove a var was
+// actively forced to 0, rather than merely happening to already read that way.
+const NONZERO_SCANNER_TIMER_BASELINE = {
+  SPO_ORPHAN_SCAN_MS: '60000',
+  SPO_UNPARK_SCAN_MS: '60000',
+  SPO_AUTO_PULL_MS: '300000',
+  SPO_AUTO_INTAKE_MS: '900000',
+  SPO_REPORT_CONFIRM_SCAN_MS: '300000',
+  SPO_AUTO_TRIAGE_MS: '900000',
+  SPO_REMOTE_REPORT_PULL_MS: '300000',
+};
+
+const RESOLVED_FIELD_BY_ENV_VAR = {
+  SPO_ORPHAN_SCAN_MS: 'orphanScanMs',
+  SPO_UNPARK_SCAN_MS: 'unparkScanMs',
+  SPO_AUTO_PULL_MS: 'autoPullMs',
+  SPO_AUTO_INTAKE_MS: 'autoIntakeMs',
+  SPO_REPORT_CONFIRM_SCAN_MS: 'reportConfirmScanMs',
+  SPO_AUTO_TRIAGE_MS: 'autoTriageMs',
+  SPO_REMOTE_REPORT_PULL_MS: 'remoteReportPullMs',
+};
+
 // The REAL mechanism 'scan-timers-disabled' checks (post-verification correction -- see
 // orchestrator/recette.js's own "Scanner timer forwarding" section header for why
 // `dispatcherConfig` above is NOT it: the scanner is a separate OS process that never reads that
 // object). All seven keys as the literal string "0" -- exactly the shape
-// runDispatcherScenario actually records into `scannerEnvOverrides`.
+// runDispatcherScenario actually records into `scannerEnvOverrides`. Built from the HARDCODED
+// list above, not recette.SCANNER_TIMER_ENV_VARS -- see that list's own comment.
 function zeroedScannerEnvOverrides() {
   const out = {};
-  for (const key of recette.SCANNER_TIMER_ENV_VARS) out[key] = '0';
+  for (const key of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) out[key] = '0';
   return out;
 }
+
+test('recette.SCANNER_TIMER_ENV_VARS is exactly these seven vars -- pinned against a list independent of the production array itself', () => {
+  assert.deepEqual(recette.SCANNER_TIMER_ENV_VARS.slice().sort(), ALL_SEVEN_SCANNER_TIMER_ENV_VARS.slice().sort());
+});
 
 function twoTerminalTasks() {
   return [
@@ -1154,9 +1328,9 @@ test('parallel-doc-log "scan-timers-disabled": fails if ANY of the seven env var
 //      plausible non-zero baseline (what a maintainer's own live systemd drop-in might set), it
 //      reports THAT value back, proving it genuinely re-reads config.js's resolution each call
 //      rather than returning a canned {..all zero} object.
-test('resolveScannerTimersUnderEnv: reflects config.js\'s own real resolution -- all-zero under "0" overrides, and NOT hardcoded to always report zero', () => {
+test('resolveScannerTimersUnderEnv: all-zero under "0" overrides, and NOT hardcoded to always report zero (faithfully reflects a real non-zero override)', () => {
   const zeroed = recette.resolveScannerTimersUnderEnv(zeroedScannerEnvOverrides());
-  for (const field of ['orphanScanMs', 'unparkScanMs', 'autoPullMs', 'autoIntakeMs', 'reportConfirmScanMs', 'autoTriageMs', 'remoteReportPullMs']) {
+  for (const field of Object.values(RESOLVED_FIELD_BY_ENV_VAR)) {
     assert.equal(zeroed[field], 0, `${field} must resolve to the NUMBER 0 under a "0" env override, got ${JSON.stringify(zeroed[field])}`);
   }
 
@@ -1177,6 +1351,53 @@ test('resolveScannerTimersUnderEnv: reflects config.js\'s own real resolution --
   assert.equal(process.env.SPO_ORPHAN_SCAN_MS, undefined);
 });
 
+// THE demonstrated attack (post-verification finding): removing 'SPO_AUTO_TRIAGE_MS' from
+// SCANNER_TIMER_ENV_VARS survived the whole suite, because config.js's own `autoTriageMs`
+// DEFAULT is already 0 -- against an empty/unset environment, "forwarded" and "never forwarded"
+// resolve identically, so no test built on an unset baseline could ever notice the omission. This
+// test proves each of the seven fields INDEPENDENTLY, one at a time, against a NONZERO baseline
+// for THAT field specifically while the other six stay correctly zeroed -- exactly the shape that
+// would catch a single field silently dropped from the forwarding list, regardless of which one.
+test('resolveScannerTimersUnderEnv: EACH of the seven fields is independently proven to reach 0 against ITS OWN nonzero baseline, one at a time', () => {
+  const allZero = zeroedScannerEnvOverrides();
+  for (const envVar of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
+    const field = RESOLVED_FIELD_BY_ENV_VAR[envVar];
+    // Sanity: this field's own baseline is genuinely non-zero, or the test proves nothing.
+    assert.notEqual(Number(NONZERO_SCANNER_TIMER_BASELINE[envVar]), 0, `fixture bug: ${envVar}'s own baseline must be nonzero`);
+
+    const forced = recette.resolveScannerTimersUnderEnv(allZero);
+    assert.equal(forced[field], 0, `${envVar} -> ${field} must resolve to 0 when correctly forwarded as "0"`);
+
+    // Left at its own REAL, nonzero baseline (the other six still correctly "0") -- proves
+    // config.js really reads THIS specific env var for THIS specific field, so a test that only
+    // ever supplies "0" for it could not be fooled by, say, a copy-paste of the wrong var name.
+    const leaked = recette.resolveScannerTimersUnderEnv({ ...allZero, [envVar]: NONZERO_SCANNER_TIMER_BASELINE[envVar] });
+    assert.equal(
+      leaked[field],
+      Number(NONZERO_SCANNER_TIMER_BASELINE[envVar]),
+      `${envVar} left at its own nonzero baseline must leak through as ${field}=${NONZERO_SCANNER_TIMER_BASELINE[envVar]}, proving config.js reads this exact var for this exact field`
+    );
+  }
+});
+
+// Finding 4(b): require.cache restoration. resolveScannerTimersUnderEnv cache-busts config.js's
+// own require.cache entry to force a fresh read, then restores it -- pinned directly here since a
+// mutation that skips the restore (leaving the cache entry deleted, or left holding the
+// overridden-env build) previously had no test to catch it.
+test('resolveScannerTimersUnderEnv: restores require.cache\'s config.js entry to exactly what it was before the call', () => {
+  const configPath = require.resolve('../orchestrator/config');
+  const before = require.cache[configPath];
+  assert.ok(before, 'config.js must already be cached before this test runs (recette.js requires it at load time)');
+
+  recette.resolveScannerTimersUnderEnv(zeroedScannerEnvOverrides());
+
+  const after = require.cache[configPath];
+  assert.equal(after, before, 'require.cache[configPath] must be the SAME object reference after the call, not a fresh one and not deleted');
+  // And the object require('./config') resolves to elsewhere in this process is still exactly
+  // the one every other already-loaded module holds its own reference to.
+  assert.equal(require('../orchestrator/config'), before.exports);
+});
+
 // Wires the two layers together: even with a scannerEnvOverrides object that HAS all seven keys
 // set to the string "0" (passing layer 1), the check must still be reading config.js's own
 // resolution (layer 2), not merely echoing layer 1's own string comparison back -- proven by
@@ -1188,6 +1409,45 @@ test('parallel-doc-log "scan-timers-disabled": the passing detail names config.j
   assert.equal(check.ok, true);
   assert.match(check.detail, /orphanScanMs/);
   assert.match(check.detail, /remoteReportPullMs/);
+});
+
+// Finding 4(c): layer 2 was, until this test, decorative -- since layer 1 already requires every
+// env var to be the literal string "0" before layer 2 ever runs, and config.js's own correct
+// parsing of "0" is always 0, NOTHING reachable through the public check could distinguish "layer
+// 2 really called resolveScannerTimersUnderEnv" from "layer 2 is a canned {..:0} literal" -- both
+// produce an identical passing detail. `info.resolveScannerTimers` (TEST-ONLY, defaults to the
+// real resolveScannerTimersUnderEnv; production/runDispatcherScenario never sets it) closes that
+// gap: a test can now inject a resolver that LIES about one field despite a correctly-"0"
+// scannerEnvOverrides, and confirm the check actually uses ITS return value rather than a
+// hardcoded answer.
+test('parallel-doc-log "scan-timers-disabled": layer 2 is NOT decorative -- an injected resolver that lies about one field is caught, proving the check uses ITS return value, not a canned literal', () => {
+  const scenario = recette.SCENARIOS['parallel-doc-log'];
+  let resolverCalledWith = null;
+  const lyingResolver = (overrides) => {
+    resolverCalledWith = overrides;
+    return { orphanScanMs: 0, unparkScanMs: 0, autoPullMs: 60000, autoIntakeMs: 0, reportConfirmScanMs: 0, autoTriageMs: 0, remoteReportPullMs: 0 };
+  };
+
+  const result = recette.evaluateCrossTaskAssertions(scenario, {
+    tasks: twoTerminalTasks(),
+    daemonEvents: [],
+    scannerEnvOverrides: zeroedScannerEnvOverrides(),
+    resolveScannerTimers: lyingResolver,
+  });
+
+  const check = checkFrom(result, 'scan-timers-disabled');
+  assert.equal(check.ok, false, 'a resolver reporting a non-zero autoPullMs must fail the check even though layer 1 (all "0" strings) passed');
+  assert.match(check.detail, /autoPullMs/);
+  assert.deepEqual(resolverCalledWith, zeroedScannerEnvOverrides(), 'the injected resolver must have been called WITH the actual scannerEnvOverrides, proving real wiring, not a bypassed stub');
+
+  // And the ordinary (non-injected) path still uses the REAL resolveScannerTimersUnderEnv --
+  // production never sets info.resolveScannerTimers, so this default path is what actually runs.
+  const realResult = recette.evaluateCrossTaskAssertions(scenario, {
+    tasks: twoTerminalTasks(),
+    daemonEvents: [],
+    scannerEnvOverrides: zeroedScannerEnvOverrides(),
+  });
+  assert.equal(checkFrom(realResult, 'scan-timers-disabled').ok, true);
 });
 
 test('parallel-doc-log "zero-cross-task-writes": fails if one task\'s own journal mentions the sibling\'s taskId anywhere', () => {
@@ -1356,6 +1616,65 @@ test('parallel-doc-log "real-overlap": a task\'s own worker-exit record before i
   assert.equal(check.ok, false);
   assert.match(check.detail, /corrupt event order/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Finding 3: a stranded GitHub issue. The original shape pushed a task into `tasks` only AFTER
+// BOTH createIssue AND enqueueTask succeeded for that card -- so if enqueueTask threw for card 2
+// (its own createIssue having already made a REAL `gh issue create` call), cleanup never learned
+// that issue existed, and nothing ever closed it. Fixed by pushing the tasks-array entry
+// immediately after createIssue succeeds (taskId: null until enqueueTask fills it in).
+// ---------------------------------------------------------------------------------------------
+
+test(
+  "runDispatcherScenario: a real GitHub issue created for card 2 is NOT stranded when card 2's OWN enqueueTask throws -- cleanup still closes it",
+  { timeout: 20000 },
+  async () => {
+    const issuesCreated = [];
+    const issuesClosed = [];
+    let nextIssue = 9980;
+    const spawnSync = (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') {
+        const n = nextIssue++;
+        issuesCreated.push(n);
+        return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${n}
+`);
+      }
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'close') {
+        issuesClosed.push(Number(args[2]));
+        return ok('');
+      }
+      if (command === 'git') return fail(1, "fatal: 'x' is not a working tree");
+      if (command === 'gh') return fail(1, 'Could not resolve to a PullRequest');
+      throw new Error(`unhandled fake call: ${command} ${JSON.stringify(args)}`);
+    };
+
+    const scenario = recette.SCENARIOS['parallel-doc-log'];
+    const config = recette.resolveConfig(
+      { recetteDir: mkTmp('spo-recette-stranded-run-'), productJournalRoot: mkTmp('spo-recette-stranded-pj-'), accountsDir: poolDir(2) },
+      scenario
+    );
+    const plan = recette.buildPlan(scenario, config);
+
+    // Force enqueueTask to throw for card index 1 (the SECOND card, queue filename
+    // '0002-recette.json') ONLY -- pre-create a DIRECTORY at that exact path, so
+    // fs.writeFileSync throws EISDIR for that one write while card 0's own write
+    // ('0001-recette.json') succeeds normally. Card 1's own createIssue (the `gh issue create`
+    // call) still runs BEFORE enqueueTask and still succeeds -- that is the exact shape of the
+    // bug: a real issue created, then the very next line throws.
+    fs.mkdirSync(config.queueDir, { recursive: true });
+    fs.mkdirSync(path.join(config.queueDir, '0002-recette.json'));
+
+    const result = await recette.runDispatcherScenario(scenario, config, plan, {}, { spawnSync });
+
+    assert.equal(issuesCreated.length, 2, "both createIssue calls must have happened -- card 2's own createIssue succeeds; only its enqueueTask fails");
+    assert.ok(result.error, 'runError must be set (enqueueTask threw)');
+    assert.equal(result.ok, false);
+
+    // THE fix: every issue that was actually CREATED must be closed by cleanup -- none stranded,
+    // regardless of whether its own enqueueTask ever succeeded.
+    assert.deepEqual(issuesClosed.slice().sort(), issuesCreated.slice().sort(), 'every created issue must be closed -- none left stranded');
+  }
+);
 
 // ---------------------------------------------------------------------------------------------
 // cleanupMultiTask -- per-task GitHub artifact steps, ONE shared run-dir step (not one per task)
@@ -1921,7 +2240,7 @@ test(
     const envDumpScript = [
       'const fs = require("fs");',
       `fs.writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({`,
-      ...recette.SCANNER_TIMER_ENV_VARS.map((k) => `  ${JSON.stringify(k)}: process.env[${JSON.stringify(k)}],`),
+      ...ALL_SEVEN_SCANNER_TIMER_ENV_VARS.map((k) => `  ${JSON.stringify(k)}: process.env[${JSON.stringify(k)}],`),
       '}));',
       'const p = process.ppid;',
       'setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);',
@@ -1931,16 +2250,9 @@ test(
     // A REALISTIC, PLAUSIBLE nonzero baseline -- what a maintainer's own live daemon's systemd
     // drop-in might already have set in the shell `spo recette` gets run from -- set on THIS
     // process's own env BEFORE calling runDispatcherScenario, so a passing assertion below proves
-    // an active override, not a coincidental absence.
-    const probeEnv = {
-      SPO_ORPHAN_SCAN_MS: '60000',
-      SPO_UNPARK_SCAN_MS: '60000',
-      SPO_AUTO_PULL_MS: '300000',
-      SPO_AUTO_INTAKE_MS: '900000',
-      SPO_REPORT_CONFIRM_SCAN_MS: '300000',
-      SPO_AUTO_TRIAGE_MS: '900000',
-      SPO_REMOTE_REPORT_PULL_MS: '300000',
-    };
+    // an active override, not a coincidental absence. The SAME hardcoded baseline (not derived
+    // from recette.SCANNER_TIMER_ENV_VARS) the rest of this section's own per-var tests use.
+    const probeEnv = NONZERO_SCANNER_TIMER_BASELINE;
     const savedProbeEnv = {};
     for (const [k, v] of Object.entries(probeEnv)) {
       savedProbeEnv[k] = process.env[k];
@@ -1990,13 +2302,16 @@ test(
 
       await waitFor(() => fs.existsSync(outFile), 8000);
       const dumped = JSON.parse(fs.readFileSync(outFile, 'utf8'));
-      for (const key of recette.SCANNER_TIMER_ENV_VARS) {
+      // Hardcoded list, not recette.SCANNER_TIMER_ENV_VARS -- see that constant's own header for
+      // why: a mutation that shrinks the production array must not also shrink what this test
+      // checks.
+      for (const key of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
         assert.equal(dumped[key], '0', `${key} must have been forwarded as "0" to the REAL spawned scanner process (was ${JSON.stringify(dumped[key])}, this test's own probe baseline was ${JSON.stringify(probeEnv[key])})`);
       }
 
       // And this process's OWN env is genuinely restored afterward -- the forwarding must not
       // leak past the span it is supposed to cover.
-      for (const key of recette.SCANNER_TIMER_ENV_VARS) {
+      for (const key of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
         assert.equal(process.env[key], probeEnv[key], `${key} must be restored to this test's own probe baseline after runDispatcherScenario returns`);
       }
     } finally {
@@ -2007,6 +2322,394 @@ test(
     }
   }
 );
+
+// ---------------------------------------------------------------------------------------------
+// A2 (cross-action sweep, MEDIUM, the identical class of bug as the seven scan timers): K is
+// clamped in THIS process against config.claudeAccountsDir (bin/spo's own --accounts-dir), but
+// buildWorkerArgv/buildScannerArgv forward no accounts-dir of their own -- every spawned child
+// resolves its OWN config.claudeAccountsDir fresh from SPO_ACCOUNTS_DIR, which could be a
+// DIFFERENT, real pool. Proven the same way as the seven timers: a real spawned child process,
+// against a mismatched real-pool baseline, dumping what it actually inherited.
+// ---------------------------------------------------------------------------------------------
+
+test(
+  'runDispatcherScenario really forwards SPO_ACCOUNTS_DIR to a REAL spawned scanner process too -- A2, the identical class of bug as the seven scan timers',
+  { timeout: 20000 },
+  async () => {
+    const outDir = mkTmp('spo-recette-accountsproof-out-');
+    const outFile = path.join(outDir, 'accounts-dir-dump.txt');
+    const spawnScannerDump = (cmd, args, opts) =>
+      realSpawn(
+        process.execPath,
+        [
+          '-e',
+          `require("fs").writeFileSync(${JSON.stringify(outFile)}, process.env.SPO_ACCOUNTS_DIR || ""); const p = process.ppid; setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);`,
+        ],
+        { ...opts, stdio: 'ignore' }
+      );
+
+    // The INTENDED pool (what --accounts-dir/config.claudeAccountsDir actually says) is
+    // DELIBERATELY DIFFERENT from whatever SPO_ACCOUNTS_DIR already happens to be in this
+    // process's own env -- so a passing assertion below proves an ACTIVE override, the same
+    // "realistic mismatched baseline" shape the seven-timer ship-blocker proof uses.
+    const intendedPool = poolDir(2);
+    const mismatchedRealPool = poolDir(1);
+    const savedAccountsDir = process.env.SPO_ACCOUNTS_DIR;
+    process.env.SPO_ACCOUNTS_DIR = mismatchedRealPool;
+
+    try {
+      let nextIssue = 9993;
+      const spawnSync = (command, args) => {
+        if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${nextIssue++}\n`);
+        if (command === 'git') return fail(1, "fatal: 'x' is not a working tree");
+        if (command === 'gh') return fail(1, 'Could not resolve to a PullRequest');
+        throw new Error(`unhandled fake call: ${command} ${JSON.stringify(args)}`);
+      };
+
+      const customScenario = {
+        name: 'accounts-proof',
+        label: 'spo-recette',
+        driver: 'dispatcher',
+        k: 1,
+        capMs: 3000,
+        capLlmSteps: 1,
+        buildCard: () => ({ title: '[test] accounts-proof', body: '## Done means\n\nnothing.\n' }),
+        assertions: [],
+      };
+      const config = recette.resolveConfig(
+        {
+          recetteDir: mkTmp('spo-recette-accountsproof-run-'),
+          productJournalRoot: mkTmp('spo-recette-accountsproof-pj-'),
+          accountsDir: intendedPool,
+          configOverrides: {
+            shadowMode: true,
+            real: false,
+            pollIntervalMs: 30,
+            pipelineWorktreesDir: mkTmp('spo-recette-accountsproof-wt-'),
+            productRepo: mkTmp('spo-recette-accountsproof-product-'),
+          },
+        },
+        customScenario
+      );
+      const plan = recette.buildPlan(customScenario, config);
+
+      await recette.runDispatcherScenario(customScenario, config, plan, { keep: true }, { spawnSync, spawn: spawnIsolated, spawnScanner: spawnScannerDump });
+
+      await waitFor(() => fs.existsSync(outFile), 8000);
+      const dumped = fs.readFileSync(outFile, 'utf8');
+      assert.equal(
+        dumped,
+        intendedPool,
+        `the spawned scanner must inherit the INTENDED accounts dir (${intendedPool}), not whatever SPO_ACCOUNTS_DIR already was (${mismatchedRealPool}) -- got ${JSON.stringify(dumped)}`
+      );
+
+      assert.equal(process.env.SPO_ACCOUNTS_DIR, mismatchedRealPool, "this process's own env must be restored to its own prior value afterward");
+    } finally {
+      if (savedAccountsDir === undefined) delete process.env.SPO_ACCOUNTS_DIR;
+      else process.env.SPO_ACCOUNTS_DIR = savedAccountsDir;
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------------------------
+// Finding 4(a): a scan-timer env var that was UNSET before a dispatcher-driver run must be
+// DELETED afterward, not left set to "0" -- otherwise a recette run permanently pollutes the
+// process's own env for anything that runs after it in the same process (e.g. a later `spo
+// status`/`spo pull` call in the same interactive shell, or a later test in this same suite
+// process). Uses a FAKE dispatcher (immediate resolve, no real spawn) purely to reach
+// runDispatcherScenario's own finally block quickly; a small capMs bounds the watchdog's own
+// wait for "the one task never became terminal" (a fake dispatcher.run() never spawns a real
+// worker, so nothing ever writes state.json).
+// ---------------------------------------------------------------------------------------------
+
+test(
+  'runDispatcherScenario: a scan-timer env var that was UNSET before the run is DELETED afterward, not left as "0"',
+  { timeout: 10000 },
+  async () => {
+    const saved = {};
+    for (const key of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    try {
+      for (const key of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
+        assert.equal(process.env[key], undefined, `fixture bug: ${key} must be genuinely unset before this test runs`);
+      }
+
+      const fakeDispatcher = {
+        run: () => Promise.resolve({ reason: 'stop-requested' }),
+        stop: () => {},
+        killAllChildren: () => {},
+      };
+      const createDispatcherFn = () => fakeDispatcher;
+
+      let nextIssue = 9960;
+      const spawnSync = (command, args) => {
+        if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${nextIssue++}\n`);
+        return fail(1, 'unexpected');
+      };
+
+      const customScenario = {
+        name: 'env-unset-proof',
+        label: 'spo-recette',
+        driver: 'dispatcher',
+        k: 1,
+        capMs: 500,
+        capLlmSteps: 999,
+        buildCard: () => ({ title: '[test] env-unset-proof', body: '## Done means\n\nnothing.\n' }),
+        assertions: [],
+      };
+      const config = recette.resolveConfig(
+        { recetteDir: mkTmp('spo-recette-envunset-run-'), productJournalRoot: mkTmp('spo-recette-envunset-pj-'), accountsDir: poolDir(1) },
+        customScenario
+      );
+      const plan = recette.buildPlan(customScenario, config);
+
+      await recette.runDispatcherScenario(customScenario, config, plan, { keep: true }, { spawnSync, createDispatcher: createDispatcherFn });
+
+      for (const key of ALL_SEVEN_SCANNER_TIMER_ENV_VARS) {
+        assert.equal(process.env[key], undefined, `${key} was unset before the run and must be DELETED afterward, not left as "0" (was ${JSON.stringify(process.env[key])})`);
+      }
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------------------------
+// Finding 5: disambiguating Promise.allSettled from isAborted -- the two DIFFERENT mechanisms
+// runDispatcherScenario's own comment now attributes separately. `isAborted` is what stops the
+// watchdog from polling for up to capMs when dispatcher.run() rejects; Promise.allSettled's own,
+// narrower job is ensuring runDispatcherScenario does not RETURN while the watchdog is still
+// mid-poll in the background. Two separate mutations, two separate tests.
+// ---------------------------------------------------------------------------------------------
+
+// Mutating AWAY isAborted (a fake dispatcher whose run() rejects, and a watchdog with no way to
+// learn that) must reproduce the capMs-scale hang -- this is the ACTUAL danger Promise.allSettled
+// alone does not prevent (see recette.js's own corrected comment). Simulated here by calling the
+// watchdog directly with `isAborted` omitted (its own default, `() => false`) against a
+// FAKE dispatcher whose run() has already rejected -- same shape runDispatcherScenario's own
+// internals produce when isAborted is wired correctly, minus the wiring.
+test('runDispatcherCapWatchdog: WITHOUT isAborted wired (default), a rejected run() is invisible to the watchdog -- it only stops via capMs, never early', { timeout: 10000 }, async () => {
+  const journalRoot = mkTmp('spo-recette-noabort-');
+  const taskId = 'recette-noabort-a';
+  fs.mkdirSync(path.join(journalRoot, taskId), { recursive: true });
+  fs.writeFileSync(path.join(journalRoot, taskId, 'state.json'), JSON.stringify({ state: 'IMPLEMENT' })); // never terminal
+
+  const dispatcher = fakeDispatcher();
+  const startedAt = Date.now();
+  // No `isAborted` passed -- defaults to `() => false`, exactly what a caller that forgot to wire
+  // it (or reverted to plain Promise.all without it) would produce. capMs is small here (300ms,
+  // not the 1-hour scale a real regression would use) purely so THIS test stays fast while still
+  // proving the watchdog has NO early-exit signal available: it must run the full capMs, never
+  // shorter, because nothing tells it run() already ended.
+  const result = await recette.runDispatcherCapWatchdog({ dispatcher, journalRoot, taskIds: [taskId], capMs: 300, capLlmSteps: 999, mono: () => Date.now(), pollMs: 20 });
+  const elapsedWall = Date.now() - startedAt;
+
+  assert.equal(result.tripped.reason, 'wall-clock-cap-exceeded', 'with no isAborted signal, the ONLY way this watchdog stops is the wall-clock cap itself');
+  assert.ok(elapsedWall >= 300, `must have run the FULL capMs (300ms) with no early exit -- took only ${elapsedWall}ms`);
+});
+
+// The narrower thing Promise.allSettled itself (given isAborted IS wired) actually buys: by the
+// time runDispatcherScenario RETURNS, the watchdog has genuinely finished -- no straggler
+// dispatcher.stop()/killAllChildren() call arrives afterward. Reuses the existing
+// "if dispatcher.run() rejects" fixture (defined further below in this file) is not possible here
+// (ordering), so this test builds its own minimal equivalent.
+test(
+  'runDispatcherScenario: once it returns, no further dispatcher.stop()/killAllChildren() calls arrive later -- the watchdog was not left running in the background',
+  { timeout: 10000 },
+  async () => {
+    const stopCalls = [];
+    const killCalls = [];
+    const fakeDisp = {
+      run: () => Promise.reject(new Error('boom -- simulated dispatcher.run() failure')),
+      stop: (r) => stopCalls.push(r),
+      killAllChildren: (sig) => killCalls.push(sig),
+    };
+    const createDispatcherFn = () => fakeDisp;
+
+    let nextIssue = 9970;
+    const spawnSync = (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${nextIssue++}\n`);
+      return fail(1, 'unexpected');
+    };
+
+    const customScenario = {
+      name: 'no-straggler-proof',
+      label: 'spo-recette',
+      driver: 'dispatcher',
+      k: 1,
+      capMs: 60 * 60 * 1000,
+      capLlmSteps: 999,
+      buildCard: () => ({ title: '[test] no-straggler-proof', body: '## Done means\n\nnothing.\n' }),
+      assertions: [],
+    };
+    const config = recette.resolveConfig(
+      { recetteDir: mkTmp('spo-recette-nostraggler-run-'), productJournalRoot: mkTmp('spo-recette-nostraggler-pj-'), accountsDir: poolDir(1) },
+      customScenario
+    );
+    const plan = recette.buildPlan(customScenario, config);
+
+    await recette.runDispatcherScenario(customScenario, config, plan, { keep: true }, { spawnSync, createDispatcher: createDispatcherFn, dispatcherPollMs: 30 });
+    const stopCallsAtReturn = stopCalls.length;
+    const killCallsAtReturn = killCalls.length;
+
+    // Longer than several poll ticks (dispatcherPollMs: 30 above) -- if the watchdog were still
+    // running in the background (the Promise.all-without-allSettled shape), its own eventual
+    // dispatcher.stop()/killAllChildren() call would land somewhere in this window.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.equal(stopCalls.length, stopCallsAtReturn, 'no further dispatcher.stop() calls after runDispatcherScenario already returned');
+    assert.equal(killCalls.length, killCallsAtReturn, 'no further dispatcher.killAllChildren() calls after runDispatcherScenario already returned');
+  }
+);
+
+// ---------------------------------------------------------------------------------------------
+// A1 (cross-action sweep, HIGH, blocks the live gate run): a scanner/worker circuit-breaker trip
+// inside a recette dispatcher run. dispatcher.js's own run() RESOLVES with its own stopReason
+// when the breaker trips -- it never rejects for that -- so a plain `.catch()` never saw it, and
+// a worker killed during that shutdown is deliberately never reparked (dispatcher.js's own
+// handleExit: "NOT reparking here is strictly safer"), so state.json stays non-terminal and
+// allTasksTerminal() never becomes true either. Before this fix, the ONLY way such a run ended
+// was capMs itself (45 minutes by default), reporting a misleading 'wall-clock-cap-exceeded' for
+// a run that actually died to its own circuit breaker in seconds. Both branches the review named
+// are pinned below: the breaker trip racing AHEAD of any task reaching a terminal state (this
+// file's own repro of "the actual reported bug"), and the breaker trip racing ALONGSIDE a task
+// that independently goes PARKED around the same instant (the second branch, where the breaker
+// was previously dropped silently instead).
+// ---------------------------------------------------------------------------------------------
+
+test(
+  'runDispatcherScenario: a circuit-breaker trip (run() RESOLVES with its own stopReason, no task ever goes terminal) is surfaced as dispatcherStopReason within seconds, never as a 45-minute cap trip',
+  { timeout: 10000 },
+  async () => {
+    const breakerStopReason = { reason: 'worker-crash-circuit-breaker', consecutiveCrashes: 3, crashLimit: 3, lastId: 'recette-x' };
+    const fakeDisp = {
+      // Resolves (never rejects) after a short delay -- exactly dispatcher.js's own run()
+      // contract on a breaker trip: `killAllChildren('SIGTERM'); await allSettled(pending);
+      // return stopReason`.
+      run: () => new Promise((resolve) => setTimeout(() => resolve(breakerStopReason), 50)),
+      stop: () => {},
+      killAllChildren: () => {},
+    };
+    const createDispatcherFn = () => fakeDisp;
+
+    let nextIssue = 9991;
+    const spawnSync = (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${nextIssue++}\n`);
+      return fail(1, 'unexpected');
+    };
+
+    const customScenario = {
+      name: 'breaker-proof',
+      label: 'spo-recette',
+      driver: 'dispatcher',
+      k: 1,
+      capMs: 60 * 60 * 1000, // 1 HOUR -- if this fix regressed, this test would hang/time out instead of resolving in ~50-150ms
+      capLlmSteps: 999,
+      buildCard: () => ({ title: '[test] breaker-proof', body: '## Done means\n\nnothing.\n' }),
+      assertions: [],
+    };
+    const config = recette.resolveConfig(
+      { recetteDir: mkTmp('spo-recette-breaker-run-'), productJournalRoot: mkTmp('spo-recette-breaker-pj-'), accountsDir: poolDir(1) },
+      customScenario
+    );
+    const plan = recette.buildPlan(customScenario, config);
+
+    const startedAt = Date.now();
+    const result = await recette.runDispatcherScenario(
+      customScenario,
+      config,
+      plan,
+      { keep: true },
+      { spawnSync, createDispatcher: createDispatcherFn, dispatcherPollMs: 20 }
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(elapsedMs < 5000, `must resolve within seconds, never wait out the 1-hour capMs -- took ${elapsedMs}ms`);
+    assert.ok(result.dispatcherStopReason, 'the breaker trip must be surfaced as its own field');
+    assert.equal(result.dispatcherStopReason.reason, 'worker-crash-circuit-breaker');
+    assert.deepEqual(result.dispatcherStopReason, breakerStopReason, 'the exact stopReason dispatcher.run() resolved with, not a re-derived summary');
+    assert.equal(result.capTripped, null, 'must NOT be reported as a cap trip -- a breaker trip is a different cause, and CLAUDE.md\'s own "verdict by exit code" standard means the WRONG field must not read truthy either');
+    assert.equal(result.ok, false);
+  }
+);
+
+test(
+  'runDispatcherScenario: a circuit-breaker trip is still surfaced even when a task independently reaches a terminal state around the same instant (the second, previously-silent-drop branch)',
+  { timeout: 10000 },
+  async () => {
+    let nextIssue = 9992;
+    const spawnSync = (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/Crazz-Org/SPO-WebClient/issues/${nextIssue++}\n`);
+      return fail(1, 'unexpected');
+    };
+
+    const customScenario = {
+      name: 'breaker-race-proof',
+      label: 'spo-recette',
+      driver: 'dispatcher',
+      k: 1,
+      capMs: 60 * 60 * 1000,
+      capLlmSteps: 999,
+      buildCard: () => ({ title: '[test] breaker-race-proof', body: '## Done means\n\nnothing.\n' }),
+      assertions: [{ id: 'reached-done', description: 'd', check: ({ finalState }) => ({ ok: finalState === 'DONE', detail: finalState }) }],
+    };
+    const config = recette.resolveConfig(
+      { recetteDir: mkTmp('spo-recette-breakerrace-run-'), productJournalRoot: mkTmp('spo-recette-breakerrace-pj-'), accountsDir: poolDir(1) },
+      customScenario
+    );
+    const plan = recette.buildPlan(customScenario, config);
+
+    // createIssue's first (and only) call returns issue #9992 -> taskId 'recette-9992', by this
+    // fixture's own construction (nextIssue starts at 9992 above).
+    const taskId = 'recette-9992';
+    const breakerStopReason = { reason: 'worker-crash-circuit-breaker', consecutiveCrashes: 3, crashLimit: 3, lastId: taskId };
+
+    const fakeDisp = {
+      run: () =>
+        new Promise((resolve) => {
+          // The task's own state.json goes PARKED (a reparked crash) essentially AT THE SAME
+          // TIME run() resolves with the breaker's own stopReason -- in the real dispatcher,
+          // reparkCrashedWorker and the stopReason assignment both happen inside the SAME
+          // synchronous handleExit call, so they are for-practical-purposes simultaneous. This is
+          // the race the review's own second branch names: "if the workers happen to crash and
+          // repark before the breaker sets stopReason, the tasks go PARKED, the watchdog exits
+          // recette-scenario-complete, and the breaker is dropped silently instead."
+          fs.mkdirSync(path.join(config.journalRoot, taskId), { recursive: true });
+          fs.writeFileSync(path.join(config.journalRoot, taskId, 'state.json'), JSON.stringify({ state: 'PARKED', reason: 'worker-crashed' }));
+          setTimeout(() => resolve(breakerStopReason), 30);
+        }),
+      stop: () => {},
+      killAllChildren: () => {},
+    };
+    const createDispatcherFn = () => fakeDisp;
+
+    const result = await recette.runDispatcherScenario(
+      customScenario,
+      config,
+      plan,
+      { keep: true },
+      { spawnSync, createDispatcher: createDispatcherFn, dispatcherPollMs: 10 }
+    );
+
+    assert.equal(result.tasks[0].finalState, 'PARKED');
+    assert.ok(result.dispatcherStopReason, 'the breaker trip must still be surfaced even though a task independently went terminal around the same instant');
+    assert.equal(result.dispatcherStopReason.reason, 'worker-crash-circuit-breaker');
+    assert.equal(result.ok, false);
+  }
+);
+
+test('computeDispatcherOk: dispatcherStopReason alone -> false, and is a SEPARATE term from capTripped', () => {
+  assert.equal(recette.computeDispatcherOk({ ...passingDispatcherOkInputs(), dispatcherStopReason: { reason: 'worker-crash-circuit-breaker' } }), false);
+  // Sanity: the passing baseline itself has no dispatcherStopReason key at all (undefined is
+  // falsy, same as null) -- computeDispatcherOk must not require callers to pass it explicitly.
+  assert.equal(recette.computeDispatcherOk(passingDispatcherOkInputs()), true);
+});
 
 // ---------------------------------------------------------------------------------------------
 // runRecette('parallel-doc-log') end to end -- shadow-mode workers via opts.configOverrides
