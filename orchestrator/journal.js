@@ -202,6 +202,30 @@ function writeLiveWorkerIds(journalRoot, ids) {
   }
 }
 
+// readLiveWorkersRaw(journalRoot) -> {present, ids, updatedAt} -- action 6.7. Same tolerant read
+// as readLiveWorkerIds below, but WITHOUT collapsing "no dispatcher has ever published this
+// file" into the same shape as "a dispatcher published it and it is empty right now". The one
+// caller this file had before 6.7 (state-machine.js's runScanCycle -> orphanScan) never needed
+// that distinction -- an empty Set means "treat nothing as live" either way, for orphanScan's
+// purposes. `spo status`'s worker section (bin/spo's cmdStatus, orchestrator/worker-status.js)
+// does need it: reporting a missing file as "0 workers running" is indistinguishable from "no
+// dispatcher has ever run here", and the action's own spec calls that out by name as a rendering
+// bug to avoid, not a hypothetical one. Rather than change readLiveWorkerIds's return shape out
+// from under its one real caller, this is a second, raw read that readLiveWorkerIds now
+// delegates to -- one parse path, two views of the same file.
+function readLiveWorkersRaw(journalRoot) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(liveWorkersPath(journalRoot), 'utf8'));
+    return {
+      present: true,
+      ids: new Set(Array.isArray(raw && raw.ids) ? raw.ids : []),
+      updatedAt: raw && typeof raw.updatedAt === 'string' ? raw.updatedAt : null,
+    };
+  } catch {
+    return { present: false, ids: new Set(), updatedAt: null };
+  }
+}
+
 // Tolerant read -> Set<string>: a missing file (no dispatcher has ever run against this journal
 // root, or this is a --once/--worker/--scanner-only invocation with no dispatcher at all) or an
 // unparsable one (read mid-rename is impossible thanks to the atomic write above, but a read of a
@@ -209,12 +233,7 @@ function writeLiveWorkerIds(journalRoot, ids) {
 // -- the same "absence is not an error" posture this module already applies to appendDaemonEvent
 // and to orphan-scan.js's own owner-shape tolerance.
 function readLiveWorkerIds(journalRoot) {
-  try {
-    const raw = JSON.parse(fs.readFileSync(liveWorkersPath(journalRoot), 'utf8'));
-    return new Set(Array.isArray(raw && raw.ids) ? raw.ids : []);
-  } catch {
-    return new Set();
-  }
+  return readLiveWorkersRaw(journalRoot).ids;
 }
 
 function writeReport(taskDir, { id, reason, lastState, ts, detail }) {
@@ -243,4 +262,5 @@ module.exports = {
   liveWorkersPath,
   writeLiveWorkerIds,
   readLiveWorkerIds,
+  readLiveWorkersRaw,
 };

@@ -1711,3 +1711,45 @@ test('a worker child spawned by a --workers K dispatcher resolves K, and therefo
   assert.equal(waitBoundMs({ workers: k }), WORST_HOLD_MS, 'at K=2 a worker must be willing to wait out ONE other worst-case holder');
   assert.notEqual(waitBoundMs({ workers: k }), 0, 'a zero wait bound is the defect: the card parks instead of waiting');
 });
+
+// ---- action 6.7 verification: the dispatcher stamps its own startup into daemon.jsonl ---------
+//
+// `idleNoHealthyAccounts` (fillSlots) is IN-MEMORY, and the dispatcher-idle/-returned pair it
+// drives is EDGE-triggered. A restart destroys that memory, so if the pool goes idle, the daemon
+// restarts (this project's post-merge hook SIGTERMs it on every merge), and the pool then
+// recovers, the `returned` edge is never written -- leaving a bare idle edge as daemon.jsonl's
+// newest dispatcher event forever. bin/spo's computeDispatcherIdleStatus answers "is the
+// dispatcher idle right now" by walking back to the newest edge, so without a startup boundary it
+// reported a permanent false alarm (measured: "IDLE since 191h06m ago" on a busy fixture).
+test('the dispatcher writes a dispatcher-start event at startup -- the boundary `spo status` stops its idle walk at', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-start-q-');
+  const journalDir = mkTmp('spo-disp-start-j-');
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(0), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    const daemonLog = path.join(journalDir, 'daemon.jsonl');
+    await waitFor(() => fs.existsSync(daemonLog) && fs.readFileSync(daemonLog, 'utf8').includes('dispatcher-start'));
+    const events = fs
+      .readFileSync(daemonLog, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    const start = events.find((e) => e.event === 'dispatcher-start');
+    assert.ok(start, 'a dispatcher must stamp its own start');
+    assert.equal(start.pid, process.pid, 'the dispatcher runs in-process here -- the pid is this one');
+    assert.equal(typeof start.workers, 'number', 'K is recorded, so the line says what this process was configured for');
+
+    // It must come BEFORE the scanner spawn, for the same reason publishLiveWorkerIds does: the
+    // boundary has to already be on disk before anything the dispatcher starts can journal.
+    const startIdx = events.findIndex((e) => e.event === 'dispatcher-start');
+    const scannerIdx = events.findIndex((e) => e.event === 'scanner-spawn');
+    if (scannerIdx !== -1) assert.ok(startIdx < scannerIdx, 'dispatcher-start must precede scanner-spawn');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});

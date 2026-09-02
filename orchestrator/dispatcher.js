@@ -671,6 +671,22 @@ function createDispatcher(queueDir, journalRoot, config) {
     // timer starting at null -- already sees a truthful file rather than racing this write.
     publishLiveWorkerIds();
 
+    // Action 6.7 verification fix. `idleNoHealthyAccounts` below is IN-MEMORY state, and the
+    // dispatcher-idle/-returned pair it drives is EDGE-triggered: exactly one line when the pool
+    // first has no healthy account, exactly one when it recovers. A restart destroys that memory
+    // -- so if the pool goes idle, the daemon is then restarted (which this project does on every
+    // single merge: the post-merge hook SIGTERMs it), and the pool recovers, the `returned` edge
+    // is NEVER written, because the new process's flag started false. daemon.jsonl is then left
+    // with a bare `dispatcher-idle-no-healthy-accounts` as its newest dispatcher edge, forever,
+    // and any reader that answers "is the dispatcher idle right now" by walking back to the most
+    // recent edge (bin/spo's computeDispatcherIdleStatus) reports a permanent false alarm --
+    // measured at "IDLE since 191h06m ago" against a fixture whose daemon was demonstrably busy.
+    // This event is the boundary that reader stops at: an idle edge older than the newest
+    // dispatcher start says nothing about the CURRENT process. It is self-healing rather than
+    // merely suppressive -- if the pool really is still idle, this same process's very next
+    // fillSlots pass re-emits the idle edge from its own freshly-false flag.
+    appendDaemonEvent(journalRoot, 'dispatcher-start', { pid: process.pid, workers: resolveWorkerCount(config) });
+
     spawnScanner(); // exactly one, up front -- see handleScannerExit for the respawn-on-crash loop.
 
     for (;;) {
