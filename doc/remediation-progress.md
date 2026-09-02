@@ -30,7 +30,7 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured; 7.1/7.2/7.3/7.5 built and verified; gate running |
 | **C7 bis** — what Gate C7 certifies | **in progress** — added 2026-09-02 after three Opus passes on the original clause returned 7, ~11 then ~52 divergences, 80% of the last in territory no pass had reached |
 | **C8** — the bench: audit, remediation, migration | **not started** — added 2026-09-02. 8.1 (the audit) is the only committed row; it produces its own derived plan, and how many chantiers this really needs is 8.1's answer, not this table's |
-| **C9** — the documentation corpus | **not started** — deferred behind C8, which is scheduled to rewrite most of the surface C9 would audit |
+| **C9** — the documentation corpus | **not started** — **re-planned 2026-09-02 to run in parallel with C8, from C8b on.** Its deferral rested on C8 rewriting `orchestrator/`; row 8.5 is superseded, so that premise is gone. One documentary dependency survives: C9 must not audit `doc/state-machine-spec.md` or `doc/environments.md` until the C8 actions that rewrite them (8.2, 8.4, 8.6) have landed |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
@@ -1845,9 +1845,16 @@ opposite, and the pre-push hook dropped its own check on that promise.
 
 **The audit contradicts plan row 8.5: do NOT move the bench into `orchestrator/`** — it reports 0
 of 8 defect classes living at the repo boundary. **Consequence: chantier 9's deferral collapses**,
-since it rested entirely on C8 rewriting `orchestrator/`. C9 should be re-planned as parallel from
-C8b on. **Neither change is in the plan yet — make it after Opus verifies the audit**, which is
-8.1's job and has not been done.
+since it rested entirely on C8 rewriting `orchestrator/`.
+
+**Both changes are now in the plan** (maintainer decision, 2026-09-02): row 8.5 is marked
+**superseded** with the original hypothesis kept as written, the migration demoted from a
+commitment to a question 8.1 answers on evidence, and chantier 9 **re-planned as parallel from
+C8b on** with one surviving documentary dependency — it must not audit `doc/state-machine-spec.md`
+or `doc/environments.md` until 8.2, 8.4 and 8.6 have landed. **The amendment states its own
+provenance**: it rests on a Fable audit that is *not yet Opus-verified*, so **8.1 re-derives it
+and may overturn it** — and if it does, it must say so explicitly rather than silently
+re-adopting 8.5.
 
 **Two acts the pipeline cannot perform**, both the maintainer's: restoring `bench/gate` to the
 ruleset, and rebuilding/restarting the bench worker. **Do them together, in that order, and not

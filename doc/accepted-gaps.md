@@ -9,9 +9,10 @@ historical log (and therefore correctly out of scope rather than un-audited), an
 an accepted, named gap handed to chantier 9. Every line of every candidate file lands in
 exactly one bucket below. This register is itself a dated record, true as of 2026-09-02,
 against the tree at commit `bb3594225b5ac087c0952c469f38a5f2d0a0951a`, with two later
-corrections applied by the driver: `doc/remediation-progress.md` 1,823 → 1,865 (the C7 handoff
-rewritten at the end of the chantier), and `test/prompt-contract-sweep.test.js`, which is outside
-this corpus. Nothing else in the corpus changes after that pin except this file, which excludes
+corrections applied by the driver: `doc/remediation-progress.md` 1,823 → 1,872 and
+`doc/remediation-plan-2026-08.md` 402 → 443 (the C7 handoff rewritten at the end of the chantier,
+and the plan amended to supersede row 8.5, re-plan chantier 9 as parallel, and widen execution
+rule 6's scope list), plus `test/prompt-contract-sweep.test.js`, which is outside this corpus. Nothing else in the corpus changes after that pin except this file, which excludes
 itself — so the counts below are true at the branch's merge state, not only at the pin. Re-run the commands
 in §1 to refresh it; do not hand-edit the numbers.
 
@@ -24,11 +25,13 @@ see §4.
 
 ## 1 · The surface, named explicitly
 
-**In scope** — action 7bis.6's own sibling-grep list (`doc/`, `prompts/`, `orchestrator/`,
-`bin/spo`, `console/`, `README.md`) is the plan's own operational definition of "the documents
-and comments this chantier holds itself accountable for," but it is **not exhaustive** of the
-repo's own documentation-and-comment surface — `scripts/` and `accounts/` carry real comments
-and were missing from it (see below). Corrected list:
+**In scope** — action 7bis.6's sibling-grep list (execution rule 6 in
+`doc/remediation-plan-2026-08.md`) is the plan's own operational definition of "the documents and
+comments this chantier holds itself accountable for." As written on 2026-09-02 that list was
+`doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/`, `README.md` — **not exhaustive** of
+the repo's documentation-and-comment surface, because `scripts/` and `accounts/` carry real
+comments and were absent from it. **Execution rule 6 has since been amended to add both**, so
+this register and that rule now name the same surface. Full list:
 
 - `doc/*.md` (all files directly under `doc/`)
 - `prompts/*.md` (all files directly under `prompts/`)
@@ -41,13 +44,13 @@ and were missing from it (see below). Corrected list:
   and `scripts/git-hooks/post-merge` are shell)
 - `accounts/spo-test-accounts.yml` (comment lines only — it is a config file, not a doc)
 
-**Corrected into scope by this edit.** `scripts/` and `accounts/` were absent from both lists
-below in the prior version of this register — an undeclared, unnamed surface, not a considered
-exclusion. Root cause: this corpus definition was inherited from action 7bis.6's own sibling-grep
-scope list (`doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/`, `README.md` — see
-execution rule 6 in `doc/remediation-plan-2026-08.md`), which itself omits `scripts/` and
-`accounts/`. That inheritance is the root cause, and it means execution rule 6 carries the same
-blind spot — the sibling-grep in §7 below does not actually cover these two directories either.
+**Corrected into scope.** `scripts/` and `accounts/` were absent from both lists below in the
+prior version of this register — an undeclared, unnamed surface, not a considered exclusion. Root
+cause: this corpus definition was inherited from action 7bis.6's sibling-grep scope list, which
+itself omitted them, **so execution rule 6 carried the same blind spot and every sibling grep run
+under it was blind to these two directories.** The register was the symptom; the rule was the
+cause. **Both are now fixed**: execution rule 6 was amended on 2026-09-02 to add `scripts/` and
+`accounts/`, and records there why. The §7 grep below was re-run over the widened scope.
 
 **This file itself** is classified-historical, by the same rule as §3b and by its own opening
 paragraph. Its line count is deliberately **not** added to the §3 totals: this register does not
@@ -264,14 +267,14 @@ Read line by line against `step-contracts.js`, `prompt-template.js`, `task-value
 state-machine branch reading each verdict, per 7bis.4. `prompts/README.md` is **not** in this
 bucket — it is a derived table, not a step's own instructions; see 3c/3d.
 
-### 3b · Classified-historical (running logs) — 3 files, 2,506 lines
+### 3b · Classified-historical (running logs) — 3 files, 2,554 lines
 
 | File | Lines |
 |---|---|
-| `doc/remediation-progress.md` | 1,865 |
+| `doc/remediation-progress.md` | 1,872 |
 | `doc/improvisation-analysis.md` | 239 |
-| `doc/remediation-plan-2026-08.md` | 402 |
-| **Subtotal** | **2,506** |
+| `doc/remediation-plan-2026-08.md` | 443 |
+| **Subtotal** | **2,554** |
 
 (Re-measured against `bb35942`; all three grew since the register's prior `c9b8d458` pin —
 `remediation-progress.md` +2, `improvisation-analysis.md` +2, `remediation-plan-2026-08.md` +18
@@ -400,8 +403,8 @@ included, per §2's grep method) — `scripts/daemon-install.sh` 53/105, `script
 
 | Figure | Plan's estimate | This register's measurement | Delta |
 |---|---|---|---|
-| Total corpus | ~16,800 | **18,020** (Bucket 3a + 3b + 3d = 1,146 + 2,506 + 14,368) | +1,220 (+7.3%) |
-| Retired (classified-historical) | ~2,290 | **2,506** (Bucket 3b) | +216 (+9.4%) |
+| Total corpus | ~16,800 | **18,068** (Bucket 3a + 3b + 3d = 1,146 + 2,554 + 14,368) | +1,268 (+7.5%) |
+| Retired (classified-historical) | ~2,290 | **2,554** (Bucket 3b) | +264 (+11.5%) |
 
 **These measurements win; the plan's ~16,800 and ~2,290 are superseded by the numbers above** —
 and so is this register's own prior measurement of 17,750/2,442. The new total corpus, 17,978,

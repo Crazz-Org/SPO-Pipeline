@@ -62,7 +62,8 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    the driver re-resolving anchors.
 6. **The sibling grep** (action 7bis.6). Any action that corrects a factual claim greps
    **both** the corrected phrasing and the pre-correction phrasing across `doc/`, `prompts/`,
-   `orchestrator/`, `bin/spo`, `console/` and `README.md` before committing, and reports what
+   `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/` and `README.md` before
+   committing, and reports what
    it found; its Opus verifier checks that it did, and treats "I corrected it in the file the
    action names" as an incomplete answer. This is enforced by rule 2 — a human-and-verifier
    habit — **not by CI**, and it is stated plainly here so nobody mistakes it for a guarantee.
@@ -76,6 +77,15 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    for a claim that was wrong from the start and was never revisited. That class belongs to
    the sweeps (7bis.1-7bis.3) and to the accepted-gap register (`doc/accepted-gaps.md`),
    which names what no mechanism covers.
+
+   **Amended 2026-09-02: `scripts/` and `accounts/` were added to the scope list above.** They
+   were missing from the day the rule was written, so every sibling grep run under it had been
+   blind to 6 tracked files and 177 comment lines. It surfaced only because 7bis.5 inherited this
+   list as its corpus definition and a verifier re-derived the register's counts -- the register
+   was the symptom, this list was the cause. Recorded rather than quietly fixed, because the
+   lesson generalises: **a scope list is itself a claim about coverage, and nothing was checking
+   it.** Anything added to the repo's top level belongs here or in `doc/accepted-gaps.md` §1's
+   out-of-scope list, with a stated reason; neither list may omit it silently.
 
 ---
 
@@ -283,7 +293,7 @@ reads `ParkSignal(` literals, so a reason built by concatenation is invisible to
 | 7bis.3 | **Documented-constant sweep**, with the citation ratchet folded in. Constants a doc states as a number and code owns: `spawnStep`'s per-class timeouts (2.1), the cooldown tiers (3.5), `autoPullLimit` and the `in-flight + queued ≤ K` watermark (6.6), `mainMovedRegateBudget` (6.5), any surviving `maxBudgetUsd` (3.7). Each gets a single exported or comment-anchored constant and a doc assertion against it. The `file:line` existence check rides along as ~10 lines and **no more**: all 68 citations in the prose resolve today, and such a check would have caught **0 of pass 3's ~52 findings** — it is a ratchet against future deletion, not leverage. This document is excluded by name; it declares its own line numbers historical. | `test/doc-constant-sweep.test.js` (new), `orchestrator/config.js`, `doc/state-machine-spec.md`, `orchestrator/README.md` |
 | 7bis.4 | **The prompts, exhaustively — 100 %, once.** All 8 files read line by line against `step-contracts.js`, `prompt-template.js`, `task-values.js`, and the state-machine branch reading each verdict. This is the **only** place in this plan where reading is the right instrument, for one reason: the surface is small enough that one pass really is exhaustive, so the failure mode that killed the original clause does not arise. Every finding **fixed, not filed** — the accepted-gap register does not apply here, because a false promise in a prompt is a behaviour bug: C7 already found three (`implement.md`'s escalation that never fires from the plan's file set, `validate-change.md`'s dedup gate that does not exist, `review-card.md` naming three callers that do not call it). | `prompts/*.md` |
 | 7bis.5 | **The accepted-gap register**, and the classification that retires ~2,290 lines without reading them. Name what is certified, what is not, and the line count of each. Then `doc/remediation-progress.md`, `doc/improvisation-analysis.md` and this document each gain a one-line status header declaring what this document already declares of itself — **a dated record, true as of its entry's date, never re-verified against present code.** That is not a dodge; it is the accurate description of a running log, and it converts those lines from "un-audited claims" to "correctly-scoped historical claims" by classification rather than by reading. The remainder — overwhelmingly `orchestrator/` comments — is named and handed to chantier 9. | `doc/state-machine-spec.md`, `doc/remediation-progress.md`, `doc/improvisation-analysis.md`, `doc/remediation-plan-2026-08.md` |
-| 7bis.6 | **The sibling grep becomes an execution rule, not a test.** Pass 3's one mechanical leverage point was that 4 of its findings — plus a three-way `intake.js:711` — were a claim corrected in one file and left standing in a sibling. A general duplicate-phrase detector was probed and rejected: it fires on deliberate in-prompt repetition and on progress entries quoting commit subjects, so it would be allowlisted into uselessness. The honest weaker thing: **any action correcting a factual claim greps both the corrected and the pre-correction phrasing across `doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/` and `README.md` before committing, and its Opus verifier checks that it did.** Enforced by execution rule 2, not by CI — stated plainly so nobody mistakes it for a guarantee. Applied once already: it caught four unlisted copies, including `intake.js:711`'s third home in `steps/llm.js`. | this document (execution rules) |
+| 7bis.6 | **The sibling grep becomes an execution rule, not a test.** Pass 3's one mechanical leverage point was that 4 of its findings — plus a three-way `intake.js:711` — were a claim corrected in one file and left standing in a sibling. A general duplicate-phrase detector was probed and rejected: it fires on deliberate in-prompt repetition and on progress entries quoting commit subjects, so it would be allowlisted into uselessness. The honest weaker thing: **any action correcting a factual claim greps both the corrected and the pre-correction phrasing across `doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/` and `README.md` before committing, and its Opus verifier checks that it did.** Enforced by execution rule 2, not by CI — stated plainly so nobody mistakes it for a guarantee. Applied once already: it caught four unlisted copies, including `intake.js:711`'s third home in `steps/llm.js`. **The scope list in this row is the one as written on 2026-09-02 and is now incomplete — execution rule 6 above is authoritative, and was amended the same day to add `scripts/` and `accounts/`.** | this document (execution rules) |
 
 **Gate C7 bis**: the restated Gate C7 above.
 
@@ -293,7 +303,18 @@ reads `ParkSignal(` literals, so a reason built by concatenation is invisible to
 
 ## Chantier 9 — The documentation corpus
 
-*Deferred. Runs **after** C8's derived plan lands — not inside 8.1, and not in parallel.*
+*~~Deferred. Runs **after** C8's derived plan lands -- not inside 8.1, and not in parallel.~~*
+
+**Re-planned 2026-09-02: chantier 9 runs in PARALLEL with C8, from C8b on.** The conditional this
+section already carries -- *"if 8.1's derived plan does not move the bench into `orchestrator/`,
+this sequencing loses its force and chantier 9 should be re-planned as parallel"* -- has fired
+(see the amendment to row 8.5). It still does **not** run inside 8.1: that row is scoped to one
+corpus and loading a second dilutes it, and 8.1 starts only once C7 is closed. **The one
+dependency that survives is documentary, not structural**: 8.2, 8.4 and 8.6 amend
+`doc/state-machine-spec.md` and `doc/environments.md`, so chantier 9 must not audit those two
+files until the C8 actions that rewrite them have landed. Everything else in its corpus --
+overwhelmingly `orchestrator/` comments, measured at 8,577 lines across 39 files in
+`doc/accepted-gaps.md` §3d -- is unaffected and can start as soon as 8.1's derived plan exists.
 
 **Not inside 8.1**, because 8.1 is the only row in C8 with the standing of a commitment and is scoped to one corpus (`~/.spo-bench/`); loading a second dilutes it. 8.1 also starts only once C7 is closed, so anything placed inside it becomes a reason C7 cannot close — the exact failure 7bis exists to remove.
 
@@ -367,9 +388,29 @@ land, and be observed working on a real card, before 8.5 moves any file.
 | 8.2 | **The attestation stops lying** (blocking, and the reason this chantier exists). `verdicts/<sha>.json` gains what the gate actually did: whether the live stage ran, which flows were routed, which were skipped and why, and the capability evidence read from the server. The pipeline's GATE then **refuses to treat a static-only gate as an L2 attestation** — a card whose diff routes to a live flow and whose verdict says the flow never ran is not green. Same rule the judges got in C1: *evidence over silence, and a skipped stage is never a pass.* | `scripts/verify-gate.js`, `src/e2e/bench/verdict.ts`, `orchestrator/steps/scripted.js` (`realGate`) |
 | 8.3 | **Kill the stale-build class structurally.** A worker running a binary older than the source it was built from silently downgraded every gate for 3.5 days and nothing anywhere noticed. The worker attests its **own** provenance — the sha and build time of the binary it is executing — into every verdict, and refuses to start (or attests `ENVIRONMENT`, never `PASS`) when that is older than the checkout it is gating. A restart discipline documented in a runbook is *not* the fix; the plan already knows what an unenforced rule is worth. | `src/e2e/bench/worker.ts`, `verdict.ts`, `orchestrator/steps/scripted.js` |
 | 8.4 | **Draw and freeze the boundary** before moving code: a versioned contract between bench infrastructure (submit a ref, get an attested verdict) and product knowledge (flows, routing, capability, the RDO wire). The contract is what lets the two halves live in different repos and version independently — and it is what 8.2's honest verdict schema already half-defines. Write it down, with the schema, before any file moves. | `doc/environments.md`, `doc/`, `src/e2e/**` |
-| 8.5 | **Move the infrastructure into `orchestrator/`, reusing what is already here.** The bench re-implements problems this repo has solved and hardened: single-instance locking (`lock.js`), a serialized shared resource (`product-repo-lock.js`), append-only multi-process journaling (`journal.js`), child supervision with circuit breakers (`dispatcher.js`), pid-liveness sweeps, atomic tmp+rename state. Port the *behaviour*, not the code — a second implementation of each is how the two diverge. The product repo keeps `src/e2e/*.ts` and gains a thin submit client. | `orchestrator/`, `src/e2e/bench/**`, `scripts/bench-*.sh` |
+| 8.5 | **SUPERSEDED 2026-09-02 -- do NOT move the bench into `orchestrator/`; see the amendment below this table.** *(Original hypothesis, kept as written:)* **Move the infrastructure into `orchestrator/`, reusing what is already here.** The bench re-implements problems this repo has solved and hardened: single-instance locking (`lock.js`), a serialized shared resource (`product-repo-lock.js`), append-only multi-process journaling (`journal.js`), child supervision with circuit breakers (`dispatcher.js`), pid-liveness sweeps, atomic tmp+rename state. Port the *behaviour*, not the code — a second implementation of each is how the two diverge. The product repo keeps `src/e2e/*.ts` and gains a thin submit client. | `orchestrator/`, `src/e2e/bench/**`, `scripts/bench-*.sh` |
 | 8.6 | **The live gate becomes a first-class pipeline step**, with the state machine's own rules: a real timeout per class (C2's 2.1), a park reason that names what actually failed rather than a collapsed FAIL (C4's 4.2 — which already had to reconstruct `baseMain` because the bench did not always write it), retry budgets, and journal events a human can read. GATE's existing `gate-worker-down` / `gate-timeout` / `gate-non-attesting` legs become real states rather than exit-code guesses. | `orchestrator/state-machine.js`, `orchestrator/steps/scripted.js`, `doc/state-machine-spec.md` |
 | 8.7 | **Nightly and main-red re-homed.** The pipeline already consumes `<spoBenchDir>/nightly/latest.json` to refuse a merge onto a red main (`scripted.js`'s `nightlyMainRed`), from a file another repo's cron writes. After 8.5 the nightly is a pipeline schedule with a pipeline journal — and the `main-red-no-merge` / `main-red-refuse-worktree` legs stop depending on a file nobody in this repo produces. | `orchestrator/`, `scripts/nightly-check.sh` |
+
+**Amendment, 2026-09-02 -- row 8.5 is superseded, on the maintainer's decision.** The early
+bench audit (`doc/bench-audit-2026-09-02.md`, produced read-only in parallel with C7 bis) reports
+**0 of 8 defect classes living at the repo boundary**: the bench's problems are internal to the
+bench, so moving ~7.5k lines into `orchestrator/` would relocate them without fixing one, while
+merging two supervision models that currently fail independently. **The migration is not
+cancelled -- it is demoted from a chantier-8 commitment to a question 8.1's derived plan answers
+on evidence.** 8.4's versioned boundary contract stands on its own merits and is the part worth
+keeping: it is what lets the two halves version independently *whether or not* they ever share a
+repo.
+
+**Provenance, stated plainly**: everything in that audit is Fable's and **not yet Opus-verified**,
+except one finding the driver checked personally (the `bench/gate` ruleset removal). This
+amendment is the maintainer's decision taken on that evidence, not a verified conclusion -- **8.1
+re-derives it and may overturn it.** If 8.1 finds the boundary *is* where the defects live, this
+note is what it overturns, and it must say so explicitly rather than silently re-adopting 8.5.
+
+**Consequence for chantier 9**: its deferral rested entirely on C8 rewriting `orchestrator/`.
+That premise is gone, so the conditional chantier 9 already carries has **triggered** -- see its
+own header.
 
 **Gate C8**: full suite green + a card whose diff **routes to a real flow**, driven end to end,
 whose attestation *proves the live drive ran* (flows named, capability evidence present) — the
