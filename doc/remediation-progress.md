@@ -26,7 +26,7 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
 | **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
 | **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured; 7.1/7.2/7.3/7.5 built and verified; gate running |
-| **C8** — the bench: remediation, then migration | **not started** — added 2026-09-02, after the bench was measured for the first time |
+| **C8** — the bench: audit, remediation, migration | **not started** — added 2026-09-02. 8.1 (the audit) is the only committed row; it produces its own derived plan, and how many chantiers this really needs is 8.1's answer, not this table's |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
