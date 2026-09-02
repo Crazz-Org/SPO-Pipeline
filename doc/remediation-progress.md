@@ -21,7 +21,7 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C3** — token hemorrhage | **DONE and merged**; gate green except the 24h soak, which is **running** and has held 9h+ |
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
-| **C6** — pipelined parallelism (K workers) | actions 6.1–6.6 **committed**, cross-action verification done (branch `claude-crazz/c6-pipelined-parallelism`); not yet merged |
+| **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
 | C7 | not started |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
@@ -1396,21 +1396,6 @@ cards' worktrees were explicitly checked and intact.
 
 The lesson worth keeping: **on this CLI, probe a write-capable subcommand by reading `bin/spo`'s
 usage line, never by passing it `--help`.**
-
-### The former Part 3 note (superseded)
-
-This needs a real maintainer-supervised run, exactly as C5's gate was closed. Prerequisites now
-met: both pool accounts read `cooldown=none`, so K=2 is reachable for the first time today.
-
-Two things must be sequenced around it, and neither is optional:
-
-- **The merge restarts the daemon by itself.** It is the `git pull` in `/home/crazz/SPO-Pipeline`
-  that fires the post-merge hook, not the merge on GitHub. So deploying C6 brings a `--real`
-  dispatcher up unattended.
-- **Auto-pull is currently disabled by a systemd drop-in** (`auto-pull-off.conf`,
-  `SPO_AUTO_PULL_MS=0`), added because another session is filing many cards into project 1's Todo.
-  The gate needs a *controlled* batch of two, not whatever is topmost on the board, so that drop-in
-  should stay for the gate run and the two cards be fed by hand.
 
 ## What C6 hands C7
 
