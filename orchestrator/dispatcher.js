@@ -103,10 +103,20 @@ const { appendDaemonEvent, writeLiveWorkerIds } = require('./journal');
 const { readJsonSafe } = require('./park-loop');
 const { takeNextTask, buildCtx, finalizePark } = require('./state-machine');
 const { sleep } = require('./steps/scripted');
+// Elapsed-duration measurement for exactly one thing below: how long a spawned scanner stayed
+// alive before it crashed, inside THIS process only -- see that module's own header, and
+// resolveScannerHealthyUptimeMs's comment, for why this is the right clock for that and the wrong
+// one for anything written to disk or compared across processes.
+const { monotonicNowMs } = require('./monotonic-clock');
 
 const DAEMON_PATH = path.join(__dirname, 'daemon.js');
 const DEFAULT_WORKERS = 1;
 const DEFAULT_CRASH_LIMIT = 3;
+// Matches config.js's own scannerHealthyUptimeMs default (max(orphanScanMs, unparkScanMs), both
+// 60s) -- see that field's comment for the full derivation. Only reached if a caller hands
+// createDispatcher a config object that omits the field entirely (config.js's own shipped default
+// never does); same fallback posture as DEFAULT_CRASH_LIMIT above.
+const DEFAULT_SCANNER_HEALTHY_UPTIME_MS = 60 * 1000;
 
 function resolveWorkerCount(config) {
   const raw = config && config.workers;
@@ -127,6 +137,19 @@ function resolveCrashLimit(config) {
 function resolveScannerCrashLimit(config) {
   const raw = config && config.scannerCrashLimit;
   return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_CRASH_LIMIT;
+}
+
+// Same shape as resolveScannerCrashLimit above, for config.scannerHealthyUptimeMs -- see that
+// field's own comment in config.js for the full derivation (orphanScanMs/unparkScanMs, why a
+// scanner's first loop pass is never evidence of health, why uptime rather than a terminal outcome
+// is the only signal a `for (;;)` scanner can offer). A non-finite or non-positive override (a
+// config assembled by a test, or a malformed env var that already fell back to config.js's own
+// default before reaching here) falls back to DEFAULT_SCANNER_HEALTHY_UPTIME_MS rather than 0 --
+// 0 would mean "every crash is healthy", i.e. consecutiveScannerCrashes could never exceed 1 and
+// the breaker this action exists to keep honest would never trip at all.
+function resolveScannerHealthyUptimeMs(config) {
+  const raw = config && config.scannerHealthyUptimeMs;
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SCANNER_HEALTHY_UPTIME_MS;
 }
 
 // Collapses daemon.js's own --worker exit-code table (see that file's header) to the two buckets
@@ -326,16 +349,33 @@ function createDispatcher(queueDir, journalRoot, config) {
   const deps = (config && config.deps) || {};
   const spawnFn = deps.spawn || realSpawn;
   const spawnScannerFn = deps.spawnScanner || deps.spawn || realSpawn;
+  // Same injection idiom as spawn/spawnScanner above, for the ONE other real-world input the
+  // scanner-crash-breaker fix reads: production always gets the real monotonicNowMs (an elapsed
+  // wall-clock read -- see that module's own header for why it's the right measurement here and
+  // the wrong one for anything written to disk). A test that wants a DETERMINISTIC uptime --
+  // "this crash happened after exactly 50ms", "this one after exactly 1300ms" -- without an
+  // actual `setTimeout`-driven child process can inject a fake clock here instead; a test that
+  // wants to prove the PRODUCTION PATH really measures real elapsed time leaves this un-injected
+  // and uses a real, slow child (see test/dispatcher.test.js's own split between the two).
+  const monotonicNowMsFn = deps.monotonicNowMs || monotonicNowMs;
   const accountsDir = config.claudeAccountsDir;
   const crashLimit = resolveCrashLimit(config);
   const scannerCrashLimit = resolveScannerCrashLimit(config);
+  const scannerHealthyUptimeMs = resolveScannerHealthyUptimeMs(config);
 
   const live = new Map(); // id -> {pid, taskDir} -- TASK-owning workers only, never the scanner
   const pending = new Set(); // Set<Promise<void>>, one per in-flight child's own exit-watch chain
   let consecutiveCrashes = 0;
   let consecutiveScannerCrashes = 0;
+  // Cumulative, unlike consecutiveScannerCrashes above -- every scanner crash this dispatcher has
+  // ever seen, never reset. Genuinely useful for diagnosis (see handleScannerExit's own comment on
+  // why the codebase still wants a "how many total" figure even once "how many IN A ROW" is fixed
+  // to mean what it says) -- but it earns its OWN honestly-named field in the journal rather than
+  // being smuggled back in under consecutiveScannerCrashes' name, which is the exact defect this
+  // action closes.
+  let totalScannerCrashes = 0;
   let stopReason = null;
-  let scanner = null; // {pid} of the one live scanner child, or null while none is running
+  let scanner = null; // {pid, startedAtMonotonicMs} of the one live scanner child, or null while none is running
 
   // Publishes the CURRENT set of task-owning worker ids to <journalRoot>/live-workers.json
   // (journal.js's writeLiveWorkerIds, atomic tmp+rename) -- called every time `live` changes
@@ -508,7 +548,37 @@ function createDispatcher(queueDir, journalRoot, config) {
   // dispatcher on trip (see the `stopReason` assignment) -- a scanner stuck in a crash loop with
   // no way to recover is exactly as loud a signal as a worker stuck in one, even though the two
   // are never confused for each other.
+  //
+  // CONSECUTIVE MEANS CONSECUTIVE (post-verification correction to THIS action's own original
+  // shape). consecutiveScannerCrashes used to be incremented here and reset nowhere -- a plain
+  // cumulative total wearing a name that promised otherwise. Proved with a real dispatcher: three
+  // scanner crashes with 700ms of healthy scanning between each one tripped the breaker exactly
+  // as fast as three crashes with none, because nothing ever brought the counter back down. A
+  // WORKER gets to reset consecutiveCrashes on a terminal outcome (handleExit above, `outcome ===
+  // 'done' || 'parked'`) because a worker's job has a defined end. THE SCANNER'S NEVER DOES --
+  // state-machine.js's runForever is `for (;;)` and returns only by crashing or by this
+  // dispatcher's own shutdown -- so there is no terminal-outcome signal to reset on here, and
+  // uptime is the only substitute available: a scanner that stayed up long enough to complete a
+  // second pass of its own orphanScanMs/unparkScanMs cycle (config.scannerHealthyUptimeMs -- see
+  // that field's own comment in config.js for exactly why THAT derivation and not, say,
+  // pollIntervalMs) demonstrably did real work before it died, and its death should start a fresh
+  // streak, not extend whatever streak came before it.
+  //
+  // Measured with `monotonicNowMs()` (orchestrator/monotonic-clock.js), an elapsed-duration read
+  // taken at spawn and again at exit, both inside THIS process -- never written to disk, never
+  // compared against another process's own clock (that module's header names this the one thing
+  // never to do to it). `startedAtMonotonicMs` is captured from the CURRENT `scanner` before it is
+  // nulled out below, so a respawn's own fresh timestamp can never leak into this crash's uptime
+  // calculation.
+  //
+  // The cumulative total is NOT thrown away -- it stays genuinely useful for diagnosis ("how many
+  // times has this scanner died today, however far apart") -- it just gets its OWN honestly-named
+  // field (`totalScannerCrashes`) instead of hiding under a name that says "in a row" and means
+  // "ever". A maintainer reading daemon.jsonl now gets both numbers, correctly labelled, rather
+  // than one number under two different implied meanings depending on which event they happen to
+  // be looking at.
   function handleScannerExit({ code, signal, spawnError }) {
+    const startedAtMonotonicMs = scanner ? scanner.startedAtMonotonicMs : null;
     scanner = null;
     if (stopReason) {
       appendDaemonEvent(journalRoot, 'scanner-exit-during-shutdown', {
@@ -518,17 +588,40 @@ function createDispatcher(queueDir, journalRoot, config) {
       return;
     }
 
-    consecutiveScannerCrashes += 1;
+    // `startedAtMonotonicMs` should always be set (spawnScanner records it synchronously, before
+    // this exit can possibly be observed) -- the `=== null` branch only guards a spawn that failed
+    // so early `scanner` was never assigned at all, and treats that the same as "no uptime",
+    // i.e. definitely not healthy, which is the honest, conservative reading of "we don't actually
+    // know how long it ran."
+    const uptimeMs = startedAtMonotonicMs === null ? 0 : monotonicNowMsFn() - startedAtMonotonicMs;
+    const healthyUptime = uptimeMs >= scannerHealthyUptimeMs;
+    consecutiveScannerCrashes = healthyUptime ? 1 : consecutiveScannerCrashes + 1;
+    totalScannerCrashes += 1;
+
+    // scannerHealthyUptimeMs is journalled alongside uptimeMs -- without it, `{"uptimeMs":45000,
+    // "consecutiveScannerCrashes":3}` is uninterpretable to a reader who has not also opened
+    // config.js AND checked the operator's env for a SPO_SCANNER_HEALTHY_UPTIME_MS override. Both
+    // numbers together let daemon.jsonl answer "was this crash judged healthy, and against what
+    // bar" on its own, the same way scannerCrashLimit sits next to consecutiveScannerCrashes so a
+    // reader never has to go compute "how close was this to tripping" by hand.
     appendDaemonEvent(journalRoot, 'scanner-crashed', {
       code: code === undefined ? null : code,
       signal: signal || null,
       consecutiveScannerCrashes,
+      totalScannerCrashes,
       scannerCrashLimit,
+      uptimeMs,
+      scannerHealthyUptimeMs,
       ...(spawnError ? { spawnError: String((spawnError && spawnError.message) || spawnError) } : {}),
     });
 
     if (consecutiveScannerCrashes >= scannerCrashLimit) {
-      stopReason = { reason: 'scanner-crash-circuit-breaker', consecutiveScannerCrashes, scannerCrashLimit };
+      stopReason = {
+        reason: 'scanner-crash-circuit-breaker',
+        consecutiveScannerCrashes,
+        totalScannerCrashes,
+        scannerCrashLimit,
+      };
       return; // do not respawn -- the dispatcher itself is stopping.
     }
     spawnScanner(); // immediate respawn -- see this function's own header.
@@ -557,7 +650,11 @@ function createDispatcher(queueDir, journalRoot, config) {
   function spawnScanner() {
     const argv = buildScannerArgv(queueDir, journalRoot, config);
     const child = spawnScannerFn(process.execPath, argv, { detached: true, stdio: 'ignore' });
-    scanner = { pid: child.pid };
+    // startedAtMonotonicMs recorded HERE, synchronously, before this call returns -- so
+    // handleScannerExit can never observe a `scanner` whose start time is missing or stale (see
+    // that function's own comment on why the uptime measurement it makes is only trustworthy
+    // because of this ordering).
+    scanner = { pid: child.pid, startedAtMonotonicMs: monotonicNowMsFn() };
     appendDaemonEvent(journalRoot, 'scanner-spawn', { pid: child.pid || null });
 
     const p = watchChild(child)
@@ -736,6 +833,7 @@ module.exports = {
   resolveWorkerCount,
   resolveCrashLimit,
   resolveScannerCrashLimit,
+  resolveScannerHealthyUptimeMs,
   // Exported for the same reason classifyWorkerExit/resolveWorkerCount above are: a direct unit
   // test. Specifically the mode flag -- a dispatcher that spawned `--shadow` workers from a
   // `--real` daemon would do NOTHING real in production while passing every end-to-end test in
