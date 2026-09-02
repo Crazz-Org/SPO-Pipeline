@@ -17,6 +17,7 @@ const {
   resolvePromptText,
   extractTokens,
   classifyFailure,
+  cannedDryRunPayload,
 } = require('../orchestrator/steps/llm');
 
 function realShapedPayload(overrides = {}) {
@@ -402,6 +403,80 @@ test('invokeClaudeReal: is_error + api_error_status 529 -> {ok:false, kind:"limi
   assert.equal(result.limitKind, 'overloaded');
 });
 
+// action 7.1: the two tests above drive limitKind through LIMIT_STATUSES (api_error_status 429/
+// 529) -- llm.js's own limitKindForFailure is not exported (a deliberately small, private pure
+// function; see its own header), so its OTHER branch, the terminal_reason-only Sets
+// (USAGE_LIMIT_TERMINAL_REASONS / OVERLOADED_TERMINAL_REASONS), has to be reached the same way
+// production reaches it: a reply with NO api_error_status match at all, classified purely on
+// terminal_reason. classifyFailure's own tests already prove these strings classify as 'limit';
+// what those tests do NOT cover is which limitKind invokeClaudeReal then attaches -- exactly the
+// distinction accounts.markLimit uses to pick a cooldown tier (R5's own comment: a status and a
+// terminal_reason used to be able to disagree on kind silently).
+test('invokeClaudeReal: terminal_reason "rate_limit_error" alone (no api_error_status match) -> limitKind "usage"', async () => {
+  const payload = realShapedPayload({
+    is_error: true,
+    api_error_status: null,
+    terminal_reason: 'rate_limit_error',
+    result: 'rate limited, no structured status this time',
+  });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.kind, 'limit');
+  assert.equal(result.limitKind, 'usage');
+});
+
+test('invokeClaudeReal: terminal_reason "overloaded_error" alone (no api_error_status match) -> limitKind "overloaded"', async () => {
+  const payload = realShapedPayload({
+    is_error: true,
+    api_error_status: null,
+    terminal_reason: 'overloaded_error',
+    result: 'server overloaded, no structured status this time',
+  });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.kind, 'limit');
+  assert.equal(result.limitKind, 'overloaded');
+});
+
+// action 7.1 (round 2, verifier finding): the arbitration BETWEEN api_error_status and
+// terminal_reason, when a reply carries a limit-shaped value on both, is exactly what R5's own
+// comment (llm.js, above LIMIT_STATUSES) exists to keep consistent -- and nothing in this suite
+// had ever set both at once. limitKindForFailure checks LIMIT_STATUSES (api_error_status) FIRST,
+// unconditionally returning on a match before terminal_reason is even read -- so the status
+// table must win. This is not cosmetic: #483 (the cooldown model) is the project's live risk, and
+// getting this wrong means a reply with a spent-quota status (429, "usage" tier: 1h/5h cooldown)
+// but a stale/mismatched "overloaded" terminal_reason would cool for the much SHORTER overloaded
+// tier instead -- hammering an account whose quota is actually exhausted. Also pins classifyFailure
+// itself the same way: it must classify 'limit' on the first matching condition, not evaluate both
+// and disagree with limitKindForFailure about which one "wins".
+test('invokeClaudeReal: api_error_status AND a conflicting terminal_reason both present -> the status table wins (429 + overloaded_error -> limitKind "usage", not "overloaded")', async () => {
+  const payload = realShapedPayload({
+    is_error: true,
+    api_error_status: 429, // usage-tier status
+    terminal_reason: 'overloaded_error', // overloaded-tier reason -- deliberately conflicting
+    result: 'a reply that disagrees with itself about which kind of limit this is',
+  });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.kind, 'limit');
+  assert.equal(result.limitKind, 'usage', 'api_error_status must be checked (and win) before terminal_reason is ever consulted');
+});
+
 test('invokeClaudeReal: a non-limit failure never carries a limitKind at all', async () => {
   const payload = realShapedPayload({ is_error: true, api_error_status: 400, result: 'invalid json schema' });
   const deps = {
@@ -588,4 +663,45 @@ test('invokeClaudeReal: a 200KB prompt (over Linux MAX_ARG_STRLEN) goes to stdin
       `argv entry exceeds MAX_ARG_STRLEN: ${arg.slice(0, 60)}...`
     );
   }
+});
+
+// ---- action 7.1: cannedDryRunPayload's three least-exercised shapes ------------------------
+//
+// --dry-run's stub table is exported and dedicated per-step, but end-to-end --dry-run runs
+// (test/dry-run-demo.test.js) only ever walk a happy-path card through PLAN/IMPLEMENT/VALIDATE --
+// DIAGNOSE and CITATION_VERIFIER are both explicitly asserted NEVER reached there, and nothing
+// drives an unrecognized step through the `default` branch at all (no --dry-run task can name one
+// -- STEP_CONTRACTS is a closed set). These three shapes are only reachable, and only worth
+// pinning, as direct unit calls.
+
+test('cannedDryRunPayload: CITATION_VERIFIER stub is a real PASS-shaped verdict with no entries', () => {
+  const payload = cannedDryRunPayload('CITATION_VERIFIER', null, null);
+  assert.deepEqual(payload, { ok: true, dryRun: true, verdict: 'PASS', entries: [] });
+});
+
+test('cannedDryRunPayload: VALIDATE stub is a real PASS-shaped verdict with a canned reason and no findings', () => {
+  const payload = cannedDryRunPayload('VALIDATE', null, null);
+  assert.deepEqual(payload, {
+    ok: true,
+    dryRun: true,
+    verdict: 'PASS',
+    reasons: ['[dry-run] no verdict rendered'],
+    findings: [],
+  });
+});
+
+// The defensive fallthrough: a step this module has never heard of still has to satisfy whatever
+// outputContract.required a future STEP_CONTRACTS entry declares, or a --dry-run walk through that
+// step would fail its own contract validation immediately after cannedDryRunPayload runs --
+// defeating the entire point of --dry-run as a pre-flight check that never fails on missing keys.
+test('cannedDryRunPayload: an unrecognized step falls to the defensive default -- every declared outputContract.required key comes back present and null, alongside ok/dryRun', () => {
+  const contract = { outputContract: { required: ['foo', 'bar', 'baz'] } };
+  const payload = cannedDryRunPayload('SOME_FUTURE_STEP', contract, null);
+
+  assert.equal(payload.ok, true);
+  assert.equal(payload.dryRun, true);
+  assert.deepEqual(Object.keys(payload).sort(), ['bar', 'baz', 'dryRun', 'foo', 'ok']);
+  assert.equal(payload.foo, null);
+  assert.equal(payload.bar, null);
+  assert.equal(payload.baz, null);
 });

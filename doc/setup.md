@@ -31,6 +31,15 @@ cd ~/SPO-Pipeline && bin/spo account add pool1
 
 - List and health: `cd ~/SPO-Pipeline && bin/spo accounts` · disable/enable:
   `cd ~/SPO-Pipeline && bin/spo account disable pool1` (marker file, reversible).
+- Stuck on a cooldown the provider does not actually impose:
+  `cd ~/SPO-Pipeline && bin/spo account clear-cooldown pool1`. This clears the account's whole
+  `state.json` entry, not just `cooldownUntil` — `lastUsageLimitAt` and `usageLimitStreak` go
+  with it (`accounts.js`'s `clearCooldown`), which matters: leaving `lastUsageLimitAt` behind
+  keeps the escalation window armed, so the next limit inside it jumps straight to the 5h tier
+  as though nothing had been cleared. The cooldown itself is invented locally and never
+  re-checked against the server (#483), so an account can read as cooling while its dashboard
+  shows headroom -- most often because the quota is per *model* and the cooldown is per
+  *account*.
 - Verify an account end to end (one real call, ~$0.02):
 
 ```bash

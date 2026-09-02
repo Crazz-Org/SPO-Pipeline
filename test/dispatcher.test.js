@@ -58,6 +58,47 @@ function spawnExit(code) {
   return () => realSpawn(process.execPath, ['-e', `process.exit(${code})`], { stdio: 'ignore' });
 }
 
+// Same shape as spawnExit above, but the child sleeps `ms` (real wall-clock time, via the child's
+// OWN setTimeout -- there is nothing to fake here, the point of the ONE test that still uses this
+// is a REAL elapsed interval for dispatcher.js's own monotonicNowMs-based uptime read to measure)
+// before exiting with `code`.
+//
+// `opts` IS FORWARDED, unlike an earlier version of this helper -- without it the child is never
+// `detached: true`, so it is never its own process-group leader, and killAllChildren's
+// `process.kill(-pid, signal)` (the negative pid targets a GROUP) throws ESRCH into a swallowed
+// catch instead of reaching it. That is not cosmetic: this file's own `finally` teardown then
+// does `await Promise.allSettled(pending)`, which waits the child's own `ms` out for real instead
+// of the signal killing it early -- measured as ~1.2s of dead teardown time per use before this
+// forward existed. See neverExitsSpawn's own comment above for the identical reasoning.
+function spawnScannerAliveFor(ms, code) {
+  return (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', `setTimeout(() => process.exit(${code}), ${ms})`], { ...opts, stdio: 'ignore' });
+}
+
+// A tiny queue-backed fake clock for `deps.monotonicNowMs` (the injection seam createDispatcher
+// exposes for exactly this): each call returns the next value from `sequence`, in order, and
+// throws if called more times than the sequence provides -- an over-call is a sign the test's own
+// call-count model of spawnScanner/handleScannerExit (one read at spawn, one read at exit, per
+// scanner lifecycle) has drifted from the real code, which is a bug in the TEST, not something to
+// silently tolerate by returning `undefined` or looping the sequence.
+//
+// This is what lets the scannerHealthyUptimeMs tests below assert on a PRECISE, deterministic
+// uptime (e.g. "this crash is exactly 50ms, that one is exactly 1300ms") using ordinary
+// near-instant real child processes (spawnExit), instead of an actual `setTimeout`-driven child
+// whose real wall-clock survival time the test would otherwise have to wait out. Production always
+// gets the real monotonicNowMs (deps.monotonicNowMs is only ever set here, in a test) -- see
+// createDispatcher's own comment on the seam, and the one test below that deliberately leaves it
+// un-injected to prove the production wiring still works end to end with a real clock.
+function mockClock(sequence) {
+  let i = 0;
+  return () => {
+    if (i >= sequence.length) {
+      throw new Error(`mockClock: called ${i + 1} times but only ${sequence.length} values were queued`);
+    }
+    return sequence[i++];
+  };
+}
+
 // A real, but inert, stand-in for the scanner -- lives far longer than any test's own timeout and
 // exits on nothing this file does except the dispatcher's own killAllChildren (SIGTERM) in
 // cleanup. Every test below that hands `deps.spawn` a crash-code SEQUENCE for a KNOWN NUMBER of
@@ -158,7 +199,7 @@ function slowDoneTask(id, implementDelayMs) {
 
 // ---- 1. K=1: a task runs to DONE through a real spawned worker; worker-spawn/worker-exit journalled
 
-test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worker-exit are journalled', { timeout: 20000 }, async () => {
+test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worker-exit are journalled', { timeout: 30000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-t1.json', { id: 't1', kind: 'synthetic', shadow: { forceState: 'DONE' } });
@@ -171,6 +212,21 @@ test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worke
       const s = readState(journalDir, 't1');
       return s && s.state === 'DONE';
     });
+    // Wait for the worker-EXIT event itself before calling stop(), not just the DONE state.
+    // state.json DONE is written by the worker (state-machine.js) BEFORE it exits; if stop()
+    // races ahead of the real exit, run()'s own killAllChildren('SIGTERM') on its way out can
+    // catch the worker still inside its exit path, and watchChild's 'exit' handler then observes
+    // (code: null, signal: 'SIGTERM') instead of the real (0, null) -- a real race, measured at
+    // ~10% (36/40 clean, 4/40 SIGTERM'd, all still finishing DONE regardless). Waiting on the
+    // event that actually means "the worker is gone" -- not the state write that merely precedes
+    // it -- is what test 3 below (the PARK case) already does, and why it never flakes.
+    // Explicit timeout, shorter than the DONE wait above it: this test's own {timeout: 30000}
+    // must cover BOTH sequential waitFor calls, and waitFor's own 10000ms default on each would
+    // let a loaded box exhaust the test's whole budget as an opaque node:test timeout instead of
+    // a readable assertion failure -- in practice this event is already true (or true within
+    // milliseconds) by the time the DONE wait above resolves, since the worker's own exit follows
+    // its state.json write immediately.
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit' && e.id === 't1'), 8000);
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -188,7 +244,7 @@ test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worke
 
 // ---- 2. K=2: two tasks run concurrently; prove real overlap (not just both finishing)
 
-test('K=2: two tasks run concurrently -- real overlap, not two runs that merely both finished', { timeout: 20000 }, async () => {
+test('K=2: two tasks run concurrently -- real overlap, not two runs that merely both finished', { timeout: 30000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-a.json', slowDoneTask('disp-a', 200));
@@ -221,6 +277,19 @@ test('K=2: two tasks run concurrently -- real overlap, not two runs that merely 
       const b = readState(journalDir, 'disp-b');
       return a && a.state === 'DONE' && b && b.state === 'DONE';
     });
+    // Wait for BOTH worker-exit events, not just the DONE states, before stop() -- see the K=1
+    // test's comment above for the exact race (state.json DONE precedes the real process exit;
+    // stop()'s killAllChildren('SIGTERM') can otherwise land on a worker still inside its own exit
+    // path and turn a clean (0, null) into a (null, 'SIGTERM')). Nothing here asserts an exit code
+    // yet, but the next person to add one (as :161 eventually did) must not inherit this flake.
+    // Explicit, shorter-than-default timeout -- same reasoning as the K=1 test's own comment
+    // above: this test's {timeout: 30000} has to cover every waitFor call in the try block, and
+    // a 10000ms default here would risk the whole thing surfacing as an opaque node:test timeout
+    // rather than a readable failure on a loaded box.
+    await waitFor(() => {
+      const ev = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-exit');
+      return ev.some((e) => e.id === 'disp-a') && ev.some((e) => e.id === 'disp-b');
+    }, 8000);
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -297,6 +366,70 @@ test('a worker exiting an unrecognized code IS reparked worker-crashed, with the
   const parkEvt = taskJournal.find((e) => e.event === 'parked');
   assert.equal(parkEvt.reason, 'worker-crashed');
   assert.equal(parkEvt.detail.exitCode, 7);
+});
+
+// ---- action 7.3: a worker exiting AFTER its taskDir is already terminal must NOT be reparked ----
+//
+// reparkCrashedWorker (dispatcher.js) checks state.json's state BEFORE ever calling finalizePark:
+// DONE/PARKED/ABANDONED short-circuit straight to a bare `worker-exit-after-terminal` daemon
+// event and nothing else -- dispatcher.js's own header calls this the "believed unreachable, but
+// not asserted so" case of a worker producing more exit-path activity after its own outcome is
+// already durable on disk. It matters because finalizePark is NOT idempotent against a taskDir
+// that already has an outcome: calling it here would make the crash-repark path a SECOND writer
+// racing the terminal write that already legitimately happened -- overwriting a genuine DONE with
+// a spurious PARKED worker-crashed, and (worse, in the DONE case) posting a park comment on an
+// issue whose PR the pipeline may already have opened. Nothing upstream of this function prevents
+// that from being reachable: a stray SIGKILL to a grandchild, a delayed OS signal after runTask's
+// own process.exit(0) call raced its own cleanup -- this check is the only thing standing between
+// that and a corrupted terminal task.
+test('a worker exiting non-zero AFTER its taskDir already reads DONE is journalled worker-exit-after-terminal, never reparked', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-t.json', { id: 'disp-post-terminal', kind: 'synthetic' });
+
+  // Pre-seeds the taskDir with a state.json that already reads DONE, as if a prior (unmodelled)
+  // worker process had already run this task to completion durably on disk -- takeNextTask's own
+  // fs.mkdirSync(taskDir, {recursive: true}) tolerates the directory already existing, so this
+  // does not interfere with the dispatcher's ordinary claim of the queue entry below.
+  const taskDir = path.join(journalDir, 'disp-post-terminal');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({ id: 'disp-post-terminal', state: 'DONE' }));
+
+  // spawnExit(7): a real process that does nothing but exit 7 -- classifyWorkerExit(7) is
+  // 'crashed', which is exactly the outcome that would ordinarily call reparkCrashedWorker.
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit-after-terminal' && e.id === 'disp-post-terminal')
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const events = readDaemonEvents(journalDir);
+  const afterTerminal = events.find((e) => e.event === 'worker-exit-after-terminal' && e.id === 'disp-post-terminal');
+  assert.equal(afterTerminal.exitCode, 7);
+  assert.equal(afterTerminal.signal, null);
+  assert.equal(afterTerminal.lastState, 'DONE');
+
+  // state.json must read EXACTLY what it did before this exit -- the short-circuit returned
+  // before finalizePark's own writeState(ctx.taskDir, snap) ever ran.
+  const state = readState(journalDir, 'disp-post-terminal');
+  assert.equal(state.state, 'DONE');
+
+  // The negatives that carry the actual meaning: no daemon-level `parked` event, no task-level
+  // `parked` event, and no report.md -- all three are things ONLY finalizePark writes, and this
+  // path never reaches it.
+  assert.equal(events.some((e) => e.event === 'parked' && e.id === 'disp-post-terminal'), false);
+  const taskJournal = readJournal(journalDir, 'disp-post-terminal');
+  assert.equal(taskJournal.some((e) => e.event === 'parked'), false);
+  assert.equal(fs.existsSync(path.join(taskDir, 'report.md')), false, 'finalizePark must never have run -- it writes report.md unconditionally on every park');
 });
 
 // Action 6.5: reparkCrashedWorker restores the same four counters orphan-scan.js does, and for
@@ -627,7 +760,7 @@ test('a clamp to zero caused by an empty/disabled pool reports a null cooldown e
 
 // ---- 7. K is clamped to healthy accounts before each spawn
 
-test('K is clamped to the number of healthy accounts before each spawn, even when configured higher', { timeout: 20000 }, async () => {
+test('K is clamped to the number of healthy accounts before each spawn, even when configured higher', { timeout: 40000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-a.json', slowDoneTask('clamp-a', 150));
@@ -652,6 +785,19 @@ test('K is clamped to the number of healthy accounts before each spawn, even whe
       const b = readState(journalDir, 'clamp-b');
       return a && a.state === 'DONE' && b && b.state === 'DONE';
     });
+    // Wait for BOTH worker-exit events before stop() -- same race as the K=1 test above: DONE in
+    // state.json precedes the real process exit, and stop()'s SIGTERM can otherwise catch a
+    // worker still unwinding its own exit path. Latent here (nothing below asserts an exit code
+    // yet), but left un-waited this test would flake the moment someone adds one.
+    // Explicit, shorter-than-default timeout. This test alone now runs FOUR sequential waitFor
+    // calls (worker-spawn, the ===2 wait already carrying its own explicit 8000, the both-DONE
+    // wait, and this one) inside one {timeout: 40000} test -- at waitFor's own 10000ms default
+    // for every call, a loaded box could exhaust the whole test budget and surface an opaque
+    // node:test timeout instead of a readable assertion failure.
+    await waitFor(() => {
+      const ev = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-exit');
+      return ev.some((e) => e.id === 'clamp-a') && ev.some((e) => e.id === 'clamp-b');
+    }, 8000);
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -926,6 +1072,37 @@ test('resolveWorkerCount: K defaults to 1, and a non-positive-integer config fal
   assert.equal(resolveWorkerCount({ workers: -2 }), 1);
   assert.equal(resolveWorkerCount({ workers: 1.5 }), 1);
   assert.equal(resolveWorkerCount({ workers: 4 }), 4);
+});
+
+// Same shape as resolveWorkerCount's own table above, for resolveScannerHealthyUptimeMs -- a
+// direct unit test of the exported function, not routed through a real dispatcher, because the
+// whole point is pinning every boundary of the fallback logic by hand, including ones a real
+// scanner-crash scenario would never exercise on its own.
+//
+// The stake, stated in resolveScannerHealthyUptimeMs's own comment: "0 would mean 'every crash is
+// healthy' ... the breaker this action exists to keep honest would never trip at all." Two
+// mutations of exactly that shape were verified to survive the whole suite before this test
+// existed: `raw === undefined ? DEFAULT : raw` (lets 0 through unguarded) and `raw || DEFAULT`
+// (lets -1 through, since `-1 || x` is `-1`, truthy). Both are covered explicitly below, alongside
+// the same NaN/Infinity/string/object shapes resolveWorkerCount's own table does not need to
+// cover (workers is validated with Number.isInteger; this field is a duration, validated with
+// Number.isFinite, so its hostile-input surface is a superset).
+test('resolveScannerHealthyUptimeMs: falls back to the 60s default for any non-finite or non-positive override', () => {
+  const { resolveScannerHealthyUptimeMs } = require('../orchestrator/dispatcher');
+  const DEFAULT_MS = 60 * 1000; // dispatcher.js's own DEFAULT_SCANNER_HEALTHY_UPTIME_MS -- pinned by this literal, not re-derived
+  assert.equal(resolveScannerHealthyUptimeMs({}), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs(null), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: undefined }), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: 0 }), DEFAULT_MS, 'the M9a-shaped mutation: 0 must NOT pass through, or every crash reads as healthy');
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: -1 }), DEFAULT_MS, 'the M9b-shaped mutation: a bare `||` fallback would let -1 (truthy) through');
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: NaN }), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: Infinity }), DEFAULT_MS, 'an unbounded bar would make the breaker unable to EVER see a healthy reset');
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: -Infinity }), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: '400' }), DEFAULT_MS, 'a string is not finite by Number.isFinite -- no implicit coercion');
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: 'abc' }), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: {} }), DEFAULT_MS);
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: 1.5 }), 1.5, 'unlike a worker COUNT, a fractional duration is legitimate -- no integer requirement here');
+  assert.equal(resolveScannerHealthyUptimeMs({ scannerHealthyUptimeMs: 400 }), 400);
 });
 
 // SURVIVOR: BOTH `detached: true` (removed from the spawn options) and `process.kill(-pid)`
@@ -1310,6 +1487,13 @@ test('a scanner whose --parent-pid IS its parent keeps running -- the check must
   );
 });
 
+// This is also the safety-property regression test for the healthy-uptime fix below: spawnExit(1)
+// crashes in single-digit-to-low-double-digit ms, nowhere near baseConfig/defaultConfig's
+// scannerHealthyUptimeMs (60s, untouched by this test's own overrides) -- so every one of these
+// crashes must still be classified UNHEALTHY and the streak must still extend, not reset. If a
+// future change to the healthy-uptime logic ever made a near-instant crash count as "healthy" by
+// mistake, this test traps it: the breaker would never trip and dispatcher.run() would hang past
+// its own 20s timeout instead of resolving with a tripped stopReason.
 test('a crashed scanner is respawned immediately, up to its own scannerCrashLimit, then trips a SEPARATE breaker from the worker one', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-scancrash-q-');
   const journalDir = mkTmp('spo-disp-scancrash-j-');
@@ -1326,6 +1510,7 @@ test('a crashed scanner is respawned immediately, up to its own scannerCrashLimi
 
   assert.equal(stopReason.reason, 'scanner-crash-circuit-breaker');
   assert.equal(stopReason.consecutiveScannerCrashes, 2);
+  assert.equal(stopReason.totalScannerCrashes, 2, 'no healthy uptime ever occurred, so the cumulative total matches the consecutive count here');
   assert.equal(stopReason.scannerCrashLimit, 2);
 
   const events = readDaemonEvents(journalDir);
@@ -1333,6 +1518,286 @@ test('a crashed scanner is respawned immediately, up to its own scannerCrashLimi
   assert.equal(events.filter((e) => e.event === 'scanner-crashed').length, 2);
   // Never counted against, or confused with, the WORKER breaker's own fields.
   assert.equal(events.some((e) => e.event === 'worker-crashed' || e.reason === 'worker-crash-circuit-breaker'), false);
+});
+
+// ---- consecutiveScannerCrashes must mean CONSECUTIVE (this action's own fix) ------------------
+//
+// Before this fix, consecutiveScannerCrashes was incremented on every scanner-crashed event and
+// reset nowhere -- a cumulative total wearing a name that promised "in a row". Proved on a real
+// dispatcher (this action's own verification): three crashes with 700ms of healthy scanning
+// between each one tripped the breaker exactly as fast as three crashes with none, because
+// nothing ever brought the counter back down.
+//
+// Every test below except the LAST one drives that fix through a REAL createDispatcher with
+// `deps.monotonicNowMs` injected (mockClock, above) -- never by poking the counter directly, and
+// never by waiting out a real `setTimeout`-driven child. Injecting the clock is what lets these
+// assert on an EXACT, deterministic uptime (down to the millisecond) while every child is an
+// ordinary near-instant `spawnExit` process: the dispatcher's own arithmetic reads whatever the
+// mock clock says, regardless of how long the real child actually took to spawn and exit. This
+// removed ~7s of real `setTimeout` waiting from this file (three tests that used to sleep 1200ms
+// per scanner lifecycle) without weakening any assertion -- if anything the assertions got
+// tighter, since "uptime >= 400" became "uptime === exactly 1300".
+//
+// The LAST test in this group deliberately leaves `deps.monotonicNowMs` un-injected, so it is the
+// one thing here still paying for a real `setTimeout` -- see its own comment for why that trade is
+// worth keeping.
+
+test('a scanner that survives past scannerHealthyUptimeMs before crashing leaves the streak at 1, not extended to 2', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-scanheal-q-');
+  const journalDir = mkTmp('spo-disp-scanheal-j-');
+
+  // Three scanner lifecycles, each a (start, end) pair consumed in order by mockClock:
+  //   scanner 1: 0    -> 50    => uptime   50ms (< 400 -- unhealthy)
+  //   scanner 2: 100  -> 1400  => uptime 1300ms (>= 400 -- healthy)
+  //   scanner 3: 1500 -> 1550  => uptime   50ms (< 400 -- unhealthy)
+  // Under the pre-fix cumulative counter, scanner 2's crash would read 2 (extending scanner 1's
+  // streak); under the fix, surviving the bar means it starts a FRESH streak, so it must read 1.
+  // Scanner 3's crash then extends THAT fresh streak to 2 -- proving the reset is a one-shot event
+  // tied to the healthy exit, not a permanent "the breaker is now disarmed" side effect. Every
+  // child is `spawnExit(1)` (real, near-instant) -- the 1300ms is entirely the mock clock's doing.
+  // Padding beyond the 3 crashes this test actually asserts on. `spawnScanner`'s own respawn
+  // after crash 3 is synchronous and unconditional (handleScannerExit calls it whenever the
+  // breaker has not just tripped -- and it has not, scannerCrashLimit is 10 here), so a 4th
+  // scanner's `startedAtMonotonicMs` read WILL happen before this test's own `dispatcher.stop()`
+  // can land -- and because that 4th scanner is a REAL, near-instant `spawnExit(1)` child, it may
+  // itself crash and trigger a 5th, 6th... before stop() wins that race. None of that is asserted
+  // on below (only crashes[0..2] are), so this padding only needs to be long enough that mockClock
+  // is never exhausted by that unavoidable extra respawn-or-two -- kept "healthy" (>=400ms gaps)
+  // so it can never accidentally trip the scannerCrashLimit=10 breaker either.
+  const sequence = [0, 50, 100, 1400, 1500, 1550];
+  for (let i = 0; i < 20; i++) sequence.push(2000 + i * 10000, 2000 + i * 10000 + 500);
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    scannerCrashLimit: 10, // high enough that nothing here trips the breaker -- not what this test is about
+    scannerHealthyUptimeMs: 400,
+    deps: { spawn: spawnExit(0), spawnScanner: spawnExit(1), monotonicNowMs: mockClock(sequence) },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed').length >= 3, 10000);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const crashes = readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed');
+  assert.ok(crashes.length >= 3, `expected at least 3 scanner-crashed events, got ${crashes.length}`);
+  assert.equal(crashes[0].uptimeMs, 50);
+  assert.equal(crashes[0].consecutiveScannerCrashes, 1, 'first-ever crash always starts a streak at 1');
+  assert.equal(crashes[1].uptimeMs, 1300);
+  assert.equal(crashes[1].consecutiveScannerCrashes, 1, 'a crash after healthy uptime must reset the streak, not extend it to 2');
+  assert.equal(crashes[2].uptimeMs, 50);
+  assert.equal(crashes[2].consecutiveScannerCrashes, 2, 'the NEXT near-instant crash extends the freshly-reset streak, proving the reset is not a permanent disarm');
+  // Cumulative total keeps counting regardless -- this is the field that actually answers "how
+  // many total crashes has this scanner had", now under its own honest name.
+  assert.equal(crashes[2].totalScannerCrashes, 3);
+  assert.ok(
+    crashes.every((e) => e.scannerHealthyUptimeMs === 400),
+    'the resolved threshold itself must be visible on every event, not just derivable from config'
+  );
+});
+
+test('the breaker does NOT trip when crashes are separated by healthy uptime, even though total crashes exceed scannerCrashLimit -- the bug this action fixes', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-scannotrip-q-');
+  const journalDir = mkTmp('spo-disp-scannotrip-j-');
+
+  // Six scanner lifecycles, EVERY ONE surviving exactly 500ms (>= the 400ms healthy bar) by the
+  // mock clock -- so every crash resets the streak to 1, and consecutiveScannerCrashes should
+  // never reach scannerCrashLimit=3 no matter how many total crashes accumulate.
+  //
+  // The liveness proof is STRUCTURAL, not timing-based: waiting for a 6th crash (double the
+  // limit) can only succeed if the dispatcher kept respawning past crash 3 -- spawnScanner is only
+  // ever called again from INSIDE handleScannerExit, after the breaker check does not trip. If a
+  // regression made the breaker trip at 3 (the pre-fix cumulative behaviour, or any of the mutants
+  // the verifier found), respawning stops there, no crash 4-6 ever gets journalled, and this
+  // `waitFor` times out with a named error -- a hard failure, not a race that can pass by luck the
+  // way a `Promise.race` against a fixed sleep could.
+  // 40 lifecycles, not 6 -- the same unavoidable "one guaranteed extra respawn, possibly more if
+  // it races and crashes before stop() lands" reasoning as the sibling test above applies here
+  // too, and this test's own liveness proof (waiting for a 6th crash, then calling stop()) needs
+  // headroom past that. All are "healthy" (500ms >= the 400ms bar), so however many of these
+  // actually get consumed before stop() wins, none of them can trip the limit-3 breaker.
+  const sequence = [];
+  for (let i = 0; i < 40; i++) sequence.push(i * 1000, i * 1000 + 500); // (start, end) => uptime 500ms each
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    scannerCrashLimit: 3,
+    scannerHealthyUptimeMs: 400,
+    deps: { spawn: spawnExit(0), spawnScanner: spawnExit(1), monotonicNowMs: mockClock(sequence) },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed').length >= 6, 10000);
+
+    const crashes = readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed');
+    assert.ok(crashes.length >= 6, `expected at least 6 scanner-crashed events, got ${crashes.length}`);
+    assert.ok(
+      crashes.every((e) => e.consecutiveScannerCrashes === 1),
+      `every crash here follows healthy uptime, so consecutiveScannerCrashes must read 1 on all of them, got ${JSON.stringify(crashes.map((e) => e.consecutiveScannerCrashes))}`
+    );
+    assert.equal(
+      readDaemonEvents(journalDir).some((e) => e.reason === 'scanner-crash-circuit-breaker'),
+      false,
+      'the breaker must never have tripped'
+    );
+
+    // Positive confirmation that run() is genuinely still active, not merely "hasn't resolved
+    // yet": stop() only sets stopReason if nothing has already set it (dispatcher.js's own `if
+    // (!stopReason)` guard), so if the breaker HAD already tripped, this would still read
+    // 'scanner-crash-circuit-breaker' here, not 'stop-requested' -- there is no timing window in
+    // which this assertion can pass by luck.
+    dispatcher.stop();
+    const stopReason = await runPromise;
+    assert.equal(stopReason.reason, 'stop-requested', 'the dispatcher must have still been running when stop() was called');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// F1 (verifier finding, this action's own rework): the two tests above only ever exercise the
+// case where consecutiveScannerCrashes and totalScannerCrashes happen to be EQUAL (no healthy
+// reset occurred before the trip, or the breaker never trips at all) -- which means a straight
+// SWAP of the two field values on the stopReason/event object would ship green through the whole
+// suite, twice over. That is byte-for-byte the defect this action exists to close, in the one
+// artifact a human reads once the daemon has stopped: `{"consecutiveScannerCrashes":9,
+// "totalScannerCrashes":3}` transposed would read as "9 crashes in a row" for a scanner that
+// actually crashed 3 in a row out of 9 total. This test is the one case where the two numbers
+// MUST differ: a breaker trip that happens AFTER a healthy reset.
+test('the breaker trips with consecutiveScannerCrashes and totalScannerCrashes at DIFFERENT values -- pins the two fields against a swap', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-scandiverge-q-');
+  const journalDir = mkTmp('spo-disp-scandiverge-j-');
+
+  // Four scanner lifecycles: unhealthy, healthy (resets the streak), unhealthy, unhealthy.
+  //   c1: 0-50      (uptime 50,   unhealthy) -> consecutive 1, total 1
+  //   c2: 100-1400  (uptime 1300, healthy)   -> consecutive 1 (RESET), total 2
+  //   c3: 1500-1550 (uptime 50,   unhealthy) -> consecutive 2, total 3
+  //   c4: 1600-1650 (uptime 50,   unhealthy) -> consecutive 3 == scannerCrashLimit -> TRIPS, total 4
+  // consecutiveScannerCrashes (3) and totalScannerCrashes (4) are DIFFERENT at the trip -- the one
+  // scenario a same-value assertion could never catch a field swap on.
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    scannerCrashLimit: 3,
+    scannerHealthyUptimeMs: 400,
+    deps: {
+      spawn: spawnExit(0),
+      spawnScanner: spawnExit(1),
+      monotonicNowMs: mockClock([0, 50, 100, 1400, 1500, 1550, 1600, 1650]),
+    },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const stopReason = await dispatcher.run(); // resolves on its own once the breaker trips
+
+  // Literals named here, not recomputed from config, per this file's own standing rule on that
+  // mistake (CLAUDE.md; this suite shipped it twice already cutting a safety constant). 3 is
+  // scannerCrashLimit above; 4 is the 4th crash in the sequence commented above.
+  assert.deepEqual(stopReason, {
+    reason: 'scanner-crash-circuit-breaker',
+    consecutiveScannerCrashes: 3,
+    totalScannerCrashes: 4,
+    scannerCrashLimit: 3,
+  });
+
+  const crashes = readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed');
+  assert.equal(crashes.length, 4);
+  assert.deepEqual(
+    crashes.map((e) => [e.consecutiveScannerCrashes, e.totalScannerCrashes]),
+    [
+      [1, 1],
+      [1, 2],
+      [2, 3],
+      [3, 4],
+    ]
+  );
+  assert.equal(readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-spawn').length, 4, 'initial spawn + 3 respawns, then the breaker stops the 5th');
+});
+
+// The ONE test in this group that leaves `deps.monotonicNowMs` un-injected -- everything above
+// proves the DECISION LOGIC is correct given a clock reading; this proves the PRODUCTION WIRING
+// (spawnScanner's read at spawn, handleScannerExit's read at exit, both through the real
+// `monotonicNowMs` from orchestrator/monotonic-clock.js) actually measures real elapsed wall-clock
+// time end to end. Kept deliberately small -- 2 crashes, ~1.2s of real sleep total, not the ~7s
+// the mock-clock rewrite above removed -- because this is the one place a mock CAN'T stand in for
+// reality without begging the question.
+test('with the REAL monotonic clock (no injected deps), a scanner that genuinely survives past the bar is measured and classified healthy', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-scanrealclock-q-');
+  const journalDir = mkTmp('spo-disp-scanrealclock-j-');
+
+  // Spawn 1 crashes near-instantly (real, unhealthy). Spawn 2 genuinely sleeps 1200ms (real
+  // `setTimeout` inside the child) before crashing -- >= 3x scannerHealthyUptimeMs (400ms) and
+  // >= 10x the 33-108ms near-instant spawn cost measured on this box under contention (this
+  // action's own verification), so the margin is not a number picked to pass once.
+  let call = 0;
+  const spawnScannerFn = (cmd, args, opts) => {
+    call += 1;
+    return call === 2 ? spawnScannerAliveFor(1200, 1)(cmd, args, opts) : spawnExit(1)();
+  };
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    scannerCrashLimit: 10,
+    scannerHealthyUptimeMs: 400,
+    deps: { spawn: spawnExit(0), spawnScanner: spawnScannerFn }, // no monotonicNowMs override -- the real clock
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed').length >= 2, 10000);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const crashes = readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed');
+  assert.equal(crashes.length, 2);
+  assert.ok(crashes[0].uptimeMs < 400, `expected the near-instant crash to read well under 400ms, got ${crashes[0].uptimeMs}`);
+  assert.equal(crashes[0].consecutiveScannerCrashes, 1);
+  assert.ok(crashes[1].uptimeMs >= 400, `expected the real 1200ms sleep to be measured as >= 400ms, got ${crashes[1].uptimeMs}`);
+  assert.equal(crashes[1].consecutiveScannerCrashes, 1, 'the real elapsed time genuinely crossed the bar, so this must read as a reset, not an extension to 2');
+});
+
+// ---- the journalled event must name what it reports (this action's own requirement) -----------
+//
+// A maintainer diagnosing a stopped daemon reads daemon.jsonl, not this file -- so the exact field
+// names and the exact numbers on both the per-crash event and the circuit-breaker stopReason are
+// asserted literally here, not derived from the constant under test (this suite has shipped that
+// mistake twice already -- see this file's own header / CLAUDE.md for the standing rule).
+test('the scanner-crashed event and the circuit-breaker stopReason report consecutiveScannerCrashes and totalScannerCrashes under their own honest names', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-scanfield-q-');
+  const journalDir = mkTmp('spo-disp-scanfield-j-');
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    scannerCrashLimit: 1, // trips on the very first crash -- keeps this test to exactly one event of each kind
+    scannerHealthyUptimeMs: 5000,
+    deps: { spawn: spawnExit(0), spawnScanner: spawnExit(1), monotonicNowMs: mockClock([1000, 1042]) }, // uptime exactly 42ms
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const stopReason = await dispatcher.run();
+
+  // The literals are 1 because scannerCrashLimit above is the literal 1 -- named here, not
+  // recomputed from config, per this file's own standing rule on that mistake.
+  assert.deepEqual(stopReason, {
+    reason: 'scanner-crash-circuit-breaker',
+    consecutiveScannerCrashes: 1,
+    totalScannerCrashes: 1,
+    scannerCrashLimit: 1,
+  });
+
+  const crashEvent = readDaemonEvents(journalDir).find((e) => e.event === 'scanner-crashed');
+  assert.ok(crashEvent, 'expected a scanner-crashed event');
+  assert.equal(crashEvent.consecutiveScannerCrashes, 1);
+  assert.equal(crashEvent.totalScannerCrashes, 1);
+  assert.equal(crashEvent.scannerCrashLimit, 1);
+  // Exact values, driven by the mock clock above -- not merely `typeof === 'number'`, which a
+  // hardcoded 0 would also satisfy. The uptime that drove the healthy/unhealthy decision, and the
+  // threshold it was judged against, must both be visible to a reader with no other file open.
+  assert.equal(crashEvent.uptimeMs, 42);
+  assert.equal(crashEvent.scannerHealthyUptimeMs, 5000);
 });
 
 test('a scanner exit caused by the dispatcher\'s own shutdown is never counted as a crash or respawned', { timeout: 20000 }, async () => {

@@ -71,6 +71,15 @@ const COMMAND_TIMEOUTS_MS = {
 };
 const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
+// Hoisted out of the `orphanScanMs`/`unparkScanMs` fields below (action 7's scanner-crash-breaker
+// fix) so scannerHealthyUptimeMs's own default can be DERIVED from these two instead of a third,
+// independently-typed literal that could silently drift from them -- see that field's own comment
+// for why THESE two, specifically, are the right derivation source. Still exported verbatim as
+// `orphanScanMs` / `unparkScanMs` below; this only moves the declaration, same pattern as
+// CI_CHECKS_MAX_POLLS/CI_CHECKS_POLL_INTERVAL_MS above.
+const ORPHAN_SCAN_MS = process.env.SPO_ORPHAN_SCAN_MS !== undefined ? Number(process.env.SPO_ORPHAN_SCAN_MS) : 60 * 1000;
+const UNPARK_SCAN_MS = process.env.SPO_UNPARK_SCAN_MS !== undefined ? Number(process.env.SPO_UNPARK_SCAN_MS) : 60 * 1000;
+
 // Hoisted out of the `autoTriageMs` field below (action 3.3) so autoTriageBackoffBaseMs can
 // default off the SAME resolved value rather than re-parsing SPO_AUTO_TRIAGE_MS a second time and
 // risking the two silently drifting apart.
@@ -445,6 +454,37 @@ module.exports = {
   // SPO_SCANNER_CRASH_LIMIT overrides.
   scannerCrashLimit: positiveIntFromEnv('SPO_SCANNER_CRASH_LIMIT', 3),
 
+  // How long (ms) a spawned scanner must stay alive -- measured by dispatcher.js's own
+  // handleScannerExit with orchestrator/monotonic-clock.js's monotonicNowMs, an ELAPSED-DURATION
+  // measurement inside that one process, never written to disk or compared across processes (see
+  // that file's own header) -- before ITS crash is treated as the START of a fresh consecutive
+  // streak rather than an extension of the previous one. This is what makes
+  // consecutiveScannerCrashes actually consecutive: a worker has a terminal outcome (0/20) that
+  // defines "healthy", but the scanner's own loop never returns on its own (state-machine.js's
+  // runForever is `for (;;)`), so there is no terminal-outcome signal to reset on -- uptime is the
+  // only substitute dispatcher.js has for "this run of the scanner was fine, not a symptom of the
+  // same failure as the last one."
+  //
+  // DERIVED, not invented: shouldScanOrphans/shouldScanUnpark (orphan-scan.js / park-loop.js) both
+  // treat a null last-run as due NOW, so EVERY scanner -- healthy or about to crash on its next
+  // line -- completes one orphan+unpark pass on its very first loop iteration, regardless of
+  // orphanScanMs/unparkScanMs. That freebie first pass is therefore NOT evidence the scanner is
+  // doing real, sustained work; surviving long enough for orphanScanMs/unparkScanMs to come due A
+  // SECOND time is -- that is what "completing scan cycles" (as opposed to merely starting up)
+  // actually means for this process. Default is the larger of the two (ORPHAN_SCAN_MS,
+  // UNPARK_SCAN_MS -- equal today at 60s, but expressed as a derivation in case they diverge)
+  // rather than pollIntervalMs (5s): pollIntervalMs is just this loop's own tick, and a scanner
+  // that ticks once and dies has not been shown to do anything useful, only to have started.
+  //
+  // STATED PLAINLY, same posture as workerCrashLimit/scannerCrashLimit's own comments above and
+  // mainMovedRegateBudget further down: THIS IS A TUNABLE WITH NO JOURNAL EVIDENCE BEHIND IT. The
+  // live daemon's journal has zero scanner-crashed events across its ~6h of post-C6 uptime (2
+  // dispatcher-start events) -- there is no observed crash-clustering pattern to calibrate against,
+  // only the code-level argument above for why uptime, not a fixed cadence, is the right signal and
+  // why THESE timers are the right source for it. Recalibrate once a real scanner-crashed history
+  // exists. SPO_SCANNER_HEALTHY_UPTIME_MS overrides.
+  scannerHealthyUptimeMs: positiveMsFromEnv('SPO_SCANNER_HEALTHY_UPTIME_MS', Math.max(ORPHAN_SCAN_MS, UNPARK_SCAN_MS)),
+
   // ---- crash recovery: orphaned tasks + lock re-verification (orchestrator/orphan-scan.js,
   // orchestrator/lock.js) -- see doc/daemon-crash-recovery.md for the incident this covers
   // (2026-08-30, card #385: a daemon that died mid-DIAGNOSE left state.json frozen on a
@@ -456,7 +496,7 @@ module.exports = {
   // startup (before this timer's first tick) -- that is the case that matters (crash -> systemd
   // restart), this timer is the belt-and-suspenders for a daemon that keeps running but somehow
   // loses track of a task. SPO_ORPHAN_SCAN_MS overrides.
-  orphanScanMs: process.env.SPO_ORPHAN_SCAN_MS !== undefined ? Number(process.env.SPO_ORPHAN_SCAN_MS) : 60 * 1000,
+  orphanScanMs: ORPHAN_SCAN_MS,
 
   // action 2.7 bullet 4: park-loop.js's unparkScan used to run unconditionally on EVERY
   // drainQueueOnce cycle (pollIntervalMs, 5s by default) in real mode -- a `gh api .../comments`
@@ -464,7 +504,7 @@ module.exports = {
   // shape and same default as orphanScanMs above (park-loop.js's shouldScanUnpark). SPO_UNPARK_SCAN_MS
   // overrides, 0 disables (a parked task then only unparks via a hand-run `spo retry`/equivalent,
   // never the daemon's own scan).
-  unparkScanMs: process.env.SPO_UNPARK_SCAN_MS !== undefined ? Number(process.env.SPO_UNPARK_SCAN_MS) : 60 * 1000,
+  unparkScanMs: UNPARK_SCAN_MS,
 
   // action 2.7: the sane bound on comment-scan.js's own pagination (`fetchCommentsAfterAnchor`),
   // shared by park-loop.js's unparkScan and report-intake.js's reportConfirmScan -- see that

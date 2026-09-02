@@ -6,10 +6,11 @@
 // two disagreed while this file was written is called out in a comment next to the field it
 // affects -- see orchestrator/README.md "Real mode" for the summary list.
 //
-// `review-card.md` (the sixth prompt file) deliberately has NO entry here: state-machine-spec.md
-// § Step contracts lists exactly five rows, and prompts/README.md's own header names
-// `review-card` as "not yet a state-machine-spec.md row" -- it is driven by the intake path
-// (card filing), never by orchestrator/state-machine.js's callLlmStep.
+// Three of prompts/'s eight files deliberately have NO entry here -- `review-card.md`,
+// `draft-card.md` and `triage-bug-report.md`. state-machine-spec.md § Step contracts lists
+// exactly five rows, and all three of those are driven by the intake path
+// (orchestrator/intake.js's reviewCard/draftCard/triageBugReport, which carry their own
+// model/effort/allowedTools inline), never by orchestrator/state-machine.js's callLlmStep.
 //
 // Two things below are NOT sourced from either doc, because neither one gives a number or names
 // a CLI permission-mode value per step -- they are this build's own inferred defaults:
@@ -87,24 +88,28 @@ const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE
 //                            change-validator (prompts/README.md), meaning "when Fable is
 //                            unavailable" -- this build has no way to detect that at the CLI
 //                            layer, so a task-level override flag stands in for it.
-//   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, the RDO wire rule (CLAUDE.md's
-//                            "the RDO wire ... src/shared/rdo-*, src/server/rdo.ts,
-//                            rdo-members.ts, session phases"). Per the spec's own Step
+//   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, standing in for the RDO wire rule
+//                            stated in SPO-WebClient/doc/kanban-workflow.md (not this repo's
+//                            CLAUDE.md, which has no RDO rule) -- "src/shared/rdo-*,
+//                            src/server/rdo.ts, rdo-members.ts, session phases".
+//                            intake.js's makeTask only detects a slice of that
+//                            (`area === 'rdo' || /rdo-members\.ts/.test(body)`), once at
+//                            intake, before a plan exists.
+//                            Per the spec's own Step
 //                            contracts table this applies to IMPLEMENT and to VALIDATE's
 //                            change-validator (its escalation is stated explicitly in the
 //                            prompt file validate-change.md itself, not just the table) --
-//                            NOT to PLAN. See the DIVERGENCE note on the PLAN entry below.
+//                            NOT to PLAN. See the note on the PLAN entry below.
 //   - 'lSize'             -- task.size === 'L', IMPLEMENT only ("... or L-sized task").
 const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
     baseModel: 'fable',
     escalatedModel: 'opus',
-    // DIVERGENCE: prompts/README.md's own step table reads "Fable 5 (Opus 5 on the wire rule
-    // or as fallback)" for PLAN -- but state-machine-spec.md's Step contracts row for PLAN
-    // reads only "Fable 5 (Opus 5 fallback)", with no wire-rule clause. The spec wins per the
-    // task brief, so PLAN escalates on the generic fallback flag only, never on
-    // task.touchesRdoMembers.
+    // prompts/README.md's own step table now agrees with state-machine-spec.md's Step
+    // contracts row for PLAN -- both read "Fable 5 (Opus 5 fallback only ... deliberately NOT
+    // PLAN)", no wire-rule clause (fixed in commit 0e84bac, which used to diverge from the spec
+    // here). PLAN escalates on the generic fallback flag only, never on task.touchesRdoMembers.
     escalatesOn: ['escalateFlag'],
     effort: 'bySize',
     // Spec + README table both say "Read, Grep, Glob, Bash(ro)" -- the "(ro)" is enforced by
@@ -173,12 +178,11 @@ const STEP_CONTRACTS = {
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
     effort: 'high',
-    // DIVERGENCE (flagged, not corrected here): both the spec row and prompts/README.md's
-    // table say "Read, Grep" for citation-verifier -- but verify-citations.md's own body says
-    // twice, in its own words, "You hold Read, Grep, Bash and no more". The two tables the task
-    // brief names as authorities agree with each other, so this entry follows them (no Bash);
-    // the prompt file's stricter self-description is not itself contradicted by omitting a
-    // tool the prompt never actually needs to invoke (it is read-only regardless).
+    // RESOLVED (action 7.5): the spec row, prompts/README.md's table, and this entry all said
+    // "Read, Grep" for citation-verifier, but verify-citations.md's own body disagreed with all
+    // three -- it said twice, in its own words, "You hold Read, Grep, Bash and no more". The code
+    // was already right (this step never invokes Bash); the prompt's self-description was the
+    // outlier and has been corrected to match (`prompts/verify-citations.md`, both mentions).
     allowedTools: ['Read', 'Grep'],
     permissionMode: 'default',
     cwdKind: 'pipeline',

@@ -1,4 +1,4 @@
-# orchestrator — v2 skeleton, shadow mode
+# orchestrator — v2, real mode shipped
 
 Implements the lifecycle table in [../doc/state-machine-spec.md](../doc/state-machine-spec.md)
 (v1.1): INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI_CHECKS → VALIDATE →
@@ -24,10 +24,13 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
   `realPushPr`/`realGate`/`realCiChecks`/`realMerge`/`realFinish`) run for real — see "Real
   scripted steps" below. `--real` and `--shadow` are mutually exclusive (daemon.js refuses to
   start); if `--dry-run` is also given, `--dry-run` wins, same precedence as `--shadow` winning
-  over `--dry-run`. Nothing in the `node --test` suite ever spawns a real `git`/`npm`/`gh`/
-  `claude` process — every real-mode test (`test/llm-real*.test.js`,
+  over `--dry-run`. No test that runs the real-mode functions in-process spawns a real
+  `git`/`npm`/`gh`/`claude` process — every real-mode test (`test/llm-real*.test.js`,
   `test/account-rotation.test.js`, `test/real-steps.test.js`) injects `deps.spawnSync` and calls
-  the real-mode functions directly, never through `daemon.js`'s own child-process dispatch.
+  the real-mode functions directly, never through `daemon.js`'s own child-process dispatch. That
+  guarantee stops at a process boundary, though: a test that spawns a real `daemon.js
+  --worker`/`--scanner` child reaches the real, unpatched `spawnSync` inside that child — see
+  "The hermeticity guarantee stops at a process boundary" below.
 - Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
   missing). Point both at a temp dir to run an isolated batch — this is how the test suite
   works.
@@ -76,14 +79,15 @@ Recognized keys:
 | `nightlyMainRed` | refuse WORKTREE / refuse a main-moved merge | boolean |
 | `worktree`, `check`, `pushPr`, `finish`, `prMergeEnqueue` | exit code for that scripted step | number (0 = success) |
 | `gate` | `npm run gate` exit code: 0 PASS · 1 fail · 2 dirty · 3 worker down · 4 timeout | number |
-| `ciChecks` | the one failing CI check name this CI_CHECKS visit, or falsy for green | string \| null |
+| `ciChecks` | the one failing CI check name this CI_CHECKS visit, or falsy for green. Two shapes, both live: a bare string (legacy; routes EVERY check name to DIAGNOSE, since it carries no step info) or `{check, step}` (action 4.3, `state-machine.js`'s `resolveShadowCiChecks`; the step is what actually lets routing reach `IMPLEMENT` or `pr-rules-needs-approval` at all) | string \| null \| `{check, step}` |
 | `mainMoved` | whether `origin/main` touched the branch's files this CI_CHECKS visit | boolean |
 | `prWait` | `pr:wait` exit code: 0 merged · 1 closed unmerged · 4 still open (bounded re-wait) | number |
 | `llm.PLAN`, `llm.IMPLEMENT` | step payload; any object with `ok !== false` succeeds | object |
 | `llm.DIAGNOSE` | `{ "rootCause": "…" }` | object |
 | `llm.CITATION_VERIFIER` | `{ "verdict": "PASS" \| "REJECT" \| "DIVERGES" }` (only consulted when `task.touchesRdoMembers` is true) | object |
 | `llm.VALIDATE` | `{ "verdict": "PASS" \| "PASS_WITH_FINDINGS" \| "REJECT" }` | object |
-| `delays.<STATE>` | artificial ms delay before that step returns, for the deadline test | number |
+| `delays.<STATE>` | artificial ms delay before an LLM step returns (`delays.PLAN`, `delays.IMPLEMENT`, `delays.DIAGNOSE`, `delays.CITATION_VERIFIER`, `delays.VALIDATE`), for the deadline test | number |
+| `delays.<fixtureKey>` | same mechanism for a **scripted** step, but keyed on its fixture key, not its state name: `delays.worktree`, `delays.check`, `delays.pushPr`, `delays.gate`, `delays.prMergeEnqueue`, `delays.prWait`, `delays.finish` — `delays.WORKTREE`/`delays.CHECK`/`delays.PUSH_PR`/etc. are silently ignored (`steps/scripted.js` reads `delays.${fixtureKey}`, never the state name) | number |
 | `forceState` | INTAKE returns this state name instead of `WORKTREE` — a test-only hook for exercising the unrecognized-state catch-all | string |
 
 Example (from the spec):
@@ -104,7 +108,9 @@ Example (from the spec):
 
 ## Budgets
 
-Two independent counters per task, both journaled and both visible in `state.json`:
+`config.js` ships five budget counters in total (`diagnoseBudget`, `validateRejectBudget`,
+`transientRetryBudget`, `ciRetryBudget`, `mainMovedRegateBudget`); the two below are the
+per-task retry budgets this section is about, both journaled and both visible in `state.json`:
 
 - **DIAGNOSE → IMPLEMENT retries**: `diagnoseBudget` (default 3) attempts total; any root
   cause seen twice for the same task parks immediately, even under budget. One line per
@@ -132,9 +138,21 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
   is a JS timer, not a process kill, so it cannot preempt a blocking `spawnSync`: it is a no-op
   against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there)
   and, in real mode, equally inert around an LLM step (bounded instead by
-  `LLM_STEP_DEADLINE_MS` below). It is live only in shadow mode, where an LLM step has no
-  blocking `spawnSync` underneath it and a fixture delay races this 120s timer instead of the
-  900000ms figure below (`doc/state-machine-spec.md` § Step contracts).
+  `LLM_STEP_DEADLINE_MS` below). The generic 120000ms default is live only in shadow mode, where
+  an LLM step has no blocking `spawnSync` underneath it and a fixture delay races this 120s timer
+  instead of the 900000ms figure below (`doc/state-machine-spec.md` § Step contracts) — but
+  `deadline.js`'s `deadlineMsFor` consults `config.stepDeadlineMsByState[state]` before falling
+  back to this default, and that override IS live in real mode: `config.js` gives `CI_CHECKS`,
+  `WORKTREE` and `FINISH` their own, much larger entries (derived from the in-flight poll budget
+  and the product-repo mutex's own worst-case wait). `WORKTREE`/`FINISH`'s overrides were sized
+  "large enough never to fire" against a purely-synchronous `spawnSync` body, but 6.4's
+  product-repo mutex added the first `await` in that path (its poll loop's `await sleep(pollMs)`)
+  — which armed a timer that had never been live before. Measured during 6.4's own verification:
+  with a holder still inside the critical section, the timer fired for real, parking
+  `step-deadline-exceeded-twice` and leaving an orphan worktree behind (`deadline.js`'s
+  `withTimeout` abandons the loser rather than cancelling it, so the abandoned invocation kept
+  running alongside its own retry). See `config.js`'s own comment on `stepDeadlineMsByState` for
+  the full incident and the derivation.
 - `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the `spawnSync` timeout
   `invokeClaudeReal` arms for every LLM step call (PLAN, IMPLEMENT, DIAGNOSE,
   CITATION_VERIFIER, VALIDATE), uniformly regardless of task size or model, in real mode.
@@ -218,7 +236,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:711`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:747-749`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -322,7 +340,7 @@ A card task's own fields:
 
 `size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
 `EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
-for IMPLEMENT and VALIDATE (never PLAN — see the DIVERGENCE comment on `step-contracts.js`'s
+for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
 PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
 CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
 only when `touchesRdoMembers` is true. `citations` in the JSON above is shown as a hand-set task
@@ -564,10 +582,12 @@ typed `NoAccountsRegisteredError` (`state-machine.js` maps it to PARKED, same as
 **Cooldown duration — an escalating probe, not a flat number (action 3.5, 2026-08-31 redesign).**
 This action's own first cut used a flat 5-hour cooldown for every usage limit. A verifier caught
 why that was wrong before it shipped: the real pool has **2 accounts**
-(`~/.claude-accounts/pool1`, `pool2`), and `daemon.js` has no pool-health gate anywhere — with
-`maxAttempts` equal to the pool size, two usage limits landing inside one window took the *whole
-pool* down for up to 5 hours, parking every card the daemon pulled during that window at its
-first LLM step, each needing a manual `retry` comment. And the figure itself over-waits by
+(`~/.claude-accounts/pool1`, `pool2`), and at the time `daemon.js` had no pool-health gate
+anywhere — with `maxAttempts` equal to the pool size, two usage limits landing inside one window
+took the *whole pool* down for up to 5 hours, parking every card the daemon pulled during that
+window at its first LLM step, each needing a manual `retry` comment. (Chantier 6 action 6.3 later
+closed that gap — see "How much the daemon takes on at once" below for the dispatcher's own
+healthy-accounts clamp, which this cooldown redesign does not depend on and is unaffected by.) And the figure itself over-waits by
 construction: the Claude Max session window resets 5h after the *session's first message*, not
 after the limit hit, so `now + 5h` sleeps for (5h − the true remaining wait) longer than
 necessary — often 4h+. The problem a long cooldown was solving is real but small: at a 1-hour
@@ -635,9 +655,47 @@ spo account add acct-2
 prints the exact next steps (`CLAUDE_CONFIG_DIR=... claude setup-token`, where to paste the
 token, the `chmod 600`, then `spo accounts` to verify) — it never runs `claude` itself.
 `spo account enable <name>` / `spo account disable <name>` toggle the `disabled` marker.
+`spo account clear-cooldown <name>` clears a *cooldown*, which the marker has nothing to do with:
+it deletes the account's whole `state.json` entry under the same short lock `markLimit` takes.
+Clearing `cooldownUntil` by hand is not equivalent -- `computeLimitUpdate` also stores
+`lastUsageLimitAt`, and leaving it behind means the next limit inside `ESCALATION_WINDOW_MS`
+escalates straight to the 5h tier as though nothing had been cleared. It exists because the
+cooldown is invented locally and never reconciled against the server (issue #483): 4 of the 7
+cooldowns in the live journal carry `defaulted: true`, i.e. the server supplied no retry-after
+and the code guessed.
 `K` parallel workers scales with `K` healthy accounts — the gate itself stays serialized (one
 live world), so adding an account adds implementation capacity, not gate throughput
 (state-machine-spec.md § Account pool).
+
+**Per-step account leases (chantier 6 action 6.2, `orchestrator/account-lease.js`).**
+`accounts.pick()` is deterministic first-fit — two concurrent callers get handed the *same*
+account every time, invisible under the pre-C6 single-threaded daemon and a real bug once a
+worker and the scanner process (§ "How much the daemon takes on at once") can both be calling an
+LLM step at once. A lease is acquired around one LLM call, per-step rather than per-task
+(deliberate: the real pool is 2 accounts, a card's models already rotate fable → sonnet → fable
+with no cross-step cache to protect, and 15% of cards already rotate mid-run in ~6s at zero cost —
+a per-task lease on a 2-account pool would turn that routine rotation into a park class that has
+never fired), and released the instant that call finishes. Lease files live at
+`<poolDir>/.lease-<name>.json` (`{pid, startedAt}`), acquired/released via `lock.js`'s
+`acquireShortLock`/`releaseShortLock` — the same pid-liveness stale-sweep idiom `daemon.lock`
+uses, and, since the measured 39%-torn-read defect (`lock.js:257-288`: 119 of 800 cooldown
+entries lost), the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too
+(`account-lease.js:156` → `lock.js:255` `acquireShortLock` → `:289` `tryCreate`) — a bare `'wx'`
+create is exactly the defect that idiom replaced, not a shortcut this path still takes.
+
+A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
+**bounded wait** (`config.accountLeaseWaitMs`) before parking `all-accounts-leased` — distinct
+from `AllAccountsCoolingError` (a cooldown, never worth waiting on; that still parks immediately).
+The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **31.5 minutes**: 2 ×
+`LLM_STEP_DEADLINE_MS` plus 10% slack) — the age at which a lease is presumed dead and swept
+regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That distinction
+was a real C6-verification bug: the original default (5 min, reasoned from the typical duration)
+gave up while a legitimately-held lease could still be alive and un-sweepable for up to another
+26.5 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
+always terminates one of two honest ways — it gets a lease, or the holder ages out and it takes
+that one — instead of parking early. `countHealthyAccounts` (the `K ≤ healthy accounts` clamp
+above) is deliberately blind to lease state, only to cooldowns: a lease frees every 90–265s, and
+clamping `K` on that churn would make it flap on every single LLM call.
 
 ### cwd policy
 
@@ -685,9 +743,9 @@ real binary on `PATH`). Each function is judged on exit codes only (principle 1,
 doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure, or returns the
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
-**Where the commands run.** `config.productRepo` is always `path.join(os.homedir(),
-'SPO-WebClient')` — the product checkout, never a relative `../SPO-WebClient` (a session
-worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
+**Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:615`) — the product checkout,
+never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
 `config.cwdForStep`) reads that path back off `ctx.task.worktreePath`, set once WORKTREE
@@ -729,7 +787,7 @@ run by `steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:49` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:98` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -933,7 +991,8 @@ throws `ParkSignal('<class>-timed-out', {state, argv, commandClass, timeoutMs})`
 reason naming the command class, never the calling state's own failure reason (a timed-out GATE
 parks `npm-gate-timed-out`, never `gate-timeout` — that string is the *domain* exit-4 reason
 `npm run gate` itself can return — and never reaches DIAGNOSE). The retry lives inside
-`spawnStep`, not at each of its 48 call sites, so the policy cannot drift between them. Retrying
+`spawnStep`, not at each of its 63 call sites (`grep -c 'spawnStep(ctx'` finds 64 matches across
+`orchestrator/`; one is the function's own definition), so the policy cannot drift between them. Retrying
 after a timeout is not obviously safe for every command — a first attempt that actually
 succeeded server-side before the local process hung could in principle be repeated — but every
 call site was audited: `git push`/`git commit`/`git worktree add`/etc. are all naturally
@@ -952,9 +1011,11 @@ independent of the CLI flag (so a caller that builds `ctx.config` by hand gets t
 refusal). `--real` and `--shadow` are mutually exclusive at the CLI (`daemon.js` refuses to
 start with both); a non-`"card"` (e.g. `"synthetic"`) task is never gated by `--real` at all.
 
-**First live run is maintainer-supervised.** Nothing in `node --test` ever spawns a real
-`git`/`npm`/`gh` process — every test in `test/real-steps.test.js` injects `deps.spawnSync` and
-calls `realWorktree`/`realCheck`/... directly. The first time `daemon.js --real` actually drives
+**First live run is maintainer-supervised.** No in-process test spawns a real `git`/`npm`/`gh`
+process — every test in `test/real-steps.test.js` injects `deps.spawnSync` and calls
+`realWorktree`/`realCheck`/... directly; that guarantee does not extend to tests that spawn a
+real `daemon.js --worker`/`--scanner` child (see "The hermeticity guarantee stops at a process
+boundary" below). The first time `daemon.js --real` actually drives
 a `kind: "card"` task against the real product repo and a real GitHub PR, a maintainer should be
 watching: it worktree-adds off `origin/main`, runs `npm ci`, claims a real board card, pushes a
 real branch, opens a real PR, and — on the happy path — merges it and removes its own worktree.
@@ -1021,9 +1082,28 @@ Three things action 5.1 changed here, each measured against the 18-task journal 
 
 The issue comment (gh needs no cwd) still posts either way.
 
+### Action 4.4: bounded auto-retry never reaches the board at all
+
+Everything below this heading describes what happens when a task actually parks. `finalizePark`
+(`state-machine.js`) checks one thing FIRST, before any of it: whether `ctx.config.real` is set
+and the reason is one of a closed allowlist -- `claim-rate-limited`, `gate-non-attesting` (unless
+its detail says the bench's verdicts directory itself is missing, which is a permanent
+misconfiguration, not a transient fault) and the four `llm-transport-failed:*` reasons -- with
+the per-task `transientRetries` counter still under `config.transientRetryBudget` (default **2**).
+If so, the task is silently re-enqueued instead of parked: no board move, no `Parked` comment, no
+`state.json` PARKED write -- nothing the rest of this section describes happens. It waits
+`config.transientRetryDelaysMs` (default `[60s, 5min]`, indexed by attempt) before it is eligible
+to run again, journalled as `transient-retry` (or `transient-retry-failed` if the re-enqueue
+write itself fails, which falls through to an ordinary park). Only once the budget is exhausted
+does the SAME reason fall through to the ordinary park machinery below. The comment in
+`finalizePark` itself is explicit about why this matters: a card taking this branch "must not
+look parked to `spo parked`, the dashboard, or a maintainer reading the issue thread" -- none of
+those three surfaces has anything to show for it while the retry budget still has room.
+
 ### Park <-> kanban round trip
 
-When a real, `kind: "card"` task parks, `state-machine.js`'s `finalizePark` calls
+When a real, `kind: "card"` task actually parks -- the action 4.4 branch above did not apply, or
+its budget is exhausted -- `state-machine.js`'s `finalizePark` calls
 `park-loop.js`'s `postParkComment`: moves the card to `Parked` (never blocks, see above) and
 posts a structured comment on the issue -- the reason, what the machine expects from the
 maintainer, and this literal line:
@@ -1070,7 +1150,7 @@ neither word -- is left alone, since a human conversation on the issue is allowe
   prompt fill" above) mistake "nobody re-measured it this run" for "`origin/main` hasn't moved")
   and journals `unparked-by-maintainer`. This does NOT by itself cost PLAN's LLM call again: if
   the plan `reEnqueueTask` left on disk (`journal/<id>/scratch/`, never touched by a retry) is
-  still valid against the freshly-measured `baseMainSha` and the park wasn't one of the six
+  still valid against the freshly-measured `baseMainSha` and the park wasn't one of the seven
   plan-invalidating reasons, PLAN reuses it instead of re-deriving it -- action 3.1's whole point,
   since a retry restarting at INTAKE would otherwise re-run PLAN from scratch on a plan that was
   already correct. Action 2.8: the `0000-`
@@ -1686,8 +1766,9 @@ the full correction text still reaches the maintainer, since `review-card`'s own
 create` + `gh issue comment`, `orchestrator/intake.js`).
 
 **Cost**: `spo ask` makes about two real `claude -p` calls per request -- one DRAFT_CARD (skipped
-entirely in the brainstorm lane) and one review-card -- both at `SMALL_BUDGET_USD`
-(`step-contracts.js`), an order of magnitude cheaper than a single PLAN/IMPLEMENT call.
+entirely in the brainstorm lane) and one review-card -- both with `maxBudgetUsd: undefined`
+(no cap; `step-contracts.js` -- no `SMALL_BUDGET_USD` constant exists in this build), an order
+of magnitude cheaper in practice than a single PLAN/IMPLEMENT call by task shape alone.
 
 **`spo pull`** never claims a card and never writes the board -- it only spawns
 `npm run board:claim` (cwd = the product repo, the cheap ~2-point GraphQL read
@@ -1744,7 +1825,20 @@ normally against the winner's now-live lock.
 A task whose owning daemon process dies mid-run (crash, hard kill, a losing race against
 `watchLock` above) leaves `journal/<id>/state.json` frozen on a non-terminal state with no
 `queue/` entry — invisible to a drain pass and to `unparkScan`'s own PARKED-only scan alike.
-`orchestrator/orphan-scan.js` closes that gap: every `state.json` snapshot now carries an
+
+This section covers the **fallback** path only. The **primary** cover, since chantier 6 split the
+daemon into dispatcher/worker/scanner processes, is `dispatcher.js`'s `handleExit` →
+`reparkCrashedWorker`: the dispatcher notices a worker child exit abnormally and reparks it
+immediately, in-process, reason `worker-crashed` — no wait for a scan at all (see
+doc/state-machine-spec.md § Principles, Principle 2). The scanner-based mechanism below exists for
+what the dispatcher itself cannot cover: a worker killed during the dispatcher's OWN shutdown
+(deliberately not reparked in-process, since a park half-written by a process already being
+SIGKILLed can never be recovered later — `dispatcher.js:485-499`) and any owning daemon process
+that simply never comes back to run `handleExit` at all (a hard kill of the whole process tree).
+The shutdown case is this project's most common one in practice: a merge's `git pull` SIGTERMing
+an in-flight card.
+
+`orchestrator/orphan-scan.js` closes that remaining gap: every `state.json` snapshot now carries an
 `owner: {host, pid, lockStartedAt}` (set once, from `daemon.js`'s own lock holder), and a task
 whose owner pid is no longer alive on this host — past a grace window
 (`config.orphanGraceMs`, default 4 min, to avoid racing a transition's own last write) — is
@@ -1839,15 +1933,30 @@ suite runs once, and the check passes exactly when that suite is green. GATE rec
 diff CHECK already passed — the smallest, least surprising input the bench can be asked to judge.
 See `orchestrator/recette.js`'s own comment above `RECETTE_DOC_FILE` for the full reasoning.
 
-**Scenarios are data.** `recette.js`'s `SCENARIOS` is a plain object, `{name, label, buildCard(ctx),
-assertions: [...]}` per entry — the runner (`runRecette`) is generic over any entry shaped that
-way. Adding a second scenario (action 7.2) means adding a second object literal, never touching
-`runRecette`, `evaluateAssertions`, or the cleanup logic.
+**Scenarios are data.** `recette.js`'s `SCENARIOS` is a plain object, one entry per scenario:
+`{name, label, description, driver, k, buildCard(ctx), targetFile(index), assertions: [...],
+crossTaskAssertions?}` — `driver` is `'inline'` (the original path, verbatim: `drainQueueOnce` plus
+the `deps.spawnSync`-wrapped cap) or `'dispatcher'` (drives the real `createDispatcher` with real
+worker children); `k` is how many synthetic cards the scenario runs; `capLlmSteps`/`capMs` are
+optional per-scenario overrides of the global cap defaults (opts/env still win over them);
+`crossTaskAssertions` only applies at `k > 1`, checked once across every task's combined events
+rather than per-task. A scenario that only changes what IMPLEMENT is asked to do, at `driver:
+'inline'`, really is just a second object literal, touching neither `runRecette` nor
+`evaluateAssertions` nor the cleanup logic — `trivial-doc-log` (`k: 1`) is exactly that. That does
+not hold for a `dispatcher`-driver scenario: chantier 7 action 7.2 landed `parallel-doc-log`
+(`k: 2`) at `c0e4bbb`, which needed its own driver branch (`runDispatcherScenario`) and an
+out-of-process cap (`runDispatcherCapWatchdog`, summing `llm-call` events across every task the
+run owns), since the inline cap wraps `deps.spawnSync` in-process and a dispatcher runs its
+workers as separate OS processes the in-process wrapper never sees.
 
-**The cap.** The remediation plan's "capped budget" predates this project retiring dollars as a
-metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent, honestly-enforceable
-bounds, both checked at the one choke point every real spawn (scripted **and** `claude -p`, per
-`steps/llm.js`'s `invokeClaudeReal`) already passes through: `deps.spawnSync`.
+**The cap — `driver: 'inline'`.** The remediation plan's "capped budget" predates this project
+retiring dollars as a metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent,
+honestly-enforceable bounds, both checked at the one choke point every real spawn *the inline
+driver makes* (scripted **and** `claude -p`, per `steps/llm.js`'s `invokeClaudeReal`) already
+passes through: `deps.spawnSync`. This does not extend to `driver: 'dispatcher'` — its workers are
+separate OS processes, invisible to an in-process `deps.spawnSync` wrapper, which is exactly why
+that driver carries its own out-of-process watchdog (`runDispatcherCapWatchdog`, above) instead of
+reusing this mechanism.
 
 - **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
   spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
@@ -1878,15 +1987,32 @@ rendered `PASS`/`PASS_WITH_FINDINGS`; MERGE actually enqueued the PR; FINISH rec
 Each assertion is `{id, description, check(info) -> {ok, detail}}` and never throws — one broken
 event fails only its own assertion, so the report always shows the rest.
 
-**Safety: refuses while a live daemon is running.** There is no product-repo mutex until chantier
-6 action 6.4 (`config.js`'s own note on the 44-worktree/61-branch incident this project already
-paid for once) — the only guard today is refusing to *start* while a live daemon holds **its own**
-lock file, `<repoRoot>/journal/daemon.lock` (`orchestrator/lock.js`). Checked read-only (recette
-reads the lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does —
-it never calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly,
-for a maintainer who has confirmed by hand that nothing is actually running. This is a best-effort
+**Safety: refuses while a live daemon is running.** Chantier 6 action 6.4 added a real
+product-repo mutex (`orchestrator/product-repo-lock.js`, `config.js`'s own note on the
+44-worktree/61-branch incident this project already paid for once), but recette does not itself
+acquire it — WORKTREE's setup and FINISH's teardown already take the lock, the same `realWorktree`/
+`realFinish` code every driver runs (via `drainQueueOnce` for `driver: 'inline'`, via a real worker
+process for `driver: 'dispatcher'`). What recette adds on top is a coarser, earlier guard: refusing
+to *start* at all while a live daemon holds **its own** lock file, `<repoRoot>/journal/daemon.lock`
+(`orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
+whether a daemon is running at all before recette begins. Checked read-only (recette reads the
+lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does — it never
+calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly, for a
+maintainer who has confirmed by hand that nothing is actually running. This is a best-effort
 check, not a mutex: it catches "I forgot the daemon is running", not a daemon that starts a second
 after the check passes.
+
+**Safety: a second, unrelated refusal for `driver: 'dispatcher'`.** A dispatcher-driver scenario
+spawns a real scanner child, and that child inherits `SPO_REMOTE_REPORT_URL` from this process's
+own environment exactly as it inherits the seven zeroed scan-timer vars (see "Scenarios are data"
+above) — but zeroing `SPO_REMOTE_REPORT_PULL_MS` does not stop `remote-report-pull.js`'s first
+pull, which runs unconditionally on scanner startup. If `SPO_REMOTE_REPORT_URL` is ever set in the
+shell `spo recette` runs from (today it lives only in the live daemon's systemd drop-in, never an
+interactive shell), a `driver: 'dispatcher'` run would make a genuine HTTPS pull-and-ack against
+production bug reports into this machine's real `~/.spo-reports`. `runRecette` refuses outright
+when that env var is set and the driver is `dispatcher` (`reason: 'remote-report-url-set'`),
+`--force` overrides both refusals for a maintainer who has confirmed by hand that a real pull is
+acceptable. `driver: 'inline'` never spawns a scanner at all, so this refusal never applies to it.
 
 **`--dry`** resolves the exact same config `--force`-free real run would (one function,
 `buildPlan`, feeds both paths so they cannot structurally diverge), prints it, and returns before
@@ -2048,15 +2174,68 @@ here parks, retries, or otherwise changes pipeline behavior.
 
 ## How much the daemon takes on at once
 
-The daemon drains **serially** — one task at a time (`drainQueueOnce`) — and `runForever`
-*awaits* that drain before pulling again. So a pull only ever happens with the daemon idle,
-and `autoPullLimit` (`SPO_AUTO_PULL_LIMIT`, **default 1**) is the most cards that can sit off
-the board, unstarted, at any moment — not a per-cycle burst layered on top of work in
-progress.
+Chantier 6 replaced the single-process daemon with three kinds of process sharing one journal
+root, and how much work is in flight is now split across two different questions: how many
+tasks run at once, and how many more are allowed to queue up unstarted.
 
-At 1, the daemon takes one card, finishes it, then looks again: cards stay on the board —
-visible, reorderable, claimable by a human — until it is actually ready for them. Raise it if
-serial intake proves to be the bottleneck.
+**Three processes, one journal root.**
+
+- The **dispatcher** (`node orchestrator/daemon.js (--shadow|--dry-run|--real)`, no mode flag
+  beyond that — `orchestrator/dispatcher.js`) holds the single-instance lock and is the only one
+  of the three that does. It spawns and reaps up to `K` worker children and exactly one scanner
+  child; it never itself runs a scan or a task.
+
+  It carries **two independent circuit breakers**, and they count differently on purpose. A
+  worker's streak (`consecutiveCrashes`) resets on any `done` **or** `parked` outcome — a park is
+  a successful run of the state machine, so a run of parked cards can never trip a breaker meant
+  to catch a broken one. A scanner has no terminal outcome to succeed at (it only ever leaves by
+  crashing), so its streak resets on **uptime**: a scanner that lived at least
+  `scannerHealthyUptimeMs` before dying starts a new streak instead of extending the old one.
+  Chantier 7 fixed that field, which was incremented and reset nowhere — three scanner crashes
+  across a dispatcher's entire lifetime, however far apart, used to stop the whole daemon while
+  the journalled field said "consecutive". `scanner-crashed` now carries `consecutiveScannerCrashes`,
+  the cumulative `totalScannerCrashes` under its own honest name, the measured `uptimeMs`, and
+  `scannerHealthyUptimeMs` itself — without that last one, `{"uptimeMs":45000,
+  "consecutiveScannerCrashes":3}` cannot be read without also opening config.js and the
+  operator's environment. **The trade this makes is real and is filed as #79**: a crash loop
+  slower than the bar never trips the breaker at all, and every scanner respawn runs a full scan
+  cycle immediately, because every `should*` predicate treats a null last-run as due now.
+- A **worker** (`daemon.js --worker <taskDir>`) runs the one task already sitting in `<taskDir>`
+  to its terminal state and exits — action 6.1. It does not take the single-instance lock (the
+  dispatcher already holds it for the whole journal root).
+- The **scanner** (`daemon.js --scanner`, exactly one, action 6.3) runs `state-machine.js`'s
+  `runForever` — now just the periodic scans (orphan/unpark/auto-pull/report-intake) on their
+  own timers, queue-draining removed — forever, in its own process. It was split out after
+  measuring one of those scans (auto-triage's `claude` call) block the single JS thread for
+  3+ minutes, which would otherwise freeze worker-slot refills and SIGTERM handling for that
+  whole window if it ran inside the dispatcher's own loop.
+
+**How many tasks run at once.** `orchestrator/dispatcher.js`'s `fillSlots` fills as many worker
+slots as `K` currently allows, where `K` is `Math.min(config.workers, healthy accounts)` —
+re-clamped to `accounts.countHealthyAccounts(accountsDir)` immediately before *every* spawn, not
+once per loop. `config.workers` (`SPO_WORKERS`) defaults to **1** — at K=1 the dispatcher still
+spawns a worker child for every task rather than keeping a separate in-process serial path, so
+there is one code path to keep correct instead of two.
+
+**How many more are allowed to queue up unstarted.** Auto-pull used to mean "how many candidates
+one cycle takes off the board", with nothing else bounding how many cycles could each take that
+many — at the shipped defaults (workers=1, autoPullMs=5min, autoPullLimit=1) a scanner with no
+ceiling could still put 12 cards/hour into `queue/`, unclaimable by a human, with no relation to
+how many workers actually exist. Action 6.6 added a second, harder ceiling above the per-cycle
+rate: `orchestrator/auto-pull.js`'s `computeAutoPullBudget` reads how many tasks are already
+queued (`queuedIds`) and how many are already in flight (`live-workers.json`, the dispatcher's own
+published set — read as `K` worst-case if the file is missing/unreadable, never as 0) and clamps
+this cycle's pull to `min(autoPullLimit, K - queued - inFlight)`, never negative. `autoPullLimit`
+(`SPO_AUTO_PULL_LIMIT`, **default 1**) survives as the per-cycle rate cap; `K` (`config.workers`)
+is the watermark, not `K + autoPullLimit` — the maintainer's own stated rationale for
+`autoPullLimit` ("cards stay on the board — visible, reorderable, claimable by a human — until
+ready") only holds while `K` is also the ceiling on how much can ever be unstarted-but-claimed at
+once. This scan runs in the scanner process (above), not the dispatcher.
+
+At the shipped defaults, this still behaves like the old description in the common case: one card
+queued, one worker running, look again next cycle. The difference only shows once `K > 1` or a
+maintainer manually queues several cards at once — the watermark, not the per-cycle rate, is what
+stops the scanner from over-filling `queue/` beyond what the dispatcher can actually run.
 
 ## Where journals live
 
@@ -2075,7 +2254,12 @@ atomic within a filesystem) rather than a single `fs.writeFileSync` — a crash 
 mid-write can no longer leave a truncated, unparsable `state.json` behind for a real in-flight
 task (action 2.5).
 
-`bin/spo` reads only these files (plus `queue/` for depth) — it holds no state of its own.
+`bin/spo`'s read-only subcommands (`status`/`task`/`parked`/`resume`/`tokens`/`reports`) read
+only these files (plus `queue/` for depth, and the account pool, `~/.spo-bench`,
+`~/.spo-reports` for their own sections) — they hold no state of their own. Several other
+subcommands DO write local or live state: `account add`/`account enable`/`account disable`/
+`account clear-cooldown` touch the account pool and `state.json`/`daemon.jsonl`; `ask`/`pull`/
+`intake`/`triage --file`/`recette` write to real GitHub. See `bin/spo`'s own header comment.
 
 ## CLI
 
@@ -2088,6 +2272,7 @@ bin/spo cost [--journal <dir>]                     # DEPRECATED alias for `spo t
 bin/spo resume <id> [--journal <dir>]              # print `claude --resume <sessionId>` for a task's LLM steps
 bin/spo accounts [--accounts-dir <dir>]            # list the account pool: name, enabled, cooldown, token, credentials
 bin/spo account add <name> [--accounts-dir <dir>]  # create the pool slot, print the guided setup steps
+bin/spo account clear-cooldown <name>              # drop a locally-invented cooldown (and its escalation state)
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
@@ -2126,8 +2311,12 @@ Two render modes, same underlying data:
   (everything else -- services (daemon/queue/bench-worker/nightly/verdicts/prod), accounts,
   daemon stats, bug reports, tokens -- meant to be polled every 30s). `--no-prod` disables the
   outbound starpeace.zz.works / GitHub Releases probe (`console/prod-version.js`) for an offline
-  run. Never binds anywhere but `localhost`/LAN by default; the externally hosted copy (nginx +
-  basic auth) is a `spo dashboard` + rsync concern owned by SPO-Deploy.
+  run. **Binds all interfaces by default, with no authentication of its own**: `bin/spo`'s
+  `server.listen(port, opts.host || undefined, …)` binds `::`/`0.0.0.0` unless `--host` names a
+  specific interface, and `console/serve.js` has no auth layer at all -- the externally hosted
+  copy's nginx + basic auth (a `spo dashboard` + rsync concern owned by SPO-Deploy) is the only
+  access control in front of it. Run `--serve` with an explicit `--host localhost` (or behind a
+  firewall) unless you mean to expose it.
 
 Per-task detail (id, state, reason, per-LLM-step `claude --resume <sessionId>`) is deliberately
 NOT rendered -- it duplicates the GitHub Projects board (Kanban), which owns that view. The
@@ -2153,7 +2342,7 @@ SPO-WebClient/SPO-Deploy change, outside this repo's scope -- so the deployed ve
 section -- see `console/render.js`'s `renderProdTile`.
 
 **Tokens card:** two parts. The primary view is an operating-cost **trend**
-(`console/usage-scan.js`'s `buildTrendViews`, fed by `console/usage-rollups.json` -- a small,
+(`console/usage-scan.js`'s `buildTrendViews`, fed by `<journalRoot>/usage-rollups.json` -- a small,
 durable daily-rollup file the live server's usage-scan timer writes on the same ~5-minute
 cadence it already scans on, capped at 180 days): a weighted (`WEIGHT()`-formula) average
 Mtok-equivalent per session, with today/7d/30d KPI tiles and week-over-week deltas, a sparkline,
@@ -2179,7 +2368,7 @@ node scripts/usage-report.js > journal/usage-snapshot.json
 ## Tests
 
 ```bash
-node --test test/*.test.js
+node --test --test-timeout=30000 test/*.test.js
 ```
 
 From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, so the
@@ -2187,6 +2376,12 @@ moment a parked card holds a product worktree under `worktrees/issue-<n>/` it wa
 SPO-WebClient's own TypeScript suites and reports thousands of foreign failures — 1926 tests /
 1168 failures with four parked cards, none of them this repo's. `worktrees/` is gitignored, so
 `git status` stays clean and the result reads as a catastrophic regression in code that is fine.
+`--test-timeout=30000` bounds a single test that hangs instead of letting the whole run stall
+(`doc/remediation-progress.md` pins the reference count at this invocation). **When reading the
+result — mutation testing especially — check `# fail` AND `# cancelled`, never `# fail` alone.**
+Node reports a timed-out test as `cancelled`, not `fail`: a run that prints `# pass 1418 # fail 0`
+can still have killed a hanging test past the 30s bound, and reading `# fail` alone reads that
+killed mutant as a survivor.
 
 `node --test test/` does not work either: Node treats `test/` as a test-name filter rather than a
 directory, matches nothing, and prints `not ok 1 - test`.
@@ -2237,4 +2432,20 @@ cleaning up, cleanup's idempotency (including when the injected `spawnSync` itse
 `evaluateAssertions` as a pure function -- including the one that hands it a `DONE` journal
 missing a required event and confirms the assertion set actually catches it, never rubber-stamping
 a run that merely reached `DONE`. None of them ever touch a real
-`git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.
+`git`, `npm`, `gh` or `claude` process in-process -- but that is not the same as "the whole suite
+never spawns one for real": a test that spawns a real `daemon.js --worker`/`--scanner` child
+reaches the real `spawnSync` inside that child, unpatched. See "The hermeticity guarantee stops
+at a process boundary" immediately below.
+
+**The hermeticity guarantee stops at a process boundary.** `test/no-real-spawn.js` (the killswitch
+above) patches `child_process.spawnSync` in the parent test process only — it protects every call
+made in-process, but a test that spawns a real `daemon.js --worker`/`--scanner` child reaches the
+real `spawnSync` inside that child with no killswitch at all, since the patch was never applied to
+that process's own `child_process` module. This is a limitation of the guard's own design, not a
+bug in it (`test/no-real-spawn-sweep.test.js`'s file-by-file scan can only ever prove "this file
+requires the module first," never "nothing this file's tests spawn can reach `spawnSync`
+unpatched"), and it was proved the hard way during chantier 7: a mutation-testing round routed
+tests through real `daemon.js --worker` children and created a live worktree and branch in
+`/home/crazz/SPO-WebClient` while the `--real` daemon was running against it. Any future test that
+spawns the dispatcher or a worker/scanner child for real needs its own injection point or its own
+isolation — this suite does not give it one for free.

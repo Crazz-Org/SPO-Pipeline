@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 'use strict';
-// spo -- reads ONLY the journals under journal/<id>/ (never its own state).
+// spo -- the read-only subcommands (status/task/parked/resume/tokens/reports) read ONLY the
+// journals under journal/<id>/ and never touch state.json. Several other subcommands DO write:
+// `account add`/`account sync-settings` mkdir and sync local settings; `account enable`/
+// `account disable` write marker files; `account clear-cooldown` rewrites state.json and appends
+// to daemon.jsonl; `dashboard` writes a file or binds a listener; `ask`/`pull`/`intake`/
+// `triage --file` file real GitHub issues; `recette` creates and deletes real issues, branches,
+// PRs and worktrees.
 //
 //   spo status              queue depth, bench queue depth (~/.spo-bench/spool,running), account
 //                            health + cooldowns, today's billable-weighted spend (with its own
@@ -80,6 +86,12 @@
 //                            Never runs `claude` itself.
 //   spo account enable/disable <name>
 //                            Creates or removes the `disabled` marker file for that account.
+//   spo account clear-cooldown <name>
+//                            Clears a cooling account's state.json entry (cooldownUntil AND
+//                            lastUsageLimitAt AND usageLimitStreak together -- clearing
+//                            cooldownUntil alone leaves the escalation window armed, see
+//                            accounts.js's clearCooldown). Same short lock as markLimit; refuses
+//                            an unknown name (exit 1) rather than writing an orphan entry.
 //   spo account sync-settings
 //                            Installs <repo>/.claude/settings.json as every pool account's
 //                            user-tier settings.json. An account directory IS a
@@ -116,8 +128,13 @@
 //                            "Intake" board column, and posts confirm/discard instructions. See
 //                            orchestrator/report-intake.js.
 //   spo reports [--reports-dir <dir>]
-//                            Lists what is waiting in <reports-dir>/pending/ for a maintainer's
-//                            "confirm"/"discard" reply -- the intake analogue of `spo parked`.
+//                            Lists everything in <reports-dir>/pending/ -- the intake analogue
+//                            of `spo parked`. NOT one population: a raw card can be there
+//                            awaiting its FIRST "confirm"/"discard" reply, already confirmed and
+//                            awaiting auto-triage, or HELD -- already triaged with a negative
+//                            verdict and restored to pending/ by auto-triage.js so a human still
+//                            sees it (never archived unseen). All three render identically; the
+//                            remedy differs per population.
 //   spo triage [--limit N] [--file]
 //                            Stage 3+: reproduces/routes/drafts every report already replied
 //                            "confirm" to, via orchestrator/intake.js's triageBugReport, then the
@@ -144,15 +161,19 @@
 //                            § Report intake.
 //   spo recette [--scenario <name>] [--keep] [--dry] [--force]
 //                            ACTION 2.9 -- the supervised live harness, and the standard live
-//                            gate this project uses from chantier 3 on: drives ONE trivial
-//                            synthetic `kind: "card"` task through the REAL pipeline
-//                            (config.real=true) against a dedicated, distinctly-labelled GitHub
-//                            issue in the product repo, under a wall-clock + LLM-step-count cap,
-//                            asserts the scenario's declared checks against the produced
-//                            journal, then cleans up unconditionally (worktree, branches, PR,
-//                            issue, its own isolated journal dir under .recette/) -- never the
-//                            live journal/queue. Refuses to run while a live daemon holds
-//                            journal/daemon.lock, unless --force. --dry prints the plan (no
+//                            gate this project uses from chantier 3 on: drives one or more
+//                            trivial synthetic `kind: "card"` task(s) through the REAL pipeline
+//                            (config.real=true) against dedicated, distinctly-labelled GitHub
+//                            issue(s) in the product repo, under a wall-clock + LLM-step-count
+//                            cap, asserts the scenario's declared checks against the produced
+//                            journal(s), then cleans up unconditionally (worktree(s), branches,
+//                            PR(s), issue(s), its own isolated journal dir under .recette/) --
+//                            never the live journal/queue. The default scenario (trivial-doc-log)
+//                            is ONE task against ONE issue; `parallel-doc-log`
+//                            (`driver: 'dispatcher', k: 2`) files TWO live issues and spawns a
+//                            real worker/scanner tree, not the single-issue single-process shape
+//                            this once described uniformly. Refuses to run while a live daemon
+//                            holds journal/daemon.lock, unless --force. --dry prints the plan (no
 //                            issue, no worktree, no LLM call, no side effect at all) and exits.
 //                            --keep skips cleanup, for debugging a run by hand. See
 //                            orchestrator/recette.js and orchestrator/README.md § Recette.
@@ -178,6 +199,7 @@ const os = require('os');
 const { collectAll, readDaemonEventsTail } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
 const accounts = require('../orchestrator/accounts');
+const journal = require('../orchestrator/journal');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
 const { formatDuration } = require('../orchestrator/task-summary');
 const defaultConfig = require('../orchestrator/config');
@@ -212,6 +234,14 @@ function parseArgs(argv) {
     recetteDir: null,
     capMs: null,
     capLlmSteps: null,
+    // action 7.2, post-verification correction: `--help` was NOT recognized here at all before
+    // this -- it fell straight into `opts._` (unused) and `spo recette --help` (or, worse,
+    // `spo recette --scenario parallel-doc-log --help`) fell through to cmdRecette's own real-run
+    // path exactly like `spo pull --help` already does (a pre-existing, disclosed footgun this
+    // action's own dispatcher driver made materially worse: a two-issue, K=2, real-dispatcher run
+    // instead of a single-card one). Scoped to `spo recette` only (cmdRecette checks this FIRST,
+    // before anything else) -- see that function's own header.
+    help: false,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -238,6 +268,7 @@ function parseArgs(argv) {
     else if (a === '--recette-dir') opts.recetteDir = argv[++i];
     else if (a === '--cap-ms') opts.capMs = Number(argv[++i]);
     else if (a === '--cap-llm-steps') opts.capLlmSteps = Number(argv[++i]);
+    else if (a === '--help' || a === '-h') opts.help = true;
     else opts._.push(a);
   }
   return opts;
@@ -1104,7 +1135,7 @@ function cmdDashboard(opts) {
 // account -- see orchestrator/accounts.js): name, enabled, cooldownUntil (only shown while
 // actually cooling), whether an oauth-token file is present, and whether the account's
 // CLAUDE_CONFIG_DIR holds any credentials file of its own (anything besides oauth-token/
-// disabled). Same fields the dashboard's "Comptes Claude" section shows.
+// disabled). Same fields the dashboard's "Claude accounts" section shows.
 function cmdAccounts(opts) {
   const accountsDir = resolveAccountsDir(opts);
   const registry = accounts.readRegistry(accountsDir);
@@ -1224,6 +1255,79 @@ function cmdAccountDisable(name, opts) {
   if (!dir) return;
   fs.writeFileSync(path.join(dir, accounts.DISABLED_MARKER_FILENAME), '');
   console.log(`${name}: disabled`);
+}
+
+// `spo account clear-cooldown <name>` -- the escape hatch for a cooldown the server would have
+// let through: today the ONLY way to clear one is hand-editing <accounts-dir>/state.json
+// OUTSIDE accounts.markLimit's own short lock (see accounts.js's header on stateLockPath), which
+// is exactly the read-modify-write race markLimit's lock exists to prevent. This command takes
+// the same lock (accounts.clearCooldown) instead of repeating that mistake with a CLI wrapper.
+//
+// Unknown name: accounts.clearCooldown itself refuses BEFORE taking the lock (UnknownAccountError)
+// -- same `accountMarkerDir`-shaped guard as enable/disable use, so a typo'd name can never write
+// an orphan entry into state.json. Exit 1, per this repo's "verdict by exit code" rule
+// (CLAUDE.md) -- never inferred from the printed text.
+//
+// Reports what actually happened rather than a fixed string, because the three outcomes a
+// maintainer running this cares about are genuinely different: nothing was on record at all (no
+// state.json entry -- nothing changed, nothing written); an entry existed but had already
+// expired (cooldownUntil was in the past -- still cleared, since a stale entry still carries
+// lastUsageLimitAt/usageLimitStreak that would otherwise arm the NEXT limit's escalation); or the
+// account really was cooling right now. `escalationWasArmed` is the line that matters most: it
+// answers whether this call did more than the cosmetic thing a hand `jq` edit on cooldownUntil
+// alone would have done -- see accounts.js's clearCooldown for why lastUsageLimitAt left armed
+// is believed to be exactly what happened to the two manual state.json edits made 2026-09-02.
+function cmdAccountClearCooldown(name, opts) {
+  const accountsDir = resolveAccountsDir(opts);
+  if (!name) {
+    console.error('usage: spo account clear-cooldown <name>');
+    process.exitCode = 1;
+    return;
+  }
+
+  let result;
+  try {
+    result = accounts.clearCooldown(accountsDir, name);
+  } catch (err) {
+    if (err instanceof accounts.UnknownAccountError) {
+      console.error(`spo account clear-cooldown: no account "${name}" in ${accountsDir} (see \`spo accounts\`)`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+
+  if (!result.hadEntry) {
+    console.log(`${name}: not cooling -- no cooldown state on record, nothing changed`);
+    return;
+  }
+
+  const coolingNote = result.wasCooling
+    ? `was cooling until ${result.cooldownUntilIso}`
+    : `had a stale cooldownUntil ${result.cooldownUntilIso} (already past)`;
+  const escalationNote = result.escalationWasArmed
+    ? 'escalation state WAS armed (the next usage limit would have jumped straight to the 5h tier) -- cleared'
+    : 'escalation state was not armed';
+  console.log(`${name}: cleared -- ${coolingNote}; ${escalationNote}`);
+  if (result.degraded) {
+    console.log(`${name}: pool state lock timed out -- unlocked fallback used (accounts.js's clearCooldown), same degrade-never-fail posture as markLimit`);
+  }
+
+  // Journalled into daemon.jsonl -- this command has no taskDir of its own (it isn't scoped to
+  // any one card), so appendEvent's per-task journal.jsonl is the wrong place; appendDaemonEvent
+  // already carries other repo-wide, non-task facts (auto-pull, orphan-scan-would-repark) into
+  // exactly this file, for exactly this reason. A hand state.json edit leaves no trace at all;
+  // this at least leaves one.
+  const { journalRoot } = resolveDirs(opts);
+  journal.appendDaemonEvent(journalRoot, 'account-cooldown-cleared', {
+    account: name,
+    hadEntry: result.hadEntry,
+    wasCooling: result.wasCooling,
+    cooldownUntil: result.cooldownUntil,
+    cooldownUntilIso: result.cooldownUntilIso,
+    escalationWasArmed: result.escalationWasArmed,
+    degraded: result.degraded,
+  });
 }
 
 // `spo ask <text…>` -- intake, fast lane: DRAFT_CARD (Sonnet 5) -> review-card (Fable 5) -> file
@@ -1414,9 +1518,12 @@ async function cmdIntake(opts, deps = {}) {
   if (result.errors.length > 0) process.exitCode = 1;
 }
 
-// `spo reports [--reports-dir <dir>]` -- lists what is waiting in <reports-dir>/pending/ (raw
-// cards already filed, awaiting a "confirm"/"discard" reply) -- the intake analogue of
-// `spo parked`. Reads only the filesystem, no `gh` call.
+// `spo reports [--reports-dir <dir>]` -- lists everything in <reports-dir>/pending/ -- the
+// intake analogue of `spo parked`. Reads only the filesystem, no `gh` call. Three populations
+// render identically here: awaiting a first "confirm"/"discard" reply, already confirmed and
+// awaiting auto-triage, and HELD (auto-triage.js restores a negative-verdict report to its
+// original pending/ path rather than archiving it unseen -- see processConfirmedReport's
+// `finally`).
 function cmdReports(opts) {
   const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
   const pendingDir = path.join(reportsDir, 'pending');
@@ -1549,23 +1656,59 @@ async function cmdTriageRetry(opts, autoTriageImpl, journalRoot) {
 // (daemon lock held), a tripped cap, a park, or a failed assertion are all exit 1. `deps.recette`
 // is the test-only override (same convention as `deps.intake`/`deps.autoTriage`).
 async function cmdRecette(opts, deps = {}) {
+  // Checked FIRST, before `deps.recette`/`impl.runRecette` is ever reached -- action 7.2,
+  // post-verification correction. `--help` used to be unrecognized entirely and fell through to
+  // a REAL run (`spo pull --help`'s own pre-existing footgun, CLAUDE.md-documented; this action's
+  // own K=2 dispatcher driver made the SAME gap materially more expensive: `spo recette
+  // --scenario parallel-doc-log --help` would have filed two live GitHub issues and spawned a
+  // real K=2 dispatcher). Same safety contract as `--dry`: zero side effects, nothing spawns.
+  if (opts.help) {
+    console.log('usage: spo recette [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--accounts-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]');
+    console.log('  --scenario <name>   trivial-doc-log (default, driver: inline) | parallel-doc-log (driver: dispatcher, K=2)');
+    console.log('  --dry               print the plan (driver, k, steps) and exit -- no side effects, nothing spawns');
+    console.log('  --keep              skip cleanup, leave the run dir + real GitHub artifacts behind for inspection');
+    console.log('  --force             override the daemon-lock refusal (only when you have confirmed by hand nothing is running)');
+    console.log('  --accounts-dir <dir> the account pool this run uses -- forwarded to every spawned worker AND scanner too (driver: dispatcher only, via SPO_ACCOUNTS_DIR), not just clamped against in this process');
+    console.log('  --help, -h          print this and exit -- never runs the scenario');
+    return;
+  }
+
   const impl = deps.recette || recette;
-  const result = await impl.runRecette(
-    {
-      scenario: opts.scenario,
-      keep: opts.keep,
-      dry: opts.dry,
-      force: opts.force,
-      recetteDir: opts.recetteDir,
-      accountsDir: opts.accountsDir,
-      capMs: opts.capMs || null,
-      capLlmSteps: opts.capLlmSteps || null,
-    },
-    {}
-  );
+  let result;
+  try {
+    result = await impl.runRecette(
+      {
+        scenario: opts.scenario,
+        keep: opts.keep,
+        dry: opts.dry,
+        force: opts.force,
+        recetteDir: opts.recetteDir,
+        accountsDir: opts.accountsDir,
+        capMs: opts.capMs || null,
+        capLlmSteps: opts.capLlmSteps || null,
+      },
+      {}
+    );
+  } catch (err) {
+    // resolveScenario (recette.js) throws synchronously for an unknown --scenario, before any
+    // plan even exists to print -- action 7.2 requirement: list the known scenarios rather than
+    // letting this fall through to run()'s own generic `spo: <message>` catch, which drops
+    // err.detail.known on the floor entirely.
+    if (err && err.name === 'RecetteError' && err.reason === 'unknown-scenario') {
+      console.error(`spo recette: unknown scenario "${err.detail.name}" -- known scenarios: ${err.detail.known.join(', ')}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
 
   if (result.dry) {
     console.log(`spo recette --dry -- scenario "${result.scenario}" (nothing runs):`);
+    // action 7.2: driver + k, always printed -- a k>1 dispatcher-driver scenario spawns REAL
+    // worker/scanner child processes and files K real GitHub issues; a maintainer reading --dry
+    // output must be able to tell that apart from trivial-doc-log's single in-process task
+    // without opening orchestrator/recette.js.
+    console.log(`  driver: ${result.plan.driver}  k: ${result.plan.k}`);
     for (const line of result.plan.steps) console.log(`  - ${line}`);
     console.log('');
     console.log(`  journal root:          ${result.plan.journalRoot}`);
@@ -1578,6 +1721,52 @@ async function cmdRecette(opts, deps = {}) {
   if (result.refused) {
     console.error(`spo recette: refused (${result.reason}) -- ${JSON.stringify(result.detail)}`);
     process.exitCode = 1;
+    return;
+  }
+
+  // action 7.2: a driver:'dispatcher' scenario's result carries `tasks: [...]` (one or more
+  // cards) instead of a single top-level issueNumber/finalState/assertions -- see
+  // orchestrator/recette.js's runDispatcherScenario for the full shape. `ok`/`capTripped`/
+  // `elapsedMs`/`llmSteps` stay at the top level either way (that action's own requirement: this
+  // function's exit-code contract must not have to branch on driver).
+  if (Array.isArray(result.tasks)) {
+    console.log(`spo recette: scenario "${result.scenario}" (driver=${result.driver}, k=${result.k}), run ${result.runId}`);
+    console.log(`  elapsed: ${result.elapsedMs}ms  llmSteps: ${result.llmSteps}`);
+    if (result.capTripped) console.log(`  CAP TRIPPED: ${result.capTripped.reason} -- ${JSON.stringify(result.capTripped)}`);
+    if (result.error) console.error(`  error: ${result.error.name}: ${result.error.message}`);
+
+    for (const t of result.tasks) {
+      console.log(`  task ${t.taskId}: issue #${t.issueNumber || '?'}  finalState=${t.finalState}`);
+      if (t.assertions) {
+        for (const a of t.assertions.results) {
+          console.log(`    [${a.ok ? 'ok' : 'FAIL'}] ${a.id} -- ${a.description}${a.ok ? '' : ` (${a.detail})`}`);
+        }
+      } else {
+        console.log('    (no assertions evaluated -- this task did not reach a finalState)');
+      }
+    }
+
+    if (result.crossTaskAssertions) {
+      for (const a of result.crossTaskAssertions.results) {
+        console.log(`  [cross-task] [${a.ok ? 'ok' : 'FAIL'}] ${a.id} -- ${a.description}${a.ok ? '' : ` (${a.detail})`}`);
+      }
+    }
+
+    if (result.cleanupReport) {
+      const allSteps = (result.cleanupReport.perTask || [])
+        .flatMap((t) => t.steps)
+        .concat(result.cleanupReport.runDirStep ? [result.cleanupReport.runDirStep] : []);
+      const failed = allSteps.filter((s) => !s.ok);
+      console.log(
+        failed.length
+          ? `  cleanup: ${allSteps.length} step(s), ${failed.length} NOT CLEAN (${failed.map((s) => s.name).join(', ')} -- state may have been left behind)`
+          : `  cleanup: ${allSteps.length} step(s), nothing left behind`
+      );
+    } else if (result.kept) {
+      console.log(`  --keep: cleanup skipped -- inspect ${result.plan.runDir}`);
+    }
+
+    process.exitCode = result.ok ? 0 : 1;
     return;
   }
 
@@ -1621,7 +1810,7 @@ async function cmdRecette(opts, deps = {}) {
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
+      'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
       '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
@@ -1665,8 +1854,9 @@ function main() {
     if (sub === 'add') return cmdAccountAdd(name, opts);
     if (sub === 'enable') return cmdAccountEnable(name, opts);
     if (sub === 'disable') return cmdAccountDisable(name, opts);
+    if (sub === 'clear-cooldown') return cmdAccountClearCooldown(name, opts);
     if (sub === 'sync-settings') return cmdAccountSyncSettings(opts);
-    console.error('usage: spo account <add|enable|disable> <name> | spo account sync-settings [--dry]');
+    console.error('usage: spo account <add|enable|disable|clear-cooldown> <name> | spo account sync-settings [--dry]');
     process.exitCode = 1;
     return;
   }

@@ -443,6 +443,66 @@ test('postParkComment: a malformed journal.jsonl never breaks the park comment -
   assert.match(body, /billable-weighted tokens not recorded/);
 });
 
+// ---- action 7.3: the park-write ordering unparkScan's safety silently depends on --------------
+//
+// unparkScan (below) has NO live-worker guard of its own -- it filters candidate taskDirs on
+// nothing but `state.state === 'PARKED' || 'ABANDONED'` (see this file's own unparkScan). A
+// taskDir genuinely CAN read PARKED while its worker is still alive and still writing: state.json
+// is rewritten to PARKED, by finalizePark, several statements before that same worker process
+// finishes writing everything else a park touches (report.md, the board move, this comment).
+//
+// What actually keeps unparkScan from acting on a park mid-write is an ordering property nobody
+// enforces in code: the park-comment JOURNAL EVENT below (parsed by findParkAnchor as the retry/
+// abandon anchor) is deliberately the LAST journal.jsonl entry finalizePark's worker process ever
+// appends for this taskDir -- and unparkScan cannot act on a task at all until findParkAnchor
+// finds that event (park-loop.js's own per-task loop skips a PARKED task with no anchor yet). So
+// by the time unparkScan's anchor check can ever succeed, the worker that parked this task has
+// already appended everything it is ever going to append -- not because anything checks the
+// worker is dead, but because the one journal entry unparkScan waits on is provably the worker's
+// last. (This test pins the JOURNAL ordering specifically, via journal.jsonl's own append order --
+// it does not, and cannot from the outside, prove that no OTHER file under taskDir is ever
+// touched after the anchor; state.json/report.md's own ordering relative to the anchor is pinned
+// separately, above, by the state.json snapshot captured at anchor time.)
+//
+// If a future change ever moves the anchor write earlier (e.g. journalling park-comment before
+// state.json, or before report.md), that ordering guarantee silently breaks: unparkScan could then
+// see a PARKED task with a live anchor while finalizePark is still mid-write on the SAME taskDir it
+// is about to hand a retry/abandon to. Nothing else in this codebase would catch that -- this test
+// is the only thing that does.
+test('finalizePark: the park-comment anchor is the LAST JOURNAL EVENT for taskDir, strictly after state.json already reads PARKED -- unparkScan\'s only safety net', () => {
+  const taskDir = mkTmp('spo-park-order-taskdir-');
+  const config = testConfig();
+  // No worktreePath on the task: preserveWorktreeWip short-circuits to a no-op (nothing to
+  // preserve), so the only spawns finalizePark makes are the two postParkComment itself issues
+  // (npm run board:move, gh issue comment) -- keeps this test about ORDER, not about every other
+  // thing a park can do.
+  const task = { id: 'card-order', kind: 'card', issue: 950, title: 'x' };
+
+  // Captured the instant the anchor-producing `gh issue comment` call happens -- i.e. captured
+  // from INSIDE the same synchronous call stack finalizePark is still running, not read back
+  // afterward. Reading state.json back after finalizePark returns would prove nothing about
+  // ORDER: by then every write is done regardless of what order they happened in.
+  let stateAtAnchorTime = null;
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        stateAtAnchorTime = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8')).state;
+        return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/950#issuecomment-9001\n');
+      }
+      return ok(''); // npm run board:move
+    },
+  };
+
+  const ctx = buildCtx('card-order', task, taskDir, { ...config, deps });
+  finalizePark(ctx, 'GATE', 'gate-dirty-tree', { exit: 2 });
+
+  assert.equal(stateAtAnchorTime, 'PARKED', 'state.json must already read PARKED before the anchor comment is posted');
+
+  const journal = readJournal(taskDir);
+  assert.equal(journal[journal.length - 1].event, 'park-comment', 'the anchor must be the LAST journal.jsonl event this taskDir ever receives from this park');
+  assert.equal(journal[journal.length - 1].commentId, 9001);
+});
+
 // ---- unpark scan: retry / abandon / ignored ---------------------------------------------------
 
 // `worktreePath`/`prNumber` are optional -- undefined for every pre-4.5 caller (retry/ignored/

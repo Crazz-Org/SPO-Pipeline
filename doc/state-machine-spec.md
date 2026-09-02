@@ -6,6 +6,13 @@ of driver actions improvised, dispositions BRANCH 78 % · PARK 18 % · DIAGNOSE 
 adds the two states that analysis found missing (CI_CHECKS, the `main`-moved transition) and
 the design consequences at the bottom.
 
+**What in this document (and the rest of the doc/prompts/orchestrator-comment corpus) is
+verified, and by what** is not stated inline — see
+[`accepted-gaps.md`](accepted-gaps.md), action 7bis.5's register: exhaustively-read surface,
+sweep-enforced facts, classified-historical logs, and the named, line-counted accepted gap
+handed to chantier 9. This file's own prose is in that last bucket except for the specific
+park-reason and documented-constant facts a sweep checks — see `accepted-gaps.md` §3.
+
 ## Principles
 
 1. **Exit codes are the contract.** Every scripted step is judged on its exit code, never on
@@ -15,15 +22,35 @@ the design consequences at the bottom.
    event, zero further tokens. Explicit error handling means a safe cheap catch-all, not
    foreseeing everything. Parked tasks are handled by the maintainer or an interactive
    session; every parking reason that recurs becomes a new branch (frequency-ordered). One
-   case a task cannot produce a park for itself: the daemon *process* dying mid-run (crash,
-   hard kill, a lost single-instance lock). `orchestrator/orphan-scan.js` covers it
-   *a posteriori* — a `state.json` left on a non-terminal state with no `queue/` entry and a
-   dead owner pid is reparked automatically (`task-orphaned-daemon-restart`) through the same
-   `finalizePark` path a normal catch-all park uses (including restoring `worktreePath` onto the
-   rebuilt ctx, so a still-dirty worktree is pushed to a `wip/` ref exactly as a live park would),
-   the next time a `--real` daemon starts or runs its periodic scan. A `--shadow`/`--dry-run`
-   start never does real side effects, so it only detects the orphan and journals
-   `orphan-scan-would-repark` — it never parks. See `orchestrator/README.md` § Orphan recovery.
+   case a task cannot produce a park for itself: the process running it dying mid-run (crash,
+   hard kill, a lost single-instance lock). Since chantier 6 split the daemon into a dispatcher,
+   worker and scanner process (`orchestrator/README.md` § "How much the daemon takes on at once"),
+   the **primary** cover is the dispatcher's own exit handler: `dispatcher.js`'s `handleExit` →
+   `reparkCrashedWorker` runs the exact same `buildCtx`/`finalizePark` round trip a normal
+   catch-all park uses, immediately and in-process, the moment a worker child exits abnormally —
+   reason `worker-crashed`, detail `{exitCode, signal}`. `orchestrator/orphan-scan.js` is now the
+   **fallback**, covering the case the dispatcher itself cannot: a `state.json` left on a
+   non-terminal state with no `queue/` entry and a dead owner pid is reparked automatically
+   (`task-orphaned-daemon-restart`) through the same `finalizePark` path (including restoring
+   `worktreePath` onto the rebuilt ctx, so a still-dirty worktree is pushed to a `wip/` ref
+   exactly as a live park would), the next time a `--real` daemon starts or the scanner runs its
+   periodic scan. `orphan-scan.js` has a second, narrower shape for the same fallback role: a task
+   claimed off `queue/` (a `task.json` on disk) that never reached even one handler — no
+   `state.json` was ever written, so there is nothing to compare an owner pid against — is parked
+   `task-orphaned-before-start` once it has sat unclaimed-by-any-live-worker for longer than the
+   grace window; `lastState` is recorded as `INTAKE` (honest, not a guess: a task in this shape by
+   definition never got past it) so a bare `retry` reply restarts it from the beginning, a
+   complete recovery for a task that never ran. A `--shadow`/`--dry-run` start never does real
+   side effects, so both shapes only detect the orphan and journal
+   `orphan-scan-would-repark` — neither ever parks. `handleExit` also
+   deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
+   dispatcher's own shutdown** (`dispatcher.js:485-499`, `stopReason && outcome === 'crashed'`):
+   reparking from inside a process already SIGTERMed and about to be SIGKILLed risks a
+   `finalizePark` caught mid-write (state.json PARKED, no park-comment yet), which no later
+   scan can ever recover — deferring instead just leaves an ordinary non-terminal `state.json`
+   for orphan-scan to pick up cleanly next start. This is not a corner case: a merge's `git pull`
+   SIGTERMing an in-flight card is this project's single most common shutdown, so the fallback
+   above is the primary path for that one. See `orchestrator/README.md` § Orphan recovery.
    **Action 4.4:** the catch-all remains the error policy for every park reason except a closed,
    named allowlist of ones that are facts about the *world at that instant*, not about the card —
    `claim-rate-limited` (a board-claim rate limit), `gate-non-attesting` (action 4.2's bench-
@@ -31,8 +58,12 @@ the design consequences at the bottom.
    VALIDATE, exact strings — never a prefix match). Those are auto-retried a bounded number of
    times (`config.transientRetryBudget`, default 2) with a journalled backoff
    (`config.transientRetryDelaysMs`, 1 min then 5 min, carried as an absolute `notBefore` on the
-   re-queued task rather than a `sleep` — the daemon's drain loop is awaited, so sleeping inside
-   it would stall every other card) before falling through to an ordinary park. A task on this
+   re-queued task rather than a `sleep` — since chantier 6 split worker execution out into its own
+   process (`orchestrator/README.md` § "How much the daemon takes on at once"), a sleep here would
+   stall only the one worker process that is exiting anyway, not a shared drain loop; `notBefore`
+   is still the right mechanism (a queued deadline survives that process exiting, a `sleep` would
+   not), the original "stall every other card" justification just predates the split) before
+   falling through to an ordinary park. A task on this
    path is never marked `PARKED` and never gets a park comment or board move — it is not parked,
    it is retrying — and a human's `retry` reply always resets the budget to zero and starts
    immediately, restoring the "a human can always make progress" guarantee. Everything else,
@@ -47,7 +78,16 @@ the design consequences at the bottom.
    now, budget unused", i.e. an unbounded retry loop after a SIGTERM in the gap. If that write
    fails, the task journals `transient-retry-failed` and takes the ordinary park — the journal
    never claims a retry that is not really queued. See `orchestrator/state-machine.js`'s
-   `TRANSIENT_RETRY_REASONS`/`isTransientRetryReason`/`finalizePark`.
+   `TRANSIENT_RETRY_REASONS`/`isTransientRetryReason`/`finalizePark`. Two further park reasons sit
+   inside `state-machine.js`'s own dispatch loop rather than inside any handler, and so are never
+   thrown as a `ParkSignal` at all — they call `finalizePark` directly, the same sink every other
+   reason above eventually reaches: a run that hops between states more than `HOP_LIMIT` (200)
+   times parks `state-machine-runaway` (`{hops}`) — the guard against a real handler bug producing
+   a valid-looking but cyclic path (e.g. an infinite DIAGNOSE↔IMPLEMENT loop from a logic error),
+   never tripped by any legitimate path, which completes in well under this many hops; and a
+   `state` value with no entry in `HANDLERS` parks `unrecognized-state` (`{state}`) — defensive
+   only, since every `state.json`/task-journal write in this codebase is produced by the state
+   names this same file defines.
 3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.
@@ -75,17 +115,17 @@ INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI
 | State | Kind | Does | Success → | Failure → |
 |---|---|---|---|---|
 | INTAKE | script | take next task file from `queue/` (priority = file order; sources: board export, `/triage-report`, later in-game reports). **Action 3.2:** for a `kind: "card"` task, the criterion and title are scanned for a protected-file mention (`.claude/settings.json`, `.claude/settings.local.json`, anything under `.claude/hooks/` — see `orchestrator/intake.js`'s `detectProtectedFiles`) after the `invalid-task-json`, `shadow.forceState`, and `real-flag-required` checks but before `appendEvent('INTAKE', 'ok')` runs; a hit parks the task at zero cost, since INTAKE never makes an LLM call either way. | WORKTREE | PARKED (also `plan-requires-protected-files`, `{source: 'criterion', matches}`, when the card's own criterion or title names a protected file) |
-| WORKTREE | script | fresh worktree + branch off last green `main`; refuse if nightly says `main` is red (repair task only) | PLAN | PARKED |
+| WORKTREE | script | fresh worktree + branch off last green `main`; refuse if nightly says `main` is red (repair task only) | PLAN | PARKED — `product-repo-lock-timeout` when the chantier 6 product-repo mutex isn't acquired within its wait bound (`withProductRepoLock`, shared with FINISH below), plus real mode's own sequence: `worktree-fetch-failed` / `worktree-rev-parse-failed` / `worktree-add-failed` (the `git fetch origin` / `rev-parse origin/main` / `worktree add` calls themselves exit non-zero); `nightly-main-red` (the freshly-fetched `origin/main` sha matches a `FAIL` verdict in `~/.spo-bench/nightly/latest.json`, checked before anything is created); `worktree-npm-ci-failed` (`npm ci` in the fresh worktree). Card #424's leftover sweep (`sweepWorktreeLeftovers`, action 4.6) runs before `worktree add`: `worktrees/<taskId>` + branch `claude-pipe/<taskId>` is the pipeline's own exclusive namespace, so a retry may clean up its own previous attempt rather than collide with it — a dirty leftover worktree is pushed to a durable `wip/` ref then removed, but PARKS `worktree-dirty-leftover` if that preserve itself fails (never destroys unsaved work); a leftover local branch whose tip this run cannot vouch for (not an ancestor of `origin/main`, not equal to its own remote tip, not covered by one of this task's own `wip/<id>-*` refs) PARKS `branch-unmerged-leftover` rather than guess (card #385); any of the sweep's own cleanup calls failing (`worktree-remove`, `branch-delete`, `remote-preserve`, `remote-pr-lookup`, `remote-pr-close`, `remote-branch-delete`) PARKS `worktree-cleanup-failed` (`detail.step` names which one — card #455 added the PR-lookup/close steps so a remote branch delete never auto-closes an open PR as an invisible side effect). The claim itself (`npm run board:take`, run last — only once fetch/rev-parse/leftover-sweep/add/npm-ci have all succeeded, since only the fresh worktree gives the npm aliases a product cwd) maps its own exit code: 3 → `claim-lost`, 4 or 5 → `claim-rate-limited` (a GitHub board-claim rate limit — unrelated to the Claude account pool's own cooldowns under Account pool below, despite the similar name), 6 → `claim-finished-worktree`, anything else → `claim-unrecognized-exit`; see `orchestrator/README.md` "WORKTREE, in order — and why claim is last" for the full sequence and exit-code table. Shadow mode and `--dry-run` never reach any of the real-mode reasons above: their own generic scripted-step path (a non-zero exit from the fake `worktree` script, no `git`/`gh`/`npm` ever spawned) PARKS the distinct, generic `worktree-failed` instead. A shadow-mode fixture (`nightlyMainRed`) checked before the real/scripted branch is even chosen PARKS `main-red-refuse-worktree` — the shadow-only sibling of real mode's own `nightly-main-red` above, same concept (nightly says `main` is red), different code path (fixture vs a real read of `nightly/latest.json`). |
 | PLAN | `claude -p` | plan + invariants file + runnable check commands + `files_to_change` (action 3.2 — the plan's own declared list of files it will change; a sibling `optional` field of the output contract, not `required`, so its absence never parks — see step-contracts.js); once written, the driver resolves every invariant against the worktree and journals the result as the CHECK baseline (action 1.8) — an invariant that fails to resolve here is logged and excluded from that baseline, never a park, never a re-run of PLAN. **Action 3.1:** real mode only — shadow and `--dry-run` never reuse, checked explicitly as the guard's first condition. On a `retry` after a park, PLAN is skipped entirely (no LLM call) when the plan already on disk from the run that parked is still valid: `origin/main` has not moved since it was written, both plan/invariants files are still present, are regular files, and non-empty, the last PLAN `result` payload is not itself a failure (a transport-failure payload carries no `plan_path`/`invariant_ids`/`check_commands` to hand IMPLEMENT), and the park that ended the previous run was not one of the seven reasons that indict the plan itself (`plan-invalid`, `plan-requires-protected-files`, `diagnose-duplicate-root-cause`, `diagnose-no-new-cause`, `diagnose-budget-exhausted`, `validate-reject-budget-exhausted`, `ci-retry-budget-exhausted`) — every other park reason (transport failures, gate/CI failures, claim losses, merge conflicts) is orthogonal to whether the plan was right. The invariants baseline is still rebuilt fresh against the retried worktree either way; the plan/invariants text and PLAN's own declared `invariant_ids`/`check_commands` are carried forward with `plan_path`/`invariants_path` stamped explicitly (not merely trusted to already be present on the carried-forward payload), journalled as `plan-reused`. See `orchestrator/state-machine.js`'s `decidePlanReuse`. | IMPLEMENT | PARKED (plan invalid/not executable; a transport failure — the call never produced a verdict at all — is `llm-transport-failed:PLAN`, distinct from an invalid plan the model DID produce; **action 3.2:** `plan-requires-protected-files` — `{source: 'files_to_change', matches, declaredFiles}` when an entry of the model's own declared `files_to_change` names a protected file, scanned before any scratch file is written. `plan_markdown` prose is never scanned — measured at 33% precision (2 false positives against 1 true positive across all 17 real plans) and dropped for that reason. When `files_to_change` is absent, `null`, not an array, or contains a non-string entry, PLAN does not park and does not fall back to scanning prose — it journals `plan-files-undeclared` and proceeds normally; an empty array counts as a clean declaration, not an undeclared one) |
 | IMPLEMENT | `claude -p` | write code + tests in the worktree per plan | CHECK | DIAGNOSE (a transport failure is never routed to DIAGNOSE — it PARKS `llm-transport-failed:IMPLEMENT` instead, since there is no answer for DIAGNOSE to diagnose) |
 | CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |
-| PUSH_PR | script | commit, push, open PR (`Closes #N`) — PR precedes gate (CI needs it) | GATE | PARKED |
-| GATE | script | `npm run gate` (bench job, background wait); read **exit code**: 0 PASS · 1 fail · 2 dirty · 3 worker down · 4 timeout. **Action 4.2:** exit 1 is no longer an unconditional route to DIAGNOSE — the exit code alone conflates three different situations the bench itself distinguishes. Read the bench's own verdict for HEAD (`<spoBenchDir>/verdicts/<sha>.json`, the same file CI_CHECKS reads below for its own `main`-moved test): the bench merges `origin/main` into the checkout itself before building (`worker.ts`'s `prepareRef`), so `baseMain` is absent from that file precisely when the branch no longer merges cleanly with `origin/main` — measured over all 375 `ref`-type verdicts `npm run gate` submits: 359/359 PASS carry `baseMain`, 14/16 FAIL do; the missing 2 are exactly the main-moved conflicts (confirmed end to end on card #439 / commit `379ada60`, which burned all 3 DIAGNOSE attempts and parked `diagnose-budget-exhausted` before a `retry` — a fresh worktree off the new `main` — reached DONE in 19 minutes). No verdict file **on disk** means the run is *non-attesting* (`worker.ts`'s `NON_ATTESTING = {DIRTY, ENVIRONMENT, ABANDONED}` is deliberately never written to `verdicts/`, yet `cli.ts`'s `wait()` still maps all three to exit 1) — nothing was learned about the code, so it parks rather than spending a DIAGNOSE call on it. A FAIL that DOES carry `baseMain` failed with `origin/main` already merged in by the bench; that is a real failure and still routes to DIAGNOSE, unchanged. A FAIL *without* `baseMain` fetches `origin/main` and attempts the same local merge CI_CHECKS' own `main`-moved path performs (below) — clean → back to CHECK and re-gate; conflict → `merge --abort` then PARKED. The plan's own intersection test is deliberately not implemented for this path: with no `baseMain` there is nothing to intersect against. | CI_CHECKS | exit 1 with a verdict carrying `baseMain` → DIAGNOSE (unchanged) · exit 1 and the lookup itself failed — `rev-parse HEAD` non-zero, or exit 0 with stdout that is not an object name (a failing `git rev-parse` prints the ref name itself, action 4.1's measurement), or a verdict file that is present but does not parse — → DIAGNOSE, journalled `gate-verdict-unreadable`, never a park: a failed diagnostic must not become the thing that parks the card · exit 1, no verdict file on disk → PARKED (`gate-non-attesting`, detail carries `verdictDirExists` so a misconfigured `spoBenchDir` is one look) · exit 1, FAIL without `baseMain`, merge conflicts → PARKED (`main-moved-conflict`) · main-moved re-gates already used this task's `mainMovedRegateBudget` (config.js, default 1 — **action 6.5**, see below) → PARKED (`main-moved-twice`, counter shared with CI_CHECKS) · nightly says `main` is red at the fetched sha → PARKED (`main-red-no-merge`, guard shared with CI_CHECKS) · 2/3/4 → PARKED |
-| CI_CHECKS | script | Two checks the bench does not make. (0) Before either: a bounded **in-flight wait** (action 1.7) — a check-run with `conclusion: null` (still running) or zero check-runs at all (CI hasn't registered anything yet) is never read as green; re-poll `gh api .../check-runs` up to `ciChecksMaxPolls` times (default 30), sleeping `ciChecksPollIntervalMs` between polls (default 20000ms, injectable in tests; ~10 min total, deliberately uncalibrated — see config.js), journaling each observation, until nothing is in flight. *(2026-08-30 audit: 8/12 measured "green" events had `claude review` still in progress.)* (a) `gh pr checks <n>` once nothing is in flight — CI normally concluded while the gate queued; on red, map the failing check **by name**: `Coverage of changed lines` → IMPLEMENT · `Lint` → IMPLEMENT · `PR rules` (protected files, needs `rdo-approved`) → PARKED · anything else → DIAGNOSE. (b) the `main`-moved test: intersect `git diff --name-only <baseMain>..origin/main` with the branch's changed files — non-empty → merge `origin/main`, back to CHECK and re-gate; while the nightly says `main` is red, never merge from it → PARKED. *(Added in v1.1: 5/16 measured sessions reached a green gate and could not merge — every one improvised CI forensics; 4/16 needed the `main`-moved branch.)* **Action 4.2:** the `mainMoveUsed` counter and the nightly-red guard are the exact same shared state GATE's own main-moved path (above) uses — a move already spent from either state blocks the other, and a nightly-red main blocks a merge attempted from either. **Action 6.5:** the re-gate is now allowed up to `config.mainMovedRegateBudget` times per task (default **1** — today's "once" behaviour, unchanged), not a hardcoded once; the (n+1)th move → PARKED (`main-moved-twice`, the name kept for continuity even past a raised budget — it names the event, not a literal second occurrence). This is a settled decision, not a re-derivable default: the intersection test above is deliberately narrower than "did `main` move at all" — the GitHub merge queue serializes *landing*, not *semantics*, so two merged PRs with disjoint files but interacting behaviour can both land without either ever being re-gated against the other, and this budget does not close that gap. Two ways to close it were considered and declined — a dispatcher-held MERGE admission token (measured +42s/card at K=2, and it would not even fix the semantics: card B still merges having never been gated against card A, it only stops interleaving, which the merge queue already does) and widening the intersection test to bare movement (~6-8% more bench load, declined against an unquantified risk that already has a backstop) — so the gap is accepted explicitly and **the nightly is the accepted backstop**. The default itself is a model, not a measurement (the corpus has zero `main-moved` events — today's single-threaded daemon cannot produce one — so none can exist until K>1 has actually run); see config.js's own `mainMovedRegateBudget` comment for the full derivation (Poisson arrival over the measured 39-52% GATE-to-merge exposure and the measured 10.5% file-overlap rate across the 18 merged pipeline PRs) and doc/remediation-progress.md's "6.5's counter" section for the corpus it rests on. | VALIDATE | per cause table, or still in flight after the bounded wait → PARKED (`ci-checks-still-running`) |
+| PUSH_PR | script | commit, push, open PR (`Closes #N`) — PR precedes gate (CI needs it) | GATE | PARKED — every step of `add`/`commit`/`push`/`pr-create`/`pr-number-unparsed`/`diff-name-only` PARKS the single reason `push-pr-failed`, `detail.step` naming which one (principle 2 above: measured, every corpus occurrence is a logic failure, never a transient network one, so this is never on the bounded-auto-retry allowlist). `commit`'s own exit 1 ("nothing to commit") is not automatically a failure — a clean tree there is resolved against both `origin/<branch>` and `origin/main` to tell a genuinely empty pass (`detail.reason: 'nothing-implemented'`, HEAD sits on `origin/main` — IMPLEMENT never committed anything) from one that already pushed everything at HEAD (`detail.reason: 'nothing-new-to-push'`) from CI_CHECKS' own main-moved merge commit sitting unpushed (skips the commit, falls through to push, journalled `commit-skipped-nothing-staged`) — see the inline comment at `steps/scripted.js`'s `realPushPr` (card #213 vs card #385's main-moved case) for why a HEAD-vs-`origin/main` test alone is the wrong condition. A dirty tree after a failed commit (`detail.dirty: true`) or an unreadable `git status`/`rev-parse` mid-diagnosis both PARK the same `push-pr-failed` rather than let a diagnostic step itself bury the real cause. Shadow mode and `--dry-run` never reach any `detail.step` — their own generic scripted-step failure PARKS the same bare `push-pr-failed` reason with no `step` detail (`state-machine.js`'s `handlePushPr`). Touching `src/shared/rdo-members.ts` (checked against the real diff, not the task's own declared `touchesRdoMembers`, which intake only infers from issue text and can be wrong — card #385) with no `<Fichier>.pas:<Ligne>` citation found in either the catalogue diff or the issue criterion PARKS `rdo-citation-missing` — SPO-WebClient's own `check-pr-rules.js` CI check requires exactly this citation for any RDO-catalogue change; a maintainer resolving this park adds the citation to the PR body or the card criterion and retries. |
+| GATE | script | `npm run gate` (bench job, background wait); read **exit code**: 0 PASS · 1 fail · 2 dirty · 3 worker down · 4 timeout. **Action 4.2:** exit 1 is no longer an unconditional route to DIAGNOSE — the exit code alone conflates three different situations the bench itself distinguishes. Read the bench's own verdict for HEAD (`<spoBenchDir>/verdicts/<sha>.json`, the same file CI_CHECKS reads below for its own `main`-moved test): the bench merges `origin/main` into the checkout itself before building (`worker.ts`'s `prepareRef`), so `baseMain` is absent from that file precisely when the branch no longer merges cleanly with `origin/main` — measured over all 375 `ref`-type verdicts `npm run gate` submits: 359/359 PASS carry `baseMain`, 14/16 FAIL do; the missing 2 are exactly the main-moved conflicts (confirmed end to end on card #439 / commit `379ada60`, which burned all 3 DIAGNOSE attempts and parked `diagnose-budget-exhausted` before a `retry` — a fresh worktree off the new `main` — reached DONE in 19 minutes). No verdict file **on disk** means the run is *non-attesting* (`worker.ts`'s `NON_ATTESTING = {DIRTY, ENVIRONMENT, ABANDONED}` is deliberately never written to `verdicts/`, yet `cli.ts`'s `wait()` still maps all three to exit 1) — nothing was learned about the code, so it parks rather than spending a DIAGNOSE call on it. A FAIL that DOES carry `baseMain` failed with `origin/main` already merged in by the bench; that is a real failure and still routes to DIAGNOSE, unchanged. A FAIL *without* `baseMain` fetches `origin/main` and attempts the same local merge CI_CHECKS' own `main`-moved path performs (below) — clean → back to CHECK and re-gate; conflict → `merge --abort` then PARKED. The plan's own intersection test is deliberately not implemented for this path: with no `baseMain` there is nothing to intersect against. | CI_CHECKS | exit 1 with a verdict carrying `baseMain` → DIAGNOSE (unchanged) · exit 1 and the lookup itself failed — `rev-parse HEAD` non-zero, or exit 0 with stdout that is not an object name (a failing `git rev-parse` prints the ref name itself, action 4.1's measurement), or a verdict file that is present but does not parse — → DIAGNOSE, journalled `gate-verdict-unreadable`, never a park: a failed diagnostic must not become the thing that parks the card · exit 1, no verdict file on disk → PARKED (`gate-non-attesting`, detail carries `verdictDirExists` so a misconfigured `spoBenchDir` is one look) · exit 1, FAIL without `baseMain`, merge conflicts → PARKED (`main-moved-conflict`) · main-moved re-gates already used this task's `mainMovedRegateBudget` (config.js, default 1 — **action 6.5**, see below) → PARKED (`main-moved-twice`, counter shared with CI_CHECKS) · nightly says `main` is red at the fetched sha → PARKED (`main-red-no-merge`, guard shared with CI_CHECKS) · 2 → PARKED `gate-dirty-tree` · 3 → PARKED `gate-worker-down` · 4 → PARKED `gate-timeout` · any other exit code (`npm run gate` returning something this table does not know about) → PARKED `gate-unrecognized-exit`, the catch-all this row falls back to rather than silently treating an unrecognized exit as one of the four known ones |
+| CI_CHECKS | script | Two checks the bench does not make. (0) Before either: a bounded **in-flight wait** (action 1.7) — a check-run with `conclusion: null` (still running) or zero check-runs at all (CI hasn't registered anything yet) is never read as green; re-poll `gh api .../check-runs` up to `ciChecksMaxPolls` times (default 30), sleeping `ciChecksPollIntervalMs` between polls (default 20000ms, injectable in tests; ~10 min total, deliberately uncalibrated — see config.js), journaling each observation, until nothing is in flight. *(2026-08-30 audit: 8/12 measured "green" events had `claude review` still in progress.)* (a) `gh pr checks <n>` once nothing is in flight — CI normally concluded while the gate queued; on red, map the failing check **by name**: `Coverage of changed lines` → IMPLEMENT · `Lint` → IMPLEMENT · `PR rules (coverage ratchet, RDO citation)` (`ci-cause-table.js`'s `classifyCiFailure`, exact step-name match only, never a substring or prefix) → PARKED `pr-rules-needs-approval` · anything else, or no step name recovered at all (a non-zero `gh api .../actions/jobs/<id>`, an unparsable body, a job whose steps all passed, or a legacy bare-string shadow fixture) → DIAGNOSE, deliberately, per `ci-cause-table.js`'s own header: a step name this table does not recognize must degrade to "ask a judge", never to a silent retry or a silent park. (b) the `main`-moved test: intersect `git diff --name-only <baseMain>..origin/main` with the branch's changed files — non-empty → merge `origin/main`, back to CHECK and re-gate; while the nightly says `main` is red, never merge from it → PARKED. *(Added in v1.1: 5/16 measured sessions reached a green gate and could not merge — every one improvised CI forensics; 4/16 needed the `main`-moved branch.)* **Action 4.2:** the `mainMoveUsed` counter and the nightly-red guard are the exact same shared state GATE's own main-moved path (above) uses — a move already spent from either state blocks the other, and a nightly-red main blocks a merge attempted from either. **Action 6.5:** the re-gate is now allowed up to `config.mainMovedRegateBudget` times per task (default **1** — today's "once" behaviour, unchanged), not a hardcoded once; the (n+1)th move → PARKED (`main-moved-twice`, the name kept for continuity even past a raised budget — it names the event, not a literal second occurrence). This is a settled decision, not a re-derivable default, but the gap it accepts is wider than "disjoint files, interacting behaviour": the intersection test runs once per CI_CHECKS **visit** (`steps/scripted.js`'s `realCiChecks`) — a task that loops DIAGNOSE→IMPLEMENT→CHECK→PUSH_PR→GATE→CI_CHECKS, or re-gates after its own main-moved merge, reaches it again each time; nothing re-runs it at VALIDATE or MERGE, so a sibling that merges into `origin/main` **after** this task's own CI_CHECKS pass — even one whose files DO intersect this branch's — is never re-tested before MERGE tries to land this one too. `realCiChecks` also never `git fetch`es (the only fetches in this file are `realWorktree`'s at WORKTREE and `realGate`'s on the no-`baseMain` retry path), so the one-shot intersection test itself can already be judging a stale `origin/main`. **Observed, not merely modeled**: a 2026-09-02 K=2 `parallel-doc-log` recette run hit exactly this — two cards touching the same file, the second PR's CI_CHECKS intersection test passed clean, the first PR then merged and moved `main` under it, and GitHub's merge queue itself caught the resulting conflict ("This branch has conflicts that must be resolved") — but nothing routes that back to CHECK/re-gate the way GATE's and CI_CHECKS' own main-moved paths do; `pr:wait` just polls exit 4 until its bound, and the task parks on a symptom (`merge-queue-not-landing`) rather than the actual cause. Filed as **#84** ("The GATE→merge-queue-landing window is never re-gated: a sibling merge parks the card instead"), not fixed; the nightly is a backstop for drift in general, not a check this specific window runs. The `mainMovedRegateBudget` default itself is still a model, not a measurement of *this* gap (see config.js's own comment for the Poisson derivation over the measured 39-52% GATE-to-merge exposure and the measured 10.5% file-overlap rate across the 18 merged pipeline PRs, and doc/remediation-progress.md's "6.5's counter" section for the corpus it rests on) — but that corpus predates K>1 ever running for real, which chantier 6 made possible; the case above is the first observed instance of *this gap* since — not a `main-moved` event itself: the whole finding is that the main-moved path never fired (the intersection test passed clean), so no `main-moved-merge`/`main-moved-twice` event exists in any corpus for it. | VALIDATE | per cause table, or still in flight after the bounded wait → PARKED (`ci-checks-still-running`, `detail` carries `attempts`/`totalRuns`/`pendingRuns`) · the real path's own `git -C <worktree> rev-parse <ref>` (resolving HEAD before reading check-runs, and `origin/main` inside the main-moved test) failing → PARKED `ci-checks-rev-parse-failed` (`detail.ref` names which one) · `gh api .../commits/<sha>/check-runs` itself exiting non-zero → PARKED `ci-checks-read-failed` (a malformed-but-200 JSON body is not this reason — it degrades to an empty check list instead, never a park) · the main-moved path's own `git merge origin/main` exiting non-zero → PARKED `main-moved-merge-failed` (distinct from GATE's own `main-moved-conflict`: this merge runs directly in the worktree with no `merge --abort` cleanup step, since CI_CHECKS reaches it only after a green gate, not mid-DIAGNOSE) |
 | DIAGNOSE | `claude -p` | one-line root cause from diff + gate log + ledger (diff.patch and, when entered from GATE, gate.log are really generated on entry — `steps/scripted.js`'s `prepareJudgeInputs`/`realGate`; gate.log is required only when this DIAGNOSE was entered from GATE, never from a CHECK failure or an empty IMPLEMENT, where no gate has run yet); append to ledger. The reply is one of two mutually-exclusive shapes: `root_cause: "<string>"` (+ category/suggested_fix), or the honest `root_cause: null` (+ a one-line `reason`) meaning "no cause beyond what the ledger already has" — a present-but-null `root_cause` satisfies the output contract, it is never treated as a missing answer. | IMPLEMENT (retry) | PARKED (3 attempts, same root cause twice → `diagnose-duplicate-root-cause`; the model explicitly has no new cause → `diagnose-no-new-cause`; a transport failure — no verdict produced at all — → `llm-transport-failed:DIAGNOSE`, never fabricated as a cause; or gate.log required but unproducible when entered from GATE → `judge-inputs-missing`) |
-| VALIDATE | `claude -p` ×1–2 | `citation-verifier` (only if `rdo-members.ts` changed) then `change-validator`; JSON verdicts. Its declared `diff.patch` is really generated on entry (`prepareJudgeInputs`) — always producible post-PUSH_PR. citation-verifier is fail-closed: a verifier that cannot render a verdict (transport error, timeout, malformed payload) parks the card — it never passes by default. A REJECT's `reasons`/`findings` are appended to the ledger and threaded into the next IMPLEMENT's `diagnosis` placeholder (action 1.6), attributed as a VALIDATE rejection distinct from a DIAGNOSE finding — if both exist for a task, the most recently journaled one leads and the other stays visible for context. | MERGE | REJECT → IMPLEMENT (own budget of 3) · false citation → PARKED (`citation-false`) · verifier couldn't answer → PARKED (`citation-verifier-failed`) · verdict the code doesn't recognize → PARKED (`citation-verifier-unrecognized-verdict`) · change-validator transport failure (no verdict produced at all) → PARKED (`llm-transport-failed:VALIDATE`) · diff.patch unproducible → PARKED (`judge-inputs-missing`) |
-| MERGE | script | `gh pr merge --merge` (enqueues), `npm run pr:wait`; exit code is the verdict. Exit 4 (still open) → **one** more bounded wait, then PARKED. The queue is never dequeued, re-enqueued, `--admin`-forced or fed empty commits by the machine — the measured costliest improvisation family (24 episodes; one wrote Done on an open PR). | FINISH | PARKED |
-| FINISH | script | fast-forward main checkout, reap worktree, close task (board sync: Done + short comment) | DONE | PARKED |
+| VALIDATE | `claude -p` ×1–2 | `citation-verifier` (only if `rdo-members.ts` changed) then `change-validator`; JSON verdicts. Its declared `diff.patch` is really generated on entry (`prepareJudgeInputs`) — always producible post-PUSH_PR. citation-verifier is fail-closed: a verifier that cannot render a verdict (transport error, timeout, malformed payload) parks the card — it never passes by default. A REJECT's `reasons`/`findings` are appended to the ledger and threaded into the next IMPLEMENT's `diagnosis` placeholder (action 1.6), attributed as a VALIDATE rejection distinct from a DIAGNOSE finding — if both exist for a task, the most recently journaled one leads and the other stays visible for context. | MERGE | REJECT → IMPLEMENT (own budget of 3) · false citation → PARKED (`citation-false`) · verifier couldn't answer → PARKED (`citation-verifier-failed`) · verdict the code doesn't recognize → PARKED (`citation-verifier-unrecognized-verdict`) · change-validator transport failure (no verdict produced at all) → PARKED (`llm-transport-failed:VALIDATE`) · diff.patch unproducible → PARKED (`judge-inputs-missing`) · change-validator answered with a verdict string this code does not recognize (neither `PASS`, `PASS_WITH_FINDINGS`, `REJECT`, nor a transport failure already handled above) → PARKED (`validate-unrecognized-verdict`, `detail.verdict` carries what it actually sent) |
+| MERGE | script | `gh pr merge --merge` (enqueues), `npm run pr:wait`; exit code is the verdict. Exit 4 (still open) → **one** more bounded wait, then PARKED. The queue is never dequeued, re-enqueued, `--admin`-forced or fed empty commits by the machine — the measured costliest improvisation family (24 episodes; one wrote Done on an open PR). | FINISH | PARKED — `gh pr merge --merge` itself exiting non-zero → `pr-merge-enqueue-failed` (nothing was ever enqueued, `pr:wait` never runs); `pr:wait`'s own exit code, read after the enqueue succeeded: 1 (closed without merging) → `pr-closed-unmerged`; 4 on the second, bounded re-wait (still open even after the one extra wait this row's Does column describes) → `merge-queue-not-landing` (`detail.lastExit` carries the second wait's own exit — see CI_CHECKS' own **#84** discussion above for the one measured way a card actually reaches this: a sibling's merge moves `main` under it in the un-re-gated GATE→merge-queue window); anything else the first `pr:wait` call returns (neither 0, 1, nor 4) → `pr-wait-unrecognized-exit` |
+| FINISH | script | fast-forward main checkout, reap worktree, close task (board sync: Done + short comment) | DONE | PARKED (also `product-repo-lock-timeout`, same mutex as WORKTREE above, teardown side) — all three of the board move to `Done`, the closing issue comment, and the final `git worktree remove` PARK the same `finish-failed` reason on a non-zero exit, `detail.step` naming which one (`board-move` / `issue-comment` / `worktree-remove`); this is deliberately the one park in the whole daemon that blocks on what is everywhere else a best-effort side effect (`board.js`'s own moveCard convention), because a card that cannot be marked `Done` is not done |
 
 Ledger per task (`journal/<task>/ledger.md`): one line per attempt —
 `attempt N | root cause | outcome`. The 3-attempts rule is a string comparison over it. A
@@ -97,7 +137,7 @@ be confused: `validate-reject N | reasons | outcome` (action 1.6).
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
 | PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 900000ms / 15min |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on the wire rule** (`src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session phases) or L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
+| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
 | DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
 | VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
@@ -114,13 +154,40 @@ end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-u
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
 
+[^rdo-wire]: `task.touchesRdoMembers` (`intake.js`'s `makeTask`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
+    stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
+    `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session-phase code — but only
+    detects a slice of it, and is set once at intake, before a plan exists. IMPLEMENT never sees
+    a rederivation against the plan or the real diff; PUSH_PR (`steps/scripted.js`) does
+    re-derive the flag from the real diff, but only for the literal file
+    `src/shared/rdo-members.ts`, and only in time to escalate the change-validator that follows
+    IMPLEMENT, not IMPLEMENT itself.
+
+Before any of the five calls above ever spawns, `steps/llm.js`'s real path fills the step's own
+`prompts/<file>.md` template against the values `task-values.js` derives for it
+(`buildPromptValues` → `fillPromptTemplate`). A template's header declares its placeholders; a
+declared `{{name}}` with no value supplied, or any `{{...}}` token still present in the body after
+every declared one has been substituted (a body reference to a name the header never declared,
+almost always a typo), throws `prompt-template.js`'s typed `MissingPlaceholderError` before the
+`claude` process is ever spawned — no tokens spent. `steps/llm.js` turns that into
+`ParkSignal(`prompt-missing-placeholder:${err.placeholder}`, {step, promptFile, placeholder,
+missing})` — the reason string carries the specific placeholder name, so two different broken
+templates park distinguishably rather than colliding on one generic reason. A maintainer resolving
+this park fixes the named prompt file's header/body mismatch and retries; nothing about the task
+itself is at fault.
+
 Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 `--json-schema` for the payload, `--allowedTools`, `--model`, `--effort`,
 `--permission-mode` per step (plus `--max-budget-usd` when a caller supplies a numeric
 `maxBudgetUsd` — no daemon or intake path does; the only caller that does is the hand-run
 `scripts/smoke-llm.js`), run under the account chosen by the scheduler
-(`CLAUDE_CONFIG_DIR=<account dir>`). Domain context comes from the product worktree's
-(trimmed) `CLAUDE.md` plus the step prompt from `prompts/`.
+(`CLAUDE_CONFIG_DIR=<account dir>`). Domain context comes from whatever `CLAUDE.md` sits in the
+step's own `cwd` -- the CLI loads it itself (`steps/llm.js` deliberately passes neither
+`--safe-mode` nor `--bare`), and **nothing trims it**: an earlier "(trimmed)" here described an
+intention nobody implemented. Which file that is depends on the step: `config.js`'s `cwdForStep`
+gives the product worktree to PLAN and IMPLEMENT only, while DIAGNOSE and both VALIDATE steps run
+from this repo's root *specifically to avoid* that tree, whose preamble was measured at ~40k input
+tokens. Plus the step prompt from `prompts/`.
 
 ## Account pool
 
@@ -131,12 +198,21 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
   authenticated once via `claude setup-token`; see `doc/setup.md` § Accounts for the guided
   procedure (`spo account add <name>`).
 - A pool with zero registered accounts is a hard stop for real mode: `orchestrator/accounts.js`'s
-  `pick()` throws `NoAccountsRegisteredError`, the state machine parks on it, and
-  `daemon.js --real` refuses to even start.
+  `pick()` throws `NoAccountsRegisteredError('no-accounts-registered', ...)`, `callLlmStep`
+  (`state-machine.js`) rethrows it verbatim as `ParkSignal('no-accounts-registered', ...)`, and
+  `daemon.js --real` refuses to even start. `pick()`'s other sibling for a non-empty pool that
+  still yields nobody healthy — every enabled account cooling, `AllAccountsCoolingError` — is
+  `'all-accounts-cooling-unknown'` when nothing in the registry ever recorded a cooldown to report
+  a time for, else `` `all-accounts-cooling-until-${ISO timestamp}` `` naming the earliest cooldown
+  any checked account will clear; both are rethrown the same verbatim way, distinct from
+  `all-accounts-leased` above (that one fires when at least one account IS healthy, just not
+  currently available) and from `all-accounts-cooling-after-retry` below (which fires only once
+  every account in one full rotation pass was actually tried and limited, not merely found
+  cooling before a single call was attempted).
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:711`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:747-749`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -149,10 +225,12 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
   observed, never from further guesswork.
 - **Cooldown duration is an escalating probe, not a flat number** (`orchestrator/accounts.js`'s
   `markLimit`, action 3.5's 2026-08-31 redesign — this action's own first cut used a flat 5-hour
-  usage cooldown, rejected before it shipped). The real pool has **2 accounts**, and
-  `daemon.js` has no pool-health gate: with `maxAttempts` equal to pool size, two usage limits
+  usage cooldown, rejected before it shipped). The real pool has **2 accounts**, and at the time
+  had no pool-health gate anywhere: with `maxAttempts` equal to pool size, two usage limits
   inside one window would take the *whole pool* down for up to 5 hours, parking every card the
-  daemon pulled in that window. A flat 5h also over-waits by construction — the Claude Max
+  daemon pulled in that window. (Chantier 6 action 6.3 later added the gate this section used to
+  say was missing — see the dispatcher bullet below; the escalating-probe redesign here stands on
+  its own regardless.) A flat 5h also over-waits by construction — the Claude Max
   session window resets 5h after the *session's first message*, not after the limit hit, so
   `now + 5h` sleeps for (5h − the true remaining wait) longer than necessary, often 4h+. So:
   a first usage limit for an account (`limitKind: 'usage'`, i.e. 429 / `rate_limit_error` /
@@ -162,9 +240,11 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
   `overloaded` (529 / `overloaded_error`) stays a flat **5 minutes** and never escalates — a busy
   *server* says nothing about this account's own quota. An absent/unrecognised limit kind falls
   back to the usage flow (probe or escalated, by the same history check), never a shorter tier.
-  Exhausting the pool inside one rotation pass never re-calls `pick()`, so the resulting park/
-  error carries the last cooldown's own ISO timestamp explicitly rather than relying on `pick()`'s
-  own reason string, which that path never reaches.
+  Exhausting the pool inside one rotation pass never re-calls `pick()`, so the resulting park —
+  `ParkSignal('all-accounts-cooling-after-retry', {attempts, lastResult, cooldownUntilIso})`,
+  thrown by `callLlmStep` itself once its attempt loop runs out of accounts — carries the last
+  cooldown's own ISO timestamp explicitly rather than relying on `pick()`'s own reason string,
+  which that path never reaches.
 - This rotation rule is not daemon-only: `orchestrator/intake.js`'s three maintainer/auto-triage
   LLM steps (draftCard, reviewCard, triageBugReport) follow it too, via their own
   `callIntakeStepWithRotation` helper — same pick/call/cool/rotate mechanics as
@@ -174,9 +254,33 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
   journal of its own — a cooldown comes back on the result's `cooldowns` array for the caller to
   journal (`auto-triage.js` appends `report-triage-cooldown`). See `orchestrator/README.md`'s
   "Account rotation" section for the full mechanics.
-- **K parallel workers ≤ healthy accounts.** Parallelism scales implementation capacity;
-  the gate stays serialized (one live world) — adding an account does not add gate
-  throughput.
+- **K parallel workers ≤ healthy accounts — enforced, not aspirational** (chantier 6 action 6.3).
+  `orchestrator/dispatcher.js`'s `fillSlots` re-clamps `K` to
+  `Math.min(config.workers, accounts.countHealthyAccounts(accountsDir))` immediately before
+  *every* worker spawn — not once per loop, not once at startup — so an account that cools down
+  mid-cycle (one of this dispatcher's own workers just hit a limit) is reflected on the very next
+  spawn decision. A clamp to zero healthy accounts is journalled
+  (`dispatcher-idle-no-healthy-accounts`) and the recovery edge journalled the same way
+  (`dispatcher-healthy-accounts-returned`). Parallelism scales implementation capacity; the gate
+  stays serialized (one live world) — adding an account does not add gate throughput.
+- **Per-step account leases** (chantier 6 action 6.2, `orchestrator/account-lease.js`) stop two
+  concurrent callers — a worker's `callLlmStep` and the scanner process's
+  `callIntakeStepWithRotation` — from being handed the *same* account by `accounts.pick()`'s
+  deterministic first-fit, invisible under the pre-C6 single-threaded daemon and a real bug once
+  a worker and the scanner can run at once. A lease is per-step, not per-task, released the
+  instant the one LLM call it wraps finishes; a healthy account currently leased by another live
+  process is `AllAccountsLeasedError`, worth a bounded wait (`config.accountLeaseWaitMs`, default
+  **31.5 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the age at which a lease is swept as
+  dead — never the ~90–265s a sibling's own step is *usually* measured at: a waiter has to outlast
+  the longest a sibling can *legitimately* hold the lease, not its typical duration, and the old
+  5-minute default was found wrong in C6 verification for exactly that reason — it gave up while a
+  legitimate holder was still alive and un-sweepable for up to 26.5 more minutes, parking a healthy
+  card `all-accounts-leased`) — distinct from
+  `AllAccountsCoolingError` (a cooldown, never worth waiting on) — and parks `all-accounts-leased`
+  if that wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
+  `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns), since
+  clamping K on lease churn — a lease frees every 90–265s — would make K flap on every single LLM
+  call.
 - `scripts/usage-report.js` becomes per-account: it is the instrument that says when one
   more subscription pays for itself.
 
@@ -184,8 +288,8 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
 
 Journals are the single source of truth; `~/.spo-bench/` remains the bench's own surface.
 
-- `journal/<task-id>.jsonl` — every event: state transitions, step spawns and results
-  (`{step, model, effort, account, session_id, tokensSource, freshInputTokens,
+- `journal/<task-id>/journal.jsonl` — every event: state transitions, step spawns and results
+  (`{step, model, effort, account, sessionId, tokensSource, freshInputTokens,
   cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, duration_s, exit,
   verdict}` — no dollar figure anywhere; `orchestrator/tokens.js`'s "billable-weighted" =
   fresh input + cache-creation + output, cache-read reported separately, never summed in).
@@ -207,9 +311,10 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   journalled move while the board reads `Done`, and that is the whole reason. A move made without
   a task worktree (a pre-WORKTREE park) runs from the product repo and carries
   `via: "product-repo"`. `board-move-failed` `{column, exit, timedOut}` on a non-zero exit;
-  `board-move-skipped` `{reason, column}` only for `already-in-column` (the card is already
-  there, no spawn) or the vestigial `no worktree` (neither a worktree nor a product repo, which
-  the shipped config never produces). A card entering DIAGNOSE for the first time posts one
+  `board-move-skipped` `{reason, column}` for `already-in-column` (the card is already
+  there, no spawn), the vestigial `no worktree` (neither a worktree nor a product repo, which
+  the shipped config never produces), or `no issue` (`ctx.task.issue` unset, reachable for any
+  task without one — `board.js`'s `moveCard`). A card entering DIAGNOSE for the first time posts one
   comment and journals `diagnose-surfaced` `{attempt, budget}`, or `diagnose-surface-failed`
   `{exit, timedOut}` — never blocking, exactly like a board move.
 - **External reconciliation (action 5.1b)** — the board's `Done` on 213/428/443 was reached
@@ -218,7 +323,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   it: 2 of the 3 were `PARKED` for a fix a human made and closed by hand hours later (213, 428);
   the third (443) was `ABANDONED` on a false park — `pr:wait` read `closed false` at 13:17:57,
   parked `pr-closed-unmerged`, and PR #447 actually merged 30 seconds later at 13:18:27, before the
-  maintainer's own `abandon` reply at 13:53. `park-loop.js`'s `reconcileExternalClosure`, called
+  maintainer's own `abandon` reply at 13:53. Reaching `ABANDONED` at all is `park-loop.js`'s own
+  unpark-scan reconciler recognizing an `abandon` reply on a `PARKED` task's issue thread: terminal,
+  no re-enqueue, `state.json` written directly as `{state: 'ABANDONED', reason:
+  'abandoned-by-maintainer', ...}` — the one park reason in this codebase that is neither thrown as
+  a `ParkSignal` nor passed through `finalizePark`, because the task is not re-entering
+  `runTask`'s loop at all. The state write happens before the ack comment or any cleanup, so a
+  daemon crash at any point afterward resumes into a task that is already correctly terminal.
+  `park-loop.js`'s `reconcileExternalClosure`, called
   from inside `unparkScan`'s own loop for every `PARKED`/`ABANDONED` task, reads the owning issue
   and — record, never overwrite — writes `state.json`'s `externallyResolved: {via: 'issue-closed'
   | 'pr-merged', closedAt, prNumber, mergedAt, at}` and journals `reconciled-externally` with the
@@ -258,14 +370,20 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   Journals `validate-findings-posted {count, commentId}` on success,
   `validate-findings-post-failed {exit, timedOut}` on a non-zero `gh` exit or a timed-out spawn —
   never blocking, real mode only, same contract as `diagnose-surfaced`/board moves above.
-- **Claude session management**: the `session_id` of every step is recorded, so any step can
-  be reopened for debugging with `claude --resume <session_id>` (full transcript, continue
-  interactively). `claude agents` lists live background sessions.
-- Console CLI (planned order): `spo status` (queue, active tasks + state, bench queue,
-  accounts health, today's token usage) · `spo task <id>` (timeline from the journal) ·
-  `spo parked` (parked tasks + reasons) · `spo resume <session_id>` (wraps
-  `claude --resume`). A generated static HTML dashboard comes after the CLI, fed by the same
-  journals.
+- **Claude session management**: the `sessionId` of every step is recorded, so any step can
+  be reopened for debugging with `claude --resume <sessionId>` (full transcript, continue
+  interactively) — `spo resume <task-id>` prints the exact command per step (see below), it does
+  not run it. `claude agents` lists live background sessions.
+- Console CLI (`bin/spo`; ~20 subcommands ship today, not the four originally planned):
+  `spo status` (queue, active tasks + state, bench queue, accounts health, today's token usage) ·
+  `spo task <id>` (timeline from the journal) · `spo parked` (parked tasks + reasons) ·
+  `spo resume <task-id|session_id>` — **prints** the `claude --resume <sessionId>` command for
+  each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
+  · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
+  `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1071`)
+  is a generated static HTML page reading the same local journals, and already ships alongside
+  the CLI rather than after it.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).
 
 ## Design consequences from the measured improvisation (v1.1)
@@ -281,7 +399,11 @@ The analysis's top families are mostly **states not to have** rather than branch
    worktree.
 3. **Every step has a wall-clock deadline.** The "sub-agent hadn't returned" family (18
    episodes: list/ping/re-spawn loops, twice a duplicate executor) becomes: spawn once, wait
-   with a deadline, on expiry kill → retry once → PARKED. Never two live executors for one
+   with a deadline, on expiry kill → retry once → PARKED (`deadline.js`'s `callWithDeadline`:
+   a state whose `withTimeout` wrapper races out twice in a row — the retry itself also missed
+   the deadline, not merely the first attempt — parks `step-deadline-exceeded-twice`, `detail`
+   naming the state; a single timeout is retried silently, journalled `deadline-exceeded` but
+   never parked). Never two live executors for one
    task. Two independent mechanisms enforce this, because a JS timer cannot preempt a
    synchronous child: `claude -p` calls (LLM steps) are killed by `spawnSync`'s own `timeout`
    option inside `steps/llm.js`'s `invokeClaudeReal`, racing `deadline.js`'s `callWithDeadline`
@@ -396,20 +518,47 @@ something: one trivial, synthetic `kind: "card"` task, driven through the real p
 (`config.real = true`) against a dedicated, distinctly-labelled GitHub issue in the product
 repo, under a wall-clock + LLM-step-count cap, asserted against its own journal (not merely
 "did it reach DONE"), cleaned up unconditionally on every exit path. **This is the standard
-live gate for every chantier from 3 on** -- chantier 7 action 7.2 adds a second scenario to the
-same harness rather than a new tool; scenarios are plain data
-(`orchestrator/recette.js`'s `SCENARIOS`), so the runner never has to change to gain one.
+live gate for every chantier from 3 on** -- scenarios are plain data
+(`orchestrator/recette.js`'s `SCENARIOS`), and for a `driver: 'inline'` scenario that only
+changes what IMPLEMENT is asked to do, adding one really is just a new object literal. That
+claim is scoped, not general: a scenario that changes *how* the pipeline is driven, not merely
+what it asks IMPLEMENT to do, changes the runner too. Chantier 7 action 7.2 did exactly that:
+scenarios now carry a `driver`, `inline` keeps this path unchanged, and `dispatcher` drives the
+real `createDispatcher` with real worker children -- which needs its own out-of-process cap,
+because the inline cap wraps `deps.spawnSync` and a dispatcher's workers are separate processes. It also forwards all seven
+scan-timer env vars as `0` to the scanner child (a separate OS process that re-reads `config.js`
+from scratch and never sees the parent's config object) -- six of them are genuinely disabled by
+`0` (the `should*`/`shouldScan*` predicates all read `!(x > 0)` as "never due"), but
+`SPO_REMOTE_REPORT_PULL_MS` is not one of them: `startRemoteReportPullLoop`'s first `tick()` runs
+unconditionally on scanner startup regardless of that value, which only sets the reschedule delay
+*after* that first pull. What actually keeps a dispatcher-driver scenario safe from a real
+pull-and-ack is a second, explicit refusal -- see below. `parallel-doc-log` (K=2) is the scenario
+that exercises this driver.
 
 Refuses to run while a live daemon holds its own `journal/daemon.lock` (read-only check,
-`--force` to override) -- there is no product-repo mutex until chantier 6 action 6.4, so this is
-the only guard available today against a recette run colliding with a real card the daemon is
-mid-flight on. See `orchestrator/README.md` § Recette for the full design: isolation, the
-`trivial-doc-log` scenario and why it is docs-only, the cap and what tripping it does, the
-assertion set, and cleanup's own idempotency contract.
+`--force` to override). Chantier 6 action 6.4 added a real product-repo mutex
+(`orchestrator/product-repo-lock.js`), but recette does not itself take it -- WORKTREE and FINISH
+acquire it either way, whichever driver ran them: `inline` reaches them through `drainQueueOnce`
+in recette's own process, `dispatcher` through a real `daemon.js --worker` child. The lock is
+taken inside those two steps (`steps/scripted.js`'s `withProductRepoLock`), not by whatever drove
+them, which is what makes both drivers safe against a concurrent daemon without recette knowing
+about the mutex at all. The daemon.lock check above is the coarser, earlier guard: it catches "a live daemon is
+running at all" before recette starts, which 6.4's lock (scoped to one WORKTREE/FINISH call) does
+not by itself. A `dispatcher`-driver scenario carries a second, unrelated refusal: its real
+scanner child inherits `SPO_REMOTE_REPORT_URL` from this process's own environment exactly as it
+inherits the zeroed scan timers above, and `remote-report-pull.js`'s first pull is unconditional
+-- so recette refuses outright when that env var is set (`--force` to override, for a maintainer
+who has confirmed by hand that a real pull-and-ack against `~/.spo-reports` is acceptable), rather
+than risk a synthetic recette run making a genuine HTTPS pull against production bug reports. See
+`orchestrator/README.md` § Recette for the full design: isolation, the `trivial-doc-log` scenario
+and why it is docs-only, the cap and what tripping it does, the assertion set, and cleanup's own
+idempotency contract.
 
 ## Open questions (tracked, not blocking shadow mode)
 
-- Bug-report transport production → dev (HTTPS pull vs file pickup) and report schema v1.
+- Bug-report transport production → dev is no longer open: `remote-report-pull.js` implements
+  the HTTPS pull (`config.remoteReportUrl`), live enough to need the recette refusal above.
+  Report schema v1 is still open.
 - Board sync depth: view-only export vs writing Status/comment at transitions (current
   lean: write at transitions like today, through the existing board scripts).
 - Whether CHECK runs inside the IMPLEMENT session (self-check) or only outside (current

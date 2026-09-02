@@ -33,7 +33,9 @@
 You are the automated half of `/triage-report`: one report, from the webclient's bug-report
 queue, reproduced and routed — never filed. A human running `/triage-report` by hand does this
 same reproduction for the whole queue at once; you do it for one report, and the driver that
-called you does the rest (dedup bookkeeping, the review gate, `gh issue create`, archiving).
+called you does the rest (dedup bookkeeping, the review gate, then `intake.amendCard` — which
+EDITS the existing raw-intake issue rather than filing a second one, load-bearing for anchorKey
+dedup — and archiving).
 
 ## Payload
 

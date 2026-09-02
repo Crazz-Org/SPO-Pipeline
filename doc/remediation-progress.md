@@ -1,6 +1,11 @@
 # Remediation plan — execution state
 
-Companion to `doc/remediation-plan-2026-08.md`, which is the contract and does not change.
+> **Status: a dated record.** True as of its entry's date; never re-verified against present code.
+
+Companion to `doc/remediation-plan-2026-08.md`, which is the contract. It did not change for
+C1-C7. **It was amended once, on 2026-09-02, by the maintainer**: chantier 8 was appended after
+C7 to cover the bench's remediation and migration. That is an addition, not a revision — nothing
+in C1-C7 was rewritten, and the reason is recorded under "The bench" below.
 This file is what the plan *turned out to be* once executed: what is done, what the plan itself
 got wrong, and what the next session needs to proceed safely. Update it at the end of every
 chantier.
@@ -22,7 +27,10 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C4** — correct remediation loops | **DONE and merged** (PR #66) |
 | **C5** — a truthful kanban & observability | **DONE and merged** (PR #71 + #72); **gate green** — supervised live card #473, 2026-09-01 |
 | **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
-| C7 | not started |
+| **C7** — truthfulness consolidation & docs | **in progress** — premises re-measured; 7.1/7.2/7.3/7.5 built and verified; gate running |
+| **C7 bis** — what Gate C7 certifies | **in progress** — added 2026-09-02 after three Opus passes on the original clause returned 7, ~11 then ~52 divergences, 80% of the last in territory no pass had reached |
+| **C8** — the bench: audit, remediation, migration | **not started** — added 2026-09-02. 8.1 (the audit) is the only committed row; it produces its own derived plan, and how many chantiers this really needs is 8.1's answer, not this table's |
+| **C9** — the documentation corpus | **not started** — **re-planned 2026-09-02 to run in parallel with C8, from C8b on.** Its deferral rested on C8 rewriting `orchestrator/`; row 8.5 is superseded, so that premise is gone. One documentary dependency survives: C9 must not audit `doc/state-machine-spec.md` or `doc/environments.md` until the C8 actions that rewrite them (8.2, 8.4, 8.6) have landed |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
@@ -1502,3 +1510,363 @@ replay holes predates all of it.
   parallelism is opt-in and deleting that drop-in is the safe rollback.
 - **Deploying still restarts the daemon by itself** — the `git pull` fires the post-merge hook, not
   the merge. Check for in-flight tasks first; a docs-only merge needs no pull.
+
+---
+
+## C7 — its own measurement, before any of it was built
+
+C6's handoff said three of C7's four remaining rows were written against a daemon that no longer
+exists. That was right, and measuring found more: **two of 7.1's five named holes are already
+closed**, 7.2's blocker is not the one the handoff named, and 7.3 has a genuinely flaky test in
+the file that was supposed to close it.
+
+### Baseline
+
+`node --test --test-timeout=30000 test/*.test.js` at `f7cf9da`: **1382 passing, 0 failing**, twice
+in a row. Wall clock ~17 s.
+
+**`--experimental-test-coverage` is not usable on the whole suite**, two ways:
+
+- The aggregated report is discarded — `Warning: Could not report code coverage. SyntaxError:
+  Unexpected end of JSON input`. A test that kills a child process truncates that child's V8
+  coverage file, and one truncated file kills the entire report. Excluding
+  `dispatcher.test.js`, `worker-mode.test.js` and `journal-concurrent-append.test.js` brings the
+  report back.
+- Under coverage, `dispatcher.test.js:161` ("K=1: a task runs to DONE through a real spawned
+  worker") **fails**: `exitEvt.code` is `null`, not `0`. See the flake below — coverage did not
+  cause it, it exposed it.
+
+So the coverage measurement below is the **intersection** of two runs (everything-but-those-three,
+and those-three-alone): a line is reported as a hole only when *neither* run covered it.
+
+### 7.1 — the hole list is two-fifths stale, and coverage is far higher than when it was written
+
+Measured, all files, intersection of both runs: **97.53 % lines, 90.97 % branch, 96.43 % funcs.**
+
+Of the five holes 7.1 names, **two are already closed**:
+
+- **the `oauthTokenFile` branch** — `llm.js:376-383` (env injection *and* the unreadable-file
+  error leg) is covered. The row was written when only `accounts.js`'s discovery was tested.
+- **park-reason assertions in the account-rotation test** — `test/account-rotation.test.js` now
+  asserts `caught.reason` on `all-accounts-cooling-after-retry`, `all-accounts-cooling-until-*`,
+  `no-accounts-registered` and `all-accounts-leased`. Nothing left to add.
+
+What is genuinely still uncovered:
+
+| file | lines | what it is |
+|---|---|---|
+| `state-machine.js` | 181-182 | `invalid-task-json` — 7.1's own named catch-all |
+| | 228-229 | `main-red-refuse-worktree` (the `nightlyMainRed` fixture at WORKTREE) |
+| | 250 | `worktree-failed` shadow exit — 7.1's "worktree" |
+| | 597 | `parseFilesChanged` on unparsable JSON |
+| | 699 | `push-pr-failed` shadow exit — 7.1's "pushPr" |
+| | 715 | `gate-unrecognized-exit` |
+| | 772-773 | `main-red-no-merge` |
+| | 828-831 | `diagnose-budget-exhausted` (marked defensive/unreachable in its own comment) |
+| | 1160 | `pr-wait-unrecognized-exit` — 7.1's "prWait 1" |
+| | 1172 | `finish-failed` — 7.1's "finish" |
+| | 1433-1434 | the `park-repeat` event at repeat ≥ 2 |
+| | 1497-1499 | `state-machine-runaway` — 7.1's own named catch-all |
+| | 1747-1749 | `runScanCycle`'s `runAutoTriage` timer leg |
+| | 1828 | `runForever`'s loop tail |
+| `scripted.js` | 72-79 | the "no real command configured" throw |
+| | 784-807 | **`preserveWorktreeWip`'s four error legs** (status/detach/add/commit → `wip-preserve-failed`) |
+| | 1617-1618 | check-runs JSON unparsable → `null` — 7.1's "check-runs" |
+| | 1842 | `pr-wait-unrecognized-exit` |
+| `llm.js` | 354-357 | `limitKindForFailure`'s classification branches |
+| | 599, 603-605 | the CITATION_VERIFIER / VALIDATE / default dry-run stubs |
+| `account-lease.js` | 123-124 | the unreadable/torn lease-file catch |
+| `orphan-scan.js` | 90-97 | the mtime fallback when the journal is unreadable |
+| `journal.js` | 196-202 | the atomic-write rollback (unlink the tmp, rethrow) |
+
+`preserveWorktreeWip`'s error legs are the notable one: it is a **C6 feature**, so 7.1's list
+could not have named it. `product-repo-lock.js`, `product-repo-hold.js`, `worker-status.js`,
+`main-moved-budget.js`, `bench-queue-wait.js` and `monotonic-clock.js` — the rest of what C6 added
+— are fully covered.
+
+### 7.2 — the blocker is the cap, not the drain
+
+The handoff is right that `spo recette` drives `drainQueueOnce` and that production drives the
+dispatcher. But the reason that is hard to change is one level down: **the cap is a `deps.spawnSync`
+wrapper** (`makeCap`), counting `claude` invocations and enforcing wall clock *inside the same
+process as the pipeline*. `drainQueueOnce` runs `runTask` in-process, so the wrapper sees every
+spawn. A dispatcher runs its workers as **separate processes** — `createDispatcher` injects
+`config.deps.spawn` (the child spawn), never the worker's own `spawnSync` — so the existing cap
+cannot survive the move at all.
+
+A dispatcher-driven scenario therefore needs an **out-of-process cap**: a wall-clock watchdog
+calling `stop()` + `killAllChildren()`, and an LLM-step count read from the workers' journals
+(`llm.js` appends an `llm-call` event per call to the taskDir, so the count is available to a
+poller). That is the design decision 7.2 has to make before any scenario is written; it is not a
+matter of swapping one function for another.
+
+Also measured: `SCENARIOS` still holds exactly **one** entry, `trivial-doc-log`. Gate C7's "all
+scenarios" is, today, one scenario.
+
+### 7.3 — most of it exists, and the file that holds it has a real flake
+
+`test/dispatcher.test.js` (42 tests) already covers, under names of its own:
+
+- **double daemon** → "a second instance against the same journal root is refused"; plus the two
+  scanner cases (`--parent-pid` mismatch exits; exactly one scanner at startup).
+- **timers under a drain** → the row's own premise is gone, but its intent is covered twice: "a
+  periodic scan runs in the scanner process while a worker is still alive" and "a BLOCKING scan in
+  the scanner process does not stall the dispatcher".
+
+**New finding — `test/dispatcher.test.js:161` is racy.** It waits for `state.json` to read `DONE`,
+then calls `dispatcher.stop()`; `run()` kills the children on its way out. The worker writes
+`state.json` *before* it exits, so a worker that has not yet reached exit is SIGTERMed — and the
+journalled `worker-exit` carries `code: null`, not `0`. Asserting `exitEvt.code === 0` therefore
+depends on winning a race the test does nothing to arbitrate. It passes 3/3 in isolation and
+failed under whole-suite coverage load; the trap list's own warning that "a flaky suite silently
+misreports a surviving mutation as killed" applies directly to the file C7 is meant to extend.
+
+**daemon + CLI concurrently** is the part with no coverage, and it is wider than the `#443` seam
+the row cites (that one, the triage `pending/` → `in-progress/` rename, was closed by 2.6): C6 put
+the dispatcher's crash-repark and the scanner's `orphanScan`/`unparkScan`/reconciler in *different
+processes* from the workers, all reaching for the same taskDir.
+
+### 7.5 — the spec no longer describes the daemon it specifies
+
+Vocabulary count over the whole of `doc/state-machine-spec.md` (416 lines):
+
+| term | occurrences |
+|---|---|
+| `scanner` | **0** |
+| `lease` | **0** |
+| `live-workers` | **0** |
+| `bench-queue` | **0** |
+| `K workers` | **0** |
+| `dispatcher` | **1** |
+| `worker` | 3 |
+
+C6 amended exactly one row (CI_CHECKS, in `f8505d6`) and added a decision record. The two-process
+model, the account lease, the product-repo mutex and the live-worker table — the whole of what C6
+shipped — are absent. Gate C7's "zero uncommented divergences" is an authoring job, not a re-read.
+
+Of the plan's five named 7.5 items, one is confirmed live and precise: **`prompts/verify-citations.md`
+says twice that the step holds `Read, Grep, Bash`; `step-contracts.js` grants `['Read', 'Grep']`**
+and flags the disagreement in a `DIVERGENCE` comment rather than resolving it.
+
+## C7 commits (one per action; the breaker fix, clear-cooldown and the cross-action pass are not in the plan)
+
+| action | commit | what it does |
+|---|---|---|
+| — | `92ec755` | C7's own measurement: every row re-derived before anything was built |
+| 7.1 | `b27fe32` | the replay holes that are *still* holes, closed (34 tests) |
+| 7.3 | `c8ba6ad` | the concurrency tests, minus the race in the file that held them |
+| — | `0d51d3d` | `consecutiveScannerCrashes` was neither consecutive nor reset |
+| 7.2 | `c0e4bbb` | a recette scenario library, and the process boundary it exposed |
+| — | `eff1928` | `spo account clear-cooldown`, after a live incident |
+| 7.5 | `2a840be` | the spec stops describing a daemon that no longer exists |
+| — | `719d143` | the doc gaps only a cross-action read could see |
+| 7.2 | `740e381` | the gaps between "the assertion passes" and "the run is safe" |
+
+Tests: 454 (plan baseline) → 1032 (C4) → 1177 (C5) → 1382 (C6) → **1511** (end of C7).
+
+### What the re-measurement changed
+
+Every C7 row was re-derived before being built, and the exercise paid for itself again:
+
+- **7.1's list was two-fifths stale.** The `oauthTokenFile` branch and the account-rotation
+  park-reason assertions were already closed; coverage was already 97.53 % lines / 90.97 % branch.
+  What the row could *not* name was `preserveWorktreeWip`'s four error legs — a C6 feature that
+  postdates it.
+- **7.2's blocker was not the one the handoff named.** The handoff said the problem was that
+  recette drives `drainQueueOnce` while production drives the dispatcher. True, but one level
+  down the real obstacle is that the cap is a `deps.spawnSync` wrapper: a dispatcher runs workers
+  as child processes, where that wrapper cannot reach at all.
+- **7.3 was mostly already built**, and the file meant to hold it raced itself.
+- **7.5 was far larger than five inconsistencies.** Two documents described a daemon that no
+  longer existed: the spec said `scanner` **0** times and `lease` **0** times; `orchestrator/README.md`,
+  169 KB of it, said `dispatcher` **0** times and still asserted the daemon "drains **serially**".
+
+### The pattern held: in every action, the mutation that survived was the action's own claim
+
+C6 recorded this six times. C7 recorded it four more, and two of them would have shipped:
+
+| action | the survivor |
+|---|---|
+| 7.1 | a test that read its expectation back out of `statSync`, so `.mtimeMs → .ctimeMs` survived |
+| breaker | the circuit-breaker `stopReason`'s two new field names — both assertion sites tested scenarios where the numbers were **equal**, so a straight swap shipped green twice over 1431 tests |
+| 7.2 | the seven-var forwarding list, pinned only by accident: `SPO_AUTO_TRIAGE_MS` could be dropped and the suite stayed green, because config's own default for it is `0` — while the live drop-in sets `900000` |
+| 7.2 | `scan-timers-disabled` validating the **parent's** config object, which the scanner process never reads |
+
+That last one is the chantier's most important finding and is 6.5's failure exactly: every test
+baked its own value in, so none read what production resolves.
+
+### Three traps added to the standing list
+
+- **Node reports a timed-out test as `cancelled`, not `fail`.** A mutation round reading `# fail`
+  alone sees `# pass 1418 # fail 0` and calls a *killed* mutant a survivor. This compounds with
+  the `--test-timeout=30000` rule: without the flag, mutations hang 100-150 s *and* then report as
+  cancelled. Read `not ok` + `# fail` + `# cancelled` + the exit code, always.
+- **`--experimental-test-coverage` cannot report on the whole suite.** One killed child truncates
+  a V8 coverage file and the entire aggregate report is discarded. Coverage must be taken as the
+  intersection of runs that exclude the child-spawning suites.
+- **`test/no-real-spawn.js` patches `spawnSync` in the PARENT only.** Every hermetic guarantee
+  this suite makes stops at a process boundary. Proved the hard way: a mutation routed tests
+  through real worker children and created a real worktree and branch in `/home/crazz/SPO-WebClient`
+  while the `--real` daemon was running. Cleaned up, nothing pushed — but no guard stopped it.
+
+### Filed rather than fixed — the maintainer's decision, 2026-09-02
+
+Verification found five production defects outside C7's scope. The decision was to fix the
+scanner breaker (a one-line asymmetry with a lying field name) and file the rest with their
+evidence, rather than land concurrency changes in a remediation plan's final chantier.
+
+| # | what | severity |
+|---|---|---|
+| [#77](https://github.com/Crazz-Org/SPO-Pipeline/issues/77) | a failed `gh issue comment` strands a parked card forever — the retry channel dies silently, no race required | **high** |
+| [#78](https://github.com/Crazz-Org/SPO-Pipeline/issues/78) | the crash-repark runs `finalizePark` synchronously in the dispatcher — the starvation class 6.3 moved the scans out for | **high** |
+| [#79](https://github.com/Crazz-Org/SPO-Pipeline/issues/79) | scanner robustness: an unguarded rename kills it, `spo intake` has no daemon guard, and the fixed breaker now only reaches a scanner's first 60 s | **high** |
+| [#80](https://github.com/Crazz-Org/SPO-Pipeline/issues/80) | `takeNextTask` drains a duplicate straight over a terminal taskDir | medium |
+| [#81](https://github.com/Crazz-Org/SPO-Pipeline/issues/81) | twelve `*Ms` config fields read a malformed env override as "disabled" | medium |
+| [#82](https://github.com/Crazz-Org/SPO-Pipeline/issues/82) | `no-real-spawn` is parent-only | medium |
+| [#83](https://github.com/Crazz-Org/SPO-Pipeline/issues/83) | the reconciler's stale snapshot, and `orphanScan`'s inverted read order | low |
+
+### The account cooldown, re-measured on the live pool
+
+The maintainer reported the pipeline calling an account stuck while the dashboard showed under
+100 % on the 5-hour window. Measured, and it is #483 in three parts at once:
+
+- `pick()`'s only health test is `!cooldownUntil || cooldownUntil <= now` — a **locally invented**
+  number compared to the wall clock, with **nothing ever reconciling against the server**.
+- The cooldown key is the **account**, not the account+model. A Fable exhaustion at PLAN cools the
+  account for Sonnet and Opus too, which is exactly why a dashboard can show headroom.
+- 4 of the 7 cooldown events in the live journal carry **`defaulted: true`** — the server supplied
+  no retry-after and the code guessed 1 h or 5 h.
+
+All 7 cooldowns in the whole corpus are `pool1`, never `pool2` (Max 5x vs Max 20x).
+
+Two things fixed on the spot: `~/.claude-accounts/labels.json` was **invalid JSON** (a stray `{`),
+and `readLabels` swallows the parse error and returns `{}` — so the dashboard had been silently
+showing no email/plan columns, degrading the very view being used to diagnose this. And
+`spo account clear-cooldown` now exists, because hand-editing `state.json` takes no lock and
+clears only the visible field: `lastUsageLimitAt` survives, so the next limit inside the 2 h
+window escalates straight to the 5 h tier. Measured against the real code: limit #1 → 3600000,
+limit #2 ten minutes later → **18000000**, clear, limit #3 → 3600000.
+
+---
+## What C7 hands the next session — written 2026-09-02, at commit `3d7a0b7`
+
+**Branch `claude-crazz/c7-truthfulness-docs`, 23 commits on `f7cf9da`. Suite 1562 passing, 0
+failing, 0 cancelled.** **Not yet merged.** The daemon is **stopped** (stopped for the live gate
+run; restart it after merge). Every operational fact in this section is true as of the commit
+named in the heading and nowhere re-verified since — that is what the file's status header means.
+
+### Gate C7 — all three conjuncts
+
+**1. Full suite green.** 1562 tests at `3d7a0b7`.
+
+**2. `spo recette`, all scenarios.** Passed live: `trivial-doc-log`, and a K=2 `parallel-doc-log`
+with real parallelism (two workers 5 ms apart on `pool1`/`pool2`, PRs #636 and #637 both merged,
+board Todo unchanged at 142, zero `auto-pull` events, all seven scan timers confirmed `0` in the
+scanner child's own `/proc` environ).
+
+**3. The three certifications** that replaced the original clause (see "Chantier 7 bis" in the
+plan for why the clause was unclosable by scope rather than by bar):
+
+| | |
+|---|---|
+| **Enforced** | 7bis.1 park-reason sweep, 7bis.2 prompt-contract sweep, 7bis.3 documented-constant sweep. Both halves of 7bis.2 are now pinned to their ground truth: a sixth `STEP_CONTRACTS` entry and a fourth intake prompt each turn the sweep red. |
+| **Exhaustive** | 7bis.4 — all 8 files under `prompts/` read line by line. Verification spot-checked 5 of the 8 against `step-contracts.js` / `task-values.js` / the state-machine branch reading each verdict and found nothing a line-by-line read should have caught. |
+| **Declared** | `doc/accepted-gaps.md` — the partition, pinned to `bb35942`. Corpus **17,978** lines, retired **2,464**, accepted gap **14,368** across 65 files. Both figures supersede the plan's ~16,800 / ~2,290. |
+
+### What verification actually found, and why it mattered
+
+7bis.1, 7bis.3 and 7bis.4 shipped on a driver canary alone. The Opus pass with mutation testing
+returned **seven mutants that survived the full suite**, and the C6/C7 pattern held for the fifth
+time: **what survived was each action's own central claim.**
+
+The structural one is worth carrying forward. `new ParkSignal(...)` is the **throw** site;
+`finalizePark(...)` is the **sink**, and `state-machine.js:1527` is
+`finalizePark(ctx, state, err.reason, err.detail)`. The sweep scanned throws and never the sink,
+which carries six literal reasons no `ParkSignal` throws — four documented nowhere. One of them,
+`abandoned-by-maintainer`, is written straight to `state.json.reason`, so a maintainer grepping
+for `ParkSignal` would never have found it. **The sweep's headline claim was false while the
+sweep was green.**
+
+The rest were sweeps failing to guard themselves: `blankComments` could be reduced to a no-op and
+stay green, because the fixture naming it omitted the `new` its own scanner requires; the floors
+sat *below* the level at which four resolver families could be deleted; both allowlists were
+unpinned, so one edit could exempt a reason forever; 29 % of `PINS` was deletable. In 7bis.2, the
+prose tool-grant check read only the **first** statement — and `verify-citations.md` states its
+grant twice, the second time under a heading titled *"repeated because it is the invariant that
+matters most"*, in the one prompt that *reasons* from its grant.
+
+**The lesson to carry into C8 and C9 is not "run more passes" — it is that for a sweep, green is
+its normal state, so a scanner mutated into a no-op is indistinguishable from one that works.**
+Only mutation testing separates them. Every sweep this chantier shipped now names the specific
+resolver that died rather than reporting a smaller number.
+
+### The register was caught undercounting three times
+
+Each time by someone **re-deriving its numbers**, never by reading it: `bench-queue-wait.js`
+missing from a table whose own subtotal was right (and the one file dropped from the accepted-gap
+register was the bench file); the register's own 345 lines in no bucket; and `scripts/` —
+6 tracked files, 177 comment lines across 665 — in neither the in-scope nor the out-of-scope list.
+Its §7 also asserted a clean sibling grep that its own quoted command contradicts: `~16,800` is at
+`doc/remediation-plan-2026-08.md:259`, in the chantier 7 bis preamble, present tense, as the
+load-bearing premise of the whole scope argument — not in the 7bis.5 row as claimed.
+
+**Root cause of the `scripts/` omission, and it is not local to the register:** the corpus
+definition was inherited from execution rule 6's grep scope list, **which has the same blind
+spot**. Rule 6's list should gain `scripts/` and `accounts/`.
+
+### The two things a fresh session will get wrong
+
+1. **An isolated worktree is not necessarily on the branch you named.** **Nine** agents across this
+   chantier were provisioned at `f7cf9da` — the *pre-C7* base — while being told they were on the
+   branch HEAD. **Make every subagent's first act `git rev-parse HEAD` against the base it was told
+   to expect**, and give it a suite count to check against. Note `git reset --hard` is refused by
+   the permission layer for subagents; `git checkout <sha>` from a clean tree is the fallback that
+   works.
+2. **`git checkout -- <file>` is not a mutation-testing restore, and `git stash` is forbidden.**
+   Copy to `/tmp` and back, and verify with `git diff --stat` between mutants.
+
+### The bench, and why C8's shape changed before C8 started
+
+`doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` are 8.1's two
+deliverables, produced early (read-only, in parallel with C7 bis, on the maintainer's decision).
+**Everything in them is Fable's and unverified except one finding the driver checked personally:**
+
+> **`bench/gate` has not been a required status check on SPO-WebClient's `main` since
+> 2026-08-29T10:17Z.** Ruleset 21111153 version 47551828 required
+> `["typecheck + tests","bench/gate"]`; version 48039109 requires `["typecheck + tests"]`.
+> Verified via `/rulesets/21111153/history/{version_id}` — the `?ruleset_version_id=` query form
+> is **silently ignored** and returns current state for every version, which is how this nearly
+> went unconfirmed.
+
+That reframes the `--live` defect: the stale worker made the gate **silent** from 2026-08-30, but
+the ruleset had already made it **advisory** a day earlier. Every merge since went on CI alone.
+`CLAUDE.md`, `doc/bench-worker.md` and `.claude/hooks/pre-push-gate.sh` all still promise the
+opposite, and the pre-push hook dropped its own check on that promise.
+
+**The audit contradicts plan row 8.5: do NOT move the bench into `orchestrator/`** — it reports 0
+of 8 defect classes living at the repo boundary. **Consequence: chantier 9's deferral collapses**,
+since it rested entirely on C8 rewriting `orchestrator/`.
+
+**Both changes are now in the plan** (maintainer decision, 2026-09-02): row 8.5 is marked
+**superseded** with the original hypothesis kept as written, the migration demoted from a
+commitment to a question 8.1 answers on evidence, and chantier 9 **re-planned as parallel from
+C8b on** with one surviving documentary dependency — it must not audit `doc/state-machine-spec.md`
+or `doc/environments.md` until 8.2, 8.4 and 8.6 have landed. **The amendment states its own
+provenance**: it rests on a Fable audit that is *not yet Opus-verified*, so **8.1 re-derives it
+and may overturn it** — and if it does, it must say so explicitly rather than silently
+re-adopting 8.5.
+
+**Two acts the pipeline cannot perform**, both the maintainer's: restoring `bench/gate` to the
+ruleset, and rebuilding/restarting the bench worker. **Do them together, in that order, and not
+before the audit is verified** — the stale binary is the evidence, and restoring the required
+check while the worker still runs it would re-arm a gate that certifies less than its name
+promises. Confirm one gate artifact shows the live stage actually ran before calling it done.
+
+### Filed this chantier
+
+SPO-Pipeline **#77-#83** (the five production defects verification found and the maintainer chose
+to file rather than fix in a final chantier), **#84** and **#85** (the GATE→merge-queue window, and
+`merge-queue-not-landing` naming a symptom — both found by the live gate run). SPO-WebClient
+**#640** (`CLAUDE.md` names `Rdo/Server/` as the RDO declaration authority; it holds none, and a
+verifier obeying it rejects correct citations). **#77 reproduced live during the gate run**, four
+hours after it was filed.

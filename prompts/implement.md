@@ -101,11 +101,20 @@ diagnosis:  {{diagnosis}}
   REJECT, it only ever describes something already blocking this same card (a failing check, a
   red gate, a CI failure, or the change-validator's own verdict on the previous attempt), never
   new scope of its own.
-- **The RDO wire rule is not your call.** If the plan touches `src/shared/rdo-*`,
-  `src/server/rdo.ts`, `rdo-members.ts`, or session-phase code, the caller has already escalated
-  this step to Opus 5 per CLAUDE.md's wire rule — you do not choose your own model, and a new
-  `rdo-members.ts` catalogue entry still needs a genuine `File.pas:Line` citation from
-  `~/SPO-Original/Rdo/Server/`, never invented, never probed from the live server.
+- **The RDO wire rule is not your call, and it does not track this plan.** Model selection
+  happens once, at intake, before this plan exists — from the issue's own Area field and text
+  (`area === 'rdo'` or a literal `rdo-members.ts` mention in the body), never from the plan's
+  actual file list, and never from `src/shared/rdo-*`, `src/server/rdo.ts`, or session-phase
+  code generically (that fuller set is the wire rule as stated in
+  `SPO-WebClient/doc/kanban-workflow.md`, not this repo's CLAUDE.md, and intake only detects a
+  slice of it). If the issue signaled RDO relevance you are already running as Opus 5; if it did
+  not, you are running at whatever model was already chosen regardless of what this plan touches
+  — a later step (PUSH_PR) re-derives the flag from the real diff, but only in time for the
+  change-validator that follows you, not for you. Either way you do not choose your own model,
+  and a new `rdo-members.ts` catalogue entry still needs a genuine `File.pas:Line` citation to
+  the member's own `published` declaration inside `~/SPO-Original` (today those sit under
+  `~/SPO-Original/Kernel/`; `Rdo/Server/` is the RDO transport layer, not where a game object is
+  declared) — never invented, never probed from the live server.
 - **No diff bodies and no pasted file contents in your reply.** The orchestrator reads git
   directly — `summary` is a few sentences of prose; every other field is data, not narrative.
 - Your reply is read by a script. Output **only** the JSON object in the header above — no

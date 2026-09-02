@@ -1,7 +1,11 @@
 <!--
-  Step: review-card  (intake path, not yet a state-machine-spec.md row — used wherever a card
-  is drafted before filing: change-validator findings, hook-hardening candidates, the split
-  card of a task that turned out to be two)
+  Step: review-card  (intake path, not yet a state-machine-spec.md row — reviewCard has exactly
+  two callers: `spo ask` (bin/spo's cmdAsk, a maintainer's own brainstorm, interactive or via
+  the /SPO-Draft slash command) and the bug-report queue (`auto-triage.js`'s `reviewAndFile`,
+  reached from `routeConfirmedReport`/`processConfirmedReport` -- a player-filed report a human
+  has already confirmed). `spo pull` does NOT call this step. Neither input is a change-validator
+  finding or a hook-hardening candidate — this card is judged on its own merits, not on where
+  the idea came from)
   Adapted from SPO-WebClient/.claude/agents/card-reviewer.md — same neutrality rules and four
   checks, JSON output instead of a prose block.
   Placeholders: {{card_title}} {{card_body}} {{card_category}} {{card_size}} {{card_area}}
@@ -68,8 +72,9 @@ available, but only for checks 1–2 below (the claim does not hold against the 
 duplicate / already fixed) — never for "this is only a preference", since a human already
 judged that question before you ever saw it.
 
-**`human_confirmed: no`** (every other caller — `spo ask`, `/SPO-Draft`, `spo pull`'s review of
-a board candidate):
+**`human_confirmed: no`** (the other caller — `spo ask`, whether typed directly or reached
+through the `/SPO-Draft` slash command; `spo pull` never runs this step at all, it only writes
+queue files):
 
 - A preference with no objective malfunction — the player "doesn't like it", wants different
   behaviour with nothing demonstrably broken — is **`DO_NOT_FILE`**, and
@@ -86,9 +91,11 @@ judge. The claim is what you are testing, not the prose. A finder who misread a 
 described intentional and documented behaviour as a defect, produces a card whose claimer spends
 its whole context proving there is nothing to do.
 
-Where the card asserts something about the RDO wire, the authority is the server-side
-declaration in `~/SPO-Original/Rdo/Server/` — not the draft's summary of it, and never the live
-server.
+Where the card asserts something about the RDO wire, the authority is the member's own
+`published` server-side Pascal declaration inside `~/SPO-Original` — the file the card cites,
+opened and read — not the draft's summary of it, and never the live server. `Rdo/Server/` there
+is the RDO transport layer — dispatch machinery, not the game objects a catalogue entry names;
+the declarations the client's catalogue cites today sit under `~/SPO-Original/Kernel/`.
 
 ### 2 · Is it already covered?
 
@@ -129,7 +136,7 @@ row wins). A card that genuinely spans two blocking areas is two cards.
 | `verdict` | Meaning | What happens next |
 |---|---|---|
 | `FILE` | The card holds as written. | Filed unchanged. |
-| `FILE_AMENDED` | The finding is real, the card is not right yet. | The named corrections are applied, then it is filed. |
+| `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:` correction is applied as a `cat:`/`size:` label before filing; a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
 | `DO_NOT_FILE` | There is no card here — not a defect, duplicate of #N, or already fixed at `<sha>`. | Nothing is filed. |
 
 `FILE_AMENDED` must name **exactly** what to change in `corrections` — the corrected `category`,

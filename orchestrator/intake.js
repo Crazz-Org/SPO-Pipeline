@@ -60,10 +60,12 @@ const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'cli
 
 // config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted/LLM steps and must stay
 // that way -- it is not a fit for either intake step. draftCard and reviewCard are the
-// maintainer-facing `spo ask`/`spo pull` path, not the daemon loop: reviewCard in particular runs
+// maintainer-facing `spo ask` path (bin/spo's cmdAsk; cmdPull calls neither -- `spo pull` only
+// runs pullBoard + makeTask and writes queue files), not the daemon loop: reviewCard in particular runs
 // fable at effort high verifying citations into the sibling product repo, real cross-repo file
 // reads that legitimately run long. Reproduced 2026-08-29 with the review budget already fixed to
-// $3 (see step-contracts.js's SMALL_BUDGET_USD, PR #13): a real review still died at the 120s
+// $3 (a prior maxBudgetUsd cap in step-contracts.js, since removed -- it is `undefined`/no cap
+// today, PR #13): a real review still died at the 120s
 // wall-clock mark with "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]" --
 // (that exact message no longer occurs since the 2026-08-30 fix -- a deadline kill now says
 // "claude ran but exceeded the Xms deadline and was killed", see steps/llm.js's `timedOut`) --
@@ -420,9 +422,10 @@ async function reviewCard(draft, deps = {}) {
     card_area: draft.area,
     repo: ghRepo,
     // 'yes' only when auto-triage.js passes deps.humanConfirmed for a report a maintainer has
-    // already replied "confirm" to (orchestrator/report-intake.js's reportConfirmScan) -- every
-    // other caller (spo ask, /SPO-Draft, spo pull's own review of a board candidate) gets the
-    // default 'no'. See prompts/review-card.md § 0 for what this changes.
+    // already replied "confirm" to (orchestrator/report-intake.js's reportConfirmScan) -- the
+    // only other caller, bin/spo's cmdAsk (`spo ask`, typed or via the /SPO-Draft slash command),
+    // gets the default 'no'. `spo pull` does NOT call reviewCard at all -- cmdPull only runs
+    // pullBoard + makeTask. See prompts/review-card.md § 0 for what this changes.
     human_confirmed: deps.humanConfirmed ? 'yes' : 'no',
   });
 
@@ -758,8 +761,9 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 // change (3.6) is what makes an opus limit on the picked account actually rotate instead of
 // wedging the whole pipeline again.
 //
-// Bash is in allowedTools (unlike draftCard's read-only set): step 1's server-log curl and step
-// 3's `gh issue list --search` dedup both need it; permissionMode stays 'plan' regardless --
+// allowedTools is the SAME set draftCard/reviewCard hold (['Read','Grep','Glob','Bash']) -- Bash
+// included, which this step is the one that actually exercises: step 1's server-log curl and step
+// 3's `gh issue list --search` dedup both need it. permissionMode stays 'plan' regardless --
 // neither of those is a write.
 //
 // `selfIssue` -- required, not optional: under the human-first design the report has ALREADY

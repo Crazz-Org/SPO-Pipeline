@@ -59,14 +59,19 @@ today:        {{today}}
 7. **`confirmed`** — `true` only when the request itself supplies a reproduction precise enough to
    replay, or you found verifiable evidence reading `{{product_repo}}` (a `file:line` that shows
    the described behaviour, or its absence). `false` otherwise — including when `is_bug_report` is
-   `true` but nothing backs it up yet. This is the field `review-card`'s own § 0 confirmation gate
-   reads; do not mark `confirmed: true` to make a thin report look stronger than it is.
+   `true` but nothing backs it up yet. Both this field and `is_bug_report` are required by the
+   draft contract every lane is validated against (`intake.js`'s `validateDraftContract`), and
+   nothing downstream reads either one: `review-card` is not handed them at all. Its § 0 gate
+   reads a separate `human_confirmed` field, which the driver sets only for a report a maintainer
+   already replied "confirm" to. So this value is a record of what you found, not a switch that
+   opens or closes a gate — which is exactly why marking `confirmed: true` to make a thin report
+   look stronger buys nothing and misstates the record.
 
 ## Rules
 
-- You may `Read`/`Grep`/`Glob` `{{product_repo}}`, read-only, to find supporting `file:line`
-  references or to check whether the described behaviour is really there. You hold no edit tool
-  and never write into it.
+- You may `Read`/`Grep`/`Glob`/`Bash` `{{product_repo}}`, read-only (`permissionMode: 'plan'` —
+  no tool you hold can write), to find supporting `file:line` references or to check whether the
+  described behaviour is really there. You hold no edit tool and never write into it.
 - Never invent a file path or a citation — re-check with your read tools before writing one down.
   A wrong citation fails silently, later, at the worst point in the pipeline (the review step that
   reads this card opens every one you cite).

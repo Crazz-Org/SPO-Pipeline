@@ -162,3 +162,50 @@ test('writeLiveWorkerIds: still overwrites on every call (no stale ids survive a
   writeLiveWorkerIds(dir, new Set(['c']));
   assert.deepEqual(readLiveWorkerIds(dir), new Set(['c']));
 });
+
+// action 7.1: writeLiveWorkerIds' own failure path -- mirrors writeState's "tmp file is cleaned
+// up on the failure path" test above exactly, for the sibling function that never got the same
+// coverage. Same mechanism (renameSync(tmp, target) fails because target is a pre-existing
+// directory, not a file -- a real EISDIR, unrelated to the atomic-write machinery itself, standing
+// in for "rename fails" generically).
+test('writeLiveWorkerIds: tmp file is cleaned up on the failure path (rename fails), error still propagates', () => {
+  const dir = mkTmp('spo-journal-liveids-renamefail-');
+  // Make the target a directory instead of a file: renameSync(tmp, live-workers.json) then fails
+  // EISDIR.
+  fs.mkdirSync(liveWorkersPath(dir));
+
+  assert.throws(() => writeLiveWorkerIds(dir, new Set(['a'])), (err) => {
+    assert.equal(err.code, 'EISDIR');
+    return true;
+  });
+
+  // Only the pre-existing directory remains -- the tmp file the failed rename left dangling was
+  // cleaned up (the catch's own fs.unlinkSync(tmp)), not left as litter.
+  const files = fs.readdirSync(dir);
+  assert.deepEqual(files, ['live-workers.json']);
+  assert.equal(fs.statSync(liveWorkersPath(dir)).isDirectory(), true);
+});
+
+// The inner catch's OWN failure mode: the cleanup unlink itself fails (the tmp file is already
+// gone by the time the catch runs -- a second writer, a concurrent cleanup, or here, simply
+// simulated directly) is swallowed by its own empty `catch {}`, and the ORIGINAL rename error is
+// what must propagate out of writeLiveWorkerIds -- never a secondary ENOENT from the failed
+// unlink masking the real cause. Monkey-patching fs.renameSync (same spy idiom the atomic-rename
+// tests above already use) is the only way to land inside that inner catch deterministically: it
+// deletes the tmp file itself as a side effect, immediately before throwing, so by the time the
+// outer catch's fs.unlinkSync(tmp) runs, tmp is already gone.
+test('writeLiveWorkerIds: a rename failure whose tmp file is ALSO already gone still rethrows the original rename error, never a secondary ENOENT from the cleanup unlink', () => {
+  const dir = mkTmp('spo-journal-liveids-doublefail-');
+  const origRename = fs.renameSync;
+  const renameError = new Error('simulated rename failure, tmp vanishes underneath it');
+  renameError.code = 'ESIMULATED';
+  fs.renameSync = (src) => {
+    fs.unlinkSync(src); // tmp is gone before the catch below ever gets a chance to clean it up
+    throw renameError;
+  };
+  try {
+    assert.throws(() => writeLiveWorkerIds(dir, new Set(['x'])), (err) => err === renameError);
+  } finally {
+    fs.renameSync = origRename;
+  }
+});

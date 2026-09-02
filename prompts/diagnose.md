@@ -16,10 +16,15 @@
 
 # DIAGNOSE
 
-You read one failed attempt — a bench gate FAIL or an unclassified CI failure — and name
-**one** root cause the driver has not already spent an attempt on. This step exists because the
-retry budget is three attempts and two identical root causes in the ledger ends the task: your
-only job is telling a genuinely new cause from a restatement of an old one.
+You read one failed attempt and name **one** root cause the driver has not already spent an
+attempt on. More than the gate routes a task here — among the entry points: a bench gate FAIL, a
+CI failure the cause table could not classify, a failed CHECK (the invariant substring check,
+typecheck, lint or `coverage:changed`), an IMPLEMENT that returned an empty `files_changed`, and
+an IMPLEMENT whose worktree had not actually moved despite the files it claimed. Those last three
+happen **before any gate has run** — see step 2. This step exists because the retry budget is
+`config.diagnoseBudget` = three attempts, and a root cause the driver has already seen this run
+parks the task immediately, even under budget: your only job is telling a genuinely new cause
+from a restatement of an old one.
 
 ## Payload
 
@@ -34,14 +39,19 @@ ledger:    {{ledger_path}}
 1. **Read `{{ledger_path}}` first.** It carries two kinds of line:
    - `attempt N | root cause | outcome` — a previous diagnosis of yours. Every cause already
      there is off limits: your task is not to find *a* cause, it is to find one that is not
-     already there in substance, however it was worded.
+     already there in substance, however it was worded. Note the ledger outlives the driver's own
+     memory: its duplicate guard is an exact string match against the causes seen in the CURRENT
+     run only, while this file accumulates across every retry of the card. So a cause repeated
+     from an earlier run slips past the guard — the ledger, and this instruction, are what stop
+     it.
    - `validate-reject N | reasons | outcome` — the change-validator rejecting a built change.
      This is **not** a diagnosis and is **not** off limits. It is evidence about what was wrong
      with the work, and the underlying cause may well still be undiagnosed. Never return
      `root_cause: null` on the grounds that a `validate-reject` line already covers your finding.
 2. **Read `{{gate_log_path}}` if it exists.** It holds the LAST gate run's output only, and it
-   is written only when a gate has actually run: DIAGNOSE is also reached from a failed CHECK or
-   an empty IMPLEMENT, before any gate. A missing file is normal there and is **not** itself a
+   is written only when a gate has actually run — never on the three pre-gate routes above (a
+   failed CHECK, an empty IMPLEMENT, an IMPLEMENT whose worktree did not move). A missing file is
+   normal on those and is **not** itself a
    finding — diagnose from the ledger and the diff instead. If the file exists but you were not
    sent here by the gate, it predates the current diff: treat it as history, not as this
    attempt's evidence. This is a file path, not a live command — never re-run the
@@ -61,9 +71,10 @@ ledger:    {{ledger_path}}
      together do not carry enough signal to tell two candidate causes apart → return
      `root_cause: null` with a one-line `reason` (e.g. `"same coverage gap as attempt 2"` or
      `"log does not show which check step failed"`). **Never reword an already-tried cause to
-     make it look new just to produce a non-null value** — the three-attempts rule downstream is
-     a plain string comparison, and a diagnosis written to dodge it defeats the reason the rule
-     exists.
+     make it look new just to produce a non-null value** — the duplicate-cause guard downstream
+     is a plain exact string match against the causes already seen for this task, so a reworded
+     duplicate slips past it and buys one more IMPLEMENT attempt against a cause that has already
+     failed once. That defeats the reason the guard exists.
 5. **Choose `category`** as a short, stable, lowercase-hyphenated token. Reuse one already in
    the ledger when the same *kind* of failure recurs even though the specific cause differs
    (examples: `coverage`, `typecheck`, `lint`, `build`, `l2-live-drive`, `flaky`, `infra`,

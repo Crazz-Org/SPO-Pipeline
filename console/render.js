@@ -46,7 +46,7 @@
 //                                                          // usageSnapshotFreshness -- action 5.5, item B
 //     trend: { series, lastRecordedDate, todayLocalDate, stale, staleDays, kpis } | null,
 //                                                          // console/usage-scan.js buildTrendViews,
-//                                                          // from console/usage-rollups.json -- populated
+//                                                          // from <journalRoot>/usage-rollups.json -- populated
 //                                                          // in BOTH static and live mode (a cheap read of
 //                                                          // an already-computed file, not a live scan)
 //     services: { daemon, queue, benchWorker, nightly, verdicts, workers },  // console/collect.js
