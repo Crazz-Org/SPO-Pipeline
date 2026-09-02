@@ -1344,7 +1344,60 @@ the whole run, in two arms differing only in the wait bound.
 the criterion exactly: "excess workers wait or park, never share an account". The decisive column is
 the last one: no card got past an LLM step while another process held the account.
 
-### Part 3 — a supervised parallel batch of 2 S-sized cards: PENDING
+### Part 3 — a supervised parallel batch of 2 S-sized cards: GREEN, 2026-09-02
+
+Run on C6 deployed to production, K=2, both accounts healthy, auto-pull disabled so the batch was
+the two cards chosen rather than whatever was topmost on the board. Cards **#485** and **#487**,
+both `size:S`, fed by hand.
+
+| | |
+|---|---|
+| outcome | both **DONE**; **PR #628** merged 04:22:36Z, **PR #629** merged 04:33:53Z |
+| max concurrent workers | **2**, sustained ~15 min |
+| accounts | `#485 -> pool1 -> pool2`, `#487 -> pool2 -> pool1` — **never the same account at the same time** |
+| board moves | #485 **7**, ending `Done`; #487 **11**, including three `Implementing -> Checks & PR` returns |
+| divergence | **zero** — board `Done`, journal `DONE`, for both |
+| cleanup | both product worktrees reaped; worktree count back to its pre-batch value |
+| cooldowns incurred | none; both accounts still `cooldown=none` afterwards |
+
+The transition timeline is the evidence that this was genuine parallelism rather than a fast serial
+drain:
+
+    t=2s    both WORKTREE          <- the product-repo mutex (6.4) serialising setup
+    t=19s   485 PLAN, 487 WORKTREE
+    t=35s   both PLAN
+    t=136s  485 IMPLEMENT, 487 PLAN
+    t=448s  485 GATE, 487 IMPLEMENT
+    t=923s  485 DONE, 487 DIAGNOSE  <- live-workers.json correctly drops to 1
+    t=1609s both DONE
+
+Three C6 mechanisms are visible in it. At t=2 both cards sit in WORKTREE and only one leaves at
+t=19 — **6.4's mutex serialising the shared clone** while everything else overlaps. The account
+column shows **6.2's per-step leases** handing the two workers different accounts and then rotating
+them, never colliding. And at t=923 the live-worker table drops from 2 to 1 the moment #485
+finishes — **6.3/6.6's publish-on-exit**, the mechanism whose absence at startup was 6.6's fatal
+deadlock.
+
+**#487 is the more valuable half of this gate.** It failed CHECK and went round the
+DIAGNOSE → IMPLEMENT → CHECK loop three times before passing, while #485 ran to completion beside
+it. So the batch exercised the remediation loop *under* parallelism, not just a clean happy path
+twice — and the two cards' board moves stayed correctly interleaved and attributed throughout.
+
+### What it cost to get here, recorded because it was avoidable
+
+Setting the batch up, `spo pull --help` was used to check the flag. `--help` is not recognised by
+that subcommand, so it **ran a real pull**, queued five of the maintainer's cards, and the
+dispatcher took #484 to PLAN before it was stopped. Restored: queue cleared, product worktree
+removed via `worktree remove --force` + `prune`, local branch deleted (nothing had been pushed, no
+PR), the journal directory moved aside rather than destroyed, and the board card returned to
+`Todo`. The `prune` also cleared two pre-existing stale worktree registrations, which is the
+manoeuvre CLAUDE.md prescribes but did change the count beyond a pure restore. The three parked
+cards' worktrees were explicitly checked and intact.
+
+The lesson worth keeping: **on this CLI, probe a write-capable subcommand by reading `bin/spo`'s
+usage line, never by passing it `--help`.**
+
+### The former Part 3 note (superseded)
 
 This needs a real maintainer-supervised run, exactly as C5's gate was closed. Prerequisites now
 met: both pool accounts read `cooldown=none`, so K=2 is reachable for the first time today.
