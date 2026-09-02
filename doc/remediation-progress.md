@@ -1411,3 +1411,109 @@ Two things must be sequenced around it, and neither is optional:
   `SPO_AUTO_PULL_MS=0`), added because another session is filing many cards into project 1's Todo.
   The gate needs a *controlled* batch of two, not whatever is topmost on the board, so that drop-in
   should stay for the gate run and the two cards be fed by hand.
+
+## What C6 hands C7
+
+C7 is "truthfulness consolidation & docs": 7.1 replay holes, 7.2 a `spo recette` scenario library,
+7.3 concurrency tests, 7.4 (already done), 7.5 a final doc sweep. **Three of those rows were
+written against a daemon that no longer exists**, and one of them is now largely delivered. Read
+this before planning them.
+
+### 7.3's first premise is gone, and most of that row is already built
+
+The row asks for "runForever timers under a long drain". **`runForever` no longer drains anything.**
+C6 moved it into a separate `daemon.js --scanner` process that runs timers only; the dispatcher
+drains. So "timers under a long drain" is no longer a scenario the code can be in.
+
+The defect that row was reaching for is real, was measured, and is fixed: the scans reach intake's
+**blocking** `spawnSync('claude')`, measured at 3 m 24.9 s and 3 m 11.5 s on the live daemon, and
+A/B'd at **reaping lag 9182 ms → 6 ms** and **3 of 90 → 88 of 90 timer ticks**. What C7 can still
+add is a *test* that the dispatcher's loop stays responsive while a scan blocks — `test/dispatcher.test.js`
+has one, pinned by injecting a blocking sleep into `run()`'s loop, so check what it already covers
+before writing more.
+
+"Double daemon" now means two different things and both have coverage: two dispatchers (refused by
+the single-instance lock) and two scanners (the orphan case — a `detached` scanner survives its
+dispatcher; closed with `--parent-pid`, and the leak was reproduced before being fixed).
+
+"daemon + CLI concurrently" is the live one. The taskDir single-writer invariant is now written
+down in `orchestrator/journal.js`, and C6 **added writers**: the dispatcher's crash-repark, and the
+scanner's `orphanScan`/`unparkScan`/reconciler in a different process from the workers. That seam
+is wider than it was when the row was written.
+
+### 7.2's harness exercises a path production no longer takes
+
+`spo recette` calls `drainQueueOnce`. That function still exists and is still correct, but **the
+daemon no longer uses it** — the dispatcher does. So a recette scenario today validates a code path
+production does not run. Before extending the harness with K>1 scenarios, decide whether recette
+should drive the *dispatcher* instead; a K>1 scenario built on `drainQueueOnce` cannot exercise
+parallelism at all, because that function is serial by construction.
+
+Also still true and still a trap: **`spo recette` files a synthetic SPO-WebClient issue**, and
+project 1's auto-add drops it into the daemon's own queue. C5's gate deliberately avoided it for
+that reason.
+
+### The surfaces C6 added, none of which existed when 7.1 was written
+
+`orchestrator/dispatcher.js`, `account-lease.js`, `product-repo-lock.js`, `product-repo-hold.js`,
+`worker-status.js`, `main-moved-budget.js`, `bench-queue-wait.js`, `monotonic-clock.js`, plus
+`daemon.js`'s `--worker`/`--scanner` modes and `journal.js`'s live-worker helpers. 7.1's list of
+replay holes predates all of it.
+
+### Six things that will bite C7 specifically
+
+- **The suite has no per-test timeout.** Several mutations "pass" by hanging for 100–150 s. Run
+  `node --test --test-timeout=30000 test/*.test.js`. Never bare — bare walks into parked cards'
+  product worktrees and reports ~1168 foreign failures.
+- **Run a NEGATIVE timezone offset.** `TZ=Pacific/Niue` (UTC−11) found a real pre-existing failure
+  at HEAD that UTC and UTC+14 had both missed — a fixture assuming two instants five hours apart
+  share a local day, which no pair can across a 26-hour offset range.
+- **This box's `Date.now()` jumps backward** — measured −2515 ms across a 10 ms monotonic interval,
+  twice, independently. Bounded wait loops must use `process.hrtime.bigint()`; anything written to
+  disk or compared across processes stays wall-clock. **A flaky suite silently misreports a
+  surviving mutation as killed** — it did so in C4 and again in C6.
+- **Tests that spawn real children must pass `--parent-pid`** or an interrupted run leaks detached
+  processes. C6 accumulated 33 orphaned scanners this way before fixing it.
+- **`git checkout -- <file>` is not a mutation-testing restore.** It reverts to HEAD, not to the
+  working copy, and it silently wiped a real feature addition mid-round. Copy to `/tmp` and back.
+  `git stash` is forbidden outright — the stack is shared across worktrees and live sessions.
+- **`spo pull --help` is not a help flag.** That subcommand ignores it and runs a real pull. It
+  queued five live cards and took one to PLAN. Read `bin/spo`'s usage line instead.
+
+### Open, in the order they will bite
+
+- **#483 — the cooldown model is wrong in two directions at once, and it is the live risk.**
+  `markLimit` cools the whole ACCOUNT for 1 h/5 h, all three constants shaped around the 5-hour
+  session window. Anthropic's quotas are **per model**, and one window is **7 days**. A card runs
+  `fable → sonnet → fable`, so a Fable exhaustion kills every card at PLAN on an account whose
+  Sonnet quota is fine — too broad — while a 5 h cooldown against a 7-day quota retries into a wall
+  ~34 times a week — too short. And the cooldown is **never reconciled with the server**: `pick()`
+  compares a locally-invented `cooldownUntil` to the wall clock and nothing re-checks. `pool1` hit
+  its limit **twice on 2026-09-02** and the maintainer had to clear the entry by hand both times
+  for K=2 to be reachable. **C6's K ≤ healthy-accounts clamp rests directly on this being right.**
+- **`runAutoTriage`'s third-mechanical-failure test fails ~1 run in 40** under full-suite load and
+  is not reproducible in 48 isolated runs of its own file. Needs full-suite load; unfiled.
+- **`callLlmStep` releases the account lease before `markLimit` cools it**, so a sibling polling at
+  1 s can lease the just-limited account and burn one call. Reported and deliberately not changed —
+  it is the order `account-lease.js`'s own header describes as intended, so it is a 6.2 contract
+  decision for the maintainer, not a slip.
+- **The C6 circuit breaker's persistence question.** `workerCrashLimit` is per-restart. With the
+  systemd rate limiter fixed (it was in `[Service]`, where systemd **ignores** it — its own journal
+  says so) the worst case is bounded, so cross-restart persistence was deliberately not built.
+- Still open on project 2: **#476**, **#477**, **#482** (overlaps **#31**), **#43**, **#31**, and
+  the unowned half of **#475**.
+
+### Operational state as C6 closes
+
+- `main` = the C6 merge plus this handoff. Suite **1382 passing, 0 failing** under UTC,
+  `Pacific/Niue` and `Pacific/Kiritimati`.
+- The daemon runs **two processes**: a dispatcher (holds the lock) and a scanner child carrying
+  `--parent-pid`, `--workers` and explicit `--queue`/`--journal`. `spo status` renders a `workers:`
+  line and per-row worker detail.
+- **Two systemd drop-ins were added and both are load-bearing.** `auto-pull-off.conf`
+  (`SPO_AUTO_PULL_MS=0`) exists because another session filed ~140 cards into project 1's Todo and
+  the daemon claims from exactly there; **removing it re-arms claiming on the next restart.**
+  `workers.conf` (`SPO_WORKERS=2`) sets K for the gate. `config.js`'s own default is **K=1**, so
+  parallelism is opt-in and deleting that drop-in is the safe rollback.
+- **Deploying still restarts the daemon by itself** — the `git pull` fires the post-merge hook, not
+  the merge. Check for in-flight tasks first; a docs-only merge needs no pull.
