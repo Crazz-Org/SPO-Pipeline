@@ -63,9 +63,15 @@ B3–B6 are parallel once B2 lands. B6 overlaps chantier 9's corpus on the bench
 | 1.5 | **Restore `bench/gate` to ruleset 21111153** — *last*, and only after 1.3 has produced a live artifact. Restoring a required check while the worker still certifies less than its name promises re-arms a lie. | operational (GitHub) |
 
 **Gate B1**: a gate artifact dated after the restart whose `live` block names driven flows, on a
-commit whose diff routes to at least one real flow · `bench/gate` present in the ruleset's
-current `required_status_checks` · full pipeline suite green · the reinstall rule proven by a
-test that fails when `realFinish` skips it.
+commit whose diff routes to at least one real flow · **and that drive confirmed from outside the
+bench, in `http://158.69.153.134/logs/FIVEINTERFACESERVER/`** — a logon burst inside the job's
+window whose shape matches the flows the artifact names, not the nightly's 9-logon signature ·
+`bench/gate` present in the ruleset's current `required_status_checks` · full pipeline suite
+green · the reinstall rule proven by a test that fails when `realFinish` skips it.
+
+> **The server log is the acceptance test, not the artifact.** The whole of D1/D2 is a system
+> whose every self-report agreed with every other and all of them were wrong. No live claim in
+> B1-B6 is accepted on the bench's own evidence.
 
 ---
 

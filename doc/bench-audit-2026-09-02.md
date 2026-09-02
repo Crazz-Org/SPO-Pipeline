@@ -91,6 +91,41 @@ dist/e2e/bench/worker.js` is **0**; `src/e2e/bench/worker.ts:482` is **1**.
 The two clocks are intrinsic: the job body **must** come from the commit under test. That is the
 single most important structural fact in this audit, and it is why the fix is not a rebuild.
 
+### Confirmed from outside the bench — the game server's own logs
+
+*Added 2026-09-03 on the maintainer's instruction: a live scenario is confirmed against
+`http://158.69.153.134/logs/`, never against the bench's own artifacts. It is the only witness
+the system under test cannot write to.*
+
+`FIVEINTERFACESERVER/Survival 26-09-02.log` records every `LOGON ATTEMPT: User=…` with a
+timestamp, in UTC. For **2026-09-02**, against the bench's own `done/` records:
+
+| the bench claims | the server shows |
+|---|---|
+| 5 `nightly` jobs, each *"live drive exited 0 (PASS)"* | **5 bursts of exactly 9 logons** (7 `SPO_test3`, 2 `Crazz`), each opening within a minute of its job's start |
+| 8 `ref` gate jobs, each *"verify-gate exited 0 (PASS)"* | **nothing. Not one logon in any of the eight windows** |
+
+```
+nightly 03:56:17 → 03:59:51   burst 03:57:04 → 03:59:31
+nightly 04:30:23 → 04:33:49   burst 04:31:02 → 04:33:35
+nightly 12:52:53 → 12:56:34   burst 12:53:34 → 12:56:17
+nightly 16:28:53 → 16:32:24   burst 16:29:46 → 16:32:06
+nightly 16:43:57 → 16:47:22   burst 16:44:40 → 16:47:07
+ref     04:15 · 04:28 · 14:56 · 14:59 · 16:33 · 16:37 · 16:40 · 16:48   — no logon in any window
+```
+
+`world/run-history.json` holds exactly five entries for the day, all `branch: "local"`, matching
+the five bursts. **Three witnesses agree, and the third is outside the system under test.**
+
+Two observations for later use:
+
+- **The nightly's signature is 9 logons.** A gate's live drive routes a diff-dependent flow set,
+  so it will produce a *different* burst — which is what makes the check discriminating rather
+  than merely present/absent.
+- One logon sits outside every bench job: `SPO_test3` at 22:20:46, with
+  `SPO_test3.IP = 82.165.165.224` as the log's last line. Not attributable to anything in the
+  corpus; recorded, not chased.
+
 ### Ten merges with no attestation whatsoever
 
 | PR | merged (UTC) | title |
