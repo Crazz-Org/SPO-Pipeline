@@ -1744,3 +1744,78 @@ showing no email/plan columns, degrading the very view being used to diagnose th
 clears only the visible field: `lastUsageLimitAt` survives, so the next limit inside the 2 h
 window escalates straight to the 5 h tier. Measured against the real code: limit #1 → 3600000,
 limit #2 ten minutes later → **18000000**, clear, limit #3 → 3600000.
+
+---
+
+## What C7 hands the next session
+
+**Branch `claude-crazz/c7-truthfulness-docs`, 17 commits on `f7cf9da`. Suite 1529 passing, 0
+failing, 0 cancelled**, green under UTC, `Pacific/Niue` and `Pacific/Kiritimati`. **Not yet
+merged.** The daemon is **stopped** (I stopped it for the live gate run; restart it after merge).
+
+### Where C7 actually stands
+
+Gate C7's first two conjuncts are met: the suite is green, and **`spo recette` passed live on
+both scenarios today** — `trivial-doc-log`, and a K=2 `parallel-doc-log` with real parallelism
+(two workers 5 ms apart on `pool1` and `pool2`, PRs #636 and #637 both **merged**, board Todo
+unchanged at 142, zero `auto-pull` events, all seven scan timers confirmed `0` in the scanner
+child's own `/proc` environ).
+
+The third conjunct was rewritten. It could not close as worded — see "Chantier 7 bis" in the
+plan for the argument and the numbers. **Three of its six actions remain:**
+
+| | |
+|---|---|
+| **7bis.2** prompt-contract sweep | not started; unblocked now 7bis.4 has settled the prose |
+| **7bis.5** accepted-gap register | not started; Gate C7's "declared" certification rests on it |
+| **7bis.6** execution rule | not started; one paragraph in the plan's execution rules |
+
+**And one gap in the driver loop itself**: 7bis.1, 7bis.3 and 7bis.4 were canaried by the driver
+but never got the full **Opus adversarial pass with mutation testing** that every other C7 action
+received. The gate now rests on those three. Do that before merging.
+
+### The two things a fresh session will get wrong
+
+1. **An isolated worktree is not necessarily on the branch you named.** Three agents this session
+   were provisioned at `f7cf9da` — the *pre-C7* base — while being told they were on the branch
+   HEAD. Two noticed (one only because the suite reported 1396 tests instead of 1513) and fixed
+   their own base; one did not and had to be corrected mid-flight. **Make every builder's first
+   act `git rev-parse HEAD` against the base it was told to expect.**
+2. **`git checkout -- <file>` is not a mutation-testing restore, and `git stash` is forbidden.**
+   Copy to `/tmp` and back. This is in the traps list and was still nearly re-learned.
+
+### The bench, and why C8's shape changed before C8 started
+
+`doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` are 8.1's two
+deliverables, produced early (in parallel with C7 bis, read-only, on the maintainer's decision).
+**Everything in them is Fable's and unverified except one finding the driver checked personally:**
+
+> **`bench/gate` has not been a required status check on SPO-WebClient's `main` since
+> 2026-08-29T10:17Z.** Ruleset 21111153 version 47551828 required
+> `["typecheck + tests","bench/gate"]`; version 48039109 requires `["typecheck + tests"]`.
+> Verified via `/rulesets/21111153/history/{version_id}` — note the `?ruleset_version_id=` query
+> form is **silently ignored** and returns current state for every version, which is how this
+> nearly went unconfirmed.
+
+That reframes the `--live` defect this session found earlier: the stale worker made the gate
+**silent** from 2026-08-30, but the ruleset had already made it **advisory** a day before. Every
+merge since went on CI alone. `CLAUDE.md`, `doc/bench-worker.md` and `.claude/hooks/pre-push-gate.sh`
+all still promise the opposite, and the pre-push hook dropped its own check on that promise.
+
+**The audit contradicts plan row 8.5: do NOT move the bench into `orchestrator/`** — it reports 0
+of 8 defect classes living at the repo boundary. **Consequence: chantier 9's deferral collapses**,
+because it rested entirely on C8 rewriting `orchestrator/`. C9 should be re-planned as parallel
+from C8b on. Neither change is in the plan yet; make it after Opus verifies the audit.
+
+**Two acts the pipeline cannot perform** and which are the maintainer's: restoring `bench/gate` to
+the ruleset, and rebuilding/restarting the bench worker. **Do not rebuild the worker until the
+audit's findings are Opus-verified** — its stale binary is the evidence.
+
+### Filed this chantier
+
+SPO-Pipeline **#77-#83** (the five production defects verification found and the maintainer chose
+to file rather than fix in a final chantier), **#84** and **#85** (the GATE→merge-queue window,
+and `merge-queue-not-landing` naming a symptom — both found by the live gate run). SPO-WebClient
+**#640** (`CLAUDE.md` names `Rdo/Server/` as the RDO declaration authority; it holds none, and a
+verifier obeying it rejects correct citations). **#77 reproduced live during the gate run**, four
+hours after it was filed.
