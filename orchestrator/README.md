@@ -649,6 +649,33 @@ and the code guessed.
 live world), so adding an account adds implementation capacity, not gate throughput
 (state-machine-spec.md § Account pool).
 
+**Per-step account leases (chantier 6 action 6.2, `orchestrator/account-lease.js`).**
+`accounts.pick()` is deterministic first-fit — two concurrent callers get handed the *same*
+account every time, invisible under the pre-C6 single-threaded daemon and a real bug once a
+worker and the scanner process (§ "How much the daemon takes on at once") can both be calling an
+LLM step at once. A lease is acquired around one LLM call, per-step rather than per-task
+(deliberate: the real pool is 2 accounts, a card's models already rotate fable → sonnet → fable
+with no cross-step cache to protect, and 15% of cards already rotate mid-run in ~6s at zero cost —
+a per-task lease on a 2-account pool would turn that routine rotation into a park class that has
+never fired), and released the instant that call finishes. Lease files live at
+`<poolDir>/.lease-<name>.json` (`{pid, startedAt}`), acquired/released via `lock.js`'s
+`acquireShortLock`/`releaseShortLock` — the same pid-liveness stale-sweep idiom `daemon.lock`
+uses, simpler because a lease never needs the tmp+link dance.
+
+A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
+**bounded wait** (`config.accountLeaseWaitMs`) before parking `all-accounts-leased` — distinct
+from `AllAccountsCoolingError` (a cooldown, never worth waiting on; that still parks immediately).
+The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **31.5 minutes**: 2 ×
+`LLM_STEP_DEADLINE_MS` plus 10% slack) — the age at which a lease is presumed dead and swept
+regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That distinction
+was a real C6-verification bug: the original default (5 min, reasoned from the typical duration)
+gave up while a legitimately-held lease could still be alive and un-sweepable for up to another
+26.5 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
+always terminates one of two honest ways — it gets a lease, or the holder ages out and it takes
+that one — instead of parking early. `countHealthyAccounts` (the `K ≤ healthy accounts` clamp
+above) is deliberately blind to lease state, only to cooldowns: a lease frees every 90–265s, and
+clamping `K` on that churn would make it flap on every single LLM call.
+
 ### cwd policy
 
 Real-mode LLM calls run from one of two places, chosen by `orchestrator/config.js`'s
@@ -1849,21 +1876,30 @@ suite runs once, and the check passes exactly when that suite is green. GATE rec
 diff CHECK already passed — the smallest, least surprising input the bench can be asked to judge.
 See `orchestrator/recette.js`'s own comment above `RECETTE_DOC_FILE` for the full reasoning.
 
-**Scenarios are data — for the inline driver this harness runs today.** `recette.js`'s
-`SCENARIOS` is a plain object, `{name, label, buildCard(ctx), assertions: [...]}` per entry — the
-runner (`runRecette`) is generic over any entry shaped that way, and a scenario that only changes
-what IMPLEMENT is asked to do (like `trivial-doc-log` above) really is just a second object
-literal, touching neither `runRecette` nor `evaluateAssertions` nor the cleanup logic. That does
-not hold for every scenario, though: one that changes *how* the pipeline is driven — a
-dispatcher-driven run instead of the inline one, say — needs a driver branch and its own
-out-of-process cap, since the existing cap wraps `deps.spawnSync` in-process and a dispatcher runs
-its workers as child processes. Chantier 7 action 7.2 (in flight as of this writing) is adding
-exactly that kind of scenario; see its own record for the shape it landed on.
+**Scenarios are data.** `recette.js`'s `SCENARIOS` is a plain object, one entry per scenario:
+`{name, label, description, driver, k, buildCard(ctx), targetFile(index), assertions: [...],
+crossTaskAssertions?}` — `driver` is `'inline'` (the original path, verbatim: `drainQueueOnce` plus
+the `deps.spawnSync`-wrapped cap) or `'dispatcher'` (drives the real `createDispatcher` with real
+worker children); `k` is how many synthetic cards the scenario runs; `capLlmSteps`/`capMs` are
+optional per-scenario overrides of the global cap defaults (opts/env still win over them);
+`crossTaskAssertions` only applies at `k > 1`, checked once across every task's combined events
+rather than per-task. A scenario that only changes what IMPLEMENT is asked to do, at `driver:
+'inline'`, really is just a second object literal, touching neither `runRecette` nor
+`evaluateAssertions` nor the cleanup logic — `trivial-doc-log` (`k: 1`) is exactly that. That does
+not hold for a `dispatcher`-driver scenario: chantier 7 action 7.2 landed `parallel-doc-log`
+(`k: 2`) at `c0e4bbb`, which needed its own driver branch (`runDispatcherScenario`) and an
+out-of-process cap (`runDispatcherCapWatchdog`, summing `llm-call` events across every task the
+run owns), since the inline cap wraps `deps.spawnSync` in-process and a dispatcher runs its
+workers as separate OS processes the in-process wrapper never sees.
 
-**The cap.** The remediation plan's "capped budget" predates this project retiring dollars as a
-metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent, honestly-enforceable
-bounds, both checked at the one choke point every real spawn (scripted **and** `claude -p`, per
-`steps/llm.js`'s `invokeClaudeReal`) already passes through: `deps.spawnSync`.
+**The cap — `driver: 'inline'`.** The remediation plan's "capped budget" predates this project
+retiring dollars as a metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent,
+honestly-enforceable bounds, both checked at the one choke point every real spawn *the inline
+driver makes* (scripted **and** `claude -p`, per `steps/llm.js`'s `invokeClaudeReal`) already
+passes through: `deps.spawnSync`. This does not extend to `driver: 'dispatcher'` — its workers are
+separate OS processes, invisible to an in-process `deps.spawnSync` wrapper, which is exactly why
+that driver carries its own out-of-process watchdog (`runDispatcherCapWatchdog`, above) instead of
+reusing this mechanism.
 
 - **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
   spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
@@ -1897,16 +1933,29 @@ event fails only its own assertion, so the report always shows the rest.
 **Safety: refuses while a live daemon is running.** Chantier 6 action 6.4 added a real
 product-repo mutex (`orchestrator/product-repo-lock.js`, `config.js`'s own note on the
 44-worktree/61-branch incident this project already paid for once), but recette does not itself
-acquire it — it drives its task through `drainQueueOnce` exactly like a real worker, so
-WORKTREE's setup and FINISH's teardown already take the lock that way. What recette adds on top is
-a coarser, earlier guard: refusing to *start* at all while a live daemon holds **its own** lock
-file, `<repoRoot>/journal/daemon.lock` (`orchestrator/lock.js`) — 6.4's lock is scoped to one
-WORKTREE/FINISH call and says nothing about whether a daemon is running at all before recette
-begins. Checked read-only (recette reads the lock file and probes the pid's liveness the same way
-`lock.js`'s own stale-sweep does — it never calls `acquireLock`, which would create the lock
-itself). `--force` overrides, loudly, for a maintainer who has confirmed by hand that nothing is
-actually running. This is a best-effort check, not a mutex: it catches "I forgot the daemon is
-running", not a daemon that starts a second after the check passes.
+acquire it — WORKTREE's setup and FINISH's teardown already take the lock, the same `realWorktree`/
+`realFinish` code every driver runs (via `drainQueueOnce` for `driver: 'inline'`, via a real worker
+process for `driver: 'dispatcher'`). What recette adds on top is a coarser, earlier guard: refusing
+to *start* at all while a live daemon holds **its own** lock file, `<repoRoot>/journal/daemon.lock`
+(`orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
+whether a daemon is running at all before recette begins. Checked read-only (recette reads the
+lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does — it never
+calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly, for a
+maintainer who has confirmed by hand that nothing is actually running. This is a best-effort
+check, not a mutex: it catches "I forgot the daemon is running", not a daemon that starts a second
+after the check passes.
+
+**Safety: a second, unrelated refusal for `driver: 'dispatcher'`.** A dispatcher-driver scenario
+spawns a real scanner child, and that child inherits `SPO_REMOTE_REPORT_URL` from this process's
+own environment exactly as it inherits the seven zeroed scan-timer vars (see "Scenarios are data"
+above) — but zeroing `SPO_REMOTE_REPORT_PULL_MS` does not stop `remote-report-pull.js`'s first
+pull, which runs unconditionally on scanner startup. If `SPO_REMOTE_REPORT_URL` is ever set in the
+shell `spo recette` runs from (today it lives only in the live daemon's systemd drop-in, never an
+interactive shell), a `driver: 'dispatcher'` run would make a genuine HTTPS pull-and-ack against
+production bug reports into this machine's real `~/.spo-reports`. `runRecette` refuses outright
+when that env var is set and the driver is `dispatcher` (`reason: 'remote-report-url-set'`),
+`--force` overrides both refusals for a maintainer who has confirmed by hand that a real pull is
+acceptable. `driver: 'inline'` never spawns a scanner at all, so this refusal never applies to it.
 
 **`--dry`** resolves the exact same config `--force`-free real run would (one function,
 `buildPlan`, feeds both paths so they cannot structurally diverge), prints it, and returns before

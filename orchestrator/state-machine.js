@@ -1393,9 +1393,14 @@ function finalizePark(ctx, lastState, reason, detail) {
       // park-loop.js's reEnqueueTask does the whole write, in ONE atomic step, with this
       // attempt's two fields handed in through its `extra` parameter -- see its header for why
       // "write the base entry, then patch it" is a correctness bug and not a style choice. The
-      // `notBefore` deadline lives on the queue ENTRY, never in a `sleep` -- runForever's
-      // drainQueueOnce loop is awaited, so sleeping inside it would stall every other card in the
-      // queue for as long as this one's backoff runs.
+      // `notBefore` deadline lives on the queue ENTRY, never in a `sleep`. Stale-as-of-C6
+      // justification this comment used to give: "runForever's drainQueueOnce loop is awaited, so
+      // sleeping inside it would stall every other card in the queue" -- true before chantier 6,
+      // false now that a real daemon runs each task in its own worker process (dispatcher.js);
+      // a `sleep` here today would stall only the one worker process that is exiting anyway.
+      // `notBefore` on the queue entry is still the right mechanism regardless -- a deadline
+      // survives that process exiting, a `sleep` would not -- it just isn't preventing the stall
+      // it was originally written to prevent.
       //
       // Queue entry first, journal line second, and the return gated on the write having actually
       // happened: `transient-retry` is the journal's claim that this card IS coming back, and the
