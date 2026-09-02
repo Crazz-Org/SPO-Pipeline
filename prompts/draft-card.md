@@ -59,8 +59,13 @@ today:        {{today}}
 7. **`confirmed`** — `true` only when the request itself supplies a reproduction precise enough to
    replay, or you found verifiable evidence reading `{{product_repo}}` (a `file:line` that shows
    the described behaviour, or its absence). `false` otherwise — including when `is_bug_report` is
-   `true` but nothing backs it up yet. This is the field `review-card`'s own § 0 confirmation gate
-   reads; do not mark `confirmed: true` to make a thin report look stronger than it is.
+   `true` but nothing backs it up yet. Both this field and `is_bug_report` are required by the
+   draft contract every lane is validated against (`intake.js`'s `validateDraftContract`), and
+   nothing downstream reads either one: `review-card` is not handed them at all. Its § 0 gate
+   reads a separate `human_confirmed` field, which the driver sets only for a report a maintainer
+   already replied "confirm" to. So this value is a record of what you found, not a switch that
+   opens or closes a gate — which is exactly why marking `confirmed: true` to make a thin report
+   look stronger buys nothing and misstates the record.
 
 ## Rules
 

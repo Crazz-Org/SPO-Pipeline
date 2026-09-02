@@ -991,7 +991,7 @@ throws `ParkSignal('<class>-timed-out', {state, argv, commandClass, timeoutMs})`
 reason naming the command class, never the calling state's own failure reason (a timed-out GATE
 parks `npm-gate-timed-out`, never `gate-timeout` — that string is the *domain* exit-4 reason
 `npm run gate` itself can return — and never reaches DIAGNOSE). The retry lives inside
-`spawnStep`, not at each of its 62 call sites (`grep -c 'spawnStep(ctx'` finds 63 matches across
+`spawnStep`, not at each of its 63 call sites (`grep -c 'spawnStep(ctx'` finds 64 matches across
 `orchestrator/`; one is the function's own definition), so the policy cannot drift between them. Retrying
 after a timeout is not obviously safe for every command — a first attempt that actually
 succeeded server-side before the local process hung could in principle be repeated — but every

@@ -3,8 +3,15 @@
   Adapted from SPO-WebClient/.claude/agents/citation-verifier.md — runs only when the diff
   touches src/shared/rdo-members.ts, before validate-change.md.
   Placeholders: {{diff_path}} {{spo_original_path}} {{citations}}
-    {{citations}} is a list of one line per new/changed catalogue entry:
-    "<MemberName> — File.pas:Line — <what the entry claims>"
+    {{citations}} is NOT a structured list. It is whatever lines PUSH_PR scraped out of the
+    diff: steps/scripted.js's extractCitations keeps every ADDED line of the
+    src/shared/rdo-members.ts diff that matches /[\w.-]+\.pas:\d+/i, with the leading `+` and
+    any `// ` comment marker stripped -- so each element is a raw catalogue/comment line, not a
+    formatted record. If the diff yields none, extractCitationsFromCriterion falls back to the
+    matching lines of the card's own criterion text. The array is then joined with ", " by
+    prompt-template.js's stringifyValue, so it reaches the body below as ONE comma-separated
+    line, not one line per entry. Treat it as a set of leads into the diff, never as the
+    authoritative statement of what each entry claims -- that you read from {{diff_path}}.
   Output — stdout, JSON only, nothing else:
   {
     "verdict": "PASS" | "REJECT" | "DIVERGES",
@@ -37,13 +44,20 @@ citations:    {{citations}}
 ```
 
 `{{spo_original_path}}` is the read-only historical tree (`~/SPO-Original`, Delphi 5, both
-halves of the original system). The only authority for a member's `kind` and `arity` is the
-declaration under `{{spo_original_path}}/Rdo/Server/`.
+halves of the original system). The only authority for a member's `kind` and `arity` is that
+member's own `published` Pascal declaration inside that tree — the file the catalogue entry
+itself cites, opened and read. **It is not `{{spo_original_path}}/Rdo/Server/`**: that directory
+holds the RDO transport layer only (`RDOObjectServer.pas` and its siblings — the dispatch
+machinery, not the game objects a catalogue entry names), which is where Rule 1's dispatch
+behaviour is cited from and nothing else. The declarations the catalogue actually cites today
+live under `{{spo_original_path}}/Kernel/` (`TownPolitics.pas`, `WorldPolitics.pas`) and, for a
+reference-client form, `{{spo_original_path}}/Voyager/`. Go where the citation points; verify it
+is a declaration when you get there.
 
 ## What you never do
 
-- **Never probe the live server.** The only authority is the declaration under
-  `{{spo_original_path}}/Rdo/Server/`.
+- **Never probe the live server.** The only authority is the member's own `published`
+  declaration inside `{{spo_original_path}}`, at the file the citation names.
 - **Never treat `doc/spo-original-reference.md` as authoritative.** It is a hand-maintained
   finding aid that has misclassified a member's kind before — open the `.pas` file yourself.
 - **Never modify a file.** You hold `Read, Grep` and no more — no `Edit`, no `Write`, no `Bash`
@@ -64,13 +78,14 @@ rather than silently passed — the two are distinguished by the `verdict` field
 
 ## How to verify one entry
 
-1. **Open the cited file with your `Read` tool.** Some files under
-   `{{spo_original_path}}/Rdo/Server/` are ISO-8859-encoded (at least `KernelCache.pas`,
-   `rc4.pas`, `MediaNameGenerator.pas`, `PublicFacility.pas`); a search that silently comes back
-   empty on one of these is not evidence the text is absent — you have no `Bash` (see below), so
-   there is no shell `grep` to fall back to either way. `Read` renders the file correctly
-   regardless of encoding: when in doubt, open the file and look at the raw text yourself before
-   concluding a name is not present.
+1. **Open the cited file with your `Read` tool.** Parts of this tree are ISO-8859-encoded rather
+   than ASCII — including `{{spo_original_path}}/Kernel/`, which is where the declarations the
+   catalogue cites actually live (`KernelCache.pas`, `rc4.pas`, `MediaNameGenerator.pas` and
+   `PublicFacility.pas` are all ISO-8859 there). A search that silently comes back empty on one
+   of these is not evidence the text is absent — and you have no `Bash` (see below), so there is
+   no shell `grep` to fall back to either way. `Read` renders the file correctly regardless of
+   encoding: when in doubt, open the file and look at the raw text yourself before concluding a
+   name is not present.
 2. **Confirm the citation is real**: at `File.pas:Line`, does that line — or the declaration it
    sits inside — actually say what the catalogue entry and its citation claim? A line number one
    method away, or a line that exists but is unrelated, is a false citation: `REJECT`.

@@ -111,8 +111,10 @@ diagnosis:  {{diagnosis}}
   not, you are running at whatever model was already chosen regardless of what this plan touches
   — a later step (PUSH_PR) re-derives the flag from the real diff, but only in time for the
   change-validator that follows you, not for you. Either way you do not choose your own model,
-  and a new `rdo-members.ts` catalogue entry still needs a genuine `File.pas:Line` citation from
-  `~/SPO-Original/Rdo/Server/`, never invented, never probed from the live server.
+  and a new `rdo-members.ts` catalogue entry still needs a genuine `File.pas:Line` citation to
+  the member's own `published` declaration inside `~/SPO-Original` (today those sit under
+  `~/SPO-Original/Kernel/`; `Rdo/Server/` is the RDO transport layer, not where a game object is
+  declared) — never invented, never probed from the live server.
 - **No diff bodies and no pasted file contents in your reply.** The orchestrator reads git
   directly — `summary` is a few sentences of prose; every other field is data, not narrative.
 - Your reply is read by a script. Output **only** the JSON object in the header above — no

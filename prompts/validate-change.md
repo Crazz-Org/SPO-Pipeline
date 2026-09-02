@@ -79,7 +79,7 @@ the diff did not touch.
 |---|---|---|
 | `PASS` | Criterion met, integration clean. | The task proceeds to merge. |
 | `PASS_WITH_FINDINGS` | Criterion met; serious doubts on the touched ground. | The task still proceeds; `findings` are posted as one comment on the issue, never as a block — nothing routes them into a card. |
-| `REJECT` | The criterion is **not** met. | Failed attempt: the one entry in `reasons` becomes the ledger's root-cause line; the task returns to IMPLEMENT. |
+| `REJECT` | The criterion is **not** met. | Failed attempt: the one entry in `reasons` becomes the ledger's root-cause line (as a `validate-reject` line, distinct from a DIAGNOSE attempt's) and is threaded into the next IMPLEMENT's `diagnosis`; the task returns to IMPLEMENT. This has its own budget, separate from DIAGNOSE's: `config.validateRejectBudget` (3) — the third REJECT on one card parks it `validate-reject-budget-exhausted` instead of retrying. |
 
 `REJECT` is reserved for *the goal is not reached* — never taste, never style. It throws away a
 bench pass on a serialised, exclusive bench — that cost is what keeps the threshold honest.
@@ -88,8 +88,9 @@ bench pass on a serialised, exclusive bench — that cost is what keeps the thre
 
 **You never open an issue and you file nothing.** A `PASS_WITH_FINDINGS` verdict returns
 `findings`; the driver posts them as one best-effort comment on the task's own issue
-(`state-machine.js`'s `postValidateFindingsComment`) — nothing routes them to `review-card` or
-any other filing step, and nothing checks them against the open board for duplicates. If a
+(`park-loop.js`'s `postValidateFindingsComment`, called from `state-machine.js`'s
+`handleValidate`) — nothing routes them to `review-card` or any other filing step, and nothing
+checks them against the open board for duplicates. If a
 finding is worth its own card, say so and note the risk of a duplicate in your `reasons` — the
 driver will not catch one for you.
 

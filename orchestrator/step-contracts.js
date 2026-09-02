@@ -6,10 +6,11 @@
 // two disagreed while this file was written is called out in a comment next to the field it
 // affects -- see orchestrator/README.md "Real mode" for the summary list.
 //
-// `review-card.md` (the sixth prompt file) deliberately has NO entry here: state-machine-spec.md
-// § Step contracts lists exactly five rows, and prompts/README.md's own header names
-// `review-card` as "not yet a state-machine-spec.md row" -- it is driven by the intake path
-// (card filing), never by orchestrator/state-machine.js's callLlmStep.
+// Three of prompts/'s eight files deliberately have NO entry here -- `review-card.md`,
+// `draft-card.md` and `triage-bug-report.md`. state-machine-spec.md § Step contracts lists
+// exactly five rows, and all three of those are driven by the intake path
+// (orchestrator/intake.js's reviewCard/draftCard/triageBugReport, which carry their own
+// model/effort/allowedTools inline), never by orchestrator/state-machine.js's callLlmStep.
 //
 // Two things below are NOT sourced from either doc, because neither one gives a number or names
 // a CLI permission-mode value per step -- they are this build's own inferred defaults:
@@ -90,9 +91,10 @@ const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE
 //   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, standing in for the RDO wire rule
 //                            stated in SPO-WebClient/doc/kanban-workflow.md (not this repo's
 //                            CLAUDE.md, which has no RDO rule) -- "src/shared/rdo-*,
-//                            src/server/rdo.ts, rdo-members.ts, session phases". intake.js:1174
-//                            only detects a slice of that (area === 'rdo' or a literal
-//                            "rdo-members.ts" mention), once at intake, before a plan exists.
+//                            src/server/rdo.ts, rdo-members.ts, session phases".
+//                            intake.js's makeTask only detects a slice of that
+//                            (`area === 'rdo' || /rdo-members\.ts/.test(body)`), once at
+//                            intake, before a plan exists.
 //                            Per the spec's own Step
 //                            contracts table this applies to IMPLEMENT and to VALIDATE's
 //                            change-validator (its escalation is stated explicitly in the

@@ -1211,7 +1211,7 @@ async function realPushPr(ctx, deps = {}) {
   if (changed.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'diff-name-only', exit: changed.exit });
   const touchesCatalogue = splitLines(changed.stdout).includes('src/shared/rdo-members.ts');
 
-  // The diff is ground truth; intake.js:1174 only ever infers touchesRdoMembers from the issue's
+  // The diff is ground truth; intake.js's makeTask only ever infers touchesRdoMembers from the issue's
   // OWN TEXT (area === 'rdo' or a literal "rdo-members.ts" mention). Card #385 touched the
   // catalogue with neither, so this stayed false all the way through VALIDATE and
   // handleValidate's CITATION_VERIFIER step never ran. Correct it the moment the real diff
