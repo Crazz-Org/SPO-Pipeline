@@ -158,7 +158,7 @@ function slowDoneTask(id, implementDelayMs) {
 
 // ---- 1. K=1: a task runs to DONE through a real spawned worker; worker-spawn/worker-exit journalled
 
-test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worker-exit are journalled', { timeout: 20000 }, async () => {
+test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worker-exit are journalled', { timeout: 30000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-t1.json', { id: 't1', kind: 'synthetic', shadow: { forceState: 'DONE' } });
@@ -171,6 +171,21 @@ test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worke
       const s = readState(journalDir, 't1');
       return s && s.state === 'DONE';
     });
+    // Wait for the worker-EXIT event itself before calling stop(), not just the DONE state.
+    // state.json DONE is written by the worker (state-machine.js) BEFORE it exits; if stop()
+    // races ahead of the real exit, run()'s own killAllChildren('SIGTERM') on its way out can
+    // catch the worker still inside its exit path, and watchChild's 'exit' handler then observes
+    // (code: null, signal: 'SIGTERM') instead of the real (0, null) -- a real race, measured at
+    // ~10% (36/40 clean, 4/40 SIGTERM'd, all still finishing DONE regardless). Waiting on the
+    // event that actually means "the worker is gone" -- not the state write that merely precedes
+    // it -- is what test 3 below (the PARK case) already does, and why it never flakes.
+    // Explicit timeout, shorter than the DONE wait above it: this test's own {timeout: 30000}
+    // must cover BOTH sequential waitFor calls, and waitFor's own 10000ms default on each would
+    // let a loaded box exhaust the test's whole budget as an opaque node:test timeout instead of
+    // a readable assertion failure -- in practice this event is already true (or true within
+    // milliseconds) by the time the DONE wait above resolves, since the worker's own exit follows
+    // its state.json write immediately.
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit' && e.id === 't1'), 8000);
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -188,7 +203,7 @@ test('K=1: a task runs to DONE through a real spawned worker; worker-spawn/worke
 
 // ---- 2. K=2: two tasks run concurrently; prove real overlap (not just both finishing)
 
-test('K=2: two tasks run concurrently -- real overlap, not two runs that merely both finished', { timeout: 20000 }, async () => {
+test('K=2: two tasks run concurrently -- real overlap, not two runs that merely both finished', { timeout: 30000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-a.json', slowDoneTask('disp-a', 200));
@@ -221,6 +236,19 @@ test('K=2: two tasks run concurrently -- real overlap, not two runs that merely 
       const b = readState(journalDir, 'disp-b');
       return a && a.state === 'DONE' && b && b.state === 'DONE';
     });
+    // Wait for BOTH worker-exit events, not just the DONE states, before stop() -- see the K=1
+    // test's comment above for the exact race (state.json DONE precedes the real process exit;
+    // stop()'s killAllChildren('SIGTERM') can otherwise land on a worker still inside its own exit
+    // path and turn a clean (0, null) into a (null, 'SIGTERM')). Nothing here asserts an exit code
+    // yet, but the next person to add one (as :161 eventually did) must not inherit this flake.
+    // Explicit, shorter-than-default timeout -- same reasoning as the K=1 test's own comment
+    // above: this test's {timeout: 30000} has to cover every waitFor call in the try block, and
+    // a 10000ms default here would risk the whole thing surfacing as an opaque node:test timeout
+    // rather than a readable failure on a loaded box.
+    await waitFor(() => {
+      const ev = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-exit');
+      return ev.some((e) => e.id === 'disp-a') && ev.some((e) => e.id === 'disp-b');
+    }, 8000);
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -297,6 +325,70 @@ test('a worker exiting an unrecognized code IS reparked worker-crashed, with the
   const parkEvt = taskJournal.find((e) => e.event === 'parked');
   assert.equal(parkEvt.reason, 'worker-crashed');
   assert.equal(parkEvt.detail.exitCode, 7);
+});
+
+// ---- action 7.3: a worker exiting AFTER its taskDir is already terminal must NOT be reparked ----
+//
+// reparkCrashedWorker (dispatcher.js) checks state.json's state BEFORE ever calling finalizePark:
+// DONE/PARKED/ABANDONED short-circuit straight to a bare `worker-exit-after-terminal` daemon
+// event and nothing else -- dispatcher.js's own header calls this the "believed unreachable, but
+// not asserted so" case of a worker producing more exit-path activity after its own outcome is
+// already durable on disk. It matters because finalizePark is NOT idempotent against a taskDir
+// that already has an outcome: calling it here would make the crash-repark path a SECOND writer
+// racing the terminal write that already legitimately happened -- overwriting a genuine DONE with
+// a spurious PARKED worker-crashed, and (worse, in the DONE case) posting a park comment on an
+// issue whose PR the pipeline may already have opened. Nothing upstream of this function prevents
+// that from being reachable: a stray SIGKILL to a grandchild, a delayed OS signal after runTask's
+// own process.exit(0) call raced its own cleanup -- this check is the only thing standing between
+// that and a corrupted terminal task.
+test('a worker exiting non-zero AFTER its taskDir already reads DONE is journalled worker-exit-after-terminal, never reparked', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-t.json', { id: 'disp-post-terminal', kind: 'synthetic' });
+
+  // Pre-seeds the taskDir with a state.json that already reads DONE, as if a prior (unmodelled)
+  // worker process had already run this task to completion durably on disk -- takeNextTask's own
+  // fs.mkdirSync(taskDir, {recursive: true}) tolerates the directory already existing, so this
+  // does not interfere with the dispatcher's ordinary claim of the queue entry below.
+  const taskDir = path.join(journalDir, 'disp-post-terminal');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({ id: 'disp-post-terminal', state: 'DONE' }));
+
+  // spawnExit(7): a real process that does nothing but exit 7 -- classifyWorkerExit(7) is
+  // 'crashed', which is exactly the outcome that would ordinarily call reparkCrashedWorker.
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit-after-terminal' && e.id === 'disp-post-terminal')
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const events = readDaemonEvents(journalDir);
+  const afterTerminal = events.find((e) => e.event === 'worker-exit-after-terminal' && e.id === 'disp-post-terminal');
+  assert.equal(afterTerminal.exitCode, 7);
+  assert.equal(afterTerminal.signal, null);
+  assert.equal(afterTerminal.lastState, 'DONE');
+
+  // state.json must read EXACTLY what it did before this exit -- the short-circuit returned
+  // before finalizePark's own writeState(ctx.taskDir, snap) ever ran.
+  const state = readState(journalDir, 'disp-post-terminal');
+  assert.equal(state.state, 'DONE');
+
+  // The negatives that carry the actual meaning: no daemon-level `parked` event, no task-level
+  // `parked` event, and no report.md -- all three are things ONLY finalizePark writes, and this
+  // path never reaches it.
+  assert.equal(events.some((e) => e.event === 'parked' && e.id === 'disp-post-terminal'), false);
+  const taskJournal = readJournal(journalDir, 'disp-post-terminal');
+  assert.equal(taskJournal.some((e) => e.event === 'parked'), false);
+  assert.equal(fs.existsSync(path.join(taskDir, 'report.md')), false, 'finalizePark must never have run -- it writes report.md unconditionally on every park');
 });
 
 // Action 6.5: reparkCrashedWorker restores the same four counters orphan-scan.js does, and for
@@ -627,7 +719,7 @@ test('a clamp to zero caused by an empty/disabled pool reports a null cooldown e
 
 // ---- 7. K is clamped to healthy accounts before each spawn
 
-test('K is clamped to the number of healthy accounts before each spawn, even when configured higher', { timeout: 20000 }, async () => {
+test('K is clamped to the number of healthy accounts before each spawn, even when configured higher', { timeout: 40000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-a.json', slowDoneTask('clamp-a', 150));
@@ -652,6 +744,19 @@ test('K is clamped to the number of healthy accounts before each spawn, even whe
       const b = readState(journalDir, 'clamp-b');
       return a && a.state === 'DONE' && b && b.state === 'DONE';
     });
+    // Wait for BOTH worker-exit events before stop() -- same race as the K=1 test above: DONE in
+    // state.json precedes the real process exit, and stop()'s SIGTERM can otherwise catch a
+    // worker still unwinding its own exit path. Latent here (nothing below asserts an exit code
+    // yet), but left un-waited this test would flake the moment someone adds one.
+    // Explicit, shorter-than-default timeout. This test alone now runs FOUR sequential waitFor
+    // calls (worker-spawn, the ===2 wait already carrying its own explicit 8000, the both-DONE
+    // wait, and this one) inside one {timeout: 40000} test -- at waitFor's own 10000ms default
+    // for every call, a loaded box could exhaust the whole test budget and surface an opaque
+    // node:test timeout instead of a readable assertion failure.
+    await waitFor(() => {
+      const ev = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-exit');
+      return ev.some((e) => e.id === 'clamp-a') && ev.some((e) => e.id === 'clamp-b');
+    }, 8000);
   } finally {
     dispatcher.stop();
     await runPromise;

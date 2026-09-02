@@ -48,6 +48,16 @@ const ALLOWLIST = {
   // file requiring an orchestrator module with no killswitch, or with one that arrives too late)
   // is exactly what the fixture tests below already prove the scanner catches.
   'no-real-spawn-sweep.test.js': 'self-scan false positive from this file\'s own fixture strings; see comment above',
+  // test/bin-spo-state-write-sweep.test.js used to carry an entry here too, for the identical
+  // self-scan false positive (its own fixture strings contain the literal text
+  // `require('../orchestrator/journal')` as inert text). Action 7.3's verification found that
+  // exemption itself was the gap: a REAL `require('../orchestrator/park-loop')` was added to that
+  // file with no killswitch, and this sweep stayed green because the whole file was excused, not
+  // because the specific line was ever checked. The fix was to give that file the ONE-LINE
+  // killswitch itself -- `require('./no-real-spawn')`, which lands (textually) before the fixture
+  // strings that would otherwise trip this sweep, so it satisfies the real rule instead of being
+  // excused from it -- and delete the entry that used to sit here. Do not re-add it: if that file
+  // ever again needs an allowlist entry instead of the one-line fix, something has regressed.
 };
 
 // Same convention as gh-api-argv.test.js's blankComments: blank out comments before searching so
