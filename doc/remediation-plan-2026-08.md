@@ -60,6 +60,22 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    `gh pr edit`). Line numbers in this plan date from the audit: two actions touching the
    same region (e.g. 2.7 rewrites the comment-scan area) are sequenced rebase-aware, with
    the driver re-resolving anchors.
+6. **The sibling grep** (action 7bis.6). Any action that corrects a factual claim greps
+   **both** the corrected phrasing and the pre-correction phrasing across `doc/`, `prompts/`,
+   `orchestrator/`, `bin/spo`, `console/` and `README.md` before committing, and reports what
+   it found; its Opus verifier checks that it did, and treats "I corrected it in the file the
+   action names" as an incomplete answer. This is enforced by rule 2 — a human-and-verifier
+   habit — **not by CI**, and it is stated plainly here so nobody mistakes it for a guarantee.
+   A general duplicate-phrase detector was probed and rejected: it fires on deliberate
+   in-prompt repetition and on progress entries quoting commit subjects, so it would be
+   allowlisted into uselessness. The weaker, honest rule earns its place empirically — the
+   audit's third pass found 4 divergences that were a claim fixed in one file and left
+   standing in a sibling, and applying the rule once caught four more unlisted copies,
+   including `intake.js:711`'s third home in `steps/llm.js`. Its limit is equally plain: it
+   only fires when someone already knows they are correcting something, so it does nothing
+   for a claim that was wrong from the start and was never revisited. That class belongs to
+   the sweeps (7bis.1-7bis.3) and to the accepted-gap register (`doc/accepted-gaps.md`),
+   which names what no mechanism covers.
 
 ---
 
