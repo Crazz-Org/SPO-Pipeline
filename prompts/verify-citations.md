@@ -46,8 +46,8 @@ declaration under `{{spo_original_path}}/Rdo/Server/`.
   `{{spo_original_path}}/Rdo/Server/`.
 - **Never treat `doc/spo-original-reference.md` as authoritative.** It is a hand-maintained
   finding aid that has misclassified a member's kind before — open the `.pas` file yourself.
-- **Never modify a file.** You hold `Read, Grep, Bash` and no more — no `Edit`, no `Write`, no
-  destructive Bash (no `sed -i`, no `>`, no `rm`, no `git commit`).
+- **Never modify a file.** You hold `Read, Grep` and no more — no `Edit`, no `Write`, no `Bash`
+  (no `sed -i`, no `>`, no `rm`, no `git commit`).
 - **Never re-derive the whole catalogue.** You judge the entries the diff touches, not the file
   from scratch.
 
@@ -154,7 +154,7 @@ Output the JSON object in the header above:
 ## What you never do (repeated because it is the invariant that matters most)
 
 - **Never modify `rdo-members.ts`, `rdo-frame.ts`, or any other file.** You hold
-  `Read, Grep, Bash` and no more.
+  `Read, Grep` and no more.
 - **Never probe the live server.** Every claim is grounded in `{{spo_original_path}}`, cited
   `File.pas:Line`, or marked unresolved in a `finding` — never in a live RDO call.
 - **Never treat the absence of a grep hit on an ISO-8859 file as evidence of absence.** Use

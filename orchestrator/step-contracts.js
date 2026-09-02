@@ -173,12 +173,11 @@ const STEP_CONTRACTS = {
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
     effort: 'high',
-    // DIVERGENCE (flagged, not corrected here): both the spec row and prompts/README.md's
-    // table say "Read, Grep" for citation-verifier -- but verify-citations.md's own body says
-    // twice, in its own words, "You hold Read, Grep, Bash and no more". The two tables the task
-    // brief names as authorities agree with each other, so this entry follows them (no Bash);
-    // the prompt file's stricter self-description is not itself contradicted by omitting a
-    // tool the prompt never actually needs to invoke (it is read-only regardless).
+    // RESOLVED (action 7.5): the spec row, prompts/README.md's table, and this entry all said
+    // "Read, Grep" for citation-verifier, but verify-citations.md's own body disagreed with all
+    // three -- it said twice, in its own words, "You hold Read, Grep, Bash and no more". The code
+    // was already right (this step never invokes Bash); the prompt's self-description was the
+    // outlier and has been corrected to match (`prompts/verify-citations.md`, both mentions).
     allowedTools: ['Read', 'Grep'],
     permissionMode: 'default',
     cwdKind: 'pipeline',

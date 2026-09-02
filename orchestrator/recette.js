@@ -12,15 +12,17 @@
 // throws.
 //
 // SAFETY: real mode here spawns actual git/npm/gh/claude commands against config.productRepo --
-// the exact repo a live daemon may be driving real cards through right now. There is no
-// product-repo mutex until chantier 6 action 6.4 (see config.js's own productRepo comment on the
-// 44-worktree/61-branch incident this project already paid for once). The only guard available
-// today is refusing to START while a live daemon holds ITS OWN lock file
-// (<repoRoot>/journal/daemon.lock, orchestrator/lock.js) -- checked here READ-ONLY (recette is
-// not a daemon and must never create, touch, or release that lock itself). `--force` overrides,
-// loudly, for a maintainer who has confirmed by hand that nothing is actually running. This is a
-// best-effort check, not a mutex: it catches "I forgot the daemon is running", not a daemon that
-// starts a second after this check passes.
+// the exact repo a live daemon may be driving real cards through right now. Chantier 6 action 6.4
+// added a product-repo mutex (`orchestrator/product-repo-lock.js`, held by `steps/scripted.js`
+// around WORKTREE's setup and FINISH's teardown -- see the 44-worktree/61-branch incident config.js's
+// own productRepo comment records), but recette does not take it: this runner drives the task
+// through `drainQueueOnce` like a real daemon worker would, so the same lock already applies to
+// its WORKTREE/FINISH phases. The guard here is a coarser, earlier one: refusing to START while a
+// live daemon holds ITS OWN lock file (<repoRoot>/journal/daemon.lock, orchestrator/lock.js) --
+// checked here READ-ONLY (recette is not a daemon and must never create, touch, or release that
+// lock itself). `--force` overrides, loudly, for a maintainer who has confirmed by hand that
+// nothing is actually running. This is a best-effort check, not a mutex: it catches "I forgot the
+// daemon is running", not a daemon that starts a second after this check passes.
 //
 // SCENARIOS ARE DATA: `SCENARIOS` below is a plain object; the runner (`runRecette`) is generic
 // over any entry shaped `{name, label, buildCard(ctx), assertions: [...]}`. `evaluateAssertions`

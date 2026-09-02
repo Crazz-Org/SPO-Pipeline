@@ -564,10 +564,12 @@ typed `NoAccountsRegisteredError` (`state-machine.js` maps it to PARKED, same as
 **Cooldown duration — an escalating probe, not a flat number (action 3.5, 2026-08-31 redesign).**
 This action's own first cut used a flat 5-hour cooldown for every usage limit. A verifier caught
 why that was wrong before it shipped: the real pool has **2 accounts**
-(`~/.claude-accounts/pool1`, `pool2`), and `daemon.js` has no pool-health gate anywhere — with
-`maxAttempts` equal to the pool size, two usage limits landing inside one window took the *whole
-pool* down for up to 5 hours, parking every card the daemon pulled during that window at its
-first LLM step, each needing a manual `retry` comment. And the figure itself over-waits by
+(`~/.claude-accounts/pool1`, `pool2`), and at the time `daemon.js` had no pool-health gate
+anywhere — with `maxAttempts` equal to the pool size, two usage limits landing inside one window
+took the *whole pool* down for up to 5 hours, parking every card the daemon pulled during that
+window at its first LLM step, each needing a manual `retry` comment. (Chantier 6 action 6.3 later
+closed that gap — see "How much the daemon takes on at once" below for the dispatcher's own
+healthy-accounts clamp, which this cooldown redesign does not depend on and is unaffected by.) And the figure itself over-waits by
 construction: the Claude Max session window resets 5h after the *session's first message*, not
 after the limit hit, so `now + 5h` sleeps for (5h − the true remaining wait) longer than
 necessary — often 4h+. The problem a long cooldown was solving is real but small: at a 1-hour
@@ -1839,10 +1841,16 @@ suite runs once, and the check passes exactly when that suite is green. GATE rec
 diff CHECK already passed — the smallest, least surprising input the bench can be asked to judge.
 See `orchestrator/recette.js`'s own comment above `RECETTE_DOC_FILE` for the full reasoning.
 
-**Scenarios are data.** `recette.js`'s `SCENARIOS` is a plain object, `{name, label, buildCard(ctx),
-assertions: [...]}` per entry — the runner (`runRecette`) is generic over any entry shaped that
-way. Adding a second scenario (action 7.2) means adding a second object literal, never touching
-`runRecette`, `evaluateAssertions`, or the cleanup logic.
+**Scenarios are data — for the inline driver this harness runs today.** `recette.js`'s
+`SCENARIOS` is a plain object, `{name, label, buildCard(ctx), assertions: [...]}` per entry — the
+runner (`runRecette`) is generic over any entry shaped that way, and a scenario that only changes
+what IMPLEMENT is asked to do (like `trivial-doc-log` above) really is just a second object
+literal, touching neither `runRecette` nor `evaluateAssertions` nor the cleanup logic. That does
+not hold for every scenario, though: one that changes *how* the pipeline is driven — a
+dispatcher-driven run instead of the inline one, say — needs a driver branch and its own
+out-of-process cap, since the existing cap wraps `deps.spawnSync` in-process and a dispatcher runs
+its workers as child processes. Chantier 7 action 7.2 (in flight as of this writing) is adding
+exactly that kind of scenario; see its own record for the shape it landed on.
 
 **The cap.** The remediation plan's "capped budget" predates this project retiring dollars as a
 metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent, honestly-enforceable
@@ -1878,15 +1886,19 @@ rendered `PASS`/`PASS_WITH_FINDINGS`; MERGE actually enqueued the PR; FINISH rec
 Each assertion is `{id, description, check(info) -> {ok, detail}}` and never throws — one broken
 event fails only its own assertion, so the report always shows the rest.
 
-**Safety: refuses while a live daemon is running.** There is no product-repo mutex until chantier
-6 action 6.4 (`config.js`'s own note on the 44-worktree/61-branch incident this project already
-paid for once) — the only guard today is refusing to *start* while a live daemon holds **its own**
-lock file, `<repoRoot>/journal/daemon.lock` (`orchestrator/lock.js`). Checked read-only (recette
-reads the lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does —
-it never calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly,
-for a maintainer who has confirmed by hand that nothing is actually running. This is a best-effort
-check, not a mutex: it catches "I forgot the daemon is running", not a daemon that starts a second
-after the check passes.
+**Safety: refuses while a live daemon is running.** Chantier 6 action 6.4 added a real
+product-repo mutex (`orchestrator/product-repo-lock.js`, `config.js`'s own note on the
+44-worktree/61-branch incident this project already paid for once), but recette does not itself
+acquire it — it drives its task through `drainQueueOnce` exactly like a real worker, so
+WORKTREE's setup and FINISH's teardown already take the lock that way. What recette adds on top is
+a coarser, earlier guard: refusing to *start* at all while a live daemon holds **its own** lock
+file, `<repoRoot>/journal/daemon.lock` (`orchestrator/lock.js`) — 6.4's lock is scoped to one
+WORKTREE/FINISH call and says nothing about whether a daemon is running at all before recette
+begins. Checked read-only (recette reads the lock file and probes the pid's liveness the same way
+`lock.js`'s own stale-sweep does — it never calls `acquireLock`, which would create the lock
+itself). `--force` overrides, loudly, for a maintainer who has confirmed by hand that nothing is
+actually running. This is a best-effort check, not a mutex: it catches "I forgot the daemon is
+running", not a daemon that starts a second after the check passes.
 
 **`--dry`** resolves the exact same config `--force`-free real run would (one function,
 `buildPlan`, feeds both paths so they cannot structurally diverge), prints it, and returns before
@@ -2048,15 +2060,52 @@ here parks, retries, or otherwise changes pipeline behavior.
 
 ## How much the daemon takes on at once
 
-The daemon drains **serially** — one task at a time (`drainQueueOnce`) — and `runForever`
-*awaits* that drain before pulling again. So a pull only ever happens with the daemon idle,
-and `autoPullLimit` (`SPO_AUTO_PULL_LIMIT`, **default 1**) is the most cards that can sit off
-the board, unstarted, at any moment — not a per-cycle burst layered on top of work in
-progress.
+Chantier 6 replaced the single-process daemon with three kinds of process sharing one journal
+root, and how much work is in flight is now split across two different questions: how many
+tasks run at once, and how many more are allowed to queue up unstarted.
 
-At 1, the daemon takes one card, finishes it, then looks again: cards stay on the board —
-visible, reorderable, claimable by a human — until it is actually ready for them. Raise it if
-serial intake proves to be the bottleneck.
+**Three processes, one journal root.**
+
+- The **dispatcher** (`node orchestrator/daemon.js (--shadow|--dry-run|--real)`, no mode flag
+  beyond that — `orchestrator/dispatcher.js`) holds the single-instance lock and is the only one
+  of the three that does. It spawns and reaps up to `K` worker children and exactly one scanner
+  child; it never itself runs a scan or a task.
+- A **worker** (`daemon.js --worker <taskDir>`) runs the one task already sitting in `<taskDir>`
+  to its terminal state and exits — action 6.1. It does not take the single-instance lock (the
+  dispatcher already holds it for the whole journal root).
+- The **scanner** (`daemon.js --scanner`, exactly one, action 6.3) runs `state-machine.js`'s
+  `runForever` — now just the periodic scans (orphan/unpark/auto-pull/report-intake) on their
+  own timers, queue-draining removed — forever, in its own process. It was split out after
+  measuring one of those scans (auto-triage's `claude` call) block the single JS thread for
+  3+ minutes, which would otherwise freeze worker-slot refills and SIGTERM handling for that
+  whole window if it ran inside the dispatcher's own loop.
+
+**How many tasks run at once.** `orchestrator/dispatcher.js`'s `fillSlots` fills as many worker
+slots as `K` currently allows, where `K` is `Math.min(config.workers, healthy accounts)` —
+re-clamped to `accounts.countHealthyAccounts(accountsDir)` immediately before *every* spawn, not
+once per loop. `config.workers` (`SPO_WORKERS`) defaults to **1** — at K=1 the dispatcher still
+spawns a worker child for every task rather than keeping a separate in-process serial path, so
+there is one code path to keep correct instead of two.
+
+**How many more are allowed to queue up unstarted.** Auto-pull used to mean "how many candidates
+one cycle takes off the board", with nothing else bounding how many cycles could each take that
+many — at the shipped defaults (workers=1, autoPullMs=5min, autoPullLimit=1) a scanner with no
+ceiling could still put 12 cards/hour into `queue/`, unclaimable by a human, with no relation to
+how many workers actually exist. Action 6.6 added a second, harder ceiling above the per-cycle
+rate: `orchestrator/auto-pull.js`'s `computeAutoPullBudget` reads how many tasks are already
+queued (`queuedIds`) and how many are already in flight (`live-workers.json`, the dispatcher's own
+published set — read as `K` worst-case if the file is missing/unreadable, never as 0) and clamps
+this cycle's pull to `min(autoPullLimit, K - queued - inFlight)`, never negative. `autoPullLimit`
+(`SPO_AUTO_PULL_LIMIT`, **default 1**) survives as the per-cycle rate cap; `K` (`config.workers`)
+is the watermark, not `K + autoPullLimit` — the maintainer's own stated rationale for
+`autoPullLimit` ("cards stay on the board — visible, reorderable, claimable by a human — until
+ready") only holds while `K` is also the ceiling on how much can ever be unstarted-but-claimed at
+once. This scan runs in the scanner process (above), not the dispatcher.
+
+At the shipped defaults, this still behaves like the old description in the common case: one card
+queued, one worker running, look again next cycle. The difference only shows once `K > 1` or a
+maintainer manually queues several cards at once — the watermark, not the per-cycle rate, is what
+stops the scanner from over-filling `queue/` beyond what the dispatcher can actually run.
 
 ## Where journals live
 
@@ -2179,7 +2228,7 @@ node scripts/usage-report.js > journal/usage-snapshot.json
 ## Tests
 
 ```bash
-node --test test/*.test.js
+node --test --test-timeout=30000 test/*.test.js
 ```
 
 From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, so the
@@ -2187,6 +2236,12 @@ moment a parked card holds a product worktree under `worktrees/issue-<n>/` it wa
 SPO-WebClient's own TypeScript suites and reports thousands of foreign failures — 1926 tests /
 1168 failures with four parked cards, none of them this repo's. `worktrees/` is gitignored, so
 `git status` stays clean and the result reads as a catastrophic regression in code that is fine.
+`--test-timeout=30000` bounds a single test that hangs instead of letting the whole run stall
+(`doc/remediation-progress.md` pins the reference count at this invocation). **When reading the
+result — mutation testing especially — check `# fail` AND `# cancelled`, never `# fail` alone.**
+Node reports a timed-out test as `cancelled`, not `fail`: a run that prints `# pass 1418 # fail 0`
+can still have killed a hanging test past the 30s bound, and reading `# fail` alone reads that
+killed mutant as a survivor.
 
 `node --test test/` does not work either: Node treats `test/` as a test-name filter rather than a
 directory, matches nothing, and prints `not ok 1 - test`.
@@ -2238,3 +2293,16 @@ cleaning up, cleanup's idempotency (including when the injected `spawnSync` itse
 missing a required event and confirms the assertion set actually catches it, never rubber-stamping
 a run that merely reached `DONE`. None of them ever touch a real
 `git`, `npm`, `gh` or `claude` process, so the whole suite stays hermetic.
+
+**The hermeticity guarantee stops at a process boundary.** `test/no-real-spawn.js` (the killswitch
+above) patches `child_process.spawnSync` in the parent test process only — it protects every call
+made in-process, but a test that spawns a real `daemon.js --worker`/`--scanner` child reaches the
+real `spawnSync` inside that child with no killswitch at all, since the patch was never applied to
+that process's own `child_process` module. This is a limitation of the guard's own design, not a
+bug in it (`test/no-real-spawn-sweep.test.js`'s file-by-file scan can only ever prove "this file
+requires the module first," never "nothing this file's tests spawn can reach `spawnSync`
+unpatched"), and it was proved the hard way during chantier 7: a mutation-testing round routed
+tests through real `daemon.js --worker` children and created a live worktree and branch in
+`/home/crazz/SPO-WebClient` while the `--real` daemon was running against it. Any future test that
+spawns the dispatcher or a worker/scanner child for real needs its own injection point or its own
+isolation — this suite does not give it one for free.

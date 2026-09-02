@@ -825,8 +825,10 @@ function chargeCiImplementRetry(ctx, next) {
 // including the one that trips either rule.
 async function handleDiagnose(ctx) {
   if (ctx.counters.diagnoseAttempts >= ctx.config.diagnoseBudget) {
-    // Defensive: should be unreachable, since the budget check below always parks on the
-    // attempt that reaches it rather than letting a further one be attempted.
+    // Unreachable through the normal loop -- the budget check below always parks on the attempt
+    // that reaches it rather than letting a further one be attempted. Reachable by configuration
+    // though: `diagnoseBudget` is a plain config value (default 3), and at 0 this guard is the
+    // only thing that ever fires, since the check below never runs.
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 

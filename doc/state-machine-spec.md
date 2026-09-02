@@ -149,10 +149,12 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
   observed, never from further guesswork.
 - **Cooldown duration is an escalating probe, not a flat number** (`orchestrator/accounts.js`'s
   `markLimit`, action 3.5's 2026-08-31 redesign — this action's own first cut used a flat 5-hour
-  usage cooldown, rejected before it shipped). The real pool has **2 accounts**, and
-  `daemon.js` has no pool-health gate: with `maxAttempts` equal to pool size, two usage limits
+  usage cooldown, rejected before it shipped). The real pool has **2 accounts**, and at the time
+  had no pool-health gate anywhere: with `maxAttempts` equal to pool size, two usage limits
   inside one window would take the *whole pool* down for up to 5 hours, parking every card the
-  daemon pulled in that window. A flat 5h also over-waits by construction — the Claude Max
+  daemon pulled in that window. (Chantier 6 action 6.3 later added the gate this section used to
+  say was missing — see the dispatcher bullet below; the escalating-probe redesign here stands on
+  its own regardless.) A flat 5h also over-waits by construction — the Claude Max
   session window resets 5h after the *session's first message*, not after the limit hit, so
   `now + 5h` sleeps for (5h − the true remaining wait) longer than necessary, often 4h+. So:
   a first usage limit for an account (`limitKind: 'usage'`, i.e. 429 / `rate_limit_error` /
@@ -174,9 +176,28 @@ Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
   journal of its own — a cooldown comes back on the result's `cooldowns` array for the caller to
   journal (`auto-triage.js` appends `report-triage-cooldown`). See `orchestrator/README.md`'s
   "Account rotation" section for the full mechanics.
-- **K parallel workers ≤ healthy accounts.** Parallelism scales implementation capacity;
-  the gate stays serialized (one live world) — adding an account does not add gate
-  throughput.
+- **K parallel workers ≤ healthy accounts — enforced, not aspirational** (chantier 6 action 6.3).
+  `orchestrator/dispatcher.js`'s `fillSlots` re-clamps `K` to
+  `Math.min(config.workers, accounts.countHealthyAccounts(accountsDir))` immediately before
+  *every* worker spawn — not once per loop, not once at startup — so an account that cools down
+  mid-cycle (one of this dispatcher's own workers just hit a limit) is reflected on the very next
+  spawn decision. A clamp to zero healthy accounts is journalled
+  (`dispatcher-idle-no-healthy-accounts`) and the recovery edge journalled the same way
+  (`dispatcher-healthy-accounts-returned`). Parallelism scales implementation capacity; the gate
+  stays serialized (one live world) — adding an account does not add gate throughput.
+- **Per-step account leases** (chantier 6 action 6.2, `orchestrator/account-lease.js`) stop two
+  concurrent callers — a worker's `callLlmStep` and the scanner process's
+  `callIntakeStepWithRotation` — from being handed the *same* account by `accounts.pick()`'s
+  deterministic first-fit, invisible under the pre-C6 single-threaded daemon and a real bug once
+  a worker and the scanner can run at once. A lease is per-step, not per-task, released the
+  instant the one LLM call it wraps finishes; a healthy account currently leased by another live
+  process is `AllAccountsLeasedError`, worth a bounded wait (`config.accountLeaseWaitMs`, default
+  5 min, since a sibling's own step is measured at 90–265s) — distinct from
+  `AllAccountsCoolingError` (a cooldown, never worth waiting on) — and parks `all-accounts-leased`
+  if that wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
+  `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns), since
+  clamping K on lease churn — a lease frees every 90–265s — would make K flap on every single LLM
+  call.
 - `scripts/usage-report.js` becomes per-account: it is the instrument that says when one
   more subscription pays for itself.
 
@@ -396,14 +417,21 @@ something: one trivial, synthetic `kind: "card"` task, driven through the real p
 (`config.real = true`) against a dedicated, distinctly-labelled GitHub issue in the product
 repo, under a wall-clock + LLM-step-count cap, asserted against its own journal (not merely
 "did it reach DONE"), cleaned up unconditionally on every exit path. **This is the standard
-live gate for every chantier from 3 on** -- chantier 7 action 7.2 adds a second scenario to the
-same harness rather than a new tool; scenarios are plain data
-(`orchestrator/recette.js`'s `SCENARIOS`), so the runner never has to change to gain one.
+live gate for every chantier from 3 on** -- scenarios are plain data
+(`orchestrator/recette.js`'s `SCENARIOS`) *for the inline driver this harness runs today*, so
+adding one is ordinarily just a new object literal. That claim is narrower than it sounds: a
+scenario that changes *how* the pipeline is driven, not merely what it asks IMPLEMENT to do,
+changes the runner too -- chantier 7 action 7.2 (in flight as of this writing) is adding exactly
+such a scenario, against a dispatcher-driven run rather than the inline one, and its own record
+is the place to check once it lands.
 
 Refuses to run while a live daemon holds its own `journal/daemon.lock` (read-only check,
-`--force` to override) -- there is no product-repo mutex until chantier 6 action 6.4, so this is
-the only guard available today against a recette run colliding with a real card the daemon is
-mid-flight on. See `orchestrator/README.md` § Recette for the full design: isolation, the
+`--force` to override). Chantier 6 action 6.4 added a real product-repo mutex
+(`orchestrator/product-repo-lock.js`), but recette does not itself take it -- it drives the task
+through the same `drainQueueOnce` path a real worker uses, so WORKTREE/FINISH already acquire it
+that way. The daemon.lock check above is the coarser, earlier guard: it catches "a live daemon is
+running at all" before recette starts, which 6.4's lock (scoped to one WORKTREE/FINISH call) does
+not by itself. See `orchestrator/README.md` § Recette for the full design: isolation, the
 `trivial-doc-log` scenario and why it is docs-only, the cap and what tripping it does, the
 assertion set, and cleanup's own idempotency contract.
 
