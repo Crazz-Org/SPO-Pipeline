@@ -212,6 +212,14 @@ function parseArgs(argv) {
     recetteDir: null,
     capMs: null,
     capLlmSteps: null,
+    // action 7.2, post-verification correction: `--help` was NOT recognized here at all before
+    // this -- it fell straight into `opts._` (unused) and `spo recette --help` (or, worse,
+    // `spo recette --scenario parallel-doc-log --help`) fell through to cmdRecette's own real-run
+    // path exactly like `spo pull --help` already does (a pre-existing, disclosed footgun this
+    // action's own dispatcher driver made materially worse: a two-issue, K=2, real-dispatcher run
+    // instead of a single-card one). Scoped to `spo recette` only (cmdRecette checks this FIRST,
+    // before anything else) -- see that function's own header.
+    help: false,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -238,6 +246,7 @@ function parseArgs(argv) {
     else if (a === '--recette-dir') opts.recetteDir = argv[++i];
     else if (a === '--cap-ms') opts.capMs = Number(argv[++i]);
     else if (a === '--cap-llm-steps') opts.capLlmSteps = Number(argv[++i]);
+    else if (a === '--help' || a === '-h') opts.help = true;
     else opts._.push(a);
   }
   return opts;
@@ -1549,23 +1558,58 @@ async function cmdTriageRetry(opts, autoTriageImpl, journalRoot) {
 // (daemon lock held), a tripped cap, a park, or a failed assertion are all exit 1. `deps.recette`
 // is the test-only override (same convention as `deps.intake`/`deps.autoTriage`).
 async function cmdRecette(opts, deps = {}) {
+  // Checked FIRST, before `deps.recette`/`impl.runRecette` is ever reached -- action 7.2,
+  // post-verification correction. `--help` used to be unrecognized entirely and fell through to
+  // a REAL run (`spo pull --help`'s own pre-existing footgun, CLAUDE.md-documented; this action's
+  // own K=2 dispatcher driver made the SAME gap materially more expensive: `spo recette
+  // --scenario parallel-doc-log --help` would have filed two live GitHub issues and spawned a
+  // real K=2 dispatcher). Same safety contract as `--dry`: zero side effects, nothing spawns.
+  if (opts.help) {
+    console.log('usage: spo recette [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]');
+    console.log('  --scenario <name>   trivial-doc-log (default, driver: inline) | parallel-doc-log (driver: dispatcher, K=2)');
+    console.log('  --dry               print the plan (driver, k, steps) and exit -- no side effects, nothing spawns');
+    console.log('  --keep              skip cleanup, leave the run dir + real GitHub artifacts behind for inspection');
+    console.log('  --force             override the daemon-lock refusal (only when you have confirmed by hand nothing is running)');
+    console.log('  --help, -h          print this and exit -- never runs the scenario');
+    return;
+  }
+
   const impl = deps.recette || recette;
-  const result = await impl.runRecette(
-    {
-      scenario: opts.scenario,
-      keep: opts.keep,
-      dry: opts.dry,
-      force: opts.force,
-      recetteDir: opts.recetteDir,
-      accountsDir: opts.accountsDir,
-      capMs: opts.capMs || null,
-      capLlmSteps: opts.capLlmSteps || null,
-    },
-    {}
-  );
+  let result;
+  try {
+    result = await impl.runRecette(
+      {
+        scenario: opts.scenario,
+        keep: opts.keep,
+        dry: opts.dry,
+        force: opts.force,
+        recetteDir: opts.recetteDir,
+        accountsDir: opts.accountsDir,
+        capMs: opts.capMs || null,
+        capLlmSteps: opts.capLlmSteps || null,
+      },
+      {}
+    );
+  } catch (err) {
+    // resolveScenario (recette.js) throws synchronously for an unknown --scenario, before any
+    // plan even exists to print -- action 7.2 requirement: list the known scenarios rather than
+    // letting this fall through to run()'s own generic `spo: <message>` catch, which drops
+    // err.detail.known on the floor entirely.
+    if (err && err.name === 'RecetteError' && err.reason === 'unknown-scenario') {
+      console.error(`spo recette: unknown scenario "${err.detail.name}" -- known scenarios: ${err.detail.known.join(', ')}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
 
   if (result.dry) {
     console.log(`spo recette --dry -- scenario "${result.scenario}" (nothing runs):`);
+    // action 7.2: driver + k, always printed -- a k>1 dispatcher-driver scenario spawns REAL
+    // worker/scanner child processes and files K real GitHub issues; a maintainer reading --dry
+    // output must be able to tell that apart from trivial-doc-log's single in-process task
+    // without opening orchestrator/recette.js.
+    console.log(`  driver: ${result.plan.driver}  k: ${result.plan.k}`);
     for (const line of result.plan.steps) console.log(`  - ${line}`);
     console.log('');
     console.log(`  journal root:          ${result.plan.journalRoot}`);
@@ -1578,6 +1622,52 @@ async function cmdRecette(opts, deps = {}) {
   if (result.refused) {
     console.error(`spo recette: refused (${result.reason}) -- ${JSON.stringify(result.detail)}`);
     process.exitCode = 1;
+    return;
+  }
+
+  // action 7.2: a driver:'dispatcher' scenario's result carries `tasks: [...]` (one or more
+  // cards) instead of a single top-level issueNumber/finalState/assertions -- see
+  // orchestrator/recette.js's runDispatcherScenario for the full shape. `ok`/`capTripped`/
+  // `elapsedMs`/`llmSteps` stay at the top level either way (that action's own requirement: this
+  // function's exit-code contract must not have to branch on driver).
+  if (Array.isArray(result.tasks)) {
+    console.log(`spo recette: scenario "${result.scenario}" (driver=${result.driver}, k=${result.k}), run ${result.runId}`);
+    console.log(`  elapsed: ${result.elapsedMs}ms  llmSteps: ${result.llmSteps}`);
+    if (result.capTripped) console.log(`  CAP TRIPPED: ${result.capTripped.reason} -- ${JSON.stringify(result.capTripped)}`);
+    if (result.error) console.error(`  error: ${result.error.name}: ${result.error.message}`);
+
+    for (const t of result.tasks) {
+      console.log(`  task ${t.taskId}: issue #${t.issueNumber || '?'}  finalState=${t.finalState}`);
+      if (t.assertions) {
+        for (const a of t.assertions.results) {
+          console.log(`    [${a.ok ? 'ok' : 'FAIL'}] ${a.id} -- ${a.description}${a.ok ? '' : ` (${a.detail})`}`);
+        }
+      } else {
+        console.log('    (no assertions evaluated -- this task did not reach a finalState)');
+      }
+    }
+
+    if (result.crossTaskAssertions) {
+      for (const a of result.crossTaskAssertions.results) {
+        console.log(`  [cross-task] [${a.ok ? 'ok' : 'FAIL'}] ${a.id} -- ${a.description}${a.ok ? '' : ` (${a.detail})`}`);
+      }
+    }
+
+    if (result.cleanupReport) {
+      const allSteps = (result.cleanupReport.perTask || [])
+        .flatMap((t) => t.steps)
+        .concat(result.cleanupReport.runDirStep ? [result.cleanupReport.runDirStep] : []);
+      const failed = allSteps.filter((s) => !s.ok);
+      console.log(
+        failed.length
+          ? `  cleanup: ${allSteps.length} step(s), ${failed.length} NOT CLEAN (${failed.map((s) => s.name).join(', ')} -- state may have been left behind)`
+          : `  cleanup: ${allSteps.length} step(s), nothing left behind`
+      );
+    } else if (result.kept) {
+      console.log(`  --keep: cleanup skipped -- inspect ${result.plan.runDir}`);
+    }
+
+    process.exitCode = result.ok ? 0 : 1;
     return;
   }
 
