@@ -1,5 +1,7 @@
 # Remediation plan — execution state
 
+> **Status: a dated record.** True as of its entry's date; never re-verified against present code.
+
 Companion to `doc/remediation-plan-2026-08.md`, which is the contract. It did not change for
 C1-C7. **It was amended once, on 2026-09-02, by the maintainer**: chantier 8 was appended after
 C7 to cover the bench's remediation and migration. That is an addition, not a revision — nothing

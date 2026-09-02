@@ -1,5 +1,7 @@
 # Driver improvisation in the retiring pipeline — measurement
 
+> **Status: a dated record.** True as of its entry's date; never re-verified against present code.
+
 Empirical input to `state-machine-spec.md` v2. The v1 spec replaces the LLM driver with a
 state machine whose only error policy is *scripted branches + a catch-all that parks*. This
 document measures what the old LLM driver actually did when it left the script, so that each

@@ -6,6 +6,13 @@ of driver actions improvised, dispositions BRANCH 78 % · PARK 18 % · DIAGNOSE 
 adds the two states that analysis found missing (CI_CHECKS, the `main`-moved transition) and
 the design consequences at the bottom.
 
+**What in this document (and the rest of the doc/prompts/orchestrator-comment corpus) is
+verified, and by what** is not stated inline — see
+[`accepted-gaps.md`](accepted-gaps.md), action 7bis.5's register: exhaustively-read surface,
+sweep-enforced facts, classified-historical logs, and the named, line-counted accepted gap
+handed to chantier 9. This file's own prose is in that last bucket except for the specific
+park-reason and documented-constant facts a sweep checks — see `accepted-gaps.md` §3.
+
 ## Principles
 
 1. **Exit codes are the contract.** Every scripted step is judged on its exit code, never on

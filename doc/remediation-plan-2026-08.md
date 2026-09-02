@@ -1,5 +1,7 @@
 # Pipeline remediation & optimization plan — audit of 2026-08-30
 
+> **Status: a dated record.** True as of its entry's date; never re-verified against present code.
+
 Produced by the multi-agent audit of 2026-08-30: 9 reader-auditors, one per subsystem
 (123 raw findings), 16 adversarial verifications (11 confirmed, 5 partially corrected,
 0 refuted), cross-checked against the real run journals (`journal/`, 15 cards, 91 LLM calls,
