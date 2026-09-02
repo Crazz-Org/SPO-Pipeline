@@ -108,33 +108,75 @@ function undeclaredBodyReferences(promptFile) {
 }
 
 // The prose tool-grant a prompt file states about itself, in one of the two shapes this corpus
-// uses today ("You hold `A, B, C`" / "You may `A`/`B`/`C`"), or null when the file states no
-// explicit tool-name list at all (plan.md, implement.md and triage-bug-report.md describe their
-// permission generically -- "read-only", "full edit tools" -- without ever enumerating tool names;
-// see the NO_PROSE_TOOL_GRANT set and its own regression test below).
-function parseProseToolGrant(body) {
-  const holdMatch = body.match(/You hold `([^`]+)`/);
-  if (holdMatch) {
-    return holdMatch[1]
+// uses today ("You hold `A, B, C`" / "You may `A`/`B`/`C`"). A body can state its grant MORE THAN
+// ONCE -- verify-citations.md does, once at its top and again under a heading literally titled
+// "What you never do (repeated because it is the invariant that matters most)" -- so this returns
+// EVERY occurrence, in source order, each tagged with the 1-based line it starts on (so a
+// divergence report can name which statement is wrong, not just "somewhere in this file"). A
+// single `body.match(...)` (no /g) silently returns only the FIRST hit and was, for exactly this
+// file, the bug: the SECOND ("repeated because it is the invariant that matters most") statement
+// could drift from allowedTools and nothing would notice. The whitespace between "hold"/"may" and
+// the opening backtick is `\s+`, not a literal space, because that second statement line-wraps
+// ("You hold\n  `Read, Grep` and no more.") -- a literal space would fail to find it even with /g.
+function findProseToolGrants(body) {
+  const grants = [];
+  const holdRe = /You hold\s+`([^`]+)`/g;
+  let m;
+  while ((m = holdRe.exec(body))) {
+    const tools = m[1]
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+    grants.push({ tools, index: m.index, line: lineNumberAt(body, m.index) });
   }
-  const mayMatch = body.match(/You may ((?:`[A-Za-z]+`\/?)+)/);
-  if (mayMatch) {
+  const mayRe = /You may\s+((?:`[A-Za-z]+`\/?)+)/g;
+  while ((m = mayRe.exec(body))) {
     const tools = [];
-    const re = /`([A-Za-z]+)`/g;
-    let m;
-    while ((m = re.exec(mayMatch[1]))) tools.push(m[1]);
-    return tools;
+    const inner = /`([A-Za-z]+)`/g;
+    let im;
+    while ((im = inner.exec(m[1]))) tools.push(im[1]);
+    grants.push({ tools, index: m.index, line: lineNumberAt(body, m.index) });
   }
-  return null;
+  grants.sort((a, b) => a.index - b.index);
+  return grants;
+}
+
+function lineNumberAt(text, index) {
+  return text.slice(0, index).split('\n').length;
+}
+
+// Single-statement convenience reader -- the FIRST grant found, or null when the body states no
+// explicit tool-name list at all (plan.md, implement.md and triage-bug-report.md describe their
+// permission generically -- "read-only", "full edit tools" -- without ever enumerating tool names;
+// see the NO_PROSE_TOOL_GRANT set and its own regression test below). Used where "is there a grant
+// at all" is the only question (the exemption-list test); the real sweep below uses
+// findProseToolGrants/extractProseToolGrants instead, precisely so it is never limited to "first".
+function parseProseToolGrant(body) {
+  const grants = findProseToolGrants(body);
+  return grants.length > 0 ? grants[0].tools : null;
 }
 
 function extractProseToolGrant(promptFile) {
   const text = fs.readFileSync(promptFile, 'utf8');
   const { body } = splitHeaderAndBody(text);
   return parseProseToolGrant(body);
+}
+
+// The plural counterpart evaluateContract actually drives: every grant statement in the file,
+// each checked independently against allowedTools.
+function extractProseToolGrants(promptFile) {
+  const text = fs.readFileSync(promptFile, 'utf8');
+  const { body } = splitHeaderAndBody(text);
+  // findProseToolGrants numbers lines within the body, but a failure message is read by someone
+  // about to open the file -- so shift to file-relative. Not by the header's own length:
+  // splitHeaderAndBody returns body = text.slice(header).replace(/^\s*\n/, ''), so the header's
+  // length undercounts by whatever that strip removed. body is an exact suffix of text, so the
+  // byte offset is the only honest anchor. Reporting the body-relative line would point a
+  // maintainer ~23 lines above the real statement -- the same wrong-line-inside-the-right-file
+  // defect doc/accepted-gaps.md registers about the citation ratchet, committed by the sweep
+  // built to catch that class.
+  const linesBeforeBody = text.slice(0, text.length - body.length).split('\n').length - 1;
+  return findProseToolGrants(body).map((g) => ({ ...g, line: g.line + linesBeforeBody }));
 }
 
 // null when there is nothing to compare (no prose statement) or the two sets agree; otherwise the
@@ -276,7 +318,20 @@ function sliceBetween(source, startMarker, endMarker) {
     throw new Error(`prompt-contract-sweep: marker not found in orchestrator/intake.js: ${startMarker}`);
   }
   const end = source.indexOf(endMarker, start + startMarker.length);
-  return source.slice(start, end === -1 ? source.length : end);
+  // S3 fix: a missing END marker used to silently widen the slice to end-of-file, which is exactly
+  // the confusion this function's own header comment claims it prevents ("keeps draftCard's
+  // `model: 'sonnet'` from ever being confused with reviewCard's `model: 'fable'` a few hundred
+  // lines away"). Renaming, say, `// ---- mechanical corrections ----` (REVIEW_CARD's end marker)
+  // used to survive every test: the widened slice still finds review-card's OWN allowedTools/model
+  // first (regex .match returns the first hit), so nothing looked wrong -- until review-card's own
+  // section additionally lost its allowedTools line, at which point the widened slice would read
+  // clean past the intended boundary and pick up `triageBugReport`'s grant, ~390 lines away, and
+  // report it as review-card's. Throw here, symmetrically with the start-marker case above, so a
+  // missing end marker is a loud, immediate failure instead of a silent, distance-dependent one.
+  if (end === -1) {
+    throw new Error(`prompt-contract-sweep: end marker not found in orchestrator/intake.js: ${endMarker}`);
+  }
+  return source.slice(start, end);
 }
 
 // The balanced-brace span of the first `{...}` object literal reachable after `marker`, or null.
@@ -457,16 +512,19 @@ function evaluateContract(contract) {
     );
   }
 
-  const prose = extractProseToolGrant(contract.promptFile);
-  if (prose) {
+  const proseGrants = extractProseToolGrants(contract.promptFile);
+  if (proseGrants.length > 0) {
     proseChecked += 1;
-    const mismatch = proseToolGrantMismatch(prose, contract.allowedTools);
-    if (mismatch) {
-      offenders.push(
-        `${contract.step} (${path.basename(contract.promptFile)}): prose tool grant disagrees with allowedTools -- ` +
-          `prose is missing [${mismatch.missingFromProse.join(', ')}], prose claims extra [${mismatch.extraInProse.join(', ')}]`
-      );
-    }
+    proseGrants.forEach((grant, idx) => {
+      const mismatch = proseToolGrantMismatch(grant.tools, contract.allowedTools);
+      if (mismatch) {
+        offenders.push(
+          `${contract.step} (${path.basename(contract.promptFile)}): prose tool grant #${idx + 1} of ${proseGrants.length} ` +
+            `(line ${grant.line}) disagrees with allowedTools -- ` +
+            `prose is missing [${mismatch.missingFromProse.join(', ')}], prose claims extra [${mismatch.extraInProse.join(', ')}]`
+        );
+      }
+    });
   }
 
   for (const problem of readmeRowProblems(contract.readmeRow, contract)) {
@@ -523,6 +581,37 @@ test('STEP_CONTRACT_STEPS covers every STEP_CONTRACTS entry -- a new step cannot
     assert.ok(README_ROW_RE[step], `no README_ROW_RE entry for step ${step}`);
     assert.ok(readmeRowFor(step), `prompts/README.md has no table row for step ${step}`);
   }
+});
+
+// S2's fix: STEP_CONTRACT_STEPS above is pinned to STEP_CONTRACTS (the state-machine half), but
+// the three `intakeContract({...})` calls that build the intake half of ALL_CONTRACTS are still a
+// hard-coded list "tied to nothing" (this file's own header, describing the pre-fix code) -- a
+// new prompts/*.md file is simply never picked up, so the `>= 8` floors above only ever grow, and
+// a genuinely unchecked ninth prompt sails through green. This closes that gap directly: the set
+// of prompts/*.md files (minus README.md, which documents the others rather than being a step
+// prompt itself) must be EXACTLY the set of files ALL_CONTRACTS covers, in both directions -- a
+// new prompt file with no contract entry goes red here (not just silently uncounted), and so does
+// deleting a prompt file while its contract entry lingers (already caught differently by
+// evaluateContract's own `fs.existsSync` guard, but this assertion catches it too, and names the
+// mismatch directly instead of via a promptFile-does-not-exist offender).
+test('prompts/*.md (minus README.md) is exactly the set of prompt files ALL_CONTRACTS covers', () => {
+  const onDisk = fs
+    .readdirSync(PROMPTS_DIR)
+    .filter((f) => f.endsWith('.md') && f !== 'README.md')
+    .map((f) => path.join(PROMPTS_DIR, f))
+    .sort();
+  const covered = ALL_CONTRACTS.map((c) => c.promptFile).sort();
+  assert.deepEqual(
+    covered,
+    onDisk,
+    'prompts/*.md and ALL_CONTRACTS disagree on the set of prompt files checked. If you ADDED a '
+      + 'prompt file, add a matching entry to ALL_CONTRACTS (a STEP_CONTRACTS entry + '
+      + 'STEP_CONTRACT_STEPS for a state-machine step, or an intakeContract({...}) call for an '
+      + 'intake-path step) -- a file present only on disk means a prompt this sweep never checks. '
+      + 'If you REMOVED a prompt file, drop its ALL_CONTRACTS entry too -- a contract present only '
+      + 'in ALL_CONTRACTS means evaluateContract will fail with "promptFile does not exist" instead '
+      + 'of this naming the real mismatch.'
+  );
 });
 
 test('the prose-tool-grant exemption list is exactly the files with no explicit "You hold/may" statement', () => {
@@ -635,6 +724,118 @@ test('proseToolGrantMismatch: clean (null) when the prose and allowedTools sets 
 
 test('proseToolGrantMismatch: nothing to compare (null) when the file states no explicit tool grant', () => {
   assert.equal(proseToolGrantMismatch(null, ['Read', 'Grep']), null);
+});
+
+// Regression for the S1 defect: a single (non-/g) match reads only the FIRST grant statement in a
+// body, so a divergence written into a REPEATED statement (verify-citations.md's own shape --
+// stated once near the top, restated under "What you never do (repeated because it is the
+// invariant that matters most)") would never be found. These prove findProseToolGrants/
+// extractProseToolGrants check EVERY occurrence, independent of which one (first, middle, last)
+// carries the drift.
+
+test('findProseToolGrants: finds every "You hold" statement in a body, not just the first', () => {
+  const body = [
+    'Intro. You hold `Read, Grep` and no more.',
+    '',
+    '## Repeated because it is the invariant that matters most',
+    '',
+    'Still true: You hold',
+    '  `Read, Grep` and no more.',
+  ].join('\n');
+  const grants = findProseToolGrants(body);
+  assert.equal(grants.length, 2, `expected 2 grant statements, found ${grants.length}`);
+  assert.deepEqual(grants[0].tools, ['Read', 'Grep']);
+  assert.deepEqual(grants[1].tools, ['Read', 'Grep']);
+  assert.ok(grants[1].line > grants[0].line, 'second occurrence should be reported on a later line');
+});
+
+test('findProseToolGrants: finds a "You hold" statement that line-wraps between "hold" and the backtick', () => {
+  // Exactly verify-citations.md's own second statement's shape -- a literal single space between
+  // "hold" and the opening backtick would never find this one.
+  const body = 'You hold\n  `Read, Grep` and no more.';
+  const grants = findProseToolGrants(body);
+  assert.equal(grants.length, 1);
+  assert.deepEqual(grants[0].tools, ['Read', 'Grep']);
+});
+
+test('evaluateContract: a divergence in the SECOND of two repeated prose grant statements is caught (not just the first)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const promptFile = writeTempPrompt(
+    dir,
+    'fixture-repeated-grant.md',
+    [
+      '<!--',
+      '  Placeholders: {{a_field}}',
+      '-->',
+      '',
+      '# FIXTURE REPEATED GRANT',
+      '',
+      'First statement, correct: You hold `Read, Grep` and no more.',
+      '',
+      '{{a_field}}',
+      '',
+      '## What you never do (repeated because it is the invariant that matters most)',
+      '',
+      // The SECOND statement claims Bash and Edit, which allowedTools below does not grant -- the
+      // exact shape of the verifier's mutation to verify-citations.md.
+      'Second statement, wrong: You hold `Read, Grep, Bash, Edit` and no more.',
+    ].join('\n')
+  );
+
+  const contract = {
+    step: 'FIXTURE_REPEATED_GRANT',
+    promptFile,
+    allowedTools: ['Read', 'Grep'],
+    baseModel: 'fable',
+    escalatedModel: null,
+    derivedKeys: ['a_field'],
+    readmeRow: '| FIXTURE_REPEATED_GRANT | `fixture-repeated-grant.md` | Fable 5 | high | `Read, Grep` |',
+  };
+
+  const { offenders, proseChecked } = evaluateContract(contract);
+  assert.equal(proseChecked, 1);
+  assert.equal(offenders.length, 1, `expected exactly 1 offender (the second statement's drift), got:\n  ${offenders.join('\n  ')}`);
+  assert.ok(offenders[0].includes('#2 of 2'), `expected the offender to name it as occurrence #2 of 2, got: ${offenders[0]}`);
+  assert.ok(offenders[0].includes('Bash'), 'missing the extra Bash claim in the offender message');
+  assert.ok(offenders[0].includes('Edit'), 'missing the extra Edit claim in the offender message');
+});
+
+test('evaluateContract: a divergence in the FIRST of two repeated prose grant statements is also caught (not just the last)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const promptFile = writeTempPrompt(
+    dir,
+    'fixture-repeated-grant-2.md',
+    [
+      '<!--',
+      '  Placeholders: {{a_field}}',
+      '-->',
+      '',
+      '# FIXTURE REPEATED GRANT 2',
+      '',
+      // The FIRST statement is the one that drifts this time.
+      'First statement, wrong: You hold `Read, Grep, Bash` and no more.',
+      '',
+      '{{a_field}}',
+      '',
+      'Second statement, correct: You hold `Read, Grep` and no more.',
+    ].join('\n')
+  );
+
+  const contract = {
+    step: 'FIXTURE_REPEATED_GRANT_2',
+    promptFile,
+    allowedTools: ['Read', 'Grep'],
+    baseModel: 'fable',
+    escalatedModel: null,
+    derivedKeys: ['a_field'],
+    readmeRow: '| FIXTURE_REPEATED_GRANT_2 | `fixture-repeated-grant-2.md` | Fable 5 | high | `Read, Grep` |',
+  };
+
+  const { offenders, proseChecked } = evaluateContract(contract);
+  assert.equal(proseChecked, 1);
+  assert.equal(offenders.length, 1, `expected exactly 1 offender (the first statement's drift), got:\n  ${offenders.join('\n  ')}`);
+  assert.ok(offenders[0].includes('#1 of 2'), `expected the offender to name it as occurrence #1 of 2, got: ${offenders[0]}`);
+  assert.ok(offenders[0].includes('Bash'), 'missing the extra Bash claim in the offender message');
 });
 
 test('readmeRowProblems: catches a row missing a real tool name', () => {
@@ -754,6 +955,65 @@ test('evaluateContract: a fully consistent synthetic contract is clean', () => {
   assert.deepEqual(offenders, []);
 });
 
+// S3 regression: sliceBetween must throw on a missing marker SYMMETRICALLY -- start already did
+// (three mutations killed it, per this action's brief); the end marker used to silently widen the
+// slice to end-of-file instead, which defeats the whole point of slicing per-function in the first
+// place (see sliceBetween's own comment above on why: it is what keeps one intake step's
+// allowedTools/model from ever being read out of a DIFFERENT step's section).
+
+test('sliceBetween: throws on a missing start marker (unchanged regression)', () => {
+  assert.throws(
+    () => sliceBetween('no markers here at all', '// ---- NOPE ----', '// ---- ALSO_NOPE ----'),
+    /marker not found/
+  );
+});
+
+test('sliceBetween: throws on a missing end marker instead of silently widening to end-of-file', () => {
+  const source = [
+    '// ---- SECTION_A ----',
+    'const a = { allowedTools: [\'Read\'], model: \'sonnet\' };',
+    // No "// ---- SECTION_B ----" marker at all -- renamed or deleted.
+    '// ---- SECTION_C ----',
+    'const c = { allowedTools: [\'Bash\', \'Edit\'], model: \'fable\' };',
+  ].join('\n');
+  assert.throws(
+    () => sliceBetween(source, '// ---- SECTION_A ----', '// ---- SECTION_B ----'),
+    /end marker not found/
+  );
+});
+
+test('sliceBetween: a present end marker still bounds the slice correctly (does not over-throw)', () => {
+  const source = [
+    '// ---- SECTION_A ----',
+    'const a = { allowedTools: [\'Read\'], model: \'sonnet\' };',
+    '// ---- SECTION_B ----',
+    'const b = { allowedTools: [\'Bash\', \'Edit\'], model: \'fable\' };',
+  ].join('\n');
+  const slice = sliceBetween(source, '// ---- SECTION_A ----', '// ---- SECTION_B ----');
+  assert.ok(slice.includes("allowedTools: ['Read']"), "slice should include section A's own content");
+  assert.ok(!slice.includes("allowedTools: ['Bash', 'Edit']"), "slice must NOT reach into section B's content");
+});
+
+test('sliceBetween: proves the exact cross-contamination the old silent-widen bug allowed, now throws instead', () => {
+  // Mirrors the real shape: REVIEW_CARD's own section loses its allowedTools line AND its end
+  // marker is renamed -- the old code would silently widen past both boundaries and read
+  // triageBugReport's allowedTools, hundreds of lines away, and report it as review-card's.
+  const source = [
+    '// ---- review-card ----',
+    'const reviewCard = { model: \'fable\' }; // allowedTools line missing on purpose',
+    // '// ---- mechanical corrections ----' renamed away, simulating the real defect
+    '// ---- RENAMED-mechanical-corrections ----',
+    'something unrelated',
+    '// ---- triageBugReport ----',
+    'const triageBugReport = { allowedTools: [\'Read\', \'Grep\', \'Bash\'], model: \'fable\' };',
+  ].join('\n');
+  assert.throws(
+    () => sliceBetween(source, '// ---- review-card ----', '// ---- mechanical corrections ----'),
+    /end marker not found/,
+    'a missing end marker must throw, not silently widen the slice into a later, unrelated section'
+  );
+});
+
 test('objectLiteralKeys: reads both `key: value` and shorthand `key` properties, matching intake.js\'s own literals', () => {
   const keys = objectLiteralKeys("{ request_text: requestText, product_repo: productRepo, today, }");
   assert.deepEqual(keys, ['request_text', 'product_repo', 'today']);
@@ -767,10 +1027,13 @@ module.exports = {
   underivablePlaceholders,
   unusedDerivedValues,
   undeclaredBodyReferences,
+  findProseToolGrants,
   parseProseToolGrant,
   extractProseToolGrant,
+  extractProseToolGrants,
   proseToolGrantMismatch,
   readmeRowProblems,
+  sliceBetween,
   objectLiteralKeys,
   evaluateContract,
   ALL_CONTRACTS,
