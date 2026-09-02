@@ -31,6 +31,11 @@ cd ~/SPO-Pipeline && bin/spo account add pool1
 
 - List and health: `cd ~/SPO-Pipeline && bin/spo accounts` · disable/enable:
   `cd ~/SPO-Pipeline && bin/spo account disable pool1` (marker file, reversible).
+- Stuck on a cooldown the provider does not actually impose:
+  `cd ~/SPO-Pipeline && bin/spo account clear-cooldown pool1`. The cooldown is invented locally
+  and never re-checked against the server (#483), so an account can read as cooling while its
+  dashboard shows headroom -- most often because the quota is per *model* and the cooldown is per
+  *account*.
 - Verify an account end to end (one real call, ~$0.02):
 
 ```bash

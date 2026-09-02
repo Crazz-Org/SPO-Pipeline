@@ -637,6 +637,14 @@ spo account add acct-2
 prints the exact next steps (`CLAUDE_CONFIG_DIR=... claude setup-token`, where to paste the
 token, the `chmod 600`, then `spo accounts` to verify) — it never runs `claude` itself.
 `spo account enable <name>` / `spo account disable <name>` toggle the `disabled` marker.
+`spo account clear-cooldown <name>` clears a *cooldown*, which the marker has nothing to do with:
+it deletes the account's whole `state.json` entry under the same short lock `markLimit` takes.
+Clearing `cooldownUntil` by hand is not equivalent -- `computeLimitUpdate` also stores
+`lastUsageLimitAt`, and leaving it behind means the next limit inside `ESCALATION_WINDOW_MS`
+escalates straight to the 5h tier as though nothing had been cleared. It exists because the
+cooldown is invented locally and never reconciled against the server (issue #483): 4 of the 7
+cooldowns in the live journal carry `defaulted: true`, i.e. the server supplied no retry-after
+and the code guessed.
 `K` parallel workers scales with `K` healthy accounts — the gate itself stays serialized (one
 live world), so adding an account adds implementation capacity, not gate throughput
 (state-machine-spec.md § Account pool).
@@ -2070,6 +2078,22 @@ tasks run at once, and how many more are allowed to queue up unstarted.
   beyond that — `orchestrator/dispatcher.js`) holds the single-instance lock and is the only one
   of the three that does. It spawns and reaps up to `K` worker children and exactly one scanner
   child; it never itself runs a scan or a task.
+
+  It carries **two independent circuit breakers**, and they count differently on purpose. A
+  worker's streak (`consecutiveCrashes`) resets on any `done` **or** `parked` outcome — a park is
+  a successful run of the state machine, so a run of parked cards can never trip a breaker meant
+  to catch a broken one. A scanner has no terminal outcome to succeed at (it only ever leaves by
+  crashing), so its streak resets on **uptime**: a scanner that lived at least
+  `scannerHealthyUptimeMs` before dying starts a new streak instead of extending the old one.
+  Chantier 7 fixed that field, which was incremented and reset nowhere — three scanner crashes
+  across a dispatcher's entire lifetime, however far apart, used to stop the whole daemon while
+  the journalled field said "consecutive". `scanner-crashed` now carries `consecutiveScannerCrashes`,
+  the cumulative `totalScannerCrashes` under its own honest name, the measured `uptimeMs`, and
+  `scannerHealthyUptimeMs` itself — without that last one, `{"uptimeMs":45000,
+  "consecutiveScannerCrashes":3}` cannot be read without also opening config.js and the
+  operator's environment. **The trade this makes is real and is filed as #79**: a crash loop
+  slower than the bar never trips the breaker at all, and every scanner respawn runs a full scan
+  cycle immediately, because every `should*` predicate treats a null last-run as due now.
 - A **worker** (`daemon.js --worker <taskDir>`) runs the one task already sitting in `<taskDir>`
   to its terminal state and exits — action 6.1. It does not take the single-instance lock (the
   dispatcher already holds it for the whole journal root).
@@ -2137,6 +2161,7 @@ bin/spo cost [--journal <dir>]                     # DEPRECATED alias for `spo t
 bin/spo resume <id> [--journal <dir>]              # print `claude --resume <sessionId>` for a task's LLM steps
 bin/spo accounts [--accounts-dir <dir>]            # list the account pool: name, enabled, cooldown, token, credentials
 bin/spo account add <name> [--accounts-dir <dir>]  # create the pool slot, print the guided setup steps
+bin/spo account clear-cooldown <name>              # drop a locally-invented cooldown (and its escalation state)
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)

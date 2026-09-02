@@ -421,9 +421,13 @@ live gate for every chantier from 3 on** -- scenarios are plain data
 (`orchestrator/recette.js`'s `SCENARIOS`) *for the inline driver this harness runs today*, so
 adding one is ordinarily just a new object literal. That claim is narrower than it sounds: a
 scenario that changes *how* the pipeline is driven, not merely what it asks IMPLEMENT to do,
-changes the runner too -- chantier 7 action 7.2 (in flight as of this writing) is adding exactly
-such a scenario, against a dispatcher-driven run rather than the inline one, and its own record
-is the place to check once it lands.
+changes the runner too. Chantier 7 action 7.2 did exactly that: scenarios now carry a `driver`,
+`inline` keeps this path unchanged, and `dispatcher` drives the real `createDispatcher` with real
+worker children -- which needs its own out-of-process cap, because the inline cap wraps
+`deps.spawnSync` and a dispatcher's workers are separate processes. It also has to force every
+scan timer to 0 **through the environment**, since the scanner is a child that re-reads
+`config.js` and never sees the parent's config object. `parallel-doc-log` (K=2) is the scenario
+that exercises it.
 
 Refuses to run while a live daemon holds its own `journal/daemon.lock` (read-only check,
 `--force` to override). Chantier 6 action 6.4 added a real product-repo mutex
