@@ -103,3 +103,45 @@ test('console/collect.js still reads the heartbeat by CONTENT, never by mtime --
   assert.doesNotMatch(heartbeatSrc, /mtimeMs/, 'bench-heartbeat.js must not read the heartbeat file by mtime either');
   assert.match(heartbeatSrc, /readFileSync/, "bench-heartbeat.js must read the heartbeat file's content");
 });
+
+// ---- B5.2: the heartbeat gains a payload, and BOTH shapes have to keep working.
+//
+// SPO-WebClient's B5.2 makes the worker write `{writtenAt, currentJob, startedAt}` instead of a
+// bare epoch, so a client can tell a worker that is merely ALIVE from one that is PROGRESSING --
+// today an idle worker and one wedged mid-job look identical, because the beat rides its own
+// timer and says nothing about the loop.
+//
+// This reader ships FIRST and deliberately: JSON-then-fallback reads both shapes, whereas the
+// worker shipping JSON against the old `Number(raw)` reader turns every heartbeat into `unknown`
+// and regresses `spo status` / `spo dashboard` from an accurate up/stale answer to none at all.
+// Landing them in the other order would break the dashboard for the whole window between merges.
+//
+// The trap these cases exist for: `JSON.parse('123')` SUCCEEDS and yields a number, so a bare
+// try/catch cannot tell a legacy heartbeat from a B5.2 one. Only the object check does, and
+// dropping it misreads every pre-B5.2 heartbeat as corrupt. That exact bug bit B5.2's own first
+// implementation on the WebClient side before its own tests caught it.
+test('heartbeatAgeMs reads BOTH on-disk shapes -- the legacy bare epoch and B5.2s payload', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-heartbeat-shapes-'));
+  const file = path.join(dir, 'heartbeat');
+  const now = 1_000_000;
+
+  const cases = [
+    ['legacy bare epoch (every heartbeat written before B5.2)', String(now - 5000), 5000],
+    ['B5.2 payload, worker idle', JSON.stringify({ writtenAt: now - 5000, currentJob: null, startedAt: null }), 5000],
+    ['B5.2 payload, job in flight', JSON.stringify({ writtenAt: now - 3000, currentJob: 'job-x', startedAt: 't' }), 3000],
+    ['unparseable bytes', 'not-a-number', null],
+    ['a JSON array is not a payload', '[1,2,3]', null],
+    ['a JSON null is not a payload', 'null', null],
+    ['an object with no writtenAt says nothing about when', JSON.stringify({ currentJob: 'x' }), null],
+  ];
+
+  for (const [name, body, expected] of cases) {
+    fs.writeFileSync(file, body);
+    assert.equal(
+      bench.heartbeatAgeMs(file, now),
+      expected,
+      `${name}: bench.heartbeatAgeMs must return ${expected} for content ${JSON.stringify(body)}`
+    );
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
