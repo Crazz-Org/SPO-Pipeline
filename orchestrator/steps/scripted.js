@@ -1742,6 +1742,92 @@ function liveRoutedButNotDriven(live) {
   return !!live && live.status === 'skipped' && Array.isArray(live.required) && live.required.length > 0;
 }
 
+// ---- action B3.4: stop collapsing distinct causes at the wire (defect class D8) -----------
+//
+// `npm run gate`'s exit code is a lossy projection of what the bench actually decided.
+// `SPO-WebClient/src/e2e/bench/cli.ts`'s own `wait()` collapses SEVEN distinct `JobVerdict`
+// values (`SPO-WebClient/src/e2e/bench/job.ts`'s own union -- FAIL, BLOCKED, ENVIRONMENT,
+// STALE, DIRTY, ABANDONED, INTERRUPTED; PASS/LEASED exit 0) onto the single exit 1. Two of
+// those seven (BLOCKED, and a FAIL missing `baseMain`) are already read off
+// `<spoBenchDir>/verdicts/<sha>.json` above (actions B2.3/4.2) -- but that file is written only
+// for the `ref` job type and only when `worker.ts`'s own `NON_ATTESTING = {DIRTY, ENVIRONMENT,
+// ABANDONED}` does NOT contain the verdict (`processOldest`'s own guard), and never at all for
+// INTERRUPTED (`recoverInterrupted` writes straight to `done/`, skipping the `verdicts/` write
+// entirely) -- so those four verdicts still fall through the `if (!verdict)` branch below into
+// one undifferentiated `gate-non-attesting` park. Measured against the live bench today
+// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are
+// verdict ENVIRONMENT ("git fetch failed while fetching <sha>") -- every one of those seven
+// would have parked the identical `gate-non-attesting`, with nothing in the park comment
+// distinguishing a fetch failure from an abandoned worktree or a dirty worker checkout.
+//
+// None of this is missing information -- it is on the floor, not gone: `cli.ts`'s `submit()`
+// prints `` `job ${request.id} queued...` `` to stdout the moment a job is deposited (the SAME
+// stdout `gateLogPath` above already captures), and `job.ts`'s `Spool.writeReport` writes
+// `<spoBenchDir>/done/<id>.json` UNCONDITIONALLY, for every verdict, before `wait()`'s polling
+// loop can ever return 0 or 1 -- so whenever `npm run gate` exits 0 or 1, that file already
+// exists with the exact verdict/detail/staticProof the CLI's own exit code just collapsed.
+//
+// parseGateJobId/readGateDoneReport read that richer answer defensively: a missing, unreadable,
+// malformed, or non-object `done/<id>.json` (a JSON `null`, a bare JSON string, and a JSON
+// ARRAY all parse successfully and are none of them the JobReport object shape this reads --
+// exactly the un-guarded-parse hazard this chantier has hit before, a bookkeeping file read
+// with no shape check turning every subsequent gate into a false FAIL) must never turn a good
+// gate into a park, and must never be silently read as a verdict either -- every call site below
+// falls back to the pre-existing exit-code/verdicts-file routing exactly as it stood before this
+// action whenever the richer read is unavailable, journalling why.
+function parseGateJobId(stdout) {
+  const m = /(?:^|\n)job (\S+) queued/.exec(stdout || '');
+  return m ? m[1] : null;
+}
+
+function readGateDoneReport(config, jobId) {
+  if (!jobId) return { report: null, skipped: 'no-job-id', donePath: null };
+  const donePath = path.join(config.spoBenchDir, 'done', `${jobId}.json`);
+  let raw;
+  try {
+    raw = fs.readFileSync(donePath, 'utf8');
+  } catch (err) {
+    // Distinguish "nothing there yet" (ENOENT -- the ordinary case for a job whose report has
+    // not landed, e.g. exit 3/4's still-pending job) from a genuine read failure (permissions, a
+    // misconfigured spoBenchDir mounted read-protected, ...) -- the same "misconfiguration vs.
+    // genuine empty answer" split `verdictDirExists` already draws one function away, and
+    // FINISH's own `bench-dir-unreadable` draws for `spool`/`running`.
+    const skipped = err && err.code === 'ENOENT' ? 'missing' : 'unreadable';
+    return { report: null, skipped, donePath, errCode: (err && err.code) || null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { report: null, skipped: 'malformed', donePath };
+  }
+  // Shape guard: `null`, a bare JSON string, and a JSON array all parse without throwing and are
+  // none of them the JobReport object this function exists to read.
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { report: null, skipped: 'wrong-shape', donePath };
+  }
+  if (typeof parsed.verdict !== 'string' || parsed.verdict === '') {
+    return { report: null, skipped: 'no-verdict-field', donePath };
+  }
+  return { report: parsed, skipped: null, donePath };
+}
+
+// Journals the attempt either way (a maintainer reading journal.jsonl can always see whether the
+// richer read was tried and why it did or did not apply) and returns the JobReport, or `null`
+// when anything short of a genuine, well-shaped report was found -- callers fall back to their
+// pre-existing routing on `null`, exactly as if this function did not exist.
+function readGateJobReportForRouting(ctx, config, state, stdout) {
+  const jobId = parseGateJobId(stdout);
+  const { report, skipped, donePath } = readGateDoneReport(config, jobId);
+  appendEvent(ctx.taskDir, state, 'gate-job-report-read', {
+    jobId,
+    donePath,
+    skipped,
+    verdict: report ? report.verdict : null,
+  });
+  return report;
+}
+
 async function realGate(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -1891,6 +1977,43 @@ async function realGate(ctx, deps = {}) {
         appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'verdict-parse', verdictPath });
         return 'DIAGNOSE';
       }
+
+      // Action B3.4: before falling back to the undifferentiated `gate-non-attesting`, ask the
+      // job's own `done/<id>.json` which of the four NON_ATTESTING-or-INTERRUPTED verdicts this
+      // actually was -- see readGateJobReportForRouting's header above for why this file is safe
+      // to trust here and what makes it fall back cleanly when it is not available. Only the four
+      // verdicts that explain "no verdicts/<sha>.json entry exists" are branched on by name; a
+      // report present here that is verdict PASS/LEASED (contradicts exit 1) or FAIL/BLOCKED/
+      // STALE (those DO get written to verdicts/<sha>.json, so reaching this branch at all with
+      // one of THOSE verdicts means the two files disagree) is an inconsistency this function
+      // does not try to explain -- it falls through to the pre-existing gate-non-attesting park
+      // exactly as if the richer read had failed.
+      const jobReport = readGateJobReportForRouting(ctx, config, 'GATE', r.stdout);
+      if (jobReport) {
+        const detail = { headSha, jobId: jobReport.id, jobDetail: jobReport.detail || null };
+        if (jobReport.verdict === 'ENVIRONMENT') {
+          appendEvent(ctx.taskDir, 'GATE', 'gate-environment', detail);
+          throw new ParkSignal('gate-environment', detail);
+        }
+        if (jobReport.verdict === 'DIRTY') {
+          // NOT the session's own tree (bench-gate.sh already refused a dirty session tree at
+          // exit 2, before a job was ever deposited) -- this is worker.ts's OWN shared ref
+          // checkout (`paths.refCheckout`) found dirty by the worker itself, after `prepareRef`.
+          // A worker-side environment fact, never named `gate-dirty-tree` (that name is reserved
+          // for the session's own tree, exit 2, below).
+          appendEvent(ctx.taskDir, 'GATE', 'gate-worker-dirty-checkout', detail);
+          throw new ParkSignal('gate-worker-dirty-checkout', detail);
+        }
+        if (jobReport.verdict === 'ABANDONED') {
+          appendEvent(ctx.taskDir, 'GATE', 'gate-abandoned', detail);
+          throw new ParkSignal('gate-abandoned', detail);
+        }
+        if (jobReport.verdict === 'INTERRUPTED') {
+          appendEvent(ctx.taskDir, 'GATE', 'gate-interrupted', detail);
+          throw new ParkSignal('gate-interrupted', detail);
+        }
+      }
+
       // `verdictDirExists` is on the event AND on the park detail deliberately: a misconfigured
       // or unmounted `config.spoBenchDir` makes EVERY failing gate land here, and the two cases a
       // maintainer has to tell apart -- "the bench genuinely attested nothing" vs "the machine
@@ -2076,14 +2199,69 @@ async function realGate(ctx, deps = {}) {
       throw new ParkSignal('main-moved-conflict', { headSha, mergeExit: merge.exit });
     }
 
+    // Action B3.4: STALE ("the tree changed between deposit and the end of the run") is not a
+    // code defect either -- verify-gate.js's own PASS/FAIL body verdict, whatever it was, applies
+    // to a tree that no longer exists, and the bench's own advice is "resubmit", never "diagnose
+    // this". Unlike DIRTY/ENVIRONMENT/ABANDONED/INTERRUPTED above, `verdicts/<sha>.json` IS
+    // written for STALE (it is not in `NON_ATTESTING`), so `verdict.verdict === 'STALE'` is
+    // already known here without needing `done/<id>.json` -- but that file's own `detail` still
+    // gives a maintainer the human-readable "what changed and when" the compact verdicts/ entry
+    // does not carry, so it is read best-effort for that alone; its absence never blocks the park.
+    if (verdict.verdict === 'STALE') {
+      const jobReport = readGateJobReportForRouting(ctx, config, 'GATE', r.stdout);
+      const jobDetail = jobReport && jobReport.verdict === 'STALE' ? jobReport.detail || null : null;
+      const detail = { headSha, jobDetail };
+      appendEvent(ctx.taskDir, 'GATE', 'gate-stale', detail);
+      throw new ParkSignal('gate-stale', detail);
+    }
+
     // FAIL carrying baseMain (a real failure -- see the header comment above), or any other
-    // shape (e.g. a PASS verdict recorded against an exit-1 gate; BLOCKED is carved out above)
-    // -> DIAGNOSE, unchanged.
+    // shape (e.g. a PASS verdict recorded against an exit-1 gate; BLOCKED/STALE are carved out
+    // above) -> DIAGNOSE, unchanged.
     return 'DIAGNOSE';
   }
 
-  if (r.exit === 2) throw new ParkSignal('gate-dirty-tree', { exit: r.exit });
-  if (r.exit === 3) throw new ParkSignal('gate-worker-down', { exit: r.exit });
+  // ---- action B3.4: exit 2/3 sub-causes, named from the CLI's own printed diagnostic --------
+  //
+  // Principle 1 above ("exit codes are the contract... never printed text") still decides the
+  // ROUTE for exit 2 and exit 3 -- both remain a park, unconditionally, exactly as before this
+  // action. What changes is only the NAME attached to that already-decided park: `done/<id>.json`
+  // cannot help here (SPO-WebClient/scripts/bench-gate.sh's own two pre-flight refusals, and
+  // cli.ts submit()'s WORKER DOWN / DuplicateJobError checks, all run BEFORE any job is deposited
+  // -- there is no job id to parse yet; the one exit-3 case where a job WAS deposited, "WORKER
+  // DIED while job was pending", returns the instant `!worker.alive`, before the worker's own
+  // restart-time `recoverInterrupted` has had any chance to write that job's `done/<id>.json`) --
+  // so the only place the distinguishing fact still exists is the literal diagnostic text each
+  // script already prints to stderr, captured unchanged in `r.stderr` (and journalled to
+  // gate.log above regardless). Three sub-causes per exit code
+  // (SPO-WebClient/scripts/bench-gate.sh's "DIRTY TREE"/"NOT PUSHED", cli.ts submit()'s
+  // DuplicateJobError message, for exit 2; SPO-WebClient/scripts/bench-submit.sh's "bench client
+  // not built", cli.ts submit()'s "WORKER DOWN", cli.ts wait()'s "WORKER DIED", for exit 3) --
+  // matched by substring against known, stable literals this pipeline does not control but does
+  // cite exactly (see each regex's own comment). Anything unrecognized falls back to the
+  // pre-existing, most-common-case name (`gate-dirty-tree` / `gate-worker-down`) exactly as
+  // before this action -- never a new failure mode, only a more specific one when the text is
+  // there to support it.
+  if (r.exit === 2) {
+    const text = (r.stderr || '') + '\n' + (r.stdout || '');
+    // scripts/bench-gate.sh: `echo "NOT PUSHED: ..." >&2`
+    if (/NOT PUSHED/.test(text)) throw new ParkSignal('gate-not-pushed', { exit: r.exit });
+    // job.ts's DuplicateJobError message: "This worktree already has job <id> ... waiting..."
+    if (/already has job/.test(text)) throw new ParkSignal('gate-duplicate-job', { exit: r.exit });
+    // scripts/bench-gate.sh: `echo "DIRTY TREE: ..." >&2` -- also the fallback for anything this
+    // pipeline does not recognize, matching this reason's own pre-existing, most-common meaning.
+    throw new ParkSignal('gate-dirty-tree', { exit: r.exit });
+  }
+  if (r.exit === 3) {
+    const text = (r.stderr || '') + '\n' + (r.stdout || '');
+    // scripts/bench-submit.sh: `echo "bench client not built at $CLI ..." >&2`
+    if (/bench client not built/.test(text)) throw new ParkSignal('gate-worker-not-built', { exit: r.exit });
+    // cli.ts wait(): `deps.err(\`WORKER DIED while job ${id} was pending: ...\`)`
+    if (/WORKER DIED/.test(text)) throw new ParkSignal('gate-worker-died-midjob', { exit: r.exit });
+    // cli.ts submit(): `deps.err(\`WORKER DOWN: ...\`)` -- also the fallback for anything
+    // unrecognized, matching this reason's own pre-existing, most-common meaning.
+    throw new ParkSignal('gate-worker-down', { exit: r.exit });
+  }
   if (r.exit === 4) throw new ParkSignal('gate-timeout', { exit: r.exit });
   throw new ParkSignal('gate-unrecognized-exit', { exit: r.exit });
 }

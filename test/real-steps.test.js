@@ -1881,6 +1881,213 @@ for (const [exit, nextOrReason, isPark] of [
   });
 }
 
+// ---- GATE, action B3.4: done/<jobId>.json splits the collapsed exit-1 causes ------------------
+//
+// `worker.ts`'s `NON_ATTESTING = {DIRTY, ENVIRONMENT, ABANDONED}` plus INTERRUPTED
+// (`recoverInterrupted` never writes `verdicts/<sha>.json` at all) all fall into today's
+// undifferentiated `gate-non-attesting` when no `verdicts/<sha>.json` entry exists for HEAD --
+// see steps/scripted.js's own B3.4 header comment. Four tests, one shared shape: `npm run gate`
+// exits 1, prints a job id at deposit (captured in stdout, exactly as the real CLI does), no
+// `verdicts/<sha>.json` exists for HEAD, but a real, well-shaped `done/<jobId>.json` names which
+// of the four this actually was.
+
+function gateJobStdout(jobId) {
+  return `job ${jobId} queued (ref, position 1)\nreport will land in <spoBenchDir>/done/${jobId}.json\n`;
+}
+
+const B34_VERDICT_CASES = [
+  ['ENVIRONMENT', 'gate-environment', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'job-00000000000001-aaaaaa'],
+  ['DIRTY', 'gate-worker-dirty-checkout', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'job-00000000000002-bbbbbb'],
+  ['ABANDONED', 'gate-abandoned', 'cccccccccccccccccccccccccccccccccccccccc', 'job-00000000000003-cccccc'],
+  ['INTERRUPTED', 'gate-interrupted', 'dddddddddddddddddddddddddddddddddddddddd', 'job-00000000000004-dddddd'],
+];
+
+for (const [verdict, expectedReason, headSha, jobId] of B34_VERDICT_CASES) {
+  test(`realGate (action B3.4): exit 1, no verdicts/<sha>.json, done/<jobId>.json verdict ${verdict} -> PARKED ${expectedReason}, not the collapsed gate-non-attesting`, async () => {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-gate-b34-wt-');
+    const task = { id: `card-b34-${verdict}`, kind: 'card', issue: 910, worktreePath };
+    const ctx = testCtx({ id: `card-b34-${verdict}`, task, config });
+
+    writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+      id: jobId,
+      type: 'ref',
+      worktree: '/fake/checkout',
+      branch: 'main',
+      verdict,
+      fingerprints: { atSubmit: { head: headSha, hash: 'x', clean: true } },
+      targetMoved: false,
+      startedAt: '2026-09-03T00:00:00.000Z',
+      detail: `synthetic ${verdict} detail for the B3.4 test`,
+    });
+
+    const deps = {
+      spawnSync: (command, args) => {
+        if (args.includes('gate')) return { status: 1, stdout: gateJobStdout(jobId), stderr: '', signal: null };
+        if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+        return ok('');
+      },
+    };
+
+    await assert.rejects(
+      () => realGate(ctx, deps),
+      (err) => err instanceof ParkSignal && err.reason === expectedReason
+    );
+
+    const journal = readJournal(ctx.taskDir);
+    const readEvent = journal.find((e) => e.event === 'gate-job-report-read');
+    assert.ok(readEvent, 'expected a gate-job-report-read journal event');
+    assert.equal(readEvent.jobId, jobId);
+    assert.equal(readEvent.skipped, null);
+    assert.equal(readEvent.verdict, verdict);
+    assert.ok(
+      !journal.some((e) => e.event === 'gate-non-attesting'),
+      'the split reason must fire INSTEAD of gate-non-attesting, not alongside it'
+    );
+  });
+}
+
+// STALE is already written to verdicts/<sha>.json (it is not in NON_ATTESTING) -- unlike the four
+// above, this used to fall through to the generic `return 'DIAGNOSE'` at the end of realGate's
+// exit-1 block, spending a judge call on a body verdict ("the tree changed mid-run") that no
+// longer describes any tree that exists. done/<jobId>.json is read best-effort here purely to
+// enrich the park's `jobDetail` -- STALE itself is already known without it.
+test('realGate (action B3.4): exit 1, verdicts/<sha>.json verdict STALE -> PARKED gate-stale (never DIAGNOSE), enriched with the job report\'s own detail text', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-stale-wt-');
+  const headSha = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+  const jobId = 'job-00000000000005-eeeeee';
+  const task = { id: 'card-b34-stale', kind: 'card', issue: 911, worktreePath };
+  const ctx = testCtx({ id: 'card-b34-stale', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'STALE' });
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'STALE',
+    detail: 'the tree changed between deposit and the end of the run -- resubmit',
+  });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('gate')) return { status: 1, stdout: gateJobStdout(jobId), stderr: '', signal: null };
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'gate-stale' && err.detail.jobDetail === 'the tree changed between deposit and the end of the run -- resubmit'
+  );
+});
+
+// ---- GATE, action B3.4: the richer read must fall back SAFELY -- never a new failure mode -----
+//
+// Four shapes, one property each: `done/<jobId>.json` missing, malformed JSON, a JSON array, and
+// a JSON `null` must ALL leave the outcome exactly what it was before this action
+// (`gate-non-attesting`, same detail shape) and journal WHY the richer read did not apply. The
+// array/null cases are the exact hazard named in this action's own brief -- a bookkeeping file
+// parsed with no shape guard turning a good gate into a false park elsewhere in this same
+// chantier.
+const B34_FALLBACK_CASES = [
+  ['missing (no done/<jobId>.json written at all)', 'missing', undefined],
+  ['malformed (invalid JSON syntax)', 'malformed', '{not valid json'],
+  ['a JSON array (parses fine, is not the JobReport object shape)', 'wrong-shape', '[1,2,3]'],
+  ['a JSON null (parses fine, is not the JobReport object shape)', 'wrong-shape', 'null'],
+];
+
+for (const [label, expectedSkipped, rawContent] of B34_FALLBACK_CASES) {
+  test(`realGate (action B3.4): done/<jobId>.json ${label} -> falls back to gate-non-attesting exactly as before this action, journalled skipped:'${expectedSkipped}'`, async () => {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-gate-b34fallback-wt-');
+    const headSha = 'f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0';
+    const jobId = 'job-00000000000006-f0f0f0';
+    const id = `card-b34-fallback-${expectedSkipped}-${B34_FALLBACK_CASES.findIndex((c) => c[1] === expectedSkipped && c[2] === rawContent)}`;
+    const task = { id, kind: 'card', issue: 912, worktreePath };
+    const ctx = testCtx({ id, task, config });
+
+    if (rawContent !== undefined) {
+      const donePath = path.join(config.spoBenchDir, 'done', `${jobId}.json`);
+      fs.mkdirSync(path.dirname(donePath), { recursive: true });
+      fs.writeFileSync(donePath, rawContent);
+    }
+
+    const deps = {
+      spawnSync: (command, args) => {
+        if (args.includes('gate')) return { status: 1, stdout: gateJobStdout(jobId), stderr: '', signal: null };
+        if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+        return ok('');
+      },
+    };
+
+    await assert.rejects(
+      () => realGate(ctx, deps),
+      (err) => err instanceof ParkSignal && err.reason === 'gate-non-attesting' && err.detail.headSha === headSha
+    );
+
+    const journal = readJournal(ctx.taskDir);
+    const readEvent = journal.find((e) => e.event === 'gate-job-report-read');
+    assert.ok(readEvent, 'expected a gate-job-report-read journal event even on a failed read');
+    assert.equal(readEvent.jobId, jobId);
+    assert.equal(readEvent.skipped, expectedSkipped);
+    assert.equal(readEvent.verdict, null, 'a failed/unusable read must never surface a verdict, even a wrong one');
+  });
+}
+
+test("realGate (action B3.4): no job id in npm run gate's stdout at all (the pre-existing gate-legs-reachability fixture shape) -> falls back exactly as before, journalled skipped:'no-job-id'", async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-b34-nojobid-wt-');
+  const headSha = 'f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1';
+  const task = { id: 'card-b34-nojobid', kind: 'card', issue: 913, worktreePath };
+  const ctx = testCtx({ id: 'card-b34-nojobid', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('gate')) return fail(1); // empty stdout -- no "job ... queued" line
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      return ok('');
+    },
+  };
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'gate-non-attesting'
+  );
+
+  const readEvent = readJournal(ctx.taskDir).find((e) => e.event === 'gate-job-report-read');
+  assert.ok(readEvent);
+  assert.equal(readEvent.jobId, null);
+  assert.equal(readEvent.skipped, 'no-job-id');
+});
+
+// ---- GATE, action B3.4: exit 2/3 sub-causes named from the CLI's own printed stderr -----------
+//
+// No job id exists to read a done/<jobId>.json by for any of these -- see the GATE row of
+// doc/state-machine-spec.md and steps/scripted.js's own comment on this block for why. The route
+// stays exit-code-only (Principle 1); only the park's NAME is refined by matching the literal,
+// stable diagnostic text scripts/bench-gate.sh / scripts/bench-submit.sh / cli.ts already print.
+for (const [exit, stderrText, expectedReason] of [
+  [2, 'NOT PUSHED: abc12345 is not on origin, so the worker cannot fetch it.\n', 'gate-not-pushed'],
+  [2, 'This worktree already has job job-1-abc (ref) waiting in the queue.\n', 'gate-duplicate-job'],
+  [2, 'DIRTY TREE: this worktree has uncommitted or untracked changes.\n', 'gate-dirty-tree'],
+  [3, "bench client not built at /home/x/SPO-WebClient/dist/e2e/bench/cli.js -- run 'npm run build:e2e'\n", 'gate-worker-not-built'],
+  [3, 'WORKER DIED while job job-1-abc was pending: heartbeat stale\n', 'gate-worker-died-midjob'],
+  [3, 'WORKER DOWN: worker pid 12345 is not running\n', 'gate-worker-down'],
+]) {
+  test(`realGate (action B3.4): exit ${exit}, stderr "${stderrText.slice(0, 40).trim()}..." -> PARKED ${expectedReason}`, async () => {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-gate-b34-exit23-wt-');
+    const task = { id: `card-b34-exit${exit}-${expectedReason}`, kind: 'card', issue: 914, worktreePath };
+    const ctx = testCtx({ id: `card-b34-exit${exit}-${expectedReason}`, task, config });
+    const deps = { spawnSync: (command, args) => (args.includes('gate') ? fail(exit, stderrText) : ok('')) };
+
+    await assert.rejects(
+      () => realGate(ctx, deps),
+      (err) => err instanceof ParkSignal && err.reason === expectedReason && err.detail.exit === exit
+    );
+  });
+}
+
 // ---- CI_CHECKS ------------------------------------------------------------------------------
 
 function ciCtx(overrides = {}) {
