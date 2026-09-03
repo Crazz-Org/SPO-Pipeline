@@ -199,7 +199,7 @@ async function handleIntake(ctx) {
   // runs. INTAKE is scripted (no LLM call on this path either way), so parking here costs
   // literally nothing -- and it still gets the FULL standard park treatment (park comment on the
   // issue, kanban move, the maintainer's retry/abandon path) that refusing to enqueue the card in
-  // intake.js's pullOne would not: a refusal there would leave the card silently re-scanned every
+  // intake.js's pullBoard would not: a refusal there would leave the card silently re-scanned every
   // cycle, uncommented and unmoved on the board, forever. Card-only (a synthetic/test task has no
   // criterion/title worth scanning) and string-only (detectProtectedFiles already tolerates
   // anything else, but there is no reason to call it on a non-string field).
@@ -832,7 +832,9 @@ async function handleDiagnose(ctx) {
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
-  // Action 5.1d: surface DIAGNOSE on the card, first entry only -- see park-loop.js's
+  // Action 5.1 (DIAGNOSE-surfacing sub-item -- see park-loop.js's own "action 5.1" comment on
+  // why this used to be miswritten "5.1d"; the plan does not letter row 5.1's sub-items):
+  // surface DIAGNOSE on the card, first entry only -- see park-loop.js's
   // postDiagnoseSurfaceComment for the comment mechanics/measurement and this file's own
   // ctx.counters.diagnoseSurfaced comment (buildCtx) for why the flag is in-memory and per-run.
   // Set BEFORE calling, not after: "first entry" means first entry regardless of whether the
@@ -1246,7 +1248,8 @@ function buildCtx(id, task, taskDir, config) {
       // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
       // than reusing one of them.
       ciImplementRetries: 0,
-      // Action 5.1d: whether this task has already posted its one-time "pipeline diagnosing"
+      // Action 5.1 (DIAGNOSE-surfacing sub-item, see park-loop.js's own "action 5.1" comment):
+      // whether this task has already posted its one-time "pipeline diagnosing"
       // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
       // persisted lifetime as board.js's own 5.1c dedupe memo, and for the same reason: a retry
       // always restarts a task at INTAKE with a fresh ctx (see this file's own cameFrom comment),

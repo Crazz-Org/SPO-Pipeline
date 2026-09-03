@@ -2465,7 +2465,7 @@ function benchPathsTouched(diffNameOnlyOutput) {
 }
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` -- worker.ts:779 maps that SIGTERM straight
+// `systemctl --user restart spo-bench-worker.service` -- worker.ts:892 maps that SIGTERM straight
 // to `process.exit(0)`, no drain -- and this daemon runs K=2 in production (SPO_WORKERS=2 on the
 // live systemd drop-in). Without this wait, a card reaching FINISH's reinstall step can cut a
 // SIBLING card's in-flight GATE mid-job: the cut job recovers as INTERRUPTED (worker.ts's
@@ -2544,7 +2544,7 @@ function benchQueueDepth(deps, config) {
 // `Merging` with its worktree still on disk until a human intervenes; (3) the 15-minute bound is
 // not generous against the actual population of bench jobs -- the config comment's own "generous"
 // claim was derived only from bench-queue-wait.js's ref/nightly constants and omitted
-// SPO-WebClient's worker.ts:107 `DEFAULT_LEASE_MINUTES = 30` / `MAX_LEASE_MINUTES = 120`: an
+// SPO-WebClient's worker.ts:109-110 `DEFAULT_LEASE_MINUTES = 30` / `MAX_LEASE_MINUTES = 120`: an
 // ORDINARY human bench lease on this shared machine (2x-8x the bound) would terminally park any
 // bench-touching card the daemon finishes during it -- the same "a human's normal use of a shared
 // resource terminally parks a merged card" failure the `--untracked-files=no` narrowing exists to

@@ -122,7 +122,7 @@ const SCANNER_TIMER_ENV_VARS_ZEROED = Object.fromEntries(SCANNER_TIMER_ENV_VARS.
 //   autoIntakeMs, reportConfirmScanMs, autoTriageMs, remoteReportPullMs} -- faithfully reproduces
 // what a FRESH `require('./config')` (exactly what daemon.js's own --scanner branch does, in its
 // own process) resolves the seven fields to, under the given env var overrides. Runs config.js's
-// OWN, unmodified parsing (env var name, Number() coercion, fallback-on-undefined) -- cache-busted
+// own, unmodified parsing (env var name, Number() coercion, fallback-on-undefined) -- cache-busted
 // and re-required here, synchronously, so this is never a hand-rolled duplicate of that logic that
 // could silently drift from it. `envOverrides` is applied and reverted around one synchronous
 // require; nothing else in this single-threaded process can observe the window in between.

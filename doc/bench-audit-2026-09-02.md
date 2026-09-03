@@ -222,7 +222,7 @@ their artifact verbatim; the rest join on head sha and on `verdict.tree` against
 
 **Nothing anywhere compares the worker's binary to its source or to the tree it gates.**
 `worker.json` records `{pid, startedAt, repo, port}` and no build provenance; `workerStatus`
-(`paths.ts:143-163`) checks pid liveness and heartbeat age only. The one rule that would have
+(`src/e2e/bench/paths.ts:143-163`) checks pid liveness and heartbeat age only. The one rule that would have
 caught it exists and is never reached — see D3.
 
 ### D3 — three links, all gone
@@ -321,7 +321,7 @@ attested; `INTERRUPTED` is `done/`-only). A non-attesting outcome writes a `done
 verdict — and `done/` is purged after 24 h (`worker.ts:106`, `:576`). **The corpus is
 structurally unable to show them**, which is why 509 verdicts contain exactly two values.
 
-`BLOCKED`'s rate-limit path cannot fire either: `config.ts:93,98` set `minIntervalMinutes: 0`
+`BLOCKED`'s rate-limit path cannot fire either: `src/e2e/config.ts:93,98` set `minIntervalMinutes: 0`
 and `maxRunsPerDay: 1000`. The corpus's only `BLOCKED` sits in the pre-bench main-checkout store
 from 2026-08-21.
 

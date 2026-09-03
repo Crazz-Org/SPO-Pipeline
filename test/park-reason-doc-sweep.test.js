@@ -896,3 +896,276 @@ test('a required reason absent from the spec text is reported, allowlisted reaso
   }
   assert.deepEqual(offenders, ['totally-undocumented-reason']);
 });
+
+// =================================================================================================
+// journal-event doc sweep (E2, action 9.2) -- doc/comment-corpus-audit-2026-09-03.md's largest
+// class: 50 undocumented journal event literals (35 task + 15 daemon), measured against this
+// file's own scanner shape (throw-site AND sink, extended here to journal.js's appendEvent/
+// appendDaemonEvent and their alias bindings) rather than a fresh mechanism. Same three reasons
+// this file exists at all, restated for events instead of park reasons:
+//   - a journal event string either occurs in doc/state-machine-spec.md or orchestrator/README.md
+//     or it does not -- complete over every appendEvent/appendDaemonEvent call site, not over
+//     whatever a reader happened to reach.
+//   - a whole-file exemption is the exact gap this suite's own header (and
+//     test/no-real-spawn-sweep.test.js's) already warns against -- EVENT_ALLOWLIST below is
+//     per-event, pinned to its exact membership, same as ALLOWLIST above.
+//   - the SINK, not just the throw: 9.1's own scanner (vocab-scan.js) under-reported by 7
+//     because it matched only a literal THIRD argument at a direct `appendEvent(...)` call --
+//     park-loop.js aliases the sink three times (`const journal = (event, detail) =>
+//     appendEvent(taskDir, ..., event, detail)`, twice, plus an object-literal-property form) and
+//     report-intake.js wraps `appendDaemonEvent` the same way. journalEventSpans below resolves
+//     both the direct call sites AND every `journal(...)` call reached through one of those
+//     aliases -- the exact fix E2's own row names ("resolving one level of sink aliasing").
+//
+// ---- one more indirection layer than ParkSignal has: comment-scan.js's shared scanner --------
+// `commentScan.scanForMatch` (comment-scan.js) is called by BOTH park-loop.js (unpark scan, a
+// TASK-side appendEvent alias) and report-intake.js (report-confirm scan, a DAEMON-side
+// appendDaemonEvent alias), and its own three journal(...) call sites pass `events.X || '<literal
+// default>'` -- `events` is a per-caller PARAMETER, resolved from park-loop.js's
+// UNPARK_SCAN_EVENTS and report-intake.js's CONFIRM_SCAN_EVENTS object literals (six real event
+// strings between them), with comment-scan.js's own three literal defaults reachable only if some
+// future caller omits a key -- still real strings the module can emit, so still required.
+// resolveCommentScanEvents reads all three sources directly, the same posture
+// resolveAccountPoolReasons/resolveCiCauseParkReasons already take above.
+const COMMENT_SCAN_SRC = readSource(path.join('orchestrator', 'comment-scan.js'));
+
+function extractEventsObject(source, constName) {
+  const m = new RegExp(`${constName}\\s*=\\s*\\{([\\s\\S]*?)\\n\\};`).exec(source);
+  if (!m) return null;
+  const out = {};
+  const re = /(\w+):\s*'([^']+)'/g;
+  let mm;
+  while ((mm = re.exec(m[1]))) out[mm[1]] = mm[2];
+  return out;
+}
+
+// journalEventSpans(source) -- appendEvent's 3rd argument / appendDaemonEvent's 2nd argument /
+// a bare `journal(<literal>, ...)` call through one of the aliases defined in park-loop.js or
+// report-intake.js. Same balanced-paren + top-level-comma-split technique parkSignalSpans and
+// finalizeParkSpans above use. `kind` is 'task' for appendEvent/park-loop-alias sites, 'daemon'
+// for appendDaemonEvent/report-intake-alias sites -- journal.js's own two function DECLARATIONS
+// are excluded (their "event" parameter name is not a call argument).
+function journalEventSpans(source, rel) {
+  const spans = [];
+  function balancedArgs(re, kind, argIndex) {
+    let m;
+    while ((m = re.exec(source))) {
+      const preceding = source.slice(Math.max(0, m.index - 12), m.index);
+      if (/function\s*$/.test(preceding)) continue; // journal.js's own declaration, not a call
+      const openParen = source.indexOf('(', m.index);
+      let depth = 0;
+      let close = -1;
+      for (let i = openParen; i < source.length; i++) {
+        if (source[i] === '(') depth++;
+        else if (source[i] === ')') {
+          depth--;
+          if (depth === 0) { close = i; break; }
+        }
+      }
+      if (close === -1) continue;
+      const inner = source.slice(openParen + 1, close);
+      const args = [];
+      let depth2 = 0;
+      let start = 0;
+      for (let i = 0; i < inner.length; i++) {
+        const c = inner[i];
+        if (c === '(' || c === '[' || c === '{') depth2++;
+        else if (c === ')' || c === ']' || c === '}') depth2--;
+        else if (c === ',' && depth2 === 0) { args.push(inner.slice(start, i).trim()); start = i + 1; }
+      }
+      args.push(inner.slice(start).trim());
+      // The alias DEFINITION's own forwarding call -- `const journal = (event, detail) =>
+      // appendEvent(taskDir, ..., event, detail)` -- passes the bare, unquoted identifier
+      // `event` here. That is unambiguous in this codebase (a real event is always a string
+      // literal or a template) and is never itself a second citation: the REAL literals flow
+      // through the alias's own call sites, scanned separately below. Skipped silently, not
+      // reported as unresolved -- reporting it would mean this file's OWN alias-definition lines
+      // permanently fail their own sweep, never a real gap.
+      if (args[argIndex] === 'event') continue;
+      spans.push({ index: m.index, arg: args[argIndex], kind });
+    }
+  }
+  balancedArgs(/\bappendEvent\s*\(/g, 'task', 2);
+  balancedArgs(/\bappendDaemonEvent\s*\(/g, 'daemon', 1);
+  // A bare `journal(...)` call through the alias -- restricted to the two files that actually
+  // DEFINE the alias (park-loop.js, report-intake.js). Scanning every file for the bare word
+  // "journal" followed by "(" is unsafe beyond those two: bin/spo's own
+  // "`  product journal (lock check): ...`" is prose inside a template literal, not a call --
+  // blankComments strips `//`/`/* */` comments, never string/template content, so a naive
+  // whole-corpus scan for this shape produces exactly that false positive.
+  if (rel !== path.join('orchestrator', 'park-loop.js') && rel !== path.join('orchestrator', 'report-intake.js')) {
+    return spans;
+  }
+  const journalCallRe = /\bjournal\s*\(/g;
+  let jm;
+  while ((jm = journalCallRe.exec(source))) {
+    const before = source.slice(Math.max(0, jm.index - 30), jm.index);
+    if (/=>\s*$/.test(before)) continue; // the alias definition's own arrow, not a call through it
+    if (/:\s*\(event/.test(source.slice(jm.index, jm.index + 20))) continue; // object-literal alias definition
+    const openParen = source.indexOf('(', jm.index);
+    let depth = 0;
+    let close = -1;
+    for (let i = openParen; i < source.length; i++) {
+      if (source[i] === '(') depth++;
+      else if (source[i] === ')') { depth--; if (depth === 0) { close = i; break; } }
+    }
+    if (close === -1) continue;
+    const inner = source.slice(openParen + 1, close);
+    const args = [];
+    let depth2 = 0;
+    let start = 0;
+    for (let i = 0; i < inner.length; i++) {
+      const c = inner[i];
+      if (c === '(' || c === '[' || c === '{') depth2++;
+      else if (c === ')' || c === ']' || c === '}') depth2--;
+      else if (c === ',' && depth2 === 0) { args.push(inner.slice(start, i).trim()); start = i + 1; }
+    }
+    args.push(inner.slice(start).trim());
+    // report-intake.js's own alias forwards to appendDaemonEvent -- every other file's `journal`
+    // alias (park-loop.js, and comment-scan.js's own parameter) forwards to appendEvent.
+    const kind = rel === path.join('orchestrator', 'report-intake.js') ? 'daemon' : 'task';
+    spans.push({ index: jm.index, arg: args[0], kind });
+  }
+  return spans;
+}
+
+test('every journal event literal (appendEvent/appendDaemonEvent, direct or through a journal(...) alias) is documented in doc/state-machine-spec.md or orchestrator/README.md, or named on EVENT_ALLOWLIST', () => {
+  const files = [...SCAN_DIRS.flatMap(jsFilesUnder), ...SCAN_FILES];
+  let taskSiteCount = 0;
+  let daemonSiteCount = 0;
+  const required = new Map(); // event -> { isTask, isDaemon, sites: [] }
+  const unresolvedDynamic = [];
+
+  function record(event, kind, loc) {
+    const existing = required.get(event);
+    if (existing) {
+      existing.sites.push(loc);
+      existing.isTask = existing.isTask || kind === 'task';
+      existing.isDaemon = existing.isDaemon || kind === 'daemon';
+    } else {
+      required.set(event, { isTask: kind === 'task', isDaemon: kind === 'daemon', sites: [loc] });
+    }
+  }
+
+  for (const rel of files) {
+    const abs = path.join(REPO_ROOT, rel);
+    if (!fs.existsSync(abs)) continue;
+    const source = blankComments(fs.readFileSync(abs, 'utf8'));
+    for (const span of journalEventSpans(source, rel)) {
+      if (span.kind === 'task') taskSiteCount += 1;
+      else daemonSiteCount += 1;
+      const loc = `${rel}:${lineOf(source, span.index)}`;
+      const litm = /^'((?:[^'\\]|\\.)*)'$/.exec(span.arg) || /^"((?:[^"\\]|\\.)*)"$/.exec(span.arg);
+      if (litm) {
+        record(litm[1], span.kind, loc);
+      } else {
+        unresolvedDynamic.push(`${loc}: journal event argument \`${span.arg}\` is neither a literal nor a known dynamic pass-through`);
+      }
+    }
+  }
+
+  // resolveCommentScanEvents: the events.X || 'default' indirection -- park-loop.js's
+  // UNPARK_SCAN_EVENTS (task-side) and report-intake.js's CONFIRM_SCAN_EVENTS (daemon-side) each
+  // resolve three of comment-scan.js's own three journal(...) call sites; comment-scan.js's own
+  // literal defaults are recorded too (reachable if a future caller omits a key).
+  const parkLoopSrc = readSource(path.join('orchestrator', 'park-loop.js'));
+  const reportIntakeSrc = readSource(path.join('orchestrator', 'report-intake.js'));
+  const unparkEvents = extractEventsObject(parkLoopSrc, 'UNPARK_SCAN_EVENTS');
+  const confirmEvents = extractEventsObject(reportIntakeSrc, 'CONFIRM_SCAN_EVENTS');
+  if (!unparkEvents) unresolvedDynamic.push('park-loop.js: UNPARK_SCAN_EVENTS object shape changed');
+  else for (const v of Object.values(unparkEvents)) record(v, 'task', 'park-loop.js:UNPARK_SCAN_EVENTS');
+  if (!confirmEvents) unresolvedDynamic.push('report-intake.js: CONFIRM_SCAN_EVENTS object shape changed');
+  else for (const v of Object.values(confirmEvents)) record(v, 'daemon', 'report-intake.js:CONFIRM_SCAN_EVENTS');
+  const defaultRe = /events\.(\w+)\s*\|\|\s*'([^']+)'/g;
+  let dm;
+  let defaultCount = 0;
+  while ((dm = defaultRe.exec(COMMENT_SCAN_SRC))) { record(dm[2], 'task', 'comment-scan.js:default-fallback'); defaultCount += 1; }
+  if (defaultCount === 0) unresolvedDynamic.push('comment-scan.js: no events.X || \'default\' fallback found -- shape changed');
+
+  // Floors, same reasoning as this file's own siteCount/finalizeParkSiteCount above: measured
+  // 2026-09-03, 123 `appendEvent(...)` call sites, 6 `appendDaemonEvent(...)` call sites (plus
+  // aliasing), 138 distinct event literals total. Set well below the measured figures.
+  assert.ok(taskSiteCount >= 100, `expected at least 100 task-side journal call sites (appendEvent + journal() aliases), found ${taskSiteCount} -- has the call convention changed?`);
+  assert.ok(daemonSiteCount >= 5, `expected at least 5 daemon-side journal call sites (appendDaemonEvent + journal() aliases), found ${daemonSiteCount} -- has the call convention changed?`);
+  assert.ok(required.size >= 120, `expected at least 120 distinct journal event literals, found ${required.size} -- did a resolver stop matching?`);
+
+  assert.deepEqual(
+    unresolvedDynamic,
+    [],
+    `journal event call site(s) this sweep cannot verify automatically -- extend the sweep, do not ignore:\n  ${unresolvedDynamic.join('\n  ')}`
+  );
+
+  // Sink-aliasing regression guard, named the same way FINDING 3's dynamic-family assertions
+  // above are: a mutation that narrows journalEventSpans back to direct appendEvent/
+  // appendDaemonEvent call sites only (dropping the journal(...) alias scan) would still pass a
+  // bare count floor by shrinking taskSiteCount/required together. `abandon-pr-closed` is reached
+  // ONLY through park-loop.js's `journal('abandon-pr-closed', ...)` alias call (never a direct
+  // appendEvent call) -- if the alias scan dies, this specific event vanishes from `required`.
+  assert.ok(required.has('abandon-pr-closed'), "the journal(...) alias scan did not contribute 'abandon-pr-closed' (park-loop.js's own abandon-reply reconciler) -- has alias resolution stopped running?");
+  assert.ok(required.has('unpark-scan-backoff-skip'), "resolveCommentScanEvents did not contribute 'unpark-scan-backoff-skip' -- has park-loop.js's UNPARK_SCAN_EVENTS scan stopped matching?");
+  assert.ok(required.has('report-confirm-scan-backoff-skip') || required.has('report-confirm-scan-truncated'), "resolveCommentScanEvents did not contribute a report-confirm-scan-* event -- has report-intake.js's CONFIRM_SCAN_EVENTS scan stopped matching?");
+
+  const spec = fs.readFileSync(SPEC_PATH, 'utf8');
+  const readme = fs.readFileSync(path.join(REPO_ROOT, 'orchestrator', 'README.md'), 'utf8');
+  const offenders = [];
+  for (const [event, info] of required) {
+    if (Object.prototype.hasOwnProperty.call(EVENT_ALLOWLIST, event)) continue;
+    if (!reasonDocumented(spec, event, false) && !reasonDocumented(readme, event, false)) {
+      const kind = info.isTask && info.isDaemon ? 'task+daemon' : info.isTask ? 'task' : 'daemon';
+      offenders.push(`${event} (${kind}) -- from ${info.sites.slice(0, 2).join(', ')}${info.sites.length > 2 ? `, +${info.sites.length - 2} more` : ''}`);
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'A journal event is neither documented in doc/state-machine-spec.md or orchestrator/README.md ' +
+      'nor on this file\'s EVENT_ALLOWLIST. Either document it (what produces it, what a maintainer ' +
+      `should read it as) or add a named, reasoned EVENT_ALLOWLIST entry:\n  ${offenders.join('\n  ')}`
+  );
+
+  // Ratchet-down guard: an EVENT_ALLOWLIST entry that has since BECOME documented (9.3 wrote it
+  // into the spec or README but forgot to remove the entry here) is reported too -- an allowlist
+  // that can only grow, never shrink, is the same staleness class test/doc-constant-sweep.test.js's
+  // KNOWN_FICTIONAL ratchet and this file's own ALLOWLIST ratchet already guard against, extended
+  // to catch the entry going stale in the OTHER direction (no longer needed, not never needed).
+  const staleAllowlistEntries = Object.keys(EVENT_ALLOWLIST).filter(
+    (event) => reasonDocumented(spec, event, false) || reasonDocumented(readme, event, false)
+  );
+  assert.deepEqual(
+    staleAllowlistEntries,
+    [],
+    `EVENT_ALLOWLIST entry(ies) that are now documented -- remove them from EVENT_ALLOWLIST in the ` +
+      `same change that documented them:\n  ${staleAllowlistEntries.join('\n  ')}`
+  );
+});
+
+// ---- EVENT_ALLOWLIST: 9.1's own E2 finding, now DOCUMENTED rather than exempted --------------
+//
+// Fix round on action 9.2 (2026-09-03, adversarial pass): the first cut of this file carved out
+// all 55 events 9.1's E2 finding named as undocumented into EVENT_ALLOWLIST, with three boilerplate
+// reason shapes ("undocumented ...; deferred to 9.3") that restated the finding instead of arguing
+// why any one event could stay unexplained. That was an exemption wearing the shape of remediation
+// -- the scope excuse ("doc/state-machine-spec.md is off-limits this action") never covered
+// orchestrator/README.md, which this action was already editing. All 55 are now documented in
+// orchestrator/README.md's "Journal event literals" table (read from each event's real
+// appendEvent/appendDaemonEvent/journal(...)-alias call site, not guessed from the name), so
+// EVENT_ALLOWLIST is empty. It stays here, not deleted, for the same reason
+// PHANTOM_SYMBOL_ALLOWLIST (test/doc-constant-sweep.test.js) stays here empty: a future finding
+// this sweep should NOT be immediately documented (a name about to change, a test-only literal,
+// a meaning that cannot be established from its call site) has somewhere to go as a named,
+// reasoned exception -- never a whole-file or bulk carve-out.
+const EVENT_ALLOWLIST = {};
+
+test('EVENT_ALLOWLIST holds exactly the events this action could not document -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(EVENT_ALLOWLIST).sort(),
+    [],
+    'EVENT_ALLOWLIST changed size or membership. Adding an entry here exempts a journal event from ' +
+      'ever needing to appear in doc/state-machine-spec.md or orchestrator/README.md, until removed ' +
+      '-- it needs its own named, reasoned justification (the real call site, not assumed) naming ' +
+      'WHY this one specific event cannot be documented now, not a category or a deferral. This pin ' +
+      'needs updating in the same change, by name. Removing an entry means it was documented -- ' +
+      'confirm that before deleting the pin, not the other way around.'
+  );
+});
