@@ -140,7 +140,15 @@ that fails if the suffix filter is dropped · full suite green.
 | 5.1 | **A deadline per stage.** `realRunCommand` spawns `git fetch`, `npm ci`, `npm run build:*`, `verify-gate.js` and `run.js` with no timeout and no kill. One wedged job parks every later card `gate-timeout` at two hours each. | `src/e2e/bench/worker.ts`, `worker.test.ts` |
 | 5.2 | **The heartbeat reports progress, not existence.** It rides its own `setInterval` and says nothing about the loop; carry `{currentJob, startedAt}` so a client can tell ALIVE from PROGRESSING. | `src/e2e/bench/worker.ts`, `paths.ts` |
 | 5.3 | **One staleness contract for the heartbeat.** The bench reads it by **mtime with a 20 s bound**; `console/collect.js`, reached from `bin/spo:1090-1093`, reads it by **content with a 120 s bound**. Two readers, two contracts, one file. | `console/collect.js`, `src/e2e/bench/paths.ts`, `test/` |
-| 5.4 | **The SPO-WebClient suite stops writing into the live bench.** 6938 of 7172 `gate-*` logs and 2249 of 2336 `.alive` files are test output in the production corpus. Point every test at a temporary `SPO_BENCH_DIR` — the pipeline already does exactly this (`test/helpers.js:65-80`) and is the model. Add a sweep test that fails if any test path can resolve to `~/.spo-bench`. **Note `sanctuarize.test.ts:151-156` writes there deliberately, to assert the default** — that assertion needs a different shape, not an exemption. | `src/e2e/**/*.test.ts`, `src/__tests__/`, a new sweep test |
+| 5.4 | **The SPO-WebClient suite stops writing into the live bench.** 6938 of 7172 `gate-*` logs and 2249 of 2336 `.alive` files are test output in the production corpus. Point every test at a temporary `SPO_BENCH_DIR` — the pipeline already does exactly this (`test/helpers.js:65-80`) and is the model. Add a sweep test that fails if any test path can resolve to `~/.spo-bench`. **Corrected 2026-09-03 by 9.1's verification**: the original wording here cited
+`sanctuarize.test.ts:151-156` as the deliberate writer. That file was deleted on 2026-08-29 in
+`9a03ac49`, four days before this plan was written — a dangling citation in a remediation row, in
+the plan produced by an audit about dangling citations. The live picture, measured: **15 test
+files touch the bench dir; 4 name the real `~/.spo-bench` and never set `SPO_BENCH_DIR`** —
+`src/__tests__/area-reservation.test.ts`, `src/__tests__/github-api-discipline.test.ts`,
+`src/e2e/finish.test.ts`, `src/e2e/verify-gate.test.ts`. Those four are the action. Exactly one
+file deletes the variable deliberately, to assert the default — **`src/e2e/bench/paths.test.ts`**
+— and that assertion needs a different shape, not an exemption. | `src/e2e/**/*.test.ts`, `src/__tests__/`, a new sweep test |
 | 5.5 | **World-lock: a crash must not erase what it was holding.** `acquire()` takes over a dead holder and drops its `pendingRestores` without marking `dirty`, so "a run that aborts before restore blocks every later run until a human clears it" holds only for a clean unwind — and a test pins the erasure as intended. | `src/e2e/world-lock.ts`, `world-lock.test.ts`, `doc/E2E-POLICY.md` |
 
 **Gate B5**: a stage that hangs is killed and reported, in a test · the sweep test fails when a
