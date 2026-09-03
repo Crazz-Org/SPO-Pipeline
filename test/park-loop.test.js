@@ -2095,3 +2095,162 @@ test('unparkScan: the page bound being hit is journalled distinguishably from "n
   assert.ok(journal.some((e) => e.event === 'unpark-scan-truncated'), 'must be distinguishable from the silent "nothing matched" case');
   assert.ok(!journal.some((e) => e.event === 'unparked-by-maintainer'));
 });
+
+// ---- issue #77: a failed `gh issue comment` must not strand the card ---------------------------
+//
+// finalizePark writes the terminal state.json long before postParkComment gets anywhere near
+// GitHub. Before this fix the anchor was journalled ONLY on a zero exit, so one non-zero
+// `gh issue comment` -- a rate limit, a network blip, a commandTimeoutsMs expiry, a body over
+// 65536 chars -- left the card PARKED with no anchor, and then nothing could reach it: unparkScan
+// requires an anchor, orphanScan skips it as terminal, and crash-repark journals
+// `worker-exit-after-terminal`. The maintainer's `retry` produced no reaction and no error.
+//
+// The tests below drive the real thing rather than reasoning about it.
+
+/** A parked taskDir whose park comment FAILED -- the #77 state, built the way the code builds it. */
+function parkedTaskDirCommentFailed(journalRoot, id, { issue, at }) {
+  const taskDir = path.join(journalRoot, id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', issue, title: 'x', criterion: 'y', size: 'S' }));
+  writeState(taskDir, { id, state: 'PARKED', reason: 'gate-failed' });
+  appendEvent(taskDir, 'GATE', 'parked', { reason: 'gate-failed' });
+  appendEvent(taskDir, 'PARKED', 'park-comment-failed', { exit: 1, timedOut: false });
+  appendEvent(taskDir, 'PARKED', 'park-anchor', { at });
+  return taskDir;
+}
+
+test('#77 postParkComment: a non-zero `gh issue comment` still leaves an anchor, and it is the LAST journal event', () => {
+  const taskDir = mkTmp('spo-77-anchor-');
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-77', kind: 'card', issue: 77 }));
+  const ctx = { taskDir, task: { id: 'card-77', kind: 'card', issue: 77 }, config: testConfig() };
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') return { status: 1, stdout: '', stderr: 'rate limited' };
+      return ok('');
+    },
+  };
+
+  postParkComment(ctx, deps, { reason: 'gate-failed', detail: {}, lastState: 'GATE' });
+
+  const journal = readJournal(taskDir);
+  const anchor = findParkAnchor(journal);
+  assert.ok(anchor, 'a failed comment must still leave an anchor -- without one the card is unreachable');
+  assert.equal(anchor.commentId, null);
+  assert.ok(Number.isFinite(anchor.sinceMs));
+  assert.ok(journal.some((e) => e.event === 'park-comment-failed'), 'the failure is still reported');
+  // The ordering invariant unparkScan's safety rests on -- see the finalizePark ordering test
+  // above. Writing the anchor BEFORE the gh call would satisfy #77 and break this.
+  assert.equal(journal[journal.length - 1].event, 'park-anchor');
+});
+
+test('#77 postParkComment: the anchor timestamp PREDATES the gh call, so a retry posted during it still counts', () => {
+  const taskDir = mkTmp('spo-77-stamp-');
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-77b', kind: 'card', issue: 77 }));
+  const ctx = { taskDir, task: { id: 'card-77b', kind: 'card', issue: 77 }, config: testConfig() };
+  let clock = 1_000_000;
+  const deps = {
+    now: () => clock,
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') {
+        clock += 60_000; // the call takes a minute; alertPark already fired before it
+        return { status: 1, stdout: '', stderr: 'timeout' };
+      }
+      return ok('');
+    },
+  };
+
+  postParkComment(ctx, deps, { reason: 'gate-failed', detail: {}, lastState: 'GATE' });
+
+  const anchor = findParkAnchor(readJournal(taskDir));
+  assert.equal(anchor.sinceMs, 1_000_000, 'stamped before the call, not after it');
+});
+
+test('#77 unparkScan: a "retry" on a card whose park comment FAILED re-enqueues it', async () => {
+  const queueDir = mkTmp('spo-77-queue-');
+  const journalRoot = mkTmp('spo-77-journal-');
+  const taskDir = parkedTaskDirCommentFailed(journalRoot, 'card-801', { issue: 801, at: '2026-08-29T00:00:00Z' });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([
+            { id: 95, user: { login: 'Crazz-E' }, created_at: '2026-08-28T00:00:00Z', body: 'retry -- posted BEFORE the park, must be ignored' },
+            { id: 105, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:10:00Z', body: 'retry\nthe gate flaked' },
+          ])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1, 'the retry channel is alive for a card whose park comment failed');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(queueDir, queued[0]), 'utf8')).id, 'card-801');
+  const unparked = readJournal(taskDir).find((e) => e.event === 'unparked-by-maintainer');
+  assert.equal(unparked.retryCommentId, 105);
+});
+
+test('#77 unparkScan: a "retry" posted BEFORE the park is still ignored -- the timestamp is a real boundary', async () => {
+  const queueDir = mkTmp('spo-77-old-queue-');
+  const journalRoot = mkTmp('spo-77-old-journal-');
+  parkedTaskDirCommentFailed(journalRoot, 'card-802', { issue: 802, at: '2026-08-29T00:00:00Z' });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(JSON.stringify([{ id: 95, user: { login: 'Crazz-E' }, created_at: '2026-08-28T00:00:00Z', body: 'retry -- from the PREVIOUS park cycle' }]));
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  assert.deepEqual(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')), [], 'a stale retry must not re-trigger');
+});
+
+test('#77 findParkAnchor: a later failed cycle supersedes an earlier successful one', () => {
+  const anchor = findParkAnchor([
+    { event: 'park-comment', commentId: 10 },
+    { event: 'unparked-by-maintainer' },
+    { event: 'park-comment-failed', exit: 1 },
+    { event: 'park-anchor', at: '2026-08-29T00:00:00Z' },
+  ]);
+  // Keeping commentId 10 would take a boundary from a cycle two parks ago and silently NARROW
+  // the scan window -- every comment since then would read as "already seen".
+  assert.equal(anchor.commentId, null);
+  assert.equal(anchor.sinceMs, Date.parse('2026-08-29T00:00:00Z'));
+  assert.equal(anchor.alreadyHandled, false);
+});
+
+test('#77 findParkAnchor: a later successful cycle supersedes an earlier failed one', () => {
+  const anchor = findParkAnchor([
+    { event: 'park-anchor', at: '2026-08-29T00:00:00Z' },
+    { event: 'unparked-by-maintainer' },
+    { event: 'park-comment', commentId: 20 },
+  ]);
+  assert.equal(anchor.commentId, 20);
+  assert.equal(anchor.sinceMs, null);
+});
+
+test('#77 findParkAnchor: an unparseable park-anchor stamp is no anchor at all, never "scan everything"', () => {
+  assert.equal(findParkAnchor([{ event: 'park-anchor', at: 'not-a-date' }]), null);
+  assert.equal(findParkAnchor([{ event: 'park-anchor' }]), null);
+});
+
+test('#77 findParkAnchor: alreadyHandled still works off a timestamp anchor -- idempotent across scans', () => {
+  const anchor = findParkAnchor([
+    { event: 'park-anchor', at: '2026-08-29T00:00:00Z' },
+    { event: 'unparked-by-maintainer', retryCommentId: 105 },
+  ]);
+  assert.equal(anchor.alreadyHandled, true);
+});

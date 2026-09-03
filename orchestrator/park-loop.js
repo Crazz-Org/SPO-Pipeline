@@ -205,10 +205,34 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
 
+  // Issue #77: an anchor is what makes a parked card reachable again, and until this change
+  // a non-zero `gh issue comment` left the card with none. findParkAnchor then returned null
+  // and NOTHING could reach the card -- unparkScan `continue`s without an anchor, orphanScan
+  // skips it as terminal, and the dispatcher's crash-repark journals
+  // `worker-exit-after-terminal`. A maintainer's `retry` reply produced no reaction and no
+  // error: the same silent-retry-channel shape this project has already paid for once (the
+  // `gh api -f` POST bug, CLAUDE.md). ONE non-zero exit was enough -- a rate limit, a network
+  // blip, a commandTimeoutsMs expiry, or a body over 65536 chars. No race required.
+  //
+  // STAMPED here, JOURNALLED after the call. Both halves are load-bearing and they pull in
+  // opposite directions:
+  //
+  //   stamped before -- the timestamp is the scan's "since" boundary, so it must predate the
+  //     call. alertPark has already fired by now, so a maintainer CAN reply `retry` while
+  //     this `gh` call is still in flight; a boundary taken afterwards would miss it.
+  //   journalled after -- the anchor must remain the LAST journal event this worker appends.
+  //     unparkScan has no live-worker guard: what stops it acting on a park mid-write is
+  //     precisely that it cannot act before the anchor exists, and the anchor is provably
+  //     last. Writing it first would let unparkScan re-enqueue a task whose parking worker is
+  //     still writing -- issue #43's shape. The ordering test below pins this.
+  const anchoredAt = new Date(deps.now ? deps.now() : Date.now()).toISOString();
+
   const result = runSync(deps, 'gh', ['issue', 'comment', String(issue), '--repo', ghRepo, '--body-file', commentFile], {}, ctx.config);
   const exit = normalizeExit(result);
   if (exit !== 0) {
     appendEvent(ctx.taskDir, 'PARKED', 'park-comment-failed', { exit, timedOut: result.timedOut === true });
+    // Strictly last, and after the diagnostic event above: see `anchoredAt`.
+    appendEvent(ctx.taskDir, 'PARKED', 'park-anchor', { at: anchoredAt });
     return;
   }
 
@@ -601,17 +625,45 @@ function readJournalLines(taskDir) {
     .filter(Boolean);
 }
 
-// The anchor for the CURRENT park cycle: the LAST `park-comment` event with a numeric
-// commentId, and whether an `unparked-by-maintainer`/`abandoned-by-maintainer` event already
-// follows it (in which case this cycle was already handled -- idempotent across scans, whether
-// or not the re-enqueued task has been drained back out of PARKED yet).
+// The anchor for the CURRENT park cycle, and whether an `unparked-by-maintainer` /
+// `abandoned-by-maintainer` event already follows it (in which case this cycle was already
+// handled -- idempotent across scans, whether or not the re-enqueued task has been drained
+// back out of PARKED yet).
+//
+// TWO shapes, and the weaker one is the point (issue #77):
+//
+//   `park-comment`  -- the comment landed, so its numeric commentId is the boundary. GitHub
+//                      comment ids increase monotonically, so "id > anchorId" is exactly
+//                      "posted after we commented". Preferred whenever it exists.
+//   `park-anchor`   -- journalled before the `gh` call, so it survives that call failing or
+//                      the daemon being SIGTERMed mid-call. Its timestamp is the boundary
+//                      instead: a `retry` counts if it was posted after the park.
+//
+// The LAST of either kind wins, by journal position -- so a later successful cycle's
+// commentId supersedes an earlier cycle's bare timestamp, and a park whose comment failed
+// supersedes the commentId of the cycle before it. Taking the last `park-comment` alone
+// would let a stale id from a PREVIOUS cycle act as this cycle's boundary, which silently
+// narrows the scan window rather than widening it.
 function findParkAnchor(lines) {
   let anchorIndex = -1;
   let commentId = null;
+  let sinceMs = null;
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].event === 'park-comment' && typeof lines[i].commentId === 'number') {
+    const e = lines[i];
+    if (e.event === 'park-comment' && typeof e.commentId === 'number') {
       anchorIndex = i;
-      commentId = lines[i].commentId;
+      commentId = e.commentId;
+      sinceMs = null;
+      continue;
+    }
+    if (e.event === 'park-anchor') {
+      const at = Date.parse(e.at);
+      // An unparseable stamp is no anchor at all: falling back to "scan everything" would
+      // let a `retry` from a previous cycle re-trigger this one.
+      if (!Number.isFinite(at)) continue;
+      anchorIndex = i;
+      commentId = null;
+      sinceMs = at;
     }
   }
   if (anchorIndex === -1) return null;
@@ -620,7 +672,7 @@ function findParkAnchor(lines) {
     .slice(anchorIndex + 1)
     .some((e) => e.event === 'unparked-by-maintainer' || e.event === 'abandoned-by-maintainer');
 
-  return { commentId, alreadyHandled };
+  return { commentId, sinceMs, alreadyHandled };
 }
 
 // firstLine matching itself now lives in comment-scan.js's scanForMatch -- RETRY_RE/ABANDON_RE
@@ -1115,6 +1167,7 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
       ghRepo,
       issue: task.issue,
       anchorId: anchor.commentId,
+      sinceMs: anchor.sinceMs,
       patterns: UNPARK_PATTERNS,
       scanState,
       journalRoot,
