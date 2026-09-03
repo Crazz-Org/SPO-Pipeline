@@ -1339,11 +1339,72 @@ function snapshot(ctx, state) {
 // Also deliberately NOT on the list: `gate-live-not-driven` -- a routed-but-undriven diff is a
 // property of the worker binary or a reused verdict, not of the moment; see steps/scripted.js's
 // own comment on that reason for the full argument.
+//
+// Action B3.4, round 2 (fixing a regression round 1 shipped): before this action, `DIRTY`,
+// `ENVIRONMENT`, `ABANDONED` and `INTERRUPTED` all shared ONE reason -- `gate-non-attesting`,
+// above -- and that reason retries. Round 1 split each into its own name
+// (steps/scripted.js's realGate) but reported the split as "naming correctness, not retry
+// policy" and added none of the four to this set. That is not a no-op: this Set is exactly what
+// `isTransientRetryReason` below keys on, so the split silently turned the commonest non-PASS
+// bench outcome (`gate-environment` -- 7 of 29 real completed jobs, all "git fetch failed",
+// measured 2026-09-03) from auto-retried into terminal/human-only, along with three siblings.
+// Restoring the pre-split behaviour per reason, not blanket:
+//   gate-environment      -- ADD. A failed `git fetch` is a fact about this worker's network
+//                             at this moment, not about the code; retrying asks the same bench
+//                             the same question again, exactly the class this file's own header
+//                             comment (below) already names as the transient one.
+//   gate-interrupted      -- ADD. The worker restarted mid-job (`recoverInterrupted`,
+//                             worker.ts) -- precisely what `realFinish`'s bench reinstall does
+//                             to a sibling card's in-flight gate. The FINISH design already
+//                             treats this cut job as recovering and transient-retryable; this
+//                             set must agree with that design, not silently contradict it.
+//   gate-abandoned        -- ADD. The depositing session's pid was gone before the job started
+//                             -- a fact about that moment's process table, not about the diff;
+//                             resubmitting is a fresh deposit with a live pid.
+//   gate-stale            -- ADD. Newly a park at all under this action (previously fell into
+//                             the generic exit-1 `return 'DIAGNOSE'`, spending a judge call on a
+//                             body verdict for a tree that no longer exists -- see
+//                             steps/scripted.js's own STALE comment) so there is no PRIOR retry
+//                             behaviour to preserve here, but the same "asks the same bench the
+//                             same question again" test applies: `verify-gate.js`'s own STALE
+//                             detail text says the fix is literally "resubmit", and nothing about
+//                             the code was implicated -- terminal would waste a human's attention
+//                             on a race that a second gate run most likely just clears.
+//   gate-worker-dirty-checkout -- DELIBERATELY NOT added; see its own paragraph below. This IS a
+//                             narrowing versus the pre-split `gate-non-attesting` behaviour, and
+//                             is called out as one rather than slipped in silently.
+// The exit-2/3 sub-causes this same action split out of `gate-dirty-tree`/`gate-worker-down`
+// (`gate-not-pushed`, `gate-duplicate-job`, `gate-worker-not-built`, `gate-worker-died-midjob`)
+// are NOT added either -- neither `gate-dirty-tree` nor `gate-worker-down` was ever on this set,
+// so leaving their four children off it is the status quo continuing, not a new decision.
+//
+// `gate-worker-dirty-checkout` (DIRTY): the worker's OWN shared `ref` checkout
+// (`paths.refCheckout` in SPO-WebClient, one instance for the whole bench, never a per-card
+// worktree) found dirty by `worker.ts` -- but only AFTER `prepareRef` has already run that same
+// checkout through `reset --hard` + `clean -fd` for THIS job (doc/bench-audit-2026-09-02.md's
+// D5: "atStart.hash === atEnd.hash, both taken by the worker on its own checkout, which
+// `prepareRef` has just reset --hard'ed and clean -fd'ed"). A dirty verdict reached AFTER an
+// automatic reset+clean cycle already ran is not the ordinary case reset+clean exists to fix --
+// it is what SURVIVES that cycle: git-ignored artifacts `clean -fd` does not touch, a file a
+// stray process still holds, a permission problem, or manual interference with a shared host
+// resource. A bare retry re-runs the IDENTICAL reset+clean and asks the identical question of
+// the identical checkout, with no structural reason to expect a different answer -- the same
+// "real LLM spend burned per attempt, for as long as the underlying condition stands" argument
+// `gate-non-attesting`'s own `verdictDirExists === false` carve-out already makes for a
+// misconfigured `spoBenchDir`, below. Because the checkout is SHARED, once genuinely stuck this
+// way it stays stuck for every card's gate until a human clears it by hand, not only this one's.
+// Decision: terminal, human-only -- a DELIBERATE NARROWING versus the pre-split behaviour (DIRTY
+// used to share `gate-non-attesting`'s blanket auto-retry), stated here and in
+// doc/state-machine-spec.md rather than left for a reader to infer from an absence.
 const TRANSIENT_RETRY_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
 const TRANSIENT_RETRY_REASONS = new Set([
   'claim-rate-limited',
   'gate-non-attesting',
   'gate-live-blocked',
+  'gate-environment',
+  'gate-interrupted',
+  'gate-abandoned',
+  'gate-stale',
   ...TRANSIENT_RETRY_LLM_STEPS.map((step) => `llm-transport-failed:${step}`),
 ]);
 
