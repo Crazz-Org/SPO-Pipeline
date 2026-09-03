@@ -4,14 +4,36 @@
 # dashboard-install.sh -- either install script re-creates the same symlink, so installing
 # one service also arms the restart-on-update behaviour for the other if it's present.
 #
-# Only touches units that are actually installed: `systemctl --user restart` on a unit that
-# was never enabled is a no-op error here, not a failure worth surfacing.
+# Which units get restarted, and why the test is not `is-enabled`.
+#
+# `is-enabled` answers "does this unit start at boot". That is not the question. The
+# question is "is a process running this repo's code right now, and is it now stale". A
+# systemd unit can be **active and disabled** at the same time -- started by hand, or by an
+# install script, without ever being enabled -- and `spo-pipeline-daemon.service` was
+# exactly that on 2026-09-03: `active=active enabled=disabled`. Every `git pull` printed
+# nothing about it, looked like a deploy, and left the daemon running code from before the
+# merge. It ran eight-hour-old code for a whole working day.
+#
+# So the test is `is-active OR is-enabled`:
+#   - active  -> it is running this repo's code and that code just changed. Restart it.
+#   - enabled -> it is meant to be running; `restart` starts it if it is not.
+# `list-unit-files` still gates both, so a unit that was never installed is skipped in
+# silence rather than producing an error on every pull.
 set -euo pipefail
 
 for unit in spo-pipeline-daemon.service spo-pipeline-dashboard.service; do
-  if systemctl --user list-unit-files "$unit" >/dev/null 2>&1 && \
-     systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
-    echo "== post-merge: restarting $unit (repo updated)"
-    systemctl --user restart "$unit" || echo "!! post-merge: failed to restart $unit" >&2
+  systemctl --user list-unit-files "$unit" >/dev/null 2>&1 || continue
+
+  if systemctl --user is-active "$unit" >/dev/null 2>&1; then
+    reason='running'
+  elif systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
+    reason='enabled'
+  else
+    # Installed but neither running nor enabled: nothing is executing stale code, and
+    # starting it here would deploy a service nobody asked for.
+    continue
   fi
+
+  echo "== post-merge: restarting $unit ($reason; repo updated)"
+  systemctl --user restart "$unit" || echo "!! post-merge: failed to restart $unit" >&2
 done
