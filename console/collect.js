@@ -20,6 +20,7 @@ const path = require('path');
 const accountsModule = require('../orchestrator/accounts');
 const { processAlive } = require('../orchestrator/lock');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
+const { HEARTBEAT_STALE_MS, heartbeatAgeMs: benchHeartbeatAgeMs } = require('../orchestrator/bench-heartbeat');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
@@ -374,8 +375,9 @@ function startOfWeek(now) {
   return d.getTime();
 }
 
-// Statuses for the 6 surfaces that compose "the pipeline": no network probe, no spawn --
-// lock file + heartbeat file + mtime only.
+// Statuses for the 6 surfaces that compose "the pipeline": no network probe, no spawn -- a lock
+// file, a heartbeat file read by CONTENT (see orchestrator/bench-heartbeat.js), and JSON
+// timestamps only.
 function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } = {}) {
   const services = {
     daemon: { status: 'unknown', pid: null, host: null, mode: null, startedAt: null, uptimeMs: null },
@@ -422,19 +424,17 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
     services.queue.status = q.depth === 0 ? 'ok' : q.depth < 10 ? 'busy' : 'warn';
   }
 
-  // bench worker
+  // bench worker -- staleness contract (content, HEARTBEAT_STALE_MS) lives in
+  // orchestrator/bench-heartbeat.js, pinned to SPO-WebClient's own copy by
+  // test/heartbeat-contract-pin.test.js; see that module's header for why (action B5.3).
   if (benchRoot) {
     const workerFile = path.join(benchRoot, 'worker.json');
     const heartbeatFile = path.join(benchRoot, 'heartbeat');
     const worker = readJsonSafe(workerFile, null);
-    let heartbeatMs = null;
-    try {
-      const raw = fs.readFileSync(heartbeatFile, 'utf8').trim();
-      const n = Number(raw);
-      if (Number.isFinite(n)) heartbeatMs = n;
-    } catch {
-      /* absent -- down below */
-    }
+    const age = benchHeartbeatAgeMs(heartbeatFile, now);
+    // heartbeatAt is derived from age (not a second, independent read of the file) so there is
+    // only one place that decides whether the content parsed -- benchHeartbeatAgeMs itself.
+    const heartbeatMs = age !== null ? now - age : null;
     if (!worker && heartbeatMs === null) {
       services.benchWorker.status = 'down';
     } else {
@@ -442,10 +442,9 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
       services.benchWorker.port = (worker && worker.port) || null;
       services.benchWorker.startedAt = (worker && worker.startedAt) || null;
       services.benchWorker.heartbeatAt = heartbeatMs !== null ? new Date(heartbeatMs).toISOString() : null;
-      const age = heartbeatMs !== null ? now - heartbeatMs : null;
       services.benchWorker.heartbeatAgeMs = age;
       if (age === null) services.benchWorker.status = 'unknown';
-      else services.benchWorker.status = age < 120000 ? 'up' : 'stale';
+      else services.benchWorker.status = age < HEARTBEAT_STALE_MS ? 'up' : 'stale';
     }
   }
 
