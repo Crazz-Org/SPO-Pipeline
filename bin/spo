@@ -405,7 +405,7 @@ function formatRemaining(ms) {
 // a `notBefore` field -- an ordinary freshly-pulled task never has one). Read from the QUEUE
 // ENTRY itself, not the journal's own `transient-retry` event, because the queue entry is what
 // actually governs when the daemon will pick this card back up (state-machine.js's
-// isEligibleNow reads `notBefore` off the task, not off the journal) -- the two carry the same
+// isQueueEntryEligibleNow reads `notBefore` off the task, not off the journal) -- the two carry the same
 // numbers today, but the queue entry is the one that is actually true if they ever drift.
 function collectBackoffEntries(queueDir) {
   const map = new Map();
@@ -712,7 +712,7 @@ function cmdStatus(opts) {
       backoff++;
       const attempt = backoffEntry.transientRetries === null ? '?' : backoffEntry.transientRetries;
       // A `notBefore` already in the PAST is not a backoff any more -- the entry is eligible and
-      // is simply waiting for the next drain (state-machine.js's isEligibleNow would take it
+      // is simply waiting for the next drain (state-machine.js's isQueueEntryEligibleNow would take it
       // now). Saying BACKOFF there would be wrong in the direction that matters: with the daemon
       // stopped, a queue full of long-past `notBefore` entries would read as "all backing off,
       // nothing to see" instead of "nothing is draining this queue".
@@ -1872,7 +1872,7 @@ function main() {
   process.exitCode = 1;
 }
 
-// cmdAsk/cmdPull are async (they await orchestrator/intake.js's LLM/spawn calls); every other
+// cmdAsk/cmdPull are async (they await the LLM/spawn calls orchestrator/intake.js makes); every other
 // command is synchronous and main() just returns undefined for them. Awaiting unconditionally
 // here would be a no-op for the sync commands (Promise.resolve(undefined) still resolves this
 // tick) but it is skipped anyway so a thrown synchronous error (e.g. `spo task` with no
