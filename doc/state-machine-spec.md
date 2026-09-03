@@ -302,7 +302,12 @@ separate repos with no shared runtime.
   spawn decision. A clamp to zero healthy accounts is journalled
   (`dispatcher-idle-no-healthy-accounts`) and the recovery edge journalled the same way
   (`dispatcher-healthy-accounts-returned`). Parallelism scales implementation capacity; the gate
-  stays serialized (one live world) — adding an account does not add gate throughput.
+  stays serialized — adding a *Claude* account does not add gate throughput. *(Corrected
+  2026-09-03: this previously read "(one live world)", which gave the reason as a property of
+  the world. It is not. `planitia` is an MMO world built for concurrent players, and the real
+  limit is one active session per **SPO** account — so the bench's single-flight lock is its own
+  policy, and more SPO test accounts could add gate throughput. See `doc/environments.md`,
+  "What the test accounts can and cannot do".)*
 - **Per-step account leases** (chantier 6 action 6.2, `orchestrator/account-lease.js`) stop two
   concurrent callers — a worker's `callLlmStep` and the scanner process's
   `callIntakeStepWithRotation` — from being handed the *same* account by `accounts.pick()`'s

@@ -26,8 +26,10 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
 - **Latency**: 77.3h of the 85.5h wall-clock corpus = **waiting for a human reply after a
   park**. Active time is LLM-dominated (IMPLEMENT 3.0h, PLAN 1.6h). GATE = ~2.5 min/run
   (0.68h total): **the bench is NOT the current bottleneck** — and it has its own queue
-  (`~/.spo-bench/spool` → `running`), so "one live world" serialization is already enforced
-  outside the pipeline.
+  (`~/.spo-bench/spool` → `running`), so its serialization is already enforced outside the
+  pipeline. *(Corrected 2026-09-03: this previously called it "one live world" serialization,
+  attributing it to the world. `planitia` is an MMO world built for concurrent players; the
+  serialization is the bench's own single-flight policy. See `doc/environments.md`.)*
 - **Test truthfulness**: the `node --test` suite is 100% hermetic (no real spawn anywhere) —
   4 production bugs sailed through it green in 48h (E2BIG #452, deadline-kill #449, missing
   placeholder #443, head=base #247). Real VALIDATE verdicts did drive transitions, but were
