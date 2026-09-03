@@ -224,6 +224,15 @@ async function handleIntake(ctx) {
 }
 
 async function handleWorktree(ctx) {
+  // action B3.3: this fixture read is checked BEFORE isRealMode(ctx) is even consulted below,
+  // and it can only ever be true off task.shadow.nightlyMainRed -- orchestrator/intake.js's
+  // makeTask (the only real-card producer) never writes a `shadow` key, so for a real card this
+  // is always false and `main-red-refuse-worktree` cannot fire in real mode. That is deliberate,
+  // not a gap: it is the shadow-mode-only sibling of realWorktree's OWN real check further down
+  // this file's steps/scripted.js (guardNightlyRed's classifyNightly, reading
+  // <spoBenchDir>/nightly/latest.json), which throws ParkSignal('nightly-main-red', ...) on a
+  // genuine red main and IS wired to the real signal -- see doc/state-machine-spec.md's WORKTREE
+  // row and test/gate-legs-reachability.test.js for both legs firing, each in the one mode it can.
   if (ctx.fixture('nightlyMainRed', false)) {
     throw new ParkSignal('main-red-refuse-worktree', {});
   }
