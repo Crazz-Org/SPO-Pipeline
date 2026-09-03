@@ -300,7 +300,85 @@ function splitLines(text) {
     .filter(Boolean);
 }
 
-// ---- shared: "is origin/main itself red right now" guard (action 4.2) ---------------------
+// ---- shared: nightly-verdict semantics (action B3.2) ---------------------------------------
+//
+// One classification, three states, read by every real-mode consumer of
+// `<spoBenchDir>/nightly/latest.json` in this file (realWorktree's own nightly-main-red check
+// and guardNightlyRed below, shared by CI_CHECKS' and GATE's main-moved paths) -- mirrored,
+// case for case, by SPO-WebClient's `scripts/nightly-check.sh` (the human-facing
+// `npm run bench:nightly` probe over the SAME file, from the other repo). The two cannot share
+// one implementation across the repo boundary (bash vs. Node, two separate repos, no shared
+// runtime, no package either would take a cross-repo dependency on) -- kept in sync by hand,
+// each side's header pointing at the other's, rather than by import. Before this action, this
+// file itself had already drifted from ONE implementation into an inline duplicate a second
+// time (realWorktree's own read-compare-throw next to this function, below) -- exactly the
+// class of copy this comment used to warn about while itself being a second copy. Both real-mode
+// call sites now go through classifyNightly.
+//
+// - 'green'   -- a positive attestation that `main` AT THIS EXACT SHA passed: verdict PASS, a
+//                sha recorded, and it equals the sha being asked about.
+// - 'red'     -- a positive attestation that `main` AT THIS EXACT SHA failed: verdict FAIL, a
+//                sha recorded, and it equals the sha being asked about. This is the only state
+//                a merge-onto-main decision refuses over.
+// - 'unknown' -- everything else: no file, unreadable/malformed JSON, no verdict field, an
+//                unrecognised verdict, a verdict that by design attests nothing about main
+//                (worker.ts's own NON_ATTESTING -- DIRTY/ENVIRONMENT/ABANDONED -- plus
+//                INTERRUPTED/BLOCKED/STALE/LEASED, none of which NON_ATTESTING covers), or a
+//                PASS/FAIL recorded for a DIFFERENT sha than the one being asked about. A sha
+//                mismatch is the routine case, not corruption -- it means "unproven for the sha
+//                in question", never "broken" and never "clean". This is NOT because nightly runs
+//                at most once a day (NIGHTLY_MIN_GAP_MS, nightly.ts, governs only the periodic
+//                window path): nightlyDue also re-fires on a main-moved event, rate-limited at
+//                just NIGHTLY_MOVE_RATE_LIMIT_MS = 15 minutes (nightly.ts), so the nightly runs
+//                several times a day in practice -- five drives on 2026-09-02 alone. A mismatch
+//                is routine because proving a *freshly-arrived* tip still takes time: measured
+//                over that day, two of five origin/main tips were superseded before any nightly
+//                ever proved them, and the fastest proof took 7 minutes. Never silently folded into
+//                'green' (the old bug this action fixes) or into 'red' (the inversion the plan
+//                explicitly warns against) -- see each caller below for what 'unknown' costs it.
+const NIGHTLY_NON_ATTESTING_VERDICTS = new Set([
+  'ENVIRONMENT',
+  'INTERRUPTED',
+  'BLOCKED',
+  'DIRTY',
+  'ABANDONED',
+  'STALE',
+  'LEASED',
+]);
+
+function classifyNightly(nightly, targetSha) {
+  if (!nightly || typeof nightly !== 'object') {
+    return { status: 'unknown', reason: 'no nightly result on file' };
+  }
+  const verdict = nightly.verdict;
+  if (!verdict) {
+    return { status: 'unknown', reason: 'nightly result carries no verdict field' };
+  }
+  if (NIGHTLY_NON_ATTESTING_VERDICTS.has(verdict)) {
+    return { status: 'unknown', reason: `nightly verdict ${verdict} proves nothing about main` };
+  }
+  if (verdict !== 'PASS' && verdict !== 'FAIL') {
+    return { status: 'unknown', reason: `unrecognised nightly verdict ${verdict}` };
+  }
+  // `nightly.sha` is read from a file another repo writes -- never assume it is a string just
+  // because it is truthy (a number, an object, `true`, ... are all valid JSON and all crash
+  // `.slice`). A non-string sha can never equal targetSha anyway, so it is unknown either way;
+  // the only change here is not throwing on the way to that answer.
+  const shaIsString = typeof nightly.sha === 'string' && nightly.sha.length > 0;
+  if (!shaIsString || nightly.sha !== targetSha) {
+    const got = shaIsString ? nightly.sha.slice(0, 8) : '(no sha)';
+    const want = targetSha ? targetSha.slice(0, 8) : '(none)';
+    return {
+      status: 'unknown',
+      reason: `nightly ${verdict} recorded for ${got}, not the sha in question (${want})`,
+    };
+  }
+  return verdict === 'PASS'
+    ? { status: 'green', reason: 'nightly PASS at this exact sha' }
+    : { status: 'red', reason: 'nightly FAIL at this exact sha' };
+}
+
+// "Is origin/main itself red right now" guard (action 4.2, semantics fixed by action B3.2).
 //
 // Both CI_CHECKS' main-moved path and GATE's own main-moved path (GATE section below) merge
 // `origin/main` into the branch when it has moved during the task -- and both need the identical
@@ -312,10 +390,31 @@ function splitLines(text) {
 // header comment), and copying the three lines a second time is exactly the kind of drift
 // CLAUDE.md's own `gh api -f` story warns about: one wrong copy can silently outlive a fixed one
 // for months. Factored out so both call sites share one definition of "red".
-function guardNightlyRed(config, originMainSha) {
+//
+// action B3.2: only 'red' blocks -- unchanged from before, and deliberately so. 'unknown' does
+// NOT block, and this is called from the main-moved path specifically -- CI_CHECKS' and GATE's
+// own re-merge, which runs seconds after `origin/main` is observed to have moved during the task.
+// By construction it is asking about a sha that has JUST appeared, and proving a fresh tip takes
+// real time (see classifyNightly's own header comment for why -- it is the 15-minute main-moved
+// rate limit, not a once-daily cadence). Measured directly against the 2026-09-02 corpus: of the
+// five origin/main tips that day, this guard would have classified 'unknown' for all five (two
+// were superseded before ever being nightly-proven; the fastest proof took 7 minutes) -- so
+// treating 'unknown' as a merge refusal here would park essentially every main-moved merge on
+// timing, not on any evidence anything is wrong. That mirrors an existing
+// precedent in this same file: GATE's own unreadable verdict is journalled
+// (`gate-verdict-unreadable`) and treated as "proceed", never parked, because "a failed
+// diagnostic must not become the thing that parks the card" (see realGate below). What action
+// B3.2 changes is that 'unknown' is no longer silently indistinguishable from 'green' the way it
+// used to be (a stale FAIL used to fall through this function's old FAIL-and-sha-match check
+// exactly like a genuine PASS did) -- it is now classified, and journalled, as what it is.
+function guardNightlyRed(ctx, stepName, config, originMainSha) {
   const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
-  if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+  const { status, reason } = classifyNightly(nightly, originMainSha);
+  if (status === 'red') {
     throw new ParkSignal('main-red-no-merge', {});
+  }
+  if (status === 'unknown') {
+    appendEvent(ctx.taskDir, stepName, 'nightly-unknown', { sha: originMainSha, reason });
   }
 }
 
@@ -1152,9 +1251,22 @@ async function realWorktree(ctx, deps = {}) {
     appendEvent(ctx.taskDir, 'WORKTREE', 'base-main', { sha: originMainSha });
     ctx.task.baseMainSha = originMainSha;
 
+    // action B3.2: routed through the same classifyNightly this file's guardNightlyRed uses --
+    // this used to be its own second copy of the FAIL-and-sha-match predicate (the exact kind of
+    // drift guardNightlyRed's own header warns about), and it silently treated every other
+    // verdict, including INTERRUPTED, the same as a clean PASS. Only 'red' still parks; 'unknown'
+    // is now journalled rather than falling through unlabelled -- see guardNightlyRed's header
+    // for why 'unknown' does not also park here.
     const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
-    if (nightly && nightly.verdict === 'FAIL' && nightly.sha === originMainSha) {
+    const nightlyClassification = classifyNightly(nightly, originMainSha);
+    if (nightlyClassification.status === 'red') {
       throw new ParkSignal('nightly-main-red', { sha: originMainSha });
+    }
+    if (nightlyClassification.status === 'unknown') {
+      appendEvent(ctx.taskDir, 'WORKTREE', 'nightly-unknown', {
+        sha: originMainSha,
+        reason: nightlyClassification.reason,
+      });
     }
 
     sweepWorktreeLeftovers(ctx, deps, { productRepo, worktreePath, branch });
@@ -1750,7 +1862,7 @@ async function realGate(ctx, deps = {}) {
       // costs one CHECK/GATE cycle, where a false park costs a maintainer.
       const originMainRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
       if (originMainRes.exit === 0) {
-        guardNightlyRed(config, originMainRes.stdout.trim());
+        guardNightlyRed(ctx, 'GATE', config, originMainRes.stdout.trim());
       } else {
         appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-rev-parse-failed', { exit: originMainRes.exit });
       }
@@ -2035,7 +2147,7 @@ async function realCiChecks(ctx, deps = {}) {
   if (!moved) return 'VALIDATE';
 
   const originMainSha = await gitRevParse(ctx, deps, worktreePath, 'origin/main');
-  guardNightlyRed(config, originMainSha); // action 4.2: shared with GATE's own main-moved path
+  guardNightlyRed(ctx, 'CI_CHECKS', config, originMainSha); // action 4.2: shared with GATE's own main-moved path
   // Action 6.5: same configurable-budget comparison GATE's own main-moved path uses above --
   // see this function's shared counter with realGate (action 4.2) and config.js's
   // mainMovedRegateBudget comment.
@@ -2588,4 +2700,10 @@ module.exports = {
   // read the SAME queue-depth logic rather than a second copy that can drift -- see
   // benchQueueDepth's own header.
   benchQueueDepth,
+  // action B3.2: exported so test/nightly-verdict-semantics.test.js can pin the classification
+  // table directly, one named assertion per verdict value, without spinning up a full
+  // realWorktree/realCiChecks/realGate harness for every case -- the integration tests in that
+  // same file still exercise the real call sites for the properties a unit test cannot see
+  // (which park reason fires, that the 'unknown' journal event actually lands, ordering).
+  classifyNightly,
 };

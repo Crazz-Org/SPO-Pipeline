@@ -189,6 +189,46 @@ gives the product worktree to PLAN and IMPLEMENT only, while DIAGNOSE and both V
 from this repo's root *specifically to avoid* that tree, whose preamble was measured at ~40k input
 tokens. Plus the step prompt from `prompts/`.
 
+### Nightly verdict semantics (action B3.2)
+
+Every real-mode reader of `<spoBenchDir>/nightly/latest.json` inside `orchestrator/steps/
+scripted.js` (realWorktree's own check, and `guardNightlyRed`, shared by realCiChecks' and
+realGate's main-moved paths) goes through one function, `classifyNightly(nightly, targetSha)`,
+returning exactly one of three states -- never silently folding one into another:
+
+- **`green`** -- verdict `PASS`, a `sha` recorded, and it equals the sha in question. The only
+  state that means "proven".
+- **`red`** -- verdict `FAIL`, a `sha` recorded, and it equals the sha in question. The only state
+  a merge-onto-main decision refuses over (`main-red-no-merge` at CI_CHECKS'/GATE's shared
+  main-moved guard, `nightly-main-red` at WORKTREE).
+- **`unknown`** -- everything else: no file, unreadable/malformed JSON, no `verdict` field, an
+  unrecognised verdict, a verdict that by design attests nothing about `main` (worker.ts's
+  `ENVIRONMENT`/`INTERRUPTED`/`BLOCKED`/`DIRTY`/`ABANDONED`/`STALE`/`LEASED`), or a PASS/FAIL
+  recorded for a *different* sha than the one in question (a sha mismatch is the routine case,
+  not corruption -- not because nightly runs at most once a day: `nightlyDue` also re-fires on a
+  main-moved event, rate-limited at just `NIGHTLY_MOVE_RATE_LIMIT_MS` = 15 minutes, so the nightly
+  runs several times a day in practice, five drives on 2026-09-02 alone; a mismatch is routine
+  because proving a *freshly-arrived* tip still takes time). `unknown` does **not** park -- measured
+  against the 2026-09-02 corpus, of the five `origin/main` tips that day this guard would have
+  classified `unknown` for all five (two were superseded before ever being nightly-proven; the
+  fastest proof took 7 minutes), so treating `unknown` as a merge refusal here would park
+  essentially every main-moved merge on timing, not on any real signal -- which is the same
+  principle GATE's own `gate-verdict-unreadable` path already applies ("a failed diagnostic must
+  not become the thing that parks the card") -- but it
+  is never silently equivalent to `green` either: every real-mode call site journals a
+  `nightly-unknown` event (`{sha, reason}`) at its own state (`WORKTREE` / `CI_CHECKS` / `GATE`)
+  whenever the classification comes back `unknown`, so an INTERRUPTED or stale nightly always
+  leaves an explicit, distinguishable trace instead of reading as proof of anything.
+
+Before this action, `INTERRUPTED` -- written by `worker.ts`'s `recoverInterrupted` precisely so a
+worker death does not read as a clean run -- and a `FAIL` recorded for a sha `main` had since
+moved past both fell through the same "not red" branch a genuine `PASS` did, in this file, and
+`scripts/nightly-check.sh` (SPO-WebClient, the human-facing `npm run bench:nightly` probe over
+the same file) printed the literal text "MAIN: GREEN" for both. That script now applies the
+identical table (0/1/2 exit codes for green/red/unknown; see its own header) -- kept in sync by
+hand across the repo boundary, not by a shared import, since the two are bash and Node in two
+separate repos with no shared runtime.
+
 ## Account pool
 
 - **One place holds account information** (maintainer decision, 2026-08-29): the pool
