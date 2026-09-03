@@ -243,7 +243,7 @@ function readLiveWorkerIds(journalRoot) {
 // parking when the bounded bench-idle wait (waitForBenchIdle) times out with the bench still
 // busy -- a card whose PR has already merged must not sit terminally parked over a shared
 // resource's ordinary use (a human's routine bench lease can run up to 120 minutes,
-// worker.ts:110's own MAX_LEASE_MINUTES, dwarfing the 15-minute wait) -- so FINISH completes
+// worker.ts:111's own MAX_LEASE_MINUTES, dwarfing the 15-minute wait) -- so FINISH completes
 // normally (board move, comment, worktree remove, DONE) and the debt is recorded here instead.
 // steps/scripted.js's realWorktree (payBenchReinstallDebtIfOwed) reads/clears it the NEXT time
 // any card reaches WORKTREE and finds the bench idle -- round 4: paid from inside a worker's own

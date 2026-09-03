@@ -901,7 +901,12 @@ const PRODUCT_REPO = process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SP
 // constant is scanner-local on purpose; see the header above.
 const DEPLOY_REPO = process.env.SPO_DEPLOY_REPO || path.join(os.homedir(), 'SPO-Deploy');
 
-const CITATION_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json)):(\d+)(?:-(\d+))?/g;
+// `bin/spo` is an explicit alternative, not a generalized "extensionless path" allowance: it is
+// the one extensionless executable this corpus cites by line (action 9.3 found real citations to
+// it -- doc/state-machine-spec.md:448, and two dated-record sites -- invisible to the plain
+// `\.ext` shape below, meaning `bin/spo:1090-1093`'s drift to :1137 (see part 2.5) could not even
+// be SEEN, let alone bounds- or anchor-checked, before this widening).
+const CITATION_RE = /((?:bin\/spo)|(?:[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))):(\d+)(?:-(\d+))?/g;
 const POSSESSIVE_LINE_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))'s(?:[^()\n]{0,60})?\(line (\d+)\)/g;
 const CHAIN_RE = /`:(\d+)(?:-(\d+))?`|(?<=\bat ):(\d+)(?:-(\d+))?\b/g;
 const PROXIMITY_CHARS = 150;
@@ -1165,22 +1170,28 @@ function extractCitations(text) {
   let lastFile = null;
   let lastFileEnd = -1;
   for (const mm of filtered) {
+    // idx/end (the match's own character span) are carried through for part 2.5's anchor check
+    // below, which needs to know WHERE in the citing text a citation sits in order to scan its
+    // surrounding prose -- part 2 itself never reads these two fields.
     if (mm.kind === 'chain') {
       if (!lastFile || mm.idx - lastFileEnd > PROXIMITY_CHARS) {
-        out.push({ raw: `(unanchored) :${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: null, start: mm.start, stop: mm.stop, unanchored: true });
+        out.push({ raw: `(unanchored) :${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: null, start: mm.start, stop: mm.stop, unanchored: true, idx: mm.idx, end: mm.end });
       } else {
-        out.push({ raw: `${lastFile}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: lastFile, start: mm.start, stop: mm.stop, unanchored: false });
+        out.push({ raw: `${lastFile}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: lastFile, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
       }
     } else {
       lastFile = mm.file;
       lastFileEnd = mm.end;
-      out.push({ raw: `${mm.file}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: mm.file, start: mm.start, stop: mm.stop, unanchored: false });
+      out.push({ raw: `${mm.file}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: mm.file, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
     }
   }
   return out;
 }
 
-// Pinned 2026-09-03: the exact sorted set of `${file} :: ${citation}` this corpus holds, widened
+// Pinned 2026-09-03, re-measured for action 9.3 (adds 3 `bin/spo:N` sites CITATION_RE could not
+// see before, and 13 line-number corrections part 2.5's anchor check below found and fixed in
+// passing -- see that section's header for the full list, including the two real-drift cases
+// that motivated it): the exact sorted set of `${file} :: ${citation}` this corpus holds, widened
 // regex + all 65 files + line-unwrap + chain resolution. Not a floor -- a citation added anywhere
 // in the corpus (a real one, or a new narrative aside shaped like one) must be added HERE, by
 // name, in the same change, the same way PINS's name list above works. See the test below for
@@ -1189,6 +1200,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1137",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1219,6 +1231,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1137",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -1230,40 +1243,41 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
-  "doc/board-audit.md :: config.js:711",
-  "doc/board-audit.md :: orchestrator/steps/scripted.js:937",
+  "doc/board-audit.md :: config.js:764",
+  "doc/board-audit.md :: orchestrator/steps/scripted.js:1295",
   "doc/board-audit.md :: report-intake.js:29",
+  "doc/state-machine-spec.md :: bin/spo:1102",
   "doc/state-machine-spec.md :: dispatcher.js:485-499",
   "doc/state-machine-spec.md :: intake.js:747-749",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
-  "orchestrator/README.md :: config.js:615",
+  "orchestrator/README.md :: config.js:658",
   "orchestrator/README.md :: dispatcher.js:485-499",
-  "orchestrator/README.md :: doc/state-machine-spec.md:98",
+  "orchestrator/README.md :: doc/state-machine-spec.md:140",
   "orchestrator/README.md :: intake.js:747-749",
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:217",
-  "orchestrator/bench-queue-wait.js :: worker.ts:108",
-  "orchestrator/bench-queue-wait.js :: worker.ts:689",
-  "orchestrator/config.js :: worker.ts:892",
-  "orchestrator/invariants.js :: doc/state-machine-spec.md:49",
+  "orchestrator/bench-queue-wait.js :: worker.ts:109",
+  "orchestrator/bench-queue-wait.js :: worker.ts:922",
+  "orchestrator/config.js :: worker.ts:1169",
+  "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
-  "orchestrator/journal.js :: worker.ts:110",
-  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:186",
-  "orchestrator/park-loop.js :: doc/remediation-progress.md:647",
+  "orchestrator/journal.js :: worker.ts:111",
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:649",
   "orchestrator/park-loop.js :: intake.js:747-749",
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/steps/llm.js :: intake.js:747-749",
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
-  "orchestrator/steps/scripted.js :: worker.ts:109-110",
-  "orchestrator/steps/scripted.js :: worker.ts:892",
+  "orchestrator/steps/scripted.js :: worker.ts:110-111",
+  "orchestrator/steps/scripted.js :: worker.ts:1169",
   "prompts/README.md :: plan.md:103",
-  "prompts/README.md :: step-contracts.js:108",
+  "prompts/README.md :: step-contracts.js:99",
 ];
 
 test('every file:line citation in the 65-file corpus resolves, or is on the named allowlist', () => {
@@ -1463,6 +1477,548 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
   assert.equal(resolveIn(bogusRoot, 'anything.ts'), null);
   if (savedEnv === undefined) delete process.env.SPO_PRODUCT_REPO;
   else process.env.SPO_PRODUCT_REPO = savedEnv;
+});
+
+// ---- part 2.5: citation ANCHOR check (E18 residual, action 9.3) -------------------------------
+//
+// Part 2 above only ever asked "does this file have this many lines" -- `c.stop > lineCount`.
+// It never asked whether line N *says* what the citation claims. That is invisible-by-design to
+// a bounds check: a citation can drift by any number of lines, in any direction, through any
+// unrelated edit, and stay "resolved" forever as long as the file is still long enough. Two
+// confirmed cases, both silently passed by part 2 the whole time it ran:
+//
+//   - `run.ts:64` -- SPO-WebClient PR #646 deleted a call above it, so the `status: 'BLOCKED'`
+//     assignment this corpus's five citations mean moved to line 63. Fixed here (both pipeline
+//     sites now read `:63`) after this check caught it -- see the mutation-proof canary below,
+//     which reverts the fix in memory and proves the check reds on the original bug.
+//   - `bin/spo:1090-1093` -- drifted to :1137 through unrelated edits over the life of the file.
+//     CITATION_RE could not even SEE this one before this action (`bin/spo` has no extension);
+//     widening it (see that constant, above) is what let this check find it at all. Fixed here
+//     (both dated-record sites now read `:1137`) -- also proven via mutation-proof canary below.
+//
+// Widening the resolver (E1, the fix that made part 2 read the real product tree instead of a
+// stale nested worktree) plus THIS check together found nine more real, live drifts while this
+// action was measured against the pinned corpus -- none hypothetical, all confirmed by reading
+// the current target line and fixed in passing, the same "unambiguous fix, per this action's own
+// brief" posture E5/E6/E12 already used in part 1.8/1.75/1.9: `config.js:615` (should be `:658`,
+// `productRepo`), `doc/state-machine-spec.md:98`/`:49` (two citations, both should be `:140`, the
+// CHECK row's own "invariant substring check" promise), `worker.ts:689`'s chain continuation
+// (should be `:922`, `purgeDone`'s real call site), `worker.ts:892` (should be `:1169`, the real
+// `SIGTERM` handler -- cited twice), `worker.ts:108`/`:110`/`:109-110` (each one line short of
+// the real `DONE_RETENTION_MS`/`MAX_LEASE_MINUTES`/`DEFAULT_LEASE_MINUTES` declarations),
+// `doc/remediation-plan-2026-08.md:186` and `doc/remediation-progress.md:647` (both two lines
+// short of the real "DIAGNOSE" row/paragraph they cite), `step-contracts.js:108` (should be
+// `:99`, the comment block that actually states the IMPLEMENT/VALIDATE-not-PLAN escalation rule),
+// and `doc/board-audit.md`'s own two: `orchestrator/steps/scripted.js:937` (should be `:1295`,
+// the real `npm run board:take` spawn site) and `config.js:711` (should be `:764`, the real
+// `reportIntakeColumn` default).
+//
+// ---- the rule -----------------------------------------------------------------------------------
+//
+// For a citation `<file>:<line>`, extract CANDIDATE IDENTIFIERS from the same prose (a window of
+// `ANCHOR_WIN` characters around the citation in the CITING text, clipped at the nearest
+// NEIGHBOURING citation that names a DIFFERENT file -- so a dense paragraph citing three files in
+// three sentences never lets file A's candidates leak into file B's citation; a neighbour citing
+// the SAME file is not a clip point, since a chain continuation like "worker.ts:108, called at
+// :922" is one fact about one file, not two). Candidates are ranked by character distance from
+// the citation match in the SOURCE text (nearest-in-the-sentence first) and the nearest TWO are
+// checked (`ANCHOR_TOPK`) against the RESOLVED file: does the candidate appear within the
+// candidate's own tolerance of the cited line range?
+//
+// That tolerance is PER CANDIDATE KIND, not one global N, and this is the measured finding that
+// makes the rule work at all:
+//
+//   - 'const' (CONST_CASE, e.g. `BLOCKED`, `SIGTERM`, `DONE_RETENTION_MS`) and 'file' (a
+//     cross-file basename mention, below) claim to be AT the cited line -- tolerance 0, the EXACT
+//     cited range only.
+//   - 'camel' / 'snake' (`runLive`, `api_error_status`) claim to be a DECLARATION near the cited
+//     line (a multi-line signature, a leading comment) -- tolerance `ANCHOR_LOOSE_N` (5) lines.
+//
+// This distinction is what catches `run.ts:64` at all. `runLive` (the enclosing function,
+// declared 12-13 lines from either 63 or 64) is the nearest-ranked candidate in the SOURCE text
+// but is too far from EITHER line to discriminate them under any reasonable N -- a single global
+// N that is loose enough to accept `runLive` near a correct citation is also loose enough to
+// accept it near the wrong one, one line off. `BLOCKED` (the second-ranked candidate, a literal
+// status value) sits EXACTLY on line 63 -- close enough to :64 that a loose N would wrongly pass
+// the bug too, but an EXACT match against :63 (right) and a miss against :64 (wrong) tells them
+// apart. Measured, not assumed: a synthetic revert-to-:64 test below proves this discriminates in
+// both directions on the real file.
+//
+// A cross-file "'file' mention" candidate exists for exactly one shape this corpus needed: prose
+// that names a DIFFERENT file as what the cited line reaches into ("`console/collect.js`, reached
+// from `bin/spo:N`") rather than naming a symbol. It is matched by SUBSTRING (not a `\b`-bounded
+// identifier match), since the real call site is typically a camelCase name DERIVED from the
+// mentioned file's stem (`collect.js` -> `collectAll`), not the stem verbatim -- and it is used
+// ONLY as a fallback, when no ordinary identifier candidate exists nearby at all: letting it
+// compete on equal footing with real identifiers let an UNRELATED file mentioned in passing
+// (`park-loop.js`'s own comment mentions `state-machine.js` while citing a completely different
+// fact in `doc/remediation-plan-2026-08.md`) outrank the real, if more distant, identifier -- a
+// measured false positive this posture removes.
+//
+// ---- what this check still cannot see, stated plainly (the chantier's own recurring lesson) ----
+//
+//   1. A drift that lands EXACTLY on a still-plausible neighbouring line for a 'camel'/'snake'
+//      candidate (within `ANCHOR_LOOSE_N`) is invisible. The rule only distinguishes "near" from
+//      "far", never "this specific line" from "the line next to it", for a declaration-shaped
+//      candidate -- exactly the discrimination 'const'/'file' candidates get for free from their
+//      zero-tolerance rule. A function whose citation drifts by 2-3 lines because of an unrelated
+//      edit inside its own body, where no CONST_CASE/snake_case value happens to sit on the exact
+//      correct line either, would pass uncaught.
+//   2. Only ONE class of "no identifier named" citation is handled (the cross-file mention). A
+//      citation whose true subject is a QUOTED STRING that is not CONST_CASE-shaped, a numeric
+//      literal, or a purely structural/prose description (E1's "capability-question variant", a
+//      real citation this action leaves on the allowlist below for exactly this reason) has no
+//      candidate at all and is reported UNANCHORABLE -- correctly not failed, but also not
+//      verified. It passes on trust, same as before this action.
+//   3. Two candidates ranked by SOURCE-text proximity can both be wrong for the SAME reason a
+//      human skim-reads past this bug class: a paragraph that discusses TWO related functions or
+//      files close together can rank the wrong one first. The clip-at-neighbouring-citation rule
+//      closes the worst version of this (a citation's own candidates leaking from an ADJACENT
+//      citation's sentence), but two candidates for the SAME citation can still be mis-ordered
+//      within one un-clipped span -- `account-lease.js:156`, `dispatcher.js:485-499`, and
+//      `verify-gate.js:308` on CITATION_ANCHOR_ALLOWLIST below are exactly this: a real, nearby
+//      identifier that turned out to belong to a different clause than the one being cited, not a
+//      wrong citation. Every one was read by hand and reasoned about below, not assumed.
+//   4. Excludes `doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` (see
+//      ANCHOR_EXCLUDED_FILES below) -- their own citations are still bounds/dangling-checked by
+//      part 2, unchanged, just not content-anchored.
+
+// Excluded from the ANCHOR layer only (part 2's bounds/dangling check above still covers them in
+// full, unchanged): these two are DATED, point-in-time audit records, already treated specially
+// by CITATION_ALLOWLIST's own historical entries above ("product file has shrunk/deleted since
+// this dated record's measurement commit"). Measured directly while building this check: the
+// product tree is not a fixed target even across this ONE action's own working session --
+// `verdict.ts` was 167 lines when this file's CITATION_ALLOWLIST entries were written (hours
+// before this section) and 422 lines when this section's own measurement ran, because other work
+// landed in SPO-WebClient in between. Anchor-checking these two files' citations against
+// "whatever the product tree happens to contain today" measured 22 failures, nearly all of them
+// paragraphs of quoted code from a snapshot the product has since been substantially rewritten
+// past -- not a wrong citation, a snapshot no longer matching a moving target, which is exactly
+// the class of fact this suite's own CITATION_ALLOWLIST entries already recognize and exempt for
+// these same two files. Per-fact allowlisting all 22 was rejected as disproportionate noise for a
+// property these two files' own header already establishes (dated, not live); a file-level scope
+// limit for the ANCHOR layer specifically -- stated here, not silent, and still fully
+// bounds/dangling-checked -- was judged the honest choice. The one exception, `bin/spo:1090-1093`
+// -> `:1137`, was NOT left on this exemption: it was fixed in passing (see the header above)
+// because the underlying fact ("console/collect.js is reached from bin/spo") is still true today,
+// just at a different line -- a stale pointer, not a stale snapshot -- and its catch is proven
+// directly against the real files by the mutation-proof canary below, independent of this
+// exclusion.
+const ANCHOR_EXCLUDED_FILES = new Set(['doc/bench-audit-2026-09-02.md', 'doc/bench-plan-derived-2026-09-02.md']);
+
+const ANCHOR_WIN = 150; // chars of citing prose scanned on each side, same order of magnitude as CHAIN_RE's own PROXIMITY_CHARS
+const ANCHOR_TOPK = 2; // nearest-ranked candidates checked; see the run.ts:64 discussion above for why 1 is too strict and 3 adds nothing over 2 in this corpus
+const ANCHOR_LOOSE_N = 5; // line tolerance for a 'camel'/'snake' (declaration-shaped) candidate
+
+// Documentation/table-label noise: words that pass the CONST_CASE shape test (isCodeShapedIdentifier,
+// part 1.8) but are, in THIS corpus's actual prose, either ordinary capitalized emphasis (MUST,
+// NOT, OWN, ONE, DAY, HEAD -- the same class part 1.8's own header already found for the phantom-
+// symbol check) or a markdown table's own row-label vocabulary (PLAN/IMPLEMENT/VALIDATE, the step
+// names doc/state-machine-spec.md and prompts/README.md both use as literal `| PLAN |` cells --
+// measured to sit adjacent to unrelated citations often enough to win the nearest-candidate rank
+// without ever being the thing actually being cited) or a documentation category tag this corpus's
+// own account-lease comment uses (OBSERVED/ANTICIPATED, `steps/llm.js`'s allowlist-provenance
+// labels). SECOND and LLM are part 1.8's own two false-match findings, reused here for the same
+// reason. Never a silent blanket -- DIAGNOSE, GATE, BLOCKED etc. are all still live candidates
+// where the corpus's prose genuinely means them (see the anchored verdicts in the main test).
+const ANCHOR_STOPWORDS = new Set([
+  'NOT', 'MUST', 'OWN', 'ONE', 'DAY', 'HEAD', 'PLAN', 'LLM', 'SECOND', 'OBSERVED', 'ANTICIPATED', 'IMPLEMENT', 'VALIDATE',
+]);
+
+// Anchor-check-local widening of part 1.8's isCodeShapedIdentifier: also accepts snake_case
+// (`api_error_status`) -- real vocabulary this corpus cites (API error codes, env-shaped names)
+// that the phantom-symbol check's own CONST_CASE/camelCase pair does not recognize. Deliberately
+// NOT folded into isCodeShapedIdentifier itself -- that function's own pinned floor (>=400 checked
+// citations, part 1.8) is a property of ITS regex family, not this one, and widening it here would
+// risk perturbing a check this action does not otherwise touch.
+function isAnchorCandidateIdentifier(ident) {
+  if (isCodeShapedIdentifier(ident)) return true;
+  return /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(ident);
+}
+
+function candidateKind(ident) {
+  if (/^[A-Z][A-Z0-9_]{2,}$/.test(ident)) return 'const';
+  return /[a-z][A-Z]/.test(ident) ? 'camel' : 'snake';
+}
+
+// extractAnchorCandidates -- identifier candidates in a window around one citation's own match
+// span, ranked nearest-first by character distance in the CITING text. `clipFrom`/`clipTo` (from
+// the caller, the nearest NEIGHBOURING citation naming a different file) bound the window so a
+// dense paragraph citing several files never lets one citation's candidates leak from another's
+// sentence -- the exact contamination `park-loop.js`'s own "this and its two state-machine.js
+// sibling comments" aside caused before this clip existed (see part 2.5's header, finding 3).
+function extractAnchorCandidates(normalizedText, idx, end, clipFrom, clipTo) {
+  const from = Math.max(0, idx - ANCHOR_WIN, clipFrom == null ? 0 : clipFrom);
+  const to = Math.min(normalizedText.length, end + ANCHOR_WIN, clipTo == null ? normalizedText.length : clipTo);
+  const window = normalizedText.slice(from, to);
+  const re = /[A-Za-z_][A-Za-z0-9_]*/g;
+  let m;
+  const cands = [];
+  const seen = new Map();
+  while ((m = re.exec(window))) {
+    const ident = m[0];
+    if (!isAnchorCandidateIdentifier(ident) || ANCHOR_STOPWORDS.has(ident)) continue;
+    const absPos = from + m.index;
+    // Reject a match glued to a hyphen on either side ("SPO"/"WebClient" out of "SPO-WebClient")
+    // -- a real code identifier is never hyphen-adjacent; a proper-noun fragment is not a candidate.
+    if (normalizedText[absPos - 1] === '-' || normalizedText[absPos + ident.length] === '-') continue;
+    const dist = absPos < idx ? idx - (absPos + ident.length) : absPos >= end ? absPos - end : 0;
+    const existing = seen.get(ident);
+    if (!existing || dist < existing.dist) seen.set(ident, { ident, dist, kind: candidateKind(ident) });
+  }
+  return [...seen.values()].sort((a, b) => a.dist - b.dist);
+}
+
+// A cross-file mention near the citation ("`console/collect.js`, reached from `bin/spo:N`") --
+// FALLBACK ONLY (the main test below only calls this when extractAnchorCandidates found nothing),
+// matched by substring against the target window rather than a `\b`-bounded identifier match,
+// since the real call site is typically a camelCase name DERIVED from the mentioned file's stem
+// (`collect.js` -> `collectAll`), not the stem verbatim. Restricted to a file other than the
+// citation's own target -- this must never compete with same-file identifier anchoring, where
+// "worker" as a bare substring would trivially match almost anywhere in worker.ts.
+const FILE_MENTION_RE = /`?([A-Za-z0-9_-]+)\.(?:js|ts)`?(?!:\d)/g;
+function extractFileMentionCandidates(normalizedText, idx, end, clipFrom, clipTo, ownFile) {
+  const from = Math.max(0, idx - ANCHOR_WIN, clipFrom == null ? 0 : clipFrom);
+  const to = Math.min(normalizedText.length, end + ANCHOR_WIN, clipTo == null ? normalizedText.length : clipTo);
+  const window = normalizedText.slice(from, to);
+  const ownStem = path.basename(ownFile).replace(/\.(?:js|ts)$/, '');
+  FILE_MENTION_RE.lastIndex = 0;
+  let m;
+  const cands = [];
+  const seen = new Set();
+  while ((m = FILE_MENTION_RE.exec(window))) {
+    const stem = m[1];
+    if (stem === ownStem || seen.has(stem)) continue;
+    seen.add(stem);
+    const absPos = from + m.index;
+    const dist = absPos < idx ? idx - (absPos + m[0].length) : absPos >= end ? absPos - end : 0;
+    cands.push({ ident: stem, dist, kind: 'file', substring: true });
+  }
+  return cands.sort((a, b) => a.dist - b.dist);
+}
+
+// mergedCandidates -- identifier candidates first; file-mention candidates ONLY as a fallback
+// when no identifier was found at all (see extractFileMentionCandidates's own header).
+function mergedCandidates(normalizedText, idx, end, clipFrom, clipTo, ownFile) {
+  const idents = extractAnchorCandidates(normalizedText, idx, end, clipFrom, clipTo);
+  if (idents.length > 0) return idents;
+  return extractFileMentionCandidates(normalizedText, idx, end, clipFrom, clipTo, ownFile);
+}
+
+// kindN/candidateFoundNear -- the per-kind tolerance from this section's header: 'const'/'file'
+// candidates claim to be AT the exact cited range (tolerance 0); 'camel'/'snake' candidates claim
+// to be a nearby DECLARATION (tolerance ANCHOR_LOOSE_N lines).
+function kindN(kind) { return kind === 'const' || kind === 'file' ? 0 : ANCHOR_LOOSE_N; }
+function candidateFoundNear(cand, targetPath, startLine, stopLine) {
+  const n = kindN(cand.kind);
+  const lines = fs.readFileSync(targetPath, 'utf8').split('\n');
+  const lo = Math.max(0, startLine - 1 - n);
+  const hi = Math.min(lines.length, stopLine + n);
+  const windowText = lines.slice(lo, hi).join('\n');
+  return cand.substring ? windowText.includes(cand.ident) : new RegExp(`\\b${cand.ident}\\b`).test(windowText);
+}
+
+// CITATION_ANCHOR_ALLOWLIST -- per-fact, same posture and same `${file} :: ${citation}` keying as
+// CITATION_ALLOWLIST above (isCitationAllowlisted, reused verbatim). Every entry here is a citation
+// this action READ BY HAND and confirmed correct -- the nearest-ranked candidate the heuristic
+// picked belongs to a DIFFERENT clause in the same paragraph, not to the cited line, which is
+// exactly finding 3 in this section's header ("what this check still cannot see").
+const CITATION_ANCHOR_ALLOWLIST = {
+  // "...the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too (`account-lease.js:156`
+  // -> `lock.js:255` `acquireShortLock` -> `:289` `tryCreate`)": `tryCreate`/`linkSync` describe
+  // `lock.js`'s daemon.lock idiom BY ANALOGY, two citations away in the same sentence -- not
+  // account-lease.js:156's own content (`tryAcquireLease`'s closing brace, genuinely unnamed in
+  // this prose). Confirmed correct: line 156 is exactly where `tryAcquireLease`
+  // (orchestrator/account-lease.js) calls `lock.acquireShortLock` and closes.
+  'orchestrator/README.md :: account-lease.js:156':
+    "nearest candidate ('tryCreate'/'linkSync') belongs to an earlier analogy about lock.js's " +
+    "daemon.lock idiom, not to this citation's own content -- confirmed correct by hand: line " +
+    '156 is where tryAcquireLease calls lock.acquireShortLock and closes.',
+  // "...a worker killed during the dispatcher's OWN shutdown (... `dispatcher.js:485-499`) and any
+  // owning daemon process that simply never comes back to run `handleExit` at all...": `handleExit`
+  // is the SECOND clause's subject (the daemon-never-returns case, uncited), not the first
+  // (dispatcher.js:485-499, the worker-killed-during-shutdown case this citation actually names).
+  // Confirmed correct: lines 485-499 are exactly the `worker-exit-during-shutdown` handling this
+  // prose describes.
+  'orchestrator/README.md :: dispatcher.js:485-499':
+    "nearest candidate ('handleExit') is the SUBJECT OF THE NEXT CLAUSE in the same sentence (a " +
+    "daemon that never runs handleExit at all), not of this citation -- confirmed correct by " +
+    'hand: lines 485-499 are the worker-exit-during-shutdown handling this prose actually names.',
+  // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:308`'s capability-question
+  // variant, where `required` can be empty...": the true subject is a PROSE PHRASE
+  // ("capability-question variant"), not a code-shaped identifier -- `BLOCKED`/`GATE` are
+  // incidental nearby words, not this citation's own content. Confirmed correct: line 308 sits at
+  // the Stage 2 (capabilities) / Stage 3 (routing) boundary this "capability-question" prose
+  // describes.
+  'orchestrator/steps/scripted.js :: verify-gate.js:308':
+    "no code-shaped candidate names this citation's true subject (a prose phrase, " +
+    "'capability-question variant', not an identifier) -- 'BLOCKED'/'GATE' are incidental nearby " +
+    'words. Confirmed correct by hand: line 308 sits at the Stage 2/Stage 3 boundary this prose describes.',
+};
+
+function isAnchorAllowlisted(rel, raw) {
+  return isCitationAllowlisted(CITATION_ANCHOR_ALLOWLIST, rel, raw);
+}
+
+test('CITATION_ANCHOR_ALLOWLIST holds exactly the entries this action explicitly justified -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(CITATION_ANCHOR_ALLOWLIST).sort(),
+    [
+      'orchestrator/README.md :: account-lease.js:156',
+      'orchestrator/README.md :: dispatcher.js:485-499',
+      'orchestrator/steps/scripted.js :: verify-gate.js:308',
+    ],
+    'CITATION_ANCHOR_ALLOWLIST changed size or membership -- read the new/changed citation by ' +
+      'hand against its target before adding an entry; this pin needs updating in the same change, by name.'
+  );
+});
+
+test('every anchorable file:line citation in the anchor-checked corpus points at a line whose own prose names something actually there', () => {
+  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_EXCLUDED_FILES.has(rel));
+  // Named floor, not a silent "no exclusions happened": if a future edit to CORPUS_FILES or
+  // ANCHOR_EXCLUDED_FILES drops this to 2 or fewer, that is exactly the two dated docs swallowing
+  // the whole corpus (or a mis-typed exclusion) and this fails loudly instead of quietly checking nothing.
+  assert.equal(anchorCorpus.length, CORPUS_FILES.length - ANCHOR_EXCLUDED_FILES.size, 'ANCHOR_EXCLUDED_FILES no longer matches exactly two CORPUS_FILES entries by name.');
+
+  const offenders = [];
+  let anchored = 0;
+  let unanchorable = 0;
+  for (const rel of anchorCorpus) {
+    const raw = read(rel);
+    const withoutFences = rel.endsWith('.md') ? stripFences(raw) : raw;
+    const normalized = normalizeWrap(withoutFences);
+    const cites = extractCitations(normalized).filter((c) => !c.unanchored);
+    for (let i = 0; i < cites.length; i++) {
+      const c = cites[i];
+      if (isCitationAllowlisted(CITATION_ALLOWLIST, rel, c.raw)) continue; // part 2's own offenders are not this check's to re-litigate
+      const resolved = resolveCitationTarget(c.file);
+      if (!resolved.target || resolved.ambiguous) continue; // part 2 already reports these; this check only ever narrows a citation part 2 accepted
+      const lineCount = fs.readFileSync(resolved.target, 'utf8').split('\n').length;
+      if (c.stop > lineCount) continue; // ditto -- part 2's own bounds offender
+      const key = `${rel} :: ${c.raw}`;
+      if (isAnchorAllowlisted(rel, c.raw)) continue;
+
+      const prevC = i > 0 ? cites[i - 1] : null;
+      const nextC = i < cites.length - 1 ? cites[i + 1] : null;
+      const clipFrom = prevC && prevC.file !== c.file ? prevC.end : null;
+      const clipTo = nextC && nextC.file !== c.file ? nextC.idx : null;
+
+      const candidates = mergedCandidates(normalized, c.idx, c.end, clipFrom, clipTo, c.file);
+      if (candidates.length === 0) { unanchorable += 1; continue; }
+      const top = candidates.slice(0, ANCHOR_TOPK);
+      const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
+      if (found) { anchored += 1; continue; }
+      offenders.push(
+        `${key} -- none of [${top.map((cand) => `${cand.ident}/${cand.kind}`).join(', ')}] found ` +
+          `(tolerance ${top.map((cand) => kindN(cand.kind)).join('/')} lines) near ${resolved.target}:${c.start}${c.stop !== c.start ? `-${c.stop}` : ''}`
+      );
+    }
+  }
+
+  // Measured 2026-09-03 against the anchor-checked corpus (63 of 65 CORPUS_FILES): 26 verified,
+  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
+  // scripted.js :: verify-gate.js:342`, `prompts/README.md :: step-contracts.js:99` (each cites a
+  // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
+  // mention -- correctly unverifiable, not wrong) -- 3 on CITATION_ANCHOR_ALLOWLIST (already
+  // excluded above), 0 unexplained offenders after this action's own fixes landed. Both counts
+  // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
+  // never silently grow into an escape hatch, so the unanchorable population is capped here
+  // exactly like PINS/EXPECTED_CITATIONS above.
+  assert.equal(anchored, 26, `expected 26 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  assert.equal(unanchorable, 3, `expected exactly 3 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
+  assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
+});
+
+// ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check
+// stays provably correct independent of what the real corpus happens to say today.
+
+test('isAnchorCandidateIdentifier: accepts snake_case in addition to isCodeShapedIdentifier\'s CONST_CASE/camelCase', () => {
+  assert.equal(isAnchorCandidateIdentifier('api_error_status'), true);
+  assert.equal(isAnchorCandidateIdentifier('DONE_RETENTION_MS'), true); // CONST_CASE, via isCodeShapedIdentifier
+  assert.equal(isAnchorCandidateIdentifier('runLive'), true); // camelCase, via isCodeShapedIdentifier
+  assert.equal(isAnchorCandidateIdentifier('lowercase'), false); // no shape at all
+});
+
+test('candidateKind: classifies CONST_CASE, camelCase and snake_case distinctly', () => {
+  assert.equal(candidateKind('BLOCKED'), 'const');
+  assert.equal(candidateKind('runLive'), 'camel');
+  assert.equal(candidateKind('api_error_status'), 'snake');
+});
+
+test('extractAnchorCandidates: ranks the nearer identifier first, and rejects a hyphen-adjacent fragment', () => {
+  const text = 'see SPO-WebClient run.ts:64 runLive returns BLOCKED soon after';
+  const idx = text.indexOf('run.ts:64');
+  const end = idx + 'run.ts:64'.length;
+  const cands = extractAnchorCandidates(text, idx, end, null, null);
+  const idents = cands.map((c) => c.ident);
+  assert.ok(idents.includes('runLive'), 'runLive must be a candidate');
+  assert.ok(idents.includes('BLOCKED'), 'BLOCKED must be a candidate');
+  assert.equal(idents.indexOf('runLive') < idents.indexOf('BLOCKED'), true, 'runLive sits immediately after the citation and must rank nearer than BLOCKED, further away');
+  assert.ok(!idents.includes('SPO'), 'SPO is a hyphen-glued fragment of SPO-WebClient, never a real candidate');
+  assert.ok(!idents.includes('WebClient'), 'WebClient is a hyphen-glued fragment of SPO-WebClient, never a real candidate');
+});
+
+test('extractAnchorCandidates: a neighbouring citation to a DIFFERENT file clips the window; the SAME file does not', () => {
+  const text = 'alpha.js:1 nearIdentOne beta.js:2 farIdentTwo';
+  // Citing alpha.js:1's own candidate window: clipTo at beta.js:2's start (different file) must
+  // exclude farIdentTwo, which belongs to the OTHER citation's own sentence.
+  const idxAlpha = text.indexOf('alpha.js:1');
+  const endAlpha = idxAlpha + 'alpha.js:1'.length;
+  const clipTo = text.indexOf('beta.js:2');
+  const candsClipped = extractAnchorCandidates(text, idxAlpha, endAlpha, null, clipTo);
+  assert.ok(candsClipped.map((c) => c.ident).includes('nearIdentOne'));
+  assert.ok(!candsClipped.map((c) => c.ident).includes('farIdentTwo'), 'a DIFFERENT-file neighbour must clip the window');
+
+  // A same-file chain continuation must NOT clip -- the two mentions are one fact.
+  const text2 = 'gamma.js:1 identA, called at gamma.js:2 identB';
+  const idx1 = text2.indexOf('gamma.js:1');
+  const end1 = idx1 + 'gamma.js:1'.length;
+  // gamma.js:2 names the SAME file, so the real main-test loop passes clipTo: null here (no clip)
+  const candsUnclipped = extractAnchorCandidates(text2, idx1, end1, null, null);
+  assert.ok(candsUnclipped.map((c) => c.ident).includes('identA'));
+});
+
+test('extractFileMentionCandidates: matches a cross-file basename mention by substring, never the citation\'s own file', () => {
+  const text = '`console/collect.js`, reached from `bin/spo:1137`, reads it by content';
+  const idx = text.indexOf('bin/spo:1137');
+  const end = idx + 'bin/spo:1137'.length;
+  const cands = extractFileMentionCandidates(text, idx, end, null, null, 'bin/spo');
+  assert.deepEqual(cands.map((c) => c.ident), ['collect']);
+  assert.equal(cands[0].kind, 'file');
+  assert.equal(cands[0].substring, true);
+
+  // Own-file mention must never become a candidate for itself -- only a DIFFERENT file's mention
+  // counts, since a same-file mention ("collect.js" cited from within collect.js) says nothing a
+  // same-file identifier candidate wouldn't already say.
+  const selfText = '`console/collect.js`\'s own logic, cited at `console/collect.js:5`';
+  const idx2 = selfText.lastIndexOf('console/collect.js:5');
+  const end2 = idx2 + 'console/collect.js:5'.length;
+  const candsSelf = extractFileMentionCandidates(selfText, idx2, end2, null, null, 'console/collect.js');
+  assert.deepEqual(candsSelf, [], 'a mention of the citation\'s own file must never become a candidate for itself');
+});
+
+test('mergedCandidates: falls back to a file-mention candidate ONLY when no identifier candidate exists', () => {
+  // No identifier at all near the citation -- must fall back to the file mention.
+  const noIdentText = '`console/collect.js`, reached from `bin/spo:1137`, reads it by content';
+  const idx1 = noIdentText.indexOf('bin/spo:1137');
+  const end1 = idx1 + 'bin/spo:1137'.length;
+  const fallback = mergedCandidates(noIdentText, idx1, end1, null, null, 'bin/spo');
+  assert.deepEqual(fallback.map((c) => c.ident), ['collect']);
+
+  // An identifier candidate present -- the file mention must never compete with it (the
+  // park-loop.js/state-machine.js false-positive this posture was built to close). The window
+  // here genuinely contains BOTH a file mention ("state-machine.js") and a real identifier
+  // ("realThing") -- proving the fallback guard actually suppresses the file mention, not merely
+  // that this particular text happens to produce no file-mention candidate at all.
+  const withIdentText = 'state-machine.js sibling comments mention realThing near other.md:9';
+  const idx2 = withIdentText.indexOf('other.md:9');
+  const end2 = idx2 + 'other.md:9'.length;
+  assert.ok(
+    extractFileMentionCandidates(withIdentText, idx2, end2, null, null, 'other.md').length > 0,
+    'fixture precondition: this text must actually contain a would-be file-mention candidate ("state-machine"), or this test cannot prove the fallback guard suppresses it'
+  );
+  const preferred = mergedCandidates(withIdentText, idx2, end2, null, null, 'other.md');
+  assert.ok(preferred.every((c) => c.kind !== 'file'), 'a file-mention candidate must never be returned when a real identifier candidate exists nearby');
+  assert.deepEqual(preferred, extractAnchorCandidates(withIdentText, idx2, end2, null, null), 'mergedCandidates must equal the identifier-only result when identifiers exist');
+});
+
+test('candidateFoundNear: a "const"/"file" candidate requires the EXACT cited line, never a neighbour', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
+  const file = path.join(dir, 'target.txt');
+  fs.writeFileSync(file, ['line one', "status: 'BLOCKED',", 'line three'].join('\n'));
+  // BLOCKED is on line 2 (1-indexed).
+  assert.equal(candidateFoundNear({ ident: 'BLOCKED', kind: 'const' }, file, 2, 2), true);
+  assert.equal(candidateFoundNear({ ident: 'BLOCKED', kind: 'const' }, file, 3, 3), false, 'one line off must still fail a zero-tolerance const candidate');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('candidateFoundNear: a "camel"/"snake" candidate tolerates ANCHOR_LOOSE_N lines, never more', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
+  const file = path.join(dir, 'target.txt');
+  const lines = [];
+  for (let i = 0; i < 20; i++) lines.push(i === 10 ? 'function runLive() {' : `line ${i}`);
+  fs.writeFileSync(file, lines.join('\n'));
+  // runLive is on line 11 (1-indexed). ANCHOR_LOOSE_N is 5.
+  assert.equal(candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 11 + 5, 11 + 5), true, 'exactly ANCHOR_LOOSE_N lines away must still be found');
+  assert.equal(candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 11 + 6, 11 + 6), false, 'one line beyond ANCHOR_LOOSE_N must not be found');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1137 needs it ("collect" inside "collectAll")', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
+  const file = path.join(dir, 'target.txt');
+  fs.writeFileSync(file, ['line one', 'const data = collectAll(sources);', 'line three'].join('\n'));
+  // "collect" never appears as its own whole word here -- only glued inside "collectAll". A
+  // \b-bounded match would find nothing; only substring:true finds the real call site.
+  assert.equal(candidateFoundNear({ ident: 'collect', kind: 'file', substring: true }, file, 2, 2), true, 'a file-mention candidate must match by substring, finding "collect" inside "collectAll"');
+  assert.equal(new RegExp('\\bcollect\\b').test('const data = collectAll(sources);'), false, 'fixture precondition: "collect" must NOT be a whole-word match inside "collectAll", or this test proves nothing about substring vs \\b-bounded matching');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---- mutation-proof canaries: the two real drifts that motivated this whole check, reverted IN
+// MEMORY against the real, current source and target files, proving this check would have caught
+// them before they were fixed above. Neither test touches disk -- the real citing files are read
+// once, the fix is undone with a single string replace, and the exact same functions the main
+// test above calls are run against that reverted text and the REAL target file.
+
+test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug) makes this check red, on the real files', () => {
+  const raw = read('orchestrator/state-machine.js');
+  const normalized = normalizeWrap(raw);
+  const reverted = normalized.replace('SPO-WebClient\'s `run.ts:63` `runLive` returns BLOCKED', 'SPO-WebClient\'s `run.ts:64` `runLive` returns BLOCKED');
+  assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
+
+  const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'run.ts');
+  assert.equal(cites.length, 1, 'expected exactly one run.ts citation in state-machine.js');
+  const c = cites[0];
+  assert.equal(c.start, 64, 'the revert must have actually changed the parsed line number');
+
+  const resolved = resolveCitationTarget(c.file);
+  assert.ok(resolved.target, 'run.ts must resolve against the real product repo for this proof to mean anything');
+  const candidates = mergedCandidates(reverted, c.idx, c.end, null, null, c.file);
+  const top = candidates.slice(0, ANCHOR_TOPK);
+  const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
+  assert.equal(found, false, 'the historical run.ts:64 bug must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact bug that motivated it');
+
+  // And the fixed text (:63, actually on disk) must anchor cleanly -- the check is not simply
+  // always-red; it discriminates the specific one-line difference in both directions.
+  const cites63 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'run.ts');
+  const c63 = cites63[0];
+  const candidates63 = mergedCandidates(normalized, c63.idx, c63.end, null, null, c63.file);
+  const found63 = candidates63.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c63.start, c63.stop));
+  assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
+});
+
+test('MUTATION PROOF: reverting bin/spo:1137 back to bin/spo:1090-1093 (the historical bug) makes this check red, on the real files', () => {
+  const raw = read('doc/bench-plan-derived-2026-09-02.md');
+  const withoutFences = stripFences(raw);
+  const normalized = normalizeWrap(withoutFences);
+  const reverted = normalized.replace('reached from `bin/spo:1137`', 'reached from `bin/spo:1090-1093`');
+  assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
+
+  const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
+  assert.equal(cites.length, 1, 'expected exactly one bin/spo citation in this doc');
+  const c = cites[0];
+  assert.deepEqual([c.start, c.stop], [1090, 1093], 'the revert must have actually changed the parsed line range');
+
+  const resolved = resolveCitationTarget(c.file);
+  assert.ok(resolved.target, 'bin/spo must resolve for this proof to mean anything');
+  const candidates = mergedCandidates(reverted, c.idx, c.end, null, null, c.file);
+  const top = candidates.slice(0, ANCHOR_TOPK);
+  const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
+  assert.equal(found, false, 'the historical bin/spo:1090-1093 bug must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact bug that motivated it');
+
+  // And the fixed text (:1137, actually on disk) must anchor cleanly, via the SAME substring-
+  // matched 'file' candidate ("collect", from `console/collect.js`) -- proving both that the
+  // check discriminates the specific drift in both directions AND that the 'file' kind's
+  // substring matching (see candidateFoundNear's own fixture test) is what makes it possible at
+  // all: "collect" is never a \b-bounded whole word at the real call site, only a substring of
+  // `collectAll`.
+  const cites1137 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
+  const c1137 = cites1137[0];
+  const candidates1137 = mergedCandidates(normalized, c1137.idx, c1137.end, null, null, c1137.file);
+  assert.equal(candidates1137[0] && candidates1137[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
+  const found1137 = candidates1137.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1137.start, c1137.stop));
+  assert.equal(found1137, true, 'the real, fixed :1137 citation must anchor cleanly');
 });
 
 // ---- part 3: dangling doc/*.md path reference check (E3, action 9.2) ---------------------------
