@@ -49,7 +49,8 @@ nothing.
 concurrent sessions are already possible; the webclient supports multiple players at once
 because it is an MMO client. **So the bench's single-flight world lock is a bench policy, not a
 property of the world** (`src/e2e/world-lock.ts`: *"one live session at a time, across both
-accounts"*). It buys restore safety and rate limiting, and it could be replaced with per-account
+accounts"*). It buys restore safety and -- since B3.5 deleted the dedicated limiter on 2026-09-03 -- it is now
+the ONLY thing throttling live runs at all. It could be replaced with per-account
 session limits plus per-object restore guarding — see the note under "adding accounts" below.
 
 ### The capability axes
@@ -78,9 +79,12 @@ checkouts, and N worker slots.
 
 Two cautions. **Role-exclusive flows do not scale with accounts** — there is one Mayor of
 Helartia, so governance flows stay singleton unless more test towns gain their own role sets.
-And **the rate limiter would stop being decorative**: it exists to keep a retry loop from
-becoming a login storm against servers real players are using, and is currently inert
-(`LIMITS.minIntervalMinutes: 0`, `maxRunsPerDay: 1000`). Serialisation is also doing unearned
+And **there is no longer a rate limiter to fall back on.** One existed and was inert
+(`LIMITS.minIntervalMinutes: 0`, `maxRunsPerDay: 1000`); action B3.5 deleted it on 2026-09-03
+(SPO-WebClient PR #646) rather than tune it, because its stated purpose -- stopping a retry loop
+becoming a login storm -- describes a threat this domain does not have: planitia is built for
+many concurrent players. If lanes are ever added and a real cap turns out to be wanted, it has
+to be written fresh, deliberately, against a measured need. Serialisation is also doing unearned
 safety work today — it is why no two gates have ever raced each other's restores, so
 `world-lock.ts`'s crash path (it erases a dead holder's `pendingRestores`) becomes load-bearing
 the moment lanes exist.
