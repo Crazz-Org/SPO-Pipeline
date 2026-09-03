@@ -78,6 +78,28 @@ const PINS = [
     ],
   },
   {
+    name: 'command timeout: bench-install (900000ms / 15min)', // action B1.4, orchestrator/config.js
+    checks: [
+      { file: 'orchestrator/config.js', contains: "'bench-install': timeoutFromEnv('SPO_TIMEOUT_BENCH_INSTALL_MS', 900000)," },
+      { file: 'doc/state-machine-spec.md', contains: '| `bench-install` | 900s (15 min) |' },
+      { file: 'orchestrator/README.md', contains: '| `bench-install`' },
+    ],
+  },
+  {
+    // R1/R3 (post-verification, third pass): benchIdleWaitMaxPolls/benchIdleWaitPollIntervalMs
+    // are the direct model of ciChecksMaxPolls/ciChecksPollIntervalMs below, which ARE already
+    // pinned here -- these two were not, and mutations V18/W10 (adversarial verification round 2)
+    // proved the consequence empirically: either default can change while 1580+ tests stay green
+    // and the spec keeps citing "180 x 5s = 15 minutes".
+    name: 'benchIdleWaitMaxPolls default (180) and benchIdleWaitPollIntervalMs default (5000ms)',
+    checks: [
+      { file: 'orchestrator/config.js', contains: 'process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS !== undefined ? Number(process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS) : 180;' },
+      { file: 'orchestrator/config.js', contains: '? Number(process.env.SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS)' },
+      { file: 'orchestrator/config.js', contains: ': 5000;' },
+      { file: 'doc/state-machine-spec.md', contains: 'default 180 × 5s = 15 minutes' },
+    ],
+  },
+  {
     name: 'account cooldown: usage probe (1 hour)', // action 3.5, orchestrator/accounts.js
     checks: [
       { file: 'orchestrator/accounts.js', contains: 'const USAGE_PROBE_COOLDOWN_MS = 60 * 60 * 1000;' },
@@ -218,8 +240,10 @@ test('every pinned documented constant matches a literal in both the code and th
       'account cooldown: usage probe (1 hour)',
       'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (31.5 min), not a flat 5 min',
       'autoPullLimit default (1) and the in-flight+queued<=K watermark',
+      'benchIdleWaitMaxPolls default (180) and benchIdleWaitPollIntervalMs default (5000ms)',
       'ciChecksMaxPolls default (30)',
       'ciChecksPollIntervalMs default (20000ms)',
+      'command timeout: bench-install (900000ms / 15min)',
       'command timeout: gh (120000ms / 120s)',
       'command timeout: git (120000ms / 120s)',
       'command timeout: npm-ci (600000ms / 10min)',

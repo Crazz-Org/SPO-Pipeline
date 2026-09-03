@@ -497,11 +497,25 @@ async function main() {
         defaultConfig.stepDeadlineMs,
         productRepoHold.worstHoldMs(defaultConfig.commandTimeoutsMs)
       ),
-      FINISH: productRepoHold.lockedStepDeadlineMs(
+      // Action B1.4: FINISH now acquires the product-repo lock TWICE (finish-sync, then
+      // finish -- see product-repo-hold.js's own finishStepDeadlineMs header), so
+      // lockedStepDeadlineMs's single-wait-plus-single-hold shape no longer fits it. Must call
+      // the SAME finishStepDeadlineMs formula config.js uses, or this recompute silently
+      // reintroduces the pre-B1.4 (and now too-short) ceiling on every daemon run, defeating
+      // config.js's own derivation. See test/worker-mode.test.js's
+      // "re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K" guard, which pins
+      // this shape specifically so it cannot regress silently again.
+      //
+      // FOURTH argument: the hazard-fix bench-idle wait's own bound (defaultConfig.benchIdleWaitMaxMs
+      // -- config.js's own BENCH_IDLE_WAIT_MAX_MS). Unlike WORKTREE/FINISH's wait bound this does
+      // NOT move with --workers (it is not a function of K -- see config.js's own comment on
+      // BENCH_IDLE_WAIT_MAX_POLLS), so defaultConfig's already-resolved value is reused verbatim
+      // rather than re-derived here.
+      FINISH: productRepoHold.finishStepDeadlineMs(
         defaultConfig.commandTimeoutsMs,
         effectiveWorkers,
         defaultConfig.stepDeadlineMs,
-        productRepoHold.finishHoldMs(defaultConfig.commandTimeoutsMs)
+        defaultConfig.benchIdleWaitMaxMs
       ),
     },
     queueDir,

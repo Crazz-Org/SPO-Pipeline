@@ -126,15 +126,23 @@ const ALLOWLIST = {
   'command-timed-out': (
     "the `'command'` fallback branch of `${commandClass || 'command'}-timed-out` " +
     "(steps/scripted.js's spawnStep, ~line 256) only fires when classifyCommand(command, args) " +
-    "returns null for a call that already survived two spawnSync timeouts. Enumerated every " +
-    "spawnStep call site in steps/scripted.js by hand for this action (grep " +
-    "\"spawnStep(ctx, deps, '<STATE>', '<command>'\"): every one passes 'git', 'gh', or 'npm' " +
-    "with args[0] either 'ci' or 'run' -- classifyCommand always returns a real class ('git' / " +
-    "'gh' / 'npm-ci' / 'npm-gate' / 'npm-run') for every one of them, never null. Defensive dead " +
-    "code today, not a reachable park reason -- documenting it in the spec as something that " +
-    "actually happens would be exactly the plausible-sounding-but-wrong sentence this chantier " +
-    "exists to stop writing. Left in the source (no executable change to orchestrator/ is in " +
-    "scope for this action) but not claimed as real behaviour.'"
+    "returns null for a call that already survived two spawnSync timeouts. Originally enumerated " +
+    "every spawnStep call site in steps/scripted.js BY HAND for this action (grep " +
+    "\"spawnStep(ctx, deps, '<STATE>', '<command>'\"): every one passed 'git', 'gh', or 'npm' " +
+    "with args[0] either 'ci' or 'run' -- classifyCommand always returned a real class ('git' / " +
+    "'gh' / 'npm-ci' / 'npm-gate' / 'npm-run') for every one of them, never null. Action B1.4 " +
+    "(post-verification finding D3) is the FIRST change ever to add a spawnStep call site outside " +
+    "that set -- 'bash', for the conditional bench-worker reinstall -- which falsified this " +
+    "paragraph's own claim ('every one passes git, gh, or npm') without falsifying the PROPERTY " +
+    "it was defending: command-timeout.js's classifyCommand gained its own dedicated 'bash' " +
+    "branch (matched on the literal bench-install.sh path, never bare 'bash') in the same change, " +
+    "so 'command-timed-out' is STILL unreachable -- but that is now an ENFORCED fact, not a hand " +
+    "count: see 'classifyCommand never returns null for any real spawnStep call site...' below, " +
+    "which source-scans steps/scripted.js itself rather than trusting this paragraph again. " +
+    "Defensive dead code today, not a reachable park reason -- documenting it in the spec as " +
+    "something that actually happens would be exactly the plausible-sounding-but-wrong sentence " +
+    "this chantier exists to stop writing. Left in the source (no executable change to " +
+    "orchestrator/ is in scope for THIS allowlist entry) but not claimed as real behaviour.'"
   ),
 };
 
@@ -178,6 +186,94 @@ function jsFilesUnder(dir) {
   }
   return out;
 }
+
+// ---- D3 (post-verification finding, action B1.4): the ALLOWLIST's 'command-timed-out' entry
+// above claims, IN PROSE, that classifyCommand never returns null for any real spawnStep call
+// site -- and until B1.4, nothing ever CHECKED that; a mutation deleting classifyCommand's whole
+// 'bash' branch (adversarial verification's M15) survived the entire suite, because
+// park-reason-doc-sweep's own coverage stops at the DOCUMENTED reason strings, never at whether
+// an allowlisted-as-unreachable one has quietly become reachable. Source-scanned, same idiom as
+// this file's own parkSignalSpans/finalizeParkSpans above, so a call site added tomorrow -- in a
+// state that does not exist yet -- is covered without anyone remembering to extend this by hand,
+// which is exactly how the ORIGINAL hand count went stale the moment B1.4 added 'bash'.
+//
+// spawnStepCallSites(source) -- every `spawnStep(ctx, deps, '<STATE>', '<command>', [...])` (or
+// the two dynamic-state call sites inside sweepWorktreeLeftovers, `forState`/`state`) in
+// steps/scripted.js, resolved to {command, args} pairs classifyCommand can actually be run
+// against. Only 'command' and, where it is decidable FROM THE SOURCE TEXT alone, the ARGS
+// classifyCommand's own branches inspect (args[0] for 'npm'/'bash', args[1] only for npm's
+// 'run'+'gate' special case) are extracted -- never the full args expression, which is often
+// built at runtime (`path.join(...)`, `String(...)`) and cannot be evaluated by a regex. git and
+// gh both ignore args entirely (classifyCommand's own source: `if (command === 'git') return
+// 'git';` / `if (command === 'gh') return 'gh';`), so `[]` is always the right args to test them
+// with regardless of what the real call actually passes.
+function spawnStepCallSites(source) {
+  const sites = [];
+  const re = /spawnStep\(ctx,\s*deps,\s*(?:forState|state|'[A-Z_]+')\s*,\s*'([a-zA-Z-]+)'\s*,\s*\[\s*(?:'([^']*)')?\s*(?:,\s*'([^']*)')?/g;
+  let m;
+  while ((m = re.exec(source))) {
+    const [, command, arg0, arg1] = m;
+    if (command === 'git' || command === 'gh') {
+      sites.push({ index: m.index, command, args: [] });
+    } else if (command === 'npm') {
+      // Every npm spawnStep call site in this codebase passes a literal args[0] ('ci' or 'run');
+      // arg1 is only meaningful (and only ever literal) for the 'run gate' -> 'npm-gate' shape.
+      sites.push({ index: m.index, command, args: arg1 !== undefined ? [arg0, arg1] : [arg0] });
+    } else if (command === 'bash') {
+      // The ONE bash call site (FINISH's conditional bench reinstall) builds its args from
+      // `path.join(productRepo, 'scripts', 'bench-install.sh')`, not a string literal -- verified
+      // directly against the real installer path below rather than left unresolved.
+      sites.push({ index: m.index, command, args: null, unresolvedBash: true });
+    } else {
+      sites.push({ index: m.index, command, args: undefined, unresolvedCommand: true });
+    }
+  }
+  return sites;
+}
+
+test("classifyCommand never returns null for any real spawnStep call site in steps/scripted.js -- the property the 'command-timed-out' ALLOWLIST entry above claims in prose, now source-scanned and enforced (post-verification finding D3, action B1.4)", () => {
+  const { classifyCommand } = require('../orchestrator/command-timeout');
+  const src = blankComments(fs.readFileSync(path.join(REPO_ROOT, 'orchestrator', 'steps', 'scripted.js'), 'utf8'));
+  const sites = spawnStepCallSites(src);
+
+  assert.ok(sites.length > 0, 'the spawnStep call-site scan matched nothing -- the regex needs updating, not the property it checks');
+
+  // The real bench-install.sh path, exactly as the FINISH call site itself builds it
+  // (`path.join(productRepo, 'scripts', 'bench-install.sh')`) -- classifyCommand's own 'bash'
+  // branch matches on `args[0].endsWith('/scripts/bench-install.sh')`, so any productRepo value
+  // proves the point; this one is deliberately NOT the real machine's home directory.
+  const realInstallerPath = require('path').join('/fake/product/repo', 'scripts', 'bench-install.sh');
+
+  let bashSitesSeen = 0;
+  for (const site of sites) {
+    assert.ok(
+      !site.unresolvedCommand,
+      `spawnStep call site at char ${site.index} uses command '${site.command}', which this test's ` +
+        "scan does not yet know how to resolve args for -- classifyCommand must be checked against " +
+        'it directly (add a branch to spawnStepCallSites above), not silently skipped'
+    );
+    if (site.unresolvedBash) {
+      bashSitesSeen += 1;
+      assert.equal(
+        classifyCommand('bash', [realInstallerPath]),
+        'bench-install',
+        "classifyCommand('bash', [<the real bench-install.sh path>]) must return 'bench-install', " +
+          "never null -- deleting classifyCommand's 'bash' branch (adversarial verification's M15) " +
+          "must fail HERE, not merely leave 'command-timed-out' silently reachable"
+      );
+      continue;
+    }
+    assert.notEqual(
+      classifyCommand(site.command, site.args),
+      null,
+      `classifyCommand('${site.command}', ${JSON.stringify(site.args)}) returned null for a real ` +
+        `spawnStep call site at char ${site.index} of steps/scripted.js -- every real call site must ` +
+        "classify to a real class, or 'command-timed-out' (allowlisted above as unreachable dead " +
+        'code) becomes a reachable park reason with no documentation anywhere'
+    );
+  }
+  assert.equal(bashSitesSeen, 1, "expected exactly ONE 'bash' spawnStep call site (FINISH's conditional bench reinstall) -- a second one needs its own resolution, not silent reuse of the first's expected path");
+});
 
 function lineOf(source, index) {
   return source.slice(0, index).split('\n').length;

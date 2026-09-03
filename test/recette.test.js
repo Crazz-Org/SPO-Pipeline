@@ -195,6 +195,10 @@ function makeHappyPathSpawnSync({ calls } = {}) {
     if (command === 'git') {
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers, ever
+      // Action B1.4: FINISH's own branch check (`rev-parse --abbrev-ref HEAD`) -- checked BEFORE
+      // the more general 'HEAD' branch below (both include 'HEAD' in argv), so it must come first
+      // or the fast-forward would see a raw sha where it expects a branch name.
+      if (args.includes('rev-parse') && args.includes('--abbrev-ref')) return ok('main\n');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${originMainSha}\n`);
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('worktree') && args.includes('list')) return ok(''); // nothing registered
@@ -209,6 +213,11 @@ function makeHappyPathSpawnSync({ calls } = {}) {
       if (args.includes('branch') && args.includes('-D')) return ok(''); // cleanup: local branch
       if (args.includes('diff') && args.includes('--name-only')) return ok('doc/recette-log.md\n');
       if (args.includes('diff')) return ok('diff --git a/doc/recette-log.md b/doc/recette-log.md\n+one line\n');
+      // Action B1.4: FINISH's own `merge --ff-only origin/main`, once the branch/dirty checks
+      // above have already handed it a clean `main` (the two `status --porcelain` and
+      // `rev-parse --abbrev-ref` branches above make the fast-forward genuinely succeed here,
+      // not merely fall through to the journal-only "could not determine" path).
+      if (args.includes('merge') && args.includes('--ff-only')) return ok('');
       return fail(1, `unhandled fake git call: ${args.join(' ')}`);
     }
 
@@ -224,6 +233,12 @@ function makeHappyPathSpawnSync({ calls } = {}) {
         return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success', status: 'completed' }] }));
       }
       if (args[0] === 'pr' && args[1] === 'merge') return ok('');
+      // Action B1.4: FINISH's own merge-sha lookup, by PR number -- this scenario's merge never
+      // touches src/e2e/bench/ or scripts/bench- (its own `diff --name-only` fake above proves
+      // that), so the reinstall is correctly skipped once this resolves.
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return ok(JSON.stringify({ mergeCommit: { oid: 'c'.repeat(40) } }));
+      }
       if (args[0] === 'issue' && args[1] === 'comment') return ok('');
       if (args[0] === 'pr' && args[1] === 'close') return ok('');
       if (args[0] === 'issue' && args[1] === 'close') return ok('');

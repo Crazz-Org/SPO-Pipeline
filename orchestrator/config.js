@@ -58,6 +58,39 @@ const CI_CHECKS_POLL_INTERVAL_MS =
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
     : 20000;
 
+// Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
+// `systemctl --user restart spo-bench-worker.service` (worker.ts:779 maps the SIGTERM straight to
+// `process.exit(0)`, no drain), and this daemon runs K=2 in production (SPO_WORKERS=2 on the live
+// systemd drop-in) -- so a card reaching FINISH's reinstall step can cut a SIBLING card's
+// in-flight GATE. That recovers as `gate-non-attesting` (transient-retryable -- see
+// state-machine.js's own TRANSIENT_RETRY_REASONS comment) but re-runs WORKTREE through GATE for
+// that card, real LLM spend, not merely "a wasted gate". steps/scripted.js's waitForBenchIdle
+// polls `~/.spo-bench/spool` and `~/.spo-bench/running` (the SAME two directories `spo status`
+// already reports, bin/spo's own collectBenchQueueDepth) before ever invoking bench-install.sh,
+// same maxPolls/pollIntervalMs shape as CI_CHECKS_MAX_POLLS/CI_CHECKS_POLL_INTERVAL_MS above.
+//
+// Hoisted here (not left as literals in steps/scripted.js) for the SAME reason CI_CHECKS_MAX_POLLS
+// is: stepDeadlineMsByState's FINISH entry below has to derive from the SAME bound, or a legitimate
+// bench-idle wait can outlast the very deadline meant to cover it -- see product-repo-hold.js's own
+// finishSyncHoldMs comment for the full account of why this is threaded through as an explicit
+// parameter rather than folded into commandTimeoutsMs.
+//
+// DEFAULT: 180 polls x 5s = 900000ms (15 min) -- deliberately generous relative to the worst
+// realistic case (orchestrator/bench-queue-wait.js's own measured constants: a nightly caught
+// mid-run, 232000ms, plus up to two queued sibling ref jobs at K=3, 2 x 161000ms -- 554000ms
+// total, well under 900000ms), the same "large enough never to legitimately fire" posture
+// CI_CHECKS/WORKTREE/FINISH's own deadlines already use, not a tight fit. SPO_BENCH_IDLE_WAIT_
+// MAX_POLLS / SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS override.
+const BENCH_IDLE_WAIT_MAX_POLLS =
+  process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS !== undefined ? Number(process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS) : 180;
+const BENCH_IDLE_WAIT_POLL_INTERVAL_MS =
+  process.env.SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS !== undefined
+    ? Number(process.env.SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS)
+    : 5000;
+// The product of the two above, computed once so config.js's own FINISH derivation and
+// steps/scripted.js's actual poll loop can never restate (and drift from) the same number twice.
+const BENCH_IDLE_WAIT_MAX_MS = BENCH_IDLE_WAIT_MAX_POLLS * BENCH_IDLE_WAIT_POLL_INTERVAL_MS;
+
 // Hoisted for the SAME reason CI_CHECKS_MAX_POLLS above is (action 6.4): WORKTREE's and FINISH's
 // stepDeadlineMsByState entries are derived from these two, and a field of the export object
 // cannot be read while that object is still being built. Both are still exported verbatim as
@@ -68,6 +101,13 @@ const COMMAND_TIMEOUTS_MS = {
   'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
   'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
   'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
+  // Action B1.4: FINISH's conditional bench-worker reinstall (`bash scripts/bench-install.sh`,
+  // command-timeout.js's own 'bench-install' class) -- an `npm run build:e2e` plus a
+  // `systemctl --user restart`, neither bounded by any OTHER class's own budget (not npm-ci, not
+  // npm-run's pr:wait-sized bound). 15 minutes is generous relative to a measured `build:e2e`
+  // (well under it) with headroom for a cold cache; see product-repo-hold.js's own comment for why
+  // this does not need to be folded into the product-repo mutex's MAX_LOCK_AGE_MS.
+  'bench-install': timeoutFromEnv('SPO_TIMEOUT_BENCH_INSTALL_MS', 900000),
 };
 const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
@@ -337,12 +377,15 @@ module.exports = {
       STEP_DEADLINE_MS,
       productRepoHold.worstHoldMs(COMMAND_TIMEOUTS_MS)
     ),
-    FINISH: productRepoHold.lockedStepDeadlineMs(
-      COMMAND_TIMEOUTS_MS,
-      WORKERS,
-      STEP_DEADLINE_MS,
-      productRepoHold.finishHoldMs(COMMAND_TIMEOUTS_MS)
-    ),
+    // Action B1.4: FINISH now acquires the product-repo lock TWICE (phase 'finish-sync' -- the
+    // fast-forward + conditional bench reinstall this action added, ahead of the pre-existing
+    // teardown phase 'finish' -- still just `git worktree remove`), so its own wait can legitimately
+    // happen twice, not once -- lockedStepDeadlineMs's single-wait shape no longer fits it. The
+    // FOURTH argument is the hazard-fix bench-idle wait's own bound (BENCH_IDLE_WAIT_MAX_MS above)
+    // -- that wait runs INSIDE 'finish-sync', ahead of the reinstall, so it has to be folded into
+    // this deadline for the identical reason the bench-install timeout itself already is. See
+    // product-repo-hold.js's finishStepDeadlineMs for the full derivation.
+    FINISH: productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),
   },
 
   // ---- action 2.1: real spawnSync per-command-class timeouts -----------------------------
@@ -640,6 +683,16 @@ module.exports = {
   // isolatedEnv() (test/helpers.js) points this at a throwaway tmp dir for every `spo status`
   // subprocess it spawns, so no test ever reads the maintainer's real ~/.spo-bench.
   spoBenchDir: process.env.SPO_BENCH_DIR || path.join(os.homedir(), '.spo-bench'),
+
+  // Post-verification hazard fix (action B1.4): steps/scripted.js's waitForBenchIdle reads these
+  // two before ever invoking bench-install.sh -- see BENCH_IDLE_WAIT_MAX_POLLS's own comment above
+  // (near CI_CHECKS_MAX_POLLS) for the full rationale and the default's derivation.
+  // benchIdleWaitMaxMs is the pre-multiplied bound (maxPolls x pollIntervalMs) -- exported so it
+  // can be read directly wherever only the total matters (this file's own FINISH deadline above),
+  // without re-deriving it from the other two a second time.
+  benchIdleWaitMaxPolls: BENCH_IDLE_WAIT_MAX_POLLS,
+  benchIdleWaitPollIntervalMs: BENCH_IDLE_WAIT_POLL_INTERVAL_MS,
+  benchIdleWaitMaxMs: BENCH_IDLE_WAIT_MAX_MS,
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //

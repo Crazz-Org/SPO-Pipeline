@@ -273,16 +273,93 @@ test("daemon.js re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K -
     /stepDeadlineMsByState:\s*\{/,
     "main()'s config must re-derive stepDeadlineMsByState: config.js built it from the env-time K, and --workers changes K for this process"
   );
-  for (const state of ['WORKTREE', 'FINISH']) {
-    assert.match(
-      configLiteral,
-      new RegExp(`${state}: productRepoHold\\.lockedStepDeadlineMs\\(`),
-      `${state}'s deadline must be recomputed through product-repo-hold.js's own formula, never restated as a literal here`
-    );
-  }
+  // WORKTREE acquires the product-repo lock once (setup phase), so lockedStepDeadlineMs's
+  // single-wait-plus-single-hold shape still fits it.
+  assert.match(
+    configLiteral,
+    /WORKTREE: productRepoHold\.lockedStepDeadlineMs\(/,
+    "WORKTREE's deadline must be recomputed through product-repo-hold.js's own lockedStepDeadlineMs, never restated as a literal here"
+  );
+  // Action B1.4: FINISH now acquires the lock TWICE (finish-sync, then finish), so it needs
+  // product-repo-hold.js's own finishStepDeadlineMs -- the SAME formula config.js itself calls
+  // (config.js:352) -- not lockedStepDeadlineMs, which only accounts for one acquisition.
+  assert.match(
+    configLiteral,
+    /FINISH: productRepoHold\.finishStepDeadlineMs\(/,
+    "FINISH's deadline must be recomputed through product-repo-hold.js's own finishStepDeadlineMs (it acquires the product-repo lock twice), never lockedStepDeadlineMs and never restated as a literal here"
+  );
   // And from the EFFECTIVE K (the --workers-aware value), not defaultConfig.workers.
   const byState = configLiteral.slice(configLiteral.indexOf('stepDeadlineMsByState:'));
   assert.match(byState, /effectiveWorkers/, 'the recompute must use the --workers-aware K, not config.js\'s env-time default');
+});
+
+test("daemon.js's re-derived stepDeadlineMsByState entries produce THE SAME NUMBERS config.js derives at the default worker count -- a source-shape guard alone cannot tell a real derivation from a literal that happens to look like one", () => {
+  // Defect class this closes: B1.4's D1 -- config.js grew a new, correctly-derived FINISH
+  // deadline (finishStepDeadlineMs, accounting for FINISH's second lock acquisition), but
+  // daemon.js's main() unconditionally overwrites config.defaultConfig.stepDeadlineMsByState
+  // with its OWN literal, which had not been updated to match and kept calling the pre-B1.4
+  // formula -- silently discarding config.js's derivation on every real daemon run. The regex
+  // guard above catches "calls the wrong function BY NAME", which is necessary but not
+  // sufficient: it would not catch daemon.js calling the right-looking function with stale
+  // constants, a swapped argument order, or any other value-level drift. This test actually
+  // EVALUATES daemon.js's stepDeadlineMsByState object literal (via vm, with the real
+  // product-repo-hold.js and config.js bound in, at effectiveWorkers === defaultConfig.workers
+  // -- the case where daemon.js's recompute and config.js's own values MUST agree exactly) and
+  // diffs every entry against config.js's own defaultConfig.stepDeadlineMsByState. Any state
+  // whose daemon.js recompute is ever again replaced by a stale/literal/mis-derived value fails
+  // here even if it still happens to call *some* productRepoHold function.
+  const vm = require('vm');
+  const productRepoHold = require('../orchestrator/product-repo-hold');
+  const defaultConfig = require('../orchestrator/config');
+
+  const source = fs.readFileSync(DAEMON, 'utf8');
+  const configAt = source.indexOf('const config = {');
+  assert.notEqual(configAt, -1, "main()'s config literal is no longer recognisable -- update this guard");
+  const configLiteral = source.slice(configAt, source.indexOf('\n  };', configAt));
+
+  const byStateKey = 'stepDeadlineMsByState: {';
+  const byStateStart = configLiteral.indexOf(byStateKey);
+  assert.notEqual(byStateStart, -1, "main()'s config no longer has a stepDeadlineMsByState block -- update this guard");
+  // Depth-count braces from the opening one to find the matching close -- the block's own
+  // entries contain only parens, no nested braces, so a plain counter is sufficient.
+  const openAt = byStateStart + byStateKey.length - 1;
+  let depth = 0;
+  let closeAt = -1;
+  for (let i = openAt; i < configLiteral.length; i++) {
+    if (configLiteral[i] === '{') depth++;
+    else if (configLiteral[i] === '}') {
+      depth--;
+      if (depth === 0) {
+        closeAt = i;
+        break;
+      }
+    }
+  }
+  assert.notEqual(closeAt, -1, 'could not find the closing brace of stepDeadlineMsByState -- update this guard');
+  const byStateLiteral = configLiteral.slice(openAt, closeAt + 1);
+
+  // effectiveWorkers === defaultConfig.workers here on purpose: that is the no-'--workers'-flag
+  // case, where daemon.js's recompute and config.js's own derivation MUST land on the same
+  // number. (A '--workers' override deliberately moves them apart -- that is action 6.4's whole
+  // point, and not what this test is checking.)
+  const sandbox = { productRepoHold, defaultConfig, effectiveWorkers: defaultConfig.workers };
+  vm.createContext(sandbox);
+  let actual;
+  try {
+    actual = vm.runInContext(`(${byStateLiteral})`, sandbox);
+  } catch (err) {
+    assert.fail(`could not evaluate daemon.js's stepDeadlineMsByState literal -- update this guard: ${err.message}`);
+  }
+
+  for (const state of Object.keys(defaultConfig.stepDeadlineMsByState)) {
+    assert.equal(
+      actual[state],
+      defaultConfig.stepDeadlineMsByState[state],
+      `daemon.js's recomputed ${state} deadline (${actual[state]}) must equal config.js's own derivation ` +
+        `(${defaultConfig.stepDeadlineMsByState[state]}) at the default worker count -- a mismatch means ` +
+        `daemon.js's recompute silently drifted from (or was overwritten by a literal in place of) config.js's derivation`
+    );
+  }
 });
 
 // ---- CROSS-ACTION defect: a worker's crash left NO record anywhere ---------------------------

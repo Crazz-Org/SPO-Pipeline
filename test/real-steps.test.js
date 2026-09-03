@@ -33,11 +33,12 @@ const {
   spawnStep,
   classifyCommand,
   finalComment,
+  benchQueueDepth,
 } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx, runTask } = require('../orchestrator/state-machine');
-const { lockFilePath } = require('../orchestrator/product-repo-lock');
+const { lockFilePath, acquireProductRepoLock, releaseProductRepoLock } = require('../orchestrator/product-repo-lock');
 const { ParkSignal } = require('../orchestrator/park-signal');
-const { appendEvent } = require('../orchestrator/journal');
+const { appendEvent, readBenchReinstallOwed, writeBenchReinstallOwed } = require('../orchestrator/journal');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
@@ -95,12 +96,34 @@ function testConfig(overrides = {}) {
     // main-moved-budget.js's own fallback, so a test that overrides it is visibly opting OUT of
     // the default rather than relying on an implicit one.
     mainMovedRegateBudget: 1,
+    // Post-verification hazard fix: waitForBenchIdle's own bound. Small numbers here for the SAME
+    // reason ciChecksMaxPolls/ciChecksPollIntervalMs above are -- every existing bench test's
+    // spoBenchDir is a fresh, empty tmp dir (spool/running never even created), so
+    // benchQueueDepth reads 0/0 on the FIRST poll and this never actually gets exercised except
+    // by the dedicated bench-idle-wait tests below (which override it further where a specific
+    // bound matters).
+    benchIdleWaitMaxPolls: 3,
+    benchIdleWaitPollIntervalMs: 10,
     ...overrides,
   };
 }
 
+// action B1.4 round 4: taskDir's PARENT is journalRoot in production
+// (state-machine.js's takeNextTask: `taskDir = path.join(journalRoot, id)`) -- and
+// payBenchReinstallDebtIfOwed/readBenchReinstallOwed now read/write
+// `<journalRoot>/bench-reinstall-owed.json` off exactly that parent, unconditionally, at the
+// very start of every realWorktree call. A bare `mkTmp('spo-real-taskdir-')` (a NEW mkdtemp
+// dropped directly under os.tmpdir()) makes every test's own "journalRoot" the SAME shared OS tmp
+// directory -- so an EARLIER test's realFinish deferring a reinstall (writeBenchReinstallOwed)
+// left a real /tmp/bench-reinstall-owed.json that a LATER, unrelated realWorktree test then read
+// back, inserting extra git calls into argv assertions that had nothing to do with this debt.
+// Nesting taskDir one level inside its OWN fresh mkTmp gives every test call a private
+// journalRoot, matching production's real shape, with no cross-test leakage through the real
+// filesystem.
 function testCtx({ id = 'card-1', task, config, taskDir } = {}) {
-  return buildCtx(id, task, taskDir || mkTmp('spo-real-taskdir-'), {
+  const dir = taskDir || path.join(mkTmp('spo-real-journalroot-'), id);
+  fs.mkdirSync(dir, { recursive: true });
+  return buildCtx(id, task, dir, {
     shadowMode: false,
     dryRun: false,
     ...(config || testConfig()),
@@ -720,6 +743,435 @@ test('realWorktree leftover sweep: a pushed remote branch leftover (no local bra
   const cleanedEvent = journal.find((e) => e.event === 'remote-branch-cleaned');
   assert.ok(cleanedEvent && cleanedEvent.branch === branch && cleanedEvent.sha === remoteSha);
 });
+
+// ---- WORKTREE: action B1.4 round 4 -- payBenchReinstallDebtIfOwed, paying back an EARLIER
+// card's deferred bench-worker reinstall from INSIDE this WORKTREE's own product-repo lock span
+// ------------------------------------------------------------------------------------------------
+//
+// Round 3's answer to the same debt was a separate daemon scan timer
+// (orchestrator/bench-reconcile.js), since deleted -- see payBenchReinstallDebtIfOwed's own header
+// in steps/scripted.js for why. These tests pin round 4's replacement: reuse the SAME
+// fastForwardMainAndInstall function realFinish calls (no second copy of the preconditions), reuse
+// the lock realWorktree already holds (no new lock holder), and -- the property every failure mode
+// below exists to prove -- NEVER block or park the card paying the debt, even when the debt itself
+// cannot be paid this cycle.
+
+// debtPaySpawnSync(calls, opts) -- a superset of noLeftoversSpawnSync above: handles both
+// payBenchReinstallDebtIfOwed's own calls (the `--abbrev-ref` branch check, `status
+// --untracked-files=no`, `merge --ff-only`, `merge-base --is-ancestor`, `bash` install) AND
+// realWorktree's own ordinary calls (fetch, `rev-parse origin/main`, the leftover sweep's
+// `--verify` probes, `worktree add`, `npm ci`, `board:take`) -- so a debt-owed test still reaches
+// PLAN exactly like an ordinary run once the debt itself is settled one way or another.
+function debtPaySpawnSync(calls, { onMain = true, dirty = false, ffOk = true, ancestryOk = true, installExit = 0 } = {}) {
+  return (command, args, opts) => {
+    calls.push({ command, args: [...args], cwd: opts && opts.cwd });
+    if (command === 'git' && args.includes('rev-parse') && args.includes('--abbrev-ref')) {
+      return onMain ? ok('main\n') : ok('some-feature-branch\n');
+    }
+    if (command === 'git' && args.includes('status') && args.includes('--porcelain')) {
+      return dirty ? ok(' M some/tracked/file.ts\n') : ok('');
+    }
+    if (command === 'git' && args.includes('merge') && args.includes('--ff-only')) {
+      return ffOk ? ok('') : fail(1, 'not fast forward');
+    }
+    if (command === 'git' && args.includes('merge-base') && args.includes('--is-ancestor')) {
+      return ancestryOk ? ok('') : fail(1);
+    }
+    if (command === 'bash') {
+      return installExit === 0 ? ok('') : fail(installExit);
+    }
+    if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers
+    if (args.includes('rev-parse')) return ok('originmainsha00000000000000000000000000\n');
+    if (args.includes('board:take')) return ok('claimed\n');
+    return ok('');
+  };
+}
+
+test('realWorktree: NO debt owed -- payBenchReinstallDebtIfOwed is a true no-op, byte-identical argv and journal to a run with no debt-repayment code at all', async () => {
+  const config = testConfig();
+  const task = { id: 'card-nodebt', kind: 'card', issue: 900 };
+  const ctx = testCtx({ id: 'card-nodebt', task, config });
+
+  const calls = [];
+  const deps = { spawnSync: noLeftoversSpawnSync(calls) };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+  // Exactly the 9 calls the very first WORKTREE test in this file pins -- no extra fetch, no
+  // branch/status/merge/ancestry/install call ever appears when nothing is owed.
+  assert.equal(calls.length, 9, 'no debt owed must mean no extra spawnStep calls at all');
+  assert.deepEqual(calls[0], { command: 'git', args: ['-C', config.productRepo, 'fetch', 'origin'], cwd: undefined });
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(!journal.some((e) => e.event.startsWith('bench-debt-') || e.event === 'main-fast-forward-failed'));
+});
+
+test('realWorktree (B1.4 round 4): an OWED debt, idle bench, valid ancestry -- paid BEFORE any of WORKTREE\'s own calls, record cleared, bench-debt-paid journalled, and the card still reaches PLAN', async () => {
+  const config = testConfig();
+  const task = { id: 'card-debt-pay', kind: 'card', issue: 901 };
+  const ctx = testCtx({ id: 'card-debt-pay', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 777, issue: 700 });
+
+  const calls = [];
+  const deps = { spawnSync: debtPaySpawnSync(calls), readdirSync: benchDirFake([0], [0]) };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'paying back an earlier card\'s debt must never block or park THIS card');
+
+  // Exact ordering: the debt's own fetch/branch/status/merge/ancestry/install run FIRST, entirely
+  // ahead of realWorktree's own fetch -- this is the "skip the preconditions before installing"
+  // mutation's kill site, along with the argv assertions below.
+  const debtCalls = calls.slice(0, 6);
+  assert.deepEqual(debtCalls[0], { command: 'git', args: ['-C', config.productRepo, 'fetch', 'origin'], cwd: undefined });
+  assert.deepEqual(debtCalls[1], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'rev-parse', '--abbrev-ref', 'HEAD'],
+    cwd: undefined,
+  });
+  assert.deepEqual(debtCalls[2], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'status', '--porcelain', '--untracked-files=no'],
+    cwd: undefined,
+  });
+  assert.deepEqual(debtCalls[3], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'merge', '--ff-only', 'origin/main'],
+    cwd: undefined,
+  });
+  assert.deepEqual(debtCalls[4], {
+    command: 'git',
+    args: ['-C', config.productRepo, 'merge-base', '--is-ancestor', owedSha, 'HEAD'],
+    cwd: undefined,
+  });
+  assert.deepEqual(debtCalls[5], {
+    command: 'bash',
+    args: [path.join(config.productRepo, 'scripts', 'bench-install.sh')],
+    cwd: config.productRepo,
+  });
+  // realWorktree's own sequence starts fresh right after, unaffected -- same shape as the
+  // no-debt-owed test above.
+  assert.deepEqual(calls[6], { command: 'git', args: ['-C', config.productRepo, 'fetch', 'origin'], cwd: undefined });
+  assert.equal(calls.length, 6 + 9, 'the debt-repayment calls plus the ordinary WORKTREE sequence, nothing more');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.equal(owedAfter, null, 'the debt must be CLEARED once the install actually ran and succeeded');
+
+  const journal = readJournal(ctx.taskDir);
+  const paid = journal.find((e) => e.event === 'bench-debt-paid');
+  assert.ok(paid, 'paying the debt must be journalled by its own name');
+  assert.equal(paid.mergeSha, owedSha);
+  assert.ok(journal.some((e) => e.event === 'main-fast-forwarded' && e.state === 'WORKTREE'));
+  assert.ok(journal.some((e) => e.event === 'bench-reinstalled' && e.state === 'WORKTREE'));
+});
+
+test('realWorktree (B1.4 round 4): an OWED debt with a BUSY bench is left owed, journals bench-debt-still-busy, never installs, never blocks the card -- a single check, not a poll', async () => {
+  const config = testConfig();
+  const task = { id: 'card-debt-busy', kind: 'card', issue: 902 };
+  const ctx = testCtx({ id: 'card-debt-busy', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = 'b'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 778, issue: 701 });
+
+  let bashRan = false;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'bash') bashRan = true;
+      return debtPaySpawnSync([])(command, args, opts);
+    },
+    readdirSync: benchDirFake([1], [0]), // spool has one job -- busy
+    sleep: () => {
+      throw new Error('payBenchReinstallDebtIfOwed must never sleep/poll -- it checks ONCE and moves on');
+    },
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'a busy bench must never block or park the card paying the debt');
+  assert.ok(!bashRan, 'a busy bench must never run the reinstall -- this is the "pay it while the bench is busy" mutation this test kills');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed -- clearing it without installing is the "clear the debt without installing" mutation this test kills');
+  assert.equal(owedAfter.mergeSha, owedSha);
+
+  const journal = readJournal(ctx.taskDir);
+  const busy = journal.find((e) => e.event === 'bench-debt-still-busy');
+  assert.ok(busy, 'a busy bench at debt-repayment time must be journalled by its own name');
+  assert.equal(busy.spool, 1);
+  assert.equal(busy.running, 0);
+  assert.equal(busy.mergeSha, owedSha);
+});
+
+test('realWorktree (B1.4 round 4): an OWED debt with an UNREADABLE bench dir is left owed, journals bench-debt-dir-unreadable, never installs, never blocks the card', async () => {
+  const config = testConfig();
+  const task = { id: 'card-debt-unreadable', kind: 'card', issue: 903 };
+  const ctx = testCtx({ id: 'card-debt-unreadable', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = 'c'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 779, issue: 702 });
+
+  let bashRan = false;
+  const eacces = () => {
+    const err = new Error('EACCES: permission denied');
+    err.code = 'EACCES';
+    throw err;
+  };
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'bash') bashRan = true;
+      return debtPaySpawnSync([])(command, args, opts);
+    },
+    readdirSync: eacces,
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'an unreadable bench dir must never block or park the card paying the debt');
+  assert.ok(!bashRan);
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed when the bench dir cannot even be read');
+
+  const journal = readJournal(ctx.taskDir);
+  const unreadable = journal.find((e) => e.event === 'bench-debt-dir-unreadable');
+  assert.ok(unreadable, 'an unreadable bench dir at debt-repayment time must be journalled by its own name');
+  assert.equal(unreadable.code, 'EACCES');
+});
+
+test('realWorktree (B1.4 round 4): an OWED debt whose mergeSha is NOT an ancestor of the fast-forwarded HEAD is left owed, journals bench-debt-ancestry-check-failed, never installs -- defense in depth against a stale/corrupted record', async () => {
+  const config = testConfig();
+  const task = { id: 'card-debt-badancestry', kind: 'card', issue: 904 };
+  const ctx = testCtx({ id: 'card-debt-badancestry', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = 'd'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 780, issue: 703 });
+
+  let bashRan = false;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'bash') bashRan = true;
+      return debtPaySpawnSync([], { ancestryOk: false })(command, args, opts);
+    },
+    readdirSync: benchDirFake([0], [0]),
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN');
+  assert.ok(!bashRan, 'an unverified ancestry must never run the reinstall -- the "skip the preconditions before installing" mutation this test kills');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed when its mergeSha cannot be confirmed as an ancestor of HEAD');
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'bench-debt-ancestry-check-failed');
+  assert.ok(failed, 'a failed ancestry check must be journalled by its own name');
+  assert.equal(failed.mergeSha, owedSha);
+});
+
+test('realWorktree (B1.4 round 4): an OWED debt whose fast-forward itself fails (dirty tree) is left owed, journals main-fast-forward-failed under WORKTREE, never installs, never parks', async () => {
+  const config = testConfig();
+  const task = { id: 'card-debt-dirty', kind: 'card', issue: 905 };
+  const ctx = testCtx({ id: 'card-debt-dirty', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = 'e'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 781, issue: 704 });
+
+  let bashRan = false;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'bash') bashRan = true;
+      return debtPaySpawnSync([], { dirty: true })(command, args, opts);
+    },
+    readdirSync: benchDirFake([0], [0]),
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'a dirty product-repo checkout at debt-repayment time must never park THIS card -- only realFinish\'s OWN merge parks on a dirty tree');
+  assert.ok(!bashRan, 'a failed fast-forward must never reach the install step -- the "skip the preconditions before installing" mutation this test kills');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed when the fast-forward itself fails');
+
+  const journal = readJournal(ctx.taskDir);
+  const ffFailed = journal.find((e) => e.event === 'main-fast-forward-failed' && e.state === 'WORKTREE');
+  assert.ok(ffFailed, 'a failed fast-forward during debt-repayment must still be journalled under WORKTREE, same vocabulary realFinish uses');
+  assert.equal(ffFailed.reason, 'dirty');
+  assert.ok(!journal.some((e) => e.event === 'bench-debt-paid'));
+});
+
+test('realWorktree (B1.4 round 4): an OWED debt whose reinstall itself FAILS (bench-install.sh exits non-zero) is left owed, journals bench-reinstall-failed under WORKTREE, never parks', async () => {
+  const config = testConfig();
+  const task = { id: 'card-debt-installfail', kind: 'card', issue: 906 };
+  const ctx = testCtx({ id: 'card-debt-installfail', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = 'f'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 782, issue: 705 });
+
+  const deps = {
+    spawnSync: debtPaySpawnSync([], { installExit: 1 }),
+    readdirSync: benchDirFake([0], [0]),
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'a failed reinstall attempt must never park THIS card -- the next card\'s WORKTREE simply tries again');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'clearing the debt on a FAILED install would be exactly the "clear the debt without installing [successfully]" mutation this test kills');
+  assert.equal(owedAfter.mergeSha, owedSha);
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'bench-reinstall-failed' && e.state === 'WORKTREE');
+  assert.ok(failed, 'a failed reinstall must be journalled under WORKTREE using the SAME event name realFinish uses');
+  assert.ok(!journal.some((e) => e.event === 'bench-debt-paid'));
+});
+
+test('realWorktree (B1.4 R4, fifth pass F1): a TIMED-OUT bench-install.sh while paying an EARLIER card\'s debt never parks or crashes THIS card -- caught, journalled bench-debt-attempt-failed, debt stays owed', async () => {
+  // The contract payBenchReinstallDebtIfOwed's own header, orchestrator/README.md and this spec
+  // all claimed before this fix: "never parks or blocks the card, on any failure mode". That was
+  // true only of NON-ZERO EXIT failures -- spawnStep converts a TIMEOUT into a thrown ParkSignal,
+  // not an exit code, and an uncaught throw here would both park THIS card (over a debt it did not
+  // create, on a reason -- bench-install-timed-out -- that is not on TRANSIENT_RETRY_REASONS, so
+  // terminally) AND leave the debt owed, so the NEXT card's WORKTREE hits the same wedged
+  // installer and parks the same way: a single stuck `bash scripts/bench-install.sh` would
+  // terminally stall every card that starts. This test pins the fix.
+  //
+  // commandTimeoutsMs must actually name 'bench-install' -- spawnOnce only treats an ETIMEDOUT
+  // fake result as a real timeout when a numeric deadline was armed (`deadlineArmed`); testConfig's
+  // own default has no commandTimeoutsMs at all, which would silently make this ETIMEDOUT result
+  // read as a plain exit failure instead, same shape test/real-steps.test.js:4671 already learned.
+  const config = testConfig({ commandTimeoutsMs: { 'bench-install': 900000 } });
+  const task = { id: 'card-debt-installtimeout', kind: 'card', issue: 907 };
+  const ctx = testCtx({ id: 'card-debt-installtimeout', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = '1'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 783, issue: 706 });
+
+  let bashRuns = 0;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'bash') {
+        bashRuns += 1;
+        return timeoutResult();
+      }
+      return debtPaySpawnSync([])(command, args, opts);
+    },
+    readdirSync: benchDirFake([0], [0]),
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'a wedged installer paying an EARLIER card\'s debt must never park or crash THIS card');
+  assert.equal(bashRuns, 1, 'bench-install is never retried on a timeout -- spawnStep\'s own bench-install exemption');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed when the install itself times out');
+  assert.equal(owedAfter.mergeSha, owedSha);
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'bench-debt-attempt-failed');
+  assert.ok(failed, 'a caught throw while paying the debt must be journalled by its own name, not silently swallowed');
+  assert.equal(failed.reason, 'bench-install-timed-out');
+  assert.equal(failed.mergeSha, owedSha);
+  assert.ok(!journal.some((e) => e.event === 'bench-debt-paid'));
+});
+
+test('realWorktree (B1.4 R4, fifth pass F1): a TIMED-OUT git call (two consecutive timeouts) while paying an EARLIER card\'s debt never parks or crashes THIS card -- caught, journalled bench-debt-attempt-failed, debt stays owed', async () => {
+  // Same deadlineArmed requirement as the bench-install test above -- 'git' must be a real key in
+  // commandTimeoutsMs or the fake ETIMEDOUT result is read as a plain exit failure instead.
+  const config = testConfig({ commandTimeoutsMs: { git: 120000 } });
+  const task = { id: 'card-debt-gittimeout', kind: 'card', issue: 908 };
+  const ctx = testCtx({ id: 'card-debt-gittimeout', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = '3'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 785, issue: 708 });
+
+  let ancestryAttempts = 0;
+  let bashRan = false;
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'git' && args.includes('merge-base') && args.includes('--is-ancestor')) {
+        ancestryAttempts += 1;
+        return timeoutResult();
+      }
+      if (command === 'bash') bashRan = true;
+      return debtPaySpawnSync([])(command, args, opts);
+    },
+    readdirSync: benchDirFake([0], [0]),
+  };
+
+  const next = await realWorktree(ctx, deps);
+  assert.equal(next, 'PLAN', 'two timed-out git calls paying an EARLIER card\'s debt must never park or crash THIS card');
+  assert.equal(ancestryAttempts, 2, 'a `git` command IS retried once before a second timeout parks -- pinning the ordinary retry policy still runs on this path');
+  assert.ok(!bashRan, 'the ancestry check never resolved, so the reinstall must never run');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed when the ancestry check itself times out');
+  assert.equal(owedAfter.mergeSha, owedSha);
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'bench-debt-attempt-failed');
+  assert.ok(failed, 'a caught throw while paying the debt must be journalled by its own name, not silently swallowed');
+  assert.equal(failed.reason, 'git-timed-out');
+  assert.equal(failed.mergeSha, owedSha);
+  assert.ok(!journal.some((e) => e.event === 'bench-debt-paid'));
+});
+
+test('realWorktree (B1.4 R4, fifth pass F1): clearBenchReinstallOwed itself THROWING (a read-only journalRoot) while paying an EARLIER card\'s debt never crashes THIS card -- caught, journalled bench-debt-attempt-failed, debt stays owed', async () => {
+  // The one vector that is NOT a ParkSignal: clearBenchReinstallOwed's own fs.writeFileSync/
+  // renameSync raise a raw Error (park-signal.js's own header: runTask deliberately does NOT
+  // convert a bare Error into a park, "a real bug -- surface it, do not disguise it as a park") --
+  // so before this fix, an install that succeeded but then failed to CLEAR the record would crash
+  // the worker outright rather than merely leave the debt owed for a retry.
+  const config = testConfig();
+  const task = { id: 'card-debt-clearfail', kind: 'card', issue: 909 };
+  const ctx = testCtx({ id: 'card-debt-clearfail', task, config });
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owedSha = '2'.repeat(40);
+  writeBenchReinstallOwed(journalRoot, { mergeSha: owedSha, prNumber: 786, issue: 709 });
+
+  const deps = {
+    spawnSync: debtPaySpawnSync([]),
+    readdirSync: benchDirFake([0], [0]),
+  };
+
+  // journalRoot itself (not ctx.taskDir, already created and independently writable) loses its
+  // write bit -- clearBenchReinstallOwed's own tmp-file write inside journalRoot fails EACCES,
+  // exactly as reproduced live against a real read-only journalRoot in the fourth-round audit.
+  fs.chmodSync(journalRoot, 0o500);
+  let next;
+  try {
+    next = await realWorktree(ctx, deps);
+  } finally {
+    fs.chmodSync(journalRoot, 0o700);
+  }
+  assert.equal(next, 'PLAN', 'a broken journalRoot must never crash the card paying an EARLIER card\'s debt');
+
+  const owedAfter = readBenchReinstallOwed(journalRoot);
+  assert.ok(owedAfter, 'the debt must stay owed when clearing the record itself fails -- clearing is what would otherwise have marked it paid');
+  assert.equal(owedAfter.mergeSha, owedSha);
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'bench-debt-attempt-failed');
+  assert.ok(failed, 'a raw Error thrown by clearBenchReinstallOwed must be caught and journalled, not left to crash the worker');
+  assert.equal(failed.reason, 'EACCES');
+  assert.ok(!journal.some((e) => e.event === 'bench-debt-paid'), 'bench-debt-paid must not be journalled when clearing itself failed');
+});
+
+test('realWorktree: payBenchReinstallDebtIfOwed is wired into runScanCycle\'s replacement (WORKTREE) -- deleting the call from realWorktree must be caught, not merely unit-tested in isolation', async () => {
+  // Source-level guard, same shape as test/worker-mode.test.js's config-literal guards: an owed
+  // debt that a future edit accidentally stops calling would otherwise only be caught by the
+  // tests above still passing (which they would NOT, since they call realWorktree directly) --
+  // this pins that the WIRING itself -- the call site inside realWorktree's own lock span --
+  // still exists in source, the "never pay the debt at WORKTREE" mutation's kill site.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'steps', 'scripted.js'), 'utf8');
+  const worktreeFnStart = src.indexOf('async function realWorktree(');
+  assert.notEqual(worktreeFnStart, -1);
+  const worktreeFnBody = src.slice(worktreeFnStart, src.indexOf('\n}\n', worktreeFnStart));
+  assert.match(
+    worktreeFnBody,
+    /await payBenchReinstallDebtIfOwed\(ctx, deps, config\)/,
+    'realWorktree must call payBenchReinstallDebtIfOwed -- deleting this call site is the "never pay the debt at WORKTREE" mutation'
+  );
+});
+
 
 // ---- CHECK ----------------------------------------------------------------------------------
 
@@ -2037,6 +2489,48 @@ test('realMerge: pr:wait exit 9 (unrecognized) -> PARKED pr-wait-unrecognized-ex
 });
 
 // ---- FINISH ---------------------------------------------------------------------------------
+//
+// Action B1.4 gave realFinish a new preamble (inside a FIRST, separate product-repo-lock
+// acquisition, phase 'finish-sync'): fetch, look up this card's own merge commit by PR number
+// (`gh pr view`), check whether the merge touched the bench worker (`git diff --name-only`),
+// fast-forward config.productRepo (branch/dirty checks + `git merge --ff-only`), and -- only when
+// the merge touched the bench worker AND the fast-forward succeeded -- reinstall it. Every test
+// below this point that predates that action is about board-move/issue-comment/worktree-remove,
+// not this new preamble -- `finishSyncOk` below gives every one of them a default happy path for
+// it (on `main`, clean, fast-forwardable, merge touched nothing under src/e2e/bench/ or
+// scripts/bench-) so their OWN assertions keep meaning what they always meant, and
+// `isPostSyncCall` lets a test that records every spawnStep call filter down to just the three
+// calls it actually cares about, exactly as if the preamble were not there.
+
+// finishSyncOk(overrideFn) -- `overrideFn(command, args)` is checked FIRST (same override-then-
+// fallback convention noLeftoversSpawnSync already uses elsewhere in this file); returning a
+// falsy value falls through to the happy-path default below. The only two calls needing anything
+// beyond a bare `ok('')` are the branch check (must say 'main', not empty) and the merge-sha
+// lookup (must be valid JSON, or JSON.parse throws and the whole preamble parks
+// 'merge-sha-lookup' before ever reaching board-move) -- fetch/status/merge/diff all read a
+// correct "nothing to see here" from a bare success with empty stdout.
+function finishSyncOk(overrideFn) {
+  return (command, args, opts) => {
+    if (overrideFn) {
+      const overridden = overrideFn(command, args, opts);
+      if (overridden) return overridden;
+    }
+    if (command === 'git' && args.includes('rev-parse') && args.includes('--abbrev-ref')) return ok('main\n');
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return ok(JSON.stringify({ mergeCommit: { oid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } }));
+    }
+    return ok('');
+  };
+}
+
+// isPostSyncCall(args) -- true for exactly the three calls the PRE-B1.4 tests below were written
+// to observe (board:move, the issue comment, `git worktree remove`), false for anything in the
+// new finish-sync preamble. `args.includes('view')` on its own would also match nothing else here
+// (no other FINISH call passes 'view'), so this stays a plain OR of three narrow, specific checks
+// rather than an exclusion list that would have to be updated every time the preamble grows.
+function isPostSyncCall(args) {
+  return args.includes('board:move') || args.includes('comment') || (args.includes('worktree') && args.includes('remove'));
+}
 
 test('realFinish: board:move, then gh issue comment, then git worktree remove --force, in order; sums llm billableTokens', async () => {
   const config = testConfig();
@@ -2049,7 +2543,12 @@ test('realFinish: board:move, then gh issue comment, then git worktree remove --
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'llm-call', { billableTokens: 2500 });
 
   const calls = [];
-  const deps = { spawnSync: (command, args) => { calls.push({ command, args: [...args] }); return ok(''); } };
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (isPostSyncCall(args)) calls.push({ command, args: [...args] });
+      return null;
+    }),
+  };
 
   const next = await realFinish(ctx, deps);
   assert.equal(next, 'DONE');
@@ -2092,14 +2591,15 @@ test('realFinish: board:move failure -> PARKED (finish-failed), worktree never r
   const worktreePath = mkTmp('spo-real-finish-wt2-');
   const task = { id: 'card-finish2', kind: 'card', issue: 121, worktreePath };
   const ctx = testCtx({ id: 'card-finish2', task, config });
+  ctx.prNumber = 121;
 
   const calls = [];
   const deps = {
-    spawnSync: (command, args) => {
-      calls.push(args);
+    spawnSync: finishSyncOk((command, args) => {
+      if (isPostSyncCall(args)) calls.push(args);
       if (args.includes('board:move')) return fail(1);
-      return ok('');
-    },
+      return null;
+    }),
   };
 
   await assert.rejects(
@@ -2134,13 +2634,14 @@ test('realFinish: the board move is journalled BEFORE the issue comment -- a par
   const worktreePath = mkTmp('spo-real-finish-wt3-');
   const task = { id: 'card-finish3', kind: 'card', issue: 122, worktreePath };
   const ctx = testCtx({ id: 'card-finish3', task, config });
+  ctx.prNumber = 122;
 
   const deps = {
-    spawnSync: (command, args) => {
+    spawnSync: finishSyncOk((command, args) => {
       if (args.includes('board:move')) return ok('');
       if (args.includes('comment')) return fail(1);
-      return ok('');
-    },
+      return null;
+    }),
   };
 
   await assert.rejects(
@@ -2156,6 +2657,790 @@ test('realFinish: the board move is journalled BEFORE the issue comment -- a par
   const moved = journal.find((e) => e.event === 'board-move');
   assert.ok(moved, 'the successful move to Done must already be journalled when the comment parks');
   assert.equal(moved.column, 'Done');
+});
+
+// ---- action B1.4: fast-forward config.productRepo, then (conditionally) reinstall the bench
+// worker -- the behaviours that must fail LOUDLY when removed, per this action's own design
+// constraint, not merely pass today. ------------------------------------------------------------
+
+function readJournal(taskDir) {
+  return fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+test('realFinish (action B1.4): a merge touching src/e2e/bench/worker.ts runs the reinstall, AFTER the fast-forward -- asserted on the actual argv and the ordering', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-bench1-');
+  const task = { id: 'card-bench1', kind: 'card', issue: 1001, worktreePath };
+  const ctx = testCtx({ id: 'card-bench1', task, config });
+  ctx.prNumber = 1001;
+
+  const order = [];
+  let installArgs = null;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'git' && args.includes('merge') && args.includes('--ff-only')) order.push('fast-forward');
+      if (command === 'bash') {
+        order.push('reinstall');
+        installArgs = [...args];
+      }
+      return null;
+    }),
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+
+  assert.deepEqual(order, ['fast-forward', 'reinstall'], 'the fast-forward must run, and succeed, BEFORE the reinstall ever does');
+  assert.ok(installArgs, 'bash scripts/bench-install.sh must actually have been spawned');
+  assert.deepEqual(installArgs, [path.join(config.productRepo, 'scripts', 'bench-install.sh')]);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'main-fast-forwarded'), 'the fast-forward success must be journalled by name');
+  assert.ok(journal.some((e) => e.event === 'bench-reinstalled'), 'the reinstall success must be journalled by name');
+});
+
+// ---- D2 (adversarial verification): mutation M14 -- dropping the '^' from `${mergeSha}^` left
+// the diff range empty, benchTouched permanently false, and the ENTIRE reinstall silently
+// disabled -- with all 1572 pre-existing tests staying green, because every fake matches on
+// `diff` + `--name-only` alone and never inspects the revs themselves. Assert the actual argv,
+// both revisions included, so a caret dropped (or a rev swapped, or a third rev appended) cannot
+// survive unnoticed again.
+test("realFinish (action B1.4): the merge-diff call's actual argv is `git -C <productRepo> diff --name-only <mergeSha>^ <mergeSha>` -- both revisions, caret included, asserted directly (not just 'a diff call happened')", async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-diffargv-');
+  const task = { id: 'card-diffargv', kind: 'card', issue: 1009, worktreePath };
+  const ctx = testCtx({ id: 'card-diffargv', task, config });
+  ctx.prNumber = 1009;
+
+  let diffArgs = null;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) {
+        diffArgs = [...args];
+      }
+      return null;
+    }),
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+
+  assert.ok(diffArgs, 'the merge-diff call must actually have been spawned');
+  // finishSyncOk's own gh pr view fake always answers with this exact sha.
+  const mergeSha = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+  assert.deepEqual(
+    diffArgs,
+    ['-C', config.productRepo, 'diff', '--name-only', `${mergeSha}^`, mergeSha],
+    'both revisions must be present, in order, with the caret on the FIRST one -- a caret dropped ' +
+      '(diff range collapses to empty, benchTouched permanently false, reinstall silently never ' +
+      'runs) or a rev swapped/duplicated must fail this even though every OTHER test here only ' +
+      "matches on the call happening at all, never its actual revs"
+  );
+});
+
+test('realFinish (action B1.4): a merge touching NOTHING under src/e2e/bench/ or scripts/bench- does NOT run the reinstall', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-bench2-');
+  const task = { id: 'card-bench2', kind: 'card', issue: 1002, worktreePath };
+  const ctx = testCtx({ id: 'card-bench2', task, config });
+  ctx.prNumber = 1002;
+
+  const calls = [];
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) {
+        return ok('src/client/App.tsx\ndoc/README.md\n');
+      }
+      return null;
+    }),
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+  assert.ok(!calls.some((c) => c.command === 'bash'), 'no `bash` call at all -- the reinstall must never even be attempted');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'bench-reinstall-skipped'), 'the skip must be journalled by name, not merely absent from the log');
+});
+
+test("realFinish (action B1.4): a merge touching scripts/bench-install.sh itself ALSO runs the reinstall -- the 'scripts/bench-' half of the pattern, kept as its own test rather than sharing one with the src/e2e/bench/ half", async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-bench3-');
+  const task = { id: 'card-bench3', kind: 'card', issue: 1003, worktreePath };
+  const ctx = testCtx({ id: 'card-bench3', task, config });
+  ctx.prNumber = 1003;
+
+  let installRan = false;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('scripts/bench-install.sh\n');
+      if (command === 'bash') installRan = true;
+      return null;
+    }),
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+  assert.ok(installRan, "a change to scripts/bench-install.sh itself must trip the 'scripts/bench-' half of the path match");
+});
+
+// ---- post-verification hazard fix: waitForBenchIdle, ahead of the reinstall -------------------
+//
+// bench-install.sh ends in an unconditional `systemctl --user restart spo-bench-worker.service`;
+// this daemon runs K=2 in production, so reinstalling while the bench is still busy can cut a
+// SIBLING card's in-flight GATE. These three tests are the minimum the fix's own instructions
+// call for: an idle bench never waits at all, a busy bench defers and then proceeds once it
+// drains, and a bench that never drains hits the bound and PARKS rather than reinstalling anyway
+// or silently skipping (see waitForBenchIdle's own header in steps/scripted.js).
+
+// benchDirFake(spoolCounts, runningCounts) -- deps.readdirSync stand-in. Each call to
+// readdirSync(<spoBenchDir>/spool) consumes the next entry of `spoolCounts` (an array of ENTRY
+// COUNTS, one per poll -- e.g. [2, 1, 0] means "2 queued, then 1, then drained"), clamped to the
+// last element once exhausted; `running` works the same way off `runningCounts`. Throws for
+// anything else, matching countDirEntries' own "missing directory -> 0" contract being exercised
+// by every OTHER bench test via a real (but empty, never-created) tmp dir instead.
+function benchDirFake(spoolCounts, runningCounts) {
+  let spoolCalls = 0;
+  let runningCalls = 0;
+  return (dir) => {
+    const base = path.basename(dir);
+    if (base === 'spool') {
+      const n = spoolCounts[Math.min(spoolCalls, spoolCounts.length - 1)];
+      spoolCalls += 1;
+      return Array.from({ length: n }, (_, i) => `job-${i}`);
+    }
+    if (base === 'running') {
+      const n = runningCounts[Math.min(runningCalls, runningCounts.length - 1)];
+      runningCalls += 1;
+      return Array.from({ length: n }, (_, i) => `job-${i}`);
+    }
+    const err = new Error(`ENOENT: benchDirFake does not know directory ${dir}`);
+    err.code = 'ENOENT';
+    throw err;
+  };
+}
+
+// ---- W2 (post-verification, third pass): benchQueueDepth must read config.spoBenchDir, and an
+// UNREADABLE bench dir must never be silently read as "idle" -- see countDirEntries'/
+// benchQueueDepth's own header in steps/scripted.js for the full rationale (a misconfigured
+// SPO_BENCH_DIR used to reduce the whole guard to a no-op while the suite stayed green). --------
+
+test('benchQueueDepth: reads config.spoBenchDir specifically, not a hardcoded or derived path', () => {
+  const dirsRead = [];
+  const config = { spoBenchDir: '/a/distinctive/bench/dir/nobody/else/would/pick' };
+  const deps = {
+    readdirSync: (dir) => {
+      dirsRead.push(dir);
+      return [];
+    },
+  };
+  const depth = benchQueueDepth(deps, config);
+  assert.equal(depth.spool, 0);
+  assert.equal(depth.running, 0);
+  assert.equal(depth.error, null);
+  assert.deepEqual(dirsRead.sort(), [
+    path.join(config.spoBenchDir, 'running'),
+    path.join(config.spoBenchDir, 'spool'),
+  ]);
+});
+
+test('benchQueueDepth: a MISSING subdirectory (ENOENT) reads as an honest 0, no error -- "no bench installed" and "never spooled a job" are both legitimate', () => {
+  const config = { spoBenchDir: mkTmp('spo-real-benchqd-enoent-') };
+  const deps = {}; // no deps.readdirSync override -- exercises the REAL fs.readdirSync against a genuinely empty tmp dir
+  const depth = benchQueueDepth(deps, config);
+  assert.deepEqual(depth, { spool: 0, running: 0, error: null });
+});
+
+test('benchQueueDepth: an UNREADABLE subdirectory (EACCES, or any error other than ENOENT) is reported as an error, NEVER silently collapsed to 0 -- the guard must not become a no-op on a misconfigured or permission-denied bench dir', () => {
+  const config = { spoBenchDir: '/wherever' };
+  const deps = {
+    readdirSync: (dir) => {
+      const err = new Error('EACCES: permission denied');
+      err.code = 'EACCES';
+      throw err;
+    },
+  };
+  const depth = benchQueueDepth(deps, config);
+  assert.equal(depth.spool, 0);
+  assert.equal(depth.running, 0);
+  assert.ok(depth.error, 'a non-ENOENT read failure must be surfaced, never swallowed as "idle"');
+  assert.equal(depth.error.code, 'EACCES');
+});
+
+test('realFinish (W2, post-verification third pass): an UNREADABLE bench dir PARKS finish-failed/bench-idle-wait/bench-dir-unreadable IMMEDIATELY -- distinguishable from a merely BUSY bench (which defers, never parks) -- no sleep, no reinstall attempted, and no owed record written (this is a park, not a defer)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-benchunreadable-');
+  // Isolated journalRoot -- the default testCtx taskDir lands directly under os.tmpdir(), shared
+  // by every other default-taskDir test in this file, which would make the "no owed record"
+  // assertion below meaningless if another test's leftover file happened to still be there.
+  const journalRoot = mkTmp('spo-real-finish-benchunreadable-root-');
+  const taskDir = path.join(journalRoot, 'card-benchunreadable');
+  fs.mkdirSync(taskDir, { recursive: true });
+  const task = { id: 'card-benchunreadable', kind: 'card', issue: 1016, worktreePath };
+  const ctx = testCtx({ id: 'card-benchunreadable', task, config, taskDir });
+  ctx.prNumber = 1016;
+
+  const sleeps = [];
+  let installRan = false;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'bash') installRan = true;
+      return null;
+    }),
+    readdirSync: () => {
+      const err = new Error('EACCES: permission denied');
+      err.code = 'EACCES';
+      throw err;
+    },
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'finish-failed' &&
+      err.detail.step === 'bench-idle-wait' &&
+      err.detail.reason === 'bench-dir-unreadable' &&
+      err.detail.code === 'EACCES'
+  );
+  assert.ok(!installRan, 'the reinstall must never be attempted against an unreadable bench dir');
+  assert.deepEqual(sleeps, [], 'an unreadable bench dir must be reported on the FIRST read -- no pointless polling of a directory that will never become readable by waiting');
+
+  const journal = readJournal(ctx.taskDir);
+  const unreadable = journal.find((e) => e.event === 'bench-dir-unreadable');
+  assert.ok(unreadable, 'the unreadable dir must be journalled by its own name, distinct from bench-busy-wait/bench-idle-wait-timed-out');
+  assert.equal(unreadable.code, 'EACCES');
+  assert.ok(!journal.some((e) => e.event === 'bench-busy-wait' || e.event === 'bench-idle-wait-timed-out' || e.event === 'bench-reinstall-deferred'));
+
+  const owed = readBenchReinstallOwed(journalRoot);
+  assert.equal(owed, null, 'a PARK (unreadable dir) must never also write a durable owed record -- that record is exclusively for the DEFER path');
+});
+
+test('realFinish (hazard fix): an IDLE bench (the default -- spool and running both empty) reinstalls immediately, with NO wait and NO bench-busy-wait events', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-benchidle-');
+  const task = { id: 'card-benchidle', kind: 'card', issue: 1012, worktreePath };
+  const ctx = testCtx({ id: 'card-benchidle', task, config });
+  ctx.prNumber = 1012;
+
+  const sleeps = [];
+  let installRan = false;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'bash') installRan = true;
+      return null;
+    }),
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+  assert.ok(installRan, 'the reinstall must still run once the bench is confirmed idle');
+  assert.deepEqual(sleeps, [], 'an already-idle bench must never sleep at all');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(!journal.some((e) => e.event === 'bench-busy-wait'), 'an already-idle bench must never journal a busy-wait poll');
+  const idle = journal.find((e) => e.event === 'bench-idle');
+  assert.ok(idle, 'the idle confirmation must be journalled by name');
+  assert.equal(idle.attempts, 0, 'zero busy-wait attempts when the bench was already idle on the first check');
+});
+
+test('realFinish (hazard fix): a BUSY bench defers (journals bench-busy-wait, actually sleeps between polls) and then proceeds once it drains -- reinstall still runs', async () => {
+  const config = testConfig({ benchIdleWaitMaxPolls: 5, benchIdleWaitPollIntervalMs: 10 });
+  const worktreePath = mkTmp('spo-real-finish-benchbusy-');
+  const task = { id: 'card-benchbusy', kind: 'card', issue: 1013, worktreePath };
+  const ctx = testCtx({ id: 'card-benchbusy', task, config });
+  ctx.prNumber = 1013;
+
+  const sleeps = [];
+  let installRan = false;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'bash') installRan = true;
+      return null;
+    }),
+    // Busy (1 running job) for the first two polls, drained by the third.
+    readdirSync: benchDirFake([0, 0, 0], [1, 1, 0]),
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+  assert.ok(installRan, 'the reinstall must run once the bench actually drains');
+  assert.deepEqual(sleeps, [10, 10], 'must sleep exactly once per busy poll, at the configured interval');
+
+  const journal = readJournal(ctx.taskDir);
+  const busyEvents = journal.filter((e) => e.event === 'bench-busy-wait');
+  assert.equal(busyEvents.length, 2, 'exactly two busy polls must be journalled before the bench drains');
+  assert.equal(busyEvents[0].attempt, 1);
+  assert.equal(busyEvents[1].attempt, 2);
+  const idle = journal.find((e) => e.event === 'bench-idle');
+  assert.ok(idle, 'the eventual idle confirmation must be journalled by name');
+  assert.equal(idle.attempts, 2);
+});
+
+test('realFinish (R1, post-verification third pass): a bench that NEVER goes idle DEFERS the reinstall (bench-reinstall-deferred + a durable owed record) and still completes the card to DONE -- the old bench-idle-wait PARK terminally stranded a card whose PR had already merged over an ordinary bench lease', async () => {
+  const config = testConfig({ benchIdleWaitMaxPolls: 3, benchIdleWaitPollIntervalMs: 10 });
+  const worktreePath = mkTmp('spo-real-finish-benchstuck-');
+  // NOT the default testCtx taskDir -- that lands directly under os.tmpdir() (mkTmp's own root),
+  // which every OTHER default-taskDir test in this file also shares, so path.dirname(taskDir)
+  // would collide with other tests' owed-record writes. An explicit, isolated journalRoot keeps
+  // this test's readBenchReinstallOwed assertions meaningful.
+  const journalRoot = mkTmp('spo-real-finish-benchstuck-root-');
+  const taskDir = path.join(journalRoot, 'card-benchstuck');
+  fs.mkdirSync(taskDir, { recursive: true });
+  const task = { id: 'card-benchstuck', kind: 'card', issue: 1014, worktreePath };
+  const ctx = testCtx({ id: 'card-benchstuck', task, config, taskDir });
+  ctx.prNumber = 1014;
+
+  const sleeps = [];
+  let installRan = false;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'bash') installRan = true;
+      return null;
+    }),
+    // Permanently busy: always 1 queued job, never drains.
+    readdirSync: benchDirFake([1], [0]),
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE', "a bench that never goes idle must not block a card whose PR already merged -- realFinish must still complete it to DONE, not park");
+  assert.ok(!installRan, 'the reinstall must never run against a still-busy bench -- that is still the unsafe half of the trap this fix closes, just no longer paid for with a terminal park');
+  assert.equal(sleeps.length, config.benchIdleWaitMaxPolls, 'must sleep exactly maxPolls times before giving up on the wait, never fewer and never more');
+
+  const journal = readJournal(ctx.taskDir);
+  const busyEvents = journal.filter((e) => e.event === 'bench-busy-wait');
+  assert.equal(busyEvents.length, config.benchIdleWaitMaxPolls, 'every busy poll must be journalled, including the last one before giving up');
+  const timedOut = journal.find((e) => e.event === 'bench-idle-wait-timed-out');
+  assert.ok(timedOut, 'giving up on the wait must be journalled by its own name');
+  assert.equal(timedOut.attempts, config.benchIdleWaitMaxPolls);
+  assert.ok(!journal.some((e) => e.event === 'bench-idle' || e.event === 'bench-reinstalled' || e.event === 'bench-reinstall-failed'));
+
+  // R1's own design constraint: "a deferred reinstall that never happens is the original defect"
+  // -- so the defer itself must be loud (a named event) AND durable (survives this process, this
+  // ctx -- readBenchReinstallOwed reads it back straight off disk, not from any in-memory state
+  // realFinish might have kept).
+  const deferred = journal.find((e) => e.event === 'bench-reinstall-deferred');
+  assert.ok(deferred, 'the defer must be journalled by its own name -- the journal alone must answer "was a reinstall ever owed and never paid"');
+  assert.equal(deferred.spool, 1);
+  assert.equal(deferred.running, 0);
+  assert.equal(deferred.attempts, config.benchIdleWaitMaxPolls);
+  assert.equal(deferred.prNumber, 1014);
+
+  assert.equal(path.dirname(ctx.taskDir), journalRoot, 'sanity: taskDir must actually live under the isolated journalRoot');
+  const owed = readBenchReinstallOwed(journalRoot);
+  assert.ok(owed, 'the debt must be recorded durably (journal.js\'s writeBenchReinstallOwed) so a daemon restart cannot lose it');
+  assert.equal(owed.owed, true);
+  assert.equal(owed.prNumber, 1014);
+  assert.equal(owed.issue, 1014);
+  assert.equal(owed.spool, 1);
+  assert.equal(owed.running, 0);
+
+  // And the card itself finished exactly as if nothing were owed: board move, comment, worktree
+  // remove, `finished` -- the whole point of deferring instead of parking.
+  assert.ok(journal.some((e) => e.event === 'board-move' && e.column === 'Done'));
+  assert.ok(journal.some((e) => e.event === 'finished'));
+});
+
+test('realFinish (R1, post-verification third pass): TWO bench-touching cards deferring during the SAME busy window must not accumulate duplicate owed records -- one journal root, one record, the SECOND card\'s mergeSha wins', async () => {
+  const config = testConfig({ benchIdleWaitMaxPolls: 2, benchIdleWaitPollIntervalMs: 10 });
+  const journalRoot = mkTmp('spo-real-finish-benchowed-root-');
+  const taskDirA = path.join(journalRoot, 'card-owed-a');
+  const taskDirB = path.join(journalRoot, 'card-owed-b');
+  fs.mkdirSync(taskDirA, { recursive: true });
+  fs.mkdirSync(taskDirB, { recursive: true });
+
+  const worktreeA = mkTmp('spo-real-finish-benchowed-wt-a-');
+  const worktreeB = mkTmp('spo-real-finish-benchowed-wt-b-');
+  const ctxA = testCtx({ id: 'card-owed-a', task: { id: 'card-owed-a', kind: 'card', issue: 2001, worktreePath: worktreeA }, config, taskDir: taskDirA });
+  ctxA.prNumber = 2001;
+  const ctxB = testCtx({ id: 'card-owed-b', task: { id: 'card-owed-b', kind: 'card', issue: 2002, worktreePath: worktreeB }, config, taskDir: taskDirB });
+  ctxB.prNumber = 2002;
+
+  const shaA = 'a'.repeat(40);
+  const shaB = 'b'.repeat(40);
+  const makeDeps = (mergeSha) => ({
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        return ok(JSON.stringify({ mergeCommit: { oid: mergeSha } }));
+      }
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      return null;
+    }),
+    // Permanently busy for both cards -- each independently exhausts its own bound and defers.
+    readdirSync: benchDirFake([1], [0]),
+    sleep: () => Promise.resolve(),
+  });
+
+  const nextA = await realFinish(ctxA, makeDeps(shaA));
+  assert.equal(nextA, 'DONE');
+  const nextB = await realFinish(ctxB, makeDeps(shaB));
+  assert.equal(nextB, 'DONE');
+
+  // Both defers must be on the record -- one journal.jsonl per task, never merged or dropped.
+  assert.ok(readJournal(taskDirA).some((e) => e.event === 'bench-reinstall-deferred' && e.mergeSha === shaA));
+  assert.ok(readJournal(taskDirB).some((e) => e.event === 'bench-reinstall-deferred' && e.mergeSha === shaB));
+
+  // But the SHARED durable owed record must hold exactly ONE entry -- the latest defer -- never
+  // an array, never one file per card. bench-install.sh always rebuilds from whatever is
+  // CURRENTLY fast-forwarded, so paying the debt back once (from card B's sha, the more recent
+  // one) already covers whatever card A's merge needed too.
+  const owed = readBenchReinstallOwed(journalRoot);
+  assert.ok(owed);
+  assert.equal(owed.mergeSha, shaB, 'the SECOND defer must win -- the record is overwritten, not appended to');
+  assert.equal(owed.owed, true);
+
+  const entries = fs.readdirSync(journalRoot).filter((f) => f.includes('bench-reinstall-owed'));
+  assert.deepEqual(entries, ['bench-reinstall-owed.json'], 'two cards deferring must never produce two owed-record files');
+});
+
+test('realFinish (action B1.4): a FAILED fast-forward means the reinstall never runs at all -- even though the merge touched the bench worker', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-ff-order-');
+  const task = { id: 'card-ff-order', kind: 'card', issue: 1004, worktreePath };
+  const ctx = testCtx({ id: 'card-ff-order', task, config });
+  ctx.prNumber = 1004;
+
+  const order = [];
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'git' && args.includes('merge') && args.includes('--ff-only')) {
+        order.push('fast-forward-attempted');
+        return fail(1);
+      }
+      if (command === 'bash') order.push('reinstall'); // must never be reached
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'fast-forward'
+  );
+
+  assert.deepEqual(order, ['fast-forward-attempted'], 'the reinstall must never run once the fast-forward itself failed');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'main-fast-forward-failed'), 'the failure must be journalled by name, loud on the failure path too');
+  assert.ok(!journal.some((e) => e.event === 'bench-reinstalled' || e.event === 'bench-reinstall-failed'));
+});
+
+test('realFinish (action B1.4/hazard fix): a TRACKED modification still refuses the fast-forward, never forced -- and, since the merge touched the bench worker, PARKS finish-failed/fast-forward/dirty', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-dirty-');
+  const task = { id: 'card-dirty', kind: 'card', issue: 1005, worktreePath };
+  const ctx = testCtx({ id: 'card-dirty', task, config });
+  ctx.prNumber = 1005;
+
+  const calls = [];
+  let statusArgs = null;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      calls.push([...args]);
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('scripts/bench-install.sh\n');
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) {
+        statusArgs = [...args];
+        return ok(' M some/tracked-file.ts\n');
+      }
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'finish-failed' &&
+      err.detail.step === 'fast-forward' &&
+      err.detail.reason === 'dirty'
+  );
+
+  // The hazard fix itself: the status call must actually narrow to tracked changes
+  // (`--untracked-files=no`), not just bare `--porcelain` -- a test that only fakes on
+  // `includes('--porcelain')` cannot tell the narrowed call from the old one.
+  assert.ok(statusArgs, 'the status call must actually have been spawned');
+  assert.ok(statusArgs.includes('--untracked-files=no'), 'the dirty check must pass --untracked-files=no, narrowing it to what can actually block a fast-forward');
+
+  // Fail-closed, never force: no call anywhere in this run may carry a force/discard flag -- a
+  // human works in config.productRepo, and this checkout being dirty means real, uncommitted work
+  // may be sitting there.
+  const forceLike = calls.filter(
+    (a) => a.includes('--force') || a.includes('-f') || (a.includes('reset') && a.includes('--hard')) || a.includes('-D')
+  );
+  assert.deepEqual(forceLike, [], 'a dirty productRepo checkout must never be forced, reset --hard, or otherwise discarded');
+  assert.ok(!calls.some((a) => a.includes('merge') && a.includes('--ff-only')), 'the merge itself must never even be attempted once the tree is known dirty');
+});
+
+test("realFinish (action B1.4/hazard fix): a STRAY UNTRACKED file does NOT refuse the fast-forward -- `git status --porcelain` alone would call this dirty, but `git pull --ff-only` (the human rule this mirrors, scripts/finish.sh's sync_main) does not care, so neither should this", async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-untracked-');
+  const task = { id: 'card-untracked', kind: 'card', issue: 1011, worktreePath };
+  const ctx = testCtx({ id: 'card-untracked', task, config });
+  ctx.prNumber = 1011;
+
+  const order = [];
+  const deps = {
+    // Genuinely differential, not just "an empty status proceeds": simulates what git ITSELF
+    // would report for a tree with exactly one stray untracked file, under EITHER invocation --
+    // `--untracked-files=no` present -> git omits untracked entries entirely -> empty; absent
+    // (the pre-fix, bare `--porcelain` shape) -> git reports it as a `??` line, which the
+    // pre-fix code would then read as dirty. A fake that ignored args and always answered empty
+    // could not tell "the code asks the narrow question" apart from "the code asks the broad one
+    // and got lucky" -- this one can, and does fail under the pre-fix shape (proven by mutation
+    // below).
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) {
+        return ok(args.includes('--untracked-files=no') ? '' : '?? some/stray-scratch-file.tmp\n');
+      }
+      if (command === 'git' && args.includes('merge') && args.includes('--ff-only')) order.push('fast-forward');
+      if (command === 'bash') order.push('reinstall');
+      return null;
+    }),
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE', 'a stray untracked file must never block the fast-forward or the reinstall');
+  assert.deepEqual(order, ['fast-forward', 'reinstall'], 'both must actually have run');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'main-fast-forwarded'), 'the fast-forward must be journalled as a SUCCESS, not refused as dirty');
+  assert.ok(!journal.some((e) => e.event === 'main-fast-forward-failed'), 'a stray untracked file must never be journalled as a fast-forward failure');
+});
+
+test('realFinish (action B1.4): the WRONG branch is refused too -- and, when the merge did NOT touch the bench worker, this is JOURNALLED, not parked (the card\'s PR already merged)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-wrongbranch-');
+  const task = { id: 'card-wrongbranch', kind: 'card', issue: 1006, worktreePath };
+  const ctx = testCtx({ id: 'card-wrongbranch', task, config });
+  ctx.prNumber = 1006;
+
+  const calls = [];
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      calls.push([...args]);
+      if (command === 'git' && args.includes('rev-parse') && args.includes('--abbrev-ref')) return ok('some-other-branch\n');
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('doc/README.md\n');
+      return null;
+    }),
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE', "a card whose PR already merged must not be blocked over a repo-hygiene issue the merge itself didn't touch");
+  assert.ok(!calls.some((a) => a.includes('status') && a.includes('--porcelain')), 'the dirty check is never even reached once the branch check already failed');
+  assert.ok(!calls.some((a) => a.includes('merge') && a.includes('--ff-only')), 'the merge itself must never be attempted on the wrong branch');
+  assert.ok(!calls.some((a) => a[0] === 'scripts/bench-install.sh' || (a.length && String(a[a.length - 1]).endsWith('bench-install.sh'))));
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'main-fast-forward-failed');
+  assert.ok(failed, 'the wrong-branch refusal must be journalled by name even though it never parks');
+  assert.equal(failed.reason, 'wrong-branch');
+});
+
+// ---- R3 (post-verification, third pass): a FAILED probe is not the same fact as a genuinely
+// dirty tree or a genuinely wrong branch -- `check-failed` gives the failure its own value so a
+// maintainer reading the journal does not go hunting for uncommitted work that was never there. --
+
+test("realFinish (R3, post-verification third pass): the BRANCH check command itself FAILING (git rev-parse exits non-zero) is journalled/parked as check-failed/branch, never misreported as wrong-branch", async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-branchcheckfailed-');
+  const task = { id: 'card-branchcheckfailed', kind: 'card', issue: 1017, worktreePath };
+  const ctx = testCtx({ id: 'card-branchcheckfailed', task, config });
+  ctx.prNumber = 1017;
+
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('rev-parse') && args.includes('--abbrev-ref')) return fail(1);
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'finish-failed' &&
+      err.detail.step === 'fast-forward' &&
+      err.detail.reason === 'check-failed' &&
+      err.detail.check === 'branch' &&
+      err.detail.exit === 1
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'main-fast-forward-failed');
+  assert.ok(failed);
+  assert.equal(failed.reason, 'check-failed');
+  assert.equal(failed.check, 'branch');
+  assert.notEqual(failed.reason, 'wrong-branch', 'a FAILED command is not the same fact as a genuinely wrong branch');
+});
+
+test("realFinish (R3, post-verification third pass): the STATUS check command itself FAILING (git status exits non-zero) is journalled/parked as check-failed/status, never misreported as dirty -- and never on a merge that didn't touch the bench worker (journalled only, not parked)", async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-statuscheckfailed-');
+  const task = { id: 'card-statuscheckfailed', kind: 'card', issue: 1018, worktreePath };
+  const ctx = testCtx({ id: 'card-statuscheckfailed', task, config });
+  ctx.prNumber = 1018;
+
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return fail(2);
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('scripts/bench-install.sh\n');
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'finish-failed' &&
+      err.detail.step === 'fast-forward' &&
+      err.detail.reason === 'check-failed' &&
+      err.detail.check === 'status' &&
+      err.detail.exit === 2
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'main-fast-forward-failed');
+  assert.ok(failed);
+  assert.equal(failed.reason, 'check-failed');
+  assert.equal(failed.check, 'status');
+  assert.notEqual(failed.reason, 'dirty', 'a FAILED command is not the same fact as a genuinely dirty tree');
+});
+
+
+test('realFinish (action B1.4): the merge-sha lookup failing ALWAYS parks -- benchTouched is genuinely unknowable at that point, so there is no lenient path', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-shafail-');
+  const task = { id: 'card-shafail', kind: 'card', issue: 1007, worktreePath };
+  const ctx = testCtx({ id: 'card-shafail', task, config });
+  ctx.prNumber = 1007;
+
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') return fail(1);
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'merge-sha-lookup'
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'merge-sha-lookup-failed'), 'the failure must be journalled by name');
+});
+
+// ---- D4 (adversarial verification): mutation M13 -- `gh pr view` exiting 0 with a NULL
+// `mergeCommit` was untested, and it is the LIKELIER real-world shape than a non-zero exit: probed
+// against the real repo, both an open PR (#465) and a closed-unmerged one (#633) return exit 0
+// with `{"mergeCommit":null}` -- `gh` only fails non-zero on a transport/auth problem, never on
+// "this PR has no merge commit yet". Mutating `if (!mergeSha)` to `if (prView.exit !== 0)` let an
+// exit-0/null response sail straight through into `git diff --name-only null^ null` with the
+// ENTIRE suite still green, because the only merge-sha test above ever drives `gh` to a non-zero
+// exit. The code's own handling is already correct (`(parsed && parsed.mergeCommit &&
+// parsed.mergeCommit.oid) || null`, then the SAME merge-sha-lookup park as a hard failure) --
+// this only makes sure a regression here is caught.
+test('realFinish (action B1.4): `gh pr view` exiting 0 with a NULL mergeCommit (an open or closed-unmerged PR -- the shape a real `gh` actually returns) parks merge-sha-lookup too, and nothing downstream ever runs on the undefined sha', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-nullmerge-');
+  const task = { id: 'card-nullmerge', kind: 'card', issue: 1010, worktreePath };
+  const ctx = testCtx({ id: 'card-nullmerge', task, config });
+  ctx.prNumber = 1010;
+
+  const calls = [];
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        // Exit 0, valid JSON, but `mergeCommit` is null -- the real shape `gh pr view` returns
+        // for a PR that has not (yet, or ever) actually merged. `fail(1)` above only covers a
+        // transport/auth failure, a DIFFERENT and less likely real-world case.
+        return ok(JSON.stringify({ mergeCommit: null }));
+      }
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'finish-failed' &&
+      err.detail.step === 'merge-sha-lookup' &&
+      err.detail.exit === 0
+  );
+
+  // Nothing past the lookup may ever run: benchTouched is genuinely unknowable without a sha, so
+  // no `git diff`, no branch/status check, no `git merge --ff-only`, and certainly no `bash`
+  // reinstall may be spawned on an undefined mergeSha.
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && c.args.includes('diff') && c.args.includes('--name-only')),
+    'the merge-diff call must never run once the sha lookup came back with no usable oid'
+  );
+  assert.ok(
+    !calls.some((c) => c.command === 'git' && (c.args.includes('merge') || (c.args.includes('status') && c.args.includes('--porcelain')))),
+    'the fast-forward itself must never even be attempted'
+  );
+  assert.ok(!calls.some((c) => c.command === 'bash'), 'the reinstall must never be attempted');
+
+  const journal = readJournal(ctx.taskDir);
+  const failed = journal.find((e) => e.event === 'merge-sha-lookup-failed');
+  assert.ok(failed, 'the failure must be journalled by name even though `gh` itself exited 0');
+  assert.equal(failed.exit, 0, 'the journalled exit code must be the REAL gh exit code (0), not inferred as if it had failed to run at all');
+});
+
+test('realFinish (action B1.4): bench-install.sh itself exiting non-zero PARKS finish-failed/bench-reinstall, journalled by name', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-installfail-');
+  const task = { id: 'card-installfail', kind: 'card', issue: 1008, worktreePath };
+  const ctx = testCtx({ id: 'card-installfail', task, config });
+  ctx.prNumber = 1008;
+
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'bash') return fail(1, 'npm run build:e2e failed');
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'bench-reinstall'
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'bench-reinstall-failed'), 'the failure must be journalled by name');
+  assert.ok(journal.some((e) => e.event === 'main-fast-forwarded'), 'the fast-forward itself must have succeeded first');
 });
 
 // ---- action 6.4: the product-repo mutex, as wired into realWorktree/realFinish ----------------
@@ -2211,8 +3496,9 @@ test('realFinish (action 6.4): the product-repo lock is released after a success
   const worktreePath = mkTmp('spo-real-finish-lock-ok-');
   const task = { id: 'card-lock-finish-ok', kind: 'card', issue: 902, worktreePath };
   const ctx = testCtx({ id: 'card-lock-finish-ok', task, config });
+  ctx.prNumber = 902;
 
-  const next = await realFinish(ctx, { spawnSync: () => ok('') });
+  const next = await realFinish(ctx, { spawnSync: finishSyncOk() });
   assert.equal(next, 'DONE');
   assert.equal(fs.existsSync(lockFilePath(config)), false);
 });
@@ -2222,8 +3508,9 @@ test('realFinish (action 6.4): the product-repo lock is released even when `git 
   const worktreePath = mkTmp('spo-real-finish-lock-fail-');
   const task = { id: 'card-lock-finish-fail', kind: 'card', issue: 903, worktreePath };
   const ctx = testCtx({ id: 'card-lock-finish-fail', task, config });
+  ctx.prNumber = 903;
   const deps = {
-    spawnSync: (command, args) => (args.includes('remove') ? fail(1) : ok('')),
+    spawnSync: finishSyncOk((command, args) => (args.includes('remove') ? fail(1) : null)),
   };
 
   await assert.rejects(
@@ -2288,13 +3575,14 @@ test('realFinish (action 6.4): the product-repo lock is HELD BY THIS PROCESS dur
   const worktreePath = mkTmp('spo-real-finish-lock-inside-');
   const task = { id: 'card-lock-finish-inside', kind: 'card', issue: 909, worktreePath };
   const ctx = testCtx({ id: 'card-lock-finish-inside', task, config });
+  ctx.prNumber = 909;
 
   let atRemove;
   const deps = {
-    spawnSync: (command, args) => {
+    spawnSync: finishSyncOk((command, args) => {
       if (args.includes('worktree') && args.includes('remove')) atRemove = lockHolderDuring(config);
-      return ok('');
-    },
+      return null;
+    }),
   };
 
   assert.equal(await realFinish(ctx, deps), 'DONE');
@@ -2322,21 +3610,57 @@ test('realWorktree (action 6.4): the product-repo lock wait bound exceeded -> Pa
   );
 });
 
-test('realFinish (action 6.4): the product-repo lock wait bound exceeded -> ParkSignal(product-repo-lock-timeout), phase "finish"', async () => {
+test('realFinish (action B1.4/6.4): the product-repo lock wait bound exceeded on FINISH\'s FIRST acquisition -> ParkSignal(product-repo-lock-timeout), phase "finish-sync"', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-finish-lock-timeout-');
   const task = { id: 'card-lock-timeout-fin', kind: 'card', issue: 905, worktreePath };
   const ctx = testCtx({ id: 'card-lock-timeout-fin', task, config });
+  ctx.prNumber = 905;
 
+  // Pre-seeded busy and never released within this test -- realFinish's very FIRST acquisition
+  // ('finish-sync', action B1.4's own new preamble) is the one that blocks and times out here; it
+  // never even reaches the second ('finish', worktree-remove).
   fs.mkdirSync(path.dirname(lockFilePath(config)), { recursive: true });
   fs.writeFileSync(lockFilePath(config), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
 
-  const deps = { spawnSync: () => ok(''), productRepoLockOpts: { waitMs: 40, pollMs: 10 } };
+  const deps = { spawnSync: finishSyncOk(), productRepoLockOpts: { waitMs: 40, pollMs: 10 } };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'product-repo-lock-timeout' && err.detail.phase === 'finish-sync'
+  );
+});
+
+test('realFinish (action B1.4/6.4): the product-repo lock wait bound exceeded on FINISH\'s SECOND acquisition -> ParkSignal(product-repo-lock-timeout), phase "finish"', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-lock-timeout2-');
+  const task = { id: 'card-lock-timeout-fin2', kind: 'card', issue: 9052, worktreePath };
+  const ctx = testCtx({ id: 'card-lock-timeout-fin2', task, config });
+  ctx.prNumber = 9052;
+
+  // The FIRST acquisition ('finish-sync') must succeed cleanly (real acquire/release against the
+  // real lock file, so board-move/issue-comment run for real too); only the SECOND ('finish',
+  // guarding `git worktree remove`) is made to time out, by re-seeding a busy holder the instant
+  // the first release happens. Proves the "finish" reason from THIS run's own second acquisition,
+  // not merely a phase string the first acquisition happens to share.
+  let acquireCalls = 0;
+  const deps = {
+    spawnSync: finishSyncOk(),
+    acquireProductRepoLock: async (cfg, opts) => {
+      acquireCalls += 1;
+      if (acquireCalls === 1) return acquireProductRepoLock(cfg, opts);
+      fs.mkdirSync(path.dirname(lockFilePath(cfg)), { recursive: true });
+      fs.writeFileSync(lockFilePath(cfg), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+      return acquireProductRepoLock(cfg, { ...opts, waitMs: 40, pollMs: 10 });
+    },
+    releaseProductRepoLock,
+  };
 
   await assert.rejects(
     () => realFinish(ctx, deps),
     (err) => err instanceof ParkSignal && err.reason === 'product-repo-lock-timeout' && err.detail.phase === 'finish'
   );
+  assert.equal(acquireCalls, 2, 'both of FINISH\'s own acquisitions must have been attempted');
 });
 
 test('action 6.4: realWorktree (setup) and realFinish (teardown) acquire the SAME product-repo lock file for the same config -- one mutex, not two', async () => {
@@ -2360,17 +3684,28 @@ test('action 6.4: realWorktree (setup) and realFinish (teardown) acquire the SAM
   const worktreePath = mkTmp('spo-real-finish-samefile-');
   const finTask = { id: 'card-samefile-fin', kind: 'card', issue: 907, worktreePath };
   const finCtx = testCtx({ id: 'card-samefile-fin', task: finTask, config });
+  finCtx.prNumber = 907;
   await realFinish(finCtx, {
-    spawnSync: () => ok(''),
+    spawnSync: finishSyncOk(),
     acquireProductRepoLock: spyAcquire,
     releaseProductRepoLock: spyRelease,
   });
 
-  assert.equal(capturedPaths.length, 2);
+  // Action B1.4: realFinish now acquires the lock TWICE -- 'finish-sync' (this action's own new
+  // preamble) ahead of 'finish' (the pre-existing worktree-remove) -- so the spy sees THREE calls
+  // total: one from realWorktree's setup, two from realFinish's own two critical sections. All
+  // three must resolve to the SAME file: that is what makes every phase contend on ONE mutex, not
+  // two (or three).
+  assert.equal(capturedPaths.length, 3);
   assert.equal(
     capturedPaths[0],
     capturedPaths[1],
-    'setup and teardown must resolve to the identical lock file for the same config -- that is what makes them contend on ONE mutex'
+    'setup and FINISH\'s first (finish-sync) acquisition must resolve to the identical lock file'
+  );
+  assert.equal(
+    capturedPaths[1],
+    capturedPaths[2],
+    'FINISH\'s own two acquisitions (finish-sync, then finish) must resolve to the identical lock file too'
   );
 });
 
@@ -2563,7 +3898,16 @@ test('--real gating: --dry-run bypasses the gate even for a card task with no co
 
 test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> MERGE -> FINISH, one fictional card', async () => {
   const config = testConfig();
-  const taskDir = mkTmp('spo-real-walkthrough-taskdir-');
+  // R4 (fifth pass, F2): this test passes an explicit taskDir, so it bypasses testCtx's own fix
+  // (nesting taskDir inside a FRESH mkTmp root, one per test) -- a bare mkTmp() here drops
+  // journalRoot (path.dirname(taskDir)) directly under the shared OS tmpdir, same as every OTHER
+  // call site testCtx's fix was written to close. Reproduced live: a `/tmp/bench-reinstall-owed.json`
+  // planted before this test ran was silently consumed and cleared by this walkthrough's own
+  // realWorktree call, and the test still passed -- nesting one level inside its own fresh mkTmp
+  // root gives this test a private journalRoot, matching production's real shape and every other
+  // call site in this file.
+  const taskDir = path.join(mkTmp('spo-real-walkthrough-jr-'), 'card-4242');
+  fs.mkdirSync(taskDir, { recursive: true });
   const task = {
     id: 'card-4242',
     kind: 'card',
@@ -2581,11 +3925,22 @@ test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHE
       log.push({ command, args: [...args], cwd: opts && opts.cwd });
       // card #424's leftover sweep -- no leftovers for this fresh, never-retried task.
       if (args.includes('rev-parse') && args.includes('--verify')) return fail(1);
+      // Action B1.4: FINISH's own branch check (`rev-parse --abbrev-ref HEAD`) -- checked BEFORE
+      // the more general 'HEAD' branch below, which would otherwise also match it (both include
+      // 'HEAD' in argv) and hand it a raw sha instead of a branch name.
+      if (args.includes('rev-parse') && args.includes('--abbrev-ref')) return ok('main\n');
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('originmainsha000000000000000000000000000\n');
       if (args.includes('board:take')) return ok('claimed\n');
       if (command === 'gh' && args[0] === 'pr' && args[1] === 'create') {
         return ok('Creating PR...\nhttps://github.com/Crazz-Org/SPO-WebClient/pull/4242\n');
+      }
+      // Action B1.4: FINISH's own merge-sha lookup -- a real card's own merge commit, by PR
+      // number. This fictional card never touches src/e2e/bench/ or scripts/bench-, so the
+      // default `git diff --name-only` fallback below (empty stdout) correctly reports no bench
+      // paths touched and FINISH skips the reinstall.
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        return ok(JSON.stringify({ mergeCommit: { oid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } }));
       }
       if (command === 'gh' && args[0] === 'api') {
         return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success' }] }));
@@ -2626,6 +3981,31 @@ test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHE
   // Printed for human inspection -- this is the "one line per state" argv sequence.
   console.log('\n--- WORKTREE -> FINISH argv sequence (fictional card-4242) ---');
   for (const line of perStateArgv) console.log(line);
+});
+
+test('full lifecycle walkthrough (B1.4 R4, fifth pass F2): its taskDir must be nested inside its OWN fresh mkTmp root, never a bare mkTmp() dropped straight into the shared OS tmpdir', () => {
+  // Source-level guard, same shape as the payBenchReinstallDebtIfOwed wiring guard elsewhere in
+  // this file: pins that a future edit cannot silently reintroduce the bug this exact test line
+  // carried through round 4 -- a bare `mkTmp('spo-real-walkthrough-taskdir-')` assigned straight to
+  // taskDir makes journalRoot (path.dirname(taskDir)) the SHARED os.tmpdir() itself, so an EARLIER
+  // test's planted `bench-reinstall-owed.json` (or this walkthrough's own realFinish deferring one)
+  // silently leaks into whatever OTHER test reaches realWorktree next. Reproduced live before this
+  // fix: a real `/tmp/bench-reinstall-owed.json` planted ahead of time was silently consumed and
+  // cleared by this walkthrough's own realWorktree call, and the walkthrough still passed.
+  const src = fs.readFileSync(__filename, 'utf8');
+  const testStart = src.indexOf("test('full lifecycle walkthrough: WORKTREE ->");
+  assert.notEqual(testStart, -1, 'the walkthrough test itself must still exist under this exact name');
+  const testBody = src.slice(testStart, src.indexOf('\n});', testStart));
+  assert.doesNotMatch(
+    testBody,
+    /const taskDir = mkTmp\(/,
+    "the walkthrough's taskDir must be NESTED inside its own fresh mkTmp root (path.join(mkTmp(...), id)), never a bare mkTmp() -- a bare one drops journalRoot directly into the shared OS tmpdir"
+  );
+  assert.match(
+    testBody,
+    /const taskDir = path\.join\(mkTmp\('spo-real-walkthrough-jr-'\), 'card-4242'\)/,
+    "the walkthrough must nest its taskDir one level inside a fresh mkTmp root, matching testCtx's own fix"
+  );
 });
 
 // ---- action 1.3: judge inputs -- diff.patch / gate.log / gate-report.md --------------------
@@ -3451,6 +4831,153 @@ test('spawnStep: a timed-out GATE parks on its own reason and is NEVER retried -
     'journalled as a timeout, never as an exit-1 gate failure'
   );
   assert.equal(gateSpawns[0].timeoutMs, TIMEOUT_TABLE['npm-gate']);
+});
+
+test("spawnStep (R2, post-verification third pass): a timed-out bench-install (FINISH's `bash scripts/bench-install.sh`) parks bench-install-timed-out and is NEVER retried -- a retry would start a SECOND `npm run build:e2e` into the SAME dist/, exactly the mechanics npm-gate's own exemption above already names", async () => {
+  const config = testConfig({ commandTimeoutsMs: { ...TIMEOUT_TABLE, 'bench-install': 900000 } });
+  const worktreePath = mkTmp('spo-real-finish-benchinstalltimeout-');
+  const task = { id: 'card-benchinstalltimeout', kind: 'card', issue: 1015, worktreePath };
+  const ctx = testCtx({ id: 'card-benchinstalltimeout', task, config });
+  ctx.prNumber = 1015;
+
+  let installRuns = 0;
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'bash') {
+        installRuns += 1;
+        return timeoutResult();
+      }
+      return null;
+    }),
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => {
+      assert.ok(err instanceof ParkSignal);
+      assert.equal(err.reason, 'bench-install-timed-out');
+      assert.notEqual(err.reason, 'finish-failed', 'a stuck reinstall must not be mistaken for a plain finish-failed step');
+      assert.equal(err.detail.retried, false);
+      return true;
+    }
+  );
+  assert.equal(
+    installRuns,
+    1,
+    'bash scripts/bench-install.sh must run exactly once -- a retry would build into the SAME dist/ concurrently and race a second `systemctl restart`'
+  );
+
+  const installSpawns = readJournal(ctx.taskDir)
+    .filter((e) => e.event === 'spawn')
+    .filter((e) => e.argv[0] === 'bash');
+  assert.deepEqual(
+    installSpawns.map((e) => [e.attempt, e.timedOut]),
+    [[1, true]],
+    'journalled as a single timed-out attempt, never a second one'
+  );
+});
+
+// ---- W11 (post-verification, third pass): benchIdleWaitMaxMs must be pinned BY VALUE, not just
+// by shape -- a shape-only test (e.g. asserting `finishStepDeadlineMs(` appears in the source)
+// stays green even when the ARITHMETIC inside config.js silently changes from `x` to `+`, which
+// leaves the FINISH deadline covering 185ms of what is documented (and, separately, load-bearing
+// in product-repo-hold.js's own finishSyncHoldMs) as a 900000ms wait -- reintroducing D1's exact
+// defect shape (a step deadline shorter than a legitimate wait it must cover) through the hazard
+// fix's own constant. ------------------------------------------------------------------------
+
+test('config.benchIdleWaitMaxMs is the PRODUCT of benchIdleWaitMaxPolls and benchIdleWaitPollIntervalMs (900000 = 180 x 5000), never their sum or anything else -- pinned BY VALUE so a `*` silently mutated to `+` cannot survive a green suite', () => {
+  const config = require('../orchestrator/config.js');
+  assert.equal(config.benchIdleWaitMaxPolls, 180, 'the documented default poll count');
+  assert.equal(config.benchIdleWaitPollIntervalMs, 5000, 'the documented default poll interval');
+  // Recomputed with THIS test's own `*`, independent of whatever operator config.js's own
+  // BENCH_IDLE_WAIT_MAX_MS derivation actually used -- a mutation from `*` to `+` inside config.js
+  // changes config.benchIdleWaitMaxMs (5180) while leaving these two INPUT constants untouched
+  // (180, 5000), so the two sides genuinely diverge under that mutation rather than both silently
+  // recomputing the same wrong answer.
+  assert.equal(
+    config.benchIdleWaitMaxMs,
+    config.benchIdleWaitMaxPolls * config.benchIdleWaitPollIntervalMs,
+    'benchIdleWaitMaxMs must be the PRODUCT of the two, not their sum -- a `+` here leaves the FINISH deadline covering 185ms of what must cover a 900000ms wait'
+  );
+  assert.equal(config.benchIdleWaitMaxMs, 900000, 'the documented 180 x 5s = 15 minutes default');
+});
+
+// ---- V20 (post-verification, third pass): the bench-idle wait must run ONLY when a reinstall is
+// actually needed (fast-forward succeeded AND benchTouched) -- not on every card. The pre-existing
+// bench-reinstall-skipped test only asserted "no `bash` call", which cannot tell "the wait ran and
+// then correctly found nothing to install" apart from "the wait never ran at all"; moving
+// `waitForBenchIdle` ahead of the benchTouched/ffOk gate survived the whole suite under
+// adversarial verification. -----------------------------------------------------------------------
+
+test('realFinish (V20, post-verification third pass): a merge that did NOT touch the bench worker never even CHECKS the bench queue depth -- the wait must be gated on benchTouched, not run unconditionally on every card', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-v20-skip-');
+  const task = { id: 'card-v20-skip', kind: 'card', issue: 1019, worktreePath };
+  const ctx = testCtx({ id: 'card-v20-skip', task, config });
+  ctx.prNumber = 1019;
+
+  let readdirCalls = 0;
+  const sleeps = [];
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('doc/README.md\n');
+      return null;
+    }),
+    // A bench that WOULD report busy (and, downstream, defer with a sleep) if the wait ever
+    // checked it at all -- counted directly (readdirCalls), which is the load-bearing assertion;
+    // the sleeps/journal checks below are belt-and-suspenders on the same property.
+    readdirSync: (dir) => {
+      readdirCalls += 1;
+      return benchDirFake([1], [0])(dir);
+    },
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+
+  const next = await realFinish(ctx, deps);
+  assert.equal(next, 'DONE');
+
+  assert.equal(readdirCalls, 0, 'benchQueueDepth must never be called at all when benchTouched is false -- the wait must be gated on it, not merely its OUTCOME');
+  assert.deepEqual(sleeps, [], 'a merge that never touched the bench worker must never sleep waiting for it');
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'bench-reinstall-skipped'));
+  assert.ok(
+    !journal.some((e) => e.event === 'bench-busy-wait' || e.event === 'bench-idle' || e.event === 'bench-idle-wait-timed-out'),
+    'the bench-idle wait must never even run (no bench-busy-wait/bench-idle/bench-idle-wait-timed-out event) when benchTouched is false'
+  );
+});
+
+test('realFinish (V20, post-verification third pass): a FAILED fast-forward on a merge that DID touch the bench worker still never checks bench queue depth -- the wait is gated on ffOk too, not merely benchTouched', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-finish-v20-ffgate-');
+  const task = { id: 'card-v20-ffgate', kind: 'card', issue: 1020, worktreePath };
+  const ctx = testCtx({ id: 'card-v20-ffgate', task, config });
+  ctx.prNumber = 1020;
+
+  const sleeps = [];
+  const deps = {
+    spawnSync: finishSyncOk((command, args) => {
+      if (command === 'git' && args.includes('diff') && args.includes('--name-only')) return ok('src/e2e/bench/worker.ts\n');
+      if (command === 'git' && args.includes('merge') && args.includes('--ff-only')) return fail(1);
+      return null;
+    }),
+    readdirSync: benchDirFake([1], [0]),
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
+  };
+
+  await assert.rejects(
+    () => realFinish(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'finish-failed' && err.detail.step === 'fast-forward'
+  );
+  assert.deepEqual(sleeps, [], 'a failed fast-forward must never reach the bench-idle wait, even on a bench-touching merge');
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(!journal.some((e) => e.event === 'bench-busy-wait' || e.event === 'bench-idle' || e.event === 'bench-idle-wait-timed-out'));
 });
 
 test('npm-gate timeout exceeds the bench\'s own wait bound, so the bench always renders its verdict first', () => {

@@ -31,7 +31,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const { appendEvent } = require('../journal');
+const { appendEvent, writeBenchReinstallOwed, readBenchReinstallOwed, clearBenchReinstallOwed } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { resolveMainMovedRegateBudget } = require('../main-moved-budget');
@@ -242,6 +242,30 @@ function spawnStep(ctx, deps, state, command, args, opts = {}) {
       timeoutMs,
       retried: false,
       detail: 'not retried: re-running `npm run gate` re-submits a bench job for the same (worktree, ref)',
+    });
+  }
+
+  // R2 (post-verification, third pass): `bash scripts/bench-install.sh` must NOT be retried
+  // either, for the IDENTICAL mechanics npm-gate's own comment just above already names --
+  // spawnSync's timeout kills only the direct child (`bash`), never any grandchild it spawned.
+  // bench-install.sh's own body runs `npm run build:e2e` (a `tsc` compile into `productRepo`'s
+  // shared `dist/`) followed by `systemctl --user restart spo-bench-worker.service`; a killed
+  // `bash` can leave `tsc` (or, past that point, the restarted worker itself) still running, and
+  // a retry immediately starts a SECOND `npm run build:e2e` writing into the SAME `dist/`
+  // directory plus a SECOND `systemctl restart` racing the first -- two concurrent builds landing
+  // in one output directory is exactly "installs the wrong binary and reports success", the
+  // defect class this whole action exists to close, reproduced by the retry policy meant to make
+  // spawnStep more resilient. Not transient-retryable either way: a `bench-install` timeout means
+  // `npm run build:e2e` (or the restart) is taking longer than SPO_TIMEOUT_BENCH_INSTALL_MS
+  // (900000ms / 15 min, generous already), and a second attempt cannot make that faster.
+  if (commandClass === 'bench-install') {
+    throw new ParkSignal('bench-install-timed-out', {
+      state,
+      argv: [command, ...args].slice(0, 6),
+      commandClass,
+      timeoutMs,
+      retried: false,
+      detail: 'not retried: a killed `bash` can leave `npm run build:e2e`/`systemctl restart` still running underneath it, so a second attempt would build into the same dist/ concurrently',
     });
   }
 
@@ -862,6 +886,223 @@ async function withProductRepoLock(ctx, deps, phase, fn) {
   }
 }
 
+// fastForwardMainAndInstall(ctx, deps, config, {state, skipFetch, decideInstall}) -- action B1.4
+// round 4: the ONE implementation of "is config.productRepo's checkout safe to build a bench
+// binary from, and should bench-install.sh actually run" -- fetch, then refuse (never force)
+// unless the checkout is on `main` and clean of TRACKED changes, then `git merge --ff-only
+// origin/main`, then -- ONLY once that succeeded AND the caller's own `decideInstall()` says so --
+// `bash scripts/bench-install.sh`. realFinish (this card's OWN merge) and
+// payBenchReinstallDebtIfOwed (an EARLIER card's deferred debt, paid back from WORKTREE) both call
+// THIS function rather than each keeping their own copy of these preconditions -- a second copy is
+// precisely the drift CLAUDE.md's own `gh api -f` story is about, and round 3's reconciler
+// (orchestrator/bench-reconcile.js, since deleted) shipped with NONE of them, reproducing
+// realFinish's own "installs the WRONG binary and reports success" defect from a second door.
+//
+// `state` is the caller's own step name ('WORKTREE' or 'FINISH') -- every spawnStep/appendEvent
+// call below is journalled under it, so the SAME event vocabulary
+// (main-fast-forward-failed/main-fast-forwarded/bench-reinstalled/bench-reinstall-failed) reads
+// correctly from either caller's journal without a second, parallel vocabulary.
+//
+// `skipFetch` -- realFinish already ran an UNCONDITIONAL `git fetch origin` of its own (its step 1,
+// needed before `gh pr view`'s merge sha and the bench-path diff can be resolved, both of which
+// happen BEFORE this function is ever called there) -- so realFinish passes `skipFetch: true` to
+// avoid a redundant second fetch, and starts straight at the branch/dirty check.
+// payBenchReinstallDebtIfOwed has no such earlier fetch, so it leaves this false.
+//
+// `decideInstall()` -- called ONLY once the fast-forward has actually succeeded, and must resolve
+// to `{install: bool}`. This is where the two callers genuinely differ, so it stays theirs, not
+// folded into this function: realFinish's own version waits for the bench to go idle (a BOUNDED
+// POLL, waitForBenchIdle) and defers (writeBenchReinstallOwed) rather than install if it never
+// does; payBenchReinstallDebtIfOwed's own version checks ONCE, never polls, and leaves the debt
+// owed rather than block the card if the bench is busy -- see that function's own header for why.
+//
+// Returns {ffOk, ffReason, ffDetail, installed, installExit} -- the caller, not this function,
+// decides whether a failure PARKS (realFinish, when benchTouched) or is merely journalled and
+// left owed (payBenchReinstallDebtIfOwed, always -- this function never throws a ParkSignal
+// itself, so a debt repayment can never block the card paying it).
+async function fastForwardMainAndInstall(ctx, deps, config, { state, skipFetch, decideInstall }) {
+  const productRepo = config.productRepo;
+
+  if (!skipFetch) {
+    const fetch = spawnStep(ctx, deps, state, 'git', ['-C', productRepo, 'fetch', 'origin']);
+    if (fetch.exit !== 0) {
+      appendEvent(ctx.taskDir, state, 'main-fast-forward-failed', { reason: 'fetch-failed', exit: fetch.exit });
+      return { ffOk: false, ffReason: 'fetch-failed', ffDetail: { exit: fetch.exit }, installed: false, installExit: null };
+    }
+  }
+
+  // Same narrowing as this function has always used (`--untracked-files=no`, not bare
+  // `--porcelain`) -- config.productRepo is a checkout a HUMAN also works in directly, so a stray
+  // untracked file must never refuse a fast-forward `git pull --ff-only` itself would sail
+  // through.
+  const branch = spawnStep(ctx, deps, state, 'git', ['-C', productRepo, 'rev-parse', '--abbrev-ref', 'HEAD']);
+  const onMain = branch.exit === 0 && branch.stdout.trim() === 'main';
+  const status = onMain
+    ? spawnStep(ctx, deps, state, 'git', ['-C', productRepo, 'status', '--porcelain', '--untracked-files=no'])
+    : null;
+  const clean = onMain && status.exit === 0 && status.stdout.trim() === '';
+  const merge = clean
+    ? spawnStep(ctx, deps, state, 'git', ['-C', productRepo, 'merge', '--ff-only', 'origin/main'])
+    : null;
+  const ffOk = clean && merge.exit === 0;
+
+  // A command that FAILED TO ANSWER (branch.exit/status.exit non-zero) is not the same fact as a
+  // tree that genuinely IS dirty or genuinely IS on the wrong branch -- `check-failed` gives that
+  // its own value (R3, post-verification third pass) rather than misreporting it as `dirty`/
+  // `wrong-branch`.
+  const branchCheckFailed = branch.exit !== 0;
+  const statusCheckFailed = onMain && status.exit !== 0;
+
+  let ffReason = null;
+  let ffDetail = {};
+  if (branchCheckFailed) {
+    ffReason = 'check-failed';
+    ffDetail = { check: 'branch', exit: branch.exit };
+  } else if (!onMain) {
+    ffReason = 'wrong-branch';
+  } else if (statusCheckFailed) {
+    ffReason = 'check-failed';
+    ffDetail = { check: 'status', exit: status.exit };
+  } else if (!clean) {
+    ffReason = 'dirty';
+  } else if (!ffOk) {
+    ffReason = 'not-fast-forwardable';
+  }
+
+  if (!ffOk) {
+    appendEvent(ctx.taskDir, state, 'main-fast-forward-failed', { reason: ffReason, ...ffDetail });
+    return { ffOk: false, ffReason, ffDetail, installed: false, installExit: null };
+  }
+  appendEvent(ctx.taskDir, state, 'main-fast-forwarded', {});
+
+  const decision = (await decideInstall()) || { install: false };
+  if (!decision.install) {
+    return { ffOk: true, ffReason: null, ffDetail: {}, installed: false, installExit: null };
+  }
+
+  const install = spawnStep(ctx, deps, state, 'bash', [path.join(productRepo, 'scripts', 'bench-install.sh')], {
+    cwd: productRepo,
+  });
+  if (install.exit !== 0) {
+    appendEvent(ctx.taskDir, state, 'bench-reinstall-failed', { exit: install.exit });
+    return { ffOk: true, ffReason: null, ffDetail: {}, installed: false, installExit: install.exit };
+  }
+  appendEvent(ctx.taskDir, state, 'bench-reinstalled', {});
+  return { ffOk: true, ffReason: null, ffDetail: {}, installed: true, installExit: 0 };
+}
+
+// payBenchReinstallDebtIfOwed(ctx, deps, config) -- action B1.4 round 4: pays back a bench-worker
+// reinstall an EARLIER card's FINISH deferred (writeBenchReinstallOwed) instead of parking, from
+// INSIDE WORKTREE's own product-repo lock span, before this card does anything else.
+//
+// WHY WORKTREE, not FINISH-only and not a separate timer: WORKTREE runs before GATE, so a card
+// that STARTS while a reinstall is owed pays it back before it can gate against a stale worker --
+// the exact failure this debt exists to prevent. Paying only at FINISH would leave a one-card
+// window where a card gates stale and only then settles the debt. Round 3's answer was a
+// dedicated daemon scan timer (orchestrator/bench-reconcile.js) -- deleted: it held the SAME
+// product-repo lock from a THIRD process `waitBoundMs`'s own derivation assumes cannot exist (at
+// K=1 a worker reaching this lock while the scanner held it parked `product-repo-lock-timeout`
+// after 0ms, terminal and human-only), ran bench-install.sh with none of this function's
+// preconditions, and had no backoff on a failing install. Three rounds of adding to a SEPARATE
+// reconciler produced a new must-fix each round -- more machinery than the problem needs. This is
+// simpler: reuse the lock a worker already holds, reuse the preconditions realFinish already
+// enforces, no new lock holder, no new timer.
+//
+// NEVER blocks or parks THIS card over a debt it did not create: every failure mode below (a
+// fast-forward failure, a busy bench, an unreadable bench dir, an owed mergeSha that is not yet an
+// ancestor of the fast-forwarded HEAD, a failed install) leaves the record owed, journals why, and
+// returns -- WORKTREE continues exactly as if nothing were owed. The NEXT card's WORKTREE tries
+// again. No hot loop either: this runs at most once per card, never retried within the same call.
+//
+// R4 (fifth pass, F1): the paragraph above was true only of the EXIT-CODE failure modes -- it did
+// NOT cover spawnStep itself throwing. A `bash scripts/bench-install.sh` or `git` call that TIMES
+// OUT (config.js's commandTimeoutsMs) makes spawnStep throw ParkSignal('bench-install-timed-out'
+// / 'git-timed-out') rather than return a non-zero exit, and `bench-install-timed-out` is not on
+// state-machine.js's TRANSIENT_RETRY_REASONS -- an uncaught throw here would park THIS card
+// terminally, and (worse) leave the debt owed, so the NEXT card's WORKTREE hits the same wedged
+// installer and parks the same way: a hung reinstall would terminally stall the whole backlog,
+// exactly what this function's own header already claims cannot happen. clearBenchReinstallOwed
+// below can also throw a raw Error (e.g. a read-only/full journalRoot) -- runTask deliberately does
+// NOT convert a bare Error into a park (see park-signal.js's header), so uncaught that crashes the
+// worker outright. The try/catch below is what actually makes the "never blocks or parks" and
+// "never throws" claims true for every failure mode, not just exit codes: anything thrown while
+// paying the debt is journalled (with the caught reason, so the failure stays VISIBLE -- only its
+// propagation is suppressed, not the record of it) and swallowed here, leaving the debt owed for
+// the next attempt. It deliberately wraps ONLY this function's own work -- realWorktree's other
+// steps (worktree add, npm ci, board:take, ...) are called from OUTSIDE this function and keep
+// throwing/parking exactly as before.
+async function payBenchReinstallDebtIfOwed(ctx, deps, config) {
+  const journalRoot = path.dirname(ctx.taskDir);
+  const owed = readBenchReinstallOwed(journalRoot);
+  if (!owed) return; // the common case, every WORKTREE, on a healthy daemon -- no journal line at all
+
+  try {
+    const result = await fastForwardMainAndInstall(ctx, deps, config, {
+      state: 'WORKTREE',
+      decideInstall: async () => {
+        const depth = benchQueueDepth(deps, config);
+        if (depth.error) {
+          appendEvent(ctx.taskDir, 'WORKTREE', 'bench-debt-dir-unreadable', {
+            mergeSha: owed.mergeSha,
+            code: (depth.error && depth.error.code) || null,
+          });
+          return { install: false };
+        }
+        if (depth.spool > 0 || depth.running > 0) {
+          appendEvent(ctx.taskDir, 'WORKTREE', 'bench-debt-still-busy', {
+            mergeSha: owed.mergeSha,
+            spool: depth.spool,
+            running: depth.running,
+          });
+          return { install: false };
+        }
+        // Defense in depth, not a behaviour change: the fast-forward above already proves
+        // config.productRepo is a clean, up-to-date `main`, and `bash scripts/bench-install.sh`
+        // builds from whatever is CURRENTLY checked out there -- but owed.mergeSha was written by a
+        // DIFFERENT card's FINISH, possibly long ago, so this confirms it really is an ancestor of
+        // the checkout about to be rebuilt from rather than trusting the record blindly.
+        const ancestry = spawnStep(ctx, deps, 'WORKTREE', 'git', [
+          '-C',
+          config.productRepo,
+          'merge-base',
+          '--is-ancestor',
+          owed.mergeSha,
+          'HEAD',
+        ]);
+        if (ancestry.exit !== 0) {
+          appendEvent(ctx.taskDir, 'WORKTREE', 'bench-debt-ancestry-check-failed', {
+            mergeSha: owed.mergeSha,
+            exit: ancestry.exit,
+          });
+          return { install: false };
+        }
+        return { install: true };
+      },
+    });
+
+    if (result.installed) {
+      clearBenchReinstallOwed(journalRoot, { lastMergeSha: owed.mergeSha });
+      appendEvent(ctx.taskDir, 'WORKTREE', 'bench-debt-paid', { mergeSha: owed.mergeSha });
+    }
+    // Any other outcome (ffOk === false, or installed === false for any other reason) leaves the
+    // debt owed -- already journalled above or inside fastForwardMainAndInstall -- and WORKTREE
+    // continues normally below.
+  } catch (err) {
+    // Anything thrown while paying an EARLIER card's debt -- a ParkSignal from spawnStep's own
+    // timeout handling (bench-install-timed-out, git-timed-out, ...) or a raw Error from
+    // clearBenchReinstallOwed's own fs call -- must never propagate out of THIS function: this
+    // card did not create the debt and must not park or crash over it. The debt stays owed
+    // (nothing above ran clearBenchReinstallOwed successfully on this path) for the next card's
+    // WORKTREE to retry. Journalled, not silently swallowed, so a wedged installer or a broken
+    // journalRoot is still visible to a human reading the journal.
+    appendEvent(ctx.taskDir, 'WORKTREE', 'bench-debt-attempt-failed', {
+      mergeSha: owed.mergeSha,
+      reason: err && err.name === 'ParkSignal' ? err.reason : (err && err.code) || (err && err.name) || 'error',
+      message: (err && err.message) || String(err),
+    });
+  }
+}
+
 // action 6.4: everything from `fetch` through `npm ci` below mutates config.productRepo's shared
 // `.git` (fetch writes FETCH_HEAD; the leftover sweep and `worktree add` mutate
 // `.git/worktrees/`'s administrative files) or spikes shared disk/CPU (`npm ci`) -- see
@@ -886,6 +1127,11 @@ async function realWorktree(ctx, deps = {}) {
   fs.mkdirSync(worktreesDir, { recursive: true });
 
   await withProductRepoLock(ctx, deps, 'worktree', async () => {
+    // action B1.4 round 4: pay back an owed bench-worker reinstall from an EARLIER card's
+    // deferred FINISH before this card does anything else -- see payBenchReinstallDebtIfOwed's
+    // own header for why WORKTREE, and why this can never block or park this card.
+    await payBenchReinstallDebtIfOwed(ctx, deps, config);
+
     const fetch = spawnStep(ctx, deps, 'WORKTREE', 'git', ['-C', productRepo, 'fetch', 'origin']);
     if (fetch.exit !== 0) throw new ParkSignal('worktree-fetch-failed', { exit: fetch.exit });
 
@@ -1934,18 +2180,343 @@ function sumJournalBillableTokens(taskDir) {
   return summarizeTask(taskDir).billableTokens;
 }
 
-// realFinish's own `board:move -- <issue> Done` is deliberately NOT routed through board.js's
-// moveCard/COLUMN_BY_STATE: moveCard's whole contract is "never blocks the task" (board.js's own
-// header), because a stale board display is cosmetic everywhere else. It is not cosmetic here --
-// a card the daemon cannot mark Done is not actually done, so this is the one board move in the
-// whole system that must block on failure, via spawnStep's own ParkSignal path below, same as it
-// always has. Adding a `FINISH: 'Done'` entry to COLUMN_BY_STATE would silently arm moveCard's
-// non-blocking path for it instead -- see board.js's header for the matching note.
+// BENCH_PATH_RE -- the pipeline's own copy of scripts/finish.sh's own path test
+// (`grep -qE '^src/e2e/bench/|^scripts/bench-'`), matched against ONE name per line the way
+// `git diff --name-only` (and this file's own splitLines) always produce it.
+const BENCH_PATH_RE = /^(?:src\/e2e\/bench\/|scripts\/bench-)/;
+function benchPathsTouched(diffNameOnlyOutput) {
+  return splitLines(diffNameOnlyOutput).some((p) => BENCH_PATH_RE.test(p));
+}
+
+// Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
+// `systemctl --user restart spo-bench-worker.service` -- worker.ts:779 maps that SIGTERM straight
+// to `process.exit(0)`, no drain -- and this daemon runs K=2 in production (SPO_WORKERS=2 on the
+// live systemd drop-in). Without this wait, a card reaching FINISH's reinstall step can cut a
+// SIBLING card's in-flight GATE mid-job: the cut job recovers as INTERRUPTED (worker.ts's
+// recoverInterrupted never calls writeVerdictIn), so the sibling's GATE finds no
+// verdicts/<sha>.json and parks `gate-non-attesting` -- transient-retryable, but
+// state-machine.js's own TRANSIENT_RETRY_REASONS comment is explicit that a transient retry
+// re-runs WORKTREE, PLAN, IMPLEMENT and GATE: real LLM spend caused by this action, not merely a
+// wasted gate. The product-repo mutex this section already holds cannot guard against this
+// either way -- the bench worker is a systemd unit, not the product-repo clone, so GATE (which
+// takes no lock at all) is never excluded by it.
+//
+// benchQueueDepth(deps, config) -- ~/.spo-bench/spool (jobs waiting for a worker) and
+// ~/.spo-bench/running (jobs a worker currently holds), the SAME two directories `spo status`
+// already reports (bin/spo's own collectBenchQueueDepth) -- read the same way here rather than
+// re-derived, the exact kind of second-copy-that-drifts CLAUDE.md's `gh api -f` story is about.
+// `deps.readdirSync` is the test injection point, same convention as this file's own
+// `deps.spawnSync`/`deps.sleep`; production code never passes it.
+// countDirEntries(readdirSyncFn, dir) -> {count, error} -- W2 (post-verification, third pass):
+// `error` is null for a genuinely EMPTY answer -- the directory does not exist (ENOENT), which
+// covers BOTH "no bench installed on this box" and "neither spool/ nor running/ has ever been
+// created yet", bin/spo's own countDirEntries makes the identical ENOENT -> 0 choice for the
+// identical reason -- and non-null for anything else (EACCES, EIO, ENOTDIR, a symlink loop, ...)
+// that must NEVER be silently read as "idle". Before this fix EVERY error collapsed to 0, i.e.
+// "safe to restart the worker" -- the opposite of the conservative direction for a safety gate: a
+// misconfigured or unreadable SPO_BENCH_DIR silently reduced the whole wait to a no-op while the
+// suite stayed green (mutation W2, adversarial verification round 2). realGate's own
+// `verdictDirExists` (this file, ~line 1455) already draws the identical distinction one function
+// away -- "the bench genuinely attested nothing" vs "the machine was looking in the wrong place"
+// -- this follows that same pattern rather than inventing a second one.
+function countDirEntries(readdirSyncFn, dir) {
+  try {
+    return { count: readdirSyncFn(dir).length, error: null };
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return { count: 0, error: null };
+    return { count: 0, error: err };
+  }
+}
+
+// benchQueueDepth(deps, config) -- reads config.spoBenchDir's own spool/ (jobs waiting for a
+// worker) and running/ (jobs a worker currently holds), the SAME two directories `spo status`
+// already reports (bin/spo's own collectBenchQueueDepth) -- read the same way here rather than
+// re-derived, the exact kind of second-copy-that-drifts CLAUDE.md's `gh api -f` story is about.
+// `deps.readdirSync` is the test injection point, same convention as this file's own
+// `deps.spawnSync`/`deps.sleep`; production code never passes it. Exported (module.exports below)
+// so payBenchReinstallDebtIfOwed's own decideInstall (above) can read the SAME function rather
+// than a second copy.
+//
+// `error` on the returned object (see countDirEntries above) is the FIRST of spool's/running's own
+// unexpected errors, non-null only when one of the two subdirectories could not actually be read
+// for a reason other than "it simply is not there yet" -- every caller below must treat that as
+// UNKNOWN, never as "idle".
+function benchQueueDepth(deps, config) {
+  const readdirSyncFn = (deps && deps.readdirSync) || fs.readdirSync;
+  const benchDir = config.spoBenchDir;
+  const spool = countDirEntries(readdirSyncFn, path.join(benchDir, 'spool'));
+  const running = countDirEntries(readdirSyncFn, path.join(benchDir, 'running'));
+  return {
+    spool: spool.count,
+    running: running.count,
+    error: spool.error || running.error,
+  };
+}
+
+// waitForBenchIdle(ctx, deps, config) -> {idle, attempts, spool, running} -- polls
+// benchQueueDepth until BOTH directories are empty, sleeping config.benchIdleWaitPollIntervalMs
+// between polls (same `pollSleep` idiom realCiChecks' own bounded poll loop below uses), bounded
+// by config.benchIdleWaitMaxPolls. Called ONLY once the fast-forward has already succeeded AND
+// benchTouched is true -- i.e. only when the worker genuinely needs reinstalling (see realFinish's
+// own call site below, and V20/adversarial verification round 2's own note on why that ordering
+// itself is pinned by a dedicated test now, not merely implied).
+//
+// R1 (post-verification, third pass): this used to PARK (`finish-failed`/`bench-idle-wait`) the
+// instant the bound was exhausted. That policy was wrong on three counts, all measured: (1)
+// `finish-failed` is not on state-machine.js's TRANSIENT_RETRY_REASONS -- terminal, human-only;
+// (2) the park fires BEFORE the board move below, so a card whose PR has ALREADY MERGED sits in
+// `Merging` with its worktree still on disk until a human intervenes; (3) the 15-minute bound is
+// not generous against the actual population of bench jobs -- the config comment's own "generous"
+// claim was derived only from bench-queue-wait.js's ref/nightly constants and omitted
+// SPO-WebClient's worker.ts:107 `DEFAULT_LEASE_MINUTES = 30` / `MAX_LEASE_MINUTES = 120`: an
+// ORDINARY human bench lease on this shared machine (2x-8x the bound) would terminally park any
+// bench-touching card the daemon finishes during it -- the same "a human's normal use of a shared
+// resource terminally parks a merged card" failure the `--untracked-files=no` narrowing exists to
+// prevent, reintroduced through a different door.
+//
+// So this function no longer THROWS on a timed-out wait -- it returns `{idle: false, ...}` and
+// leaves the decision to its caller (realFinish): DEFER the reinstall (journal
+// `bench-reinstall-deferred` loudly, record the debt durably via journal.js's
+// writeBenchReinstallOwed, let the card finish normally -- board move, comment, worktree remove,
+// DONE) rather than park a card whose PR has already merged. realWorktree's own
+// payBenchReinstallDebtIfOwed pays the debt back the NEXT time a card reaches WORKTREE and finds
+// the bench idle (round 4: no separate daemon timer). The bounded wait ITSELF is unchanged by
+// this -- it still absorbs the common case of a gate finishing seconds later; only the TIMEOUT
+// behaviour moved from park to defer.
+//
+// An UNREADABLE bench dir (W2's `depth.error`, above) is a different, non-transient class of
+// problem that polling cannot fix -- no amount of waiting turns a misconfigured or permission-
+// denied directory readable -- so that path is still thrown here, immediately, distinguishably
+// from both a busy bench (deferred, not parked) and every other `finish-failed` reason.
+async function waitForBenchIdle(ctx, deps, config) {
+  const maxPolls = config.benchIdleWaitMaxPolls;
+  const pollIntervalMs = config.benchIdleWaitPollIntervalMs;
+
+  const throwUnreadable = (depth, attempt) => {
+    appendEvent(ctx.taskDir, 'FINISH', 'bench-dir-unreadable', { code: (depth.error && depth.error.code) || null, attempt });
+    throw new ParkSignal('finish-failed', {
+      step: 'bench-idle-wait',
+      reason: 'bench-dir-unreadable',
+      code: (depth.error && depth.error.code) || null,
+    });
+  };
+
+  let depth = benchQueueDepth(deps, config);
+  if (depth.error) throwUnreadable(depth, 0);
+
+  let attempt = 0;
+  while ((depth.spool > 0 || depth.running > 0) && attempt < maxPolls) {
+    attempt += 1;
+    appendEvent(ctx.taskDir, 'FINISH', 'bench-busy-wait', { attempt, spool: depth.spool, running: depth.running });
+    await pollSleep(deps, pollIntervalMs);
+    depth = benchQueueDepth(deps, config);
+    if (depth.error) throwUnreadable(depth, attempt);
+  }
+  if (depth.spool > 0 || depth.running > 0) {
+    appendEvent(ctx.taskDir, 'FINISH', 'bench-idle-wait-timed-out', { attempts: attempt, spool: depth.spool, running: depth.running });
+    return { idle: false, attempts: attempt, spool: depth.spool, running: depth.running };
+  }
+  appendEvent(ctx.taskDir, 'FINISH', 'bench-idle', { attempts: attempt });
+  return { idle: true, attempts: attempt };
+}
+
+// action B1.4: fast-forward config.productRepo's own checkout to origin/main, then -- ONLY when
+// this card's merge touched the bench worker's own sources -- reinstall it. Mirrors
+// SPO-WebClient's scripts/finish.sh, the rule a HUMAN session already runs after merging (fast-
+// forward `~/SPO-WebClient`, `git diff --name-only <merge_sha>^ <merge_sha> | grep -qE
+// '^src/e2e/bench/|^scripts/bench-'`, then `bash scripts/bench-install.sh`) but that this pipeline
+// itself had NEVER run: realFinish did board-move/issue-comment/worktree-remove and nothing else,
+// so a PR merged by the daemon left the bench worker exactly as stale as one merged by a human who
+// never ran `npm run finish` -- the root cause behind the bench worker silently running a stale
+// binary for 3.5 days across 11 merges (see this action's own report for the full account).
+//
+// THE TRAP, and why this is not two independent steps: scripts/bench-install.sh builds from
+// WHATEVER config.productRepo is currently checked out to (`REPO="$(cd "$(dirname "$0")/.." &&
+// pwd)"`, then `npm run build:e2e`, then `systemctl --user restart`). Reinstalling from a checkout
+// that is behind, dirty, or on the wrong branch installs the WRONG binary and reports success --
+// reproducing the exact defect class this action exists to close. So the fast-forward always runs
+// first, and the reinstall runs ONLY once it has actually succeeded.
+//
+// ORDER WITHIN THIS FUNCTION (deliberately not identical to finish.sh's own call order):
+//   1. `git fetch origin` -- always first, unconditional on everything else: every other check
+//      below depends on it (the merge-diff needs its objects, the fast-forward needs its ref), and
+//      it never touches config.productRepo's WORKING TREE (no branch/dirty precondition), so it is
+//      safe to attempt even when the checkout turns out to be unusable for anything else.
+//   2. `gh pr view <prNumber> --json mergeCommit` -- this card's own merge commit sha, read off
+//      GitHub by PR NUMBER (what ctx already carries -- ctx.prNumber, set by PUSH_PR), never
+//      derived from origin/main's own tip: under config.js's WORKERS > 1 a sibling worker's PR can
+//      merge after this one's, so "origin/main's tip" and "this task's own merge commit" stop
+//      being the same claim once concurrency is real. ctx does not carry a merge sha anywhere
+//      today (MERGE only ever asks `gh pr merge` + `npm run pr:wait` to enqueue/await the merge,
+//      never reads the resulting commit back) -- this is the one place this action had to ask
+//      GitHub for something ctx does not already carry, rather than inventing a local derivation.
+//   3. `git diff --name-only <mergeSha>^ <mergeSha>` -- which paths this merge touched (a `git
+//      diff <mergeSha>^ <mergeSha>` needs that commit's objects, which only a successful fetch
+//      guarantees local as of THIS run) -- independent of the fast-forward's own git calls (steps
+//      4-6), so it runs here, right after the sha is known, making `benchTouched` available BEFORE
+//      deciding how severely to treat a fast-forward failure below (step 7).
+//   4-6. the fast-forward itself: refuse (never force) on the wrong branch, a dirty tree, or
+//      whatever `git merge --ff-only` itself refuses (diverged) -- each guards the next, the same
+//      short-circuit shape sweepWorktreeLeftovers above already uses. The branch/dirty checks are
+//      this pipeline's OWN addition, stricter than finish.sh's own `git pull --ff-only`-only
+//      posture (which relies on ff-only's native refusal alone) -- see this action's report.
+//   7. the fast-forward's own outcome, and the deliberate park-vs-journal split -- see this
+//      action's own report for the argument on both sides. Short version: benchTouched, known from
+//      step 3 regardless of whether steps 4-6 succeed, is the deciding fact, not "did the fast-
+//      forward work" alone. A fast-forward failure on a merge that never touched the bench worker
+//      leaves real but non-blocking drift (the same "35 commits behind" gap this action's own
+//      background measured) on a card whose PR has already merged -- journalled, not parked, so an
+//      unrelated repo-hygiene hiccup cannot stall the whole backlog. A fast-forward failure on a
+//      merge that DID touch the bench worker is the high-stakes case this action exists to close:
+//      reinstalling would be unsafe (the trap above) and skipping it silently is the exact failure
+//      this whole remediation chantier is about, so this PARKS -- loud and blocking, and BEFORE
+//      the board move below, while the card is still `Merging`, not after the board already says
+//      `Done`.
+//   8. post-verification hazard fix: wait for the bench worker to go IDLE (waitForBenchIdle,
+//      bounded by config.benchIdleWaitMaxPolls/benchIdleWaitPollIntervalMs) before ever invoking
+//      the reinstall -- ONLY reached once the fast-forward actually succeeded AND benchTouched is
+//      true (the same gate step 9 below is reached under). See waitForBenchIdle's own header for
+//      why: bench-install.sh's own unconditional `systemctl restart` can otherwise cut a SIBLING
+//      card's in-flight GATE on this daemon's real K=2 deployment.
+//   R1 (post-verification, third pass): a bench that never goes idle within the bound no longer
+//      PARKS -- it DEFERS. waitForBenchIdle itself no longer throws on a timed-out wait (it still
+//      throws immediately, and only, on an UNREADABLE bench dir -- see its own header); it returns
+//      `{idle: false, ...}` and this function journals `bench-reinstall-deferred`, records the
+//      debt durably (journal.js's writeBenchReinstallOwed), and returns -- the SAME early-return
+//      shape step 7's non-blocking branch and the benchTouched-false skip below already use, so
+//      FINISH proceeds to the board move exactly as if nothing were owed. See waitForBenchIdle's
+//      own header for why parking here was wrong (terminal, pre-board-move, and derived from a
+//      bound that omits SPO-WebClient's own bench leases) and payBenchReinstallDebtIfOwed
+//      (realWorktree, above) for how the debt actually gets paid.
+//   9. the reinstall itself, ONLY reached once the fast-forward succeeded AND the bench is
+//      confirmed idle (not merely "the wait returned" -- a deferred wait takes the branch above
+//      instead and never reaches this line).
+//
+// Every branch below is loud on both success and failure -- an appendEvent either way -- so the
+// journal can answer "did the worker get reinstalled" without reading a log (this action's own
+// design constraint).
 async function realFinish(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
   const issue = ctx.task && ctx.task.issue;
+  const productRepo = config.productRepo;
+  const prNumber = ctx.prNumber;
 
+  await withProductRepoLock(ctx, deps, 'finish-sync', async () => {
+    // 1. fetch -- see the header above for why this is unconditional and comes first.
+    const fetch = spawnStep(ctx, deps, 'FINISH', 'git', ['-C', productRepo, 'fetch', 'origin']);
+    if (fetch.exit !== 0) {
+      appendEvent(ctx.taskDir, 'FINISH', 'main-fast-forward-failed', { reason: 'fetch-failed', exit: fetch.exit });
+      throw new ParkSignal('finish-failed', { step: 'fast-forward', reason: 'fetch-failed', exit: fetch.exit });
+    }
+
+    // 2. this card's own merge commit, by PR number.
+    const prView = spawnStep(ctx, deps, 'FINISH', 'gh', [
+      'pr',
+      'view',
+      String(prNumber),
+      '--repo',
+      config.ghRepo,
+      '--json',
+      'mergeCommit',
+    ]);
+    let mergeSha = null;
+    if (prView.exit === 0) {
+      try {
+        const parsed = JSON.parse(prView.stdout);
+        mergeSha = (parsed && parsed.mergeCommit && parsed.mergeCommit.oid) || null;
+      } catch {
+        mergeSha = null;
+      }
+    }
+    if (!mergeSha) {
+      appendEvent(ctx.taskDir, 'FINISH', 'merge-sha-lookup-failed', { prNumber, exit: prView.exit });
+      throw new ParkSignal('finish-failed', { step: 'merge-sha-lookup', exit: prView.exit });
+    }
+
+    // 3. which paths this merge touched -- benchTouched is known from here on, REGARDLESS of
+    // whether the fast-forward below (steps 4-6) succeeds.
+    const diff = spawnStep(ctx, deps, 'FINISH', 'git', ['-C', productRepo, 'diff', '--name-only', `${mergeSha}^`, mergeSha]);
+    if (diff.exit !== 0) {
+      appendEvent(ctx.taskDir, 'FINISH', 'bench-diff-check-failed', { prNumber, mergeSha, exit: diff.exit });
+      throw new ParkSignal('finish-failed', { step: 'bench-diff-check', exit: diff.exit });
+    }
+    const benchTouched = benchPathsTouched(diff.stdout);
+    appendEvent(ctx.taskDir, 'FINISH', 'bench-diff-checked', { prNumber, mergeSha, benchTouched });
+
+    // 4-9. fast-forward + conditional reinstall -- the ONE implementation shared with
+    // payBenchReinstallDebtIfOwed (realWorktree, above), action B1.4 round 4. `skipFetch: true`:
+    // this card's own fetch already ran at step 1 above (needed there for the mergeSha/diff
+    // lookups this function does not do), so a second one here would be redundant.
+    const result = await fastForwardMainAndInstall(ctx, deps, config, {
+      state: 'FINISH',
+      skipFetch: true,
+      decideInstall: async () => {
+        if (!benchTouched) {
+          appendEvent(ctx.taskDir, 'FINISH', 'bench-reinstall-skipped', { reason: 'merge did not touch the bench worker' });
+          return { install: false };
+        }
+
+        // post-verification hazard fix -- wait for the bench worker to go idle before ever
+        // invoking the reinstall. waitForBenchIdle still throws immediately
+        // (ParkSignal('finish-failed', {step: 'bench-idle-wait', reason: 'bench-dir-unreadable',
+        // ...})) on an UNREADABLE bench dir -- a misconfiguration polling cannot fix. A timed-out
+        // BUSY wait no longer throws at all: see R1 in the header above and waitForBenchIdle's
+        // own header for the full account.
+        const idleResult = await waitForBenchIdle(ctx, deps, config);
+        if (!idleResult.idle) {
+          // R1 (post-verification, third pass): DEFER, don't park. The card's PR has already
+          // merged and nothing about the card itself is wrong -- only the bench worker's own
+          // binary is now owed a reinstall. Journalled loudly (this is the ONLY place
+          // `bench-reinstall-deferred` is ever written, so its presence alone answers "was this
+          // card's reinstall deferred"), and recorded durably so a daemon restart cannot lose the
+          // debt -- see journal.js's writeBenchReinstallOwed and realWorktree's own
+          // payBenchReinstallDebtIfOwed for how the debt gets paid back (round 4: from WORKTREE's
+          // own product-repo lock span, never a separate daemon timer).
+          appendEvent(ctx.taskDir, 'FINISH', 'bench-reinstall-deferred', {
+            prNumber,
+            mergeSha,
+            attempts: idleResult.attempts,
+            spool: idleResult.spool,
+            running: idleResult.running,
+          });
+          writeBenchReinstallOwed(path.dirname(ctx.taskDir), {
+            mergeSha,
+            prNumber,
+            issue,
+            spool: idleResult.spool,
+            running: idleResult.running,
+            attempts: idleResult.attempts,
+          });
+          return { install: false };
+        }
+        return { install: true };
+      },
+    });
+
+    // 7 (fast-forward's own outcome) and 9 (the reinstall's own outcome) -- see the header above
+    // for the park-vs-journal split. fastForwardMainAndInstall already journalled
+    // main-fast-forward-failed/main-fast-forwarded/bench-reinstalled/bench-reinstall-failed;
+    // deciding whether a failure PARKS this card is FINISH's own call (payBenchReinstallDebtIfOwed
+    // never parks on the identical failures -- see its own header for why).
+    if (!result.ffOk) {
+      if (benchTouched) {
+        throw new ParkSignal('finish-failed', { step: 'fast-forward', reason: result.ffReason, ...result.ffDetail });
+      }
+      return;
+    }
+    if (!result.installed && result.installExit !== null) {
+      throw new ParkSignal('finish-failed', { step: 'bench-reinstall', exit: result.installExit });
+    }
+  });
+
+  // realFinish's own `board:move -- <issue> Done` is deliberately NOT routed through board.js's
+  // moveCard/COLUMN_BY_STATE: moveCard's whole contract is "never blocks the task" (board.js's own
+  // header), because a stale board display is cosmetic everywhere else. It is not cosmetic here --
+  // a card the daemon cannot mark Done is not actually done, so this is the one board move in the
+  // whole system that must block on failure, via spawnStep's own ParkSignal path below, same as it
+  // always has. Adding a `FINISH: 'Done'` entry to COLUMN_BY_STATE would silently arm moveCard's
+  // non-blocking path for it instead -- see board.js's header for the matching note.
   const move = spawnStep(ctx, deps, 'FINISH', 'npm', ['run', 'board:move', '--', String(issue), 'Done'], {
     cwd: worktreePath,
   });
@@ -2012,4 +2583,9 @@ module.exports = {
   prepareJudgeInputs,
   finalComment,
   sumJournalBillableTokens,
+  // Exported for test/real-steps.test.js's own direct coverage, and so
+  // payBenchReinstallDebtIfOwed (above, in this same file) and realFinish's own waitForBenchIdle
+  // read the SAME queue-depth logic rather than a second copy that can drift -- see
+  // benchQueueDepth's own header.
+  benchQueueDepth,
 };

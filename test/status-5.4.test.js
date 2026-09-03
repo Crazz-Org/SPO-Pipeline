@@ -28,6 +28,7 @@ require('./no-real-spawn');
 const { mkTmp, writeTask, writePoolDir, runSpo } = require('./helpers');
 const { tokenReport, todaySpend } = require('../orchestrator/tokens');
 const { collectDaemonStats, collectJournalTasks } = require('../console/collect');
+const { writeBenchReinstallOwed } = require('../orchestrator/journal');
 const { invokeClaudeReal } = require('../orchestrator/steps/llm');
 
 function writeJournalLines(taskDir, lines) {
@@ -196,6 +197,46 @@ test('spo status: bench queue depth counts ~/.spo-bench/spool and running, and a
   const missingBenchDir = path.join(mkTmp('spo-status-nobench-'), 'does-not-exist');
   const out2 = runSpo(['status', '--journal', journalDir, '--queue', queueDir, '--bench-dir', missingBenchDir]);
   assert.match(out2, /bench: spool=0\s+running=0/);
+});
+
+// Action B1.4 round 4: an owed bench-worker reinstall (journal.js's writeBenchReinstallOwed,
+// <journalRoot>/bench-reinstall-owed.json) was otherwise visible only by reading that file
+// directly or grepping a task's journal.jsonl -- neither of which a maintainer has any reason to
+// go looking for. `spo status` already prints the bench queue depth right above this; the owed
+// debt belongs next to it, the same "follow what spo status already reads" instruction this
+// action's own report names.
+test('spo status: an owed bench-worker reinstall is surfaced by name, with when it was recorded and which merge it covers', () => {
+  const journalDir = mkTmp('spo-status-benchdebt-journal-');
+  const queueDir = mkTmp('spo-status-benchdebt-queue-');
+  const recordedAt = writeBenchReinstallOwed(journalDir, {
+    mergeSha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    prNumber: 555,
+    issue: 900,
+  }).recordedAt;
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.match(out, /bench reinstall owed:/);
+  assert.ok(out.includes(recordedAt), 'must render the actual recordedAt timestamp, not a placeholder');
+  assert.ok(out.includes('deadbeefdead'), 'must render (at least a prefix of) the owed mergeSha');
+});
+
+test('spo status: NO owed bench-worker reinstall prints no such line at all -- silence means nothing is owed, the same convention the journal itself uses', () => {
+  const journalDir = mkTmp('spo-status-nobenchdebt-journal-');
+  const queueDir = mkTmp('spo-status-nobenchdebt-queue-');
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.doesNotMatch(out, /bench reinstall owed/);
+});
+
+test('spo status: a bench-worker reinstall that WAS owed and then paid back (cleared) is no longer reported as owed', () => {
+  const journalDir = mkTmp('spo-status-clearedbenchdebt-journal-');
+  const queueDir = mkTmp('spo-status-clearedbenchdebt-queue-');
+  const { clearBenchReinstallOwed } = require('../orchestrator/journal');
+  writeBenchReinstallOwed(journalDir, { mergeSha: 'a'.repeat(40), prNumber: 1, issue: 1 });
+  clearBenchReinstallOwed(journalDir, { lastMergeSha: 'a'.repeat(40) });
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.doesNotMatch(out, /bench reinstall owed/);
 });
 
 test('spo status: an expired cooldown renders as none, a live one renders with time remaining', () => {

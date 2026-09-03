@@ -753,8 +753,15 @@ succeeds. `config.ghRepo` (`Crazz-Org/SPO-WebClient`) is the `--repo` / API path
 call uses. `config.spoBenchDir` (default `~/.spo-bench`) is where the nightly-red refusal and
 the main-moved `baseMain` lookup read local JSON instead of polling GitHub or the bench.
 
-**WORKTREE, in order — and why claim is last.** `git -C <productRepo> fetch origin`, then `git
--C <productRepo> rev-parse origin/main` to get the sha the nightly check compares against
+**WORKTREE, in order — and why claim is last.** Action B1.4 round 4: BEFORE any of the below,
+inside the SAME product-repo-lock span (phase `worktree`), `payBenchReinstallDebtIfOwed` pays back
+a bench-worker reinstall an EARLIER card's FINISH deferred, if one is owed -- see the FINISH
+section below ("Round 4: the debt is paid back by the NEXT card's own WORKTREE") for the full
+mechanism. It never blocks or parks this card: a no-op when nothing is owed (the common case, no
+journal line at all), and every failure mode on the way to paying an owed debt leaves the record
+owed and lets WORKTREE continue exactly as if nothing were owed. Then `git -C <productRepo> fetch
+origin`, then `git -C <productRepo> rev-parse origin/main` to get the sha the nightly check
+compares against
 `~/.spo-bench/nightly/latest.json`'s `{verdict, sha}` (a `FAIL` at that exact sha parks
 `nightly-main-red` before anything is created). Action 3.1: the rev-parsed sha is journalled
 (`{state: 'WORKTREE', event: 'base-main', sha}`) and set onto `ctx.task.baseMainSha` immediately,
@@ -904,14 +911,85 @@ merge origin/main`, and success returns `'CHECK'` to re-run CHECK and re-gate.
 run pr:wait -- <n>` in the worktree, with exactly one bounded re-wait on exit 4 ("still open"),
 identical to the shadow-mode bounded-wait logic.
 
-**FINISH** runs `npm run board:move -- <issue> Done` and `gh issue comment <n> --repo <ghRepo>
---body-file <file>` (the comment in `journal/<id>/final-comment.md` — since action 5.2 it also carries billable-weighted
-tokens, elapsed time with the parked share broken out, and any attempt counters) **before** removing
-the worktree — the same "npm aliases need a product cwd" rule as WORKTREE's claim ordering, so
-the board sync must happen while the worktree still exists. Only then `git -C <productRepo>
-worktree remove --force <worktreePath>`. A final `finished` journal event carries the task's
-summed `billableTokens` (every `llm-call` event's `billableTokens` in `journal.jsonl` -- fresh
-input + cache-creation + output, cache-read excluded) and the PR number.
+**FINISH** (action B1.4 gave it a new preamble, ahead of the pre-existing board-sync/teardown
+below) first fast-forwards `config.productRepo`'s own checkout to `origin/main` and, only when
+this card's merge touched the bench worker's own sources, reinstalls it — the rule
+`SPO-WebClient/scripts/finish.sh` already runs for a human session, now finally on the pipeline's
+own path too (see `doc/state-machine-spec.md`'s FINISH row for the full account, including why
+the root cause of the bench worker running a stale binary for 3.5 days was that this pipeline had
+never run it at all). Inside its own product-repo-lock critical section (phase `finish-sync`,
+ahead of the pre-existing teardown phase `finish` below): `git fetch origin`; this card's own
+merge commit by PR number (`gh pr view <prNumber> --json mergeCommit` — ctx carries no merge sha
+directly); `git diff --name-only <mergeSha>^ <mergeSha>` to learn whether the merge touched
+`src/e2e/bench/` or `scripts/bench-`; then the fast-forward itself, refusing (never forcing)
+unless the checkout is on `main`, clean of TRACKED changes (`git status --porcelain
+--untracked-files=no` -- post-verification hazard fix: narrowed from bare `--porcelain`, which also
+counted untracked files and so refused in cases the human rule it mirrors, `git pull --ff-only`,
+would not; R3, post-verification third pass: a FAILED branch/status probe is `check-failed`,
+`detail.check`/`detail.exit` naming which and why, never misreported as `wrong-branch`/`dirty`),
+and `git merge --ff-only origin/main` itself succeeds; then, only once that succeeded and the
+merge did touch the bench worker, a second post-verification hazard fix: wait for the bench
+worker to go IDLE (`waitForBenchIdle` -- `~/.spo-bench/spool` and `~/.spo-bench/running`, read off
+`config.spoBenchDir` itself, both empty, bounded by `benchIdleWaitMaxPolls` x
+`benchIdleWaitPollIntervalMs`, default 15 minutes -- `bash scripts/bench-install.sh`'s own
+unconditional `systemctl restart` can otherwise cut a SIBLING card's in-flight GATE under this
+daemon's real K=2 deployment; R2/W2, post-verification third pass: an UNREADABLE `spool`/`running`
+-- anything other than "simply not there" -- PARKS immediately, `finish-failed`/`bench-idle-wait`/
+`bench-dir-unreadable`, never silently read as idle), THEN `bash scripts/bench-install.sh`
+(never retried on a timeout -- R2, post-verification third pass, the same exemption `npm-gate`
+already has and for the identical reason: a killed `bash` can leave `npm run build:e2e`/
+`systemctl restart` still running underneath it). R1 (post-verification third pass): a bench
+that stays BUSY for the whole bound no longer PARKS -- it DEFERS. The old park was terminal
+(`finish-failed` is not on `TRANSIENT_RETRY_REASONS`), fired BEFORE the board move (stranding an
+already-merged card in `Merging`), and its 15-minute bound omitted SPO-WebClient's own bench
+leases (`worker.ts`'s `DEFAULT_LEASE_MINUTES = 30` / `MAX_LEASE_MINUTES = 120` -- an ordinary
+human lease is 2x-8x the bound). So FINISH now journals `bench-reinstall-deferred`, records the
+debt durably (`journal.js`'s `writeBenchReinstallOwed`, `<journalRoot>/bench-reinstall-owed.json`
+-- a SECOND defer during the same busy window overwrites this ONE record with its newer
+`mergeSha` rather than accumulating a duplicate), and completes the card normally -- board move,
+comment, worktree remove, `DONE` -- exactly as if nothing were owed.
+
+**Round 4: the debt is paid back by the NEXT card's own WORKTREE**, not a separate daemon timer.
+Round 3 shipped `orchestrator/bench-reconcile.js`, a dedicated scan timer wired into
+`state-machine.js`'s `runScanCycle` that took the SAME product-repo lock from the scanner's own
+process to pay the debt back once the bench went idle -- since deleted: it held that lock from a
+THIRD process `product-repo-lock.js`'s `waitBoundMs` derivation explicitly assumes cannot exist
+(at K=1 a worker reaching the lock while the scanner held it parked
+`product-repo-lock-timeout` after 0ms, terminal and human-only), ran `bash
+scripts/bench-install.sh` with none of `realFinish`'s own preconditions, and had no backoff on a
+failing install. Three rounds of adding to that separate reconciler produced a new must-fix each
+round -- more machinery than the problem needs.
+
+Instead, `realWorktree`'s own product-repo-lock span (phase `worktree`) opens with
+`payBenchReinstallDebtIfOwed`, BEFORE anything else -- WORKTREE runs before GATE, so a card that
+starts while a reinstall is owed pays it back before it can gate against a stale worker, the exact
+failure this debt exists to prevent; paying only at FINISH would leave a one-card window where a
+card gates stale and only then settles the debt. It calls the SAME `fastForwardMainAndInstall`
+function `realFinish` calls below (one implementation of "fetch, refuse unless clean and
+fast-forwardable, `git merge --ff-only origin/main`, conditionally reinstall" -- not two copies
+that could drift), reusing `realFinish`'s own preconditions in full. The "conditionally" is
+resolved by a SINGLE, non-blocking `benchQueueDepth` read (never a poll -- this must never hold up
+the card): busy or an unreadable bench dir leaves the record owed and journals
+`bench-debt-still-busy`/`bench-debt-dir-unreadable`, retried by the next card's own WORKTREE. Once
+idle, a `git merge-base --is-ancestor <owed mergeSha> HEAD` confirms the debt's own record is
+still an ancestor of the freshly fast-forwarded checkout (defense in depth against a stale or
+corrupted record) before the reinstall runs; a failure there journals
+`bench-debt-ancestry-check-failed`. A fast-forward failure or a failed install use the SAME
+`main-fast-forward-failed`/`bench-reinstall-failed` vocabulary `realFinish` uses, `detail.state:
+'WORKTREE'` telling the two apart. **Every one of these leaves the record owed and NEVER parks or
+blocks the card** -- payBenchReinstallDebtIfOwed never throws a `ParkSignal`, on any failure mode,
+by construction. Only a successful install clears the record (`clearBenchReinstallOwed`) and
+journals `bench-debt-paid`. Only THEN does it run `npm run board:move -- <issue> Done` and `gh
+issue comment <n> --repo <ghRepo> --body-file <file>` (the comment in
+`journal/<id>/final-comment.md` — since action 5.2 it also carries billable-weighted tokens,
+elapsed time with the parked share broken out, and any attempt counters) **before** removing the
+worktree — the same "npm aliases need a product cwd" rule as WORKTREE's claim ordering, so the
+board sync must happen while the worktree still exists. Only then `git -C <productRepo> worktree
+remove --force <worktreePath>` (its own, separate product-repo-lock critical section, phase
+`finish` — board-move and the issue comment stay deliberately outside both locked spans, neither
+touches `config.productRepo`). A final `finished` journal event carries the task's summed
+`billableTokens` (every `llm-call` event's `billableTokens` in `journal.jsonl` -- fresh input +
+cache-creation + output, cache-read excluded) and the PR number.
 
 **Every spawn**, across all seven functions, journals one compact `{state, argv (first 6
 tokens), exit, ms, attempt, commandClass, timeoutMs, timedOut, signal}` `'spawn'` event via
@@ -936,6 +1014,7 @@ by command + leading args (`classifyCommand`, `orchestrator/command-timeout.js`)
 | `npm-ci` | 600000 | `SPO_TIMEOUT_NPM_CI_MS` |
 | `npm-gate` | 7800000 | `SPO_TIMEOUT_NPM_GATE_MS` |
 | `npm-run` (every other `npm run <alias>`: `typecheck`, `lint`, `coverage:changed`, `board:take`, `board:move`, `pr:wait`, `report:card`) | 660000 | `SPO_TIMEOUT_NPM_RUN_MS` |
+| `bench-install` (action B1.4's conditional bench-worker reinstall, `bash scripts/bench-install.sh` -- never retried, see spawnStep's own comment) | 900000 | `SPO_TIMEOUT_BENCH_INSTALL_MS` |
 
 **Action 2.1b closed the remaining gap.** The real commands spawned OUTSIDE `spawnStep` by their
 own private `runSync` helpers — `board.js`'s `moveCard` (`npm run board:move`, called from inside
