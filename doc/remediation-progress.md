@@ -470,7 +470,9 @@ against 10.0k fresh input, which is exactly why dollars were the wrong headline 
   the `app` guard earns itself immediately — `CodeQL` reports as `github-advanced-security`, so its
   `id` is NOT an Actions job id and must never be fed to `actions/jobs/<id>`.
 - **C4's cost on the green path is zero**, as designed: no job lookup (nothing red), no verdict
-  read at GATE (exit 0), no `commit-skipped-nothing-staged` (real work was staged).
+  read at GATE (exit 0), no `commit-skipped-nothing-staged` (real work was staged). Dated record
+  of what this C4 recette run observed at the time — superseded by action B2.3, which now DOES
+  read the verdict at GATE exit 0 (see `doc/state-machine-spec.md`'s GATE row).
 - `ciImplementRetries` reaches state.json; `baseMainSha` recorded at WORKTREE.
 
 ### What it found: the protected-files guard fails open on every real card

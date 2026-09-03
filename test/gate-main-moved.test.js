@@ -92,14 +92,23 @@ function gateCtx(overrides = {}) {
   return testCtx({ id: 'gmm-card', task, config });
 }
 
-// ---- 1. exit 0 / 2 / 3 / 4 unchanged; exit 0 makes no rev-parse, no verdict read -------------
-
-test('realGate: exit 0 -> CI_CHECKS with no extra call at all (no rev-parse, no verdict read)', async () => {
+// ---- 1. exit 2 / 3 / 4 unchanged, no verdict lookup; exit 0 now reads the verdict (B2.3) ------
+//
+// Action B2.3(a) ended "exit 0 makes no rev-parse, no verdict read": PASS from `npm run gate` is
+// no longer read as proof on its own -- realGate now resolves HEAD and reads verdicts/<sha>.json
+// even on exit 0, so a card whose verdict says routing required a live drive that never happened
+// is not waved through as green. See test/gate-live-attestation.test.js for the full B2.3 table
+// (routed-but-not-driven parks, absence stays safe, BLOCKED stops reaching DIAGNOSE); this test
+// now only pins the SHAPE of the exit-0 call sequence (rev-parse HEAD, then a verdict lookup that
+// finds nothing) and that the common "nothing on file" case still reaches CI_CHECKS.
+test('realGate: exit 0 -> CI_CHECKS after reading HEAD\'s verdict (action B2.3) -- no verdict on disk is read as safe, not as proof', async () => {
   const ctx = gateCtx();
+  const headSha = fakeSha('gate-exit0-b23-noverdict');
   const calls = [];
   const deps = {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       return ok('');
     },
   };
@@ -107,9 +116,17 @@ test('realGate: exit 0 -> CI_CHECKS with no extra call at all (no rev-parse, no 
   const next = await realGate(ctx, deps);
   assert.equal(next, 'CI_CHECKS');
 
-  // Only moveCard's `npm run board:move` and the gate run itself -- never a `git rev-parse`.
-  assert.ok(!calls.some((c) => c.command === 'git'), 'the green path must spawn no git command at all');
   assert.ok(calls.some((c) => c.command === 'npm' && c.args[0] === 'run' && c.args[1] === 'gate'));
+  assert.ok(
+    calls.some((c) => c.command === 'git' && c.args.includes('rev-parse') && c.args.includes('HEAD')),
+    'action B2.3(a): the exit-0 path now resolves HEAD to look up the verdict'
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  const evt = journal.find((e) => e.event === 'gate-live-unknown');
+  assert.ok(evt, 'no verdict file at all for this sha must be journalled, not silently ignored');
+  assert.equal(evt.verdictExists, false);
+  assert.ok(!journal.some((e) => e.event === 'gate-live-not-driven'), 'absence must never park');
 });
 
 for (const [exit, reason] of [
@@ -435,6 +452,78 @@ test('realGate: exit 1, rev-parse HEAD itself fails -> DIAGNOSE, nothing parks, 
   assert.equal(evt.step, 'rev-parse');
   assert.equal(evt.exit, 128);
   assert.ok(!journal.some((e) => e.event === 'gate-non-attesting' || e.event === 'gate-verdict'));
+});
+
+// ---- 8b. exit 0, rev-parse HEAD itself fails -> CI_CHECKS, nothing parks (B2.3's mirror) -------
+//
+// Action B2.3 shares resolveGateHeadSha between the exit-1 path above and the exit-0 path this
+// action added. Before this fix-round test, the exit-1 mirror above was the ONLY invariant test
+// for "a failed diagnostic must never become the thing that parks the card" -- the exit-0 side had
+// none, which is exactly why mutation M12 (make an unreadable HEAD park on exit 0 instead of
+// returning CI_CHECKS) survived the suite during adversarial verification.
+
+test('realGate: exit 0, rev-parse HEAD itself fails -> CI_CHECKS, nothing parks, gate-verdict-unreadable journalled', async () => {
+  const ctx = gateCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (args.includes('run') && args.includes('gate')) return ok('');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return fail(128, 'fatal: not a git repository');
+      return ok('');
+    },
+  };
+
+  const next = await realGate(ctx, deps);
+  assert.equal(next, 'CI_CHECKS');
+
+  const journal = readJournal(ctx.taskDir);
+  const evt = journal.find((e) => e.event === 'gate-verdict-unreadable');
+  assert.ok(evt, 'the failure must be journalled, never silently swallowed');
+  assert.equal(evt.step, 'rev-parse');
+  assert.equal(evt.exit, 128);
+  assert.ok(!journal.some((e) => e.event === 'gate-live-unknown' || e.event === 'gate-live-not-driven'));
+});
+
+// ---- 8c. exit 0, rev-parse HEAD TIMES OUT twice -> CI_CHECKS, nothing parks --------------------
+//
+// The sharper case (adversarial verification finding T3-1, mutation M12): resolveGateHeadSha's
+// own spawnStep call throws ParkSignal('git-timed-out') -- NOT a non-zero exit -- when the same
+// git command is killed by its own spawnSync timeout twice in a row (action 2.1). Before this
+// fix, that throw was uncaught inside resolveGateHeadSha and unwound straight out of the exit-0
+// path (which spawns no other git command to catch it), parking a gate that PASSED, permanently
+// (`git-timed-out` is not on TRANSIENT_RETRY_REASONS) -- contradicting resolveGateHeadSha's own
+// header comment ("returning null on ANY failure to read it -- never fatal here"). Same fake
+// timeout signature test/gate-main-moved.test.js's own "merge --abort that TIMES OUT" test uses:
+// a signalled child (`status: null`, `signal: 'SIGTERM'`) with a deadline armed.
+
+test('realGate: exit 0, rev-parse HEAD TIMES OUT twice -> CI_CHECKS, nothing parks (never git-timed-out)', async () => {
+  const config = testConfig({ commandTimeoutsMs: { git: 5000 } });
+  const ctx = gateCtx({ config });
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('run') && args.includes('gate')) return ok('');
+      if (args.includes('rev-parse') && args.includes('HEAD')) {
+        return { status: null, stdout: '', stderr: '', signal: 'SIGTERM' };
+      }
+      return ok('');
+    },
+  };
+
+  // The prior invariant test (8b) asserts CI_CHECKS via a plain return; here the failure mode is
+  // a THROW deep inside resolveGateHeadSha's own spawnStep call, so the assertion that matters is
+  // that realGate does NOT reject at all -- a park here would be exactly the regression this test
+  // exists to catch.
+  const next = await realGate(ctx, deps);
+  assert.equal(next, 'CI_CHECKS', 'a timed-out diagnostic must never park a gate that passed');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(!journal.some((e) => e.event === 'parked'), 'nothing may park on a failed diagnostic');
+  const evt = journal.find((e) => e.event === 'gate-verdict-unreadable');
+  assert.ok(evt, 'the swallowed timeout must still be journalled, not silently eaten');
+  assert.equal(evt.step, 'rev-parse');
+  assert.equal(evt.threw, true);
+  assert.equal(evt.reason, 'git-timed-out');
 });
 
 // ---- 9. gate.log is still written on every exit-1 path -----------------------------------------

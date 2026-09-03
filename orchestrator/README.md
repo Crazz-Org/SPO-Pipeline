@@ -867,19 +867,37 @@ PR number is parsed off the `/pull/<n>` URL in `gh pr create`'s stdout and store
 (and from there into every `state.json` snapshot) for MERGE and FINISH to read back; an
 unparsable URL parks `push-pr-failed` (`step: 'pr-number-unparsed'`) rather than guessing.
 
-**GATE** runs `npm run gate` in the worktree. 0 → `'CI_CHECKS'` and 2/3/4 → PARKED
+**GATE** runs `npm run gate` in the worktree. 2/3/4 → PARKED
 `gate-dirty-tree`/`gate-worker-down`/`gate-timeout` are still exactly the shadow-mode table
-(`handleGate`, state-machine.js). **Exit 1 is not, since action 4.2** — the real path reads the
-bench's own verdict for HEAD (`<spoBenchDir>/verdicts/<sha>.json`) and splits what the exit code
-alone conflates: no verdict file at all → PARKED `gate-non-attesting` (a `NON_ATTESTING` bench
-verdict is never written to `verdicts/`, so nothing was learned about the code and a DIAGNOSE call
-would be spent on nothing); a `FAIL` with no `baseMain` → the branch no longer merges with
-`origin/main` (the bench merges it itself, before assigning `baseMain`), so fetch + merge
-`origin/main` → `'CHECK'`, or `merge --abort` and PARKED `main-moved-conflict`; anything else,
-including a `FAIL` that does carry `baseMain`, → `'DIAGNOSE'` as before. `main-moved-twice` and
-`main-red-no-merge` are reachable from GATE too, sharing `ctx.counters.mainMoveUsed` and the
-`guardNightlyRed` helper with CI_CHECKS. The shadow-fixture path keeps the old flat table. See
-`doc/state-machine-spec.md`'s GATE row and realGate's own header comment for the measurement.
+(`handleGate`, state-machine.js). **Neither exit 0 nor exit 1 is, since actions 4.2 and B2.3** —
+the real path reads the bench's own verdict for HEAD (`<spoBenchDir>/verdicts/<sha>.json`) on
+EVERY exit, not only exit 1, and splits what the exit code alone conflates.
+
+Exit 1: no verdict file at all → PARKED `gate-non-attesting` (a `NON_ATTESTING` bench verdict is
+never written to `verdicts/`, so nothing was learned about the code and a DIAGNOSE call would be
+spent on nothing); a `FAIL` with no `baseMain` → the branch no longer merges with `origin/main`
+(the bench merges it itself, before assigning `baseMain`), so fetch + merge `origin/main` →
+`'CHECK'`, or `merge --abort` and PARKED `main-moved-conflict`; a `FAIL` that DOES carry
+`baseMain` → `'DIAGNOSE'`, unchanged.
+
+Exit 0 (action B2.3): no longer read as proof on its own. `verdicts/<sha>.json` now carries
+`live` (`LiveAttestation` — `{status:'ran', flows}` · `{status:'skipped', why, required}` ·
+`{status:'unknown', why}`); no verdict file, no `live` key, or `live.status === 'unknown'` are all
+read as "nothing proven either way" and journalled `gate-live-unknown` → `'CI_CHECKS'` unchanged
+(parking on old data would stall the whole backlog).
+
+Both exits, `BLOCKED`/exit 1 or a routed-but-undriven `live.status === 'skipped'`/exit 0 → PARKED
+`gate-live-not-driven` — the SAME reason on both, because the underlying fact (routing required a
+live drive that never happened) is identical either way. `BLOCKED` has other producers too (a
+world-lock refusal or a dead-today rate limit, `run.ts`'s `runLive` in SPO-WebClient) whose
+`live.status` is `'unknown'`, not routed-but-undriven — those get their own reason,
+`gate-live-blocked`, on `TRANSIENT_RETRY_REASONS` (the world lock clears itself in minutes; see
+`orchestrator/state-machine.js`'s own comment on that entry).
+
+`main-moved-twice` and `main-red-no-merge` are reachable from GATE too, sharing
+`ctx.counters.mainMoveUsed` and the `guardNightlyRed` helper with CI_CHECKS. The shadow-fixture
+path keeps the old flat table. See `doc/state-machine-spec.md`'s GATE row and realGate's own
+header comment for the measurement.
 
 **CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
 <worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to

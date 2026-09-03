@@ -1686,8 +1686,62 @@ async function realPushPr(ctx, deps = {}) {
 // ---- GATE -----------------------------------------------------------------------------------
 //
 // `npm run gate`: 0 PASS -> CI_CHECKS, 1 fail -> see the exit-1 block below (action 4.2), 2 dirty
-// / 3 worker down / 4 timeout -> PARKED. 0/2/3/4 are unchanged and still mirror handleGate's own
-// shadow-mode cause table exactly; the green path (exit 0) makes no extra call at all.
+// / 3 worker down / 4 timeout -> PARKED. 2/3/4 are unchanged and still mirror handleGate's own
+// shadow-mode cause table exactly. Action B2.3: the green path (exit 0) is no longer silent --
+// see the block below the `r.exit === 0` check.
+
+// Shared by GATE's exit-0 and exit-1 paths (action B2.3, factored out of the exit-1 block action
+// 4.1 originally wrote it for): resolves HEAD's sha, journalling and returning null on ANY
+// failure to read it -- never fatal here. Action 4.1's own finding: exit 0 is necessary but not
+// sufficient to trust the stdout -- an orphan/unborn HEAD prints the literal ref name `HEAD` on
+// stdout with exit 0, so both a non-zero exit AND a result that does not look like an object name
+// count as unreadable. A failed diagnostic must never become the thing that parks or blocks the
+// card -- callers decide their own fallback routing on a null return.
+//
+// That "never fatal" contract was not actually true until this try/catch (adversarial
+// verification of B2.3, finding T3-1): since action 2.1, spawnStep ITSELF throws
+// ParkSignal('git-timed-out') -- not a non-zero exit -- when the same git command is killed by
+// its own spawnSync timeout twice in a row. Uncaught, that throw unwinds straight out of this
+// helper and, on the exit-0 path above (which spawns no other git command and has nothing else to
+// catch it), parks a gate that PASSED, permanently (`git-timed-out` is not on
+// TRANSIENT_RETRY_REASONS), because a purely diagnostic `git rev-parse HEAD` happened to hang.
+// Same shape, same fix, as preserveWorktreeWip's own guard and the main-moved-conflict merge
+// --abort guard just below in this file: catch ONLY ParkSignal (a genuine programming error must
+// still escape, never get swallowed into a plausible-looking journal event), journal it as just
+// another unreadable-HEAD outcome, and return null so callers fall back exactly as they already
+// do for exit 128 / a malformed sha.
+function resolveGateHeadSha(ctx, deps, worktreePath) {
+  let headRes;
+  try {
+    headRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+  } catch (err) {
+    if (!(err instanceof ParkSignal)) throw err;
+    appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', {
+      step: 'rev-parse',
+      threw: true,
+      reason: err.reason,
+      argv: err.detail && err.detail.argv,
+    });
+    return null;
+  }
+  const headSha = (headRes.stdout || '').trim();
+  if (headRes.exit !== 0 || !/^[0-9a-f]{7,64}$/.test(headSha)) {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'rev-parse', exit: headRes.exit, headSha });
+    return null;
+  }
+  return headSha;
+}
+
+// The fact both the exit-0 and exit-1 paths below need to read off `verdict.live` (action B2.3):
+// routing named flows this diff must be driven through, and the live stage never drove them.
+// `required` is `LiveAttestation`'s own `skipped` member's field name (SPO-WebClient's
+// src/e2e/bench/verdict.ts) -- present and non-empty is the one shape that means "the router
+// asked for a live drive and nothing gave it one"; present-and-empty is the common, legitimate
+// case (186 of 215 corpus skips -- doc/bench-audit-2026-09-02.md) and must never trip this.
+function liveRoutedButNotDriven(live) {
+  return !!live && live.status === 'skipped' && Array.isArray(live.required) && live.required.length > 0;
+}
+
 async function realGate(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -1702,7 +1756,60 @@ async function realGate(ctx, deps = {}) {
   // never runs the gate itself.
   fs.writeFileSync(gateLogPath(ctx.taskDir), r.stdout || r.stderr || '');
 
-  if (r.exit === 0) return 'CI_CHECKS';
+  if (r.exit === 0) {
+    // ---- action B2.3(a): exit 0 is no longer read as proof on its own -----------------------
+    //
+    // The bench-side fix (verify-gate.js) now fails a routed-but-not-driven diff closed --
+    // BLOCKED, never PASS -- so this combination should be unreachable from a CURRENT worker.
+    // This check is the pipeline's OWN read of the same fact, defence in depth: it also covers a
+    // verdict written by an older worker binary, and a REUSED verdict (merge-queue.ts's
+    // `mayReuseVerdict`) copied forward from one. Reaching it at all means something is wrong
+    // that a human should see, not something a retry can fix -- WORKTREE->PLAN->IMPLEMENT->GATE
+    // would just ask the exact same worker the exact same question at real LLM cost, so this
+    // reason is never added to state-machine.js's TRANSIENT_RETRY_REASONS.
+    const headSha = resolveGateHeadSha(ctx, deps, worktreePath);
+    if (!headSha) return 'CI_CHECKS'; // unreadable HEAD is a failed diagnostic, not evidence -- unchanged behaviour
+
+    const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
+    const verdict = readJsonSafe(verdictPath); // same accessor the exit-1 path below and realCiChecks already use
+
+    // Absence must be safe (action B2.3(c)): no verdict file at all (515 of 517 files on this
+    // very machine today have none), a verdict present but with no `live` key (every verdict
+    // written before this field existed -- see verdict.ts's own field comment), an unparsable
+    // file, or `live.status === 'unknown'` are ALL the identical fact -- "nothing on file proves
+    // the live stage ran" -- and none of them may be read as proof either way. Parking on any of
+    // them would stall the whole backlog on old data; routing exactly as before (CI_CHECKS) is
+    // the defensible middle this action calls for. Journalled so the gap stays visible without
+    // being actionable per card.
+    const live = verdict && verdict.live;
+    if (!live || live.status === 'unknown') {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-live-unknown', {
+        headSha,
+        verdictPath,
+        verdictExists: fs.existsSync(verdictPath),
+      });
+      return 'CI_CHECKS';
+    }
+
+    if (liveRoutedButNotDriven(live)) {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-live-not-driven', {
+        headSha,
+        exitFrom: 0,
+        why: live.why,
+        required: live.required,
+      });
+      // exitFrom on the ParkSignal detail too (adversarial verification T4), not only the
+      // journal event above -- the park comment and state.json are built from `detail`
+      // (park-loop.js's buildParkComment), and before this fix neither one said whether this
+      // park arrived honestly off exit 1 or via the pipeline's own defence-in-depth read of a
+      // PASS/exit-0 verdict; a maintainer had to open journal.jsonl to tell the two apart.
+      throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom: 0, why: live.why, required: live.required });
+    }
+
+    // live.status === 'ran', or 'skipped' with nothing required (the common, legitimate case) --
+    // proceed exactly as before.
+    return 'CI_CHECKS';
+  }
 
   if (r.exit === 1) {
     // ---- action 4.2: exit 1 is no longer an unconditional route to DIAGNOSE ------------------
@@ -1755,39 +1862,19 @@ async function realGate(ctx, deps = {}) {
     // failure that was never actually observed. (Action 4.4 adds `gate-non-attesting` to its
     // transient auto-retry allowlist, so this parks honestly today and self-heals once that
     // lands -- no retry loop is built here.)
-    const headRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
-    if (headRes.exit !== 0) {
-      // Never make the diagnostic itself fatal to the card -- an unreadable HEAD sha means the
-      // verdict lookup below cannot even be attempted; fall back to today's behaviour.
-      appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'rev-parse', exit: headRes.exit });
-      return 'DIAGNOSE';
-    }
-    const headSha = headRes.stdout.trim();
-
-    // Exit 0 is necessary but NOT sufficient to trust this string, and the SHAPE has to be
-    // checked too -- action 4.1's own finding, one function up: a failing `git rev-parse <ref>`
-    // prints the REF NAME ITSELF on stdout (measured: an orphan/unborn HEAD gives exit 128,
-    // "fatal: ambiguous argument 'HEAD'" on stderr, and the literal `HEAD` on stdout), so any
-    // path that reads stdout without also pinning down what a sha looks like is one odd git state
-    // away from carrying a plausible-looking non-sha forward. The exit check above catches the
-    // measured case; this catches the class. The cost of NOT catching it is higher here than at
-    // realPushPr's guard: there a bogus sha fell through to a push that could only fail, whereas
-    // here it makes `verdicts/<bogus>.json` miss -- and a miss now PARKS the card
-    // `gate-non-attesting`, i.e. tells a maintainer "the bench attested nothing about your code"
-    // when the truth is that the machine never asked the bench the right question. Anything that
-    // is not a hex object name is therefore treated exactly like a non-zero exit: journalled, and
-    // routed to today's DIAGNOSE. Never park on a failed diagnostic. (7..64 rather than exactly
-    // 40: `--short` output and a future sha-256 repo are both still real object names; the point
-    // of the test is to exclude `HEAD`, an empty string and any error text, not to re-implement
-    // git's own object-name parser.)
-    if (!/^[0-9a-f]{7,64}$/.test(headSha)) {
-      appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', {
-        step: 'rev-parse',
-        exit: headRes.exit,
-        headSha,
-      });
-      return 'DIAGNOSE';
-    }
+    // Action B2.3: this used to be its own inline rev-parse + shape check; now shared with the
+    // exit-0 path above via resolveGateHeadSha (identical behaviour -- exit 0 is necessary but
+    // NOT sufficient to trust the stdout, action 4.1's own finding: a failing `git rev-parse
+    // <ref>` prints the REF NAME ITSELF on stdout, measured: an orphan/unborn HEAD gives exit
+    // 128, "fatal: ambiguous argument 'HEAD'" on stderr, and the literal `HEAD` on stdout. The
+    // cost of NOT catching the shape is higher here than at realPushPr's guard: there a bogus sha
+    // fell through to a push that could only fail, whereas here it makes `verdicts/<bogus>.json`
+    // miss -- and a miss PARKS the card `gate-non-attesting`, i.e. tells a maintainer "the bench
+    // attested nothing about your code" when the truth is that the machine never asked the bench
+    // the right question. Never park on a failed diagnostic -- routed to DIAGNOSE instead, same
+    // as a non-zero exit.)
+    const headSha = resolveGateHeadSha(ctx, deps, worktreePath);
+    if (!headSha) return 'DIAGNOSE';
 
     const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
     const verdict = readJsonSafe(verdictPath); // same accessor realCiChecks already uses below
@@ -1822,6 +1909,82 @@ async function realGate(ctx, deps = {}) {
       baseMain: baseMain || null,
       merged: verdict.merged === true,
     });
+
+    // ---- action B2.3(b): BLOCKED stops being routed to DIAGNOSE -----------------------------
+    //
+    // `cli.ts`'s wait() collapses every non-PASS/LEASED report.verdict to the same exit 1
+    // (`report.verdict === 'PASS' || 'LEASED' ? 0 : 1`) -- BLOCKED included, and BLOCKED is not in
+    // worker.ts's `NON_ATTESTING` set, so the verdict IS on disk here, distinguishable from a real
+    // FAIL by `verdict.verdict` alone. Without this check a BLOCKED gate falls straight through to
+    // `return 'DIAGNOSE'` at the bottom of this block and asks a judge to diagnose a code defect
+    // that was never observed -- verify-gate.js's own BLOCKED comment says as much: "This is not a
+    // verdict on the change: the flows could not be driven, none failed." Same shape as
+    // `main-moved-conflict` just below (a real park for a "not the code's fault" situation, not a
+    // DIAGNOSE call spent on an unanswerable question).
+    //
+    // Adversarial verification of B2.3 (finding T4) found `BLOCKED` is not one fact, it is at
+    // least four, from four different producers in SPO-WebClient, and a bare
+    // `verdict.verdict === 'BLOCKED'` check collapsed all of them into `gate-live-not-driven` --
+    // a name that asserts "routing required a live drive that never happened". That is true for
+    // the headline case (a routed-but-undriven diff, `verify-gate.js:342`, and `verify-gate.js:
+    // 308`'s capability-question variant) but false for the fourth: `run.ts:64`'s `runLive`
+    // returning BLOCKED because the world lock refused the run (dirty, or another live run
+    // already in flight) or, structurally possible but effectively dead today
+    // (`E2E_MIN_INTERVAL_MINUTES=0`, `E2E_MAX_RUNS_PER_DAY=1000`, config.ts -- no override set
+    // anywhere in this tree), a rate limit. `liveAttestationFrom` (worker.ts) maps that fourth
+    // case to `live.status === 'unknown'` -- the IDENTICAL value the exit-0 path just above
+    // reads as "nothing proven either way" and explicitly refuses to park on. Parking it here,
+    // under a name that claims routing was proven undriven, was the collapse: the same fact
+    // treated two opposite ways depending on which exit code carried it.
+    //
+    // So the split keys on the `live` FACT (`liveRoutedButNotDriven`, shared with the exit-0
+    // path above), not the bare verdict string. Only a genuinely routed-but-undriven BLOCKED
+    // gets `gate-live-not-driven` -- unchanged reason, unchanged non-transient treatment (a
+    // property of the worker binary or a reused verdict, not of the moment; a retry just asks
+    // the same worker the same question at real WORKTREE->PLAN->IMPLEMENT->GATE cost). Every
+    // other BLOCKED -- world lock, rate limit, or `verify-gate.js:308`'s capability-question
+    // variant, where `required` can be empty and nothing was actually routed -- gets its own
+    // reason, `gate-live-blocked`, deliberately not reusing a name that would misdescribe it.
+    //
+    // `gate-live-blocked`'s own disposition: unlike `gate-live-not-driven`, this one IS added to
+    // `TRANSIENT_RETRY_REASONS` below. The operational case that motivates it -- a maintainer
+    // running `gate:local --live` takes the single-flight lock (`world-lock.ts`'s own error:
+    // "A live run is already in flight ... Live runs are single-flight") -- clears itself in
+    // minutes, and parking the daemon's card on it permanently for that reason alone would be
+    // wrong. A genuinely DIRTY world lock ("Only a human clears this", world-lock.ts) does NOT
+    // self-heal, and the rate-limit arm is dead either way -- but `why` is free text from a
+    // different repo, not a contract this file should parse to split those apart, and
+    // TRANSIENT_RETRY_REASONS' own bounded budget (`config.transientRetryBudget`, default 2)
+    // already caps the cost of getting that wrong: a persistently-dirty lock burns at most 2
+    // extra WORKTREE->PLAN->IMPLEMENT->GATE cycles before falling through to an ordinary,
+    // human-visible park, exactly like `gate-non-attesting`'s own transient-but-bounded
+    // treatment above. Self-healing the common case beats a permanent park on a condition that
+    // was never the card's fault to begin with.
+    if (verdict.verdict === 'BLOCKED') {
+      const live = verdict.live;
+      if (liveRoutedButNotDriven(live)) {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-live-not-driven', {
+          headSha,
+          exitFrom: 1,
+          why: live.why,
+          required: live.required,
+        });
+        throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom: 1, why: live.why, required: live.required });
+      }
+
+      appendEvent(ctx.taskDir, 'GATE', 'gate-live-blocked', {
+        headSha,
+        exitFrom: 1,
+        liveStatus: live && live.status,
+        why: live && live.why,
+      });
+      throw new ParkSignal('gate-live-blocked', {
+        headSha,
+        exitFrom: 1,
+        liveStatus: live && live.status,
+        why: live && live.why,
+      });
+    }
 
     if (verdict.verdict === 'FAIL' && !baseMain) {
       // The bench never got past `prepareRef` -- this branch does not merge with origin/main.
@@ -1914,7 +2077,8 @@ async function realGate(ctx, deps = {}) {
     }
 
     // FAIL carrying baseMain (a real failure -- see the header comment above), or any other
-    // shape (e.g. a PASS verdict recorded against an exit-1 gate) -> DIAGNOSE, unchanged.
+    // shape (e.g. a PASS verdict recorded against an exit-1 gate; BLOCKED is carved out above)
+    // -> DIAGNOSE, unchanged.
     return 'DIAGNOSE';
   }
 
