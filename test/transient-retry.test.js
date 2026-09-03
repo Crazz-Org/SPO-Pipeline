@@ -733,3 +733,70 @@ test('drainQueueOnce: a queue holding nothing but a future notBefore terminates,
     assert.deepEqual(queuedFiles(queueDir), ['0000-retry-1-later.json'], 'and the entry is still waiting');
   });
 });
+
+// ---- 16: action B3.4 round 2 -- the nine reasons the exit-1/2/3 split introduced, pinned one ----
+//         by one so a flipped classification (either direction) fails exactly this test ----------
+//
+// Round 1 split `gate-non-attesting` (which auto-retries) into four exit-1 names plus a new
+// `gate-stale` park, and split `gate-dirty-tree`/`gate-worker-down` (neither of which auto-
+// retries) into four exit-2/3 names -- and reported the whole split as "naming correctness, not
+// retry policy", adding none of the nine to TRANSIENT_RETRY_REASONS. For four of them that is a
+// silent regression: DIRTY/ENVIRONMENT/ABANDONED/INTERRUPTED previously retried under the shared
+// `gate-non-attesting` name, and `gate-environment` alone is the commonest non-PASS bench outcome
+// measured against the live corpus (7 of 29). See state-machine.js's own TRANSIENT_RETRY_REASONS
+// comment and doc/state-machine-spec.md's GATE row ("Retry policy, corrected in round 2") for the
+// full per-reason justification this test pins.
+
+for (const reason of ['gate-environment', 'gate-interrupted', 'gate-abandoned', 'gate-stale']) {
+  test(`finalizePark: ${reason} is on the allowlist -> auto-retried, not parked (restored pre-split gate-non-attesting behaviour)`, () => {
+    const config = testConfig();
+    const ctx = buildParkCtx({ config });
+
+    finalizePark(ctx, 'GATE', reason, { headSha: 'abc1234', jobId: 'job-1', jobDetail: 'x' });
+
+    assert.equal(readState(ctx.taskDir), null, `${reason} must not park -- it must queue a retry instead`);
+    const queued = queuedFiles(config.queueDir);
+    assert.equal(queued.length, 1);
+    const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+    assert.equal(requeued.transientRetries, 1);
+    const retryEvt = readJournal(ctx.taskDir).find((e) => e.event === 'transient-retry');
+    assert.ok(retryEvt, `expected a transient-retry event for ${reason}`);
+    assert.equal(retryEvt.reason, reason);
+  });
+}
+
+test('finalizePark: gate-worker-dirty-checkout is NOT on the allowlist -> ordinary park (deliberate narrowing vs. the pre-split gate-non-attesting)', () => {
+  // DIRTY used to share gate-non-attesting's blanket auto-retry before this action split it out.
+  // Making it terminal now is a considered, documented narrowing (state-machine.js's own comment,
+  // and doc/state-machine-spec.md's GATE row) -- not an accident -- so this reason must stay OFF
+  // the allowlist, pinned the same way gate-live-not-driven is pinned as a negative just above.
+  const config = testConfig();
+  const ctx = buildParkCtx({ config });
+
+  finalizePark(ctx, 'GATE', 'gate-worker-dirty-checkout', { headSha: 'abc1234', jobId: 'job-1', jobDetail: 'x' });
+
+  const state = readState(ctx.taskDir);
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'gate-worker-dirty-checkout');
+  assert.equal(queuedFiles(config.queueDir).length, 0);
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'));
+});
+
+// The exit-2/3 four: neither gate-dirty-tree nor gate-worker-down (the reasons they refine) was
+// ever on TRANSIENT_RETRY_REASONS, so all four staying off it is the status quo continuing, not a
+// new decision -- pinned here anyway so a future accidental addition is caught the same way a
+// future accidental removal from the four above would be.
+for (const reason of ['gate-not-pushed', 'gate-duplicate-job', 'gate-worker-not-built', 'gate-worker-died-midjob']) {
+  test(`finalizePark: ${reason} is NOT on the allowlist -> ordinary park (same terminal disposition gate-dirty-tree/gate-worker-down already had)`, () => {
+    const config = testConfig();
+    const ctx = buildParkCtx({ config });
+
+    finalizePark(ctx, 'GATE', reason, { exit: 2 });
+
+    const state = readState(ctx.taskDir);
+    assert.equal(state.state, 'PARKED');
+    assert.equal(state.reason, reason);
+    assert.equal(queuedFiles(config.queueDir).length, 0);
+    assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'));
+  });
+}
