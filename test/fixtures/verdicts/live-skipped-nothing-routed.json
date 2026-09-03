@@ -1,0 +1,21 @@
+{
+  "head": "373eac71d2b445c22c0f4071b363c16f64ad79c6",
+  "branch": "373eac71d2b445c22c0f4071b363c16f64ad79c6",
+  "worktree": "/home/crazz/.spo-bench/ref/checkout",
+  "verdict": "PASS",
+  "fingerprintStable": true,
+  "baseMain": "0b5b5687703ce25122db4bee6e40eedadb7a938c",
+  "tree": "fddc57c296562314ff8fa025cc9113f5033da2aa",
+  "jobId": "job-01788420173153-a52293",
+  "createdAt": "2026-09-03T07:23:31.239Z",
+  "exceptions": 0,
+  "live": {
+    "status": "skipped",
+    "why": "nothing in this diff is observable over the wire",
+    "required": []
+  },
+  "staticProof": {
+    "status": "ci"
+  },
+  "published": true
+}

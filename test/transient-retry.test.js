@@ -469,6 +469,48 @@ test('finalizePark: gate-non-attesting with verdictDirExists:false is a MISCONFI
   assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'));
 });
 
+// ---- 9b: gate-live-blocked -- action B2.3 fix round's split of the BLOCKED collapse ------------
+//
+// Adversarial verification (T4/T5) found `verdict.verdict === 'BLOCKED'` collapsed at least four
+// SPO-WebClient producers into one `gate-live-not-driven` park, including `run.ts:64`'s world
+// lock / rate-limit refusal -- a fact `liveAttestationFrom` maps to `live.status: 'unknown'`, the
+// same value the exit-0 GATE path treats as proof of nothing. The fix splits that case out into
+// its own reason, `gate-live-blocked`, and puts it here (unlike `gate-live-not-driven`) because
+// the operational case that motivates it -- a maintainer's `gate:local --live` holding the
+// single-flight world lock -- clears itself within minutes.
+
+test('finalizePark: gate-live-blocked is on the allowlist -> auto-retried, not parked', () => {
+  const config = testConfig();
+  const ctx = buildParkCtx({ config });
+
+  finalizePark(ctx, 'GATE', 'gate-live-blocked', { headSha: 'abc1234', exitFrom: 1, liveStatus: 'unknown' });
+
+  assert.equal(readState(ctx.taskDir), null);
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.equal(requeued.transientRetries, 1);
+  const retryEvt = readJournal(ctx.taskDir).find((e) => e.event === 'transient-retry');
+  assert.equal(retryEvt.reason, 'gate-live-blocked');
+});
+
+test('finalizePark: gate-live-not-driven is NOT on the allowlist -> ordinary park, distinct from gate-live-blocked', () => {
+  // The sibling reason: a genuinely routed-but-undriven diff is a property of the worker binary
+  // or a reused verdict, not of the moment, so it must NOT get the transient treatment its
+  // world-lock/rate-limit sibling does -- pinned here so the two reasons cannot silently merge
+  // back into one allowlist entry.
+  const config = testConfig();
+  const ctx = buildParkCtx({ config });
+
+  finalizePark(ctx, 'GATE', 'gate-live-not-driven', { headSha: 'abc1234', exitFrom: 1, why: 'x', required: ['y'] });
+
+  const state = readState(ctx.taskDir);
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'gate-live-not-driven');
+  assert.equal(queuedFiles(config.queueDir).length, 0);
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'));
+});
+
 // ---- 10: more exact-match negatives -- the two the original negatives could not reach ----------
 //
 // `llm-transport-failed` / `llm-transport-failed:NOPE` catch a match loosened towards the FAMILY
@@ -480,6 +522,7 @@ test('finalizePark: gate-non-attesting with verdictDirExists:false is a MISCONFI
 for (const reason of [
   'claim-rate-limited-permanently', // an allowlist entry as a strict PREFIX
   'gate-non-attesting-forever',
+  'gate-live-blocked-permanently',
   'llm-transport-failed:PLANNED', // ...including inside the family
   'Claim-Rate-Limited', // case must matter: park reasons are exact literals, not labels
   'llm-transport-failed:plan',

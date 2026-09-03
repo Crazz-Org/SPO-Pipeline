@@ -565,6 +565,22 @@ function cmdStatus(opts) {
   const bench = collectBenchQueueDepth(benchDir);
   console.log(`bench: spool=${bench.spool}  running=${bench.running}`);
 
+  // Action B1.4 round 4: a bench-worker reinstall an EARLIER card's FINISH deferred
+  // (journal.js's writeBenchReinstallOwed, <journalRoot>/bench-reinstall-owed.json) is otherwise
+  // visible only by reading that file directly or grepping a task's journal.jsonl for
+  // `bench-reinstall-deferred` -- neither of which a maintainer has any reason to go looking for.
+  // Round 3's reconciler paid it back on its own timer with nobody needing to know; round 4 pays
+  // it back from the NEXT card's own WORKTREE, which can be a while if the backlog is quiet, so
+  // this line is what tells a human the debt exists at all in the meantime.
+  const benchDebt = journal.readBenchReinstallOwed(journalRoot);
+  if (benchDebt) {
+    console.log(
+      `bench reinstall owed: since ${benchDebt.recordedAt || 'unknown time'}, mergeSha=${
+        benchDebt.mergeSha ? benchDebt.mergeSha.slice(0, 12) : 'unknown'
+      } (paid back automatically the next time a card's WORKTREE finds the bench idle)`
+    );
+  }
+
   // C: account health + cooldowns, folded in from the same reader `spo accounts` uses.
   const accountRows = collectAccountsStatus(accountsDir, now);
   if (accountRows.length === 0) {

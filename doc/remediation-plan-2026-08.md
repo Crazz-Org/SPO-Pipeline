@@ -26,8 +26,10 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
 - **Latency**: 77.3h of the 85.5h wall-clock corpus = **waiting for a human reply after a
   park**. Active time is LLM-dominated (IMPLEMENT 3.0h, PLAN 1.6h). GATE = ~2.5 min/run
   (0.68h total): **the bench is NOT the current bottleneck** — and it has its own queue
-  (`~/.spo-bench/spool` → `running`), so "one live world" serialization is already enforced
-  outside the pipeline.
+  (`~/.spo-bench/spool` → `running`), so its serialization is already enforced outside the
+  pipeline. *(Corrected 2026-09-03: this previously called it "one live world" serialization,
+  attributing it to the world. `planitia` is an MMO world built for concurrent players; the
+  serialization is the bench's own single-flight policy. See `doc/environments.md`.)*
 - **Test truthfulness**: the `node --test` suite is 100% hermetic (no real spawn anywhere) —
   4 production bugs sailed through it green in 48h (E2BIG #452, deadline-kill #449, missing
   placeholder #443, head=base #247). Real VALIDATE verdicts did drive transitions, but were
@@ -347,9 +349,13 @@ nobody tested. The first afternoon anyone looked, two defects fell out, one of t
   from `dist/e2e/run.js` and prints `=== live drive on planitia`. **80 of 300 artifacts record it
   actually running.** The nightly ran live the same day (`~/.spo-bench/nightly/latest.json`:
   `"live drive exited 0 (PASS)"`).
-- **But no gate has driven planitia since 2026-08-29 22:34.** From 2026-08-30 07:20 every artifact
-  reads `live.skipped: true, why: "live stage requires --live (worker-only)"` — without exception,
-  including C6's own gate batch (#485/#487 → PRs #628/#629) and C7's K=2 recette.
+- **But no gate has driven planitia since 2026-08-30T02:20:36Z.** *(Corrected by 8.1 on
+  2026-09-02: the figure originally written here, "2026-08-29 22:34", was four hours early, and
+  the break begins at 2026-08-30T07:17:57Z when `e180bfb6` reached `main` — not 07:20.)* Every
+  artifact since reads `live.skipped: true, why: "live stage requires --live (worker-only)"` —
+  without exception, including C6's own gate batch (#485/#487 → PRs #628/#629) and C7's K=2
+  recette. **8.1's measured figures supersede every number in this section**; see
+  `doc/bench-audit-2026-09-02.md`.
 - **Root cause: a stale worker binary.** The running worker (pid 270, started 2026-08-28 22:23,
   `dist/e2e/bench/worker.js` built 2026-08-29 09:39) calls `verify-gate.js` with **no `--live`**;
   the source gained `--live` in `e180bfb6` (2026-08-29 22:39), a commit titled *"fix: gate:local
@@ -392,9 +398,30 @@ land, and be observed working on a real card, before 8.5 moves any file.
 | 8.6 | **The live gate becomes a first-class pipeline step**, with the state machine's own rules: a real timeout per class (C2's 2.1), a park reason that names what actually failed rather than a collapsed FAIL (C4's 4.2 — which already had to reconstruct `baseMain` because the bench did not always write it), retry budgets, and journal events a human can read. GATE's existing `gate-worker-down` / `gate-timeout` / `gate-non-attesting` legs become real states rather than exit-code guesses. | `orchestrator/state-machine.js`, `orchestrator/steps/scripted.js`, `doc/state-machine-spec.md` |
 | 8.7 | **Nightly and main-red re-homed.** The pipeline already consumes `<spoBenchDir>/nightly/latest.json` to refuse a merge onto a red main (`scripted.js`'s `nightlyMainRed`), from a file another repo's cron writes. After 8.5 the nightly is a pipeline schedule with a pipeline journal — and the `main-red-no-merge` / `main-red-refuse-worktree` legs stop depending on a file nobody in this repo produces. | `orchestrator/`, `scripts/nightly-check.sh` |
 
+**8.1 LANDED, 2026-09-03.** Its two deliverables are `doc/bench-audit-2026-09-02.md` (the
+measurement) and `doc/bench-plan-derived-2026-09-02.md` (the plan derived from it). Protocol as
+specified: a three-part read-only Fable 5.1 sweep — corpus, source, boundary — then every finding
+re-verified by Opus running real probes. **The verification refuted five derived claims and
+corrected four of the driver's own numbers**, so the sweeps' output is not quotable on its own;
+the audit document is.
+
+**Rows 8.2-8.7 below are REPLACED by the derived plan**, as this row provided for. The derived
+plan is **six chantiers B1-B6**, not one: B1 (restore the gate) runs first and alone, B2 (the
+attestation carries its evidence) gates every later chantier's evidence, B3-B6 are parallel after
+it. The old-row mapping is in that document's section 5. Rows 8.2-8.7 are kept below **as written
+and superseded**, for the same reason 8.5 was: a hypothesis that measurement replaced is part of
+the record.
+
+**One number in this section is corrected and one conclusion is overturned** -- see the two
+inline notes above, and the amendment below.
+
 **Amendment, 2026-09-02 -- row 8.5 is superseded, on the maintainer's decision.** The early
 bench audit (`doc/bench-audit-2026-09-02.md`, produced read-only in parallel with C7 bis) reports
-**0 of 8 defect classes living at the repo boundary**: the bench's problems are internal to the
+**0 of 8 defect classes living at the repo boundary** *(**corrected by 8.1, 2026-09-02: it is
+four of ten**, and the four — attestation opacity, the merge-safety chain, exit-code collapse,
+and process-tree ownership across `exec` — are **contract** defects, not location defects. The
+decision below stands; only its reason changes. See `doc/bench-audit-2026-09-02.md` §5.)*: the
+bench's problems were read as internal to the
 bench, so moving ~7.5k lines into `orchestrator/` would relocate them without fixing one, while
 merging two supervision models that currently fail independently. **The migration is not
 cancelled -- it is demoted from a chantier-8 commitment to a question 8.1's derived plan answers

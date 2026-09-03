@@ -1,0 +1,13 @@
+{
+  "head": "00f6588185f414c54e9c07fb4369c04d101643d6",
+  "branch": "gh-readonly-queue/main/pr-397-51ed8f7a98ada2de81fe1652f3f2d49e743fde2c",
+  "worktree": "/home/crazz/.spo-bench/ref/checkout",
+  "verdict": "PASS",
+  "fingerprintStable": true,
+  "baseMain": "51ed8f7a98ada2de81fe1652f3f2d49e743fde2c",
+  "tree": "046ff37ecf0e319a9708db8309c62f7181de5d2b",
+  "jobId": "job-01787927530679-629639",
+  "createdAt": "2026-08-28T14:36:37.637Z",
+  "exceptions": 0,
+  "published": true
+}

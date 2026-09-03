@@ -1,0 +1,21 @@
+{
+  "head": "4b8c2e91f7a03d5c6e19b4a8f2d0c7b3e5a91d6c",
+  "branch": "4b8c2e91f7a03d5c6e19b4a8f2d0c7b3e5a91d6c",
+  "worktree": "/home/crazz/.spo-bench/ref/checkout",
+  "verdict": "BLOCKED",
+  "fingerprintStable": true,
+  "baseMain": "0b5b5687703ce25122db4bee6e40eedadb7a938c",
+  "tree": "1a9d4f6b2c8e05317a94bd6c0f2e83b5d7a1c4e9",
+  "jobId": "job-01788421000000-b21c93",
+  "createdAt": "2026-09-03T07:40:12.114Z",
+  "exceptions": 0,
+  "live": {
+    "status": "skipped",
+    "why": "--live was never supplied; routed flows: login-spine, building-details",
+    "required": ["login-spine", "building-details"]
+  },
+  "staticProof": {
+    "status": "ci"
+  },
+  "published": true
+}

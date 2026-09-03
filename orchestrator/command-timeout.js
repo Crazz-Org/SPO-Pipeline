@@ -32,6 +32,21 @@ function classifyCommand(command, args) {
     if (args[0] === 'run' && args[1] === 'gate') return 'npm-gate';
     if (args[0] === 'run') return 'npm-run';
   }
+  // Action B1.4: FINISH's own reinstall of the bench worker (scripts/bench-install.sh, the same
+  // script scripts/finish.sh's human-session rule already runs) -- `npm run build:e2e` followed by
+  // a `systemctl --user restart`, run as ONE opaque command rather than reimplemented here, so it
+  // can never drift from finish.sh's own behaviour. Its OWN class, not folded into 'npm-run':
+  // building the worker is not bounded by pr:wait's own budget (npm-run's rationale), and giving it
+  // no class at all would make it the first spawnStep call site in this codebase that classifyCommand
+  // resolves to null -- the ALLOWLIST entry for 'command-timed-out' in
+  // test/park-reason-doc-sweep.test.js explicitly claims that never happens ("every [spawnStep call
+  // site] passes 'git', 'gh', or 'npm'... classifyCommand always returns a real class... never
+  // null") -- a claim this would silently falsify. Matched on the exact script path, not bare
+  // `command === 'bash'`, so any OTHER future use of `bash` in this codebase still falls through to
+  // "no class default" rather than being silently absorbed into a budget sized for THIS script.
+  if (command === 'bash' && typeof args[0] === 'string' && args[0].endsWith('/scripts/bench-install.sh')) {
+    return 'bench-install';
+  }
   return null;
 }
 

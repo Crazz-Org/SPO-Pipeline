@@ -1299,6 +1299,24 @@ function snapshot(ctx, state) {
 //                               post-merge hook SIGTERMing an in-flight `claude`). The model
 //                               never ran; there is nothing about THIS card's plan or diff that
 //                               made the transport fail.
+//   gate-live-blocked       -- action B2.3's realGate throws this on an exit-1 `BLOCKED` verdict
+//                               whose `live` fact is NOT "routed but undriven" (that shape stays
+//                               `gate-live-not-driven`, below, deliberately not on this list).
+//                               SPO-WebClient's `run.ts:64` `runLive` returns BLOCKED from
+//                               exactly one place -- the world lock refused the run (dirty, or
+//                               another live run already in flight -- `world-lock.ts`'s single-
+//                               flight error) -- or, structurally possible but dead today
+//                               (`E2E_MIN_INTERVAL_MINUTES=0`/`E2E_MAX_RUNS_PER_DAY=1000`, no
+//                               override set anywhere in this tree), a rate limit. The
+//                               operational case this exists for: a maintainer running
+//                               `gate:local --live` takes that single-flight lock, and it clears
+//                               itself within minutes -- parking the daemon's card permanently
+//                               on it would be wrong. A genuinely dirty lock does not self-heal,
+//                               but `why` is free text from a different repo, not a contract this
+//                               file parses to split the two apart -- this budget (below) already
+//                               bounds that cost at 2 wasted WORKTREE->PLAN->IMPLEMENT->GATE
+//                               cycles before falling through to an ordinary, human-visible park,
+//                               the same trade-off `gate-non-attesting` above already makes.
 //
 // Built as exact strings from the four step names above, not a prefix/substring match -- C3
 // shipped a bug behind exactly that shortcut (a loose `llm-transport-failed` match), and this
@@ -1309,10 +1327,14 @@ function snapshot(ctx, state) {
 // journal corpus is a logic failure (`step: 'commit'` -- "nothing to commit", i.e. IMPLEMENT
 // produced no diff), never a network failure -- auto-retrying it would re-run an entire card,
 // worktree rebuild and all, to arrive at the identical "nothing to commit" a few minutes later.
+// Also deliberately NOT on the list: `gate-live-not-driven` -- a routed-but-undriven diff is a
+// property of the worker binary or a reused verdict, not of the moment; see steps/scripted.js's
+// own comment on that reason for the full argument.
 const TRANSIENT_RETRY_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
 const TRANSIENT_RETRY_REASONS = new Set([
   'claim-rate-limited',
   'gate-non-attesting',
+  'gate-live-blocked',
   ...TRANSIENT_RETRY_LLM_STEPS.map((step) => `llm-transport-failed:${step}`),
 ]);
 

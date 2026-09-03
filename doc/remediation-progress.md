@@ -29,8 +29,8 @@ Daemon + dashboard **running** in `--real` since 2026-09-01 07:17:38Z.
 | **C6** — pipelined parallelism (K workers) | **DONE and merged** (PR #73 + #74 + #75); **gate green** — all three parts, closed by a supervised parallel batch of 2 S-sized cards, 2026-09-02 |
 | **C7** — truthfulness consolidation & docs | **DONE** — merged 2026-09-02 as PR #86 (merge commit `7af15c0`). Gate C7 green on all three conjuncts |
 | **C7 bis** — what Gate C7 certifies | **DONE** — merged in PR #86. Added 2026-09-02 after three Opus passes on the original clause returned 7, ~11 then ~52 divergences, 80% of the last in territory no pass had reached. All six actions built, and 7bis.1-7bis.5 verified by adversarial Opus passes with mutation testing that returned **ten survivors across the two rounds**, every one of them the action's own central claim |
-| **C8** — the bench: audit, remediation, migration | **NEXT — unblocked, C7 is merged.** Added 2026-09-02. 8.1 (the audit) is the only committed row and runs FIRST; it produces its own derived plan, and how many chantiers this really needs is 8.1's answer, not this table's. Row 8.5 was superseded before C8 began — the migration into `orchestrator/` is demoted to a question 8.1 answers on evidence |
-| **C9** — the documentation corpus | **not started** — **re-planned 2026-09-02 to run in parallel with C8, from C8b on.** Its deferral rested on C8 rewriting `orchestrator/`; row 8.5 is superseded, so that premise is gone. One documentary dependency survives: C9 must not audit `doc/state-machine-spec.md` or `doc/environments.md` until the C8 actions that rewrite them (8.2, 8.4, 8.6) have landed |
+| **C8** — the bench: audit, remediation, migration | **8.1 DONE 2026-09-03** — `doc/bench-audit-2026-09-02.md` + `doc/bench-plan-derived-2026-09-02.md`. **Rows 8.2-8.7 are replaced** by the derived plan: **six chantiers B1-B6**, B1 (restore the gate) first and alone, B2 (the attestation carries its evidence) gating every later chantier's evidence. Row 8.5 stays superseded — but its stated reason was wrong: **four of ten defect classes are boundary-shaped, not zero**, and all four are contract defects |
+| **C9** — the documentation corpus | **not started** — **re-planned 2026-09-02 to run in parallel with C8, from C8b on.** Its deferral rested on C8 rewriting `orchestrator/`; row 8.5 is superseded, so that premise is gone. One documentary dependency survives: C9 must not audit `doc/state-machine-spec.md` or `doc/environments.md` until the C8 actions that rewrite them have landed — **as of 8.1's derived plan those are B1.4 and B2.3, not 8.2/8.4/8.6**, and `doc/environments.md` is no longer rewritten by C8 at all |
 
 Tests: 454 (plan baseline) → 759 (end of C2) → 892 (end of C3) → 1032 (end of C4) → **1177**
 (end of C5).
@@ -470,7 +470,9 @@ against 10.0k fresh input, which is exactly why dollars were the wrong headline 
   the `app` guard earns itself immediately — `CodeQL` reports as `github-advanced-security`, so its
   `id` is NOT an Actions job id and must never be fed to `actions/jobs/<id>`.
 - **C4's cost on the green path is zero**, as designed: no job lookup (nothing red), no verdict
-  read at GATE (exit 0), no `commit-skipped-nothing-staged` (real work was staged).
+  read at GATE (exit 0), no `commit-skipped-nothing-staged` (real work was staged). Dated record
+  of what this C4 recette run observed at the time — superseded by action B2.3, which now DOES
+  read the verdict at GATE exit 0 (see `doc/state-machine-spec.md`'s GATE row).
 - `ciImplementRetries` reaches state.json; `baseMainSha` recorded at WORKTREE.
 
 ### What it found: the protected-files guard fails open on every real card
@@ -1849,9 +1851,12 @@ the ruleset had already made it **advisory** a day earlier. Every merge since we
 `CLAUDE.md`, `doc/bench-worker.md` and `.claude/hooks/pre-push-gate.sh` all still promise the
 opposite, and the pre-push hook dropped its own check on that promise.
 
-**The audit contradicts plan row 8.5: do NOT move the bench into `orchestrator/`** — it reports 0
-of 8 defect classes living at the repo boundary. **Consequence: chantier 9's deferral collapses**,
-since it rested entirely on C8 rewriting `orchestrator/`.
+**The audit contradicts plan row 8.5: do NOT move the bench into `orchestrator/`** — it reported
+0 of 8 defect classes living at the repo boundary. **Corrected by 8.1 on 2026-09-02: it is four
+of ten**, and the four are contract defects rather than location defects; the recommendation to
+keep 8.5 superseded stands on a different argument (`doc/bench-audit-2026-09-02.md` §5).
+**Consequence: chantier 9's deferral collapses**, since it rested entirely on C8 rewriting
+`orchestrator/`.
 
 **Both changes are now in the plan** (maintainer decision, 2026-09-02): row 8.5 is marked
 **superseded** with the original hypothesis kept as written, the migration demoted from a
@@ -1867,6 +1872,15 @@ ruleset, and rebuilding/restarting the bench worker. **Do them together, in that
 before the audit is verified** — the stale binary is the evidence, and restoring the required
 check while the worker still runs it would re-arm a gate that certifies less than its name
 promises. Confirm one gate artifact shows the live stage actually ran before calling it done.
+
+### 8.1's suite observation — one unidentified failure in seven runs
+
+The suite was run seven times at the end of 8.1. **The first run reported 1562 tests, 1561
+passing, 1 failing; the six runs after it were 1562 / 0 / 0.** The failing run's output was not
+captured, so **which test failed is unknown** — that is a mistake in how the first run was
+invoked, recorded rather than glossed. Six consecutive clean runs is not proof the flake is
+gone; it is proof it is not frequent. Anyone who sees a second one should capture
+`node --test --test-timeout=30000 test/*.test.js` to a file before tailing it.
 
 ### Filed this chantier
 

@@ -72,7 +72,11 @@ test('WORST_HOLD_MS/MAX_LOCK_AGE_MS are DERIVED from config.js\'s commandTimeout
   // a hardcoded WORST_HOLD_MS/MAX_LOCK_AGE_MS literal fails this unless it happens to equal every
   // one of these by coincidence, which the `changed` run makes vanishingly unlikely.
   for (const run of [base, changed]) {
-    const worst = run.SETUP_GIT_CALLS * 2 * run.git + run.SETUP_GH_CALLS * 2 * run.gh + 1 * 2 * run.npmCi;
+    // action B1.4 round 4: worstHoldMs picked up a fourth term -- payBenchReinstallDebtIfOwed's
+    // own conditional bench-install.sh, budgeted at ONE attempt (never retried, same exemption as
+    // FINISH_SYNC_BENCH_INSTALL_ATTEMPTS), not `2 * run.npmCi`'s usual doubling.
+    const worst =
+      run.SETUP_GIT_CALLS * 2 * run.git + run.SETUP_GH_CALLS * 2 * run.gh + 1 * 2 * run.npmCi + 1 * 1 * run.benchInstall;
     assert.equal(run.WORST_HOLD_MS, worst, 'WORST_HOLD_MS must equal the documented sum-of-bounded-spawns formula');
     assert.equal(run.MAX_LOCK_AGE_MS, worst + Math.round(worst / 10), 'MAX_LOCK_AGE_MS must be WORST_HOLD_MS + 10% slack');
   }
@@ -105,7 +109,9 @@ test('WORKTREE/FINISH step deadlines are DERIVED from the product-repo wait boun
   const changed = runWith({ SPO_TIMEOUT_GIT_MS: String(base.git * 3), SPO_WORKERS: '3' });
 
   for (const run of [base, changed]) {
-    const worst = run.SETUP_GIT_CALLS * 2 * run.git + run.SETUP_GH_CALLS * 2 * run.gh + 1 * 2 * run.npmCi;
+    // action B1.4 round 4: see the identical term added to the derivation test just above.
+    const worst =
+      run.SETUP_GIT_CALLS * 2 * run.git + run.SETUP_GH_CALLS * 2 * run.gh + 1 * 2 * run.npmCi + 1 * 1 * run.benchInstall;
     const waitBound = Math.max(0, run.workers - 1) * worst;
     assert.equal(run.waitBoundMs, waitBound, 'the wait bound must follow K and the command timeouts');
     assert.equal(
@@ -113,15 +119,50 @@ test('WORKTREE/FINISH step deadlines are DERIVED from the product-repo wait boun
       waitBound + worst + run.stepDeadlineMs,
       'WORKTREE = longest legitimate wait + its own worst hold + one step deadline of margin'
     );
+    // Action B1.4: FINISH now acquires the product-repo lock TWICE -- 'finish-sync' (fast-forward
+    // + conditional bench reinstall) ahead of 'finish' (the pre-existing `git worktree remove`
+    // alone) -- so its own wait bound is counted TWICE, and its own hold is the SUM of both
+    // sections' worst legitimate work, not just the second section's. Post-verification hazard
+    // fix: the bounded bench-idle wait ahead of the reinstall also runs INSIDE 'finish-sync', so
+    // its own ceiling (benchIdleWaitMaxMs, counted ONCE -- it is a single bounded wait, not a
+    // spawnStep call subject to the x2 retry convention every other term here is) has to be part
+    // of the same sum, or a legitimate bench-idle wait could outlast the very deadline meant to
+    // cover it -- the identical D1 defect shape, reintroduced by this action's own hazard fix if
+    // left unguarded.
+    // R2 (post-verification, third pass): 'bench-install' is never retried (spawnStep's own
+    // exemption, matching 'npm-gate''s pre-existing one), so its own term is budgeted at ONE
+    // attempt (FINISH_SYNC_BENCH_INSTALL_ATTEMPTS), not the x2 every other term here still is.
+    const finishSyncHold =
+      run.FINISH_SYNC_GIT_CALLS * 2 * run.git +
+      run.FINISH_SYNC_GH_CALLS * 2 * run.gh +
+      run.FINISH_SYNC_BENCH_INSTALL_CALLS * run.FINISH_SYNC_BENCH_INSTALL_ATTEMPTS * run.benchInstall +
+      run.benchIdleWaitMaxMs;
+    const finishHold = 2 * run.git;
     assert.equal(
       run.FINISH_DEADLINE_MS,
-      waitBound + 2 * run.git + run.stepDeadlineMs,
-      'FINISH = the same wait, but only its own single `git worktree remove` of work'
+      2 * waitBound + finishSyncHold + finishHold + run.stepDeadlineMs,
+      "FINISH = the wait bound counted TWICE (one per lock acquisition) + 'finish-sync'’s own " +
+        "worst hold + 'finish'’s own single `git worktree remove` of work"
     );
     // The property that actually matters, stated directly rather than left implicit in the
     // formula: the deadline must never be able to fire on a legitimate wait.
     assert.ok(run.WORKTREE_DEADLINE_MS > waitBound + worst, 'WORKTREE deadline must exceed any legitimate wait+work');
-    assert.ok(run.FINISH_DEADLINE_MS > waitBound + 2 * run.git, 'FINISH deadline must exceed any legitimate wait+work');
+    assert.ok(
+      run.FINISH_DEADLINE_MS > 2 * waitBound + finishSyncHold + finishHold,
+      'FINISH deadline must exceed any legitimate wait+work across BOTH of its lock acquisitions'
+    );
+    // Action B1.4's own safety property, guarded rather than just asserted in prose
+    // (product-repo-hold.js's own comment on finishSyncHoldMs): the ONE shared lock file's
+    // staleness sweep (MAX_LOCK_AGE_MS) is derived from WORKTREE's own worst hold alone, which is
+    // only a safe ceiling for 'finish-sync' too as long as 'finish-sync' never legitimately
+    // outlasts it. A raised 'bench-install' (or 'git'/'gh') timeout that ever flips this relation
+    // reopens the exact clone-corruption path the mutex exists to prevent -- sweeping a still-
+    // legitimate holder.
+    assert.ok(
+      finishSyncHold < worst,
+      "'finish-sync's own worst hold must stay under WORKTREE's (WORST_HOLD_MS) -- MAX_LOCK_AGE_MS " +
+        "is derived from WORKTREE alone and only covers 'finish-sync' as long as this holds"
+    );
   }
 
   assert.ok(changed.WORKTREE_DEADLINE_MS > base.WORKTREE_DEADLINE_MS, 'raising the timeouts and K must raise the WORKTREE ceiling');
@@ -208,17 +249,46 @@ test('the call enumeration matches the ACTUAL spawnStep call sites in the locked
   };
 
   const tally = (text) => {
-    const counts = { git: 0, gh: 0, npm: 0 };
-    for (const m of text.matchAll(/spawnStep\(ctx, deps, [^,]+, '(git|gh|npm)'/g)) counts[m[1]] += 1;
+    const counts = { git: 0, gh: 0, npm: 0, bash: 0 };
+    for (const m of text.matchAll(/spawnStep\(ctx, deps, [^,]+, '(git|gh|npm|bash)'/g)) counts[m[1]] += 1;
     return counts;
   };
-  const add = (a, b) => ({ git: a.git + b.git, gh: a.gh + b.gh, npm: a.npm + b.npm });
+  const add = (a, b) => ({ git: a.git + b.git, gh: a.gh + b.gh, npm: a.npm + b.npm, bash: a.bash + b.bash });
 
-  // WORKTREE's setup: the span the mutex actually holds, plus everything it calls into.
+  // WORKTREE's setup: the span the mutex actually holds, plus everything it calls into. Action
+  // B1.4 round 4: payBenchReinstallDebtIfOwed (WORKTREE's own debt-repayment, called from inside
+  // the locked span as a single line) and fastForwardMainAndInstall (the function IT calls, and
+  // the SAME function realFinish's own 'finish-sync' span below calls) are both bodies reachable
+  // from inside the lock, not merely lines inside it -- so their OWN spawnStep call sites have to
+  // be tallied here too, or SETUP_GIT_CALLS/SETUP_BENCH_INSTALL_CALLS could drift from the code
+  // silently, the exact defect this whole test exists to catch.
+  const worktreeLockedSpan = spanOf(bodyOf('async function realWorktree('), "withProductRepoLock(ctx, deps, 'worktree'", '\n  });');
+
+  // R4 (fifth pass, F3): the enumeration just below tallies payBenchReinstallDebtIfOwed's and
+  // fastForwardMainAndInstall's spawnStep call sites by pulling their whole FUNCTION BODIES
+  // (bodyOf), never checking those bodies are actually REACHABLE from inside the locked span --
+  // "reachable from inside the lock, not merely lines inside it" is this guard's own comment above,
+  // but nothing here ever tested that half of the claim. Moving the
+  // `await payBenchReinstallDebtIfOwed(ctx, deps, config)` call OUTSIDE withProductRepoLock's
+  // callback would let `git merge --ff-only` and a 15-minute `bash scripts/bench-install.sh` (its
+  // own unconditional `systemctl --user restart`) run against config.productRepo's shared clone
+  // UNSYNCHRONISED with a sibling's `worktree add`/`npm ci` at K>=2 -- exactly the clone-corruption
+  // race this mutex exists to prevent -- while worstHoldMs keeps budgeting 151 minutes for work no
+  // longer inside the span at all. This assertion is what actually pins "the repayment runs inside
+  // the lock", the central safety claim of round 4's whole redesign: it greps the SPAN text itself
+  // (not the function body) for the call site.
+  assert.match(
+    worktreeLockedSpan,
+    /await payBenchReinstallDebtIfOwed\(/,
+    'payBenchReinstallDebtIfOwed must be called from INSIDE realWorktree\'s own withProductRepoLock span -- moving the call out would let the reinstall race a sibling\'s fast-forward of the SAME shared checkout, unsynchronised'
+  );
+
   const setup = [
-    spanOf(bodyOf('async function realWorktree('), "withProductRepoLock(ctx, deps, 'worktree'", '\n  });'),
+    worktreeLockedSpan,
     bodyOf('function sweepWorktreeLeftovers('),
     bodyOf('function preserveWorktreeWipUnguarded('),
+    bodyOf('async function payBenchReinstallDebtIfOwed('),
+    bodyOf('async function fastForwardMainAndInstall('),
   ].map(tally).reduce(add);
 
   assert.equal(
@@ -230,11 +300,72 @@ test('the call enumeration matches the ACTUAL spawnStep call sites in the locked
   );
   assert.equal(setup.gh, hold.SETUP_GH_CALLS, 'SETUP_GH_CALLS must match the gh call sites in the locked span');
   assert.equal(setup.npm, hold.SETUP_NPM_CI_CALLS, 'the locked span runs exactly one npm command (`npm ci`) -- `board:take` is outside it');
+  assert.equal(
+    setup.bash,
+    hold.SETUP_BENCH_INSTALL_CALLS,
+    'SETUP_BENCH_INSTALL_CALLS must match the bash (bench-install.sh) call sites reachable from the locked span'
+  );
 
-  // FINISH's teardown: a single `git worktree remove`.
+  // FINISH's teardown: a single `git worktree remove`. Matched on `'finish'` with the closing
+  // quote right after it (the literal text `"withProductRepoLock(ctx, deps, 'finish'"`), which
+  // deliberately does NOT match action B1.4's own `'finish-sync'` call below (there the character
+  // right after `finish` is `-`, not the closing quote) -- see that action's own test just below
+  // for why the two phases need their own, separately named spans rather than sharing this one.
   const finish = tally(spanOf(bodyOf('async function realFinish('), "withProductRepoLock(ctx, deps, 'finish'", '\n  );'));
   assert.equal(finish.git, hold.FINISH_GIT_CALLS, 'FINISH_GIT_CALLS must match the git call sites in the teardown span');
   assert.equal(finish.gh + finish.npm, 0, 'the teardown span must hold the mutex across git only -- board:move and the issue comment stay outside');
+});
+
+// ---- action B1.4: the SECOND critical section FINISH now holds ('finish-sync' -- fast-forward +
+// conditional bench reinstall), enumerated the same way the test just above holds WORKTREE's and
+// FINISH's teardown spans to the real source -- see product-repo-hold.js's own
+// FINISH_SYNC_GIT_CALLS/FINISH_SYNC_GH_CALLS/FINISH_SYNC_BENCH_INSTALL_CALLS comment for the full
+// call-by-call account this pins.
+test("the 'finish-sync' span (action B1.4's fast-forward + conditional bench reinstall) matches FINISH_SYNC_GIT_CALLS/FINISH_SYNC_GH_CALLS/FINISH_SYNC_BENCH_INSTALL_CALLS", () => {
+  const hold = require('../orchestrator/product-repo-hold');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'steps', 'scripted.js'), 'utf8');
+
+  const bodyOf = (header) => {
+    const a = src.indexOf(header);
+    assert.notEqual(a, -1, `${header} not found -- the guard needs updating, not deleting`);
+    return src.slice(a, src.indexOf('\n}\n', a));
+  };
+  const spanOf = (body, opener, closer) => {
+    const a = body.indexOf(opener);
+    assert.notEqual(a, -1, `${opener} not found -- the locked span is no longer recognisable`);
+    const b = body.indexOf(closer, a);
+    assert.notEqual(b, -1, `could not find the end of the span opened by ${opener}`);
+    return body.slice(a, b);
+  };
+
+  const span = spanOf(bodyOf('async function realFinish('), "withProductRepoLock(ctx, deps, 'finish-sync'", '\n  });');
+  // Action B1.4 round 4: realFinish's own span calls fastForwardMainAndInstall (the SAME shared
+  // function realWorktree's payBenchReinstallDebtIfOwed calls, see the "call enumeration" test
+  // above) rather than repeating the fetch/branch/dirty/merge/install sequence inline -- so that
+  // function's own body has to be tallied here too, or FINISH_SYNC_GIT_CALLS could drift from the
+  // code silently. realFinish passes `skipFetch: true` there (its OWN fetch already ran earlier in
+  // this same span, for the mergeSha/diff lookups the shared function does not do), but the call
+  // SITE for that skipped fetch still exists in source and is counted as the worst case, same
+  // convention every other term in this file already uses.
+  const shared = bodyOf('async function fastForwardMainAndInstall(');
+  const counts = { git: 0, gh: 0, bash: 0 };
+  for (const text of [span, shared]) {
+    for (const m of text.matchAll(/spawnStep\(ctx, deps, [^,]+, '(git|gh|bash)'/g)) counts[m[1]] += 1;
+  }
+
+  assert.equal(
+    counts.git,
+    hold.FINISH_SYNC_GIT_CALLS,
+    `the 'finish-sync' span has ${counts.git} git spawnStep sites; FINISH_SYNC_GIT_CALLS ` +
+      `(${hold.FINISH_SYNC_GIT_CALLS}) must match exactly. Adding or removing a git command inside ` +
+      "this critical section means re-deriving finishSyncHoldMs -- see product-repo-hold.js."
+  );
+  assert.equal(counts.gh, hold.FINISH_SYNC_GH_CALLS, 'FINISH_SYNC_GH_CALLS must match the gh call sites in the finish-sync span');
+  assert.equal(
+    counts.bash,
+    hold.FINISH_SYNC_BENCH_INSTALL_CALLS,
+    'FINISH_SYNC_BENCH_INSTALL_CALLS must match the bash (bench-install.sh) call sites in the finish-sync span'
+  );
 });
 
 // ---- items 3 and 4: pid-liveness sweeps a dead holder immediately; MAX_LOCK_AGE_MS is the

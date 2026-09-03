@@ -1,0 +1,24 @@
+{
+  "head": "355a55293675e45d7cba5079bcda85cb6afb081e",
+  "branch": "355a55293675e45d7cba5079bcda85cb6afb081e",
+  "worktree": "/home/crazz/.spo-bench/ref/checkout",
+  "verdict": "PASS",
+  "fingerprintStable": true,
+  "baseMain": "0b5b5687703ce25122db4bee6e40eedadb7a938c",
+  "tree": "052bd720624a85e43d93835cc69aefc5d21c39d1",
+  "jobId": "job-01788417996609-efac79",
+  "createdAt": "2026-09-03T06:49:50.714Z",
+  "exceptions": 0,
+  "live": {
+    "status": "ran",
+    "flows": [
+      "login-spine",
+      "building-details"
+    ]
+  },
+  "staticProof": {
+    "status": "bench",
+    "why": "no \"typecheck + tests\" run exists for this commit yet"
+  },
+  "published": true
+}

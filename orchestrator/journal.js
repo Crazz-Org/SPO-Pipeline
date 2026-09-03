@@ -236,6 +236,92 @@ function readLiveWorkerIds(journalRoot) {
   return readLiveWorkersRaw(journalRoot).ids;
 }
 
+// benchReinstallOwedPath/writeBenchReinstallOwed/readBenchReinstallOwed/clearBenchReinstallOwed --
+// action B1.4 R1 (post-verification, third pass): the durable "a bench reinstall is owed" record,
+// <journalRoot>/bench-reinstall-owed.json, same atomic tmp-then-rename idiom as
+// writeLiveWorkerIds/writeState above. steps/scripted.js's realFinish writes this instead of
+// parking when the bounded bench-idle wait (waitForBenchIdle) times out with the bench still
+// busy -- a card whose PR has already merged must not sit terminally parked over a shared
+// resource's ordinary use (a human's routine bench lease can run up to 120 minutes,
+// worker.ts:107's own MAX_LEASE_MINUTES, dwarfing the 15-minute wait) -- so FINISH completes
+// normally (board move, comment, worktree remove, DONE) and the debt is recorded here instead.
+// steps/scripted.js's realWorktree (payBenchReinstallDebtIfOwed) reads/clears it the NEXT time
+// any card reaches WORKTREE and finds the bench idle -- round 4: paid from inside a worker's own
+// existing product-repo lock span, never a separate daemon scan timer (round 3's
+// orchestrator/bench-reconcile.js, since deleted -- it held that same lock from a THIRD process
+// the mutex's own wait-bound derivation assumes cannot exist).
+//
+// A SINGLE record, not a queue keyed per-card: bash scripts/bench-install.sh always rebuilds from
+// WHATEVER config.productRepo is currently fast-forwarded to, so a SECOND bench-touching card
+// deferring during the same busy window does not need a second entry -- reinstalling once, from
+// the LATEST fast-forwarded checkout, already covers every merge that landed since the debt was
+// first recorded. Overwriting (writeFileSync + rename, never append) is what keeps the record
+// from accumulating duplicates for free -- a second write during the same busy window simply
+// replaces the first with the newer mergeSha, which is also the more useful one to retry with.
+//
+// "A deferred reinstall that never happens is the original defect" (this action's own report) --
+// so this file is never unlinked on completion, only overwritten with an explicit {owed: false}
+// record (clearBenchReinstallOwed), so a maintainer inspecting it directly can always tell "never
+// owed" (file absent) apart from "owed, then paid" (file present, owed: false) apart from "owed
+// right now" (file present, owed: true) -- and readBenchReinstallOwed's own null-on-anything-else
+// tolerance (same posture as readLiveWorkerIds above) means a reader never has to special-case a
+// half-written or missing file, only ever the three meaningful shapes above.
+function benchReinstallOwedPath(journalRoot) {
+  return path.join(journalRoot, 'bench-reinstall-owed.json');
+}
+
+function writeBenchReinstallOwed(journalRoot, detail = {}) {
+  fs.mkdirSync(journalRoot, { recursive: true });
+  const target = benchReinstallOwedPath(journalRoot);
+  const tmp = path.join(journalRoot, `.bench-reinstall-owed.json.${process.pid}.${Date.now()}.tmp`);
+  const payload = { ...detail, owed: true, recordedAt: new Date().toISOString() };
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n');
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // tmp was never created, or rename already moved it -- nothing to clean up either way.
+    }
+    throw err;
+  }
+  return payload;
+}
+
+// Tolerant read -> the record object when (and only when) `owed === true`, else `null` -- a
+// missing file (nothing has ever been deferred against this journal root), an unparsable one
+// (impossible mid-rename thanks to the atomic write above, but tolerated regardless, same posture
+// readLiveWorkerIds already takes), and a present-but-cleared record ({owed: false}) all collapse
+// to the same "nothing owed right now" answer a caller actually needs.
+function readBenchReinstallOwed(journalRoot) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(benchReinstallOwedPath(journalRoot), 'utf8'));
+    return raw && raw.owed === true ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearBenchReinstallOwed(journalRoot, detail = {}) {
+  fs.mkdirSync(journalRoot, { recursive: true });
+  const target = benchReinstallOwedPath(journalRoot);
+  const tmp = path.join(journalRoot, `.bench-reinstall-owed.json.${process.pid}.${Date.now()}.tmp`);
+  const payload = { ...detail, owed: false, clearedAt: new Date().toISOString() };
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n');
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // tmp was never created, or rename already moved it -- nothing to clean up either way.
+    }
+    throw err;
+  }
+  return payload;
+}
+
 function writeReport(taskDir, { id, reason, lastState, ts, detail }) {
   const body = [
     `# Parked: ${id}`,
@@ -263,4 +349,8 @@ module.exports = {
   writeLiveWorkerIds,
   readLiveWorkerIds,
   readLiveWorkersRaw,
+  benchReinstallOwedPath,
+  writeBenchReinstallOwed,
+  readBenchReinstallOwed,
+  clearBenchReinstallOwed,
 };
