@@ -216,7 +216,16 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   appendEvent(ctx.taskDir, 'PARKED', 'park-comment', { commentId, reason });
 }
 
-// ---- action 5.1d: surface DIAGNOSE on the card -------------------------------------------------
+// ---- action 5.1: surface DIAGNOSE on the card -------------------------------------------------
+//
+// Fix round (2026-09-03, adversarial pass, S3): this and its two state-machine.js sibling
+// comments used to append the letter "d" to this action id. The plan (doc/remediation-plan-2026-08.md:186) does not
+// letter row 5.1's sub-items at all -- it names three in one cell: pre-worktree board moves,
+// DIAGNOSE activity surfaced (this one), and dropping the redundant IMPLEMENT-retry move.
+// doc/remediation-progress.md:647 confirms the same referent under "DIAGNOSE surfacing" ("6 tasks
+// entered DIAGNOSE, 18 attempts total, 4 of them ending in a park"). Only the letter "d" was
+// invented (by whichever pass first wrote this comment) -- the id itself was never ambiguous.
+// Renamed to the plan's actual, unlettered id.
 //
 // Measured: 6 tasks entered DIAGNOSE (18 attempts total, 4 ending in a park). DIAGNOSE has no
 // board column at all (see board.js's own COLUMN_BY_STATE header) and, before this, no

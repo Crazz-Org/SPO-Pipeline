@@ -25,7 +25,7 @@
 // this box's co-resident bench worker need their own admission control is unmeasured and is not
 // answered here -- see doc/remediation-progress.md's C6 row for that call.
 //
-// SHAPE: reuses lock.js's SECOND idiom (acquireShortLock/releaseShortLock -- write-tmp-then-link,
+// SHAPE: reuses lock.js's second idiom (acquireShortLock/releaseShortLock -- write-tmp-then-link,
 // pid-liveness sweep, release-only-if-both-pid-and-startedAt-match), the same primitive
 // account-lease.js already wraps for the per-account leases. NOT lock.js's tmp+link `acquireLock`
 // (daemon.lock) -- that one exists for a file re-read on a timer for the DAEMON'S WHOLE LIFETIME;

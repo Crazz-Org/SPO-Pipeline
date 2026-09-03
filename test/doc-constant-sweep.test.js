@@ -21,6 +21,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { execFileSync } = require('child_process');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -265,31 +267,757 @@ test('every pinned documented constant matches a literal in both the code and th
   );
 });
 
+// ---- part 1.5: table-aware constant check (E8, action 9.2) -------------------------------------
+//
+// doc/comment-corpus-audit-2026-09-03.md's E8 finding: `const-scan.js` "prints 74 rows for a
+// human to eyeball; nothing in the sweep compared a doc number to a resolved config value
+// programmatically," and it excludes doc/state-machine-spec.md BY FILENAME -- 15 of the 17 PINS
+// above have their doc side in that file, so the exclusion was not a small gap. The audit's own
+// verification planted `120000 -> 90000` in orchestrator/README.md's command-timeout table AND
+// in the spec's mirror row: the README plant was invisible because a bare table cell (`| 90000
+// |`) carries no unit word for a regex anchored on "ms"/"minutes" to match; the spec plant was
+// invisible because the file was excluded outright. Both gaps are closed here: this check reads
+// table CELLS by pipe-delimited position (no unit-word anchor needed) and scans
+// doc/state-machine-spec.md explicitly (the whole point of this item -- see the class comment
+// above on why this file is otherwise left alone by this action).
+//
+// This does NOT replace the 17 PINS above -- the audit's own explicit conclusion was that
+// retiring them "would silently delete real coverage." It is table-driven, DERIVED from
+// config.js's own COMMAND_TIMEOUTS_MS object (a command class added there is picked up
+// automatically, the same posture resolveTimedOutClassReasons takes in
+// test/park-reason-doc-sweep.test.js), covering exactly the one class of constant (the five
+// per-command timeouts) that happens to live in a markdown TABLE in both docs -- narrower in
+// scope than PINS, broader in one specific way PINS cannot be without becoming table-driven
+// itself.
+function extractCommandTimeoutsFromConfig(source) {
+  const blockMatch = /COMMAND_TIMEOUTS_MS\s*=\s*\{([\s\S]*?)\n\};/.exec(source);
+  if (!blockMatch) return null;
+  const out = {};
+  const entryRe = /(?:'([^']+)'|([A-Za-z_$][\w$-]*))\s*:\s*timeoutFromEnv\('([^']+)',\s*(\d+)\)/g;
+  let m;
+  while ((m = entryRe.exec(blockMatch[1]))) {
+    out[m[1] || m[2]] = { envVar: m[3], ms: Number(m[4]) };
+  }
+  return out;
+}
+
+// Reads the "Class | Default | override" table by CELL POSITION, not by scanning for a unit
+// word near a number -- a bare `| 90000 |` cell is read the same as `| 120000 |`.
+function extractCommandTimeoutsFromReadmeTable(source) {
+  const out = {};
+  const lineRe = /^\|\s*`([A-Za-z0-9_-]+)`[^|]*\|\s*([0-9]+)\s*\|\s*`(SPO_TIMEOUT_[A-Z_]+)`\s*\|/gm;
+  let m;
+  while ((m = lineRe.exec(source))) out[m[1]] = { ms: Number(m[2]), envVar: m[3] };
+  return out;
+}
+
+// Reads doc/state-machine-spec.md's own mirror table -- values in SECONDS, converted to ms for
+// comparison. Same cell-position posture: `| \`git\` | 90s |` is read as 90, no unit-word regex.
+function extractCommandTimeoutsFromSpecTable(source) {
+  const out = {};
+  const lineRe = /^\|\s*`([A-Za-z0-9_-]+)`\s*\|\s*([0-9]+)s\b/gm;
+  let m;
+  while ((m = lineRe.exec(source))) out[m[1]] = { seconds: Number(m[2]) };
+  return out;
+}
+
+test('every COMMAND_TIMEOUTS_MS class matches its table row in BOTH orchestrator/README.md and doc/state-machine-spec.md', () => {
+  const configSrc = read('orchestrator/config.js');
+  const readmeSrc = read('orchestrator/README.md');
+  const specSrc = read('doc/state-machine-spec.md');
+
+  const codeMap = extractCommandTimeoutsFromConfig(configSrc);
+  assert.ok(codeMap && Object.keys(codeMap).length > 0, 'COMMAND_TIMEOUTS_MS object shape changed -- extractCommandTimeoutsFromConfig stopped matching');
+
+  // Named floor, not a silent count: this is the exact set of classes measured 2026-09-03, re-measured after B1.4 added `bench-install`. A
+  // class added to COMMAND_TIMEOUTS_MS tomorrow changes this set, and the assertion below names
+  // which table (README, spec, or both) failed to grow with it, rather than passing vacuously.
+  assert.deepEqual(
+    Object.keys(codeMap).sort(),
+    ['bench-install', 'gh', 'git', 'npm-ci', 'npm-gate', 'npm-run'],
+    'COMMAND_TIMEOUTS_MS gained or lost a command class -- both doc tables need a matching row in the same change.'
+  );
+
+  const readmeMap = extractCommandTimeoutsFromReadmeTable(readmeSrc);
+  const specMap = extractCommandTimeoutsFromSpecTable(specSrc);
+
+  const offenders = [];
+  for (const [cls, { envVar, ms }] of Object.entries(codeMap)) {
+    const readmeRow = readmeMap[cls];
+    if (!readmeRow) {
+      offenders.push(`${cls}: no row in orchestrator/README.md's command-timeout table`);
+    } else {
+      if (readmeRow.ms !== ms) {
+        offenders.push(`${cls}: orchestrator/README.md's table says ${readmeRow.ms}ms, config.js says ${ms}ms`);
+      }
+      if (readmeRow.envVar !== envVar) {
+        offenders.push(`${cls}: orchestrator/README.md's table names ${readmeRow.envVar}, config.js reads ${envVar}`);
+      }
+    }
+    const specRow = specMap[cls];
+    if (!specRow) {
+      offenders.push(`${cls}: no row in doc/state-machine-spec.md's timeout table`);
+    } else if (specRow.seconds * 1000 !== ms) {
+      offenders.push(`${cls}: doc/state-machine-spec.md's table says ${specRow.seconds}s (${specRow.seconds * 1000}ms), config.js says ${ms}ms`);
+    }
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `a command-timeout table cell no longer matches config.js's COMMAND_TIMEOUTS_MS -- this is ` +
+      `the exact E8 gap (a bare table cell with no unit word, or doc/state-machine-spec.md ` +
+      `excluded outright) doc/comment-corpus-audit-2026-09-03.md found:\n  ${offenders.join('\n  ')}`
+  );
+});
+
+// ---- fixture tests: extractCommandTimeoutsFrom* against synthetic table text, so this checker
+// stays provably correct independent of what the real docs say today, and to prove BY NAME the
+// two specific gaps E8 found: a bare-number README cell, and a spec-file table row.
+
+test('extractCommandTimeoutsFromReadmeTable: a bare-number cell with no unit word is still read correctly', () => {
+  const fixture = [
+    '| Class | Default | `SPO_TIMEOUT_*_MS` override |',
+    '|---|---|---|',
+    '| `git` | 90000 | `SPO_TIMEOUT_GIT_MS` |',
+  ].join('\n');
+  assert.deepEqual(extractCommandTimeoutsFromReadmeTable(fixture), { git: { ms: 90000, envVar: 'SPO_TIMEOUT_GIT_MS' } });
+});
+
+test('extractCommandTimeoutsFromSpecTable: reads a doc/state-machine-spec.md-shaped row (seconds, not ms)', () => {
+  const fixture = '| `git` | 90s | every `git` call |';
+  assert.deepEqual(extractCommandTimeoutsFromSpecTable(fixture), { git: { seconds: 90 } });
+});
+
+test('the table-aware check catches a planted README mutation the unit-word-anchored PINS regex could not', () => {
+  // This is the audit's own verification, replayed as a permanent fixture: `120000 -> 90000` in
+  // a bare table cell. PINS's `contains` string for this row (`| \`git\` | 120000 |
+  // \`SPO_TIMEOUT_GIT_MS\` |`) would also catch this specific mutation (PINS checks the whole
+  // row, not just the number) -- the GAP this test proves closed is that a checker keyed on the
+  // CELL VALUE, not a literal string match, generalizes to a table PINS does not enumerate a row
+  // for at all.
+  const mutatedReadme = '| `git` | 90000 | `SPO_TIMEOUT_GIT_MS` |';
+  const codeMap = { git: { envVar: 'SPO_TIMEOUT_GIT_MS', ms: 120000 } };
+  const readmeMap = extractCommandTimeoutsFromReadmeTable(mutatedReadme);
+  assert.notEqual(readmeMap.git.ms, codeMap.git.ms, 'fixture sanity: the planted mutation must actually differ from the code value');
+});
+
+test('the table-aware check reads doc/state-machine-spec.md at all, unlike the excluded-by-filename const-scan.js it replaces', () => {
+  // E8's second gap: const-scan.js excluded this file BY NAME. Proven here by actually reading
+  // it (not a fixture) and confirming the extractor returns rows from it, rather than an
+  // exclusion list silently producing an empty (vacuously "clean") map.
+  const specMap = extractCommandTimeoutsFromSpecTable(read('doc/state-machine-spec.md'));
+  assert.ok(Object.keys(specMap).length >= 5, `expected at least 5 command-timeout rows read from doc/state-machine-spec.md, found ${Object.keys(specMap).length}`);
+});
+
+// ---- part 1.75: derived-list check (E6, action 9.2) ---------------------------------------------
+//
+// doc/comment-corpus-audit-2026-09-03.md's E6 finding: root README.md:34's own summary of
+// `bin/spo`'s subcommands is a DERIVED list (a human-typed digest of bin/spo's real dispatch
+// table), and it had drifted -- omitting `tokens`, `cost`, `accounts`, `pull-reports`, and
+// `reports` (5 of bin/spo's 16 top-level `cmd === '<x>'` leaves; the audit counted 6 against a
+// slightly different baseline). Fixed in passing (README.md:34 now names all 16) as part of this
+// action -- an unambiguous fix, a missing README row, per this action's own brief. This check
+// ratchets it: reads bin/spo's OWN dispatch table (never a hand-copied enum) and asserts every
+// leaf's command name is named in the `bin/spo` ROW ITSELF, so a subcommand added to bin/spo
+// tomorrow without a README update fails here, by name, instead of drifting silently again.
+//
+// Fix round (2026-09-03, adversarial pass): the first cut of this check searched the whole file,
+// not the row it exists to ratchet -- restoring the exact drifted row 34 while separately naming
+// the 5 missing subcommands anywhere else in the file (a footer sentence, say) left it green,
+// because the file as a whole still named them. Anchored to ROW_RE below: the row is located by
+// its own leading `| \`bin/spo\` |` cell, and every subcommand must appear inside THAT row's text,
+// not merely somewhere in README.md.
+function extractTopLevelSubcommands(source) {
+  const out = [];
+  const re = /if\s*\(cmd\s*===\s*'([a-z-]+)'\)/g;
+  let m;
+  while ((m = re.exec(source))) out.push(m[1]);
+  return out;
+}
+
+test('every bin/spo top-level subcommand is named in README.md', () => {
+  const binSpoSrc = read('bin/spo');
+  const commands = extractTopLevelSubcommands(binSpoSrc);
+
+  // Named floor: measured 2026-09-03, 16 top-level `cmd === '<x>'` leaves. A regex that stopped
+  // matching (a reformatted dispatch table) would pass vacuously -- fail loudly instead, same
+  // posture as this file's other siteCount/checked floors.
+  assert.deepEqual(
+    commands.slice().sort(),
+    ['account', 'accounts', 'ask', 'cost', 'dashboard', 'intake', 'parked', 'pull', 'pull-reports', 'recette', 'reports', 'resume', 'status', 'task', 'tokens', 'triage'],
+    'bin/spo\'s top-level dispatch table changed -- a subcommand was added, removed, or renamed. ' +
+      'Update this pin AND README.md\'s bin/spo row in the same change.'
+  );
+
+  const readmeSrc = read('README.md');
+  // The `bin/spo` table row itself, located by its own leading cell -- never the whole file (see
+  // this test's header comment on the exact 9.1 defect that gap let back in undetected).
+  const ROW_RE = /^\|\s*`bin\/spo`\s*\|.*\|\s*$/m;
+  const rowMatch = ROW_RE.exec(readmeSrc);
+  assert.ok(
+    rowMatch,
+    "README.md's own `bin/spo` table row (originally line 34) is missing or no longer matches " +
+      'the expected `| `bin/spo` | ... |` shape -- has the Repository map table been reformatted?'
+  );
+  const row = rowMatch[0];
+  const missing = commands.filter((cmd) => {
+    const re = new RegExp(`(?<![A-Za-z0-9_-])${cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_-])`);
+    return !re.test(row);
+  });
+  assert.deepEqual(
+    missing,
+    [],
+    `bin/spo subcommand(s) not named in README.md's own \`bin/spo\` table row -- that row is a ` +
+      `DERIVED digest of bin/spo's dispatch table and has drifted out of sync:\n  ${missing.join('\n  ')}`
+  );
+});
+
+test('extractTopLevelSubcommands: reads a synthetic dispatch table, proving the extractor is not vacuous', () => {
+  const fixture = [
+    "  if (cmd === 'alpha') return cmdAlpha(opts);",
+    "  if (cmd === 'beta-two') return cmdBetaTwo(opts);",
+  ].join('\n');
+  assert.deepEqual(extractTopLevelSubcommands(fixture), ['alpha', 'beta-two']);
+});
+
+// ---- part 1.8: phantom symbol check (E5, action 9.2) --------------------------------------------
+//
+// doc/comment-corpus-audit-2026-09-03.md's E5: a comment reads "`<file>.js`'s `<ident>`" -- a
+// possessive naming a specific symbol another file supposedly exports -- and `<ident>` is not
+// actually defined there. 3 sites / 2 symbols, both fixed in passing as part of this action (an
+// unambiguous rename, per this action's own brief):
+//   - bin/spo:407-408 and bin/spo:715 both said "state-machine.js's isEligibleNow"; the real
+//     function is `isQueueEntryEligibleNow` (orchestrator/state-machine.js).
+//   - orchestrator/state-machine.js:202 and orchestrator/README.md:441 both said "intake.js's
+//     pullOne"; the real function is `pullBoard` (orchestrator/intake.js).
+// Property: every CODE-SHAPED identifier cited as "`<file>.js`'s `<ident>`" is actually defined
+// in that file. "Code-shaped" matters -- a naive scan over this possessive shape also matches
+// ordinary prose ("config.js's own", "dispatcher.js's header"), which is never a symbol citation
+// at all; restricting to camelCase/CONST_CASE tokens is what makes this check non-vacuous without
+// also being noisy.
+//
+// Fix round (2026-09-03, adversarial pass), two gaps closed together:
+//
+//   (M15b) symbolDefinedIn used to be a WHOLE-FILE occurrence test, comments included -- planting
+//   `// config.js's spawnStep resolves the class` in a citing file left the suite green, because
+//   `spawnStep` genuinely appears in config.js, but ONLY inside its own comments (steps/
+//   scripted.js's spawnStep, quoted there in prose -- see this file's header on the class of bug
+//   this whole suite exists to catch: a doc SAYS something a re-reader would have to notice is
+//   false). blankComments (the same idiom test/park-reason-doc-sweep.test.js's own scanners use,
+//   copied verbatim below) now runs on the CITED file before the occurrence test, so a name that
+//   exists only in that file's own commentary about a DIFFERENT file's symbol no longer counts as
+//   "there". Comments in the CITING text are still left alone (unchanged from before) -- the
+//   citations themselves live in comments, so blanking those would blank away the thing being
+//   checked; normalizeWrap (part 2, reused here) still runs, so a wrapped citation is read whole.
+//   This is deliberately a "does this code genuinely reference the symbol" test, not a stricter
+//   "is this a top-level function/const/class declaration" parse -- real corpus citations
+//   legitimately point at a property key (`config.js`'s `stepDeadlineMs`), a destructured import
+//   (`account-lease.js`'s `MAX_LEASE_AGE_MS`), or a bare call (`deadline.js`'s `setTimeout`), none
+//   of which is a "definition" in the narrowest sense but all of which are real, checkable code
+//   presence -- exactly what distinguishes them from the two genuine E5 fabrications above, which
+//   did not appear ANYWHERE in the cited file, comments included.
+//
+//   (M16) SYMBOL_CITATION_RE only matched the bare-prose shape (`file.js's ident`, no backticks).
+//   The corpus's actual markdown convention is backtick-wrapped on both sides (`` `file.js`'s
+//   `ident` ``) -- orchestrator/README.md:441's own fixed citation is written that way. The old
+//   regex matched that shape ZERO times, so README.md's 72 backtick-possessive sites were
+//   invisible to this check entirely (6 of 334 checked citations came from README.md, all via
+//   incidental unbacktick'd prose). Backticks are now optional around both the filename and the
+//   identifier, so both shapes are read as the same citation.
+//
+// Widening the scan surfaced 3 real matches that are not phantom SYMBOL citations at all --
+// isCodeShapedIdentifier's CONST_CASE heuristic (3+ leading uppercase letters) also matches
+// ordinary capitalized prose emphasis, which the possessive shape happens to precede in three
+// places (`lock.js`'s `SECOND` idiom -- ordinal "a second, simpler idiom", not a constant;
+// `config.js`'s `OWN` -- emphasis on "own", not an identifier; `intake.js`'s `LLM` -- "the intake
+// LLM steps", not a symbol). Reworded at the source (product-repo-lock.js:28, recette.js:125,
+// bin/spo:1875) rather than allowlisted: these were never real symbol citations to begin with, so
+// an allowlist entry would misrepresent them as reviewed-and-accepted phantoms instead of what
+// they are, three sentences that happened to fall into a regex's blind spot.
+function isCodeShapedIdentifier(ident) {
+  if (/^[A-Z][A-Z0-9_]{2,}$/.test(ident)) return true; // CONST_CASE
+  if (/[a-z][A-Z]/.test(ident) && ident.length >= 5) return true; // camelCase
+  return false;
+}
+
+// blankComments -- verbatim copy of gh-api-argv.test.js's / test/park-reason-doc-sweep.test.js's
+// idiom: blanks `/* */` blocks and whole-line `//` comments (preserving line numbers/lengths),
+// so an identifier that exists ONLY in the file's own commentary about code does not count as
+// "present" -- the M15b fix. An inline trailing `// comment` on a code line is not blanked (same
+// limitation the copied idiom already has everywhere else it's used in this suite) -- harmless
+// here since it can only ever make symbolDefinedIn MORE permissive, never hide a real phantom
+// that M15b's own mutation (a comment-only mention) already proves this catches.
+function blankComments(source) {
+  const withoutBlocks = source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
+  return withoutBlocks
+    .split('\n')
+    .map((line) => (line.trimStart().startsWith('//') ? ' '.repeat(line.length) : line))
+    .join('\n');
+}
+
+// The filename group allows internal dots (`[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*`) so a multi-
+// segment name like `lock.test.js` is captured whole -- a class without them would instead match
+// only its LAST segment ("test.js"), turning a real (out-of-scope, see below) citation to
+// test/lock.test.js into a fabricated one to a nonexistent bare "test.js". Backticks around the
+// filename and/or the identifier are optional (M16, above) -- both the bare-prose shape
+// ("state-machine.js's buildCtx") and the markdown shape ("`intake.js`'s `pullBoard`") match.
+const SYMBOL_CITATION_RE = /`?\b([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.js)`?'s `?([A-Za-z_][A-Za-z0-9_]*)`?/g;
+
+function extractSymbolCitations(text) {
+  const out = [];
+  let m;
+  SYMBOL_CITATION_RE.lastIndex = 0;
+  while ((m = SYMBOL_CITATION_RE.exec(text))) {
+    const ident = m[2];
+    if (!isCodeShapedIdentifier(ident)) continue;
+    // test/**.test.js is out of this corpus's scope by the same rule doc/accepted-gaps.md
+    // states for the rest of this action (test/** was never part of Gate C7's clause, and
+    // CORPUS_FILES above excludes it entirely) -- a symbol cited FROM a test file is a test-
+    // maintenance fact, not a documentation-truthfulness one this sweep owns.
+    if (m[1].endsWith('.test.js')) continue;
+    out.push({ file: m[1], ident, index: m.index });
+  }
+  return out;
+}
+
+// symbolDefinedIn -- M15b: tests whether `ident` occurs in the CITED file's real code (comments
+// blanked first), not merely anywhere in the file's raw text. A whole-file occurrence test (the
+// pre-fix shape) cannot distinguish "this file's code genuinely uses/declares this name" from
+// "this file's own commentary happens to mention this name while discussing a DIFFERENT file" --
+// exactly the gap the config.js/spawnStep plant above proves closed.
+function symbolDefinedIn(fileName, ident) {
+  // findByBasename returns EVERY tracked match, so the empty case is `.length === 0` and not a
+  // falsy check: `if (!target)` on an array is always false, which would have sent an empty
+  // result straight into readFileSync. Ambiguity is its own answer, never a silent first pick --
+  // see findByBasename's header for the stale-worktree resolution this replaced.
+  const hits = findByBasename(fileName, REPO_ROOT);
+  if (hits.length === 0) return 'no-such-file';
+  if (hits.length > 1) return 'ambiguous-file';
+  const src = blankComments(fs.readFileSync(hits[0], 'utf8'));
+  return new RegExp(`\\b${ident}\\b`).test(src);
+}
+
+// PHANTOM_SYMBOL_ALLOWLIST: per-fact, same posture as CITATION_ALLOWLIST above -- empty today
+// (every known phantom, including the 3 CONST_CASE-prose false matches M16's wider scan
+// surfaced, was fixed in passing rather than exempted), kept so a future finding this action's
+// own judgement should NOT rename (e.g. an intentionally-approximate paraphrase) has somewhere to
+// go without becoming a whole-file exemption. Membership pinned below, same as this suite's other
+// allowlists -- the one this file previously shipped withOUT a pin.
+const PHANTOM_SYMBOL_ALLOWLIST = {};
+
+test('PHANTOM_SYMBOL_ALLOWLIST holds exactly the entries this action explicitly justified -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(PHANTOM_SYMBOL_ALLOWLIST).sort(),
+    [],
+    'PHANTOM_SYMBOL_ALLOWLIST changed size or membership. Adding an entry here exempts a symbol ' +
+      'citation from ever needing to resolve, forever -- it needs its own named, reasoned ' +
+      'justification (read from the actual file, not assumed), and this pin needs updating in the ' +
+      'same change, by name.'
+  );
+});
+
+test('every "<file>.js\'s <CodeShapedIdent>" possessive citation names a symbol that actually exists in that file', () => {
+  const SCAN_REL = [
+    ...fs.readdirSync(path.join(REPO_ROOT, 'orchestrator'), { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.js'))
+      .map((e) => path.join('orchestrator', e.name)),
+    ...fs.readdirSync(path.join(REPO_ROOT, 'orchestrator', 'steps'), { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.js'))
+      .map((e) => path.join('orchestrator', 'steps', e.name)),
+    'bin/spo',
+    'orchestrator/README.md',
+  ];
+
+  const offenders = [];
+  let checked = 0;
+  for (const rel of SCAN_REL) {
+    const raw = read(rel);
+    const normalized = normalizeWrap(rel.endsWith('.md') ? stripFences(raw) : raw);
+    for (const c of extractSymbolCitations(normalized)) {
+      checked += 1;
+      const key = `${rel} :: ${c.file}'s ${c.ident}`;
+      if (Object.prototype.hasOwnProperty.call(PHANTOM_SYMBOL_ALLOWLIST, key)) continue;
+      const exists = symbolDefinedIn(c.file, c.ident);
+      if (exists !== true) {
+        offenders.push(
+          `${key} -- ${
+            exists === 'no-such-file'
+              ? `no such file ${c.file}`
+              : exists === 'ambiguous-file'
+                ? `ambiguous basename ${c.file}: several tracked files share it, so this citation does not say which file it means -- cite a path`
+                : `no \`${c.ident}\` defined in ${c.file}`
+          }`
+        );
+      }
+    }
+  }
+
+  // Floor raised from 100 to 400 (M16): widening SYMBOL_CITATION_RE to the backtick-wrapped
+  // markdown shape roughly doubled real coverage (measured 2026-09-03: 478 checked, up from ~230
+  // under the old regex) -- almost entirely orchestrator/README.md's 72 previously-invisible
+  // sites. 400 stays comfortably below the measured figure while still failing loudly if either
+  // regex half (bare-prose or backtick-wrapped) stops matching.
+  assert.ok(checked >= 400, `expected at least 400 code-shaped "<file>.js's <ident>" citations, found ${checked} -- has the possessive-citation style changed, or did isCodeShapedIdentifier / the backtick-optional SYMBOL_CITATION_RE stop matching?`);
+  assert.deepEqual(
+    offenders,
+    [],
+    `phantom symbol citation(s) -- a comment names a symbol that does not exist in the file it ` +
+      `cites:\n  ${offenders.join('\n  ')}`
+  );
+});
+
+test('extractSymbolCitations: filters prose ("config.js\'s own") from real symbol citations ("state-machine.js\'s buildCtx")', () => {
+  const text = "see config.js's own defaults, and state-machine.js's buildCtx for the real shape";
+  assert.deepEqual(extractSymbolCitations(text).map((c) => `${c.file}'s ${c.ident}`), ["state-machine.js's buildCtx"]);
+});
+
+test('extractSymbolCitations: the backtick-wrapped markdown possessive ("`file.js`\'s `ident`") is read the same as the bare-prose shape (M16)', () => {
+  const text = 'between drain passes (`state-machine.js`\'s `runForever`) -- the exact same `pullBoard`';
+  assert.deepEqual(extractSymbolCitations(text).map((c) => `${c.file}'s ${c.ident}`), ["state-machine.js's runForever"]);
+});
+
+test('symbolDefinedIn: a mutation-proof canary -- a symbol invented for this fixture is correctly reported absent', () => {
+  assert.equal(symbolDefinedIn('config.js', 'thisIdentifierDoesNotExistAnywhereInTheRepoXYZ'), false);
+});
+
+test('symbolDefinedIn (M15b): a name that exists ONLY inside the cited file\'s own comments is reported absent, not present', () => {
+  // config.js genuinely contains the substring "spawnStep" -- but only inside its own comments,
+  // quoting steps/scripted.js's real function. The pre-fix whole-file occurrence test could not
+  // tell that apart from a real definition/usage; blankComments (above) is what makes it able to.
+  assert.equal(symbolDefinedIn('config.js', 'spawnStep'), false);
+});
+
+// ---- part 1.9: unanchored action-id check (E12, action 9.2) -------------------------------------
+//
+// doc/comment-corpus-audit-2026-09-03.md's E12: a comment marks itself "---- action N.Na ----"
+// (a section banner naming which plan action the code below implements) and that id does not
+// appear in either plan document. 1 id / 3 sites, found 2026-09-03: `action 5.1d`
+// (orchestrator/park-loop.js:219, orchestrator/state-machine.js:835,1249).
+//
+// Fix round (2026-09-03, adversarial pass), S3: the first cut of this allowlist entry claimed
+// the referent was "a judgement call about the plan's own history." Re-resolved directly against
+// both docs -- it was not. doc/remediation-plan-2026-08.md:186 lists row 5.1's three sub-items in
+// one cell, unlettered: pre-worktree board moves, "DIAGNOSE activity surfaced (a 'diagnosing,
+// attempt N/3' comment or a dedicated column -- driver decision)" (this one), and dropping the
+// redundant IMPLEMENT-retry move. doc/remediation-progress.md:647 names the same referent again,
+// under "DIAGNOSE surfacing" ("6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a
+// park"). The referent was never ambiguous -- only the letter `d` was invented (the plan does not
+// letter row 5.1's sub-items at all; a scatter of OTHER letters -- 5.1a/5.1b/5.1c/5.1e -- exists
+// only in code comments too, none of them plan-assigned). Fixed at the three call sites (renamed
+// to the plan's real, unlettered id, "action 5.1") rather than allowlisted with a corrected
+// reason: an unambiguous referent belongs in the code, not in an exception list. ACTION_ID_ALLOWLIST
+// is therefore empty -- kept, not deleted, for the same reason this suite's other now-empty
+// allowlists (EVENT_ALLOWLIST, PHANTOM_SYMBOL_ALLOWLIST) are kept: a genuinely ambiguous future
+// id has somewhere to go, named and reasoned, without becoming a bulk exemption.
+const ACTION_ID_RE = /\baction (\d+(?:bis)?\.\d+[a-z]?)\b/g;
+const ACTION_ID_DOCS = ['doc/remediation-plan-2026-08.md', 'doc/remediation-progress.md'];
+
+function actionIdDocumented(id) {
+  return ACTION_ID_DOCS.some((rel) => {
+    const text = read(rel);
+    const re = new RegExp(`\\| ?${id.replace('.', '\\.')} ?\\||\\b${id.replace('.', '\\.')}\\b`);
+    return re.test(text);
+  });
+}
+
+// ACTION_ID_ALLOWLIST: per-id (never per-site), same reasoned-pin posture as this suite's other
+// allowlists. Empty since the S3 fix above (see the header comment on why "5.1d" was fixed at
+// its call sites rather than allowlisted).
+const ACTION_ID_ALLOWLIST = {};
+
+test('ACTION_ID_ALLOWLIST holds exactly the ids this action found genuinely unanchored -- no more, no fewer', () => {
+  assert.deepEqual(Object.keys(ACTION_ID_ALLOWLIST).sort(), [], 'ACTION_ID_ALLOWLIST changed -- update this pin in the same change, with a named reason.');
+});
+
+test('every "action N.Na" banner comment names an id that appears in one of the two plan docs, or is on ACTION_ID_ALLOWLIST', () => {
+  const SCAN_REL = [
+    ...fs.readdirSync(path.join(REPO_ROOT, 'orchestrator'), { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.js'))
+      .map((e) => path.join('orchestrator', e.name)),
+    ...fs.readdirSync(path.join(REPO_ROOT, 'orchestrator', 'steps'), { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.js'))
+      .map((e) => path.join('orchestrator', 'steps', e.name)),
+    'bin/spo',
+  ];
+
+  const ids = new Set();
+  let checked = 0;
+  for (const rel of SCAN_REL) {
+    const src = read(rel);
+    let m;
+    const re = new RegExp(ACTION_ID_RE.source, 'g');
+    while ((m = re.exec(src))) { ids.add(m[1]); checked += 1; }
+  }
+
+  assert.ok(checked >= 5, `expected at least 5 "action N.Na" mentions across orchestrator/**+bin/spo, found ${checked} -- has the banner convention changed?`);
+
+  const offenders = [];
+  for (const id of ids) {
+    if (Object.prototype.hasOwnProperty.call(ACTION_ID_ALLOWLIST, id)) continue;
+    if (!actionIdDocumented(id)) offenders.push(id);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `action id(s) cited in code but absent from both plan docs, not on ACTION_ID_ALLOWLIST:\n  ${offenders.join('\n  ')}`
+  );
+});
+
 // ---- part 2: file:line citation ratchet -----------------------------------------------------
 //
-// Deliberately small in LEVERAGE, not in lines: measured 2026-09-02, this check would have
-// caught ZERO of gate C7's pass-3 ~52 divergences (none of them were dangling citations) -- it is
-// a ratchet against a citation surviving a future rename/move/deletion, not leverage on the class
-// of bug this file exists for. The plan (doc/remediation-plan-2026-08.md's action 7bis.3 row,
-// historical and excluded from this file's own sweep by name) budgeted this ratchet at "~10 lines
-// and no more" -- that claim was never true even at the size measured for the adversarial review
-// that flagged it (72 lines / 55 non-comment code lines, a 5.5x overrun), and this action's own
-// fixes (the KNOWN_FICTIONAL pin, the corrected checked-count comment) have grown it further.
-// Correcting the SIZE claim here, not the code: the plan's "10 lines" was wrong from the start,
-// this ratchet has not grown into any leverage the plan denied it, and whether that size is worth
-// trimming is a decision for whoever reviews this action, not this comment.
+// Rebuilt for action 9.2 (E18 of doc/comment-corpus-audit-2026-09-03.md): the ratchet used to
+// check 2 of the corpus's 65 in-scope files, with a regex that missed `.json` targets, `(line N)`
+// prose, and bare `` `:N` `` chain-continuations (` foo.js:10, `:20` ` naming the SAME file
+// twice) -- 9 of 63 real citations, 14%, with a `checked >= 8` floor one deletion from vacuous.
+// Widened to all 65 corpus files (CORPUS_FILES below, the same exclusions doc/accepted-gaps.md
+// §3a/3b/self already made, plus this action's own audit doc -- dated 2026-09-03, written AFTER
+// the corpus was measured, so it was never part of what got measured), a regex that also matches
+// `.json`, and two more citation shapes resolved by the scanner below rather than left as false
+// negatives. `checked` is no longer a floor: EXPECTED_CITATIONS pins the exact sorted set of citation
+// strings this corpus holds today, so a citation added, removed, or reworded fails this test by
+// NAME (the exact diff), not by a shrinking/growing number -- gate C7's own lesson, restated.
 //
-// Existence-only by construction, also registered in doc/accepted-gaps.md: a citation repointed
-// to the WRONG line within a file that still has enough lines to satisfy the `end > lineCount`
-// check below is not detected. Not fixed here -- an existence check cannot become a correctness
-// check without actually parsing what each citation claims to be true of the line it names, which
-// is a different, much larger mechanism than this ratchet.
-const CITATION_DOCS = ['doc/state-machine-spec.md', 'orchestrator/README.md'];
-const CITATION_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts)):(\d+)(?:-(\d+))?/g;
-// issue-418's plan once asserted this exact path was absent, and orchestrator/README.md quotes
-// that assertion verbatim as a worked example ("That file does not exist") -- a real citation to
-// a real absence, not a stale one. See orchestrator/README.md's "Why not scan plan_markdown".
-const KNOWN_FICTIONAL = new Set(['.claude/hooks/context-router.sh:117']);
+// ---- three citation shapes ---------------------------------------------------------------------
+//   1. `path/to/file.ext:N` or `:N-M` -- the original shape, CITATION_RE below.
+//   2. `path/to/file.ext`'s `thing` (line N) -- prose possessive form, POSSESSIVE_LINE_RE. One
+//      live site: orchestrator/bench-queue-wait.js's own header, citing the product's `job.ts`'s
+//      `purgeDone`.
+//   3. A bare backtick `` `:N` `` (or, in a JS comment, "at :N") immediately after a real
+//      citation established the file -- `` `account-lease.js:156` -> `lock.js:255` ... -> `:289`
+//      tryCreate `` (orchestrator/README.md) chains three citations to two files without
+//      repeating the second filename. CHAIN_RE below, resolved against the nearest PRECEDING
+//      real citation within PROXIMITY_CHARS -- far enough to catch a same-sentence chain, close
+//      enough that a `.md` file's later, unrelated citation-shaped prose (doc/bench-audit-2026-
+//      09-02.md's own "cli.ts ... was cited to `:458`", quoting a DIFFERENT sweep's broken
+//      citation as historical evidence, three of them in a row with no filename directly before
+//      the colon) is reported as unanchored rather than silently mis-attributed to whatever real
+//      citation happened to appear last. An unanchored chain is never treated as a resolvable
+//      citation -- it is reported and, where it turns out to be exactly the quoted-elsewhere's-
+//      broken-citation shape above, allowlisted BY NAME below, same as any other offender this
+//      file cannot fix by editing a dated record.
+//
+// ---- line-wrap normalisation (E15) ---------------------------------------------------------------
+// Sweeps cannot be line-based: 9.1 measured 6 wrapped identifiers in this corpus, one of them a
+// real citation (orchestrator/invariants.js:2-3: "doc/state-machine-\n// spec.md:49", the comment
+// marker re-starting mid-identifier). normalizeWrap joins a line ending in `-` or `/` directly to
+// its continuation (stripping any `//`/`*`/`#` comment leader first, so the join produces
+// `state-machine-spec.md`, not `state- // machine-spec.md`) and collapses every other line break
+// to a single space, so a citation is read as one contiguous string regardless of where the
+// source happened to wrap it. Fenced code blocks in `.md` files are blanked first (stripFences,
+// unchanged from before) -- a format TEMPLATE inside a fence was never a real citation.
+//
+// ---- cross-repo resolution (E1, minimally) -------------------------------------------------------
+// A citation that does not resolve in THIS repo is not automatically dangling: 31 of the 65
+// corpus files' citations name a `.ts` file, a bare product basename (`worker.ts`, `cli.ts`,
+// ...), or a path explicitly prefixed `SPO-WebClient/` -- none of which this repo could ever
+// contain (it ships zero `.ts` files). resolveCitationTarget tries this repo, then
+// `config.productRepo`'s default (`~/SPO-WebClient`), then a scanner-local `DEPLOY_REPO`
+// (`~/SPO-Deploy` -- config.js has no `deployRepo` constant to import; adding one is a
+// production-code decision out of this action's scope, left for 9.3, see the report). Per E1's
+// own requirement, an ABSENT product or deploy repo is never a silent pass: if a citation cannot
+// be resolved locally and the repo that would have to resolve it is missing from disk, that is
+// reported as its own offender, distinct from a genuinely dangling citation, so the two failure
+// modes are never confused with each other or silently merged into "clean."
+
+// Pinned 2026-09-03 against `git ls-files doc orchestrator bin/spo console scripts accounts
+// README.md prompts/README.md`, minus doc/accepted-gaps.md (classified-historical by its own
+// text), the three doc/accepted-gaps.md §3b running logs (doc/remediation-progress.md,
+// doc/improvisation-analysis.md, doc/remediation-plan-2026-08.md), and
+// doc/comment-corpus-audit-2026-09-03.md (9.1's own deliverable, written AFTER the corpus it
+// measured -- not part of what it measured). 65 files, matching doc/accepted-gaps.md §3d's own
+// count. A file added to or removed from this scope is a deliberate act -- update this array in
+// the same change, by name, the same way PINS's name list above works.
+const CORPUS_FILES = [
+  'README.md',
+  'accounts/spo-test-accounts.yml',
+  'bin/spo',
+  'console/collect.js',
+  'console/prod-version.js',
+  'console/render.js',
+  'console/serve.js',
+  'console/system.js',
+  'console/usage-rollups.js',
+  'console/usage-scan.js',
+  'doc/bench-audit-2026-09-02.md',
+  'doc/bench-plan-derived-2026-09-02.md',
+  'doc/board-audit.md',
+  'doc/environments.md',
+  'doc/jewels-inventory.md',
+  'doc/permissions.md',
+  'doc/setup.md',
+  'doc/state-machine-spec.md',
+  'orchestrator/README.md',
+  'orchestrator/account-lease.js',
+  'orchestrator/accounts.js',
+  'orchestrator/auto-pull.js',
+  'orchestrator/auto-triage.js',
+  'orchestrator/bench-queue-wait.js',
+  'orchestrator/board.js',
+  'orchestrator/ci-cause-table.js',
+  'orchestrator/command-timeout.js',
+  'orchestrator/comment-scan.js',
+  'orchestrator/config.js',
+  'orchestrator/daemon.js',
+  'orchestrator/deadline.js',
+  'orchestrator/dispatcher.js',
+  'orchestrator/fixture.js',
+  'orchestrator/http.js',
+  'orchestrator/intake.js',
+  'orchestrator/invariants.js',
+  'orchestrator/journal.js',
+  'orchestrator/lock.js',
+  'orchestrator/main-moved-budget.js',
+  'orchestrator/monotonic-clock.js',
+  'orchestrator/orphan-scan.js',
+  'orchestrator/park-alert.js',
+  'orchestrator/park-loop.js',
+  'orchestrator/park-signal.js',
+  'orchestrator/product-repo-hold.js',
+  'orchestrator/product-repo-lock.js',
+  'orchestrator/prompt-template.js',
+  'orchestrator/recette.js',
+  'orchestrator/remote-report-pull.js',
+  'orchestrator/report-intake.js',
+  'orchestrator/state-machine.js',
+  'orchestrator/step-contracts.js',
+  'orchestrator/steps/llm.js',
+  'orchestrator/steps/scripted.js',
+  'orchestrator/task-summary.js',
+  'orchestrator/task-values.js',
+  'orchestrator/tokens.js',
+  'orchestrator/worker-status.js',
+  'prompts/README.md',
+  'scripts/daemon-install.sh',
+  'scripts/dashboard-install.sh',
+  'scripts/git-hooks/post-merge',
+  'scripts/park-alert.sh',
+  'scripts/smoke-llm.js',
+  'scripts/usage-report.js',
+];
+
+const PRODUCT_REPO = process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient');
+// No `config.deployRepo` exists (confirmed by doc/comment-corpus-audit-2026-09-03.md §5) -- this
+// constant is scanner-local on purpose; see the header above.
+const DEPLOY_REPO = process.env.SPO_DEPLOY_REPO || path.join(os.homedir(), 'SPO-Deploy');
+
+const CITATION_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json)):(\d+)(?:-(\d+))?/g;
+const POSSESSIVE_LINE_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))'s(?:[^()\n]{0,60})?\(line (\d+)\)/g;
+const CHAIN_RE = /`:(\d+)(?:-(\d+))?`|(?<=\bat ):(\d+)(?:-(\d+))?\b/g;
+const PROXIMITY_CHARS = 150;
+
+// Per-fact allowlist, exactly the ALLOWLIST/KNOWN_FICTIONAL idiom this suite and
+// park-reason-doc-sweep.test.js already use -- keyed `${file} :: ${citation}`, never per-file
+// (test/no-real-spawn-sweep.test.js's own header: a whole-file exemption was itself the gap that
+// hid a real missing killswitch). Every entry is either a deliberate, real absence (never
+// fixable by editing the citing file) or a dated record whose citation was true when written and
+// has since drifted -- "rewrite the citation" would misrepresent what the record actually said
+// at measurement time, so these are named exceptions, not defects fixed in passing.
+const CITATION_ALLOWLIST = {
+  // issue-418's plan once asserted this exact path was absent, and orchestrator/README.md quotes
+  // that assertion verbatim as a worked example ("That file does not exist") -- a real citation
+  // to a real absence, not a stale one. See orchestrator/README.md's "Why not scan plan_markdown".
+  'orchestrator/README.md :: .claude/hooks/context-router.sh:117':
+    'deliberate worked example of a citation to a file that was asserted, and remains, absent -- ' +
+    'not a stale citation.',
+  // orchestrator/invariants.js:37's own "File: relative/path/to/file.ts:123" is the INV block
+  // format's own documentation example -- a deliberately fake path, the same role a fenced
+  // markdown template plays (stripFences already excludes those; this one is a bare `//` comment
+  // line, not inside a fence, so stripFences cannot reach it).
+  'orchestrator/invariants.js :: relative/path/to/file.ts:123':
+    "format-template example in the comment documenting the INV block's `File: <path>:<line>` " +
+    'syntax -- never a real citation.',
+  // doc/bench-audit-2026-09-02.md and doc/bench-plan-derived-2026-09-02.md are dated 8.1 audit
+  // records (measured against a pinned SPO-WebClient commit); 9.1's own re-verification
+  // (doc/comment-corpus-audit-2026-09-03.md §1) confirmed sanctuarize.test.ts has since been
+  // deleted from the product repo. The citation was true when the record was written -- editing
+  // it now would misrepresent what the audit actually found at measurement time.
+  'doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156':
+    'product file deleted after this dated record was written (confirmed by 9.1, ' +
+    'doc/comment-corpus-audit-2026-09-03.md §1) -- historical citation, not a live one.',
+  'doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156':
+    'product file deleted after this dated record was written (confirmed by 9.1, ' +
+    'doc/comment-corpus-audit-2026-09-03.md §1) -- historical citation, not a live one.',
+  // Same dated-record posture: the product's verdict.ts and worker.ts have both shrunk since
+  // 2026-09-02 (measured today at 167 and 759 lines respectively), so citations to :183 and :780
+  // now exceed EOF. Re-verified: 2026-09-03.
+  'doc/bench-audit-2026-09-02.md :: verdict.ts:162-183':
+    "product file has shrunk since this dated record's measurement commit (167 lines today) -- " +
+    'historical citation, not a live one.',
+  'doc/bench-audit-2026-09-02.md :: worker.ts:779-780':
+    "product file has shrunk since this dated record's measurement commit (759 lines today) -- " +
+    'historical citation, not a live one.',
+  // This repo's own .claude/settings.json has been edited since 2026-09-02 (120 lines today,
+  // down from the 109-127 range cited as evidence of a 33%-precision worked example) -- same
+  // dated-record posture, this time about THIS repo rather than the product.
+  'orchestrator/README.md :: .claude/settings.json:109-127':
+    "this repo's .claude/settings.json has been edited since this dated record's measurement " +
+    'date -- historical citation (worked-example evidence), not a live one.',
+  // doc/bench-audit-2026-09-02.md's own "One sweep's broken references are all in `.ts` files
+  // (`cli.ts` is 310 lines and was cited to `:458`; `fingerprint.ts` is 80 and cited to `:277`);
+  // the other's are all in shell scripts (`bench-submit.sh` is 15 lines, cited to `:65-69`)"
+  // quotes a DIFFERENT sweep's broken citations as historical evidence -- cli.ts/fingerprint.ts/
+  // bench-submit.sh are named in prose without a `:N` directly attached, so CHAIN_RE's nearest-
+  // preceding-citation resolution correctly finds no anchor within PROXIMITY_CHARS and reports
+  // these three as unanchored rather than silently attributing them to whatever real citation
+  // happened to appear earlier in the file. Not a defect in the ratchet or in this document.
+  'doc/bench-audit-2026-09-02.md :: (unanchored) :458':
+    "narrative aside quoting a different, historical sweep's broken citation to cli.ts as " +
+    'evidence -- not a live citation chain.',
+  'doc/bench-audit-2026-09-02.md :: (unanchored) :277':
+    "narrative aside quoting a different, historical sweep's broken citation to fingerprint.ts " +
+    'as evidence -- not a live citation chain.',
+  'doc/bench-audit-2026-09-02.md :: (unanchored) :65-69':
+    "narrative aside quoting a different, historical sweep's broken citation to bench-submit.sh " +
+    'as evidence -- not a live citation chain.',
+};
+
+// isCitationAllowlisted -- extracted so the per-FACT (never per-file) matching discipline
+// CITATION_ALLOWLIST depends on is itself under test below, not merely asserted by its own
+// membership pin. Fix round (2026-09-03, adversarial pass), M13: the shipped inline check
+// (`Object.prototype.hasOwnProperty.call(CITATION_ALLOWLIST, \`${c.rel} :: ${c.raw}\`)`) was
+// already per-fact and correct, but nothing proved it stays that way -- a mutation that degraded
+// the match to per-FILE (`Object.keys(CITATION_ALLOWLIST).some((k) => k.startsWith(c.rel))`) plus
+// a real dangling `orchestrator/journal.js:999999` planted in an already-allowlisted file passed
+// 24/24, because the key pin alone cannot see how the main test's loop actually compares a key --
+// only that CITATION_ALLOWLIST's OWN keys look right. This function is that comparison, called by
+// the main test below instead of inlining it, so the fixture test right after it is exercising
+// the exact same logic the real ratchet runs, not a parallel reimplementation that could drift.
+function isCitationAllowlisted(allowlist, rel, raw) {
+  return Object.prototype.hasOwnProperty.call(allowlist, `${rel} :: ${raw}`);
+}
+
+test('isCitationAllowlisted: matches per FACT (file + citation), never by file alone (M13)', () => {
+  const allowlist = { 'orchestrator/README.md :: known-absent.ts:1': 'a real, dated absence' };
+  assert.equal(isCitationAllowlisted(allowlist, 'orchestrator/README.md', 'known-absent.ts:1'), true);
+  // A DIFFERENT, real dangling citation in the SAME file must NOT be swallowed just because some
+  // other citation in that file happens to be allowlisted -- the exact degradation class M13's
+  // adversarial mutation (per-file matching + a planted real-dangling orchestrator/journal.js:
+  // 999999 in an already-allowlisted file) exploited, and which stayed green under the pre-fix
+  // inline check with no test of its own.
+  assert.equal(isCitationAllowlisted(allowlist, 'orchestrator/README.md', 'journal.js:999999'), false);
+});
+
+test('CITATION_ALLOWLIST holds exactly the entries this action explicitly justified -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(CITATION_ALLOWLIST).sort(),
+    [
+      'doc/bench-audit-2026-09-02.md :: (unanchored) :277',
+      'doc/bench-audit-2026-09-02.md :: (unanchored) :458',
+      'doc/bench-audit-2026-09-02.md :: (unanchored) :65-69',
+      'doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156',
+      'doc/bench-audit-2026-09-02.md :: verdict.ts:162-183',
+      'doc/bench-audit-2026-09-02.md :: worker.ts:779-780',
+      'doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156',
+      'orchestrator/README.md :: .claude/hooks/context-router.sh:117',
+      'orchestrator/README.md :: .claude/settings.json:109-127',
+      'orchestrator/invariants.js :: relative/path/to/file.ts:123',
+    ],
+    'CITATION_ALLOWLIST changed size or membership. Adding an entry here exempts a citation from ' +
+      'ever needing to resolve, forever -- it needs its own named, reasoned justification (read ' +
+      'from the actual file, not assumed), and this pin needs updating in the same change, by name.'
+  );
+});
 
 function stripFences(src) {
   // Fenced code blocks hold format TEMPLATES (e.g. "File: relative/path/to/file.ts:123" in the
@@ -308,71 +1036,565 @@ function stripFences(src) {
     .join('\n');
 }
 
-function findByBasename(name, dir) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === '.git' || entry.name === 'node_modules') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const hit = findByBasename(name, full);
-      if (hit) return hit;
-    } else if (entry.name === name) {
-      return full;
-    }
-  }
-  return null;
+// normalizeWrap(src) -- E18/E15: joins an identifier or citation the source happened to wrap
+// across a line break, so CITATION_RE (which never spans a space, deliberately -- spanning one
+// would turn ordinary prose into false-positive matches) still reads it as one contiguous string.
+// Two cases, in order: (1) the line up to the break ends in `-` or `/` -- a path or hyphenated
+// identifier continuation (`doc/state-machine-` + `spec.md:49`) -- joined with NO inserted
+// character, after stripping any `//`/`*`/`#` comment leader the continuation line starts with;
+// (2) every other line break, collapsed to a single space (safe: a citation never legitimately
+// contains a literal space, so this can only ever help a match, never manufacture a false one).
+function normalizeWrap(src) {
+  let text = src.replace(/([-/])\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, '$1');
+  text = text.replace(/[ \t]*\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, ' ');
+  return text;
 }
 
-// FINDING 4 (adversarial review, 2026-09-02): KNOWN_FICTIONAL had no ratchet -- adding a second
-// entry to hide a genuinely dangling citation survived the whole suite, since the only thing
-// read from it anywhere was `.has(full)`, never its full contents. Pinned to the exact single
-// entry this file ships with, the same posture as ALLOWLIST in park-reason-doc-sweep.test.js:
-// adding an entry here is a deliberate act (a citation to a real, deliberate absence, not a
-// stale one -- see the comment above KNOWN_FICTIONAL) that needs its own justification and an
-// update to this pin in the same change, not a silent exemption.
-test('KNOWN_FICTIONAL holds exactly the one citation this file explicitly justified -- no more, no fewer', () => {
+// trackedFiles(root) -- the repo's OWN tree, from git, cached per root.
+//
+// This replaced a recursive readdir walk that skipped only `.git` and `node_modules`, and it is
+// not a tidy-up: the walk descended into NESTED GIT WORKTREES. `/home/crazz/SPO-WebClient` holds
+// abandoned agent worktrees under `.claude/worktrees/<slug>/`, each a full copy of the product
+// tree, and `.claude` sorts before `src`, so a bare-basename citation like `worker.ts:892`
+// resolved to a MONTHS-OLD copy and was line-checked against it. That is how four dangling
+// cross-repo citations passed 9.1's verification and this ratchet's own green run: the file the
+// checker read was not the file the citation meant. Measured 2026-09-03, when `worker.ts:892`
+// (a real line in the product's `src/e2e/bench/worker.ts`) was reported dangling because the
+// worktree copy it resolved to has only 759 lines.
+//
+// `git ls-files` is the fix and not merely a filter: a nested worktree is not tracked by the
+// parent repo, and neither are `node_modules`, `dist` or any other ignored build output, so the
+// exclusion is the repo's own definition of what belongs to it rather than a denylist this file
+// would have to keep in step with whatever a future tool drops on disk.
+const _trackedCache = new Map();
+function trackedFiles(root) {
+  if (_trackedCache.has(root)) return _trackedCache.get(root);
+  let list = [];
+  try {
+    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+      .split('\n')
+      .filter(Boolean);
+  } catch {
+    list = [];
+  }
+  _trackedCache.set(root, list);
+  return list;
+}
+
+// findByBasename -- every tracked file whose basename matches, never just the first. An
+// AMBIGUOUS basename is a defect in the citation (it does not say which file it means) and the
+// caller reports it by name; silently taking the first match is what let the stale-worktree copy
+// win above, and "pick one and say nothing" is the shape this whole sweep exists to remove.
+function findByBasename(name, root) {
+  return trackedFiles(root)
+    .filter((rel) => path.basename(rel) === name)
+    .map((rel) => path.join(root, rel));
+}
+
+// resolveIn(root, filePath) -> { target } | { ambiguous: [paths] } | null
+function resolveIn(root, filePath) {
+  if (filePath.includes('/')) {
+    const target = path.join(root, filePath);
+    return fs.existsSync(target) ? { target } : null;
+  }
+  const hits = findByBasename(filePath, root);
+  if (hits.length === 0) return null;
+  if (hits.length > 1) return { ambiguous: hits };
+  return { target: hits[0] };
+}
+
+// resolveCitationTarget(filePath) -- E1, minimally: this repo first, then the product repo (with
+// a leading "SPO-WebClient/" stripped, since prose sometimes spells the citation out with the
+// repo name attached), then SPO-Deploy the same way. Returns one of:
+//   { target, root: 'repo' | 'product' | 'deploy' }            -- resolved
+//   { target: null, root: 'product-absent' | 'deploy-absent' } -- the repo that would be needed
+//                                                                  to tell isn't on disk: this is
+//                                                                  NEVER treated as a pass (see
+//                                                                  the header's E1 section)
+//   { target: null, root: null }                               -- resolved nowhere; dangling
+function resolveCitationTarget(filePath) {
+  // `ambiguous` is carried out to the caller rather than resolved here: only the caller knows the
+  // citation's own text, and the offender line has to name the candidates for the maintainer to
+  // pick between them. Never collapse it to a target.
+  const local = resolveIn(REPO_ROOT, filePath);
+  if (local && local.ambiguous) return { target: null, root: 'repo', ambiguous: local.ambiguous };
+  if (local) return { target: local.target, root: 'repo' };
+  const productPath = filePath.replace(/^SPO-WebClient\//, '');
+  if (!fs.existsSync(PRODUCT_REPO)) return { target: null, root: 'product-absent' };
+  const product = resolveIn(PRODUCT_REPO, productPath);
+  if (product && product.ambiguous) return { target: null, root: 'product', ambiguous: product.ambiguous };
+  if (product) return { target: product.target, root: 'product' };
+  const deployPath = filePath.replace(/^SPO-Deploy\//, '');
+  if (!fs.existsSync(DEPLOY_REPO)) return { target: null, root: 'deploy-absent' };
+  const deploy = resolveIn(DEPLOY_REPO, deployPath);
+  if (deploy && deploy.ambiguous) return { target: null, root: 'deploy', ambiguous: deploy.ambiguous };
+  if (deploy) return { target: deploy.target, root: 'deploy' };
+  return { target: null, root: null };
+}
+
+// extractCitations(text) -- the three shapes, merged in document order, chain matches resolved
+// against the nearest preceding real citation within PROXIMITY_CHARS. `text` is expected to
+// already be fence-stripped (if markdown) and normalizeWrap'd. Exported shape:
+// [{ raw, file, start, stop, unanchored }], `file: null` iff `unanchored` is true.
+function extractCitations(text) {
+  const matches = [];
+  let m;
+  CITATION_RE.lastIndex = 0;
+  while ((m = CITATION_RE.exec(text))) {
+    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[3] || m[2]) });
+  }
+  POSSESSIVE_LINE_RE.lastIndex = 0;
+  while ((m = POSSESSIVE_LINE_RE.exec(text))) {
+    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[2]) });
+  }
+  CHAIN_RE.lastIndex = 0;
+  while ((m = CHAIN_RE.exec(text))) {
+    const start = Number(m[1] || m[3]);
+    const stop = Number(m[2] || m[4] || start);
+    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'chain', start, stop });
+  }
+  matches.sort((a, b) => a.idx - b.idx);
+
+  // A chain match landing inside a full/possessive match's own span is the ":N" already captured
+  // by that match (e.g. the ":49" inside "spec.md:49") -- drop it, it is not a second citation.
+  const filtered = matches.filter(
+    (mm) => mm.kind !== 'chain' || !matches.some((o) => o.kind !== 'chain' && mm.idx >= o.idx && mm.idx < o.end)
+  );
+
+  const out = [];
+  let lastFile = null;
+  let lastFileEnd = -1;
+  for (const mm of filtered) {
+    if (mm.kind === 'chain') {
+      if (!lastFile || mm.idx - lastFileEnd > PROXIMITY_CHARS) {
+        out.push({ raw: `(unanchored) :${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: null, start: mm.start, stop: mm.stop, unanchored: true });
+      } else {
+        out.push({ raw: `${lastFile}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: lastFile, start: mm.start, stop: mm.stop, unanchored: false });
+      }
+    } else {
+      lastFile = mm.file;
+      lastFileEnd = mm.end;
+      out.push({ raw: `${mm.file}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: mm.file, start: mm.start, stop: mm.stop, unanchored: false });
+    }
+  }
+  return out;
+}
+
+// Pinned 2026-09-03: the exact sorted set of `${file} :: ${citation}` this corpus holds, widened
+// regex + all 65 files + line-unwrap + chain resolution. Not a floor -- a citation added anywhere
+// in the corpus (a real one, or a new narrative aside shaped like one) must be added HERE, by
+// name, in the same change, the same way PINS's name list above works. See the test below for
+// what happens when this array and the live corpus disagree.
+const EXPECTED_CITATIONS = [
+  "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
+  "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
+  "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
+  "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
+  "doc/bench-audit-2026-09-02.md :: cli.ts:179",
+  "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:128",
+  "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
+  "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
+  "doc/bench-audit-2026-09-02.md :: run.ts:109",
+  "doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:1347",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:1944-1994",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:292-293",
+  "doc/bench-audit-2026-09-02.md :: scripts/finish.sh:245-247",
+  "doc/bench-audit-2026-09-02.md :: scripts/nightly-check.sh:70-73",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/bench/paths.ts:143-163",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/bench/worker.ts:482",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/config.ts:93",
+  "doc/bench-audit-2026-09-02.md :: test/helpers.js:65-80",
+  "doc/bench-audit-2026-09-02.md :: verdict.ts:162-183",
+  "doc/bench-audit-2026-09-02.md :: verdict.ts:23-67",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:106",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:301",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:307-319",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:482",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:482-486",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:487",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:495-502",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:543-546",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:576",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:750",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
+  "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
+  "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
+  "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
+  "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293",
+  "doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156",
+  "doc/bench-plan-derived-2026-09-02.md :: scripts/finish.sh:245-247",
+  "doc/bench-plan-derived-2026-09-02.md :: scripts/nightly-check.sh:70-73",
+  "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
+  "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
+  "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
+  "doc/board-audit.md :: config.js:711",
+  "doc/board-audit.md :: orchestrator/steps/scripted.js:937",
+  "doc/board-audit.md :: report-intake.js:29",
+  "doc/state-machine-spec.md :: dispatcher.js:485-499",
+  "doc/state-machine-spec.md :: intake.js:747-749",
+  "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
+  "orchestrator/README.md :: .claude/settings.json:109-127",
+  "orchestrator/README.md :: account-lease.js:156",
+  "orchestrator/README.md :: config.js:615",
+  "orchestrator/README.md :: dispatcher.js:485-499",
+  "orchestrator/README.md :: doc/state-machine-spec.md:98",
+  "orchestrator/README.md :: intake.js:747-749",
+  "orchestrator/README.md :: lock.js:255",
+  "orchestrator/README.md :: lock.js:257-288",
+  "orchestrator/README.md :: lock.js:289",
+  "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:217",
+  "orchestrator/bench-queue-wait.js :: worker.ts:108",
+  "orchestrator/bench-queue-wait.js :: worker.ts:689",
+  "orchestrator/config.js :: worker.ts:892",
+  "orchestrator/invariants.js :: doc/state-machine-spec.md:49",
+  "orchestrator/invariants.js :: relative/path/to/file.ts:123",
+  "orchestrator/journal.js :: worker.ts:110",
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:186",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:647",
+  "orchestrator/park-loop.js :: intake.js:747-749",
+  "orchestrator/state-machine.js :: run.ts:64",
+  "orchestrator/steps/llm.js :: intake.js:747-749",
+  "orchestrator/steps/scripted.js :: run.ts:64",
+  "orchestrator/steps/scripted.js :: verify-gate.js:308",
+  "orchestrator/steps/scripted.js :: verify-gate.js:342",
+  "orchestrator/steps/scripted.js :: worker.ts:109-110",
+  "orchestrator/steps/scripted.js :: worker.ts:892",
+  "prompts/README.md :: plan.md:103",
+  "prompts/README.md :: step-contracts.js:108",
+];
+
+test('every file:line citation in the 65-file corpus resolves, or is on the named allowlist', () => {
+  // Immediate, named diagnosis if a file is added to or dropped from CORPUS_FILES without
+  // updating this pin -- the EXPECTED_CITATIONS deepEqual below would also catch it (every
+  // citation that file held would vanish from `found`), but that failure reads as "which
+  // citations changed," not "the corpus scope itself changed." Checked first so the more likely
+  // cause is named up front.
+  assert.equal(CORPUS_FILES.length, 65, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
+
+  const found = [];
+  for (const rel of CORPUS_FILES) {
+    const raw = read(rel);
+    const withoutFences = rel.endsWith('.md') ? stripFences(raw) : raw;
+    const normalized = normalizeWrap(withoutFences);
+    for (const c of extractCitations(normalized)) {
+      found.push({ rel, ...c });
+    }
+  }
+
+  const foundKeys = found.map((c) => `${c.rel} :: ${c.raw}`).sort();
+
+  // FINDING (this action): a numeric floor cannot say WHICH citation died, added, or drifted --
+  // gate C7's own history and this suite's E18 finding are both about exactly that failure mode.
+  // deepEqual against the exact pinned set fails by NAME (assert.deepEqual's own diff) the moment
+  // a single citation is added, removed, or reworded anywhere in the 65-file corpus.
   assert.deepEqual(
-    [...KNOWN_FICTIONAL].sort(),
-    ['.claude/hooks/context-router.sh:117'],
-    'KNOWN_FICTIONAL changed size or membership -- update this pin in the same change, with a ' +
-      'named reason next to the new entry, the same way the existing one is justified above.'
+    foundKeys,
+    EXPECTED_CITATIONS,
+    'the corpus\'s citation set changed -- a citation was added, removed, or reworded. Update ' +
+      'EXPECTED_CITATIONS in the same change, by name, after confirming the new/changed citation ' +
+      'actually resolves (or belongs on CITATION_ALLOWLIST, with its own reason).'
+  );
+
+  const offenders = [];
+  const repoAbsentOffenders = [];
+  for (const c of found) {
+    const key = `${c.rel} :: ${c.raw}`;
+    if (isCitationAllowlisted(CITATION_ALLOWLIST, c.rel, c.raw)) continue;
+    if (c.unanchored) {
+      offenders.push(`${key} -- unanchored chain continuation, no real citation within ${PROXIMITY_CHARS} chars before it`);
+      continue;
+    }
+    const resolved = resolveCitationTarget(c.file);
+    if (resolved.root === 'product-absent') {
+      repoAbsentOffenders.push(`${key} -- does not resolve in this repo, and ${PRODUCT_REPO} is not on disk to check further (E1: never a silent pass)`);
+      continue;
+    }
+    if (resolved.root === 'deploy-absent') {
+      repoAbsentOffenders.push(`${key} -- does not resolve in this repo or the product repo, and ${DEPLOY_REPO} is not on disk to check further (E1: never a silent pass)`);
+      continue;
+    }
+    if (resolved.ambiguous) {
+      offenders.push(
+        `${key} -- ambiguous basename: ${resolved.ambiguous.length} tracked files in the ` +
+          `${resolved.root} repo share it (${resolved.ambiguous.join(', ')}). Cite a path, not a ` +
+          `bare filename -- picking one silently is how a citation gets line-checked against the ` +
+          `wrong file.`
+      );
+      continue;
+    }
+    if (!resolved.target) {
+      offenders.push(`${key} -- not found in this repo, ${PRODUCT_REPO}, or ${DEPLOY_REPO}`);
+      continue;
+    }
+    const lineCount = fs.readFileSync(resolved.target, 'utf8').split('\n').length;
+    if (c.stop > lineCount) {
+      offenders.push(`${key} -- ${resolved.root} file ${resolved.target} has only ${lineCount} lines`);
+    }
+  }
+
+  assert.deepEqual(
+    repoAbsentOffenders,
+    [],
+    `citation(s) this ratchet could not verify because a cross-repo dependency is missing from ` +
+      `disk -- this is a setup problem, never a silent pass (E1):\n  ${repoAbsentOffenders.join('\n  ')}`
+  );
+  assert.deepEqual(
+    offenders,
+    [],
+    `dangling citation(s), not on CITATION_ALLOWLIST:\n  ${offenders.join('\n  ')}`
   );
 });
 
-test('every file:line citation in doc/state-machine-spec.md and orchestrator/README.md resolves', () => {
-  let checked = 0;
-  const offenders = [];
-  for (const docFile of CITATION_DOCS) {
-    const stripped = stripFences(read(docFile));
+// ---- fixture tests: normalizeWrap / extractCitations, exercised against synthetic strings so
+// this scanner stays provably correct independent of what the real corpus happens to say today.
+// Same rationale as no-real-spawn-sweep.test.js's own fixture block.
+
+test('normalizeWrap: a hyphen-wrapped identifier reads as one contiguous string', () => {
+  const src = ['// see doc/state-machine-', '// spec.md:49 for the invariant'].join('\n');
+  const normalized = normalizeWrap(src);
+  assert.match(normalized, /doc\/state-machine-spec\.md:49/);
+  // Mutation proof: a no-op normalizeWrap must leave the wrap broken (the citation regex would
+  // then only ever see the truncated "spec.md:49", never the real path).
+  assert.doesNotMatch(src, /doc\/state-machine-spec\.md:49/);
+});
+
+test('normalizeWrap: an ordinary prose wrap (no trailing hyphen/slash) still collapses to a single space, never a false join', () => {
+  const src = ['// this sentence wraps normally', '// right here, not at a path'].join('\n');
+  const normalized = normalizeWrap(src);
+  // The leading "// " on the FIRST line is untouched (only a line break's own comment leader is
+  // ever stripped, by design -- normalizeWrap joins wrap points, it does not blank comments).
+  assert.equal(normalized, '// this sentence wraps normally right here, not at a path');
+});
+
+test('extractCitations: a full citation establishes the file a later bare chain resolves against', () => {
+  const text = 'see `account-lease.js:156` -> `lock.js:255` acquireShortLock -> `:289` tryCreate';
+  const cites = extractCitations(text);
+  const raws = cites.map((c) => c.raw);
+  assert.deepEqual(raws, ['account-lease.js:156', 'lock.js:255', 'lock.js:289']);
+  assert.equal(cites[2].file, 'lock.js', 'the bare `:289` chain must resolve against the nearest preceding file, lock.js, not account-lease.js');
+});
+
+test('extractCitations: a bare chain with no real citation within range is reported unanchored, never mis-attributed', () => {
+  const farAway = 'x'.repeat(PROXIMITY_CHARS + 50);
+  const text = `\`worker.ts:106\` ${farAway} \`:576\``;
+  const cites = extractCitations(text);
+  const chain = cites.find((c) => c.raw.includes('576'));
+  assert.equal(chain.unanchored, true, 'a chain match beyond PROXIMITY_CHARS must not silently attach to a distant earlier citation');
+  assert.equal(chain.file, null);
+});
+
+test('extractCitations: the possessive "(line N)" shape is extracted with its filename', () => {
+  const text = "SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 217) rmSync's the report";
+  const cites = extractCitations(text);
+  assert.deepEqual(cites.map((c) => c.raw), ['SPO-WebClient/src/e2e/bench/job.ts:217']);
+});
+
+// ---- M-2026-09-03: the resolver used to read the WRONG FILE, silently.
+//
+// findByBasename walked the tree with readdirSync and returned the first basename match, skipping
+// only `.git` and `node_modules`. `/home/crazz/SPO-WebClient` carries abandoned agent worktrees
+// under `.claude/worktrees/<slug>/`, each a whole copy of the product tree, and `.claude` sorts
+// before `src` -- so `worker.ts:892` resolved to a months-old copy with 759 lines and was
+// line-checked against THAT. Four cross-repo citations were stale in the corpus while this sweep
+// ran green, including two the sweep's own EXPECTED_CITATIONS had pinned as verified.
+//
+// These two tests are hermetic (a throwaway git repo in tmpdir), so they pin the resolver's
+// contract rather than whatever happens to be on this machine's disk today.
+function makeFixtureRepo(layout) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-citation-resolver-'));
+  for (const [rel, body] of Object.entries(layout)) {
+    const full = path.join(root, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, body);
+  }
+  execFileSync('git', ['-C', root, 'init', '-q']);
+  execFileSync('git', ['-C', root, 'add', '-A']);
+  return root;
+}
+
+test('findByBasename: a copy inside a NESTED WORKTREE never shadows the repo\'s own tracked file', () => {
+  // The nested copy is present on disk and is NOT tracked -- exactly the shape of an abandoned
+  // `.claude/worktrees/<slug>/` checkout. It also sorts first, which is what made the old
+  // readdir walk pick it.
+  const root = makeFixtureRepo({ 'src/e2e/bench/worker.ts': 'export const real = 1;\n' });
+  const shadow = path.join(root, '.claude/worktrees/stale/src/e2e/bench/worker.ts');
+  fs.mkdirSync(path.dirname(shadow), { recursive: true });
+  fs.writeFileSync(shadow, 'export const stale = 1;\n');
+  _trackedCache.delete(root);
+
+  const hits = findByBasename('worker.ts', root);
+  assert.deepEqual(
+    hits,
+    [path.join(root, 'src/e2e/bench/worker.ts')],
+    'the untracked nested-worktree copy leaked into resolution -- a citation would be line-checked against the wrong file'
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolveIn: an ambiguous basename is reported as ambiguous, never silently resolved to the first match', () => {
+  const root = makeFixtureRepo({
+    'src/e2e/config.ts': 'export const a = 1;\n',
+    'src/shared/config.ts': 'export const b = 2;\n',
+  });
+  _trackedCache.delete(root);
+
+  const resolved = resolveIn(root, 'config.ts');
+  assert.ok(resolved && resolved.ambiguous, 'a basename shared by two tracked files must not resolve to one of them');
+  assert.deepEqual(resolved.ambiguous.map((f) => path.relative(root, f)).sort(), ['src/e2e/config.ts', 'src/shared/config.ts']);
+  assert.equal(resolved.target, undefined, 'ambiguous resolution must carry no target -- a target is what a caller line-checks against');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolveCitationTarget: resolves a local repo path before ever trying the product repo', () => {
+  const resolved = resolveCitationTarget('orchestrator/config.js');
+  assert.equal(resolved.root, 'repo');
+});
+
+test('resolveCitationTarget: an absent product repo is reported as product-absent, never as a silent dangling/pass', () => {
+  const savedEnv = process.env.SPO_PRODUCT_REPO;
+  // Point PRODUCT_REPO-shaped resolution at a path that cannot exist -- re-require the module in
+  // isolation is not worth it for one env var; instead exercise resolveIn/fs.existsSync directly
+  // via a path guaranteed absent, proving the underlying primitive this function is built from.
+  const bogusRoot = path.join(os.tmpdir(), `spo-citation-sweep-absent-${process.pid}-${Date.now()}`);
+  assert.equal(fs.existsSync(bogusRoot), false, 'fixture precondition: bogusRoot must not exist');
+  assert.equal(resolveIn(bogusRoot, 'anything.ts'), null);
+  if (savedEnv === undefined) delete process.env.SPO_PRODUCT_REPO;
+  else process.env.SPO_PRODUCT_REPO = savedEnv;
+});
+
+// ---- part 3: dangling doc/*.md path reference check (E3, action 9.2) ---------------------------
+//
+// doc/comment-corpus-audit-2026-09-03.md's E3: a comment or doc names a `doc/<name>.md` path with
+// NO line number (so part 2's citation ratchet never sees it -- that scanner only fires on
+// `path:N`) and the path resolves nowhere: not in this repo, not in the product, not runtime-
+// generated. Property: every bare `doc/<name>.md` reference resolves in this repo, in the
+// product repo (config.js's default `~/SPO-WebClient`, reusing resolveCitationTarget's own
+// PRODUCT_REPO/DEPLOY_REPO from part 2), or is on DANGLING_DOC_REF_ALLOWLIST with a reason.
+const DOC_REF_RE = /\bdoc\/[A-Za-z0-9_-]+\.md\b/g;
+
+// DANGLING_DOC_REF_ALLOWLIST: per-path, same posture as this file's other allowlists. Three
+// shapes, each with its own reason:
+//   - genuinely dangling (never existed anywhere) -- doc/daemon-crash-recovery.md and doc/todo-
+//     triage-after-hooks-retirement.md. Not fixed here: writing the doc from scratch would mean
+//     inventing the incident's content rather than citing it, and deleting the citation is a
+//     judgement call about whether the surrounding comment still makes sense without it -- both
+//     belong to 9.3, per this action's own brief ("where a fix is a judgement call, allowlist it").
+//   - runtime-generated, never committed -- doc/recette-log.md and its per-parallel-index
+//     siblings (recette.js's own header explains why: written by a REAL, unattended recette run
+//     against `~/.spo-bench/`, never present in a fresh worktree by design).
+const DANGLING_DOC_REF_ALLOWLIST = {
+  'doc/daemon-crash-recovery.md': 'orchestrator/config.js:489 -- never existed (git log --all has no history for this path); the incident it names is recorded only in the maintainer\'s own memory, not this repo. Deferred to 9.3: write the doc, or drop the citation.',
+  'doc/todo-triage-after-hooks-retirement.md': 'orchestrator/state-machine.js:930 -- never existed in this repo (nor the product); the name matches a maintainer memory-file title, not a tracked doc. Deferred to 9.3.',
+  'doc/recette-log.md': 'orchestrator/recette.js:229,254,447 -- RECETTE_DOC_FILE, written by a real unattended recette run against `~/.spo-bench/`; absent in a fresh worktree by design, not a broken reference.',
+  'doc/recette-log-a.md': 'orchestrator/recette.js:458-459 -- parallel-index sibling of RECETTE_DOC_FILE, same runtime-generated posture.',
+  'doc/recette-log-b.md': 'orchestrator/recette.js:458-459 -- parallel-index sibling of RECETTE_DOC_FILE, same runtime-generated posture.',
+};
+
+test('DANGLING_DOC_REF_ALLOWLIST holds exactly the paths this action found dangling or runtime-only -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(DANGLING_DOC_REF_ALLOWLIST).sort(),
+    ['doc/daemon-crash-recovery.md', 'doc/recette-log-a.md', 'doc/recette-log-b.md', 'doc/recette-log.md', 'doc/todo-triage-after-hooks-retirement.md'],
+    'DANGLING_DOC_REF_ALLOWLIST changed -- update this pin in the same change, with a named reason.'
+  );
+});
+
+test('every bare "doc/<name>.md" reference in the 65-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
+  const found = new Map(); // path -> [rel,...]
+  for (const rel of CORPUS_FILES) {
+    const src = read(rel);
     let m;
-    while ((m = CITATION_RE.exec(stripped))) {
-      const [full, filePath, startStr, endStr] = m;
-      if (KNOWN_FICTIONAL.has(full)) continue;
-      checked += 1;
-      const target = filePath.includes('/') ? abs(filePath) : findByBasename(filePath, REPO_ROOT);
-      if (!target || !fs.existsSync(target)) {
-        offenders.push(`${docFile}: ${full} -- no such file`);
-        continue;
-      }
-      const lineCount = fs.readFileSync(target, 'utf8').split('\n').length;
-      const end = Number(endStr || startStr);
-      if (end > lineCount) {
-        offenders.push(`${docFile}: ${full} -- ${target} has only ${lineCount} lines`);
-      }
+    const re = new RegExp(DOC_REF_RE.source, 'g');
+    while ((m = re.exec(src))) {
+      if (!found.has(m[0])) found.set(m[0], []);
+      found.get(m[0]).push(rel);
     }
   }
 
-  // FINDING 6 (adversarial review, 2026-09-02): this comment previously claimed 11 real
-  // citations, measured wrong -- the actual count at the time was 10 (re-derived, not trusted
-  // from the prior comment). This action's own citation fixes changed the true count again:
-  // `intake.js:1174` (the [^rdo-wire] footnote) was re-pointed BY NAME, matching how
-  // step-contracts.js:93 and steps/scripted.js:1214 already cite `intake.js`'s `makeTask` (no
-  // line number at all -- see that footnote), which removes one line-number citation from this
-  // regex's count entirely; the drifted `intake.js:744-746` citations (both docs) were corrected
-  // to `747-749`, which does not change the count. Re-measured after both fixes: 9. A regex that
-  // stopped matching (a reformat, a renamed backtick style) would pass vacuously -- fail loudly
-  // instead, same posture as this suite's other siteCount/checked floors. Existence-only by
-  // construction (registered in doc/accepted-gaps.md): this cannot detect a citation repointed to
-  // a WRONG line within a file that still has enough lines to satisfy it.
-  assert.ok(checked >= 8, `expected several file:line citations, found ${checked} -- has the citation style changed?`);
-  assert.deepEqual(offenders, [], `dangling citation(s):\n  ${offenders.join('\n  ')}`);
+  assert.ok(found.size >= 10, `expected at least 10 distinct "doc/<name>.md" references across the corpus, found ${found.size} -- has the reference style changed?`);
+
+  const offenders = [];
+  const repoAbsentOffenders = [];
+  for (const [docPath, sites] of found) {
+    if (Object.prototype.hasOwnProperty.call(DANGLING_DOC_REF_ALLOWLIST, docPath)) continue;
+    if (fs.existsSync(abs(docPath))) continue;
+    const resolved = resolveCitationTarget(docPath);
+    if (resolved.root === 'product-absent' || resolved.root === 'deploy-absent') {
+      repoAbsentOffenders.push(`${docPath} -- cited from ${[...new Set(sites)].join(', ')}; cannot verify, cross-repo dependency missing from disk`);
+      continue;
+    }
+    if (resolved.ambiguous) {
+      offenders.push(`${docPath} -- cited from ${[...new Set(sites)].join(', ')}; ambiguous basename, ${resolved.ambiguous.length} tracked files in the ${resolved.root} repo share it (${resolved.ambiguous.join(', ')})`);
+      continue;
+    }
+    if (!resolved.target) {
+      offenders.push(`${docPath} -- cited from ${[...new Set(sites)].join(', ')}; not found in this repo, ${PRODUCT_REPO}, or ${DEPLOY_REPO}`);
+    }
+  }
+
+  assert.deepEqual(repoAbsentOffenders, [], `path(s) this ratchet could not verify because a cross-repo dependency is missing from disk (E1: never a silent pass):\n  ${repoAbsentOffenders.join('\n  ')}`);
+  assert.deepEqual(offenders, [], `dangling "doc/<name>.md" reference(s), not on DANGLING_DOC_REF_ALLOWLIST:\n  ${offenders.join('\n  ')}`);
+});
+
+// ---- part 4: SPO-Deploy artifact reference check (E1 residual, fix round S4) -------------------
+//
+// verify-92.md's Q6 finding (2026-09-03 adversarial pass): DEPLOY_REPO (part 2, above) is wired
+// into resolveCitationTarget's fallback chain, but 0 of the 68 pinned file:line citations ever
+// reach it -- every citation this corpus makes to a SPO-Deploy file happens to be a BARE filename
+// mention with no line number (`` SPO-Deploy's `DEPLOY.md` § 5.5 ``, `cd ~/SPO-Deploy &&
+// ./deploy.sh setup dev`), the same shape part 3's DOC_REF_RE exists for `doc/<name>.md` -- so
+// `SPO_DEPLOY_REPO=/nonexistent` left the suite green not because SPO-Deploy resolution was
+// exercised and passed, but because nothing in the corpus was shaped to reach it at all. That is
+// exactly the trap this project keeps hitting: a resolution path that LOOKS like coverage while
+// checking nothing.
+//
+// This closes the specific, checkable subset: the three real SPO-Deploy artifacts this corpus
+// actually names by filename (measured 2026-09-03: `DEPLOY.md` -- orchestrator/README.md:1667;
+// `deploy.sh` and `setup.conf.example` -- doc/setup.md:11,15), each verified to exist in
+// DEPLOY_REPO, or reported as a setup problem (E1 posture, never a silent pass) if DEPLOY_REPO
+// itself is absent from disk.
+//
+// What this does NOT cover, named rather than left to look covered: roughly a dozen more corpus
+// lines name "SPO-Deploy" as a bare ENTITY ("owned by SPO-Deploy", "Consumes product releases",
+// "a `spo dashboard` + rsync concern owned by SPO-Deploy") with no specific artifact attached --
+// there is nothing in those sentences for a scanner to resolve against a file, the same reason
+// DOC_REF_RE never fires on a sentence that merely says "see the docs". Those are true prose
+// references this sweep does not, and structurally cannot, check without inventing a claim about
+// what they mean; SPO-Deploy's own README.md § Setup (doc/setup.md:73's citation) is likewise out
+// of scope for the same reason -- a section-heading reference, not a file this sweep can resolve.
+const SPO_DEPLOY_ARTIFACTS = ['DEPLOY.md', 'deploy.sh', 'setup.conf.example'];
+
+test('the SPO-Deploy artifact filenames this corpus mentions are exactly SPO_DEPLOY_ARTIFACTS -- no more, no fewer', () => {
+  const mentioned = new Set();
+  for (const rel of CORPUS_FILES) {
+    const src = read(rel);
+    for (const name of SPO_DEPLOY_ARTIFACTS) {
+      if (src.includes(name)) mentioned.add(name);
+    }
+  }
+  assert.deepEqual(
+    [...mentioned].sort(),
+    SPO_DEPLOY_ARTIFACTS.slice().sort(),
+    'the set of SPO-Deploy artifacts this corpus actually mentions by filename changed -- update ' +
+      'SPO_DEPLOY_ARTIFACTS (and verify the new/changed name actually resolves in SPO-Deploy) in ' +
+      'the same change, by name, the same way this file\'s other pinned lists work.'
+  );
+});
+
+test('every SPO_DEPLOY_ARTIFACTS filename actually exists in SPO-Deploy, or its absence is reported as a setup problem (E1)', () => {
+  if (!fs.existsSync(DEPLOY_REPO)) {
+    assert.fail(
+      `SPO-Deploy is not on disk at ${DEPLOY_REPO} -- cannot verify ${SPO_DEPLOY_ARTIFACTS.length} ` +
+        'artifact reference(s) this corpus names by filename; this is a setup problem, never a ' +
+        'silent pass (E1).'
+    );
+  }
+  const missing = SPO_DEPLOY_ARTIFACTS.filter((name) => !fs.existsSync(path.join(DEPLOY_REPO, name)));
+  assert.deepEqual(
+    missing,
+    [],
+    `SPO-Deploy artifact(s) this corpus names by filename but that do not exist at ${DEPLOY_REPO}:\n  ${missing.join('\n  ')}`
+  );
 });

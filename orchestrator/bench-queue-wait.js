@@ -36,7 +36,7 @@
 //     action, days later, on the same machine. THE SPOOL ROTATES, and that is what explains the
 //     drop from 8 to 5: SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 217) rmSync's
 //     every report whose mtime is older than the retention window it is passed, and worker.ts
-//     calls it on each pass with DONE_RETENTION_MS = 24h (worker.ts:106, called at :576). So
+//     calls it on each pass with DONE_RETENTION_MS = 24h (worker.ts:108, called at :689). So
 //     ~/.spo-bench/done is a ONE-DAY sliding window, and every number below is the worst service
 //     time seen within a day, NOT an all-time record -- a genuinely worse job could have run and
 //     been swept before either measurement. Recorded plainly because it bounds what these
