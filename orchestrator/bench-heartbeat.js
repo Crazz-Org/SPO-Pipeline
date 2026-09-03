@@ -55,6 +55,22 @@ const HEARTBEAT_STALE_MS = 20_000;
  * content isn't a parseable timestamp. Reads by CONTENT -- the epoch ms touchHeartbeat wrote --
  * never by mtime; see this file's header for why that side of the contract matters as much as
  * the bound does.
+ *
+ * TWO on-disk shapes, and both must keep working:
+ *
+ *   legacy  `1788436013067`                       -- a bare epoch, every heartbeat before B5.2
+ *   B5.2    `{"writtenAt":178...,"currentJob":..}` -- the tick PLUS which job is in flight
+ *
+ * B5.2 (SPO-WebClient) makes the worker carry `{currentJob, startedAt}` so a client can tell a
+ * worker that is ALIVE from one that is PROGRESSING -- today an idle worker and one wedged
+ * mid-job look identical here, because the beat rides its own timer and says nothing about the
+ * loop. This reader lands FIRST and on purpose: JSON-then-fallback reads both shapes, whereas
+ * the worker shipping JSON against a `Number(raw)` reader turns every heartbeat into `unknown`
+ * and regresses `spo status` / `spo dashboard` from an accurate up/stale answer to none at all.
+ *
+ * `JSON.parse('123')` SUCCEEDS and yields a number, so a bare try/catch is not enough to tell the
+ * two shapes apart -- the object check is what does it, and dropping it misreads every legacy
+ * heartbeat as corrupt. (The same trap bit B5.2's own first implementation on the WebClient side.)
  */
 function heartbeatAgeMs(heartbeatFile, nowMs = Date.now()) {
   let raw;
@@ -63,6 +79,19 @@ function heartbeatAgeMs(heartbeatFile, nowMs = Date.now()) {
   } catch {
     return null;
   }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const writtenAt = Number(parsed.writtenAt);
+    if (!Number.isFinite(writtenAt)) return null;
+    return nowMs - writtenAt;
+  }
+
   const writtenMs = Number(raw);
   if (!Number.isFinite(writtenMs)) return null;
   return nowMs - writtenMs;
