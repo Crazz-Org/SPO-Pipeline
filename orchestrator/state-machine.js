@@ -1314,12 +1314,14 @@ function snapshot(ctx, state) {
 //   gate-live-blocked       -- action B2.3's realGate throws this on an exit-1 `BLOCKED` verdict
 //                               whose `live` fact is NOT "routed but undriven" (that shape stays
 //                               `gate-live-not-driven`, below, deliberately not on this list).
-//                               SPO-WebClient's `run.ts:64` `runLive` returns BLOCKED from
-//                               exactly one place -- the world lock refused the run (dirty, or
-//                               another live run already in flight -- `world-lock.ts`'s single-
-//                               flight error) -- or, structurally possible but dead today
-//                               (`E2E_MIN_INTERVAL_MINUTES=0`/`E2E_MAX_RUNS_PER_DAY=1000`, no
-//                               override set anywhere in this tree), a rate limit. The
+//                               SPO-WebClient's `run.ts:63` `runLive` returns BLOCKED from
+//                               exactly one place now -- the world lock refused the run (dirty,
+//                               or another live run already in flight -- `world-lock.ts`'s
+//                               single-flight error). Action B3.5 (SPO-WebClient PR #646)
+//                               DELETED the second producer, a live-run rate limiter that could
+//                               never fire (`minIntervalMinutes: 0`, `maxRunsPerDay: 1000`);
+//                               `checkRateLimit` and its `run-history.json` ledger are gone, so
+//                               the world lock is the whole of it. The
 //                               operational case this exists for: a maintainer running
 //                               `gate:local --live` takes that single-flight lock, and it clears
 //                               itself within minutes -- parking the daemon's card permanently

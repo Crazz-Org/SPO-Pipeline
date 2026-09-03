@@ -27,7 +27,7 @@
 // hoc.
 //
 // A fix-round finding (adversarial verification T4/T5) narrowed (b) further: `BLOCKED` is not
-// only produced by a routed-but-undriven diff. `run.ts:64`'s `runLive` also returns BLOCKED when
+// only produced by a routed-but-undriven diff. `run.ts:63`'s `runLive` also returns BLOCKED when
 // the world lock refuses the run (dirty, or another live run already in flight -- single-flight)
 // or, structurally possible but dead today, a rate limit -- and `liveAttestationFrom` maps THAT
 // to `live.status: 'unknown'`, the identical value (c) reads as proof of nothing. A bare
@@ -162,7 +162,7 @@ for (const [label, gateExit] of [
 
 // ---- BLOCKED, but NOT routed-but-undriven -- fix-round finding T4/T5 --------------------------
 //
-// `run.ts:64`'s `runLive` is the OTHER producer of a BLOCKED verdict: the world lock refused the
+// `run.ts:63`'s `runLive` is the OTHER producer of a BLOCKED verdict: the world lock refused the
 // run (dirty, or another live run already in flight) or, structurally possible but dead today, a
 // rate limit. `liveAttestationFrom` maps all three to `live.status: 'unknown'` -- never
 // `'skipped'` with a `required` list -- so `liveRoutedButNotDriven` is false and this must NOT
