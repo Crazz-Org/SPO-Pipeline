@@ -438,7 +438,7 @@ field in the detail, from **two** call sites in `state-machine.js`:
   possible catch: INTAKE is scripted, so the card parks having spent zero LLM calls, and still
   gets the full standard park treatment — a park comment on the issue, the kanban move, the
   maintainer's `retry`/`abandon` path — which refusing to enqueue the card in `intake.js`'s
-  `pullOne` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It
+  `pullBoard` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It
   is free insurance, not the mechanism that saved #428's $12.01 — #428's own criterion says "both
   kept hooks" and "the hook script", never a path, so this site scores zero hits (true or false)
   across all 17 real cards measured.
@@ -2357,6 +2357,74 @@ only these files (plus `queue/` for depth, and the account pool, `~/.spo-bench`,
 subcommands DO write local or live state: `account add`/`account enable`/`account disable`/
 `account clear-cooldown` touch the account pool and `state.json`/`daemon.jsonl`; `ask`/`pull`/
 `intake`/`triage --file`/`recette` write to real GitHub. See `bin/spo`'s own header comment.
+
+### Journal event literals
+
+`journal.jsonl`/`daemon.jsonl` carry many more event names than the ones called out in prose
+elsewhere in this doc. The table below is that missing index — one row per event literal
+`doc/comment-corpus-audit-2026-09-03.md`'s E2 finding (action 9.1) found reachable but
+undocumented, read from its real `appendEvent`/`appendDaemonEvent`/`journal(...)`-alias call
+site(s), not guessed from the name. **Kind** is `task` for a per-card `journal.jsonl` line,
+`daemon` for a repo-wide `daemon.jsonl` line (see "Where journals live" above for the
+task/daemon split itself).
+
+| Event | Kind | What it records |
+|---|---|---|
+| `account-cooldown-cleared` | daemon | `spo account clear-cooldown <name>` manually cleared an account's cooldown — journalled so a hand edit of the account pool still leaves a trace (`bin/spo`). |
+| `abandon-branch-deleted` | task | `abandon` cleanup deleted the local `claude-pipe/<id>` branch once ancestry proved it safe to drop (`park-loop.js`). |
+| `abandon-cleanup-failed` | task | one step of `abandon` cleanup (PR close, worktree remove, local/remote branch delete) exited non-zero or hit an unexpected error — `detail.step` says which (`park-loop.js`). |
+| `abandon-cleanup-skipped` | task | the worktree step of `abandon` cleanup was skipped because `git status` itself failed or the tree was dirty — a dirty tree is never destroyed (`park-loop.js`). |
+| `abandon-pr-closed` | task | `abandon` cleanup closed the card's open PR (`gh pr close`) before touching the worktree or branch (`park-loop.js`, via its `journal(...)` alias). |
+| `abandon-remote-branch-deleted` | task | `abandon` cleanup deleted the remote branch after its tip was vouched for (merged) or preserved (`park-loop.js`). |
+| `abandon-remote-preserved` | task | `abandon` cleanup pushed the remote branch's unmerged tip to a throwaway ref before deleting the branch (`park-loop.js`). |
+| `abandon-worktree-removed` | task | `abandon` cleanup ran `git worktree remove --force` on a clean tree (`park-loop.js`). |
+| `checks-green` | task | CI_CHECKS found every required check passing, routing on to VALIDATE or a main-moved regate (`state-machine.js` / `steps/scripted.js`). |
+| `ci-implement-retry` | task | CI_CHECKS routed back to IMPLEMENT for another attempt; records the attempt number and the failing check/step that caused it (`state-machine.js`). |
+| `ci-step-lookup-failed` | task | CI_CHECKS could not look up a failing job's step detail via `gh api .../actions/jobs/<id>` (exception, non-zero exit, or unparsable JSON) — routing falls back to check-level classification (`steps/scripted.js`). |
+| `comment-scan-backoff-skip` | task | `comment-scan.js`'s own default name for "skipped this cycle, still backed off from a recent `gh` failure" — reached only by a caller that omits its own event override; today's two callers (unpark scan, report-confirm scan) always override it (`comment-scan.js`). |
+| `comment-scan-ignored-unauthorized` | task | same posture: `comment-scan.js`'s default name for "a comment matched a keyword but its author is not an authorized collaborator" (`comment-scan.js`). |
+| `comment-scan-truncated` | task | same posture: `comment-scan.js`'s default name for "the comment fetch hit `maxPages` before reaching the end of the issue's comments" (`comment-scan.js`). |
+| `diagnose-surface-skipped` | task | DIAGNOSE could not post its "diagnosing, attempt N/3" comment because the card carries no GitHub issue number (`park-loop.js`). |
+| `diff-empty` | task | the diff captured for this state came back empty even though `committed` files were listed (`steps/scripted.js`). |
+| `dispatcher-start` | daemon | the dispatcher process started; records its pid and configured worker count, and anchors a later "pool idle" edge to this process (`dispatcher.js`). |
+| `empty-implement` | task | IMPLEMENT's payload declared `files_changed` but the list parsed empty — routes to DIAGNOSE (`state-machine.js`). |
+| `force-state` | task | a shadow-mode task's `task.shadow.forceState` short-circuited INTAKE straight to the named state — a test/fixture hook (`state-machine.js`). |
+| `gate-main-moved-abort-failed` | task | GATE's `git merge --abort` (cleaning up a failed main-moved regate merge) itself exited non-zero or hit a spawn timeout (`steps/scripted.js`). |
+| `gate-main-moved-fetch-failed` | task | GATE's `git fetch origin main` (refreshing before a main-moved regate) exited non-zero — not fatal, continues with the local tip (`steps/scripted.js`). |
+| `gate-main-moved-rev-parse-failed` | task | GATE's `git rev-parse origin/main` (checking whether the refreshed main is nightly-red) exited non-zero — the red-main guard is skipped, not fatal (`steps/scripted.js`). |
+| `gate-verdict` | task | the bench's verdict for this head sha (`{verdict, baseMain, merged}`) was read and journalled before GATE routes on it (`steps/scripted.js`). |
+| `invariants-declared-parsed-mismatch` | task | PLAN's declared `invariant_ids` count disagrees with the count `invariants.js` actually parsed from the worktree — a signal to go look at the parser, never a park (`state-machine.js`, two call sites). |
+| `leftover-branch-deleted` | task | WORKTREE's retry-leftover sweep deleted a stale local `claude-pipe/<id>` branch it proved safe to drop (`steps/scripted.js`). |
+| `leftover-pr-closed` | task | the leftover sweep closed an open PR on the stale branch before deleting the remote ref (`steps/scripted.js`). |
+| `leftover-pr-lookup-failed` | task | the leftover sweep's `gh pr list` for the stale branch failed or returned unparsable JSON — the delete is refused rather than risk closing an invisible PR (`steps/scripted.js`). |
+| `leftover-remote-preserved` | task | the leftover sweep pushed the stale remote branch's unmerged tip to a `wip/` ref before deleting it (`steps/scripted.js`). |
+| `leftover-worktree-removed` | task | the leftover sweep removed (or pruned the registration of) a stale worktree directory (`steps/scripted.js`). |
+| `no-worktree-change` | task | IMPLEMENT's `files_changed` claim was non-empty but `git status --porcelain` on the worktree came back clean — routes to DIAGNOSE (card #385's cross-check, `state-machine.js`). |
+| `orphan-scan-unknown-owner` | daemon | the daemon-startup orphan scan found a task `state.json` with no recognisable `owner.workerPid`/`owner.pid` — skipped rather than guessed at (`orphan-scan.js`). |
+| `park-comment-skipped` | task | the PARKED-state board comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
+| `park-repeat` | task | this park shares the same reason+detail fingerprint as an earlier park on the same card, at least twice — feeds the park comment's "repeated" wording (`state-machine.js`). |
+| `pr-body-patch-failed` | task | PUSH_PR's `gh api ... -X PATCH` re-titling a reused PR exited non-zero — the reuse still proceeds to GATE (`steps/scripted.js`). |
+| `pr-created` | task | `gh pr create` succeeded; records the new PR number before routing to GATE (`steps/scripted.js`). |
+| `pr-merge-enqueue` | task | MERGE's enqueue step (`gh pr merge --merge`, or the scripted `prMergeEnqueue`) ran; records its exit code before `pr:wait` (`state-machine.js` / `steps/scripted.js`). |
+| `pr-reused` | task | PUSH_PR found an already-open PR for this branch and reused it (patching its body) instead of creating a new one (`steps/scripted.js`). |
+| `remote-branch-cleaned` | task | the leftover sweep's final step: the stale remote branch was deleted (`git push origin --delete`) once any PR was closed and the tip preserved or vouched for (`steps/scripted.js`). |
+| `remote-report-pull-failed` | daemon | a periodic remote-report pull tick failed — either the pull itself reported `ok: false`, or the call threw (`remote-report-pull.js`). |
+| `report-confirm-scan-ignored-author` | daemon | `report-intake.js`'s own name for `comment-scan.js`'s shared `ignoredAuthor` event, reached by the confirm/discard comment scan (`report-intake.js`, via `comment-scan.js`). |
+| `report-intake-cycle` | daemon | one report-intake pass filed, deduplicated, or otherwise disposed of at least one report; summarises `processed`/`filed`/`duplicates`/`schemaVersion`/`errors` for the cycle (`report-intake.js`). |
+| `report-promote-failed` | daemon | auto-triage's move of a confirmed report's issue to the `Todo` column failed (`board.moveIssueToColumn` returned not-ok) (`auto-triage.js`). |
+| `scanner-exit-during-shutdown` | daemon | the scanner subprocess exited while the daemon was already stopping — not counted as a crash (`dispatcher.js`). |
+| `scanner-orphan-exit` | daemon | a scanner process detected its parent pid no longer matches the daemon that spawned it, and exited rather than keep running detached (`state-machine.js`'s `runScanCycle` guard). |
+| `scanner-spawn` | daemon | the dispatcher spawned the (single) scanner subprocess; records its pid (`dispatcher.js`). |
+| `touches-rdo-members-rederived` | task | PUSH_PR's real diff touched the RDO members catalogue even though intake's own guess (`ctx.task.touchesRdoMembers`) said it wouldn't — the flag is corrected before CITATION_VERIFIER runs (`steps/scripted.js`). |
+| `uncaught-error` | daemon | `daemon.js`'s top-level handler caught an otherwise-uncaught exception or unhandled rejection; records the crash context (mode, id, taskDir) and a capped message/stack before the process exits (`daemon.js`). |
+| `unpark-scan-backoff-skip` | task | `park-loop.js`'s own name for `comment-scan.js`'s shared `backoffSkip` event, reached when the unpark (retry/abandon) comment scan is still backed off from a recent `gh` failure (`park-loop.js`, via `comment-scan.js`). |
+| `validate-findings-post-skipped` | task | VALIDATE's findings comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
+| `wip-preserve-failed` | task | `preserveWorktreeWip` could not commit/push a dirty worktree's diff to a `wip/` ref before a park (a spawn timeout, or a failed `git status`/`checkout --detach`/etc. step) — the park still proceeds without a wip ref (`steps/scripted.js`). |
+| `worker-crash-repark-failed` | daemon | the dispatcher's own attempt to repark a crashed worker's task itself failed (couldn't read `task.json`, or an unexpected error mid-repark) (`dispatcher.js`). |
+| `worker-exit` | daemon | a worker process exited; records its outcome (done/parked/crashed), code, and signal (`dispatcher.js`). |
+| `worker-exit-after-terminal` | daemon | a worker process produced exit-path activity after its task was already DONE/PARKED/ABANDONED on disk — not reparked, so a second writer never races the terminal state (`dispatcher.js`). |
+| `worker-exit-during-shutdown` | daemon | a worker crashed while the daemon was already stopping — not counted against the crash-loop breaker (`dispatcher.js`). |
+| `worker-spawn` | daemon | the dispatcher spawned a new worker process for a claimed task; records its pid (`dispatcher.js`). |
 
 ## CLI
 
