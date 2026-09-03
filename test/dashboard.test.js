@@ -12,6 +12,10 @@ const path = require('path');
 const crypto = require('crypto');
 
 const { mkTmp, runSpo, writePoolDir } = require('./helpers');
+// Killswitch first, textually, before this file's own direct `require('../orchestrator/...')`
+// below (HEARTBEAT_STALE_MS) -- see test/no-real-spawn.js's header and
+// test/no-real-spawn-sweep.test.js's standing guard over this exact ordering rule.
+require('./no-real-spawn');
 const {
   collectAll,
   collectServices,
@@ -23,6 +27,7 @@ const {
 } = require('../console/collect');
 const { renderDashboard, renderDataFragments } = require('../console/render');
 const { saveRollups } = require('../console/usage-rollups');
+const { HEARTBEAT_STALE_MS } = require('../orchestrator/bench-heartbeat');
 
 function writeJson(filePath, obj) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -278,6 +283,31 @@ test('collectServices reads a fresh bench heartbeat as up and an old one as stal
 
   const staleServices = collectServices({ benchRoot: benchRootStale });
   assert.equal(staleServices.benchWorker.status, 'stale');
+});
+
+// Action B5.3: the bound is HEARTBEAT_STALE_MS (20s -- 4 missed beats of the worker's 5s
+// HEARTBEAT_PERIOD_MS), not the 120s this tile used to carry. A heartbeat this old is squarely
+// inside the gap the old bound would have called "up" and the new one correctly calls "stale" --
+// this is the test a revert of the bound to 120000 (or any value >= 30s) reds.
+test('collectServices marks a heartbeat older than HEARTBEAT_STALE_MS but younger than the old 120s bound as stale', () => {
+  assert.ok(HEARTBEAT_STALE_MS < 30_000, 'this test assumes the bound is well under 30s -- see orchestrator/bench-heartbeat.js');
+  const benchRoot = mkTmp('spo-dash-bench-30s-');
+  writeJson(path.join(benchRoot, 'worker.json'), { pid: 1, startedAt: new Date().toISOString(), port: 8080 });
+  fs.writeFileSync(path.join(benchRoot, 'heartbeat'), String(Date.now() - 30_000));
+
+  const services = collectServices({ benchRoot });
+  assert.equal(services.benchWorker.status, 'stale');
+});
+
+// The other edge of the same bound: a heartbeat just inside HEARTBEAT_STALE_MS must still read
+// "up" -- pins the exact threshold, not just "eventually turns stale somewhere".
+test('collectServices marks a heartbeat just inside HEARTBEAT_STALE_MS as up', () => {
+  const benchRoot = mkTmp('spo-dash-bench-inbound-');
+  writeJson(path.join(benchRoot, 'worker.json'), { pid: 1, startedAt: new Date().toISOString(), port: 8080 });
+  fs.writeFileSync(path.join(benchRoot, 'heartbeat'), String(Date.now() - (HEARTBEAT_STALE_MS - 1_000)));
+
+  const services = collectServices({ benchRoot });
+  assert.equal(services.benchWorker.status, 'up');
 });
 
 // ---- action 5.5, item B audit: nightly + bench verdicts staleness (STALE_BENCH_AGE_MS) --------
