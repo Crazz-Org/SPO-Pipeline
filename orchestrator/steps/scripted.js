@@ -2052,9 +2052,10 @@ async function realGate(ctx, deps = {}) {
     // the headline case (a routed-but-undriven diff, `verify-gate.js:342`, and `verify-gate.js:
     // 308`'s capability-question variant) but false for the fourth: `run.ts:63`'s `runLive`
     // returning BLOCKED because the world lock refused the run (dirty, or another live run
-    // already in flight) or, structurally possible but effectively dead today
-    // (`E2E_MIN_INTERVAL_MINUTES=0`, `E2E_MAX_RUNS_PER_DAY=1000`, config.ts -- no override set
-    // anywhere in this tree), a rate limit. `liveAttestationFrom` (worker.ts) maps that fourth
+    // already in flight). There used to be a second producer here -- a live-run rate limiter
+    // that could never fire -- but action B3.5 (SPO-WebClient PR #646) deleted it outright
+    // rather than tune it, so the world lock is now the whole of this case.
+    // `liveAttestationFrom` (worker.ts) maps that fourth
     // case to `live.status === 'unknown'` -- the IDENTICAL value the exit-0 path just above
     // reads as "nothing proven either way" and explicitly refuses to park on. Parking it here,
     // under a name that claims routing was proven undriven, was the collapse: the same fact
@@ -2065,7 +2066,7 @@ async function realGate(ctx, deps = {}) {
     // gets `gate-live-not-driven` -- unchanged reason, unchanged non-transient treatment (a
     // property of the worker binary or a reused verdict, not of the moment; a retry just asks
     // the same worker the same question at real WORKTREE->PLAN->IMPLEMENT->GATE cost). Every
-    // other BLOCKED -- world lock, rate limit, or `verify-gate.js:308`'s capability-question
+    // other BLOCKED -- the world lock, or `verify-gate.js:308`'s capability-question
     // variant, where `required` can be empty and nothing was actually routed -- gets its own
     // reason, `gate-live-blocked`, deliberately not reusing a name that would misdescribe it.
     //

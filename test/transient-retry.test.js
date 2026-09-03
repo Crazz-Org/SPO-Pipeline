@@ -472,7 +472,7 @@ test('finalizePark: gate-non-attesting with verdictDirExists:false is a MISCONFI
 // ---- 9b: gate-live-blocked -- action B2.3 fix round's split of the BLOCKED collapse ------------
 //
 // Adversarial verification (T4/T5) found `verdict.verdict === 'BLOCKED'` collapsed at least four
-// SPO-WebClient producers into one `gate-live-not-driven` park, including `run.ts:64`'s world
+// SPO-WebClient producers into one `gate-live-not-driven` park, including `run.ts:63`'s world
 // lock / rate-limit refusal -- a fact `liveAttestationFrom` maps to `live.status: 'unknown'`, the
 // same value the exit-0 GATE path treats as proof of nothing. The fix splits that case out into
 // its own reason, `gate-live-blocked`, and puts it here (unlike `gate-live-not-driven`) because
