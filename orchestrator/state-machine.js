@@ -1314,7 +1314,7 @@ function snapshot(ctx, state) {
 //   gate-live-blocked       -- action B2.3's realGate throws this on an exit-1 `BLOCKED` verdict
 //                               whose `live` fact is NOT "routed but undriven" (that shape stays
 //                               `gate-live-not-driven`, below, deliberately not on this list).
-//                               SPO-WebClient's `run.ts:64` `runLive` returns BLOCKED from
+//                               SPO-WebClient's `run.ts:63` `runLive` returns BLOCKED from
 //                               exactly one place -- the world lock refused the run (dirty, or
 //                               another live run already in flight -- `world-lock.ts`'s single-
 //                               flight error) -- or, structurally possible but dead today

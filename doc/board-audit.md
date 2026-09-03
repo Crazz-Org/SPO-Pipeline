@@ -150,7 +150,7 @@ outside the ~30-point budget and explicitly disallowed for this audit.
 | `Status` field ordering | New v2 options appended out of pipeline order | **Retire now via UI** — reorder to the target sequence (see checklist). Not a functional blocker, but leave-it in place misleads any human reading the board. |
 | "Item reopened" workflow → `Needs triage` | Old ownership-triage target | **Retire now via UI** — retarget the action to `Parked`, keep enabled. |
 | "Pull request linked to issue" workflow | Currently ON, jumps cards to legacy `PR` column | **Retire now via UI** — disable. Highest-impact fix; it actively fights the orchestrator today. |
-| `Session` project field | Ownership marker written by `board-take.sh` (`npm run board:take`, spawned live from `orchestrator/steps/scripted.js:937` at WORKTREE) on every claim, and read back by its own `--release` path | **Keep** — this field is live and load-bearing for the single orchestrator today, not a legacy holdover. Not touched here. |
+| `Session` project field | Ownership marker written by `board-take.sh` (`npm run board:take`, spawned live from `orchestrator/steps/scripted.js:1295` at WORKTREE) on every claim, and read back by its own `--release` path | **Keep** — this field is live and load-bearing for the single orchestrator today, not a legacy holdover. Not touched here. |
 | `Area` project field | Metadata, orthogonal to pipeline stage | **Keep** — stays useful; not legacy. |
 | `.github/workflows/orphan-cards.yml` (confirmed present in `$HOME/SPO-WebClient`) | Old ownership law: comments on orphaned cards, frees nothing (per CLAUDE.md) | **Retire later via product card** — file a card in the product repo; not read in depth or touched here (read-only existence check only, per the task's explicit "do NOT touch it"). |
 | `rdo-approved` label | Being retired by a separate maintainer RDO decision | **Out of scope here** — already owned elsewhere, noted only. |
@@ -170,7 +170,7 @@ outside the ~30-point budget and explicitly disallowed for this audit.
 4. **Reorder the `Status` field options** to the target sequence — open the `Status` field's
    options editor and drag into: `Todo, Planning, Implementing, Checks & PR, Gate, Validation,
    Merging, Done, Parked, Intake`. `Intake` is not part of the pipeline's own stage sequence but
-   MUST stay an option: `config.js:711`'s `reportIntakeColumn` defaults to it, and
+   MUST stay an option: `config.js:764`'s `reportIntakeColumn` defaults to it, and
    `report-intake.js:29` calls a failed move there "NOT safe to ignore" — the one board move in
    this repo that is load-bearing rather than cosmetic. Do not include it among the options step
    5 deletes.
