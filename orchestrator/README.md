@@ -129,7 +129,7 @@ per-task retry budgets this section is about, both journaled and both visible in
 wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
 
 - `config.js`'s `commandTimeoutsMs` (git 120000ms, gh 120000ms, npm-ci 600000ms,
-  npm-gate 7800000ms, npm-run 660000ms) — `spawnSync`'s own `timeout` option, armed per call by
+  npm-gate 7800000ms, npm-run 660000ms, bench-install 900000ms) — `spawnSync`'s own `timeout` option, armed per call by
   `steps/scripted.js`'s `spawnStep`. This is the bound that actually fires against a hung
   `git`/`gh`/`npm` child; see `doc/state-machine-spec.md`'s design consequence #3 for why two
   mechanisms exist and how they interact.

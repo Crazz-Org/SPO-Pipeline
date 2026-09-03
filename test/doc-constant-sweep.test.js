@@ -22,6 +22,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFileSync } = require('child_process');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -328,12 +329,12 @@ test('every COMMAND_TIMEOUTS_MS class matches its table row in BOTH orchestrator
   const codeMap = extractCommandTimeoutsFromConfig(configSrc);
   assert.ok(codeMap && Object.keys(codeMap).length > 0, 'COMMAND_TIMEOUTS_MS object shape changed -- extractCommandTimeoutsFromConfig stopped matching');
 
-  // Named floor, not a silent count: this is the exact set of classes measured 2026-09-03. A
+  // Named floor, not a silent count: this is the exact set of classes measured 2026-09-03, re-measured after B1.4 added `bench-install`. A
   // class added to COMMAND_TIMEOUTS_MS tomorrow changes this set, and the assertion below names
   // which table (README, spec, or both) failed to grow with it, rather than passing vacuously.
   assert.deepEqual(
     Object.keys(codeMap).sort(),
-    ['gh', 'git', 'npm-ci', 'npm-gate', 'npm-run'],
+    ['bench-install', 'gh', 'git', 'npm-ci', 'npm-gate', 'npm-run'],
     'COMMAND_TIMEOUTS_MS gained or lost a command class -- both doc tables need a matching row in the same change.'
   );
 
@@ -586,9 +587,14 @@ function extractSymbolCitations(text) {
 // "this file's own commentary happens to mention this name while discussing a DIFFERENT file" --
 // exactly the gap the config.js/spawnStep plant above proves closed.
 function symbolDefinedIn(fileName, ident) {
-  const target = findByBasename(fileName, REPO_ROOT);
-  if (!target) return 'no-such-file';
-  const src = blankComments(fs.readFileSync(target, 'utf8'));
+  // findByBasename returns EVERY tracked match, so the empty case is `.length === 0` and not a
+  // falsy check: `if (!target)` on an array is always false, which would have sent an empty
+  // result straight into readFileSync. Ambiguity is its own answer, never a silent first pick --
+  // see findByBasename's header for the stale-worktree resolution this replaced.
+  const hits = findByBasename(fileName, REPO_ROOT);
+  if (hits.length === 0) return 'no-such-file';
+  if (hits.length > 1) return 'ambiguous-file';
+  const src = blankComments(fs.readFileSync(hits[0], 'utf8'));
   return new RegExp(`\\b${ident}\\b`).test(src);
 }
 
@@ -634,7 +640,15 @@ test('every "<file>.js\'s <CodeShapedIdent>" possessive citation names a symbol 
       if (Object.prototype.hasOwnProperty.call(PHANTOM_SYMBOL_ALLOWLIST, key)) continue;
       const exists = symbolDefinedIn(c.file, c.ident);
       if (exists !== true) {
-        offenders.push(`${key} -- ${exists === 'no-such-file' ? `no such file ${c.file}` : `no \`${c.ident}\` defined in ${c.file}`}`);
+        offenders.push(
+          `${key} -- ${
+            exists === 'no-such-file'
+              ? `no such file ${c.file}`
+              : exists === 'ambiguous-file'
+                ? `ambiguous basename ${c.file}: several tracked files share it, so this citation does not say which file it means -- cite a path`
+                : `no \`${c.ident}\` defined in ${c.file}`
+          }`
+        );
       }
     }
   }
@@ -1036,27 +1050,57 @@ function normalizeWrap(src) {
   return text;
 }
 
-function findByBasename(name, dir) {
-  if (!fs.existsSync(dir)) return null;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === '.git' || entry.name === 'node_modules') continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const hit = findByBasename(name, full);
-      if (hit) return hit;
-    } else if (entry.name === name) {
-      return full;
-    }
+// trackedFiles(root) -- the repo's OWN tree, from git, cached per root.
+//
+// This replaced a recursive readdir walk that skipped only `.git` and `node_modules`, and it is
+// not a tidy-up: the walk descended into NESTED GIT WORKTREES. `/home/crazz/SPO-WebClient` holds
+// abandoned agent worktrees under `.claude/worktrees/<slug>/`, each a full copy of the product
+// tree, and `.claude` sorts before `src`, so a bare-basename citation like `worker.ts:892`
+// resolved to a MONTHS-OLD copy and was line-checked against it. That is how four dangling
+// cross-repo citations passed 9.1's verification and this ratchet's own green run: the file the
+// checker read was not the file the citation meant. Measured 2026-09-03, when `worker.ts:892`
+// (a real line in the product's `src/e2e/bench/worker.ts`) was reported dangling because the
+// worktree copy it resolved to has only 759 lines.
+//
+// `git ls-files` is the fix and not merely a filter: a nested worktree is not tracked by the
+// parent repo, and neither are `node_modules`, `dist` or any other ignored build output, so the
+// exclusion is the repo's own definition of what belongs to it rather than a denylist this file
+// would have to keep in step with whatever a future tool drops on disk.
+const _trackedCache = new Map();
+function trackedFiles(root) {
+  if (_trackedCache.has(root)) return _trackedCache.get(root);
+  let list = [];
+  try {
+    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+      .split('\n')
+      .filter(Boolean);
+  } catch {
+    list = [];
   }
-  return null;
+  _trackedCache.set(root, list);
+  return list;
 }
 
+// findByBasename -- every tracked file whose basename matches, never just the first. An
+// AMBIGUOUS basename is a defect in the citation (it does not say which file it means) and the
+// caller reports it by name; silently taking the first match is what let the stale-worktree copy
+// win above, and "pick one and say nothing" is the shape this whole sweep exists to remove.
+function findByBasename(name, root) {
+  return trackedFiles(root)
+    .filter((rel) => path.basename(rel) === name)
+    .map((rel) => path.join(root, rel));
+}
+
+// resolveIn(root, filePath) -> { target } | { ambiguous: [paths] } | null
 function resolveIn(root, filePath) {
   if (filePath.includes('/')) {
     const target = path.join(root, filePath);
-    return fs.existsSync(target) ? target : null;
+    return fs.existsSync(target) ? { target } : null;
   }
-  return findByBasename(filePath, root);
+  const hits = findByBasename(filePath, root);
+  if (hits.length === 0) return null;
+  if (hits.length > 1) return { ambiguous: hits };
+  return { target: hits[0] };
 }
 
 // resolveCitationTarget(filePath) -- E1, minimally: this repo first, then the product repo (with
@@ -1069,16 +1113,22 @@ function resolveIn(root, filePath) {
 //                                                                  the header's E1 section)
 //   { target: null, root: null }                               -- resolved nowhere; dangling
 function resolveCitationTarget(filePath) {
+  // `ambiguous` is carried out to the caller rather than resolved here: only the caller knows the
+  // citation's own text, and the offender line has to name the candidates for the maintainer to
+  // pick between them. Never collapse it to a target.
   const local = resolveIn(REPO_ROOT, filePath);
-  if (local) return { target: local, root: 'repo' };
+  if (local && local.ambiguous) return { target: null, root: 'repo', ambiguous: local.ambiguous };
+  if (local) return { target: local.target, root: 'repo' };
   const productPath = filePath.replace(/^SPO-WebClient\//, '');
   if (!fs.existsSync(PRODUCT_REPO)) return { target: null, root: 'product-absent' };
   const product = resolveIn(PRODUCT_REPO, productPath);
-  if (product) return { target: product, root: 'product' };
+  if (product && product.ambiguous) return { target: null, root: 'product', ambiguous: product.ambiguous };
+  if (product) return { target: product.target, root: 'product' };
   const deployPath = filePath.replace(/^SPO-Deploy\//, '');
   if (!fs.existsSync(DEPLOY_REPO)) return { target: null, root: 'deploy-absent' };
   const deploy = resolveIn(DEPLOY_REPO, deployPath);
-  if (deploy) return { target: deploy, root: 'deploy' };
+  if (deploy && deploy.ambiguous) return { target: null, root: 'deploy', ambiguous: deploy.ambiguous };
+  if (deploy) return { target: deploy.target, root: 'deploy' };
   return { target: null, root: null };
 }
 
@@ -1142,11 +1192,9 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
-  "doc/bench-audit-2026-09-02.md :: config.ts:93",
   "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:128",
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
-  "doc/bench-audit-2026-09-02.md :: paths.ts:143-163",
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
   "doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156",
   "doc/bench-audit-2026-09-02.md :: scripted.js:1347",
@@ -1154,7 +1202,9 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: scripted.js:292-293",
   "doc/bench-audit-2026-09-02.md :: scripts/finish.sh:245-247",
   "doc/bench-audit-2026-09-02.md :: scripts/nightly-check.sh:70-73",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/bench/paths.ts:143-163",
   "doc/bench-audit-2026-09-02.md :: src/e2e/bench/worker.ts:482",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-audit-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-audit-2026-09-02.md :: verdict.ts:162-183",
   "doc/bench-audit-2026-09-02.md :: verdict.ts:23-67",
@@ -1171,13 +1221,13 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
-  "doc/bench-plan-derived-2026-09-02.md :: config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293",
   "doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156",
   "doc/bench-plan-derived-2026-09-02.md :: scripts/finish.sh:245-247",
   "doc/bench-plan-derived-2026-09-02.md :: scripts/nightly-check.sh:70-73",
+  "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
   "doc/board-audit.md :: config.js:711",
@@ -1196,14 +1246,22 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:217",
-  "orchestrator/bench-queue-wait.js :: worker.ts:106",
-  "orchestrator/bench-queue-wait.js :: worker.ts:576",
+  "orchestrator/bench-queue-wait.js :: worker.ts:108",
+  "orchestrator/bench-queue-wait.js :: worker.ts:689",
+  "orchestrator/config.js :: worker.ts:892",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:49",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
+  "orchestrator/journal.js :: worker.ts:110",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:186",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:647",
   "orchestrator/park-loop.js :: intake.js:747-749",
+  "orchestrator/state-machine.js :: run.ts:64",
   "orchestrator/steps/llm.js :: intake.js:747-749",
+  "orchestrator/steps/scripted.js :: run.ts:64",
+  "orchestrator/steps/scripted.js :: verify-gate.js:308",
+  "orchestrator/steps/scripted.js :: verify-gate.js:342",
+  "orchestrator/steps/scripted.js :: worker.ts:109-110",
+  "orchestrator/steps/scripted.js :: worker.ts:892",
   "prompts/README.md :: plan.md:103",
   "prompts/README.md :: step-contracts.js:108",
 ];
@@ -1256,6 +1314,15 @@ test('every file:line citation in the 65-file corpus resolves, or is on the name
     }
     if (resolved.root === 'deploy-absent') {
       repoAbsentOffenders.push(`${key} -- does not resolve in this repo or the product repo, and ${DEPLOY_REPO} is not on disk to check further (E1: never a silent pass)`);
+      continue;
+    }
+    if (resolved.ambiguous) {
+      offenders.push(
+        `${key} -- ambiguous basename: ${resolved.ambiguous.length} tracked files in the ` +
+          `${resolved.root} repo share it (${resolved.ambiguous.join(', ')}). Cite a path, not a ` +
+          `bare filename -- picking one silently is how a citation gets line-checked against the ` +
+          `wrong file.`
+      );
       continue;
     }
     if (!resolved.target) {
@@ -1323,6 +1390,62 @@ test('extractCitations: the possessive "(line N)" shape is extracted with its fi
   const text = "SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 217) rmSync's the report";
   const cites = extractCitations(text);
   assert.deepEqual(cites.map((c) => c.raw), ['SPO-WebClient/src/e2e/bench/job.ts:217']);
+});
+
+// ---- M-2026-09-03: the resolver used to read the WRONG FILE, silently.
+//
+// findByBasename walked the tree with readdirSync and returned the first basename match, skipping
+// only `.git` and `node_modules`. `/home/crazz/SPO-WebClient` carries abandoned agent worktrees
+// under `.claude/worktrees/<slug>/`, each a whole copy of the product tree, and `.claude` sorts
+// before `src` -- so `worker.ts:892` resolved to a months-old copy with 759 lines and was
+// line-checked against THAT. Four cross-repo citations were stale in the corpus while this sweep
+// ran green, including two the sweep's own EXPECTED_CITATIONS had pinned as verified.
+//
+// These two tests are hermetic (a throwaway git repo in tmpdir), so they pin the resolver's
+// contract rather than whatever happens to be on this machine's disk today.
+function makeFixtureRepo(layout) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-citation-resolver-'));
+  for (const [rel, body] of Object.entries(layout)) {
+    const full = path.join(root, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, body);
+  }
+  execFileSync('git', ['-C', root, 'init', '-q']);
+  execFileSync('git', ['-C', root, 'add', '-A']);
+  return root;
+}
+
+test('findByBasename: a copy inside a NESTED WORKTREE never shadows the repo\'s own tracked file', () => {
+  // The nested copy is present on disk and is NOT tracked -- exactly the shape of an abandoned
+  // `.claude/worktrees/<slug>/` checkout. It also sorts first, which is what made the old
+  // readdir walk pick it.
+  const root = makeFixtureRepo({ 'src/e2e/bench/worker.ts': 'export const real = 1;\n' });
+  const shadow = path.join(root, '.claude/worktrees/stale/src/e2e/bench/worker.ts');
+  fs.mkdirSync(path.dirname(shadow), { recursive: true });
+  fs.writeFileSync(shadow, 'export const stale = 1;\n');
+  _trackedCache.delete(root);
+
+  const hits = findByBasename('worker.ts', root);
+  assert.deepEqual(
+    hits,
+    [path.join(root, 'src/e2e/bench/worker.ts')],
+    'the untracked nested-worktree copy leaked into resolution -- a citation would be line-checked against the wrong file'
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolveIn: an ambiguous basename is reported as ambiguous, never silently resolved to the first match', () => {
+  const root = makeFixtureRepo({
+    'src/e2e/config.ts': 'export const a = 1;\n',
+    'src/shared/config.ts': 'export const b = 2;\n',
+  });
+  _trackedCache.delete(root);
+
+  const resolved = resolveIn(root, 'config.ts');
+  assert.ok(resolved && resolved.ambiguous, 'a basename shared by two tracked files must not resolve to one of them');
+  assert.deepEqual(resolved.ambiguous.map((f) => path.relative(root, f)).sort(), ['src/e2e/config.ts', 'src/shared/config.ts']);
+  assert.equal(resolved.target, undefined, 'ambiguous resolution must carry no target -- a target is what a caller line-checks against');
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('resolveCitationTarget: resolves a local repo path before ever trying the product repo', () => {
@@ -1400,6 +1523,10 @@ test('every bare "doc/<name>.md" reference in the 65-file corpus resolves here, 
     const resolved = resolveCitationTarget(docPath);
     if (resolved.root === 'product-absent' || resolved.root === 'deploy-absent') {
       repoAbsentOffenders.push(`${docPath} -- cited from ${[...new Set(sites)].join(', ')}; cannot verify, cross-repo dependency missing from disk`);
+      continue;
+    }
+    if (resolved.ambiguous) {
+      offenders.push(`${docPath} -- cited from ${[...new Set(sites)].join(', ')}; ambiguous basename, ${resolved.ambiguous.length} tracked files in the ${resolved.root} repo share it (${resolved.ambiguous.join(', ')})`);
       continue;
     }
     if (!resolved.target) {
