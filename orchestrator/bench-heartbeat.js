@@ -26,12 +26,13 @@
 //
 // CROSS-REPO, NOT IMPORTABLE: this repo cannot `require()` a TypeScript file in a sibling repo,
 // so HEARTBEAT_STALE_MS below is a hand-restated copy of SPO-WebClient's own
-// src/e2e/bench/paths.ts:52 literal, not a shared module. test/heartbeat-contract-pin.test.js
-// pins the two literals against each other by reading the product repo's real source text (via
-// `git ls-files`, so a typo'd path fails loudly) -- see that file's own header for the pattern,
-// modelled on test/doc-constant-sweep.test.js's house rule: LITERAL strings, typed independently,
-// never re-derived from the value under test. If B5.2 ever changes HEARTBEAT_STALE_MS's own
-// value on the product side, that pin reds here until this file's copy is updated to match.
+// `src/e2e/bench/paths.ts`'s `HEARTBEAT_STALE_MS` literal, not a shared module.
+// test/heartbeat-contract-pin.test.js pins the two literals against each other by reading the
+// product repo's real source text (via `git ls-files`, so a typo'd path fails loudly) -- see
+// that file's own header for the pattern, modelled on test/doc-constant-sweep.test.js's house
+// rule: LITERAL strings, typed independently, never re-derived from the value under test. If
+// B5.2 ever changes HEARTBEAT_STALE_MS's own value on the product side, that pin reds here until
+// this file's copy is updated to match.
 //
 // B5.2 (not built, not this action): will make the heartbeat carry `{currentJob, startedAt}` so
 // a client can tell ALIVE from PROGRESSING. That changes what the file's content MEANS, not how
@@ -44,7 +45,7 @@ const fs = require('fs');
 
 /**
  * Heartbeat older than this = the worker is not running, whatever else looks alive. Mirrors
- * SPO-WebClient/src/e2e/bench/paths.ts:52's HEARTBEAT_STALE_MS -- see this file's header for the
+ * SPO-WebClient/src/e2e/bench/paths.ts's HEARTBEAT_STALE_MS -- see this file's header for the
  * derivation (4 missed beats of the worker's 5s HEARTBEAT_PERIOD_MS) and
  * test/heartbeat-contract-pin.test.js for how the two literals are kept from drifting apart.
  */

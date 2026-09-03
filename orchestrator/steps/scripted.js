@@ -1997,8 +1997,12 @@ async function realGate(ctx, deps = {}) {
         }
         if (jobReport.verdict === 'DIRTY') {
           // NOT the session's own tree (bench-gate.sh already refused a dirty session tree at
-          // exit 2, before a job was ever deposited) -- this is worker.ts's OWN shared ref
-          // checkout (`paths.refCheckout`) found dirty by the worker itself, after `prepareRef`.
+          // exit 2, before a job was ever deposited) -- this is the bench worker's OWN shared
+          // ref checkout (`paths.refCheckout`) found dirty by the worker itself, after
+          // `prepareRef`. Deliberately named "the bench worker" and NOT by filename: part 1.8
+          // of test/doc-constant-sweep.test.js reads a possessive filename followed by a code-
+          // shaped word as a symbol citation, and the emphatic OWN here is prose, not a symbol
+          // the worker's source defines.
           // A worker-side environment fact, never named `gate-dirty-tree` (that name is reserved
           // for the session's own tree, exit 2, below).
           appendEvent(ctx.taskDir, 'GATE', 'gate-worker-dirty-checkout', detail);
@@ -2723,11 +2727,11 @@ function benchQueueDepth(deps, config) {
 // `Merging` with its worktree still on disk until a human intervenes; (3) the 15-minute bound is
 // not generous against the actual population of bench jobs -- the config comment's own "generous"
 // claim was derived only from bench-queue-wait.js's ref/nightly constants and omitted
-// SPO-WebClient's worker.ts:130-131 `DEFAULT_LEASE_MINUTES = 30` / `MAX_LEASE_MINUTES = 120`: an
-// ORDINARY human bench lease on this shared machine (2x-8x the bound) would terminally park any
-// bench-touching card the daemon finishes during it -- the same "a human's normal use of a shared
-// resource terminally parks a merged card" failure the `--untracked-files=no` narrowing exists to
-// prevent, reintroduced through a different door.
+// SPO-WebClient's `worker.ts`'s `DEFAULT_LEASE_MINUTES` = 30 and `worker.ts`'s
+// `MAX_LEASE_MINUTES` = 120: an ORDINARY human bench lease on this shared machine (2x-8x the
+// bound) would terminally park any bench-touching card the daemon finishes during it -- the same
+// "a human's normal use of a shared resource terminally parks a merged card" failure the
+// `--untracked-files=no` narrowing exists to prevent, reintroduced through a different door.
 //
 // So this function no longer THROWS on a timed-out wait -- it returns `{idle: false, ...}` and
 // leaves the decision to its caller (realFinish): DEFER the reinstall (journal
