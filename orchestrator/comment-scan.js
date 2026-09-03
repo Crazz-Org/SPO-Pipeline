@@ -157,7 +157,26 @@ function createScanState() {
 // the argv and never learns what `gh` does with it. The standing guard is therefore a source
 // sweep -- see test/gh-api-argv.test.js, which fails on any `gh api` call site anywhere in the
 // repo that passes `-f`/`-F` without an explicit `--method`/`-X`.
-function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, maxPages }) {
+// `anchorId` is the boundary when the park comment landed; `sinceMs` is the boundary when it
+// did not (issue #77 -- see park-loop.js's findParkAnchor for why both exist). Exactly one is
+// used, id first: a comment id is an exact "after this comment", while a timestamp is only
+// "after this moment" and so is very slightly wider. Wider is the correct direction to err --
+// the failure being fixed is not seeing the maintainer's `retry` at all.
+//
+// With NEITHER, nothing is collected. That is deliberate and is the safe end: scanning every
+// comment on the issue would let a `retry` from a previous park cycle re-trigger this one.
+function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, sinceMs, maxPages }) {
+  const hasId = typeof anchorId === 'number' && Number.isFinite(anchorId);
+  const hasSince = !hasId && typeof sinceMs === 'number' && Number.isFinite(sinceMs);
+  const isAfterAnchor = (c) => {
+    if (hasId) return typeof c.id === 'number' && c.id > anchorId;
+    if (!hasSince) return false;
+    const createdAt = Date.parse(c.created_at);
+    // An unparseable or absent `created_at` cannot be placed relative to the boundary. Keep
+    // it: a comment the scan cannot date is better matched than silently dropped, and the
+    // author allowlist and pattern match still have to accept it.
+    return !Number.isFinite(createdAt) || createdAt >= sinceMs;
+  };
   const bound = Number.isInteger(maxPages) && maxPages > 0 ? maxPages : DEFAULT_MAX_PAGES;
   const collected = [];
 
@@ -182,7 +201,7 @@ function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, 
     if (!Array.isArray(batch)) batch = []; // parsed but not a list -- same as "nothing on this page"
 
     for (const c of batch) {
-      if (c && typeof c.id === 'number' && c.id > anchorId) collected.push(c);
+      if (c && typeof c.id === 'number' && isAfterAnchor(c)) collected.push(c);
     }
 
     if (batch.length < PER_PAGE) {
@@ -314,6 +333,7 @@ async function scanForMatch({
   ghRepo,
   issue,
   anchorId,
+  sinceMs,
   patterns,
   scanState,
   journalRoot,
@@ -334,7 +354,7 @@ async function scanForMatch({
     return { ok: false, reason: 'backoff' };
   }
 
-  const fetched = fetchCommentsAfterAnchor({ deps, config, ghRepo, issue, anchorId, maxPages });
+  const fetched = fetchCommentsAfterAnchor({ deps, config, ghRepo, issue, anchorId, sinceMs, maxPages });
   if (!fetched.ok) {
     recordFailure(scanState, ghRepo, issue, nowMs);
     return { ok: false, reason: fetched.reason, exit: fetched.exit, timedOut: fetched.timedOut };
