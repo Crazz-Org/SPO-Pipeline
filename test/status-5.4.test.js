@@ -423,7 +423,13 @@ test('spo status: a parked task with a successful scan since its failures shows 
   writeStateJson(dir, { id, state: 'PARKED', reason: 'branch-unmerged-leftover' });
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', mkTmp('spo-status-scan-ok-queue-')]);
-  assert.match(out, /issue-385\s+PARKED\s+reason=branch-unmerged-leftover\s+retry-channel: no failures recorded/);
+  // Project-2 card #476 turned the old "no failures recorded" here into a POSITIVE claim: the
+  // truncation notice is itself proof `gh` answered, so the line now names the moment the channel
+  // was last confirmed alive instead of merely reporting an absence of bad news.
+  assert.match(
+    out,
+    /issue-385\s+PARKED\s+reason=branch-unmerged-leftover\s+retry-channel: healthy, last confirmed .+ ago \(2026-08-30T11:00:00\.000Z\)/
+  );
 });
 
 test('spo status: an unrelated event after the failures does NOT clear the streak -- only a park ending, or proof the scan worked', () => {
@@ -456,10 +462,10 @@ test('spo status: an unrelated event after the failures does NOT clear the strea
 });
 
 test('spo status: an `unpark-scan-ignored-author` after the failures DOES clear the streak -- it proves gh answered', () => {
-  // The other half of the rule. A successful scan that matches nothing journals no event at all,
-  // so `unpark-scan-truncated` and `unpark-scan-ignored-author` are the only lines a WORKING scan
-  // ever leaves. Both must end the streak, or a channel that recovered would report an outage
-  // forever.
+  // The other half of the rule. `unpark-scan-truncated` and `unpark-scan-ignored-author` were the
+  // only lines a WORKING scan ever left behind before project-2 card #476 added the edge-triggered
+  // `unpark-scan-ok`; all three must end the streak, or a channel that recovered would report an
+  // outage forever.
   const journalDir = mkTmp('spo-status-scan-recovered-');
   const id = 'issue-900';
   const dir = path.join(journalDir, id);
@@ -471,7 +477,8 @@ test('spo status: an `unpark-scan-ignored-author` after the failures DOES clear 
   writeStateJson(dir, { id, state: 'PARKED', reason: 'x' });
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', mkTmp('spo-status-scan-recovered-queue-')]);
-  assert.match(out, /retry-channel: no failures recorded/);
+  assert.match(out, /retry-channel: healthy, last confirmed .+ ago \(2026-08-30T11:00:00\.000Z\)/);
+  assert.doesNotMatch(out, /failure\(s\)/);
 });
 
 // ---- G: the parking rate matches console/collect.js's denominator, same fixture -----------------

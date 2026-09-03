@@ -1269,6 +1269,30 @@ Idempotent across scans: a task already acted on for its current park cycle (an
 `park-comment` in the journal) is skipped, whether or not the re-enqueued task has been drained
 back out of `PARKED` yet.
 
+**Is the channel alive? (project-2 card #476).** This scan is the maintainer's ONLY way back into
+a parked card, and it went down for 33 hours on 2026-08-30 with nothing anywhere reporting it: 238
+consecutive `unpark-scan-failed` events on `journal/issue-213` alone, every one of them
+`{exit: 1, timedOut: false}` and nothing more. Two holes, both closed:
+
+- **A failure names its cause.** `unpark-scan-failed` now carries `gh`'s own first stderr line
+  (`comment-scan.js`'s `firstStderrLine`, capped and marked when truncated), so a repeat of that
+  outage is diagnosable after the fact instead of only while the process is still alive. The same
+  field rides on `comment-scan-collaborators-stale`/`-unreadable` and on `reportConfirmScan`'s own
+  error entries -- the blindness was the shared scanner's, not `park-loop.js`'s.
+- **A success is recorded when it CHANGES.** A clean scan used to journal nothing at all, so an
+  old streak in a journal's tail could not be told apart from a channel that had recovered
+  silently, and "the retry channel is alive" was only ever inferrable from an *absence* of
+  failures -- which is exactly what a dead scanner also looks like. `unpark-scan-ok` is written on
+  the first proven-live scan of a park cycle and once more after each outage it recovers from:
+  1 + (number of outages) lines per park cycle, never per cycle. This is deliberately NOT the
+  heartbeat that was removed in SPO-WebClient PR #444, and re-adding one would undo that decision.
+
+`retry-channel.js` owns the one rule that reads those lines back (`summarizeUnparkScanTail`) and
+the one that decides whether to write `unpark-scan-ok` (`shouldJournalScanOk`) -- writer and the
+two readers (`bin/spo`'s `cmdStatus`, `console/collect.js`'s retry-channel tile) share it rather
+than each re-deriving it. See that module's header for what breaks the walk and why each of those
+rules was measured against the real outage rather than reasoned about.
+
 **Reconciling against the issue (action 5.1b).** `unparkScan`'s per-task loop, above, runs one
 more thing BEFORE the retry/abandon comment scan: for every journaled task whose `state.json`
 reads `PARKED` or `ABANDONED`, `reconcileExternalClosure` checks whether the issue it owns has
@@ -2418,6 +2442,7 @@ task/daemon split itself).
 | `scanner-spawn` | daemon | the dispatcher spawned the (single) scanner subprocess; records its pid (`dispatcher.js`). |
 | `touches-rdo-members-rederived` | task | PUSH_PR's real diff touched the RDO members catalogue even though intake's own guess (`ctx.task.touchesRdoMembers`) said it wouldn't — the flag is corrected before CITATION_VERIFIER runs (`steps/scripted.js`). |
 | `uncaught-error` | daemon | `daemon.js`'s top-level handler caught an otherwise-uncaught exception or unhandled rejection; records the crash context (mode, id, taskDir) and a capped message/stack before the process exits (`daemon.js`). |
+| `unpark-scan-ok` | task | the unpark (retry/abandon) comment scan reached GitHub, journalled ONLY when that is a change of outcome: the first proven-live scan of this park cycle, or a recovery from a standing `unpark-scan-failed` streak (`afterFailures` says which, and `firstFailedAt` dates the streak it ends). Never per-cycle — a healthy scan that has already said so writes nothing. Project-2 card #476: before it a successful scan journalled nothing at all, so an old failure streak in a journal's tail could not be told apart from a channel that had recovered silently, and "the retry channel is alive" was only ever inferrable from an ABSENCE of failures (`park-loop.js`; the rule deciding when it is an outcome change is `retry-channel.js`'s `shouldJournalScanOk`). |
 | `unpark-scan-backoff-skip` | task | `park-loop.js`'s own name for `comment-scan.js`'s shared `backoffSkip` event, reached when the unpark (retry/abandon) comment scan is still backed off from a recent `gh` failure (`park-loop.js`, via `comment-scan.js`). |
 | `validate-findings-post-skipped` | task | VALIDATE's findings comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `wip-preserve-failed` | task | `preserveWorktreeWip` could not commit/push a dirty worktree's diff to a `wip/` ref before a park (a spawn timeout, or a failed `git status`/`checkout --detach`/etc. step) — the park still proceeds without a wip ref (`steps/scripted.js`). |
@@ -2474,7 +2499,8 @@ Two render modes, same underlying data:
 - **Live** (`--serve`): `console/serve.js` wraps the same `collectAll`/`renderDashboard` but adds
   two JSON routes the page polls client-side (no full reload): `GET /api/system` (CPU-per-core +
   memory, meant to be polled every 1s -- see `console/system.js`) and `GET /api/data`
-  (everything else -- services (daemon/queue/bench-worker/nightly/verdicts/prod), accounts,
+  (everything else -- services (daemon/queue/workers/retry-channel/bench-worker/nightly/verdicts/
+  prod), accounts,
   daemon stats, bug reports, tokens -- meant to be polled every 30s). `--no-prod` disables the
   outbound starpeace.zz.works / GitHub Releases probe (`console/prod-version.js`) for an offline
   run. **Binds all interfaces by default, with no authentication of its own**: `bin/spo`'s

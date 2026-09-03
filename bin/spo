@@ -209,6 +209,7 @@ const reportIntake = require('../orchestrator/report-intake');
 const remoteReportPull = require('../orchestrator/remote-report-pull');
 const { tokenReport, todaySpend, formatTokenCount } = require('../orchestrator/tokens');
 const recette = require('../orchestrator/recette');
+const retryChannel = require('../orchestrator/retry-channel');
 
 function parseArgs(argv) {
   const opts = {
@@ -429,69 +430,14 @@ function collectBackoffEntries(queueDir) {
   return map;
 }
 
-// computeUnparkScanFailureStreak(lines) -- item F: how badly, and for how long, this card's retry
-// channel has been failing. `firstFailedAt` is the EARLIEST ts in the streak (what "failing for N
-// hours" is measured from); `lastFailedAt` is the most recent one.
-//
-// The rule is "count `unpark-scan-failed` back to the last event that is NEITHER a failure NOR an
-// `unpark-scan-backoff-skip`", and each half was measured against the real outage rather than
-// reasoned about:
-//
-//   * A backoff-skip does NOT break the streak. It is a CONSEQUENCE of the failures --
-//     comment-scan.js backs a failing issue off and then journals the skips -- so treating it as
-//     a recovery is exactly backwards. The real tail of journal/issue-213 is
-//     `failed, skip, skip, skip, skip, skip, skip, skip, failed, skip x7, failed`. Breaking on a
-//     skip reported that 33-hour, 238-failure outage as **"FAILING x1 since 19:52:07"** -- one
-//     minute of trouble instead of a day and a half. The feature built to surface the outage
-//     would not have surfaced the outage.
-//   * There is nothing positive to reset against. A SUCCESSFUL unpark scan journals no event at
-//     all (park-loop.js's unparkScan just `continue`s when the scan is ok and matches nothing),
-//     so this cannot distinguish "still failing" from "failed, then recovered silently" -- which
-//     is the live state right now: the scan recovered when the daemon restarted at 07:17Z today,
-//     and the journals' tails are still the old failures. That is why the caller renders the AGE
-//     of the last failure and says what it can and cannot mean, instead of claiming a card is
-//     failing. Making a success legible is filed separately; do NOT close the gap by adding a
-//     heartbeat event, one was deliberately removed (PR #444).
-// The two, and only two, kinds of event that end the failure streak below.
-//
-// A park cycle ENDING or RESTARTING: `parked` is a fresh park, so the previous cycle's failures
-// belong to a park that no longer exists (this is why issue-385 correctly reports 8 failures
-// where issue-213 reports 238, on the same outage); `unparked-by-maintainer` and
-// `abandoned-by-maintainer` are the two ways a human ends one.
-const PARK_CYCLE_ENDING_EVENTS = new Set(['parked', 'unparked-by-maintainer', 'abandoned-by-maintainer']);
-
-// Or POSITIVE EVIDENCE that the scan itself succeeded. A successful scan that matches nothing
-// journals no event at all (park-loop.js's unparkScan just `continue`s), so these two are the
-// only lines a working scan ever leaves behind: it paginated to its bound, or it found a comment
-// and rejected the author. Either one proves `gh` answered.
-const UNPARK_SCAN_SUCCESS_EVENTS = new Set(['unpark-scan-truncated', 'unpark-scan-ignored-author']);
-
-function computeUnparkScanFailureStreak(lines) {
-  let count = 0;
-  let firstFailedAt = null;
-  let lastFailedAt = null;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const ev = lines[i];
-    if (!ev) break;
-    // The walk breaks ONLY on the two named sets above -- a park that ended, or proof the scan
-    // worked. Everything else is ignored, including events that merely happen to be newer.
-    //
-    // Measured live, an hour after this shipped: action 5.1b's reconciler appended one
-    // `reconciled-externally` line to issue-213 and issue-428 on the daemon's first cycle, and
-    // this line went from "238 failure(s), last 14h50m ago" to "no failures recorded". The 238
-    // failures had not gone anywhere -- an unrelated event landed after them, the walk broke on
-    // it, and an outage indicator became an all-clear about a channel nothing had proven healthy.
-    // Same class as the backoff-skip bug this walk already carries a comment about, one layer
-    // out. Two exceptions in a row is the signal to stop enumerating what does NOT end a streak
-    // and name what does.
-    if (PARK_CYCLE_ENDING_EVENTS.has(ev.event) || UNPARK_SCAN_SUCCESS_EVENTS.has(ev.event)) break;
-    if (ev.event !== 'unpark-scan-failed') continue;
-    count += 1;
-    if (lastFailedAt === null) lastFailedAt = ev.ts || null;
-    firstFailedAt = ev.ts || firstFailedAt;
-  }
-  return { count, firstFailedAt, lastFailedAt };
-}
+// Item F: how badly, and for how long, this card's retry channel has been failing -- and, since
+// project-2 card #476, whether it is provably WORKING. The rule itself
+// (`summarizeUnparkScanTail`, what breaks the walk and why, and what `healthySince` may claim)
+// moved out to orchestrator/retry-channel.js when card #476 gave it a third reader: this command,
+// console/collect.js's dashboard tile, and park-loop.js itself, which has to apply the reader's
+// own rule to decide whether a successful scan is an outcome change worth journalling. See that
+// module's header -- it carries the measurements (the 238-failure outage, the backoff-skip trap,
+// the `reconciled-externally` all-clear) that this rule is shaped by.
 
 // ---- action 6.7 helpers (worker observability) -------------------------------------------
 
@@ -516,7 +462,7 @@ function readTaskAccount(lines) {
 // dispatcher idle right now" is answered by walking the tail backwards for whichever of the two
 // event names comes LAST -- an idle event with no later recovery event means still idle; a
 // recovery event, or no matching event at all, means nothing to report. Same "walk backwards to
-// the most recent relevant marker" shape as computeUnparkScanFailureStreak above, for the same
+// the most recent relevant marker" shape as retry-channel.js's summarizeUnparkScanTail, for the same
 // reason: this is daemon.jsonl's OWN edge history, not a poll of current pool health (`spo
 // status`'s own account rows already do that separately, from the pool's state.json).
 function computeDispatcherIdleStatus(daemonEvents) {
@@ -688,19 +634,27 @@ function cmdStatus(opts) {
       // (238 of them on issue-213 alone), which is the unpark SCAN's own retry noise, not why the
       // card parked in the first place.
       const reason = state.reason || 'unknown';
-      // F: the scan's own failure streak, read off the SAME journal lines already loaded above.
-      const streak = computeUnparkScanFailureStreak(lines);
-      // "last failure Nh ago", not "FAILING": a successful scan journals nothing, so an old
-      // streak in the journal's tail cannot tell a still-broken channel from one that recovered
-      // silently -- and both of those are true of the corpus right now. The AGE is the number a
-      // maintainer can act on either way: minutes old means it is broken now; a day old means
-      // either it is still broken or nobody can tell, and both deserve a look.
+      // F: the scan's own health, read off the SAME journal lines already loaded above.
+      const streak = retryChannel.summarizeUnparkScanTail(lines);
+      // "last failure Nh ago", not "FAILING": the AGE is the number a maintainer can act on --
+      // minutes old means it is broken right now, a day old means it may have recovered since.
       const ageMs = streak.lastFailedAt ? now - Date.parse(streak.lastFailedAt) : null;
       const age = Number.isFinite(ageMs) ? formatRemaining(ageMs) : '?';
+      // Three outcomes, and the third is the point of card #476. Before it, a successful scan
+      // journalled nothing at all, so a clean tail said "no failures recorded" whether the channel
+      // was healthy or had never once run -- and a maintainer could only reason from the ABSENCE
+      // of failures, which is precisely what a dead scanner also looks like. park-loop.js now
+      // records the outcome when it CHANGES (`unpark-scan-ok`), so "healthy" is a positive claim
+      // with a timestamp behind it, and "no scan outcome recorded yet" is said out loud instead of
+      // being dressed up as an all-clear.
+      const healthyAgeMs = streak.healthySince ? now - Date.parse(streak.healthySince) : null;
+      const healthyAge = Number.isFinite(healthyAgeMs) ? formatRemaining(healthyAgeMs) : '?';
       const scanStatus =
         streak.count > 0
           ? `${streak.count} failure(s), last ${age} ago (first ${streak.firstFailedAt})`
-          : 'no failures recorded';
+          : streak.healthySince
+            ? `healthy, last confirmed ${healthyAge} ago (${streak.healthySince})`
+            : 'no scan outcome recorded yet';
       // action 6.7: 'worker-crashed', 'all-accounts-leased' and 'product-repo-lock-timeout'
       // (all three new PARKED reasons this action's own chantier introduced -- dispatcher.js's
       // reparkCrashedWorker, account-lease.js's leaseHealthyAccount, product-repo-lock.js's
@@ -782,6 +736,17 @@ function cmdStatus(opts) {
   }
 
   console.log(`active: ${active}  backoff: ${backoff}  parked: ${parked}  abandoned: ${abandoned}  done: ${done}`);
+
+  // Project-2 card #476. The per-row `retry-channel:` detail above renders inside the PARKED
+  // branch and nowhere else, so with zero parked cards the maintainer's retry channel has NO
+  // surface at all -- and a surface that silently disappears reads exactly like one that broke.
+  // This is the honest reading of that state rather than a health claim: unparkScan iterates
+  // PARKED tasks and only those (park-loop.js's own filter), so with none parked it did not run,
+  // and nothing about it is either confirmed or in doubt. Printed only when `parked === 0`, same
+  // "earn a line" posture as the dispatcher-idle and account-cooldown lines below.
+  if (parked === 0) {
+    console.log('retry-channel: idle -- nothing parked, so the unpark scan has nothing to scan (per-card health shows on PARKED rows)');
+  }
 
   // action 6.7: the worker summary line -- built from `liveWorkerRows`/`staleWorkerRows`/
   // `trailingWorkerRows`, the SAME counters the rows above just printed from, NEVER from
