@@ -562,7 +562,22 @@ function blankComments(source) {
 // test/lock.test.js into a fabricated one to a nonexistent bare "test.js". Backticks around the
 // filename and/or the identifier are optional (M16, above) -- both the bare-prose shape
 // ("state-machine.js's buildCtx") and the markdown shape ("`intake.js`'s `pullBoard`") match.
-const SYMBOL_CITATION_RE = /`?\b([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.js)`?'s `?([A-Za-z_][A-Za-z0-9_]*)`?/g;
+//
+// M17 (2026-09-03) widened the file group twice, so that this check can carry the citations
+// converted away from `file:line` in the same change (see the commit message for the drift
+// problem that motivated the conversion):
+//
+//   - `.ts` as well as `.js`. Every line-number citation this corpus makes into SPO-WebClient
+//     points at a TypeScript file, so a `.js`-only regex could not see a single converted
+//     citation. This is what makes the conversion a trade of one check for another rather than a
+//     trade of a check for nothing.
+//   - an optional leading path (`src/e2e/bench/paths.ts`, `SPO-WebClient/src/e2e/bench/paths.ts`).
+//     `paths.ts` is an ambiguous basename in the product repo, so its citation MUST spell a path
+//     to say which file it means -- and a regex that stopped at the basename would have read
+//     `src/e2e/bench/paths.ts`'s citation as a bare, ambiguous `paths.ts`. resolveSymbolFile
+//     above consumes the path; see its header for the basename fallback that keeps this corpus's
+//     existing repo-relative-ish prose ("steps/scripted.js") resolving exactly as it did before.
+const SYMBOL_CITATION_RE = /`?\b((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.(?:js|ts))`?'s `?([A-Za-z_][A-Za-z0-9_]*)`?/g;
 
 function extractSymbolCitations(text) {
   const out = [];
@@ -575,10 +590,52 @@ function extractSymbolCitations(text) {
     // states for the rest of this action (test/** was never part of Gate C7's clause, and
     // CORPUS_FILES above excludes it entirely) -- a symbol cited FROM a test file is a test-
     // maintenance fact, not a documentation-truthfulness one this sweep owns.
-    if (m[1].endsWith('.test.js')) continue;
+    if (m[1].endsWith('.test.js') || m[1].endsWith('.test.ts')) continue;
     out.push({ file: m[1], ident, index: m.index });
   }
   return out;
+}
+
+// resolveSymbolFile(fileName) -- M17: the cited file, resolved the SAME way part 2's line-number
+// citations already resolve (resolveCitationTarget: this repo, then the product repo, then
+// SPO-Deploy), rather than the old basename-in-THIS-repo-only lookup. Two things forced the
+// widening, both from converting `file:line` citations to symbol citations (see the M17 header
+// above SYMBOL_CITATION_RE):
+//
+//   - a symbol citation to a PRODUCT file (`worker.ts`'s `MAX_LEASE_MINUTES`) is the whole point
+//     of the conversion, and the old lookup could only ever answer 'no-such-file' for it;
+//   - `paths.ts` is an AMBIGUOUS basename in the product repo (src/e2e/bench/paths.ts and
+//     src/server/paths.ts), so the honest citation spells a path -- which the old basename-only
+//     lookup could not consume at all.
+//
+// Two attempts, in order: the cited text verbatim, then its basename. The basename fallback is
+// what keeps every PRE-EXISTING citation working now that SYMBOL_CITATION_RE captures a leading
+// path: this corpus's prose writes `steps/scripted.js`, but the file's real path is
+// `orchestrator/steps/scripted.js`, and resolveCitationTarget only joins paths, never searches
+// for a suffix. Verbatim-first (not basename-first) is deliberate: it is what lets a path-bearing
+// citation disambiguate a basename that is ambiguous on its own, which is the entire reason
+// `src/e2e/bench/paths.ts` has to be written out.
+//
+// A missing cross-repo checkout is returned as its own answer ('product-absent'/'deploy-absent'),
+// never collapsed into 'no-such-file' -- same E1 posture part 2 already takes: "the repo needed to
+// tell isn't on disk" is a setup problem the caller must fail loudly on, not a silent pass. It is
+// only returned when NO attempt resolved, so a citation whose basename resolves locally is
+// unaffected by whether SPO-Deploy happens to be checked out.
+function resolveSymbolFile(fileName) {
+  const attempts = fileName.includes('/') ? [fileName, path.basename(fileName)] : [fileName];
+  const failures = [];
+  for (const attempt of attempts) {
+    const r = resolveCitationTarget(attempt);
+    if (r.target) return r.target;
+    // Ambiguity is its own answer, never a silent first pick -- see findByBasename's header for
+    // the stale-worktree resolution that rule replaced.
+    if (r.ambiguous) failures.push('ambiguous-file');
+    else if (r.root === 'product-absent' || r.root === 'deploy-absent') failures.push(r.root);
+    else failures.push('no-such-file');
+  }
+  const absent = failures.find((f) => f === 'product-absent' || f === 'deploy-absent');
+  if (absent) return absent;
+  return failures.includes('ambiguous-file') ? 'ambiguous-file' : 'no-such-file';
 }
 
 // symbolDefinedIn -- M15b: tests whether `ident` occurs in the CITED file's real code (comments
@@ -587,14 +644,11 @@ function extractSymbolCitations(text) {
 // "this file's own commentary happens to mention this name while discussing a DIFFERENT file" --
 // exactly the gap the config.js/spawnStep plant above proves closed.
 function symbolDefinedIn(fileName, ident) {
-  // findByBasename returns EVERY tracked match, so the empty case is `.length === 0` and not a
-  // falsy check: `if (!target)` on an array is always false, which would have sent an empty
-  // result straight into readFileSync. Ambiguity is its own answer, never a silent first pick --
-  // see findByBasename's header for the stale-worktree resolution this replaced.
-  const hits = findByBasename(fileName, REPO_ROOT);
-  if (hits.length === 0) return 'no-such-file';
-  if (hits.length > 1) return 'ambiguous-file';
-  const src = blankComments(fs.readFileSync(hits[0], 'utf8'));
+  const target = resolveSymbolFile(fileName);
+  if (target === 'no-such-file' || target === 'ambiguous-file' || target === 'product-absent' || target === 'deploy-absent') {
+    return target;
+  }
+  const src = blankComments(fs.readFileSync(target, 'utf8'));
   return new RegExp(`\\b${ident}\\b`).test(src);
 }
 
@@ -617,7 +671,7 @@ test('PHANTOM_SYMBOL_ALLOWLIST holds exactly the entries this action explicitly 
   );
 });
 
-test('every "<file>.js\'s <CodeShapedIdent>" possessive citation names a symbol that actually exists in that file', () => {
+test('every "<file>.js|.ts\'s <CodeShapedIdent>" possessive citation names a symbol that actually exists in that file', () => {
   const SCAN_REL = [
     ...fs.readdirSync(path.join(REPO_ROOT, 'orchestrator'), { withFileTypes: true })
       .filter((e) => e.isFile() && e.name.endsWith('.js'))
@@ -644,9 +698,13 @@ test('every "<file>.js\'s <CodeShapedIdent>" possessive citation names a symbol 
           `${key} -- ${
             exists === 'no-such-file'
               ? `no such file ${c.file}`
-              : exists === 'ambiguous-file'
-                ? `ambiguous basename ${c.file}: several tracked files share it, so this citation does not say which file it means -- cite a path`
-                : `no \`${c.ident}\` defined in ${c.file}`
+              : exists === 'product-absent'
+                ? `${c.file} does not resolve in this repo, and ${PRODUCT_REPO} is not on disk to check further (E1: never a silent pass)`
+                : exists === 'deploy-absent'
+                  ? `${c.file} does not resolve in this repo or the product repo, and ${DEPLOY_REPO} is not on disk to check further (E1: never a silent pass)`
+                  : exists === 'ambiguous-file'
+                    ? `ambiguous basename ${c.file}: several tracked files share it, so this citation does not say which file it means -- cite a path`
+                    : `no \`${c.ident}\` defined in ${c.file}`
           }`
         );
       }
@@ -658,6 +716,36 @@ test('every "<file>.js\'s <CodeShapedIdent>" possessive citation names a symbol 
   // under the old regex) -- almost entirely orchestrator/README.md's 72 previously-invisible
   // sites. 400 stays comfortably below the measured figure while still failing loudly if either
   // regex half (bare-prose or backtick-wrapped) stops matching.
+  //
+  // M17 re-measured 2026-09-03: 513 checked, up from 497 on the pre-M17 tree. (The 478 figure in
+  // the M16 paragraph above is the measurement of the day M16 landed and was NOT re-measured
+  // since; the corpus grew to 497 in the commits between. Both numbers are kept, each attached to
+  // the change that measured it, rather than one being silently restated as the other's.)
+  //
+  // The +16 is the `.ts` and leading-path widening (see SYMBOL_CITATION_RE's header), and it was
+  // measured by dumping both key sets and diffing them, not by subtraction:
+  //
+  //   - 7 are the symbol citations this change WROTE in place of a `file:line` -- bench-
+  //     heartbeat.js's two paths.ts ones, bench-queue-wait.js's purgeDone and DONE_RETENTION_MS,
+  //     journal.js's and steps/scripted.js's MAX_LEASE_MINUTES, steps/scripted.js's
+  //     DEFAULT_LEASE_MINUTES.
+  //   - 9 are cross-repo symbol claims the corpus was ALREADY making in prose and nothing
+  //     checked, because a `.js`-only filename group cannot see a `.ts` at all: worker.ts's
+  //     NON_ATTESTING (x3 sites) and recoverInterrupted, job.ts's DuplicateJobError and
+  //     purgeDone, merge-queue.ts's mayReuseVerdict, run.ts's runLive, and a second
+  //     DEFAULT_LEASE_MINUTES in orchestrator/README.md. All 16 resolve and pass.
+  //
+  // The rest of the diff between the two key sets is rendering, not population: a citation the
+  // corpus writes as `steps/scripted.js`'s `realCheck` used to key on the basename alone and now
+  // keys on the path it was actually written with. resolveSymbolFile's basename fallback is what
+  // keeps those resolving; see its header.
+  //
+  // bench-heartbeat.js is worth naming separately: part 2 never covered it at all (it is not in
+  // CORPUS_FILES), which is exactly how its `paths.ts:52` drifted to a real line 77 unnoticed --
+  // the conversion had to fix the fact, not merely the shape.
+  //
+  // Floor deliberately left at 400: it is a "did the regex stop matching" tripwire, not a second
+  // pin on the exact population, which EXPECTED_CITATIONS already is.
   assert.ok(checked >= 400, `expected at least 400 code-shaped "<file>.js's <ident>" citations, found ${checked} -- has the possessive-citation style changed, or did isCodeShapedIdentifier / the backtick-optional SYMBOL_CITATION_RE stop matching?`);
   assert.deepEqual(
     offenders,
@@ -665,6 +753,26 @@ test('every "<file>.js\'s <CodeShapedIdent>" possessive citation names a symbol 
     `phantom symbol citation(s) -- a comment names a symbol that does not exist in the file it ` +
       `cites:\n  ${offenders.join('\n  ')}`
   );
+});
+
+// resolveSymbolFile is new in M17 and is the half of the conversion that keeps it a trade of one
+// check for ANOTHER check rather than a trade of a check for nothing: a citation that drops its
+// `:NNN` is only as good as the resolution behind the symbol. The two cases below are the ones
+// the conversion actually rests on, and they pull in opposite directions -- the basename fallback
+// has to be permissive enough for the corpus's existing repo-relative-ish prose, while the
+// verbatim-first ORDER has to still let a spelled-out path disambiguate a basename that is
+// ambiguous on its own. Reversing that order would make the second assertion below pass for the
+// wrong reason (ambiguous, then arbitrarily resolved) and is exactly what these pin.
+test('resolveSymbolFile: repo-relative-ish prose ("steps/scripted.js") resolves via the basename fallback', () => {
+  assert.equal(resolveSymbolFile('steps/scripted.js'), path.join(REPO_ROOT, 'orchestrator', 'steps', 'scripted.js'));
+});
+
+test('resolveSymbolFile: a spelled-out path disambiguates a product-repo basename that is ambiguous alone', () => {
+  // `paths.ts` is src/e2e/bench/paths.ts AND src/server/paths.ts in the product repo: the bare
+  // basename must stay an error, never a silent first pick.
+  assert.equal(resolveSymbolFile('paths.ts'), 'ambiguous-file');
+  assert.equal(resolveSymbolFile('src/e2e/bench/paths.ts'), path.join(PRODUCT_REPO, 'src/e2e/bench/paths.ts'));
+  assert.equal(resolveSymbolFile('SPO-WebClient/src/e2e/bench/paths.ts'), path.join(PRODUCT_REPO, 'src/e2e/bench/paths.ts'));
 });
 
 test('extractSymbolCitations: filters prose ("config.js\'s own") from real symbol citations ("state-machine.js\'s buildCtx")', () => {
@@ -1188,6 +1296,13 @@ function extractCitations(text) {
   return out;
 }
 
+// M17 (2026-09-03) removed 4 entries -- `orchestrator/bench-queue-wait.js :: worker.ts:129` and
+// `:997`, `orchestrator/journal.js :: worker.ts:131`, `orchestrator/steps/scripted.js ::
+// worker.ts:130-131` -- not because those facts stopped being checked, but because each was
+// rewritten as a SYMBOL citation (`worker.ts`'s `DONE_RETENTION_MS`) that part 1.8 above now
+// verifies instead. A line number is a second database that drifts on every unrelated edit to the
+// cited file; the symbol its own prose already named beside the number does not.
+//
 // Pinned 2026-09-03, re-measured for action 9.3 (adds 3 `bin/spo:N` sites CITATION_RE could not
 // see before, and 13 line-number corrections part 2.5's anchor check below found and fixed in
 // passing -- see that section's header for the full list, including the two real-drift cases
@@ -1260,12 +1375,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
-  "orchestrator/bench-queue-wait.js :: worker.ts:129",
-  "orchestrator/bench-queue-wait.js :: worker.ts:997",
   "orchestrator/config.js :: worker.ts:1535",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
-  "orchestrator/journal.js :: worker.ts:131",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:649",
   "orchestrator/park-loop.js :: intake.js:747-749",
@@ -1274,7 +1386,6 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
-  "orchestrator/steps/scripted.js :: worker.ts:130-131",
   "orchestrator/steps/scripted.js :: worker.ts:1535",
   "prompts/README.md :: plan.md:103",
   "prompts/README.md :: step-contracts.js:99",
@@ -1815,7 +1926,13 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
     }
   }
 
-  // Measured 2026-09-03 against the anchor-checked corpus (63 of 65 CORPUS_FILES): 26 verified,
+  // Re-measured 2026-09-03 after M17's symbol-citation conversion: 22 verified (was 26), 3
+  // unanchorable (unchanged). The 4 that left the anchored set are the 4 line-number citations
+  // converted to symbol citations in the same change -- `worker.ts:129`/`:997`/`:131`/`:130-131`
+  // -- each now checked by part 1.8's symbol check instead, against the symbol its own prose
+  // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
+  //
+  // Original measurement, for the shape of the unanchorable set: 26 verified,
   // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
   // scripted.js :: verify-gate.js:342`, `prompts/README.md :: step-contracts.js:99` (each cites a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
@@ -1824,7 +1941,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
-  assert.equal(anchored, 26, `expected 26 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  assert.equal(anchored, 22, `expected 22 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   assert.equal(unanchorable, 3, `expected exactly 3 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
   assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
 });

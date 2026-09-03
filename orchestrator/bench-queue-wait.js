@@ -35,17 +35,17 @@
 //     this file's directory held only 3 ref + 2 nightly reports when re-measured for THIS
 //     action, days later, on the same machine. THE SPOOL ROTATES, and that is what explains the
 //     drop from 8 to 5: SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 325) rmSync's
-//     every report whose mtime is older than the retention window it is passed, and worker.ts
-//     calls it on each pass with DONE_RETENTION_MS = 24h (worker.ts:129, called at :997). So
-//     ~/.spo-bench/done is a ONE-DAY sliding window, and every number below is the worst service
-//     time seen within a day, NOT an all-time record -- a genuinely worse job could have run and
-//     been swept before either measurement. Recorded plainly because it bounds what these
-//     constants can claim: they are a floor on the true max, not the max. The conclusion below
-//     survives it anyway, and that is the point of stating it -- npm-gate's 7800000ms clears
-//     even the K=3 bound by a factor of ~9.8, so the true max would have to be nearly an order
-//     of magnitude worse than a full day of observed traffic before the verdict changed. The two
-//     measurements also agree on the max to within 1s (160.2s vs 161s) despite disagreeing on
-//     sample count.
+//     every report whose mtime is older than the retention window it is passed, and
+//     `worker.ts`'s `purgeDone` call site passes it `worker.ts`'s `DONE_RETENTION_MS` = 24h on
+//     every pass. So ~/.spo-bench/done is a ONE-DAY sliding window, and every number below is
+//     the worst service time seen within a day, NOT an all-time record -- a genuinely worse job
+//     could have run and been swept before either measurement. Recorded plainly because it
+//     bounds what these constants can claim: they are a floor on the true max, not the max. The
+//     conclusion below survives it anyway, and that is the point of stating it -- npm-gate's
+//     7800000ms clears even the K=3 bound by a factor of ~9.8, so the true max would have to be
+//     nearly an order of magnitude worse than a full day of observed traffic before the verdict
+//     changed. The two measurements also agree on the max to within 1s (160.2s vs 161s) despite
+//     disagreeing on sample count.
 //
 //   NIGHTLY_JOB_MAX_MS -- 232s. Same directory, 'nightly'-type reports: 2 on disk, 212.5/232.0s
 //     -- max 232.0s, matching doc/remediation-progress.md's own 213/213/232s citation on the
