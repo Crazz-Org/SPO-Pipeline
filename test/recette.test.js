@@ -266,11 +266,35 @@ function setupAccountsDir() {
 }
 
 function baseOpts(overrides = {}) {
+  const { configOverrides, ...rest } = overrides;
   return {
     recetteDir: mkTmp('spo-recette-run-'),
     productJournalRoot: mkTmp('spo-recette-product-journal-'), // no live daemon there
     accountsDir: setupAccountsDir(),
-    ...overrides,
+    ...rest,
+    configOverrides: {
+      // pipelineWorktreesDir IS ISOLATED FOR EVERY baseOpts() TEST, not just the dispatcher-driver
+      // ones this file's header already requires it for. Left at the config.js default it resolves
+      // to `<repo>/worktrees`, and product-repo-lock.js puts its mutex at
+      // `<pipelineWorktreesDir>/.product-repo.lock` -- a REPO-GLOBAL path. That makes the suite
+      // non-reentrant: two `node --test test/*.test.js` processes on the same checkout fight over
+      // one lock file, the loser parks `product-repo-lock-timeout`, and four recette tests fail
+      // for a reason that has nothing to do with the code under test.
+      //
+      // Measured (issue #111): 8 concurrent runs of THIS FILE ALONE, default dir -> 8/8 failed;
+      // the same 8 with a per-process dir -> 0/8. It is contention, not load -- this file alone
+      // barely loads the box. It is also what made #111's own required verification protocol
+      // ("run several full suites in parallel", the #480 harness) unrunnable on this repo without
+      // an SPO_WORKTREES_DIR workaround per suite.
+      //
+      // Same class as the `bin/spo dashboard` race recorded in doc/remediation-progress.md's #480
+      // table ("the one test whose subject is a repo-global path, so two concurrent suites race"),
+      // and the fix this file's own header already mandates for its dispatcher-driver tests, just
+      // applied to every test that takes this helper. Spread FIRST so a caller's own
+      // configOverrides still wins per key.
+      pipelineWorktreesDir: mkTmp('spo-recette-worktrees-'),
+      ...(configOverrides || {}),
+    },
   };
 }
 
