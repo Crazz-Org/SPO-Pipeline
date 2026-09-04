@@ -98,6 +98,13 @@ systemctl --user --no-pager --lines=8 status spo-pipeline-daemon.service || true
 echo "== wiring post-merge hook (restart on git pull)"
 ln -sf "$REPO/scripts/git-hooks/post-merge" "$REPO/.git/hooks/post-merge"
 
+# Pre-push gate: runs scripts/gate.sh (this repo's own suite) before a push leaves the machine.
+# Same symlink mechanism as post-merge above, and installed by the same scripts, so a box that has
+# the daemon also has the gate. See scripts/git-hooks/pre-push for why the local half exists
+# alongside the CI one.
+echo "== wiring pre-push hook (run the gate before pushing)"
+ln -sf "$REPO/scripts/git-hooks/pre-push" "$REPO/.git/hooks/pre-push"
+
 echo ""
 echo "== the daemon is now AUTONOMOUS: --real, auto-pull every 5 min, one card at a time."
 echo "== journals: $REPO/journal/   status: bin/spo status   cost: bin/spo cost"
