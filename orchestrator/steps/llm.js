@@ -88,7 +88,7 @@ const { sleep } = require('./scripted');
 const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
-const { resolveStepContract, LLM_STEP_DEADLINE_MS } = require('../step-contracts');
+const { resolveStepContract, deadlineMsForStep } = require('../step-contracts');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
 
@@ -675,7 +675,10 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       promptFile: override.promptFile,
       cwd,
       account,
-      deadlineMs: LLM_STEP_DEADLINE_MS,
+      // Per-step (PLAN 1800000ms, every other step 900000ms). This legacy override path has no
+      // resolved contract to read the figure off, so it asks step-contracts directly -- same
+      // source, so the two paths can never disagree about how long a PLAN may run.
+      deadlineMs: deadlineMsForStep(stepName),
     };
 
     const result = await invokeClaudeReal(opts, deps);
@@ -738,7 +741,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     promptText,
     cwd,
     account,
-    deadlineMs: LLM_STEP_DEADLINE_MS,
+    deadlineMs: contract.deadlineMs,
   };
 
   if (ctx.dryRun) {

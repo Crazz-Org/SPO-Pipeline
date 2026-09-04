@@ -686,7 +686,7 @@ create is exactly the defect that idiom replaced, not a shortcut this path still
 A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
 **bounded wait** (`config.accountLeaseWaitMs`) before parking `all-accounts-leased` — distinct
 from `AllAccountsCoolingError` (a cooldown, never worth waiting on; that still parks immediately).
-The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **31.5 minutes**: 2 ×
+The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×
 `LLM_STEP_DEADLINE_MS` plus 10% slack) — the age at which a lease is presumed dead and swept
 regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That distinction
 was a real C6-verification bug: the original default (5 min, reasoned from the typical duration)

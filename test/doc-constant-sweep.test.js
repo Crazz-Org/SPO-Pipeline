@@ -155,25 +155,38 @@ const PINS = [
     // The historical bug this row guards: the spec once said 5 minutes here, restating a
     // REJECTED rationale (an observed max step duration) instead of the ceiling the code
     // actually derives the wait from -- see config.js's own accountLeaseWaitMs comment.
-    name: 'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (31.5 min), not a flat 5 min', // action 6.2
+    name: 'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (63 min), not a flat 5 min', // action 6.2
     checks: [
       {
         file: 'orchestrator/step-contracts.js',
-        contains: 'const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE_MS / 10);',
+        // MAX_LLM_STEP_DEADLINE_MS, not LLM_STEP_DEADLINE_MS: PLAN carries a longer deadline since
+        // 2026-09-04, and the lease bound must follow the LONGEST legitimate hold, not the default.
+        contains: 'const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10);',
       },
       {
         file: 'orchestrator/config.js',
         contains: "accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', MAX_LEASE_AGE_MS),",
       },
-      { file: 'doc/state-machine-spec.md', contains: '**31.5 min** — `MAX_LEASE_AGE_MS`' },
-      { file: 'orchestrator/README.md', contains: '`MAX_LEASE_AGE_MS` (`step-contracts.js`, **31.5 minutes**: 2 ×' },
+      { file: 'doc/state-machine-spec.md', contains: '**63 min** — `MAX_LEASE_AGE_MS`' },
+      { file: 'orchestrator/README.md', contains: '`MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×' },
     ],
   },
   {
-    name: 'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- all five LLM steps', // action 1.x / 2.1
+    name: 'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, four of the five LLM steps', // action 1.x / 2.1
     checks: [
       { file: 'orchestrator/step-contracts.js', contains: 'const LLM_STEP_DEADLINE_MS = 900000;' },
       { file: 'doc/state-machine-spec.md', contains: '| 900000ms / 15min |' },
+    ],
+  },
+  {
+    // PLAN is the one step off the default (2026-09-04). Card #486 (size:L, the only card ever to
+    // reach PLAN's `L -> high` row) failed three times, twice on deadline kills at ~825s of measured
+    // wall clock, and terminal-parked llm-transport-failed:PLAN -- the pipeline could not plan an
+    // L card at all. This row exists so the raise cannot drift from the spec table that states it.
+    name: 'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN gets 1800000ms / 30min',
+    checks: [
+      { file: 'orchestrator/step-contracts.js', contains: 'PLAN: 1800000, // 30 min' },
+      { file: 'doc/state-machine-spec.md', contains: '| 1800000ms / 30min |' },
     ],
   },
   {
@@ -235,12 +248,13 @@ test('every pinned documented constant matches a literal in both the code and th
   assert.deepEqual(
     PINS.map((p) => p.name).sort(),
     [
-      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- all five LLM steps',
+      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, four of the five LLM steps',
+      'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN gets 1800000ms / 30min',
       'account cooldown: escalation window (2 hours)',
       'account cooldown: overloaded (5 minutes, flat, never escalates)',
       'account cooldown: usage escalated (5 hours)',
       'account cooldown: usage probe (1 hour)',
-      'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (31.5 min), not a flat 5 min',
+      'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (63 min), not a flat 5 min',
       'autoPullLimit default (1) and the in-flight+queued<=K watermark',
       'benchIdleWaitMaxPolls default (180) and benchIdleWaitPollIntervalMs default (5000ms)',
       'ciChecksMaxPolls default (30)',
@@ -1391,7 +1405,6 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
   "orchestrator/steps/scripted.js :: worker.ts:1535",
   "prompts/README.md :: plan.md:103",
-  "prompts/README.md :: step-contracts.js:99",
 ];
 
 test('every file:line citation in the 65-file corpus resolves, or is on the named allowlist', () => {
@@ -1939,7 +1952,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
   // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
-  // scripted.js :: verify-gate.js:342`, `prompts/README.md :: step-contracts.js:99` (each cites a
+  // scripted.js :: verify-gate.js:342` (each cites a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
   // mention -- correctly unverifiable, not wrong) -- 3 on CITATION_ANCHOR_ALLOWLIST (already
   // excluded above), 0 unexplained offenders after this action's own fixes landed. Both counts
@@ -1947,7 +1960,12 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
   assert.equal(anchored, 22, `expected 22 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
-  assert.equal(unanchorable, 3, `expected exactly 3 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
+  // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
+  // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
+  // The escalation was deleted, so the row no longer makes the claim and no longer needs the
+  // citation. The population SHRANK -- which is the direction this pin is happy to move in; it
+  // exists to stop "cannot verify" growing.
+  assert.equal(unanchorable, 2, `expected exactly 2 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
   assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
 });
 

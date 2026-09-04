@@ -155,11 +155,11 @@ be confused: `validate-reject N | reasons | outcome` (action 1.6).
 
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
-| PLAN | Fable 5 (Opus 5 fallback) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 900000ms / 15min |
+| PLAN | Fable 5 — no escalation (the promised "Opus 5 fallback" was unreachable and was removed 2026-09-04) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
 | IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
-| DIAGNOSE | Fable 5 | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
+| DIAGNOSE | Opus 5 (was Fable 5 until 2026-09-04) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
-| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself) | high | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when the diff touches the RDO wire | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
 
 The deadline is the same figure for all five rows — `step-contracts.js`'s `LLM_STEP_DEADLINE_MS`,
 the `spawnSync` timeout `invokeClaudeReal` arms for every one of these calls
@@ -334,7 +334,7 @@ separate repos with no shared runtime.
   a worker and the scanner can run at once. A lease is per-step, not per-task, released the
   instant the one LLM call it wraps finishes; a healthy account currently leased by another live
   process is `AllAccountsLeasedError`, worth a bounded wait (`config.accountLeaseWaitMs`, default
-  **31.5 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the age at which a lease is swept as
+  **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the age at which a lease is swept as
   dead — never the ~90–265s a sibling's own step is *usually* measured at: a waiter has to outlast
   the longest a sibling can *legitimately* hold the lease, not its typical duration, and the old
   5-minute default was found wrong in C6 verification for exactly that reason — it gave up while a
