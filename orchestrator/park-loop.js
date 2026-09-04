@@ -33,6 +33,7 @@ const { appendEvent, writeState } = require('./journal');
 const { moveCard } = require('./board');
 const { armTimeout } = require('./command-timeout');
 const commentScan = require('./comment-scan');
+const retryChannel = require('./retry-channel');
 const { summarizeTask, formatAttemptLines } = require('./task-summary');
 const { formatTokenCount } = require('./tokens');
 
@@ -1158,8 +1159,24 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
     // not change that; only reconcileExternalClosure runs for it.
     if (state.state !== 'PARKED') continue;
 
-    const anchor = findParkAnchor(readJournalLines(taskDir));
+    const lines = readJournalLines(taskDir);
+    const anchor = findParkAnchor(lines);
     if (!anchor || anchor.alreadyHandled) continue;
+
+    // Card #476, half 2. The tail is summarized BEFORE the scan, on the same lines findParkAnchor
+    // just read (never a second read of the file), because what makes this cycle's outcome worth
+    // journalling is what the journal said a moment ago -- see retryChannel.shouldJournalScanOk.
+    const tailBefore = retryChannel.summarizeUnparkScanTail(lines);
+    // scanForMatch's own journal callback may write positive evidence of its own this cycle
+    // (`unpark-scan-truncated`, `unpark-scan-ignored-author` -- both prove `gh` answered). If it
+    // does, the outcome is already on record and an `unpark-scan-ok` beside it would be a second
+    // line saying the same thing, every cycle, for as long as the condition holds -- i.e. the
+    // per-cycle heartbeat this event exists specifically not to be.
+    let positiveThisCycle = false;
+    const journalScanEvent = (event, detail) => {
+      if (retryChannel.UNPARK_SCAN_SUCCESS_EVENTS.has(event)) positiveThisCycle = true;
+      appendEvent(taskDir, 'PARKED', event, detail);
+    };
 
     const scan = await commentScan.scanForMatch({
       deps,
@@ -1171,7 +1188,7 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
       patterns: UNPARK_PATTERNS,
       scanState,
       journalRoot,
-      journal: (event, detail) => appendEvent(taskDir, 'PARKED', event, detail),
+      journal: journalScanEvent,
       events: UNPARK_SCAN_EVENTS,
       scannerKey: 'unpark',
       now: nowMs,
@@ -1184,9 +1201,36 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
         exit: scan.exit,
         timedOut: scan.timedOut === true,
         reason: scan.reason === 'unparsable' ? 'unparsable-comments' : undefined,
+        // Card #476, half 1: `gh`'s own first stderr line. `undefined` (dropped by the JSON
+        // encoder, never written as `null`) on the 'unparsable' branch, where `gh` exited 0 and
+        // there is genuinely nothing it said -- the absence is the honest record there, and the
+        // pre-#476 shape of every other field on this event is unchanged.
+        stderr: scan.stderr || undefined,
       });
       continue;
     }
+
+    // The scan reached GitHub. Card #476, half 2: journal that ONLY when it is an outcome CHANGE
+    // -- the first proven-live scan of this park cycle, or a recovery from a standing failure
+    // streak. A scan that succeeds when a success is already on record writes nothing at all,
+    // which is what keeps a 60s-cadence scanner from re-becoming the journal's dominant line.
+    //
+    // Written as a LITERAL, not as `retryChannel.UNPARK_SCAN_OK_EVENT`, for two reasons that
+    // point the same way: test/park-reason-doc-sweep.test.js resolves journal event names out of
+    // the source and treats an unresolvable dynamic argument as a sweep hole to be closed, not
+    // ignored; and the readers' break-set lives in retry-channel.js, so writer and reader are two
+    // places either way. The agreement between them is pinned by a test that emits this event and
+    // asserts the next cycle stays silent -- a drifted name makes it repeat every 60 seconds,
+    // which is the failure this event exists to avoid, and the test fails on it.
+    if (!positiveThisCycle && retryChannel.shouldJournalScanOk(tailBefore)) {
+      appendEvent(taskDir, 'PARKED', 'unpark-scan-ok', {
+        // What CHANGED, so the line carries its own justification: the streak it ends, or the
+        // fact that it is this park cycle's first recorded outcome.
+        afterFailures: tailBefore.count,
+        firstFailedAt: tailBefore.firstFailedAt || undefined,
+      });
+    }
+
     if (!scan.match) continue;
     const match = scan.match.comment;
 

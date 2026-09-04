@@ -57,7 +57,10 @@ test('spo status and spo task exit 0 and render the produced journals', () => {
   // (gate-dirty-tree, from this fixture's shadow.gate: [2]), never the last journal event's
   // name -- and carries the unpark scan's own failure-streak status (item F), "ok" here since
   // this fixture never ran the scan at all.
-  assert.match(statusOut, /cli-parked\s+PARKED\s+reason=gate-dirty-tree\s+retry-channel: no failures recorded/);
+  // Project-2 card #476: a clean tail with no recorded scan OUTCOME is no longer dressed up as an
+  // all-clear. This fixture's journal has neither failures nor positive evidence, which is exactly
+  // the state a never-running scanner also produces -- so the line says so.
+  assert.match(statusOut, /cli-parked\s+PARKED\s+reason=gate-dirty-tree\s+retry-channel: no scan outcome recorded yet/);
 
   const taskOut = runSpo(['task', 'cli-demo', '--journal', journalDir]);
   assert.match(taskOut, /INTAKE/);
