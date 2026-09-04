@@ -1233,6 +1233,20 @@ test('shouldSkipForTriageBackoff: pure table across (errorCount, elapsed) pairs,
   // A huge errorCount is still bounded by the ceiling (5000ms here), never "skip forever".
   assert.equal(shouldSkipForTriageBackoff(now - 5001, now, 50, config), false);
   assert.equal(shouldSkipForTriageBackoff(now - 4999, now, 50, config), true);
+
+  // #660: `lastErrorAtMs` AHEAD of `nowMs` -- the shape a backward Date.now() jump produces
+  // (monotonic-clock.js's own header: measured -2515ms on this box, twice, independently). Elapsed
+  // time cannot really be negative, so this must clamp to "no time has passed" (elapsed 0), not
+  // invert the comparison. With a zeroed base (the CAP tests' own isolation config -- waitMs 0 for
+  // any errorCount > 0) a negative elapsed used to read as `< 0`, which is true, flipping "never
+  // skip" into "skip" on exactly the call after a report-triage-error write raced a clock hiccup.
+  const zeroBaseConfig = { autoTriageBackoffBaseMs: 0, autoTriageBackoffCeilingMs: 5000 };
+  assert.equal(shouldSkipForTriageBackoff(now + 1, now, 1, zeroBaseConfig), false, 'clock stepped back 1ms since the recorded error, base 0 -- must still never skip');
+  assert.equal(shouldSkipForTriageBackoff(now + 5000, now, 1, zeroBaseConfig), false, 'clock stepped back further -- still clamped, not inverted');
+  // Same shape with a real (non-zero) base: a small backward jump must not EXTEND the wait beyond
+  // its configured bound either -- clamped elapsed is 0, so this behaves exactly like "the error
+  // just happened", never like "the error is somehow still in the future".
+  assert.equal(shouldSkipForTriageBackoff(now + 1, now, 1, config), true, 'clamped to elapsed 0, still inside the 1000ms wait');
 });
 
 // ---- integration: runAutoTriage wiring for the cap ----------------------------------------
@@ -1321,6 +1335,34 @@ test('runAutoTriage: the THIRD mechanical failure holds the report with a dedica
   assert.equal(fs.existsSync(path.join(spoReportsDir, IN_PROGRESS_DIRNAME, path.basename(pendingPath))), false, 'not stranded in in-progress/ either');
 
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), [], 'report-held-mechanical counts as handled');
+});
+
+// #660: integration-level regression for the flake -- a report-triage-error whose journalled `ts`
+// is slightly AHEAD of "now" (exactly what a backward Date.now() jump produces between the write
+// and the very next call's backoff check, see monotonic-clock.js's header) must never cause
+// runAutoTriage to back off a report whose autoTriageBackoffBaseMs is 0. Fabricated directly via
+// appendDaemonEventAt (same trick the backoff tests below already use to backdate) rather than by
+// monkeypatching Date.now, so this test proves the PRODUCTION decision function's own clamp, not a
+// test-harness workaround.
+test('runAutoTriage: a report-triage-error whose ts is ahead of "now" (a backward clock jump) never triggers a spurious backoff skip', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-mech-clockjump-');
+  const journalRoot = mkTmp('spo-autotriage-mech-clockjump-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_mech-clockjump.json');
+  confirmedEntry(journalRoot, { issue: 1004, pendingPath });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo', autoTriageBackoffBaseMs: 0 };
+
+  // A mechanical failure "just recorded" -- but stamped a few seconds into the future relative to
+  // the real clock, simulating the box's own documented backward jump landing between this write
+  // and the next call's `Date.now()` read.
+  const aheadOfNow = new Date(Date.now() + 5000).toISOString();
+  appendDaemonEventAt(journalRoot, 'report-triage-error', { issue: 1004, step: 'TRIAGE_BUG_REPORT', error: 'boom' }, aheadOfNow);
+
+  const result = await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false });
+
+  assert.equal(result.backoffSkipped, 0, 'autoTriageBackoffBaseMs: 0 must mean never skip, even with a ts that looks like it is in the future');
+  assert.equal(result.errors.length, 1, 'the report was actually processed (and mechanically failed again), not silently skipped');
+  assert.equal(mechanicalFailureHistory(journalRoot, 1004).count, 2, 'the fabricated failure plus this real one');
 });
 
 test('runAutoTriage: a later report-confirmed for the same issue resets the mechanical-failure count (the hook action 3.4 depends on)', async () => {
