@@ -2243,3 +2243,69 @@ test('retryHeldReport: carries kind forward for a suggestion report, and the ret
   assert.equal(fileCounted.count(), 1, 'the retried suggestion must cost exactly one LLM call on the next cycle too -- never two');
   assert.equal(cycle.filed, 1, 'the recovered suggestion reaches filed on the very next cycle');
 });
+
+// ---- SPO-Pipeline#117: a triage cycle's LLM spend reaches daemon.jsonl ------------------------
+//
+// The end-to-end half of the fix. intake.js does the writing (test/intake.test.js pins the event
+// shape) and tokens.js does the reading (test/tokens.test.js pins the sums), but neither proves
+// the ONE thing that was actually broken in production: the wiring between them. Nothing was
+// missing from intake's own return value -- `journalRoot` simply never reached it from here, so
+// `journal/daemon.jsonl` held zero `llm-call` events against 58 auto-triage cycles. Severing
+// that argument again is invisible to every other test in this file.
+
+function daemonLlmCalls(journalRoot) {
+  return fs
+    .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l))
+    .filter((e) => e.event === 'llm-call');
+}
+
+test('runAutoTriage: both LLM calls of a triage cycle leave an `llm-call` record in daemon.jsonl', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-reports-tokens-');
+  const journalRoot = mkTmp('spo-autotriage-journal-tokens-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-09-04T10-00-00-000Z_desktop_ttt.json');
+  confirmedEntry(journalRoot, { issue: 991, pendingPath });
+
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review' },
+    ],
+  });
+
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+  assert.equal(result.ok, true);
+
+  // TRIAGE_BUG_REPORT then REVIEW_CARD -- the two calls a "draft" outcome costs, in order.
+  assert.deepEqual(daemonLlmCalls(journalRoot).map((e) => e.step), ['TRIAGE_BUG_REPORT', 'REVIEW_CARD']);
+});
+
+test('runAutoTriage --dry: the llm-call record is written even though every other daemon event is suppressed', async () => {
+  // A dry cycle still spawns `claude` and still spends the tokens (routeConfirmedReport calls
+  // triageBugReport before it consults `dry` at all). `dry` suppresses acts on the world and the
+  // routing events the scanners read; an accounting record is neither, and omitting it would
+  // reintroduce the very defect this closes, at dry-run scale.
+  const spoReportsDir = mkTmp('spo-autotriage-reports-dry-tokens-');
+  const journalRoot = mkTmp('spo-autotriage-journal-dry-tokens-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-09-04T11-00-00-000Z_desktop_ddd.json');
+  confirmedEntry(journalRoot, { issue: 992, pendingPath });
+
+  const deps = makeDeps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'cannot reproduce' }] });
+
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
+  assert.equal(result.ok, true);
+
+  const calls = daemonLlmCalls(journalRoot);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].step, 'TRIAGE_BUG_REPORT');
+  // …and the routing events really are still suppressed, so this test is not just observing a
+  // dry run that quietly stopped being dry.
+  const events = fs
+    .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l).event);
+  assert.ok(!events.includes('report-held'), 'a dry cycle still journals no terminal routing event');
+});

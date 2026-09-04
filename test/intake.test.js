@@ -1792,3 +1792,233 @@ test('draftCard: an account leased by another LIVE process is skipped -- the oth
   assert.equal(fs.existsSync(path.join(dir, '.lease-acct2.json')), false, 'our own lease is released');
   assert.deepEqual(accounts.readState(dir), {}, 'a leased account is never cooled down -- nothing here was a limit');
 });
+
+// ---- SPO-Pipeline#117: intake spend leaves a token record ------------------------------------
+//
+// Before this, draftCard/reviewCard/triageBugReport computed the token block, returned it, and
+// every caller dropped it: journal/daemon.jsonl held ZERO `llm-call` events against 58
+// auto-triage cycles, and `spo status` shipped a caveat saying its own number was short by an
+// unknown amount. These tests pin the write side; test/tokens.test.js pins the read side.
+
+// modelUsage carrying real counts -- realShapedReply's default only has costUSD, which
+// extractTokens reads as `tokensSource: null` (not reported), the one shape that must never be
+// mistaken for a genuine zero.
+function replyWithTokens(resultObj, usage) {
+  return realShapedReply(resultObj, {
+    modelUsage: {
+      'claude-x': {
+        input_tokens: usage.fi,
+        cache_creation_input_tokens: usage.cc,
+        cache_read_input_tokens: usage.cr,
+        output_tokens: usage.out,
+      },
+    },
+  });
+}
+
+function readDaemonLlmCalls(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l))
+    .filter((e) => e.event === 'llm-call');
+}
+
+test('draftCard: journals an `llm-call` into daemon.jsonl with the same fields a pipeline step writes', async () => {
+  const journalRoot = mkTmp('spo-intake-journal-');
+  const deps = {
+    accountsDir: poolDir(),
+    journalRoot,
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 900, cc: 8000, cr: 21000, out: 50 })),
+      stderr: '',
+      signal: null,
+    })),
+  };
+
+  const result = await intake.draftCard('anything', deps);
+  assert.equal(result.ok, true);
+
+  const calls = readDaemonLlmCalls(journalRoot);
+  assert.equal(calls.length, 1);
+  const ev = calls[0];
+  // The step name is intake's own, never a pipeline step's -- so one reader summing both
+  // journals can still tell where the spend went.
+  assert.equal(ev.step, 'DRAFT_CARD');
+  assert.equal(ev.model, 'sonnet');
+  assert.equal(ev.effort, 'medium');
+  assert.equal(ev.account, 'acct1');
+  assert.equal(ev.ok, true);
+  // `tokensSource` is the marker that distinguishes "reported zero" from "not reported" --
+  // without it every reader here has to guess, which is the whole erratum this closes.
+  assert.equal(ev.tokensSource, 'modelUsage');
+  assert.equal(ev.freshInputTokens, 900);
+  assert.equal(ev.cacheCreationTokens, 8000);
+  assert.equal(ev.cacheReadTokens, 21000);
+  assert.equal(ev.outputTokens, 50);
+  assert.equal(ev.billableTokens, 8950); // cache-READ excluded, same rule as tokens.js
+  assert.equal(typeof ev.ts, 'string');
+});
+
+test('reviewCard and triageBugReport journal their own step names and models, never draftCard\'s', async () => {
+  const journalRoot = mkTmp('spo-intake-journal-review-');
+  const deps = {
+    accountsDir: poolDir(),
+    journalRoot,
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(
+        replyWithTokens(
+          { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' },
+          { fi: 10, cc: 20, cr: 30, out: 40 }
+        )
+      ),
+      stderr: '',
+      signal: null,
+    })),
+  };
+  const reviewed = await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(reviewed.ok, true);
+
+  const triageJournalRoot = mkTmp('spo-intake-journal-triage-');
+  const triaged = await intake.triageBugReport('/tmp/report.json', 501, {
+    accountsDir: poolDir(),
+    journalRoot: triageJournalRoot,
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(
+        replyWithTokens({ outcome: 'draft', draft: VALID_DRAFT }, { fi: 3, cc: 4, cr: 5, out: 6 })
+      ),
+      stderr: '',
+      signal: null,
+    })),
+  });
+  assert.equal(triaged.ok, true);
+
+  assert.deepEqual(
+    readDaemonLlmCalls(journalRoot).map((e) => [e.step, e.model]),
+    [['REVIEW_CARD', 'fable']]
+  );
+  assert.deepEqual(
+    readDaemonLlmCalls(triageJournalRoot).map((e) => [e.step, e.model, e.billableTokens]),
+    [['TRIAGE_BUG_REPORT', 'opus', 13]]
+  );
+});
+
+test('a deadline-timeout retry journals TWO llm-call events -- one per call, because each spent its own tokens', async () => {
+  // The single most expensive intake shape (a doubled call) must not be the one shape that
+  // reports half its cost. auto-triage.js's `report-triage-retry` makes the retry VISIBLE; this
+  // makes it COUNTED.
+  const journalRoot = mkTmp('spo-intake-journal-retry-');
+  let n = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    journalRoot,
+    spawnSync: fakeSpawnSync(() => {
+      n += 1;
+      if (n === 1) return timeoutResult();
+      return {
+        status: 0,
+        stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 5, cc: 0, cr: 0, out: 1 })),
+        stderr: '',
+        signal: null,
+      };
+    }),
+  };
+
+  const result = await intake.draftCard('anything', deps);
+  assert.equal(result.ok, true);
+  assert.ok(result.retriedAfterTimeout, 'the retry record is still returned');
+
+  const calls = readDaemonLlmCalls(journalRoot);
+  assert.equal(calls.length, 2, 'the timed-out call is journalled too, not only the one that worked');
+  // A deadline-killed call never gets a token block: it must read as "not reported" (null), never
+  // as a genuine zero -- tokens.js counts it under llmCallsWithoutTokens on exactly that field.
+  assert.equal(calls[0].ok, false);
+  assert.equal(calls[0].tokensSource, null);
+  assert.equal(calls[1].ok, true);
+  assert.equal(calls[1].tokensSource, 'modelUsage');
+});
+
+test('an account rotation journals one llm-call per account tried -- the cooled account\'s call is not free', async () => {
+  const journalRoot = mkTmp('spo-intake-journal-rotate-');
+  let n = 0;
+  const deps = {
+    accountsDir: twoAccountPoolDir(),
+    journalRoot,
+    spawnSync: fakeSpawnSync(() => {
+      n += 1;
+      if (n === 1) return limitSpawnResult();
+      return {
+        status: 0,
+        stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 7, cc: 0, cr: 0, out: 2 })),
+        stderr: '',
+        signal: null,
+      };
+    }),
+  };
+
+  const result = await intake.draftCard('anything', deps);
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    readDaemonLlmCalls(journalRoot).map((e) => [e.account, e.ok]),
+    [['acct1', false], ['acct2', true]]
+  );
+});
+
+test('no journalRoot in deps -> no journal write, and the call still returns normally', () => {
+  // Every unit test above this block calls draftCard with no journalRoot at all. A hard
+  // requirement would have turned each of them into an ENOENT rather than a test failure with a
+  // readable cause -- and `spo pull` and any future caller with no journal must stay callable.
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 1, cc: 1, cr: 1, out: 1 })),
+      stderr: '',
+      signal: null,
+    })),
+  };
+  return intake.draftCard('anything', deps).then((result) => {
+    assert.equal(result.ok, true);
+  });
+});
+
+test(
+  'spo ask: passes the resolved journalRoot to draftCard AND reviewCard, so an interactive filing lands in the token ledger too',
+  withExitCodeReset(async () => {
+    // `spo ask` spends two real LLM calls and left no record of them anywhere (SPO-Pipeline#117).
+    // The fix is one argument at each call site, and an argument is exactly the kind of thing a
+    // refactor drops silently: nothing else in cmdAsk's behaviour changes when it goes missing.
+    const journalDir = mkTmp('spo-ask-journal-');
+    const seen = [];
+    const fakeIntake = {
+      draftCard: async (_text, deps) => {
+        seen.push(['draftCard', deps && deps.journalRoot]);
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async (_draft, deps) => {
+        seen.push(['reviewCard', deps && deps.journalRoot]);
+        return { ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } };
+      },
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['add', 'a', 'badge', '--dry', '--journal', journalDir]);
+      await spo.cmdAsk(opts, { intake: fakeIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.deepEqual(seen, [
+      ['draftCard', journalDir],
+      ['reviewCard', journalDir],
+    ]);
+  })
+);

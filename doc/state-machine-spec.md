@@ -271,7 +271,7 @@ separate repos with no shared runtime.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:747-749`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:796-798`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -368,6 +368,18 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
   `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
   failed and the task fell through to an ordinary park instead).
+- `journal/daemon.jsonl` — the daemon-scoped sibling of the per-task journals (dispatcher
+  `worker-spawn`/`worker-exit`, the intake/confirm/triage scanners' own
+  `report-intake`/`report-confirmed`/`report-triaged`/`auto-triage` events), and since
+  SPO-Pipeline#117 the **`llm-call` events of the intake stages** — `DRAFT_CARD`, `REVIEW_CARD`
+  and `TRIAGE_BUG_REPORT`, in the same shape and with the same field names a pipeline step writes
+  into `journal.jsonl`. They live here rather than in a task journal because there is no card yet
+  when they run: no `ctx.taskDir` exists to write into. One event per `claude` spawn, so a
+  deadline-timeout retry and an account rotation each leave two — the doubled call is the shape
+  most worth counting, not the one to collapse. `orchestrator/tokens.js` reads BOTH files through
+  one accumulator, so there is still exactly one definition of "billable". Before that, the file
+  held zero `llm-call` events of any kind and every spend figure the project reported was short by
+  the whole of intake; `spo status` shipped a caveat line saying so, now removed.
 - **Kanban truth (action 5.1)** — every column change a task causes is journalled, so the board
   and the journal can be reconciled against each other. `board-move` `{column}` on a successful
   move, including **FINISH's move to `Done`**, which was previously the one move that changed the
@@ -445,7 +457,7 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1067`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1094`)
   is a generated static HTML page reading the same local journals, and already ships alongside
   the CLI rather than after it.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).

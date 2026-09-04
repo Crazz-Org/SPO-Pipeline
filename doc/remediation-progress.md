@@ -102,6 +102,15 @@ spend for want of a `taskDir` — `journal/daemon.jsonl` holds **zero `llm-call`
 kind**, so that spend is journalled nowhere. Any "today's spend" figure is short by an unknown
 amount, and `spo status` now says so.
 
+> **CLOSED 2026-09-04, SPO-Pipeline#117.** `intake.js`'s `callIntakeStepWithRotation` journals one
+> `llm-call` per `claude` spawn into `daemon.jsonl`, in the same shape a pipeline step writes, and
+> `tokens.js` reads both journals through one accumulator (`tokenReport` exposes an `intake` row
+> and folds it into every aggregate; `todaySpend` applies the same local-midnight filter to both).
+> The caveat line is gone from `spo status`, replaced by an "of which intake/triage" sub-line when
+> intake contributed. The card's claim that "the dashboard's cost trend has the same blind spot"
+> was **wrong and was not acted on**: `console/usage-scan.js` streams `~/.claude*/projects`
+> session transcripts, never the journals, so the trend always saw intake calls.
+
 **Two production outages surfaced that nothing was reporting.** The unpark scan — the maintainer's
 whole `retry`/`abandon` channel — failed **238 consecutive times over 33 hours** (2026-08-30 10:11
 → 2026-08-31 19:52) in silence; it has since recovered on its own and the cause is unrecoverable
@@ -1496,7 +1505,8 @@ replay holes predates all of it.
   systemd rate limiter fixed (it was in `[Service]`, where systemd **ignores** it — its own journal
   says so) the worst case is bounded, so cross-restart persistence was deliberately not built.
 - Still open on project 2: **#476**, **#477**, **#482** (overlaps **#31**), **#43**, **#31**, and
-  the unowned half of **#475**.
+  the unowned half of **#475**. *(#477 was re-filed as SPO-Pipeline#117 and closed 2026-09-04 —
+  see the CLOSED note on the intake-spend caveat above.)*
 
 ### Operational state as C6 closes
 
