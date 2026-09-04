@@ -87,3 +87,11 @@ decisions of record are mirrored into this repo's docs as they land.
 
 Repository content is English (same rule as the product board). Conversations with the
 maintainer may be French; translate on the way in.
+
+## License
+
+Source-available, **not** open source — see [LICENSE](LICENSE).
+
+The code is published to be read, studied and audited. No permission is granted to use,
+copy, modify or redistribute it; all rights are reserved by the copyright holder. If you
+want to use any of it, ask.
