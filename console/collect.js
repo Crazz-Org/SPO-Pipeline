@@ -21,6 +21,7 @@ const accountsModule = require('../orchestrator/accounts');
 const { processAlive } = require('../orchestrator/lock');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
 const { HEARTBEAT_STALE_MS, heartbeatAgeMs: benchHeartbeatAgeMs } = require('../orchestrator/bench-heartbeat');
+const { summarizeUnparkScanTail } = require('../orchestrator/retry-channel');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
@@ -128,6 +129,13 @@ function collectJournalTasks(journalRoot) {
       lastEventTs: last ? last.ts : null,
       lastEventName: last ? last.event : null,
       llmSteps,
+      // Project-2 card #476: the health of THIS card's retry (unpark) channel, off the journal
+      // lines already read above -- never a second parse. Computed here rather than in
+      // collectServices because this is the only place in the module that holds a task's journal
+      // lines at all. PARKED only, and null otherwise, because park-loop.js's unparkScan scans
+      // PARKED tasks and no others: a summary for a running card would describe a scanner that
+      // never looked at it. The aggregate tile is built from these by applyRetryChannelStats.
+      retryChannel: (state.state || 'UNKNOWN') === 'PARKED' ? summarizeUnparkScanTail(lines) : null,
     };
   });
 }
@@ -393,6 +401,13 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
     // bin/spo does), never a second, independently-derived total -- see that module's header for
     // the double-count hazard this avoids repeating for a second surface.
     workers: { status: 'unknown', present: false, count: 0, staleCount: 0, trailingCount: 0, updatedAt: null, ageMs: null },
+    // Project-2 card #476: the maintainer's retry/abandon channel. AGGREGATE ONLY, same rule as
+    // `workers` above -- this module's header ("per-task detail duplicates the GitHub Projects
+    // board") is why it counts cards instead of listing them, and bin/spo's cmdStatus stays the
+    // per-card surface. Filled in by collectAll (applyRetryChannelStats below), not here, for the
+    // same reason `workers` is: it needs `journalTasks`, and several tests call collectServices
+    // bare. Left honestly 'unknown' until then rather than defaulting to a green 'idle'.
+    retryChannel: { status: 'unknown', parkedCards: 0, failingCards: 0, unprovenCards: 0, healthyCards: 0, worstFailures: 0, worstFirstFailedAt: null, lastFailedAt: null, lastFailedAgeMs: null },
   };
 
   // daemon
@@ -539,6 +554,63 @@ function applyWorkerStats(services, journalRoot, journalTasks, now) {
   services.workers.updatedAt = worker.updatedAt;
   services.workers.ageMs = worker.ageMs;
   services.workers.status = worker.present ? 'ok' : 'unknown';
+  return services;
+}
+
+// applyRetryChannelStats(services, journalTasks) -- project-2 card #476, and the same
+// mutate-in-place shape as applyWorkerStats above, for the same reason: it needs `journalTasks`.
+//
+// Four states, and the two that are NOT green are the point of the card:
+//
+//   idle     -- nothing is parked. unparkScan iterates PARKED tasks and no others, so it did not
+//               run and there is nothing to be healthy or broken ABOUT. Said out loud, because a
+//               tile that simply disappeared when the parked count hit zero would look exactly
+//               like a tile whose collector broke.
+//   fail     -- at least one parked card has a standing `unpark-scan-failed` streak. This is what
+//               was invisible for 33 hours on 2026-08-30 while the retry channel was dead.
+//   unknown  -- cards are parked and NOT ONE of them has a recorded scan outcome yet. Before card
+//               #476 a successful scan journalled nothing, so this was the permanent state of the
+//               whole corpus and it rendered as silence. It is now distinguishable from `ok` and
+//               says so: a scan that has never once proven it reached GitHub is not a healthy one.
+//   ok       -- every parked card has positive evidence (`unpark-scan-ok` / `-truncated` /
+//               `-ignored-author`) sitting on top of its tail, with no failures above it.
+//
+// `fail` outranks `unknown` outranks `ok`: a real outage is never softened by a sibling card that
+// merely has nothing to say, the same precedence rule collectServices' own nightly tile applies
+// when it checks FAIL before staleness.
+function applyRetryChannelStats(services, journalTasks, now = Date.now()) {
+  const rc = services.retryChannel;
+  const parked = (journalTasks || []).filter((t) => t && t.retryChannel);
+  rc.parkedCards = parked.length;
+  if (parked.length === 0) {
+    rc.status = 'idle';
+    return services;
+  }
+  for (const t of parked) {
+    const s = t.retryChannel;
+    if (s.count > 0) {
+      rc.failingCards += 1;
+      if (s.count > rc.worstFailures) {
+        rc.worstFailures = s.count;
+        rc.worstFirstFailedAt = s.firstFailedAt || null;
+      }
+      // The most recent failure anywhere in the corpus -- what "the channel broke N ago" is
+      // measured from. String compare is safe and total here: every `ts` this walks is a
+      // journal.js ISO-8601 UTC stamp, so lexical order IS chronological order.
+      if (s.lastFailedAt && (rc.lastFailedAt === null || s.lastFailedAt > rc.lastFailedAt)) {
+        rc.lastFailedAt = s.lastFailedAt;
+      }
+    } else if (s.healthySince) {
+      rc.healthyCards += 1;
+    } else {
+      rc.unprovenCards += 1;
+    }
+  }
+  // The age is computed HERE, not in console/render.js, for the same reason usageSnapshotMeta is:
+  // render.js is a pure function of already-parsed data and owns no clock of its own.
+  const lastMs = rc.lastFailedAt ? Date.parse(rc.lastFailedAt) : NaN;
+  rc.lastFailedAgeMs = Number.isFinite(lastMs) ? now - lastMs : null;
+  rc.status = rc.failingCards > 0 ? 'fail' : rc.healthyCards > 0 ? 'ok' : 'unknown';
   return services;
 }
 
@@ -811,7 +883,11 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
   // action 6.7: `applyWorkerStats` needs `journalTasks` (for its own `isCardKind` filter) --
   // computed here, once, rather than inside collectServices, which several existing tests call
   // bare (see that function's own comment on `services.workers`).
-  const services = applyWorkerStats(collectServices({ journalRoot, queueDir, benchRoot, now }), journalRoot, journalTasks, now);
+  const services = applyRetryChannelStats(
+    applyWorkerStats(collectServices({ journalRoot, queueDir, benchRoot, now }), journalRoot, journalTasks, now),
+    journalTasks,
+    now
+  );
 
   return {
     generatedAt: new Date().toISOString(),
@@ -852,4 +928,5 @@ module.exports = {
   buildSessionIndex,
   readDaemonEventsTail,
   applyWorkerStats,
+  applyRetryChannelStats,
 };

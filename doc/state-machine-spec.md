@@ -445,7 +445,7 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1102`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1067`)
   is a generated static HTML page reading the same local journals, and already ships alongside
   the CLI rather than after it.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).

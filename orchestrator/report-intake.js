@@ -402,10 +402,15 @@ async function reportConfirmScan(journalRoot, config, deps = {}, scanState = com
       }
       errors.push({
         issue: entry.issue,
+        // Project-2 card #476 was measured on the unpark side of this shared scanner, but the
+        // blindness is the scanner's, not park-loop.js's: "gh api comments exited 1" names no
+        // endpoint, no HTTP status and no cause either. `stderr` is `gh`'s own first line,
+        // dropped (never `null`) on the 'unparsable' branch, where `gh` exited 0 and said nothing.
         error:
           scan.reason === 'unparsable'
             ? 'unparsable comments reply'
             : `gh api comments exited ${scan.exit}`,
+        stderr: scan.stderr || undefined,
         timedOut: scan.timedOut === true,
       });
       continue;
