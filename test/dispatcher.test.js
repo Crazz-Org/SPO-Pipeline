@@ -2001,32 +2001,50 @@ test('after run() returns, NO dispatcher-spawned child is still alive -- not the
 // Every OTHER test in this file would stay green if a future edit put a blocking call back into
 // run()'s loop -- they all use short-lived children and a 30ms poll interval, so "the loop is
 // free" and "the loop is frozen for 2 seconds" are indistinguishable. This test makes them
-// distinguishable: the scanner child BLOCKS ITS OWN THREAD for BLOCK_MS (a real execFileSync
-// sleep, the same shape as the real spawnSync('claude')), and the dispatcher must still reap the
-// worker and refill its slot LONG before that block ends. If the blocking work is ever back on the
-// dispatcher's thread, the refill cannot happen until the block finishes, and this fails.
+// distinguishable: the scanner child BLOCKS ITS OWN THREAD (real execFileSync sleeps, the same
+// shape as the real spawnSync('claude')) and does not stop blocking until this test releases it,
+// while the dispatcher must still reap the worker and refill its slot. If the blocking work is
+// ever back on the dispatcher's thread, that refill can never happen at all -- the test deadlocks
+// into its own descriptive failure rather than having to out-run a timer. See the assertion's own
+// comment for why the block is released by this test and not by a `sleep` duration.
 test('a BLOCKING scan in the scanner process does not stall the dispatcher: a worker is still reaped and its slot refilled mid-block', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-freethread-q-');
   const journalDir = mkTmp('spo-disp-freethread-j-');
   writeTask(queueDir, '0001-a.json', { id: 'freethread-a', kind: 'synthetic' });
   writeTask(queueDir, '0002-b.json', { id: 'freethread-b', kind: 'synthetic' });
 
-  const BLOCK_MS = 2000; // the scanner's own thread, hard-blocked, like a real spawnSync('claude')
-  const WORKER_MS = 300; // worker 1 exits well INSIDE that block
-  const BUDGET_MS = 1200; // refill must beat the block by a wide margin -- measured at ~310ms
+  const WORKER_MS = 300; // worker 1 exits while the scan is still blocking
+  const STALL_MS = 10000; // a stall detector, NOT a budget to beat -- see the assertion below.
+  // A BACKSTOP, not a budget: the block normally ends because this test releases it (~400ms in,
+  // 2.1s at the worst load ever measured here), and this cap is never reached on a correct
+  // dispatcher. It exists so the regression fails READABLY. run() is called in-process, so a scan
+  // running on the dispatcher's loop freezes THIS TEST's event loop too -- with a block that only
+  // ever ends on release, that is an opaque hang that even node:test's own timeout cannot
+  // interrupt (timers cannot fire on a blocked loop). Ending the block here lets the loop resume,
+  // the assertion below then sees blockDoneFile present and says so in words. 4x the worst
+  // legitimate refill, and below STALL_MS so the readable assertion wins the race to report.
+  const BLOCK_CAP_MS = 8000;
 
-  // A REAL process that really blocks its own thread, then stays alive so it is never mistaken
-  // for a crash-and-respawn. It marks `blockDoneFile` the instant its block ends -- that file, not
-  // a clock reading, is how the assertion below knows whether the refill beat the block.
+  // A REAL process that really blocks its own thread and STAYS blocked until this test releases
+  // it, then stays alive so it is never mistaken for a crash-and-respawn. It marks `blockDoneFile`
+  // the instant its block ends -- that file, not a clock reading, is how the assertion below knows
+  // the scan was still blocking when the slot was refilled.
   const blockDoneFile = path.join(journalDir, 'scanner-block-finished');
+  const releaseBlockFile = path.join(journalDir, 'release-scanner-block');
   const blockingScanner = (cmd, args, opts) =>
     realSpawn(
       process.execPath,
       // Same orphan self-exit as neverExitsSpawn above, for the same measured reason.
       [
         '-e',
-        `require('child_process').execFileSync('sleep', ['${BLOCK_MS / 1000}']); ` +
-          `require('fs').writeFileSync(${JSON.stringify(blockDoneFile)}, '');` +
+        // Hard-blocks its own thread, in 50ms `sleep` calls so the release is noticed promptly,
+        // and DOES NOT STOP UNTIL THIS TEST RELEASES IT. Each execFileSync is a real synchronous
+        // block, exactly like the spawnSync('claude') this models -- the loop only makes the
+        // block releasable, it does not make the thread any freer between iterations.
+        `const fs = require('fs'), cp = require('child_process');` +
+          `const t0 = Date.now();` +
+          `while (!fs.existsSync(${JSON.stringify(releaseBlockFile)}) && Date.now() - t0 < ${BLOCK_CAP_MS}) { cp.execFileSync('sleep', ['0.05']); }` +
+          `fs.writeFileSync(${JSON.stringify(blockDoneFile)}, '');` +
           'const p = process.ppid; setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);',
       ],
       { ...opts, stdio: 'ignore' }
@@ -2036,7 +2054,7 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
 
   const config = baseConfig({
     workers: 1, // K=1: task b can ONLY start once a's slot is freed and refilled
-    pollIntervalMs: 8000, // >> BUDGET_MS, so a refill inside the budget can only be the exit-wake
+    pollIntervalMs: 8000, // >> the ~310ms refill, so a prompt refill can only be the exit-wake
     claudeAccountsDir: onePoolDir(1),
     deps: { spawn: shortWorker, spawnScanner: blockingScanner },
   });
@@ -2044,38 +2062,58 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
   const dispatcher = createDispatcher(queueDir, journalDir, config);
   const runPromise = dispatcher.run();
   try {
+    // THE SCAN IS STILL BLOCKING WHEN THE SLOT IS REFILLED -- and it is still blocking because it
+    // CANNOT end on its own, not because the refill won a race against it.
+    //
+    // This assertion was `elapsed < BLOCK_MS`, with `elapsed` measured from before run(). Both
+    // halves look like milliseconds and only one of them is: BLOCK_MS was a real `sleep 2` in a
+    // child, which load does not slow down at all, while `elapsed` accumulates this process's node
+    // boot, two child spawns and every scheduling delay the box inflicts on a starved event loop.
+    // Measured failing at `refilled after the scan's 2000ms block finished (2147ms)` -- 1/40 at 8x
+    // and 4/96 at 12x full-suite load (issue #111; this test was NOT in the issue, the campaign
+    // found it).
+    //
+    // Replacing the subtraction with "did blockDoneFile appear yet" was NOT enough, and that is
+    // the interesting part: it still failed 1/60 at 12x. A file-existence read is load-invariant,
+    // but the QUESTION was still a race -- the scanner's 2s sleep runs in an unstarved frame of
+    // reference while the dispatcher's reap-and-refill runs in a starved one, so on a 1.5x
+    // oversubscribed box the refill genuinely lands after the block ends, for reasons that have
+    // nothing to do with whose thread the scan is on. No budget can separate "blocked by the scan"
+    // from "starved by the box" while the scan ends on a timer.
+    //
+    // So the scan no longer ends on a timer: it blocks until THIS TEST releases it. THE REGRESSION
+    // THIS TEST GUARDS IS A SCAN RUNNING ON THE DISPATCHER'S OWN LOOP, and this fixture's scan
+    // never finishes on its own -- so under that regression the refill cannot happen AT ALL, at
+    // any load, and the waitFor below fails hard with its own message. That is a categorical
+    // outcome, not a photo-finish: it does not get closer or further from passing as the box gets
+    // busier. Verified by mutation (the dispatcher performing this fixture's own blocking scan
+    // inline) rather than assumed.
+    //
+    // WHAT THIS DELIBERATELY NO LONGER DETECTS, stated plainly: a FINITE stall shorter than
+    // STALL_MS. The old form nominally caught one, but only nominally -- against a 2000ms
+    // reference, correct behaviour was already measured at 2147ms, so its margin was ~1x and it
+    // was failing on correct behaviour as often as it would have caught a real 2s stall. A
+    // probabilistic guard is not a guard. The real defect this exists for is intake.js's blocking
+    // spawnSync('claude'), measured at 3m11s-3m25s on the live daemon (see this test's header) --
+    // 10s is ~19x the worst legitimate refill ever measured here (2147ms, 12x load) and 1/19th of
+    // the smallest real instance of the defect, so both sides have room.
     await waitFor(
       () => readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').length >= 2,
-      BUDGET_MS
+      STALL_MS
     ).catch(() => {
       throw new Error(
-        `the second worker was not spawned within ${BUDGET_MS}ms while the scanner was blocking for ${BLOCK_MS}ms -- ` +
+        `the second worker was not spawned within ${STALL_MS}ms while the scanner was still blocking -- ` +
           "the blocking work is on the DISPATCHER's own thread, which is exactly what moving the scans into a " +
           'sibling process was supposed to prevent'
       );
     });
-    // THE REFILL BEAT THE BLOCK -- read off the scanner's OWN state, not off a clock.
-    //
-    // This was `elapsed < BLOCK_MS`, with `elapsed` measured from before run(). Both halves of
-    // that comparison look like milliseconds and only one of them is: BLOCK_MS is a real `sleep 2`
-    // in a child, which full-suite load does not slow down at all, while `elapsed` accumulates
-    // this process's node boot, two child spawns and every scheduling delay the box inflicts on a
-    // starved event loop. Under load `elapsed` crosses 2000ms while the dispatcher is still doing
-    // exactly what this test exists to prove -- measured failing at `refilled after the scan's
-    // 2000ms block finished (2147ms)`, 1/40 and 4/96 full-suite runs (issue #111, found by this
-    // campaign rather than filed in it).
-    //
-    // `blockDoneFile` appears the instant the scanner's block ends, so its ABSENCE at the moment
-    // the second worker spawned is the same claim without the clock: the slot was refilled while
-    // the scan was still blocking. Starvation delays the refill and the file's creation by the
-    // same event-loop backlog, so the ordering this reads is load-invariant where the subtraction
-    // was not.
     assert.equal(
       fs.existsSync(blockDoneFile),
       false,
-      `the freed slot was only refilled after the scan's ${BLOCK_MS}ms block finished -- the dispatcher's thread was not free`
+      'the scanner stopped blocking before the slot was refilled -- this run proved nothing about concurrency'
     );
   } finally {
+    fs.writeFileSync(releaseBlockFile, ''); // let the scanner's block end so teardown is not held by it
     // stop() is only noticed at the TOP of the next loop iteration, and this test deliberately
     // runs an 8s poll interval with a scanner that never exits on its own -- so without waking the
     // race explicitly, teardown would sit out the whole interval (measured: +4.9s on this file
