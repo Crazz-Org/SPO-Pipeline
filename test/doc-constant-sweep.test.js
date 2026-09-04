@@ -1676,11 +1676,19 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // it was the rule's real granularity finally being reported instead of masked.
 //
 // So the band was measured rather than re-tuned. Sweeping the loose tolerance 5 -> 0 over the
-// whole anchor corpus (2026-09-03) moved NOTHING: 22 anchored / 3 unanchorable / 0 offenders at
-// every value of N from 5 down to 0. Every one of the 22 anchored citations has a top-ranked
+// whole anchor corpus moved NOTHING: 0 offenders at every value of N from 5 down to 0, with
+// `anchored` flat at 22 throughout. Every one of the 22 anchored citations has a top-ranked
 // candidate ON a line inside its own cited range; not one of them was living on the slack. The
 // tolerance was buying zero anchors and costing the entire one-line discrimination, so it is
 // gone. `kindN` is gone with it -- a knob whose only safe value is 0 is a footgun, not a knob.
+//
+// Measured twice, on two different corpora, because the corpus moved underneath this change while
+// it sat unmerged: 22 anchored / 3 unanchorable / 0 offenders at every N on 2026-09-03, and
+// 22 anchored / 2 unanchorable / 0 offenders at every N on 2026-09-04, after #109 deleted the
+// unfireable `escalateFlag` and with it prompts/README.md's `step-contracts.js:99` citation. The
+// `unanchorable` move is #109's, not this change's -- removing a citation cannot alter what a
+// tolerance band accepts -- and the sweep's own result is unchanged by it: the band is still
+// buying zero anchors. The second measurement is a re-run, not the first one with a digit edited.
 //
 // What this buys, measured below and not asserted: the check now discriminates a one-line drift
 // on the REAL files for the citation that motivated it, via `runLive` itself, with no dependence
@@ -1978,16 +1986,17 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   });
 
   // Re-measured 2026-09-03 after M17's symbol-citation conversion: 22 verified (was 26), 3
-  // unanchorable (unchanged). The 4 that left the anchored set are the 4 line-number citations
+  // unanchorable (unchanged then; 2 since 2026-09-04 -- see the note on the pin itself below). The 4 that left the anchored set are the 4 line-number citations
   // converted to symbol citations in the same change -- `worker.ts:129`/`:997`/`:131`/`:130-131`
   // -- each now checked by part 1.8's symbol check instead, against the symbol its own prose
   // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
   // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
-  // scripted.js :: verify-gate.js:342` (each cites a
+  // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:99` (deleted
+  // by #109, leaving the two still listed here) -- each citing a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
-  // mention -- correctly unverifiable, not wrong) -- 3 on CITATION_ANCHOR_ALLOWLIST (already
+  // mention -- correctly unverifiable, not wrong -- 3 on CITATION_ANCHOR_ALLOWLIST (already
   // excluded above), 0 unexplained offenders after this action's own fixes landed. Both counts
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
@@ -2079,11 +2088,14 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
     else blunt.push(`${key} -- still anchors at ${survives.join(' and ')} on [${top.map((cand) => `${cand.ident}/${cand.kind}`).join(', ')}]`);
   });
 
-  // Measured 2026-09-03, after zero tolerance replaced the per-kind band: 15 discriminating, 2
-  // blunt, 5 ranges. The SAME measurement re-run against the old 5-line band (restored in a scratch
-  // copy, not asserted from memory) reports 5 discriminating, 12 blunt, 5 ranges -- so the band was
-  // blinding TEN of the seventeen single-line citations in this corpus to a one-line drift, and the
-  // only five it left sharp were the ones anchored by a zero-tolerance 'const'/'file' candidate.
+  // Measured after zero tolerance replaced the per-kind band: 15 discriminating, 2 blunt, 5 ranges.
+  // The SAME measurement re-run against the old 5-line band (restored in a scratch copy, not
+  // asserted from memory) reports 5 discriminating, 12 blunt, 5 ranges -- so the band was blinding
+  // TEN of the seventeen single-line citations in this corpus to a one-line drift, and the only
+  // five it left sharp were the ones anchored by a zero-tolerance 'const'/'file' candidate.
+  // Re-run in full on 2026-09-04 against the post-#109 corpus: both halves reproduce digit for
+  // digit (15/2/5 and 5/12/5). #109 removed an UNANCHORABLE citation, which never entered these
+  // three populations in the first place -- they partition the ANCHORED set, and that stayed 22.
   // `run.ts:63` was among the twelve, from BOTH of its citing files. That is the honest size of
   // what the red canary was reporting: not one stale test, a corpus-wide blindness that one green
   // canary had been covering for. Re-pointing that canary at a bigger mutation would have restored
