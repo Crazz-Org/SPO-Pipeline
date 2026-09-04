@@ -1813,10 +1813,29 @@ test('with the REAL monotonic clock (no injected deps), a scanner that genuinely
   // breaker. The flake lived in the fixture's constants, not in the code they exercise.
   const HEALTHY_BAR_MS = 2000;
   const HEALTHY_SLEEP_MS = 3000;
+  // THE THIRD SPAWN IS INERT, and that is what makes `crashes.length === 2` a fact rather than a
+  // race. This fixture models exactly two scanner lifecycles, but scannerCrashLimit is 10 (the
+  // breaker must not trip here) and handleScannerExit respawns IMMEDIATELY -- so the moment crash
+  // 2 lands, a third scanner is already starting. If it is another spawnExit(1) it crashes at
+  // once, and whether that third crash beats this test's `dispatcher.stop()` is a coin flip
+  // decided by how busy the box is.
+  //
+  // It came up heads on 100 loaded full-suite runs on the dev box and tails on the FIRST CI run
+  // (2-core GitHub runner): `3 !== 2`. The race predates this campaign -- it is not a consequence
+  // of the constants above -- and no timing margin can close it, because the two events being
+  // ordered are a child's boot and this process's next event-loop turn.
+  //
+  // neverExitsSpawn is this file's own documented idiom for exactly this ("every test that hands a
+  // crash-code SEQUENCE for a KNOWN NUMBER of spawns must also hand this to deps.spawnScanner"),
+  // applied here to the scanner's own sequence: spawns past the two being modelled produce no
+  // further exits, so the count is deterministic under any load and the assertion stays a strict
+  // equality rather than being relaxed to `>= 2`.
   let call = 0;
   const spawnScannerFn = (cmd, args, opts) => {
     call += 1;
-    return call === 2 ? spawnScannerAliveFor(HEALTHY_SLEEP_MS, 1)(cmd, args, opts) : spawnExit(1)();
+    if (call === 1) return spawnExit(1)(); // near-instant crash: real, and unhealthy
+    if (call === 2) return spawnScannerAliveFor(HEALTHY_SLEEP_MS, 1)(cmd, args, opts); // real elapsed time, healthy
+    return neverExitsSpawn(cmd, args, opts); // inert: the fixture models two lifecycles, not three
   };
 
   const config = baseConfig({

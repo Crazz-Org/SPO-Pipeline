@@ -1,10 +1,10 @@
-Copyright (c) 2026 Crazz-Org. All rights reserved.
+Copyright (c) 2026 Crazz-E. All rights reserved.
 
 SOURCE-AVAILABLE, NOT OPEN SOURCE
 ---------------------------------
 
-The source code in this repository is published so that it can be read, studied, audited
-and referenced. It is NOT open source: no permission is granted to use it.
+The source code in this repository is published so that it can be read, studied, audited,
+copied and referenced. It is NOT open source: copying is permitted, USE is not.
 
 "Open source" (as the term is commonly and formally understood) requires granting everyone
 the right to use, modify and redistribute the software. This licence deliberately grants
@@ -14,34 +14,51 @@ separate written grant from the copyright holder.
 WHAT YOU MAY DO
 ---------------
 
-  1. Read and view the source code.
-  2. Reference and quote short excerpts for the purpose of commentary, review, teaching,
-     reporting on, or discussing this project, where such use is permitted by applicable
-     law (for example fair use / fair dealing), with attribution to this repository.
+Everything git and GitHub already let you do with a public repository:
+
+  1. Read, view, study and audit the source code and its history.
+  2. Clone, fork and copy the repository, in whole or in part, and keep those copies,
+     locally or hosted.
+  3. Share verbatim copies, provided this licence and all copyright and attribution
+     notices are kept intact and unaltered.
+  4. Reference and quote excerpts for the purpose of commentary, review, teaching,
+     reporting on, or discussing this project, with attribution to this repository.
 
 WHAT YOU MAY NOT DO
 -------------------
 
 Without prior written permission from the copyright holder, you may not:
 
-  1. Use the software, in whole or in part, for any purpose, personal or commercial,
-     including running it, or operating it as or within a service.
-  2. Copy, reproduce, publish or redistribute the software or any part of it.
-  3. Modify the software, or create derivative or adapted works based on it.
-  4. Incorporate the software, or any part of it, into another work or product.
-  5. Sell, licence, sublicence, rent, lease or otherwise transfer the software.
-  6. Remove, obscure or alter this licence or any copyright or attribution notice.
+  1. USE the software, in whole or in part, for any purpose, personal or commercial.
+     This includes running or executing it, operating it as or within a service, and
+     using it to produce or deliver anything.
+  2. Modify the software, or create derivative or adapted works based on it.
+  3. Incorporate the software, or any part of it, into another work or product.
+  4. Sell, licence, sublicence, rent, lease or otherwise commercially exploit it.
+  5. Distribute modified copies, or copies stripped of this licence or of any copyright
+     or attribution notice.
+  6. Represent the software, or any part of it, as your own work.
+
+POSSESSION IS NOT PERMISSION
+----------------------------
+
+Copying is permitted because publishing source through git makes copying inherent: a clone
+or a fork IS a copy, and a licence that forbade it would be a rule the medium itself
+breaks. Permitting it is a statement of fact, not a grant of anything further.
+
+Being technically able to run a copy you hold is therefore not permission to run it. The
+restriction in this licence is on USE, and it survives every copy: the copy is lawful, the
+use is not.
 
 All rights not expressly granted above are reserved by the copyright holder.
 
 A NOTE ON GITHUB
 ----------------
 
-While this repository is hosted publicly on GitHub, GitHub's Terms of Service separately
-grant every GitHub user the ability to view and fork it within GitHub. That is a condition
-of publishing publicly on that platform and is not extended, broadened or waived by this
-licence. Nothing in a GitHub fork grants any of the rights withheld above; forking within
-GitHub does not permit use, modification outside GitHub, or redistribution.
+Hosting this repository publicly on GitHub separately grants every GitHub user the ability
+to view and fork it under GitHub's Terms of Service. That is consistent with the grant
+above and is neither broadened nor waived by this licence. A fork is a copy, and a copy
+carries no right to use.
 
 NO WARRANTY
 -----------
@@ -57,4 +74,5 @@ CONTACT
 -------
 
 For permission to use this software beyond what is granted above, contact the copyright
-holder through https://github.com/Crazz-Org/SPO-Pipeline.
+holder at https://github.com/Crazz-E, or through
+https://github.com/Crazz-Org/SPO-Pipeline.
