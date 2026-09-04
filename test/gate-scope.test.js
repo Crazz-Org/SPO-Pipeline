@@ -161,3 +161,65 @@ test('the CI workflow runs the gate through scripts/gate.sh, never its own copy 
     'the workflow spells out its own `node --test` invocation -- that is a second, drifting definition of the gate; call scripts/gate.sh'
   );
 });
+
+// ---- how the gate REACHES a machine: the pre-push hook, and the scripts that install it --------
+//
+// The CI half of the gate is pinned above. This is the local half, and it is pinned for a reason
+// that has already bitten: on 2026-09-04 the gate commit shipped scripts/git-hooks/pre-push and
+// wired it into BOTH install scripts, and yet `.git/hooks/` on the maintainer's box still held
+// only `post-merge` -- because the installers had not been re-run since. The hook's absence is
+// invisible: pushes simply keep working, ungated, exactly as they did before it existed.
+//
+// So the wiring is a ratchet now. Nothing here installs anything or touches `.git/hooks` (a test
+// that arms a real push hook on the machine running it would be a hostile test); these read the
+// two install scripts and the hook, and assert the wiring they claim to perform is still spelled
+// out. Removing an `ln -sf` line from either installer is a silent, green regression otherwise --
+// the same class the exclusion ratchet at the top of this file guards.
+const HOOKS = ['post-merge', 'pre-push'];
+const INSTALLERS = ['daemon-install.sh', 'dashboard-install.sh'];
+
+test('both install scripts wire BOTH git hooks -- either script arms a box completely', () => {
+  for (const installer of INSTALLERS) {
+    const src = fs.readFileSync(path.join(REPO_ROOT, 'scripts', installer), 'utf8');
+    const body = src
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    for (const hook of HOOKS) {
+      // The link must go FROM the tracked hook TO .git/hooks, so the installed hook tracks the
+      // repo instead of being a copy that silently ages.
+      const wiring = new RegExp(`ln\\s+-sf\\s+"?\\$\\{?REPO\\}?/scripts/git-hooks/${hook}"?\\s+"?\\$\\{?REPO\\}?/\\.git/hooks/${hook}"?`);
+      assert.match(
+        body,
+        wiring,
+        `scripts/${installer} no longer symlinks scripts/git-hooks/${hook} into .git/hooks -- a box installed by it would run ungated`
+      );
+    }
+  }
+});
+
+test('every hook the installers wire actually exists and is executable -- a dangling symlink is a silently skipped hook', () => {
+  // git does not warn when a hook path does not resolve; it just runs nothing. A name that drifts
+  // from the file beside it therefore disarms the hook with no signal at all.
+  for (const hook of HOOKS) {
+    const p = path.join(REPO_ROOT, 'scripts', 'git-hooks', hook);
+    assert.ok(fs.existsSync(p), `scripts/git-hooks/${hook} is wired by the install scripts but does not exist`);
+    assert.ok(fs.statSync(p).mode & 0o111, `scripts/git-hooks/${hook} must be executable -- git runs it directly`);
+  }
+});
+
+test('the pre-push hook runs the gate through scripts/gate.sh, never its own copy of the command', () => {
+  // Same one-definition rule the CI workflow is held to directly above: a push that passes locally
+  // and a PR that passes in CI must not be able to disagree about what "green" means.
+  const hook = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'git-hooks', 'pre-push'), 'utf8');
+  const body = hook
+    .split('\n')
+    .filter((l) => !/^\s*#/.test(l))
+    .join('\n');
+  assert.match(body, /\$\{?REPO\}?"?\/scripts\/gate\.sh/, 'scripts/git-hooks/pre-push must exec scripts/gate.sh');
+  assert.doesNotMatch(
+    body,
+    /node\s+--test/,
+    'the pre-push hook spells out its own `node --test` invocation -- that is a second, drifting definition of the gate; call scripts/gate.sh'
+  );
+});
