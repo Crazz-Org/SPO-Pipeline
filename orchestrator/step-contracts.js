@@ -31,6 +31,45 @@ const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 // VALIDATE steps are pinned "high" regardless of size; validate-change.md's own text: "Effort
 // is high regardless of task size -- the mission is not proportional to diff size").
 const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
+
+// IMPLEMENT_EFFORT_BY_SIZE -- IMPLEMENT no longer shares PLAN's map: its S row is 'medium'.
+//
+// THIS IS A DELIBERATE EXPERIMENT, NOT A MEASURED RESULT. Read the numbers before trusting the
+// change, because the first version of this comment got them wrong and the correction is the
+// interesting part.
+//
+// The corpus CANNOT answer whether raising IMPLEMENT's floor helps, and it cannot answer it by
+// construction: `effort` is a pure function of `size` through this very map, so across every
+// IMPLEMENT call ever made there are ZERO observations of an S-sized card run at 'medium'. Size
+// and effort are perfectly confounded. Any comparison of "S cards" against "M cards" is a
+// comparison of two different card populations, not of two effort settings.
+//
+// What the 7 merged cards of 2026-09-01/04 actually show, counting MERGED cards only:
+//
+//   S -> low      4 cards, 11 IMPLEMENT calls  = 2.75/card, mean 436,445 billable
+//   M -> medium   3 cards,  6 IMPLEMENT calls  = 2.00/card, mean 531,037 billable
+//
+// Fewer attempts at 'medium', but MORE tokens per merged card -- and the token figure is carried
+// entirely by one card (#492, 1,135,558). The two halves disagree, n is 7, and the result flips on
+// a single card. An earlier draft of this comment claimed 1.0 calls and 229k for the M side; that
+// set excluded #492 (still in flight when it was counted) and included #489 (parked, never
+// merged). It also claimed no DIAGNOSE call sits on a medium-effort card -- #492 has one.
+//
+// So why change it at all? One argument survives, and it is not from this corpus: effort 'low' is
+// below the CLI's own default for coding and agentic work, and IMPLEMENT is the only step that
+// writes code. That is a reason to TRY 'medium', not evidence that it wins.
+//
+// HOW TO SETTLE IT. This map is the intervention: with S -> medium, the next S-sized cards are the
+// first observations of that cell that have ever existed. Compare them against the S/low baseline
+// above -- 2.75 IMPLEMENT calls, 436k billable per merged card -- over ~8 cards. If IMPLEMENT calls
+// per merged card do not fall below ~2.0, revert this map to { S: 'low', M: 'medium', L: 'high' };
+// the experiment will have answered no, which is a result worth having either way.
+//
+// PLAN deliberately keeps the shared map. Its cost is essentially all per-turn (fit over 9 real
+// calls: fixed ~= 0, 4,531/turn, R^2 = 0.89), and its `L -> high` row is already the one
+// configuration that has never completed -- see LLM_STEP_DEADLINE_MS_BY_STEP.
+const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
+
 const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 
 // Per-call $ budget cap (`--max-budget-usd`) is intentionally NOT set anywhere in this file --
@@ -58,6 +97,42 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // changes what invokeClaudeReal's own spawnSync timeout is armed with for an LLM call.
 const LLM_STEP_DEADLINE_MS = 900000;
 
+// LLM_STEP_DEADLINE_MS_BY_STEP -- per-step overrides of the figure above. Only PLAN has one.
+//
+// WHY. 900000ms is not enough for PLAN on an L-sized card, and the pipeline could not plan one at
+// all. Card #486 (size:L) is the only card ever to reach PLAN's `L -> high` row: three attempts,
+// three failures, two of them deadline kills at ~825s of measured wall clock, zero reported
+// tokens each. It terminal-parked `llm-transport-failed:PLAN` after burning ~33 minutes. The
+// effort ladder measured over the same corpus is PLAN low ~158s -> medium ~339s -> high >=825s,
+// roughly x2.1 per step, against a deadline that does not move with it.
+//
+// Only PLAN moves. Every other step has room to spare against 900s: IMPLEMENT's longest real call
+// was 871s (#492, and that one SUCCEEDED -- it is the reason this is a raise for PLAN rather than
+// a cut for everyone), DIAGNOSE peaked at 142s, VALIDATE at 124s.
+//
+// This is a bet, and a bounded one: #486's calls were KILLED mid-flight, so we know 900s was not
+// enough and do NOT know that 1800s is. If PLAN at `high` still times out, the journal says so and
+// the evidence-backed fallback is PLAN's own `L -> medium` (proven: max 567s observed), not more
+// deadline. The cost of being wrong is ~3 x 1800s of wall clock before the transient-retry budget
+// parks the card.
+const LLM_STEP_DEADLINE_MS_BY_STEP = {
+  PLAN: 1800000, // 30 min
+};
+
+// The longest any single LLM call may legitimately run, across every step. MAX_LEASE_AGE_MS below
+// is derived from THIS, not from LLM_STEP_DEADLINE_MS: the moment one step got a longer deadline,
+// deriving the lease bound from the default would have understated the worst legitimate hold and
+// reintroduced exactly the defect C6's verification found -- a waiter giving up while the holder
+// is still alive and still un-sweepable. Computed from the map so it can never drift from it.
+const MAX_LLM_STEP_DEADLINE_MS = Math.max(LLM_STEP_DEADLINE_MS, ...Object.values(LLM_STEP_DEADLINE_MS_BY_STEP));
+
+// deadlineMsForStep(stepName) -- the spawnSync timeout steps/llm.js arms for one call. Falls back
+// to LLM_STEP_DEADLINE_MS for any step with no override, including an unrecognized name (the
+// intake steps, which carry their own INTAKE_DEADLINE_MS, never reach here).
+function deadlineMsForStep(stepName) {
+  return LLM_STEP_DEADLINE_MS_BY_STEP[stepName] || LLM_STEP_DEADLINE_MS;
+}
+
 // MAX_LEASE_AGE_MS -- the age past which account-lease.js presumes a lease dead and sweeps it
 // regardless of pid liveness. Its full justification (why 2x, why the +10% slack, and the
 // residual SIGTERM-ignoring-child risk it deliberately does not close) lives in
@@ -78,16 +153,19 @@ const LLM_STEP_DEADLINE_MS = 900000;
 // built to avoid. Deriving the wait from this constant makes the wait outlast every legitimate
 // hold by construction -- the same asymmetry product-repo-lock.js states for its own wait bound:
 // waiting too long only delays a card, giving up too early parks a healthy one.
-const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE_MS / 10);
+const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10);
 
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
 // to `escalatedModel` -- resolved by resolveStepContract() below, per
 // state-machine-spec.md § Step contracts' per-row escalation language:
-//   - 'escalateFlag'      -- task.escalate === true. The generic "fallback" hook: the spec
-//                            says "Opus 5 fallback" for PLAN and "... or as fallback" for
-//                            change-validator (prompts/README.md), meaning "when Fable is
-//                            unavailable" -- this build has no way to detect that at the CLI
-//                            layer, so a task-level override flag stands in for it.
+//   REMOVED 2026-09-04: 'escalateFlag' (task.escalate === true). It was never sourced from the
+//   remediation plan -- it entered with this file in `4d76168` as a stand-in this build invented
+//   for the spec's phrase "Opus 5 fallback", and `task.escalate` is assigned NOWHERE in
+//   orchestrator/, bin/ or console/. It could not fire, so the fallback both docs promised did not
+//   exist. Deleted rather than wired: falling back off Fable when Fable is unavailable is a real
+//   need (a Fable quota exhaustion cools the whole ACCOUNT, every model with it -- see accounts.js's
+//   markLimit), but it is served today by account rotation + cooldown, and doing it at the model
+//   layer is a separate design decision, not a dead boolean.
 //   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, standing in for the RDO wire rule
 //                            stated in SPO-WebClient/doc/kanban-workflow.md (not this repo's
 //                            CLAUDE.md, which has no RDO rule) -- "src/shared/rdo-*,
@@ -105,12 +183,12 @@ const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
     baseModel: 'fable',
-    escalatedModel: 'opus',
-    // prompts/README.md's own step table now agrees with state-machine-spec.md's Step
-    // contracts row for PLAN -- both read "Fable 5 (Opus 5 fallback only ... deliberately NOT
-    // PLAN)", no wire-rule clause (fixed in commit 0e84bac, which used to diverge from the spec
-    // here). PLAN escalates on the generic fallback flag only, never on task.touchesRdoMembers.
-    escalatesOn: ['escalateFlag'],
+    // No escalation. Both docs described one -- the spec's "Opus 5 fallback", README's matching
+    // row -- and neither was reachable: the only trigger PLAN carried was 'escalateFlag', which
+    // nothing sets (see the removal note above). Removed rather than left as decoration, so the
+    // table says what the code does.
+    escalatedModel: null,
+    escalatesOn: [],
     effort: 'bySize',
     // Spec + README table both say "Read, Grep, Glob, Bash(ro)" -- the "(ro)" is enforced by
     // the prompt's own text ("you hold no edit tool there") and by permissionMode below, not
@@ -142,8 +220,9 @@ const STEP_CONTRACTS = {
     promptFile: path.join(PROMPTS_DIR, 'implement.md'),
     baseModel: 'sonnet',
     escalatedModel: 'opus',
-    escalatesOn: ['touchesRdoMembers', 'lSize', 'escalateFlag'],
+    escalatesOn: ['touchesRdoMembers', 'lSize'],
     effort: 'bySize',
+    effortBySize: IMPLEMENT_EFFORT_BY_SIZE, // floor raised to 'medium' -- see that map's comment
     // Neither doc enumerates the literal tool names behind "full edit tools in the worktree"
     // (spec) / "full edit tools" (README) -- this is the concretization this build needs to
     // pass a real --allowedTools value. Read/Grep/Glob to navigate the plan and invariants,
@@ -158,8 +237,28 @@ const STEP_CONTRACTS = {
 
   DIAGNOSE: {
     promptFile: path.join(PROMPTS_DIR, 'diagnose.md'),
-    baseModel: 'fable',
-    escalatedModel: null, // neither doc, nor diagnose.md itself, names an Opus alternative
+    // Fable -> Opus, 2026-09-04. Two independent reasons, neither of them "Fable was failing":
+    //
+    // COST. Opus is half Fable's token price, and DIAGNOSE is ~16% of tier-weighted spend. The
+    // maintainer's own triageBugReport decision (intake.js, 2026-08-31) already records Opus as at
+    // least Fable's equal as a JUDGE on this project -- that finding was taken on the one step
+    // where it was examined and never propagated to the four steps that judge.
+    //
+    // AVAILABILITY. Four of five steps defaulted to Fable, and accounts.markLimit keys its cooldown
+    // by ACCOUNT, not by model -- so a Fable-only usage limit takes the whole account out for every
+    // model, Sonnet IMPLEMENT included. That has stalled the pool twice: 12.8h on 2026-08-30/31 (53
+    // cycles, 128 attempts) and again on 2026-09-04 with every account at 100% Fable quota. DIAGNOSE
+    // is the cheapest step to take off that single point of failure.
+    //
+    // NOT because Fable was diagnosing badly. Post-C1 the corpus shows 8/8 DIAGNOSE calls succeeded
+    // and ZERO diagnose-* parks across 10 cards -- every card that entered a DIAGNOSE->IMPLEMENT
+    // loop (#487, #488, #492) reached DONE. The plan's own conditional ("if diagnose-* parks stay
+    // > 10% after C1, escalate attempt 3 to Opus") is measurably NOT met; the pre-C1 17% was the
+    // blind-judge artifact action 1.3 fixed. So this is a lateral move made for price and quota,
+    // and the 8/8 baseline (~52k mean billable, ~90s, ~20 turns) is what a future reader should
+    // compare against to tell whether it cost anything.
+    baseModel: 'opus',
+    escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Bash'],
@@ -192,14 +291,24 @@ const STEP_CONTRACTS = {
   VALIDATE: {
     promptFile: path.join(PROMPTS_DIR, 'validate-change.md'),
     baseModel: 'fable',
-    escalatedModel: 'opus',
-    // validate-change.md's own text states the wire-rule (and fallback) escalation explicitly
-    // ("The caller escalates you to Opus 5 when the diff touches the RDO wire ... or when
-    // Fable is unavailable -- you never run as Sonnet 5"); the spec's table row is silent on
-    // escalation but does not contradict it ("Fable 5 (never Sonnet -- the executor may not
-    // judge itself)"). Matches the task brief's own instruction that touchesRdoMembers
-    // escalates VALIDATE.
-    escalatesOn: ['touchesRdoMembers', 'escalateFlag'],
+    // The wire-rule escalation was INVERTED, and it was live in the corpus. Fable is the more
+    // capable and the more expensive tier; Opus is half its price. So `fable -> opus` made the
+    // judge WEAKER exactly where the stakes are highest. Card #462 shows both halves in one run:
+    // IMPLEMENT escalated sonnet -> opus (a real upgrade) while VALIDATE escalated fable -> opus
+    // (a downgrade), leaving the unescalated citation verifier (fable) more capable than the
+    // change-validator judging the same diff.
+    //
+    // Fixed by escalating the lever that actually points up: EFFORT. The model stays Fable on
+    // every path, and the RDO wire buys `xhigh` instead of `high`.
+    //
+    // Why xhigh is safe here: VALIDATE is the cheapest and fastest step in the pipeline -- 6/6
+    // successful calls, mean 57.8k billable, mean 77s, max 124s against a 900000ms deadline. There
+    // is an order of magnitude of headroom, which is why this step (not PLAN, where effort `high`
+    // already blew the deadline) is where the first use of an effort above `high` belongs.
+    escalatedModel: null,
+    escalatesOn: [],
+    escalatedEffort: 'xhigh',
+    escalatesEffortOn: ['touchesRdoMembers'],
     neverModel: 'sonnet', // documentation only -- 'sonnet' never appears as base or escalated
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
@@ -214,9 +323,22 @@ const STEP_CONTRACTS = {
 // CITATION_VERIFIER).
 function shouldEscalate(stepDef, task) {
   if (!stepDef.escalatedModel) return false;
-  if (task && task.escalate === true && stepDef.escalatesOn.includes('escalateFlag')) return true;
   if (task && task.touchesRdoMembers === true && stepDef.escalatesOn.includes('touchesRdoMembers')) return true;
   if (task && task.size === 'L' && stepDef.escalatesOn.includes('lSize')) return true;
+  return false;
+}
+
+// The effort-side twin of shouldEscalate, reading `escalatedEffort`/`escalatesEffortOn` instead of
+// `escalatedModel`/`escalatesOn`. Deliberately a SEPARATE function and a separate pair of fields:
+// a step may escalate on one axis, the other, or neither, and VALIDATE is the case that forced the
+// split -- it escalates effort and must never escalate model (see its entry). Same signal
+// vocabulary as shouldEscalate so a reader learns one set of names, and false for any step with no
+// escalatedEffort at all, which is every step except VALIDATE.
+function shouldEscalateEffort(stepDef, task) {
+  if (!stepDef.escalatedEffort) return false;
+  const on = stepDef.escalatesEffortOn || [];
+  if (task && task.touchesRdoMembers === true && on.includes('touchesRdoMembers')) return true;
+  if (task && task.size === 'L' && on.includes('lSize')) return true;
   return false;
 }
 
@@ -235,7 +357,14 @@ function resolveStepContract(stepName, task = {}) {
   const model = escalated ? stepDef.escalatedModel : stepDef.baseModel;
 
   const size = (task && task.size) || DEFAULT_SIZE;
-  const effort = stepDef.effort === 'bySize' ? EFFORT_BY_SIZE[size] || EFFORT_BY_SIZE[DEFAULT_SIZE] : stepDef.effort;
+  // Each step may bring its own size->effort map (IMPLEMENT does, with a raised floor); the shared
+  // EFFORT_BY_SIZE is the default for any step that does not.
+  const effortMap = stepDef.effortBySize || EFFORT_BY_SIZE;
+  const baseEffort = stepDef.effort === 'bySize' ? effortMap[size] || effortMap[DEFAULT_SIZE] : stepDef.effort;
+  // Effort escalation is resolved AFTER the size map, and overrides it: a step whose signal fires
+  // gets its escalated effort regardless of what the card's size label said.
+  const effortEscalated = shouldEscalateEffort(stepDef, task);
+  const effort = effortEscalated ? stepDef.escalatedEffort : baseEffort;
 
   return {
     step: stepName,
@@ -243,6 +372,10 @@ function resolveStepContract(stepName, task = {}) {
     model,
     escalated,
     effort,
+    effortEscalated,
+    // Per-step, not the module default: PLAN gets 1800000ms, every other step 900000ms. steps/llm.js
+    // arms invokeClaudeReal's spawnSync timeout with this rather than reading the constant itself.
+    deadlineMs: deadlineMsForStep(stepName),
     allowedTools: stepDef.allowedTools,
     permissionMode: stepDef.permissionMode,
     // No $ cap: steps/llm.js's buildArgv only passes --max-budget-usd when this is a number.
@@ -256,7 +389,12 @@ function resolveStepContract(stepName, task = {}) {
 module.exports = {
   STEP_CONTRACTS,
   EFFORT_BY_SIZE,
+  IMPLEMENT_EFFORT_BY_SIZE,
   LLM_STEP_DEADLINE_MS,
+  LLM_STEP_DEADLINE_MS_BY_STEP,
+  MAX_LLM_STEP_DEADLINE_MS,
+  deadlineMsForStep,
+  shouldEscalateEffort,
   MAX_LEASE_AGE_MS,
   shouldEscalate,
   resolveStepContract,

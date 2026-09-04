@@ -89,7 +89,7 @@ const LEASE_SUFFIX = '.json';
 // an unconditional guarantee -- measured, a SIGTERM-ignoring child ran 27.6s against a 400ms
 // timeout. A `claude` that ignored SIGTERM could therefore hold a lease past this bound and have
 // it swept while still running, which is the D1 failure (two `claude` processes on one account)
-// rather than the D3 one this closes. That is why the bound is generous rather than tight: 31.5
+// rather than the D3 one this closes. That is why the bound is generous rather than tight: 63
 // minutes is roughly 7x the longest full two-attempt step the C6 funnel actually measured
 // (90-265s per call).
 // The derivation itself now lives in step-contracts.js, beside LLM_STEP_DEADLINE_MS, because
