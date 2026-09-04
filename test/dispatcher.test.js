@@ -775,10 +775,6 @@ test('K is clamped to the number of healthy accounts before each spawn, even whe
   const runPromise = dispatcher.run();
   try {
     await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn'));
-    await sleep(60); // well inside the 150ms IMPLEMENT delay -- the second task must still be untouched
-    const spawns = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn');
-    assert.equal(spawns.length, 1, 'a second worker spawned despite only one healthy account');
-
     await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').length === 2, 8000);
     await waitFor(() => {
       const a = readState(journalDir, 'clamp-a');
@@ -798,6 +794,36 @@ test('K is clamped to the number of healthy accounts before each spawn, even whe
       const ev = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-exit');
       return ev.some((e) => e.id === 'clamp-a') && ev.some((e) => e.id === 'clamp-b');
     }, 8000);
+
+    // THE CLAMP, ASSERTED AS THE INVARIANT dispatcher.js ACTUALLY ENFORCES -- fillSlots's own
+    // `if (live.size >= k) return;`. k is a bound on workers CONCURRENTLY LIVE, not on how many
+    // spawns a stretch of wall-clock may contain, so that is what this replays: walk the journal's
+    // spawn/exit events in order and track the live count. Both tasks still run (2 spawns), but
+    // never at the same time.
+    //
+    // This replaced a `sleep(60)` + `spawns.length === 1` probe, which measured the clamp at ONE
+    // INSTANT chosen to fall "well inside the 150ms IMPLEMENT delay". That budget was a race, not
+    // a guard: the sleep is the TEST's own event loop, while the 150ms delay and the worker's
+    // ~75ms node boot are wall-clock in a CHILD. Under full-suite load the parent's 60ms sleep
+    // overshoots the child's whole lifetime, worker a legitimately reaches DONE and exits, the
+    // dispatcher CORRECTLY refills the freed slot with task b, and the probe read `2 !== 1` for a
+    // dispatcher that never broke the clamp for an instant. Measured on this box at 3/40 and
+    // 1/40 full-suite runs under 8x parallel load (issue #111).
+    //
+    // The ordering this reads cannot be distorted by load: both events are appended by the SAME
+    // (dispatcher) process, so their order in daemon.jsonl is their real order. Starvation moves
+    // every timestamp and moves no event past another. And this is strictly STRONGER than the
+    // probe it replaces -- it holds over the whole run rather than at one sampled instant, so an
+    // unclamped dispatcher cannot slip through by being slow at the moment the old probe looked.
+    const lifecycle = readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn' || e.event === 'worker-exit');
+    let liveNow = 0;
+    let peakLive = 0;
+    for (const e of lifecycle) {
+      liveNow += e.event === 'worker-spawn' ? 1 : -1;
+      peakLive = Math.max(peakLive, liveNow);
+    }
+    assert.equal(peakLive, 1, 'two workers were alive at once despite only one healthy account -- K was not clamped');
+    assert.equal(lifecycle.filter((e) => e.event === 'worker-spawn').length, 2, 'both tasks must still have run, one after the other');
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -850,9 +876,37 @@ test('a periodic scan (orphan scan) runs in the scanner process while a worker i
   // the fake worker spawn below ignores its content entirely.
   writeTask(queueDir, '0001-live.json', { id: 'scan-while-alive-live', kind: 'synthetic' });
 
-  const LIVE_MS = 300;
-  const fakeLiveWorker = () =>
-    realSpawn(process.execPath, ['-e', `setTimeout(() => process.exit(0), ${LIVE_MS})`], { stdio: 'ignore' });
+  // The live worker stays alive until THIS TEST RELEASES IT, by creating `releaseFile`. It is not
+  // on a timer at all.
+  //
+  // It used to be `setTimeout(() => process.exit(0), 300)`, and that 300ms was the flake: the
+  // proof below needs the worker to still be alive when the orphan's repark lands, but the repark
+  // has to get there through a REAL spawned scanner's node boot (~75ms idle) plus a scan cycle,
+  // while the 300ms ran as wall-clock in a child that load does not slow down. Under full-suite
+  // load the boot dilates past the worker's fixed lifetime, the worker exits first, and the test
+  // reports `the live worker already exited -- raise LIVE_MS` about a scanner that never once
+  // waited on it. Measured on this box at 5/40 and 10/40 full-suite runs under 8x parallel load,
+  // the most frequent of the three in issue #111. Raising LIVE_MS is what its own message asks
+  // for and is the wrong fix -- it buys a bigger number to lose against, not a guarantee.
+  //
+  // With the release file there is no budget left to lose: the worker CANNOT exit before the
+  // assertion runs, so `alive(pid) === true` stops being a race the test has to win and becomes a
+  // fact it establishes. That makes the concurrency proof STRONGER than the timer version, which
+  // could only ever observe "the worker happened to still be running".
+  const releaseFile = path.join(journalDir, 'release-live-worker');
+  const fakeLiveWorker = (cmd, args, opts) =>
+    realSpawn(
+      process.execPath,
+      // Same orphan self-exit guard every long-lived stand-in in this file carries (see
+      // neverExitsSpawn's own comment): if the kernel reparents us away from the runner, exit,
+      // so a SIGKILLed suite leaves nothing behind.
+      [
+        '-e',
+        `const p = process.ppid; const fs = require('fs');` +
+          `setInterval(() => { if (process.ppid !== p || fs.existsSync(${JSON.stringify(releaseFile)})) process.exit(0); }, 20);`,
+      ],
+      { ...opts, stdio: 'ignore' }
+    );
 
   const config = baseConfig({
     shadowMode: false,
@@ -885,12 +939,13 @@ test('a periodic scan (orphan scan) runs in the scanner process while a worker i
       const s = readState(journalDir, orphanId);
       return s && s.state === 'PARKED';
     });
-    assert.equal(alive(spawnEvt.pid), true, 'the live worker already exited -- raise LIVE_MS, this did not prove concurrency');
+    assert.equal(alive(spawnEvt.pid), true, 'the live worker exited before the repark landed -- the scanner did not run concurrently with it');
 
     const orphanState = readState(journalDir, orphanId);
     assert.equal(orphanState.reason, 'task-orphaned-daemon-restart');
 
-    await waitFor(() => !alive(spawnEvt.pid)); // let the fake live worker finish on its own
+    fs.writeFileSync(releaseFile, ''); // only now may the live worker finish
+    await waitFor(() => !alive(spawnEvt.pid));
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -1727,26 +1782,53 @@ test('with the REAL monotonic clock (no injected deps), a scanner that genuinely
   const queueDir = mkTmp('spo-disp-scanrealclock-q-');
   const journalDir = mkTmp('spo-disp-scanrealclock-j-');
 
-  // Spawn 1 crashes near-instantly (real, unhealthy). Spawn 2 genuinely sleeps 1200ms (real
-  // `setTimeout` inside the child) before crashing -- >= 3x scannerHealthyUptimeMs (400ms) and
-  // >= 10x the 33-108ms near-instant spawn cost measured on this box under contention (this
-  // action's own verification), so the margin is not a number picked to pass once.
+  // Spawn 1 crashes near-instantly (real, unhealthy). Spawn 2 genuinely sleeps HEALTHY_SLEEP_MS
+  // (real `setTimeout` inside the child) before crashing.
+  //
+  // THE BAR AND THE SLEEP ARE DERIVED FROM A MEASUREMENT OF THE THING THAT ACTUALLY MOVES: the
+  // cost of "near-instant" spawn 1, which is not zero but a whole node process boot, and which is
+  // what the bar has to stay clear of. This test previously ran a 400ms bar against a claimed
+  // "33-108ms near-instant spawn cost measured on this box under contention" -- a real
+  // measurement, but taken on an IDLE box, where it still reproduces (28-42ms over 40 samples,
+  // re-measured 2026-09-04). Under real full-suite load it does not hold:
+  //
+  //   spawn -> 'exit' handler, the exact interval dispatcher.js records as uptimeMs
+  //     idle                    28ms min / 33ms p50 / 42ms max   (40 samples)
+  //     under 8x full suite     44ms min / 93ms p50 / 206ms max  (40 samples)
+  //     observed in the flake   402, 432, 460, 477ms             (real failures, 12x full suite)
+  //
+  // So the claimed 10x margin was ~1x: the 400ms bar sat INSIDE node's own spawn-cost tail, and
+  // the test failed with `expected the near-instant crash to read well under 400ms, got 460` --
+  // reporting a dispatcher that had measured a genuinely 460ms-long scanner entirely correctly.
+  // Measured at 5 occurrences over 96 full-suite runs (issue #111).
+  //
+  // 2000ms is >4x the worst value ever observed for spawn 1 (477ms) and ~10x the 8x-load p90; the
+  // sleep is 1.5x the bar, and load can only make a real sleep LONGER, never shorter, so that side
+  // needs no tail margin at all. Only spawn 1's side was ever the race.
+  //
+  // NOT A PRODUCTION CONCERN, checked rather than assumed: 400 was only ever this FIXTURE's
+  // scaled-down bar. config.js resolves the real scannerHealthyUptimeMs to
+  // max(ORPHAN_SCAN_MS, UNPARK_SCAN_MS) = 60_000ms, ~125x the worst spawn cost above, so a
+  // genuinely crash-looping production scanner is still classified unhealthy and still trips the
+  // breaker. The flake lived in the fixture's constants, not in the code they exercise.
+  const HEALTHY_BAR_MS = 2000;
+  const HEALTHY_SLEEP_MS = 3000;
   let call = 0;
   const spawnScannerFn = (cmd, args, opts) => {
     call += 1;
-    return call === 2 ? spawnScannerAliveFor(1200, 1)(cmd, args, opts) : spawnExit(1)();
+    return call === 2 ? spawnScannerAliveFor(HEALTHY_SLEEP_MS, 1)(cmd, args, opts) : spawnExit(1)();
   };
 
   const config = baseConfig({
     claudeAccountsDir: onePoolDir(1),
     scannerCrashLimit: 10,
-    scannerHealthyUptimeMs: 400,
+    scannerHealthyUptimeMs: HEALTHY_BAR_MS,
     deps: { spawn: spawnExit(0), spawnScanner: spawnScannerFn }, // no monotonicNowMs override -- the real clock
   });
   const dispatcher = createDispatcher(queueDir, journalDir, config);
   const runPromise = dispatcher.run();
   try {
-    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed').length >= 2, 10000);
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed').length >= 2, 15000);
   } finally {
     dispatcher.stop();
     await runPromise;
@@ -1754,9 +1836,15 @@ test('with the REAL monotonic clock (no injected deps), a scanner that genuinely
 
   const crashes = readDaemonEvents(journalDir).filter((e) => e.event === 'scanner-crashed');
   assert.equal(crashes.length, 2);
-  assert.ok(crashes[0].uptimeMs < 400, `expected the near-instant crash to read well under 400ms, got ${crashes[0].uptimeMs}`);
+  assert.ok(
+    crashes[0].uptimeMs < HEALTHY_BAR_MS,
+    `expected the near-instant crash to read well under ${HEALTHY_BAR_MS}ms, got ${crashes[0].uptimeMs}`
+  );
   assert.equal(crashes[0].consecutiveScannerCrashes, 1);
-  assert.ok(crashes[1].uptimeMs >= 400, `expected the real 1200ms sleep to be measured as >= 400ms, got ${crashes[1].uptimeMs}`);
+  assert.ok(
+    crashes[1].uptimeMs >= HEALTHY_BAR_MS,
+    `expected the real ${HEALTHY_SLEEP_MS}ms sleep to be measured as >= ${HEALTHY_BAR_MS}ms, got ${crashes[1].uptimeMs}`
+  );
   assert.equal(crashes[1].consecutiveScannerCrashes, 1, 'the real elapsed time genuinely crossed the bar, so this must read as a reset, not an extension to 2');
 });
 
@@ -1928,7 +2016,9 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
   const BUDGET_MS = 1200; // refill must beat the block by a wide margin -- measured at ~310ms
 
   // A REAL process that really blocks its own thread, then stays alive so it is never mistaken
-  // for a crash-and-respawn.
+  // for a crash-and-respawn. It marks `blockDoneFile` the instant its block ends -- that file, not
+  // a clock reading, is how the assertion below knows whether the refill beat the block.
+  const blockDoneFile = path.join(journalDir, 'scanner-block-finished');
   const blockingScanner = (cmd, args, opts) =>
     realSpawn(
       process.execPath,
@@ -1936,6 +2026,7 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
       [
         '-e',
         `require('child_process').execFileSync('sleep', ['${BLOCK_MS / 1000}']); ` +
+          `require('fs').writeFileSync(${JSON.stringify(blockDoneFile)}, '');` +
           'const p = process.ppid; setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);',
       ],
       { ...opts, stdio: 'ignore' }
@@ -1951,7 +2042,6 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
   });
 
   const dispatcher = createDispatcher(queueDir, journalDir, config);
-  const startedAt = Date.now();
   const runPromise = dispatcher.run();
   try {
     await waitFor(
@@ -1964,10 +2054,26 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
           'sibling process was supposed to prevent'
       );
     });
-    const elapsed = Date.now() - startedAt;
-    assert.ok(
-      elapsed < BLOCK_MS,
-      `the freed slot was only refilled after the scan's ${BLOCK_MS}ms block finished (${elapsed}ms) -- the dispatcher's thread was not free`
+    // THE REFILL BEAT THE BLOCK -- read off the scanner's OWN state, not off a clock.
+    //
+    // This was `elapsed < BLOCK_MS`, with `elapsed` measured from before run(). Both halves of
+    // that comparison look like milliseconds and only one of them is: BLOCK_MS is a real `sleep 2`
+    // in a child, which full-suite load does not slow down at all, while `elapsed` accumulates
+    // this process's node boot, two child spawns and every scheduling delay the box inflicts on a
+    // starved event loop. Under load `elapsed` crosses 2000ms while the dispatcher is still doing
+    // exactly what this test exists to prove -- measured failing at `refilled after the scan's
+    // 2000ms block finished (2147ms)`, 1/40 and 4/96 full-suite runs (issue #111, found by this
+    // campaign rather than filed in it).
+    //
+    // `blockDoneFile` appears the instant the scanner's block ends, so its ABSENCE at the moment
+    // the second worker spawned is the same claim without the clock: the slot was refilled while
+    // the scan was still blocking. Starvation delays the refill and the file's creation by the
+    // same event-loop backlog, so the ordering this reads is load-invariant where the subtraction
+    // was not.
+    assert.equal(
+      fs.existsSync(blockDoneFile),
+      false,
+      `the freed slot was only refilled after the scan's ${BLOCK_MS}ms block finished -- the dispatcher's thread was not free`
     );
   } finally {
     // stop() is only noticed at the TOP of the next loop iteration, and this test deliberately
