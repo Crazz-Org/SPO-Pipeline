@@ -827,21 +827,40 @@ test('orphanScan: the never-started shape is guarded as tightly as the ordinary 
   const journalRoot = mkTmp('spo-orphan-journal-');
   const queueDir = mkTmp('spo-orphan-queue-');
 
+  // THE AGES AND THE GRACE ARE SCALED SO THE SETUP BELOW CANNOT OUTRUN THEM.
+  //
+  // This test used the fixture defaults: a 1000 ms grace with `issue-fresh` seeded 74 ms old,
+  // leaving 926 ms of headroom for everything between that line and the scan reading its age.
+  // That headroom is the TEST PROCESS's wall clock, and under full-suite load it is not
+  // guaranteed: `issue-fresh` aged past the grace during its own setup and was parked, failing as
+  // `+ id: 'issue-fresh'` in the recovered list -- an orphanScan that applied the grace window
+  // exactly right. Measured 1/60 full-suite runs at 12x parallel load (issue #111; not in the
+  // issue, found by that campaign).
+  //
+  // The fix is headroom that no plausible scheduling delay can consume, NOT a different guard:
+  // 60 s of grace against a 74 ms-old task is ~65x the worst delay this campaign ever measured
+  // anywhere. The STALE ages move with it, deliberately -- at the fixture default of 10 s they
+  // would now sit INSIDE the wider grace, and cases 1 and 2 would be excluded by freshness rather
+  // than by the live-owner and queue-entry guards they exist to prove. A test that still passes
+  // for the wrong reason is worse than the flake.
+  const STALE_MS = 600_000; // 10 minutes: well past the grace, and the realistic shape of a real orphan
+  const FRESH_MS = 74; // the measured worker-boot window this case models -- unchanged
+
   // 1. Owned by a live worker RIGHT NOW -- this IS the 74 ms window; reparking here would be the
   //    two-writers race the module's header forbids.
-  const liveDir = seedTakenButNeverStarted(journalRoot, 'issue-live');
+  const liveDir = seedTakenButNeverStarted(journalRoot, 'issue-live', { ageMs: STALE_MS });
   // 2. Still has a queue entry (a re-enqueued retry with a taskDir from a previous run).
-  const queuedDir = seedTakenButNeverStarted(journalRoot, 'issue-queued');
+  const queuedDir = seedTakenButNeverStarted(journalRoot, 'issue-queued', { ageMs: STALE_MS });
   fs.writeFileSync(path.join(queueDir, '0009-q.json'), JSON.stringify({ id: 'issue-queued', kind: 'card', issue: 9 }));
-  // 3. Inside the grace window: a worker merely slow to boot (74 ms against a 1000 ms grace).
-  const freshDir = seedTakenButNeverStarted(journalRoot, 'issue-fresh', { ageMs: 74 });
+  // 3. Inside the grace window: a worker merely slow to boot (74 ms against a 60 s grace).
+  const freshDir = seedTakenButNeverStarted(journalRoot, 'issue-fresh', { ageMs: FRESH_MS });
   // 4. A directory with no task.json at all -- not a claimed task, nothing to recover.
   const bareDir = path.join(journalRoot, 'issue-bare');
   fs.mkdirSync(bareDir, { recursive: true });
   // 5. The genuine control, so a scan that recovered NOTHING cannot pass this test.
-  seedTakenButNeverStarted(journalRoot, 'issue-real');
+  seedTakenButNeverStarted(journalRoot, 'issue-real', { ageMs: STALE_MS });
 
-  const config = testConfig(); // orphanGraceMs: 1000
+  const config = testConfig({ orphanGraceMs: 60_000 });
   const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/1#issuecomment-1') };
 
   const recovered = await orphanScan(queueDir, journalRoot, config, deps, new Set(['issue-live']));
