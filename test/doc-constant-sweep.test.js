@@ -1654,24 +1654,48 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // checked (`ANCHOR_TOPK`) against the RESOLVED file: does the candidate appear within the
 // candidate's own tolerance of the cited line range?
 //
-// That tolerance is PER CANDIDATE KIND, not one global N, and this is the measured finding that
-// makes the rule work at all:
+// That tolerance is ZERO, for every candidate kind: the candidate must appear INSIDE the cited
+// line range itself. This is the second answer this section has given to that question, and the
+// first one's failure is the reason the rule is now stated as a property instead of a ranking.
 //
-//   - 'const' (CONST_CASE, e.g. `BLOCKED`, `SIGTERM`, `DONE_RETENTION_MS`) and 'file' (a
-//     cross-file basename mention, below) claim to be AT the cited line -- tolerance 0, the EXACT
-//     cited range only.
-//   - 'camel' / 'snake' (`runLive`, `api_error_status`) claim to be a DECLARATION near the cited
-//     line (a multi-line signature, a leading comment) -- tolerance `ANCHOR_LOOSE_N` (5) lines.
+// The original rule made tolerance PER CANDIDATE KIND -- 0 for 'const'/'file' (a value sitting AT
+// the cited line), `ANCHOR_LOOSE_N` (5) lines for 'camel'/'snake' (a DECLARATION near it, allowing
+// for a multi-line signature or a leading comment) -- and accepted a citation when EITHER of the
+// two nearest candidates matched within ITS OWN tolerance. That `.some()` over mixed tolerances
+// let the LOOSEST candidate decide: an 11-line acceptance band, and no way to tell "this line"
+// from "the line next to it".
 //
-// This distinction is what catches `run.ts:64` at all. `runLive` (the enclosing function,
-// declared 12-13 lines from either 63 or 64) is the nearest-ranked candidate in the SOURCE text
-// but is too far from EITHER line to discriminate them under any reasonable N -- a single global
-// N that is loose enough to accept `runLive` near a correct citation is also loose enough to
-// accept it near the wrong one, one line off. `BLOCKED` (the second-ranked candidate, a literal
-// status value) sits EXACTLY on line 63 -- close enough to :64 that a loose N would wrongly pass
-// the bug too, but an EXACT match against :63 (right) and a miss against :64 (wrong) tells them
-// apart. Measured, not assumed: a synthetic revert-to-:64 test below proves this discriminates in
-// both directions on the real file.
+// It nevertheless caught the historical `run.ts:64` bug, and the reason it did was an accident of
+// somebody else's file layout, not a property of the rule. `BLOCKED` (zero tolerance) sat exactly
+// on line 63 while `runLive` sat 12 lines away, outside its own loose band -- so the strict
+// candidate was the only one voting, and it discriminated. `runLive` has since MOVED ONTO line 63
+// (SPO-WebClient deleted the live-run rate limiter above it) and `BLOCKED` has moved down to 75.
+// The same citation now anchors on `runLive` at exactly 63 -- but under a 5-line band, `:64`
+// anchors on it just as happily, and the one-line drift this whole section exists to catch went
+// invisible. The mutation-proof canary below went red and stayed red: it was not a broken test,
+// it was the rule's real granularity finally being reported instead of masked.
+//
+// So the band was measured rather than re-tuned. Sweeping the loose tolerance 5 -> 0 over the
+// whole anchor corpus moved NOTHING: 0 offenders at every value of N from 5 down to 0, with
+// `anchored` flat at 22 throughout. Every one of the 22 anchored citations has a top-ranked
+// candidate ON a line inside its own cited range; not one of them was living on the slack. The
+// tolerance was buying zero anchors and costing the entire one-line discrimination, so it is
+// gone. `kindN` is gone with it -- a knob whose only safe value is 0 is a footgun, not a knob.
+//
+// Measured twice, on two different corpora, because the corpus moved underneath this change while
+// it sat unmerged: 22 anchored / 3 unanchorable / 0 offenders at every N on 2026-09-03, and
+// 22 anchored / 2 unanchorable / 0 offenders at every N on 2026-09-04, after #109 deleted the
+// unfireable `escalateFlag` and with it prompts/README.md's `step-contracts.js:99` citation. The
+// `unanchorable` move is #109's, not this change's -- removing a citation cannot alter what a
+// tolerance band accepts -- and the sweep's own result is unchanged by it: the band is still
+// buying zero anchors. The second measurement is a re-run, not the first one with a digit edited.
+//
+// What this buys, measured below and not asserted: the check now discriminates a one-line drift
+// on the REAL files for the citation that motivated it, via `runLive` itself, with no dependence
+// on where SPO-WebClient happens to put `BLOCKED` this week. And the discrimination is no longer
+// proven by ONE canary that a product-side edit can silently retire -- the corpus-wide +/-1
+// mutation test below re-derives it for every single-line citation in the corpus, every run, and
+// pins by name the ones that genuinely cannot discriminate.
 //
 // A cross-file "'file' mention" candidate exists for exactly one shape this corpus needed: prose
 // that names a DIFFERENT file as what the cited line reaches into ("`console/collect.js`, reached
@@ -1686,13 +1710,17 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //
 // ---- what this check still cannot see, stated plainly (the chantier's own recurring lesson) ----
 //
-//   1. A drift that lands EXACTLY on a still-plausible neighbouring line for a 'camel'/'snake'
-//      candidate (within `ANCHOR_LOOSE_N`) is invisible. The rule only distinguishes "near" from
-//      "far", never "this specific line" from "the line next to it", for a declaration-shaped
-//      candidate -- exactly the discrimination 'const'/'file' candidates get for free from their
-//      zero-tolerance rule. A function whose citation drifts by 2-3 lines because of an unrelated
-//      edit inside its own body, where no CONST_CASE/snake_case value happens to sit on the exact
-//      correct line either, would pass uncaught.
+//   1. A drift is invisible whenever the candidate that anchors the citation ALSO appears on the
+//      drifted-to line. Zero tolerance removes the systematic version of this (the old 11-line
+//      band, which made every 'camel'/'snake' anchor blind to +/-1 by construction) but not the
+//      incidental version: a common identifier that genuinely occurs on two adjacent lines
+//      anchors both of them. This is no longer a comment asking to be trusted -- the corpus-wide
+//      +/-1 mutation test below MEASURES it every run, classifies each single-line citation as
+//      discriminating or blunt, and pins both counts by name, so the blunt population cannot grow
+//      in silence any more than `unanchorable` can.
+//   1b. Ranges are blunt by construction and are excluded from that measurement: shifting
+//      `:257-288` by one line leaves a 32-line window that still contains the same identifier.
+//      A range citation is bounds-checked and content-anchored, never line-discriminated.
 //   2. Only ONE class of "no identifier named" citation is handled (the cross-file mention). A
 //      citation whose true subject is a QUOTED STRING that is not CONST_CASE-shaped, a numeric
 //      literal, or a purely structural/prose description (E1's "capability-question variant", a
@@ -1737,7 +1765,9 @@ const ANCHOR_EXCLUDED_FILES = new Set(['doc/bench-audit-2026-09-02.md', 'doc/ben
 
 const ANCHOR_WIN = 150; // chars of citing prose scanned on each side, same order of magnitude as CHAIN_RE's own PROXIMITY_CHARS
 const ANCHOR_TOPK = 2; // nearest-ranked candidates checked; see the run.ts:64 discussion above for why 1 is too strict and 3 adds nothing over 2 in this corpus
-const ANCHOR_LOOSE_N = 5; // line tolerance for a 'camel'/'snake' (declaration-shaped) candidate
+// No line tolerance constant: a candidate must appear INSIDE the cited range, whatever its kind.
+// The old per-kind `ANCHOR_LOOSE_N` (5) was measured to buy 0 of 22 anchors and to cost the whole
+// one-line discrimination -- see this section's header.
 
 // Documentation/table-label noise: words that pass the CONST_CASE shape test (isCodeShapedIdentifier,
 // part 1.8) but are, in THIS corpus's actual prose, either ordinary capitalized emphasis (MUST,
@@ -1834,16 +1864,13 @@ function mergedCandidates(normalizedText, idx, end, clipFrom, clipTo, ownFile) {
   return extractFileMentionCandidates(normalizedText, idx, end, clipFrom, clipTo, ownFile);
 }
 
-// kindN/candidateFoundNear -- the per-kind tolerance from this section's header: 'const'/'file'
-// candidates claim to be AT the exact cited range (tolerance 0); 'camel'/'snake' candidates claim
-// to be a nearby DECLARATION (tolerance ANCHOR_LOOSE_N lines).
-function kindN(kind) { return kind === 'const' || kind === 'file' ? 0 : ANCHOR_LOOSE_N; }
+// candidateFoundNear -- zero tolerance, every kind: the candidate must appear INSIDE the cited
+// line range, never on a neighbouring line. `kind` survives only for the offender message and for
+// the substring-vs-word-boundary rule ('file' mentions match by substring); it no longer widens
+// the window for anybody. See this section's header for the measurement that removed the band.
 function candidateFoundNear(cand, targetPath, startLine, stopLine) {
-  const n = kindN(cand.kind);
   const lines = fs.readFileSync(targetPath, 'utf8').split('\n');
-  const lo = Math.max(0, startLine - 1 - n);
-  const hi = Math.min(lines.length, stopLine + n);
-  const windowText = lines.slice(lo, hi).join('\n');
+  const windowText = lines.slice(Math.max(0, startLine - 1), Math.min(lines.length, stopLine)).join('\n');
   return cand.substring ? windowText.includes(cand.ident) : new RegExp(`\\b${cand.ident}\\b`).test(windowText);
 }
 
@@ -1902,16 +1929,18 @@ test('CITATION_ANCHOR_ALLOWLIST holds exactly the entries this action explicitly
   );
 });
 
-test('every anchorable file:line citation in the anchor-checked corpus points at a line whose own prose names something actually there', () => {
-  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_EXCLUDED_FILES.has(rel));
-  // Named floor, not a silent "no exclusions happened": if a future edit to CORPUS_FILES or
-  // ANCHOR_EXCLUDED_FILES drops this to 2 or fewer, that is exactly the two dated docs swallowing
-  // the whole corpus (or a mis-typed exclusion) and this fails loudly instead of quietly checking nothing.
-  assert.equal(anchorCorpus.length, CORPUS_FILES.length - ANCHOR_EXCLUDED_FILES.size, 'ANCHOR_EXCLUDED_FILES no longer matches exactly two CORPUS_FILES entries by name.');
-
-  const offenders = [];
-  let anchored = 0;
-  let unanchorable = 0;
+// forEachAnchorCheckedCitation -- the ONE walk over the anchor-checked corpus, shared by the main
+// anchor test and the corpus-wide +/-1 mutation test below. Deliberately one function and not two
+// copies of the same twenty lines: the mutation test's whole claim is "the check discriminates one
+// line for EVERY citation the check accepts", and it is only worth anything if both are looking at
+// exactly the same citation set. Two hand-maintained copies would drift, and the drift would show
+// up as the mutation test quietly measuring a smaller corpus than the one being enforced.
+//
+// Yields, per citation that survives part 2's own filters (allowlisted, unresolvable, ambiguous
+// and out-of-bounds citations are part 2's to report, never this layer's to re-litigate):
+//   { rel, key, c, resolved, lineCount, top }   -- `top` is the ANCHOR_TOPK nearest candidates,
+// empty iff the citation is UNANCHORABLE (no code-shaped candidate named anywhere nearby).
+function forEachAnchorCheckedCitation(anchorCorpus, fn) {
   for (const rel of anchorCorpus) {
     const raw = read(rel);
     const withoutFences = rel.endsWith('.md') ? stripFences(raw) : raw;
@@ -1924,7 +1953,6 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
       if (!resolved.target || resolved.ambiguous) continue; // part 2 already reports these; this check only ever narrows a citation part 2 accepted
       const lineCount = fs.readFileSync(resolved.target, 'utf8').split('\n').length;
       if (c.stop > lineCount) continue; // ditto -- part 2's own bounds offender
-      const key = `${rel} :: ${c.raw}`;
       if (isAnchorAllowlisted(rel, c.raw)) continue;
 
       const prevC = i > 0 ? cites[i - 1] : null;
@@ -1933,28 +1961,42 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
       const clipTo = nextC && nextC.file !== c.file ? nextC.idx : null;
 
       const candidates = mergedCandidates(normalized, c.idx, c.end, clipFrom, clipTo, c.file);
-      if (candidates.length === 0) { unanchorable += 1; continue; }
-      const top = candidates.slice(0, ANCHOR_TOPK);
-      const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
-      if (found) { anchored += 1; continue; }
-      offenders.push(
-        `${key} -- none of [${top.map((cand) => `${cand.ident}/${cand.kind}`).join(', ')}] found ` +
-          `(tolerance ${top.map((cand) => kindN(cand.kind)).join('/')} lines) near ${resolved.target}:${c.start}${c.stop !== c.start ? `-${c.stop}` : ''}`
-      );
+      fn({ rel, key: `${rel} :: ${c.raw}`, c, resolved, lineCount, top: candidates.slice(0, ANCHOR_TOPK) });
     }
   }
+}
+
+test('every anchorable file:line citation in the anchor-checked corpus points at a line whose own prose names something actually there', () => {
+  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_EXCLUDED_FILES.has(rel));
+  // Named floor, not a silent "no exclusions happened": if a future edit to CORPUS_FILES or
+  // ANCHOR_EXCLUDED_FILES drops this to 2 or fewer, that is exactly the two dated docs swallowing
+  // the whole corpus (or a mis-typed exclusion) and this fails loudly instead of quietly checking nothing.
+  assert.equal(anchorCorpus.length, CORPUS_FILES.length - ANCHOR_EXCLUDED_FILES.size, 'ANCHOR_EXCLUDED_FILES no longer matches exactly two CORPUS_FILES entries by name.');
+
+  const offenders = [];
+  let anchored = 0;
+  let unanchorable = 0;
+  forEachAnchorCheckedCitation(anchorCorpus, ({ key, c, resolved, top }) => {
+    if (top.length === 0) { unanchorable += 1; return; }
+    if (top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop))) { anchored += 1; return; }
+    offenders.push(
+      `${key} -- none of [${top.map((cand) => `${cand.ident}/${cand.kind}`).join(', ')}] found ` +
+        `ON ${resolved.target}:${c.start}${c.stop !== c.start ? `-${c.stop}` : ''} itself (zero line tolerance)`
+    );
+  });
 
   // Re-measured 2026-09-03 after M17's symbol-citation conversion: 22 verified (was 26), 3
-  // unanchorable (unchanged). The 4 that left the anchored set are the 4 line-number citations
+  // unanchorable (unchanged then; 2 since 2026-09-04 -- see the note on the pin itself below). The 4 that left the anchored set are the 4 line-number citations
   // converted to symbol citations in the same change -- `worker.ts:129`/`:997`/`:131`/`:130-131`
   // -- each now checked by part 1.8's symbol check instead, against the symbol its own prose
   // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
   // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
-  // scripted.js :: verify-gate.js:342` (each cites a
+  // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:99` (deleted
+  // by #109, leaving the two still listed here) -- each citing a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
-  // mention -- correctly unverifiable, not wrong) -- 3 on CITATION_ANCHOR_ALLOWLIST (already
+  // mention -- correctly unverifiable, not wrong -- 3 on CITATION_ANCHOR_ALLOWLIST (already
   // excluded above), 0 unexplained offenders after this action's own fixes landed. Both counts
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
@@ -1967,6 +2009,107 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // exists to stop "cannot verify" growing.
   assert.equal(unanchorable, 2, `expected exactly 2 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
   assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
+});
+
+// ---- part 2.6: corpus-wide +/-1 mutation proof (this action) ------------------------------------
+//
+// Why this exists, and why it is not just another canary. The two mutation-proof canaries at the
+// end of this file each revert ONE historical drift and assert the check goes red. They are worth
+// keeping -- they are the real bugs, on the real files. But a canary proves the check catches the
+// mutation it names, and nothing else, and this action found out the hard way what that is worth:
+// the `run.ts:63` canary went red without a single line of THIS repo changing, because
+// SPO-WebClient moved `runLive` onto line 63 and `BLOCKED` off it. The canary had been passing on
+// an accident of somebody else's file layout. The property it was believed to prove -- "this check
+// discriminates a one-line drift" -- had quietly stopped being true for every OTHER citation in
+// the corpus at the same time, and nothing said so.
+//
+// So the property is measured directly instead, for every citation the anchor check accepts:
+// shift the cited line by one in each direction and re-run the SAME anchoring the main test runs.
+// If the citation still anchors on a neighbouring line, the check cannot tell those two lines
+// apart and says so, by name, here -- rather than in a comment that ages out of true.
+//
+// Three populations, all three pinned, summing to the main test's own `anchored` pin:
+//   - DISCRIMINATING: both neighbours miss. A one-line drift would be caught.
+//   - BLUNT (ANCHOR_BLUNT_CITATIONS): a neighbour still anchors. Capped by name for exactly the
+//     reason `unanchorable` is capped -- "cannot discriminate" must never become a quiet escape
+//     hatch. Both of today's entries are the same shape and neither is a rule defect: the anchor
+//     word is genuinely on two adjacent lines of a PROSE target (a markdown table column, a
+//     two-line bullet), where no line-level rule can help.
+//   - RANGES: blunt by construction, excluded rather than allowlisted. Shifting `:257-288` by one
+//     leaves a 32-line window still containing the same identifier; a range citation is
+//     bounds-checked and content-anchored, never line-discriminated. Counted, not hidden.
+const ANCHOR_BLUNT_CITATIONS = {
+  // README.md: "`doc/state-machine-spec.md:140` has always promised CHECK runs an invariant
+  // substring check". The target is the spec's own step TABLE, where `CHECK` is both a step name
+  // and the "next state" cell of the rows above it -- lines 138, 139, 140 and 142 all contain the
+  // bare word. The citation is correct (140 IS the CHECK row); no identifier-level rule can
+  // separate row 139 from row 140 when the discriminating token is the table's own column value.
+  'orchestrator/README.md :: doc/state-machine-spec.md:140':
+    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (138-140, 142) " +
+    '-- the anchor word is the column value itself, so :139 anchors as well as :140. Citation ' +
+    'confirmed correct by hand: 140 is the CHECK row.',
+  // park-loop.js: "doc/remediation-progress.md:649 confirms the same referent under 'DIAGNOSE
+  // surfacing'". Line 649 is the bullet's own heading line and 650 is its continuation, which
+  // opens with the same word ("DIAGNOSE has no column..."). Correct citation, two-line bullet.
+  'orchestrator/park-loop.js :: doc/remediation-progress.md:649':
+    "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 649 and its own " +
+    'continuation line 650. Citation confirmed correct by hand: 649 is the bullet heading.',
+};
+
+test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to discriminate one line -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
+    [
+      'orchestrator/README.md :: doc/state-machine-spec.md:140',
+      'orchestrator/park-loop.js :: doc/remediation-progress.md:649',
+    ],
+    'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +
+      'by hand and justify it here before pinning it, exactly as CITATION_ANCHOR_ALLOWLIST requires.'
+  );
+});
+
+test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check accepts stops anchoring when its line is shifted by one', () => {
+  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_EXCLUDED_FILES.has(rel));
+  const discriminating = [];
+  const blunt = [];
+  const ranges = [];
+  forEachAnchorCheckedCitation(anchorCorpus, ({ key, c, resolved, lineCount, top }) => {
+    if (top.length === 0) return; // unanchorable -- the main test's own pinned population
+    if (!top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop))) return; // offender; the main test reports it
+    if (c.start !== c.stop) { ranges.push(key); return; }
+
+    const survives = [];
+    for (const off of [-1, 1]) {
+      const shifted = c.start + off;
+      if (shifted < 1 || shifted > lineCount) continue; // no neighbouring line to confuse it with
+      if (top.some((cand) => candidateFoundNear(cand, resolved.target, shifted, shifted))) survives.push(off > 0 ? '+1' : '-1');
+    }
+    if (survives.length === 0) discriminating.push(key);
+    else blunt.push(`${key} -- still anchors at ${survives.join(' and ')} on [${top.map((cand) => `${cand.ident}/${cand.kind}`).join(', ')}]`);
+  });
+
+  // Measured after zero tolerance replaced the per-kind band: 15 discriminating, 2 blunt, 5 ranges.
+  // The SAME measurement re-run against the old 5-line band (restored in a scratch copy, not
+  // asserted from memory) reports 5 discriminating, 12 blunt, 5 ranges -- so the band was blinding
+  // TEN of the seventeen single-line citations in this corpus to a one-line drift, and the only
+  // five it left sharp were the ones anchored by a zero-tolerance 'const'/'file' candidate.
+  // Re-run in full on 2026-09-04 against the post-#109 corpus: both halves reproduce digit for
+  // digit (15/2/5 and 5/12/5). #109 removed an UNANCHORABLE citation, which never entered these
+  // three populations in the first place -- they partition the ANCHORED set, and that stayed 22.
+  // `run.ts:63` was among the twelve, from BOTH of its citing files. That is the honest size of
+  // what the red canary was reporting: not one stale test, a corpus-wide blindness that one green
+  // canary had been covering for. Re-pointing that canary at a bigger mutation would have restored
+  // the green and left all ten blind.
+  assert.deepEqual(
+    blunt.map((b) => b.split(' -- ')[0]).sort(),
+    Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
+    `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
+  );
+  assert.equal(discriminating.length, 15, `expected 15 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
+  assert.equal(ranges.length, 5, `expected 5 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
+  // Ties this measurement to the main test's own pin: the three populations must together be
+  // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
+  assert.equal(discriminating.length + blunt.length + ranges.length, 22, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (22).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check
@@ -2072,15 +2215,30 @@ test('candidateFoundNear: a "const"/"file" candidate requires the EXACT cited li
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('candidateFoundNear: a "camel"/"snake" candidate tolerates ANCHOR_LOOSE_N lines, never more', () => {
+// The regression guard on the tolerance band itself. This test used to assert the OPPOSITE -- that
+// a 'camel' candidate is found up to ANCHOR_LOOSE_N (5) lines away -- and that band is precisely
+// what let `run.ts:64` anchor on `runLive` at 63 once the product file moved, retiring the
+// mutation-proof canary below without a single line of THIS repo changing. Zero tolerance now
+// applies to every kind; if anyone reintroduces a band, this fails before the canary does.
+test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance either -- the neighbouring line must miss', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
   const file = path.join(dir, 'target.txt');
   const lines = [];
   for (let i = 0; i < 20; i++) lines.push(i === 10 ? 'function runLive() {' : `line ${i}`);
   fs.writeFileSync(file, lines.join('\n'));
-  // runLive is on line 11 (1-indexed). ANCHOR_LOOSE_N is 5.
-  assert.equal(candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 11 + 5, 11 + 5), true, 'exactly ANCHOR_LOOSE_N lines away must still be found');
-  assert.equal(candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 11 + 6, 11 + 6), false, 'one line beyond ANCHOR_LOOSE_N must not be found');
+  // runLive is on line 11 (1-indexed).
+  assert.equal(candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 11, 11), true, 'the exact declaration line must be found');
+  for (const off of [-5, -2, -1, 1, 2, 5]) {
+    assert.equal(
+      candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 11 + off, 11 + off),
+      false,
+      `a 'camel' candidate ${off} line(s) from the cited line must NOT be found -- this is the exact ` +
+        'slack that made the run.ts:63/:64 pair indistinguishable once runLive moved onto line 63'
+    );
+  }
+  // A range citation still matches anywhere INSIDE its own range -- zero tolerance bounds the
+  // window to the cited range, it does not shrink it to a single line.
+  assert.equal(candidateFoundNear({ ident: 'runLive', kind: 'camel' }, file, 8, 14), true, 'a candidate inside a cited RANGE is still found');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -2101,6 +2259,16 @@ test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bound
 // once, the fix is undone with a single string replace, and the exact same functions the main
 // test above calls are run against that reverted text and the REAL target file.
 
+// This canary spent a while red, and the red was correct. When it was written, the discriminating
+// candidate was `BLOCKED` -- zero tolerance, sitting exactly on line 63 while `runLive` sat 12
+// lines off, outside its own 5-line band. SPO-WebClient then deleted the live-run rate limiter
+// above `runLive`, which moved `runLive` ONTO 63 and `BLOCKED` down to 75, and the 5-line band
+// happily anchored `:64` on `runLive` -- one line off, invisible, which is the exact bug this
+// whole section exists to catch. The canary was reporting a real loss of granularity, not aging
+// out. It discriminates again because the band is gone (part 2.5's header), now via `runLive`
+// itself and with no dependence on where the product repo keeps `BLOCKED`; and it is no longer
+// the only thing standing behind that claim -- part 2.6 re-derives the same +/-1 property for
+// every single-line citation in the corpus on every run.
 test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug) makes this check red, on the real files', () => {
   const raw = read('orchestrator/state-machine.js');
   const normalized = normalizeWrap(raw);
