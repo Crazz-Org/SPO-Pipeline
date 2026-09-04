@@ -155,25 +155,38 @@ const PINS = [
     // The historical bug this row guards: the spec once said 5 minutes here, restating a
     // REJECTED rationale (an observed max step duration) instead of the ceiling the code
     // actually derives the wait from -- see config.js's own accountLeaseWaitMs comment.
-    name: 'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (31.5 min), not a flat 5 min', // action 6.2
+    name: 'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (63 min), not a flat 5 min', // action 6.2
     checks: [
       {
         file: 'orchestrator/step-contracts.js',
-        contains: 'const MAX_LEASE_AGE_MS = 2 * LLM_STEP_DEADLINE_MS + Math.round(LLM_STEP_DEADLINE_MS / 10);',
+        // MAX_LLM_STEP_DEADLINE_MS, not LLM_STEP_DEADLINE_MS: PLAN carries a longer deadline since
+        // 2026-09-04, and the lease bound must follow the LONGEST legitimate hold, not the default.
+        contains: 'const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10);',
       },
       {
         file: 'orchestrator/config.js',
         contains: "accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', MAX_LEASE_AGE_MS),",
       },
-      { file: 'doc/state-machine-spec.md', contains: '**31.5 min** — `MAX_LEASE_AGE_MS`' },
-      { file: 'orchestrator/README.md', contains: '`MAX_LEASE_AGE_MS` (`step-contracts.js`, **31.5 minutes**: 2 ×' },
+      { file: 'doc/state-machine-spec.md', contains: '**63 min** — `MAX_LEASE_AGE_MS`' },
+      { file: 'orchestrator/README.md', contains: '`MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×' },
     ],
   },
   {
-    name: 'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- all five LLM steps', // action 1.x / 2.1
+    name: 'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, four of the five LLM steps', // action 1.x / 2.1
     checks: [
       { file: 'orchestrator/step-contracts.js', contains: 'const LLM_STEP_DEADLINE_MS = 900000;' },
       { file: 'doc/state-machine-spec.md', contains: '| 900000ms / 15min |' },
+    ],
+  },
+  {
+    // PLAN is the one step off the default (2026-09-04). Card #486 (size:L, the only card ever to
+    // reach PLAN's `L -> high` row) failed three times, twice on deadline kills at ~825s of measured
+    // wall clock, and terminal-parked llm-transport-failed:PLAN -- the pipeline could not plan an
+    // L card at all. This row exists so the raise cannot drift from the spec table that states it.
+    name: 'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN gets 1800000ms / 30min',
+    checks: [
+      { file: 'orchestrator/step-contracts.js', contains: 'PLAN: 1800000, // 30 min' },
+      { file: 'doc/state-machine-spec.md', contains: '| 1800000ms / 30min |' },
     ],
   },
   {
@@ -235,12 +248,13 @@ test('every pinned documented constant matches a literal in both the code and th
   assert.deepEqual(
     PINS.map((p) => p.name).sort(),
     [
-      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- all five LLM steps',
+      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, four of the five LLM steps',
+      'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN gets 1800000ms / 30min',
       'account cooldown: escalation window (2 hours)',
       'account cooldown: overloaded (5 minutes, flat, never escalates)',
       'account cooldown: usage escalated (5 hours)',
       'account cooldown: usage probe (1 hour)',
-      'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (31.5 min), not a flat 5 min',
+      'accountLeaseWaitMs derives from MAX_LEASE_AGE_MS (63 min), not a flat 5 min',
       'autoPullLimit default (1) and the in-flight+queued<=K watermark',
       'benchIdleWaitMaxPolls default (180) and benchIdleWaitPollIntervalMs default (5000ms)',
       'ciChecksMaxPolls default (30)',
@@ -933,9 +947,11 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
 // text), the three doc/accepted-gaps.md §3b running logs (doc/remediation-progress.md,
 // doc/improvisation-analysis.md, doc/remediation-plan-2026-08.md), and
 // doc/comment-corpus-audit-2026-09-03.md (9.1's own deliverable, written AFTER the corpus it
-// measured -- not part of what it measured). 65 files, matching doc/accepted-gaps.md §3d's own
-// count. A file added to or removed from this scope is a deliberate act -- update this array in
-// the same change, by name, the same way PINS's name list above works.
+// measured -- not part of what it measured). 66 files: the 65 of doc/accepted-gaps.md §3d's own
+// count, plus `orchestrator/retry-channel.js`, added by project-2 card #476 (the unpark scan's
+// health rule, factored out of bin/spo when the card gave it a third reader). A file added to or
+// removed from this scope is a deliberate act -- update this array in the same change, by name,
+// the same way PINS's name list above works.
 const CORPUS_FILES = [
   'README.md',
   'accounts/spo-test-accounts.yml',
@@ -987,6 +1003,7 @@ const CORPUS_FILES = [
   'orchestrator/recette.js',
   'orchestrator/remote-report-pull.js',
   'orchestrator/report-intake.js',
+  'orchestrator/retry-channel.js',
   'orchestrator/state-machine.js',
   'orchestrator/step-contracts.js',
   'orchestrator/steps/llm.js',
@@ -1315,7 +1332,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1137",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1102",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1346,7 +1363,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1137",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1102",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -1361,7 +1378,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:764",
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1295",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1102",
+  "doc/state-machine-spec.md :: bin/spo:1067",
   "doc/state-machine-spec.md :: dispatcher.js:485-499",
   "doc/state-machine-spec.md :: intake.js:747-749",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -1388,7 +1405,6 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
   "orchestrator/steps/scripted.js :: worker.ts:1535",
   "prompts/README.md :: plan.md:103",
-  "prompts/README.md :: step-contracts.js:99",
 ];
 
 test('every file:line citation in the 65-file corpus resolves, or is on the named allowlist', () => {
@@ -1397,7 +1413,7 @@ test('every file:line citation in the 65-file corpus resolves, or is on the name
   // citation that file held would vanish from `found`), but that failure reads as "which
   // citations changed," not "the corpus scope itself changed." Checked first so the more likely
   // cause is named up front.
-  assert.equal(CORPUS_FILES.length, 65, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
+  assert.equal(CORPUS_FILES.length, 66, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
 
   const found = [];
   for (const rel of CORPUS_FILES) {
@@ -1605,7 +1621,9 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //   - `bin/spo:1090-1093` -- drifted to :1137 through unrelated edits over the life of the file.
 //     CITATION_RE could not even SEE this one before this action (`bin/spo` has no extension);
 //     widening it (see that constant, above) is what let this check find it at all. Fixed here
-//     (both dated-record sites now read `:1137`) -- also proven via mutation-proof canary below.
+//     (both dated-record sites now read `:1102` -- `:1137` when this was written; project-2 card
+//     #476 moved `collectAll`'s call site again, and the same check caught it again)
+//     -- also proven via mutation-proof canary below.
 //
 // Widening the resolver (E1, the fix that made part 2 read the real product tree instead of a
 // stale nested worktree) plus THIS check together found nine more real, live drifts while this
@@ -1967,7 +1985,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
   // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
-  // scripted.js :: verify-gate.js:342`, `prompts/README.md :: step-contracts.js:99` (each cites a
+  // scripted.js :: verify-gate.js:342` (each cites a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
   // mention -- correctly unverifiable, not wrong) -- 3 on CITATION_ANCHOR_ALLOWLIST (already
   // excluded above), 0 unexplained offenders after this action's own fixes landed. Both counts
@@ -1975,7 +1993,12 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
   assert.equal(anchored, 22, `expected 22 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
-  assert.equal(unanchorable, 3, `expected exactly 3 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
+  // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
+  // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
+  // The escalation was deleted, so the row no longer makes the claim and no longer needs the
+  // citation. The population SHRANK -- which is the direction this pin is happy to move in; it
+  // exists to stop "cannot verify" growing.
+  assert.equal(unanchorable, 2, `expected exactly 2 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
   assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
 });
 
@@ -2127,9 +2150,9 @@ test('extractAnchorCandidates: a neighbouring citation to a DIFFERENT file clips
 });
 
 test('extractFileMentionCandidates: matches a cross-file basename mention by substring, never the citation\'s own file', () => {
-  const text = '`console/collect.js`, reached from `bin/spo:1137`, reads it by content';
-  const idx = text.indexOf('bin/spo:1137');
-  const end = idx + 'bin/spo:1137'.length;
+  const text = '`console/collect.js`, reached from `bin/spo:1102`, reads it by content';
+  const idx = text.indexOf('bin/spo:1102');
+  const end = idx + 'bin/spo:1102'.length;
   const cands = extractFileMentionCandidates(text, idx, end, null, null, 'bin/spo');
   assert.deepEqual(cands.map((c) => c.ident), ['collect']);
   assert.equal(cands[0].kind, 'file');
@@ -2147,9 +2170,9 @@ test('extractFileMentionCandidates: matches a cross-file basename mention by sub
 
 test('mergedCandidates: falls back to a file-mention candidate ONLY when no identifier candidate exists', () => {
   // No identifier at all near the citation -- must fall back to the file mention.
-  const noIdentText = '`console/collect.js`, reached from `bin/spo:1137`, reads it by content';
-  const idx1 = noIdentText.indexOf('bin/spo:1137');
-  const end1 = idx1 + 'bin/spo:1137'.length;
+  const noIdentText = '`console/collect.js`, reached from `bin/spo:1102`, reads it by content';
+  const idx1 = noIdentText.indexOf('bin/spo:1102');
+  const end1 = idx1 + 'bin/spo:1102'.length;
   const fallback = mergedCandidates(noIdentText, idx1, end1, null, null, 'bin/spo');
   assert.deepEqual(fallback.map((c) => c.ident), ['collect']);
 
@@ -2207,7 +2230,7 @@ test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance eit
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1137 needs it ("collect" inside "collectAll")', () => {
+test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1102 needs it ("collect" inside "collectAll")', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
   const file = path.join(dir, 'target.txt');
   fs.writeFileSync(file, ['line one', 'const data = collectAll(sources);', 'line three'].join('\n'));
@@ -2261,11 +2284,11 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1137 back to bin/spo:1090-1093 (the historical bug) makes this check red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1102 back to bin/spo:1090-1093 (the historical bug) makes this check red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
-  const reverted = normalized.replace('reached from `bin/spo:1137`', 'reached from `bin/spo:1090-1093`');
+  const reverted = normalized.replace('reached from `bin/spo:1102`', 'reached from `bin/spo:1090-1093`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
@@ -2280,18 +2303,18 @@ test('MUTATION PROOF: reverting bin/spo:1137 back to bin/spo:1090-1093 (the hist
   const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
   assert.equal(found, false, 'the historical bin/spo:1090-1093 bug must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact bug that motivated it');
 
-  // And the fixed text (:1137, actually on disk) must anchor cleanly, via the SAME substring-
+  // And the fixed text (:1102, actually on disk) must anchor cleanly, via the SAME substring-
   // matched 'file' candidate ("collect", from `console/collect.js`) -- proving both that the
   // check discriminates the specific drift in both directions AND that the 'file' kind's
   // substring matching (see candidateFoundNear's own fixture test) is what makes it possible at
   // all: "collect" is never a \b-bounded whole word at the real call site, only a substring of
   // `collectAll`.
-  const cites1137 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
-  const c1137 = cites1137[0];
-  const candidates1137 = mergedCandidates(normalized, c1137.idx, c1137.end, null, null, c1137.file);
-  assert.equal(candidates1137[0] && candidates1137[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
-  const found1137 = candidates1137.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1137.start, c1137.stop));
-  assert.equal(found1137, true, 'the real, fixed :1137 citation must anchor cleanly');
+  const cites1102 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
+  const c1102 = cites1102[0];
+  const candidates1102 = mergedCandidates(normalized, c1102.idx, c1102.end, null, null, c1102.file);
+  assert.equal(candidates1102[0] && candidates1102[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
+  const found1102 = candidates1102.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1102.start, c1102.stop));
+  assert.equal(found1102, true, 'the real, fixed :1102 citation must anchor cleanly');
 });
 
 // ---- part 3: dangling doc/*.md path reference check (E3, action 9.2) ---------------------------

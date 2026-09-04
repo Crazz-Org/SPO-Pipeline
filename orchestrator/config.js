@@ -597,7 +597,7 @@ module.exports = {
   //
   //   sibling worker, one two-attempt LLM step   2 x LLM_STEP_DEADLINE_MS  = 30   min
   //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS    = 10   min
-  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS          = 31.5 min
+  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS          = 63   min
   //
   // Against a 5-minute wait every one of those is longer. A worker at K=2 therefore gave up while
   // the holder was still legitimately alive AND still un-sweepable for up to another 26.5 minutes,

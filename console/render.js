@@ -49,10 +49,14 @@
 //                                                          // from <journalRoot>/usage-rollups.json -- populated
 //                                                          // in BOTH static and live mode (a cheap read of
 //                                                          // an already-computed file, not a live scan)
-//     services: { daemon, queue, benchWorker, nightly, verdicts, workers },  // console/collect.js
+//     services: { daemon, queue, benchWorker, nightly, verdicts, workers, retryChannel },
 //                    -- `workers` added action 6.7: C6's dispatcher.js live-worker count
 //                       (present/count/staleCount/trailingCount/updatedAt/ageMs), an aggregate
 //                       ONLY -- see console/collect.js's own header on why no per-task rows
+//                    -- `retryChannel` added by project-2 card #476: the unpark (retry/abandon)
+//                       scan's own health (status/parkedCards/failingCards/healthyCards/
+//                       unprovenCards/worstFailures/lastFailedAgeMs), aggregate only for the
+//                       same reason, and absent entirely before the card
 //     daemonStats: { total, done, parked, abandoned, week, today, active, imported, inFlight,
 //                     parkingRatePct },   // abandoned added action 4.5 -- see console/collect.js
 //     reports: { queuedIntake, pendingConfirm, confirmedAwaitingTriage, lastIntakeCycle,
@@ -457,6 +461,7 @@ function renderServicesInner(services, accounts, prod) {
   const nightly = s.nightly || {};
   const verdicts = s.verdicts || {};
   const workers = s.workers || {};
+  const retry = s.retryChannel || {};
 
   // action 5.5, item B audit: `nightly.status`/`verdicts.status` (console/collect.js's
   // collectServices) already compute a 'stale' value on a 36h clock (STALE_BENCH_AGE_MS there) --
@@ -478,6 +483,26 @@ function renderServicesInner(services, accounts, prod) {
   const verdictsCaption = verdicts.recentTotal
     ? `${verdicts.recentPass}/${verdicts.recentTotal} PASS${verdicts.status === 'stale' ? ` — STALE, last ${fmtAgeMs(verdicts.ageMs)} ago` : ''}`
     : 'no data';
+
+  // Project-2 card #476: the maintainer's retry/abandon channel had NO dashboard surface at all
+  // -- not a tile, not a reader, nothing -- while it was dead for 33 hours. Four words, and the
+  // two non-green ones carry the card's whole point (console/collect.js's applyRetryChannelStats
+  // owns which is which): IDLE means nothing is parked, so the scan did not run and has nothing
+  // to be healthy about; UNPROVEN means cards ARE parked and not one has a recorded scan outcome,
+  // which is exactly what a dead scanner looks like and must not render as a reassuring green.
+  const RETRY_WORD = { ok: 'ALIVE', fail: 'FAILING', idle: 'IDLE', unknown: 'UNPROVEN' };
+  const retryStatus = RETRY_WORD[retry.status] || 'UNPROVEN';
+  const retryBig =
+    retry.status === 'fail' ? fmtInt(retry.failingCards)
+      : retry.status === 'ok' ? fmtInt(retry.healthyCards)
+        : '—';
+  const retryCaption =
+    retry.status === 'idle' ? 'nothing parked — nothing to scan'
+      : retry.status === 'fail'
+        ? `of ${retry.parkedCards} parked failing — worst streak ${retry.worstFailures}, last ${fmtAgeMs(retry.lastFailedAgeMs)} ago`
+        : retry.status === 'ok'
+          ? `of ${retry.parkedCards} parked confirmed reaching GitHub${retry.unprovenCards ? `, ${retry.unprovenCards} unproven` : ''}`
+          : `${retry.parkedCards} parked, no scan outcome recorded yet`;
 
   const tiles = [
     svcTile({
@@ -510,6 +535,13 @@ function renderServicesInner(services, accounts, prod) {
       caption: workers.present
         ? `live${workers.staleCount ? `, ${workers.staleCount} stale` : ''}${workers.trailingCount ? `, ${workers.trailingCount} exiting` : ''} — published ${fmtAgeMs(workers.ageMs)} ago`
         : 'no live-workers.json published',
+    }),
+    svcTile({
+      name: 'Retry channel',
+      status: retryStatus,
+      cls: tileClass(retry.status),
+      big: retryBig,
+      caption: retryCaption,
     }),
     svcTile({
       name: 'Bench worker',

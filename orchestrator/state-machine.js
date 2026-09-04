@@ -30,7 +30,7 @@ const {
   writeReport,
   readLiveWorkerIds,
 } = require('./journal');
-const { scratchDir, lastResultPayload } = require('./task-values');
+const { scratchDir, lastResultPayload, lastJournaledCitations } = require('./task-values');
 const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
@@ -981,7 +981,42 @@ async function handleValidate(ctx) {
   let citationVerdict = null;
   let citationEntries = [];
 
-  if (ctx.task.touchesRdoMembers) {
+  // 2026-09-04, interim: run the verifier only when there is something to verify.
+  //
+  // WHY. Two different facts decide this block today and they can disagree. Whether the step RUNS
+  // is `ctx.task.touchesRdoMembers` -- an intake GUESS made from the card's own text
+  // (intake.js's makeTask: `area === 'rdo'` or a literal "rdo-members.ts" mention). Whether the
+  // step CAN run is whether `citations` exists -- and realPushPr only ever collects those when
+  // the REAL diff touched the catalogue. realPushPr corrects the guess false -> true when the
+  // diff disagrees (the `touches-rdo-members-rederived` event, added for card #385), but never
+  // true -> false, so an intake false positive survives all the way to here and meets an empty
+  // citations list.
+  //
+  // Measured: card #489 (2026-09-03) was implemented, passed every invariant, opened PR #659 and
+  // went CI-green -- then parked `prompt-missing-placeholder:citations` because its diff touched
+  // no catalogue file and no `rdo-citation` event was ever written (journal: 0 of them). Card
+  // #385 parked on the same reason pre-C1. The step has ONE successful execution in the project's
+  // history (#462).
+  //
+  // The availability test mirrors task-values.js's own resolution order exactly (in-memory first,
+  // journal fallback second) so this can never skip a call the placeholder fill would have
+  // satisfied. When the guess says RDO and no citations exist, the skip is journaled -- it is a
+  // real signal (either intake over-flagged, or an RDO change shipped uncited) and must not go
+  // silent. Fail-closed behaviour for every OTHER cv shape below is untouched.
+  //
+  // This is an INTERIM narrowing, not the fix: the fix is to make the trigger and the input come
+  // from the same source (the diff). See the SPO Factory card that carries this note.
+  const inMemoryCitations = Array.isArray(ctx.task.citations) && ctx.task.citations.length > 0;
+  const citationsAvailable = inMemoryCitations || (lastJournaledCitations(ctx.taskDir) || []).length > 0;
+
+  if (ctx.task.touchesRdoMembers && !citationsAvailable) {
+    appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier-skipped-no-citations', {
+      touchesRdoMembers: true,
+      source: 'interim-narrowing-2026-09-04',
+    });
+  }
+
+  if (ctx.task.touchesRdoMembers && citationsAvailable) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
 
     // Fail-closed judge (2026-08-30 audit): the citation verifier has never actually been

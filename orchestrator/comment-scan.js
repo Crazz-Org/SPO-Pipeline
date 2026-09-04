@@ -113,6 +113,35 @@ function firstLine(text) {
   return ((text || '').split('\n')[0] || '').trim();
 }
 
+// firstStderrLine(result) -- the one field the 33-hour outage of 2026-08-30 needed and did not
+// have (project-2 card #476). Every one of the 238 `unpark-scan-failed` events it produced reads
+// `{exit: 1, timedOut: false}` and nothing else, so "a `gh` process exited non-zero" is the whole
+// of what is recoverable: not which endpoint, not the HTTP status, not whether it was auth, rate
+// limiting or DNS. `gh` writes all of that to stderr and this module dropped it on the floor,
+// while its sibling board.js's moveIssueToColumn was already returning `{ok:false, exit, stderr,
+// timedOut}` -- so this is that existing convention, not a new one.
+//
+// The FIRST non-empty line only, capped: `gh`'s first line is the diagnosis ("HTTP 401: Bad
+// credentials (...)", "error connecting to api.github.com"), and the rest is usually a
+// documentation URL or a paginated body. An uncapped stderr would put an arbitrary-length
+// attacker- or upstream-controlled string into an append-only journal that is read line by line,
+// once per failing cycle -- the same journal 46% of whose corpus was already unpark-scan noise.
+// Truncation is marked, never silent, so a cut line never reads as a complete one.
+const STDERR_MAX_CHARS = 300;
+function firstStderrLine(result) {
+  const raw = result && result.stderr;
+  // spawnSync is armed with `encoding: 'utf8'` (command-timeout.js), so this is a string in
+  // production -- but a stubbed `deps.spawnSync` may hand back a Buffer, or nothing at all, and a
+  // failure-reporting helper that throws is worse than useless.
+  const text = typeof raw === 'string' ? raw : raw ? String(raw) : '';
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    return trimmed.length > STDERR_MAX_CHARS ? `${trimmed.slice(0, STDERR_MAX_CHARS)}... (truncated)` : trimmed;
+  }
+  return null;
+}
+
 const PER_PAGE = 100;
 const DEFAULT_MAX_PAGES = 20; // 20 * 100 = 2000 comments -- see header
 
@@ -189,7 +218,13 @@ function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, 
       config
     );
     if (normalizeExit(result) !== 0) {
-      return { ok: false, reason: 'gh-failed', exit: normalizeExit(result), timedOut: result.timedOut === true };
+      return {
+        ok: false,
+        reason: 'gh-failed',
+        exit: normalizeExit(result),
+        timedOut: result.timedOut === true,
+        stderr: firstStderrLine(result),
+      };
     }
 
     let batch;
@@ -219,21 +254,27 @@ function fetchCommentsAfterAnchor({ deps = {}, config, ghRepo, issue, anchorId, 
 
 // ---- (b) author allowlist ----------------------------------------------------------------------
 
+// -> {logins: Set<string>|null, stderr: string|null}. `stderr` carries `gh`'s own first line when
+// the process itself failed (card #476, same reason as fetchCommentsAfterAnchor's): a collaborator
+// list that has NEVER been readable makes the scan fail open -- every commenter is treated as
+// authorized -- and until now the journal recorded that switch-flip with no cause attached.
+// `logins: null` with `stderr: null` is the other failure: `gh` exited 0 and its output would not
+// parse as a list of collaborators, which has no stderr to report.
 function fetchCollaboratorLogins(deps, config, ghRepo) {
   const result = runSync(deps, 'gh', ['api', `repos/${ghRepo}/collaborators`, '--paginate'], {}, config);
-  if (normalizeExit(result) !== 0) return null;
+  if (normalizeExit(result) !== 0) return { logins: null, stderr: firstStderrLine(result) };
   let list;
   try {
     list = JSON.parse(result.stdout);
   } catch {
-    return null;
+    return { logins: null, stderr: null };
   }
-  if (!Array.isArray(list)) return null;
+  if (!Array.isArray(list)) return { logins: null, stderr: null };
   const logins = new Set();
   for (const c of list) {
     if (c && typeof c.login === 'string') logins.add(c.login.toLowerCase());
   }
-  return logins;
+  return { logins, stderr: null };
 }
 
 // getCollaborators(...) -> {logins: Set<string>|null, ok, failOpen, fetchedAt}. See this
@@ -245,9 +286,9 @@ function getCollaborators(deps, config, ghRepo, scanState, journalRoot, scannerK
   const ttl = cached && cached.ok ? COLLAB_TTL_OK_MS : COLLAB_TTL_FAIL_MS;
   if (cached && nowMs - cached.fetchedAt < ttl) return cached;
 
-  const logins = fetchCollaboratorLogins(deps, config, ghRepo);
-  if (logins) {
-    const entry = { logins, ok: true, failOpen: false, fetchedAt: nowMs };
+  const fetched = fetchCollaboratorLogins(deps, config, ghRepo);
+  if (fetched.logins) {
+    const entry = { logins: fetched.logins, ok: true, failOpen: false, fetchedAt: nowMs };
     scanState.collaborators.set(ghRepo, entry);
     return entry;
   }
@@ -257,11 +298,16 @@ function getCollaborators(deps, config, ghRepo, scanState, journalRoot, scannerK
       scanner: scannerKey,
       ghRepo,
       ageMs: nowMs - cached.fetchedAt,
+      stderr: fetched.stderr || undefined,
     });
     return cached; // known-good, just older than COLLAB_TTL_OK_MS -- see header
   }
 
-  appendDaemonEvent(journalRoot, 'comment-scan-collaborators-unreadable', { scanner: scannerKey, ghRepo });
+  appendDaemonEvent(journalRoot, 'comment-scan-collaborators-unreadable', {
+    scanner: scannerKey,
+    ghRepo,
+    stderr: fetched.stderr || undefined,
+  });
   const entry = { logins: null, ok: false, failOpen: true, fetchedAt: nowMs };
   scanState.collaborators.set(ghRepo, entry);
   return entry;
@@ -324,7 +370,7 @@ function recordSuccess(scanState, ghRepo, issue) {
 //   now         -- inject a numeric ms timestamp for tests; defaults to Date.now().
 //
 // Returns {ok: true, match: {name, comment} | null} or {ok: false, reason, ...}. `reason` is one
-// of 'backoff' (skip, already journalled), 'gh-failed' (exit/timedOut carried), or 'unparsable'
+// of 'backoff' (skip, already journalled), 'gh-failed' (exit/timedOut/stderr carried), or 'unparsable'
 // -- the caller maps these onto its own existing failure-event shape (unpark-scan-failed /
 // reportConfirmScan's own `errors` entries) so pre-2.7 journal/error text does not change.
 async function scanForMatch({
@@ -357,7 +403,17 @@ async function scanForMatch({
   const fetched = fetchCommentsAfterAnchor({ deps, config, ghRepo, issue, anchorId, sinceMs, maxPages });
   if (!fetched.ok) {
     recordFailure(scanState, ghRepo, issue, nowMs);
-    return { ok: false, reason: fetched.reason, exit: fetched.exit, timedOut: fetched.timedOut };
+    // `stderr` rides along on the same shape as `exit`/`timedOut` (card #476): the caller journals
+    // it under its own failure-event name. Absent on the 'unparsable' branch by construction --
+    // there `gh` exited 0 and it is our own JSON.parse that failed, so there is no stderr to
+    // report and a `null` there would be an honest absence, not a missing capture.
+    return {
+      ok: false,
+      reason: fetched.reason,
+      exit: fetched.exit,
+      timedOut: fetched.timedOut,
+      stderr: fetched.stderr === undefined ? null : fetched.stderr,
+    };
   }
   recordSuccess(scanState, ghRepo, issue);
 
@@ -398,6 +454,7 @@ module.exports = {
   recordFailure,
   recordSuccess,
   firstLine,
+  firstStderrLine,
   PER_PAGE,
   DEFAULT_MAX_PAGES,
 };
