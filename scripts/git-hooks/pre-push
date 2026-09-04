@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Runs the gate before a push leaves this machine. Installed as a symlink at .git/hooks/pre-push by
+# daemon-install.sh / dashboard-install.sh, exactly like the post-merge hook beside it.
+#
+# WHY, specifically. The CI gate (.github/workflows/gate.yml) covers pull requests and pushes to
+# `main` -- but it renders its verdict AFTER the code has left the machine, and on 2026-09-04 this
+# repo had a commit sitting unpushed on `main` in the primary checkout that had never been through
+# a PR at all. That is the ordinary shape here: a session whose cwd is ~/SPO-Pipeline has `main`
+# checked out, so "commit the work" means committing to `main`. This hook is the half of the gate
+# that meets that path, ~20s before the push instead of a minute after it.
+#
+# It runs the SAME scripts/gate.sh that CI runs -- never its own copy of the command -- so a push
+# that passes here and a PR that passes there cannot disagree about what "green" means.
+#
+# It is not a security boundary and does not pretend to be: `git push --no-verify` skips it, and
+# that is deliberate. It exists to stop the accident (a push whose suite was never run), not to
+# stop a decision. CI is the check that cannot be skipped from here.
+set -euo pipefail
+
+REPO="$(git rev-parse --show-toplevel)"
+
+# Nothing to verify when the push deletes a ref, and running the suite would be pure latency.
+# stdin is `<local ref> <local sha> <remote ref> <remote sha>` per line; an all-zero local sha is
+# a deletion. No lines at all (`git push` with nothing to do) is likewise nothing to gate.
+deleting_only=1
+saw_line=0
+while read -r _localref localsha _remoteref _remotesha; do
+  saw_line=1
+  case "$localsha" in
+    *[!0]*) deleting_only=0 ;;
+  esac
+done
+if [ "$saw_line" = "1" ] && [ "$deleting_only" = "1" ]; then
+  echo "== pre-push: ref deletion only, nothing to gate"
+  exit 0
+fi
+
+echo "== pre-push: running scripts/gate.sh (skip with --no-verify)"
+if ! "$REPO/scripts/gate.sh"; then
+  echo "!! pre-push: the gate failed -- push refused. Fix it, or push with --no-verify if you mean to." >&2
+  exit 1
+fi

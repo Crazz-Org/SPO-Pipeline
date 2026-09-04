@@ -1,0 +1,62 @@
+# The gate: SPO-Pipeline's own test suite, run by GitHub rather than by the author.
+#
+# This is the whole point of the file. Before it, the only thing verifying a change to this repo
+# was the claim, written by whoever made the change, that they had run the tests -- and this repo
+# merges work authored by agents. A verdict produced by the party being checked is not a gate. This
+# one runs on GitHub's machine, from a clean checkout, and its result is attached to the commit
+# whether anyone reads it or not.
+#
+# Deterministic by construction: this repo has no package.json, no node_modules and no network
+# calls in its suite (`test/no-real-spawn.js` fails any test that tries to spawn a real
+# git/gh/npm/claude), so there is no install step, no lockfile to resolve and nothing to fetch. The
+# same commit yields the same verdict here and on a laptop.
+#
+# Cheap by construction too: no dependency install, a shallow checkout, ~20s of `node --test`, and
+# superseded PR runs cancelled. A gate that costs real money per push is one that eventually gets
+# switched off.
+#
+# The command lives in scripts/gate.sh, NOT here -- one definition, so CI, the pre-push hook and a
+# human typing it cannot drift apart. test/gate-scope.test.js fails if this file grows its own
+# `node --test` invocation. See that script's header for what it deliberately does not run (the
+# three sibling-repo drift checks, which depend on SPO-WebClient's and SPO-Deploy's current state
+# rather than on this repo's diff).
+
+name: gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  # Pushing twice to a PR should not pay for two full runs; the older verdict is already obsolete.
+  # On `main` nothing is cancelled -- every commit that lands keeps its own recorded verdict.
+  group: gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: suite
+    runs-on: ubuntu-latest
+    # The suite runs in ~20s. Ten minutes is not a budget, it is a stop on a hung run billing
+    # until the six-hour default kills it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # No test in the gate reads git history; the three that shell out to `git ls-files` are
+          # the excluded sibling-repo sweeps. Measured before this was written, not assumed.
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned to a major, not "latest": a gate whose runtime changes under it is not
+          # deterministic. Matches the version this repo is developed and run against.
+          node-version: '22'
+
+      - name: gate
+        run: scripts/gate.sh

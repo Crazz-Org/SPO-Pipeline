@@ -67,6 +67,11 @@ systemctl --user --no-pager --lines=8 status spo-pipeline-dashboard.service || t
 echo "== wiring post-merge hook (restart on git pull)"
 ln -sf "$REPO/scripts/git-hooks/post-merge" "$REPO/.git/hooks/post-merge"
 
+# Pre-push gate, same as daemon-install.sh wires -- either install script arms both hooks, so a box
+# that installed only the dashboard is not left with the restart hook but no gate.
+echo "== wiring pre-push hook (run the gate before pushing)"
+ln -sf "$REPO/scripts/git-hooks/pre-push" "$REPO/.git/hooks/pre-push"
+
 echo ""
 echo "== dashboard now runs as a systemd --user service: restarts on crash, survives reboot."
 echo "== url:   http://localhost:$PORT/"
