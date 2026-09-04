@@ -1392,7 +1392,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
-  "orchestrator/config.js :: worker.ts:1535",
+  "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
@@ -1403,7 +1403,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
-  "orchestrator/steps/scripted.js :: worker.ts:1535",
+  "orchestrator/steps/scripted.js :: worker.ts:1542",
   "prompts/README.md :: plan.md:103",
 ];
 
