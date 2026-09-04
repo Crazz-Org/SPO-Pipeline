@@ -108,10 +108,30 @@ function triageBackoffMs(errorCount, config) {
 // or no known last-failure time is never skipped -- there is nothing to back off FROM, and
 // inventing a "some time" would either wrongly skip a report's very first attempt or wrongly
 // never skip one whose history genuinely cannot be read.
+//
+// #660: `elapsed` is clamped to a floor of 0. Both `lastErrorAtMs` (parsed from a
+// report-triage-error event's own `ts`, written by a PRIOR call, possibly a prior process) and
+// `nowMs` (the caller's `Date.now()`, taken just now) are wall-clock, and this box's wall clock is
+// documented to jump BACKWARD (monotonic-clock.js's own header: -2515ms measured, twice,
+// independently) -- monotonic-clock.js's `monotonicNowMs` is NOT the fix here, on purpose: that
+// module exists for "how long have I been retrying" loops within a single process, and explicitly
+// forbids using it for a value compared across processes, which `lastErrorAtMs` is (a maintainer's
+// `spo triage --retry` can re-run this hours or days, and possibly restarts, after the failure it
+// reads). Un-clamped, a backward jump lands here as `nowMs - lastErrorAtMs` going NEGATIVE, which
+// is nonsensical (elapsed time cannot be negative) and, unlike every other bounded-wait use of
+// wall-clock subtraction in this file, does not just silently "wait a few extra milliseconds": a
+// caller that has deliberately set `autoTriageBackoffBaseMs: 0` to disable backoff (the CAP tests
+// below, which need three real mechanical failures with nothing throttling between them) sees the
+// comparison flip from "never skip" (elapsed >= 0) to "skip" (elapsed < 0) on the very next call
+// after a report-triage-error write lands in the same instant the clock hiccups -- reproduced
+// deterministically by forcing Date.now() a few ms backward between two runAutoTriage calls.
+// Clamping costs nothing in the normal (base > 0, forward-moving clock) case and makes the
+// decision correct rather than merely "usually right" in every case.
 function shouldSkipForTriageBackoff(lastErrorAtMs, nowMs, errorCount, config) {
   if (!(errorCount > 0)) return false;
   if (lastErrorAtMs === null || lastErrorAtMs === undefined) return false;
-  return nowMs - lastErrorAtMs < triageBackoffMs(errorCount, config);
+  const elapsed = Math.max(0, nowMs - lastErrorAtMs);
+  return elapsed < triageBackoffMs(errorCount, config);
 }
 
 // listQueuedReports(spoReportsDir) -- the queue's own top-level *.json files (never `pending/` or
