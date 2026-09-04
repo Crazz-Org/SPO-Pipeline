@@ -92,6 +92,7 @@ maintainer may be French; translate on the way in.
 
 Source-available, **not** open source — see [LICENSE](LICENSE).
 
-The code is published to be read, studied and audited. No permission is granted to use,
-copy, modify or redistribute it; all rights are reserved by the copyright holder. If you
-want to use any of it, ask.
+Copy it, clone it, fork it, study it — that is what publishing through git means, and the
+licence says so. What it does not grant is **use**: running it, operating it, building on
+it, or shipping anything with it. Holding a copy is not permission to run it. If you want
+to use any of it, ask.
