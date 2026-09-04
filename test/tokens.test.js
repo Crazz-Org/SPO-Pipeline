@@ -14,7 +14,7 @@ const { execFileSync } = require('child_process');
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
-const { tokenReport, computeLikelyCacheExpiries } = require('../orchestrator/tokens');
+const { tokenReport, todaySpend, computeLikelyCacheExpiries } = require('../orchestrator/tokens');
 const { SPO_BIN, REPO_ROOT, mkTmp } = require('./helpers');
 
 const CONFIG_PATH = path.join(REPO_ROOT, 'orchestrator', 'config.js');
@@ -396,4 +396,130 @@ test('cacheTtlMs: defaults to 1 hour; SPO_CACHE_TTL_MS overrides', () => {
 
   assert.equal(read({ ...process.env, SPO_CACHE_TTL_MS: undefined }), 60 * 60 * 1000);
   assert.equal(read({ ...process.env, SPO_CACHE_TTL_MS: '300000' }), 300000);
+});
+
+// ---- SPO-Pipeline#117: the intake half of the ledger ------------------------------------------
+//
+// DRAFT_CARD / REVIEW_CARD / TRIAGE_BUG_REPORT run before a card has a task directory, so
+// orchestrator/intake.js journals their `llm-call` events into <journalRoot>/daemon.jsonl. Until
+// 2026-09-04 nothing wrote them and nothing read them: every figure this module produced was the
+// task journals alone, short by the whole of intake, and `spo status` shipped a caveat line
+// saying so. test/intake.test.js pins the write side; this block pins the read side.
+
+// daemon.jsonl the way intake.js leaves it -- `event: 'llm-call'`, no `state` field (there is no
+// state machine at intake time), and interleaved with the other daemon events that share the
+// file, because a reader that only works on a file containing nothing else is not the reader
+// production needs.
+function seedDaemonJournal(journalRoot, calls) {
+  fs.mkdirSync(journalRoot, { recursive: true });
+  const lines = [JSON.stringify({ ts: '2026-08-31T00:00:00.000Z', event: 'auto-triage', scanned: 3 })];
+  calls.forEach((c, i) => {
+    lines.push(
+      JSON.stringify({
+        ts: c.ts || `2026-08-31T00:1${i}:00.000Z`,
+        event: 'llm-call',
+        step: c.step || 'TRIAGE_BUG_REPORT',
+        model: c.model || 'opus',
+        tokensSource: c.tokensSource === undefined ? 'modelUsage' : c.tokensSource,
+        freshInputTokens: c.fresh || 0,
+        cacheCreationTokens: c.cacheCreation || 0,
+        cacheReadTokens: c.cacheRead || 0,
+        outputTokens: c.out || 0,
+        ok: c.ok === undefined ? true : c.ok,
+      })
+    );
+  });
+  lines.push(JSON.stringify({ ts: '2026-08-31T00:20:00.000Z', event: 'report-triaged', issue: 501, outcome: 'filed' }));
+  fs.writeFileSync(path.join(journalRoot, 'daemon.jsonl'), lines.join('\n') + '\n');
+}
+
+test('tokenReport: intake calls in daemon.jsonl are reported separately AND folded into every aggregate', () => {
+  const journalRoot = mkTmp('spo-tokens-intake-');
+  seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 100, cacheCreation: 10, cacheRead: 9000, out: 5 }], state: 'DONE' });
+  seedDaemonJournal(journalRoot, [
+    { step: 'DRAFT_CARD', fresh: 1000, cacheCreation: 100, cacheRead: 50000, out: 50 },
+    { step: 'REVIEW_CARD', fresh: 2000, cacheCreation: 200, cacheRead: 60000, out: 60 },
+  ]);
+
+  const report = tokenReport(journalRoot);
+
+  // Separately: a caller can still say where the spend went.
+  assert.equal(report.intake.llmCalls, 2);
+  assert.equal(report.intake.billableTokens, 1000 + 100 + 50 + 2000 + 200 + 60);
+  assert.equal(report.intake.cacheReadTokens, 110000);
+
+  // And folded in: "what did this run cost" has always meant the whole run.
+  assert.equal(report.llmCalls, 3, 'the task journal contributes 1, daemon.jsonl 2');
+  assert.equal(report.billableTokens, 115 + 3410);
+  assert.equal(report.cacheReadTokens, 9000 + 110000);
+  // Cache-READ is still excluded from billable on BOTH sides -- one definition, one accumulator.
+  assert.ok(report.billableTokens < report.cacheReadTokens);
+
+  // The intake row is NOT a task: the parking-rate denominator and the task list are untouched.
+  assert.equal(report.tasks.length, 1);
+  assert.equal(report.done, 1);
+});
+
+test('tokenReport: an intake call that reported no tokens counts as "not reported", never as a zero', () => {
+  // The whole erratum in miniature. A deadline-killed TRIAGE_BUG_REPORT journals numeric zeros
+  // with `tokensSource: null`; reading those as a genuine zero would let the report claim the
+  // day's intake cost nothing.
+  const journalRoot = mkTmp('spo-tokens-intake-null-');
+  seedDaemonJournal(journalRoot, [{ tokensSource: null, ok: false }, { fresh: 40, out: 2 }]);
+
+  const report = tokenReport(journalRoot);
+  assert.equal(report.intake.llmCalls, 2);
+  assert.equal(report.intake.llmCallsWithTokens, 1);
+  assert.equal(report.intake.llmCallsWithoutTokens, 1);
+  assert.equal(report.llmCallsWithoutTokens, 1, 'the aggregate carries it too, so the footer can name it');
+});
+
+test('tokenReport: no daemon.jsonl at all -> a zeroed intake row, never a crash or a null the caller has to special-case', () => {
+  const journalRoot = mkTmp('spo-tokens-no-daemon-');
+  seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 10, out: 1 }], state: 'DONE' });
+  const report = tokenReport(journalRoot);
+  assert.equal(report.intake.llmCalls, 0);
+  assert.equal(report.intake.billableTokens, 0);
+  assert.equal(report.billableTokens, 11);
+});
+
+test('todaySpend: counts intake calls made today and excludes yesterday\'s, same LOCAL-midnight rule as the task journals', () => {
+  const journalRoot = mkTmp('spo-tokens-today-intake-');
+  const now = new Date();
+  now.setHours(12, 0, 0, 0);
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  seedDaemonJournal(journalRoot, [
+    { ts: yesterday.toISOString(), fresh: 999999, out: 999999 },
+    { ts: new Date(now.getTime() - 60 * 1000).toISOString(), fresh: 300, cacheCreation: 20, out: 5 },
+  ]);
+
+  const spend = todaySpend(journalRoot, { now: now.getTime() });
+  assert.equal(spend.llmCalls, 1, "yesterday's intake call is not today's spend");
+  assert.equal(spend.billableTokens, 325);
+  assert.equal(spend.intake.llmCalls, 1);
+  assert.equal(spend.intake.billableTokens, 325);
+});
+
+test('spo tokens: renders an `(intake)` row and names the intake calls in the total line', () => {
+  const journalRoot = mkTmp('spo-tokens-intake-cli-');
+  seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 100000, out: 5000 }], state: 'DONE' });
+  seedDaemonJournal(journalRoot, [{ step: 'TRIAGE_BUG_REPORT', fresh: 20000, out: 1000 }]);
+
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  assert.match(out, /\(intake\)/);
+  assert.match(out, /over 1 tasks \+ 1 intake call\(s\)/);
+  // 105k task + 21k intake -- the aggregate, not the task journals alone.
+  assert.match(out, /billable 126\.0k/);
+});
+
+test('spo tokens: a journal root with ONLY intake calls still prints a report, not "no task journals"', () => {
+  // The corpus shape that used to be invisible end to end: a day of intake with no card taken.
+  const journalRoot = mkTmp('spo-tokens-intake-only-');
+  seedDaemonJournal(journalRoot, [{ step: 'DRAFT_CARD', fresh: 700, out: 30 }]);
+
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  assert.doesNotMatch(out, /no task journals under/);
+  assert.match(out, /\(intake\)/);
+  assert.match(out, /billable 730/);
 });

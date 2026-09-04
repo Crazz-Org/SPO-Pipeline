@@ -236,7 +236,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:747-749`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:796-798`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -2249,6 +2249,22 @@ count and park-*event* count are both shown because they answer different questi
 parked six times and still reached DONE. `spo cost` still works too, as a deprecated alias that
 prints a one-line notice and then the same table (some docs/gates still say "watching `spo
 cost`").
+
+**Intake spend is in the ledger too (SPO-Pipeline#117).** `DRAFT_CARD`, `REVIEW_CARD` and
+`TRIAGE_BUG_REPORT` run before a card has a task directory, so `intake.js`'s
+`callIntakeStepWithRotation` — the one choke point all three go through — journals their
+`llm-call` events into `journal/daemon.jsonl` instead, in the same shape `steps/llm.js` writes
+into `journal.jsonl`. `tokens.js` reads both files through one accumulator: `tokenReport` returns
+them as an `intake` row *and* folds them into every aggregate, `todaySpend` applies the same
+local-midnight filter to both, `spo tokens` renders an `(intake)` row, and `spo status` names the
+intake share under today's figure. One event per `claude` spawn, so a deadline-timeout retry or
+an account rotation leaves two — the doubled call is precisely what is worth counting. Before
+this, the token block was computed by `invokeClaudeReal`, returned by all three functions, and
+dropped one stack frame later by callers that journal only through `appendDaemonEvent`: 58
+auto-triage cycles produced zero `llm-call` events, and `spo status` printed "this figure is
+short by an unknown amount" because the number could not be made honest any other way. The
+dashboard's tokens trend never had this gap — `console/usage-scan.js` streams
+`~/.claude*/projects` session transcripts, not the journals.
 
 **Billable-weighted tokens = fresh input + cache-creation + output.** Cache-*read* tokens are
 reported separately and never folded into that total: on a quota plan a cache read is nearly

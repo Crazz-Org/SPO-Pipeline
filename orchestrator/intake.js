@@ -41,6 +41,7 @@ const { leaseHealthyAccount } = require('./account-lease');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
+const { appendDaemonEvent } = require('./journal');
 const { armTimeout } = require('./command-timeout');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
@@ -174,6 +175,52 @@ function normalizeExit(result) {
 // inline, with `account` now supplied by this loop instead of a single `pickAccount()` call.
 // Returns either {ok: false, error, cooldowns} (pool exhausted or nothing to try), or
 // {raw, account, retriedAfterTimeout, cooldowns} for the caller to finish parsing/validating.
+// journalIntakeLlmCall(deps, opts, raw) -- the intake half of the token ledger. Writes the SAME
+// `llm-call` event steps/llm.js writes for a pipeline step, with the same field names and the
+// same `tokensSource` marker, into <journalRoot>/daemon.jsonl -- the one journal an intake stage
+// has (it has no ctx.taskDir; there is no card yet at DRAFT_CARD/TRIAGE_BUG_REPORT time, and
+// REVIEW_CARD's card does not have a task directory either). orchestrator/tokens.js reads both
+// files and sums them, so there is still exactly one ledger and one definition of "billable".
+//
+// Before this, intake's token block was computed by invokeClaudeReal, returned by draftCard /
+// reviewCard / triageBugReport, and dropped one stack frame later by callers that journal only
+// through appendDaemonEvent: daemon.jsonl carried ZERO `llm-call` events of any kind against 58
+// auto-triage cycles, and every spend figure the project reported was short by an unknown
+// amount (SPO-Pipeline#117, re-measured 2026-09-04).
+//
+// Written per invokeClaudeReal CALL, not per intake step: an account attempt can cost two calls
+// (a deadline timeout burns a same-account retry) and a rotation can cost two per account. Each
+// gets its own event, because each spent its own tokens -- the retry is the exact shape
+// auto-triage.js's `report-triage-retry` exists to make visible, and summing one event per step
+// would hide half of it.
+//
+// NOT gated on the caller's `dry` flag, unlike every other daemon.jsonl write in auto-triage.js.
+// A dry run still spawns `claude` and still spends the tokens (see routeConfirmedReport, which
+// calls triageBugReport before it consults `dry` at all); `dry` suppresses acts on the world and
+// the routing-relevant events the scanners read, and an `llm-call` line is neither -- nothing
+// routes on it, it is an accounting record of a spend that really happened. Silently omitting it
+// would reintroduce this very defect at dry-run scale.
+//
+// No-ops when the caller supplied no `journalRoot` -- a unit test driving draftCard directly, or
+// any future caller with no journal, still gets its result rather than an ENOENT.
+function journalIntakeLlmCall(deps, opts, raw) {
+  const journalRoot = deps && deps.journalRoot;
+  if (!journalRoot || !raw) return;
+  appendDaemonEvent(journalRoot, 'llm-call', {
+    step: opts.step,
+    model: opts.model,
+    effort: opts.effort,
+    account: opts.account && opts.account.name,
+    sessionId: raw.sessionId,
+    ...tokenFieldsFrom(raw),
+    numTurns: raw.numTurns,
+    // duration_s: snake_case, matching steps/llm.js's own event verbatim -- see its comment for
+    // why the one field on this record breaks the camelCase convention.
+    duration_s: raw.durationS,
+    ok: raw.ok,
+  });
+}
+
 async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
   const accountsDir = (deps && deps.accountsDir) || config.claudeAccountsDir;
   const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
@@ -222,6 +269,7 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
       const opts = buildOpts(account);
 
       raw = await invokeClaudeReal(opts, deps);
+      journalIntakeLlmCall(deps, opts, raw);
       if (!raw.ok && raw.timedOut === true) {
         const record = {
           account: account.name,
@@ -229,6 +277,7 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
           firstError: formatLlmFailure(prefix, raw),
         };
         raw = await invokeClaudeReal(opts, deps);
+        journalIntakeLlmCall(deps, opts, raw);
         record.retryOk = raw.ok === true;
         record.retryTimedOut = raw.timedOut === true;
         retriedAfterTimeout = record;

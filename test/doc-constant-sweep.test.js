@@ -1332,7 +1332,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1102",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1129",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1363,7 +1363,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1102",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1129",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -1378,32 +1378,32 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:764",
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1295",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1067",
+  "doc/state-machine-spec.md :: bin/spo:1094",
   "doc/state-machine-spec.md :: dispatcher.js:485-499",
-  "doc/state-machine-spec.md :: intake.js:747-749",
+  "doc/state-machine-spec.md :: intake.js:796-798",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:658",
   "orchestrator/README.md :: dispatcher.js:485-499",
   "orchestrator/README.md :: doc/state-machine-spec.md:140",
-  "orchestrator/README.md :: intake.js:747-749",
+  "orchestrator/README.md :: intake.js:796-798",
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
-  "orchestrator/config.js :: worker.ts:1535",
+  "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
-  "orchestrator/park-loop.js :: doc/remediation-progress.md:649",
-  "orchestrator/park-loop.js :: intake.js:747-749",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
+  "orchestrator/park-loop.js :: intake.js:796-798",
   "orchestrator/state-machine.js :: run.ts:63",
-  "orchestrator/steps/llm.js :: intake.js:747-749",
+  "orchestrator/steps/llm.js :: intake.js:796-798",
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
-  "orchestrator/steps/scripted.js :: worker.ts:1535",
+  "orchestrator/steps/scripted.js :: worker.ts:1542",
   "prompts/README.md :: plan.md:103",
 ];
 
@@ -1621,9 +1621,11 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //   - `bin/spo:1090-1093` -- drifted to :1137 through unrelated edits over the life of the file.
 //     CITATION_RE could not even SEE this one before this action (`bin/spo` has no extension);
 //     widening it (see that constant, above) is what let this check find it at all. Fixed here
-//     (both dated-record sites now read `:1102` -- `:1137` when this was written; project-2 card
-//     #476 moved `collectAll`'s call site again, and the same check caught it again)
-//     -- also proven via mutation-proof canary below.
+//     (both dated-record sites now read `:1129` -- `:1137` when this was written; project-2 card
+//     #476 moved `collectAll`'s call site once, and SPO-Pipeline#117's intake-token journalling
+//     moved it again on 2026-09-04, the same check catching each one) -- also proven via
+//     mutation-proof canary below, whose own mutation had to be re-pointed at `:1102` when the
+//     original `:1090-1093` started anchoring for an accidental reason (see it for the detail).
 //
 // Widening the resolver (E1, the fix that made part 2 read the real product tree instead of a
 // stale nested worktree) plus THIS check together found nine more real, live drifts while this
@@ -1992,7 +1994,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
-  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:747-749`, `orchestrator/steps/
+  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:796-798`, `orchestrator/steps/
   // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:99` (deleted
   // by #109, leaving the two still listed here) -- each citing a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
@@ -2048,10 +2050,10 @@ const ANCHOR_BLUNT_CITATIONS = {
     "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (138-140, 142) " +
     '-- the anchor word is the column value itself, so :139 anchors as well as :140. Citation ' +
     'confirmed correct by hand: 140 is the CHECK row.',
-  // park-loop.js: "doc/remediation-progress.md:649 confirms the same referent under 'DIAGNOSE
+  // park-loop.js: "doc/remediation-progress.md:658 confirms the same referent under 'DIAGNOSE
   // surfacing'". Line 649 is the bullet's own heading line and 650 is its continuation, which
   // opens with the same word ("DIAGNOSE has no column..."). Correct citation, two-line bullet.
-  'orchestrator/park-loop.js :: doc/remediation-progress.md:649':
+  'orchestrator/park-loop.js :: doc/remediation-progress.md:658':
     "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 649 and its own " +
     'continuation line 650. Citation confirmed correct by hand: 649 is the bullet heading.',
 };
@@ -2061,7 +2063,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
       'orchestrator/README.md :: doc/state-machine-spec.md:140',
-      'orchestrator/park-loop.js :: doc/remediation-progress.md:649',
+      'orchestrator/park-loop.js :: doc/remediation-progress.md:658',
     ],
     'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +
       'by hand and justify it here before pinning it, exactly as CITATION_ANCHOR_ALLOWLIST requires.'
@@ -2296,26 +2298,35 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1102 back to bin/spo:1090-1093 (the historical bug) makes this check red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1129 back to bin/spo:1102 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
-  const reverted = normalized.replace('reached from `bin/spo:1102`', 'reached from `bin/spo:1090-1093`');
+  // The mutation is the citation's own PREVIOUS value, `:1102`, not the original historical
+  // `:1090-1093`. That first range stopped being a usable canary on 2026-09-04: intake-token
+  // journalling (SPO-Pipeline#117) pushed `cmdDashboard`'s header comment down onto lines
+  // 1090-1093, and that comment names `console/collect.js` -- so the "wrong" citation now
+  // anchors for an accidental reason and proves nothing. `:1102` is the same drift of the same
+  // citation caught a third time (after `:1137` and `#476`'s move of `collectAll`), and lands
+  // mid-`cmdDashboard` on a line naming neither collect nor a candidate. See the two "canary
+  // green for an accidental reason" notes above: a canary that passes for a reason unrelated to
+  // what it watches is worse than a missing one.
+  const reverted = normalized.replace('reached from `bin/spo:1129`', 'reached from `bin/spo:1102`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
   assert.equal(cites.length, 1, 'expected exactly one bin/spo citation in this doc');
   const c = cites[0];
-  assert.deepEqual([c.start, c.stop], [1090, 1093], 'the revert must have actually changed the parsed line range');
+  assert.deepEqual([c.start, c.stop], [1102, 1102], 'the revert must have actually changed the parsed line range');
 
   const resolved = resolveCitationTarget(c.file);
   assert.ok(resolved.target, 'bin/spo must resolve for this proof to mean anything');
   const candidates = mergedCandidates(reverted, c.idx, c.end, null, null, c.file);
   const top = candidates.slice(0, ANCHOR_TOPK);
   const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
-  assert.equal(found, false, 'the historical bin/spo:1090-1093 bug must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact bug that motivated it');
+  assert.equal(found, false, 'the stale bin/spo:1102 citation must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact class of bug that motivated it');
 
-  // And the fixed text (:1102, actually on disk) must anchor cleanly, via the SAME substring-
+  // And the fixed text (:1129, actually on disk) must anchor cleanly, via the SAME substring-
   // matched 'file' candidate ("collect", from `console/collect.js`) -- proving both that the
   // check discriminates the specific drift in both directions AND that the 'file' kind's
   // substring matching (see candidateFoundNear's own fixture test) is what makes it possible at
