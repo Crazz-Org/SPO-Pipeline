@@ -55,7 +55,7 @@ function commit(dir, msg) {
 }
 
 // A world for one test: source repo, releases dir, symlink path, and a fake systemctl that logs.
-function mkWorld({ units = 'fake.service', active = [], enabled = [], installed = [] } = {}) {
+function mkWorld({ units = 'fake.service', active = [], enabled = [], installed = [], restartFails = [] } = {}) {
   const home = mk('spo-relworld-');
   const bin = path.join(home, 'bin');
   fs.mkdirSync(bin);
@@ -65,13 +65,17 @@ function mkWorld({ units = 'fake.service', active = [], enabled = [], installed 
     `#!/usr/bin/env bash
 args=(); for a in "$@"; do [ "$a" = "--user" ] || args+=("$a"); done
 echo "\${args[*]}" >> ${JSON.stringify(log)}
-verb="\${args[0]:-}"; unit="\${args[1]:-}"
+# The verb is the first arg; the UNIT is the first NON-FLAG arg after it. Reading \${args[1]}
+# blindly makes \`restart --no-block <unit>\` look like a call on a unit named "--no-block", which
+# is how the restart-failure case first passed for the wrong reason.
+verb="\${args[0]:-}"; unit=""
+for a in "\${args[@]:1}"; do case "$a" in --*) ;; *) unit="$a"; break ;; esac; done
 contains() { case " $1 " in *" $2 "*) return 0;; esac; return 1; }
 case "$verb" in
   list-unit-files) contains ${JSON.stringify(installed.join(' '))} "$unit" ;;
   is-active)       if contains ${JSON.stringify(active.join(' '))} "$unit"; then echo active; exit 0; fi; echo inactive; exit 3 ;;
   is-enabled)      contains ${JSON.stringify(enabled.join(' '))} "$unit" ;;
-  restart)         exit 0 ;;
+  restart)         contains ${JSON.stringify(restartFails.join(' '))} "$unit" && exit 1; exit 0 ;;
   *) exit 0 ;;
 esac
 `,
@@ -86,6 +90,12 @@ esac
     bin,
     log,
     calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []),
+    // The logged line is `restart --no-block <unit>`, so a naive startsWith('restart <unit>')
+    // silently never matches -- which is how four of these tests first failed.
+    restarted: () =>
+      (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [])
+        .filter((l) => l.startsWith('restart '))
+        .map((l) => l.split(/\s+/).filter((t) => !t.startsWith('--')).slice(1).join(' ')),
   };
 }
 
@@ -99,10 +109,30 @@ function release(w, args = [], extraEnv = {}) {
     SPO_RELEASE_UNITS: w.units,
     ...extraEnv,
   };
+  // stderr goes to a FILE, not to execFileSync's pipe: on SUCCESS execFileSync returns stdout only,
+  // so a warning printed by a deploy that nonetheless exited 0 -- "failed to restart X", exactly
+  // the case below -- would be invisible to these tests.
+  const errPath = path.join(w.home, `stderr.${Date.now()}.${Math.random().toString(36).slice(2)}.log`);
+  const errFd = fs.openSync(errPath, 'w');
+  const read = () => {
+    try {
+      return fs.readFileSync(errPath, 'utf8');
+    } catch {
+      return '';
+    }
+  };
   try {
-    return { status: 0, out: execFileSync('bash', [RELEASE_SH, ...args], { encoding: 'utf8', env, timeout: 60000 }) };
+    const out = execFileSync('bash', [RELEASE_SH, ...args], {
+      encoding: 'utf8',
+      env,
+      timeout: 60000,
+      stdio: ['ignore', 'pipe', errFd],
+    });
+    return { status: 0, out, err: read() };
   } catch (err) {
-    return { status: err.status ?? 1, out: String(err.stdout || ''), err: String(err.stderr || '') };
+    return { status: err.status ?? 1, out: String(err.stdout || ''), err: read() };
+  } finally {
+    fs.closeSync(errFd);
   }
 }
 
@@ -312,4 +342,94 @@ test('strips the inherited GIT_* env -- post-merge calls this, and a hook export
   // branch and leave refs/heads/main a dangling symref (test/no-git-env-sweep.test.js).
   assert.equal(git(foreign, 'rev-parse', 'HEAD'), foreignHeadBefore, 'the hook repo\'s HEAD moved');
   assert.equal(git(foreign, 'show-ref'), foreignRefsBefore, 'the hook repo\'s refs changed');
+});
+
+// ---- the restart properties, inherited from scripts/git-hooks/post-merge ----------------------
+//
+// These moved here with the logic. post-merge used to own the "which units, and when" decision and
+// had its own test file for it; under the release layout it decides only WHICH TREE may deploy and
+// delegates the rest. Every property below was already paid for once -- the 2026-09-03 deploy hole
+// in particular -- so they are re-homed rather than rewritten, and none is dropped.
+
+test('restarts a unit that is running but DISABLED -- the 2026-09-03 deploy hole', () => {
+  // Precisely the state measured on the box: active=active, enabled=disabled. Under an
+  // `is-enabled`-only gate this restarted nothing at all, and said nothing about it -- the daemon
+  // ran eight-hour-old code for a working day.
+  const w = mkWorld({ installed: ['fake.service'], active: ['fake.service'], enabled: [] });
+  const r = release(w);
+  assert.equal(r.status, 0, r.err);
+  assert.deepEqual(w.restarted(), ['fake.service']);
+});
+
+test('restarts an ENABLED unit that is not running -- restart starts it', () => {
+  const w = mkWorld({ installed: ['fake.service'], active: [], enabled: ['fake.service'] });
+  assert.equal(release(w).status, 0);
+  assert.deepEqual(w.restarted(), ['fake.service']);
+});
+
+test('never gates on is-enabled alone -- that is the defect, and it must not come back', () => {
+  // Textual, because the behavioural tests above can both pass while the gate is written the wrong
+  // way round for some third state. The rule is "active OR enabled", never "enabled" alone.
+  const src = fs.readFileSync(RELEASE_SH, 'utf8');
+  const restartFn = src.slice(src.indexOf('restart_units()'), src.indexOf('cmd_list()'));
+  assert.match(restartFn, /is-active/, 'the restart gate no longer consults is-active at all');
+  assert.match(restartFn, /is-enabled/, 'the restart gate no longer consults is-enabled at all');
+});
+
+test('a unit still DRAINING is reported as already in flight, not skipped or restarted', () => {
+  // A stop legitimately takes up to TimeoutStopSec=2820 while cards finish, and `is-active` exits
+  // non-zero for `deactivating` -- so a naive gate reads it as "neither active nor enabled" and
+  // skips, during a window that used to be 90s and is now most of an hour.
+  const w = mkWorld({ installed: ['fake.service'] });
+  fs.writeFileSync(
+    path.join(w.bin, 'systemctl'),
+    `#!/usr/bin/env bash
+args=(); for a in "$@"; do [ "$a" = "--user" ] || args+=("$a"); done
+echo "\${args[*]}" >> ${JSON.stringify(w.log)}
+case "\${args[0]:-}" in
+  list-unit-files) exit 0 ;;
+  is-active) echo deactivating; exit 3 ;;
+  *) exit 0 ;;
+esac
+`,
+    { mode: 0o755 }
+  );
+  const r = release(w);
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.out, /is deactivating -- a restart is already in flight/);
+  assert.equal(w.calls().some((l) => l.startsWith('restart ')), false, 'it restarted a unit mid-stop');
+});
+
+test('handles several units independently -- one absent does not skip the others', () => {
+  const w = mkWorld({ units: 'absent.service present.service', installed: ['present.service'], active: ['present.service'] });
+  assert.equal(release(w).status, 0);
+  assert.deepEqual(w.restarted(), ['present.service']);
+});
+
+test('a failed restart does not abort the deploy, so the next unit still gets one', () => {
+  // `set -euo pipefail` plus an unguarded systemctl would abandon the second unit on the first
+  // failure, leaving half a deploy with a zero exit status.
+  const w = mkWorld({
+    units: 'first.service second.service',
+    installed: ['first.service', 'second.service'],
+    active: ['first.service', 'second.service'],
+    restartFails: ['first.service'],
+  });
+  const r = release(w);
+  assert.equal(r.status, 0, 'a failed restart aborted the deploy');
+  assert.ok(w.restarted().includes('second.service'), 'the second unit was abandoned');
+  assert.match(r.err || '', /failed to restart first\.service/);
+});
+
+test('the default unit list covers both pipeline services -- a third must not be silently undeployed', () => {
+  const src = fs.readFileSync(RELEASE_SH, 'utf8');
+  const m = /SPO_RELEASE_UNITS:-([^}]*)\}/.exec(src);
+  assert.ok(m, 'release.sh no longer declares a default unit list -- update this guard');
+  const units = m[1].trim().split(/\s+/).sort();
+  assert.deepEqual(units, ['spo-pipeline-dashboard.service', 'spo-pipeline-daemon.service'].sort());
+});
+
+test('says which unit it restarted, so a deploy looks different from one that did nothing', () => {
+  const w = mkWorld({ installed: ['fake.service'], active: ['fake.service'] });
+  assert.match(release(w).out, /restarting fake\.service/);
 });

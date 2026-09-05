@@ -1,227 +1,191 @@
 'use strict';
-
-/**
- * scripts/git-hooks/post-merge -- the deploy.
- *
- * This hook *is* the deployment mechanism for the daemon and the dashboard: `git pull`
- * fires it, and it restarts the units so they pick up the merged code. Nothing else does.
- *
- * The defect it carries a test for now: the hook gated on `systemctl is-enabled`, which
- * answers "does this unit start at boot" -- not "is a process running this repo's code".
- * A unit can be active and disabled at once, and on 2026-09-03
- * `spo-pipeline-daemon.service` was exactly that. Every pull printed nothing about it,
- * looked like a deploy, and left the daemon on pre-merge code for a working day. The
- * failure mode is the worst available: silent, and indistinguishable from success.
- *
- * Hermetic -- a fake `systemctl` on PATH. Nothing here touches the real units.
- */
+// Tests for scripts/git-hooks/post-merge -- THE DEPLOY.
+//
+// `git pull` in the deploy checkout fires this hook, and nothing else deploys: not a merge on
+// GitHub, not a pull in any other worktree.
+//
+// ITS JOB SHRANK, AND THAT IS WHAT THIS FILE NOW COVERS. It used to restart the units itself, and
+// owned all the "is-active vs is-enabled, deactivating, --no-block, say the skip out loud" logic.
+// Under the immutable-release layout that logic lives in scripts/release.sh -- one copy, exercised
+// by both the hook and a hand-run deploy -- and every one of those properties moved to
+// test/release-script.test.js rather than being dropped. What is left here is the single decision
+// release.sh cannot make: WHICH TREE IS ALLOWED TO DEPLOY.
+//
+// That decision is new, and it closes a hazard the old hook had. git runs this hook with cwd at
+// the top of whichever working tree was updated -- ANY of them. This repo routinely has a dozen
+// worktrees under .claude/worktrees/, and `git merge --ff-only` inside one fires the hook exactly
+// as a pull in the main checkout does (measured 2026-09-04, when it left the daemon `failed`).
+// When the hook only restarted services that was untidy; under the release layout it would deploy
+// AN AGENT WORKTREE'S BRANCH.
+//
+// Hermetic: a fake `release.sh` on a throwaway path that only records that it was called.
 
 const test = require('node:test');
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-// Overridable so the suite can be pointed at an older copy of the hook and made to fail
-// on purpose -- a test that has never been seen failing proves nothing about the fix.
-const HOOK =
-  process.env.SPO_POST_MERGE_HOOK ||
-  path.join(__dirname, '..', 'scripts', 'git-hooks', 'post-merge');
+require('./no-real-spawn');
 
-const DAEMON = 'spo-pipeline-daemon.service';
-const DASHBOARD = 'spo-pipeline-dashboard.service';
+const { gitEnv } = require('./helpers');
 
-/**
- * Run the hook against a fake systemd.
- *
- * `installed`, `active` and `enabled` are unit-name lists; they are independent on purpose,
- * because in the real world they are -- that independence is the whole bug.
- */
-function runHook({ installed = [], active = [], enabled = [], restartFails = [], states = {} } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-post-merge-'));
-  const bin = path.join(dir, 'bin');
-  fs.mkdirSync(bin);
-  const log = path.join(dir, 'calls.log');
+const HOOK = process.env.SPO_POST_MERGE_HOOK || path.join(__dirname, '..', 'scripts', 'git-hooks', 'post-merge');
 
-  fs.writeFileSync(
-    path.join(bin, 'systemctl'),
-    `#!/usr/bin/env bash
-# Drops the leading flags, then dispatches on the verb. --no-block is dropped here the same
-# way --user is, and RECORDED separately below: the hook must pass it on a restart (a daemon
-# stop drains in-flight cards, up to 45 min, and without it that wait lands on the
-# maintainer's terminal in the middle of a git pull), so a test that merely tolerated it
-# would let the flag be dropped again in silence.
-args=()
-noblock=no
-for a in "$@"; do
-  case "$a" in
-    --user) ;;
-    --no-block) noblock=yes ;;
-    *) args+=("$a") ;;
-  esac
-done
-verb="\${args[0]:-}"
-unit="\${args[1]:-}"
-echo "$verb $unit noblock=$noblock" >> ${JSON.stringify(log)}
-contains() { case " $1 " in *" $2 "*) return 0;; esac; return 1; }
-case "$verb" in
-  list-unit-files) contains ${JSON.stringify(installed.join(' '))} "$unit" ;;
-  is-active)       if contains ${JSON.stringify(active.join(' '))} "$unit"; then echo active; exit 0; fi
-                   for pair in ${JSON.stringify(Object.entries(states).map(([u, st]) => `${u}:${st}`).join(' '))}; do
-                     if [ "\${pair%%:*}" = "$unit" ]; then echo "\${pair#*:}"; exit 3; fi
-                   done
-                   echo inactive; exit 3 ;;
-  is-enabled)      contains ${JSON.stringify(enabled.join(' '))} "$unit" ;;
-  restart)         contains ${JSON.stringify(restartFails.join(' '))} "$unit" && exit 1; exit 0 ;;
-  *) exit 2 ;;
-esac
-`,
-    { mode: 0o755 },
-  );
+const mk = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env: gitEnv() }).trim();
 
-  let stdout = '';
-  let status = 0;
-  try {
-    stdout = execFileSync('bash', [HOOK], {
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (err) {
-    status = err.status ?? 1;
-    stdout = String(err.stdout ?? '');
+// A checkout on `branch`, carrying a fake scripts/release.sh that records its invocation.
+function mkCheckout({ branch = 'main', withRelease = true, releaseExecutable = true } = {}) {
+  const dir = mk('spo-pmh-');
+  execFileSync('git', ['init', '-q', '-b', branch, '.'], { cwd: dir, env: gitEnv() });
+  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+  const marker = path.join(dir, 'released.log');
+  if (withRelease) {
+    fs.writeFileSync(
+      path.join(dir, 'scripts', 'release.sh'),
+      `#!/usr/bin/env bash\necho "released $*" >> ${JSON.stringify(marker)}\n`,
+      { mode: releaseExecutable ? 0o755 : 0o644 }
+    );
   }
-
-  const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
-  const restartCalls = calls.filter(l => l.startsWith('restart '));
-  const restarted = restartCalls.map(l => l.split(' ')[1]);
-  const restartedBlocking = restartCalls.filter(l => l.endsWith('noblock=no')).map(l => l.split(' ')[1]);
-  return { restarted, restartedBlocking, calls, stdout, status };
+  fs.writeFileSync(path.join(dir, 'marker.txt'), 'x\n');
+  execFileSync('git', ['add', '-A'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'one'], {
+    cwd: dir,
+    env: gitEnv(),
+  });
+  return { dir, marker, deployed: () => fs.existsSync(marker) };
 }
 
-test('restarts a unit that is running but disabled -- the 2026-09-03 deploy hole', () => {
-  // Precisely the state measured on the box: active=active, enabled=disabled. Under the
-  // old `is-enabled` gate this restarted nothing at all, and said nothing about it.
-  const r = runHook({ installed: [DAEMON], active: [DAEMON], enabled: [] });
-  assert.deepStrictEqual(r.restarted, [DAEMON]);
-  assert.strictEqual(r.status, 0);
+// Runs the hook the way git does: cwd at the top of the updated working tree, with GIT_DIR
+// exported (which is what makes stripping it inside the hook load-bearing).
+function runHook(cwd, { sourceRepo, branch } = {}) {
+  const env = {
+    ...process.env,
+    GIT_DIR: path.join(cwd, '.git'),
+    GIT_INDEX_FILE: path.join(cwd, '.git', 'index'),
+    ...(sourceRepo ? { SPO_SOURCE_REPO: sourceRepo } : {}),
+    ...(branch ? { SPO_DEPLOY_BRANCH: branch } : {}),
+  };
+  // stderr to a FILE, not to execFileSync's pipe. On SUCCESS execFileSync returns stdout only, and
+  // this hook deliberately exits 0 while warning on stderr (a broken deploy script must not abort
+  // the pull) -- so the warning would be invisible to any test that only reads the catch branch.
+  const errPath = path.join(cwd, `hook-stderr.${Date.now()}.${Math.random().toString(36).slice(2)}.log`);
+  const errFd = fs.openSync(errPath, 'w');
+  const readErr = () => {
+    try {
+      return fs.readFileSync(errPath, 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  try {
+    const out = execFileSync('bash', [HOOK], { cwd, encoding: 'utf8', env, timeout: 30000, stdio: ['ignore', 'pipe', errFd] });
+    return { status: 0, out, err: readErr() };
+  } catch (err) {
+    return { status: err.status ?? 1, out: String(err.stdout || ''), err: readErr() };
+  } finally {
+    fs.closeSync(errFd);
+  }
+}
+
+test('the deploy checkout, on the deploy branch, deploys', () => {
+  const c = mkCheckout();
+  const r = runHook(c.dir, { sourceRepo: c.dir });
+  assert.equal(r.status, 0, r.err);
+  assert.equal(c.deployed(), true, 'release.sh was not invoked');
+  assert.match(r.out, /deploying [0-9a-f]{7,}/);
 });
 
-test('says which unit it restarted and why, so a pull that deploys looks different from one that does not', () => {
-  const r = runHook({ installed: [DAEMON], active: [DAEMON], enabled: [] });
-  assert.match(r.stdout, new RegExp(`restarting ${DAEMON.replace('.', '\\.')}`));
-  assert.match(r.stdout, /running/);
+test('ANY OTHER worktree is skipped out loud -- it must not publish its own branch', () => {
+  // The hazard the release layout introduces and this closes: a `git merge --ff-only` inside
+  // .claude/worktrees/<slug>/ fires this hook, and cutting a release there would deploy that
+  // agent's branch to the live service.
+  const deployCheckout = mkCheckout();
+  const other = mkCheckout();
+  const r = runHook(other.dir, { sourceRepo: deployCheckout.dir });
+  assert.equal(r.status, 0);
+  assert.equal(other.deployed(), false, 'a non-deploy worktree deployed');
+  assert.match(r.out, /is not the deploy checkout/);
 });
 
-test('still restarts an enabled unit that is not running -- restart starts it', () => {
-  const r = runHook({ installed: [DAEMON], active: [], enabled: [DAEMON] });
-  assert.deepStrictEqual(r.restarted, [DAEMON]);
-  assert.match(r.stdout, /enabled/);
+test('the deploy checkout on a NON-deploy branch is skipped out loud', () => {
+  const c = mkCheckout({ branch: 'main' });
+  execFileSync('git', ['checkout', '-q', '-b', 'claude/some-work'], { cwd: c.dir, env: gitEnv() });
+  const r = runHook(c.dir, { sourceRepo: c.dir });
+  assert.equal(r.status, 0);
+  assert.equal(c.deployed(), false, 'it deployed a feature branch');
+  assert.match(r.out, /is on 'claude\/some-work', not 'main'/);
 });
 
-test('restarts an active and enabled unit exactly once', () => {
-  const r = runHook({ installed: [DAEMON], active: [DAEMON], enabled: [DAEMON] });
-  assert.deepStrictEqual(r.restarted, [DAEMON]);
+test('SPO_DEPLOY_BRANCH selects which branch deploys', () => {
+  const c = mkCheckout({ branch: 'release' });
+  const r = runHook(c.dir, { sourceRepo: c.dir, branch: 'release' });
+  assert.equal(r.status, 0, r.err);
+  assert.equal(c.deployed(), true);
 });
 
-test('leaves a unit that is installed but neither running nor enabled alone', () => {
-  // Nothing is executing stale code, and starting it here would deploy a service nobody
-  // asked for. Doing nothing is the correct deploy.
-  const r = runHook({ installed: [DAEMON], active: [], enabled: [] });
-  assert.deepStrictEqual(r.restarted, []);
-  assert.strictEqual(r.status, 0);
+test('a missing or non-executable release.sh is reported, and never silently skipped', () => {
+  const absent = mkCheckout({ withRelease: false });
+  const r1 = runHook(absent.dir, { sourceRepo: absent.dir });
+  assert.equal(r1.status, 0, 'the hook must not abort the pull');
+  assert.match(r1.err || '', /missing or not executable/);
+
+  const notExec = mkCheckout({ releaseExecutable: false });
+  const r2 = runHook(notExec.dir, { sourceRepo: notExec.dir });
+  assert.equal(notExec.deployed(), false);
+  assert.match(r2.err || '', /missing or not executable/);
 });
 
-test('skips a unit that was never installed, without an error on every pull', () => {
-  const r = runHook({ installed: [], active: [], enabled: [] });
-  assert.deepStrictEqual(r.restarted, []);
-  assert.strictEqual(r.status, 0);
-  assert.ok(
-    !r.calls.some(l => l.startsWith('is-active') || l.startsWith('is-enabled')),
-    'a unit that does not exist is not interrogated further',
-  );
+test('a symlinked or non-canonical SPO_SOURCE_REPO still matches the checkout it points at', () => {
+  // `pwd -P` on both sides, because git may hand the hook a path through a symlink while the
+  // operator configured the canonical one (or the reverse). A deploy that silently stops
+  // happening because of a symlink would be indistinguishable from a successful one.
+  const c = mkCheckout();
+  const link = path.join(mk('spo-pmh-link-'), 'via-symlink');
+  fs.symlinkSync(c.dir, link);
+  const r = runHook(c.dir, { sourceRepo: link });
+  assert.equal(r.status, 0, r.err);
+  assert.equal(c.deployed(), true, 'a symlinked source repo was treated as a different tree');
 });
 
-test('handles the two units independently -- one being absent does not skip the other', () => {
-  const r = runHook({ installed: [DASHBOARD], active: [DASHBOARD], enabled: [] });
-  assert.deepStrictEqual(r.restarted, [DASHBOARD]);
+test('deploys when the checkout is REACHED through a symlink -- logical vs physical pwd', () => {
+  // The mirror of the case above, and the one that actually needs `pwd -P`. A shell that cd'd
+  // through a symlink exports PWD as the LOGICAL path, and bash's `pwd` honours it -- so a hook
+  // invoked that way sees the symlink while SPO_SOURCE_REPO holds the canonical path. Comparing
+  // logical to physical would silently stop deploying, which is indistinguishable from a deploy
+  // that worked. Measured: with PWD set to a symlink, `pwd` and `pwd -P` genuinely differ.
+  const c = mkCheckout();
+  const link = path.join(mk('spo-pmh-rev-'), 'via-symlink');
+  fs.symlinkSync(c.dir, link);
+
+  const env = {
+    ...process.env,
+    PWD: link, // what a shell that cd'd through the symlink would export
+    GIT_DIR: path.join(c.dir, '.git'),
+    SPO_SOURCE_REPO: c.dir, // the canonical path, as configured
+  };
+  execFileSync('bash', [HOOK], { cwd: link, encoding: 'utf8', env, timeout: 30000 });
+  assert.equal(c.deployed(), true, 'a checkout reached through a symlink was treated as a different tree');
 });
 
-test('restarts both when both are running, whatever their enabled state', () => {
-  const r = runHook({
-    installed: [DAEMON, DASHBOARD],
-    active: [DAEMON, DASHBOARD],
-    enabled: [DASHBOARD],
-  });
-  assert.deepStrictEqual(r.restarted.sort(), [DAEMON, DASHBOARD].sort());
-});
+test('strips the inherited GIT_* env before consulting git -- the hook runs with GIT_DIR set', () => {
+  // The branch check is a `git rev-parse --abbrev-ref HEAD`. Unstripped, GIT_DIR would decide
+  // which repo answers it, so a pull in a worktree could report the deploy checkout's branch (or
+  // vice versa) and the gate above would be reading the wrong tree entirely.
+  const c = mkCheckout();
+  const foreign = mkCheckout({ branch: 'main' });
+  execFileSync('git', ['checkout', '-q', '-b', 'not-main'], { cwd: foreign.dir, env: gitEnv() });
 
-test('a failed restart does not abort the hook, so the second unit still deploys', () => {
-  // `set -e` is on; the `|| echo` is what keeps one bad unit from silently cancelling the
-  // rest of the deploy.
-  const r = runHook({
-    installed: [DAEMON, DASHBOARD],
-    active: [DAEMON, DASHBOARD],
-    enabled: [],
-    restartFails: [DAEMON],
-  });
-  assert.deepStrictEqual(r.restarted.sort(), [DAEMON, DASHBOARD].sort());
-  assert.strictEqual(r.status, 0);
-});
-
-test('covers both pipeline units -- adding a third service must not be silently undeployed', () => {
-  const source = fs.readFileSync(HOOK, 'utf8');
-  const listed = /for unit in ([^;]+);/.exec(source);
-  assert.ok(listed, 'the hook still iterates an explicit unit list');
-  assert.deepStrictEqual(listed[1].trim().split(/\s+/).sort(), [DAEMON, DASHBOARD].sort());
-});
-
-test('never gates on is-enabled alone -- that is the defect, and it must not come back', () => {
-  const source = fs.readFileSync(HOOK, 'utf8');
-  const guard = source.split('\n').filter(l => l.includes('systemctl') && l.includes('is-'));
-  assert.ok(
-    guard.some(l => l.includes('is-active')),
-    'the hook asks whether the unit is running, not only whether it starts at boot',
-  );
-});
-
-test('a restart is --no-block, so a draining daemon does not hold up the pull', () => {
-  // Since the drain landed, `systemctl restart` waits for the stop, and a stop legitimately
-  // takes as long as the in-flight cards do -- up to config.js's drainTimeoutMs (45 min).
-  // Without --no-block that wait happens inside `git pull`. The deploy is asynchronous either
-  // way; this only decides whether the maintainer's terminal is held hostage by it.
-  const r = runHook({ installed: [DAEMON, DASHBOARD], active: [DAEMON, DASHBOARD], enabled: [] });
-  assert.deepStrictEqual(r.restarted, [DAEMON, DASHBOARD]);
-  assert.deepStrictEqual(r.restartedBlocking, [], 'a restart was issued without --no-block');
-});
-
-test('an installed-but-stopped unit is skipped OUT LOUD, not in silence', () => {
-  // The state the daemon was in on 2026-09-05: stopped on purpose (and, before the
-  // SuccessExitStatus fix, `failed` on every deliberate stop). Skipping it is correct --
-  // nothing is running stale code. Saying nothing about it is not: the pull then printed a
-  // dashboard restart and looked exactly like a deploy that had covered both units.
-  const r = runHook({ installed: [DAEMON, DASHBOARD], active: [DASHBOARD], enabled: [DASHBOARD] });
-  assert.deepStrictEqual(r.restarted, [DASHBOARD]);
-  assert.match(r.stdout, new RegExp(`SKIPPING ${DAEMON.replace('.', '\\.')}`));
-  assert.strictEqual(r.status, 0);
-});
-
-test('a unit still DRAINING is reported as already in flight, not skipped', () => {
-  // Since the drain landed, a stop legitimately takes up to TimeoutStopSec=2820 and the unit sits
-  // in `deactivating` for the whole of it. `is-active` exits non-zero for that state, so the old
-  // gate read it as "neither active nor enabled" and skipped -- during a window that used to be
-  // 90s and is now the better part of an hour. It is not a skip: a restart is already queued
-  // behind the stop, and its start execs from WorkingDirectory, so it picks up this merge too.
-  const r = runHook({ installed: [DAEMON], active: [], enabled: [], states: { [DAEMON]: 'deactivating' } });
-  assert.deepStrictEqual(r.restarted, []);
-  assert.match(r.stdout, /deactivating -- a restart is already in flight/);
-  assert.doesNotMatch(r.stdout, /SKIPPING/);
-  assert.strictEqual(r.status, 0);
-});
-
-test('an inactive unit is still skipped out loud -- deactivating is the only new case', () => {
-  const r = runHook({ installed: [DAEMON], active: [], enabled: [], states: { [DAEMON]: 'inactive' } });
-  assert.deepStrictEqual(r.restarted, []);
-  assert.match(r.stdout, new RegExp(`SKIPPING ${DAEMON.replace('.', '\\.')}`));
+  // cwd is the deploy checkout (on main) but GIT_DIR points at the foreign repo (on not-main).
+  const env = {
+    ...process.env,
+    GIT_DIR: path.join(foreign.dir, '.git'),
+    GIT_INDEX_FILE: path.join(foreign.dir, '.git', 'index'),
+    SPO_SOURCE_REPO: c.dir,
+  };
+  const out = execFileSync('bash', [HOOK], { cwd: c.dir, encoding: 'utf8', env, timeout: 30000 });
+  assert.equal(c.deployed(), true, 'the branch check consulted GIT_DIR instead of the checkout');
+  assert.match(out, /deploying/);
 });
