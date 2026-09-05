@@ -7,6 +7,12 @@ Autonomous orchestrator for the SPO-WebClient backlog: a GitHub card enters `Tod
 > This file is loaded on every LLM call whose `cwd` is the repo root — DIAGNOSE, VALIDATE,
 > CITATION_VERIFIER (`config.js` → `cwdForStep`). Keeping it short is a cost constraint, not a
 > style preference: adding context here means paying for it on every step.
+>
+> That is true **only because product worktrees live outside this repo** (`~/.spo-worktrees`,
+> `config.js` → `pipelineWorktreesDir`). Claude Code loads a CLAUDE.md from every ancestor of its
+> cwd; while worktrees sat in `<repo>/worktrees/` this file also entered every PLAN and IMPLEMENT
+> call, and § Permissions below — written about *this* repo — was read as policy for the product.
+> Card SPO-WebClient#640 burned 521.5k tokens parking on a wall it described. Don't move them back.
 
 ## `gh` conventions — traps already paid for
 
@@ -49,10 +55,11 @@ card:
 
 ## Git
 
-The repo uses worktrees for two distinct purposes:
+Two distinct kinds of worktree, in two distinct places:
 
-- `worktrees/issue-<n>/` — checkouts **of SPO-WebClient**, created and destroyed by the
-  WORKTREE step. Don't touch them by hand while a task is running.
+- `~/.spo-worktrees/issue-<n>/` — checkouts **of SPO-WebClient**, created and destroyed by the
+  WORKTREE step. Deliberately outside this repo (see the note at the top). Don't touch them by
+  hand while a task is running.
 - `.claude/worktrees/<slug>/` — working worktrees on *this* repo.
 
 The `git stash` stack is shared across all worktrees, and several sessions can run in

@@ -2651,7 +2651,7 @@ node --test --test-timeout=30000 test/*.test.js
 ```
 
 From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, so the
-moment a parked card holds a product worktree under `worktrees/issue-<n>/` it walks into
+moment a parked card holds a product worktree under `~/.spo-worktrees/issue-<n>/` it walks into
 SPO-WebClient's own TypeScript suites and reports thousands of foreign failures — 1926 tests /
 1168 failures with four parked cards, none of them this repo's. `worktrees/` is gitignored, so
 `git status` stays clean and the result reads as a catastrophic regression in code that is fine.

@@ -657,10 +657,32 @@ module.exports = {
   // into them and reported 12980 failures that had nothing to do with the code under test.
   productRepo: process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient'),
 
-  // Where WORKTREE creates one `git worktree add` per task (<dir>/<taskId>). Gitignored
-  // (worktrees/ in .gitignore) -- disposable, FINISH removes its own entry with
-  // `git worktree remove --force`.
-  pipelineWorktreesDir: process.env.SPO_WORKTREES_DIR || path.join(REPO_ROOT, 'worktrees'),
+  // Where WORKTREE creates one `git worktree add` per task (<dir>/<taskId>). Disposable --
+  // FINISH removes its own entry with `git worktree remove --force`.
+  //
+  // OUTSIDE REPO_ROOT, and that is the whole point. This defaulted to `<REPO_ROOT>/worktrees`
+  // until 2026-09-05. Claude Code loads a CLAUDE.md from every ancestor directory of its cwd, so a
+  // product worktree nested under the pipeline repo pulled `SPO-Pipeline/CLAUDE.md` into every PLAN
+  // and IMPLEMENT call -- verified by running `claude -p` in `worktrees/issue-640` and asking which
+  // files it had loaded:
+  //
+  //     /home/crazz/SPO-Pipeline/CLAUDE.md
+  //     /home/crazz/SPO-Pipeline/worktrees/issue-640/CLAUDE.md
+  //
+  // That file's own header asserts the opposite ("loaded on every LLM call whose `cwd` is the repo
+  // root -- DIAGNOSE, VALIDATE, CITATION_VERIFIER"), and both halves of the belief cost something.
+  // Correctness: on card SPO-WebClient#640 an IMPLEMENT read its § Permissions -- written about
+  // THIS repo's `.claude/settings.json` and `.claude/hooks/*.sh` -- generalized it to all of
+  // `.claude/`, quoted its "park it with that reason instead of failing it in IMPLEMENT"
+  // instruction verbatim, and declared the card impossible. It was not: card #671 edited
+  // `.claude/agents/card-reviewer.md` and merged. 521.5k billable tokens on a false park. Tokens:
+  // the file is kept deliberately short because "adding context here means paying for it on every
+  // step", sized believing that meant 3 steps of 5. It was 5 of 5.
+  //
+  // `$HOME` has no CLAUDE.md and neither does `~/.spo-worktrees`, so a worktree there sees exactly
+  // one: the product's own, at its root. Sibling convention to `~/.spo-bench`. Anything that moves
+  // this back under REPO_ROOT reinstates the leak -- test/orphan-scan.test.js pins that it does not.
+  pipelineWorktreesDir: process.env.SPO_WORKTREES_DIR || path.join(os.homedir(), '.spo-worktrees'),
 
   // productRepoLockPollMs -- action 6.4's product-repo mutex (orchestrator/product-repo-lock.js):
   // how often a worker blocked on the lock re-checks whether it has freed up. Same cadence and
