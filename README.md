@@ -96,3 +96,12 @@ decisions of record are mirrored into this repo's docs as they land.
 
 Repository content is English (same rule as the product board). Conversations with the
 maintainer may be French; translate on the way in.
+
+## License
+
+Source-available, **not** open source — see [LICENSE](LICENSE).
+
+Copy it, clone it, fork it, study it — that is what publishing through git means, and the
+licence says so. What it does not grant is **use**: running it, operating it, building on
+it, or shipping anything with it. Holding a copy is not permission to run it. If you want
+to use any of it, ask.

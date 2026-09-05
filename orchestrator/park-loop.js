@@ -247,7 +247,7 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
 // comments used to append the letter "d" to this action id. The plan (doc/remediation-plan-2026-08.md:188) does not
 // letter row 5.1's sub-items at all -- it names three in one cell: pre-worktree board moves,
 // DIAGNOSE activity surfaced (this one), and dropping the redundant IMPLEMENT-retry move.
-// doc/remediation-progress.md:649 confirms the same referent under "DIAGNOSE surfacing" ("6 tasks
+// doc/remediation-progress.md:658 confirms the same referent under "DIAGNOSE surfacing" ("6 tasks
 // entered DIAGNOSE, 18 attempts total, 4 of them ending in a park"). Only the letter "d" was
 // invented (by whichever pass first wrote this comment) -- the id itself was never ambiguous.
 // Renamed to the plan's actual, unlettered id.
@@ -362,7 +362,7 @@ function postDiagnoseSurfaceComment(ctx, deps, { attempt, budget }) {
 // Decision recorded here, not just in the plan: NO auto-filed follow-up card. The plan floats
 // "(and optionally a follow-up draft card)"; this build does not build it. Unattended filing on a
 // judge's own verdict is the exact class of behaviour C3 gated behind a human `confirm` after the
-// 12.8-hour, 128-attempt auto-triage stall (`intake.js:747-749`; `doc/audit-2026-08-30-
+// 12.8-hour, 128-attempt auto-triage stall (`intake.js:796-798`; `doc/audit-2026-08-30-
 // remediation-plan.md` does not exist in this repo -- the citation was stale) -- and a
 // comment is reversible (ignore it, reply, resolve it by hand) where a filed card is not (it sits
 // in the backlog, competing for the same intake budget as everything else, until a human notices

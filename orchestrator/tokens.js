@@ -190,6 +190,90 @@ function readTaskTokens(journalRoot, id, { cacheTtlMs } = {}) {
   };
 }
 
+// ---- the intake half of the ledger (SPO-Pipeline#117) ----------------------------------------
+//
+// An intake stage (DRAFT_CARD, REVIEW_CARD, TRIAGE_BUG_REPORT) has no task directory -- there is
+// no card yet when it runs -- so orchestrator/intake.js journals its `llm-call` events into
+// <journalRoot>/daemon.jsonl instead, in the SAME shape steps/llm.js writes into a task journal.
+// Two files, one event type, one definition of "billable": `accumulateLlmCall` below is the
+// single reduction both sides go through, so a future change to what counts can only be made in
+// one place.
+//
+// Until 2026-09-04 nothing wrote those events and nothing read them, and every figure this
+// module produced was short by the whole of intake -- 58 auto-triage cycles' worth in the
+// measured corpus, against 110 task-journal calls. `spo status` shipped a caveat line saying so
+// out loud because the number could not be made honest any other way; that line is gone, because
+// it is no longer true.
+
+// One `llm-call` event folded into a mutable accumulator. `tokensSource` -- never
+// `typeof billableTokens === 'number'` -- is the honest "did this call report tokens at all"
+// marker: a killed/E2BIG call journals a numeric zero that is NOT the same fact as "reported
+// zero". See readTaskTokens's own comment for the full rationale, not repeated here.
+function accumulateLlmCall(acc, event) {
+  acc.llmCalls += 1;
+  if (typeof event.tokensSource === 'string' && event.tokensSource) acc.llmCallsWithTokens += 1;
+  else acc.llmCallsWithoutTokens += 1;
+  const fi = typeof event.freshInputTokens === 'number' ? event.freshInputTokens : 0;
+  const cc = typeof event.cacheCreationTokens === 'number' ? event.cacheCreationTokens : 0;
+  const cr = typeof event.cacheReadTokens === 'number' ? event.cacheReadTokens : 0;
+  const out = typeof event.outputTokens === 'number' ? event.outputTokens : 0;
+  acc.freshInputTokens += fi;
+  acc.cacheCreationTokens += cc;
+  acc.cacheReadTokens += cr;
+  acc.outputTokens += out;
+  return { freshInputTokens: fi, cacheCreationTokens: cc, cacheReadTokens: cr, outputTokens: out };
+}
+
+function emptyAccumulator() {
+  return {
+    llmCalls: 0,
+    llmCallsWithTokens: 0,
+    llmCallsWithoutTokens: 0,
+    freshInputTokens: 0,
+    cacheCreationTokens: 0,
+    cacheReadTokens: 0,
+    outputTokens: 0,
+  };
+}
+
+// Every `llm-call` line of <journalRoot>/daemon.jsonl, reduced. `onEvent` (optional) is called
+// for each one BEFORE it is folded in, and returning false skips it -- todaySpend uses that to
+// apply its own day filter without a second copy of the parse loop.
+//
+// Missing file -> a zeroed row, never null: "no intake calls recorded" and "no daemon journal
+// yet" are the same answer for every caller here, and a null would make each of them invent its
+// own fallback. Unparsable lines are skipped, same posture as readTaskTokens: daemon.jsonl is
+// appended to by the dispatcher and every worker at once (see the multi-process append policy in journal.js's own header),
+// so a torn final line while we read must never throw.
+function readIntakeTokens(journalRoot, { onEvent } = {}) {
+  const acc = emptyAccumulator();
+  const calls = [];
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  } catch {
+    return { ...acc, billableTokens: 0, calls };
+  }
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.event !== 'llm-call') continue;
+    if (onEvent && onEvent(event) === false) continue;
+    accumulateLlmCall(acc, event);
+    calls.push({ ts: event.ts, step: event.step });
+  }
+  return {
+    ...acc,
+    billableTokens: acc.freshInputTokens + acc.cacheCreationTokens + acc.outputTokens,
+    calls,
+  };
+}
+
 function listTaskIds(journalRoot) {
   try {
     return fs
@@ -218,7 +302,14 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
     if (row) tasks.push(row);
   }
 
-  const sum = (key) => tasks.reduce((s, t) => s + t[key], 0);
+  // The intake stages' own calls, from daemon.jsonl -- they have no task directory to appear as a
+  // row (see readIntakeTokens's header). Reported SEPARATELY as `intake` so a caller can still
+  // show where the spend went, and folded into every aggregate below, because "what did this run
+  // cost" has always meant the whole run. Before SPO-Pipeline#117 this was simply missing: the
+  // totals were the task journals alone and said so nowhere.
+  const intake = readIntakeTokens(journalRoot);
+
+  const sum = (key) => tasks.reduce((s, t) => s + t[key], 0) + intake[key];
   const freshInputTokens = sum('freshInputTokens');
   const cacheCreationTokens = sum('cacheCreationTokens');
   const cacheReadTokens = sum('cacheReadTokens');
@@ -257,6 +348,7 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
 
   return {
     tasks,
+    intake,
     freshInputTokens,
     cacheCreationTokens,
     cacheReadTokens,
@@ -270,8 +362,9 @@ function tokenReport(journalRoot, { cacheTtlMs } = {}) {
     abandoned,
     parks,
     likelyCacheExpiries,
-    // The billable spend of the WHOLE run (every task, parked attempts included) over the
-    // number of cards that reached DONE -- same "honest cost, not just the successful pass"
+    // The billable spend of the WHOLE run (every task, parked attempts included, and since
+    // SPO-Pipeline#117 the intake/triage calls that produced the cards in the first place) over
+    // the number of cards that reached DONE -- same "honest cost, not just the successful pass"
     // semantics orchestrator/cost.js's cost-per-DONE-card used, carried forward unit-for-unit.
     // null both when no card reached DONE and when NOT ONE call reported tokens: a "0 per DONE
     // card" printed off journals that never recorded a token field is a false measurement, not a
@@ -295,26 +388,27 @@ function startOfDay(now) {
 // fact as "reported zero tokens" -- see steps/llm.js's own header). The caller renders "n/a", not
 // "0", when `llmCallsWithTokens === 0`.
 //
-// Measured erratum, worse than the C4 handoff stated (re-measured 2026-09-01, kept here rather
-// than re-derived by a caller): journal/daemon.jsonl -- where intake/triage steps
-// (report-triaged, auto-triage, report-confirmed) journal their own events -- contains ZERO
-// `llm-call` events of ANY kind, and none of those event types carry a cost or token field at
-// all. So intake/triage spend is not merely invisible to THIS function (it has no taskDir-shaped
-// journal for todaySpend to scan) -- it is not journalled anywhere, by any module, today. Any
-// "today's spend" figure this function returns is short by an unknown amount for that reason.
-// Fixing the journalling gap is out of scope for this action; the caller (bin/spo's cmdStatus)
-// prints this as a caveat alongside the number rather than trying to close the gap here.
+// Erratum CLOSED, 2026-09-04 (SPO-Pipeline#117). This used to scan the per-task journals only,
+// and journal/daemon.jsonl -- where the intake stages run -- carried ZERO `llm-call` events of
+// any kind, so every figure returned here was short by an unknown amount and bin/spo's cmdStatus
+// printed a caveat line saying so. orchestrator/intake.js now journals one `llm-call` per call
+// into daemon.jsonl, and this function reads BOTH sides through the same accumulator (see
+// readIntakeTokens above). The caveat line is gone with the gap it described.
+//
+// The day filter is applied identically to both sides: `ts` on `now`'s LOCAL calendar day, one
+// rule, one midnight (see console/usage-scan.js's localDateKey for why local and not UTC).
 function todaySpend(journalRoot, { now = Date.now() } = {}) {
   const dayStart = startOfDay(now);
+  const onToday = (event) => {
+    const ts = typeof event.ts === 'string' ? Date.parse(event.ts) : NaN;
+    return Number.isFinite(ts) && ts >= dayStart;
+  };
 
-  let freshInputTokens = 0;
-  let cacheCreationTokens = 0;
-  let cacheReadTokens = 0;
-  let outputTokens = 0;
-  let billableTokens = 0;
-  let llmCalls = 0;
-  let llmCallsWithTokens = 0;
-  let llmCallsWithoutTokens = 0;
+  // Intake first, so the same accumulator carries both halves and there is no second place where
+  // "billable" is spelled out.
+  const acc = emptyAccumulator();
+  const intake = readIntakeTokens(journalRoot, { onEvent: onToday });
+  for (const key of Object.keys(acc)) acc[key] += intake[key];
 
   for (const id of listTaskIds(journalRoot)) {
     const file = path.join(journalRoot, id, 'journal.jsonl');
@@ -333,23 +427,13 @@ function todaySpend(journalRoot, { now = Date.now() } = {}) {
         continue; // a torn final line while the daemon writes -- skip, do not throw
       }
       if (event.event !== 'llm-call') continue;
-      const ts = typeof event.ts === 'string' ? Date.parse(event.ts) : NaN;
-      if (!Number.isFinite(ts) || ts < dayStart) continue;
-
-      llmCalls += 1;
-      if (typeof event.tokensSource === 'string' && event.tokensSource) llmCallsWithTokens += 1;
-      else llmCallsWithoutTokens += 1;
-      const fi = typeof event.freshInputTokens === 'number' ? event.freshInputTokens : 0;
-      const cc = typeof event.cacheCreationTokens === 'number' ? event.cacheCreationTokens : 0;
-      const cr = typeof event.cacheReadTokens === 'number' ? event.cacheReadTokens : 0;
-      const out = typeof event.outputTokens === 'number' ? event.outputTokens : 0;
-      freshInputTokens += fi;
-      cacheCreationTokens += cc;
-      cacheReadTokens += cr;
-      outputTokens += out;
-      billableTokens += fi + cc + out;
+      if (!onToday(event)) continue;
+      accumulateLlmCall(acc, event);
     }
   }
+
+  const { freshInputTokens, cacheCreationTokens, cacheReadTokens, outputTokens, llmCalls, llmCallsWithTokens, llmCallsWithoutTokens } = acc;
+  const billableTokens = freshInputTokens + cacheCreationTokens + outputTokens;
 
   return {
     freshInputTokens,
@@ -357,10 +441,11 @@ function todaySpend(journalRoot, { now = Date.now() } = {}) {
     cacheReadTokens,
     outputTokens,
     billableTokens,
+    intake,
     llmCalls,
     llmCallsWithTokens,
     llmCallsWithoutTokens,
   };
 }
 
-module.exports = { tokenReport, readTaskTokens, todaySpend, computeLikelyCacheExpiries, formatTokenCount };
+module.exports = { tokenReport, readTaskTokens, readIntakeTokens, todaySpend, computeLikelyCacheExpiries, formatTokenCount };

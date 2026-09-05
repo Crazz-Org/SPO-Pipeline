@@ -236,7 +236,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:747-749`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:796-798`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -430,22 +430,32 @@ and GitHub's 65536-char cap would otherwise make `gh issue comment` fail and the
 uncommented) rather than throwing or growing unbounded. Every hit parks the single reason
 `plan-requires-protected-files` (already listed among action 3.1's `PLAN_INVALIDATING_PARK_REASONS`
 above, so a plan that trips this guard is never eligible for reuse), distinguished by a `source`
-field in the detail, from **two** call sites in `state-machine.js`:
+field in the detail, from **two** call sites, both of them in `handlePlan` and both going through
+the one function `guardDeclaredFiles`:
 
-- **`handleIntake`**, `source: 'criterion'` — for a `kind: "card"` task only, the criterion and
-  title are scanned before anything else in INTAKE runs (after the `invalid-task-json` and
-  `shadow.forceState` checks, and after the `real-flag-required` gate). This is the cheapest
-  possible catch: INTAKE is scripted, so the card parks having spent zero LLM calls, and still
-  gets the full standard park treatment — a park comment on the issue, the kanban move, the
-  maintainer's `retry`/`abandon` path — which refusing to enqueue the card in `intake.js`'s
-  `pullBoard` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It
-  is free insurance, not the mechanism that saved #428's $12.01 — #428's own criterion says "both
-  kept hooks" and "the hook script", never a path, so this site scores zero hits (true or false)
-  across all 17 real cards measured.
-- **`handlePlan`, normal path**, `source: 'files_to_change'` — scans `payload.files_to_change`,
-  PLAN's structured declaration of which files it intends to change (`prompts/plan.md`), *before*
-  `scratchDir`/`fs.mkdirSync`/either file write and before the action-1.8 invariants baseline. This
-  is the site the guard exists for: it stops the spend before IMPLEMENT is ever paid for.
+- **`handlePlan`, normal path**, `source: 'files_to_change'` — scans PLAN's structured declaration
+  of which files it intends to change (`prompts/plan.md`). This is the site the guard exists for:
+  it stops the spend before IMPLEMENT is ever paid for. Since **#118** (2026-09-05) it runs
+  *after* `plan-<issue>.md` and `invariants-<issue>.md` are written and `files-written` is
+  journalled, and still *before* the action-1.8 invariants baseline — so a parked card leaves the
+  plan on disk for a human to pick up (SPO-Pipeline#31's own criterion, unmet until then; the park
+  detail carries `planPath`/`invariantsPath`) while never paying for the baseline. Writing first
+  does not make the plan reusable: `plan-requires-protected-files` is plan-invalidating, so
+  `decidePlanReuse`'s condition 6 refuses it.
+- **`handlePlan`, reuse path**, `source: 'files_to_change'` with `reused: true` — the same scan
+  over the carried-forward `previousPayload.files_to_change`, before the baseline rebuild. See the
+  end of this section for why it exists again.
+
+**`handleIntake`'s prose scan (`source: 'criterion'`/`'title'`) was REMOVED by #118.** For a
+`kind: "card"` task it used to scan the card's own criterion and title before anything else in
+INTAKE ran, parking at zero cost. Measured across the whole journal corpus, that site fired
+exactly once — on Crazz-Org/SPO-WebClient#482, the card written to report that the PLAN-side guard
+had never run, whose acceptance criterion *quotes* `.claude/settings.json` and `.claude/hooks/*.sh`
+as the examples a working guard must catch. One firing, one false positive, zero true positives:
+the guard refused the card that repairs it. Prose cannot distinguish "EDITS this file" from "CITES
+this file" — the identical argument, and the identical measurement, that had already retired the
+`plan_markdown` scan below. What it costs: the rare card whose human-written criterion genuinely
+names a protected path now pays one PLAN call before parking instead of parking free at INTAKE.
 
 **Why not scan `plan_markdown` (the original design).** The first cut of this guard scanned the
 model's free-prose `plan_markdown` at this same site. Measured against all 17 real plans in
@@ -465,12 +475,23 @@ merely reads, cites as evidence, or asserts the absence of.
 
 `files_to_change` is deliberately declared but **not** `required` in `step-contracts.js` (see that
 file's own comment) — promoting it would park every card whose PLAN reply omits the new key, on a
-live pipeline, before a single real card has exercised it. When the field is absent, `null`, not
-an array, or an array containing a non-string entry, `handlePlan` does **not** park and does
-**not** fall back to scanning `plan_markdown` — that would reinstate the 33%-precision behaviour
+live pipeline, before a single real card has exercised it. **#118 (2026-09-05): the wire shape is
+a JSON-encoded string, and for a year the guard did not know it.** The shape test was
+`Array.isArray(files_to_change)`, and 93 of the 93 real PLAN replies that carry the field deliver
+it as `"[\"/abs/path\", ...]"` — a string — so the scan sat in an unreachable `else if` and
+action 3.2 had never once run on a live card (44 journalled `plan-files-undeclared
+{receivedType: "string"}` events are the fail-open record; nothing was lost only because 0 of the
+809 declared paths in that corpus name a protected file). `guardDeclaredFiles` now normalizes
+through `park-loop.js`'s `normalizeFindingsPayload` — the parser VALIDATE's identically-shaped
+`findings` already needed — so an array and a JSON string holding one are both declarations. When
+the field is absent, `null`, an object, a bare unparsable string, or a list containing a
+non-string entry, `handlePlan` does **not** park and does **not** fall back to scanning
+`plan_markdown` — that would reinstate the 33%-precision behaviour
 this revision exists to remove. It journals a `PLAN`/`plan-files-undeclared` event instead, with
-what was actually received (type/shape, capped) — the evidence promotion to `required` will
-eventually be made from. An empty array is treated as a real declaration ("this plan changes
+what was actually received (`receivedType` unchanged from before #118 so the events already on
+the record stay comparable, plus `shape` — the normalizer's own verdict, which is the only thing
+that tells `unparsable-string` from `json-string-object`, both of them `typeof 'string'` — and a
+capped sample) — the evidence promotion to `required` will eventually be made from. An empty array is treated as a real declaration ("this plan changes
 nothing already on record"), not as undeclared: no park, no event.
 
 **What this guard is actually worth — stated honestly.** Nothing cross-checks `files_to_change`
@@ -488,15 +509,17 @@ evidence-gathering above), and cross-checking IMPLEMENT's own `files_changed` ag
 declaration after the fact. Neither is implemented. Do not oversell this guard's coverage
 elsewhere in these docs either.
 
-There used to be a third call site, on the action-3.1 reuse path (`source: 'plan-file'`, re-reading
-a reused plan already on disk): reuse skips PLAN's LLM call entirely, so it never saw
-`plan_markdown`, and a plan written before the guard existed could in principle be reused straight
-into IMPLEMENT unscanned. It was removed once measured to be unreachable: every journalled PLAN
-`files-written` event in the entire corpus carries `baseMainSha: undefined` (all of them predate
-action 3.1), so `decidePlanReuse`'s condition 2 filters every one of them out before that site
-could ever run — and for any plan written from now on, tripping either remaining site parks
-`plan-requires-protected-files`, itself in `PLAN_INVALIDATING_PARK_REASONS`, which already blocks
-its own reuse.
+**The reuse-path site, removed once and restored by #118.** It was deleted on a measurement (every
+`files-written` event then in the corpus carried `baseMainSha: undefined`, so `decidePlanReuse`'s
+condition 2 filtered them all out) *and* an argument: any plan written from then on that tripped a
+site would park `plan-requires-protected-files`, itself plan-invalidating, so a dirty plan could
+never reach reuse. The measurement aged out — plans written since action 3.1 do carry
+`baseMainSha` — and the argument assumed a guard that worked. It did not: every plan written
+between action 3.2 and #118 passed through an `Array.isArray` test that rejected its own wire
+shape, so the corpus holds 93 plans whose declarations were never judged, each one `retry` away
+from being reused straight into IMPLEMENT. The site is back, sharing `guardDeclaredFiles` with the
+normal path, and the invariant it restores is worth stating plainly: **no plan reaches IMPLEMENT
+without its declared file list having been read at least once.**
 
 A missing value for any placeholder a prompt's header declares — PLAN called before
 `worktreePath` is set, IMPLEMENT called before PLAN has run, or any other gap — throws
@@ -2249,6 +2272,22 @@ count and park-*event* count are both shown because they answer different questi
 parked six times and still reached DONE. `spo cost` still works too, as a deprecated alias that
 prints a one-line notice and then the same table (some docs/gates still say "watching `spo
 cost`").
+
+**Intake spend is in the ledger too (SPO-Pipeline#117).** `DRAFT_CARD`, `REVIEW_CARD` and
+`TRIAGE_BUG_REPORT` run before a card has a task directory, so `intake.js`'s
+`callIntakeStepWithRotation` — the one choke point all three go through — journals their
+`llm-call` events into `journal/daemon.jsonl` instead, in the same shape `steps/llm.js` writes
+into `journal.jsonl`. `tokens.js` reads both files through one accumulator: `tokenReport` returns
+them as an `intake` row *and* folds them into every aggregate, `todaySpend` applies the same
+local-midnight filter to both, `spo tokens` renders an `(intake)` row, and `spo status` names the
+intake share under today's figure. One event per `claude` spawn, so a deadline-timeout retry or
+an account rotation leaves two — the doubled call is precisely what is worth counting. Before
+this, the token block was computed by `invokeClaudeReal`, returned by all three functions, and
+dropped one stack frame later by callers that journal only through `appendDaemonEvent`: 58
+auto-triage cycles produced zero `llm-call` events, and `spo status` printed "this figure is
+short by an unknown amount" because the number could not be made honest any other way. The
+dashboard's tokens trend never had this gap — `console/usage-scan.js` streams
+`~/.claude*/projects` session transcripts, not the journals.
 
 **Billable-weighted tokens = fresh input + cache-creation + output.** Cache-*read* tokens are
 reported separately and never folded into that total: on a quota plan a cache read is nearly

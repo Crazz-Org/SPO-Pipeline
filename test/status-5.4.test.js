@@ -314,12 +314,48 @@ test('todaySpend: the day boundary is LOCAL midnight -- the same one console/col
   assert.equal(spend.billableTokens, 11);
 });
 
-test('spo status: prints today\'s spend with the "not journalled at all" caveat, always', () => {
+// The caveat this used to pin -- "intake/triage steps are not journalled with token data at all
+// -- this figure is short by an unknown amount" -- is GONE, and its absence is the assertion.
+// SPO-Pipeline#117 closed the gap it described (orchestrator/intake.js journals an `llm-call`
+// per call into daemon.jsonl, todaySpend reads both journals). A caveat left standing over a
+// fixed defect is worse than no caveat: it teaches a reader to distrust a number that is now
+// correct. Asserted by regex on the sentence, not on the whole line, so a reworded caveat cannot
+// slip back in under a different shape.
+test("spo status: today's spend no longer carries the \"not journalled at all\" caveat", () => {
   const journalDir = mkTmp('spo-status-spend-cli-');
   const queueDir = mkTmp('spo-status-spend-cli-queue-');
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
   assert.match(out, /today: n\/a -- no token data reported for any call today/);
-  assert.match(out, /intake\/triage steps are not journalled with token data at all/);
+  assert.doesNotMatch(out, /short by an unknown amount/);
+  assert.doesNotMatch(out, /not journalled with token data/);
+});
+
+// The other half of the same change: an intake call in daemon.jsonl is COUNTED by the "today"
+// line, and named on its own sub-line. The fixture writes only a daemon.jsonl -- no task
+// directory at all -- which is exactly the corpus shape that used to print "n/a": before this,
+// `spo status` could see a day's whole intake spend and report no token data reported.
+test("spo status: an intake llm-call in daemon.jsonl counts toward today's spend, and says how much", () => {
+  const journalDir = mkTmp('spo-status-intake-cli-');
+  const queueDir = mkTmp('spo-status-intake-cli-queue-');
+  fs.writeFileSync(
+    path.join(journalDir, 'daemon.jsonl'),
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      event: 'llm-call',
+      step: 'TRIAGE_BUG_REPORT',
+      model: 'opus',
+      tokensSource: 'modelUsage',
+      freshInputTokens: 1000,
+      cacheCreationTokens: 200,
+      cacheReadTokens: 90000,
+      outputTokens: 300,
+      ok: true,
+    }) + '\n'
+  );
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  // 1000 + 200 + 300 billable; cache-read is never folded in (tokens.js's headline metric).
+  assert.match(out, /today: billable 1\.5k tokens over 1 reported call\(s\)/);
+  assert.match(out, /of which intake\/triage: billable 1\.5k tokens over 1 call\(s\)/);
 });
 
 // ---- E: llm-call gains duration_s ----------------------------------------------------------------

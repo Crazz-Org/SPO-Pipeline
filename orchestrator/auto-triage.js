@@ -558,7 +558,11 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
 
   // deps.humanConfirmed: true so review-card.md § 0 does not re-litigate desirability -- a
   // maintainer already confirmed this report before it ever reached here.
-  const reviewed = await intake.reviewCard(draft, { ...deps, humanConfirmed: true });
+  // `journalRoot`: intake.js's callIntakeStepWithRotation writes this call's own `llm-call`
+  // event into daemon.jsonl with it (SPO-Pipeline#117 -- before this, REVIEW_CARD's tokens
+  // were computed, returned, and dropped right here). Passed on the dry path too: see
+  // journalIntakeLlmCall's own header for why an accounting record is not a `dry`-gated write.
+  const reviewed = await intake.reviewCard(draft, { ...deps, journalRoot, humanConfirmed: true });
   if (!dry && reviewed.cooldowns) journalCooldowns(journalRoot, entry.issue, 'REVIEW_CARD', reviewed.cooldowns);
   // Every `step`-tagged {ok:false, error} return in this file is a MECHANICAL failure, never a
   // verdict -- processConfirmedReport's handleMechanicalFailure (below) is the one place that
@@ -654,7 +658,9 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
     return reviewAndFile(entry, built.draft, journalRoot, config, deps, opts, today);
   }
 
-  const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, deps);
+  // `journalRoot`: TRIAGE_BUG_REPORT's own `llm-call` event -- see reviewAndFile's call to
+  // reviewCard for the rationale, not repeated here.
+  const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, { ...deps, journalRoot });
 
   // Make the retry visible: a step that silently costs twice as long and twice as much is the
   // kind of thing that only shows up in a bill. Not a terminal event -- findConfirmedAwaitingTriage
