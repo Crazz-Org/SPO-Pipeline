@@ -2254,3 +2254,66 @@ test('#77 findParkAnchor: alreadyHandled still works off a timestamp anchor -- i
   ]);
   assert.equal(anchor.alreadyHandled, true);
 });
+
+// #103: findParkAnchor's own doc header used to conflate the STAMP with the JOURNAL ("journalled
+// before the `gh` call") and then claim, on top of that, a survival property the code does not
+// have -- the drain means a worker outlives its own SIGTERM long enough to finish an entire park
+// (dispatcher.js), so a park-anchor journalled AFTER the call returns cannot survive a signal
+// landing mid-call either way; what it actually cannot survive is a SIGKILL at TimeoutStopSec.
+// Reads the doc block itself rather than pinning exact wording, per the two sibling doc-sweep
+// tests (test/park-reason-doc-sweep.test.js, test/doc-constant-sweep.test.js) this repo already
+// has for the same reason: a reworded-but-still-correct bullet must keep passing.
+test('#103 findParkAnchor doc header: the park-anchor bullet states the true stamp/journal split and names SIGKILL, never a survived SIGTERM', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'park-loop.js'), 'utf8');
+  const lines = src.split('\n');
+  const fnIndex = lines.findIndex((l) => /^function findParkAnchor\(/.test(l));
+  assert.ok(fnIndex > 0, 'findParkAnchor not found at all -- has it been renamed or moved?');
+
+  // The doc block is the contiguous run of `//` comment lines immediately above the function.
+  let docStart = fnIndex - 1;
+  while (docStart >= 0 && /^\s*\/\//.test(lines[docStart])) docStart -= 1;
+  const docLines = lines.slice(docStart + 1, fnIndex);
+
+  const shapesStart = docLines.findIndex((l) => /TWO shapes/.test(l));
+  assert.ok(shapesStart !== -1, 'expected the "TWO shapes" intro inside findParkAnchor\'s doc block -- has the doc been restructured?');
+  // The park-anchor bullet runs from its own label line to the next blank `//` line -- located
+  // directly (not by walking a fixed number of lines past the intro), so a purely cosmetic edit
+  // elsewhere in the list (e.g. a blank `//` line inserted between the two bullets) can't shift
+  // this boundary and produce a misleading "bullet not found" failure.
+  const anchorLineIdx = docLines.findIndex((l) => /`park-anchor`/.test(l));
+  assert.ok(anchorLineIdx > shapesStart, 'expected a `park-anchor` bullet in the doc block, below the "TWO shapes" intro');
+  let bulletEnd = anchorLineIdx + 1;
+  while (bulletEnd < docLines.length && docLines[bulletEnd].trim() !== '//') bulletEnd += 1;
+  const bullet = docLines.slice(anchorLineIdx, bulletEnd).join('\n');
+
+  // (a)+(b): the STAMP (not the event) precedes the `gh` call -- that's what lets a `retry`
+  // posted while the call is still in flight still count.
+  assert.ok(!/journall?ed\s+before/i.test(bullet), 'bullet claims the park-anchor EVENT is journalled before the `gh` call -- only the timestamp is stamped before it; the event itself is appended only after the call returns (card #103)');
+  assert.ok(/stamp(?:ed)?\s+before/i.test(bullet), "bullet dropped the true claim that the timestamp is stamped before the `gh` call, which is why an in-flight `retry` still counts (card #103)");
+  assert.ok(!/\bevent\b[^.;]{0,40}\bstamp(?:ed)?\s+before\b/i.test(bullet), 'bullet makes the EVENT the thing stamped before the `gh` call -- only the `at` timestamp is (park-loop.js:229); the event is appended after the call returns (:236) (card #103)');
+
+  // (d): SIGTERM is no longer a hazard this anchor needs to survive -- the drain means a worker
+  // outlives its own SIGTERM long enough to finish an entire park (dispatcher.js).
+  assert.ok(!/SIGTERM/.test(bullet), 'bullet still names SIGTERM as something the park-anchor survives -- the drain means a worker outlives its own SIGTERM (dispatcher.js); the live hazard is a SIGKILL at TimeoutStopSec (card #103)');
+
+  // SIGKILL must be named, and only ever negated WITHIN THE CLAUSE THAT NAMES IT (the anchor does
+  // NOT survive one landing mid-call) -- never asserted as something the anchor survives. Split on
+  // clause boundaries (`.`, `;`, or this repo's own ` -- ` clause separator in comments), not on
+  // sentences: a sentence-level split lets an unrelated negation elsewhere in the same sentence
+  // (e.g. "...could not be posted") satisfy the check no matter what the SIGKILL clause itself
+  // says.
+  assert.ok(/SIGKILL/.test(bullet), 'bullet does not name SIGKILL at all -- it is the actual hazard the anchor does not survive (card #103)');
+  const sigkillClauses = bullet.split(/[.;]|\s--\s/).filter((s) => /SIGKILL/.test(s));
+  assert.ok(
+    sigkillClauses.length > 0 && sigkillClauses.every((s) => /\b(never|not|n't|nor|no)\b/i.test(s)),
+    'bullet mentions SIGKILL without negating survival IN THAT CLAUSE -- it must say the anchor does NOT survive a SIGKILL landing mid-call (card #103)'
+  );
+
+  // (c): the anchor's real purpose (issue #77) must survive the rewrite -- it exists because it
+  // survives the `gh` call FAILING, which keeps the card reachable when the park comment itself
+  // could not be posted.
+  assert.ok(/FAILED/.test(bullet) && /reachable/i.test(bullet), "bullet dropped the anchor's actual purpose -- it survives the `gh` call FAILING, keeping the card reachable (issue #77) (card #103)");
+
+  // (e): the timestamp is still the retry/abandon scan's boundary -- unchanged by this rewrite.
+  assert.ok(/boundary/i.test(bullet) && /retry/i.test(bullet), 'bullet dropped the closing boundary clause -- a `retry` must still count if it was posted after the park (card #103)');
+});

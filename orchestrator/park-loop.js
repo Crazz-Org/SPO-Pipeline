@@ -636,9 +636,12 @@ function readJournalLines(taskDir) {
 //   `park-comment`  -- the comment landed, so its numeric commentId is the boundary. GitHub
 //                      comment ids increase monotonically, so "id > anchorId" is exactly
 //                      "posted after we commented". Preferred whenever it exists.
-//   `park-anchor`   -- journalled before the `gh` call, so it survives that call failing or
-//                      the daemon being SIGTERMed mid-call. Its timestamp is the boundary
-//                      instead: a `retry` counts if it was posted after the park.
+//   `park-anchor`   -- stamped before the `gh` call, so a `retry` posted while it is still
+//                      in flight still counts, but journalled only after that call returns --
+//                      on the branch where it FAILED (issue #77). What it survives is that
+//                      failure, keeping the card reachable when the park comment itself could
+//                      not be posted -- never a SIGKILL landing mid-call. Its timestamp is
+//                      still the boundary: a `retry` counts if it was posted after the park.
 //
 // The LAST of either kind wins, by journal position -- so a later successful cycle's
 // commentId supersedes an earlier cycle's bare timestamp, and a park whose comment failed
