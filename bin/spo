@@ -200,6 +200,7 @@ const { collectAll, readDaemonEventsTail } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
 const accounts = require('../orchestrator/accounts');
 const journal = require('../orchestrator/journal');
+const { resolveStateRoot, stateQueueDir, stateJournalRoot, assertStateMigrated } = require('../orchestrator/state-root');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
 const { formatDuration } = require('../orchestrator/task-summary');
 const defaultConfig = require('../orchestrator/config');
@@ -277,9 +278,14 @@ function parseArgs(argv) {
 
 function resolveDirs(opts) {
   const repoRoot = path.join(__dirname, '..');
+  // Outside the tree by default -- see orchestrator/state-root.js. `spo` has to resolve this the
+  // SAME way the daemon does or it reports on a different journal than the one being written,
+  // which is a worse failure than not reporting at all.
+  const stateRoot = resolveStateRoot();
+  if (!opts.journal || !opts.queue) assertStateMigrated(repoRoot, stateRoot);
   return {
-    journalRoot: opts.journal || path.join(repoRoot, 'journal'),
-    queueDir: opts.queue || path.join(repoRoot, 'queue'),
+    journalRoot: opts.journal || stateJournalRoot(stateRoot),
+    queueDir: opts.queue || stateQueueDir(stateRoot),
   };
 }
 

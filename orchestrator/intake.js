@@ -37,6 +37,7 @@ const os = require('os');
 
 const accounts = require('./accounts');
 const config = require('./config');
+const { resolveStateRoot, stateQueueDir, stateJournalRoot } = require('./state-root');
 const { leaseHealthyAccount } = require('./account-lease');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
@@ -1185,8 +1186,12 @@ function nextQueueSeq(queueDir) {
 // queue/ or journal/. Returns {ok: true, skipped, id, [file, task]} or {ok: false, error}.
 function makeTask(candidate, deps = {}) {
   const ghRepo = deps.ghRepo || config.ghRepo;
-  const queueDir = deps.queueDir || path.join(config.REPO_ROOT, 'queue');
-  const journalRoot = deps.journalRoot || path.join(config.REPO_ROOT, 'journal');
+  // Same default as daemon.js -- outside the tree (orchestrator/state-root.js), because a release
+  // tree is replaced on every deploy. deps.* still wins, which is how every test points this at a
+  // throwaway root.
+  const stateRoot = resolveStateRoot();
+  const queueDir = deps.queueDir || stateQueueDir(stateRoot);
+  const journalRoot = deps.journalRoot || stateJournalRoot(stateRoot);
   const id = `issue-${candidate.issue}`;
 
   if (taskAlreadyExists(queueDir, journalRoot, id, candidate.issue)) {

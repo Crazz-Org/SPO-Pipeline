@@ -273,7 +273,7 @@ separate repos with no shared runtime.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:796-798`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:797-799`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -459,7 +459,7 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1094`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1100`)
   is a generated static HTML page reading the same local journals, and already ships alongside
   the CLI rather than after it.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).
