@@ -194,8 +194,11 @@ refuses instead, printing the `mv` commands (`orchestrator/state-root.js`).
 `gh api repos/Crazz-Org/<repo>/pulls/<n> -X PATCH`. And `gh api -f` is a POST unless
 `--method GET` is passed — that one killed the retry channel for a whole chantier.
 
-**Never bare `node --test`.** It descends into parked cards' product worktrees and reports
-thousands of foreign failures. Always `node --test test/*.test.js`.
+**Never bare `node --test`.** It auto-discovers recursively into `.claude/worktrees/*/test/` —
+**12 agent worktrees of this repo today**, each with a full suite — and runs every one of them on
+top of this one. (It no longer reaches the *product* worktrees: `769eac5` moved those to
+`~/.spo-worktrees`, outside the repo. The rule survives its original reason.) Always
+`node --test test/*.test.js`.
 
 ---
 

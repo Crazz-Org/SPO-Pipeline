@@ -137,7 +137,7 @@ the correction to apply.
 The drain (§3) makes all three rare by construction: a card is only signalled at all if it is still
 running when the bound expires.
 
-### 2.3 Found in passing: `isSpawnTimeout` calls any external signal a timeout — NOT changed
+### 2.3 Found in passing: `isSpawnTimeout` calls any external signal a timeout — FIXED in `6b5d63e`
 
 `command-timeout.js`:
 
@@ -159,10 +159,17 @@ So the clause fires **only** for external signals — it is precisely the false-
 and it is why #517 read `npm-run-timed-out` after 345s of a 660s budget. Tightening it to the
 `ETIMEDOUT` test alone is a two-token change and strictly more accurate.
 
-**Deliberately not done here.** `spawnStep` retries on `timedOut` and then throws
-`ParkSignal('<class>-timed-out')`, so the change re-classifies parks for *every* command class at
-once, and a park reason is a retry contract (`TRANSIENT_RETRY_REASONS` keys on the string). It
-belongs in its own card with its own corpus pass, not folded into a deploy change. Filed.
+**Deliberately not done here — and done shortly after, in its own commit.** The reasoning below is
+why it was split out, and it still stands as the reason: `spawnStep` retries on `timedOut` and then
+throws `ParkSignal('<class>-timed-out')`, so the change re-classifies parks for *every* command
+class at once, and a park reason is a retry contract (`TRANSIENT_RETRY_REASONS` keys on the string).
+
+**Landed as `6b5d63e`** ("fix(command-timeout): an external kill is not a timeout, and now says
+so"), 2026-09-05: `command-timeout.js` now tests `ETIMEDOUT` alone, and an external signal raises
+the distinct `command-killed-by-signal` reason instead (`steps/scripted.js`; documented in
+`doc/state-machine-spec.md` § Scripted-step timeouts). **The §2.2 table above is therefore
+incomplete: after a deploy kill an operator should look for `command-killed-by-signal`, not
+`npm-run-timed-out`.**
 
 **Resolved since — this section is a record of the finding, not of current code.** The
 `command-timeout.js` half was fixed in PR #127, which extracted `isSpawnTimeout` (tightened to the

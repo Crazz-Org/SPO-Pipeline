@@ -318,7 +318,8 @@ const STEP_CONTRACTS = {
   },
 };
 
-// task.touchesRdoMembers / task.size / task.escalate decide whether a step's model is escalated
+// task.touchesRdoMembers / task.size decide whether a step's model is escalated (task.escalate was
+// removed 2026-09-04 -- see the REMOVED note above; nothing ever assigned it)
 // this call. Never true for a step whose contract carries no escalatedModel at all (DIAGNOSE,
 // CITATION_VERIFIER).
 function shouldEscalate(stepDef, task) {

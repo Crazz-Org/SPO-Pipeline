@@ -18,7 +18,9 @@
 // own productRepo comment records), but recette does not take it: this runner drives the task
 // through `drainQueueOnce` like a real daemon worker would, so the same lock already applies to
 // its WORKTREE/FINISH phases. The guard here is a coarser, earlier one: refusing to START while a
-// live daemon holds ITS OWN lock file (<repoRoot>/journal/daemon.lock, orchestrator/lock.js) --
+// live daemon holds ITS OWN lock file (orchestrator/lock.js) -- BROKEN, SPO-Pipeline#133: the
+// default below still resolves <repoRoot>/journal, which the state move emptied, so this guard
+// reads a path that cannot exist and never refuses. The lock is at ~/.spo-state/journal/ --
 // checked here READ-ONLY (recette is not a daemon and must never create, touch, or release that
 // lock itself). `--force` overrides, loudly, for a maintainer who has confirmed by hand that
 // nothing is actually running. This is a best-effort check, not a mutex: it catches "I forgot the

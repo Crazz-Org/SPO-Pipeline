@@ -401,7 +401,7 @@ supervision model* — and demanding a **single-repo counterexample** for each c
 |---|---|
 | **D1** attestation opacity — the schema *is* the wire | D5, D6, D8, D9, D10, D11 — bench-internal |
 | **D3** the merge-safety chain | D2 — the intrinsic worker↔job-body boundary, which no relocation removes |
-| **D7** exit-code collapse — the exit code *is* the wire | stale docs — a single-repo instance was found in this very audit (`doc/state-machine-spec.md:128` promises FINISH fast-forwards the main checkout; `realFinish` does not) |
+| **D7** exit-code collapse — the exit code *is* the wire | stale docs — a single-repo instance was found in this very audit (`doc/state-machine-spec.md:134` promises FINISH fast-forwards the main checkout; `realFinish` does not) |
 | **process-tree ownership across `exec`** — the pipeline's timeout kills `npm`, the `cli.js` grandchild survives | synthetic tests — a deliberate strategy choice: `test/helpers.js:65-80` points every daemon subprocess at a fresh empty `SPO_BENCH_DIR` |
 
 **Four of ten, and the four are contract defects, not location defects.**

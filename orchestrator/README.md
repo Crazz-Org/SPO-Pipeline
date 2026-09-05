@@ -31,9 +31,11 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
   guarantee stops at a process boundary, though: a test that spawns a real `daemon.js
   --worker`/`--scanner` child reaches the real, unpatched `spawnSync` inside that child — see
   "The hermeticity guarantee stops at a process boundary" below.
-- Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
-  missing). Point both at a temp dir to run an isolated batch — this is how the test suite
-  works.
+- Defaults: `--queue` = `~/.spo-state/queue`, `--journal` = `~/.spo-state/journal` (both created
+  if missing), resolved by `orchestrator/state-root.js` and overridable as a pair with
+  `SPO_STATE_DIR`. **They are no longer under the repo**: `8d78b6c` moved them out, and
+  `assertStateMigrated` refuses to start against the old `<repo>/queue`+`<repo>/journal` layout.
+  Point both at a temp dir to run an isolated batch — this is how the test suite works.
 
 ## Task-file format
 
@@ -332,17 +334,18 @@ A card task's own fields:
   "worktreePath": "/home/crazz/.spo-worktrees/card-123",
   "size": "S",
   "touchesRdoMembers": false,
-  "escalate": false,
   "citations": ["ObjectAt — RDOObjectServer.pas:118 — function, 2 args"],
   "spoOriginalPath": "/home/crazz/SPO-Original"
 }
 ```
 
 `size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
-`EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
-for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
-PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
-CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
+`EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule flag, and it does two
+different things: it escalates IMPLEMENT's **model** (Sonnet 5 → Opus 5) and VALIDATE's **effort**
+(high → xhigh, model unchanged), never PLAN — see the comment on `step-contracts.js`'s PLAN entry.
+The generic `task.escalate` "Opus 5 fallback" override was **removed 2026-09-04**
+(`step-contracts.js`, the `REMOVED` note above `escalatesOn`): nothing ever assigned it, so no step
+could ever read it true. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
 only when `touchesRdoMembers` is true. `citations` in the JSON above is shown as a hand-set task
 field for illustration, and a maintainer-supplied value there does still win, but in practice
 nothing sets it at intake: `steps/scripted.js`'s `realPushPr` is what actually populates it, from
@@ -833,7 +836,7 @@ run by `steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:140` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:146` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1995,10 +1998,13 @@ immediately, in-process, reason `worker-crashed` — no wait for a scan at all (
 doc/state-machine-spec.md § Principles, Principle 2). The scanner-based mechanism below exists for
 what the dispatcher itself cannot cover: a worker killed during the dispatcher's OWN shutdown
 (deliberately not reparked in-process, since a park half-written by a process already being
-SIGKILLed can never be recovered later — `dispatcher.js:485-499`) and any owning daemon process
+SIGKILLed can never be recovered later — `dispatcher.js:572-586`, the
+`childrenSignalled && outcome === 'crashed'` branch; `dispatcher.js:485-499` is now `killScanner`) and any owning daemon process
 that simply never comes back to run `handleExit` at all (a hard kill of the whole process tree).
-The shutdown case is this project's most common one in practice: a merge's `git pull` SIGTERMing
-an in-flight card.
+The shutdown case *used to be* this project's most common one in practice: a merge's `git pull`
+SIGTERMing an in-flight card. Since the drain (`ee0fe64`, `eca936f`) a stop waits for the card and
+`KillMode=mixed` keeps SIGTERM off the workers, so this path is now reached only past
+`drainTimeoutMs` (45 min).
 
 `orchestrator/orphan-scan.js` closes that remaining gap: every `state.json` snapshot now carries an
 `owner: {host, pid, lockStartedAt}` (set once, from `daemon.js`'s own lock holder), and a task
@@ -2155,8 +2161,11 @@ product-repo mutex (`orchestrator/product-repo-lock.js`, `config.js`'s own note 
 acquire it — WORKTREE's setup and FINISH's teardown already take the lock, the same `realWorktree`/
 `realFinish` code every driver runs (via `drainQueueOnce` for `driver: 'inline'`, via a real worker
 process for `driver: 'dispatcher'`). What recette adds on top is a coarser, earlier guard: refusing
-to *start* at all while a live daemon holds **its own** lock file, `<repoRoot>/journal/daemon.lock`
-(`orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
+to *start* at all while a live daemon holds **its own** lock file, `~/.spo-state/journal/daemon.lock`
+(`orchestrator/lock.js`). **This guard is currently DEAD — SPO-Pipeline#133.** `recette.js` still
+defaults `productJournalRoot` to `<repoRoot>/journal`, which the state move (`8d78b6c`) emptied, so
+the read finds nothing and the refusal never fires. Until #133 lands, check
+`systemctl --user is-active spo-pipeline-daemon.service` by hand before running recette — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
 whether a daemon is running at all before recette begins. Checked read-only (recette reads the
 lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does — it never
 calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly, for a
@@ -2232,8 +2241,15 @@ spawns nothing outside `/usr/bin`).
 The unit runs `--real` with auto-pull ON (5 min): installing it makes the daemon autonomous.
 Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` →
 `[Service]` / `Environment=SPO_AUTO_PULL_MS=0`. Stop:
-`systemctl --user stop spo-pipeline-daemon.service`. Re-run the installer after pulling
-daemon changes; it rebuilds nothing (no build step) and restarts.
+`systemctl --user stop spo-pipeline-daemon.service` — note that a stop **drains** (up to 45 min)
+rather than killing the card in flight, so the unit sits in `deactivating` and is not stuck.
+
+**Deploying is a `git pull` in `~/SPO-Pipeline`, not this installer.** Since `7ef4b48` the units run
+from the `~/.spo-current` release symlink and the post-merge hook cuts the release; re-run
+`scripts/daemon-install.sh` **only when the unit text itself changes** (it starts the daemon as a
+side effect). The generated unit carries `KillMode=mixed`, `TimeoutStopSec=2820` and
+`SuccessExitStatus=143 130`, none of which a pull updates. **`doc/operating.md` is the runbook** —
+this section is the shape, that file is the commands.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
 default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
@@ -2673,10 +2689,14 @@ node --test --test-timeout=30000 test/*.test.js
 ```
 
 From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, so the
-moment a parked card holds a product worktree under `~/.spo-worktrees/issue-<n>/` it walks into
-SPO-WebClient's own TypeScript suites and reports thousands of foreign failures — 1926 tests /
-1168 failures with four parked cards, none of them this repo's. `worktrees/` is gitignored, so
-`git status` stays clean and the result reads as a catastrophic regression in code that is fine.
+moment another agent worktree exists under `.claude/worktrees/<slug>/` it walks into that
+worktree's own `test/` and runs it on top of this one — 12 such worktrees on this box today.
+**The original reason no longer applies and the rule still does:** until `769eac5` the product
+worktrees sat under the repo too, and bare discovery walked into SPO-WebClient's TypeScript suites
+(1926 tests / 1168 failures with four parked cards, none of them this repo's); they now live in
+`~/.spo-worktrees`, outside the repo, out of discovery's reach. Either way the extra worktrees are
+untracked or ignored, so `git status` stays clean and the result reads as a catastrophic regression
+in code that is fine.
 `--test-timeout=30000` bounds a single test that hangs instead of letting the whole run stall
 (`doc/remediation-progress.md` pins the reference count at this invocation). **When reading the
 result — mutation testing especially — check `# fail` AND `# cancelled`, never `# fail` alone.**
