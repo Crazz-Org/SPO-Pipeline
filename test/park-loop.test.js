@@ -1222,6 +1222,118 @@ test('unparkScan: action 5.1b -- an `abandon` reply in the SAME cycle as a recon
   );
 });
 
+test('unparkScan: action 5.1b -- a write that lands on state.json DURING the issue-read gh api call survives the reconciler\'s write (card #83.1)', async () => {
+  // reconcileExternalClosure reads `state` once, at the top of unparkScan's loop iteration, then
+  // makes one or two BLOCKING `gh api` calls before it ever writes back. A genuinely separate OS
+  // process -- a live worker mid-IMPLEMENT -- can write state.json in that window; spreading the
+  // loop-top snapshot at the end (`{ ...state, externallyResolved }`) would silently revert that
+  // write, the same class of bug the abandon-in-the-same-cycle test above pins on the other write
+  // site in this same file. The fake `gh api` handler below writes to state.json itself, from
+  // inside the issue-read branch, to reproduce the interleave deterministically -- no sleep, no
+  // second process, no race. This fixture carries no `prNumber`, so it only exercises the FIRST
+  // (issue) call's window -- the sibling test right below covers the second (PR) call's window,
+  // which a re-read placed between the two calls would still pass this one alone.
+  const queueDir = mkTmp('spo-reconcile-queue-concurrent-');
+  const journalRoot = mkTmp('spo-reconcile-journal-concurrent-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-concurrent', { issue: 701, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/701$/.test(args[1])) {
+        // Simulate a live worker's write landing WHILE this (blocking, in the real world) call is
+        // in flight -- before reconcileExternalClosure ever gets to its own writeState below.
+        const onDisk = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+        writeState(taskDir, { ...onDisk, ownerPid: 54321, concurrentWrite: 'from-a-live-worker' });
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T02:00:00Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.ownerPid, 54321, 'the concurrent write must survive the reconciler\'s own writeState');
+  assert.equal(state.concurrentWrite, 'from-a-live-worker');
+  assert.ok(state.externallyResolved, 'and the reconcile itself must still land');
+  assert.equal(state.externallyResolved.via, 'issue-closed');
+});
+
+test('unparkScan: action 5.1b -- a write that lands on state.json DURING the PR-read gh api call (the 443 shape) also survives the reconciler\'s write (card #83.1)', async () => {
+  // Same property as the test above, but for the SECOND blocking `gh api` call -- the conditional
+  // PR read that only fires once the issue already came back closed AND state.prNumber is set (the
+  // 443 shape). A re-read hoisted to sit between the two calls -- after the issue read, before
+  // `if (state.prNumber)` -- would pass the issue-window test above yet still lose a write that
+  // lands during THIS call, because it would have already re-read (and moved past) the point where
+  // this write happens. This fixture pins that window specifically.
+  const queueDir = mkTmp('spo-reconcile-queue-concurrent-pr-');
+  const journalRoot = mkTmp('spo-reconcile-journal-concurrent-pr-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-concurrent-pr', { issue: 702, commentId: 100, prNumber: 555 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/702$/.test(args[1])) {
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T02:00:00Z' }));
+      }
+      if (command === 'gh' && args[0] === 'api' && /\/pulls\/555$/.test(args[1])) {
+        // Simulate a live worker's write landing WHILE this second (blocking, in the real world)
+        // call is in flight -- after the issue read already succeeded, before reconcileExternalClosure
+        // ever gets to its own writeState below.
+        const onDisk = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+        writeState(taskDir, { ...onDisk, ownerPid: 98765, concurrentWrite: 'from-a-live-worker-during-pr-read' });
+        return ok(JSON.stringify({ merged_at: '2026-08-30T02:05:00Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.ownerPid, 98765, 'the concurrent write during the PR read must survive the reconciler\'s own writeState');
+  assert.equal(state.concurrentWrite, 'from-a-live-worker-during-pr-read');
+  assert.ok(state.externallyResolved, 'and the reconcile itself must still land');
+  assert.equal(state.externallyResolved.via, 'pr-merged');
+  assert.equal(state.externallyResolved.mergedAt, '2026-08-30T02:05:00Z');
+});
+
+test('unparkScan: action 5.1b -- a missing/unparsable state.json at re-read time falls back to the loop-top snapshot, preserving id/state/reason (card #83.1)', async () => {
+  // The re-read is `readJsonSafe(...) || state`, not a bare re-read: `writeState` itself is an
+  // atomic tmp-write + rename (journal.js's writeState), so a torn read is not reachable through
+  // this pipeline's own writers, but the fallback is still load-bearing if state.json is ever
+  // missing or corrupt at the exact instant of this re-read (e.g. hand-edited, or removed by an
+  // external tool). Without `|| state`, the write below would collapse to `{externallyResolved}`
+  // alone -- losing `id`/`state`/`reason` -- and unparkScan's own loop-top filter would then skip
+  // the task forever (`state.state` undefined), and `spo parked` would lose the row.
+  const queueDir = mkTmp('spo-reconcile-queue-missing-state-');
+  const journalRoot = mkTmp('spo-reconcile-journal-missing-state-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-missing-state', { issue: 703, commentId: 100 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok('[]');
+      if (command === 'gh' && args[0] === 'api' && /\/issues\/703$/.test(args[1])) {
+        // Corrupt state.json DURING the blocking issue-read call, so the re-read that happens
+        // right before writeState below hits unparsable JSON, not a normal snapshot.
+        fs.writeFileSync(path.join(taskDir, 'state.json'), 'not valid json{{{');
+        return ok(JSON.stringify({ state: 'closed', closed_at: '2026-08-30T02:10:00Z' }));
+      }
+      return ok('[]');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.id, 'card-missing-state', 'the loop-top snapshot\'s id must survive an unparsable on-disk file');
+  assert.equal(state.state, 'PARKED', 'and its state.state, or unparkScan\'s own loop-top filter drops this task forever');
+  assert.equal(state.reason, 'worktree-npm-ci-failed');
+  assert.ok(state.externallyResolved, 'the reconcile itself must still land');
+  assert.equal(state.externallyResolved.via, 'issue-closed');
+});
+
 test('unparkScan: action 5.1b -- the 443 shape: PARKED with a prNumber, issue closed, PR merged -> via "pr-merged" carrying the PR\'s own merged_at', async () => {
   const queueDir = mkTmp('spo-reconcile-queue-443pr-');
   const journalRoot = mkTmp('spo-reconcile-journal-443pr-');

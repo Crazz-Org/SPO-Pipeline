@@ -734,11 +734,12 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // collide with every OTHER keyless retry for this task. As of this fix that fallback is DEAD IN
 // PRODUCTION -- it exists purely as a never-throw backstop for a hypothetical future third caller
 // that forgets to pass a key, not as a path either real call site is expected to take. It must
-// stay dead-code-safe regardless: this function has no try/catch, neither of its two call sites
-// does, and neither does `runScanCycle` -- a throw here kills the scanner process, so the fallback
-// must never throw. A future caller that omits `key` gets today's non-idempotent-but-harmless
-// behaviour silently, with no test watching for it -- that is an accepted residual risk, not an
-// oversight.
+// stay dead-code-safe regardless: this function has no try/catch, its `unparkScan` call site has
+// none (finalizePark's, in state-machine.js, does wrap its own call in one -- 'transient-retry-
+// failed' on catch), and neither does `runScanCycle` -- so a throw on the unparkScan path still
+// kills the scanner process, and the fallback must never throw. A future caller that omits `key`
+// gets today's non-idempotent-but-harmless behaviour silently, with no test watching for it --
+// that is an accepted residual risk, not an oversight.
 //
 // The key segment is zero-padded to a fixed width of 20 because `listQueueFiles` sorts by plain
 // filename string, not numeric value: unpadded, `0000-retry-9-x` sorts AFTER `0000-retry-10-x`.
@@ -1193,7 +1194,12 @@ function reconcileExternalClosure(deps, config, taskDir, task, state) {
     mergedAt,
     at: new Date().toISOString(),
   };
-  writeState(taskDir, { ...state, externallyResolved });
+  // Re-read state.json rather than spreading the `state` snapshot passed in at the top of the
+  // caller's loop iteration: the two blocking `gh api` calls above give a live worker (or, same
+  // shape as the ABANDONED path a few lines down, an abandon reply landing in this same cycle)
+  // a window to write state.json while this function is off talking to GitHub. Spreading the
+  // stale snapshot would silently revert that write; re-reading here keeps it.
+  writeState(taskDir, { ...(readJsonSafe(path.join(taskDir, 'state.json')) || state), externallyResolved });
   journal('reconciled-externally', externallyResolved);
 }
 
