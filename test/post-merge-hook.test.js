@@ -38,7 +38,7 @@ const DASHBOARD = 'spo-pipeline-dashboard.service';
  * `installed`, `active` and `enabled` are unit-name lists; they are independent on purpose,
  * because in the real world they are -- that independence is the whole bug.
  */
-function runHook({ installed = [], active = [], enabled = [], restartFails = [] } = {}) {
+function runHook({ installed = [], active = [], enabled = [], restartFails = [], states = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-post-merge-'));
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
@@ -47,16 +47,31 @@ function runHook({ installed = [], active = [], enabled = [], restartFails = [] 
   fs.writeFileSync(
     path.join(bin, 'systemctl'),
     `#!/usr/bin/env bash
-# Drops the --user flag, then dispatches on the verb.
+# Drops the leading flags, then dispatches on the verb. --no-block is dropped here the same
+# way --user is, and RECORDED separately below: the hook must pass it on a restart (a daemon
+# stop drains in-flight cards, up to 45 min, and without it that wait lands on the
+# maintainer's terminal in the middle of a git pull), so a test that merely tolerated it
+# would let the flag be dropped again in silence.
 args=()
-for a in "$@"; do [ "$a" = "--user" ] || args+=("$a"); done
+noblock=no
+for a in "$@"; do
+  case "$a" in
+    --user) ;;
+    --no-block) noblock=yes ;;
+    *) args+=("$a") ;;
+  esac
+done
 verb="\${args[0]:-}"
 unit="\${args[1]:-}"
-echo "$verb $unit" >> ${JSON.stringify(log)}
+echo "$verb $unit noblock=$noblock" >> ${JSON.stringify(log)}
 contains() { case " $1 " in *" $2 "*) return 0;; esac; return 1; }
 case "$verb" in
   list-unit-files) contains ${JSON.stringify(installed.join(' '))} "$unit" ;;
-  is-active)       contains ${JSON.stringify(active.join(' '))} "$unit" ;;
+  is-active)       if contains ${JSON.stringify(active.join(' '))} "$unit"; then echo active; exit 0; fi
+                   for pair in ${JSON.stringify(Object.entries(states).map(([u, st]) => `${u}:${st}`).join(' '))}; do
+                     if [ "\${pair%%:*}" = "$unit" ]; then echo "\${pair#*:}"; exit 3; fi
+                   done
+                   echo inactive; exit 3 ;;
   is-enabled)      contains ${JSON.stringify(enabled.join(' '))} "$unit" ;;
   restart)         contains ${JSON.stringify(restartFails.join(' '))} "$unit" && exit 1; exit 0 ;;
   *) exit 2 ;;
@@ -79,8 +94,10 @@ esac
   }
 
   const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
-  const restarted = calls.filter(l => l.startsWith('restart ')).map(l => l.split(' ')[1]);
-  return { restarted, calls, stdout, status };
+  const restartCalls = calls.filter(l => l.startsWith('restart '));
+  const restarted = restartCalls.map(l => l.split(' ')[1]);
+  const restartedBlocking = restartCalls.filter(l => l.endsWith('noblock=no')).map(l => l.split(' ')[1]);
+  return { restarted, restartedBlocking, calls, stdout, status };
 }
 
 test('restarts a unit that is running but disabled -- the 2026-09-03 deploy hole', () => {
@@ -167,4 +184,44 @@ test('never gates on is-enabled alone -- that is the defect, and it must not com
     guard.some(l => l.includes('is-active')),
     'the hook asks whether the unit is running, not only whether it starts at boot',
   );
+});
+
+test('a restart is --no-block, so a draining daemon does not hold up the pull', () => {
+  // Since the drain landed, `systemctl restart` waits for the stop, and a stop legitimately
+  // takes as long as the in-flight cards do -- up to config.js's drainTimeoutMs (45 min).
+  // Without --no-block that wait happens inside `git pull`. The deploy is asynchronous either
+  // way; this only decides whether the maintainer's terminal is held hostage by it.
+  const r = runHook({ installed: [DAEMON, DASHBOARD], active: [DAEMON, DASHBOARD], enabled: [] });
+  assert.deepStrictEqual(r.restarted, [DAEMON, DASHBOARD]);
+  assert.deepStrictEqual(r.restartedBlocking, [], 'a restart was issued without --no-block');
+});
+
+test('an installed-but-stopped unit is skipped OUT LOUD, not in silence', () => {
+  // The state the daemon was in on 2026-09-05: stopped on purpose (and, before the
+  // SuccessExitStatus fix, `failed` on every deliberate stop). Skipping it is correct --
+  // nothing is running stale code. Saying nothing about it is not: the pull then printed a
+  // dashboard restart and looked exactly like a deploy that had covered both units.
+  const r = runHook({ installed: [DAEMON, DASHBOARD], active: [DASHBOARD], enabled: [DASHBOARD] });
+  assert.deepStrictEqual(r.restarted, [DASHBOARD]);
+  assert.match(r.stdout, new RegExp(`SKIPPING ${DAEMON.replace('.', '\\.')}`));
+  assert.strictEqual(r.status, 0);
+});
+
+test('a unit still DRAINING is reported as already in flight, not skipped', () => {
+  // Since the drain landed, a stop legitimately takes up to TimeoutStopSec=2820 and the unit sits
+  // in `deactivating` for the whole of it. `is-active` exits non-zero for that state, so the old
+  // gate read it as "neither active nor enabled" and skipped -- during a window that used to be
+  // 90s and is now the better part of an hour. It is not a skip: a restart is already queued
+  // behind the stop, and its start execs from WorkingDirectory, so it picks up this merge too.
+  const r = runHook({ installed: [DAEMON], active: [], enabled: [], states: { [DAEMON]: 'deactivating' } });
+  assert.deepStrictEqual(r.restarted, []);
+  assert.match(r.stdout, /deactivating -- a restart is already in flight/);
+  assert.doesNotMatch(r.stdout, /SKIPPING/);
+  assert.strictEqual(r.status, 0);
+});
+
+test('an inactive unit is still skipped out loud -- deactivating is the only new case', () => {
+  const r = runHook({ installed: [DAEMON], active: [], enabled: [], states: { [DAEMON]: 'inactive' } });
+  assert.deepStrictEqual(r.restarted, []);
+  assert.match(r.stdout, new RegExp(`SKIPPING ${DAEMON.replace('.', '\\.')}`));
 });

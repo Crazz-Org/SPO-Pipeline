@@ -90,8 +90,9 @@ daemon and dashboard keep executing the code they started with. Go to the main c
 `spo-pipeline-dashboard.service` if either is active *or* enabled. The pull is what deploys; the
 merge is not, and neither is a worktree's own pull.
 
-**Check for an in-flight card first.** The restart SIGTERMs any running `claude` step and parks
-that card `llm-transport-failed:<STEP>`. Stop the daemon, pull, restart — or wait for the card.
+**A restart now DRAINS** (`doc/deployment.md`): it stops claiming, lets the cards in flight finish
+— up to `config.drainTimeoutMs`, 45 min — then exits 0. A second signal stops immediately. So a
+pull no longer kills a card, it delays the deploy; only a card past the bound is cut.
 `systemctl --user mask` does not work here (the units are real files); just re-run
 `systemctl --user stop spo-pipeline-daemon.service` after the pull if you needed it down.
 
