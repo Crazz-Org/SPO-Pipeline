@@ -1395,7 +1395,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
-  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
   "orchestrator/park-loop.js :: intake.js:796-798",
   "orchestrator/state-machine.js :: run.ts:63",
