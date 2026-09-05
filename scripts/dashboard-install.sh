@@ -23,7 +23,7 @@ PORT="${SPO_DASHBOARD_PORT:-8090}"
 # node is not in /usr/bin still produces a working unit.
 NODE_BIN="$(command -v node)"
 
-echo "== dashboard repo: $REPO"
+echo "== source checkout: $REPO  (the service runs from $CURRENT_LINK, never from here)"
 echo "== node: $NODE_BIN"
 echo "== port: $PORT"
 
