@@ -123,6 +123,11 @@ const DEFAULT_CRASH_LIMIT = 3;
 // createDispatcher a config object that omits the field entirely (config.js's own shipped default
 // never does); same fallback posture as DEFAULT_CRASH_LIMIT above.
 const DEFAULT_SCANNER_HEALTHY_UPTIME_MS = 60 * 1000;
+// Mirrors config.js's own drainTimeoutMs default -- see that field's comment for the measurement
+// (56 real card runs out of journal/daemon.jsonl) behind the number. Only reached if a caller
+// hands createDispatcher a config that omits the field entirely; same fallback posture as
+// DEFAULT_CRASH_LIMIT above.
+const DEFAULT_DRAIN_TIMEOUT_MS = 45 * 60 * 1000;
 
 function resolveWorkerCount(config) {
   const raw = config && config.workers;
@@ -153,6 +158,17 @@ function resolveScannerCrashLimit(config) {
 // default before reaching here) falls back to DEFAULT_SCANNER_HEALTHY_UPTIME_MS rather than 0 --
 // 0 would mean "every crash is healthy", i.e. consecutiveScannerCrashes could never exceed 1 and
 // the breaker this action exists to keep honest would never trip at all.
+// How long run()'s drain is willing to wait for the cards already in flight. Same override
+// posture as the resolvers above with ONE deliberate difference: 0 is a MEANINGFUL value here, not
+// a malformed one. `SPO_DRAIN_TIMEOUT_MS=0` turns the drain off and restores the pre-drain
+// behaviour exactly (requestDrain refuses, daemon.js's handler exits 143 on the spot), which is
+// the setting a box wants if a drain ever misbehaves -- so only a NON-FINITE or NEGATIVE value
+// falls back to config.js's default.
+function resolveDrainTimeoutMs(config) {
+  const raw = config && config.drainTimeoutMs;
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DRAIN_TIMEOUT_MS;
+}
+
 function resolveScannerHealthyUptimeMs(config) {
   const raw = config && config.scannerHealthyUptimeMs;
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SCANNER_HEALTHY_UPTIME_MS;
@@ -381,6 +397,22 @@ function createDispatcher(queueDir, journalRoot, config) {
   // action closes.
   let totalScannerCrashes = 0;
   let stopReason = null;
+  // Set by killAllChildren, read by handleExit/handleScannerExit. It used to be `stopReason` that
+  // answered "did WE kill this child?", and once a DRAIN exists the two stop being the same
+  // question: a drain sets stopReason and then waits, minutes, WITHOUT signalling any worker. A
+  // genuine crash inside that window must still be reparked and still count toward the breaker --
+  // keying on stopReason would silently defer every one of them to the next start's orphanScan
+  // (`task-orphaned-daemon-restart`, terminal, needs a human `retry`) instead of the ordinary
+  // crash repark. `killAllChildren` sets this BEFORE it signals anything, so no exit it causes can
+  // ever be observed with the flag still false.
+  let childrenSignalled = false;
+  // Non-null once a drain has been requested: {signal, at}. Distinct from stopReason (which a
+  // circuit breaker also sets) because only a drain makes run() WAIT instead of killing.
+  let drainRequest = null;
+  // Resolves the current loop iteration's wake promise -- see run()'s own race. Without it a drain
+  // request waits out the full pollIntervalMs before the loop even notices, which is harmless for
+  // a 5s poll and needless when the answer is already known.
+  let wakeLoop = null;
   let scanner = null; // {pid, startedAtMonotonicMs} of the one live scanner child, or null while none is running
 
   // Publishes the CURRENT set of task-owning worker ids to <journalRoot>/live-workers.json
@@ -400,6 +432,7 @@ function createDispatcher(queueDir, journalRoot, config) {
   // the scanner existed to supervise as well -- daemon.js's exit hook calls this one name for
   // both kinds of child now.
   function killAllChildren(signal = 'SIGTERM') {
+    childrenSignalled = true;
     for (const { pid } of live.values()) {
       if (!pid) continue;
       try {
@@ -409,12 +442,21 @@ function createDispatcher(queueDir, journalRoot, config) {
         // best-effort, same posture as lock.js's own release-on-exit.
       }
     }
-    if (scanner && scanner.pid) {
-      try {
-        process.kill(-scanner.pid, signal);
-      } catch {
-        // Same best-effort posture as the worker loop above.
-      }
+    killScanner(signal);
+  }
+
+  // The scanner ALONE. A drain kills it immediately and then waits for the workers, and the
+  // asymmetry is the whole point: the scanner is the only thing that puts NEW cards into the
+  // queue (auto-pull.js) and the only thing that re-enqueues parked ones (unparkScan). Leaving it
+  // alive through a drain would mean the daemon kept claiming work for a version of itself that
+  // is on its way out -- exactly the mixed-version window the drain exists to close. It owns no
+  // taskDir and holds no lock, so killing it costs a scan cycle and nothing else.
+  function killScanner(signal = 'SIGTERM') {
+    if (!scanner || !scanner.pid) return;
+    try {
+      process.kill(-scanner.pid, signal);
+    } catch {
+      // Same best-effort posture as the worker loop above.
     }
   }
 
@@ -485,10 +527,10 @@ function createDispatcher(queueDir, journalRoot, config) {
       signal: signal || null,
       outcome,
       ...(spawnError ? { spawnError: String((spawnError && spawnError.message) || spawnError) } : {}),
-      ...(stopReason && outcome === 'crashed' ? { duringShutdown: true } : {}),
+      ...(childrenSignalled && outcome === 'crashed' ? { duringShutdown: true } : {}),
     });
 
-    if (stopReason && outcome === 'crashed') {
+    if (childrenSignalled && outcome === 'crashed') {
       // Expected, not a crash to count or repark over -- see the header comment above. Counting
       // it would also let a shutdown's own killAllChildren inflate `consecutiveCrashes` past the
       // limit and rewrite an already-decided `stopReason` (e.g. a maintainer's `stop()`
@@ -521,7 +563,10 @@ function createDispatcher(queueDir, journalRoot, config) {
           error: String((err && err.message) || err),
         });
       }
-      if (consecutiveCrashes >= crashLimit) {
+      if (consecutiveCrashes >= crashLimit && !stopReason) {
+        // `!stopReason`: a crash landing inside a drain window must not rewrite the drain's own
+        // reason as a breaker trip that never decided anything. The dispatcher is already
+        // stopping; the only effect would be to lie in the journal about why.
         stopReason = { reason: 'worker-crash-circuit-breaker', consecutiveCrashes, crashLimit, lastId: id };
       }
     }
@@ -817,18 +862,89 @@ function createDispatcher(queueDir, journalRoot, config) {
       // spawnScanner above has run, so Promise.race([sleep, ...pending]) is never racing an
       // empty second argument in practice -- the `pending.size > 0` guard stays anyway, both for
       // defensiveness and because a test can inject a `spawn` that never actually adds anything.
-      const race = [sleep(config.pollIntervalMs)];
+      const race = [sleep(config.pollIntervalMs), new Promise((resolve) => { wakeLoop = resolve; })];
       if (pending.size > 0) race.push(Promise.race(pending));
       await Promise.race(race);
+      wakeLoop = null;
     }
 
-    // Circuit breaker tripped -- shut down the same way an external SIGTERM would: signal every
-    // live child's process group and let them go, then let run() return so the caller (daemon.js)
-    // can release the lock and exit non-zero. Awaited so a caller that logs `stopReason` and exits
-    // right after this resolves is not racing this cleanup.
+    // THE DRAIN. Reached only when a signal asked for one (requestDrain); a circuit-breaker trip
+    // falls straight past it into the kill below, unchanged. By the time control gets here
+    // requestDrain has already stopped the claiming half -- stopReason broke the loop above, so
+    // fillSlots runs no more, and the scanner (the only producer of new queue entries) is dead --
+    // so every worker still in `live` is one that was already mid-card when the signal landed.
+    // Waiting for them is what converts "the deploy killed a card" into "the deploy took a few
+    // more minutes", with no new infrastructure and no change to what a card does.
+    if (drainRequest) {
+      const inFlight = [...live.keys()];
+      const timeoutMs = resolveDrainTimeoutMs(config);
+      appendDaemonEvent(journalRoot, 'dispatcher-drain-start', {
+        signal: drainRequest.signal || null,
+        timeoutMs,
+        inFlight,
+      });
+      const waitedMs = await awaitInFlight(timeoutMs);
+      const survivors = [...live.keys()];
+      appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {
+        drained: survivors.length === 0,
+        waitedMs,
+        survivors,
+      });
+      stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };
+    }
+
+    // Circuit breaker tripped, or the drain's bound expired -- shut down the same way an external
+    // SIGTERM would: signal every live child's process group and let them go, then let run()
+    // return so the caller (daemon.js) can release the lock and exit. Unconditional even after a
+    // clean drain: `live` being empty does not prove the SCANNER is gone (a drain kills it but
+    // never waits for it, and it takes no taskDir with it), and signalling an already-dead group
+    // is a no-op this function has always tolerated. Awaited so a caller that logs `stopReason`
+    // and exits right after this resolves is not racing this cleanup.
     killAllChildren('SIGTERM');
     await Promise.allSettled(pending);
     return stopReason;
+  }
+
+  // Waits for `live` to empty, up to timeoutMs; returns how long it actually waited. Woken by any
+  // child's exit, not merely by the poll -- so a card that finishes one second into a 45-minute
+  // bound ends the drain one second in, and a `systemctl restart` on an IDLE daemon costs nothing
+  // at all. Measured on the elapsed clock (monotonicNowMsFn, the same seam the scanner breaker
+  // uses), never Date.now(): a bound that a clock step could double or erase is not a bound.
+  async function awaitInFlight(timeoutMs) {
+    const startedAt = monotonicNowMsFn();
+    const elapsed = () => monotonicNowMsFn() - startedAt;
+    while (live.size > 0) {
+      const remaining = timeoutMs - elapsed();
+      if (remaining <= 0) break;
+      const race = [sleep(Math.min(remaining, config.pollIntervalMs))];
+      if (pending.size > 0) race.push(Promise.race(pending));
+      await Promise.race(race);
+    }
+    return elapsed();
+  }
+
+  // Asks for a drain instead of the immediate kill daemon.js's signal handler used to perform.
+  // Returns false if one is already under way, and that return value is the operator's escape
+  // hatch, not an error case: daemon.js turns a SECOND signal into the old immediate exit, so a
+  // maintainer who does not want to wait out the bound sends SIGTERM twice (`systemctl kill -s
+  // TERM ...` after the `stop`) and gets today's behaviour exactly.
+  //
+  // Kills the scanner HERE rather than in run()'s drain block, and the ordering matters: between
+  // the signal landing and the loop noticing stopReason there is one poll interval in which
+  // auto-pull could otherwise claim a fresh card off the board and hand it to a worker this
+  // process is about to abandon.
+  function requestDrain(detail = {}) {
+    if (drainRequest) return false;
+    // Drain disabled -- refuse, and let daemon.js's handler do what it did before this existed.
+    if (resolveDrainTimeoutMs(config) <= 0) return false;
+    drainRequest = { signal: detail.signal || null, at: monotonicNowMsFn() };
+    if (!stopReason) stopReason = { reason: 'drain-requested', signal: drainRequest.signal };
+    killScanner('SIGTERM');
+    if (wakeLoop) {
+      wakeLoop();
+      wakeLoop = null;
+    }
+    return true;
   }
 
   // Cooperative, non-forceful stop request -- distinct from killAllChildren (which signals
@@ -843,7 +959,7 @@ function createDispatcher(queueDir, journalRoot, config) {
     if (!stopReason) stopReason = reason || { reason: 'stop-requested' };
   }
 
-  return { run, killAllChildren, stop };
+  return { run, killAllChildren, stop, requestDrain };
 }
 
 module.exports = {

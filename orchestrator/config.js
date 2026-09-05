@@ -53,6 +53,11 @@ const STEP_DEADLINE_MS = 120000;
 // the CI_CHECKS deadline can be derived from the poll budget instead of hand-synchronised.
 const CI_CHECKS_MAX_POLLS =
   process.env.SPO_CI_CHECKS_MAX_POLLS !== undefined ? Number(process.env.SPO_CI_CHECKS_MAX_POLLS) : 30;
+// Env override for the drain bound below. 0 is meaningful (drain off, pre-drain behaviour
+// restored) -- see that field's comment, and dispatcher.js's resolveDrainTimeoutMs, for why only a
+// non-finite or negative value falls back to the default rather than 0 doing so.
+const DRAIN_TIMEOUT_MS =
+  process.env.SPO_DRAIN_TIMEOUT_MS !== undefined ? Number(process.env.SPO_DRAIN_TIMEOUT_MS) : 45 * 60 * 1000;
 const CI_CHECKS_POLL_INTERVAL_MS =
   process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS !== undefined
     ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
@@ -444,6 +449,27 @@ module.exports = {
   commandTimeoutsMs: COMMAND_TIMEOUTS_MS,
 
   // Poll interval for daemon.js when run without --once (queue watch mode).
+  // How long a drain (dispatcher.js's requestDrain, reached from daemon.js's SIGTERM/SIGINT
+  // handler) waits for the cards already in flight before signalling them anyway. The claiming
+  // half stops immediately either way; this bound governs only the waiting half.
+  //
+  // 45 MINUTES, AND THE NUMBER IS MEASURED, NOT CHOSEN. 56 worker-spawn -> worker-exit pairs in
+  // journal/daemon.jsonl (the whole recorded history at the time of writing) run: p50 22.9 min,
+  // p75 33.7, p90 43.1, p95 45.7, max 56.2. A card is not a "few minutes" of work, and a bound
+  // picked from that intuition would have killed the median card. 45 min is the p95: 19 cards in
+  // 20 survive a deploy untouched, and the twentieth dies exactly where it died before this
+  // existed -- a drain can never be worse than the kill it replaces, only slower.
+  //
+  // TWO THINGS MUST TRACK THIS NUMBER, and neither is in this file:
+  //   - the unit's TimeoutStopSec (scripts/daemon-install.sh). systemd SIGKILLs the whole cgroup
+  //     when its own stop timeout expires, so a TimeoutStopSec below this bound does not shorten
+  //     the drain, it DELETES it -- and a SIGKILL is strictly worse than the SIGTERM this replaces
+  //     (no park, no worktree WIP preserved, recovery deferred to the next start's orphanScan).
+  //   - the post-merge hook's `systemctl restart --no-block`. Without --no-block a `git pull`
+  //     blocks the maintainer's terminal for as long as this bound allows.
+  // A maintainer who does not want to wait sends the signal a second time (see requestDrain);
+  // SPO_DRAIN_TIMEOUT_MS=0 disables the drain entirely and restores the pre-drain behaviour.
+  drainTimeoutMs: DRAIN_TIMEOUT_MS,
   pollIntervalMs: 5000,
 
   // ---- action 6.3: the dispatcher (orchestrator/dispatcher.js) --------------------------
