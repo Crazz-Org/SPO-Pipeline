@@ -116,3 +116,74 @@ test('daemon-install.sh: the rate limit is the one that actually bounds Restart=
       'the burst is unreachable and Restart=always never stops'
   );
 });
+
+// ---- the drain's two systemd halves -------------------------------------------------------------
+
+test('daemon-install.sh: a deliberate stop is not a failure -- SuccessExitStatus covers 143 and 130', () => {
+  const parsed = sections(unitTemplate());
+  const hit = parsed.Service.find((l) => l.startsWith('SuccessExitStatus='));
+  assert.ok(hit, 'no SuccessExitStatus -- every deliberate stop leaves this unit `failed`');
+  const codes = hit.slice('SuccessExitStatus='.length).trim().split(/\s+/);
+  // daemon.js's handlers exit 143 on SIGTERM and 130 on SIGINT once a drain's bound expires or a
+  // second signal arrives. Without these, `systemctl stop` leaves ActiveState=failed -- measured
+  // on this box on 2026-09-05 (ExecMainStatus=143, Result=exit-code, UnitFileState=disabled) --
+  // and scripts/git-hooks/post-merge, which gates on `is-active OR is-enabled`, then skips the
+  // unit on the next pull. Silently, before the same change taught it to say so.
+  assert.ok(codes.includes('143'), 'SIGTERM (143) is not declared a success exit');
+  assert.ok(codes.includes('130'), 'SIGINT (130) is not declared a success exit');
+});
+
+test('daemon-install.sh: TimeoutStopSec leaves room for the whole drain, or the drain is deleted', () => {
+  const parsed = sections(unitTemplate());
+  const hit = parsed.Service.find((l) => l.startsWith('TimeoutStopSec='));
+  assert.ok(hit, 'no TimeoutStopSec -- systemd defaults to 90s and SIGKILLs the drain at 1m30s');
+  const stopSec = Number(hit.slice('TimeoutStopSec='.length));
+  assert.ok(Number.isFinite(stopSec) && stopSec > 0, 'TimeoutStopSec must be a positive number of seconds');
+
+  // The number is read out of config.js's SOURCE TEXT, not required from it: recomputing an
+  // expectation from the value under test pins nothing (test/doc-constant-sweep.test.js's own
+  // lesson, paid for twice in this repo). If the default is ever expressed differently this
+  // assertion fails loudly rather than silently checking a `null`.
+  const configSrc = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'config.js'), 'utf8');
+  const m = /SPO_DRAIN_TIMEOUT_MS[\s\S]{0,160}?:\s*(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+);/.exec(configSrc);
+  assert.ok(m, 'config.js no longer states the drain default as `N * N * N` -- update this guard');
+  const drainSec = (Number(m[1]) * Number(m[2]) * Number(m[3])) / 1000;
+  const g = /SPO_DRAIN_KILL_GRACE_MS[\s\S]{0,160}?:\s*(\d+)\s*\*\s*(\d+);/.exec(configSrc);
+  assert.ok(g, 'config.js no longer states the kill-grace default as `N * N` -- update this guard');
+  const graceSec = (Number(g[1]) * Number(g[2])) / 1000;
+
+  // systemd SIGKILLs the whole cgroup when this expires. A SIGKILL is strictly WORSE than the
+  // SIGTERM the drain replaced -- no park, no worktree WIP preserved, recovery deferred to the
+  // next start's orphanScan -- so a stop timeout below the drain bound does not shorten the
+  // drain, it deletes it and replaces a bad outcome with a worse one.
+  // `>= drainSec` ALONE IS NOT THE PROPERTY, and pinning only that was a real hole: it passed with
+  // TimeoutStopSec exactly equal to the bound, i.e. ZERO time for the daemon to signal its
+  // stragglers, let them finish dying, escalate to SIGKILL and exit. That is the half of the drain
+  // that keeps the lock released and the parks written, and it would have been deleted silently.
+  assert.ok(
+    stopSec >= drainSec + graceSec,
+    `TimeoutStopSec=${stopSec}s leaves no room for the ${graceSec}s kill grace after the ${drainSec}s bound: ` +
+      'systemd would SIGKILL the cgroup while the daemon was still shutting down cleanly'
+  );
+  // And a named slack on top, so the reap and process exit are not racing the ceiling either.
+  assert.ok(
+    stopSec >= drainSec + graceSec + 30,
+    `TimeoutStopSec=${stopSec}s has under 30s of slack above drain (${drainSec}s) + grace (${graceSec}s)`
+  );
+});
+
+// ---- the heredoc is UNQUOTED, and that is a live hazard, not a style note ------------------------
+
+test('daemon-install.sh: the unit heredoc contains no command substitution', () => {
+  const body = unitTemplate();
+  // `cat > "$UNIT" <<UNITEOF` is deliberately unquoted -- it must expand $REPO, $NODE_BIN and
+  // $HOME. That also makes every unescaped backtick pair and every $(...) a COMMAND that runs at
+  // install time and pastes its output into the generated unit. This is not hypothetical: a
+  // comment reading "and `systemctl --user show` reported ..." ran `systemctl --user show` and
+  // spliced several hundred lines of manager properties into the [Service] section. It went
+  // unnoticed only because the installer had not been re-run since that comment was added.
+  const backticks = body.split('\n').filter((l) => /(^|[^\\])`/.test(l));
+  assert.deepEqual(backticks, [], 'unescaped backtick(s) in the unit heredoc -- command substitution at install time');
+  const dollarParen = body.split('\n').filter((l) => /(^|[^\\])\$\(/.test(l));
+  assert.deepEqual(dollarParen, [], 'unescaped $(...) in the unit heredoc -- command substitution at install time');
+});

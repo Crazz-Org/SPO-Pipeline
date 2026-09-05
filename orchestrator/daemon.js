@@ -82,9 +82,17 @@ const productRepoHold = require('./product-repo-hold');
 const { drainQueueOnce, runTask, runForever } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
-const { appendDaemonEvent } = require('./journal');
+const { appendDaemonEvent, appendEvent } = require('./journal');
 const { orphanScan } = require('./orphan-scan');
 const { createDispatcher } = require('./dispatcher');
+const { readPipelineVersion } = require('./pipeline-version');
+
+// Resolved once at require time, in EVERY mode (dispatcher, worker, scanner) -- see
+// pipeline-version.js's header. A worker resolves it from its own __dirname, which is the point:
+// dispatcher.js spawns `node <DAEMON_PATH>` off a path re-read at every spawn, so after a `git
+// pull` with no restart a NEW worker genuinely is a different version from the dispatcher that
+// spawned it, and each says so for itself rather than inheriting the other's claim.
+const PIPELINE_VERSION = readPipelineVersion();
 
 function parseArgs(argv) {
   const opts = {
@@ -189,6 +197,19 @@ function printUsage() {
 // refills and SIGTERM handling. A missing/unreadable/unparsable task.json is a usage error (2),
 // not a crash (1): the dispatcher handed this process a bad path, which is its own bug to fix,
 // not this task's to be reparked over.
+// The state the card is about to resume from, for the provenance line below and nothing else.
+// Best-effort by construction: a card taken fresh out of the queue has no state.json yet, and
+// INTAKE is where runTask starts it. Never throws -- a provenance line is not worth failing a
+// card over, which is the same posture pipeline-version.js itself takes.
+function readWorkerResumeState(taskDir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+    return (raw && raw.state) || 'INTAKE';
+  } catch {
+    return 'INTAKE';
+  }
+}
+
 async function runWorker(taskDirArg, config) {
   const taskDir = path.resolve(taskDirArg);
   const taskPath = path.join(taskDir, 'task.json');
@@ -211,6 +232,22 @@ async function runWorker(taskDirArg, config) {
   // dispatcher already renamed it into taskDir/task.json), so basename(taskDir) is the right
   // fallback, not basename(some .json file).
   const id = task && task.id ? String(task.id) : path.basename(taskDir);
+  // PER-CARD PROVENANCE, first line this worker writes and before runTask can park anything.
+  // "Which version of the pipeline produced this park?" is answered from the card's own journal
+  // after this, without having to correlate timestamps against daemon.jsonl and hope no deploy
+  // landed in between. `state` is the state the card is RESUMING from where state.json says so
+  // (a retry, an unpark, a crash recovery) -- appendEvent requires one, and the honest value is
+  // the card's own, not a constant.
+  //
+  // Written unconditionally, including when sha is null: "this checkout could not describe
+  // itself" is itself the fact a later reader needs, and a silently absent line would be
+  // indistinguishable from a worker that predates this event.
+  const resumeState = readWorkerResumeState(taskDir);
+  appendEvent(taskDir, resumeState, 'pipeline-version', {
+    sha: PIPELINE_VERSION.sha,
+    ref: PIPELINE_VERSION.ref,
+    pid: process.pid,
+  });
   const finalState = await runTask(id, task, taskDir, config);
   // runTask's own while-loop only ever exits on 'DONE' or 'PARKED' (see its header comment) --
   // anything else here would mean that contract broke, which is itself a bug worth surfacing
@@ -431,8 +468,50 @@ async function main() {
     if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');
     if (lock) lock.release();
   });
+  //
+  // DRAIN ON THE FIRST SIGNAL, IMMEDIATE EXIT ON THE SECOND. Until this, every signal was
+  // `process.exit(143)` on the spot and the exit hook above then SIGTERMed every worker's process
+  // group, so a deploy killed whatever card was in flight. `git pull` fires the post-merge hook,
+  // which restarts this unit, so that was not a rare path: it was the deploy path. Measured on
+  // 2026-09-05 at 04:23:43, one pull, two cards -- #517 parked `npm-run-timed-out` at MERGE and
+  // #515 `llm-transport-failed:PLAN` at PLAN.
+  //
+  // `process.on`, NOT `process.once`, and that is the difference that makes the escape hatch
+  // work: a `once` handler is removed after the first signal, so a SECOND SIGTERM would fall
+  // through to Node's default disposition and kill this process mid-anything, leaving the lock
+  // file behind for the next start to stale-sweep -- the exact race the registration order above
+  // exists to close. With `on`, the second signal is handled, exits cleanly, and the exit hook
+  // still runs.
+  //
+  // THE SECOND SIGNAL IS DETECTED BY requestDrain REFUSING, not by a counter here. The first cut
+  // carried a `signalCount > 1 ||` arm as well; mutation testing showed it was dead -- removing it
+  // left the whole suite green, because requestDrain already returns false once `drainRequest` is
+  // set, for every ordering (SIGTERM then SIGTERM, SIGINT then SIGTERM, and a first signal whose
+  // drain was refused outright by SPO_DRAIN_TIMEOUT_MS=0, which exits on that same first signal).
+  // Two mechanisms for one decision, one of them untestable because the other always got there
+  // first. Deleted rather than given a test it could not fail.
+  //
+  // A WORKER OR SCANNER IS UNCHANGED. `dispatcherHandle` is null in both (it is only ever
+  // assigned in the continuous-dispatcher branch), so both take the `process.exit` path exactly as
+  // before -- a worker that drained its own children would be waiting on the very `claude` call
+  // the deploy is trying to stop.
   for (const sig of ['SIGINT', 'SIGTERM']) {
-    process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143));
+    process.on(sig, () => {
+      const code = sig === 'SIGINT' ? 130 : 143;
+      // No dispatcher to drain (a --worker or --scanner: both leave dispatcherHandle null), or a
+      // drain refused -- already draining, i.e. this is the second signal, or
+      // SPO_DRAIN_TIMEOUT_MS=0. Every one of those is the pre-drain behaviour, unchanged.
+      if (!dispatcherHandle || !dispatcherHandle.requestDrain({ signal: sig })) {
+        process.exit(code);
+      }
+      // A drain started: run() is now waiting on the in-flight workers and will return on its
+      // own. Deliberately no process.exit here -- returning through main() is what lets the
+      // lock be released, the drain be journalled, and an honest exit code be chosen below.
+      console.error(
+        `orchestrator/daemon.js: ${sig} -- draining (no new cards claimed; in-flight cards finish, bounded by ` +
+          `config.drainTimeoutMs). Send ${sig} again to stop immediately.`
+      );
+    });
   }
 
   // Action 6.1: a worker never takes the single-instance lock. The dispatcher (action 6.3) holds
@@ -644,8 +723,27 @@ async function main() {
     // straight through drainQueueOnce, unaffected -- see CLAUDE.md's own instruction not to
     // touch either without checking every caller.
     const dispatcher = createDispatcher(queueDir, journalRoot, config);
-    dispatcherHandle = dispatcher; // read by the exit hook registered above, via closure
-    const stopReason = await dispatcher.run(); // resolves ONLY if the crash circuit breaker trips
+    dispatcherHandle = dispatcher; // read by the exit hook and the signal handlers above, via closure
+    // Resolves when the crash circuit breaker trips, OR when a signal-requested drain finishes.
+    const stopReason = await dispatcher.run();
+    if (stopReason && stopReason.reason === 'drain-requested') {
+      // A DRAIN IS NOT A FAILURE, and the exit code has to say so. This unit declares
+      // Restart=always with no SuccessExitStatus, so before the drain existed every deliberate
+      // stop left it `failed` -- and the post-merge hook gates on `is-active OR is-enabled`, so a
+      // `failed`, disabled unit was skipped in silence on the next pull: a deploy that restarted
+      // nothing and looked exactly like one that worked. 0 when every in-flight card finished;
+      // the signal's own code when the bound expired and stragglers had to be signalled after all
+      // (scripts/daemon-install.sh declares SuccessExitStatus=143 130 for that half).
+      const code = stopReason.signal === 'SIGINT' ? 130 : 143;
+      console.error(
+        `orchestrator/daemon.js: drained on ${stopReason.signal} after ${stopReason.waitedMs}ms -- ` +
+          (stopReason.drained
+            ? 'every in-flight card finished.'
+            : `bound expired with ${stopReason.survivors.length} card(s) still running (${stopReason.survivors.join(', ')}); signalling them.`)
+      );
+      process.exitCode = stopReason.drained ? 0 : code;
+      return;
+    }
     console.error(
       `orchestrator/daemon.js: dispatcher stopped itself -- ${JSON.stringify(stopReason)} -- ` +
         'exiting non-zero rather than repark-looping (see dispatcher.js\'s workerCrashLimit/scannerCrashLimit).'

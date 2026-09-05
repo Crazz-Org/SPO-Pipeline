@@ -43,6 +43,9 @@ this register and that rule now name the same surface. Full list:
   are JS, `scripts/daemon-install.sh`, `scripts/dashboard-install.sh`, `scripts/park-alert.sh`
   and `scripts/git-hooks/post-merge` are shell)
 - `accounts/spo-test-accounts.yml` (comment lines only — it is a config file, not a doc)
+- `.github/workflows/gate.yml` (comment lines only — a config file, but its 30 comment lines
+  state what the gate is and why a self-reported verdict is not one)
+- `CLAUDE.md` (repo root) — moved in on 2026-09-05, see below
 
 **Corrected into scope.** `scripts/` and `accounts/` were absent from both lists below in the
 prior version of this register — an undeclared, unnamed surface, not a considered exclusion. Root
@@ -51,6 +54,28 @@ itself omitted them, **so execution rule 6 carried the same blind spot and every
 under it was blind to these two directories.** The register was the symptom; the rule was the
 cause. **Both are now fixed**: execution rule 6 was amended on 2026-09-02 to add `scripts/` and
 `accounts/`, and records there why. The §7 grep below was re-run over the widened scope.
+
+**Corrected into scope, again — 2026-09-05.** Two more, by the same failure and one new one.
+`.github/` was in **neither** list: not in rule 6's scope, and not in the top-level check at the
+end of this section, whose closing sentence ("every top-level entry is now placed in exactly one
+bucket, with a reason") was therefore **false as written on 2026-09-02** — it enumerated thirteen
+entries and the repo root had fourteen. `CLAUDE.md` is the different case: it was a *declared*
+exclusion below, so nothing was hidden, but its reason expired. It was excluded as
+"harness-governed operational instructions, not product/process documentation"; on 2026-09-05 it
+gained a *Working a chantier* section restating execution rule 6 and the Sonnet-builds /
+Opus-verifies-with-mutation-testing loop from `doc/remediation-progress.md`, which is process
+documentation by any reading, and duplicated process documentation at that. **The lesson this
+register drew in 2026-09-02 needs widening: re-checking a scope list means re-checking each
+exclusion's *reason*, not only that every entry appears somewhere.** An entry can be correctly
+placed on the day it is placed and wrong a week later without anything moving it. Execution rule
+6 records the matching amendment.
+
+**What this amendment does *not* do:** the §3 line counts are **not** re-measured here, so
+`.github/workflows/gate.yml`'s 30 comment lines and `CLAUDE.md`'s lines are in scope but absent
+from every total below. Those totals stay pinned to `bb35942` and to 2026-09-02, as this file's
+header says a dated record must. The scope is corrected today; the arithmetic is stale until
+someone re-runs §2's commands over the widened corpus. Said here so the gap is declared rather
+than discovered — which is the whole purpose of this register.
 
 **This file itself** is classified-historical, by the same rule as §3b and by its own opening
 paragraph. Its line count is deliberately **not** added to the §3 totals: this register does not
@@ -65,11 +90,14 @@ register exists to prevent.
   comments" — never to tests), and not in 7bis.6's own sibling-grep list either. Test files
   assert against test fixtures and test intent, not product behaviour; a stale test comment is
   a test-maintenance problem, not a truthfulness-of-documentation problem this chantier owns.
-- **`CLAUDE.md`** (repo root) and **`.claude/**`** (`settings.json`, `hooks/*.sh`, `commands/`)
-  — also absent from 7bis.6's list. These are harness-governed operational instructions, not
-  product/process documentation, and per `CLAUDE.md` itself `.claude/settings.json` and
-  `.claude/hooks/*.sh` cannot even be edited by an agent — they are excluded from this corpus
-  the same way they are excluded from every action's write scope.
+- **`.claude/**`** (`settings.json`, `hooks/*.sh`, `commands/`) — absent from 7bis.6's list.
+  Harness-governed operational configuration, not product/process documentation, and per
+  `CLAUDE.md` itself `.claude/settings.json` and `.claude/hooks/*.sh` cannot even be edited by an
+  agent — excluded from this corpus the same way they are excluded from every action's write
+  scope. **`CLAUDE.md` was excluded here alongside them until 2026-09-05 and is now in scope**;
+  see "Corrected into scope, again" above for why that reason stopped holding. The two are no
+  longer one bucket: `CLAUDE.md` is prose a reader trusts, `.claude/**` is configuration an agent
+  cannot touch.
 - **Vendored or generated files** — this exclusion class is currently **empty**: there is no
   `node_modules/`, no build output, and no generated file checked into this repo (verified:
   `ls node_modules` fails, no `dist/`/`build/` directory exists). Named so the exclusion is
@@ -89,12 +117,17 @@ register exists to prevent.
   register partitions.
 
 **Top-level directory/file check (every entry in the repo root, verified against this tree):**
-`.claude` (excluded, harness-governed, above), `accounts` (in scope, new), `bin` (in scope,
-`bin/spo`), `console` (in scope), `doc` (in scope), `orchestrator` (in scope), `prompts` (in
-scope), `scripts` (in scope, new), `test` (excluded, above), `worktrees` (excluded, untracked,
-above), `CLAUDE.md` (excluded, above), `README.md` (in scope), `.gitignore` (excluded, above),
-`.recette` (excluded, untracked and absent from disk, above). Every top-level entry is now
-placed in exactly one bucket, with a reason.
+`.claude` (excluded, harness-governed, above), `.github` (in scope since 2026-09-05 —
+`gate.yml`'s comment lines; **it was missing from this check entirely until then**), `accounts`
+(in scope, added 2026-09-02), `bin` (in scope, `bin/spo`), `console` (in scope), `doc` (in scope),
+`orchestrator` (in scope), `prompts` (in scope), `scripts` (in scope, added 2026-09-02), `test`
+(excluded, above), `worktrees` (excluded, untracked, above), `CLAUDE.md` (**in scope since
+2026-09-05**, above), `README.md` (in scope), `.gitignore` (excluded, above), `.recette`
+(excluded, untracked and absent from disk, above). Every top-level entry is now placed in exactly
+one bucket, with a reason — a sentence this section already made once, on 2026-09-02, while
+omitting `.github`, so read it as the current claim and not as a guarantee that it is checked by
+anything. Derived with `git ls-files | awk -F/ '{if(NF==1) print $0; else print $1}' | sort -u`,
+which is the check that was missing.
 
 ## 2 · Measurement commands (reproducible)
 
@@ -428,7 +461,7 @@ artifact produced ~16,800, only to supersede it with a reproducible number.
 **Where `~16,800` and `~2,290` actually appear — see §7 for the corrected sibling-grep result.**
 The prior version of this section, and of §7, claimed both figures appear exactly once each,
 in the same 7bis.5 row of `doc/remediation-plan-2026-08.md`. That is true for `~2,290` but false
-for `~16,800`, which also appears at `doc/remediation-plan-2026-08.md:259`, in the "Chantier 7
+for `~16,800`, which also appears at `doc/remediation-plan-2026-08.md:273`, in the "Chantier 7
 bis — What Gate C7 certifies" preamble, stated in the present tense as a live premise. §7 now
 reports the real grep output.
 
@@ -518,11 +551,11 @@ single-occurrence result for both figures, and that claim was false for `~16,800
 ```
 $ grep -rn "16,800\|16800" doc/ prompts/ orchestrator/ bin/spo console/ README.md \
     | grep -v "^doc/accepted-gaps.md"
-doc/remediation-plan-2026-08.md:259:Yield was tracking newly-opened surface, not residual defects, and the surface is ~16,800 lines
+doc/remediation-plan-2026-08.md:273:Yield was tracking newly-opened surface, not residual defects, and the surface is ~16,800 lines
 
 $ grep -rn "2,290\|2290" doc/ prompts/ orchestrator/ bin/spo console/ README.md \
     | grep -v "^doc/accepted-gaps.md"
-doc/remediation-plan-2026-08.md:285:| 7bis.5 | **The accepted-gap register**, and the classification that retires ~2,290 lines without reading them. [...] |
+doc/remediation-plan-2026-08.md:299:| 7bis.5 | **The accepted-gap register**, and the classification that retires ~2,290 lines without reading them. [...] |
 ```
 
 (This register's own occurrences of both figures — referring to and superseding them across §0,
@@ -534,7 +567,7 @@ those self-references too — run it without the `grep -v` if you want to see th
 **Corrected result.** Excluding this register's own self-referential prose (out of its own
 corpus, §1), `~2,290` genuinely appears exactly once in that scope — in `doc/remediation-plan-2026-08.md`'s
 7bis.5 row, line 285, as the prior version of this section claimed. **`~16,800` does not:** it
-appears at `doc/remediation-plan-2026-08.md:259`, inside the "Chantier 7 bis — What Gate C7
+appears at `doc/remediation-plan-2026-08.md:273`, inside the "Chantier 7 bis — What Gate C7
 certifies" **preamble** — *"the surface is ~16,800 lines against a few thousand per pass"* —
 which is a **different sentence, a different paragraph, and a different argument** than the
 7bis.5 row 26 lines below it. Line 259 states the figure in the **present tense**, as a live

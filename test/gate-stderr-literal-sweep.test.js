@@ -35,6 +35,9 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+// Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
+// for the incident that makes this load-bearing rather than tidy.
+const { gitEnv } = require('./helpers');
 
 // Repo-wide guard, required before the first orchestrator require -- see test/no-real-spawn.js's
 // own header and test/no-real-spawn-sweep.test.js, which checks this ordering textually across
@@ -61,7 +64,7 @@ function productRepoIsAGitCheckout() {
 // does not resolve the path to itself exactly once: renamed, moved, or deleted all fail here, by
 // design, the same as a literal no longer being `contains`ed below.
 function readTrackedFile(relPath) {
-  const out = execFileSync('git', ['-C', PRODUCT_REPO, 'ls-files', '--', relPath], { encoding: 'utf8' });
+  const out = execFileSync('git', ['-C', PRODUCT_REPO, 'ls-files', '--', relPath], { encoding: 'utf8', env: gitEnv() });
   const tracked = out.split('\n').filter(Boolean);
   assert.equal(
     tracked.length,

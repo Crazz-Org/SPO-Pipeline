@@ -12,6 +12,28 @@ const REPO_ROOT = path.join(__dirname, '..');
 const DAEMON = path.join(REPO_ROOT, 'orchestrator', 'daemon.js');
 const SPO_BIN = path.join(REPO_ROOT, 'bin', 'spo');
 
+// gitEnv() -- process.env with every GIT_* variable REMOVED, for any test that spawns a real
+// `git`. Not hygiene: without it a test that runs git in a temp directory corrupts THIS repository,
+// and it did.
+//
+// Git exports GIT_DIR (and GIT_INDEX_FILE, GIT_WORK_TREE, ...) to the hooks it runs. This repo
+// installs a pre-push hook that runs scripts/gate.sh, i.e. the whole suite. So inside a `git push`,
+// `execFileSync('git', ['init', ...], {cwd: someTmpDir})` does NOT initialise someTmpDir -- it acts
+// on the INHERITED GIT_DIR. Measured, on 2026-09-05, from test/pipeline-version.test.js's own
+// throwaway repos: three empty `one` commits were written onto the branch being pushed (and reached
+// main through a PR), `git checkout --detach` detached two live worktrees, `git symbolic-ref
+// refs/heads/main refs/heads/other` left the real `refs/heads/main` a DANGLING SYMREF, and a stray
+// `side` branch, `v1` tag and worktree were created in the real repository.
+//
+// The tell is that the suite is green under `node --test` and red under `git push`, because only
+// the second one has GIT_* in the environment. test/no-git-env-sweep.test.js is the standing guard
+// that every call site uses this.
+function gitEnv() {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+  return env;
+}
+
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -187,6 +209,7 @@ function readLedger(journalDir, id) {
 }
 
 module.exports = {
+  gitEnv,
   REPO_ROOT,
   DAEMON,
   SPO_BIN,

@@ -53,6 +53,27 @@ card:
   user layer of every account in the pool (`spo account sync-settings`, automatic on
   `account add` and on every `--real` startup). Resync after editing it.
 
+## Working a chantier (driver sessions only)
+
+The method is not optional and not re-invented per session — it is the plan's execution rules
+(`doc/remediation-plan-2026-08.md` § *Execution rules*) plus what execution corrected in them
+(`doc/remediation-progress.md` § *The driver workflow that worked*). Read both before dispatching.
+
+- **One action = one Sonnet subagent** (effort `medium`), spec self-contained with its tests.
+  **Verified by an Opus subagent** (effort `high`): adversarial diff review **+ mutation testing** —
+  the highest-value part of the loop; it repeatedly caught tests passing for the wrong reason.
+- **Subagents never commit.** The driver commits after verification: keeps "one commit per action"
+  exact and stops parallel agents clobbering each other. One PR per chantier.
+- **One chantier at a time**, next starts only on a green gate: `node --test test/*.test.js`
+  (never bare) + `daemon.js --dry-run` + the chantier's listed checks. *(live recette)* gates stop
+  and ask the maintainer.
+- Items marked **DECISION** are never delegated; the driver frames, the maintainer decides.
+- **Sibling grep** (rule 6): any action correcting a factual claim greps the old *and* new phrasing
+  across `doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`,
+  `README.md`, and reports what it found; the Opus verifier checks it did.
+- Audits use the other pairing: read-only **Fable 5.1** sweep, then **every** finding re-verified by
+  Opus running a real probe — Fable's line refs hold, its derived conclusions have been inverted.
+
 ## Git
 
 Two distinct kinds of worktree, in two distinct places:
@@ -61,6 +82,19 @@ Two distinct kinds of worktree, in two distinct places:
   WORKTREE step. Deliberately outside this repo (see the note at the top). Don't touch them by
   hand while a task is running.
 - `.claude/worktrees/<slug>/` — working worktrees on *this* repo.
+
+**After every merge into `main`, deploy it.** A merge on GitHub deploys nothing: the running
+daemon and dashboard keep executing the code they started with. Go to the main checkout
+(`~/SPO-Pipeline`, not a worktree) and `git pull` — that fires `.git/hooks/post-merge`
+(`scripts/git-hooks/post-merge`), which restarts `spo-pipeline-daemon.service` and
+`spo-pipeline-dashboard.service` if either is active *or* enabled. The pull is what deploys; the
+merge is not, and neither is a worktree's own pull.
+
+**A restart now DRAINS** (`doc/deployment.md`): it stops claiming, lets the cards in flight finish
+— up to `config.drainTimeoutMs`, 45 min — then exits 0. A second signal stops immediately. So a
+pull no longer kills a card, it delays the deploy; only a card past the bound is cut.
+`systemctl --user mask` does not work here (the units are real files); just re-run
+`systemctl --user stop spo-pipeline-daemon.service` after the pull if you needed it down.
 
 The `git stash` stack is shared across all worktrees, and several sessions can run in
 parallel: never use bare `git stash` / `git stash pop`. Prefer a WIP commit.

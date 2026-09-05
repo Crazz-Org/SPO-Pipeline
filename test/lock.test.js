@@ -391,7 +391,17 @@ test('acquireLock: link() publishes the name only once the content is already co
 test('daemon.js registers its signal handlers BEFORE acquiring the lock (no default-disposition window)', () => {
   const source = fs.readFileSync(DAEMON, 'utf8');
 
-  const sigtermAt = source.indexOf("process.once(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143))");
+  // The registration is `process.on`, NOT `process.once`, since the drain landed: a `once`
+  // handler is removed after the first signal, so the SECOND SIGTERM -- the operator's escape
+  // hatch out of a drain that may wait 45 minutes -- would fall through to the OS default
+  // disposition and kill the process mid-anything, leaking the very lock file the ordering below
+  // exists to protect. Both facts are pinned here because they are the same fact.
+  const sigtermAt = source.indexOf("process.on(sig, () => {");
+  assert.equal(
+    source.includes("process.once(sig,"),
+    false,
+    'daemon.js registers its signal handlers with process.once -- a second SIGTERM would then hit the OS default disposition and leak the lock file (see the drain escape hatch in dispatcher.js requestDrain)'
+  );
   const acquireAt = source.indexOf('acquireLock(journalRoot');
   const exitHookAt = source.indexOf("process.once('exit', () => {");
 

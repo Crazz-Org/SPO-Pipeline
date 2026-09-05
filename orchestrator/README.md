@@ -767,7 +767,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:658`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:701`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -1727,7 +1727,9 @@ it against until a fresh `report-confirmed` moves the anchor forward regardless.
 A hard process kill mid-triage is recovered by `reclaimStaleClaims` (action 2.6, above) and
 journals `report-triage-reclaimed`, NOT `report-triage-error` -- so a daemon crash-loop is
 NEITHER capped NOR backed off by this mechanism. This is a real, reachable path: merging a PR
-restarts the daemon and SIGTERMs whatever card is in flight, including a triage in progress. The
+restarts the daemon, which since the drain landed (doc/deployment.md) lets an in-flight card
+finish before exiting -- but a card still running past `config.drainTimeoutMs`, and a triage in
+progress (which the drain does not wait for: it lives in the SCANNER, killed first), are still cut. The
 gap is deliberate, not an oversight: counting a reclaim toward the mechanical-failure cap would
 hold a report after an ordinary daemon restart, punishing it for something that had nothing to do
 with the report itself or with the mechanical health of triage. If daemon restarts during triage
@@ -2449,7 +2451,11 @@ task/daemon split itself).
 | `comment-scan-truncated` | task | same posture: `comment-scan.js`'s default name for "the comment fetch hit `maxPages` before reaching the end of the issue's comments" (`comment-scan.js`). |
 | `diagnose-surface-skipped` | task | DIAGNOSE could not post its "diagnosing, attempt N/3" comment because the card carries no GitHub issue number (`park-loop.js`). |
 | `diff-empty` | task | the diff captured for this state came back empty even though `committed` files were listed (`steps/scripted.js`). |
-| `dispatcher-start` | daemon | the dispatcher process started; records its pid and configured worker count, and anchors a later "pool idle" edge to this process (`dispatcher.js`). |
+| `dispatcher-drain-end` | daemon | the drain finished, written AFTER the signalled stragglers have been reaped rather than at the bound: `drained` (did every in-flight card finish on its own), `waitedMs`, `survivors` (ids still running when the bound expired) and `outcomes` (what each survivor actually ended as). `drained: false` records that the daemon stopped waiting, which is not the same fact as a card being lost — `outcomes` is the one to read for that (`dispatcher.js`). |
+| `dispatcher-kill-escalated` | daemon | a signalled straggler was still alive after `config.drainKillGraceMs`, so the dispatcher SIGKILLed it itself rather than waiting unbounded and leaving systemd's cgroup kill as the only backstop (which would skip daemon.js's exit hook and leak the lock file). Records `graceMs` and `stillLive` (`dispatcher.js`). |
+| `dispatcher-drain-start` | daemon | a SIGTERM/SIGINT asked the dispatcher to drain instead of killing: records the `signal`, the `timeoutMs` bound (`config.drainTimeoutMs`) and the `inFlight` card ids it is about to wait for. Claiming has already stopped by the time this is written — the scanner, the only producer of new queue entries, is signalled inside `requestDrain` (`dispatcher.js`). |
+| `dispatcher-start` | daemon | the dispatcher process started; records its pid, configured worker count and the sha/ref of the PIPELINE checkout it is running (`pipelineSha`/`pipelineRef`, `pipeline-version.js`), and anchors a later "pool idle" edge to this process (`dispatcher.js`). |
+| `pipeline-version` | task | the first line a `--worker` writes: the sha and ref of the pipeline checkout THAT WORKER loaded, plus its pid — the per-card answer to "which version of the orchestrator produced this park?". Recorded per worker rather than inherited from `dispatcher-start` because `dispatcher.js` resolves `DAEMON_PATH` at every spawn, so a `git pull` with no restart genuinely puts a new-sha worker under an old-sha dispatcher; the two lines disagreeing is that gap made visible. `sha: null` means the checkout could not describe itself (no `.git`, unreadable HEAD), which is itself the fact worth recording (`daemon.js`, `pipeline-version.js`). |
 | `empty-implement` | task | IMPLEMENT's payload declared `files_changed` but the list parsed empty — routes to DIAGNOSE (`state-machine.js`). |
 | `force-state` | task | a shadow-mode task's `task.shadow.forceState` short-circuited INTAKE straight to the named state — a test/fixture hook (`state-machine.js`). |
 | `gate-main-moved-abort-failed` | task | GATE's `git merge --abort` (cleaning up a failed main-moved regate merge) itself exited non-zero or hit a spawn timeout (`steps/scripted.js`). |

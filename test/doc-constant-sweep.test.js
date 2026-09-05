@@ -23,6 +23,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
+// Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
+// for the incident that makes this load-bearing rather than tidy.
+const { gitEnv } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -1201,7 +1204,7 @@ function trackedFiles(root) {
   if (_trackedCache.has(root)) return _trackedCache.get(root);
   let list = [];
   try {
-    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: gitEnv() })
       .split('\n')
       .filter(Boolean);
   } catch {
@@ -1375,16 +1378,16 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
-  "doc/board-audit.md :: config.js:786",
+  "doc/board-audit.md :: config.js:829",
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1350",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1094",
-  "doc/state-machine-spec.md :: dispatcher.js:485-499",
+  "doc/state-machine-spec.md :: dispatcher.js:572-586",
   "doc/state-machine-spec.md :: intake.js:796-798",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
-  "orchestrator/README.md :: config.js:658",
+  "orchestrator/README.md :: config.js:701",
   "orchestrator/README.md :: dispatcher.js:485-499",
   "orchestrator/README.md :: doc/state-machine-spec.md:140",
   "orchestrator/README.md :: intake.js:796-798",
@@ -1395,7 +1398,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
-  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
   "orchestrator/park-loop.js :: intake.js:796-798",
   "orchestrator/state-machine.js :: run.ts:63",
@@ -1551,8 +1554,11 @@ function makeFixtureRepo(layout) {
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, body);
   }
-  execFileSync('git', ['-C', root, 'init', '-q']);
-  execFileSync('git', ['-C', root, 'add', '-A']);
+  // env: gitEnv() is load-bearing here, not cosmetic -- under the pre-push hook GIT_DIR is
+  // inherited, so this `init` would act on THIS repository and this `add -A` would stage into its
+  // real index. See helpers.js's gitEnv for the measured incident.
+  execFileSync('git', ['-C', root, 'init', '-q'], { env: gitEnv() });
+  execFileSync('git', ['-C', root, 'add', '-A'], { env: gitEnv() });
   return root;
 }
 

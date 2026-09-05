@@ -1845,7 +1845,7 @@ missing from a table whose own subtotal was right (and the one file dropped from
 register was the bench file); the register's own 345 lines in no bucket; and `scripts/` —
 6 tracked files, 177 comment lines across 665 — in neither the in-scope nor the out-of-scope list.
 Its §7 also asserted a clean sibling grep that its own quoted command contradicts: `~16,800` is at
-`doc/remediation-plan-2026-08.md:259`, in the chantier 7 bis preamble, present tense, as the
+`doc/remediation-plan-2026-08.md:273`, in the chantier 7 bis preamble, present tense, as the
 load-bearing premise of the whole scope argument — not in the 7bis.5 row as claimed.
 
 **Root cause of the `scripts/` omission, and it is not local to the register:** the corpus
