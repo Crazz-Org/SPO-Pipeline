@@ -1517,6 +1517,201 @@ const TRANSIENT_RETRY_REASONS = new Set([
   ...TRANSIENT_RETRY_LLM_STEPS.map((step) => `llm-transport-failed:${step}`),
 ]);
 
+// ---- TERMINAL_PARK_REASONS -----------------------------------------------------------------
+//
+// The documented trap this exists to close: TRANSIENT_RETRY_REASONS above is keyed on the EXACT
+// reason STRING (a `Set`, tested with `.has()` in `isTransientRetryReason` below). Introducing a
+// new park reason -- or renaming/splitting an existing one, exactly what action B3.4 round 1 did
+// to `gate-non-attesting` -- silently makes the new name TERMINAL by default, and nothing fails:
+// "terminal" has never been anything other than "not in the transient Set". A read-only audit
+// (2026-09-06) confirmed there was no explicit terminal list anywhere in this repo: the only
+// `TERMINAL_*` constants that exist are `TERMINAL_STATES` (orphan-scan.js, console/collect.js --
+// STATES, not park reasons) and `USAGE_LIMIT_TERMINAL_REASONS`/`OVERLOADED_TERMINAL_REASONS`
+// (steps/llm.js -- Claude API error codes, not park reasons either).
+//
+// TERMINAL_PARK_REASONS below is the other half of the same coin: every park reason the code can
+// produce that is DELIBERATELY terminal (human-only, no automatic retry). Membership is by exact
+// string, same convention as TRANSIENT_RETRY_REASONS. The two sets are disjoint by construction
+// and, together with TERMINAL_PARK_REASON_PREFIXES below, must cover every reason the code can
+// produce -- test/park-reason-partition.test.js enforces both properties by scanning the source,
+// the same way test/park-reason-doc-sweep.test.js already does for spec documentation. Adding a
+// reason to the code without adding it here (or to TRANSIENT_RETRY_REASONS) fails that test by
+// name, forcing the retry-or-terminal decision to be made on purpose instead of by omission.
+//
+// This is a CLASSIFICATION, not a behaviour change: nothing reads TERMINAL_PARK_REASONS to alter
+// what finalizePark or isTransientRetryReason do. A reason's actual retry behaviour is still
+// governed entirely by TRANSIENT_RETRY_REASONS/isTransientRetryReason, unchanged.
+//
+// Most reasons here are plain literals -- the overwhelming majority of park reasons in this
+// codebase are. Three families are NOT plain literals and are called out explicitly:
+//
+//   - `llm-transport-failed:<STEP>` -- generated from TRANSIENT_RETRY_LLM_STEPS above and already
+//     TRANSIENT for all four steps that currently exist (PLAN/IMPLEMENT/DIAGNOSE/VALIDATE). No
+//     terminal member of this family exists today; if a future LLM step is added WITHOUT adding
+//     it to TRANSIENT_RETRY_LLM_STEPS, its own `llm-transport-failed:<STEP>` literal must be added
+//     to TERMINAL_PARK_REASONS by hand -- there is no third bucket for "unmentioned LLM step".
+//   - `<commandClass>-timed-out` (steps/scripted.js's spawnStep, classes from
+//     command-timeout.js's classifyCommand: git, gh, npm-ci, npm-gate, npm-run, bench-install,
+//     plus the `command` fallback classifyCommand returning null implies) -- none of these seven
+//     is transient, so all seven are listed below as plain literals rather than a prefix rule:
+//     unlike `all-accounts-cooling-until-<ISO>` below, every value in this family is a bounded,
+//     enumerable, non-timestamped string, so there is no reason to prefer a prefix match over
+//     listing them out (and listing them out is what makes a new command-timeout class show up as
+//     an undocumented LITERAL rather than silently absorbed into an existing prefix, the same
+//     argument TRANSIENT_RETRY_LLM_STEPS's own header already makes for `llm-transport-failed`).
+//   - `all-accounts-cooling-until-<ISO>` (accounts.js's pick()) carries a timestamp, so it can
+//     NEVER be matched by exact string -- it is covered by TERMINAL_PARK_REASON_PREFIXES below,
+//     not by a literal.
+//   - `prompt-missing-placeholder:<name>` (steps/llm.js) carries an arbitrary placeholder name --
+//     also covered by TERMINAL_PARK_REASON_PREFIXES, for the same reason.
+//
+// Reasons produced only as SINKS (finalizePark called directly, never via a thrown ParkSignal) or
+// written straight to state.json (park-loop.js's abandon-reply reconciler) are included below too
+// -- classifyParkReason has no notion of "how the reason reached PARKED", only what the string is.
+const TERMINAL_PARK_REASONS = new Set([
+  // ---- account pool exhaustion (accounts.js, rethrown as a ParkSignal via this file's own
+  // `err.reason`/`err.detail` pass-through above) -- a human registers/re-enables an account or
+  // waits out a cooldown; none of this is a fact about the moment that a retry could outrun.
+  'no-accounts-registered',
+  'all-accounts-leased',
+  'all-accounts-cooling-unknown',
+  'all-accounts-cooling-after-retry',
+
+  // ---- INTAKE / plan-time guards
+  'invalid-task-json',
+  'real-flag-required',
+  'plan-requires-protected-files',
+  'plan-invalid',
+
+  // ---- WORKTREE
+  'worktree-failed',
+  'worktree-add-failed',
+  'worktree-fetch-failed',
+  'worktree-rev-parse-failed',
+  'worktree-npm-ci-failed',
+  'worktree-dirty-leftover',
+  'worktree-cleanup-failed',
+  'branch-unmerged-leftover',
+  'product-repo-lock-timeout',
+  'main-red-refuse-worktree',
+
+  // ---- CHECK / PUSH_PR
+  'push-pr-failed',
+
+  // ---- GATE -- exit codes 2-4 and the unrecognized-exit fallback; the transient exit-1 legs
+  // (gate-non-attesting, gate-live-blocked, gate-environment, gate-interrupted, gate-abandoned,
+  // gate-stale) live in TRANSIENT_RETRY_REASONS above, NOT here.
+  'gate-dirty-tree',
+  'gate-worker-down',
+  'gate-timeout',
+  'gate-unrecognized-exit',
+  'gate-live-not-driven',
+  'gate-worker-dirty-checkout',
+  'gate-not-pushed',
+  'gate-duplicate-job',
+  'gate-worker-not-built',
+  'gate-worker-died-midjob',
+
+  // ---- <commandClass>-timed-out family (see the header above) -- all seven classes, none
+  // transient.
+  'git-timed-out',
+  'gh-timed-out',
+  'npm-ci-timed-out',
+  'npm-gate-timed-out',
+  'npm-run-timed-out',
+  'bench-install-timed-out',
+  'command-timed-out',
+  'command-killed-by-signal',
+
+  // ---- CI_CHECKS
+  'ci-checks-rev-parse-failed',
+  'ci-checks-read-failed',
+  'ci-checks-still-running',
+  'ci-retry-budget-exhausted',
+  'pr-rules-needs-approval', // ci-cause-table.js's classifyCiFailure, via `outcome.reason`
+  'main-red-no-merge',
+  'main-moved-conflict',
+  'main-moved-merge-failed',
+  'main-moved-twice',
+  'nightly-main-red',
+
+  // ---- DIAGNOSE
+  'diagnose-budget-exhausted',
+  'diagnose-no-new-cause',
+  'diagnose-duplicate-root-cause',
+
+  // ---- VALIDATE / citation verification
+  'validate-reject-budget-exhausted',
+  'validate-unrecognized-verdict',
+  'citation-verifier-failed',
+  'citation-false',
+  'citation-verifier-unrecognized-verdict',
+  'rdo-citation-missing',
+  'judge-inputs-missing',
+
+  // ---- MERGE -- the queue-wait symptom plus GitHub's own five blocking causes
+  // (SPO-Pipeline#85's merge-cause.js: MERGE_CAUSE_REASONS, thrown as literals one per reason by
+  // steps/scripted.js's parkFromMergeCause). All five are a driver DECISION, already made -- not
+  // re-litigated by this action.
+  'merge-queue-not-landing',
+  'merge-conflict',
+  'merge-blocked',
+  'merge-behind-base',
+  'merge-pr-draft',
+  'merge-checks-failing',
+  'pr-merge-enqueue-failed',
+  'pr-closed-unmerged',
+  'pr-wait-unrecognized-exit',
+
+  // ---- FINISH
+  'finish-failed',
+
+  // ---- claim-* (worktree ownership races the daemon detects but cannot resolve itself)
+  'claim-lost',
+  'claim-finished-worktree',
+  'claim-unrecognized-exit',
+
+  // ---- cross-cutting engine guards
+  'step-deadline-exceeded-twice',
+
+  // ---- sinks: finalizePark called directly, or state.json written directly, never via a thrown
+  // ParkSignal -- see this const's own header.
+  'task-orphaned-before-start', // orphan-scan.js, pre-WORKTREE recovery
+  'task-orphaned-daemon-restart', // orphan-scan.js
+  'worker-crashed', // dispatcher.js
+  'state-machine-runaway', // state-machine.js's own dispatch-loop guard
+  'unrecognized-state', // state-machine.js's own dispatch-loop guard
+  'abandoned-by-maintainer', // park-loop.js's abandon-reply reconciler, written straight to state.json
+]);
+
+// TERMINAL_PARK_REASON_PREFIXES -- the two families whose values can never be enumerated as exact
+// literals (see TERMINAL_PARK_REASONS's own header). Each entry's `prefix` is matched with
+// `reason.startsWith(prefix)`, never a substring test, so a reason that merely CONTAINS one of
+// these strings without starting with it (unlikely given the hyphen/colon punctuation, but not
+// impossible) is correctly left unclassified rather than silently absorbed.
+const TERMINAL_PARK_REASON_PREFIXES = [
+  {
+    prefix: 'all-accounts-cooling-until-',
+    why: 'accounts.js pick() appends the earliest cooldown\'s own ISO timestamp; the reason can never repeat exactly, so it cannot be a Set member.',
+  },
+  {
+    prefix: 'prompt-missing-placeholder:',
+    why: 'steps/llm.js appends the missing placeholder name, which is not enumerable up front.',
+  },
+];
+
+// classifyParkReason(reason) -> 'transient' | 'terminal' | 'unclassified'. The single source of
+// truth test/park-reason-partition.test.js's source sweep checks every producible reason against.
+// Exact-match first (cheap, and the overwhelming majority of reasons), then the prefix rules
+// above; anything matching neither is 'unclassified' -- exactly the rename-trap failure mode this
+// mechanism exists to catch, surfaced as data instead of silence.
+function classifyParkReason(reason) {
+  if (TRANSIENT_RETRY_REASONS.has(reason)) return 'transient';
+  if (TERMINAL_PARK_REASONS.has(reason)) return 'terminal';
+  if (TERMINAL_PARK_REASON_PREFIXES.some(({ prefix }) => reason.startsWith(prefix))) return 'terminal';
+  return 'unclassified';
+}
+
 // Membership in the set above is necessary but not sufficient, for exactly one entry. Action 4.2
 // deliberately did NOT split the misconfigured-bench-directory case out of `gate-non-attesting`
 // into a reason of its own -- it records it as a boolean on the park detail instead
@@ -2077,4 +2272,9 @@ module.exports = {
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
   snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it
   isRealMode, // exported for orphan-scan.js -- shadow/dry-run must detect-and-journal only, never park
+  TRANSIENT_RETRY_REASONS, // exported for console/plain-language.js's SELF_RETRYING pin (test/dashboard-deck.test.js) and test/park-reason-partition.test.js
+  TERMINAL_PARK_REASONS, // exported for test/park-reason-partition.test.js's coverage/disjointness/no-dead-entries sweep
+  TERMINAL_PARK_REASON_PREFIXES, // exported for the same sweep -- the two non-literal reason families
+  classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
+  isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
 };

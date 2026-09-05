@@ -197,7 +197,12 @@ const PARK_REASONS = {
   'judge-inputs-missing': 'The reviewer was missing the diff or the test log it needs to judge.',
 
   // --- merge ---------------------------------------------------------------------------------
-  'merge-queue-not-landing': 'The merge was queued but never landed.',
+  'merge-queue-not-landing': "The merge was queued but never landed, and GitHub didn't say why.",
+  'merge-conflict': 'The pull request has a conflict with the base branch.',
+  'merge-blocked': 'GitHub is blocking the merge — a required review, a required check, or branch protection.',
+  'merge-behind-base': 'The pull request is behind the base branch and needs updating.',
+  'merge-pr-draft': 'The pull request is still a draft.',
+  'merge-checks-failing': "GitHub's checks on the pull request are failing.",
   'pr-closed-unmerged': 'The pull request was closed without being merged.',
   'pr-merge-enqueue-failed': 'The merge could not be queued.',
   'pr-wait-unrecognized-exit': 'Waiting for the merge exited in an unrecognised way.',

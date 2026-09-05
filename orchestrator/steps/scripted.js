@@ -34,6 +34,7 @@ const { spawnSync } = require('child_process');
 const { appendEvent, writeBenchReinstallOwed, readBenchReinstallOwed, clearBenchReinstallOwed } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
+const { classifyMergeCause, MERGE_CAUSE_REASONS } = require('../merge-cause');
 const { resolveMainMovedRegateBudget } = require('../main-moved-budget');
 const { moveCard } = require('../board');
 const { classifyCommand, classTimeoutMs, isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
@@ -2571,6 +2572,126 @@ async function realCiChecks(ctx, deps = {}) {
 // `gh pr merge --merge` enqueues (never --delete-branch -- see orchestrator/README.md); then
 // `npm run pr:wait`, with exactly one bounded re-wait on "still open" (exit 4), matching
 // handleMerge's own shadow-mode logic.
+
+// probeMergeability(ctx, deps, prNumber) -- SPO-Pipeline#85: the one real ask GitHub gets before
+// realMerge parks on a `pr:wait` failure. `pr:wait`'s own exit code is a LOCAL read (did the CLI
+// give up waiting); GitHub's `gh pr view --json state,mergeable,mergeStateStatus` is the actual
+// cause, and the two disagree often enough to matter -- measured: issue-443's PR merged 30s AFTER
+// the park, issue-517's PR merged 17s BEFORE it. Routed through the same `spawnStep` every other
+// gh call in this file uses, so the probe is journalled and timeout-guarded identically.
+//
+// Post-verification (efficacy fix): GitHub computes `mergeable`/`mergeStateStatus` LAZILY -- the
+// FIRST `gh pr view` on a PR kicks off a background job and answers `UNKNOWN` on both fields; a
+// LATER read returns the real value once that job lands. `UNKNOWN` is therefore the EXPECTED
+// first answer, not a rare edge case: measured against real PRs on this account, 4 of 4 open PRs
+// returned `{"mergeStateStatus":"UNKNOWN","mergeable":"UNKNOWN"}` on the first read, and PR #134
+// and #691 both resolved to a definite `DIRTY`/`CONFLICTING` only on the SECOND read. Across 9
+// timed cold PRs, a definite answer arrived once ~1.55s of wall-clock had elapsed since the first
+// UNKNOWN -- regardless of how many calls were made (per-call latency measured 399-736ms). A probe
+// that reads exactly once therefore sees `UNKNOWN` almost every time in production, which
+// degrades to `{kind: 'unknown'}` below and falls all the way back to the original SYMPTOM reason
+// (`merge-queue-not-landing` / `pr-closed-unmerged`) -- the very thing this whole action exists to
+// stop doing, reintroduced by reading too eagerly. So this re-reads, bounded to
+// `MERGE_PROBE_MAX_ATTEMPTS` attempts total, sleeping `MERGE_PROBE_POLL_INTERVAL_MS` between reads
+// (via the same injectable `pollSleep`/`deps.sleep` realCiChecks already uses above -- production
+// always sleeps for real, tests inject a no-op) so the wait is WALL-CLOCK, not call count. Total
+// added latency stays a couple of seconds -- trivial next to the 18+ minutes `pr:wait` already ran
+// before this probe is ever reached. Each read is journalled as its own `pr-mergeability` event
+// (see below) carrying its own `attempt`, so the corpus records exactly what GitHub said and when.
+//
+// Must NEVER mask the caller's own park: any non-zero exit, unparsable stdout, or thrown error
+// (spawnStep itself throwing -- e.g. its own timeout ParkSignal -- included) degrades to
+// `{kind: 'unknown'}` for THAT attempt rather than propagating, so a probe that cannot answer
+// never stops realMerge from falling back to its existing literal park reason -- it only spends
+// the remaining attempts and then falls back the same way a single failed read always did. Always
+// appends `pr-mergeability` to the journal (doc/improvisation-analysis.md's 2026-08 "journal the
+// PR number and the last mergeStateStatus" recommendation, never implemented until now) with
+// whatever it managed to read, `null` for anything it did not.
+const MERGE_PROBE_MAX_ATTEMPTS = 3;
+const MERGE_PROBE_POLL_INTERVAL_MS = 750;
+
+async function probeMergeability(ctx, deps, prNumber) {
+  const config = ctx.config;
+  let exit = null;
+  // NOT named `state` -- journal.js's appendEvent builds its record as
+  // `{ts, state, event, ...detail}`, so a detail field literally called `state` would silently
+  // CLOBBER the outer `state: 'MERGE'` positional argument (spread order: detail wins). Caught by
+  // this module's own test/merge-cause.test.js ("pr-mergeability journal event...") failing
+  // against exactly that bug during development -- `prState` throughout instead, matching the
+  // ParkSignal detail key this function's caller already uses.
+  let prState = null;
+  let mergeable = null;
+  let mergeStateStatus = null;
+  let classification = { kind: 'unknown' };
+
+  for (let attempt = 1; attempt <= MERGE_PROBE_MAX_ATTEMPTS; attempt++) {
+    exit = null;
+    prState = null;
+    mergeable = null;
+    mergeStateStatus = null;
+
+    try {
+      const probe = spawnStep(ctx, deps, 'MERGE', 'gh', [
+        'pr',
+        'view',
+        String(prNumber),
+        '--repo',
+        config.ghRepo,
+        '--json',
+        'state,mergeable,mergeStateStatus',
+      ]);
+      exit = probe.exit;
+      if (exit === 0) {
+        const parsed = JSON.parse(probe.stdout); // throws on unparsable stdout -- caught below
+        prState = parsed.state || null;
+        mergeable = parsed.mergeable || null;
+        mergeStateStatus = parsed.mergeStateStatus || null;
+      }
+    } catch (e) {
+      // spawnStep throwing (including its own timeout/kill ParkSignal) or JSON.parse throwing on
+      // unparsable stdout both land here -- either way this attempt has no usable answer, and must
+      // fall through to the 'unknown' classification below rather than let the throw escape and
+      // replace realMerge's own, more informative park.
+    }
+
+    classification =
+      exit === 0 && prState ? classifyMergeCause({ state: prState, mergeable, mergeStateStatus }) : { kind: 'unknown' };
+
+    appendEvent(ctx.taskDir, 'MERGE', 'pr-mergeability', { attempt, exit, prState, mergeable, mergeStateStatus });
+
+    // Stop the moment the answer is definite -- classifyMergeCause already resolves MERGED/CLOSED
+    // to a non-'unknown' kind ahead of any cause check, so this one condition covers both "a real
+    // blocking cause" and "the PR reached a terminal state" without a second, redundant check.
+    if (classification.kind !== 'unknown') break;
+    if (attempt < MERGE_PROBE_MAX_ATTEMPTS) await pollSleep(deps, MERGE_PROBE_POLL_INTERVAL_MS);
+  }
+
+  return { ...classification, prState, mergeable, mergeStateStatus };
+}
+
+// parkFromMergeCause(cause, detail) -- turns a `{kind: 'cause', reason}` from `classifyMergeCause`
+// into a park, as a literal `new ParkSignal('<reason>', ...)` per reason rather than
+// `new ParkSignal(cause.reason, ...)`. Deliberate: test/park-reason-doc-sweep.test.js's
+// completeness sweep only resolves a DYNAMIC ParkSignal argument through a couple of named
+// exceptions (`err.reason` -> accounts.js, `outcome.reason` -> ci-cause-table.js); `cause.reason`
+// would need a third one, hand-written into that sweep test, for no benefit over just writing the
+// five reasons out literally here -- one shared call site per reason (not one per caller), so
+// this being called from BOTH of realMerge's own failure paths still costs zero extra literal
+// occurrences of any string test/gate-legs-reachability.test.js's PINNED_LEG_REASON_COUNTS pins
+// (`merge-queue-not-landing` is not one of these five, and is never thrown from here).
+function parkFromMergeCause(cause, detail) {
+  if (cause.reason === MERGE_CAUSE_REASONS.CONFLICT) throw new ParkSignal('merge-conflict', detail);
+  if (cause.reason === MERGE_CAUSE_REASONS.BLOCKED) throw new ParkSignal('merge-blocked', detail);
+  if (cause.reason === MERGE_CAUSE_REASONS.BEHIND) throw new ParkSignal('merge-behind-base', detail);
+  if (cause.reason === MERGE_CAUSE_REASONS.DRAFT) throw new ParkSignal('merge-pr-draft', detail);
+  if (cause.reason === MERGE_CAUSE_REASONS.UNSTABLE) throw new ParkSignal('merge-checks-failing', detail);
+  // Unreachable given today's classifyMergeCause (a closed set of five reasons for `kind:
+  // 'cause'`) -- a real bug (a sixth reason added to merge-cause.js without a matching branch
+  // here), left to crash rather than silently re-parking under some OTHER reason's name
+  // (park-signal.js's own header: "any OTHER thrown error is a real bug ... left to propagate").
+  throw new Error(`parkFromMergeCause: unrecognised cause reason ${JSON.stringify(cause.reason)}`);
+}
+
 async function realMerge(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -2592,11 +2713,58 @@ async function realMerge(ctx, deps = {}) {
   const w1 = spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', String(prNumber)], { cwd: worktreePath });
   appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 1, exit: w1.exit });
   if (w1.exit === 0) return 'FINISH';
-  if (w1.exit === 1) throw new ParkSignal('pr-closed-unmerged', { exit: w1.exit });
+  if (w1.exit === 1) {
+    // SPO-Pipeline#85: a bare `pr:wait` exit 1 ("closed") used to park `pr-closed-unmerged` on a
+    // single unconfirmed read -- issue-443's own corpus proof (doc/state-machine-spec.md's MERGE
+    // row) is a PR that had, in fact, already merged 30s later. Ask GitHub before believing it.
+    const cause = await probeMergeability(ctx, deps, prNumber);
+    if (cause.kind === 'merged') return 'FINISH';
+    if (cause.kind === 'closed') {
+      throw new ParkSignal('pr-closed-unmerged', {
+        exit: w1.exit,
+        prState: cause.prState,
+        mergeable: cause.mergeable,
+        mergeStateStatus: cause.mergeStateStatus,
+      });
+    }
+    if (cause.kind === 'cause') {
+      parkFromMergeCause(cause, {
+        exit: w1.exit,
+        prState: cause.prState,
+        mergeable: cause.mergeable,
+        mergeStateStatus: cause.mergeStateStatus,
+      });
+    }
+    // GitHub had no usable answer either -- keep the pre-existing literal, unenriched.
+    throw new ParkSignal('pr-closed-unmerged', { exit: w1.exit });
+  }
   if (w1.exit === 4) {
     const w2 = spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', String(prNumber)], { cwd: worktreePath });
     appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 2, exit: w2.exit, bounded: true });
     if (w2.exit === 0) return 'FINISH';
+    // SPO-Pipeline#85: the bounded re-wait exhausted without ever confirming a real cause --
+    // `merge-queue-not-landing` is the SYMPTOM (pr:wait gave up); ask GitHub for the CAUSE before
+    // parking on it.
+    const cause = await probeMergeability(ctx, deps, prNumber);
+    if (cause.kind === 'merged') return 'FINISH';
+    if (cause.kind === 'closed') {
+      throw new ParkSignal('pr-closed-unmerged', {
+        lastExit: w2.exit,
+        prState: cause.prState,
+        mergeable: cause.mergeable,
+        mergeStateStatus: cause.mergeStateStatus,
+      });
+    }
+    if (cause.kind === 'cause') {
+      parkFromMergeCause(cause, {
+        lastExit: w2.exit,
+        prState: cause.prState,
+        mergeable: cause.mergeable,
+        mergeStateStatus: cause.mergeStateStatus,
+      });
+    }
+    // GitHub had no usable answer either -- the fallback this whole action exists to keep honest:
+    // the probe must never mask this park. Literal, unenriched, exactly as before this action.
     throw new ParkSignal('merge-queue-not-landing', { lastExit: w2.exit });
   }
   throw new ParkSignal('pr-wait-unrecognized-exit', { exit: w1.exit });

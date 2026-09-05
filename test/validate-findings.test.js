@@ -702,8 +702,10 @@ test('buildValidateFindingsComment: the WHOLE body is capped, not just each fiel
 });
 
 test('buildValidateFindingsComment: names the PR without claiming it merged -- the comment is posted BEFORE realMerge runs', () => {
-  // realMerge can still park four ways after this comment is posted (pr-merge-enqueue-failed,
-  // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit). issue-443 is the
+  // realMerge can still park nine ways after this comment is posted (pr-merge-enqueue-failed,
+  // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit, and -- SPO-Pipeline#85's
+  // GitHub-mergeability-cause reasons -- merge-conflict, merge-blocked, merge-behind-base,
+  // merge-pr-draft, merge-checks-failing). issue-443 is the
   // corpus proof: it parked `pr-closed-unmerged` at MERGE. An issue permanently carrying
   // "Merged via #427." next to a park comment saying otherwise is the board-vs-reality
   // divergence this chantier exists to end.

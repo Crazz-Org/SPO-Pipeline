@@ -493,13 +493,15 @@ function renderItems(items, formatLine) {
 function buildValidateFindingsComment({ prNumber, findings = [], diverges = false, divergesEntries = [] }) {
   const lines = ['### Pipeline validation findings', ''];
   // `PR #N.`, NOT "Merged via #N." -- this comment is posted from handleValidate BEFORE
-  // realMerge runs, and realMerge can still park four ways (pr-merge-enqueue-failed,
-  // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit). Posting before the
+  // realMerge runs, and realMerge can still park nine ways (pr-merge-enqueue-failed,
+  // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit, and — SPO-Pipeline#85's
+  // GitHub-mergeability-cause reasons — merge-conflict, merge-blocked, merge-behind-base,
+  // merge-pr-draft, merge-checks-failing). Posting before the
   // merge is deliberate (the findings must land while the card is still moving, not after it
   // closes), so the wording is what has to be honest: an issue permanently carrying "Merged via
   // #427." next to a park comment saying the PR closed unmerged is exactly the kind of
   // board-vs-reality divergence this chantier exists to end. #443 is the corpus proof that the
-  // four park paths are not theoretical.
+  // park paths are not theoretical.
   if (typeof prNumber === 'number') lines.push(`PR #${prNumber}.`, '');
   lines.push(
     'This did not block the merge -- this pipeline auto-merges once its own checks pass, so',
@@ -1088,7 +1090,13 @@ function abandonCleanup(deps, config, taskDir, id, task, state) {
 //     The maintainer then read the park comment and replied `abandon` at 13:53 -- abandoning a
 //     change that had already merged. A reconciler would have caught this within one scan
 //     interval instead of never; the MERGE-step defect itself (a single unconfirmed `closed`
-//     read treated as terminal) is filed separately and is NOT this action's to fix.
+//     read treated as terminal) was fixed by SPO-Pipeline#85 -- MERGE now probes
+//     `gh pr view --json state,mergeable,mergeStateStatus` (bounded, re-read on GitHub's own
+//     lazily-computed `UNKNOWN`) before parking, rather than believing `pr:wait`'s single local
+//     read. This reconciler remains the backstop for the residual case: the probe's own answer
+//     came back `unknown` too (GitHub had nothing usable across every bounded attempt), so the
+//     card still parks on the unenriched symptom and a human (or this reconciler) is the one who
+//     later learns the PR actually merged.
 //
 // The central design rule, worth restating here because it is the one a future "simplification"
 // will be tempted to undo: RECORD, NEVER OVERWRITE. `state.state` is never rewritten by this
