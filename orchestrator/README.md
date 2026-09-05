@@ -1727,7 +1727,9 @@ it against until a fresh `report-confirmed` moves the anchor forward regardless.
 A hard process kill mid-triage is recovered by `reclaimStaleClaims` (action 2.6, above) and
 journals `report-triage-reclaimed`, NOT `report-triage-error` -- so a daemon crash-loop is
 NEITHER capped NOR backed off by this mechanism. This is a real, reachable path: merging a PR
-restarts the daemon and SIGTERMs whatever card is in flight, including a triage in progress. The
+restarts the daemon, which since the drain landed (doc/deployment.md) lets an in-flight card
+finish before exiting -- but a card still running past `config.drainTimeoutMs`, and a triage in
+progress (which the drain does not wait for: it lives in the SCANNER, killed first), are still cut. The
 gap is deliberate, not an oversight: counting a reclaim toward the mechanical-failure cap would
 hold a report after an ordinary daemon restart, punishing it for something that had nothing to do
 with the report itself or with the mechanical health of triage. If daemon restarts during triage

@@ -144,7 +144,8 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
     // runs at all. Measured on this box with 8 real workers: 71/73/73/73/74/74/76/77 ms, median
     // 74 ms. Every task now passes through a ~74 ms window, on every single run.
     //
-    // If the whole cgroup dies inside it (a deploy SIGKILL after TimeoutStopUSec=1min30s, an OOM
+    // If the whole cgroup dies inside it (a deploy SIGKILL once the unit's TimeoutStopSec expires
+    // -- 1min30s when this was measured, 2760s since the drain landed -- an OOM
     // kill, power loss), the task becomes invisible to EVERY recovery path at once, permanently:
     // this scan used to `continue` on `!state`; unparkScan's own loop skips it for the same
     // reason (`if (!state || state.state !== 'PARKED' ...) continue`, park-loop.js); and

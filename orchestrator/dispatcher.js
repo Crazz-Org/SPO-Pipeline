@@ -38,8 +38,10 @@
 // get to iterate again, at all, for the duration of that ONE call, no matter what it races. A/B
 // against a real blocking child measured the consequence directly: reaping lag 2608ms vs 7ms, a
 // 100ms timer firing once in 9 seconds. Three minutes of that means no worker slot refills, no
-// SIGTERM response, and -- since systemd's TimeoutStopUSec is 90s -- a deploy SIGKILLs the whole
-// process before `killAllChildren` below ever runs.
+// SIGTERM response, and -- since the unit's TimeoutStopSec bounds the stop (90s when this was
+// measured; 2760s since the drain landed, scripts/daemon-install.sh) -- a deploy SIGKILLs the
+// whole process before `killAllChildren` below ever runs. The larger bound makes that far less
+// likely; it does not make a scan that blocks this loop for minutes any less wrong.
 //
 // The obvious-looking alternative fix (spawn a fresh child per scan CYCLE instead of a long-lived
 // one) is ALSO wrong, and is recorded here as a trap: comment-scan.js's own header says its
@@ -508,7 +510,8 @@ function createDispatcher(queueDir, journalRoot, config) {
   // NOT reparking here is strictly safer than reparking, not merely quieter. A park is not a
   // cheap write: finalizePark runs preserveWorktreeWip (a `git` push) plus postParkComment's
   // board move and `gh` comment, each a bounded-but-slow spawnSync, inside a process systemd has
-  // already SIGTERMed and will SIGKILL at TimeoutStopUSec=1min30s. And finalizePark writes
+  // already SIGTERMed and will SIGKILL when the unit's TimeoutStopSec expires (1min30s when this
+  // was measured; 2760s since the drain landed, so the window is wider now, not gone). And finalizePark writes
   // state.json PARKED BEFORE postParkComment posts the anchor comment, so a SIGKILL landing
   // between those two leaves a PARKED card with no `park-comment` line in its journal --
   // park-loop.js's findParkAnchor returns null, unparkScan's `if (!anchor ...) continue` skips it
