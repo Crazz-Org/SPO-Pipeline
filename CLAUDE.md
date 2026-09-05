@@ -76,5 +76,17 @@ The repo uses worktrees for two distinct purposes:
   WORKTREE step. Don't touch them by hand while a task is running.
 - `.claude/worktrees/<slug>/` — working worktrees on *this* repo.
 
+**After every merge into `main`, deploy it.** A merge on GitHub deploys nothing: the running
+daemon and dashboard keep executing the code they started with. Go to the main checkout
+(`~/SPO-Pipeline`, not a worktree) and `git pull` — that fires `.git/hooks/post-merge`
+(`scripts/git-hooks/post-merge`), which restarts `spo-pipeline-daemon.service` and
+`spo-pipeline-dashboard.service` if either is active *or* enabled. The pull is what deploys; the
+merge is not, and neither is a worktree's own pull.
+
+**Check for an in-flight card first.** The restart SIGTERMs any running `claude` step and parks
+that card `llm-transport-failed:<STEP>`. Stop the daemon, pull, restart — or wait for the card.
+`systemctl --user mask` does not work here (the units are real files); just re-run
+`systemctl --user stop spo-pipeline-daemon.service` after the pull if you needed it down.
+
 The `git stash` stack is shared across all worktrees, and several sessions can run in
 parallel: never use bare `git stash` / `git stash pop`. Prefer a WIP commit.

@@ -64,7 +64,8 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    the driver re-resolving anchors.
 6. **The sibling grep** (action 7bis.6). Any action that corrects a factual claim greps
    **both** the corrected phrasing and the pre-correction phrasing across `doc/`, `prompts/`,
-   `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/` and `README.md` before
+   `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`, `.github/`, `README.md` and
+   `CLAUDE.md` before
    committing, and reports what
    it found; its Opus verifier checks that it did, and treats "I corrected it in the file the
    action names" as an incomplete answer. This is enforced by rule 2 — a human-and-verifier
@@ -88,6 +89,19 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    lesson generalises: **a scope list is itself a claim about coverage, and nothing was checking
    it.** Anything added to the repo's top level belongs here or in `doc/accepted-gaps.md` §1's
    out-of-scope list, with a stated reason; neither list may omit it silently.
+
+   **Amended 2026-09-05: `.github/` and `CLAUDE.md` were added to the scope list above.** The same
+   defect, twice more. `.github/workflows/gate.yml` carries 30 comment lines that state what the
+   gate is and why a verdict from the party being checked is not one — claims of exactly the kind
+   this rule exists to keep true — and `.github/` was missing from *both* lists: rule 6's scope and
+   the register's "every top-level entry is now placed in exactly one bucket" check, which was
+   therefore false when written. `CLAUDE.md` was a *declared* exclusion, not a silent one, but its
+   stated reason ("harness-governed operational instructions, not product/process documentation")
+   stopped holding the day this file gained a section restating this rule and the builder/verifier
+   model from `doc/remediation-progress.md`: a file that duplicates process claims is in the
+   business of contradicting them. **The generalisation now has two instances, so state it as a
+   standing obligation rather than a lesson: an exclusion's *reason* is as perishable as the claim
+   it excludes, and re-checking the list means re-checking the reasons, not just the entries.**
 
 ---
 
