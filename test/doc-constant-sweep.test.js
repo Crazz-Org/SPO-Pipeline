@@ -1396,9 +1396,14 @@ const EXPECTED_CITATIONS = [
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
+  "orchestrator/journal.js :: auto-pull.js:49-57",
+  "orchestrator/orphan-scan.js :: auto-pull.js:49-57",
+  "orchestrator/orphan-scan.js :: daemon.js:714",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
   "orchestrator/park-loop.js :: intake.js:797-799",
+  "orchestrator/state-machine.js :: auto-pull.js:49-57",
+  "orchestrator/state-machine.js :: auto-pull.js:49-57",
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/steps/llm.js :: intake.js:797-799",
   "orchestrator/steps/scripted.js :: run.ts:63",
@@ -2007,7 +2012,14 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
-  assert.equal(anchored, 22, `expected 22 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // card #102 (2026-09-05): +5 citations to auto-pull.js:49-57 (journal.js, orphan-scan.js,
+  // state-machine.js x2) and orphan-scan.js :: daemon.js:714, all in the anchor-checked corpus.
+  // Re-measured: 27 verified (was 22), 2 unanchorable (unchanged), 0 offenders. All 5 new
+  // citations anchor -- each has a real symbol from auto-pull.js:49-57 (computeAutoPullBudget,
+  // queued, inFlight) placed close enough in the citing prose to out-rank any other nearby
+  // candidate; daemon.js:714 anchors on its own nearby prose. See EXPECTED_CITATIONS above for
+  // the exact 5 additions.
+  assert.equal(anchored, 27, `expected 27 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
@@ -2106,16 +2118,21 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // what the red canary was reporting: not one stale test, a corpus-wide blindness that one green
   // canary had been covering for. Re-pointing that canary at a bigger mutation would have restored
   // the green and left all ten blind.
+  // card #102 (2026-09-05): re-measured after +5 new citations (see the main anchor test's own
+  // note above). 4 of the 5 are ranges (auto-pull.js:49-57, cited from journal.js, orphan-scan.js,
+  // and twice from state-machine.js) -- ranges is 5 -> 9. The 5th (orphan-scan.js's own
+  // daemon.js:714) is single-line and discriminates -- discriminating is 15 -> 16. blunt is
+  // unchanged (the same two pre-existing entries); no new citation landed in that population.
   assert.deepEqual(
     blunt.map((b) => b.split(' -- ')[0]).sort(),
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
-  assert.equal(discriminating.length, 15, `expected 15 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
-  assert.equal(ranges.length, 5, `expected 5 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
+  assert.equal(discriminating.length, 16, `expected 16 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
+  assert.equal(ranges.length, 9, `expected 9 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 22, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (22).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 27, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (27).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check
