@@ -89,6 +89,7 @@ const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { resolveStepContract, deadlineMsForStep } = require('../step-contracts');
+const { isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
 
@@ -419,25 +420,61 @@ async function invokeClaudeReal(opts, deps = {}) {
   const rawExit = spawnResult.status === undefined ? null : spawnResult.status;
 
   // Deadline kill FIRST, before the generic `error` branch. When spawnOpts.timeout fires, Node
-  // fills in BOTH spawnResult.error (an Error with .code === 'ETIMEDOUT') AND spawnResult.signal
-  // (the signal it used to kill the child, SIGTERM here) -- so the `error` branch below used to
+  // fills in spawnResult.error with `.code === 'ETIMEDOUT'` -- so the `error` branch below used to
   // swallow every deadline kill and report it as "failed to spawn claude", which is exactly
   // backwards: claude spawned fine, ran, and was killed for running too long. Reproduced
   // 2026-08-30 on card #449 (`spo triage --dry`: "triageBugReport: claude call failed (error):
   // llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]").
   //
-  // A bare `signal` with NO deadline armed is NOT a timeout (an OOM kill, an operator's SIGKILL)
-  // -- that case keeps its own honest branch further down and never sets `timedOut`.
+  // The classification itself is command-timeout.js's isSpawnTimeout/isSpawnKilled -- the module
+  // PR #127 extracted for exactly this idiom, whose own header credits this function with
+  // learning it the hard way first. Sharing the definition is the point: the two copies had
+  // already drifted apart once, and this file was the half still carrying the defect.
   //
-  // `kind` stays 'error' on purpose: state-machine.js's callLlmStep rotates accounts on 'limit'
-  // and treats everything else as a plain failure. A third kind would force an audit of every
-  // `kind ===` test in the repo for no gain -- `timedOut` carries the information instead, and
-  // that is what intake.js's triageBugReport retries on.
+  // WHAT THIS FILE USED TO DO, AND WHY IT WAS WRONG. It read
+  //     (spawnResult.error && spawnResult.error.code === 'ETIMEDOUT') || (!!spawnResult.signal && deadlineArmed)
+  // and that second clause classified ANY externally-signalled child as a deadline kill.
+  // Re-measured on node v22.23.2, deadline armed in every row:
+  //
+  //   case                                        error.code   signal    status
+  //   genuine timeout expiry                      ETIMEDOUT    SIGTERM   null
+  //   genuine timeout, child traps TERM,          ETIMEDOUT    SIGKILL   null
+  //     killSignal: SIGKILL
+  //   genuine timeout, child traps TERM and       ETIMEDOUT    null      143
+  //     exits 143 itself  <-- what `claude` ACTUALLY does
+  //   external SIGTERM, nowhere near expiry       (none)       SIGTERM   null
+  //   external SIGKILL                            (none)       SIGKILL   null
+  //   ordinary non-zero exit                      (none)       null      3
+  //
+  // So `error.code === 'ETIMEDOUT'` is necessary AND sufficient, and it survives a different
+  // `killSignal`. The `signal` clause is true for precisely the two cases the contract excludes.
+  //
+  // The corpus (62 task journals in ~/.spo-state/journal, re-counted 2026-09-05) is blunter than
+  // "near-unreachable": of 22 `claude` transport failures, 11 were ETIMEDOUT, 8 were `exit 143`
+  // (claude handles SIGTERM itself and exits rather than dying of the signal), 3 were E2BIG, and
+  // ZERO were a bare signal. Every one of the 9 flagged `timedOut: true` events carries the
+  // detail `(ETIMEDOUT)`, not `(signal SIGTERM)` -- i.e. `spawnResult.signal` was null and the
+  // deleted clause did not fire on a single genuine timeout on record. It never once produced a
+  // true positive; its only reachable effect was to mislabel an external kill as a hang.
+  //
+  // That mislabelling is not cosmetic here, which is why #127 left this half for its own pass:
+  // `timedOut` drives intake.js's retry-once-on-the-SAME-account policy
+  // (intake.js's callIntakeStepWithRotation), so a deploy's SIGTERM bought a second full
+  // TRIAGE_BUG_REPORT/DRAFT_CARD/REVIEW_CARD call -- real metered spend, to re-run a prompt
+  // nobody had asked to stop running. Correcting `timedOut` stops that retry by itself; no
+  // routing change is needed for it.
+  //
+  // `kind` stays 'error' on BOTH branches on purpose: state-machine.js's four transport guards
+  // (:553, :674, :927, :1144) all route on `kind === 'error' || timedOut`, so `kind: 'error'`
+  // already dominates the disjunction and every one of them parks `llm-transport-failed:<STEP>`
+  // either way. Unlike steps/scripted.js -- where an unnamed external kill degraded to exit 1 and
+  // bought a real DIAGNOSE call -- nothing here ROUTES differently on the distinction. So
+  // `killedBySignal` is carried for the journal and the park detail, not for control flow: an
+  // operator reading a park needs "someone killed this" and "claude hung for 15 minutes" to be
+  // different sentences, because the remediations are opposite ones.
   const deadlineArmed = typeof spawnOpts.timeout === 'number';
-  const killedByDeadline =
-    (spawnResult.error && spawnResult.error.code === 'ETIMEDOUT') || (!!spawnResult.signal && deadlineArmed);
 
-  if (killedByDeadline) {
+  if (isSpawnTimeout(spawnResult, deadlineArmed)) {
     const detail = spawnResult.signal
       ? `signal ${spawnResult.signal}`
       : (spawnResult.error && (spawnResult.error.code || spawnResult.error.message)) || 'no signal reported';
@@ -445,10 +482,44 @@ async function invokeClaudeReal(opts, deps = {}) {
       ok: false,
       kind: 'error',
       timedOut: true,
-      deadlineMs: deadlineArmed ? spawnOpts.timeout : undefined,
+      deadlineMs: spawnOpts.timeout,
+      error: `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`,
+      sessionId: null,
+      ...ZERO_TOKENS,
+      numTurns: undefined,
+      durationS,
+      raw: rawExit,
+    };
+  }
+
+  // An external kill: an operator's `kill`, an OOM kill, a service manager stopping the worker.
+  // Checked BEFORE the generic `error` branch for the same reason the timeout branch is: a
+  // signalled child leaves no `error` at all, so it would otherwise fall through to the
+  // JSON-parse branch and be reported as "claude stdout was not valid JSON (exit 1)" -- blaming
+  // the model for output it was never allowed to finish writing.
+  //
+  // Deliberately NOT gated on `deadlineArmed`, matching command-timeout.js's isSpawnKilled: the
+  // same SIGTERM classified differently depending on whether this call happened to arm a deadline
+  // was never a property anyone wanted. `timedOut` is left ABSENT rather than set to false, which
+  // is this file's existing convention for every non-timeout branch (the spawn-failure branch
+  // below does the same) and what intake.js's `raw.timedOut === true` test already reads.
+  //
+  // Since KillMode=mixed landed (PR #130), `systemctl stop` no longer signals a worker's
+  // children, so this branch is rarer BY CONSTRUCTION than it was -- which lowers the urgency of
+  // classifying it and changes nothing about whether the classification is correct.
+  if (isSpawnKilled(spawnResult)) {
+    return {
+      ok: false,
+      kind: 'error',
+      killedBySignal: true,
+      signal: spawnResult.signal,
+      ...(deadlineArmed ? { deadlineMs: spawnOpts.timeout } : {}),
+      // When a deadline WAS armed, the fact that node did not raise ETIMEDOUT is itself the
+      // proof the deadline never fired -- so "inside" is measured, not assumed.
       error: deadlineArmed
-        ? `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`
-        : `llm.js: claude ran but was killed before it replied (${detail})`,
+        ? `llm.js: claude was killed by signal ${spawnResult.signal} after ${durationS}s, inside its ` +
+          `${spawnOpts.timeout}ms deadline (the deadline never fired) -- an external kill, not a timeout`
+        : `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,
@@ -463,19 +534,6 @@ async function invokeClaudeReal(opts, deps = {}) {
       ok: false,
       kind: 'error',
       error: `llm.js: failed to spawn claude: ${spawnResult.error.message}`,
-      sessionId: null,
-      ...ZERO_TOKENS,
-      numTurns: undefined,
-      durationS,
-      raw: rawExit,
-    };
-  }
-  if (spawnResult.signal) {
-    // Signalled with no deadline armed -- not this module's timeout, something external.
-    return {
-      ok: false,
-      kind: 'error',
-      error: `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,

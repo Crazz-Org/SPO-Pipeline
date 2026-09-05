@@ -164,6 +164,15 @@ and it is why #517 read `npm-run-timed-out` after 345s of a 660s budget. Tighten
 once, and a park reason is a retry contract (`TRANSIENT_RETRY_REASONS` keys on the string). It
 belongs in its own card with its own corpus pass, not folded into a deploy change. Filed.
 
+**Resolved since — this section is a record of the finding, not of current code.** The
+`command-timeout.js` half was fixed in PR #127, which extracted `isSpawnTimeout` (tightened to the
+`ETIMEDOUT` test alone) and gave the external kill its own `isSpawnKilled`/`killedBySignal` name so
+that a signalled child would not silently degrade into an ordinary exit-1 and buy a DIAGNOSE call.
+The second copy of the same clause, in `steps/llm.js`'s `invokeClaudeReal`, was fixed on 2026-09-05
+and now calls those same two functions; its own corpus pass (62 journals, 22 `claude` transport
+failures, zero bare signals) is recorded in the comment above that call. The `js` block above quotes
+code that no longer exists in either file.
+
 ---
 
 ## 3. What landed: the drain

@@ -778,6 +778,74 @@ test('triageBugReport: a malformed reply is NOT retried', async () => {
   assert.equal(result.retriedAfterTimeout, undefined);
 });
 
+// ---- the blast radius of steps/llm.js's timeout misclassification -----------------------------
+// This is WHY the `|| (!!signal && deadlineArmed)` clause in steps/llm.js mattered enough to get
+// its own pass rather than riding along with PR #127's command-timeout.js fix: `timedOut` is the
+// one flag in this codebase that spends money. An externally-signalled `claude` -- a deploy
+// restart, an operator's `kill`, an OOM kill -- used to arrive here as `timedOut: true` and buy a
+// second full TRIAGE_BUG_REPORT call on a metered account, re-running a prompt that had just been
+// deliberately stopped. Nothing about an external kill says "transient"; the retry rationale
+// (a hung third-party `curl`) does not apply to it at all.
+
+function externalKillSpawnResult(signal = 'SIGTERM') {
+  // No `error` field: node fills one in only when ITS OWN deadline fired. Measured on node
+  // v22.23.2 -- see test/llm-real.test.js's own block for the full table.
+  return { status: null, stdout: '', stderr: '', signal };
+}
+
+test('triageBugReport: an EXTERNAL kill is NOT retried -- it is not a timeout, and the retry costs a real metered call', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return externalKillSpawnResult();
+    },
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(calls, 1, 'exactly one call -- the second one was the bug');
+  assert.equal(result.ok, false);
+  assert.equal(result.retriedAfterTimeout, undefined);
+  assert.match(result.error, /killed by signal SIGTERM/);
+  assert.doesNotMatch(result.error, /exceeded the \d+ms deadline/);
+});
+
+test('triageBugReport: a genuine deadline kill is STILL retried -- the fix must not disarm the retry it was built for', async () => {
+  let calls = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return calls === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
+    },
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(calls, 2);
+  assert.equal(result.ok, true);
+  assert.equal(result.retriedAfterTimeout.retryOk, true);
+});
+
+test('triageBugReport: a genuine deadline kill in the shape the corpus records (signal null, exit 143) is retried too', async () => {
+  // `claude` traps SIGTERM and exits 143 itself, so every one of the 9 recorded deadline kills in
+  // ~/.spo-state/journal has `signal: null` -- the shape the deleted clause could never have
+  // classified, and the one this retry has always actually run on.
+  let calls = 0;
+  const err = new Error('spawnSync claude ETIMEDOUT');
+  err.code = 'ETIMEDOUT';
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: () => {
+      calls++;
+      return calls === 1
+        ? { error: err, status: 143, stdout: '', stderr: '', signal: null }
+        : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
+    },
+  };
+  const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
+  assert.equal(calls, 2);
+  assert.equal(result.retriedAfterTimeout.retryOk, true);
+});
+
 test('triageBugReport: a retry followed by an unusable reply still carries retriedAfterTimeout', async () => {
   let calls = 0;
   const deps = {
