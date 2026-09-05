@@ -155,11 +155,26 @@ function listQueuedReports(spoReportsDir) {
 // .disposition.txt`), so a maintainer reading the target dir later sees the identical shape
 // whether a human or this pipeline moved it there. Shared by report-intake.js (-> pending/,
 // -> archive/ on discard) and this file (-> archive/ on duplicate/filed).
+//
+// The rename is guarded the same way claimReport's own fs.renameSync is (see that function,
+// below): ENOENT means the source is gone. Usually a concurrent disposal already won -- a stale
+// claim reclaimed back to pending/ mid-archive, or, for report-intake.js's own unmutexed stage-1
+// call sites, two runners racing the same queued report -- the same class of race
+// processConfirmedReport's `finally` and claimReport already tolerate, so it is "already done",
+// not an error, and the winner's sidecar is left alone. It can ALSO mean the source never
+// existed, in which case this returns a dest that is not there and writes no sidecar: a
+// deliberate trade, because the alternative is the scan-loop death documented in
+// processConfirmedReport's `finally`, below. Any other error is rethrown unchanged.
 function moveReportTo(reportPath, targetDir, dispositionLine) {
   fs.mkdirSync(targetDir, { recursive: true });
   const base = path.basename(reportPath);
   const dest = path.join(targetDir, base);
-  fs.renameSync(reportPath, dest);
+  try {
+    fs.renameSync(reportPath, dest);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return dest;
+    throw err;
+  }
   fs.writeFileSync(path.join(targetDir, `${base}.disposition.txt`), `${dispositionLine}\n`);
   return dest;
 }
