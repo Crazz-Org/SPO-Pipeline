@@ -627,6 +627,42 @@ test('HANDLERS.VALIDATE (real mode): a REJECT threads its findings onward even w
   });
 });
 
+test('HANDLERS.VALIDATE (real mode): a REJECT threads its REASONS onward when they arrive as a JSON-encoded STRING (card #640)', () => {
+  // The ninth of the class, and the sibling of the test directly above: `findings` was fixed to
+  // go through normalizeFindingsPayload while `reasons`, twelve lines up in the same branch, kept
+  // a bare `Array.isArray(...) ? ... : []`. On card #640 that emptied the only field the next
+  // IMPLEMENT had to act on, and all three DIAGNOSE attempts then read the post-filter `[]` and
+  // concluded the VALIDATE prompt had violated its "exactly one entry" contract -- blaming the
+  // producer for the reader's loss, and spending the whole diagnose budget on it.
+  const raw = JSON.stringify(['the criterion is not met: two files were never edited']);
+  const spawnSync = makeValidateSpawn({
+    claudeReplies: [realShapedLlmReply({ verdict: 'REJECT', reasons: raw, findings: [] })],
+  });
+  const ctx = validateCtx({ id: 'card-vf-reject-reasons-string', issue: 640, spawnSync });
+
+  return HANDLERS.VALIDATE(ctx).then((next) => {
+    assert.equal(next, 'IMPLEMENT');
+    const journal = readJournal(ctx.taskDir);
+
+    const threaded = journal.find((e) => e.state === 'VALIDATE' && e.event === 'result');
+    assert.deepEqual(
+      threaded.payload.reasons,
+      ['the criterion is not met: two files were never edited'],
+      'the JSON-encoded reasons string is parsed, not silently dropped to []'
+    );
+
+    // The raw record beside it: what the validator actually sent, unfiltered. Without this a
+    // `reasons` the reader dropped is indistinguishable from one the validator never sent --
+    // which is precisely the inference #640's DIAGNOSE got wrong three times.
+    const rawEvent = journal.find((e) => e.event === 'change-validator');
+    assert.equal(rawEvent.reasons, raw, 'change-validator journals reasons verbatim, pre-normalization');
+
+    // And the ledger line carries the reason instead of '(no reason given)'.
+    const ledger = fs.readFileSync(path.join(ctx.taskDir, 'ledger.md'), 'utf8');
+    assert.match(ledger, /the criterion is not met/);
+  });
+});
+
 test('HANDLERS.VALIDATE (real mode): the change-validator verdict is journalled BEFORE the findings comment is posted', async () => {
   // Ordering, pinned. Verification moved the `change-validator` event to after the post and the
   // whole suite stayed green -- the same unpinned-ordering shape that shipped silently twice

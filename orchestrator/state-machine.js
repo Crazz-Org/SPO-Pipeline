@@ -1122,7 +1122,18 @@ async function handleValidate(ctx) {
 
   const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', ctx.deps);
   const verdict = result && result.verdict;
-  appendEvent(ctx.taskDir, 'VALIDATE', 'change-validator', { verdict, findings: result && result.findings });
+  // `reasons` rides along verbatim, beside findings, for one reason: this is the ONLY record of
+  // what the validator actually sent. The 'result' event below journals `reasons` only AFTER the
+  // REJECT branch has filtered it, so a `reasons` the reader dropped and a `reasons` the validator
+  // never sent are indistinguishable downstream -- and on card #640 all three DIAGNOSE attempts
+  // read that post-filter `[]`, concluded the validator had violated its contract, and spent the
+  // whole diagnose budget on it. Raw here, normalized there; the pair is what makes the claim
+  // falsifiable.
+  appendEvent(ctx.taskDir, 'VALIDATE', 'change-validator', {
+    verdict,
+    findings: result && result.findings,
+    reasons: result && result.reasons,
+  });
 
   // Action 1.4: a transport failure on the change-validator previously fell through to the
   // generic `throw new ParkSignal('validate-unrecognized-verdict', ...)` at the bottom of this
@@ -1204,7 +1215,14 @@ async function handleValidate(ctx) {
     // lastResultPayload (the reader every other step's derivation already goes through) only
     // ever looks at `event.payload`, so a flat shape here would be silently invisible to it. See
     // task-values.js's diagnosisSummary for the reader side that now also considers this event.
-    const reasons = Array.isArray(result.reasons) ? result.reasons.filter(Boolean) : [];
+    // Card #640: this was `Array.isArray(result.reasons) ? ... : []` while `findings` twelve lines
+    // down already went through normalizeFindingsPayload -- the same split that the comment below
+    // documents as the eighth bug of its class. Measured: all 16 `change-validator` events in the
+    // corpus carry `findings` as a JSON-encoded string, so a validator that encodes `reasons` the
+    // same way had it silently discarded here. On #640 that emptied the one field IMPLEMENT and
+    // DIAGNOSE had to work from: the next IMPLEMENT was handed a REJECT with nothing to act on,
+    // and DIAGNOSE then blamed the validator for the emptiness this line had produced.
+    const reasons = normalizeFindingsPayload(result.reasons).items.filter(Boolean);
     // normalizeFindingsPayload, not `Array.isArray(...) ? ... : []`, and this is the eighth
     // production bug of its class in this project. Measured 2026-09-01: ALL 16 `change-validator`
     // events in the 19-journal corpus carry `findings` as a JSON-ENCODED STRING, never an array --
