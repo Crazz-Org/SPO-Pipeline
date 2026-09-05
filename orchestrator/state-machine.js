@@ -1611,9 +1611,20 @@ function finalizePark(ctx, lastState, reason, detail) {
       // parked`, invisible to the queue, recoverable only by orphan-scan noticing the stale
       // state.json much later. Falling through to the ordinary park instead costs one honest park
       // comment and keeps every reader's view of this card true.
+      // Card #43: `attempt` also keys the queue filename (reEnqueueTask's 5th param), so a
+      // duplicate transient retry for the same attempt overwrites instead of double-enqueuing.
+      // It repeats across park cycles -- a human `retry` strips `transientRetries` above,
+      // resetting the counter, so a later transient retry is `attempt 1` again -- but that is
+      // benign: the earlier entry has already been consumed out of queue/ by takeNextTask by
+      // then, so there is nothing left for the repeated key to collide with.
+      //
+      // Maintainer-priority fix: priorityClass 't' (also this function's default, passed
+      // explicitly here for clarity) -- this is the machine's own bounded retry, never allowed to
+      // sort ahead of a maintainer's explicit 'h'-classed retry regardless of which numeric key
+      // is smaller.
       let requeuedFile = null;
       try {
-        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore });
+        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore }, attempt, 't');
       } catch (err) {
         appendEvent(ctx.taskDir, lastState, 'transient-retry-failed', {
           reason,

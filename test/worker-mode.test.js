@@ -232,7 +232,11 @@ test('daemon.js sets config.queueDir for BOTH modes -- action 4.4 auto-retry is 
   //
   // What it protects, measured rather than argued (2026-09-01): instrumenting runWorker to call
   // finalizePark(ctx, 'WORKTREE', 'claim-rate-limited', {exit:4}) with the config main() actually
-  // builds, a `--shadow --worker` run printed
+  // builds, a `--shadow --worker` run printed (filename shown pre-#43 and pre the maintainer-
+  // priority fix found in review of #43, no card number of its own; a re-run against today's code
+  // prints '0000-retry-t-00000000000000000001-probe-task.json' instead -- the `attempt`-keyed,
+  // zero-padded, priority-classed name, not a `Date.now()` timestamp -- verified by running the
+  // same finalizePark call through buildCtx directly, not re-derived by eye):
   //   PROBE queueDir=<tmp>/q2 exists=true
   //   PROBE queue before=[] after=["0000-retry-1788274127884-probe-task.json"]
   // i.e. the retry entry IS written. Drop `queueDir` from that config literal and finalizePark's

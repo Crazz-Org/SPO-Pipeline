@@ -636,9 +636,12 @@ function readJournalLines(taskDir) {
 //   `park-comment`  -- the comment landed, so its numeric commentId is the boundary. GitHub
 //                      comment ids increase monotonically, so "id > anchorId" is exactly
 //                      "posted after we commented". Preferred whenever it exists.
-//   `park-anchor`   -- journalled before the `gh` call, so it survives that call failing or
-//                      the daemon being SIGTERMed mid-call. Its timestamp is the boundary
-//                      instead: a `retry` counts if it was posted after the park.
+//   `park-anchor`   -- stamped before the `gh` call, so a `retry` posted while it is still
+//                      in flight still counts, but journalled only after that call returns --
+//                      on the branch where it FAILED (issue #77). What it survives is that
+//                      failure, keeping the card reachable when the park comment itself could
+//                      not be posted -- never a SIGKILL landing mid-call. Its timestamp is
+//                      still the boundary: a `retry` counts if it was posted after the park.
 //
 // The LAST of either kind wins, by journal position -- so a later successful cycle's
 // commentId supersedes an earlier cycle's bare timestamp, and a park whose comment failed
@@ -712,11 +715,59 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
   return nowMs - lastScanAt >= unparkScanMs;
 }
 
-// Re-enqueues `id` with the ORIGINAL task.json fields (queue/0000-retry-<ts>-<id>.json) --
-// unlike intake.makeTask's zero-padded sequence naming (built for `spo pull`'s priority-order
-// batch), a retry only ever concerns one already-known id, so a timestamp is enough for both
-// uniqueness and (combined with the `0000-` prefix below) filename-sort placement among whatever
-// else is in queue/ at the time. worktreePath/branch are dropped even if present (they never are
+// Re-enqueues `id` with the ORIGINAL task.json fields, into a filename keyed on `key` (the retry
+// comment id for a maintainer's `retry`, the bounded auto-retry `attempt` counter for
+// finalizePark's transient retry) rather than `Date.now()`. Card #43, measured: two writers
+// processing the SAME logical retry differ by more than a millisecond, so under the old
+// `Date.now()` naming the second write was a SECOND queue file, not an idempotent overwrite of
+// the first -- a double-enqueue. Keying the filename on something that repeats for the same
+// logical retry makes a duplicate re-enqueue collide on the SAME final name and overwrite instead
+// of double-enqueuing, regardless of write ordering or crash point. Issue #43's design note
+// (audit update, 2026-09-03) is the authoritative source for this fix; it supersedes an earlier
+// proposal to journal `unparked-by-maintainer` BEFORE re-enqueueing, which narrowed the race but
+// traded it for a worse failure -- see the call site below for why that ordering stays as-is.
+// `key` is required IN PRACTICE -- both of this function's real callers always pass one (the
+// comment id, the attempt counter) -- but the parameter itself still defaults to `null`, and
+// anything that is not a finite number (including `null`, `undefined`, NaN, or a string) falls
+// back to `Date.now()` rather than throwing or writing a literal "undefined"/"NaN" into the
+// filename -- the latter would still satisfy every reader's `.json`/`\d+-` checks below and then
+// collide with every OTHER keyless retry for this task. As of this fix that fallback is DEAD IN
+// PRODUCTION -- it exists purely as a never-throw backstop for a hypothetical future third caller
+// that forgets to pass a key, not as a path either real call site is expected to take. It must
+// stay dead-code-safe regardless: this function has no try/catch, its `unparkScan` call site has
+// none (finalizePark's, in state-machine.js, does wrap its own call in one -- 'transient-retry-
+// failed' on catch), and neither does `runScanCycle` -- so a throw on the unparkScan path still
+// kills the scanner process, and the fallback must never throw. A future caller that omits `key`
+// gets today's non-idempotent-but-harmless behaviour silently, with no test watching for it --
+// that is an accepted residual risk, not an oversight.
+//
+// The key segment is zero-padded to a fixed width of 20 because `listQueueFiles` sorts by plain
+// filename string, not numeric value: unpadded, `0000-retry-9-x` sorts AFTER `0000-retry-10-x`.
+// Width never mattered before this fix -- every key was a 13-digit `Date.now()`, so every retry
+// filename was the same length -- but it matters now that a GitHub comment id (~10 digits, an
+// 11th coming eventually), a small `attempt` counter (usually 1 digit), and the `Date.now()`
+// fallback can all key the same filename shape.
+//
+// Maintainer-priority fix (found in review of #43, no card number of its own -- a consequence of
+// #43's own key-space design, not a defect #43 set out to fix): zero-padding both callers into
+// ONE shared numeric key space had a consequence neither this comment nor the original fix -- a
+// GitHub comment id is ~10 digits and `attempt` is usually 1, so once both are padded to the
+// same width they compete on nothing BUT that width, and whichever key happens to be numerically
+// smaller wins the filename sort regardless of which caller it came from. Measured: a
+// maintainer's `retry` typed BEFORE several cards park transiently could still sort AFTER every
+// one of them, inverting the exact property action 2.8 exists to guarantee (below) -- a
+// maintainer's explicit retry ending up behind newly-parked, unattended work. `priorityClass`
+// fixes this by giving the two callers separate, non-competing sort classes instead of letting
+// them share one key space: `'h'` for a maintainer's own retry (unparkScan), `'t'` for
+// finalizePark's bounded auto-retry, written as its own filename segment BEFORE the padded key so
+// `'h' < 't'` decides the sort before any key comparison is even reached. Anything other than the
+// literal `'h'` -- including an unrecognized value from some future caller that forgot to
+// classify itself -- collapses to `'t'`, the LOWER-priority class: an unclassed caller can never
+// accidentally preempt a human's explicit retry. The class is a property of the CALLER (which
+// kind of retry this is), not of the key's shape, so it is threaded through as its own parameter
+// rather than inferred from `key` inside this function.
+//
+// worktreePath/branch are dropped even if present (they never are
 // -- task.json is the original queue file, never rewritten with runtime fields -- see journal.js's
 // own header comment) so WORKTREE derives both fresh from config.pipelineWorktreesDir/taskId on
 // the retry, same as a first attempt.
@@ -725,12 +776,14 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // filename-sort order, and intake.js's `nextQueueSeq` never hands out a fresh card a sequence
 // below `0001` (it starts at 1 for an empty/missing queue dir and only grows from there) -- so
 // `0000-retry-...` sorts strictly before EVERY `NNNN-issue-...` fresh card, unconditionally, by
-// the 4th character alone ('0' < '1'), with no dependence on what follows in either name. Before
+// the 4th character alone ('0' < '1'), with no dependence on what follows in either name -- which
+// is exactly why the `'h'`/`'t'` priority class (the maintainer-priority fix, below) and the
+// padded key can be layered on AFTER that prefix without disturbing this guarantee at all. Before
 // this fix the file was just `retry-<ts>-<id>.json`, and `'r' > '0'`-`'9'` put every retry BEHIND
 // every fresh card in filename-sort order -- the opposite of both this comment's original intent
 // and the spec's: a maintainer's explicit "retry" should not wait behind newly auto-pulled work.
-// Multiple retries queued at once still sort relative to each other by their own timestamp, same
-// as before. Nothing else parses this filename's shape: `takeNextTask`'s own `path.basename(file,
+// Multiple retries queued at once still sort relative to each other by their own (zero-padded)
+// key, same as before. Nothing else parses this filename's shape: `takeNextTask`'s own `path.basename(file,
 // '.json')` id fallback is never reached for a retry (task.json's own `id` field, restored above,
 // always wins first), and every other reader of queue/ (bin/spo, orphan-scan.js's `queuedIds`,
 // intake.js's `nextQueueSeq`) only ever checks `.endsWith('.json')` or a leading `\d+-`, both
@@ -762,11 +815,34 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // (state-machine.js's takeNextTask/listQueueFiles, orphan-scan.js's queuedIds, console
 // collectQueue, intake.js's nextQueueSeq) keys off `*.json`, so a half-written entry under the
 // real name is a torn read waiting to happen. queuedIds is the sharp one: it falls back to the
-// FILENAME when the JSON does not parse, so a torn `0000-retry-<ts>-<id>.json` is keyed under
-// `0000-retry-<ts>-<id>` instead of `<id>`, the task looks absent from the queue, and orphan-scan
+// FILENAME when the JSON does not parse, so a torn `0000-retry-<h|t>-<key>-<id>.json` is keyed
+// under `0000-retry-<h|t>-<key>-<id>` instead of `<id>`, the task looks absent from the queue, and orphan-scan
 // reparks a card that is sitting right there waiting out its own backoff. The temp name is
 // dot-prefixed so it matches neither the `*.json` filter nor nextQueueSeq's `^(\d+)-`; the rename
 // is atomic within the directory, so the entry only ever appears complete.
+//
+// Card #43: once the FINAL name is keyed on something that repeats (the retry comment id, the
+// attempt counter) rather than `Date.now()`, two concurrent writers processing the same logical
+// retry compute the SAME final name -- by design, so the second write overwrites the first
+// instead of double-enqueuing -- but under the OLD tmp naming (derived from the final name) they
+// would also compute the SAME temp name. Measured: the loser's `renameSync` throws `ENOENT` once
+// the winner has already renamed its own tmp file away, and with no try/catch anywhere up the
+// stack from here to `runScanCycle`, that kills the scanner process. `unparkScan` being `async`
+// means two invocations can interleave inside one process (a real daemon can also run unparkScan
+// and finalizePark against the same task around the same time), so the temp name carries its own
+// per-writer, per-call discriminator (`process.pid` plus a module-level counter -- the pid alone
+// is not enough because of that same interleaving) rather than relying on the final name to be
+// unique. It keeps the `.` prefix and the non-`.json` suffix the paragraph above relies on.
+//
+// Known, accepted consequence of that uniqueness: under the OLD naming, a crash between
+// `writeFileSync` and `renameSync` left a tmp file that the next same-key write would eventually
+// overwrite (its tmp name was derived only from the final name, so a later retry for the same
+// logical entry reused it). Under this per-writer discriminator every such leftover is unique, so
+// each crash in that window now leaks one tmp file permanently instead of being cleaned up by a
+// later write. Nothing sweeps `queueDir` for stale `.tmp` files. This is deliberately left
+// unfixed: the window is a couple of synchronous statements wide (microseconds), the files are
+// invisible to every reader in this module's own list above (none of them match `.tmp`), and
+// disk cleanup is a separate concern from the correctness property this fix is closing.
 //
 // The maintainer-facing consequence is the one worth stating in plain language: a human typing
 // `retry` on a parked issue ALWAYS restores the full auto-retry budget and starts immediately,
@@ -775,13 +851,26 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // property that keeps a human always able to make progress: an exhausted transient-retry budget
 // is a fact about how many times THE MACHINE tried unattended, not a ceiling on how many times a
 // human who has now looked at the reason gets to ask for another attempt.
-function reEnqueueTask(queueDir, taskDir, id, extra = {}) {
+// Module-level, not per-call: the per-writer tmp-name discriminator below needs to distinguish
+// two calls interleaved within the SAME process (unparkScan is `async`), not just two processes.
+let reEnqueueTmpSeq = 0;
+
+function reEnqueueTask(queueDir, taskDir, id, extra = {}, key = null, priorityClass = 't') {
   const original = readJsonSafe(path.join(taskDir, 'task.json')) || {};
   const { worktreePath, branch, baseMainSha, transientRetries, notBefore, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
-  const name = `0000-retry-${Date.now()}-${id}.json`;
+  // Card #43: fall back to Date.now() for anything that isn't a finite number, `null` default
+  // included -- see the header comment for why this must never throw.
+  const keyNum = Number.isFinite(key) ? key : Date.now();
+  // Maintainer-priority fix: anything but the literal 'h' collapses to 't' -- see the header
+  // comment for why an unclassed/unrecognized caller must never be able to preempt a human's
+  // explicit retry.
+  const cls = priorityClass === 'h' ? 'h' : 't';
+  const name = `0000-retry-${cls}-${String(keyNum).padStart(20, '0')}-${id}.json`;
   const file = path.join(queueDir, name);
-  const tmp = path.join(queueDir, `.${name}.tmp`);
+  // Per-writer, per-call discriminator -- required once `name` above can repeat across writers
+  // by design; see the header comment ("Card #43: once the FINAL name is keyed...") for why.
+  const tmp = path.join(queueDir, `.${name}.${process.pid}-${++reEnqueueTmpSeq}.tmp`);
   fs.writeFileSync(tmp, JSON.stringify({ ...rest, id, ...extra }, null, 2) + '\n');
   fs.renameSync(tmp, file);
   return file;
@@ -1105,7 +1194,12 @@ function reconcileExternalClosure(deps, config, taskDir, task, state) {
     mergedAt,
     at: new Date().toISOString(),
   };
-  writeState(taskDir, { ...state, externallyResolved });
+  // Re-read state.json rather than spreading the `state` snapshot passed in at the top of the
+  // caller's loop iteration: the two blocking `gh api` calls above give a live worker (or, same
+  // shape as the ABANDONED path a few lines down, an abandon reply landing in this same cycle)
+  // a window to write state.json while this function is off talking to GitHub. Spreading the
+  // stale snapshot would silently revert that write; re-reading here keeps it.
+  writeState(taskDir, { ...(readJsonSafe(path.join(taskDir, 'state.json')) || state), externallyResolved });
   journal('reconciled-externally', externallyResolved);
 }
 
@@ -1235,7 +1329,18 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
     const match = scan.match.comment;
 
     if (scan.match.name === 'retry') {
-      reEnqueueTask(queueDir, taskDir, id);
+      // Effect (the queue entry) before marker (this journal event) is the crash-safe order --
+      // a crash between the two loses only the marker, and the next scan's findParkAnchor sees
+      // no `unparked-by-maintainer` yet and redoes the (now idempotent -- see reEnqueueTask's
+      // header, card #43) effect. Inverting it would leave a marker with no effect: the card
+      // reads as already handled but nothing will ever work it again -- issue #77's class, on the
+      // unpark side. state-machine.js's own transient-retry write (queue entry, then journal
+      // line) states the identical rule for the identical pair of writes. Do not reorder this.
+      //
+      // Maintainer-priority fix: priorityClass 'h' -- a maintainer's OWN retry always outranks any
+      // bounded auto-retry finalizePark might have queued, regardless of which key is numerically
+      // smaller. See reEnqueueTask's header for why the two callers cannot share one key space.
+      reEnqueueTask(queueDir, taskDir, id, {}, match.id, 'h');
       appendEvent(taskDir, 'PARKED', 'unparked-by-maintainer', { retryCommentId: match.id });
       continue;
     }
