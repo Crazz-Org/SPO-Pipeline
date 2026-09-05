@@ -215,6 +215,8 @@ const PARK_REASONS = {
   'worktree-dirty-leftover': 'A previous run left uncommitted changes behind.',
   'branch-unmerged-leftover': 'A previous run left an unmerged branch behind.',
   'git-timed-out': 'A git command took too long.',
+  'command-killed-by-signal':
+    'Something outside the pipeline killed the command it was running — a restart, an out-of-memory kill, or someone stopping it by hand. Nothing was wrong with the card itself.',
   'push-pr-failed': 'Pushing the branch or opening the pull request failed.',
   'product-repo-lock-timeout': 'Another card held the repository for too long.',
 
