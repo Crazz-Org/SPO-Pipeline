@@ -653,7 +653,21 @@ test('config: SPO_PRODUCT_REPO and SPO_WORKTREES_DIR redirect the real product p
   // Absent -> the real defaults, unchanged for production.
   const defaults = load({ SPO_PRODUCT_REPO: undefined, SPO_WORKTREES_DIR: undefined });
   assert.ok(defaults.productRepo.endsWith('SPO-WebClient'));
-  assert.ok(defaults.pipelineWorktreesDir.endsWith('worktrees'));
+  assert.ok(defaults.pipelineWorktreesDir.endsWith('.spo-worktrees'));
+
+  // The invariant behind that name, pinned separately because the name alone does not carry it:
+  // the worktrees directory must not be a descendant of REPO_ROOT. Claude Code loads a CLAUDE.md
+  // from every ancestor of its cwd, so a product worktree nested under this repo pulls
+  // SPO-Pipeline/CLAUDE.md into every PLAN and IMPLEMENT call -- § Permissions and all, written
+  // about this repo and read as policy for the product. Card SPO-WebClient#640 burned 521.5k
+  // billable tokens parking on a wall that text described and that does not exist in the product
+  // repo. See config.js's own comment on this field for the measurement.
+  const repoRoot = path.resolve(__dirname, '..');
+  const rel = path.relative(repoRoot, defaults.pipelineWorktreesDir);
+  assert.ok(
+    rel.startsWith('..') || path.isAbsolute(rel),
+    `pipelineWorktreesDir must live outside REPO_ROOT, got ${defaults.pipelineWorktreesDir}`
+  );
 });
 
 // The helper every daemon subprocess goes through must actually set both, or the seam above is

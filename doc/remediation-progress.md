@@ -254,7 +254,7 @@ against the product source, not by guesswork:
   a busy bench reported as a dirty worktree that is perfectly clean. Now 7800s, and `npm-gate`
   is the one command never retried.
 - **The chantier-gate command was unusable.** Bare `node --test` walks into any parked card's
-  product worktree under `worktrees/issue-<n>/` and runs SPO-WebClient's TypeScript suites:
+  product worktree under `~/.spo-worktrees/issue-<n>/` and runs SPO-WebClient's TypeScript suites:
   1926 tests / 1168 failures with four parked cards. Use `node --test test/*.test.js`.
 
 **2.1's scope was insufficient for its own stated purpose**, so 2.1b was added: four modules

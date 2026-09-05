@@ -35,7 +35,7 @@ remains are the *project* rules, resolved from the step's `cwd` (`config.js` →
 
 | Step | `cwd` | Project rules visible |
 |---|---|---|
-| PLAN, IMPLEMENT | product worktree (`worktrees/issue-N/`) | the 70 WebClient rules (`.claude/settings.json` is versioned, so present in every worktree) ✅ |
+| PLAN, IMPLEMENT | product worktree (`~/.spo-worktrees/issue-N/`) | the 70 WebClient rules (`.claude/settings.json` is versioned, so present in every worktree) ✅ |
 | DIAGNOSE, VALIDATE, CITATION_VERIFIER | SPO-Pipeline root | **none** ❌ |
 
 These three steps run in `permissionMode: 'default'` with no human to respond: any Bash command

@@ -118,7 +118,7 @@ until you know whether zero came from a check or from a blind spot. §3 separate
 - **E10** — `README.md:35`: `` `node --test test/*.test.js` suite `` vs.
   `orchestrator/README.md:2371`: `node --test --test-timeout=30000 test/*.test.js`.
 - **E11** — `bin/spo:1654` and `orchestrator/README.md:2056` both quote `CLAUDE.md` as
-  "Verdict by exit code, never by reading text output"; `CLAUDE.md:29` reads "**Verdict by exit
+  "Verdict by exit code, never by reading text output"; `CLAUDE.md:35` reads "**Verdict by exit
   code**, never by reading `gh`'s text output" — close, but not verbatim in either repo.
 - **E1** — `doc/board-audit.md:20`: `currently holds all 12 options`; `gh project field-list 1
   --owner Crazz-Org` returns 10 today (`Todo | Planning | Implementing | Checks & PR | Gate |
@@ -179,7 +179,7 @@ This project's documents are expected to state their own errors — `doc/accepte
 the precedent: a plan claim that its own quoted grep command, if actually run, would have
 contradicted. The same class of slip happened twice while producing this one.
 
-**A manufactured finding, retracted.** The sweep read `orchestrator/config.js:704`'s comment —
+**A manufactured finding, retracted.** The sweep read `orchestrator/config.js:779`'s comment —
 "`board-move.sh` is 125 lines of `gh api graphql`" — reported the line count as **drifted**
 (`wc -l` → 147), and added a supporting sentence: "grew 22 lines since 2026-09-01." Both halves
 are wrong. `grep -c . scripts/board-move.sh` (non-blank lines) is **exactly 125** — the comment

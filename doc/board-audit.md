@@ -170,7 +170,7 @@ outside the ~30-point budget and explicitly disallowed for this audit.
 4. **Reorder the `Status` field options** to the target sequence — open the `Status` field's
    options editor and drag into: `Todo, Planning, Implementing, Checks & PR, Gate, Validation,
    Merging, Done, Parked, Intake`. `Intake` is not part of the pipeline's own stage sequence but
-   MUST stay an option: `config.js:764`'s `reportIntakeColumn` defaults to it, and
+   MUST stay an option: `config.js:786`'s `reportIntakeColumn` defaults to it, and
    `report-intake.js:29` calls a failed move there "NOT safe to ignore" — the one board move in
    this repo that is load-bearing rather than cosmetic. Do not include it among the options step
    5 deletes.
