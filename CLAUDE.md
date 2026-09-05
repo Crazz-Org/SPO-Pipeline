@@ -47,6 +47,27 @@ card:
   user layer of every account in the pool (`spo account sync-settings`, automatic on
   `account add` and on every `--real` startup). Resync after editing it.
 
+## Working a chantier (driver sessions only)
+
+The method is not optional and not re-invented per session — it is the plan's execution rules
+(`doc/remediation-plan-2026-08.md` § *Execution rules*) plus what execution corrected in them
+(`doc/remediation-progress.md` § *The driver workflow that worked*). Read both before dispatching.
+
+- **One action = one Sonnet subagent** (effort `medium`), spec self-contained with its tests.
+  **Verified by an Opus subagent** (effort `high`): adversarial diff review **+ mutation testing** —
+  the highest-value part of the loop; it repeatedly caught tests passing for the wrong reason.
+- **Subagents never commit.** The driver commits after verification: keeps "one commit per action"
+  exact and stops parallel agents clobbering each other. One PR per chantier.
+- **One chantier at a time**, next starts only on a green gate: `node --test test/*.test.js`
+  (never bare) + `daemon.js --dry-run` + the chantier's listed checks. *(live recette)* gates stop
+  and ask the maintainer.
+- Items marked **DECISION** are never delegated; the driver frames, the maintainer decides.
+- **Sibling grep** (rule 6): any action correcting a factual claim greps the old *and* new phrasing
+  across `doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`,
+  `README.md`, and reports what it found; the Opus verifier checks it did.
+- Audits use the other pairing: read-only **Fable 5.1** sweep, then **every** finding re-verified by
+  Opus running a real probe — Fable's line refs hold, its derived conclusions have been inverted.
+
 ## Git
 
 The repo uses worktrees for two distinct purposes:
