@@ -443,6 +443,18 @@ test('drain: a straggler that ignores SIGTERM is SIGKILLed, not waited on foreve
   assert.ok(elapsed < 10000, `run() took ${elapsed}ms -- the reap was not bounded`);
   const exitEvt = events.find((e) => e.event === 'worker-exit' && e.id === 'drain-stubborn');
   assert.equal(exitEvt.signal, 'SIGKILL');
+  // Verification follow-up: a straggler killed by the ESCALATION must still reach drain-end's
+  // `outcomes`. It does, because reapSignalledChildren awaits `all` after the SIGKILL rather than
+  // returning as soon as it sends it -- so every exit is observed before drain-end is written.
+  // Measured rather than assumed, and pinned here so the ordering cannot quietly invert: writing
+  // drain-end before the reap is exactly the defect that pass already found once.
+  const end = events.find((e) => e.event === 'dispatcher-drain-end');
+  assert.deepEqual(end.survivors, ['drain-stubborn']);
+  assert.deepEqual(
+    end.outcomes,
+    [{ id: 'drain-stubborn', outcome: 'crashed' }],
+    'a SIGKILLed straggler vanished from drain-end -- its exit was not observed before the record was written'
+  );
 });
 
 test('drain: a signalled straggler that finishes cleanly is recorded as such, not as a loss', { timeout: 30000 }, async () => {
@@ -743,4 +755,70 @@ test('pipeline-version: a state.json with no state field falls back to INTAKE, n
   const first = readJournal(journalDir, 'nostate-card')[0];
   assert.equal(first.event, 'pipeline-version');
   assert.equal(first.state, 'INTAKE');
+});
+
+// ---- 15. the escalation applies to the BREAKER path too, and that is deliberate ------------------
+
+test('breaker: a straggler that ignores SIGTERM is escalated on the circuit-breaker path as well', { timeout: 30000 }, async () => {
+  const queueDir = mkTmp('spo-brk-esc-q-');
+  const journalDir = mkTmp('spo-brk-esc-j-');
+  writeTask(queueDir, '0001-a.json', { id: 'brk-crash', kind: 'synthetic' });
+  writeTask(queueDir, '0002-b.json', { id: 'brk-stubborn', kind: 'synthetic' });
+
+  // NO DRAIN HERE -- no signal is sent. reapSignalledChildren replaced the bare
+  // `await Promise.allSettled(pending)` on EVERY shutdown path, not just the drain's, and this
+  // pins the consequence on the path that inherited it. It is an improvement rather than a
+  // borrowed trade: before, a breaker trip with an unkillable worker waited forever and systemd's
+  // cgroup SIGKILL at TimeoutStopSec was the only way out -- which skips daemon.js's exit hook, so
+  // the single-instance lock file leaked for the next start to stale-sweep. Now the dispatcher
+  // ends it itself, well inside that ceiling, and the lock is released properly.
+  let call = 0;
+  const spawnFn = (cmd, args, opts) => {
+    call += 1;
+    return call === 1
+      ? realSpawn(process.execPath, ['-e', 'setTimeout(() => process.exit(7), 300);'], { ...opts, stdio: 'ignore' })
+      : realSpawn(
+          process.execPath,
+          ['-e', "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 60000);"],
+          { ...opts, stdio: 'ignore' }
+        );
+  };
+
+  // TWO accounts, not one: fillSlots re-clamps K to the number of HEALTHY accounts before every
+  // spawn, so a K=2 config against baseConfig's single-account pool silently runs one worker --
+  // and this test needs a second, stubborn worker alive when the breaker trips.
+  const poolDir = mkTmp('spo-brk-pool-');
+  writePoolDir(poolDir, [{ name: 'pool1' }, { name: 'pool2' }]);
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({
+      workers: 2,
+      claudeAccountsDir: poolDir,
+      workerCrashLimit: 1, // the first crash trips it
+      drainKillGraceMs: 300,
+      deps: { spawn: spawnFn, spawnScanner: neverExitsSpawn },
+    })
+  );
+  const startedAt = Date.now();
+  const stopReason = await dispatcher.run();
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(stopReason.reason, 'worker-crash-circuit-breaker');
+  const events = readDaemonEvents(journalDir);
+  assert.equal(
+    events.filter((e) => e.event === 'worker-spawn').length,
+    2,
+    'only one worker ran -- there was no straggler alive when the breaker tripped, so this proved nothing'
+  );
+  assert.ok(
+    events.some((e) => e.event === 'dispatcher-kill-escalated'),
+    'the breaker path waited unbounded on a worker that ignores SIGTERM'
+  );
+  assert.equal(
+    events.some((e) => e.event === 'dispatcher-drain-end'),
+    false,
+    'a breaker trip is not a drain and must not journal one'
+  );
+  assert.ok(elapsed < 15000, `run() took ${elapsed}ms -- the breaker path is not bounded`);
 });

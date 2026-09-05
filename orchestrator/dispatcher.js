@@ -964,6 +964,16 @@ function createDispatcher(queueDir, journalRoot, config) {
   }
 
   // Waits for every signalled child to actually die, then ESCALATES rather than waiting forever.
+  //
+  // ON EVERY SHUTDOWN PATH, NOT ONLY THE DRAIN'S -- it replaced the bare
+  // `await Promise.allSettled(pending)` that used to end run(), so a CIRCUIT-BREAKER trip inherits
+  // it too. Named here because inheriting a trade in silence is how it gets reverted by someone
+  // who only reads the drain's argument for it. On the breaker path it is a straight improvement,
+  // not a borrowed cost: before, a breaker trip with a worker that ignores SIGTERM waited forever
+  // and systemd's cgroup SIGKILL at TimeoutStopSec was the only way out -- which kills this
+  // process without running daemon.js's exit hook, so the single-instance lock file leaks for the
+  // next start to stale-sweep. Ending it here keeps the process's own exit path intact. Pinned by
+  // test/drain.test.js's breaker-escalation test, which sends no signal at all.
   // `await Promise.allSettled(pending)` alone is unbounded, and a straggler that ignores SIGTERM is
   // exactly what production has: a worker blocked in spawnSync does not run its signal handler
   // until the loop turns. The only backstop was systemd's own SIGKILL at TimeoutStopSec -- which
