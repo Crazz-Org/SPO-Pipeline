@@ -117,7 +117,56 @@ test('daemon-install.sh: the rate limit is the one that actually bounds Restart=
   );
 });
 
+// ---- the unit must not reach into the tree a human edits ------------------------------------
+
+test('nothing in the generated unit points into the source checkout -- only the release symlink', () => {
+  const body = unitTemplate();
+  // `$REPO` is the DEV checkout: edited, pulled, and mutated under the running service. Any path
+  // the unit derives from it is a live code path still coupled to that tree, which is the one
+  // thing the immutable-release layout exists to remove -- and it is easy to reintroduce, because
+  // every line here used to read that way. SPO_PARK_ALERT_CMD did, and was missed until a deploy
+  // was already half-run: the daemon would have spawned a park-alert script out of a tree anyone
+  // could edit while it ran.
+  const offenders = body
+    .split('\n')
+    // A comment that MENTIONS $REPO is prose explaining why the directives below do not use it --
+    // systemd ignores those lines entirely, and flagging them is the same false positive the
+    // heredoc/backtick guard first produced.
+    .filter((l) => !l.trimStart().startsWith('#'))
+    .filter((l) => l.includes('$REPO'))
+    .map((l) => l.trim());
+  assert.deepEqual(
+    offenders,
+    [],
+    'unit line(s) derived from the source checkout rather than $CURRENT_LINK:\n  ' + offenders.join('\n  ')
+  );
+
+  // And the two that matter positively, so this cannot pass by the unit becoming empty.
+  const parsed = sections(body);
+  assert.ok(parsed.Service.some((l) => l.startsWith('WorkingDirectory=') && l.includes('CURRENT_LINK')));
+  assert.ok(parsed.Service.some((l) => l.startsWith('ExecStart=') && l.includes('CURRENT_LINK')));
+});
+
 // ---- the drain's two systemd halves -------------------------------------------------------------
+
+test('daemon-install.sh: KillMode=mixed, or the drain is silently defeated by systemd', () => {
+  const parsed = sections(unitTemplate());
+  const hit = parsed.Service.find((l) => l.startsWith('KillMode='));
+  assert.ok(hit, 'no KillMode -- systemd defaults to control-group and SIGTERMs every worker too');
+  assert.equal(hit, 'KillMode=mixed');
+
+  // WHY THIS IS PINNED HERE AND NOT PROVEN BY THE DRAIN TESTS. Under the default
+  // (control-group), `systemctl stop` signals EVERY process in the cgroup -- the dispatcher, each
+  // worker, and each worker's `claude`/`npm` child. The dispatcher then drains correctly and
+  // reports "every in-flight card finished" while those cards were killed by the same signal
+  // milliseconds earlier. Measured in production on the first real stop after the drain shipped
+  // (2026-09-05 12:19): a clean 357ms drain, and both in-flight cards parked
+  // `llm-transport-failed:PLAN` from a `claude` that exited 143.
+  //
+  // Every test in test/drain.test.js signals the daemon PROCESS -- `daemon.kill('SIGTERM')` --
+  // which is mixed-mode semantics, so they were green throughout. The unit file is part of the
+  // behaviour; testing the function is not testing the deployment.
+});
 
 test('daemon-install.sh: a deliberate stop is not a failure -- SuccessExitStatus covers 143 and 130', () => {
   const parsed = sections(unitTemplate());
