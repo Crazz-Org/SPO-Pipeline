@@ -179,7 +179,7 @@ This project's documents are expected to state their own errors — `doc/accepte
 the precedent: a plan claim that its own quoted grep command, if actually run, would have
 contradicted. The same class of slip happened twice while producing this one.
 
-**A manufactured finding, retracted.** The sweep read `orchestrator/config.js:779`'s comment —
+**A manufactured finding, retracted.** The sweep read `orchestrator/config.js:839`'s comment —
 "`board-move.sh` is 125 lines of `gh api graphql`" — reported the line count as **drifted**
 (`wc -l` → 147), and added a supporting sentence: "grew 22 lines since 2026-09-01." Both halves
 are wrong. `grep -c . scripts/board-move.sh` (non-blank lines) is **exactly 125** — the comment

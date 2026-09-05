@@ -194,10 +194,10 @@ test('daemon-install.sh: TimeoutStopSec leaves room for the whole drain, or the 
   // lesson, paid for twice in this repo). If the default is ever expressed differently this
   // assertion fails loudly rather than silently checking a `null`.
   const configSrc = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'config.js'), 'utf8');
-  const m = /SPO_DRAIN_TIMEOUT_MS[\s\S]{0,160}?:\s*(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+);/.exec(configSrc);
+  const m = /SPO_DRAIN_TIMEOUT_MS[\s\S]{0,160}?[:,]\s*(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+)\s*[;)]/.exec(configSrc);
   assert.ok(m, 'config.js no longer states the drain default as `N * N * N` -- update this guard');
   const drainSec = (Number(m[1]) * Number(m[2]) * Number(m[3])) / 1000;
-  const g = /SPO_DRAIN_KILL_GRACE_MS[\s\S]{0,160}?:\s*(\d+)\s*\*\s*(\d+);/.exec(configSrc);
+  const g = /SPO_DRAIN_KILL_GRACE_MS[\s\S]{0,160}?[:,]\s*(\d+)\s*\*\s*(\d+)\s*[;)]/.exec(configSrc);
   assert.ok(g, 'config.js no longer states the kill-grace default as `N * N` -- update this guard');
   const graceSec = (Number(g[1]) * Number(g[2])) / 1000;
 

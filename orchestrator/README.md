@@ -783,7 +783,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:701`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:719`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via

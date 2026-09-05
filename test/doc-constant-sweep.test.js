@@ -99,8 +99,7 @@ const PINS = [
     name: 'benchIdleWaitMaxPolls default (180) and benchIdleWaitPollIntervalMs default (5000ms)',
     checks: [
       { file: 'orchestrator/config.js', contains: 'process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS !== undefined ? Number(process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS) : 180;' },
-      { file: 'orchestrator/config.js', contains: '? Number(process.env.SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS)' },
-      { file: 'orchestrator/config.js', contains: ': 5000;' },
+      { file: 'orchestrator/config.js', contains: "positiveMsFromEnv('SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS', 5000)" },
       { file: 'doc/state-machine-spec.md', contains: 'default 180 × 5s = 15 minutes' },
     ],
   },
@@ -209,8 +208,7 @@ const PINS = [
   {
     name: 'ciChecksPollIntervalMs default (20000ms)',
     checks: [
-      { file: 'orchestrator/config.js', contains: '? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)' },
-      { file: 'orchestrator/config.js', contains: ': 20000;' },
+      { file: 'orchestrator/config.js', contains: "positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVAL_MS', 20000)" },
       { file: 'doc/state-machine-spec.md', contains: 'default 20000ms' },
     ],
   },
@@ -1378,7 +1376,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
-  "doc/board-audit.md :: config.js:829",
+  "doc/board-audit.md :: config.js:846",
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1350",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1100",
@@ -1387,7 +1385,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
-  "orchestrator/README.md :: config.js:701",
+  "orchestrator/README.md :: config.js:719",
   "orchestrator/README.md :: dispatcher.js:485-499",
   "orchestrator/README.md :: doc/state-machine-spec.md:140",
   "orchestrator/README.md :: intake.js:797-799",

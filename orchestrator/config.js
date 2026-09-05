@@ -55,15 +55,11 @@ const CI_CHECKS_MAX_POLLS =
   process.env.SPO_CI_CHECKS_MAX_POLLS !== undefined ? Number(process.env.SPO_CI_CHECKS_MAX_POLLS) : 30;
 // Env override for the drain bound below. 0 is meaningful (drain off, pre-drain behaviour
 // restored) -- see that field's comment, and dispatcher.js's resolveDrainTimeoutMs, for why only a
-// non-finite or negative value falls back to the default rather than 0 doing so.
-const DRAIN_KILL_GRACE_MS =
-  process.env.SPO_DRAIN_KILL_GRACE_MS !== undefined ? Number(process.env.SPO_DRAIN_KILL_GRACE_MS) : 60 * 1000;
-const DRAIN_TIMEOUT_MS =
-  process.env.SPO_DRAIN_TIMEOUT_MS !== undefined ? Number(process.env.SPO_DRAIN_TIMEOUT_MS) : 45 * 60 * 1000;
-const CI_CHECKS_POLL_INTERVAL_MS =
-  process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS !== undefined
-    ? Number(process.env.SPO_CI_CHECKS_POLL_INTERVAL_MS)
-    : 20000;
+// non-finite or negative (or malformed/empty) value falls back to the default rather than 0 doing
+// so -- routed through nonNegativeMsFromEnv (defined below) for exactly that reason.
+const DRAIN_KILL_GRACE_MS = nonNegativeMsFromEnv('SPO_DRAIN_KILL_GRACE_MS', 60 * 1000);
+const DRAIN_TIMEOUT_MS = nonNegativeMsFromEnv('SPO_DRAIN_TIMEOUT_MS', 45 * 60 * 1000);
+const CI_CHECKS_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVAL_MS', 20000);
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
 // `systemctl --user restart spo-bench-worker.service` (worker.ts:1542 maps the SIGTERM straight to
@@ -90,10 +86,7 @@ const CI_CHECKS_POLL_INTERVAL_MS =
 // MAX_POLLS / SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS override.
 const BENCH_IDLE_WAIT_MAX_POLLS =
   process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS !== undefined ? Number(process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS) : 180;
-const BENCH_IDLE_WAIT_POLL_INTERVAL_MS =
-  process.env.SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS !== undefined
-    ? Number(process.env.SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS)
-    : 5000;
+const BENCH_IDLE_WAIT_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS', 5000);
 // The product of the two above, computed once so config.js's own FINISH derivation and
 // steps/scripted.js's actual poll loop can never restate (and drift from) the same number twice.
 const BENCH_IDLE_WAIT_MAX_MS = BENCH_IDLE_WAIT_MAX_POLLS * BENCH_IDLE_WAIT_POLL_INTERVAL_MS;
@@ -124,13 +117,13 @@ const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 // for why THESE two, specifically, are the right derivation source. Still exported verbatim as
 // `orphanScanMs` / `unparkScanMs` below; this only moves the declaration, same pattern as
 // CI_CHECKS_MAX_POLLS/CI_CHECKS_POLL_INTERVAL_MS above.
-const ORPHAN_SCAN_MS = process.env.SPO_ORPHAN_SCAN_MS !== undefined ? Number(process.env.SPO_ORPHAN_SCAN_MS) : 60 * 1000;
-const UNPARK_SCAN_MS = process.env.SPO_UNPARK_SCAN_MS !== undefined ? Number(process.env.SPO_UNPARK_SCAN_MS) : 60 * 1000;
+const ORPHAN_SCAN_MS = nonNegativeMsFromEnv('SPO_ORPHAN_SCAN_MS', 60 * 1000);
+const UNPARK_SCAN_MS = nonNegativeMsFromEnv('SPO_UNPARK_SCAN_MS', 60 * 1000);
 
 // Hoisted out of the `autoTriageMs` field below (action 3.3) so autoTriageBackoffBaseMs can
 // default off the SAME resolved value rather than re-parsing SPO_AUTO_TRIAGE_MS a second time and
 // risking the two silently drifting apart.
-const AUTO_TRIAGE_MS = process.env.SPO_AUTO_TRIAGE_MS !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_MS) : 0;
+const AUTO_TRIAGE_MS = nonNegativeMsFromEnv('SPO_AUTO_TRIAGE_MS', 0);
 
 // A SPO_TIMEOUT_*_MS override, or the default when the variable is absent OR unusable.
 //
@@ -179,6 +172,32 @@ function positiveMsFromEnv(name, defaultMs) {
   if (raw === undefined) return defaultMs;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return defaultMs;
+  return parsed;
+}
+
+// Same fallback idiom as positiveMsFromEnv above, for the subset of *_MS timers where 0 is not a
+// typo but a documented, load-bearing SENTINEL -- an on/off switch (SPO_ORPHAN_SCAN_MS=0 disables
+// that scanner; SPO_AUTO_PULL_MS=0 is the LIVE PRODUCTION setting on the systemd drop-in
+// zz-auto-pull-off.conf, and turning it into the 5-minute default here would make the production
+// daemon start claiming cards again) or a zero-length settling window (SPO_ORPHAN_GRACE_MS=0 /
+// SPO_TRIAGE_CLAIM_GRACE_MS=0 mean "reclaim immediately, skip the anti-race wait"). positiveMsFromEnv
+// cannot be reused for these: it rejects 0 by construction, correctly, for its own 12 call sites --
+// reusing it here would turn every one of these documented off-switches/zero-windows into its
+// default the moment someone set them to the very value that means "off"/"immediately".
+//
+// A MALFORMED override must still fall back rather than silently disarming the subsystem it names
+// -- that is the actual defect this helper exists to close. Before it existed, every one of these
+// fields was a bare `Number(process.env.X)`: `Number('abc')` is NaN, and consumers guard with
+// `if (!(x > 0)) return false` (or, for lockWatchMs's sibling shape elsewhere, no guard at all) --
+// so a systemd drop-in typo silently disabled the scanner/timer it named, or in the no-guard case
+// made a `setInterval` fire at 1ms. So: unset, empty/whitespace, non-finite, or negative all fall
+// back to the default; zero and positive values (including fractional) pass through unchanged.
+function nonNegativeMsFromEnv(name, defaultMs) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultMs;
+  if (typeof raw === 'string' && raw.trim() === '') return defaultMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultMs;
   return parsed;
 }
 
@@ -605,13 +624,12 @@ module.exports = {
   // treated as orphaned rather than mid-transition-write. Longer than any legitimate step
   // (stepDeadlineMs above), short enough that a real orphan does not sit unrecovered for long.
   // SPO_ORPHAN_GRACE_MS overrides.
-  orphanGraceMs:
-    process.env.SPO_ORPHAN_GRACE_MS !== undefined ? Number(process.env.SPO_ORPHAN_GRACE_MS) : 4 * 60 * 1000,
+  orphanGraceMs: nonNegativeMsFromEnv('SPO_ORPHAN_GRACE_MS', 4 * 60 * 1000),
 
   // How often the running daemon re-reads its own lock file to confirm it is still the holder
   // (orchestrator/lock.js's watchLock) -- acquireLock only ever checks once, at startup.
   // SPO_LOCK_WATCH_MS overrides.
-  lockWatchMs: process.env.SPO_LOCK_WATCH_MS !== undefined ? Number(process.env.SPO_LOCK_WATCH_MS) : 15 * 1000,
+  lockWatchMs: positiveMsFromEnv('SPO_LOCK_WATCH_MS', 15 * 1000),
 
   // Claude Max account pool directory -- the single source of truth (maintainer decision,
   // 2026-08-29): every subdirectory is one account, plus a machine-written state.json for
@@ -771,7 +789,7 @@ module.exports = {
   // was true then. It is no longer true: the scanner is now its own process, on its own timer,
   // entirely independent of whether the dispatcher's workers are busy. A pull can now land while
   // K workers are mid-task; they simply pick the new card up via their own next takeNextTask.
-  autoPullMs: process.env.SPO_AUTO_PULL_MS !== undefined ? Number(process.env.SPO_AUTO_PULL_MS) : 5 * 60 * 1000,
+  autoPullMs: nonNegativeMsFromEnv('SPO_AUTO_PULL_MS', 5 * 60 * 1000),
   // How many claimable candidates one auto-pull cycle takes off the board.
   //
   // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card at a time off the
@@ -805,8 +823,7 @@ module.exports = {
   // `gh issue create` + a column move. Nonzero by default, UNLIKE autoTriageMs below: this stage
   // contains zero LLM judgement (see report-intake.js's own header), so it is the same risk
   // class as auto-pull, not auto-triage. SPO_AUTO_INTAKE_MS overrides, 0 disables.
-  autoIntakeMs:
-    process.env.SPO_AUTO_INTAKE_MS !== undefined ? Number(process.env.SPO_AUTO_INTAKE_MS) : 15 * 60 * 1000,
+  autoIntakeMs: nonNegativeMsFromEnv('SPO_AUTO_INTAKE_MS', 15 * 60 * 1000),
 
   // How many queued reports one intake cycle files. SPO_AUTO_INTAKE_LIMIT overrides.
   autoIntakeLimit:
@@ -840,8 +857,7 @@ module.exports = {
   // sit for days, and N pending cards x 12 scans/minute is a REST budget leak for no benefit.
   // SPO_REPORT_CONFIRM_SCAN_MS overrides, 0 disables (report-intake still FILES raw cards, they
   // just never automatically progress past a maintainer's comment).
-  reportConfirmScanMs:
-    process.env.SPO_REPORT_CONFIRM_SCAN_MS !== undefined ? Number(process.env.SPO_REPORT_CONFIRM_SCAN_MS) : 5 * 60 * 1000,
+  reportConfirmScanMs: nonNegativeMsFromEnv('SPO_REPORT_CONFIRM_SCAN_MS', 5 * 60 * 1000),
 
   // daemon.js --real polls for reports a human has already replied "confirm" to (via the scan
   // above) on this timer, running orchestrator/intake.js's triageBugReport (reproduce/route/
@@ -909,8 +925,7 @@ module.exports = {
   // mid-triage) rather than mid-write -- the exact same role orphanGraceMs plays above for a
   // crashed task's state.json, reused rather than inventing a second constant for an identical
   // shape of race. SPO_TRIAGE_CLAIM_GRACE_MS overrides.
-  triageClaimGraceMs:
-    process.env.SPO_TRIAGE_CLAIM_GRACE_MS !== undefined ? Number(process.env.SPO_TRIAGE_CLAIM_GRACE_MS) : 4 * 60 * 1000,
+  triageClaimGraceMs: nonNegativeMsFromEnv('SPO_TRIAGE_CLAIM_GRACE_MS', 4 * 60 * 1000),
 
   // ---- stage 0: remote report pull (orchestrator/remote-report-pull.js) -------------------
   //
@@ -937,8 +952,7 @@ module.exports = {
   // here (unlike a judgement-bearing timer) because the driver stays inert without BOTH
   // remoteReportUrl and a readable token file -- see remote-report-pull.js's own early return.
   // SPO_REMOTE_REPORT_PULL_MS overrides, 0 disables outright.
-  remoteReportPullMs:
-    process.env.SPO_REMOTE_REPORT_PULL_MS !== undefined ? Number(process.env.SPO_REMOTE_REPORT_PULL_MS) : 5 * 60 * 1000,
+  remoteReportPullMs: nonNegativeMsFromEnv('SPO_REMOTE_REPORT_PULL_MS', 5 * 60 * 1000),
 
   // How many production-listed reports one pull cycle fetches. SPO_REMOTE_REPORT_PULL_LIMIT overrides.
   remoteReportPullLimit:
@@ -986,7 +1000,7 @@ module.exports = {
   // informational: nothing in the state machine reads this value, and no behavior (retry, park,
   // scheduling, account rotation) is ever driven by it. SPO_CACHE_TTL_MS overrides (tests use
   // this to shorten the TTL rather than fabricating hour-long timestamps).
-  cacheTtlMs: process.env.SPO_CACHE_TTL_MS !== undefined ? Number(process.env.SPO_CACHE_TTL_MS) : 60 * 60 * 1000,
+  cacheTtlMs: positiveMsFromEnv('SPO_CACHE_TTL_MS', 60 * 60 * 1000),
 
   REPO_ROOT,
   cwdForStep,
