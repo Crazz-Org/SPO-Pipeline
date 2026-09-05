@@ -1332,7 +1332,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1129",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1135",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1363,7 +1363,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1129",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1135",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -2164,9 +2164,9 @@ test('extractAnchorCandidates: a neighbouring citation to a DIFFERENT file clips
 });
 
 test('extractFileMentionCandidates: matches a cross-file basename mention by substring, never the citation\'s own file', () => {
-  const text = '`console/collect.js`, reached from `bin/spo:1102`, reads it by content';
-  const idx = text.indexOf('bin/spo:1102');
-  const end = idx + 'bin/spo:1102'.length;
+  const text = '`console/collect.js`, reached from `bin/spo:1135`, reads it by content';
+  const idx = text.indexOf('bin/spo:1135');
+  const end = idx + 'bin/spo:1135'.length;
   const cands = extractFileMentionCandidates(text, idx, end, null, null, 'bin/spo');
   assert.deepEqual(cands.map((c) => c.ident), ['collect']);
   assert.equal(cands[0].kind, 'file');
@@ -2184,9 +2184,9 @@ test('extractFileMentionCandidates: matches a cross-file basename mention by sub
 
 test('mergedCandidates: falls back to a file-mention candidate ONLY when no identifier candidate exists', () => {
   // No identifier at all near the citation -- must fall back to the file mention.
-  const noIdentText = '`console/collect.js`, reached from `bin/spo:1102`, reads it by content';
-  const idx1 = noIdentText.indexOf('bin/spo:1102');
-  const end1 = idx1 + 'bin/spo:1102'.length;
+  const noIdentText = '`console/collect.js`, reached from `bin/spo:1135`, reads it by content';
+  const idx1 = noIdentText.indexOf('bin/spo:1135');
+  const end1 = idx1 + 'bin/spo:1135'.length;
   const fallback = mergedCandidates(noIdentText, idx1, end1, null, null, 'bin/spo');
   assert.deepEqual(fallback.map((c) => c.ident), ['collect']);
 
@@ -2244,7 +2244,7 @@ test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance eit
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1102 needs it ("collect" inside "collectAll")', () => {
+test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1135 needs it ("collect" inside "collectAll")', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
   const file = path.join(dir, 'target.txt');
   fs.writeFileSync(file, ['line one', 'const data = collectAll(sources);', 'line three'].join('\n'));
@@ -2298,35 +2298,40 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1129 back to bin/spo:1102 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1135 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
-  // The mutation is the citation's own PREVIOUS value, `:1102`, not the original historical
+  // The mutation is the citation's own PREVIOUS value, `:1129`, not the original historical
   // `:1090-1093`. That first range stopped being a usable canary on 2026-09-04: intake-token
   // journalling (SPO-Pipeline#117) pushed `cmdDashboard`'s header comment down onto lines
   // 1090-1093, and that comment names `console/collect.js` -- so the "wrong" citation now
-  // anchors for an accidental reason and proves nothing. `:1102` is the same drift of the same
-  // citation caught a third time (after `:1137` and `#476`'s move of `collectAll`), and lands
-  // mid-`cmdDashboard` on a line naming neither collect nor a candidate. See the two "canary
-  // green for an accidental reason" notes above: a canary that passes for a reason unrelated to
-  // what it watches is worse than a missing one.
-  const reverted = normalized.replace('reached from `bin/spo:1129`', 'reached from `bin/spo:1102`');
+  // anchors for an accidental reason and proves nothing.
+  //
+  // FOURTH catch of the same citation, 2026-09-05, and the first where two fixes collided: #117
+  // moved `collectAll(sources)` to :1129 and the flight deck (#122) moved it again in the same
+  // window, so `main` and the deck branch each landed a DIFFERENT correct answer (:1129 and
+  // :1108) and the merge had to recompute a third (:1135). The canary is therefore `:1129` --
+  // the value main had just fixed to, which the merge itself invalidated. It lands mid-
+  // `cmdDashboard` on a comment line naming neither collect nor a code-shaped candidate, so it
+  // fails for the right reason. See the two "canary green for an accidental reason" notes
+  // above: a canary that passes for a reason unrelated to what it watches is worse than none.
+  const reverted = normalized.replace('reached from `bin/spo:1135`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
   assert.equal(cites.length, 1, 'expected exactly one bin/spo citation in this doc');
   const c = cites[0];
-  assert.deepEqual([c.start, c.stop], [1102, 1102], 'the revert must have actually changed the parsed line range');
+  assert.deepEqual([c.start, c.stop], [1129, 1129], 'the revert must have actually changed the parsed line range');
 
   const resolved = resolveCitationTarget(c.file);
   assert.ok(resolved.target, 'bin/spo must resolve for this proof to mean anything');
   const candidates = mergedCandidates(reverted, c.idx, c.end, null, null, c.file);
   const top = candidates.slice(0, ANCHOR_TOPK);
   const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
-  assert.equal(found, false, 'the stale bin/spo:1102 citation must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact class of bug that motivated it');
+  assert.equal(found, false, 'the stale bin/spo:1129 citation must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact class of bug that motivated it');
 
-  // And the fixed text (:1129, actually on disk) must anchor cleanly, via the SAME substring-
+  // And the fixed text (:1135, actually on disk) must anchor cleanly, via the SAME substring-
   // matched 'file' candidate ("collect", from `console/collect.js`) -- proving both that the
   // check discriminates the specific drift in both directions AND that the 'file' kind's
   // substring matching (see candidateFoundNear's own fixture test) is what makes it possible at

@@ -42,7 +42,7 @@ function writeJournalTask(journalRoot, id, { state, jsonlLines }) {
 }
 
 test('renderDashboard with zero sources renders an empty-state document without throwing', () => {
-  const html = renderDashboard(collectAll({}));
+  const html = renderDashboard(collectAll({}), { view: 'health' });
   assert.match(html, /^<!doctype html>/);
   assert.match(html, /SPO Pipeline/);
   assert.match(html, /<meta http-equiv="refresh" content="30">/);
@@ -57,7 +57,7 @@ test('renderDashboard with zero sources renders an empty-state document without 
 
 test('renderDashboard also survives a completely undefined input', () => {
   assert.doesNotThrow(() => renderDashboard(undefined));
-  const html = renderDashboard(undefined);
+  const html = renderDashboard(undefined, { view: 'health' });
   assert.match(html, /<!doctype html>/);
 });
 
@@ -97,6 +97,27 @@ test('a DONE task and a PARKED task are collected with their ids, states, reason
     jsonlLines: [{ ts: '2026-08-29T00:05:00.000Z', state: 'GATE', event: 'parked', reason: 'gate-dirty-tree', detail: {} }],
   });
 
+  // A third card, RUNNING -- without one the deck assertion below would pass vacuously (both
+  // cards above finished in August and are long outside the ten-minute linger window). `kind:
+  // card`, because collectDeck filters synthetic tasks out: they are not runs along the track.
+  writeJournalTask(journalRoot, 'running-task-03', {
+    state: {
+      id: 'running-task-03',
+      title: 'Demo running task',
+      kind: 'card',
+      state: 'IMPLEMENT',
+      diagnoseAttempts: 0,
+      validateRejects: 0,
+      updatedAt: new Date(Date.now() - 60000).toISOString(),
+    },
+    jsonlLines: [
+      { ts: new Date(Date.now() - 120000).toISOString(), state: 'INTAKE', event: 'taken' },
+      { ts: new Date(Date.now() - 120000).toISOString(), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+      { ts: new Date(Date.now() - 90000).toISOString(), state: 'WORKTREE', event: 'transition', to: 'PLAN' },
+      { ts: new Date(Date.now() - 60000).toISOString(), state: 'PLAN', event: 'transition', to: 'IMPLEMENT' },
+    ],
+  });
+
   const data = collectAll({ journalRoot });
   const done = data.journalTasks.find((t) => t.id === 'done-task-01');
   const parked = data.journalTasks.find((t) => t.id === 'parked-task-02');
@@ -105,15 +126,38 @@ test('a DONE task and a PARKED task are collected with their ids, states, reason
   assert.equal(parked.reason, 'gate-dirty-tree');
   assert.equal(done.llmSteps[0].sessionId, 'sess-plan-abc');
 
-  // per-task detail is not rendered -- the Kanban board owns that view, see console/render.js's
-  // "journalTasks ... collected for other consumers ... but NOT rendered here" note.
-  const html = renderDashboard(data);
-  assert.doesNotMatch(html, /done-task-01/);
-  assert.doesNotMatch(html, /parked-task-02/);
-  assert.doesNotMatch(html, /gate-dirty-tree/);
-  // no dollar figures anywhere -- see console/render.js's header ("NEVER a dollar figure")
-  assert.doesNotMatch(html, /\$\d/);
-  assert.doesNotMatch(html, /estUsd|totalCostUsd|total cost/i);
+  // THE HEALTH PAGE still carries no per-task detail: it is about the machine, not about any one
+  // card, and the sections on it are unchanged by the deck's arrival.
+  const health = renderDashboard(data, { view: 'health' });
+  assert.doesNotMatch(health, /done-task-01/);
+  assert.doesNotMatch(health, /parked-task-02/);
+  assert.doesNotMatch(health, /gate-dirty-tree/);
+
+  // THE ROOT PAGE IS THE OPPOSITE, and this reverses a decision that stood until 2026-09-05.
+  // console/render.js used to say per-task detail "duplicates the GitHub Projects board (Kanban),
+  // which is the source of truth for task state", and this test pinned three doesNotMatch
+  // assertions on exactly these ids. That was true of a card's COLUMN and false of everything
+  // else: the board cannot say which of eleven states a card sits in, how many times it has been
+  // sent back, or how this visit compares with every previous one. The deck exists to say that,
+  // so the assertion is inverted rather than deleted -- the rule changed, it did not lapse.
+  //
+  // A card only appears once it is on the deck (running, or finished within the linger window),
+  // which is why this asserts on the collector's own gate rather than on the fixture's age.
+  const onDeck = data.deck.map((c) => c.id);
+  assert.deepEqual(onDeck, ['running-task-03'], 'the deck fixture must put exactly the running card on the deck');
+  const deck = renderDashboard(data);
+  assert.match(deck, /running-task-03/);
+  assert.match(deck, /Demo running task/);
+  // ...and the two August cards stay off it: the deck is live only, with no history list.
+  assert.doesNotMatch(deck, /done-task-01/);
+  assert.doesNotMatch(deck, /parked-task-02/);
+
+  // ...and NEITHER page ever carries a dollar figure -- see console/render.js's header
+  // ("NEVER a dollar figure"). The deck renders token COUNTS, formatted k/M, and no money.
+  for (const html of [health, deck]) {
+    assert.doesNotMatch(html, /\$\d/);
+    assert.doesNotMatch(html, /estUsd|totalCostUsd|total cost/i);
+  }
 });
 
 test('a cooling account renders in the accounts table with its cooldown timestamp, token and credentials columns', () => {
@@ -125,7 +169,7 @@ test('a cooling account renders in the accounts table with its cooldown timestam
   const cooldownUntil = Date.now() + 60 * 60 * 1000;
   writeJson(path.join(accountsDir, 'state.json'), { 'acct-cooling': { cooldownUntil } });
 
-  const html = renderDashboard(collectAll({ accountsDir }));
+  const html = renderDashboard(collectAll({ accountsDir }), { view: 'health' });
 
   assert.match(html, /acct-cooling/);
   assert.match(html, /acct-healthy/);
@@ -133,7 +177,7 @@ test('a cooling account renders in the accounts table with its cooldown timestam
   assert.match(html, new RegExp(new Date(cooldownUntil).toISOString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
-test('bin/spo dashboard honors --out, writes the file there, and prints the absolute path', () => {
+test('bin/spo dashboard honors --out, writes BOTH pages there, and prints both absolute paths', () => {
   const journalRoot = mkTmp('spo-dash-cli-journal-');
   const queueDir = mkTmp('spo-dash-cli-queue-');
   const outDir = mkTmp('spo-dash-cli-out-');
@@ -141,11 +185,20 @@ test('bin/spo dashboard honors --out, writes the file there, and prints the abso
 
   const printed = runSpo(['dashboard', '--journal', journalRoot, '--queue', queueDir, '--out', outPath]);
 
-  assert.equal(printed.trim(), outPath);
+  // Static mode emits the deck at --out and health beside it -- see cmdDashboard's own comment
+  // on why both: the public tier is an rsync of this directory and would 404 on /health
+  // otherwise.
+  const healthPath = path.join(path.dirname(outPath), 'health.html');
+  assert.deepEqual(printed.trim().split('\n'), [outPath, healthPath]);
   assert.ok(fs.existsSync(outPath));
+  assert.ok(fs.existsSync(healthPath));
+
   const html = fs.readFileSync(outPath, 'utf8');
   assert.match(html, /^<!doctype html>/);
   assert.match(html, /SPO Pipeline/);
+  assert.match(html, /id="frag-live"/); // --out is the deck
+  const health = fs.readFileSync(healthPath, 'utf8');
+  assert.match(health, /id="frag-services"/); // ...and the sections are next door
 });
 
 test('bin/spo dashboard with no --out writes to console/dashboard.html under the repo root', async () => {
@@ -183,9 +236,12 @@ test('bin/spo dashboard with no --out writes to console/dashboard.html under the
   try {
     const printed = runSpo(['dashboard', '--journal', journalRoot, '--queue', queueDir]);
 
-    assert.equal(printed.trim(), defaultOut);
+    const defaultHealth = path.join(REPO_ROOT, 'console', 'health.html');
+    assert.deepEqual(printed.trim().split('\n'), [defaultOut, defaultHealth]);
     assert.ok(fs.existsSync(defaultOut));
+    assert.ok(fs.existsSync(defaultHealth));
     fs.rmSync(defaultOut, { force: true });
+    fs.rmSync(defaultHealth, { force: true });
   } finally {
     fs.rmSync(guard, { recursive: true, force: true });
   }
@@ -327,7 +383,7 @@ test('collectServices marks nightly "stale" (not "pass") when its finishedAt is 
   // 1175 tests while rendering a self-contradictory tile: a green, pulsing "GREEN" heading over a
   // caption reading "verdict PASS, 40h ago -- STALE (>36h)". The tile's colour and word are what a
   // maintainer reads at a glance; the caption is what they read second.
-  const html = renderDashboard({ services, accounts: { rows: [] } });
+  const html = renderDashboard({ services, accounts: { rows: [] } }, { view: 'health' });
   assert.match(
     html,
     /svc-tile tile-orange[\s\S]{0,400}?Nightly[\s\S]{0,400}?>STALE</,
@@ -375,7 +431,7 @@ test('collectServices: a nightly that FAILED stays RED however old it is -- stal
   const services = collectServices({ benchRoot, now });
   assert.equal(services.nightly.status, 'fail');
 
-  const html = renderDashboard({ services, accounts: { rows: [] } });
+  const html = renderDashboard({ services, accounts: { rows: [] } }, { view: 'health' });
   assert.match(html, /svc-tile tile-red[\s\S]{0,400}?Nightly[\s\S]{0,400}?>RED</, 'a stale FAIL renders red, not orange');
 });
 
@@ -546,10 +602,11 @@ test('renderDashboard(data, {live:true}) drops the meta refresh and references /
   assert.match(html, /\/api\/system/);
 });
 
-test('renderDataFragments returns the 7 fragment keys as un-nested HTML strings', () => {
+test('renderDataFragments returns the 8 fragment keys as un-nested HTML strings', () => {
   const fragments = renderDataFragments(collectAll({}));
   // 'prod' is not its own fragment -- it's folded into the 'services' tile row (renderProdTile).
-  const ids = ['services', 'accounts', 'daemon', 'reports', 'tokens', 'secondary', 'stamp'];
+  // 'live' is the flight deck: served here at the 30s cadence AND on /api/live's own 2s timer.
+  const ids = ['services', 'accounts', 'daemon', 'reports', 'tokens', 'secondary', 'live', 'stamp'];
   assert.deepEqual(Object.keys(fragments).sort(), ids.slice().sort());
   for (const id of ids) {
     assert.equal(typeof fragments[id], 'string');
@@ -562,10 +619,10 @@ test('renderDashboard prints "not monitored" for the two live-only sections when
   data.system = null;
   data.prod = null;
   data.tokens = null;
-  const html = renderDashboard(data);
+  const html = renderDashboard(data, { view: 'health' });
   const count = (html.match(/not monitored/g) || []).length;
   assert.equal(count, 2); // system card + the Prod tile; tokens has its own distinct empty message
-  assert.doesNotThrow(() => renderDashboard(data));
+  assert.doesNotThrow(() => renderDashboard(data, { view: 'health' }));
 });
 
 // ---- tokens trend (collectAll's static-mode read + renderDashboard) --------------------------
@@ -587,7 +644,7 @@ test('collectAll reads journal/usage-rollups.json in static mode (no live server
   assert.ok(data.trend);
   assert.equal(data.trend.series.length, 2);
 
-  const html = renderDashboard(data);
+  const html = renderDashboard(data, { view: 'health' });
   assert.match(html, /today \(partial\)/);
   assert.match(html, /last 7 days/);
   assert.match(html, /last 30 days/);
@@ -597,7 +654,7 @@ test('collectAll reads journal/usage-rollups.json in static mode (no live server
 });
 
 test('renderDashboard falls back to the "no trend history yet" message when trend is null', () => {
-  const html = renderDashboard(collectAll({}));
+  const html = renderDashboard(collectAll({}), { view: 'health' });
   assert.match(html, /no trend history yet/);
 });
 
@@ -705,7 +762,7 @@ test('renderDashboard shows the snapshot\'s window and a visible STALE marker fo
     byModel_Mtokens: { 'claude-sonnet-5': { driver: { inp: 0, cc: 10, cr: 500, out: 1 } } },
   });
   const staleData = collectAll({ journalRoot: staleRoot });
-  const staleHtml = renderDashboard(staleData);
+  const staleHtml = renderDashboard(staleData, { view: 'health' });
   assert.match(staleHtml, /covers.*2026-08-20.*2026-08-29/s);
   assert.match(staleHtml, /STALE snapshot/);
 
@@ -717,7 +774,7 @@ test('renderDashboard shows the snapshot\'s window and a visible STALE marker fo
     until: null,
     byModel_Mtokens: { 'claude-sonnet-5': { driver: { inp: 0, cc: 10, cr: 500, out: 1 } } },
   });
-  const freshHtml = renderDashboard(collectAll({ journalRoot: freshRoot }));
+  const freshHtml = renderDashboard(collectAll({ journalRoot: freshRoot }), { view: 'health' });
   assert.doesNotMatch(freshHtml, /STALE snapshot/);
 });
 
@@ -749,6 +806,58 @@ test('renderDashboard, collectAll and `spo dashboard` never crash and exit 0 on 
   // IS the "exit 0" proof.
   const outPath = path.join(mkTmp('spo-dash-crash-out-'), 'dash.html');
   const printed = runSpo(['dashboard', '--journal', badStateRoot, '--queue', mkTmp('spo-dash-crash-queue-'), '--out', outPath]);
-  assert.equal(printed.trim(), outPath);
+  assert.deepEqual(printed.trim().split('\n'), [outPath, path.join(path.dirname(outPath), 'health.html')]);
   assert.ok(fs.existsSync(outPath));
+
+  // The deck's own defensive path: an unparsable state.json produces a card with state UNKNOWN
+  // and no run, which must render as a card rather than as a throw or an empty page.
+  const deckHtml = renderDashboard(collectAll({ journalRoot: badStateRoot }));
+  assert.match(deckHtml, /id="frag-live"/);
+});
+
+// ---- token formatting (K/M) ------------------------------------------------------------------
+
+test('fmtTokens reads in k and M from the RAW counts, including the sub-5k rows the M* fields destroy', () => {
+  const { fmtTokens } = require('../console/render');
+
+  // The headline cases: a million-scale figure, a hundred-thousand-scale one, and the one the
+  // old rendering could not express at all.
+  assert.equal(fmtTokens(1749860000, 1749.86), '1749.9M');
+  assert.equal(fmtTokens(330000, 0.33), '330.0k');
+  // 4,321 tokens is 0.00 at the million scale -- toM rounds to two decimals, so anything under
+  // 5,000 is gone before render ever sees it. With the raw count it reads correctly.
+  assert.equal(fmtTokens(4321, 0.0), '4.3k');
+  assert.equal(fmtTokens(0, 0), '0');
+
+  // Fallback for a row that predates the raw counts (a persisted rollup, an old fixture): still
+  // formatted, but only to the resolution the M* field actually holds.
+  assert.equal(fmtTokens(null, 0.33), '330.0k');
+  assert.equal(fmtTokens(undefined, 12.5), '12.5M');
+  assert.equal(fmtTokens(null, null), '—');
+});
+
+test('fmtTokens is orchestrator/tokens.js formatTokenCount, not a second local copy of the same rule', () => {
+  const { fmtTokens } = require('../console/render');
+  const { formatTokenCount } = require('../orchestrator/tokens');
+  for (const n of [0, 1, 999, 1000, 4321, 215400, 1e6, 12345678]) {
+    assert.equal(fmtTokens(n, null), formatTokenCount(n), `diverged at ${n}`);
+  }
+});
+
+test('console/usage-scan.js carries raw token integers beside every M* figure it emits', () => {
+  const { buildTokenViews } = require('../console/usage-scan');
+  const usageIndex = {
+    bySession: {
+      's1': { sessionId: 's1', account: 'pool1', lastTs: '2026-09-05T00:00:00.000Z', msgs: 1, models: { m: { msgs: 1, inp: 4321, cc: 10, cr: 20, out: 30 } } },
+    },
+    byModel: { m: { msgs: 1, inp: 4321, cc: 10, cr: 20, out: 30 } },
+    byAccount: { pool1: { m: { msgs: 1, inp: 4321, cc: 10, cr: 20, out: 30 } } },
+  };
+  const views = buildTokenViews(usageIndex, new Map());
+
+  // The rounded field says 0.00; the raw one says what actually happened.
+  assert.equal(views.byModel[0].Minp, 0);
+  assert.equal(views.byModel[0].rawInp, 4321);
+  assert.equal(views.byAccountModel[0].rawOut, 30);
+  assert.equal(views.totals.rawInp, 4321);
 });

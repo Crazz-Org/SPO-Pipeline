@@ -5,5 +5,6 @@ claude-accounts/
 worktrees/
 .recette/
 console/dashboard.html
+console/health.html
 *.local.*
 .DS_Store

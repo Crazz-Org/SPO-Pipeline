@@ -342,8 +342,8 @@ test('dashboard: with nothing parked the tile says IDLE -- a tile that vanished 
   const rc = tileFor(journalRoot, Date.parse('2026-09-01T12:00:00.000Z'));
   assert.equal(rc.status, 'idle');
   assert.equal(rc.parkedCards, 0);
-  assert.match(renderDashboard({ services: { retryChannel: rc } }), /Retry channel/);
-  assert.match(renderDashboard({ services: { retryChannel: rc } }), /IDLE/);
+  assert.match(renderDashboard({ services: { retryChannel: rc } }, { view: 'health' }), /Retry channel/);
+  assert.match(renderDashboard({ services: { retryChannel: rc } }, { view: 'health' }), /IDLE/);
 });
 
 test('dashboard: parked cards with no recorded scan outcome read UNPROVEN, never a reassuring green', () => {
@@ -355,7 +355,7 @@ test('dashboard: parked cards with no recorded scan outcome read UNPROVEN, never
   const rc = tileFor(journalRoot, Date.parse('2026-09-01T12:00:00.000Z'));
   assert.equal(rc.status, 'unknown');
   assert.equal(rc.unprovenCards, 1);
-  const html = renderDashboard({ services: { retryChannel: rc } });
+  const html = renderDashboard({ services: { retryChannel: rc } }, { view: 'health' });
   assert.match(html, /UNPROVEN/);
   assert.doesNotMatch(html, /ALIVE/);
 });
@@ -384,7 +384,7 @@ test('dashboard: a standing failure streak reads FAILING and outranks a healthy 
   assert.equal(rc.worstFailures, 2);
   assert.equal(rc.lastFailedAt, '2026-08-31T19:52:07.000Z');
   assert.equal(rc.lastFailedAgeMs, Date.parse('2026-09-01T12:00:00.000Z') - Date.parse('2026-08-31T19:52:07.000Z'));
-  assert.match(renderDashboard({ services: { retryChannel: rc } }), /FAILING/);
+  assert.match(renderDashboard({ services: { retryChannel: rc } }, { view: 'health' }), /FAILING/);
 });
 
 test('dashboard: every parked card confirmed reaching GitHub reads ALIVE', () => {
@@ -400,7 +400,7 @@ test('dashboard: every parked card confirmed reaching GitHub reads ALIVE', () =>
   assert.equal(rc.status, 'ok');
   assert.equal(rc.healthyCards, 1);
   assert.equal(rc.failingCards, 0);
-  assert.match(renderDashboard({ services: { retryChannel: rc } }), /ALIVE/);
+  assert.match(renderDashboard({ services: { retryChannel: rc } }, { view: 'health' }), /ALIVE/);
 });
 
 test('dashboard: a non-PARKED task contributes nothing -- the scan never looked at it', () => {

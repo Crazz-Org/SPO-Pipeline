@@ -82,6 +82,23 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+// Token counts, formatted the way the rest of the project already formats them: 12.3M / 215.4k /
+// a plain integer. Delegates to orchestrator/tokens.js's formatTokenCount -- the SAME function
+// `spo tokens`, `spo resume` and the Done/park comments use -- rather than a second local copy,
+// per the console's own "reader, never a second source of truth" rule.
+//
+// `raw` is the unrounded integer console/usage-scan.js now carries beside each M* field;
+// `mFallback` is that M* field, used only when a row predates the raw counts (a persisted rollup,
+// or a hand-built test fixture). The fallback is honest about its resolution: an M* value has
+// already been rounded to two decimals, so a 4,321-token row reads "0" there and cannot be
+// recovered -- which is exactly why the raw counts were added.
+function fmtTokens(raw, mFallback) {
+  const { formatTokenCount } = require('../orchestrator/tokens');
+  if (typeof raw === 'number' && Number.isFinite(raw)) return formatTokenCount(raw);
+  if (typeof mFallback === 'number' && Number.isFinite(mFallback)) return formatTokenCount(mFallback * 1e6);
+  return '—';
+}
+
 function fmtNum(n, digits = 2) {
   return typeof n === 'number' && Number.isFinite(n) ? n.toFixed(digits) : '—';
 }
@@ -404,6 +421,224 @@ body[data-stale="1"] #offline-banner { display: block; }
 
 @media (max-width: 720px) {
   table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+}
+
+/* ============================================================================================
+   FLIGHT DECK (console/render-deck.js). Same tokens as everything above -- the deck introduces
+   no colour of its own, only new shapes. Chunky tiles get their weight from a solid offset
+   shadow rather than a gradient, so they read as objects in both themes without a second
+   palette.
+   ============================================================================================ */
+.deck { display: flex; flex-direction: column; gap: 1.1rem; }
+.deck-card {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  overflow: hidden; box-shadow: var(--shadow-md);
+}
+.deck-card.deck-stale { opacity: 0.72; }
+.deck-card.deck-finished { border-color: var(--border); }
+
+.deck-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 1.5rem;
+  flex-wrap: wrap; padding: 1rem 1.2rem 0.85rem; border-bottom: 1px solid var(--border-soft);
+}
+.deck-id { min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
+.deck-idline { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; font-family: var(--font-mono); font-size: 0.72rem; }
+.deck-idline .mono { color: var(--muted); letter-spacing: 0.03em; }
+.deck-idline .sep { color: var(--faint); }
+.run-pill {
+  background: var(--accent); color: var(--bg); font-weight: 700; letter-spacing: 0.09em;
+  padding: 0.12rem 0.42rem; border-radius: 5px; font-size: 0.68rem;
+}
+.deck-title {
+  font-family: var(--font-display); font-size: 1.02rem; font-weight: 600; line-height: 1.35;
+  letter-spacing: -0.006em; margin: 0; max-width: 58ch; color: var(--fg);
+}
+.deck-timer { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; flex-shrink: 0; }
+.timer-big {
+  font-family: var(--font-mono); font-size: 2.3rem; font-weight: 600; letter-spacing: -0.045em;
+  line-height: 1; font-variant-numeric: tabular-nums; color: var(--fg);
+}
+.timer-delta { font-family: var(--font-mono); font-size: 0.72rem; display: inline-flex; align-items: center; gap: 0.3rem; }
+.pill {
+  display: inline-flex; align-items: center; gap: 0.4rem; font-family: var(--font-mono);
+  font-size: 0.66rem; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase;
+  padding: 0.2rem 0.55rem; border-radius: 999px;
+}
+.pill-live { background: color-mix(in srgb, var(--teal) 16%, transparent); color: var(--teal); }
+.pill-done { background: var(--green-bg); color: var(--green); }
+.pill-parked { background: var(--red-bg); color: var(--red); }
+.pill-stale { background: var(--gray-bg); color: var(--faint); text-transform: none; letter-spacing: 0.02em; }
+.pill-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+.pace-under { color: var(--green); }
+.pace-over { color: var(--orange); }
+.pace-bad { color: var(--red); }
+.pace-none { color: var(--faint); }
+
+/* ---- track ---- */
+.deck-track { padding: 1.15rem 1.1rem 0.2rem; overflow-x: auto; }
+.deck-track svg { display: block; width: 100%; min-width: 980px; height: auto; }
+.track-bed { fill: var(--border); }
+.track-lit { fill: var(--accent); }
+.arrow-head { fill: var(--orange); }
+.tile .tile-face { fill: var(--surface-2); stroke: var(--border); stroke-width: 1.6; }
+.tile .tile-icon { color: var(--faint); }
+.tile .tile-label {
+  font-family: var(--font-mono); font-size: 10px; text-anchor: middle; fill: var(--faint);
+}
+.tile-done .tile-face { fill: var(--green-bg); stroke: var(--green); }
+.tile-done .tile-icon { color: var(--green); }
+.tile-done .tile-label { fill: var(--muted); }
+.tile-stale .tile-face { fill: var(--gray-bg); stroke: var(--border); }
+.tile-stale .tile-icon { color: var(--faint); }
+.tile-current .tile-face { fill: color-mix(in srgb, var(--teal) 22%, var(--card-bg)); stroke: var(--teal); stroke-width: 2.4; }
+.tile-current .tile-icon { color: var(--teal); }
+.tile-current .tile-label { fill: var(--teal); font-weight: 700; font-size: 11px; }
+.tile-current .tile-ring { fill: none; stroke: var(--teal); stroke-width: 1.4; opacity: 0.32; }
+.tile-locked .tile-face { fill: none; stroke: var(--border); stroke-dasharray: 5 4; }
+.tile-detour .tile-face { fill: var(--orange-bg); stroke: var(--orange); stroke-width: 1.8; }
+.tile-detour .tile-icon { color: var(--orange); }
+.tile-detour .tile-label { fill: var(--orange); }
+.detour-arc { fill: none; stroke: var(--orange); stroke-width: 1.8; stroke-dasharray: 6 4; }
+.tile-attempts circle { fill: var(--orange); }
+.tile-attempts text { font-family: var(--font-mono); font-size: 10px; font-weight: 700; text-anchor: middle; fill: var(--bg); }
+.runner-body { fill: var(--teal); }
+.runner-tip { fill: var(--teal); }
+.runner-label { font-family: var(--font-mono); font-size: 13px; font-weight: 700; text-anchor: middle; fill: var(--bg); }
+
+/* ---- lives ---- */
+.deck-lives {
+  display: flex; align-items: center; gap: 1.6rem; flex-wrap: wrap;
+  padding: 0.35rem 1.2rem 0.9rem; border-bottom: 1px solid var(--border);
+}
+.life { display: flex; align-items: center; gap: 0.45rem; }
+.life-label {
+  font-family: var(--font-mono); font-size: 0.63rem; letter-spacing: 0.13em;
+  text-transform: uppercase; color: var(--faint);
+}
+.lives-out .life-label { color: var(--red); }
+.pips { display: flex; gap: 3px; }
+.pip-full { color: var(--red); }
+.pip-spent { color: var(--border); }
+.ic { vertical-align: middle; }
+
+/* ---- now ---- */
+.deck-now {
+  padding: 1.05rem 1.2rem 1.1rem; border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--teal) 10%, transparent), transparent 82%);
+}
+.now-kicker {
+  display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.7rem;
+  font-family: var(--font-mono); font-size: 0.63rem; letter-spacing: 0.17em;
+  text-transform: uppercase; color: var(--teal); font-weight: 600;
+}
+.now-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 4px color-mix(in srgb, var(--teal) 18%, transparent); }
+.now-body { display: flex; gap: 1.1rem; align-items: flex-start; flex-wrap: wrap; }
+.now-icon {
+  width: 62px; height: 62px; border-radius: 18px; flex-shrink: 0;
+  background: color-mix(in srgb, var(--teal) 18%, var(--card-bg)); border: 2px solid var(--teal);
+  color: var(--teal); display: flex; align-items: center; justify-content: center;
+}
+.now-main { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.55rem; }
+.now-head { display: flex; align-items: baseline; gap: 0.85rem; flex-wrap: wrap; }
+.now-what { font-family: var(--font-display); font-size: 1.5rem; font-weight: 640; letter-spacing: -0.02em; margin: 0; line-height: 1.12; }
+.now-clock { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.now-plain { margin: 0; font-size: 0.92rem; line-height: 1.55; color: var(--fg); max-width: 66ch; }
+.now-quote {
+  margin: 0; font-size: 0.83rem; font-style: italic; line-height: 1.5; color: var(--muted);
+  border-left: 2px solid var(--teal); padding-left: 0.75rem; max-width: 68ch;
+}
+.now-meter { display: flex; flex-direction: column; gap: 0.28rem; max-width: 540px; }
+.now-bar { position: relative; height: 11px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+.now-bar span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: linear-gradient(90deg, var(--teal), var(--orange)); }
+.now-bar em { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--fg); opacity: 0.5; }
+.now-scale { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.05em; color: var(--faint); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.chip {
+  font-family: var(--font-mono); font-size: 0.7rem; padding: 0.18rem 0.5rem; border-radius: 7px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+}
+.chip b { color: var(--fg); font-weight: 600; }
+.chip-warn { border-color: var(--orange); color: var(--orange); }
+.chip-warn b { color: var(--orange); }
+.chip-next { border-color: var(--accent); color: var(--accent); }
+.chip-next b { color: var(--accent); }
+.chip-dim { color: var(--faint); }
+.chip-dim-all { color: var(--faint); border-style: dashed; }
+
+/* ---- splits ---- */
+.splits-head {
+  display: flex; justify-content: space-between; padding: 0.8rem 1.2rem 0.35rem;
+  font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--faint);
+}
+.split {
+  display: grid; grid-template-columns: 22px 1fr 80px 78px; gap: 0.7rem; align-items: center;
+  padding: 0.35rem 1.2rem; border-top: 1px solid var(--border-soft); font-size: 0.79rem;
+}
+.split-icon { color: var(--green); display: flex; }
+.split-name { font-family: var(--font-mono); font-size: 0.74rem; color: var(--fg); min-width: 0; overflow-wrap: anywhere; }
+.split-name small { color: var(--faint); font-size: 0.68rem; margin-left: 0.3rem; }
+.split-attempt { color: var(--orange); font-weight: 700; }
+.split-time, .split-delta { font-family: var(--font-mono); font-size: 0.74rem; text-align: right; font-variant-numeric: tabular-nums; }
+.split-time { color: var(--muted); }
+.split-back { background: var(--orange-bg); box-shadow: inset 3px 0 0 var(--orange); }
+.split-back .split-icon, .split-back .split-name { color: var(--orange); }
+.split-live { background: color-mix(in srgb, var(--teal) 10%, transparent); box-shadow: inset 3px 0 0 var(--teal); }
+.split-live .split-icon, .split-live .split-name { color: var(--teal); font-weight: 700; }
+.split-live .split-time { color: var(--fg); }
+
+/* ---- outcome ---- */
+.deck-outcome {
+  padding: 1.5rem 1.2rem 1.35rem; display: flex; flex-direction: column; align-items: center;
+  gap: 0.5rem; text-align: center; border-bottom: 1px solid var(--border);
+}
+.outcome-icon {
+  width: 66px; height: 66px; border-radius: 20px; display: flex; align-items: center;
+  justify-content: center; border: 2px solid currentColor;
+}
+.outcome-parked { background: radial-gradient(420px 160px at 50% 0%, color-mix(in srgb, var(--red) 11%, transparent), transparent 72%); }
+.outcome-parked .outcome-icon { color: var(--red); background: var(--red-bg); }
+.outcome-done { background: radial-gradient(420px 160px at 50% 0%, color-mix(in srgb, var(--green) 11%, transparent), transparent 72%); }
+.outcome-done .outcome-icon { color: var(--green); background: var(--green-bg); }
+.outcome-title { font-family: var(--font-display); font-size: 1.5rem; font-weight: 720; letter-spacing: 0.015em; margin: 0.2rem 0 0; }
+.outcome-parked .outcome-title { color: var(--red); }
+.outcome-done .outcome-title { color: var(--green); }
+.outcome-why { margin: 0; font-size: 0.95rem; line-height: 1.5; color: var(--fg); max-width: 56ch; }
+.outcome-fix { margin: 0.25rem 0 0; font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); }
+.outcome-slug { color: var(--faint); }
+
+/* ---- foot / idle ---- */
+.deck-foot { display: flex; flex-wrap: wrap; gap: 0.35rem; padding: 0.8rem 1.2rem; border-top: 1px solid var(--border); background: var(--surface-2); }
+.deck-foot-center { justify-content: center; }
+.deck-idle .idle-body { padding: 2.6rem 1.2rem 2.2rem; display: flex; flex-direction: column; align-items: center; gap: 0.5rem; text-align: center; }
+.idle-track { width: 240px; height: 56px; opacity: 0.5; margin-bottom: 0.4rem; }
+.idle-tile { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.idle-kicker { margin: 0; font-family: var(--font-mono); font-size: 0.63rem; letter-spacing: 0.2em; text-transform: uppercase; color: var(--faint); }
+.idle-headline { margin: 0; font-family: var(--font-display); font-size: 1.35rem; font-weight: 660; letter-spacing: -0.018em; }
+.idle-body-text { margin: 0; font-size: 0.88rem; line-height: 1.55; color: var(--muted); max-width: 52ch; }
+
+.deck-nav { display: flex; gap: 0.5rem; align-items: center; }
+.deck-nav a {
+  font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); text-decoration: none;
+  border: 1px solid var(--border); border-radius: 7px; padding: 0.24rem 0.6rem; background: var(--card-bg);
+}
+.deck-nav a:hover { color: var(--fg); border-color: var(--accent); }
+.deck-nav a.degraded { color: var(--orange); border-color: var(--orange); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .pill-live .pill-dot, .now-dot { animation: deck-pulse 2.1s ease-out infinite; }
+  @keyframes deck-pulse {
+    0% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+    70% { box-shadow: 0 0 0 7px transparent; opacity: 0.6; }
+    100% { box-shadow: 0 0 0 0 transparent; opacity: 1; }
+  }
+}
+@media (max-width: 720px) {
+  .split { grid-template-columns: 20px 1fr 74px; }
+  .split-delta { grid-column: 2 / 4; text-align: left; }
+  .timer-big { font-size: 1.8rem; }
 }
 `;
 
@@ -778,7 +1013,7 @@ function renderTokensTrendInner(trend) {
         ? ` <span title="cache-write ratio spike on this day -- a likely sign a prompt or config changed">&#9888;</span>`
         : '';
       const label = escapeHtml(d.date.slice(5)) + (d.partial ? '*' : ''); // MM-DD; * = still accumulating
-      return `<div class="bar-row"><span>${label}</span><span class="bar"><span style="width:${pct}%"></span></span><span>${fmtNum(d.avgWeightPerSession)}${flag}</span></div>`;
+      return `<div class="bar-row"><span>${label}</span><span class="bar"><span style="width:${pct}%"></span></span><span>${fmtTokens(null, d.avgWeightPerSession)}${flag}</span></div>`;
     })
     .join('');
 
@@ -798,13 +1033,14 @@ function renderTokensTrendInner(trend) {
       changed that day</span></div>
     ${staleLine}
     <div class="kpi-grid">
-      ${kpi('today (partial)', fmtNum(k.todayAvgWeightPerSession), deltaSpan(k.todayVsLast7Pct, { warnAt: 40 }), true)}
-      ${kpi('last 7 days', fmtNum(k.last7AvgWeightPerSession), deltaSpan(k.last7VsPrev7Pct, { warnAt: 25 }))}
-      ${kpi('last 30 days', fmtNum(k.last30AvgWeightPerSession), 'baseline, no comparison')}
-      ${kpi('today, Mtok out/session', fmtNum(k.todayAvgMoutPerSession), 'plain token count, not weighted')}
+      ${kpi('today (partial)', fmtTokens(null, k.todayAvgWeightPerSession), deltaSpan(k.todayVsLast7Pct, { warnAt: 40 }), true)}
+      ${kpi('last 7 days', fmtTokens(null, k.last7AvgWeightPerSession), deltaSpan(k.last7VsPrev7Pct, { warnAt: 25 }))}
+      ${kpi('last 30 days', fmtTokens(null, k.last30AvgWeightPerSession), 'baseline, no comparison')}
+      ${kpi('out per session, today', fmtTokens(null, k.todayAvgMoutPerSession), 'plain token count, not weighted')}
     </div>
     <div class="card">
-      <p class="meta" style="margin:0 0 0.3rem">weighted Mtok-equivalent per session, last ${series.length} days</p>
+      <p class="meta" style="margin:0 0 0.3rem">weighted token-equivalent per session, last ${series.length} days
+        <span class="subgrid-note" style="display:inline">(rollups are stored rounded to 0.01M, so these read to the nearest 10k)</span></p>
       ${renderSparkline(series.map((d) => d.avgWeightPerSession), '', { auto: true })}
       <p class="meta" style="margin:0.9rem 0 0.3rem">last 14 days</p>
       ${barRows || '<p class="empty">(not enough history yet)</p>'}
@@ -818,10 +1054,10 @@ function renderTokensBreakdownInner(tokens) {
       <td><code>${escapeHtml(t.taskId)}</code></td>
       <td>${escapeHtml(t.state || '?')}</td>
       <td class="num">${escapeHtml(t.msgs)}</td>
-      <td class="num">${fmtNum(t.Minp)}</td>
-      <td class="num">${fmtNum(t.Mcc)}</td>
-      <td class="num">${fmtNum(t.Mcr)}</td>
-      <td class="num">${fmtNum(t.Mout)}</td>
+      <td class="num">${fmtTokens(t.rawInp, t.Minp)}</td>
+      <td class="num">${fmtTokens(t.rawCc, t.Mcc)}</td>
+      <td class="num">${fmtTokens(t.rawCr, t.Mcr)}</td>
+      <td class="num">${fmtTokens(t.rawOut, t.Mout)}</td>
     </tr>`
     )
     .join('');
@@ -831,10 +1067,10 @@ function renderTokensBreakdownInner(tokens) {
       (m) => `<tr>
       <td>${escapeHtml(m.model)}</td>
       <td class="num">${escapeHtml(m.msgs)}</td>
-      <td class="num">${fmtNum(m.Minp)}</td>
-      <td class="num">${fmtNum(m.Mcc)}</td>
-      <td class="num">${fmtNum(m.Mcr)}</td>
-      <td class="num">${fmtNum(m.Mout)}</td>
+      <td class="num">${fmtTokens(m.rawInp, m.Minp)}</td>
+      <td class="num">${fmtTokens(m.rawCc, m.Mcc)}</td>
+      <td class="num">${fmtTokens(m.rawCr, m.Mcr)}</td>
+      <td class="num">${fmtTokens(m.rawOut, m.Mout)}</td>
     </tr>`
     )
     .join('');
@@ -844,9 +1080,9 @@ function renderTokensBreakdownInner(tokens) {
       (r) => `<tr>
       <td>${escapeHtml(r.account)}</td>
       <td>${escapeHtml(r.model)}</td>
-      <td class="num">${fmtNum(r.Mcr)}</td>
-      <td class="num">${fmtNum(r.Mcc)}</td>
-      <td class="num">${fmtNum(r.Mout)}</td>
+      <td class="num">${fmtTokens(r.rawCr, r.Mcr)}</td>
+      <td class="num">${fmtTokens(r.rawCc, r.Mcc)}</td>
+      <td class="num">${fmtTokens(r.rawOut, r.Mout)}</td>
     </tr>`
     )
     .join('');
@@ -864,23 +1100,23 @@ function renderTokensBreakdownInner(tokens) {
       <div class="card">
         <p class="meta" style="margin:0 0 0.3rem">by task (sorted by volume)</p>
         <table>
-          <thead><tr><th>task</th><th>state</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
+          <thead><tr><th>task</th><th>state</th><th class="num">msgs</th><th class="num">in</th><th class="num">cache-write</th><th class="num">cache-read</th><th class="num">out</th></tr></thead>
           <tbody>${taskRows || '<tr><td colspan="7" class="empty">(none)</td></tr>'}</tbody>
         </table>
       </div>
       <div class="card">
         <p class="meta" style="margin:0 0 0.3rem">by model</p>
         <table>
-          <thead><tr><th>model</th><th class="num">msgs</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
+          <thead><tr><th>model</th><th class="num">msgs</th><th class="num">in</th><th class="num">cache-write</th><th class="num">cache-read</th><th class="num">out</th></tr></thead>
           <tbody>${modelRows || '<tr><td colspan="6" class="empty">(none)</td></tr>'}</tbody>
         </table>
-        <p class="subgrid-note">unattributed (sessions with no known task): ${escapeHtml(u.sessions || 0)} sessions, ${fmtNum(u.Mout)} Mtok out</p>
+        <p class="subgrid-note">unattributed (sessions with no known task): ${escapeHtml(u.sessions || 0)} sessions, ${fmtTokens(u.rawOut, u.Mout)} out</p>
       </div>
     </div>
     <div class="card" style="margin-top:0.75rem">
       <p class="meta" style="margin:0 0 0.3rem">by account</p>
       <table>
-        <thead><tr><th>account</th><th>model</th><th class="num">Mtok cache-read</th><th class="num">Mtok cache-write</th><th class="num">Mtok out</th></tr></thead>
+        <thead><tr><th>account</th><th>model</th><th class="num">cache-read</th><th class="num">cache-write</th><th class="num">out</th></tr></thead>
         <tbody>${acctRows || '<tr><td colspan="5" class="empty">(none)</td></tr>'}</tbody>
       </table>
       ${localNote}
@@ -905,10 +1141,10 @@ function renderTokensSnapshotFallback(usageSnapshot, meta) {
           const driver = byModel[m].driver || {};
           return `<tr>
             <td>${escapeHtml(m)}</td>
-            <td class="num">${fmtNum(driver.inp)}</td>
-            <td class="num">${fmtNum(driver.cc)}</td>
-            <td class="num">${fmtNum(driver.cr)}</td>
-            <td class="num">${fmtNum(driver.out)}</td>
+            <td class="num">${fmtTokens(null, driver.inp)}</td>
+            <td class="num">${fmtTokens(null, driver.cc)}</td>
+            <td class="num">${fmtTokens(null, driver.cr)}</td>
+            <td class="num">${fmtTokens(null, driver.out)}</td>
           </tr>`;
         })
         .join('')
@@ -936,7 +1172,7 @@ function renderTokensSnapshotFallback(usageSnapshot, meta) {
     ${windowLine}
     ${staleBanner}
     <table>
-      <thead><tr><th>model</th><th class="num">Mtok in</th><th class="num">Mtok cache-write</th><th class="num">Mtok cache-read</th><th class="num">Mtok out</th></tr></thead>
+      <thead><tr><th>model</th><th class="num">in</th><th class="num">cache-write</th><th class="num">cache-read</th><th class="num">out</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </details>`;
@@ -1017,6 +1253,10 @@ function renderDataFragments(data) {
     accounts: renderAccountsInner(d.accounts, d.tokens),
     tokens: renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta),
     secondary: renderSecondaryInner(d),
+    // The flight deck rides /api/data too, so a browser sitting on `/` refreshes at the 30s
+    // cadence even when the faster /api/live poll is unavailable (static mode, or a client that
+    // never started the fast timer). /api/live serves this same string on its own 2s timer.
+    live: renderLiveInner(d),
     stamp: escapeHtml(d.generatedAt || ''),
   };
 }
@@ -1064,6 +1304,10 @@ const LIVE_SCRIPT = `
   var fails = 0;
   var sysBusy = false;
   var dataBusy = false;
+  var liveBusy = false;
+  // The deck only exists on '/', the system tile only on '/health'. Each tick no-ops when its
+  // fragment is not on this page, so one script serves both views without branching on the URL.
+  var hasDeck = !!document.getElementById('frag-live');
 
   function markStale(bad) {
     if (bad) { fails++; if (fails >= 3) document.body.dataset.stale = '1'; }
@@ -1084,6 +1328,26 @@ const LIVE_SCRIPT = `
       .finally(function () { sysBusy = false; });
   }
 
+  // The flight deck's own poll. Two seconds, because it renders a card that moves -- see
+  // serve.js's DEFAULT_DECK_TTL_MS for why that is cheap. Swaps one fragment and nothing else,
+  // so it never fights the 30s tickData over the same node.
+  function tickLive() {
+    if (document.hidden || liveBusy || !hasDeck) return;
+    liveBusy = true;
+    fetch('/api/live', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.fragments || !j.fragments.live) return;
+        var el = document.getElementById('frag-live');
+        if (el) el.innerHTML = j.fragments.live;
+        var stamp = document.getElementById('frag-stamp');
+        if (stamp && j.generatedAt) stamp.textContent = j.generatedAt;
+        markStale(false);
+      })
+      .catch(function () { markStale(true); })
+      .finally(function () { liveBusy = false; });
+  }
+
   function tickData() {
     if (document.hidden || dataBusy) return;
     dataBusy = true;
@@ -1094,6 +1358,9 @@ const LIVE_SCRIPT = `
         var openState = {};
         document.querySelectorAll('details[id]').forEach(function (el) { openState[el.id] = el.open; });
         Object.keys(j.fragments).forEach(function (k) {
+          // Skip 'live' when the fast poll owns it: /api/data is 30s behind, and letting it
+          // write the deck would make the clock jump backwards twice a minute.
+          if (k === 'live' && hasDeck) return;
           var el = document.getElementById('frag-' + k);
           if (el) el.innerHTML = j.fragments[k];
         });
@@ -1107,12 +1374,14 @@ const LIVE_SCRIPT = `
       .finally(function () { dataBusy = false; });
   }
 
-  setInterval(tickSystem, 1000);
+  if (!hasDeck) setInterval(tickSystem, 1000);
+  setInterval(tickLive, 2000);
   setInterval(tickData, 30000);
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { tickSystem(); tickData(); }
+    if (!document.hidden) { tickSystem(); tickLive(); tickData(); }
   });
-  tickSystem();
+  if (!hasDeck) tickSystem();
+  tickLive();
   tickData();
 })();
 </script>`;
@@ -1120,18 +1389,19 @@ const LIVE_SCRIPT = `
 // The one exported entry point: given the collected data object, return the full HTML
 // document as a string. Deterministic for a given input -- no Date.now(), no fs, no network.
 // opts.live: true removes the meta refresh and adds the client polling script (see header).
-function renderDashboard(data, opts = {}) {
-  const d = data || {};
-  const live = !!opts.live;
-  const generatedAt = d.generatedAt || '';
-
+// The page shell both views share. `title` names the browser tab, `nav` is the link across to
+// the other view, `body` the fragments. Extracted when the root page became the flight deck and
+// health moved to /health (project-2 card: "the dashboard requires you to know what you're
+// looking for") -- both pages carry the same chrome, theme toggle and offline banner, so a
+// single shell is the only way they cannot drift apart.
+function pageShell({ title, generatedAt, stampNote, nav, body, live }) {
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 ${live ? '' : '<meta http-equiv="refresh" content="30">'}
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SPO Pipeline dashboard</title>
+<title>${escapeHtml(title)}</title>
 <style>${CSS}</style>
 </head>
 <body>
@@ -1139,9 +1409,10 @@ ${live ? '' : '<meta http-equiv="refresh" content="30">'}
 <div class="topbar">
   <div class="brand">
     <h1>SPO Pipeline</h1>
-    <span class="stamp">generated <span id="frag-stamp">${escapeHtml(generatedAt)}</span> &middot; spo dashboard</span>
+    <span class="stamp">generated <span id="frag-stamp">${escapeHtml(generatedAt)}</span> &middot; ${escapeHtml(stampNote)}</span>
   </div>
   <div class="topbar-right">
+    <div class="deck-nav">${nav}</div>
     <button class="theme-toggle" id="theme-toggle" type="button">
       <span class="icon" id="theme-icon">&#9728;&#65039;</span>
       <span id="theme-label">light</span>
@@ -1149,14 +1420,7 @@ ${live ? '' : '<meta http-equiv="refresh" content="30">'}
   </div>
 </div>
 <main>
-${frag('services', renderServicesInner(d.services, d.accounts, d.prod))}
-${frag('daemon', renderDaemonStatsInner(d.daemonStats))}
-${frag('system', renderSystemInner(d.system))}
-${frag('reports', renderReportsInner(d.reports))}
-${frag('accounts', renderAccountsInner(d.accounts, d.tokens))}
-<hr class="section-divider">
-${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta))}
-${frag('secondary', renderSecondaryInner(d))}
+${body}
 </main>
 ${THEME_SCRIPT}
 ${live ? LIVE_SCRIPT : ''}
@@ -1165,9 +1429,79 @@ ${live ? LIVE_SCRIPT : ''}
 `;
 }
 
+// healthSummary(d) -> {degraded, text} for the deck's link across to /health. Reads the same
+// `services` object the health page renders, so the link can say WHAT is wrong rather than just
+// that something is -- an unlabelled warning light sends you to the other page to find out, which
+// is exactly the "you have to know what you're looking for" problem this redesign exists to fix.
+function healthSummary(d) {
+  const s = (d && d.services) || {};
+  const bad = [];
+  for (const [name, svc] of Object.entries(s)) {
+    if (!svc || typeof svc !== 'object') continue;
+    if (['down', 'fail', 'stale', 'warn'].includes(svc.status)) bad.push(name);
+  }
+  const cooling = ((d && d.accounts && d.accounts.rows) || []).filter((a) => a.cooling).length;
+  if (cooling) bad.push(`${cooling} account${cooling === 1 ? '' : 's'} cooling`);
+  return bad.length
+    ? { degraded: true, text: `health: ${bad.slice(0, 3).join(', ')}` }
+    : { degraded: false, text: 'health' };
+}
+
+// The flight deck -- the root page. One card per running or just-finished run; the standing-by
+// panel when there are none. Health is one click away and says what is wrong before you click.
+function renderDeckPage(data, opts = {}) {
+  const d = data || {};
+  const h = healthSummary(d);
+  return pageShell({
+    title: 'SPO Pipeline — flight deck',
+    generatedAt: d.generatedAt || '',
+    stampNote: opts.live ? 'live' : 'spo dashboard',
+    nav: `<a href="/health" class="${h.degraded ? 'degraded' : ''}">${escapeHtml(h.text)}</a>`,
+    body: frag('live', renderLiveInner(d)),
+    live: !!opts.live,
+  });
+}
+
+// The health page -- every section the root page used to carry, MOVED rather than rewritten:
+// the same renderXxxInner functions, in the same order, with the same fragment ids, so
+// /api/data's payload and every existing test of those functions are unaffected.
+function renderHealthPage(data, opts = {}) {
+  const d = data || {};
+  return pageShell({
+    title: 'SPO Pipeline — health',
+    generatedAt: d.generatedAt || '',
+    stampNote: opts.live ? 'live' : 'spo dashboard',
+    nav: '<a href="/">&larr; flight deck</a>',
+    body: `${frag('services', renderServicesInner(d.services, d.accounts, d.prod))}
+${frag('daemon', renderDaemonStatsInner(d.daemonStats))}
+${frag('system', renderSystemInner(d.system))}
+${frag('reports', renderReportsInner(d.reports))}
+${frag('accounts', renderAccountsInner(d.accounts, d.tokens))}
+<hr class="section-divider">
+${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta))}
+${frag('secondary', renderSecondaryInner(d))}`,
+    live: !!opts.live,
+  });
+}
+
+// renderDashboard stays the name every existing caller and test uses, and now renders the deck
+// -- the root page's new content. `opts.view: 'health'` selects the old page.
+function renderDashboard(data, opts = {}) {
+  return opts.view === 'health' ? renderHealthPage(data, opts) : renderDeckPage(data, opts);
+}
+
+// Re-exported from console/render-deck.js so callers keep one import for "the renderer".
+const { renderLiveInner } = require('./render-deck');
+
 module.exports = {
   renderDashboard,
+  renderDeckPage,
+  renderHealthPage,
+  renderLiveInner,
+  healthSummary,
   escapeHtml,
+  fmtAgeMs,
+  fmtTokens,
   renderDataFragments,
   renderSystemFragment,
   renderServicesInner,

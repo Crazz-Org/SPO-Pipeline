@@ -25,6 +25,16 @@ const { summarizeUnparkScanTail } = require('../orchestrator/retry-channel');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
+// How long a finished run stays on the flight deck after it ends. The deck shows LIVE cards
+// only -- no history list, by design -- but a run that reaches DONE or PARKED while you are
+// looking at it should not vanish mid-glance, and a hand-back is exactly the moment you want the
+// track that produced it still on screen. After this window the card drops off entirely.
+// It also bounds the cost of buildRun(): the per-leg walk below runs for live cards plus, at
+// most, whatever finished in the last ten minutes -- never for the whole 4 MB corpus.
+const DECK_LINGER_MS = 10 * 60 * 1000;
+// The three states from which the daemon never resumes on its own (state-machine.js: PARKED is
+// terminal for the daemon; ABANDONED is a maintainer verdict; DONE is the goal).
+const TERMINAL_STATES = new Set(['DONE', 'PARKED', 'ABANDONED']);
 const DAEMON_EVENTS_MAX_BYTES = 1024 * 1024;
 const DAEMON_EVENTS_MAX_LINES = 5000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -84,6 +94,203 @@ function readJournalLines(taskDir) {
   }
 }
 
+// normalizeRootCause(raw) -> a human sentence, or null. See the `result` case in buildRun for
+// the three shapes measured in the corpus and why only one of them is renderable.
+function normalizeRootCause(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!s || s === 'null' || s === 'undefined') return null;
+  if (s.startsWith('{')) {
+    try {
+      const obj = JSON.parse(s);
+      const inner = obj && (obj.root_cause || obj.rootCause);
+      return typeof inner === 'string' && inner.trim() && inner.trim() !== 'null' ? inner.trim() : null;
+    } catch {
+      return null; // an unparsable brace-leading blob is not a sentence either
+    }
+  }
+  return s;
+}
+
+// ---- the flight deck's run builder -------------------------------------------------------
+//
+// buildRun(lines) -> the CURRENT run's walk along the track, or null when the journal records no
+// run at all. A card is not one journey: `taken` starts a new run every time the card is claimed,
+// and a retried card accumulates run after run in the SAME journal file (issue-385 reached run
+// 11, issue-247 run 7). The deck shows the current run only -- the earlier ones are history, and
+// history is what the deck deliberately does not carry.
+//
+// A "split" is one continuous occupancy of one state: entered at a transition (or at `taken`),
+// left at the next transition. A state visited three times in a run produces three splits, each
+// carrying its own `attempt` number -- that is the whole point, because "IMPLEMENT, third go" is
+// the single most useful fact about a struggling card and no existing surface shows it.
+//
+// `sentBack` is DERIVED, never special-cased per state: a split was sent back when the transition
+// out of it moved to an EARLIER position in par-times.js's TRACK_ORDER, or to DIAGNOSE (which has
+// no position at all -- it is the off-track state a card is pushed to when something failed). So
+// VALIDATE -> IMPLEMENT, CI_CHECKS -> DIAGNOSE and PUSH_PR -> WORKTREE all register without this
+// function knowing anything about what those states mean.
+//
+// Detail is attached to whichever split is OPEN when the event arrives, off the same single pass
+// -- never a second walk of the file. The events read here are exactly the ones the orchestrator
+// already journals; nothing is inferred.
+function buildRun(lines) {
+  const { orderIndex } = require('./par-times');
+  if (!Array.isArray(lines) || !lines.length) return null;
+
+  let runIndex = 0;
+  let startedAt = null;
+  let splits = [];
+  let open = null; // {state, enteredAt, attempt, detail}
+  let outcome = null; // {kind: 'done'|'parked', at, reason, detail}
+
+  const openSplit = (state, at) => {
+    const attempt = splits.filter((s) => s.state === state).length + (open && open.state === state ? 1 : 0) + 1;
+    open = { state, enteredAt: at, attempt, detail: {} };
+  };
+  const closeSplit = (at, nextState) => {
+    if (!open) return;
+    const from = orderIndex(open.state);
+    const to = orderIndex(nextState);
+    const sentBack = nextState === 'DIAGNOSE' || (from !== null && to !== null && to < from);
+    splits.push({
+      state: open.state,
+      enteredAt: open.enteredAt,
+      ms: Math.max(0, Date.parse(at) - Date.parse(open.enteredAt)),
+      attempt: open.attempt,
+      sentBack,
+      offTrack: orderIndex(open.state) === null,
+      detail: open.detail,
+    });
+    open = null;
+  };
+
+  for (const e of lines) {
+    if (!e || !e.ts) continue;
+    const ev = e.event;
+
+    if (ev === 'taken') {
+      // A new run discards the previous one wholesale -- the deck shows the current run only.
+      runIndex += 1;
+      startedAt = e.ts;
+      splits = [];
+      outcome = null;
+      open = null;
+      openSplit(e.state || 'INTAKE', e.ts);
+      continue;
+    }
+
+    if (ev === 'transition') {
+      if (!open) openSplit(e.state || 'INTAKE', e.ts);
+      closeSplit(e.ts, e.to);
+      openSplit(e.to, e.ts);
+      continue;
+    }
+
+    if (ev === 'done' || ev === 'parked') {
+      if (open) {
+        splits.push({
+          state: open.state,
+          enteredAt: open.enteredAt,
+          ms: Math.max(0, Date.parse(e.ts) - Date.parse(open.enteredAt)),
+          attempt: open.attempt,
+          sentBack: false,
+          offTrack: orderIndex(open.state) === null,
+          detail: open.detail,
+        });
+        open = null;
+      }
+      outcome = {
+        kind: ev,
+        at: e.ts,
+        reason: e.reason || null,
+        detail: e.detail || null,
+      };
+      continue;
+    }
+
+    if (!open) continue;
+    const d = open.detail;
+
+    switch (ev) {
+      case 'llm-call':
+        // Only a SUCCESSFUL call describes the work; a failed attempt (an account limit, a
+        // transport failure) is counted separately so the deck can say "2nd attempt at this
+        // call" without pretending the first one produced anything.
+        if (e.ok === false) {
+          d.failedCalls = (d.failedCalls || 0) + 1;
+          if (e.model) d.model = e.model;
+          if (e.effort) d.effort = e.effort;
+          break;
+        }
+        d.model = e.model || d.model || null;
+        d.effort = e.effort || d.effort || null;
+        d.account = e.account || d.account || null;
+        d.numTurns = typeof e.numTurns === 'number' ? e.numTurns : d.numTurns ?? null;
+        // Absence, never 0 -- an event predating the field is not a call that cost nothing.
+        // Same rule task-summary.js's hasTokenData and bin/spo's cmdTask already apply.
+        d.billableTokens = typeof e.billableTokens === 'number' ? e.billableTokens : d.billableTokens ?? null;
+        d.durationS = typeof e.duration_s === 'number' ? e.duration_s : d.durationS ?? null;
+        break;
+      case 'pr-created':
+        d.prNumber = e.prNumber ?? null;
+        break;
+      // A step can be SKIPPED rather than run: a retried card whose plan is still valid reuses
+      // it, and a re-push reuses the open PR. Both produce a split of ~0s, which without this
+      // flag renders as "3 minutes under par" -- a compliment for work that never happened.
+      case 'plan-reused':
+      case 'pr-reused':
+        d.reused = true;
+        if (e.prNumber) d.prNumber = e.prNumber;
+        break;
+      case 'invariants-checked':
+        d.invariantsChecked = Array.isArray(e.checkedIds) ? e.checkedIds.length : null;
+        d.invariantsBroken = Array.isArray(e.broken) ? e.broken.length : null;
+        break;
+      case 'change-validator':
+        d.verdict = e.verdict || null;
+        break;
+      case 'checks-green':
+        d.checksGreen = Array.isArray(e.checks) ? e.checks.length : null;
+        break;
+      case 'checks-in-flight':
+        d.ciAttempt = e.attempt ?? null;
+        d.ciPending = e.pendingRuns ?? null;
+        d.ciTotal = e.totalRuns ?? null;
+        break;
+      case 'gate-verdict':
+        d.gateVerdict = e.verdict || null;
+        break;
+      case 'result': {
+        // DIAGNOSE's `rootCause` is not always prose. Measured over the corpus it arrives in
+        // three shapes: the sentence itself; the literal string "null" (the step ran and found
+        // nothing); and, when the model answered with a JSON object instead of a bare string,
+        // the whole object re-serialised -- `{"root_cause": null, "reason": ...}` and friends.
+        // Only the first is worth putting on the deck, so unwrap the third and drop the rest
+        // rather than printing a JSON fragment at a reader.
+        const raw = e.payload && e.payload.rootCause;
+        d.rootCause = normalizeRootCause(raw) || d.rootCause || null;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (!runIndex && !splits.length && !open) return null;
+
+  return {
+    runIndex,
+    startedAt,
+    splits,
+    // The split still open is the one running RIGHT NOW (null once the run ended). Its duration
+    // is deliberately not computed here: console/render.js is a pure function with no clock, so
+    // "how long has this been going" is measured at render time against `enteredAt`.
+    current: open ? { state: open.state, enteredAt: open.enteredAt, attempt: open.attempt, detail: open.detail } : null,
+    outcome,
+  };
+}
+
 // One card's worth of data per journal/<id>/ directory. Reads state.json (current
 // state/reason/updatedAt), task.json (title/kind fallback, in case state.json predates a
 // field), and journal.jsonl (last event, and every recorded `llm-call` event -- see
@@ -92,7 +299,7 @@ function readJournalLines(taskDir) {
 // outputTokens, billableTokens, numTurns, ok}). No dollar figure is ever collected here -- see
 // console/render.js's header ("NEVER a dollar figure"); `orchestrator/tokens.js` / `spo tokens`
 // own the token-accounting view instead.
-function collectJournalTasks(journalRoot) {
+function collectJournalTasks(journalRoot, { now = Date.now() } = {}) {
   const ids = listTaskDirs(journalRoot);
   return ids.map((id) => {
     const dir = path.join(journalRoot, id);
@@ -100,6 +307,16 @@ function collectJournalTasks(journalRoot) {
     const task = readJsonSafe(path.join(dir, 'task.json'), {});
     const lines = readJournalLines(dir);
     const last = lines.length ? lines[lines.length - 1] : null;
+
+    // Deck eligibility: running now, or finished within DECK_LINGER_MS. An UNKNOWN state (no
+    // readable state.json) counts as non-terminal and therefore eligible -- if the daemon left a
+    // card in a shape this reader cannot classify, showing it is more useful than hiding it, and
+    // worker-status.js will report no live worker for it so the deck labels it stale rather than
+    // running.
+    const stateName = state.state || 'UNKNOWN';
+    const updatedMs = Date.parse(state.updatedAt || '');
+    const deckEligible =
+      !TERMINAL_STATES.has(stateName) || (Number.isFinite(updatedMs) && now - updatedMs <= DECK_LINGER_MS);
 
     const llmSteps = lines
       .filter((e) => e.event === 'llm-call')
@@ -136,6 +353,30 @@ function collectJournalTasks(journalRoot) {
       // PARKED tasks and no others: a summary for a running card would describe a scanner that
       // never looked at it. The aggregate tile is built from these by applyRetryChannelStats.
       retryChannel: (state.state || 'UNKNOWN') === 'PARKED' ? summarizeUnparkScanTail(lines) : null,
+      // The flight deck's per-split walk (buildRun above) -- computed for cards the deck can
+      // actually show, and null for every other card. That gate is the reason this module can
+      // still be called on every request: the corpus is 43 journals / 4 MB, of which at most a
+      // couple are ever live or freshly finished, and `run` is the only field here whose cost
+      // scales with journal LENGTH rather than with file count.
+      //
+      // `onDeck` says which side of that gate the card fell, so callers never re-derive the rule
+      // (and so a test can assert the gate directly rather than inferring it from `run` being
+      // null, which is also what an empty journal produces).
+      onDeck: deckEligible,
+      run: deckEligible ? buildRun(lines) : null,
+      // The retry budgets, straight off state.json -- the deck renders these as lives. Absent
+      // fields read as 0 because that is what the state machine means by them (a card that has
+      // never diagnosed has spent no attempts); the BUDGET each is measured against lives in
+      // orchestrator/config.js and is read by the renderer, not duplicated here.
+      counters: {
+        diagnoseAttempts: state.diagnoseAttempts || 0,
+        validateRejects: state.validateRejects || 0,
+        ciImplementRetries: state.ciImplementRetries || 0,
+        mainMoveUsed: state.mainMoveUsed || 0,
+      },
+      prNumber: state.prNumber ?? null,
+      worktreePath: state.worktreePath || null,
+      workerPid: (state.owner && state.owner.workerPid) || null,
     };
   });
 }
@@ -534,6 +775,63 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
 // journal dir -- production traffic never does this) would inflate this tile's count past
 // `daemonStats.active`, which is exactly the kind of "two counts of almost-the-same-set silently
 // disagree" drift action 5.4 item G already had to close once for the parking-rate denominator.
+// collectDeck(journalRoot, journalTasks, now) -> the cards the flight deck renders, newest
+// activity first. One entry per `onDeck` card kind:'card' (a report/triage task is not a run
+// along the track and has no splits to draw), each carrying the run built in collectJournalTasks
+// plus one thing that function cannot know: whether a worker is actually holding it.
+//
+// THE LIVENESS QUESTION IS NOT RE-DERIVED HERE. worker-status.js already answers "is this id's
+// live-worker entry actually a live worker right now" against live-workers.json and pid
+// liveness, and its header is explicit about why a second, independently-computed answer is a
+// bug waiting to happen. This function reads that classification and nothing more:
+//
+//   'live'     -- a worker holds it. The deck animates it and shows the live step panel.
+//   'stale'    -- the registry lists it but the pid is gone. Rendered greyed, "no worker holds
+//                 this card" -- never as running, which is the honest-limits rule from the plan.
+//   'trailing' -- terminal already; the worker just has not exited. These are exactly the cards
+//                 in the linger window, and they render as their outcome.
+//   null       -- no entry at all. A non-terminal card with no worker is stale by another name;
+//                 a terminal one is simply finished.
+function collectDeck(journalRoot, journalTasks, now = Date.now()) {
+  const cards = (journalTasks || []).filter((t) => t.onDeck && isCardKind(t));
+  if (!cards.length) return [];
+
+  let perId = new Map();
+  if (journalRoot) {
+    try {
+      const states = new Map(
+        (journalTasks || []).map((t) => [t.id, { state: t.state, owner: t.workerPid ? { workerPid: t.workerPid } : null }])
+      );
+      perId = describeLiveWorkers(journalRoot, states, now).perId;
+    } catch {
+      perId = new Map(); // a broken registry is "no worker information", never a throw
+    }
+  }
+
+  return cards
+    .map((t) => {
+      const info = perId.get(t.id) || null;
+      const terminal = TERMINAL_STATES.has(t.state);
+      return {
+        id: t.id,
+        title: t.title,
+        state: t.state,
+        reason: t.reason,
+        updatedAt: t.updatedAt,
+        prNumber: t.prNumber,
+        worktreePath: t.worktreePath,
+        workerPid: t.workerPid,
+        counters: t.counters,
+        run: t.run,
+        liveness: info ? info.classification : null,
+        // What the deck renders as its headline state. Kept here rather than in render.js so the
+        // rule lives beside the classification it reads, and so a test can assert it directly.
+        deckState: terminal ? 'finished' : info && info.classification === 'live' ? 'running' : 'stale',
+      };
+    })
+    .sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
+}
+
 function applyWorkerStats(services, journalRoot, journalTasks, now) {
   if (!journalRoot) return services;
   const kindById = new Map((journalTasks || []).map((t) => [t.id, t]));
@@ -869,7 +1167,8 @@ function buildSessionIndex(journalTasks) {
 // populated here too, since collectTrend only reads an already-computed rollup file rather than
 // running the scanner itself (see that function's own comment).
 function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsDir } = {}) {
-  const journalTasks = collectJournalTasks(journalRoot);
+  const collectedAt = Date.now();
+  const journalTasks = collectJournalTasks(journalRoot, { now: collectedAt });
   const queue = collectQueue(queueDir);
   const reportsDir = spoReportsDir || (() => {
     try {
@@ -890,8 +1189,18 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
   );
 
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt: new Date(collectedAt).toISOString(),
     journalTasks,
+    // The flight deck's own slice: the cards `/` renders, cross-referenced against the live
+    // worker registry so a card whose state.json is non-terminal but whose worker is gone shows
+    // as stale rather than as running. `liveness` is worker-status.js's classification verbatim
+    // -- this module never re-derives "is it alive", for exactly the reason that module's header
+    // gives (two independent counts drift, and did once already).
+    deck: collectDeck(journalRoot, journalTasks, collectedAt),
+    // Read-only, like collectTrend: the expensive corpus pass lives in console/par-times.js and
+    // is driven by the live server's timer. A missing file is "no pars yet" and the deck renders
+    // times without a comparison rather than inventing one.
+    parTimes: journalRoot ? require('./par-times').loadParTimes(path.join(journalRoot, 'par-times.json')) : null,
     queue,
     accounts: collectAccounts(accountsDir),
     nightly: benchRoot ? collectNightly(path.join(benchRoot, 'nightly', 'latest.json')) : null,
@@ -929,4 +1238,9 @@ module.exports = {
   readDaemonEventsTail,
   applyWorkerStats,
   applyRetryChannelStats,
+  buildRun,
+  collectDeck,
+  normalizeRootCause,
+  DECK_LINGER_MS,
+  TERMINAL_STATES,
 };

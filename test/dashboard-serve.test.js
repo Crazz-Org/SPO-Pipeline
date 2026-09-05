@@ -61,7 +61,7 @@ function request(server, method, urlPath) {
   });
 }
 
-test('GET / renders live HTML with all 7 fragment ids and no meta refresh', async (t) => {
+test('GET / renders the flight deck (frag-live), not the health sections, and no meta refresh', async (t) => {
   const journalRoot = mkTmp('spo-serve-journal-');
   const server = await startServer(
     { journalRoot },
@@ -72,8 +72,47 @@ test('GET / renders live HTML with all 7 fragment ids and no meta refresh', asyn
   const res = await get(server, '/');
   assert.equal(res.status, 200);
   assert.match(res.headers['content-type'], /text\/html/);
-  assert.match(res.body, /id="frag-services"/);
+  // The root page IS the deck now: one fragment, and the health sections are NOT on it.
+  assert.match(res.body, /id="frag-live"/);
+  assert.doesNotMatch(res.body, /id="frag-services"/);
+  assert.doesNotMatch(res.body, /id="frag-tokens"/);
+  // ...and it links across to where they went, so the split is discoverable from the page.
+  assert.match(res.body, /href="\/health"/);
   assert.doesNotMatch(res.body, /http-equiv="refresh"/);
+});
+
+test('GET /health still serves every section the root page used to carry, with the same fragment ids', async (t) => {
+  const journalRoot = mkTmp('spo-serve-health-');
+  const server = await startServer(
+    { journalRoot },
+    { systemSampler: fakeSystemSampler(), prodProbe: null, usageScanner: fakeUsageScanner() }
+  );
+  t.after(() => server.close());
+
+  const res = await get(server, '/health');
+  assert.equal(res.status, 200);
+  for (const id of ['services', 'daemon', 'system', 'reports', 'accounts', 'tokens', 'secondary']) {
+    assert.match(res.body, new RegExp(`id="frag-${id}"`), `health page is missing frag-${id}`);
+  }
+  assert.doesNotMatch(res.body, /id="frag-live"/);
+  assert.match(res.body, /href="\/"/); // and back to the deck
+});
+
+test('GET /api/live serves the deck fragment alone, so the 2s poll never rewrites the 30s sections', async (t) => {
+  const journalRoot = mkTmp('spo-serve-live-');
+  const server = await startServer(
+    { journalRoot },
+    { systemSampler: fakeSystemSampler(), prodProbe: null, usageScanner: fakeUsageScanner() }
+  );
+  t.after(() => server.close());
+
+  const res = await get(server, '/api/live');
+  assert.equal(res.status, 200);
+  const json = JSON.parse(res.body);
+  assert.deepEqual(Object.keys(json.fragments), ['live']);
+  assert.ok(json.generatedAt);
+  // Same un-nested rule as /api/data: the client assigns this to el.innerHTML.
+  assert.ok(!json.fragments.live.startsWith('<section id="frag-'));
 });
 
 test('GET /api/system returns a system snapshot + html, and never calls collectAll', async (t) => {
@@ -92,7 +131,7 @@ test('GET /api/system returns a system snapshot + html, and never calls collectA
   assert.ok(!('journalTasks' in json)); // guard: this route must not run collectAll
 });
 
-test('GET /api/data returns the 7 fragment keys, none nested', async (t) => {
+test('GET /api/data returns the 8 fragment keys, none nested', async (t) => {
   const journalRoot = mkTmp('spo-serve-journal3-');
   const server = await startServer(
     { journalRoot },
@@ -103,7 +142,9 @@ test('GET /api/data returns the 7 fragment keys, none nested', async (t) => {
   const res = await get(server, '/api/data');
   const json = JSON.parse(res.body);
   const ids = Object.keys(json.fragments).sort();
-  assert.deepEqual(ids, ['accounts', 'daemon', 'reports', 'secondary', 'services', 'stamp', 'tokens']);
+  // `live` rides here too so a client that never started the fast poll still refreshes the deck
+  // at the 30s cadence -- see renderDataFragments' own comment.
+  assert.deepEqual(ids, ['accounts', 'daemon', 'live', 'reports', 'secondary', 'services', 'stamp', 'tokens']);
   for (const v of Object.values(json.fragments)) {
     assert.ok(typeof v !== 'string' || !v.startsWith('<section id="frag-'));
   }

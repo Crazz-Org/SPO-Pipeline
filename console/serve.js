@@ -20,12 +20,24 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const { collectAll, buildSessionIndex } = require('./collect');
-const { renderDashboard, renderDataFragments, renderSystemFragment } = require('./render');
+const { renderDashboard, renderDataFragments, renderSystemFragment, renderLiveInner } = require('./render');
+const { probeDeck } = require('./live-step');
+const { refreshParTimes } = require('./par-times');
 const { createSystemSampler } = require('./system');
 const { createUsageScanner, buildTokenViews, buildTrendViews, localDateKey } = require('./usage-scan');
 const { loadRollups, mergeRollups, saveRollups } = require('./usage-rollups');
 
 const DEFAULT_DATA_TTL_MS = 5000;
+// The flight deck's own cache. Far shorter than the 30s data cache because `/` is a live view of
+// a card that moves: a two-second-old split time is fine, a thirty-second-old one is a stopped
+// clock. The whole deck build is one journal walk over at most a couple of task directories plus
+// one 64 KB transcript tail (see collect.js's DECK_LINGER_MS gate and live-step.js's rules), so
+// this cadence costs a rounding error even with several browser tabs open.
+const DEFAULT_DECK_TTL_MS = 1500;
+// Par times are recomputed on the same slow timer as the usage scan -- the pass walks every
+// journal on disk, which is exactly the work console/par-times.js exists to keep off the request
+// path. refreshParTimes() no-ops unless the corpus has actually moved.
+const DEFAULT_PAR_REFRESH_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_SCAN_MS = 5 * 60 * 1000;
 const USAGE_SCAN_DELAY_MS = 2000;
 
@@ -58,15 +70,20 @@ function createDashboardServer(sources, opts = {}) {
   const prodProbe = opts.prodProbe === undefined ? null : opts.prodProbe; // null = disabled
   const usageScanner = opts.usageScanner || createUsageScanner({ roots: discoverUsageRoots(sources.accountsDir) });
   const dataTtlMs = opts.dataTtlMs || DEFAULT_DATA_TTL_MS;
+  const deckTtlMs = opts.deckTtlMs === undefined ? DEFAULT_DECK_TTL_MS : opts.deckTtlMs;
   const usageScanMs = opts.usageScanMs || DEFAULT_USAGE_SCAN_MS;
+  const parRefreshMs = opts.parRefreshMs || DEFAULT_PAR_REFRESH_MS;
+  const parTimesPath = sources.journalRoot ? path.join(sources.journalRoot, 'par-times.json') : null;
   // The tokens trend's durable store (console/usage-rollups.js) -- co-located with the static
   // fallback's journal/usage-snapshot.json. No journalRoot (some test setups) means no trend.
   const rollupsPath = sources.journalRoot ? path.join(sources.journalRoot, 'usage-rollups.json') : null;
   let rollups = rollupsPath ? loadRollups(rollupsPath) : {};
 
   let cache = null; // {at, data}
+  let deckCache = null; // {at, data} -- the fast path behind `/` and /api/live
   let usageScanTimer = null;
   let usageScanDelayTimer = null;
+  let parTimer = null;
 
   function buildData() {
     const now = Date.now();
@@ -81,6 +98,20 @@ function createDashboardServer(sources, opts = {}) {
     return base;
   }
 
+  // buildDeckData() -- everything `/` needs, on its own short cache. Deliberately NOT
+  // buildData(): the deck does not want the usage scan, the prod probe or the CPU sample, and
+  // waiting 30 s behind their cache is exactly the stopped clock this view exists to avoid. The
+  // live-step probe runs here rather than in collect.js so that module stays sync and disk-local
+  // -- the same split system/prod/tokens already use.
+  function buildDeckData() {
+    const now = Date.now();
+    if (deckCache && now - deckCache.at <= deckTtlMs) return deckCache.data;
+    const data = collectAll(sources);
+    data.liveSteps = probeDeck(data.deck, { accountsDir: sources.accountsDir });
+    deckCache = { at: now, data };
+    return data;
+  }
+
   function sendJson(res, status, obj) {
     const body = JSON.stringify(obj);
     res.writeHead(status, {
@@ -89,6 +120,21 @@ function createDashboardServer(sources, opts = {}) {
       'x-content-type-options': 'nosniff',
     });
     res.end(body);
+  }
+
+  // The keys the deck build owns. Everything else on `/` comes from the ordinary (30 s) data
+  // object, so the two caches compose instead of one shadowing the other -- and `generatedAt`
+  // comes from the DECK build, because that is the clock the deck's own elapsed times are
+  // measured against (render-deck.js is a pure function of it).
+  function deckSlice(deckData) {
+    return {
+      generatedAt: deckData.generatedAt,
+      deck: deckData.deck,
+      parTimes: deckData.parTimes,
+      liveSteps: deckData.liveSteps,
+      queue: deckData.queue,
+      daemonStats: deckData.daemonStats,
+    };
   }
 
   const server = http.createServer((req, res) => {
@@ -101,14 +147,34 @@ function createDashboardServer(sources, opts = {}) {
 
       const url = req.url.split('?')[0];
 
-      if (url === '/') {
-        const html = renderDashboard(buildData(), { live: true });
+      const sendHtml = (html) => {
         res.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
           'x-content-type-options': 'nosniff',
         });
         res.end(html);
+      };
+
+      // `/` is the flight deck. It needs the deck build (fast, 1.5 s) plus the health summary
+      // that labels the link across, which lives in the ordinary data object -- merged rather
+      // than re-collected so the page costs one journal walk, not two.
+      if (url === '/') {
+        sendHtml(renderDashboard({ ...buildData(), ...deckSlice(buildDeckData()) }, { live: true }));
+        return;
+      }
+
+      // /health is every section the root page used to carry, unchanged.
+      if (url === '/health') {
+        sendHtml(renderDashboard(buildData(), { live: true, view: 'health' }));
+        return;
+      }
+
+      // The deck's own fast poll. One fragment, one id -- the client swaps `frag-live` and
+      // leaves the 30 s /api/data cadence to everything else.
+      if (url === '/api/live') {
+        const data = { ...buildData(), ...deckSlice(buildDeckData()) };
+        sendJson(res, 200, { generatedAt: data.generatedAt, fragments: { live: renderLiveInner(data) } });
         return;
       }
 
@@ -134,6 +200,18 @@ function createDashboardServer(sources, opts = {}) {
 
   server.on('listening', () => {
     if (prodProbe) prodProbe.start();
+    if (parTimesPath) {
+      const runPar = () => {
+        try {
+          refreshParTimes(sources.journalRoot, parTimesPath);
+        } catch {
+          /* pars are an enhancement: the deck renders times without a comparison rather than 500 */
+        }
+      };
+      runPar();
+      parTimer = setInterval(runPar, parRefreshMs);
+      if (parTimer.unref) parTimer.unref();
+    }
     const runScan = () =>
       usageScanner
         .scan()
@@ -160,6 +238,7 @@ function createDashboardServer(sources, opts = {}) {
     if (prodProbe) prodProbe.stop();
     if (usageScanTimer) clearInterval(usageScanTimer);
     if (usageScanDelayTimer) clearTimeout(usageScanDelayTimer);
+    if (parTimer) clearInterval(parTimer);
     return originalClose(cb);
   };
 

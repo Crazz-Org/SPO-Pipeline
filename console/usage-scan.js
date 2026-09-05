@@ -258,7 +258,18 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
 }
 
 const WEIGHT = (a) => a.inp + a.cc + 5 * a.out + 0.1 * a.cr;
+// toM ROUNDS AT THE MILLION SCALE, and that is lossy at source: two decimals means a resolution
+// of 10,000 tokens, so anything under 5,000 becomes 0.00 and is gone before any renderer sees
+// it. The dashboard used to print that 0.00 verbatim; formatting it as "0k" instead would have
+// been a prettier lie. So every row that carries an M* figure now carries the RAW integers
+// beside it (raw*), and console/render.js formats from those through
+// orchestrator/tokens.js's formatTokenCount -- the same function `spo tokens` and the park
+// comments already use. The M* fields stay exactly as they were: console/usage-rollups.js
+// persists them, buildTrendViews derives from them, and their tests pin them.
 const toM = (n) => +(n / 1e6).toFixed(2);
+// The raw counterparts of an M* group, so a caller never has to guess which raw field feeds
+// which rounded one.
+const rawSums = (agg) => ({ rawInp: agg.inp, rawCc: agg.cc, rawCr: agg.cr, rawOut: agg.out });
 
 function emptyMSums() {
   return { msgs: 0, Minp: 0, Mcc: 0, Mcr: 0, Mout: 0 };
@@ -309,7 +320,7 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
       const modelRows = Object.entries(t.models)
         .map(([model, agg]) => {
           msgs += agg.msgs;
-          return { model, agg, Mcr: toM(agg.cr), Mcc: toM(agg.cc), Mout: toM(agg.out) };
+          return { model, agg, Mcr: toM(agg.cr), Mcc: toM(agg.cc), Mout: toM(agg.out), ...rawSums(agg) };
         })
         .sort((a, b) => WEIGHT(b.agg) - WEIGHT(a.agg));
       for (const { agg } of modelRows) addMSums(totals, agg);
@@ -323,8 +334,20 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
         Mcc: toM(totals.Mcc),
         Mcr: toM(totals.Mcr),
         Mout: toM(totals.Mout),
+        rawInp: totals.Minp,
+        rawCc: totals.Mcc,
+        rawCr: totals.Mcr,
+        rawOut: totals.Mout,
         weight,
-        models: modelRows.map((r) => ({ model: r.model, Mcr: r.Mcr, Mcc: r.Mcc, Mout: r.Mout })),
+        models: modelRows.map((r) => ({
+          model: r.model,
+          Mcr: r.Mcr,
+          Mcc: r.Mcc,
+          Mout: r.Mout,
+          rawCr: r.rawCr,
+          rawCc: r.rawCc,
+          rawOut: r.rawOut,
+        })),
       };
     })
     .sort((a, b) => b.weight - a.weight)
@@ -338,6 +361,7 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
       Mcc: toM(agg.cc),
       Mcr: toM(agg.cr),
       Mout: toM(agg.out),
+      ...rawSums(agg),
       weight: WEIGHT(agg),
     }))
     .sort((a, b) => b.weight - a.weight)
@@ -346,7 +370,16 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
   const byAccountModel = [];
   for (const [account, models] of Object.entries(usageIndex.byAccount || {})) {
     for (const [model, agg] of Object.entries(models)) {
-      byAccountModel.push({ account, model, msgs: agg.msgs, Mcr: toM(agg.cr), Mcc: toM(agg.cc), Mout: toM(agg.out), weight: WEIGHT(agg) });
+      byAccountModel.push({
+        account,
+        model,
+        msgs: agg.msgs,
+        Mcr: toM(agg.cr),
+        Mcc: toM(agg.cc),
+        Mout: toM(agg.out),
+        ...rawSums(agg),
+        weight: WEIGHT(agg),
+      });
     }
   }
   byAccountModel.sort((a, b) => (a.account < b.account ? -1 : a.account > b.account ? 1 : b.weight - a.weight));
@@ -366,8 +399,16 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
       Mcc: toM(unattributed.agg.cc),
       Mcr: toM(unattributed.agg.cr),
       Mout: toM(unattributed.agg.out),
+      ...rawSums(unattributed.agg),
     },
-    totals: { Minp: toM(totalsAgg.inp), Mcc: toM(totalsAgg.cc), Mcr: toM(totalsAgg.cr), Mout: toM(totalsAgg.out), msgs: totalsAgg.msgs },
+    totals: {
+      Minp: toM(totalsAgg.inp),
+      Mcc: toM(totalsAgg.cc),
+      Mcr: toM(totalsAgg.cr),
+      Mout: toM(totalsAgg.out),
+      ...rawSums(totalsAgg),
+      msgs: totalsAgg.msgs,
+    },
   };
 }
 

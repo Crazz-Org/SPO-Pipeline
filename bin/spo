@@ -1119,18 +1119,34 @@ function cmdDashboard(opts) {
     server.listen(port, opts.host || undefined, () => {
       const addr = server.address();
       console.log(
-        `dashboard: http://localhost:${addr.port}/  (api: /api/system 1s, /api/data 30s -- Ctrl-C to stop)`
+        `dashboard: http://localhost:${addr.port}/  (flight deck; health at /health -- api: /api/live 2s, /api/system 1s, /api/data 30s -- Ctrl-C to stop)`
       );
     });
     return;
   }
 
+  // Static mode writes BOTH pages: the flight deck at <out> and health beside it. The deck's
+  // track, splits, lives and pars all come from the journal, which this mode already reads --
+  // only live-step.js's transcript probe is server-only, and the deck degrades to the clock
+  // alone without it (see console/live-step.js's rule 1). Two files rather than one because the
+  // externally hosted copy is a `spo dashboard` + rsync artefact owned by SPO-Deploy: if static
+  // mode emitted only the deck, /health would 404 on the public tier.
   function generateOnce() {
     const data = collectAll(sources);
-    const html = renderDashboard(data);
+    // Cheap enough for a one-shot: refreshes only when the corpus has actually moved, and this
+    // is the only place pars get computed at all when the live server is not running.
+    try {
+      require('../console/par-times').refreshParTimes(journalRoot, path.join(journalRoot, 'par-times.json'));
+      data.parTimes = require('../console/par-times').loadParTimes(path.join(journalRoot, 'par-times.json'));
+    } catch {
+      /* pars are an enhancement -- the deck renders times without a comparison rather than fail */
+    }
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    fs.writeFileSync(outPath, html);
+    fs.writeFileSync(outPath, renderDashboard(data));
+    const healthPath = path.join(path.dirname(outPath), 'health.html');
+    fs.writeFileSync(healthPath, renderDashboard(data, { view: 'health' }));
     console.log(outPath);
+    console.log(healthPath);
   }
 
   generateOnce();
