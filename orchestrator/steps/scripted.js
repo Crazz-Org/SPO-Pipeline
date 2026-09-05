@@ -36,7 +36,7 @@ const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { resolveMainMovedRegateBudget } = require('../main-moved-budget');
 const { moveCard } = require('../board');
-const { classifyCommand, classTimeoutMs, isSpawnTimeout } = require('../command-timeout');
+const { classifyCommand, classTimeoutMs, isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const {
   acquireProductRepoLock,
   releaseProductRepoLock,
@@ -132,10 +132,17 @@ function appendSpawnLog(taskDir, state, header, text) {
 // `status: null` (which a timeout kill also produces) straight to exit 1, indistinguishable
 // from a genuine failure -- so a timeout-killed GATE (exit 1 -> DIAGNOSE) paid a real LLM call
 // to diagnose a hang. `timedOut` is therefore branched FIRST, before the exit mapping, mirroring
-// llm.js's own `killedByDeadline` idiom (not a new third convention). A bare `signal` with NO
-// timeout armed (an operator's kill -9, an OOM kill) is deliberately NOT a timeout -- same
-// `deadlineArmed` guard llm.js uses -- and falls through to the pre-existing `error -> exit -1`
-// / `status: null with no error/signal -> exit 1` branches, unchanged.
+// llm.js's own `killedByDeadline` idiom (not a new third convention -- though that one still
+// carries the `|| (signal && deadlineArmed)` clause corrected here, and is left alone on purpose:
+// its `timedOut` drives intake.js's retry-once-on-the-same-account policy, so it is worth its own
+// corpus pass rather than a ride-along, and `claude` is measurably the wrong child to hit it --
+// it handles SIGTERM and exits 143 rather than dying by signal, so the clause barely fires there).
+// A bare `signal` -- an
+// operator's kill, an OOM kill, the SIGTERM a deploy restart sends -- is NOT a timeout, and since
+// the isSpawnTimeout correction it is no longer misreported as one; it gets `killedBySignal`
+// instead. Both flags mean "this command did not finish", so both take the `exit = -1` branch and
+// neither is ever routed on -- see spawnStep below for why that distinction is load-bearing rather
+// than cosmetic.
 function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, timeoutMs, attempt }) {
   const start = Date.now();
   const result = runSync(deps, command, args, spawnOpts);
@@ -143,10 +150,15 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
 
   const deadlineArmed = typeof spawnOpts.timeout === 'number';
   const timedOut = isSpawnTimeout(result, deadlineArmed);
+  const killedBySignal = isSpawnKilled(result);
 
   let exit;
-  if (timedOut) {
-    exit = -1; // never routed on -- callers must check `timedOut` before looking at `exit` at all
+  if (timedOut || killedBySignal) {
+    // never routed on -- callers must check `timedOut`/`killedBySignal` before looking at `exit`.
+    // Before the isSpawnTimeout correction an externally-killed child reached here as
+    // `status: null` with no `error` and fell out of the last branch below as exit 1, i.e. as an
+    // ordinary command failure. That is the routing spawnStep's own park exists to prevent.
+    exit = -1;
   } else if (result && result.error) {
     exit = -1;
   } else {
@@ -165,6 +177,7 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
     commandClass: commandClass || null,
     timeoutMs: deadlineArmed ? timeoutMs : null,
     timedOut,
+    killedBySignal,
     signal: (result && result.signal) || null,
   });
   appendSpawnLog(ctx.taskDir, state, [command, ...args].join(' '), stdout || stderr);
@@ -176,6 +189,7 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
     stdoutTail: tail,
     ms,
     timedOut,
+    killedBySignal,
     commandClass: commandClass || null,
     timeoutMs: deadlineArmed ? timeoutMs : undefined,
     signal: (result && result.signal) || null,
@@ -217,6 +231,30 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
 //     cosmetic (never a second PR, branch, merge, or claim) and journaled like every other
 //     attempt, so it is visible if it ever happens -- but it is a real, not fully eliminated,
 //     residual risk, called out here rather than silently assumed away.
+// The park for a command something outside this process killed. NOT on TRANSIENT_RETRY_REASONS,
+// and that is a decision rather than an oversight: it keeps the retry semantics of the only case
+// the corpus has ever produced EXACTLY as they were (all three historical `timedOut: true` events
+// were deploy kills, and they parked terminally as `npm-run-timed-out`), so this change is a
+// rename of a lie and not a silent grant of auto-retry plus LLM spend on a class that has never
+// been observed on its own. The argument for making it transient is real -- a deploy restart is
+// the textbook transient cause -- but a daemon that DRAINS on SIGTERM removes that population at
+// source, leaving OOM and operator kills, which a human should see. Revisit with evidence, on
+// purpose, in its own change.
+function killedParkSignal(state, command, args, commandClass, attempt, retried) {
+  return new ParkSignal('command-killed-by-signal', {
+    state,
+    argv: [command, ...args].slice(0, 6),
+    commandClass,
+    signal: attempt.signal || null,
+    ms: attempt.ms,
+    timeoutMs: attempt.timeoutMs,
+    retried,
+    detail:
+      'killed from outside this process (deploy restart, OOM, operator kill) -- not its own deadline: ' +
+      `ran ${attempt.ms}ms of a ${attempt.timeoutMs === undefined ? 'unset' : `${attempt.timeoutMs}ms`} budget`,
+  });
+}
+
 function spawnStep(ctx, deps, state, command, args, opts = {}) {
   const config = (ctx && ctx.config) || {};
   const commandClass = classifyCommand(command, args);
@@ -224,7 +262,12 @@ function spawnStep(ctx, deps, state, command, args, opts = {}) {
   const spawnOpts = timeoutMs === undefined ? opts : { ...opts, timeout: timeoutMs };
 
   const first = spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, timeoutMs, attempt: 1 });
-  if (!first.timedOut) return first;
+  // "Did not finish" covers both: its own deadline killed it, or something outside did. The retry
+  // and no-retry policies below were written for the first and apply verbatim to the second --
+  // spawnSync's timeout kills only the direct child, and so does an external SIGTERM to this
+  // process group, so the orphaned-grandchild reasoning under npm-gate and bench-install is if
+  // anything MORE true for a kill than for a timeout.
+  if (!first.timedOut && !first.killedBySignal) return first;
 
   // `npm run gate` is the one command here that must NOT be retried. It submits a job to the
   // live bench, and job.ts refuses a second job for the same (worktree, ref) while the first is
@@ -235,6 +278,7 @@ function spawnStep(ctx, deps, state, command, args, opts = {}) {
   // derived from the bench's own 7200s bound (config.js), reaching this line at all means the
   // bench itself is wedged -- a retry cannot help, and parking honestly is the better answer.
   if (commandClass === 'npm-gate') {
+    if (first.killedBySignal) throw killedParkSignal(state, command, args, commandClass, first, false);
     throw new ParkSignal('npm-gate-timed-out', {
       state,
       argv: [command, ...args].slice(0, 6),
@@ -259,6 +303,7 @@ function spawnStep(ctx, deps, state, command, args, opts = {}) {
   // `npm run build:e2e` (or the restart) is taking longer than SPO_TIMEOUT_BENCH_INSTALL_MS
   // (900000ms / 15 min, generous already), and a second attempt cannot make that faster.
   if (commandClass === 'bench-install') {
+    if (first.killedBySignal) throw killedParkSignal(state, command, args, commandClass, first, false);
     throw new ParkSignal('bench-install-timed-out', {
       state,
       argv: [command, ...args].slice(0, 6),
@@ -270,7 +315,17 @@ function spawnStep(ctx, deps, state, command, args, opts = {}) {
   }
 
   const second = spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, timeoutMs, attempt: 2 });
-  if (!second.timedOut) return second;
+  if (!second.timedOut && !second.killedBySignal) return second;
+
+  // Killed from outside on the retry too (or on the retry only): a park that says so, rather than
+  // `<class>-timed-out` claiming a deadline expired when the journal's own `ms` says it did not.
+  // ONE reason string, not a `<class>-killed` family mirroring `<class>-timed-out`: the per-class
+  // split exists because a wedged bench and a wedged `git` need different human remedies, whereas
+  // "something outside killed us" has the same cause and the same remedy whatever the command was.
+  // `commandClass` rides in the detail, where it informs without multiplying the reason namespace
+  // -- and a reason string is a retry contract (state-machine.js's TRANSIENT_RETRY_REASONS keys on
+  // it exactly), so one new string is one new contract instead of six.
+  if (second.killedBySignal) throw killedParkSignal(state, command, args, commandClass, second, true);
 
   // Both attempts killed by the same timeout -- a dedicated park reason naming the command
   // class, never the caller's own failure reason (a caller must not be able to mistake this for

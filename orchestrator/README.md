@@ -1033,7 +1033,7 @@ touches `config.productRepo`). A final `finished` journal event carries the task
 cache-creation + output, cache-read excluded) and the PR number.
 
 **Every spawn**, across all seven functions, journals one compact `{state, argv (first 6
-tokens), exit, ms, attempt, commandClass, timeoutMs, timedOut, signal}` `'spawn'` event via
+tokens), exit, ms, attempt, commandClass, timeoutMs, timedOut, killedBySignal, signal}` `'spawn'` event via
 `appendEvent`, and appends its stdout (falling back to stderr) to `journal/<id>/logs/<STATE>.log`
 — several spawns share one state's log file, in call order, each under its own `-----
 <command> -----` header.

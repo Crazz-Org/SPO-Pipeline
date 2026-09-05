@@ -67,8 +67,10 @@ function timeoutResult(signal = 'SIGTERM') {
   return { status: null, stdout: '', stderr: '', signal, error };
 }
 
-// A signalled child with NO deadline armed (an operator's kill -9, an OOM kill) -- must NOT be
-// mistaken for a timeout: no `error`, no ETIMEDOUT code, just a bare signal.
+// An EXTERNALLY KILLED child (an operator's kill -9, an OOM kill, a deploy restart's SIGTERM):
+// no `error`, no ETIMEDOUT code, just a bare signal. The name is historical -- what makes this
+// not a timeout is the ABSENT ETIMEDOUT, not the absent deadline, and isSpawnKilled recognises it
+// either way (a deadline being armed or not is unrelated to who killed the child).
 function killedNoDeadline(signal = 'SIGKILL') {
   return { status: null, stdout: '', stderr: '', signal, error: null };
 }
@@ -5361,7 +5363,22 @@ test('spawnStep: status: null with NO signal and NO error (pre-existing "unknown
   assert.equal(r.timedOut, false);
 });
 
-test('spawnStep: a bare signal with NO deadline armed (unclassified command, no opts.timeout) is not mistaken for a timeout', () => {
+// This test used to assert that a bare signal with no deadline armed FELL THROUGH to `exit: 1`,
+// unretried -- the "pre-existing null-status default". That is no longer the behaviour, and the
+// change is deliberate: `exit: 1` is an ORDINARY COMMAND FAILURE, so a card whose command was
+// killed from outside got routed as though the command had genuinely failed. spawnStep's own park
+// comment says why that matters ("realGate's exit-1 -> DIAGNOSE routing never even sees this"):
+// the fall-through buys a real DIAGNOSE LLM call to explain a failure that never happened.
+//
+// The old asymmetry had no defender either. The SAME SIGKILL was a "timeout" when a deadline
+// happened to be armed and an ordinary exit-1 failure when one was not -- a classification
+// turning on an unrelated config default. `isSpawnKilled` is not gated on `deadlineArmed` for
+// exactly that reason.
+//
+// Production blast radius: none. test/park-reason-doc-sweep.test.js enforces that
+// `classifyCommand` never returns null for any real spawnStep call site, so a deadline is always
+// armed in production and this "unclassified command" case exists only in tests.
+test('spawnStep: a bare signal is an EXTERNAL kill -- retried once, then parked as such, never routed as exit 1', () => {
   const ctx = timeoutTestCtx(); // TIMEOUT_TABLE has no entry for an unrecognized command
   const calls = [];
   const deps = {
@@ -5371,11 +5388,102 @@ test('spawnStep: a bare signal with NO deadline armed (unclassified command, no 
     },
   };
 
-  const r = spawnStep(ctx, deps, 'CHECK', 'some-unclassified-tool', ['--flag']);
+  assert.throws(
+    () => spawnStep(ctx, deps, 'CHECK', 'some-unclassified-tool', ['--flag']),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'command-killed-by-signal' &&
+      err.detail.signal === 'SIGKILL' &&
+      err.detail.retried === true
+  );
+  assert.equal(calls.length, 2, 'an external kill is retried once, exactly like a timeout');
 
-  assert.equal(calls.length, 1, 'no timeout was armed, so no retry is triggered by the bare signal');
+  const spawns = readJournal(ctx.taskDir).filter((e) => e.event === 'spawn');
+  assert.equal(spawns.length, 2);
+  for (const e of spawns) {
+    assert.equal(e.killedBySignal, true);
+    assert.equal(e.timedOut, false, 'a kill is never journalled as a timeout');
+    assert.equal(e.exit, -1, 'never routed on');
+  }
+});
+
+test('spawnStep: an external kill that succeeds on the retry returns normally, no park', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: () => {
+      calls.push(1);
+      return calls.length === 1 ? killedNoDeadline('SIGTERM') : ok('fine');
+    },
+  };
+
+  const r = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', '/wt', 'status']);
+  assert.equal(calls.length, 2);
+  assert.equal(r.exit, 0);
+  assert.equal(r.killedBySignal, false);
   assert.equal(r.timedOut, false);
-  assert.equal(r.exit, 1, 'falls through to the pre-existing null-status default');
+});
+
+test('spawnStep: npm-gate killed from outside parks WITHOUT a retry -- same orphaned-job reasoning as a timeout', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: () => {
+      calls.push(1);
+      return killedNoDeadline('SIGTERM');
+    },
+  };
+
+  assert.throws(
+    () => spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate']),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'command-killed-by-signal' &&
+      err.detail.commandClass === 'npm-gate' &&
+      err.detail.retried === false
+  );
+  // Re-running `npm run gate` re-submits a bench job for the same (worktree, ref); a killed
+  // spawn leaves the grandchild `node cli.js wait` alive just as a timed-out one does, so the
+  // no-retry rule has to cover both causes or it covers neither.
+  assert.equal(calls.length, 1, 'npm-gate must never be retried, however it was killed');
+});
+
+test('spawnStep: bench-install killed from outside parks WITHOUT a retry', () => {
+  const ctx = timeoutTestCtx();
+  const calls = [];
+  const deps = {
+    spawnSync: () => {
+      calls.push(1);
+      return killedNoDeadline('SIGTERM');
+    },
+  };
+
+  assert.throws(
+    () => spawnStep(ctx, deps, 'FINISH', 'bash', ['/home/x/SPO-WebClient/scripts/bench-install.sh']),
+    (err) => err instanceof ParkSignal && err.reason === 'command-killed-by-signal' && err.detail.retried === false
+  );
+  assert.equal(calls.length, 1);
+});
+
+test('spawnStep: a park for an external kill carries the evidence that it was NOT a deadline', () => {
+  const ctx = timeoutTestCtx();
+  const deps = { spawnSync: () => killedNoDeadline('SIGTERM') };
+
+  // The whole point of the reason split: issue-517 parked `npm-run-timed-out` after 345s of a
+  // 660s budget, and nothing in the reason said the budget had not been reached. The detail now
+  // carries both numbers so the journal contradicts a wrong reading on its own.
+  assert.throws(
+    () => spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', '698']),
+    (err) => {
+      assert.equal(err.reason, 'command-killed-by-signal');
+      assert.equal(err.detail.commandClass, 'npm-run');
+      assert.equal(err.detail.signal, 'SIGTERM');
+      assert.equal(typeof err.detail.ms, 'number');
+      assert.ok(err.detail.timeoutMs > err.detail.ms, 'the budget must be shown to be unspent');
+      assert.match(err.detail.detail, /not its own deadline/);
+      return true;
+    }
+  );
 });
 
 test('spawnStep: pre-existing spawn error (e.g. ENOENT, no timeout involved) still maps to exit -1, unretried', () => {

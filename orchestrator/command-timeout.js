@@ -78,13 +78,58 @@ function classTimeoutMs(config, commandClass) {
 
 // isSpawnTimeout(result, deadlineArmed) -- true only when spawnSync's OWN `timeout` option (never
 // an operator's kill -9, an OOM kill, or any other external signal) is what ended the child. A
-// timeout kill sets BOTH `result.signal` (the kill signal, SIGTERM here) AND `result.error` (an
-// Error with `.code === 'ETIMEDOUT'`) -- see steps/scripted.js's spawnOnce for the fuller trap
-// explanation (card #449, learned the hard way by steps/llm.js's invokeClaudeReal first).
-// `deadlineArmed` (was a numeric `timeout` actually passed to spawnSync for THIS call?) is what
-// tells that apart from a bare signalled child with no deadline armed at all.
+// timeout kill sets BOTH `result.signal` (the kill signal) AND `result.error` (an Error with
+// `.code === 'ETIMEDOUT'`) -- see steps/scripted.js's spawnOnce for the fuller trap explanation
+// (card #449, learned the hard way by steps/llm.js's invokeClaudeReal first).
+//
+// THIS FUNCTION USED TO CONTRADICT THE PARAGRAPH ABOVE. It read
+//     (result.error && result.error.code === 'ETIMEDOUT') || result.signal
+// and that `|| result.signal` clause is exactly the "any other external signal" the contract
+// promises to exclude: an armed deadline plus ANY signal was reported as a timeout. Measured on
+// node v22, deadline armed in every row:
+//
+//   case                                   error.code   signal    status
+//   genuine timeout expiry                 ETIMEDOUT    SIGTERM   null
+//   external SIGTERM, nowhere near expiry  (none)       SIGTERM   null
+//   external SIGKILL                       (none)       SIGKILL   null
+//   ordinary non-zero exit                 (none)       null      3
+//   maxBuffer overrun                      ENOBUFS      null      0
+//   ENOENT (never started)                 ENOENT       null      null
+//   timeout, child traps TERM, kill SIGKILL ETIMEDOUT   SIGKILL   null
+//
+// So `error.code === 'ETIMEDOUT'` is necessary AND sufficient, and it holds across `killSignal`
+// choices (last row) -- while `result.signal` alone is true for precisely the cases the contract
+// excludes. The corpus agrees without qualification: all THREE `timedOut: true` spawn events in
+// journal/ are false positives (issue-488 `npm run coverage:changed`, 14.3s of a 660s budget;
+// issue-517 `npm run pr:wait` twice, 345.5s and 0.02s of 660s), every one of them a command
+// SIGTERMed by a deploy restart, and there is not one genuine timeout on record. The clause never
+// classified anything correctly -- it only ever mislabelled deploy kills.
+//
+// `deadlineArmed` is kept as a belt: ETIMEDOUT cannot be set without a deadline, so it changes no
+// outcome, but it keeps "no deadline armed => never a timeout" true by construction rather than
+// by trusting node not to invent a new ETIMEDOUT source.
 function isSpawnTimeout(result, deadlineArmed) {
-  return !!(deadlineArmed && result && ((result.error && result.error.code === 'ETIMEDOUT') || result.signal));
+  return !!(deadlineArmed && result && result.error && result.error.code === 'ETIMEDOUT');
+}
+
+// isSpawnKilled(result) -- the case isSpawnTimeout used to swallow: something OUTSIDE this process
+// ended the child. A deploy restart (the whole recorded population above), an OOM kill, an
+// operator's `kill`.
+//
+// IT NEEDS A NAME OF ITS OWN, AND TIGHTENING isSpawnTimeout WITHOUT ONE WOULD HAVE MADE THINGS
+// WORSE. A signalled child leaves `status: null` with no `error`, which steps/scripted.js's
+// spawnOnce maps to `exit = 1` -- an ORDINARY FAILURE. spawnStep's own park comment spells out
+// what that costs: "realGate's exit-1 -> DIAGNOSE routing never even sees this, because spawnStep
+// never returns in this branch". Drop the flag and it does see it, and a card killed by a deploy
+// pays a real DIAGNOSE LLM call to explain a failure that never happened. Honest classification
+// here is not merely tidier than the lie; the lie was load-bearing, and this is what replaces it.
+//
+// Deliberately NOT gated on `deadlineArmed`. An external kill is an external kill whether or not
+// this call happened to arm a deadline, and the old code's asymmetry (the same SIGTERM classified
+// differently depending on an unrelated config default) was never a property anyone wanted.
+function isSpawnKilled(result) {
+  if (!result || !result.signal) return false;
+  return !(result.error && result.error.code === 'ETIMEDOUT');
 }
 
 // armTimeout(deps, config, command, args, opts) -- spawns `command` with `args`, arming
@@ -116,7 +161,14 @@ function armTimeout(deps, config, command, args, opts = {}) {
   result.commandClass = commandClass;
   result.timeoutMs = deadlineArmed ? timeoutMs : null;
   result.timedOut = isSpawnTimeout(result, deadlineArmed);
+  // Carried alongside `timedOut` so this function's callers can tell a hang from an external kill.
+  // None of them ROUTES on it today -- board.js, park-loop.js, report-intake.js, comment-scan.js,
+  // auto-triage.js and intake.js's pullBoard all only journal `timedOut` on a best-effort side
+  // effect, and the one `timedOut`-driven retry in the codebase (intake.js's triageBugReport)
+  // reads steps/llm.js's own flag, not this one. So no behaviour of theirs changes here; what
+  // changes is that `timedOut: true` in their journal lines now means what it says.
+  result.killedBySignal = isSpawnKilled(result);
   return result;
 }
 
-module.exports = { classifyCommand, classTimeoutMs, isSpawnTimeout, armTimeout };
+module.exports = { classifyCommand, classTimeoutMs, isSpawnTimeout, isSpawnKilled, armTimeout };

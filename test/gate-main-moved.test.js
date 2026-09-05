@@ -22,6 +22,9 @@ require('./no-real-spawn');
 const { realGate, realCiChecks } = require('../orchestrator/steps/scripted');
 const { buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
+// The accurate spawnSync timeout signature (ETIMEDOUT + kill signal) -- see command-timeout.js's
+// measured table for why a bare signal is NOT that, and is an external kill instead.
+const { timeoutResult } = require('./helpers');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -495,7 +498,15 @@ test('realGate: exit 0, rev-parse HEAD itself fails -> CI_CHECKS, nothing parks,
 // (`git-timed-out` is not on TRANSIENT_RETRY_REASONS) -- contradicting resolveGateHeadSha's own
 // header comment ("returning null on ANY failure to read it -- never fatal here"). Same fake
 // timeout signature test/gate-main-moved.test.js's own "merge --abort that TIMES OUT" test uses:
-// a signalled child (`status: null`, `signal: 'SIGTERM'`) with a deadline armed.
+// a timed-out child: `status: null`, `signal: 'SIGTERM'` AND `error.code === 'ETIMEDOUT'`.
+//
+// The last part used to be missing here, and the fixture was wrong rather than merely terse: a
+// BARE signal with no ETIMEDOUT is an EXTERNAL kill (a deploy restart, an OOM kill), which
+// measurement showed spawnSync reports with no `error` at all. The test passed anyway only
+// because isSpawnTimeout itself conflated the two. Now that it does not, the fixture has to say
+// which of the two it means -- and the external-kill shape gets its own test below, because the
+// property both of them are really defending (a diagnostic failure must never park a gate that
+// PASSED) has to hold for either cause.
 
 test('realGate: exit 0, rev-parse HEAD TIMES OUT twice -> CI_CHECKS, nothing parks (never git-timed-out)', async () => {
   const config = testConfig({ commandTimeoutsMs: { git: 5000 } });
@@ -504,7 +515,7 @@ test('realGate: exit 0, rev-parse HEAD TIMES OUT twice -> CI_CHECKS, nothing par
     spawnSync: (command, args) => {
       if (args.includes('run') && args.includes('gate')) return ok('');
       if (args.includes('rev-parse') && args.includes('HEAD')) {
-        return { status: null, stdout: '', stderr: '', signal: 'SIGTERM' };
+        return timeoutResult();
       }
       return ok('');
     },
@@ -813,10 +824,10 @@ test('realGate: a merge --abort that TIMES OUT still parks main-moved-conflict, 
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
-      // The kill signature spawnOnce/isSpawnTimeout recognise: a signalled child with a deadline
-      // armed. spawnStep retries once and then throws.
+      // A genuine timeout: ETIMEDOUT plus the kill signal (see helpers.js's timeoutResult, and
+      // command-timeout.js's own measured table). spawnStep retries once and then throws.
       if (args.includes('merge') && args.includes('--abort')) {
-        return { status: null, stdout: '', stderr: '', signal: 'SIGTERM' };
+        return timeoutResult();
       }
       if (args.includes('merge')) return fail(1, 'CONFLICT');
       return ok('');

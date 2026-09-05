@@ -539,6 +539,21 @@ class — `git-timed-out` / `gh-timed-out` / `npm-ci-timed-out` / `npm-gate-time
 gate` itself can return, and `DIAGNOSE`, which it never reaches). Both attempts are journaled as
 `spawn` events (`attempt: 1`/`2`, `timedOut: true`), so the journal explains the park on its own.
 
+**An EXTERNAL kill is not a timeout, and parks `command-killed-by-signal`.** A child killed by
+something outside this process — a deploy restart's SIGTERM, an OOM kill, an operator's `kill` —
+sets `signal` but **no `error`** at all, which is exactly what distinguishes it from the timeout
+above. `isSpawnTimeout` used to report both as timeouts (`… || result.signal`), contradicting its
+own stated contract; every one of the three `timedOut: true` events in the corpus was in fact a
+deploy kill, and one of them parked `npm-run-timed-out` after 345 s of a 660 s budget. The kill now
+takes the *same* path as a timeout — branched before the exit mapping, `exit: -1`, never routed on,
+retried once, `npm-gate`/`bench-install` never retried — and parks under its own reason with the
+evidence attached (`commandClass`, `signal`, `ms` vs `timeoutMs`). Deliberately ONE reason rather
+than a `<class>-killed` family: the per-class split above exists because a wedged bench and a
+wedged `git` need different remedies, whereas "something outside killed us" has one cause and one
+remedy whatever the command was — and a reason string is a retry contract, so one new string is one
+new contract instead of six. `command-killed-by-signal` is **not** on `TRANSIENT_RETRY_REASONS`,
+which keeps the retry semantics of the only case ever observed exactly as they were.
+
 ## Daemon-loop and best-effort spawn timeouts (action 2.1b)
 
 Action 2.1's own table above only covers commands a scripted step spawns *through `spawnStep`*.

@@ -17,15 +17,17 @@ const assert = require('node:assert/strict');
 // live issue) and why this require has to land before the orchestrator require directly below.
 require('./no-real-spawn');
 
-const { classifyCommand, classTimeoutMs, isSpawnTimeout, armTimeout } = require('../orchestrator/command-timeout');
+const { classifyCommand, classTimeoutMs, isSpawnTimeout, isSpawnKilled, armTimeout } = require('../orchestrator/command-timeout');
 const { timeoutResult, mkTmp } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
 }
 
-// A signalled child with NO deadline armed (an operator's kill -9, an OOM kill) -- must NOT be
-// mistaken for a timeout: no `error`, no ETIMEDOUT code, just a bare signal.
+// An EXTERNALLY KILLED child (an operator's kill -9, an OOM kill, a deploy restart's SIGTERM):
+// no `error`, no ETIMEDOUT code, just a bare signal. The name is historical -- what makes this
+// not a timeout is the ABSENT ETIMEDOUT, not the absent deadline, and isSpawnKilled recognises it
+// either way (a deadline being armed or not is unrelated to who killed the child).
 function killedNoDeadline(signal = 'SIGKILL') {
   return { status: null, stdout: '', stderr: '', signal, error: null };
 }
@@ -108,11 +110,59 @@ test('moveCard/postParkComment: a malformed timeout override never throws', () =
 
 // ---- isSpawnTimeout --------------------------------------------------------------------------
 
-test('isSpawnTimeout: true only when a deadline was armed AND the result carries ETIMEDOUT/signal', () => {
+// The line this test used to carry --
+//     isSpawnTimeout(killedNoDeadline(), true) === true, 'a bare signal still counts once a
+//     deadline WAS armed'
+// -- was the bug written down as an expectation. Measured on node v22, with a deadline armed in
+// every case: a GENUINE timeout sets `error.code === 'ETIMEDOUT'` (and a kill signal); an EXTERNAL
+// SIGTERM/SIGKILL sets a signal and NO error at all. So "a bare signal" is precisely the case
+// isSpawnTimeout's own contract says it must exclude, and asserting the opposite is what let the
+// clause survive. All three `timedOut: true` events in the corpus were external deploy kills; not
+// one genuine timeout has ever been recorded.
+test('isSpawnTimeout: ETIMEDOUT and a deadline, and nothing else', () => {
   assert.equal(isSpawnTimeout(timeoutResult(), true), true);
-  assert.equal(isSpawnTimeout(killedNoDeadline(), true), true, 'a bare signal still counts once a deadline WAS armed');
+  assert.equal(
+    isSpawnTimeout(killedNoDeadline(), true),
+    false,
+    'a bare signal is an EXTERNAL kill, not our own deadline -- the contract excludes it in so many words'
+  );
   assert.equal(isSpawnTimeout(killedNoDeadline(), false), false, 'no deadline armed -- an operator kill -9/OOM, never our timeout');
   assert.equal(isSpawnTimeout(ok(''), true), false, 'a clean exit is never a timeout even with a deadline armed');
+  // killSignal is a caller's choice; ETIMEDOUT is what actually means "our deadline fired".
+  assert.equal(isSpawnTimeout(timeoutResult('SIGKILL'), true), true, 'a timeout killed with SIGKILL is still a timeout');
+});
+
+test('isSpawnKilled: a signal that is NOT our own deadline', () => {
+  assert.equal(isSpawnKilled(killedNoDeadline('SIGTERM')), true, 'a deploy restart SIGTERM');
+  assert.equal(isSpawnKilled(killedNoDeadline('SIGKILL')), true, 'an OOM or operator kill -9');
+  assert.equal(isSpawnKilled(timeoutResult()), false, 'our own deadline is a timeout, never a kill -- the two are exclusive');
+  assert.equal(isSpawnKilled(timeoutResult('SIGKILL')), false, 'still a timeout even though the signal is SIGKILL');
+  assert.equal(isSpawnKilled(ok('')), false, 'a clean exit was not killed');
+  assert.equal(isSpawnKilled({ status: 3, signal: null }), false, 'an ordinary non-zero exit was not killed');
+  assert.equal(isSpawnKilled(undefined), false, 'never throws on a missing result');
+});
+
+test('isSpawnTimeout / isSpawnKilled partition the signalled cases -- never both, never neither', () => {
+  for (const [label, result] of [
+    ['genuine timeout', timeoutResult()],
+    ['external kill', killedNoDeadline()],
+  ]) {
+    const t = isSpawnTimeout(result, true);
+    const k = isSpawnKilled(result);
+    assert.equal(t && k, false, `${label}: classified as BOTH a timeout and a kill`);
+    assert.equal(t || k, true, `${label}: a signalled child was classified as neither`);
+  }
+});
+
+test('armTimeout carries killedBySignal alongside timedOut', () => {
+  const config = { commandTimeoutsMs: { git: 5000 } };
+  const killed = armTimeout({ spawnSync: () => killedNoDeadline('SIGTERM') }, config, 'git', ['status'], {});
+  assert.equal(killed.timedOut, false);
+  assert.equal(killed.killedBySignal, true);
+
+  const timedOut = armTimeout({ spawnSync: () => timeoutResult() }, config, 'git', ['status'], {});
+  assert.equal(timedOut.timedOut, true);
+  assert.equal(timedOut.killedBySignal, false);
 });
 
 // ---- armTimeout ------------------------------------------------------------------------------
