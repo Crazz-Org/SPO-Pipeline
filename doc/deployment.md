@@ -224,6 +224,25 @@ every deploy used to.
 | unit `TimeoutStopSec` | 2820 s = 2700 + 60 + 60 | systemd SIGKILLs the cgroup when this expires. Below the sum it does not *shorten* the drain, it **deletes the orderly end** of it. Pinned by a test against `config.js`'s source text — including the grace, because pinning `>= drainSec` alone passed with zero grace, i.e. with that half deleted. |
 | `post-merge` `restart --no-block` | — | without it a `git pull` blocks the terminal for up to 45 min |
 
+**`KillMode=mixed` is what makes the drain real**, and its absence silently defeated it for the
+first day it shipped. systemd's default is `control-group`: `systemctl stop` SIGTERMs *every*
+process in the cgroup — the dispatcher, every worker, and every worker's `claude`/`npm` child. The
+drain then has nothing left to protect. Measured in production on the first real stop after the
+drain landed (2026-09-05 12:19): a textbook clean drain —
+
+```
+daemon.js: SIGTERM -- draining ... drained on SIGTERM after 357ms -- every in-flight card finished
+```
+
+— while both in-flight cards recorded `llm.js: claude stdout was not valid JSON (exit 143)` and
+parked `llm-transport-failed:PLAN` inside the same 350 ms. The drain worked; it was simply not the
+thing deciding those cards' fate.
+
+The suite could not have caught it: every drain test signals the daemon *process*
+(`daemon.kill('SIGTERM')`), which is mixed-mode semantics. **The unit file is part of the
+behaviour, and testing the function is not testing the deployment.** Pinned by
+`test/daemon-install.test.js`.
+
 **Escape hatch:** a second signal exits immediately.
 `systemctl --user kill -s TERM spo-pipeline-daemon.service` after a `stop` that is taking too long.
 There is no counter behind this — `requestDrain` simply refuses once a drain is under way, and the

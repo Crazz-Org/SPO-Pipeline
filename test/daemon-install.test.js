@@ -149,6 +149,25 @@ test('nothing in the generated unit points into the source checkout -- only the 
 
 // ---- the drain's two systemd halves -------------------------------------------------------------
 
+test('daemon-install.sh: KillMode=mixed, or the drain is silently defeated by systemd', () => {
+  const parsed = sections(unitTemplate());
+  const hit = parsed.Service.find((l) => l.startsWith('KillMode='));
+  assert.ok(hit, 'no KillMode -- systemd defaults to control-group and SIGTERMs every worker too');
+  assert.equal(hit, 'KillMode=mixed');
+
+  // WHY THIS IS PINNED HERE AND NOT PROVEN BY THE DRAIN TESTS. Under the default
+  // (control-group), `systemctl stop` signals EVERY process in the cgroup -- the dispatcher, each
+  // worker, and each worker's `claude`/`npm` child. The dispatcher then drains correctly and
+  // reports "every in-flight card finished" while those cards were killed by the same signal
+  // milliseconds earlier. Measured in production on the first real stop after the drain shipped
+  // (2026-09-05 12:19): a clean 357ms drain, and both in-flight cards parked
+  // `llm-transport-failed:PLAN` from a `claude` that exited 143.
+  //
+  // Every test in test/drain.test.js signals the daemon PROCESS -- `daemon.kill('SIGTERM')` --
+  // which is mixed-mode semantics, so they were green throughout. The unit file is part of the
+  // behaviour; testing the function is not testing the deployment.
+});
+
 test('daemon-install.sh: a deliberate stop is not a failure -- SuccessExitStatus covers 143 and 130', () => {
   const parsed = sections(unitTemplate());
   const hit = parsed.Service.find((l) => l.startsWith('SuccessExitStatus='));

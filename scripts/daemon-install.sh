@@ -93,6 +93,29 @@ RestartSec=5
 # the signal it sent as success.
 # A CLEAN DRAIN NOW EXITS 0 (daemon.js), so 143/130 here cover only the other half: the drain's
 # bound expired and stragglers had to be signalled, or a second signal asked for an immediate stop.
+# KillMode=mixed IS WHAT MAKES THE DRAIN REAL, and its absence silently defeated it.
+#
+# systemd's DEFAULT is KillMode=control-group: 'systemctl stop' sends SIGTERM to EVERY process in
+# the cgroup -- the dispatcher, every worker, and every worker's own claude/npm child. The
+# dispatcher's drain then has nothing left to protect: it correctly stops claiming and waits, and
+# reports "every in-flight card finished", while the cards it was waiting for were killed by the
+# same signal a moment earlier.
+#
+# MEASURED IN PRODUCTION, 2026-09-05 12:19, on the first real stop after the drain shipped:
+#   daemon.js: SIGTERM -- draining ... drained on SIGTERM after 357ms -- every in-flight card finished
+# and both in-flight cards (issue-518, issue-519) recorded
+#   result {ok:false, error:"llm.js: claude stdout was not valid JSON (exit 143)"}
+#   parked llm-transport-failed:PLAN
+# in the same 350ms. The drain worked; it was simply not the thing deciding those cards' fate.
+#
+# The suite could not catch this: every drain test signals the daemon PROCESS
+# (daemon.kill SIGTERM), which is mixed-mode semantics. Testing the function is not testing
+# the deployment -- the unit file is part of the behaviour, and this directive is where it lives.
+#
+# 'mixed' = SIGTERM to the MAIN process only, then SIGKILL to whatever remains at TimeoutStopSec.
+# So the dispatcher alone is signalled, drains on its own terms, and signals its own children when
+# it decides to (dispatcher.js's killAllChildren) -- with TimeoutStopSec above as the backstop.
+KillMode=mixed
 SuccessExitStatus=143 130
 # MUST BE >= config.js's drainTimeoutMs (45 min = 2700s, the measured p95 of 56 real card runs)
 # PLUS drainKillGraceMs (60s, how long a SIGTERMed straggler is given to finish dying) PLUS slack
