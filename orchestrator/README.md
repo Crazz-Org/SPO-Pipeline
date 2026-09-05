@@ -1271,7 +1271,15 @@ more text) or `abandon`, case-insensitive, decides the outcome; anything else on
 `retry` posted *before* the park comment, one from a non-collaborator, or a comment matching
 neither word -- is left alone, since a human conversation on the issue is allowed:
 
-- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh `queue/0000-retry-<ts>-<id>.json`
+- **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh
+  `queue/0000-retry-<h|t>-<key>-<id>.json`, `<key>` the (zero-padded) retry comment id -- or, for
+  finalizePark's own bounded auto-retry, the attempt counter -- rather than a timestamp, so a
+  duplicate re-enqueue for the same logical retry overwrites instead of double-enqueuing (card
+  #43); `Date.now()` remains the fallback for a call with no natural repeat-key. `<h|t>` is the
+  priority class (a maintainer-priority fix found in review of #43, no card number of its own):
+  `h` for this maintainer-retry call site, `t` for finalizePark's own
+  auto-retry, sorted as its own segment BEFORE the padded key so a human's explicit retry always
+  outranks a machine's bounded one regardless of which numeric key happens to be smaller,
   with the original `task.json` fields, `worktreePath`/`branch`/`baseMainSha` dropped so WORKTREE
   derives the first two fresh, same as a first attempt, and `realWorktree` re-measures the third
   against whatever `origin/main` is *now*. Action 3.1: `baseMainSha` is stripped here for the same

@@ -16,7 +16,7 @@ const path = require('path');
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
-const { runTask, buildCtx, finalizePark, listQueueFiles } = require('../orchestrator/state-machine');
+const { runTask, buildCtx, finalizePark, listQueueFiles, takeNextTask } = require('../orchestrator/state-machine');
 const {
   buildParkComment,
   RETRY_ABANDON_LINE,
@@ -560,6 +560,283 @@ test('unparkScan: a "retry" comment posted AFTER the park comment re-enqueues th
   const unparked = journal.find((e) => e.event === 'unparked-by-maintainer');
   assert.ok(unparked);
   assert.equal(unparked.retryCommentId, 105);
+});
+
+// ---- card #43: reEnqueueTask's filename is keyed on something that REPEATS for the same
+// logical retry (the retry comment id, or finalizePark's own `attempt` counter) instead of
+// `Date.now()`, so a duplicate re-enqueue for the same logical retry overwrites the existing
+// queue file instead of creating a second one. See reEnqueueTask's own header comment (park-
+// loop.js) for the full design note this closes.
+
+test('reEnqueueTask: two calls with the SAME retry comment id collapse to exactly ONE queue file', () => {
+  const queueDir = mkTmp('spo-retry-key-queue-');
+  const taskDir = mkTmp('spo-retry-key-taskdir-');
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-900', kind: 'card', issue: 900 }));
+
+  const fileA = reEnqueueTask(queueDir, taskDir, 'card-900', {}, 4242);
+  // Force a real millisecond gap: under the OLD Date.now()-keyed naming this alone produced a
+  // SECOND, distinct file -- the exact defect card #43 exists to close. With `key` threaded
+  // through, the gap must make no difference at all.
+  const until = Date.now() + 5;
+  while (Date.now() < until) {
+    /* busy-wait: fs calls are synchronous, so this is the only way to force real wall-clock
+       time to pass between the two calls. */
+  }
+  const fileB = reEnqueueTask(queueDir, taskDir, 'card-900', {}, 4242);
+
+  assert.equal(fileA, fileB, 'same key -> same final filename');
+  const queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  assert.deepEqual(queued, [path.basename(fileA)], 'one file, not two');
+});
+
+test('reEnqueueTask: two writers racing the write/rename of the SAME final name (interleaved at the temp file) both complete without throwing, leaving exactly one queue file', () => {
+  const queueDir = mkTmp('spo-retry-race-queue-');
+  const taskDirA = mkTmp('spo-retry-race-taskdir-a-');
+  const taskDirB = mkTmp('spo-retry-race-taskdir-b-');
+  fs.writeFileSync(path.join(taskDirA, 'task.json'), JSON.stringify({ id: 'card-901' }));
+  fs.writeFileSync(path.join(taskDirB, 'task.json'), JSON.stringify({ id: 'card-901' }));
+
+  const realWrite = fs.writeFileSync;
+  let writeCount = 0;
+  fs.writeFileSync = (p, data, ...rest) => {
+    writeCount += 1;
+    const result = realWrite(p, data, ...rest);
+    if (writeCount === 1) {
+      // Force writer B's ENTIRE write+rename to land while writer A is still between its own
+      // write and its own rename -- the regression this pins: before the tmp name carried a
+      // per-writer discriminator, both writers computed the SAME temp path (derived only from
+      // the now-shared final name), so the loser's renameSync threw ENOENT once the winner had
+      // already renamed the shared temp file away -- with no try/catch anywhere up the stack
+      // from reEnqueueTask to runScanCycle, that kills the scanner process.
+      reEnqueueTask(queueDir, taskDirB, 'card-901', {}, 4343);
+    }
+    return result;
+  };
+
+  let fileA;
+  try {
+    fileA = reEnqueueTask(queueDir, taskDirA, 'card-901', {}, 4343);
+  } finally {
+    fs.writeFileSync = realWrite;
+  }
+
+  const allFiles = fs.readdirSync(queueDir);
+  const queued = allFiles.filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1, 'both writers key the SAME final name on purpose -- one file, not two');
+  assert.equal(path.basename(fileA), queued[0]);
+  assert.equal(allFiles.length, 1, 'no leftover temp file from either writer');
+});
+
+test('finalizePark: two transient-retry re-enqueues at the same attempt collapse to one queue file', () => {
+  const journalRoot = mkTmp('spo-retry-finalize-journal-');
+  const taskDir = path.join(journalRoot, 'card-902');
+  fs.mkdirSync(taskDir, { recursive: true });
+  const config = testConfig({
+    queueDir: mkTmp('spo-retry-finalize-queue-'),
+    transientRetryBudget: 2,
+    transientRetryDelaysMs: [60000, 300000],
+  });
+  const ctx = buildCtx('card-902', { id: 'card-902', kind: 'card', issue: 902 }, taskDir, {
+    ...config,
+    deps: { spawnSync: () => ok('') },
+  });
+
+  // ctx.task.transientRetries is never mutated between these two calls (finalizePark only ever
+  // writes the QUEUE entry, never patches ctx.task in place), so both calls read priorRetries=0
+  // and compute the SAME attempt (1) -- this is precisely the "human retry resets the counter,
+  // so the next transient retry repeats attempt 1" case the state-machine.js call site's own
+  // comment calls out as benign.
+  finalizePark(ctx, 'WORKTREE', 'claim-rate-limited', { exit: 4 });
+
+  const queued = fs.readdirSync(config.queueDir).filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1, 'same attempt both times -> one file, not two');
+  // The exact name pins BOTH of this call site's arguments at once, which is what actually makes
+  // the busy-wait this test used to need unnecessary: `attempt` (1, zero-padded) rules out a
+  // Date.now() fallback (a mutant dropping `attempt` from the state-machine.js call site would
+  // print a 13-digit timestamp here instead of '1', regardless of whether the two calls landed in
+  // the same millisecond or not), and the literal `t` rules out a mutant that passes `'h'` there
+  // instead -- which would otherwise silently restore the auto-retry-preempts-human regression
+  // FIX 1 exists to prevent, since finalizePark's OWN two calls never disagree with each other on
+  // class either way.
+  assert.equal(
+    queued[0],
+    `0000-retry-t-${'1'.padStart(20, '0')}-card-902.json`,
+    "the finalizePark call site must key on `attempt` AND classify itself 't': a Date.now() " +
+      "fallback or an 'h' here silently restores the auto-retry-preempts-human regression"
+  );
+});
+
+test('reEnqueueTask: a non-finite key (NaN, +/-Infinity, a string, undefined) falls back to Date.now(), never formatted literally into the filename', () => {
+  const queueDir = mkTmp('spo-retry-nonfinite-queue-');
+  const taskDir = mkTmp('spo-retry-nonfinite-taskdir-');
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-908' }));
+
+  for (const badKey of [NaN, Infinity, -Infinity, 'not-a-number', undefined]) {
+    const before = Date.now();
+    const file = reEnqueueTask(queueDir, taskDir, 'card-908', {}, badKey);
+    const after = Date.now();
+    const basename = path.basename(file);
+    // Number.isFinite rejects all of these -- if that guard were ever loosened (e.g. to
+    // `typeof key === 'number'`, which lets NaN through), this would instead produce a literal
+    // `0000-retry-t-000000000000000000NaN-card-908.json`, which still satisfies every reader's
+    // `.json`/`\d+-` checks and then collides with every OTHER keyless retry for this task.
+    assert.match(
+      basename,
+      /^0000-retry-t-\d{20}-card-908\.json$/,
+      `must be all-digit and exactly 20 wide, never a literal non-numeric key: ${basename}`
+    );
+    const m = basename.match(/^0000-retry-t-0*(\d+)-card-908\.json$/);
+    const usedKey = Number(m[1]);
+    assert.ok(usedKey >= before && usedKey <= after, 'the fallback key must be a real Date.now() timestamp taken during this call');
+  }
+});
+
+test('reEnqueueTask: keys of different digit widths (9, 10, 100, a 10-digit comment id) sort in true numeric order once zero-padded', () => {
+  const queueDir = mkTmp('spo-retry-pad-queue-');
+  const taskDir = mkTmp('spo-retry-pad-taskdir-');
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-903' }));
+
+  const keys = [100, 9, 1234567890, 10];
+  keys.forEach((key) => reEnqueueTask(queueDir, taskDir, 'card-903', {}, key));
+
+  const sorted = listQueueFiles(queueDir);
+  const actualOrder = sorted.map((f) => {
+    const m = f.match(/^0000-retry-t-0*(\d+)-card-903\.json$/);
+    assert.ok(m, `unexpected filename shape: ${f}`);
+    return Number(m[1]);
+  });
+  assert.deepEqual(actualOrder, [...keys].sort((a, b) => a - b), 'filename-sort order must equal numeric key order once padded');
+});
+
+test('reEnqueueTask: the 0000- prefix still sorts a keyed retry before a fresh 0001-issue-*.json card', () => {
+  const queueDir = mkTmp('spo-retry-prefix-queue-');
+  const taskDir = mkTmp('spo-retry-prefix-taskdir-');
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-904' }));
+  fs.writeFileSync(path.join(queueDir, '0001-issue-905.json'), JSON.stringify({ id: 'issue-905' }));
+
+  const file = reEnqueueTask(queueDir, taskDir, 'card-904', {}, 5);
+
+  const sorted = listQueueFiles(queueDir);
+  assert.deepEqual(sorted, [path.basename(file), '0001-issue-905.json']);
+});
+
+// Maintainer-priority fix (found in review of #43; no card number of its own): this is the point
+// of the priorityClass fix -- without it, zero-padding both callers
+// into one shared numeric key space lets a small `attempt` counter (~1 digit) sort AHEAD of a
+// large GitHub comment id (~10 digits) purely on key magnitude, regardless of which caller wrote
+// it. A maintainer's `retry` queued AFTER several cards already parked transiently must still be
+// taken FIRST by takeNextTask -- the exact property action 2.8's `0000-` prefix exists to give a
+// human over a fresh auto-pulled card, now extended to give a human priority over the machine's
+// own bounded auto-retry too.
+test('reEnqueueTask + takeNextTask: a human retry queued AFTER a transient auto-retry is still taken FIRST', () => {
+  const queueDir = mkTmp('spo-retry-priority-class-queue-');
+  const journalRoot = mkTmp('spo-retry-priority-class-journal-');
+
+  const transientTaskDir = mkTmp('spo-retry-priority-class-transient-taskdir-');
+  fs.writeFileSync(path.join(transientTaskDir, 'task.json'), JSON.stringify({ id: 'card-transient' }));
+  const humanTaskDir = mkTmp('spo-retry-priority-class-human-taskdir-');
+  fs.writeFileSync(path.join(humanTaskDir, 'task.json'), JSON.stringify({ id: 'card-human' }));
+
+  // The transient auto-retry (attempt 1, a single digit) is queued FIRST...
+  reEnqueueTask(queueDir, transientTaskDir, 'card-transient', {}, 1, 't');
+  // ...then the maintainer's retry lands SECOND, keyed on a comment id many digits wider. Under
+  // the old shared-key-space design this numerically LARGER key would sort AFTER the transient
+  // entry despite arriving later in real time and despite being the human's own explicit ask.
+  reEnqueueTask(queueDir, humanTaskDir, 'card-human', {}, 9876543210, 'h');
+
+  const sorted = listQueueFiles(queueDir);
+  assert.ok(sorted[0].startsWith('0000-retry-h-'), `human retry must sort first; got ${JSON.stringify(sorted)}`);
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.equal(taken.id, 'card-human', 'takeNextTask must hand back the human retry first, not the transient one');
+});
+
+test('unparkScan: the queue filename carries the (zero-padded) retry comment id, not a timestamp', async () => {
+  const queueDir = mkTmp('spo-unpark-queue-key-');
+  const journalRoot = mkTmp('spo-unpark-journal-key-');
+  parkedTaskDir(journalRoot, 'card-906', { issue: 906, commentId: 600 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([{ id: 987654321, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1);
+  assert.equal(
+    queued[0],
+    `0000-retry-h-${'987654321'.padStart(20, '0')}-card-906.json`,
+    'filename carries the padded retry comment id under the human ("h") priority class, driven through unparkScan'
+  );
+});
+
+// Card #43's crash-safety claim rests entirely on the ORDER of these two writes: the queue entry
+// (the effect) must land on disk before `unparked-by-maintainer` (the marker) is journalled, so a
+// crash between them loses only the marker and the next scan redoes the now-idempotent effect.
+// Nothing above pins that order -- only a comment does. This asserts it structurally: by the time
+// the marker's own `fs.appendFileSync`/`writeFileSync` call is observed, the queue entry must
+// already be sitting on disk. `appendEvent` (journal.js) writes via a single `fs.appendFileSync`
+// call -- confirmed by reading journal.js directly, not assumed.
+test('unparkScan: the queue entry is ALREADY on disk when unparked-by-maintainer is journalled -- effect before marker (#77 class, card #43)', async () => {
+  const queueDir = mkTmp('spo-unpark-order-queue-');
+  const journalRoot = mkTmp('spo-unpark-order-journal-');
+  parkedTaskDir(journalRoot, 'card-907', { issue: 907, commentId: 700 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([{ id: 700123456, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  const realAppend = fs.appendFileSync;
+  const realWrite = fs.writeFileSync;
+  let queueAtMarker = null;
+  const spy = (orig) => (p, data, ...rest) => {
+    if (queueAtMarker === null && typeof data === 'string' && data.includes('unparked-by-maintainer')) {
+      queueAtMarker = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+    }
+    return orig(p, data, ...rest);
+  };
+  fs.appendFileSync = spy(realAppend);
+  fs.writeFileSync = spy(realWrite);
+  try {
+    await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  } finally {
+    fs.appendFileSync = realAppend;
+    fs.writeFileSync = realWrite;
+  }
+
+  assert.notEqual(
+    queueAtMarker,
+    null,
+    'the unparked-by-maintainer write was never intercepted -- appendEvent no longer goes through ' +
+      'fs.appendFileSync/writeFileSync, so this guard is no longer watching anything: update it'
+  );
+  assert.equal(
+    queueAtMarker.length,
+    1,
+    'reEnqueueTask must run BEFORE appendEvent(unparked-by-maintainer). Do not reorder those two ' +
+      'statements in unparkScan: a marker with no effect is a card nothing will ever work again.'
+  );
 });
 
 test('unparkScan: idempotent -- a second scan (state.json still PARKED) never re-enqueues', async () => {
@@ -1827,7 +2104,7 @@ test('findParkAnchor: null with no park-comment event; the LAST one wins across 
 
 // ---- action 2.8: retry priority ----------------------------------------------------------------
 
-test('reEnqueueTask: names the file 0000-retry-<ts>-<id>.json -- sorts before any fresh NNNN-issue-... card', () => {
+test('reEnqueueTask: names the file 0000-retry-<class>-<key>-<id>.json -- sorts before any fresh NNNN-issue-... card', () => {
   const queueDir = mkTmp('spo-retry-priority-queue-');
   const journalRoot = mkTmp('spo-retry-priority-journal-');
   const taskDir = path.join(journalRoot, 'card-500');
@@ -1840,7 +2117,7 @@ test('reEnqueueTask: names the file 0000-retry-<ts>-<id>.json -- sorts before an
 
   const file = reEnqueueTask(queueDir, taskDir, 'card-500');
 
-  assert.match(path.basename(file), /^0000-retry-\d+-card-500\.json$/);
+  assert.match(path.basename(file), /^0000-retry-t-\d+-card-500\.json$/);
 
   const sorted = listQueueFiles(queueDir);
   assert.deepEqual(sorted, [path.basename(file), '0001-issue-777.json'], 'the retry must sort first');
@@ -1862,7 +2139,7 @@ test('reEnqueueTask: the id stays recoverable both from the written task.json an
   assert.ok(path.basename(file, '.json').endsWith('-card-501'));
 });
 
-test('reEnqueueTask: multiple retries queued at once still sort relative to each other by timestamp', () => {
+test('reEnqueueTask: multiple retries queued at once still sort relative to each other by key', () => {
   const queueDir = mkTmp('spo-retry-multi-queue-');
   const journalRoot = mkTmp('spo-retry-multi-journal-');
   const dirA = path.join(journalRoot, 'card-600');
