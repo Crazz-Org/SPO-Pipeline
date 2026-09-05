@@ -108,6 +108,12 @@ const { sleep } = require('./steps/scripted');
 // resolveScannerHealthyUptimeMs's comment, for why this is the right clock for that and the wrong
 // one for anything written to disk or compared across processes.
 const { monotonicNowMs } = require('./monotonic-clock');
+// The pipeline's own commit, read from .git by hand (never a `git` subprocess -- see that
+// module's header). Resolved ONCE, at require time: the files this process executes were loaded
+// at its start, so re-reading HEAD later would report a sha this process is not running.
+const { readPipelineVersion } = require('./pipeline-version');
+
+const PIPELINE_VERSION = readPipelineVersion();
 
 const DAEMON_PATH = path.join(__dirname, 'daemon.js');
 const DEFAULT_WORKERS = 1;
@@ -782,7 +788,20 @@ function createDispatcher(queueDir, journalRoot, config) {
     // dispatcher start says nothing about the CURRENT process. It is self-healing rather than
     // merely suppressive -- if the pool really is still idle, this same process's very next
     // fillSlots pass re-emits the idle edge from its own freshly-false flag.
-    appendDaemonEvent(journalRoot, 'dispatcher-start', { pid: process.pid, workers: resolveWorkerCount(config) });
+    // `pipelineSha`/`pipelineRef`: which version of THIS repo the long-lived processes are
+    // running. Until this line, `dispatcher-start` carried pid and workers only, and "which
+    // version produced that park?" had no answer anywhere in the journal -- while every card's
+    // PRODUCT provenance (WORKTREE's `base-main`) was recorded meticulously. It belongs here
+    // specifically because a worker records its OWN sha independently (daemon.js's runWorker):
+    // buildWorkerArgv spawns `node <DAEMON_PATH>` off a live path, so a `git pull` with no
+    // restart leaves this dispatcher on the old sha while its next worker loads the new one, and
+    // the two lines disagreeing is that gap made visible instead of inferred.
+    appendDaemonEvent(journalRoot, 'dispatcher-start', {
+      pid: process.pid,
+      workers: resolveWorkerCount(config),
+      pipelineSha: PIPELINE_VERSION.sha,
+      pipelineRef: PIPELINE_VERSION.ref,
+    });
 
     spawnScanner(); // exactly one, up front -- see handleScannerExit for the respawn-on-crash loop.
 

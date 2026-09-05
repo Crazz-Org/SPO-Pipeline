@@ -82,9 +82,17 @@ const productRepoHold = require('./product-repo-hold');
 const { drainQueueOnce, runTask, runForever } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
-const { appendDaemonEvent } = require('./journal');
+const { appendDaemonEvent, appendEvent } = require('./journal');
 const { orphanScan } = require('./orphan-scan');
 const { createDispatcher } = require('./dispatcher');
+const { readPipelineVersion } = require('./pipeline-version');
+
+// Resolved once at require time, in EVERY mode (dispatcher, worker, scanner) -- see
+// pipeline-version.js's header. A worker resolves it from its own __dirname, which is the point:
+// dispatcher.js spawns `node <DAEMON_PATH>` off a path re-read at every spawn, so after a `git
+// pull` with no restart a NEW worker genuinely is a different version from the dispatcher that
+// spawned it, and each says so for itself rather than inheriting the other's claim.
+const PIPELINE_VERSION = readPipelineVersion();
 
 function parseArgs(argv) {
   const opts = {
@@ -189,6 +197,19 @@ function printUsage() {
 // refills and SIGTERM handling. A missing/unreadable/unparsable task.json is a usage error (2),
 // not a crash (1): the dispatcher handed this process a bad path, which is its own bug to fix,
 // not this task's to be reparked over.
+// The state the card is about to resume from, for the provenance line below and nothing else.
+// Best-effort by construction: a card taken fresh out of the queue has no state.json yet, and
+// INTAKE is where runTask starts it. Never throws -- a provenance line is not worth failing a
+// card over, which is the same posture pipeline-version.js itself takes.
+function readWorkerResumeState(taskDir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+    return (raw && raw.state) || 'INTAKE';
+  } catch {
+    return 'INTAKE';
+  }
+}
+
 async function runWorker(taskDirArg, config) {
   const taskDir = path.resolve(taskDirArg);
   const taskPath = path.join(taskDir, 'task.json');
@@ -211,6 +232,22 @@ async function runWorker(taskDirArg, config) {
   // dispatcher already renamed it into taskDir/task.json), so basename(taskDir) is the right
   // fallback, not basename(some .json file).
   const id = task && task.id ? String(task.id) : path.basename(taskDir);
+  // PER-CARD PROVENANCE, first line this worker writes and before runTask can park anything.
+  // "Which version of the pipeline produced this park?" is answered from the card's own journal
+  // after this, without having to correlate timestamps against daemon.jsonl and hope no deploy
+  // landed in between. `state` is the state the card is RESUMING from where state.json says so
+  // (a retry, an unpark, a crash recovery) -- appendEvent requires one, and the honest value is
+  // the card's own, not a constant.
+  //
+  // Written unconditionally, including when sha is null: "this checkout could not describe
+  // itself" is itself the fact a later reader needs, and a silently absent line would be
+  // indistinguishable from a worker that predates this event.
+  const resumeState = readWorkerResumeState(taskDir);
+  appendEvent(taskDir, resumeState, 'pipeline-version', {
+    sha: PIPELINE_VERSION.sha,
+    ref: PIPELINE_VERSION.ref,
+    pid: process.pid,
+  });
   const finalState = await runTask(id, task, taskDir, config);
   // runTask's own while-loop only ever exits on 'DONE' or 'PARKED' (see its header comment) --
   // anything else here would mean that contract broke, which is itself a bug worth surfacing
