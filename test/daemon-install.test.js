@@ -148,14 +148,27 @@ test('daemon-install.sh: TimeoutStopSec leaves room for the whole drain, or the 
   const m = /SPO_DRAIN_TIMEOUT_MS[\s\S]{0,160}?:\s*(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+);/.exec(configSrc);
   assert.ok(m, 'config.js no longer states the drain default as `N * N * N` -- update this guard');
   const drainSec = (Number(m[1]) * Number(m[2]) * Number(m[3])) / 1000;
+  const g = /SPO_DRAIN_KILL_GRACE_MS[\s\S]{0,160}?:\s*(\d+)\s*\*\s*(\d+);/.exec(configSrc);
+  assert.ok(g, 'config.js no longer states the kill-grace default as `N * N` -- update this guard');
+  const graceSec = (Number(g[1]) * Number(g[2])) / 1000;
 
   // systemd SIGKILLs the whole cgroup when this expires. A SIGKILL is strictly WORSE than the
   // SIGTERM the drain replaced -- no park, no worktree WIP preserved, recovery deferred to the
   // next start's orphanScan -- so a stop timeout below the drain bound does not shorten the
   // drain, it deletes it and replaces a bad outcome with a worse one.
+  // `>= drainSec` ALONE IS NOT THE PROPERTY, and pinning only that was a real hole: it passed with
+  // TimeoutStopSec exactly equal to the bound, i.e. ZERO time for the daemon to signal its
+  // stragglers, let them finish dying, escalate to SIGKILL and exit. That is the half of the drain
+  // that keeps the lock released and the parks written, and it would have been deleted silently.
   assert.ok(
-    stopSec >= drainSec,
-    `TimeoutStopSec=${stopSec}s is below the ${drainSec}s drain bound: systemd would SIGKILL the drain before it finished`
+    stopSec >= drainSec + graceSec,
+    `TimeoutStopSec=${stopSec}s leaves no room for the ${graceSec}s kill grace after the ${drainSec}s bound: ` +
+      'systemd would SIGKILL the cgroup while the daemon was still shutting down cleanly'
+  );
+  // And a named slack on top, so the reap and process exit are not racing the ceiling either.
+  assert.ok(
+    stopSec >= drainSec + graceSec + 30,
+    `TimeoutStopSec=${stopSec}s has under 30s of slack above drain (${drainSec}s) + grace (${graceSec}s)`
   );
 });
 

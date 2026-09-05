@@ -38,7 +38,7 @@ const DASHBOARD = 'spo-pipeline-dashboard.service';
  * `installed`, `active` and `enabled` are unit-name lists; they are independent on purpose,
  * because in the real world they are -- that independence is the whole bug.
  */
-function runHook({ installed = [], active = [], enabled = [], restartFails = [] } = {}) {
+function runHook({ installed = [], active = [], enabled = [], restartFails = [], states = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-post-merge-'));
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
@@ -67,7 +67,11 @@ echo "$verb $unit noblock=$noblock" >> ${JSON.stringify(log)}
 contains() { case " $1 " in *" $2 "*) return 0;; esac; return 1; }
 case "$verb" in
   list-unit-files) contains ${JSON.stringify(installed.join(' '))} "$unit" ;;
-  is-active)       contains ${JSON.stringify(active.join(' '))} "$unit" ;;
+  is-active)       if contains ${JSON.stringify(active.join(' '))} "$unit"; then echo active; exit 0; fi
+                   for pair in ${JSON.stringify(Object.entries(states).map(([u, st]) => `${u}:${st}`).join(' '))}; do
+                     if [ "\${pair%%:*}" = "$unit" ]; then echo "\${pair#*:}"; exit 3; fi
+                   done
+                   echo inactive; exit 3 ;;
   is-enabled)      contains ${JSON.stringify(enabled.join(' '))} "$unit" ;;
   restart)         contains ${JSON.stringify(restartFails.join(' '))} "$unit" && exit 1; exit 0 ;;
   *) exit 2 ;;
@@ -201,4 +205,23 @@ test('an installed-but-stopped unit is skipped OUT LOUD, not in silence', () => 
   assert.deepStrictEqual(r.restarted, [DASHBOARD]);
   assert.match(r.stdout, new RegExp(`SKIPPING ${DAEMON.replace('.', '\\.')}`));
   assert.strictEqual(r.status, 0);
+});
+
+test('a unit still DRAINING is reported as already in flight, not skipped', () => {
+  // Since the drain landed, a stop legitimately takes up to TimeoutStopSec=2820 and the unit sits
+  // in `deactivating` for the whole of it. `is-active` exits non-zero for that state, so the old
+  // gate read it as "neither active nor enabled" and skipped -- during a window that used to be
+  // 90s and is now the better part of an hour. It is not a skip: a restart is already queued
+  // behind the stop, and its start execs from WorkingDirectory, so it picks up this merge too.
+  const r = runHook({ installed: [DAEMON], active: [], enabled: [], states: { [DAEMON]: 'deactivating' } });
+  assert.deepStrictEqual(r.restarted, []);
+  assert.match(r.stdout, /deactivating -- a restart is already in flight/);
+  assert.doesNotMatch(r.stdout, /SKIPPING/);
+  assert.strictEqual(r.status, 0);
+});
+
+test('an inactive unit is still skipped out loud -- deactivating is the only new case', () => {
+  const r = runHook({ installed: [DAEMON], active: [], enabled: [], states: { [DAEMON]: 'inactive' } });
+  assert.deepStrictEqual(r.restarted, []);
+  assert.match(r.stdout, new RegExp(`SKIPPING ${DAEMON.replace('.', '\\.')}`));
 });

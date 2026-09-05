@@ -483,18 +483,25 @@ async function main() {
   // exists to close. With `on`, the second signal is handled, exits cleanly, and the exit hook
   // still runs.
   //
+  // THE SECOND SIGNAL IS DETECTED BY requestDrain REFUSING, not by a counter here. The first cut
+  // carried a `signalCount > 1 ||` arm as well; mutation testing showed it was dead -- removing it
+  // left the whole suite green, because requestDrain already returns false once `drainRequest` is
+  // set, for every ordering (SIGTERM then SIGTERM, SIGINT then SIGTERM, and a first signal whose
+  // drain was refused outright by SPO_DRAIN_TIMEOUT_MS=0, which exits on that same first signal).
+  // Two mechanisms for one decision, one of them untestable because the other always got there
+  // first. Deleted rather than given a test it could not fail.
+  //
   // A WORKER OR SCANNER IS UNCHANGED. `dispatcherHandle` is null in both (it is only ever
   // assigned in the continuous-dispatcher branch), so both take the `process.exit` path exactly as
   // before -- a worker that drained its own children would be waiting on the very `claude` call
   // the deploy is trying to stop.
-  let signalCount = 0;
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
-      signalCount += 1;
       const code = sig === 'SIGINT' ? 130 : 143;
-      // Second signal, no dispatcher to drain, or a drain refused (already draining, or
-      // SPO_DRAIN_TIMEOUT_MS=0): the pre-drain behaviour, unchanged.
-      if (signalCount > 1 || !dispatcherHandle || !dispatcherHandle.requestDrain({ signal: sig })) {
+      // No dispatcher to drain (a --worker or --scanner: both leave dispatcherHandle null), or a
+      // drain refused -- already draining, i.e. this is the second signal, or
+      // SPO_DRAIN_TIMEOUT_MS=0. Every one of those is the pre-drain behaviour, unchanged.
+      if (!dispatcherHandle || !dispatcherHandle.requestDrain({ signal: sig })) {
         process.exit(code);
       }
       // A drain started: run() is now waiting on the in-flight workers and will return on its

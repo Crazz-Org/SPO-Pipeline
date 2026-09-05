@@ -104,7 +104,6 @@ const accounts = require('./accounts');
 const { appendDaemonEvent, writeLiveWorkerIds } = require('./journal');
 const { readJsonSafe } = require('./park-loop');
 const { takeNextTask, buildCtx, finalizePark } = require('./state-machine');
-const { sleep } = require('./steps/scripted');
 // Elapsed-duration measurement for exactly one thing below: how long a spawned scanner stayed
 // alive before it crashed, inside THIS process only -- see that module's own header, and
 // resolveScannerHealthyUptimeMs's comment, for why this is the right clock for that and the wrong
@@ -130,6 +129,27 @@ const DEFAULT_SCANNER_HEALTHY_UPTIME_MS = 60 * 1000;
 // hands createDispatcher a config that omits the field entirely; same fallback posture as
 // DEFAULT_CRASH_LIMIT above.
 const DEFAULT_DRAIN_TIMEOUT_MS = 45 * 60 * 1000;
+// Mirrors config.js's drainKillGraceMs default -- see that field for the derivation.
+const DEFAULT_DRAIN_KILL_GRACE_MS = 60 * 1000;
+
+// `sleep(ms)` (steps/scripted.js) is a plain, non-unref'd setTimeout, so the LOSER of a
+// `Promise.race` keeps the event loop alive for its full duration after the race has resolved.
+// Harmless while the only consumer was a `for(;;)` loop that was about to sleep again -- and
+// measurably wrong the moment the loop can EXIT: a SIGTERM to an idle daemon resolved run() in 5ms
+// and then sat in the event loop for another 4497ms waiting out an abandoned poll timer. That is
+// what `systemctl stop` actually waits for, so the drain's "an idle restart costs 0ms" was true of
+// awaitInFlight and false of the process. Cancelling the loser makes the two agree.
+function cancellableSleep(ms) {
+  let cancel = () => {};
+  const promise = new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    cancel = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+  });
+  return { promise, cancel };
+}
 
 function resolveWorkerCount(config) {
   const raw = config && config.workers;
@@ -169,6 +189,13 @@ function resolveScannerCrashLimit(config) {
 function resolveDrainTimeoutMs(config) {
   const raw = config && config.drainTimeoutMs;
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DRAIN_TIMEOUT_MS;
+}
+
+// How long the drain waits for a SIGNALLED straggler to finish and exit before escalating to
+// SIGKILL. Same 0-is-meaningful posture as resolveDrainTimeoutMs above (0 = escalate at once).
+function resolveDrainKillGraceMs(config) {
+  const raw = config && config.drainKillGraceMs;
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DRAIN_KILL_GRACE_MS;
 }
 
 function resolveScannerHealthyUptimeMs(config) {
@@ -405,12 +432,21 @@ function createDispatcher(queueDir, journalRoot, config) {
   // genuine crash inside that window must still be reparked and still count toward the breaker --
   // keying on stopReason would silently defer every one of them to the next start's orphanScan
   // (`task-orphaned-daemon-restart`, terminal, needs a human `retry`) instead of the ordinary
-  // crash repark. `killAllChildren` sets this BEFORE it signals anything, so no exit it causes can
-  // ever be observed with the flag still false.
+  // crash repark. `killAllChildren` sets this before it signals anything -- though the position
+  // inside that function is not what makes the invariant hold, and mutation testing said so:
+  // moving the assignment to the END of killAllChildren leaves the suite green, because
+  // `process.kill` never yields and the whole body is one synchronous run. What actually holds is
+  // that no exit handler can run until killAllChildren returns.
   let childrenSignalled = false;
   // Non-null once a drain has been requested: {signal, at}. Distinct from stopReason (which a
   // circuit breaker also sets) because only a drain makes run() WAIT instead of killing.
   let drainRequest = null;
+  // Outcomes of workers that exited AFTER killAllChildren signalled them: [{id, outcome}]. The
+  // drain reports these, because "we stopped waiting" and "a card was lost" are different facts
+  // and the first was being printed as if it were the second. Measured: a worker blocked in
+  // spawnSync survives its own SIGTERM long enough to finish an entire park (doc/deployment.md
+  // 2.2), so a signalled straggler routinely still ends `done` or `parked`.
+  const postSignalOutcomes = [];
   // Resolves the current loop iteration's wake promise -- see run()'s own race. Without it a drain
   // request waits out the full pollIntervalMs before the loop even notices, which is harmless for
   // a 5s poll and needless when the answer is already known.
@@ -543,10 +579,13 @@ function createDispatcher(queueDir, journalRoot, config) {
         code: code === undefined ? null : code,
         signal: signal || null,
       });
+      postSignalOutcomes.push({ id, outcome });
       live.delete(id);
       publishLiveWorkerIds();
       return;
     }
+
+    if (childrenSignalled) postSignalOutcomes.push({ id, outcome });
 
     if (outcome === 'done' || outcome === 'parked') {
       // A park is a SUCCESSFUL run of the state machine (the plan's own words) -- it resets the
@@ -865,9 +904,11 @@ function createDispatcher(queueDir, journalRoot, config) {
       // spawnScanner above has run, so Promise.race([sleep, ...pending]) is never racing an
       // empty second argument in practice -- the `pending.size > 0` guard stays anyway, both for
       // defensiveness and because a test can inject a `spawn` that never actually adds anything.
-      const race = [sleep(config.pollIntervalMs), new Promise((resolve) => { wakeLoop = resolve; })];
+      const poll = cancellableSleep(config.pollIntervalMs);
+      const race = [poll.promise, new Promise((resolve) => { wakeLoop = resolve; })];
       if (pending.size > 0) race.push(Promise.race(pending));
       await Promise.race(race);
+      poll.cancel(); // or the abandoned timer holds the event loop open after run() returns
       wakeLoop = null;
     }
 
@@ -878,6 +919,8 @@ function createDispatcher(queueDir, journalRoot, config) {
     // so every worker still in `live` is one that was already mid-card when the signal landed.
     // Waiting for them is what converts "the deploy killed a card" into "the deploy took a few
     // more minutes", with no new infrastructure and no change to what a card does.
+    let waitedMs = 0;
+    let survivors = [];
     if (drainRequest) {
       const inFlight = [...live.keys()];
       const timeoutMs = resolveDrainTimeoutMs(config);
@@ -886,14 +929,8 @@ function createDispatcher(queueDir, journalRoot, config) {
         timeoutMs,
         inFlight,
       });
-      const waitedMs = await awaitInFlight(timeoutMs);
-      const survivors = [...live.keys()];
-      appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {
-        drained: survivors.length === 0,
-        waitedMs,
-        survivors,
-      });
-      stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };
+      waitedMs = await awaitInFlight(timeoutMs);
+      survivors = [...live.keys()];
     }
 
     // Circuit breaker tripped, or the drain's bound expired -- shut down the same way an external
@@ -904,8 +941,50 @@ function createDispatcher(queueDir, journalRoot, config) {
     // is a no-op this function has always tolerated. Awaited so a caller that logs `stopReason`
     // and exits right after this resolves is not racing this cleanup.
     killAllChildren('SIGTERM');
-    await Promise.allSettled(pending);
+    await reapSignalledChildren(resolveDrainKillGraceMs(config));
+
+    if (drainRequest) {
+      // WRITTEN AFTER THE REAP, NOT AT THE BOUND. The first cut of this emitted drain-end the
+      // instant awaitInFlight returned, which recorded the DECISION ("we stopped waiting") in the
+      // vocabulary of an OUTCOME ("a card was lost"). Measured with a straggler that ignores
+      // SIGTERM: drain-end said `drained:false, survivors:[straggler]` at +1001ms and the card
+      // then exited 0 at +8035ms, with nothing correcting the record. That is the COMMON case, not
+      // the exotic one -- doc/deployment.md 2.2 measured a signalled worker running a full park to
+      // completion. `signalled` is what the deploy interrupted; `outcomes` is what actually became
+      // of them, which is the fact a maintainer is really asking for.
+      appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {
+        drained: survivors.length === 0,
+        waitedMs,
+        survivors,
+        outcomes: postSignalOutcomes.filter((o) => survivors.includes(o.id)),
+      });
+      stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };
+    }
     return stopReason;
+  }
+
+  // Waits for every signalled child to actually die, then ESCALATES rather than waiting forever.
+  // `await Promise.allSettled(pending)` alone is unbounded, and a straggler that ignores SIGTERM is
+  // exactly what production has: a worker blocked in spawnSync does not run its signal handler
+  // until the loop turns. The only backstop was systemd's own SIGKILL at TimeoutStopSec -- which
+  // kills the whole cgroup, so daemon.js's exit hook never runs, the single-instance lock file
+  // leaks, and the next start has to stale-sweep it. Escalating HERE keeps the process's own exit
+  // path intact, which is the whole difference between a bounded stop and a killed one.
+  async function reapSignalledChildren(graceMs) {
+    if (pending.size === 0) return;
+    const all = Promise.allSettled(pending);
+    if (graceMs > 0) {
+      const grace = cancellableSleep(graceMs);
+      const raced = await Promise.race([all.then(() => 'reaped'), grace.promise.then(() => 'grace-expired')]);
+      grace.cancel();
+      if (raced === 'reaped') return;
+    }
+    appendDaemonEvent(journalRoot, 'dispatcher-kill-escalated', {
+      graceMs,
+      stillLive: [...live.keys()],
+    });
+    killAllChildren('SIGKILL');
+    await all; // SIGKILL is not refusable, so this is genuinely bounded
   }
 
   // Waits for `live` to empty, up to timeoutMs; returns how long it actually waited. Woken by any
@@ -919,9 +998,11 @@ function createDispatcher(queueDir, journalRoot, config) {
     while (live.size > 0) {
       const remaining = timeoutMs - elapsed();
       if (remaining <= 0) break;
-      const race = [sleep(Math.min(remaining, config.pollIntervalMs))];
+      const poll = cancellableSleep(Math.min(remaining, config.pollIntervalMs));
+      const race = [poll.promise];
       if (pending.size > 0) race.push(Promise.race(pending));
       await Promise.race(race);
+      poll.cancel(); // same abandoned-timer trap as run()'s own poll -- see cancellableSleep
     }
     return elapsed();
   }

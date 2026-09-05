@@ -85,6 +85,8 @@ function readRef(gitDir, commonDir, ref) {
   }
   try {
     for (const line of fs.readFileSync(path.join(commonDir, 'packed-refs'), 'utf8').split('\n')) {
+      // `^<sha>` peeled lines carry NO space, so the `sp === -1` test below already skips them;
+      // the explicit `^` check is belt-and-braces on a format guarantee, not the thing that works.
       if (!line || line[0] === '#' || line[0] === '^') continue;
       const sp = line.indexOf(' ');
       if (sp === -1) continue;

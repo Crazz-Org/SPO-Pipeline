@@ -1,7 +1,9 @@
 # Deploying the pipeline
 
 How new orchestrator code reaches the running daemon, what that costs the cards in flight, and
-what is still open. Written 2026-09-05, after a `git pull` at 04:23:43 parked two healthy cards.
+what is still open. Written 2026-09-05, after a `git pull` at 04:23:43 (CEST) parked two healthy cards. **All journal
+timestamps below are UTC**, which is what `journal/` records — that same pull is `02:23:43Z` there.
+Wall-clock times quoted from `journalctl` or from the reflog are local; each is marked.
 
 Everything below that states a number or a mechanism was measured against `journal/` or against a
 probe on this box. Where a claim is inferred rather than measured, it says so.
@@ -70,16 +72,30 @@ The `auto-pull-on.conf` drop-in states that a restart parks the in-flight card a
 produced `llm-transport-failed:PLAN` and `npm-run-timed-out` instead. The question was whether
 orphan-scan had replaced that path or the two coexist by timing.
 
-**Neither. The drop-in describes the rarer of two paths, and the corpus says the other one wins.**
+**Neither. Both paths are real, both are deploy-reachable, and the drop-in describes the rarer one.**
 
-Across every card journal (58 `parked` events, 17 `dispatcher-start` events):
+The two have to be counted with windows pointing in opposite directions, and getting that wrong is
+how the first cut of this section reached a wrong answer. A card that parks *itself* does so in the
+seconds **before** the restart completes; an orphan park is written by `orphanScan` **after** the
+next start. Across every card journal (58 `parked` events, 17 `dispatcher-start` events):
 
-| | count | reasons |
+| path | count | detail |
 |---|---|---|
-| parks in the 30s **before** a `dispatcher-start` (i.e. caused by the stop that preceded it) | 4 | 3 × `llm-transport-failed:PLAN`, 1 × `npm-run-timed-out` |
-| `task-orphaned-daemon-restart` parks, ever | 2 | `issue-385` (2026-08-30), `issue-488` (2026-09-03) — neither at a deploy boundary |
+| self-park, in the 30s **before** a `dispatcher-start` | 4 | 3 × `llm-transport-failed:PLAN` (#486, #515, #654), 1 × `npm-run-timed-out` (#517) |
+| `task-orphaned-daemon-restart`, **after** a `dispatcher-start` | 1 | `issue-488`: worker spawned 20:13:54Z, **`dispatcher-start` 20:36:38Z**, orphan park 20:40:46Z |
 
-Zero deploy-adjacent orphan parks. The mechanism, measured with a probe rather than reasoned:
+`journal/issue-385` also carries a `task-orphaned-daemon-restart` park, but it is not machine-written:
+its detail is a hand-typed `note` reconstructing a lock-churn incident, and it appears nowhere in
+`daemon.jsonl`. `daemon.jsonl` holds exactly **one** orphan park, and it is deploy-adjacent — so the
+honest reading is *1 of 1*, not *0 of 2*.
+
+Self-parks outnumber orphan parks 4 to 1 at deploy boundaries, and `issue-488` is the clean instance
+of the condition the mechanism below predicts: at 20:36:38 its worker sat between a GATE
+`board-move` and the next GATE `spawn` — an `await`-shaped poll gap (the successful re-run shows the
+same 4-minute gap), so the SIGTERM handler ran, the worker died without parking, and orphanScan
+picked it up.
+
+The mechanism, measured with a probe rather than reasoned:
 
 > A worker blocked in `spawnSync` does not die on SIGTERM. libuv's handler only marks the signal;
 > the JS handler runs on the next event-loop turn, and `spawnSync` blocks that loop for as long as
@@ -95,10 +111,10 @@ exactly: #515's SIGTERM landed at 02:23:43.4 and the worker went on to `git stat
 alert, a **board move to Parked at 02:23:45.4** and a **GitHub park comment at 02:23:46.5** — three
 seconds of live side effects on a healthy card, on behalf of a process that was being replaced.
 
-So both paths are real, and which one fires is decided by *whether the worker is inside a blocking
-`spawnSync` when the signal lands* — not by "SIGTERM timing" in the loose sense, and not by one
-having superseded the other. `task-orphaned-daemon-restart` needs the worker itself to die without
-parking, which requires it to be at an `await`.
+So which path fires is decided by *whether the worker is inside a blocking `spawnSync` when the
+signal lands* — not by "SIGTERM timing" in the loose sense, and not by one having superseded the
+other. `task-orphaned-daemon-restart` needs the worker itself to die without parking, which requires
+it to be at an `await`; `issue-488` is that case, and the other four are not.
 
 **The retry semantics do differ, and in three directions rather than two:**
 
@@ -154,9 +170,22 @@ The first SIGTERM/SIGINT now asks the dispatcher to drain instead of killing.
   could otherwise claim a fresh card for a process on its way out.
 - The loop stops calling `fillSlots`: nothing new is claimed.
 - The cards already in flight are **waited for**, bounded, woken by any exit rather than by the
-  poll — so a restart on an idle daemon still costs 0 ms (observed: `waitedMs: 0`).
-- Stragglers past the bound are signalled exactly as before. **A drain can never be worse than the
-  kill it replaces, only slower.**
+  poll — so a restart on an idle daemon costs nothing: **15 ms from SIGTERM to process exit**,
+  measured end to end on a real daemon. (It was 4497 ms before verification caught it: `sleep()` is
+  a non-`unref`'d `setTimeout`, so the *loser* of the poll race held the event loop open for its
+  full 5 s after `run()` had already returned. `waitedMs: 0` was true of the wait and false of the
+  process — and it is the process that `systemctl stop` waits for.)
+- Stragglers past the bound are signalled exactly as before, then given `drainKillGraceMs` (60 s) to
+  finish *dying* — writing their park, preserving their worktree WIP, posting their anchor comment —
+  and **SIGKILLed by the daemon itself** if they do not. `await Promise.allSettled(pending)` alone is
+  unbounded, and production's stragglers are precisely the processes that do not die on time; the
+  only backstop was systemd's cgroup SIGKILL, which skips daemon.js's exit hook and leaks the
+  single-instance lock file. **A drain can never be worse than the kill it replaces, only slower.**
+- `dispatcher-drain-end` is written **after** the reap, not at the bound, and carries `outcomes`
+  alongside `survivors`. The first cut recorded the *decision* ("we stopped waiting") in the
+  vocabulary of an *outcome* ("a card was lost"): measured with a straggler that ignores SIGTERM, it
+  logged `drained:false, survivors:[…]` at +1001 ms and the card then exited 0 at +8035 ms, with
+  nothing correcting the record. Per §2.2 that is the common case, not the exotic one.
 - A clean drain **exits 0**.
 
 **The bound is 45 minutes, and it is measured, not chosen.** 56 `worker-spawn` → `worker-exit`
@@ -165,6 +194,16 @@ pairs in `journal/daemon.jsonl`:
 | p50 | p75 | p90 | p95 | max |
 |---|---|---|---|---|
 | 22.9 min | 33.7 min | 43.1 min | 45.7 min | 56.2 min |
+
+(Percentiles are `sorted[floor(p·n)]`. `ceil(p·n)−1` gives 22.4 / 33.0 instead — stated because the
+two conventions differ by half a minute here and the number is load-bearing.)
+
+**The population is conditioned on survival, and that biases the p95 low.** `daemon.jsonl` holds 64
+`worker-spawn` events and 56 `worker-exit` events. The 8 spawns with no exit are exactly the cards a
+restart killed — the population this bound exists for — and they are excluded because they have no
+exit to measure. A longer-tailed truth would argue for a *longer* bound, never a shorter one, so the
+direction of the bias is safe; it is recorded rather than corrected because there is no honest way
+to impute a duration for a card that was cut.
 
 A card is not "a few minutes" of work; a bound picked from that intuition would have killed the
 median card. 45 min is the p95: 19 deploys in 20 cost nothing, and the twentieth costs exactly what
@@ -175,11 +214,23 @@ every deploy used to.
 | where | what | why |
 |---|---|---|
 | `config.js` `drainTimeoutMs` | 45 min (`SPO_DRAIN_TIMEOUT_MS`) | the bound itself; `0` disables the drain and restores the pre-drain behaviour exactly |
-| unit `TimeoutStopSec` | 2760 s | systemd SIGKILLs the cgroup when this expires. Below the bound it does not *shorten* the drain, it **deletes** it — and a SIGKILL is worse than the SIGTERM the drain replaced (no park, no worktree WIP preserved). Pinned by a test against `config.js`'s source text. |
+| `config.js` `drainKillGraceMs` | 60 s (`SPO_DRAIN_KILL_GRACE_MS`) | how long a *signalled* straggler gets to finish dying before the daemon SIGKILLs it itself. ~20× the one measured park-after-signal (3.1 s). |
+| unit `TimeoutStopSec` | 2820 s = 2700 + 60 + 60 | systemd SIGKILLs the cgroup when this expires. Below the sum it does not *shorten* the drain, it **deletes the orderly end** of it. Pinned by a test against `config.js`'s source text — including the grace, because pinning `>= drainSec` alone passed with zero grace, i.e. with that half deleted. |
 | `post-merge` `restart --no-block` | — | without it a `git pull` blocks the terminal for up to 45 min |
 
 **Escape hatch:** a second signal exits immediately.
 `systemctl --user kill -s TERM spo-pipeline-daemon.service` after a `stop` that is taking too long.
+There is no counter behind this — `requestDrain` simply refuses once a drain is under way, and the
+handler falls through to the pre-drain exit. (A `signalCount > 1` arm existed in the first cut and
+was deleted: mutation testing showed removing it left the suite green, because `requestDrain`'s own
+refusal always got there first, for every ordering. Two mechanisms for one decision, one of them
+untestable.)
+
+**A pull DURING a drain is not a missed deploy.** With `--no-block` and a 47-minute ceiling, the unit
+can sit in `deactivating` for a long time, and `systemctl is-active` exits non-zero for that state —
+which the hook used to read as "neither active nor enabled" and skip. It is not a skip: a `restart`
+is already queued behind the stop, and its *start* execs from `WorkingDirectory`, so it picks up the
+newer merge as well. The hook now reads the state from stdout and says so.
 
 ---
 
@@ -297,9 +348,12 @@ the daemon reads.
 Order matters, and step 0 is not optional: the pull fires the hook, which restarts the daemon.
 
 ```
-# 0. do not deploy on top of a live card. Either wait, or stop the daemon first.
+# 0. the daemon may now be stopped WITHOUT killing a card -- it drains.
 bin/spo status
-systemctl --user stop spo-pipeline-daemon.service     # now DRAINS; second Ctrl-C/kill to force
+systemctl --user stop spo-pipeline-daemon.service
+#    ...this can take up to 47 min if a card is running. To stop waiting:
+#    systemctl --user kill -s TERM spo-pipeline-daemon.service
+#    Wait for `inactive` (not `deactivating`) before step 1 if you want the pull to redeploy.
 
 # 1. deploy
 cd ~/SPO-Pipeline && git pull

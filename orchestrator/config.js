@@ -56,6 +56,8 @@ const CI_CHECKS_MAX_POLLS =
 // Env override for the drain bound below. 0 is meaningful (drain off, pre-drain behaviour
 // restored) -- see that field's comment, and dispatcher.js's resolveDrainTimeoutMs, for why only a
 // non-finite or negative value falls back to the default rather than 0 doing so.
+const DRAIN_KILL_GRACE_MS =
+  process.env.SPO_DRAIN_KILL_GRACE_MS !== undefined ? Number(process.env.SPO_DRAIN_KILL_GRACE_MS) : 60 * 1000;
 const DRAIN_TIMEOUT_MS =
   process.env.SPO_DRAIN_TIMEOUT_MS !== undefined ? Number(process.env.SPO_DRAIN_TIMEOUT_MS) : 45 * 60 * 1000;
 const CI_CHECKS_POLL_INTERVAL_MS =
@@ -470,6 +472,21 @@ module.exports = {
   // A maintainer who does not want to wait sends the signal a second time (see requestDrain);
   // SPO_DRAIN_TIMEOUT_MS=0 disables the drain entirely and restores the pre-drain behaviour.
   drainTimeoutMs: DRAIN_TIMEOUT_MS,
+  // After the drain's bound expires and the stragglers are SIGTERMed, how long to let them finish
+  // and exit before escalating to SIGKILL. Not a duplicate of the bound above: that one governs
+  // waiting for a HEALTHY card to finish its work, this one governs waiting for a SIGNALLED one to
+  // finish DYING -- writing its park, preserving its worktree WIP, posting its anchor comment.
+  //
+  // It exists because `await Promise.allSettled(pending)` is unbounded and production's stragglers
+  // are exactly the processes that do not die on time: a worker blocked in spawnSync does not run
+  // its signal handler until the loop turns (doc/deployment.md 2.2, measured -- #515 took 3.1s
+  // from SIGTERM to its last GitHub write). Without this the only backstop was systemd's SIGKILL of
+  // the whole cgroup at TimeoutStopSec, which skips daemon.js's exit hook entirely and leaks the
+  // single-instance lock file for the next start to stale-sweep.
+  //
+  // 60s is ~20x the one measured park-after-signal (3.1s) and still leaves the unit's
+  // TimeoutStopSec (drain + this + slack) comfortably ahead of it. 0 escalates immediately.
+  drainKillGraceMs: DRAIN_KILL_GRACE_MS,
   pollIntervalMs: 5000,
 
   // ---- action 6.3: the dispatcher (orchestrator/dispatcher.js) --------------------------

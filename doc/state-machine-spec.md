@@ -62,7 +62,9 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    side effects, so both shapes only detect the orphan and journal
    `orphan-scan-would-repark` — neither ever parks. `handleExit` also
    deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
-   dispatcher's own shutdown** (`dispatcher.js:485-499`, `stopReason && outcome === 'crashed'`):
+   dispatcher's own shutdown** (`dispatcher.js:572-586`, `childrenSignalled && outcome === 'crashed'`
+   — keyed on "did we actually signal this child", not on `stopReason`, since a DRAIN sets
+   `stopReason` and then waits minutes having signalled nobody):
    reparking from inside a process already SIGTERMed and about to be SIGKILLed risks a
    `finalizePark` caught mid-write (state.json PARKED, no park-comment yet), which no later
    scan can ever recover — deferring instead just leaves an ordinary non-terminal `state.json`

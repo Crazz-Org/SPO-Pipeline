@@ -40,7 +40,21 @@ set -euo pipefail
 for unit in spo-pipeline-daemon.service spo-pipeline-dashboard.service; do
   systemctl --user list-unit-files "$unit" >/dev/null 2>&1 || continue
 
-  if systemctl --user is-active "$unit" >/dev/null 2>&1; then
+  # `is-active` EXITS non-zero for `deactivating`, and since the drain landed a unit can sit there
+  # for the better part of an hour (TimeoutStopSec=2820) while its in-flight cards finish. Before
+  # this the hook read that as "not running, not enabled" and took the skip branch -- so a second
+  # pull during a drain deployed nothing and said so, which is alarming and wrong. It is wrong
+  # because a `restart` is already queued behind that stop, and its START execs from
+  # WorkingDirectory: it will pick up THIS merge too. So the honest answer is "already in flight",
+  # not "skipped". The state is read from stdout, not from the exit code, because the exit code
+  # cannot distinguish `deactivating` from `inactive`.
+  state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+  if [ "$state" = 'deactivating' ] || [ "$state" = 'activating' ]; then
+    echo "== post-merge: $unit is $state -- a restart is already in flight and will pick up this merge"
+    continue
+  fi
+
+  if [ "$state" = 'active' ]; then
     reason='running'
   elif systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
     reason='enabled'

@@ -85,14 +85,17 @@ RestartSec=5
 # A CLEAN DRAIN NOW EXITS 0 (daemon.js), so 143/130 here cover only the other half: the drain's
 # bound expired and stragglers had to be signalled, or a second signal asked for an immediate stop.
 SuccessExitStatus=143 130
-# MUST BE >= config.js's drainTimeoutMs (45 min, measured p95 of 56 real card runs) PLUS enough
-# grace for the daemon's own force-kill-and-exit after the bound expires. systemd SIGKILLs the
-# whole cgroup when this expires, and a SIGKILL is strictly worse than the SIGTERM the drain
-# replaced -- no park, no worktree WIP preserved, recovery deferred to the next start's orphanScan.
-# So a TimeoutStopSec below the drain bound does not shorten the drain, it DELETES it. Raise both
-# together or neither. A maintainer who does not want to wait sends the signal a second time
+# MUST BE >= config.js's drainTimeoutMs (45 min = 2700s, the measured p95 of 56 real card runs)
+# PLUS drainKillGraceMs (60s, how long a SIGTERMed straggler is given to finish dying) PLUS slack
+# for the reap itself. 2700 + 60 + 60 = 2820.
+# systemd SIGKILLs the whole cgroup when this expires, which skips daemon.js's exit hook entirely:
+# no lock release, no park, no worktree WIP preserved. That is strictly worse than the SIGTERM the
+# drain replaced, so a TimeoutStopSec below the sum does not SHORTEN the drain, it DELETES the
+# orderly end of it. The daemon escalates to SIGKILL on its own inside the grace above precisely so
+# that this ceiling is never the thing that ends the process. Raise all three together or none.
+# A maintainer who does not want to wait sends the signal a second time
 # (systemctl kill -s TERM spo-pipeline-daemon.service), which exits immediately.
-TimeoutStopSec=2760
+TimeoutStopSec=2820
 # The rate limit that bounds this Restart=always lives in [Unit] above -- see the comment there
 # for the measurement that proved it was being silently ignored down here.
 # gh and claude must find their auth; PATH must reach node, npm, gh AND the claude CLI

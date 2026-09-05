@@ -163,3 +163,55 @@ test('a worker writes its own pipeline-version line, before anything it could pa
   // dispatcher. That is what makes an old-dispatcher/new-worker pull visible rather than hidden.
   assert.equal(journal[idx].ref, readPipelineVersion().ref);
 });
+
+// ---- the loose-ref-BEFORE-packed-refs order, which is reachable on any box that has run gc ------
+
+test('loose ref wins over a stale packed-refs entry -- the order is the whole point', () => {
+  const dir = mkRepo('spo-pv-both-');
+  // `git pack-refs` writes packed-refs and drops the loose ref; the NEXT commit writes a fresh
+  // loose ref and leaves the packed entry behind, now stale. `git gc --auto` packs refs and runs
+  // on ordinary pulls and commits, so this is the steady state of any long-lived checkout --
+  // including ~/SPO-Pipeline itself, which is the one this module reports on in production.
+  execFileSync('git', ['pack-refs', '--all'], { cwd: dir });
+  const stale = git(dir, 'rev-parse', 'HEAD');
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'two'], { cwd: dir });
+  const current = git(dir, 'rev-parse', 'HEAD');
+
+  assert.notEqual(stale, current, 'the second commit did not move HEAD -- this test proves nothing');
+  assert.equal(fs.existsSync(path.join(dir, '.git', 'refs', 'heads', 'main')), true, 'no loose ref was written');
+  assert.match(fs.readFileSync(path.join(dir, '.git', 'packed-refs'), 'utf8'), new RegExp(stale), 'packed-refs is not stale');
+
+  // Reading packed-refs first would report `stale` here: a silently WRONG provenance sha, which is
+  // the one failure this module exists to prevent.
+  assert.equal(readPipelineVersion(dir).sha, current);
+});
+
+test('a ref file that is not a sha is refused rather than reported as one', () => {
+  const dir = mkRepo('spo-pv-symref-');
+  // `git symbolic-ref` writes a `ref: ...` line where readRef expects 40 hex. Without SHA_RE the
+  // literal string "ref: refs/heads/other" would be journalled as this pipeline's commit.
+  execFileSync('git', ['symbolic-ref', 'refs/heads/main', 'refs/heads/other'], { cwd: dir });
+  assert.equal(readPipelineVersion(dir).sha, null);
+});
+
+test('an empty HEAD is refused rather than reported as an empty sha', () => {
+  const dir = mkRepo('spo-pv-emptyhead-');
+  fs.writeFileSync(path.join(dir, '.git', 'HEAD'), '\n');
+  assert.deepEqual(readPipelineVersion(dir), { sha: null, ref: null });
+});
+
+test('a ref file with trailing whitespace/CRLF still resolves', () => {
+  const dir = mkRepo('spo-pv-crlf-');
+  const sha = git(dir, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(dir, '.git', 'refs', 'heads', 'main'), `${sha}\r\n`);
+  assert.equal(readPipelineVersion(dir).sha, sha);
+});
+
+test('an annotated tag in packed-refs (a ^peeled line) does not derail the scan', () => {
+  const dir = mkRepo('spo-pv-peeled-');
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', 'v1', '-m', 'v1'], { cwd: dir });
+  execFileSync('git', ['pack-refs', '--all'], { cwd: dir });
+  const packed = fs.readFileSync(path.join(dir, '.git', 'packed-refs'), 'utf8');
+  assert.match(packed, /^\^/m, 'git wrote no peeled line -- this test is not exercising that path');
+  assert.equal(readPipelineVersion(dir).sha, git(dir, 'rev-parse', 'HEAD'));
+});
