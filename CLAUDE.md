@@ -83,22 +83,16 @@ Two distinct kinds of worktree, in two distinct places:
   hand while a task is running.
 - `.claude/worktrees/<slug>/` — working worktrees on *this* repo.
 
-**After every merge into `main`, deploy it.** A merge on GitHub deploys nothing. `git pull` in
-`~/SPO-Pipeline` — **that checkout only** — fires `.git/hooks/post-merge`, which cuts
-`~/.spo-releases/<sha>`, moves the `~/.spo-current` symlink the units run from, and drain-restarts
-(`doc/deployment.md`). A pull or `git merge --ff-only` in any *other* worktree deploys nothing and
-says so; it used to restart the services, which under this layout would have deployed that
-worktree's branch.
+**Operating the daemon — `doc/operating.md`.** Start/stop, deploying, unsticking a card, the
+tunables, and the traps. Four things not to rediscover:
 
-**The services never read a checkout you edit**, so editing `~/SPO-Pipeline` no longer edits a
-running program — but state lives at `~/.spo-state/{queue,journal}` now, and the daemon refuses to
-start if it would land on an empty journal.
-
-**A restart now DRAINS** (`doc/deployment.md`): it stops claiming, lets the cards in flight finish
-— up to `config.drainTimeoutMs`, 45 min — then exits 0. A second signal stops immediately. So a
-pull no longer kills a card, it delays the deploy; only a card past the bound is cut.
-`systemctl --user mask` does not work here (the units are real files); just re-run
-`systemctl --user stop spo-pipeline-daemon.service` after the pull if you needed it down.
+- **`git pull` in `~/SPO-Pipeline` is the deploy** — that checkout only. A merge on GitHub deploys
+  nothing; a pull or `git merge --ff-only` in any *other* worktree deploys nothing and says so.
+- **A stop DRAINS** (up to 45 min); a second signal stops now. So a deploy delays a card rather
+  than killing it.
+- **Anything in the generated systemd unit needs `scripts/daemon-install.sh` re-run**, not just a
+  pull — and that script *starts* the daemon.
+- **The services never read a checkout you edit**; state is `~/.spo-state/{queue,journal}`.
 
 The `git stash` stack is shared across all worktrees, and several sessions can run in
 parallel: never use bare `git stash` / `git stash pop`. Prefer a WIP commit.

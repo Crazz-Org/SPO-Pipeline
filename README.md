@@ -49,6 +49,27 @@ worktrees from the outside.
 | **SPO-Pipeline** (this repo) | The factory. Private. |
 | `~/SPO-Original`, `~/SPO-ASP` | Read-only historical references (Delphi servers + Voyager client, ASP pages). |
 
+## Operating it
+
+Two systemd `--user` units, both running from a release symlink rather than from any checkout a
+human edits. **`doc/operating.md` is the runbook** — start/stop, deploying, unsticking a card, the
+tunables, and the traps that have already cost something.
+
+```bash
+bin/spo status                                       # queue, accounts, spend, every card
+systemctl --user stop spo-pipeline-daemon.service    # DRAINS: in-flight cards finish first
+systemctl --user kill -s TERM spo-pipeline-daemon.service   # ...second signal = stop now
+cd ~/SPO-Pipeline && git pull                        # THE deploy: cuts a release, moves the
+                                                     # symlink, drain-restarts. That checkout only.
+scripts/release.sh --list                            # releases; --rollback to go back
+gh issue comment <n> --repo Crazz-Org/SPO-WebClient --body retry   # unpark a card
+```
+
+Where things live: `~/.spo-releases/<sha>` (immutable, one per deploy) ← `~/.spo-current` (what
+the units run) · `~/.spo-state/{queue,journal}` (all mutable state) · `~/.claude-accounts` (pool) ·
+`~/.spo-worktrees/issue-<n>` (product checkouts). Nothing the service runs points into
+`~/SPO-Pipeline`.
+
 ## Observability — sessions and pipeline
 
 Every component writes append-only JSONL journals; the console is a *reader*, never a second
