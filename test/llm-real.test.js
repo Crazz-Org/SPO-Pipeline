@@ -583,6 +583,110 @@ test('invokeClaudeReal: a signal with no deadline armed is reported as an extern
   assert.match(result.error, /killed by signal SIGKILL \(no deadline was armed\)/);
 });
 
+// ---- invokeClaudeReal: an EXTERNAL kill with a deadline armed is not a timeout ---------------
+// The same defect PR #127 fixed in command-timeout.js, which this file was the second copy of.
+// The deleted clause was `|| (!!spawnResult.signal && deadlineArmed)`, which classified ANY
+// externally-signalled child as a deadline kill. Blast radius: `timedOut` drives intake.js's
+// retry-once-on-the-same-account policy (intake.js's callIntakeStepWithRotation), so a
+// deploy's SIGTERM bought a second full metered call to re-run a prompt nobody asked to keep
+// running.
+//
+// Measured on node v22.23.2 (deadline armed in every row): a genuine expiry always sets
+// `error.code === 'ETIMEDOUT'` -- with signal SIGTERM, with signal SIGKILL under a different
+// killSignal, and (what `claude` actually does) with signal NULL and status 143 when the child
+// traps TERM and exits itself. An external kill sets no `error` at all. So ETIMEDOUT is
+// necessary and sufficient, and `signal` alone is true only for the excluded cases. The corpus
+// re-count (62 journals, 2026-09-05) found 22 transport failures: 11 ETIMEDOUT, 8 `exit 143`,
+// 3 E2BIG, and zero bare signals -- the clause never once produced a true positive.
+
+test('invokeClaudeReal: an EXTERNAL signal with a deadline armed is NOT timedOut (the #127 twin)', async () => {
+  const deps = {
+    // No `error` at all -- node only fills one in when ITS deadline fired.
+    spawnSync: fakeSpawnSync(() => ({ status: null, stdout: '', stderr: '', signal: 'SIGTERM' })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 900000 },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  // The regression itself: this used to be `true`, and intake.js would have paid for a retry.
+  assert.notEqual(result.timedOut, true);
+  assert.equal(result.killedBySignal, true);
+  assert.equal(result.signal, 'SIGTERM');
+  assert.match(result.error, /killed by signal SIGTERM/);
+  assert.match(result.error, /an external kill, not a timeout/);
+  assert.doesNotMatch(result.error, /exceeded the .* deadline/);
+  // It must also not be misreported as a spawn failure or as unparsable output -- the two
+  // branches it would fall through to if the kill branch were simply deleted.
+  assert.doesNotMatch(result.error, /failed to spawn/);
+  assert.doesNotMatch(result.error, /not valid JSON/);
+});
+
+test('invokeClaudeReal: an external SIGKILL with a deadline armed is NOT timedOut either', async () => {
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: null, stdout: '', stderr: '', signal: 'SIGKILL' })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 900000 },
+    deps
+  );
+  assert.notEqual(result.timedOut, true);
+  assert.equal(result.killedBySignal, true);
+  assert.equal(result.deadlineMs, 900000); // carried so a reader can see the kill was inside it
+});
+
+test('invokeClaudeReal: a deadline kill under killSignal SIGKILL is STILL a timeout, not an external kill', async () => {
+  // The row that proves `error.code === 'ETIMEDOUT'` survives a different killSignal: a child
+  // that traps TERM forces node to escalate, and the signal it reports is SIGKILL -- which under
+  // the deleted clause was indistinguishable from an operator's `kill -9`.
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: timeoutErr, status: null, stdout: '', stderr: '', signal: 'SIGKILL' })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 5000 },
+    deps
+  );
+  assert.equal(result.timedOut, true);
+  assert.equal(result.killedBySignal, undefined);
+  assert.match(result.error, /exceeded the 5000ms deadline and was killed \(signal SIGKILL\)/);
+});
+
+test('invokeClaudeReal: the shape the corpus actually records -- ETIMEDOUT, signal null, status 143', async () => {
+  // 9 of the 9 flagged `timedOut: true` events in ~/.spo-state/journal carry the detail
+  // "(ETIMEDOUT)", never "(signal SIGTERM)": `claude` traps SIGTERM and exits 143 itself, so
+  // node reports no signal at all. The deleted clause therefore did not fire on a single
+  // genuine timeout on record -- this test is what pins that claim to the code.
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: timeoutErr, status: 143, stdout: '', stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 900000 },
+    deps
+  );
+  assert.equal(result.timedOut, true);
+  assert.equal(result.killedBySignal, undefined);
+  assert.equal(result.raw, 143);
+  assert.match(result.error, /exceeded the 900000ms deadline and was killed \(ETIMEDOUT\)/);
+});
+
+test('invokeClaudeReal: an ordinary non-zero exit with no signal is neither timedOut nor killedBySignal', async () => {
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 3, stdout: 'not json', stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 900000 },
+    deps
+  );
+  assert.notEqual(result.timedOut, true);
+  assert.equal(result.killedBySignal, undefined);
+  assert.match(result.error, /not valid JSON \(exit 3\)/);
+});
+
 // ---- runLlm real branch (thin wrapper: reads ctx.task.llm.<step>, journals, returns) ---------
 
 test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.account, journals llm-call', async () => {

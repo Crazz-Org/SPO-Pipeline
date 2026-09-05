@@ -537,7 +537,23 @@ A successful reply's `result` string is `JSON.parse`d and checked against the st
 ...)` — PLAN, IMPLEMENT, DIAGNOSE, and VALIDATE's change-validator each get a distinct reason
 naming the step, so a call that never reached the model is never mistaken for one the model
 answered badly (see `doc/state-machine-spec.md`'s per-step rows). `kind: 'limit'` is excluded —
-that is the account-rotation retry path, unrelated. The validated payload is also given a
+that is the account-rotation retry path, unrelated.
+
+`timedOut` on that shape means what it says, and only since 2026-09-05. `invokeClaudeReal` used to
+classify a deadline kill as `(error.code === 'ETIMEDOUT') || (signal && deadlineArmed)` — the same
+defect PR #127 fixed in `command-timeout.js`, of which this was the second copy — so ANY externally
+signalled `claude` (a deploy restart, an operator's `kill`, an OOM kill) was reported as a hang.
+Both halves are now `command-timeout.js`'s shared `isSpawnTimeout`/`isSpawnKilled`, and an external
+kill returns `{kind: 'error', killedBySignal: true, signal}` with no `timedOut`. The four guards
+above are unaffected — `kind: 'error'` already dominates their disjunction, so an external kill
+parked `llm-transport-failed:<STEP>` before the fix and still does. What changes is
+`intake.js`'s `callIntakeStepWithRotation`, the one place in this codebase that *spends* on the
+flag: it retries once on the same account when `timedOut === true`, so a deploy's SIGTERM used to
+buy a second full metered call to re-run a prompt that had just been deliberately stopped.
+Re-measured corpus, 62 task journals, 2026-09-05: of 22 `claude` transport failures, 11 were
+ETIMEDOUT, 8 were `exit 143` (`claude` traps SIGTERM and exits rather than dying of it), 3 were
+E2BIG, and **zero** were a bare signal — every recorded deadline kill carries `signal: null`, so
+the deleted clause never once produced a true positive. The validated payload is also given a
 snake_case→camelCase alias of every key (`root_cause` → `rootCause` too, additively — this is
 the one step whose contract key differs from what `state-machine.js`'s handlers already read;
 every other step's key names matched by coincidence). Action 1.5 makes `handleDiagnose` honour
