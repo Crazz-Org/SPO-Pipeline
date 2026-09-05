@@ -2648,7 +2648,7 @@ function benchPathsTouched(diffNameOnlyOutput) {
 }
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` -- worker.ts:1535 maps that SIGTERM straight
+// `systemctl --user restart spo-bench-worker.service` -- worker.ts:1542 maps that SIGTERM straight
 // to `process.exit(0)`, no drain -- and this daemon runs K=2 in production (SPO_WORKERS=2 on the
 // live systemd drop-in). Without this wait, a card reaching FINISH's reinstall step can cut a
 // SIBLING card's in-flight GATE mid-job: the cut job recovers as INTERRUPTED (worker.ts's

@@ -354,7 +354,7 @@ blocked in `npm ci` for a day reads ALIVE, while every later card parks `gate-ti
 hours each. Latent: it has not happened.
 
 Two readers, two staleness contracts, on the same heartbeat file: the bench reads it **by mtime
-with a 20 s bound**; `console/collect.js` — reached from `bin/spo:1102` — reads it **by
+with a 20 s bound**; `console/collect.js` — reached from `bin/spo:1108` — reads it **by
 content with a 120 s bound**.
 
 ### D11 — dead stores, and one that only looks dead

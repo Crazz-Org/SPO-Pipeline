@@ -1332,7 +1332,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1102",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1108",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1363,7 +1363,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1102",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1108",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -1392,7 +1392,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
-  "orchestrator/config.js :: worker.ts:1535",
+  "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:188",
@@ -1403,7 +1403,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
-  "orchestrator/steps/scripted.js :: worker.ts:1535",
+  "orchestrator/steps/scripted.js :: worker.ts:1542",
   "prompts/README.md :: plan.md:103",
 ];
 
@@ -2162,9 +2162,9 @@ test('extractAnchorCandidates: a neighbouring citation to a DIFFERENT file clips
 });
 
 test('extractFileMentionCandidates: matches a cross-file basename mention by substring, never the citation\'s own file', () => {
-  const text = '`console/collect.js`, reached from `bin/spo:1102`, reads it by content';
-  const idx = text.indexOf('bin/spo:1102');
-  const end = idx + 'bin/spo:1102'.length;
+  const text = '`console/collect.js`, reached from `bin/spo:1108`, reads it by content';
+  const idx = text.indexOf('bin/spo:1108');
+  const end = idx + 'bin/spo:1108'.length;
   const cands = extractFileMentionCandidates(text, idx, end, null, null, 'bin/spo');
   assert.deepEqual(cands.map((c) => c.ident), ['collect']);
   assert.equal(cands[0].kind, 'file');
@@ -2182,9 +2182,9 @@ test('extractFileMentionCandidates: matches a cross-file basename mention by sub
 
 test('mergedCandidates: falls back to a file-mention candidate ONLY when no identifier candidate exists', () => {
   // No identifier at all near the citation -- must fall back to the file mention.
-  const noIdentText = '`console/collect.js`, reached from `bin/spo:1102`, reads it by content';
-  const idx1 = noIdentText.indexOf('bin/spo:1102');
-  const end1 = idx1 + 'bin/spo:1102'.length;
+  const noIdentText = '`console/collect.js`, reached from `bin/spo:1108`, reads it by content';
+  const idx1 = noIdentText.indexOf('bin/spo:1108');
+  const end1 = idx1 + 'bin/spo:1108'.length;
   const fallback = mergedCandidates(noIdentText, idx1, end1, null, null, 'bin/spo');
   assert.deepEqual(fallback.map((c) => c.ident), ['collect']);
 
@@ -2242,7 +2242,7 @@ test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance eit
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1102 needs it ("collect" inside "collectAll")', () => {
+test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1108 needs it ("collect" inside "collectAll")', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
   const file = path.join(dir, 'target.txt');
   fs.writeFileSync(file, ['line one', 'const data = collectAll(sources);', 'line three'].join('\n'));
@@ -2296,11 +2296,11 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1102 back to bin/spo:1090-1093 (the historical bug) makes this check red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1108 back to bin/spo:1090-1093 (the historical bug) makes this check red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
-  const reverted = normalized.replace('reached from `bin/spo:1102`', 'reached from `bin/spo:1090-1093`');
+  const reverted = normalized.replace('reached from `bin/spo:1108`', 'reached from `bin/spo:1090-1093`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');

@@ -2479,10 +2479,58 @@ bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised
 ## Dashboard
 
 ```bash
-bin/spo dashboard [--journal <dir>] [--queue <dir>] [--out <path>]   # generate once (static), default out: console/dashboard.html
+bin/spo dashboard [--journal <dir>] [--queue <dir>] [--out <path>]   # generate once (static): the deck at --out, health.html beside it
 bin/spo dashboard --watch                                            # regenerate every 30s (setInterval), Ctrl-C to stop
 bin/spo dashboard --serve [--port 8090] [--host <addr>] [--no-prod]  # live server (see below), Ctrl-C to stop
 ```
+
+### Two pages
+
+`/` is the **flight deck**, `/health` is everything else. The split exists because the console
+answered "is the machine healthy" and could not answer "what is the machine doing": you had to
+know which tile to read before it told you anything.
+
+The deck draws each live card as a run along the twelve-state track from `state-machine.js`'s
+lifecycle table, using the vocabulary in `console/plain-language.js` -- one plain sentence per
+state, each checked against the commands that state actually runs, so CHECK reads "checking it
+compiles, passes lint, and the tests still pass" rather than "CHECK". Four things on it are
+measured rather than styled:
+
+- **Retry budgets are drawn as lives.** `diagnoseBudget`, `validateRejectBudget`, `ciRetryBudget`
+  and `mainMovedRegateBudget` from `config.js`. Spending them all IS how a card parks, so a
+  filling row of pips is a card heading for a hand-back.
+- **Par times** come from `console/par-times.js`, which walks every journal on disk and takes the
+  p50/p90 of each state, one sample per VISIT. The live server recomputes on a five-minute timer
+  and persists to `<journalRoot>/par-times.json`; `collectAll` only ever reads that file -- the
+  same split `collectTrend` already uses for the tokens trend.
+- **Being sent back** is derived, not special-cased: `collect.js`'s `buildRun` flags a leg whose
+  exit transition moved to an earlier position on the track, or to DIAGNOSE. 22 of 39 journals in
+  the corpus loop at least once; only 17 walk the track cleanly.
+- **What an LLM step is doing right now** comes from `console/live-step.js`. PLAN, IMPLEMENT,
+  DIAGNOSE and VALIDATE run through `spawnSync` with piped stdio, so nothing is journalled and no
+  log grows until the call returns -- twelve minutes at IMPLEMENT's p90. The `claude` CLI's own
+  session transcript does move, and is reachable by an exact chain of identities: `state.json`'s
+  `owner.workerPid` names the worker, the lease file naming that pid names the account,
+  `config.cwdForStep` names the directory, and the session file created after the split's
+  `enteredAt` is this step's. Any break in that chain returns a named miss and the deck falls
+  back to the clock alone -- it never guesses which transcript belongs to which card.
+
+The deck shows LIVE cards only: no history list, no Todo. A finished run lingers for ten minutes
+(`DECK_LINGER_MS`) so a run that ends while you are looking at it does not vanish mid-glance --
+which is also what bounds the cost, since the per-leg walk runs for those cards and no others.
+The pipeline is idle most of the time (12.4% duty cycle measured over a week, and `SPO_WORKERS`
+defaults to 1), so the standing-by panel is the common case and names the queue depth: without
+it, "nothing to do" and "work waiting and the daemon is wedged" look identical.
+
+`/health` carries the service tiles, daemon counters, accounts, reports and token trend the root
+page used to carry -- the same `renderXxxInner` functions with the same fragment ids, moved
+rather than rewritten. The deck links across to it and names what is degraded, so an unlabelled
+warning light never sends you to the other page just to find out what it meant.
+
+Three poll cadences in `--serve` mode: `/api/live` every 2s (the deck alone -- it renders a card
+that moves), `/api/system` every 1s (CPU/memory, health page only), `/api/data` every 30s
+(everything else). `/api/data` also carries the `live` fragment so a client that never started
+the fast timer still refreshes.
 
 Two render modes, same underlying data:
 
