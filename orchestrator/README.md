@@ -1366,8 +1366,13 @@ park. `pr:wait` read `closed false` at 13:17:57 and parked `pr-closed-unmerged`;
 before that. The maintainer then read the park comment and replied `abandon` at 13:53 — abandoning
 a change that had already merged 35 minutes earlier. A reconciler would have caught that within
 one scan interval instead of never; the MERGE-step defect that produced the false park in the
-first place (a single unconfirmed `closed` read treated as terminal) is filed separately and is
-**not** this action's to fix.
+first place (a single unconfirmed `closed` read treated as terminal) **was fixed by
+SPO-Pipeline#85** — MERGE now probes `gh pr view --json state,mergeable,mergeStateStatus` (bounded,
+re-reading on GitHub's own lazily-computed `UNKNOWN` — see `doc/state-machine-spec.md`'s MERGE row)
+before parking, instead of believing `pr:wait`'s single local read. This reconciler remains the
+backstop for the residual case: every bounded probe attempt itself came back `unknown` (GitHub had
+nothing usable), so the card still parks on the unenriched symptom and a human, or this reconciler,
+is the one who later learns the PR actually merged.
 
 **Record, never overwrite** is the rule that makes this safe to build at all: `state.state` is
 never rewritten. The task really did park, or really was abandoned — the pipeline's own verdict
@@ -2500,6 +2505,7 @@ task/daemon split itself).
 | `pr-body-patch-failed` | task | PUSH_PR's `gh api ... -X PATCH` re-titling a reused PR exited non-zero — the reuse still proceeds to GATE (`steps/scripted.js`). |
 | `pr-created` | task | `gh pr create` succeeded; records the new PR number before routing to GATE (`steps/scripted.js`). |
 | `pr-merge-enqueue` | task | MERGE's enqueue step (`gh pr merge --merge`, or the scripted `prMergeEnqueue`) ran; records its exit code before `pr:wait` (`state-machine.js` / `steps/scripted.js`). |
+| `pr-mergeability` | task | SPO-Pipeline#85: real-mode `realMerge`'s own `gh pr view --json state,mergeable,mergeStateStatus` probe, run on a `pr:wait` failure before parking on it — records `exit`/`prState`/`mergeable`/`mergeStateStatus` (`null` for whatever it could not read; a non-zero exit or a thrown error leaves all three `null`). Post-verification: `UNKNOWN` is GitHub's own EXPECTED first answer (`mergeable`/`mergeStateStatus` are computed lazily), so one `probeMergeability` call can append UP TO THREE of these events, one per bounded re-read attempt — each carries its own `attempt` (1-3), and the loop stops journalling further attempts the moment one of them lands a definite answer or a terminal PR state. Deliberately `prState`, not `state` — journal.js's own `appendEvent` builds its record as `{ts, state, event, ...detail}`, so a detail field literally named `state` would silently clobber the outer `state: 'MERGE'`. Never written by the shadow-mode `handleMerge` twin, which has no GitHub to ask (`steps/scripted.js`'s `probeMergeability`; see `doc/state-machine-spec.md`'s MERGE row and `orchestrator/merge-cause.js`). |
 | `pr-reused` | task | PUSH_PR found an already-open PR for this branch and reused it (patching its body) instead of creating a new one (`steps/scripted.js`). |
 | `remote-branch-cleaned` | task | the leftover sweep's final step: the stale remote branch was deleted (`git push origin --delete`) once any PR was closed and the tip preserved or vouched for (`steps/scripted.js`). |
 | `remote-report-pull-failed` | daemon | a periodic remote-report pull tick failed — either the pull itself reported `ok: false`, or the call threw (`remote-report-pull.js`). |

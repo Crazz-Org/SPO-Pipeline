@@ -2659,6 +2659,7 @@ test('realMerge: pr:wait [4,4] -> PARKED (merge-queue-not-landing), never a thir
       }
       return ok('');
     },
+    sleep: () => Promise.resolve(),
   };
 
   await assert.rejects(

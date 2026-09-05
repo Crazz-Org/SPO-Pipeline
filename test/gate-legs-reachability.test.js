@@ -400,6 +400,7 @@ test('runTask (real mode, card): GATE/CI_CHECKS/VALIDATE all pass, pr:wait exits
         return fail(4);
       }
     }),
+    sleep: () => Promise.resolve(),
   };
 
   const task = cardTask('glr-merge', 906);
