@@ -206,6 +206,122 @@ test('runScanCycle reads live-workers.json fresh and protects a listed id from o
   assert.equal(reparkedState.reason, 'task-orphaned-daemon-restart');
 });
 
+// card #102: consistency with auto-pull.js:49-57's settled read order for the SAME file pair
+// (queue/, live-workers.json) -- read queue/ first, then live-workers.json, because
+// dispatcher.js's fillSlots takes a task OUT of queue/ before it spawns and publishes it as
+// in-flight, so reading queue/ first narrows the cross-process window in which a task can be
+// misread as belonging to neither. Before this action, runScanCycle's orphan-scan call site read
+// live-workers.json (readLiveWorkerIds, evaluated as an inline argument expression) BEFORE
+// orphanScan was even entered, and orphanScan itself only read queue/ on entry (queuedIds, at
+// orphan-scan.js:127 before this action, :143 now) -- the opposite order from auto-pull.js, for
+// the identical file pair.
+//
+// This is a read-ORDER test, not a behavioural one: every existing orphanScan/runScanCycle test in
+// this file passes 5 args or fewer (or, for daemon.js's startup call, 3), and every assertion in
+// them is unchanged by reordering two reads that both already happened somewhere in the call --
+// none of them would catch a regression here. It instruments the real fs module around a real
+// `runScanCycle` call (not a fake/mocked orphanScan) so it exercises the actual call site at
+// state-machine.js's runScanCycle, the same way the mutation-caught test above (:163-172) does for
+// the live-workers.json read itself. What this exists to catch: reverting the two hoisted `const`s
+// at that call site back into a single inline `orphanScan(queueDir, journalRoot, config, deps,
+// readLiveWorkerIds(journalRoot))` expression, or swapping the two consts' declaration order --
+// either must turn this test RED.
+test('runScanCycle (real call site): reads queue/ before live-workers.json on every orphan scan pass', async () => {
+  const journalRoot = mkTmp('spo-scancycle-order-journal-');
+  const queueDir = mkTmp('spo-scancycle-order-queue-');
+
+  // A real queue/ entry and a real live-workers.json, so both reads actually touch a file -- an
+  // instrumented order log that observes zero touches on one side would prove nothing about order.
+  fs.writeFileSync(path.join(queueDir, 'task-1.json'), JSON.stringify({ id: 'queued-task' }));
+  writeLiveWorkerIds(journalRoot, ['some-other-worker']);
+
+  // Every OTHER scan in runScanCycle's body disabled via its own zero-valued *Ms config (each
+  // guard is `if (!(x > 0)) return false` -- shouldScanUnpark/shouldAutoPull/shouldAutoIntake/
+  // shouldScanConfirms/shouldAutoTriage all share that shape with shouldScanOrphans itself), so
+  // only the orphan-scan branch under test can touch the filesystem this cycle.
+  const config = testConfig({
+    orphanScanMs: 1000,
+    unparkScanMs: 0,
+    autoPullMs: 0,
+    autoIntakeMs: 0,
+    reportConfirmScanMs: 0,
+    autoTriageMs: 0,
+    deps: { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/1#issuecomment-1') },
+  });
+  const timers = createScanTimers();
+  const scanStates = { unpark: createScanState(), reportConfirm: createScanState() };
+
+  const liveWorkersFile = path.join(journalRoot, 'live-workers.json');
+  const touches = [];
+  // Counted separately from `touches`, which collapses existsSync/readdirSync/readFileSync into one
+  // 'queue/' label and so cannot distinguish "read once" from "read twice". A readdir of queueDir
+  // ITSELF is exactly one queuedIds() call, so this counter is the number of times queue/ was
+  // enumerated during the pass -- see the assertion at the bottom for what a second one proves.
+  let queueListings = 0;
+
+  function classify(p) {
+    const s = String(p);
+    if (s === liveWorkersFile) return 'live-workers.json';
+    if (s === queueDir || s.startsWith(queueDir + path.sep)) return 'queue/';
+    return null;
+  }
+
+  const originalReaddirSync = fs.readdirSync;
+  const originalReadFileSync = fs.readFileSync;
+  const originalExistsSync = fs.existsSync;
+
+  fs.readdirSync = function patchedReaddirSync(p, ...rest) {
+    const kind = classify(p);
+    if (kind) touches.push(kind);
+    if (String(p) === queueDir) queueListings += 1;
+    return originalReaddirSync.call(fs, p, ...rest);
+  };
+  fs.readFileSync = function patchedReadFileSync(p, ...rest) {
+    const kind = classify(p);
+    if (kind) touches.push(kind);
+    return originalReadFileSync.call(fs, p, ...rest);
+  };
+  fs.existsSync = function patchedExistsSync(p, ...rest) {
+    const kind = classify(p);
+    if (kind) touches.push(kind);
+    return originalExistsSync.call(fs, p, ...rest);
+  };
+
+  try {
+    await runScanCycle(timers, queueDir, journalRoot, config, scanStates);
+  } finally {
+    // Restored unconditionally, even on assertion failure below -- this suite is serialized, and a
+    // leaked patch on the real fs module would corrupt every test that runs after this one.
+    fs.readdirSync = originalReaddirSync;
+    fs.readFileSync = originalReadFileSync;
+    fs.existsSync = originalExistsSync;
+  }
+
+  const queueTouchIdx = touches.indexOf('queue/');
+  const liveTouchIdx = touches.indexOf('live-workers.json');
+  const order = touches.join(' -> ');
+
+  assert.ok(queueTouchIdx !== -1, `queue/ was never read -- touches: ${order}`);
+  assert.ok(liveTouchIdx !== -1, `live-workers.json was never read -- touches: ${order}`);
+  assert.equal(touches[0], 'queue/', `expected the first fs touch to be queue/, got: ${order}`);
+  assert.ok(queueTouchIdx < liveTouchIdx, `expected queue/ before live-workers.json, got: ${order}`);
+
+  // The ordering assertions above are necessary but NOT sufficient, and this is the assertion that
+  // makes the pair pin what card #102 is actually about. Hoisting `const inQueueIds =
+  // queuedIds(queueDir)` at the call site but then NOT passing it to orphanScan satisfies every
+  // assertion above -- the first fs touch is still queue/ -- while orphanScan re-reads queue/ for
+  // itself at orphan-scan.js's `inQueueIds ?? queuedIds(queueDir)`, so the read pair the orphan
+  // logic ACTUALLY consumes is once again (live-workers.json, then queue/): the original defect,
+  // restored, undetected. A second enumeration of queue/ in one pass is the proof that the hoisted
+  // Set was computed and thrown away instead of threaded through.
+  assert.equal(
+    queueListings,
+    1,
+    `expected queue/ to be enumerated exactly once per orphan pass (the hoisted Set threaded into ` +
+      `orphanScan), got ${queueListings} -- touches: ${order}`
+  );
+});
+
 // action 7.1: runScanCycle's auto-triage timer (state-machine.js lines 1746-1749) is the one
 // scan in its own body this file's other runScanCycle test never exercises -- every timer above
 // it in the function (orphan/unpark/auto-pull/report-intake/confirm-scan) is disabled here by

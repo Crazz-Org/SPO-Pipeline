@@ -97,23 +97,39 @@ function takenAtMs(taskDir, taskFile) {
   }
 }
 
-// orphanScan(queueDir, journalRoot, config, deps, liveWorkerIds) -> [{id, reason}] for every task
-// reparked this pass. `deps.isAlive` is the test-only liveness override (same convention as
-// lock.js's own acquireLock); production never passes it.
+// orphanScan(queueDir, journalRoot, config, deps, liveWorkerIds, inQueueIds) -> [{id, reason}] for
+// every task reparked this pass. `deps.isAlive` is the test-only liveness override (same
+// convention as lock.js's own acquireLock); production never passes it.
 //
 // `liveWorkerIds` (a Set<string>, default null/none) is action 6.3's own live-worker table --
-// dispatcher.js threads its current set of in-flight worker ids through every scan cycle (see
-// state-machine.js's runScanCycle). A task in this set is SKIPPED outright, even if its
-// state.json/owner would otherwise look orphaned to every check below -- see journal.js's own
-// "taskDir single-writer invariant" doc comment for why this has to be a hard skip and not merely
-// a race that resolves itself: the instant a worker process actually exits, its pid genuinely
-// stops answering `isAlive`, so WITHOUT this check this scan would see exactly the same
-// "non-terminal state, dead owner pid" shape the dispatcher's own exit handler is (or is about
-// to be) reparking through finalizePark -- two independent writers racing the same
-// journal.jsonl/state.json. dispatcher.js's own header documents the precise ordering that makes
-// this race-free: it only removes an id from its live table AFTER its own repark (if any) has
-// already completed, synchronously, with no `await` in between.
-async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerIds = null) {
+// the DISPATCHER publishes its current set of in-flight worker ids to <journalRoot>/live-workers
+// .json on every spawn/exit (journal.js's writeLiveWorkerIds), and the SCANNER (a separate
+// process, daemon.js --scanner) reads it back and passes it in here -- see state-machine.js's
+// runScanCycle. A task in this set is SKIPPED outright, even if its state.json/owner would
+// otherwise look orphaned to every check below -- see journal.js's own "taskDir single-writer
+// invariant" doc comment for why this has to be a hard skip and not merely a race that resolves
+// itself: the instant a worker process actually exits, its pid genuinely stops answering
+// `isAlive`, so WITHOUT this check this scan would see exactly the same "non-terminal state, dead
+// owner pid" shape the dispatcher's own exit handler is (or is about to be) reparking through
+// finalizePark -- two independent writers racing the same journal.jsonl/state.json. dispatcher.js's
+// own header documents the precise ordering that makes this race-free: it only removes an id from
+// its live table AFTER its own repark (if any) has already completed, synchronously, with no
+// `await` in between.
+//
+// `inQueueIds` (a Set<string>, default null/none) lets a caller supply the queue/ read at a
+// controlled point in its OWN sequence rather than have this function read it itself, right here,
+// the instant it is entered. auto-pull.js:49-57's computeAutoPullBudget reads `queued` before
+// `inFlight` for this exact file pair (queue/, live-workers.json), and that is the settled rule:
+// read queue/ first, then live-workers.json, because dispatcher.js's fillSlots takes a task OUT
+// of queue/ before it spawns and publishes it as in-flight, so reading queue/ first narrows the
+// cross-process window in which a task can be misread as belonging to neither. state-machine.js's
+// runScanCycle hoists both reads into that order before calling orphanScan. `null`/absent means
+// "read it here yourself" -- which is what daemon.js:714's
+// unconditional startup crash-recovery scan relies on (it calls this function with no 5th/6th
+// argument at all, at a point where live-workers.json is stale by construction: the previous,
+// dead daemon's table, not yet cleared) and what every test that calls this function directly
+// still gets for free.
+async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerIds = null, inQueueIds = null) {
   const isAlive = deps.isAlive || processAlive;
   // `|| DEFAULT` would coerce a DELIBERATE 0 back to four minutes, and orphanGraceMs is a live env
   // knob (config.js: SPO_ORPHAN_GRACE_MS, resolved with Number(), so `SPO_ORPHAN_GRACE_MS=0`
@@ -124,7 +140,7 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
   // negative grace window is not a faster scan, it is a nonsense one.
   const rawGrace = config && config.orphanGraceMs;
   const graceMs = Number.isFinite(rawGrace) && rawGrace >= 0 ? rawGrace : DEFAULT_ORPHAN_GRACE_MS;
-  const inQueue = queuedIds(queueDir);
+  const inQueue = inQueueIds ?? queuedIds(queueDir);
 
   // Lazy require: state-machine.js requires this module (to wire the periodic scan into
   // runForever), so a top-level require here would be a load-time cycle. By the time orphanScan

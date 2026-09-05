@@ -34,9 +34,11 @@
 // <journalRoot>/live-workers.json, atomically (tmp-in-the-same-dir + rename, the exact idiom
 // writeState above already uses), every time a worker is spawned or its exit is handled -- see
 // dispatcher.js's own `publishLiveWorkerIds`. The scanner reads it fresh with
-// `readLiveWorkerIds(journalRoot)` at the top of EVERY scan cycle (state-machine.js's
-// runScanCycle) and hands the result to orphanScan as `liveWorkerIds` -- see orphan-scan.js's own
-// comment on that parameter for what it protects.
+// `readLiveWorkerIds(journalRoot)` once per orphan scan (state-machine.js's runScanCycle) --
+// sequenced AFTER that same cycle's queue/ read, not at the top of the cycle, per the read-order
+// rule auto-pull.js:49-57 settles for this exact file pair (computeAutoPullBudget reads `queued`
+// before `inFlight` for the same reason) -- and hands the result to orphanScan
+// as `liveWorkerIds` -- see orphan-scan.js's own comment on that parameter for what it protects.
 //
 // STALENESS, reasoned in both directions, because a file read by one process and written by
 // another is stale by construction the instant after it is read:
