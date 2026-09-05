@@ -1,6 +1,6 @@
 'use strict';
 // orchestrator/invariants.js -- action 1.8: the "invariant substring check" doc/state-machine-
-// spec.md:140 has always promised (and prompts/plan.md has always told PLAN a downstream check
+// spec.md:146 has always promised (and prompts/plan.md has always told PLAN a downstream check
 // would run) but that, until this action, never existed. This module is the whole of it: parse
 // the invariants-<issue>.md file PLAN writes (per the block format prompts/plan.md now
 // specifies), resolve each invariant's quote against a worktree via a substring test, and expose

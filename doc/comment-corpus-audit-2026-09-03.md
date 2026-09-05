@@ -102,7 +102,7 @@ until you know whether zero came from a check or from a blind spot. §3 separate
   wrapped continuation of `state-` on the line above — and the same pattern at
   `bin/spo:407-408` (`// … (state-machine.js's` / `// isEligibleNow reads …`) hid a real E5
   defect from the line-based scanner (below).
-- **E7a** — `orchestrator/README.md:1062`: `**14 of 18 tasks' journals stop at`, no date on the
+- **E7a** — `orchestrator/README.md:1065`: `**14 of 18 tasks' journals stop at`, no date on the
   line; `ls -d journal/*/ | wc -l` in this worktree gives **23** today. The safe form exists
   two files over: `orchestrator/park-loop.js:925`'s own `of 18` comment is dated.
 - **E7b** — `doc/board-audit.md` and `doc/jewels-inventory.md` both open with a plain `#`
@@ -112,12 +112,12 @@ until you know whether zero came from a check or from a blind spot. §3 separate
   `orchestrator/state-machine.js:1564` defines `function isQueueEntryEligibleNow(task, nowMs)`.
 - **E12** — `orchestrator/park-loop.js:219`: `---- action 5.1d: surface DIAGNOSE on the card
   ----`; `grep -c "5\.1d" doc/remediation-plan-2026-08.md doc/remediation-progress.md` → 0, 0.
-- **E4** — `orchestrator/README.md:790` cites `doc/state-machine-spec.md:98` for the "invariant
+- **E4** — `orchestrator/README.md:793` cites `doc/state-machine-spec.md:104` for the "invariant
   substring check"; line 98 today is an unrelated `transient-retry` note — the row is at
-  `doc/state-machine-spec.md:121`.
+  `doc/state-machine-spec.md:127`.
 - **E10** — `README.md:35`: `` `node --test test/*.test.js` suite `` vs.
-  `orchestrator/README.md:2371`: `node --test --test-timeout=30000 test/*.test.js`.
-- **E11** — `bin/spo:1654` and `orchestrator/README.md:2056` both quote `CLAUDE.md` as
+  `orchestrator/README.md:2387`: `node --test --test-timeout=30000 test/*.test.js`.
+- **E11** — `bin/spo:1654` and `orchestrator/README.md:2062` both quote `CLAUDE.md` as
   "Verdict by exit code, never by reading text output"; `CLAUDE.md:35` reads "**Verdict by exit
   code**, never by reading `gh`'s text output" — close, but not verbatim in either repo.
 - **E1** — `doc/board-audit.md:20`: `currently holds all 12 options`; `gh project field-list 1
@@ -227,7 +227,7 @@ already records that count being corrected twice (11 → 10 → 9).
   123 lines (2120–2175, 2300–2368) sat in neither the "read" nor the "swept" range; 1,483 of
   2,451 lines total. Within the swept range, marker hits were read in context — roughly 1.2%
   of it. This is not a hypothetical gap: the two stale "N of 18 tasks" numbers in §2's E7a row
-  (`orchestrator/README.md:1062`, `:1180`, against a live journal of 23) came directly out of
+  (`orchestrator/README.md:1065`, `:1180`, against a live journal of 23) came directly out of
   that unread range on a five-minute targeted probe. The coverage gap is where the live defects
   were, not a safe corner.
 - **Cross-repo checks are pinned to one commit, with no fetch.** Every product-repo claim in

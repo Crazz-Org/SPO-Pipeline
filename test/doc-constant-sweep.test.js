@@ -1339,7 +1339,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:128",
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:134",
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
@@ -1369,7 +1369,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1141",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
-  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:134",
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293",
   "doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156",
@@ -1389,17 +1389,18 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:701",
   "orchestrator/README.md :: dispatcher.js:485-499",
-  "orchestrator/README.md :: doc/state-machine-spec.md:140",
+  "orchestrator/README.md :: dispatcher.js:572-586",
+  "orchestrator/README.md :: doc/state-machine-spec.md:146",
   "orchestrator/README.md :: intake.js:797-799",
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
-  "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
+  "orchestrator/invariants.js :: doc/state-machine-spec.md:146",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
-  "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:659",
   "orchestrator/park-loop.js :: intake.js:797-799",
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/steps/llm.js :: intake.js:797-799",
@@ -2009,7 +2010,10 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
-  assert.equal(anchored, 22, `expected 22 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // Re-measured 2026-09-05: 23 (was 22). The 2026-09-05 doc-drift pass added ONE range citation,
+  // `orchestrator/README.md :: dispatcher.js:572-586` -- the drain moved the not-reparked-during-
+  // shutdown branch there, and `:485-499` (now killScanner) is kept alongside it so both resolve.
+  assert.equal(anchored, 23, `expected 23 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
@@ -2052,14 +2056,14 @@ const ANCHOR_BLUNT_CITATIONS = {
   // and the "next state" cell of the rows above it -- lines 138, 139, 140 and 142 all contain the
   // bare word. The citation is correct (140 IS the CHECK row); no identifier-level rule can
   // separate row 139 from row 140 when the discriminating token is the table's own column value.
-  'orchestrator/README.md :: doc/state-machine-spec.md:140':
+  'orchestrator/README.md :: doc/state-machine-spec.md:146':
     "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (138-140, 142) " +
     '-- the anchor word is the column value itself, so :139 anchors as well as :140. Citation ' +
     'confirmed correct by hand: 140 is the CHECK row.',
   // park-loop.js: "doc/remediation-progress.md:658 confirms the same referent under 'DIAGNOSE
   // surfacing'". Line 649 is the bullet's own heading line and 650 is its continuation, which
   // opens with the same word ("DIAGNOSE has no column..."). Correct citation, two-line bullet.
-  'orchestrator/park-loop.js :: doc/remediation-progress.md:658':
+  'orchestrator/park-loop.js :: doc/remediation-progress.md:659':
     "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 649 and its own " +
     'continuation line 650. Citation confirmed correct by hand: 649 is the bullet heading.',
 };
@@ -2068,8 +2072,8 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
   assert.deepEqual(
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
-      'orchestrator/README.md :: doc/state-machine-spec.md:140',
-      'orchestrator/park-loop.js :: doc/remediation-progress.md:658',
+      'orchestrator/README.md :: doc/state-machine-spec.md:146',
+      'orchestrator/park-loop.js :: doc/remediation-progress.md:659',
     ],
     'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +
       'by hand and justify it here before pinning it, exactly as CITATION_ANCHOR_ALLOWLIST requires.'
@@ -2097,6 +2101,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   });
 
   // Measured after zero tolerance replaced the per-kind band: 15 discriminating, 2 blunt, 5 ranges.
+  // 2026-09-05: 6 ranges -- see the pin below.
   // The SAME measurement re-run against the old 5-line band (restored in a scratch copy, not
   // asserted from memory) reports 5 discriminating, 12 blunt, 5 ranges -- so the band was blinding
   // TEN of the seventeen single-line citations in this corpus to a one-line drift, and the only
@@ -2114,10 +2119,12 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
   assert.equal(discriminating.length, 15, `expected 15 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
-  assert.equal(ranges.length, 5, `expected 5 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
+  // 6 since 2026-09-05: the doc-drift pass added `orchestrator/README.md :: dispatcher.js:572-586`
+  // (a range, so blunt by construction like the other five -- it is not a new blunt SINGLE-line one).
+  assert.equal(ranges.length, 6, `expected 6 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 22, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (22).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 23, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (23).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

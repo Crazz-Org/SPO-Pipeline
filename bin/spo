@@ -178,7 +178,7 @@
 //                            --keep skips cleanup, for debugging a run by hand. See
 //                            orchestrator/recette.js and orchestrator/README.md § Recette.
 //
-// Flags (any command): --journal <dir> --queue <dir>  (default: <repo>/journal, <repo>/queue)
+// Flags (any command): --journal <dir> --queue <dir>  (default: ~/.spo-state/{journal,queue})
 // Flags (accounts commands + dashboard + status): --accounts-dir <dir>  (default: the account
 //   pool -- see orchestrator/config.js's claudeAccountsDir / the SPO_ACCOUNTS_DIR env var)
 // Flags (status): --bench-dir <dir>  (default: orchestrator/config.js's spoBenchDir,

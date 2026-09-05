@@ -505,7 +505,8 @@ a real array; only the live model serialises it.
 
 ## Operational facts that cost time to learn
 
-- **Merging restarts the daemon.** A post-merge hook `systemctl restart`s daemon + dashboard on
+- **Merging restarts the daemon.** *(Superseded 2026-09-05 by the drain — see `doc/operating.md`
+§ Deploying: a stop now waits for the in-flight card instead of killing it.)* A post-merge hook `systemctl restart`s daemon + dashboard on
   every `git pull` in main. It SIGTERMs any in-flight `claude`, which parks the card
   `llm-transport-failed:<STEP>`. **Check for in-flight tasks before merging.** `systemctl --user
   mask` does NOT work here (the units are real files); just re-run `stop` after each pull.

@@ -247,7 +247,7 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
 // comments used to append the letter "d" to this action id. The plan (doc/remediation-plan-2026-08.md:202) does not
 // letter row 5.1's sub-items at all -- it names three in one cell: pre-worktree board moves,
 // DIAGNOSE activity surfaced (this one), and dropping the redundant IMPLEMENT-retry move.
-// doc/remediation-progress.md:658 confirms the same referent under "DIAGNOSE surfacing" ("6 tasks
+// doc/remediation-progress.md:659 confirms the same referent under "DIAGNOSE surfacing" ("6 tasks
 // entered DIAGNOSE, 18 attempts total, 4 of them ending in a park"). Only the letter "d" was
 // invented (by whichever pass first wrote this comment) -- the id itself was never ambiguous.
 // Renamed to the plan's actual, unlettered id.

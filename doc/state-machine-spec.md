@@ -68,11 +68,17 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    reparking from inside a process already SIGTERMed and about to be SIGKILLed risks a
    `finalizePark` caught mid-write (state.json PARKED, no park-comment yet), which no later
    scan can ever recover — deferring instead just leaves an ordinary non-terminal `state.json`
-   for orphan-scan to pick up cleanly next start. This is not a corner case: a merge's `git pull`
-   SIGTERMing an in-flight card is this project's single most common shutdown, so the fallback
-   above is the primary path for that one. See `orchestrator/README.md` § Orphan recovery.
+   for orphan-scan to pick up cleanly next start. This was not a corner case *before the drain*: a merge's
+   `git pull` SIGTERMing an in-flight card used to be this project's single most common shutdown.
+   Since `ee0fe64` + `eca936f` a stop **drains** and `KillMode=mixed` keeps SIGTERM off the workers,
+   so only a card still running past `drainTimeoutMs` (45 min) is ever signalled — the fallback is
+   now the rare path, not the primary one. See `orchestrator/README.md` § Orphan recovery.
    **Action 4.4:** the catch-all remains the error policy for every park reason except a closed,
-   named allowlist of ones that are facts about the *world at that instant*, not about the card —
+   named allowlist of ones that are facts about the *world at that instant*, not about the card.
+   The allowlist has **eight** members today (`state-machine.js`'s `TRANSIENT_RETRY_REASONS`): the
+   three below, the `llm-transport-failed:<STEP>` family, and the four `gate-*` verdict splits
+   action B3.4 added (`gate-environment`, `gate-interrupted`, `gate-abandoned`, `gate-stale` — each
+   argued individually in the GATE row) —
    `claim-rate-limited` (a board-claim rate limit), `gate-non-attesting` (action 4.2's bench-
    attested-nothing park), `gate-live-blocked` (action B2.3's world-lock/rate-limit BLOCKED park —
    see the GATE row below), and the `llm-transport-failed:<STEP>` family (PLAN/IMPLEMENT/DIAGNOSE/
@@ -158,12 +164,14 @@ be confused: `validate-reject N | reasons | outcome` (action 1.6).
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
 | PLAN | Fable 5 — no escalation (the promised "Opus 5 fallback" was unreachable and was removed 2026-09-04) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
+| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size, on IMPLEMENT's **own** map (`IMPLEMENT_EFFORT_BY_SIZE`, S→medium/M→medium/L→high) rather than the shared `EFFORT_BY_SIZE` — the S floor was raised from `low` on 2026-09-04 as a **labelled experiment** with a revert criterion written next to it (`step-contracts.js`: revert if IMPLEMENT calls per merged card do not fall below ~2.0). See SPO-Pipeline#112 before reading any result: two of the observed retry loops have an identified unrelated cause | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
 | DIAGNOSE | Opus 5 (was Fable 5 until 2026-09-04) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
 | VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when the diff touches the RDO wire | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
 
-The deadline is the same figure for all five rows — `step-contracts.js`'s `LLM_STEP_DEADLINE_MS`,
+The deadline is resolved per step by `step-contracts.js`'s `deadlineMsForStep()`:
+`LLM_STEP_DEADLINE_MS` (900000ms / 15min) for every row except **PLAN**, which
+`LLM_STEP_DEADLINE_MS_BY_STEP` raises to 1800000ms / 30min (2026-09-04, commit `98fc04b`). It is
 the `spawnSync` timeout `invokeClaudeReal` arms for every one of these calls
 (`orchestrator/steps/llm.js`) — but that figure governs real mode only. `state-machine.js` still
 wraps every LLM step in the outer `callWithDeadline` (`deadline.js`) using the generic
@@ -460,7 +468,8 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
   `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1100`)
-  is a generated static HTML page reading the same local journals, and already ships alongside
+  is a generated static HTML page reading the same local journals — or, with `--serve`, the live
+flight deck at `/` plus a `/health` page (`console/serve.js`, 2026-09-05), and already ships alongside
   the CLI rather than after it.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).
 
@@ -632,8 +641,10 @@ unconditionally on scanner startup regardless of that value, which only sets the
 pull-and-ack is a second, explicit refusal -- see below. `parallel-doc-log` (K=2) is the scenario
 that exercises this driver.
 
-Refuses to run while a live daemon holds its own `journal/daemon.lock` (read-only check,
-`--force` to override). Chantier 6 action 6.4 added a real product-repo mutex
+Refuses to run while a live daemon holds its own `daemon.lock` (read-only check, `--force` to
+override) — **currently dead, SPO-Pipeline#133**: `recette.js` still looks under `<repoRoot>/journal`,
+which the state move emptied, so the refusal never fires. The lock lives at
+`~/.spo-state/journal/daemon.lock`. Chantier 6 action 6.4 added a real product-repo mutex
 (`orchestrator/product-repo-lock.js`), but recette does not itself take it -- WORKTREE and FINISH
 acquire it either way, whichever driver ran them: `inline` reaches them through `drainQueueOnce`
 in recette's own process, `dispatcher` through a real `daemon.js --worker` child. The lock is
