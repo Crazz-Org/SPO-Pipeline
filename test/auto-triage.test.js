@@ -32,6 +32,7 @@ const {
   reclaimStaleClaims,
   claimReport,
   claimSidecarPath,
+  moveReportTo,
   DEFAULT_AUTO_TRIAGE_MS,
   DEFAULT_AUTO_TRIAGE_LIMIT,
   DEFAULT_TRIAGE_CLAIM_GRACE_MS,
@@ -1071,6 +1072,111 @@ test('claimReport: stamps the claimed file\'s mtime, so an OLD report is not ins
   const reclaimed = reclaimStaleClaims(journalRoot, { spoReportsDir, triageClaimGraceMs: 60 * 1000 }, {});
   assert.deepEqual(reclaimed, [], 'a live claim must not be swept just because the report file is old');
   assert.equal(fs.existsSync(claim.path), true);
+});
+
+// moveReportTo's own fs.renameSync is guarded the same way claimReport's is, just above: ENOENT
+// means a concurrent disposal already won the race and moved reportPath to dest first (a stale
+// claim reclaimed back to pending/ mid-archive, or two runners racing the same confirmed report),
+// so it is not an error -- moveReportTo returns dest and leaves the winner's disposition sidecar
+// alone. Any other rename error (EXDEV across filesystems, EPERM, ...) still propagates: there is
+// no "someone else already handled it" story for those, and swallowing them would hide a real
+// filesystem problem. Monkey-patching fs.renameSync (same spy idiom test/journal.test.js already
+// uses for this exact call) is the only deterministic way to land inside the guard.
+test('moveReportTo: an ENOENT rename (already moved by a concurrent disposal) is swallowed -- returns dest, leaves the existing disposition file alone', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-movereport-enoent-');
+  const targetDir = path.join(spoReportsDir, 'archive');
+  fs.mkdirSync(targetDir, { recursive: true });
+  const reportPath = path.join(spoReportsDir, 'in-progress', '2026-09-01T00-00-00-000Z_desktop_race.json');
+  const dest = path.join(targetDir, path.basename(reportPath));
+  // The "winner" already moved the file and wrote its own disposition line.
+  fs.writeFileSync(dest, JSON.stringify({ version: 1 }));
+  fs.writeFileSync(`${dest}.disposition.txt`, 'filed: #1 — 2026-09-01\n');
+
+  const origRename = fs.renameSync;
+  fs.renameSync = (src, d) => {
+    if (src === reportPath && d === dest) {
+      const err = new Error('simulated: source already gone');
+      err.code = 'ENOENT';
+      throw err;
+    }
+    return origRename(src, d);
+  };
+  try {
+    const result = moveReportTo(reportPath, targetDir, 'duplicate: #2 — 2026-09-01');
+    assert.equal(result, dest, 'ENOENT must be treated as "already moved", returning dest rather than throwing');
+  } finally {
+    fs.renameSync = origRename;
+  }
+
+  // The loser must not clobber the winner's disposition line.
+  assert.equal(fs.readFileSync(`${dest}.disposition.txt`, 'utf8'), 'filed: #1 — 2026-09-01\n');
+});
+
+test('moveReportTo: a non-ENOENT rename failure (e.g. EXDEV) still propagates -- never swallowed', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-movereport-exdev-');
+  const targetDir = path.join(spoReportsDir, 'archive');
+  const reportPath = path.join(spoReportsDir, 'in-progress', '2026-09-01T00-00-00-000Z_desktop_exdev.json');
+
+  const origRename = fs.renameSync;
+  const simulated = new Error('simulated: cross-device link');
+  simulated.code = 'EXDEV';
+  fs.renameSync = () => {
+    throw simulated;
+  };
+  try {
+    assert.throws(() => moveReportTo(reportPath, targetDir, 'filed: #3 — 2026-09-01'), (err) => err === simulated);
+  } finally {
+    fs.renameSync = origRename;
+  }
+});
+
+// REACHABILITY, not unit: the two tests above prove moveReportTo's guard works when called
+// directly -- they do not prove the daemon ever benefits. This one drives a whole runAutoTriage
+// filed cycle with the archive rename forced to ENOENT and asserts the cycle RETURNS. Without the
+// guard it does not: the throw leaves reviewAndFile, passes processConfirmedReport's catch-less
+// `finally`, and exits runAutoTriage, which is what kills the scan loop (card #101). Verified both
+// ways -- with the guard removed this test throws ENOENT instead of failing an assertion.
+test('runAutoTriage: an ENOENT on the archive rename does not escape the cycle -- the scan loop survives', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-archive-enoent-');
+  const journalRoot = mkTmp('spo-autotriage-archive-enoent-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, '2026-09-01T10-00-00-000Z_desktop_race.json');
+  confirmedEntry(journalRoot, { issue: 999, pendingPath });
+
+  const deps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review\n\n**Verdict:** FILE' },
+    ],
+    ghResponder: (args) => (args[0] === 'api' ? ok(JSON.stringify({ body: 'original raw body' })) : ok('')),
+    npmResponder: () => ok(''),
+  });
+
+  // ENOENT on the ARCHIVE rename only -- claimReport's pending/ -> in-progress/ move and the
+  // `finally`'s restore must both still work, or this would prove nothing about the guard.
+  const origRename = fs.renameSync;
+  fs.renameSync = (src, dest) => {
+    if (String(dest).includes(`${path.sep}archive${path.sep}`)) {
+      const err = new Error('simulated: source already gone');
+      err.code = 'ENOENT';
+      throw err;
+    }
+    return origRename(src, dest);
+  };
+  let result;
+  try {
+    result = await runAutoTriage(
+      journalRoot,
+      { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true },
+      deps,
+      { dry: false }
+    );
+  } finally {
+    fs.renameSync = origRename;
+  }
+
+  assert.equal(result.ok, true, 'the cycle must complete, not throw out into runScanCycle');
+  assert.equal(result.filed, 1);
+  assert.equal(result.results[0].outcome, 'filed');
 });
 
 // D3: a claim we can never probe -- a foreign hostname after a WSL/container rebuild -- had no age
