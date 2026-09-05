@@ -23,6 +23,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
+// Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
+// for the incident that makes this load-bearing rather than tidy.
+const { gitEnv } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -1201,7 +1204,7 @@ function trackedFiles(root) {
   if (_trackedCache.has(root)) return _trackedCache.get(root);
   let list = [];
   try {
-    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: gitEnv() })
       .split('\n')
       .filter(Boolean);
   } catch {
@@ -1551,8 +1554,11 @@ function makeFixtureRepo(layout) {
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, body);
   }
-  execFileSync('git', ['-C', root, 'init', '-q']);
-  execFileSync('git', ['-C', root, 'add', '-A']);
+  // env: gitEnv() is load-bearing here, not cosmetic -- under the pre-push hook GIT_DIR is
+  // inherited, so this `init` would act on THIS repository and this `add -A` would stage into its
+  // real index. See helpers.js's gitEnv for the measured incident.
+  execFileSync('git', ['-C', root, 'init', '-q'], { env: gitEnv() });
+  execFileSync('git', ['-C', root, 'add', '-A'], { env: gitEnv() });
   return root;
 }
 

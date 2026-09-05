@@ -29,6 +29,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+// Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
+// for the incident that makes this load-bearing rather than tidy.
+const { gitEnv } = require('./helpers');
 
 // Killswitch first, textually, before the orchestrator require below -- see test/no-real-spawn.js's
 // own header and test/no-real-spawn-sweep.test.js's standing guard over this exact ordering rule.
@@ -48,7 +51,7 @@ function readTrackedProductFile(relPath) {
   const root = productRepoRoot();
   let tracked;
   try {
-    tracked = execFileSync('git', ['-C', root, 'ls-files', '--error-unmatch', relPath], { encoding: 'utf8' }).trim();
+    tracked = execFileSync('git', ['-C', root, 'ls-files', '--error-unmatch', relPath], { encoding: 'utf8', env: gitEnv() }).trim();
   } catch (err) {
     throw new Error(
       `${relPath} is not a tracked file in the product repo at ${root} (set SPO_PRODUCT_REPO to point ` +

@@ -26,7 +26,7 @@ require('./no-real-spawn');
 const { readPipelineVersion, REPO_ROOT } = require('../orchestrator/pipeline-version');
 const { createDispatcher } = require('../orchestrator/dispatcher');
 const defaultConfig = require('../orchestrator/config');
-const { mkTmp, writePoolDir, runDaemonWorker, readJournal } = require('./helpers');
+const { gitEnv, mkTmp, writePoolDir, runDaemonWorker, readJournal } = require('./helpers');
 
 // See test/dispatcher.test.js's own copy for the orphan-exit reasoning this repeats.
 function neverExitsSpawn(cmd, args, opts) {
@@ -37,17 +37,17 @@ function neverExitsSpawn(cmd, args, opts) {
   );
 }
 
-const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env: gitEnv() }).trim();
 
 // A throwaway repo with one commit. `-c` overrides rather than a config write so the box's own
 // user.name/user.email (and any commit.gpgsign) can neither be required nor disturbed.
 function mkRepo(prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  execFileSync('git', ['init', '-q', '-b', 'main', '.'], { cwd: dir });
+  execFileSync('git', ['init', '-q', '-b', 'main', '.'], { cwd: dir, env: gitEnv() });
   execFileSync(
     'git',
     ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'one'],
-    { cwd: dir }
+    { cwd: dir, env: gitEnv() }
   );
   return dir;
 }
@@ -61,7 +61,7 @@ test('ordinary checkout (.git directory, loose ref): sha and ref match git rev-p
 
 test('packed-refs-only checkout: still resolves (a fresh clone has no loose ref for its branch)', () => {
   const dir = mkRepo('spo-pv-packed-');
-  execFileSync('git', ['pack-refs', '--all'], { cwd: dir });
+  execFileSync('git', ['pack-refs', '--all'], { cwd: dir, env: gitEnv() });
   // Guards the test itself: if git ever stops removing the loose ref, this case silently stops
   // exercising the packed-refs branch and would pass for the wrong reason.
   assert.equal(fs.existsSync(path.join(dir, '.git', 'refs', 'heads', 'main')), false, 'pack-refs left the loose ref');
@@ -70,14 +70,14 @@ test('packed-refs-only checkout: still resolves (a fresh clone has no loose ref 
 
 test('detached HEAD: sha resolves, ref is null (this is what a release checkout looks like)', () => {
   const dir = mkRepo('spo-pv-detached-');
-  execFileSync('git', ['checkout', '-q', '--detach', 'HEAD'], { cwd: dir });
+  execFileSync('git', ['checkout', '-q', '--detach', 'HEAD'], { cwd: dir, env: gitEnv() });
   assert.deepEqual(readPipelineVersion(dir), { sha: git(dir, 'rev-parse', 'HEAD'), ref: null });
 });
 
 test('linked worktree (.git FILE + commondir): refs live in the common dir, and are found there', () => {
   const dir = mkRepo('spo-pv-wt-');
   const wt = path.join(dir, 'wt');
-  execFileSync('git', ['worktree', 'add', '-q', '-b', 'side', wt], { cwd: dir });
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'side', wt], { cwd: dir, env: gitEnv() });
   assert.equal(fs.statSync(path.join(wt, '.git')).isFile(), true, 'expected a .git FILE in a linked worktree');
   assert.deepEqual(readPipelineVersion(wt), { sha: git(wt, 'rev-parse', 'HEAD'), ref: 'refs/heads/side' });
 });
@@ -172,9 +172,9 @@ test('loose ref wins over a stale packed-refs entry -- the order is the whole po
   // loose ref and leaves the packed entry behind, now stale. `git gc --auto` packs refs and runs
   // on ordinary pulls and commits, so this is the steady state of any long-lived checkout --
   // including ~/SPO-Pipeline itself, which is the one this module reports on in production.
-  execFileSync('git', ['pack-refs', '--all'], { cwd: dir });
+  execFileSync('git', ['pack-refs', '--all'], { cwd: dir, env: gitEnv() });
   const stale = git(dir, 'rev-parse', 'HEAD');
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'two'], { cwd: dir });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'two'], { cwd: dir, env: gitEnv() });
   const current = git(dir, 'rev-parse', 'HEAD');
 
   assert.notEqual(stale, current, 'the second commit did not move HEAD -- this test proves nothing');
@@ -190,7 +190,7 @@ test('a ref file that is not a sha is refused rather than reported as one', () =
   const dir = mkRepo('spo-pv-symref-');
   // `git symbolic-ref` writes a `ref: ...` line where readRef expects 40 hex. Without SHA_RE the
   // literal string "ref: refs/heads/other" would be journalled as this pipeline's commit.
-  execFileSync('git', ['symbolic-ref', 'refs/heads/main', 'refs/heads/other'], { cwd: dir });
+  execFileSync('git', ['symbolic-ref', 'refs/heads/main', 'refs/heads/other'], { cwd: dir, env: gitEnv() });
   assert.equal(readPipelineVersion(dir).sha, null);
 });
 
@@ -209,8 +209,8 @@ test('a ref file with trailing whitespace/CRLF still resolves', () => {
 
 test('an annotated tag in packed-refs (a ^peeled line) does not derail the scan', () => {
   const dir = mkRepo('spo-pv-peeled-');
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', 'v1', '-m', 'v1'], { cwd: dir });
-  execFileSync('git', ['pack-refs', '--all'], { cwd: dir });
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', 'v1', '-m', 'v1'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['pack-refs', '--all'], { cwd: dir, env: gitEnv() });
   const packed = fs.readFileSync(path.join(dir, '.git', 'packed-refs'), 'utf8');
   assert.match(packed, /^\^/m, 'git wrote no peeled line -- this test is not exercising that path');
   assert.equal(readPipelineVersion(dir).sha, git(dir, 'rev-parse', 'HEAD'));
