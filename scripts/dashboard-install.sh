@@ -14,6 +14,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CURRENT_LINK="${SPO_CURRENT_LINK:-$HOME/.spo-current}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/spo-pipeline-dashboard.service"
 PORT="${SPO_DASHBOARD_PORT:-8090}"
@@ -33,8 +34,12 @@ cat > "$UNIT" <<UNITEOF
 Description=SPO pipeline dashboard server (bin/spo dashboard --serve)
 
 [Service]
-WorkingDirectory=$REPO
-ExecStart=$NODE_BIN $REPO/bin/spo dashboard --serve --port $PORT
+# Same release symlink the daemon unit uses -- see scripts/daemon-install.sh's own comment. The
+# dashboard reads the journal, which now lives outside every tree (~/.spo-state, see
+# orchestrator/state-root.js), so running it from a release is a pure win: it reports on the same
+# state whichever release is current.
+WorkingDirectory=$CURRENT_LINK
+ExecStart=$NODE_BIN $CURRENT_LINK/bin/spo dashboard --serve --port $PORT
 Restart=always
 RestartSec=5
 # A refuse-to-start (port already bound) exits immediately; five tries in five minutes then

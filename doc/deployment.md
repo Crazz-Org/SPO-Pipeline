@@ -19,6 +19,12 @@ worktree's own pull does anything.
 
 Three facts about that, all verified in the code:
 
+> **§5 changed this.** The account below is what a deploy WAS, and why the layout had to change;
+> it is kept because §5's design is unreadable without it. Since the immutable-release layout
+> landed, `git pull` in the deploy checkout cuts `~/.spo-releases/<sha>`, moves `~/.spo-current`
+> and drain-restarts — the running service never reads the tree that was pulled, so the
+> version-mixing described here can no longer happen.
+
 **The pull alone already mixes two versions, with no restart involved.** The dispatcher and the
 scanner are long-lived processes carrying the code they loaded at start. A worker is not: it is a
 fresh process per card, spawned as `node <DAEMON_PATH> --worker …`
@@ -254,121 +260,185 @@ it.
 
 ---
 
-## 5. OPEN: separating "the code that runs" from "the checkout we edit"
+## 5. The immutable-release layout — BUILT
 
 ### The problem, stated once
 
-`~/SPO-Pipeline` is three things at once: the tree the service executes, the tree a human edits, and
-the tree `git pull` mutates. Because `DAEMON_PATH` is resolved per spawn, mutating it while the
+`~/SPO-Pipeline` was three things at once: the tree the service executes, the tree a human edits,
+and the tree `git pull` mutates. Because `DAEMON_PATH` is resolved per spawn, mutating it while the
 daemon runs is enough to split versions with no restart at all. The drain and the restart both
-narrow the window; neither can close it, because the window is a property of the layout.
+narrow that window; neither can close it, because the window is a property of the layout.
 
-Concretely, three exposures survive everything in §3:
+Three exposures survived everything in §3:
 
 1. **The pull instant.** Between `git pull` writing files and `post-merge`'s SIGTERM arriving, the
-   old dispatcher can spawn a new-code worker. Milliseconds, but unbounded if the hook is not armed.
+   old dispatcher can spawn a new-code worker.
 2. **The skipped-unit case.** If the hook skips (unit stopped, §2.1), the files change and *nothing*
-   restarts. The gap is then as long as the maintainer's attention span. This is not hypothetical:
-   the daemon ran eight-hour-old code for a working day on 2026-09-03.
-3. **Hand edits.** Any agent or human editing the live checkout is editing a running program. This
-   repo already has a standing rule against it (`CLAUDE.md`), which is another way of saying the
-   layout requires discipline to be safe.
+   restarts — the daemon ran eight-hour-old code for a working day on 2026-09-03.
+3. **Hand edits.** Any agent or human editing the live checkout is editing a running program.
 
-### Options
+And one that only arrives with self-update: **a card whose implementation is a change to this
+repo is running the code it is rewriting.** There is no moment at which "the code that ran the
+merge" and "the code on disk" can be made to agree, and the drain does not help, because the card
+doing the deploying is itself in flight. That is what settled the design — the maintainer's answer
+to "should the pipeline update itself through its own pipeline?" was yes.
 
-**A — Status quo + drain (what is deployed today).**
-Cost: zero, already done. Closes the "cards killed" half entirely. Leaves all three exposures above.
-Relies on a rule (`never edit ~/SPO-Pipeline`) that is enforced by convention only.
+### What is built
 
-**B — Immutable release trees + a symlink.**
-`~/.spo-releases/<sha>/` holds a detached checkout per release; `~/.spo-current` is a symlink;
-`ExecStart` runs `~/.spo-current/orchestrator/daemon.js`. Deploying is *create the tree, move the
-symlink, drain-restart*. `~/SPO-Pipeline` becomes an ordinary development checkout that the service
-never reads.
+The service runs from `~/.spo-releases/<sha>`, never from a checkout anyone edits. `~/.spo-current`
+is a symlink to the active release. Deploying is *create the tree, move the symlink, drain-restart*;
+rolling back is *move the symlink back, drain-restart*.
 
-The property that makes this work is not the symlink, it is Node's module resolution: `__dirname`
-is the **realpath**, so a running daemon's `DAEMON_PATH` points into its own release tree.
-Moving the symlink under a live daemon changes nothing for it; its workers keep coming from the
-tree it started in. **Version cohesion becomes a property of the layout rather than of timing.**
-Exposure 1 and 3 disappear outright; exposure 2 becomes visible (the symlink and the running
-process's tree can be compared, and `pipelineSha` already reports the latter).
+```
+~/SPO-Pipeline/            the DEV checkout. Edited, pulled, and the only tree allowed to deploy.
+                           The service never reads it.
+~/.spo-releases/<sha>/     one immutable local clone per release, detached at <sha>
+~/.spo-current  ->  ~/.spo-releases/<sha>       what both units' ExecStart points at
+~/.spo-state/{queue,journal}                    all mutable state, outside every tree
+```
 
-Cost, measured rather than guessed — and it is smaller than it looks, because most of this repo's
-state already lives outside the tree:
+**The property it rests on is not the symlink — it is that Node resolves `__dirname` to the
+realpath.** A process started through `~/.spo-current` keeps resolving paths into the tree it
+started in, so a live daemon spawns its workers from *its own* release even after a later deploy
+moves the link. Version cohesion stops being a race against `dispatcher.js` re-reading
+`DAEMON_PATH` per spawn and becomes a property of the layout. Measured, not assumed: a probe
+started via the symlink logged its `DAEMON_PATH` every 150 ms while a second release was cut and
+the symlink moved under it, and every line named the first release
+(`test/release-script.test.js`, "a RUNNING process keeps its own release tree after the symlink
+moves").
 
-| state | where it lives today | moves? |
-|---|---|---|
-| account pool | `~/.claude-accounts` | no |
-| product checkout | `~/SPO-WebClient` | no |
-| product worktrees | `~/.spo-worktrees` | no |
-| bench | `~/.spo-bench` | no |
-| **`queue/`** | `<repoRoot>/queue` | **yes** |
-| **`journal/`** | `<repoRoot>/journal` | **yes** |
+All three exposures above close outright, and the self-update case stops arising: the card writes a
+*new* tree and moves a symlink; the daemon running that card is untouched until it drains.
 
-So the work is: relocate two directories (4 call sites — `daemon.js:413-414`, `bin/spo:281-282` —
-each already overridable by flag), a release script, an install-script change, a `post-merge`
-change, and a `spo deploy`/rollback path. Plus disk: one small checkout per retained release.
-Rollback becomes `ln -sfn` + drain-restart, which is a real gain this layout gets for free.
+### The pieces, and the decisions inside them
 
-**C — Stage-and-swap without releases.** Pull into a hidden clone, then `mv` it over the live tree.
-Cheaper than B on paper, but it has B's state problem *and* keeps a mutable "current" tree, and
-`mv` over a directory a live process holds open is not atomic in the way the symlink is. Strictly
-worse than B; listed only to record that it was considered.
+| piece | what it does |
+|---|---|
+| `orchestrator/state-root.js` | `queue/` and `journal/` default to `~/.spo-state` (`SPO_STATE_DIR`). Explicit `--queue`/`--journal` still win outright. |
+| `scripts/release.sh` | build a release, switch, prune, roll back, restart. `--list`, `--rollback`, `--no-restart`. |
+| `scripts/daemon-install.sh`, `scripts/dashboard-install.sh` | units run from `~/.spo-current`; the daemon installer cuts the initial release. |
+| `scripts/git-hooks/post-merge` | decides *whether* to deploy, then delegates everything else to `release.sh`. |
 
-**D — Status quo + a hard rule and a check.** Keep A, and add a startup assertion that the daemon
-refuses to run from a dirty working tree. Cost: near zero. Closes exposure 3 loudly instead of
-silently; leaves 1 and 2.
+**`git clone --local`, not `git worktree add`.** A linked worktree keeps its administrative data
+inside the *source* repo, so `git worktree prune`, a moved `~/SPO-Pipeline` or a deleted dev
+checkout would break a *running* release. A local clone hardlinks objects into the release's own
+object store — cheap, and independent of the source's fate. Deliberately not `--shared`, which
+would reintroduce that dependency as alternates. It also keeps a real `.git`, which
+`pipeline-version.js` needs: `git archive` would produce a tree that cannot describe itself, and
+every card's `pipeline-version` line would read `null`.
 
-### Recommendation, and the question that governs it
+**Four refusals**, each because the alternative is a confident wrong answer rather than a loud
+failure:
 
-**B, if the pipeline is ever to update itself through its own pipeline. Otherwise A+D.**
+- a **dirty source tree** — the directory would claim a sha it does not contain, and
+  `pipeline-version.js` would journal that wrong sha on every card;
+- a tree that **cannot describe itself** — the probe runs `pipeline-version.js` out of the new tree
+  and refuses to switch unless it reports the sha requested, checking the clone, the detached
+  checkout and the provenance path in one go;
+- **starting on an empty journal** — see below;
+- pruning never removes the **current or previous** release, however old. A rollback target that
+  can be garbage-collected is not a rollback target.
 
-That conditional is not hedging. A process that rewrites the file it is executing has no clean
-solution in layout A — there is no moment at which "the code that ran the merge" and "the code on
-disk" can be made to agree, and the drain does not help, because the card doing the deploying is
-itself in flight. Under B the question does not arise: the card writes a *new* release tree and
-moves a symlink, and the running daemon is untouched until it drains on its own terms.
+The symlink swap is `mv -T` (`rename(2)`), not `ln -sfn`, which unlinks and re-creates: a daemon
+starting in that window would find nothing at all.
 
-So: **do we want the pipeline to be able to update itself through its own pipeline?**
+**One checkout deploys, and it is not whichever one fired the hook.** git runs `post-merge` with
+cwd at the top of whichever working tree was updated — *any* of them. This repo routinely has a
+dozen worktrees under `.claude/worktrees/`, and `git merge --ff-only` inside one fires the hook
+exactly as a pull in the main checkout does (measured 2026-09-04). While the hook only restarted
+services that was untidy; cutting a release there would **deploy that agent's branch**. So the
+deploy checkout is named (`SPO_SOURCE_REPO`, default `~/SPO-Pipeline`) rather than inferred, the
+branch is checked (`SPO_DEPLOY_BRANCH`, default `main`), and every other tree is skipped out loud.
 
-- **Yes** → B is not optional, and should be built before the first self-update card is written.
-- **No** → A+D is defensible and costs a day less. The rule "never edit `~/SPO-Pipeline`" stays a
-  rule, and D makes it loud.
+**`GIT_*` is stripped in both scripts.** A git hook exports `GIT_DIR`, so unstripped, every
+`git clone`/`git -C` in `release.sh` would act on the hook's repository rather than the one named
+on the command line. That is not hypothetical — on 2026-09-05 the same inheritance let this repo's
+own test suite write empty commits onto a live branch, detach two worktrees, leave
+`refs/heads/main` a dangling symref and set `core.bare=true` (see `test/no-git-env-sweep.test.js`).
 
-Not implemented pending that answer.
+### State had to move first, and starting without it is refused
 
----
+A release tree is replaced on every deploy, so state kept inside it is abandoned by the next one.
+`queue/` and `journal/` therefore move to `~/.spo-state`, joining `~/.claude-accounts`,
+`~/.spo-worktrees` and `~/.spo-bench` — all already outside the repo.
+
+The dangerous failure here is not "cannot find the journal", which is loud. It is finding an
+**empty** one: `orphanScan` recovers nothing, `unparkScan` sees no parked cards, so the `retry`
+channel is silently dead while the board still shows cards parked and a human waits on a machine
+that stopped listening. So a start that would land on an empty journal while real state sits in the
+repo **refuses**, and prints the exact `mv` commands. It fires narrowly — only when there is real
+daemon-written evidence in the repo *and* none at the new root — so an empty `journal/` directory
+never blocks anyone who has nothing to migrate.
+
+### Operating it
+
+```bash
+scripts/release.sh              # cut a release from the deploy checkout's HEAD and switch to it
+scripts/release.sh <ref>        # ... from a specific ref
+scripts/release.sh --list       # releases, marking current and previous
+scripts/release.sh --rollback   # back to the previous release, drain-restart
+scripts/release.sh --no-restart # cut and switch, leave the services alone
+```
+
+Tunables: `SPO_RELEASE_KEEP` (retained releases, default 5), `SPO_RELEASES_DIR`,
+`SPO_CURRENT_LINK`, `SPO_SOURCE_REPO`, `SPO_DEPLOY_BRANCH`, `SPO_RELEASE_UNITS`.
+
+Because a stop drains, a deploy is asynchronous: `release.sh` uses `restart --no-block`, so the
+pull returns at once and the old daemon finishes its cards before the new release takes over. A
+second pull during that window is reported as "a restart is already in flight" rather than skipped —
+the queued restart execs from `WorkingDirectory` and picks up the newer merge too.
 
 ## 6. Applying this to the box
 
-Nothing in §3/§4 reaches the running services until the code is deployed **and the installer is
-re-run** — `SuccessExitStatus` and `TimeoutStopSec` live in the generated unit file, not in the repo
-the daemon reads.
+Two things have to happen once, in this order, and the second is not optional: **the state
+migration**. Until it is done the daemon refuses to start rather than come up on an empty journal
+(§5), so nothing can silently go wrong — but nothing works either.
 
-Order matters, and step 0 is not optional: the pull fires the hook, which restarts the daemon.
+Step 0 is not optional either: the pull fires the hook, which deploys.
 
-```
-# 0. the daemon may now be stopped WITHOUT killing a card -- it drains.
+```bash
+# 0. do not deploy on top of a live card. The stop DRAINS -- in-flight cards finish first,
+#    up to 45 min. Send the signal twice to stop immediately.
 bin/spo status
 systemctl --user stop spo-pipeline-daemon.service
-#    ...this can take up to 47 min if a card is running. To stop waiting:
-#    systemctl --user kill -s TERM spo-pipeline-daemon.service
-#    Wait for `inactive` (not `deactivating`) before step 1 if you want the pull to redeploy.
+#    ...wait for `inactive` (not `deactivating`) if you want the pull to redeploy.
 
-# 1. deploy
+# 1. if the box should come back idle, set auto-pull off FIRST -- daemon-install.sh below
+#    ends in `enable --now`, i.e. it starts the daemon.
+systemctl --user edit spo-pipeline-daemon.service    # [Service] / Environment=SPO_AUTO_PULL_MS=0
+
+# 2. deploy the code
 cd ~/SPO-Pipeline && git pull
 
-# 2. regenerate the unit (SuccessExitStatus, TimeoutStopSec) and re-arm the hooks
+# 3. MIGRATE THE STATE. 20 MB, ~67 cards. Nothing runs until this is done.
+mkdir -p ~/.spo-state
+mv ~/SPO-Pipeline/journal ~/.spo-state/journal
+mv ~/SPO-Pipeline/queue   ~/.spo-state/queue
+
+# 4. regenerate both units (they now run from ~/.spo-current) and cut the first release
 scripts/daemon-install.sh
+scripts/dashboard-install.sh
+
+# 5. check
+scripts/release.sh --list
+bin/spo status
+systemctl --user status spo-pipeline-daemon.service
 ```
 
-`daemon-install.sh` ends with `enable --now` + `restart`: it **starts the daemon**. With
-`SPO_AUTO_PULL_MS` at its current `300000` that means claiming cards. Set the drop-in to
-`SPO_AUTO_PULL_MS=0` first if the box should come back up idle.
+After this, `git pull` in `~/SPO-Pipeline` is the whole deploy: it cuts a release, moves the
+symlink and drain-restarts. A pull in any other worktree deploys nothing and says so.
 
-**And correct the drop-in's own comment**, which §2.2 shows to be wrong
+**Correct the `auto-pull-on.conf` drop-in's own comment**, which §2.2 shows to be wrong
 (`~/.config/systemd/user/spo-pipeline-daemon.service.d/auto-pull-on.conf`). Its last paragraph
-should read: a restart no longer kills the in-flight card at all — it drains, up to 45 minutes; only
-a card still running past that bound is signalled, and such a card parks with a *step-level* reason
-(`llm-transport-failed:<STEP>`, auto-retried; or a `*-timed-out` reason, which is not) far more often
-than with `task-orphaned-daemon-restart`.
+should read: a restart no longer kills the in-flight card at all — it drains, up to 45 minutes;
+only a card still running past that bound is signalled, and such a card parks with a *step-level*
+reason far more often than with `task-orphaned-daemon-restart`.
+
+### Rolling back
+
+```bash
+scripts/release.sh --rollback
+```
+
+Moves `~/.spo-current` to the previous release and drain-restarts. The previous release is never
+pruned, however old, so this always has somewhere to go.

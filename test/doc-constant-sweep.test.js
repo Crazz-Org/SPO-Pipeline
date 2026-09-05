@@ -1335,7 +1335,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1135",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1141",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1366,7 +1366,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1135",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1141",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -1381,16 +1381,16 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:829",
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1350",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1094",
+  "doc/state-machine-spec.md :: bin/spo:1100",
   "doc/state-machine-spec.md :: dispatcher.js:572-586",
-  "doc/state-machine-spec.md :: intake.js:796-798",
+  "doc/state-machine-spec.md :: intake.js:797-799",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:701",
   "orchestrator/README.md :: dispatcher.js:485-499",
   "orchestrator/README.md :: doc/state-machine-spec.md:140",
-  "orchestrator/README.md :: intake.js:796-798",
+  "orchestrator/README.md :: intake.js:797-799",
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
@@ -1400,9 +1400,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
-  "orchestrator/park-loop.js :: intake.js:796-798",
+  "orchestrator/park-loop.js :: intake.js:797-799",
   "orchestrator/state-machine.js :: run.ts:63",
-  "orchestrator/steps/llm.js :: intake.js:796-798",
+  "orchestrator/steps/llm.js :: intake.js:797-799",
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
@@ -2000,7 +2000,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
-  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:796-798`, `orchestrator/steps/
+  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:797-799`, `orchestrator/steps/
   // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:99` (deleted
   // by #109, leaving the two still listed here) -- each citing a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
@@ -2170,9 +2170,9 @@ test('extractAnchorCandidates: a neighbouring citation to a DIFFERENT file clips
 });
 
 test('extractFileMentionCandidates: matches a cross-file basename mention by substring, never the citation\'s own file', () => {
-  const text = '`console/collect.js`, reached from `bin/spo:1135`, reads it by content';
-  const idx = text.indexOf('bin/spo:1135');
-  const end = idx + 'bin/spo:1135'.length;
+  const text = '`console/collect.js`, reached from `bin/spo:1141`, reads it by content';
+  const idx = text.indexOf('bin/spo:1141');
+  const end = idx + 'bin/spo:1141'.length;
   const cands = extractFileMentionCandidates(text, idx, end, null, null, 'bin/spo');
   assert.deepEqual(cands.map((c) => c.ident), ['collect']);
   assert.equal(cands[0].kind, 'file');
@@ -2190,9 +2190,9 @@ test('extractFileMentionCandidates: matches a cross-file basename mention by sub
 
 test('mergedCandidates: falls back to a file-mention candidate ONLY when no identifier candidate exists', () => {
   // No identifier at all near the citation -- must fall back to the file mention.
-  const noIdentText = '`console/collect.js`, reached from `bin/spo:1135`, reads it by content';
-  const idx1 = noIdentText.indexOf('bin/spo:1135');
-  const end1 = idx1 + 'bin/spo:1135'.length;
+  const noIdentText = '`console/collect.js`, reached from `bin/spo:1141`, reads it by content';
+  const idx1 = noIdentText.indexOf('bin/spo:1141');
+  const end1 = idx1 + 'bin/spo:1141'.length;
   const fallback = mergedCandidates(noIdentText, idx1, end1, null, null, 'bin/spo');
   assert.deepEqual(fallback.map((c) => c.ident), ['collect']);
 
@@ -2250,7 +2250,7 @@ test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance eit
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1135 needs it ("collect" inside "collectAll")', () => {
+test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1141 needs it ("collect" inside "collectAll")', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
   const file = path.join(dir, 'target.txt');
   fs.writeFileSync(file, ['line one', 'const data = collectAll(sources);', 'line three'].join('\n'));
@@ -2304,7 +2304,7 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1135 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1141 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
@@ -2322,7 +2322,15 @@ test('MUTATION PROOF: reverting bin/spo:1135 back to bin/spo:1129 (the drift thi
   // `cmdDashboard` on a comment line naming neither collect nor a code-shaped candidate, so it
   // fails for the right reason. See the two "canary green for an accidental reason" notes
   // above: a canary that passes for a reason unrelated to what it watches is worse than none.
-  const reverted = normalized.replace('reached from `bin/spo:1135`', 'reached from `bin/spo:1129`');
+  //
+  // FIFTH catch, same day: moving state out of the repo (orchestrator/state-root.js) added six
+  // lines to `resolveDirs` near the top of bin/spo, so `collectAll(sources)` is now :1141. The
+  // canary stays `:1129` -- it is still wrong, still for the right reason, and re-pointing it at
+  // each new correct value would only ever re-test the value the check just verified. What this
+  // repetition is really saying is that a LINE-NUMBER citation into a file under active edit
+  // cannot be kept true by discipline; it is a standing tax the symbol-citation conversion
+  // (action M17) exists to retire, and this one has now been paid five times.
+  const reverted = normalized.replace('reached from `bin/spo:1141`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');

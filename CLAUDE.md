@@ -83,12 +83,16 @@ Two distinct kinds of worktree, in two distinct places:
   hand while a task is running.
 - `.claude/worktrees/<slug>/` — working worktrees on *this* repo.
 
-**After every merge into `main`, deploy it.** A merge on GitHub deploys nothing: the running
-daemon and dashboard keep executing the code they started with. Go to the main checkout
-(`~/SPO-Pipeline`, not a worktree) and `git pull` — that fires `.git/hooks/post-merge`
-(`scripts/git-hooks/post-merge`), which restarts `spo-pipeline-daemon.service` and
-`spo-pipeline-dashboard.service` if either is active *or* enabled. The pull is what deploys; the
-merge is not, and neither is a worktree's own pull.
+**After every merge into `main`, deploy it.** A merge on GitHub deploys nothing. `git pull` in
+`~/SPO-Pipeline` — **that checkout only** — fires `.git/hooks/post-merge`, which cuts
+`~/.spo-releases/<sha>`, moves the `~/.spo-current` symlink the units run from, and drain-restarts
+(`doc/deployment.md`). A pull or `git merge --ff-only` in any *other* worktree deploys nothing and
+says so; it used to restart the services, which under this layout would have deployed that
+worktree's branch.
+
+**The services never read a checkout you edit**, so editing `~/SPO-Pipeline` no longer edits a
+running program — but state lives at `~/.spo-state/{queue,journal}` now, and the daemon refuses to
+start if it would land on an empty journal.
 
 **A restart now DRAINS** (`doc/deployment.md`): it stops claiming, lets the cards in flight finish
 — up to `config.drainTimeoutMs`, 45 min — then exits 0. A second signal stops immediately. So a

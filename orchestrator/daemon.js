@@ -86,6 +86,7 @@ const { appendDaemonEvent, appendEvent } = require('./journal');
 const { orphanScan } = require('./orphan-scan');
 const { createDispatcher } = require('./dispatcher');
 const { readPipelineVersion } = require('./pipeline-version');
+const { resolveStateRoot, stateQueueDir, stateJournalRoot, assertStateMigrated } = require('./state-root');
 
 // Resolved once at require time, in EVERY mode (dispatcher, worker, scanner) -- see
 // pipeline-version.js's header. A worker resolves it from its own __dirname, which is the point:
@@ -410,8 +411,16 @@ async function main() {
   }
 
   const repoRoot = path.join(__dirname, '..');
-  const queueDir = opts.queue || path.join(repoRoot, 'queue');
-  const journalRoot = opts.journal || path.join(repoRoot, 'journal');
+  // State lives OUTSIDE the tree (orchestrator/state-root.js). Under the immutable-release layout
+  // this process runs from ~/.spo-releases/<sha>, a new tree per deploy -- state kept inside it
+  // would be abandoned on every release. An explicit --queue/--journal still wins outright, which
+  // is what the whole test suite and recette.js depend on.
+  const stateRoot = resolveStateRoot();
+  // Only guard the DEFAULT path: a caller that named its own directories has said where it wants
+  // to look, and a throwaway temp root is never "un-migrated".
+  if (!opts.queue || !opts.journal) assertStateMigrated(repoRoot, stateRoot);
+  const queueDir = opts.queue || stateQueueDir(stateRoot);
+  const journalRoot = opts.journal || stateJournalRoot(stateRoot);
   fs.mkdirSync(queueDir, { recursive: true });
   fs.mkdirSync(journalRoot, { recursive: true });
 

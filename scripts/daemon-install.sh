@@ -28,6 +28,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# The symlink the unit runs from, and the releases it points into. Overridable for tests and for
+# anyone running a second pipeline on one box; see scripts/release.sh for the same two names.
+CURRENT_LINK="${SPO_CURRENT_LINK:-$HOME/.spo-current}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/spo-pipeline-daemon.service"
 
@@ -66,8 +69,14 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-WorkingDirectory=$REPO
-ExecStart=$NODE_BIN orchestrator/daemon.js --real
+# THE UNIT RUNS FROM THE RELEASE SYMLINK, NEVER FROM A CHECKOUT ANYONE EDITS. $REPO is the tree a
+# human edits and 'git pull' mutates; ~/.spo-current is a symlink to an immutable
+# ~/.spo-releases/<sha> (scripts/release.sh). systemd resolves it at start, and Node resolves
+# __dirname to the REALPATH -- so a running daemon keeps spawning its workers out of the tree it
+# started in even after a later deploy moves the symlink. That is what makes version cohesion a
+# property of the layout instead of a race against dispatcher.js re-reading DAEMON_PATH per spawn.
+WorkingDirectory=$CURRENT_LINK
+ExecStart=$NODE_BIN $CURRENT_LINK/orchestrator/daemon.js --real
 Restart=always
 RestartSec=5
 # A DELIBERATE STOP IS NOT A FAILURE, and without this line systemd could not tell the two apart.
@@ -109,6 +118,13 @@ Environment=SPO_PARK_ALERT_CMD=$REPO/scripts/park-alert.sh
 [Install]
 WantedBy=default.target
 UNITEOF
+
+# The unit's ExecStart points at $CURRENT_LINK, so there has to BE a release before it can start.
+# Cutting one here (rather than telling the operator to) means `daemon-install.sh` remains the one
+# command that takes a fresh box to a running daemon. --no-restart because the unit below does the
+# starting; letting release.sh restart a unit that does not exist yet would just print a skip.
+echo "== cutting the initial release"
+SPO_CURRENT_LINK="$CURRENT_LINK" "$REPO/scripts/release.sh" --no-restart
 
 systemctl --user daemon-reload
 systemctl --user enable --now spo-pipeline-daemon.service

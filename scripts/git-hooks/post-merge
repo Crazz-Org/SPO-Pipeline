@@ -1,72 +1,62 @@
 #!/usr/bin/env bash
-# Restarts the SPO-Pipeline systemd --user services after this repo is updated (git pull /
-# git merge). Installed as a symlink at .git/hooks/post-merge by daemon-install.sh and
-# dashboard-install.sh -- either install script re-creates the same symlink, so installing
-# one service also arms the restart-on-update behaviour for the other if it's present.
+# post-merge -- THE DEPLOY. `git pull` in the deploy checkout fires this; nothing else deploys.
+# A merge on GitHub deploys nothing, and neither does a pull in any other worktree.
 #
-# Which units get restarted, and why the test is not `is-enabled`.
+# Installed as a symlink at .git/hooks/post-merge by daemon-install.sh and dashboard-install.sh.
 #
-# `is-enabled` answers "does this unit start at boot". That is not the question. The
-# question is "is a process running this repo's code right now, and is it now stale". A
-# systemd unit can be **active and disabled** at the same time -- started by hand, or by an
-# install script, without ever being enabled -- and `spo-pipeline-daemon.service` was
-# exactly that on 2026-09-03: `active=active enabled=disabled`. Every `git pull` printed
-# nothing about it, looked like a deploy, and left the daemon running code from before the
-# merge. It ran eight-hour-old code for a whole working day.
+# WHAT IT DOES NOW, AND WHAT IT NO LONGER DOES. It used to restart the units in place, against a
+# checkout that was simultaneously the tree the service executed, the tree a human edited and the
+# tree the pull had just mutated. Under the immutable-release layout (doc/deployment.md) it instead
+# decides WHETHER to deploy and hands the whole job to scripts/release.sh, which builds
+# ~/.spo-releases/<sha>, moves ~/.spo-current and drain-restarts. Everything this file used to know
+# about `is-active` vs `is-enabled`, `deactivating`, `--no-block` and saying skips out loud lives
+# there now -- one copy, exercised by both the hook and a hand-run deploy.
 #
-# So the test is `is-active OR is-enabled`:
-#   - active  -> it is running this repo's code and that code just changed. Restart it.
-#   - enabled -> it is meant to be running; `restart` starts it if it is not.
-# `list-unit-files` still gates both, so a unit that was never installed is skipped in
-# silence rather than producing an error on every pull.
-#
-# WHY THE SKIP NOW PRINTS. `is-active OR is-enabled` is the right question; being SILENT when the
-# answer is no was not. A unit stopped on purpose is legitimately skipped -- nothing is executing
-# stale code, and starting it here would deploy a service nobody asked for -- but the pull then
-# printed a dashboard restart, said nothing at all about the daemon, and looked exactly like a
-# deploy that had covered both. Worse, the daemon reached that state on EVERY deliberate stop
-# rather than only on request: its SIGTERM handler exits 143, the unit declared no
-# SuccessExitStatus, so `systemctl stop` left it `failed` (fixed in scripts/daemon-install.sh --
-# re-run it). One line costs nothing and makes "not deployed" distinguishable from "deployed".
-#
-# WHY --no-block. `systemctl restart` waits for the stop to finish, and since the drain landed a
-# stop can legitimately take up to config.js's drainTimeoutMs (45 min) while the cards already in
-# flight run to completion. Without --no-block that wait lands on the maintainer's terminal in the
-# middle of `git pull`. With it, the pull returns at once and the restart proceeds on its own: the
-# old daemon claims nothing more, finishes what it has, and the new code takes over when it exits.
-# The deploy becomes asynchronous, which is what a drain makes it whether this hook waits or not.
+# The one decision left here is the one release.sh cannot make: WHICH tree is allowed to deploy.
+# See the comment on SOURCE_REPO below -- it is the difference between a deploy and an agent
+# worktree accidentally publishing its own branch.
+
 set -euo pipefail
 
-for unit in spo-pipeline-daemon.service spo-pipeline-dashboard.service; do
-  systemctl --user list-unit-files "$unit" >/dev/null 2>&1 || continue
+# GIT_* is exported to every hook. Strip it before anything below shells out to git or to
+# release.sh, or those commands act on the hook's own GIT_DIR rather than on the directory they
+# name -- see scripts/release.sh's own header and test/no-git-env-sweep.test.js for what that
+# cost once.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      GIT_COMMON_DIR GIT_PREFIX GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_CONFIG GIT_CONFIG_GLOBAL
 
-  # `is-active` EXITS non-zero for `deactivating`, and since the drain landed a unit can sit there
-  # for the better part of an hour (TimeoutStopSec=2820) while its in-flight cards finish. Before
-  # this the hook read that as "not running, not enabled" and took the skip branch -- so a second
-  # pull during a drain deployed nothing and said so, which is alarming and wrong. It is wrong
-  # because a `restart` is already queued behind that stop, and its START execs from
-  # WorkingDirectory: it will pick up THIS merge too. So the honest answer is "already in flight",
-  # not "skipped". The state is read from stdout, not from the exit code, because the exit code
-  # cannot distinguish `deactivating` from `inactive`.
-  state="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
-  if [ "$state" = 'deactivating' ] || [ "$state" = 'activating' ]; then
-    echo "== post-merge: $unit is $state -- a restart is already in flight and will pick up this merge"
-    continue
-  fi
+# ONE CHECKOUT DEPLOYS, AND IT IS NOT WHICHEVER ONE FIRED THE HOOK.
+#
+# git runs this hook with cwd at the top of the working tree that was updated -- ANY working tree.
+# This repo routinely has a dozen worktrees under .claude/worktrees/, and `git merge --ff-only`
+# inside one of them fires this hook exactly as a pull in the main checkout does. That was already
+# untidy when the hook only restarted services; under the release layout it would be a live
+# hazard, because cutting a release from an agent worktree would DEPLOY THAT WORKTREE'S BRANCH.
+#
+# So the deploy checkout is named, not inferred, and every other tree is skipped out loud.
+HERE="$(pwd -P)"
+SOURCE_REPO="$(cd "${SPO_SOURCE_REPO:-$HOME/SPO-Pipeline}" 2>/dev/null && pwd -P || echo "${SPO_SOURCE_REPO:-$HOME/SPO-Pipeline}")"
+DEPLOY_BRANCH="${SPO_DEPLOY_BRANCH:-main}"
 
-  if [ "$state" = 'active' ]; then
-    reason='running'
-  elif systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
-    reason='enabled'
-  else
-    # Installed but neither running nor enabled: nothing is executing stale code, and
-    # starting it here would deploy a service nobody asked for. Said out loud, because a
-    # silent skip is indistinguishable from a restart that happened.
-    echo "== post-merge: SKIPPING $unit (installed but neither active nor enabled -- nothing to redeploy)"
-    continue
-  fi
+if [ "$HERE" != "$SOURCE_REPO" ]; then
+  echo "== post-merge: $HERE is not the deploy checkout ($SOURCE_REPO) -- nothing deployed"
+  exit 0
+fi
 
-  echo "== post-merge: restarting $unit ($reason; repo updated)"
-  # --no-block: a daemon stop drains in-flight cards and may take up to 45 min. See the header.
-  systemctl --user restart --no-block "$unit" || echo "!! post-merge: failed to restart $unit" >&2
-done
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+if [ "$branch" != "$DEPLOY_BRANCH" ]; then
+  echo "== post-merge: $SOURCE_REPO is on '$branch', not '$DEPLOY_BRANCH' -- nothing deployed"
+  exit 0
+fi
+
+RELEASE_SH="$SOURCE_REPO/scripts/release.sh"
+if [ ! -x "$RELEASE_SH" ]; then
+  echo "!! post-merge: $RELEASE_SH is missing or not executable -- nothing deployed" >&2
+  exit 0
+fi
+
+# release.sh does the whole deploy: build the tree for the new HEAD, move ~/.spo-current, and
+# drain-restart the units (skipping ones that are stopped, saying so, and treating `deactivating`
+# as a restart already in flight). This hook's only job is deciding WHETHER to deploy.
+echo "== post-merge: deploying $(git rev-parse --short HEAD) from $SOURCE_REPO"
+exec "$RELEASE_SH"
