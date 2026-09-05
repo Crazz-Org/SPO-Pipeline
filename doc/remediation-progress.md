@@ -836,6 +836,26 @@ test **once**. The rarer of the two was the only one the project knew about.
   wire. Do NOT promote the key to `required` first. **Overlaps project 2's #31** ("PLAN should park
   a card whose plan requires editing `.claude/**`") — #31 is the behaviour 3.2 was meant to deliver
   and #482 is why it does not; close one with the other or they get worked twice.
+
+  > **CLOSED 2026-09-05, SPO-Pipeline#118** (#482 re-filed here; #31 closed into it, as this entry
+  > asked). `handlePlan` reads `files_to_change` through `normalizeFindingsPayload`, so the
+  > JSON-encoded string the wire actually sends is a declaration and the scan runs on it. Final
+  > corpus numbers before the fix: **93 of 93** PLAN replies carrying the field sent it as a
+  > string, **0** as an array; **44** `plan-files-undeclared` events, every one `receivedType:
+  > "string"`; and **0 of 809** declared paths named a protected file, so the fail-open cost
+  > nothing — luck, not safety (the 12 `.claude/` paths in that corpus are under
+  > `agents/`/`commands/`/`skills/`, which `detectProtectedFiles` deliberately does not match).
+  > Three things came with it. (1) #31's handoff criterion is now met: the plan/invariants files
+  > are written **before** the guard runs, so a parked card leaves `plan-<issue>.md` on disk and
+  > the park detail names it; the baseline still comes after, so a parking card pays for nothing
+  > else. (2) The **INTAKE prose scan was deleted** — one firing in the whole corpus, on
+  > SPO-WebClient#482 itself, whose criterion quotes the protected paths as examples: 0 true
+  > positives, and prose cannot tell a citation from an edit (the same 33%-precision argument that
+  > retired the `plan_markdown` scan). (3) The **reuse-path site is restored**: its deletion
+  > argument ("a dirty plan parks, and that park is plan-invalidating, so it can never be reused")
+  > assumed a guard that worked, and the corpus holds 93 plans whose declarations were never
+  > judged, each one `retry` away from reaching IMPLEMENT unscanned. `files_to_change` stays
+  > `optional`, as this entry required.
 - **`duration_s` has no reader.** 5.4 writes it on every `llm-call`; nothing renders it yet. The
   first card run on C5 code will be the first with per-step timings — `spo task <id>` and the
   dashboard are the natural surfaces.

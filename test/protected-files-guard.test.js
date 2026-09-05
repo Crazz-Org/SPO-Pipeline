@@ -10,18 +10,31 @@
 //   - intake.js's detectProtectedFiles(text) -- the detector itself, a pure, deliberately blunt
 //     case-insensitive substring scan. See its own header comment in orchestrator/intake.js for
 //     the false-positive/false-negative history that led this action to be revised.
-//   - state-machine.js's two call sites: handleIntake (source: 'criterion', scanning the card's
-//     own criterion/title, at zero cost -- INTAKE is scripted) and handlePlan's normal path
-//     (source: 'files_to_change', scanning PLAN's own structured file-list declaration, never
-//     plan_markdown prose -- that is the entire point of this revision).
+//   - state-machine.js's guardDeclaredFiles, reached from BOTH of handlePlan's paths (a fresh
+//     reply and action 3.1's reuse of a plan already on disk): source 'files_to_change', scanning
+//     PLAN's own structured file-list declaration, never plan_markdown prose.
 //
-// A third call site used to exist, on the action-3.1 plan-reuse path (source: 'plan-file',
-// re-reading a reused plan already on disk). It was deleted: every journalled PLAN
-// 'files-written' event in the real corpus carries baseMainSha: undefined (all predate action
-// 3.1), so decidePlanReuse's own condition 2 filters every one of them out before that site could
-// ever run, and any plan written from now on that trips either remaining site parks
-// 'plan-requires-protected-files', which is itself in PLAN_INVALIDATING_PARK_REASONS and so
-// already blocks its own reuse. There is nothing left here to test for that site.
+// Two things changed on 2026-09-05 (#118), and most of this file's edits are theirs:
+//
+//   - The guard had NEVER RUN on a live card. Its shape test was Array.isArray(files_to_change),
+//     and 93 of 93 real PLAN replies deliver that field as a JSON-encoded STRING. The scan sat in
+//     an else-if nothing reached; 44 journalled 'plan-files-undeclared {receivedType:"string"}'
+//     events are the record. It now parses the string shape (through park-loop.js's
+//     normalizeFindingsPayload, the parser VALIDATE's identically-shaped 'findings' already
+//     needed) and scans what it finds.
+//
+//   - handleIntake's site 1 -- the prose scan of the card's own criterion and title -- is GONE.
+//     It fired exactly once in the whole corpus, on SPO-WebClient#482: the card written to fix
+//     the guard, refused by the guard because its criterion QUOTES the protected paths as
+//     examples. Prose cannot tell "EDITS this file" from "CITES this file" -- the same
+//     measurement (33% precision) that had already retired the plan_markdown scan at site 2. The
+//     tests below pin its absence, since that is a deliberate loss, not an oversight.
+//
+// The plan-reuse path had a third call site once; it was deleted on the argument that a dirty
+// plan parks 'plan-requires-protected-files' (a PLAN_INVALIDATING_PARK_REASON) and so can never
+// reach reuse. That argument assumed the guard worked. It did not, so the corpus holds 93 plans
+// whose declarations were never judged, each one 'retry' away from being reused straight into
+// IMPLEMENT -- the site is back, and tested.
 //
 // Same idioms as test/plan-resume.test.js (real-mode ctx via buildCtx + an injected
 // deps.spawnSync, a call-counting spy to prove the LLM step is/isn't invoked) and
@@ -41,6 +54,7 @@ require('./no-real-spawn');
 const intake = require('../orchestrator/intake');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
+const { appendEvent } = require('../orchestrator/journal');
 const { writePoolDir } = require('./helpers');
 
 function mkTmp(prefix) {
@@ -195,78 +209,53 @@ function intakeCtx(task, overrides = {}) {
   return { ctx, spawnSync };
 }
 
-test('handleIntake: parks plan-requires-protected-files, source "criterion", when the CRITERION trips the guard -- zero spawn calls', async () => {
+// #118 -- the regression this removal exists for. Crazz-Org/SPO-WebClient#482 is the card that
+// reported the dead PLAN guard; its acceptance criterion quotes '.claude/settings.json' and
+// '.claude/hooks/*.sh' as the examples a working guard must catch, so site 1 parked it at INTAKE
+// and the fix could not be worked by the pipeline at all. One firing in the entire journal
+// corpus, zero true positives. A card that merely NAMES a protected path must now walk through
+// INTAKE; only PLAN's own machine-readable files_to_change declaration can park it.
+test('handleIntake: a card whose CRITERION quotes a protected path is NOT parked -- reaches WORKTREE and journals INTAKE/ok (the SPO-WebClient#482 regression)', async () => {
   const task = {
     id: 'card-1001',
     kind: 'card',
     issue: 1001,
-    title: 'Allow the new build command',
-    criterion: 'Edit .claude/settings.json to add the npm permission.',
+    title: 'The protected-files guard has never once run',
+    criterion:
+      'a plan declaring .claude/settings.json or .claude/hooks/*.sh parks with plan-requires-protected-files before IMPLEMENT spends anything',
   };
   const { ctx, spawnSync } = intakeCtx(task);
 
-  await assert.rejects(
-    () => HANDLERS.INTAKE(ctx),
-    (err) => {
-      assert.ok(err instanceof ParkSignal);
-      assert.equal(err.reason, 'plan-requires-protected-files');
-      assert.equal(err.detail.source, 'criterion');
-      assert.equal(err.detail.matches.length, 1);
-      assert.equal(err.detail.matches[0].path, '.claude/settings.json');
-      return true;
-    }
+  const next = await HANDLERS.INTAKE(ctx);
+  assert.equal(next, 'WORKTREE');
+  assert.equal(spawnSync.callCount, 0, 'INTAKE still spawns nothing either way');
+
+  const events = readJournal(ctx.taskDir);
+  assert.ok(
+    events.some((e) => e.state === 'INTAKE' && e.event === 'ok'),
+    'INTAKE/ok must be journalled -- the card was not parked'
   );
-  assert.equal(spawnSync.callCount, 0, 'INTAKE must park with zero LLM/spawn calls');
+  assert.ok(
+    !events.some((e) => e.event === 'parked'),
+    'no park event of any reason may be journalled for a card that only CITES a protected path'
+  );
 });
 
-// D9: source must reflect which field actually matched, not just which one is scanned first --
-// a title-only hit reports source: 'title', never 'criterion' (which would misleadingly suggest
-// the human-written acceptance criterion, not the card title, named the protected path).
-test('handleIntake: parks plan-requires-protected-files, source "title", when only the TITLE trips the guard -- zero spawn calls', async () => {
+// The other half of the removed scan: the title was scanned too (with its own 'source' value, so
+// a title-only hit could be told from a criterion hit). Both halves are gone, and a title naming
+// a protected path is now exactly as harmless as one that does not.
+test('handleIntake: a card whose TITLE names a protected path is NOT parked either -- reaches WORKTREE', async () => {
   const task = {
     id: 'card-1002',
     kind: 'card',
     issue: 1002,
     title: 'Patch .claude/hooks/pre-tool-use.sh to allow the new command',
-    criterion: 'the button turns green when the build succeeds',
-  };
-  const { ctx, spawnSync } = intakeCtx(task);
-
-  await assert.rejects(
-    () => HANDLERS.INTAKE(ctx),
-    (err) => {
-      assert.ok(err instanceof ParkSignal);
-      assert.equal(err.reason, 'plan-requires-protected-files');
-      assert.equal(err.detail.source, 'title');
-      assert.equal(err.detail.matches.length, 1);
-      assert.equal(err.detail.matches[0].path, '.claude/hooks/pre-tool-use.sh');
-      return true;
-    }
-  );
-  assert.equal(spawnSync.callCount, 0, 'INTAKE must park with zero LLM/spawn calls');
-});
-
-// D9's other half: when the CRITERION matches (with or without the title also matching),
-// source stays 'criterion' -- criterion takes priority, matching the field order matches are
-// collected in (criterionMatches before titleMatches).
-test('handleIntake: parks plan-requires-protected-files, source "criterion", when the criterion matches even if the title ALSO would', async () => {
-  const task = {
-    id: 'card-1002b',
-    kind: 'card',
-    issue: 10022,
-    title: 'Patch .claude/hooks/pre-tool-use.sh to allow the new command',
-    criterion: 'Edit .claude/settings.json to add the npm permission.',
+    criterion: 'the new command runs without a permission prompt',
   };
   const { ctx } = intakeCtx(task);
 
-  await assert.rejects(
-    () => HANDLERS.INTAKE(ctx),
-    (err) => {
-      assert.ok(err instanceof ParkSignal);
-      assert.equal(err.detail.source, 'criterion');
-      return true;
-    }
-  );
+  const next = await HANDLERS.INTAKE(ctx);
+  assert.equal(next, 'WORKTREE');
 });
 
 test('handleIntake: a clean card does not park -- proceeds to WORKTREE', async () => {
@@ -283,21 +272,7 @@ test('handleIntake: a clean card does not park -- proceeds to WORKTREE', async (
   assert.equal(next, 'WORKTREE');
 });
 
-test('handleIntake: a non-"card" kind is never scanned, even when title/criterion mention a protected path', async () => {
-  const task = {
-    id: 'synthetic-1',
-    kind: 'synthetic',
-    title: 'Edit .claude/settings.json please',
-    criterion: 'edit .claude/hooks/x too',
-  };
-  const taskDir = mkTmp('spo-pfg-intake-noncard-');
-  const ctx = buildCtx(task.id, task, taskDir, { shadowMode: false, dryRun: false, real: false });
-
-  const next = await HANDLERS.INTAKE(ctx);
-  assert.equal(next, 'WORKTREE');
-});
-
-test('handleIntake: shadow.forceState still short-circuits ahead of the protected-files guard', async () => {
+test('handleIntake: shadow.forceState still short-circuits INTAKE entirely', async () => {
   const task = {
     id: 'card-1005',
     kind: 'card',
@@ -313,34 +288,10 @@ test('handleIntake: shadow.forceState still short-circuits ahead of the protecte
   assert.equal(next, 'MERGE');
 });
 
-// ---- Mutant kills (verified by hand: apply the mutation, confirm the suite fails, revert) -----
-
-// M30: moving the INTAKE guard to AFTER appendEvent('INTAKE', 'ok'). A card parked by the guard
-// must never have journalled an 'ok' event first -- the guard has to run, and park, before that
-// line, not merely before the function returns.
-test('handleIntake: a card parked by the protected-files guard journals NO INTAKE/ok event (kills M30)', async () => {
-  const task = {
-    id: 'card-1006',
-    kind: 'card',
-    issue: 1006,
-    title: 'Allow the new build command',
-    criterion: 'Edit .claude/settings.json to add the npm permission.',
-  };
-  const { ctx } = intakeCtx(task);
-
-  await assert.rejects(() => HANDLERS.INTAKE(ctx), ParkSignal);
-
-  const events = readJournal(ctx.taskDir);
-  assert.ok(
-    !events.some((e) => e.state === 'INTAKE' && e.event === 'ok'),
-    'a task parked by the protected-files guard must never have journalled INTAKE/ok'
-  );
-});
-
-// M31: moving the INTAKE guard AHEAD of the real-flag-required gate. The safety gate must win --
-// a real-mode kind:"card" task without config.real, whose criterion ALSO names a protected path,
-// must park real-flag-required, never plan-requires-protected-files.
-test('handleIntake: real-flag-required wins over the protected-files guard when both would fire (kills M31)', async () => {
+// Was M31 ("the real-flag gate must win over the protected-files guard when both would fire").
+// Only one of the two can fire now, but the gate itself is what M31 was really protecting: a
+// real-mode kind:"card" task without config.real must never proceed, whatever its prose says.
+test('handleIntake: real-flag-required still parks a real-mode card without config.real, protected-path prose or not', async () => {
   const task = {
     id: 'card-1007',
     kind: 'card',
@@ -407,7 +358,7 @@ function baseTask(overrides = {}) {
   };
 }
 
-test('handlePlan: parks plan-requires-protected-files, source "files_to_change", when a declared file is .claude/settings.json -- scratch files NOT written, IMPLEMENT never called', async () => {
+test('handlePlan: parks plan-requires-protected-files, source "files_to_change", when a declared file is .claude/settings.json -- plan file WRITTEN and named in the detail, IMPLEMENT never called', async () => {
   const taskDir = mkTmp('spo-pfg-plan-dirty-settings-');
   const worktreePath = mkTmp('spo-pfg-plan-dirty-settings-wt-');
   const dirtyPlan = {
@@ -431,14 +382,30 @@ test('handlePlan: parks plan-requires-protected-files, source "files_to_change",
       assert.equal(err.detail.matches.length, 1);
       assert.equal(err.detail.matches[0].path, '.claude/settings.json');
       assert.deepEqual(err.detail.declaredFiles, dirtyPlan.files_to_change);
+      // #118, folded in from SPO-Pipeline#31: the park must NAME the plan file, which is what
+      // makes the human handoff ("hand plan-<issue>.md to an interactive session") possible.
+      assert.equal(err.detail.planPath, path.join(taskDir, 'scratch', 'plan-1101.md'));
+      assert.equal(err.detail.invariantsPath, path.join(taskDir, 'scratch', 'invariants-1101.md'));
       return true;
     }
   );
 
+  // The inversion of the assertion this test used to make. PLAN now writes plan-1101.md BEFORE
+  // the guard runs: #31's acceptance criterion was that a human can pick the plan up from disk,
+  // and while the park fired first the plan text existed only inside journal.jsonl. Reuse is not
+  // opened up by the earlier write -- 'plan-requires-protected-files' is plan-invalidating, so
+  // decidePlanReuse condition 6 refuses this very plan on the next retry.
   assert.equal(
-    fs.existsSync(path.join(taskDir, 'scratch')),
-    false,
-    'PLAN must park BEFORE scratchDir/fs.mkdirSync -- no scratch/ directory, let alone plan-1101.md, may exist'
+    fs.readFileSync(path.join(taskDir, 'scratch', 'plan-1101.md'), 'utf8'),
+    dirtyPlan.plan_markdown,
+    'the plan a human is told to pick up must actually be on disk, with the text PLAN produced'
+  );
+  assert.ok(fs.existsSync(path.join(taskDir, 'scratch', 'invariants-1101.md')));
+  // ...and the expensive part still does not run for a parking card.
+  const parkedEvents = readJournal(taskDir);
+  assert.ok(
+    !parkedEvents.some((e) => e.state === 'PLAN' && e.event === 'invariants-baseline'),
+    'buildBaseline must still happen strictly after the guard -- a parking card never pays for it'
   );
   assert.equal(spawnSync.callCount, 1, 'only the PLAN call itself ran; IMPLEMENT must never have been invoked');
 });
@@ -470,7 +437,7 @@ test('handlePlan: parks plan-requires-protected-files, source "files_to_change",
     }
   );
 
-  assert.equal(fs.existsSync(path.join(taskDir, 'scratch')), false);
+  assert.ok(fs.existsSync(path.join(taskDir, 'scratch', 'plan-1103.md')));
   assert.equal(spawnSync.callCount, 1);
 });
 
@@ -592,8 +559,13 @@ test('handlePlan: files_to_change is a STRING (not an array) -- journals plan-fi
   assert.equal(next, 'IMPLEMENT');
   const events = readJournal(taskDir);
   const ev = events.find((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared');
-  assert.ok(ev, 'expected a plan-files-undeclared event -- a bare string must never be scanned as if it were the array');
+  assert.ok(ev, 'expected a plan-files-undeclared event -- a bare string that is not JSON holds no declaration to scan');
   assert.equal(ev.receivedType, 'string');
+  // #118: receivedType alone cannot tell this from the JSON-encoded string the wire actually
+  // sends (both are typeof 'string'), and telling them apart is the whole evidence base for the
+  // eventual promotion of files_to_change to a required key -- so the parser's own verdict is
+  // journalled alongside it.
+  assert.equal(ev.shape, 'unparsable-string');
 });
 
 test('handlePlan: files_to_change contains a NON-STRING entry -- journals plan-files-undeclared, does not park, reaches IMPLEMENT', async () => {
@@ -765,4 +737,218 @@ test('prompts/plan.md: the files_to_change instruction is numbered item 4 (kills
   const match = planMd.match(/^(\d+)\.\s+\*\*`files_to_change`\*\*/m);
   assert.ok(match, 'expected a numbered list item introducing files_to_change');
   assert.equal(match[1], '4');
+});
+
+// =============================================================================================
+// ---- handlePlan: the JSON-encoded string shape -- #118, the defect that made the guard dead ---
+// =============================================================================================
+
+// Measured on the real corpus 2026-09-05: 93 of 93 PLAN replies that carry files_to_change send
+// it like this -- a JSON-encoded STRING holding an array of ABSOLUTE paths under the card's
+// worktree -- and 0 send a real array. Every test above this line that feeds a bare array is
+// therefore testing a shape no live card has ever produced; these are the ones that exercise the
+// wire.
+function jsonStringPlanCtx(idSuffix, filesToChangeJson, extra = {}) {
+  const taskDir = mkTmp(`spo-pfg-wire-${idSuffix}-`);
+  const worktreePath = mkTmp(`spo-pfg-wire-${idSuffix}-wt-`);
+  const payload = {
+    ok: true,
+    plan_markdown: '# Plan\n\nAdd a status badge to the header.\n',
+    invariants_markdown: '# Invariants\n\nINV-1: ...\n',
+    invariant_ids: ['INV-1'],
+    check_commands: ['npm run typecheck'],
+    files_to_change: filesToChangeJson,
+    ...extra,
+  };
+  const spawnSync = countingSpawn(planReplyEnvelope(payload));
+  const task = baseTask({ id: `card-wire-${idSuffix}`, issue: 1300 });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  return { ctx, taskDir, spawnSync, payload };
+}
+
+// THE regression test for #118. Before the fix this exact input reached IMPLEMENT: Array.isArray
+// said false, the guard journalled plan-files-undeclared and fell through to an else-if it could
+// not reach. It must now park -- and on the absolute path shape prompts/plan.md actually
+// specifies, which is the trap the card flagged as assumed-but-unpinned.
+test('handlePlan: files_to_change as a JSON-ENCODED STRING naming .claude/settings.json parks plan-requires-protected-files (the #118 regression -- this is the shape 93/93 real replies send)', async () => {
+  const declared = ['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/components/Header.tsx', '/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/settings.json'];
+  const { ctx, taskDir, spawnSync } = jsonStringPlanCtx('settings', JSON.stringify(declared));
+
+  await assert.rejects(
+    () => HANDLERS.PLAN(ctx),
+    (err) => {
+      assert.ok(err instanceof ParkSignal);
+      assert.equal(err.reason, 'plan-requires-protected-files');
+      assert.equal(err.detail.source, 'files_to_change');
+      assert.equal(err.detail.matches.length, 1);
+      assert.equal(err.detail.matches[0].path, '.claude/settings.json');
+      assert.deepEqual(err.detail.declaredFiles, declared, 'the park reports the paths as declared, absolute');
+      assert.equal(err.detail.declaredFileCount, 2);
+      return true;
+    }
+  );
+
+  assert.equal(spawnSync.callCount, 1, 'IMPLEMENT must never have been invoked');
+  const events = readJournal(taskDir);
+  assert.ok(
+    !events.some((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared'),
+    'a JSON-encoded array of strings IS a declaration -- journalling it as undeclared is the old bug'
+  );
+});
+
+test('handlePlan: files_to_change as a JSON-encoded string naming a file under .claude/hooks/ parks too -- absolute path, matched on the substring', async () => {
+  const { ctx } = jsonStringPlanCtx('hooks', JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/hooks/pre-tool-use.sh']));
+
+  await assert.rejects(
+    () => HANDLERS.PLAN(ctx),
+    (err) => {
+      assert.equal(err.reason, 'plan-requires-protected-files');
+      assert.equal(err.detail.matches[0].path, '.claude/hooks/pre-tool-use.sh');
+      return true;
+    }
+  );
+});
+
+// The negative that keeps the fix honest, drawn from the corpus rather than invented: the only
+// '.claude/' paths any real plan has ever declared are under .claude/agents/, .claude/commands/
+// and .claude/skills/ (12 entries, issues #640 and #671). Those are ordinary editable files --
+// detectProtectedFiles deliberately matches only settings.json, settings.local.json and
+// .claude/hooks/. A guard that starts firing must not start firing wrongly.
+test('handlePlan: a JSON-encoded declaration naming .claude/agents/ and .claude/commands/ files does NOT park -- reaches IMPLEMENT (the real corpus shape from issues #640/#671)', async () => {
+  const { ctx, taskDir } = jsonStringPlanCtx(
+    'agents',
+    JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/agents/citation-verifier.md', '/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/commands/triage-report.md'])
+  );
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  const events = readJournal(taskDir);
+  assert.ok(!events.some((e) => e.event === 'parked'));
+  assert.ok(!events.some((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared'));
+});
+
+test('handlePlan: a clean JSON-encoded declaration reaches IMPLEMENT and journals NO plan-files-undeclared -- the 44 fail-open events end here', async () => {
+  const { ctx, taskDir } = jsonStringPlanCtx('clean', JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/components/Header.tsx']));
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  const events = readJournal(taskDir);
+  assert.ok(!events.some((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared'));
+  assert.ok(fs.existsSync(path.join(taskDir, 'scratch', 'plan-1300.md')));
+});
+
+test('handlePlan: "[]" -- an EMPTY JSON-encoded array is a clean declaration, exactly like the empty array: no park, no plan-files-undeclared', async () => {
+  const { ctx, taskDir } = jsonStringPlanCtx('empty', '[]');
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  const events = readJournal(taskDir);
+  assert.ok(!events.some((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared'));
+});
+
+test('handlePlan: a JSON string that parses to an OBJECT is still undeclared -- receivedType "string", shape "json-string-object"', async () => {
+  const { ctx, taskDir } = jsonStringPlanCtx('object', '{"files":["a.ts"]}');
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  const ev = readJournal(taskDir).find((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared');
+  assert.ok(ev);
+  assert.equal(ev.receivedType, 'string');
+  assert.equal(ev.shape, 'json-string-object');
+});
+
+test('handlePlan: a JSON string that parses to an array with a NON-STRING entry is undeclared -- receivedType "json-string-with-non-string-entry"', async () => {
+  const { ctx, taskDir } = jsonStringPlanCtx('mixed', JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/a.ts', 42]));
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  const ev = readJournal(taskDir).find((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared');
+  assert.ok(ev);
+  assert.equal(ev.receivedType, 'json-string-with-non-string-entry');
+  assert.equal(ev.shape, 'json-string');
+});
+
+// =============================================================================================
+// ---- handlePlan: the action-3.1 reuse path scans its carried-forward declaration (#118) -------
+// =============================================================================================
+
+// The site deleted when this action was first revised, restored because its deletion argument
+// assumed a guard that worked. It did not: the corpus holds 93 plans whose files_to_change was
+// never judged, and any one of them is a single `retry` away from being reused straight into
+// IMPLEMENT. Fixture shape borrowed from test/plan-resume.test.js's priorPlanRun.
+function priorPlanRun(taskDir, { baseMainSha, filesToChange }) {
+  const dir = path.join(taskDir, 'scratch');
+  fs.mkdirSync(dir, { recursive: true });
+  const planPath = path.join(dir, 'plan-1400.md');
+  const invariantsPath = path.join(dir, 'invariants-1400.md');
+  fs.writeFileSync(planPath, '# Plan\n\nDo the thing.\n');
+  fs.writeFileSync(invariantsPath, '# Invariants\n\nINV-1: ...\n');
+  const payload = {
+    ok: true,
+    plan_path: planPath,
+    invariants_path: invariantsPath,
+    invariant_ids: ['INV-1'],
+    check_commands: ['npm run typecheck'],
+    files_to_change: filesToChange,
+  };
+  appendEvent(taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha });
+  appendEvent(taskDir, 'PLAN', 'result', { payload });
+  return { planPath, invariantsPath };
+}
+
+test('handlePlan: a REUSED plan whose declaration names a protected file parks instead of reaching IMPLEMENT -- reused:true in the detail, LLM never invoked', async () => {
+  const taskDir = mkTmp('spo-pfg-reuse-dirty-');
+  const worktreePath = mkTmp('spo-pfg-reuse-dirty-wt-');
+  const { planPath } = priorPlanRun(taskDir, {
+    baseMainSha: 'sha-X',
+    filesToChange: JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/settings.json']),
+  });
+  const spawnSync = countingSpawn(planReplyEnvelope({ ok: true, plan_markdown: 'must not be read', invariants_markdown: 'must not be read' }));
+  const task = baseTask({ id: 'card-1400', issue: 1400, baseMainSha: 'sha-X' });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+
+  await assert.rejects(
+    () => HANDLERS.PLAN(ctx),
+    (err) => {
+      assert.ok(err instanceof ParkSignal);
+      assert.equal(err.reason, 'plan-requires-protected-files');
+      assert.equal(err.detail.source, 'files_to_change');
+      assert.equal(err.detail.reused, true, 'the detail must say the declaration came from a reused plan');
+      assert.equal(err.detail.planPath, planPath);
+      return true;
+    }
+  );
+  assert.equal(spawnSync.callCount, 0, 'a reuse never calls the LLM -- not even to park');
+
+  const events = readJournal(taskDir);
+  assert.ok(events.some((e) => e.event === 'plan-reused'), 'the run really did take the reuse path');
+  assert.ok(
+    !events.some((e) => e.state === 'PLAN' && e.event === 'invariants-baseline'),
+    'the guard runs before the baseline rebuild on the reuse path too'
+  );
+});
+
+test('handlePlan: a REUSED plan with a clean declaration still reaches IMPLEMENT -- the restored site does not break reuse', async () => {
+  const taskDir = mkTmp('spo-pfg-reuse-clean-');
+  const worktreePath = mkTmp('spo-pfg-reuse-clean-wt-');
+  priorPlanRun(taskDir, {
+    baseMainSha: 'sha-X',
+    filesToChange: JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/components/Header.tsx']),
+  });
+  const spawnSync = countingSpawn(planReplyEnvelope({ ok: true, plan_markdown: 'must not be read', invariants_markdown: 'must not be read' }));
+  const task = baseTask({ id: 'card-1401', issue: 1400, baseMainSha: 'sha-X' });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  assert.equal(spawnSync.callCount, 0);
+});
+
+test('handlePlan: a REUSED plan that declares nothing at all journals plan-files-undeclared with reused:true, and still reaches IMPLEMENT', async () => {
+  const taskDir = mkTmp('spo-pfg-reuse-undecl-');
+  const worktreePath = mkTmp('spo-pfg-reuse-undecl-wt-');
+  priorPlanRun(taskDir, { baseMainSha: 'sha-X', filesToChange: undefined });
+  const spawnSync = countingSpawn(planReplyEnvelope({ ok: true, plan_markdown: 'x', invariants_markdown: 'y' }));
+  const task = baseTask({ id: 'card-1402', issue: 1400, baseMainSha: 'sha-X' });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+
+  assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
+  const ev = readJournal(taskDir).find((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared');
+  assert.ok(ev, 'a plan written before this fix carries no declaration at all -- say so on the record');
+  assert.equal(ev.reused, true);
+  assert.equal(ev.receivedType, 'undefined');
 });
