@@ -1081,13 +1081,18 @@ function extractCriterion(body) {
 // what this repo's own permission rules say. A plan that requires editing either of them cannot
 // succeed -- card #428 proved it the expensive way, burning $12.01 across PLAN and IMPLEMENT
 // before parking anyway. CLAUDE.md's own instruction is to park a card like that up front rather
-// than fail it mid-IMPLEMENT; state-machine.js's two call sites (INTAKE on the card's own
-// criterion/title, PLAN on the model's structured `files_to_change` declaration) exist to act on
-// this function's verdict and do exactly that.
+// than fail it mid-IMPLEMENT; state-machine.js's call sites -- since #118 (2026-09-05) both of
+// them inside handlePlan's guardDeclaredFiles, on the model's structured `files_to_change`
+// declaration, on a fresh reply and on a reused plan alike -- exist to act on this function's
+// verdict and do exactly that.
 //
-// This function is applied to short, targeted strings ONLY: a card's criterion/title, and each
-// entry of a plan's declared files_to_change array -- never to free-form prose such as PLAN's
-// plan_markdown. That is a revision, not the original design: the first cut of this guard scanned
+// This function is applied to short, targeted strings ONLY: each entry of a plan's declared
+// files_to_change list -- never to free-form prose such as PLAN's plan_markdown, and, since #118,
+// no longer to a card's own criterion or title either. The INTAKE site that scanned those two
+// fields was removed for the same reason the plan_markdown scan below was: it is prose. It fired
+// once in the entire corpus, on SPO-WebClient#482 -- the card reporting that the PLAN-side guard
+// had never run, whose criterion quotes the protected paths as the examples a working guard must
+// catch. One firing, zero true positives. That is a revision, not the original design: the first cut of this guard scanned
 // plan_markdown directly, on the theory that a false positive is cheap (one park, the offending
 // line quoted verbatim, instantly legible to a maintainer deciding whether to `retry`) next to a
 // false negative's cost (a full PLAN + IMPLEMENT cycle discovering the wall the hard way, exactly

@@ -193,32 +193,29 @@ async function handleIntake(ctx) {
   if (ctx.task.kind === 'card' && isRealMode(ctx) && !(ctx.config && ctx.config.real)) {
     throw new ParkSignal('real-flag-required', { kind: ctx.task.kind });
   }
-  // Action 3.2: the cheapest possible catch for CLAUDE.md's hard wall -- '.claude/settings.json'
-  // and anything under '.claude/hooks/' cannot be edited by an agent no matter what a plan says,
-  // so a card whose own criterion or title already names one of them is doomed before PLAN ever
-  // runs. INTAKE is scripted (no LLM call on this path either way), so parking here costs
-  // literally nothing -- and it still gets the FULL standard park treatment (park comment on the
-  // issue, kanban move, the maintainer's retry/abandon path) that refusing to enqueue the card in
-  // intake.js's pullBoard would not: a refusal there would leave the card silently re-scanned every
-  // cycle, uncommented and unmoved on the board, forever. Card-only (a synthetic/test task has no
-  // criterion/title worth scanning) and string-only (detectProtectedFiles already tolerates
-  // anything else, but there is no reason to call it on a non-string field).
+  // Action 3.2, site 1 -- REMOVED 2026-09-05 (#118), and this comment is the record of why.
   //
-  // This is NOT what saved #428's $12.01 -- #428's own criterion says "both kept hooks" and "the
-  // hook script", never a path, so this scan scores zero hits (true or false) across all 17 real
-  // cards measured. It earns its place anyway: free insurance with no measured false-positive
-  // risk, for the rare card whose human-written criterion or title does name a path directly.
-  if (ctx.task.kind === 'card') {
-    const criterionMatches = typeof ctx.task.criterion === 'string' ? detectProtectedFiles(ctx.task.criterion) : [];
-    const titleMatches = typeof ctx.task.title === 'string' ? detectProtectedFiles(ctx.task.title) : [];
-    const matches = [...criterionMatches, ...titleMatches];
-    if (matches.length > 0) {
-      // source reflects which field actually matched, not just which one was scanned first: a
-      // criterion-only hit is 'criterion', a title-only hit is 'title' -- see D9 test coverage.
-      const source = criterionMatches.length > 0 ? 'criterion' : 'title';
-      throw new ParkSignal('plan-requires-protected-files', { source, matches });
-    }
-  }
+  // A kind:"card" task's own criterion and title used to be scanned here for a protected-file
+  // mention, parking the card at zero cost before PLAN ever ran. That scan was PROSE, and prose
+  // cannot tell "my criterion EDITS this file" from "my criterion CITES this file" -- the exact
+  // structural argument that had already retired the plan_markdown scan at site 2 (33% precision,
+  // 2 false positives against 1 true positive across all 17 real plans) was never applied to this
+  // site, which reads text of the same kind from the same kind of author.
+  //
+  // Measured over the whole journal corpus: this site fired EXACTLY ONCE, on 2026-09-04, on
+  // Crazz-Org/SPO-WebClient#482 -- the card written to repair the very guard below, whose
+  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples
+  // of what a working guard must catch. One firing, one false positive, zero true positives, and
+  // the card it refused was the fix. The header's own defence ("free insurance with no measured
+  // false-positive risk") was written before there was any measurement; there is now, and it says
+  // the opposite.
+  //
+  // What is given up: the rare card whose human-written criterion really does name a protected
+  // path now costs one PLAN call before parking, instead of parking free at INTAKE. What is kept:
+  // the signal that is actually machine-readable -- PLAN's own files_to_change declaration
+  // (guardDeclaredFiles below), documented in prompts/plan.md as the files the plan will CHANGE,
+  // never the ones it reads, cites, or asserts the absence of. #118 made that site reachable for
+  // the first time, which is what makes dropping this one affordable.
   appendEvent(ctx.taskDir, 'INTAKE', 'ok', { title: ctx.task.title, kind: ctx.task.kind });
   return 'WORKTREE';
 }
@@ -383,6 +380,95 @@ function decidePlanReuse(ctx) {
   return { planPath, invariantsPath, baseMainSha, previousPayload };
 }
 
+// Action 3.2, site 2, revised again 2026-09-05 (#118) -- the ONE place PLAN's declared file list
+// is normalized, judged and journalled, called from both of handlePlan's paths: a fresh reply, and
+// action 3.1's reuse of a plan already on disk.
+//
+// The shape test used to be `Array.isArray(payload.files_to_change)`, inline, and it never once
+// passed. Measured across the whole journal corpus on 2026-09-05: of 151 PLAN 'result' events, 93
+// carry files_to_change and every single one of them delivers it as a JSON-ENCODED STRING
+// ('["/abs/path", ...]'), 0 as a real array. So the scan sat in an `else if` no live card ever
+// reached and action 3.2's guard had never run, on any card, since it was built -- 44 journalled
+// `plan-files-undeclared { receivedType: "string" }` events are the fail-open record of it. Nothing
+// was lost by luck alone: of 809 declared paths in that corpus, 0 name a protected file (12 name
+// `.claude/agents|commands|skills/*`, which detectProtectedFiles deliberately does not match).
+//
+// This is the same shape park-loop.js's normalizeFindingsPayload was written for when VALIDATE's
+// `findings` turned out to arrive the same way, so it is reused here rather than reimplemented:
+// exactly one definition of "an array, or a JSON string holding one, or neither".
+//
+// What counts as a DECLARATION is the array and json-string-of-array shapes only. Everything else
+// -- absent, null, an object, a bare unparsable string -- is journalled as 'plan-files-undeclared'
+// and proceeds unparked, exactly as before: a reply that fails to declare must never fall back to
+// scanning plan_markdown prose (33% precision over 17 real plans -- the measurement that produced
+// this site in the first place), and files_to_change stays `optional` in step-contracts.js, since
+// promoting it to `required` while this was broken would have turned a silent fail-open into a
+// park on every card. An empty list IS a declaration ("this plan changes nothing already on
+// record" -- a docs-only or investigation-only plan): declared and clean, no event, no park.
+//
+// The declared paths arrive ABSOLUTE, under the card's worktree
+// ('/home/crazz/SPO-Pipeline/worktrees/issue-473/src/...'), per prompts/plan.md's own contract.
+// detectProtectedFiles substring-matches, so an absolute path still trips it -- pinned by a test
+// rather than assumed, since it was the trap #118 flagged as unverified.
+function guardDeclaredFiles(ctx, rawFilesToChange, provenance) {
+  const declared = normalizeFindingsPayload(rawFilesToChange);
+  const isList = declared.shape === 'array' || declared.shape === 'json-string';
+  const filesToChange = isList ? declared.items : [];
+  const allStrings = filesToChange.every((f) => typeof f === 'string');
+  if (!isList || !allStrings) {
+    appendEvent(ctx.taskDir, 'PLAN', 'plan-files-undeclared', {
+      // Unchanged for every shape that could already reach this line -- 'undefined' (absent),
+      // 'object' (null or a real object), 'string' (a bare string that is not JSON), and
+      // 'array-with-non-string-entry' all still report exactly what they reported before, so the
+      // 44 events already on the record stay comparable with the ones written from here on. The
+      // one new value is the json-string that parses to something other than a list of strings.
+      receivedType: !isList
+        ? typeof rawFilesToChange
+        : declared.shape === 'array'
+          ? 'array-with-non-string-entry'
+          : 'json-string-with-non-string-entry',
+      // `shape` is normalizeFindingsPayload's own verdict, journalled alongside receivedType
+      // rather than instead of it: 'unparsable-string' and 'json-string-object' both report
+      // receivedType 'string', and telling them apart is the whole evidence base for the eventual
+      // required-key promotion.
+      shape: declared.shape,
+      // String(...) wraps the JSON.stringify call: a function value (unreachable from the wire,
+      // where this payload is always JSON.parse'd, but reachable from a hand-built ctx) makes
+      // JSON.stringify return `undefined`, and `undefined.slice` would throw a TypeError that
+      // escapes handlePlan past runTask's ParkSignal-only catch and kills the daemon. One
+      // character of belt-and-braces against that.
+      receivedSample: String(JSON.stringify(rawFilesToChange === undefined ? null : rawFilesToChange)).slice(0, 200),
+      ...provenance,
+    });
+    return;
+  }
+  if (filesToChange.length === 0) return;
+  // D1: detectProtectedFiles already caps matches PER CALL (PROTECTED_MATCH_CAP), but this site
+  // flatMaps it across every declared file, so the total is unbounded (N x PROTECTED_MATCH_CAP).
+  // declaredFiles below used to be filesToChange verbatim -- the whole array, uncapped in both
+  // element count and element length. Both go straight into the park detail, which park-loop.js
+  // JSON.stringifies into a GitHub comment body: GitHub caps comment bodies at 65536 chars, and
+  // measured pathological inputs blow past that (a single 70000-char entry alone produces a
+  // 70375-char detail; ~550 protected entries crosses 65536). When that happens `gh issue
+  // comment` exits non-zero, park-loop.js journals park-comment-failed and returns with NO
+  // comment posted -- and, per the pre-existing (not fixed here) null-anchor bug in
+  // findParkAnchor/unparkScan/comment-scan.js, the card also becomes retry/abandon-able by any
+  // historical comment on the issue thread. Cap both the matches (defense in depth -- already
+  // capped per-file, this caps the total across all files) and the declared-files list itself,
+  // and record the true count separately so a truncated list is never mistaken for the whole
+  // one.
+  const protectedMatches = filesToChange.flatMap((f) => detectProtectedFiles(f)).slice(0, PROTECTED_MATCH_CAP);
+  if (protectedMatches.length > 0) {
+    throw new ParkSignal('plan-requires-protected-files', {
+      source: 'files_to_change',
+      matches: protectedMatches,
+      declaredFiles: filesToChange.slice(0, 50).map((f) => f.slice(0, PROTECTED_LINE_MAX_LENGTH)),
+      declaredFileCount: filesToChange.length,
+      ...provenance,
+    });
+  }
+}
+
 async function handlePlan(ctx) {
   // Action 3.1: a still-valid plan from an earlier run short-circuits everything below, including
   // the LLM call itself -- that IS the point, not an optimization bolted onto a call that still
@@ -395,6 +481,18 @@ async function handlePlan(ctx) {
     // this run" (notably recette.js's assertion set) still finds one, exactly as the normal path
     // below produces.
     appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha });
+
+    // #118: the reuse path scans the carried-forward declaration too. A third call site here was
+    // deleted when site 2 was first revised, on the argument that a plan tripping site 2 parks
+    // 'plan-requires-protected-files', which is plan-invalidating, so a dirty plan could never
+    // reach reuse in the first place. That argument held only while site 2 worked -- and site 2
+    // has never worked. Every plan written between action 3.2 and this fix passed through an
+    // Array.isArray test that rejected its own wire shape, so the corpus holds 93 plans whose
+    // declarations were never judged; each is one `retry` away from being reused straight into
+    // IMPLEMENT, unscanned. The invariant this restores is the one worth stating: no plan reaches
+    // IMPLEMENT without its declared file list having been read at least once. Cost when the
+    // declaration is clean: one regex pass over an array already in memory.
+    guardDeclaredFiles(ctx, previousPayload.files_to_change, { planPath, invariantsPath, reused: true });
 
     // The action-1.8 invariants baseline is rebuilt exactly as the normal path does, below --
     // never reused itself. Reuse is a bet on the PLAN TEXT still being right, not on which
@@ -473,66 +571,6 @@ async function handlePlan(ctx) {
     throw new ParkSignal('plan-invalid', { payload, missing });
   }
 
-  // Action 3.2, site 2 (revised -- see intake.js's detectProtectedFiles header for the detector's
-  // own rationale). The original design scanned plan_markdown prose; measured against all 17 real
-  // plans in journal/*/scratch/plan-*.md, that scan fired on 3 -- one true positive (#428) and two
-  // false positives, both cards already DONE (issue-418's plan ASSERTS a hook is ABSENT; issue-429
-  // CITES `.claude/settings.json` as evidence). 33% precision, and structural, not bad luck:
-  // prompts/plan.md's own falsification-sweep requirement, plus SPO-WebClient's CLAUDE.md fed to
-  // every PLAN call as domain context, guarantee the prose will keep citing protected paths it has
-  // no intention of touching. Prose cannot tell "my plan EDITS this file" from "my plan CITES this
-  // file" -- so this site now scans `payload.files_to_change` instead: prompts/plan.md's
-  // machine-readable "which files" declaration (documented there as files the plan will CHANGE,
-  // never files it merely reads, cites, or asserts the absence of), never plan_markdown itself.
-  //
-  // files_to_change is deliberately `optional` in step-contracts.js, not `required` (see that
-  // file's own comment on why) -- a reply that omits it, or sends anything other than a clean
-  // array of strings, must NEVER fall back to scanning plan_markdown; that would reinstate the
-  // 33%-precision behaviour this revision exists to remove. Instead it is journalled as
-  // 'plan-files-undeclared' (what was actually received, capped) -- the evidence the eventual
-  // required-key promotion will be made from -- and the run proceeds exactly as it did before this
-  // guard existed. An empty array IS a declaration ("this plan changes nothing already on record"
-  // -- a docs-only or investigation-only plan), so it counts as declared and clean: no event, no
-  // park.
-  const filesToChange = payload.files_to_change;
-  const filesToChangeIsValid =
-    Array.isArray(filesToChange) && filesToChange.every((f) => typeof f === 'string');
-  if (!filesToChangeIsValid) {
-    appendEvent(ctx.taskDir, 'PLAN', 'plan-files-undeclared', {
-      receivedType: Array.isArray(filesToChange) ? 'array-with-non-string-entry' : typeof filesToChange,
-      // String(...) wraps the JSON.stringify call: a function value (unreachable from the wire,
-      // where this payload is always JSON.parse'd, but reachable from a hand-built ctx) makes
-      // JSON.stringify return `undefined`, and `undefined.slice` would throw a TypeError that
-      // escapes handlePlan past runTask's ParkSignal-only catch and kills the daemon. One
-      // character of belt-and-braces against that.
-      receivedSample: String(JSON.stringify(filesToChange === undefined ? null : filesToChange)).slice(0, 200),
-    });
-  } else if (filesToChange.length > 0) {
-    // D1: detectProtectedFiles already caps matches PER CALL (PROTECTED_MATCH_CAP), but this site
-    // flatMaps it across every declared file, so the total is unbounded (N x PROTECTED_MATCH_CAP).
-    // declaredFiles below used to be filesToChange verbatim -- the whole array, uncapped in both
-    // element count and element length. Both go straight into the park detail, which park-loop.js
-    // JSON.stringifies into a GitHub comment body: GitHub caps comment bodies at 65536 chars, and
-    // measured pathological inputs blow past that (a single 70000-char entry alone produces a
-    // 70375-char detail; ~550 protected entries crosses 65536). When that happens `gh issue
-    // comment` exits non-zero, park-loop.js journals park-comment-failed and returns with NO
-    // comment posted -- and, per the pre-existing (not fixed here) null-anchor bug in
-    // findParkAnchor/unparkScan/comment-scan.js, the card also becomes retry/abandon-able by any
-    // historical comment on the issue thread. Cap both the matches (defense in depth -- already
-    // capped per-file, this caps the total across all files) and the declared-files list itself,
-    // and record the true count separately so a truncated list is never mistaken for the whole
-    // one.
-    const protectedMatches = filesToChange.flatMap((f) => detectProtectedFiles(f)).slice(0, PROTECTED_MATCH_CAP);
-    if (protectedMatches.length > 0) {
-      throw new ParkSignal('plan-requires-protected-files', {
-        source: 'files_to_change',
-        matches: protectedMatches,
-        declaredFiles: filesToChange.slice(0, 50).map((f) => f.slice(0, PROTECTED_LINE_MAX_LENGTH)),
-        declaredFileCount: filesToChange.length,
-      });
-    }
-  }
-
   const dir = scratchDir(ctx.taskDir);
   fs.mkdirSync(dir, { recursive: true });
   const issue = ctx.task && ctx.task.issue != null ? ctx.task.issue : ctx.id;
@@ -544,6 +582,19 @@ async function handlePlan(ctx) {
   // compare against (condition 2/3) -- ctx.task.baseMainSha is undefined outside real mode
   // (shadow/dry-run never call realWorktree), which is exactly why reuse never triggers there.
   appendEvent(ctx.taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha: ctx.task.baseMainSha });
+
+  // #118, folded in from SPO-Pipeline#31: the guard now runs AFTER plan-<issue>.md and
+  // invariants-<issue>.md are written, not before. #31's own acceptance criterion was that the
+  // park "surface the plan's own path, so a human can hand plan-<issue>.md to an interactive
+  // session" -- and until now it could not: the park fired ahead of the write, so the plan text
+  // existed only inside journal.jsonl and the promised handoff did not exist even once the
+  // Array.isArray bug above was fixed. Writing first costs one mkdir and two file writes on a card
+  // that is about to park, and buys the maintainer the file itself; the park detail carries the
+  // path. It does NOT open the plan up for reuse: 'plan-requires-protected-files' is in
+  // PLAN_INVALIDATING_PARK_REASONS, so decidePlanReuse's condition 6 refuses the very plan this
+  // park was raised on. The expensive work (buildBaseline, below) still happens strictly after the
+  // guard, so a parking card never pays for it.
+  guardDeclaredFiles(ctx, payload.files_to_change, { planPath, invariantsPath });
 
   // Action 1.8: the PLAN-time invariant baseline. Real mode only (shadow/dry-run never spawn a
   // real worktree for buildBaseline to resolve against, and doc/state-machine-spec.md's
