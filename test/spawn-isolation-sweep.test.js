@@ -446,6 +446,22 @@ const ALLOWLIST = new Map([
     },
   ],
   [
+    'repark-race-demo.test.js',
+    {
+      reason:
+        'the crashed "worker" and the held/unheld repark-child launcher are both `-e` inline ' +
+        'one-liners standing in for a worker/repark-task child (writing a real state.json then ' +
+        'exiting a crash code; waiting on a release file then calling the real, exported ' +
+        'reparkCrashedTask) -- same shape as dispatcher.test.js\'s own worker/scanner stand-ins ' +
+        "above. The one genuinely production-shaped child this file spawns -- the real scanner, " +
+        "via spawnRealScannerFast -- forwards its executable as a bare `cmd` parameter (never a " +
+        "literal process.execPath/'node'/DAEMON/SPO_BIN token), the same shape dispatcher.test.js's " +
+        'own `spawnIsolated` helper already takes, so it is not a corpus site this sweep recognises ' +
+        'as an executable candidate at all -- it still derives its env from isolatedEnv() regardless.',
+      patterns: ["'-e',"],
+    },
+  ],
+  [
     'status-6.7.test.js',
     { reason: 'a trivial `-e` one-liner used only to mint a guaranteed-dead pid -- not daemon.js/bin/spo.', patterns: ["'-e',"] },
   ],
@@ -616,6 +632,7 @@ test('the ALLOWLIST and FILE_ALLOWLIST are pinned by name', () => {
       'product-repo-lock.test.js',
       'recette.test.js',
       'release-script.test.js',
+      'repark-race-demo.test.js',
       'status-6.7.test.js',
       'tokens.test.js',
     ].sort(),
