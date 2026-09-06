@@ -334,7 +334,7 @@ rolling back is *move the symlink back, drain-restart*.
                            The service never reads it.
 ~/.spo-releases/<sha>/     one immutable local clone per release, detached at <sha>
 ~/.spo-current  ->  ~/.spo-releases/<sha>       what both units' ExecStart points at
-~/.spo-state/{queue,journal}                    all mutable state, outside every tree
+~/.spo-state/{queue,journal,queue-refused}      all mutable state, outside every tree
 ```
 
 **The property it rests on is not the symlink — it is that Node resolves `__dirname` to the

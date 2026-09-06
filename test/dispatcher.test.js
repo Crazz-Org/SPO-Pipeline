@@ -378,32 +378,38 @@ test('a worker exiting an unrecognized code IS reparked worker-crashed, with the
 // that already has an outcome: calling it here would make the crash-repark path a SECOND writer
 // racing the terminal write that already legitimately happened -- overwriting a genuine DONE with
 // a spurious PARKED worker-crashed, and (worse, in the DONE case) posting a park comment on an
-// issue whose PR the pipeline may already have opened. Nothing upstream of this function prevents
-// that from being reachable: a stray SIGKILL to a grandchild, a delayed OS signal after runTask's
-// own process.exit(0) call raced its own cleanup -- this check is the only thing standing between
-// that and a corrupted terminal task.
+// issue whose PR the pipeline may already have opened. A stray SIGKILL to a grandchild, or a
+// delayed OS signal after runTask's own process.exit(0) call racing its own cleanup, can still
+// reach this exact path for the SAME worker that owns the taskDir -- this check is the only thing
+// standing between that and a corrupted terminal task. (A DIFFERENT reachability this comment used
+// to also claim as unguarded -- a fresh queue entry duplicating an already-terminal taskDir --
+// is no longer live: card #80 made state-machine.js's takeNextTask itself refuse such a duplicate
+// before ever spawning a worker for it, so this test can no longer use a pre-existing terminal
+// state.json to get a worker claimed and spawned; see below.)
 test('a worker exiting non-zero AFTER its taskDir already reads DONE is journalled worker-exit-after-terminal, never reparked', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-t.json', { id: 'disp-post-terminal', kind: 'synthetic' });
-
-  // Pre-seeds the taskDir with a state.json that already reads DONE, as if a prior (unmodelled)
-  // worker process had already run this task to completion durably on disk -- takeNextTask's own
-  // fs.mkdirSync(taskDir, {recursive: true}) tolerates the directory already existing, so this
-  // does not interfere with the dispatcher's ordinary claim of the queue entry below.
   const taskDir = path.join(journalDir, 'disp-post-terminal');
-  fs.mkdirSync(taskDir, { recursive: true });
-  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({ id: 'disp-post-terminal', state: 'DONE' }));
 
-  // spawnExit(7): a real process that does nothing but exit 7 -- classifyWorkerExit(7) is
-  // 'crashed', which is exactly the outcome that would ordinarily call reparkCrashedWorker.
+  // spawnScannerAliveFor(300, 7): a real process that sleeps 300ms then exits 7 -- classifyWorkerExit(7)
+  // is 'crashed', which is exactly the outcome that would ordinarily call reparkCrashedWorker. The
+  // delay is what lets this test write state.json to DONE AFTER the claim (below) instead of
+  // before it -- pre-seeding it before the claim would now (card #80) get the queue entry refused
+  // by takeNextTask rather than claimed, so no worker would ever be spawned to exit non-zero.
   const config = baseConfig({
     claudeAccountsDir: onePoolDir(1),
-    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn },
+    deps: { spawn: spawnScannerAliveFor(300, 7), spawnScanner: neverExitsSpawn },
   });
   const dispatcher = createDispatcher(queueDir, journalDir, config);
   const runPromise = dispatcher.run();
   try {
+    // Wait for the ordinary claim to land -- task.json renamed into place -- proving takeNextTask
+    // took this FRESH entry normally (there is no terminal state.json yet for it to refuse).
+    await waitFor(() => fs.existsSync(path.join(taskDir, 'task.json')));
+    // NOW simulate the worker's own outcome having already gone durable to disk, while the worker
+    // itself is still alive (asleep) -- the exact race this guard defends against.
+    fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({ id: 'disp-post-terminal', state: 'DONE' }));
     await waitFor(() =>
       readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit-after-terminal' && e.id === 'disp-post-terminal')
     );

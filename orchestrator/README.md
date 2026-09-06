@@ -54,6 +54,19 @@ branches on it. On intake the file is *moved* (not copied) into `journal/<id>/ta
 is both how a polling daemon avoids reprocessing it and what `queue depth` in `spo status`
 counts.
 
+**Card #80:** `takeNextTask` refuses this move when the candidate's id already names a taskDir
+whose `state.json` reads `DONE` or `ABANDONED` — draining over it would silently clobber a
+terminal outcome. The producer is never `spo pull`/auto-pull (`intake.js`'s own
+`taskAlreadyExists` already dedups both against `queue/` and `journal/` before writing), but
+nothing dedups a hand-filed queue entry or a `reEnqueueTask` retry racing a task that finishes
+between the retry being queued and it being taken. `PARKED` is deliberately exempt: it is the
+retry channel, and every
+non-terminal state drains exactly as before. A refused entry is moved to the sibling
+`queue-refused/` directory (never a subdirectory of `queue/`, so it does not inflate `spo
+status`'s queue depth or blind `orphan-scan.js`'s `queuedIds`) and journalled as
+`duplicate-queue-entry-refused` (see "Journal event literals" below) — `state.json` itself is
+never touched.
+
 ## Fixture format
 
 Every scripted or LLM step consults `task.shadow` instead of spawning or calling out. Two
@@ -2178,8 +2191,9 @@ product-repo mutex (`orchestrator/product-repo-lock.js`, `config.js`'s own note 
 acquire it — WORKTREE's setup and FINISH's teardown already take the lock, the same `realWorktree`/
 `realFinish` code every driver runs (via `drainQueueOnce` for `driver: 'inline'`, via a real worker
 process for `driver: 'dispatcher'`). What recette adds on top is a coarser, earlier guard: refusing
-to *start* at all while a live daemon holds **its own** lock file, `<repoRoot>/journal/daemon.lock`
-(`orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
+to *start* at all while a live daemon holds **its own** lock file,
+`stateJournalRoot(resolveStateRoot())/daemon.lock` — `~/.spo-state/journal/daemon.lock` by default
+(`orchestrator/state-root.js`, `orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
 whether a daemon is running at all before recette begins. Checked read-only (recette reads the
 lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does — it never
 calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly, for a
@@ -2495,6 +2509,8 @@ task/daemon split itself).
 | `dispatcher-drain-start` | daemon | a SIGTERM/SIGINT asked the dispatcher to drain instead of killing: records the `signal`, the `timeoutMs` bound (`config.drainTimeoutMs`) and the `inFlight` card ids it is about to wait for. Claiming has already stopped by the time this is written — the scanner, the only producer of new queue entries, is signalled inside `requestDrain` (`dispatcher.js`). |
 | `dispatcher-start` | daemon | the dispatcher process started; records its pid, configured worker count and the sha/ref of the PIPELINE checkout it is running (`pipelineSha`/`pipelineRef`, `pipeline-version.js`), and anchors a later "pool idle" edge to this process (`dispatcher.js`). |
 | `pipeline-version` | task | the first line a `--worker` writes: the sha and ref of the pipeline checkout THAT WORKER loaded, plus its pid — the per-card answer to "which version of the orchestrator produced this park?". Recorded per worker rather than inherited from `dispatcher-start` because `dispatcher.js` resolves `DAEMON_PATH` at every spawn, so a `git pull` with no restart genuinely puts a new-sha worker under an old-sha dispatcher; the two lines disagreeing is that gap made visible. `sha: null` means the checkout could not describe itself (no `.git`, unreadable HEAD), which is itself the fact worth recording (`daemon.js`, `pipeline-version.js`). |
+| `duplicate-queue-entry-refusal-disposal-failed` | task+daemon | `takeNextTask` refused a duplicate queue entry (see `duplicate-queue-entry-refused` below) but moving it into `queue-refused/` itself failed (the directory was uncreatable, or the rename lost a race) — the candidate is STILL refused (never drained), but the queue file is left in `queue/` rather than moved aside, so it will be seen and re-refused on the next scan. `error`/`attemptedMovedTo` carry enough to diagnose why. Written best-effort to both `journal.jsonl` and `daemon.jsonl`, each independently try/caught so neither write's own failure can suppress the other or escape back to the drain loop (card #80, `state-machine.js`). |
+| `duplicate-queue-entry-refused` | task+daemon | a `queue/` entry whose id names a taskDir already terminal (`DONE`/`ABANDONED`) was refused by `takeNextTask` instead of being drained over it (which would have clobbered the terminal `state.json`) — moved to the sibling `queue-refused/` directory (a sibling of `queue/`, never a subdirectory of it, so `spo status` queue depth and `orphan-scan.js`'s `queuedIds` stay blind to it), `state.json` itself never touched. Written once to the task's own `journal.jsonl` and once to `daemon.jsonl`. `PARKED` is deliberately never refused — it is the retry channel (card #80, `state-machine.js`). |
 | `empty-implement` | task | IMPLEMENT's payload declared `files_changed` but the list parsed empty — routes to DIAGNOSE (`state-machine.js`). |
 | `force-state` | task | a shadow-mode task's `task.shadow.forceState` short-circuited INTAKE straight to the named state — a test/fixture hook (`state-machine.js`). |
 | `gate-main-moved-abort-failed` | task | GATE's `git merge --abort` (cleaning up a failed main-moved regate merge) itself exited non-zero or hit a spawn timeout (`steps/scripted.js`). |
@@ -2554,9 +2570,9 @@ bin/spo account clear-cooldown <name>              # drop a locally-invented coo
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
-bin/spo pull [--limit <n>]                         # write queue/<seq>-issue-<n>.json for the top N claimable board cards
+bin/spo pull [--limit <n>] [--force]               # write queue/<seq>-issue-<n>.json for the top N claimable board cards (refuses while a live daemon holds the lock, --force overrides -- card #100)
 bin/spo pull-reports                               # STAGE 0: pull queued reports from a production deployment over HTTPS
-bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
+bin/spo intake [--limit <n>] [--reports-dir <dir>] [--force]  # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above); refuses while a live daemon holds the lock, --force overrides (card #100)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
 bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file); defaults to --dry (see "The recovery path" above)

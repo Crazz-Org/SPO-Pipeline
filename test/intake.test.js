@@ -10,6 +10,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const { mkTmp, writePoolDir, timeoutResult } = require('./helpers');
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -20,6 +21,8 @@ const intake = require('../orchestrator/intake');
 const accounts = require('../orchestrator/accounts');
 const spo = require('../bin/spo');
 const orchestratorConfig = require('../orchestrator/config');
+const { lockPath } = require('../orchestrator/lock');
+const { stateJournalRoot, stateQueueDir } = require('../orchestrator/state-root');
 
 function fakeSpawnSync(responder) {
   return (command, args, opts) => responder(command, args, opts);
@@ -1558,6 +1561,32 @@ function withExitCodeReset(fn) {
   };
 }
 
+// Card #100 post-verification fix (F1): `refuseIfDaemonLockHeld` (bin/spo) ALWAYS checks the REAL
+// default journal root -- `stateJournalRoot(resolveStateRoot())` -- in addition to whatever
+// `--journal` a command's own opts resolve to (its own ANTI-EVASION note explains why: nothing on
+// THIS process's argv can move where a live daemon's lock actually is). That means isolating a
+// cmdPull/cmdIntake test via `--journal` ALONE no longer isolates it -- the guard still probes
+// this machine's true `~/.spo-state/journal`, which measurably DOES hold a live daemon lock on
+// this box (verification's own F1 probe proved it, and it is why the pre-#100 versions of the two
+// tests below started flaky-refusing the moment the guard first landed). `SPO_STATE_DIR` is the
+// only thing that actually redirects `resolveStateRoot()` (orchestrator/state-root.js) -- so it is
+// what isolates the REAL default, not a flag or a `deps` override. Testing through the real
+// resolution rather than injecting the path is also the card #133 lesson this fix exists to
+// respect: an injected path can never prove the resolution itself is safe.
+function withIsolatedStateDir(fn) {
+  return async () => {
+    const stateDir = mkTmp('spo-cmd-state-');
+    const saved = process.env.SPO_STATE_DIR;
+    process.env.SPO_STATE_DIR = stateDir;
+    try {
+      await fn(stateDir);
+    } finally {
+      if (saved === undefined) delete process.env.SPO_STATE_DIR;
+      else process.env.SPO_STATE_DIR = saved;
+    }
+  };
+}
+
 test(
   'spo ask --dry: prints draft + review, files nothing, exit 0',
   withExitCodeReset(async () => {
@@ -1717,64 +1746,298 @@ test(
 
 test(
   'spo pull --limit 2: makeTask is called for only the top 2 of 3 candidates, in order',
-  withExitCodeReset(async () => {
-    const madeFor = [];
-    const fakeIntake = {
-      pullBoard: () => ({
-        ok: true,
-        warnings: [],
-        candidates: [
-          { rank: 1, issue: 501, area: 'client', title: 'a' },
-          { rank: 2, issue: 502, area: 'client', title: 'b' },
-          { rank: 3, issue: 503, area: 'client', title: 'c' },
-        ],
-      }),
-      makeTask: (candidate) => {
-        madeFor.push(candidate.issue);
-        return { ok: true, skipped: false, file: `000${madeFor.length}-issue-${candidate.issue}.json` };
-      },
-    };
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const madeFor = [];
+      const fakeIntake = {
+        pullBoard: () => ({
+          ok: true,
+          warnings: [],
+          candidates: [
+            { rank: 1, issue: 501, area: 'client', title: 'a' },
+            { rank: 2, issue: 502, area: 'client', title: 'b' },
+            { rank: 3, issue: 503, area: 'client', title: 'c' },
+          ],
+        }),
+        makeTask: (candidate) => {
+          madeFor.push(candidate.issue);
+          return { ok: true, skipped: false, file: `000${madeFor.length}-issue-${candidate.issue}.json` };
+        },
+      };
 
-    const console_ = captureConsole();
-    try {
-      const opts = spo.parseArgs(['--limit', '2']);
-      await spo.cmdPull(opts, { intake: fakeIntake });
-    } finally {
-      console_.restore();
-    }
+      // Card #100: no --journal here on purpose -- resolveDirs(opts) falls back to
+      // stateJournalRoot(resolveStateRoot()), and SPO_STATE_DIR (withIsolatedStateDir) is what
+      // keeps THAT real default pointed at a throwaway dir instead of this machine's own
+      // ~/.spo-state/journal, where a live daemon can genuinely hold the lock (see the note on
+      // withIsolatedStateDir's own definition for why --journal alone stopped being enough).
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--limit', '2']);
+        await spo.cmdPull(opts, { intake: fakeIntake });
+      } finally {
+        console_.restore();
+      }
 
-    assert.deepEqual(madeFor, [501, 502]);
-    assert.equal(process.exitCode, undefined);
-    assert.ok(console_.logs.some((l) => l.includes('#501')));
-    assert.ok(console_.logs.some((l) => l.includes('#502')));
-    assert.ok(!console_.logs.some((l) => l.includes('#503')));
-  })
+      assert.deepEqual(madeFor, [501, 502]);
+      assert.equal(process.exitCode, undefined);
+      assert.ok(console_.logs.some((l) => l.includes('#501')));
+      assert.ok(console_.logs.some((l) => l.includes('#502')));
+      assert.ok(!console_.logs.some((l) => l.includes('#503')));
+    })
+  )
 );
 
 test(
   'spo pull: default limit is 5, and a skipped candidate is reported as skipped not written',
-  withExitCodeReset(async () => {
-    const fakeIntake = {
-      pullBoard: () => ({
-        ok: true,
-        warnings: ['pullBoard: skipped unrecognized line: ???'],
-        candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }],
-      }),
-      makeTask: () => ({ ok: true, skipped: true, id: 'issue-501', reason: 'issue-501 already present in queue/ or journal/' }),
-    };
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const fakeIntake = {
+        pullBoard: () => ({
+          ok: true,
+          warnings: ['pullBoard: skipped unrecognized line: ???'],
+          candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }],
+        }),
+        makeTask: () => ({ ok: true, skipped: true, id: 'issue-501', reason: 'issue-501 already present in queue/ or journal/' }),
+      };
 
-    const console_ = captureConsole();
-    try {
-      const opts = spo.parseArgs([]);
-      await spo.cmdPull(opts, { intake: fakeIntake });
-    } finally {
-      console_.restore();
-    }
+      // Card #100: see the note on the --limit-2 test above.
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdPull(opts, { intake: fakeIntake });
+      } finally {
+        console_.restore();
+      }
 
-    assert.equal(process.exitCode, undefined);
-    assert.ok(console_.errors.some((l) => l.includes('skipped unrecognized line')));
-    assert.ok(console_.logs.some((l) => l.includes('#501: skipped')));
-  })
+      assert.equal(process.exitCode, undefined);
+      assert.ok(console_.errors.some((l) => l.includes('skipped unrecognized line')));
+      assert.ok(console_.logs.some((l) => l.includes('#501: skipped')));
+    })
+  )
+);
+
+// ---- cmdPull: daemon-lock guard (card #100, consolidates 79.2) -----------------------------
+//
+// `cmdPull` used to resolve nothing and call straight into `pullBoard`/`makeTask` -- no lock
+// read, no refusal, no `--force`. Now it reads orchestrator/lock.js's daemon.lock at
+// resolveDirs(opts).journalRoot (the SAME path daemon.js locks) *and* -- unconditionally -- at
+// the real default `stateJournalRoot(resolveStateRoot())` before doing anything else. Modeled on
+// test/recette.test.js:328 (refusal), :346 (--force overrides), :361 (dead pid is not a refusal)
+// -- `deps.isAlive` is the identical injection point liveDaemonHolder uses.
+//
+// Every test below isolates the REAL default via SPO_STATE_DIR (withIsolatedStateDir), not
+// --journal -- see that helper's own header for why --journal alone can no longer isolate a test
+// from this machine's real daemon lock (that is the whole point of the anti-evasion fix these
+// tests exist to lock in).
+
+test(
+  'spo pull: a live daemon lock refuses -- makeTask is never called, exit 1',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let makeTaskCalled = false;
+      const fakeIntake = {
+        pullBoard: () => ({ ok: true, warnings: [], candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }] }),
+        makeTask: () => {
+          makeTaskCalled = true;
+          return { ok: true, skipped: false, file: '0001-issue-501.json' };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdPull(opts, { intake: fakeIntake, isAlive: (pid) => pid === 999999 });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(makeTaskCalled, false, 'refusal must happen before any downstream call');
+      assert.equal(process.exitCode, 1);
+      assert.ok(console_.errors.some((l) => l.includes('999999') && l.includes('daemon.lock')));
+    })
+  )
+);
+
+test(
+  'spo pull --force: overrides the daemon-lock refusal -- makeTask IS called despite a live lock',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let makeTaskCalled = false;
+      const fakeIntake = {
+        pullBoard: () => ({ ok: true, warnings: [], candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }] }),
+        makeTask: () => {
+          makeTaskCalled = true;
+          return { ok: true, skipped: false, file: '0001-issue-501.json' };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--force']);
+        await spo.cmdPull(opts, { intake: fakeIntake, isAlive: () => true });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(makeTaskCalled, true, '--force must let the pull actually run');
+    })
+  )
+);
+
+test(
+  'spo pull: a lock file whose pid is dead is not a refusal -- makeTask IS called',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 123456, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let makeTaskCalled = false;
+      const fakeIntake = {
+        pullBoard: () => ({ ok: true, warnings: [], candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }] }),
+        makeTask: () => {
+          makeTaskCalled = true;
+          return { ok: true, skipped: false, file: '0001-issue-501.json' };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdPull(opts, { intake: fakeIntake, isAlive: () => false });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(makeTaskCalled, true);
+      assert.equal(process.exitCode, undefined);
+    })
+  )
+);
+
+test(
+  'spo pull: no lock file at all is not a refusal -- makeTask IS called, with the resolved journalRoot/queueDir forwarded',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      let capturedDeps = null;
+      const fakeIntake = {
+        pullBoard: () => ({ ok: true, warnings: [], candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }] }),
+        makeTask: (candidate, deps) => {
+          capturedDeps = deps;
+          return { ok: true, skipped: false, file: '0001-issue-501.json' };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdPull(opts, { intake: fakeIntake });
+      } finally {
+        console_.restore();
+      }
+
+      assert.ok(capturedDeps, 'makeTask must have been called');
+      assert.equal(process.exitCode, undefined);
+      // Post-verification fix (F1): makeTask must receive the SAME journalRoot/queueDir the guard
+      // itself resolved and checked -- {} (the pre-fix shape) let makeTask silently fall back to
+      // its own default resolution, independent of this command's own --journal/--queue flags.
+      assert.equal(capturedDeps.journalRoot, stateJournalRoot(stateDir));
+      assert.equal(capturedDeps.queueDir, stateQueueDir(stateDir));
+    })
+  )
+);
+
+// ---- cmdPull: anti-evasion regressions (post-verification fix, F1) --------------------------
+//
+// F1 (verification, 2026-09-06): `spo pull --journal <empty-tmp>` walked straight past a REAL
+// live daemon lock because the guard checked only the resolved --journal path, while `makeTask`
+// (via {} deps) wrote into the real default queue/ regardless -- the guard's checked path and the
+// actual write path had already diverged. Reproduced with a real `acquireLock` + a real decoy
+// `--journal` before the fix; both are reproduced here as a permanent regression.
+
+test(
+  'spo pull: a --journal decoy cannot evade a live lock at the REAL default journal root',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      const decoyJournal = mkTmp('spo-pull-decoy-journal-'); // no lock here at all
+      const decoyQueue = mkTmp('spo-pull-decoy-queue-');
+      let makeTaskCalled = false;
+      const fakeIntake = {
+        pullBoard: () => ({ ok: true, warnings: [], candidates: [{ rank: 1, issue: 99001, area: 'client', title: 'x' }] }),
+        makeTask: () => {
+          makeTaskCalled = true;
+          return { ok: true, skipped: false, file: '0001-issue-99001.json' };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--journal', decoyJournal, '--queue', decoyQueue]);
+        await spo.cmdPull(opts, { intake: fakeIntake, isAlive: (pid) => pid === 999999 });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(makeTaskCalled, false, 'a --journal/--queue decoy must not evade the real default lock check');
+      assert.equal(process.exitCode, 1);
+    })
+  )
+);
+
+test(
+  'spo pull: an explicit --journal pointed at a SECOND live daemon is also refused (belt-and-braces)',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      // The real default (stateJournalRoot(stateDir)) has NO lock here -- only the explicit
+      // --journal target does, simulating a maintainer who really did start a second daemon
+      // with --journal <secondDaemonJournal>.
+      const secondDaemonJournal = mkTmp('spo-pull-second-daemon-journal-');
+      fs.writeFileSync(
+        lockPath(secondDaemonJournal),
+        JSON.stringify({ host: os.hostname(), pid: 888888, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let makeTaskCalled = false;
+      const fakeIntake = {
+        pullBoard: () => ({ ok: true, warnings: [], candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }] }),
+        makeTask: () => {
+          makeTaskCalled = true;
+          return { ok: true, skipped: false, file: '0001-issue-501.json' };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--journal', secondDaemonJournal]);
+        await spo.cmdPull(opts, { intake: fakeIntake, isAlive: (pid) => pid === 888888 });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(makeTaskCalled, false, 'an explicit --journal naming a live second daemon must still refuse');
+      assert.equal(process.exitCode, 1);
+      assert.ok(console_.errors.some((l) => l.includes('888888')));
+    })
+  )
 );
 
 // The triage model is a maintainer decision (2026-08-31: fable/high -> opus/medium) with no

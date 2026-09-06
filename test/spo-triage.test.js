@@ -8,6 +8,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 // `../bin/spo` transitively requires 28 orchestrator modules, `command-timeout.js` among them,
 // so it destructures the real spawnSync at require time exactly like a direct orchestrator
@@ -17,6 +18,8 @@ require('./no-real-spawn');
 
 const spo = require('../bin/spo');
 const { mkTmp } = require('./helpers');
+const { lockPath } = require('../orchestrator/lock');
+const { stateJournalRoot } = require('../orchestrator/state-root');
 
 function captureConsole() {
   const logs = [];
@@ -43,6 +46,30 @@ function withExitCodeReset(fn) {
       await fn();
     } finally {
       process.exitCode = before;
+    }
+  };
+}
+
+// Card #100 post-verification fix (F1): `refuseIfDaemonLockHeld` (bin/spo) ALWAYS checks the REAL
+// default journal root -- `stateJournalRoot(resolveStateRoot())` -- in addition to whatever
+// `--journal` a command's own opts resolve to (its own ANTI-EVASION note explains why: nothing on
+// THIS process's argv can move where a live daemon's lock actually is). That means isolating a
+// cmdIntake test via `--journal` ALONE no longer isolates it -- the guard still probes this
+// machine's true `~/.spo-state/journal`, which measurably DOES hold a live daemon lock on this box
+// (verification's own F1 probe proved it). `SPO_STATE_DIR` is the only thing that actually
+// redirects `resolveStateRoot()` (orchestrator/state-root.js) -- so it is what isolates the REAL
+// default, not a flag or a `deps` override. See test/intake.test.js's identical helper for the
+// cmdPull side of the same fix.
+function withIsolatedStateDir(fn) {
+  return async () => {
+    const stateDir = mkTmp('spo-cmd-state-');
+    const saved = process.env.SPO_STATE_DIR;
+    process.env.SPO_STATE_DIR = stateDir;
+    try {
+      await fn(stateDir);
+    } finally {
+      if (saved === undefined) delete process.env.SPO_STATE_DIR;
+      else process.env.SPO_STATE_DIR = saved;
     }
   };
 }
@@ -439,66 +466,288 @@ test(
 
 test(
   'spo intake: reports filed/duplicate/schema-version/error lines and the summary',
-  withExitCodeReset(async () => {
-    let seenLimit = null;
-    let seenReportsDir = null;
-    const fakeReportIntake = {
-      DEFAULT_AUTO_INTAKE_LIMIT: 3,
-      runReportIntake: async (journalRoot, config) => {
-        seenLimit = config.autoIntakeLimit;
-        seenReportsDir = config.spoReportsDir;
-        return {
-          ok: true,
-          processed: 3,
-          filed: 1,
-          duplicates: 1,
-          schemaVersion: 1,
-          errors: [],
-          results: [
-            { file: 'a.json', outcome: 'filed', issueNumber: 501 },
-            { file: 'b.json', outcome: 'duplicate', issueNumber: 42 },
-            { file: 'c.json', outcome: 'schema-version', found: 2, expected: 1 },
-          ],
-        };
-      },
-    };
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      let seenLimit = null;
+      let seenReportsDir = null;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async (journalRoot, config) => {
+          seenLimit = config.autoIntakeLimit;
+          seenReportsDir = config.spoReportsDir;
+          return {
+            ok: true,
+            processed: 3,
+            filed: 1,
+            duplicates: 1,
+            schemaVersion: 1,
+            errors: [],
+            results: [
+              { file: 'a.json', outcome: 'filed', issueNumber: 501 },
+              { file: 'b.json', outcome: 'duplicate', issueNumber: 42 },
+              { file: 'c.json', outcome: 'schema-version', found: 2, expected: 1 },
+            ],
+          };
+        },
+      };
 
-    const console_ = captureConsole();
-    try {
-      const opts = spo.parseArgs(['--limit', '5', '--reports-dir', '/tmp/fake-reports']);
-      await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
-    } finally {
-      console_.restore();
-    }
+      // Card #100: no --journal here on purpose -- see withIsolatedStateDir's own header for why
+      // SPO_STATE_DIR, not a flag, is what isolates the real default the guard always also checks.
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--limit', '5', '--reports-dir', '/tmp/fake-reports']);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
+      } finally {
+        console_.restore();
+      }
 
-    assert.equal(seenLimit, 5);
-    assert.equal(seenReportsDir, '/tmp/fake-reports');
-    assert.ok(console_.logs.some((l) => l.includes('a.json: filed #501')));
-    assert.ok(console_.logs.some((l) => l.includes('b.json: duplicate of #42')));
-    assert.ok(console_.logs.some((l) => l.includes('c.json: schema version mismatch')));
-    assert.ok(console_.logs.some((l) => l.includes('filed: 1')));
-    assert.equal(process.exitCode, undefined);
-  })
+      assert.equal(seenLimit, 5);
+      assert.equal(seenReportsDir, '/tmp/fake-reports');
+      assert.ok(console_.logs.some((l) => l.includes('a.json: filed #501')));
+      assert.ok(console_.logs.some((l) => l.includes('b.json: duplicate of #42')));
+      assert.ok(console_.logs.some((l) => l.includes('c.json: schema version mismatch')));
+      assert.ok(console_.logs.some((l) => l.includes('filed: 1')));
+      assert.equal(process.exitCode, undefined);
+    })
+  )
 );
 
 test(
   'spo intake: nothing queued',
-  withExitCodeReset(async () => {
-    const fakeReportIntake = {
-      DEFAULT_AUTO_INTAKE_LIMIT: 3,
-      runReportIntake: async () => ({ ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] }),
-    };
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => ({ ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] }),
+      };
 
-    const console_ = captureConsole();
-    try {
-      const opts = spo.parseArgs([]);
-      await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
-    } finally {
-      console_.restore();
-    }
+      // Card #100: see the note on the previous cmdIntake test above.
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
+      } finally {
+        console_.restore();
+      }
 
-    assert.ok(console_.logs.some((l) => l.includes('no queued reports')));
-  })
+      assert.ok(console_.logs.some((l) => l.includes('no queued reports')));
+    })
+  )
+);
+
+// ---- cmdIntake: daemon-lock guard (card #100, consolidates 79.2) ---------------------------
+//
+// `cmdIntake` used to call resolveDirs(opts) and go straight to `runReportIntake` -- no lock
+// read, no refusal, no `--force`. Now it reads orchestrator/lock.js's daemon.lock at that SAME
+// resolveDirs(opts).journalRoot *and* -- unconditionally -- at the real default
+// `stateJournalRoot(resolveStateRoot())` before doing anything else. Modeled on
+// test/recette.test.js:328 (refusal), :346 (--force overrides), :361 (dead pid is not a refusal)
+// -- `deps.isAlive` is the identical injection point liveDaemonHolder uses.
+//
+// Every test below isolates the REAL default via SPO_STATE_DIR (withIsolatedStateDir) -- see that
+// helper's own header for why --journal alone can no longer isolate a test from this machine's
+// real daemon lock (that is the whole point of the anti-evasion fix these tests exist to lock in).
+
+test(
+  'spo intake: a live daemon lock refuses -- runReportIntake is never called, exit 1',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let runReportIntakeCalled = false;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => {
+          runReportIntakeCalled = true;
+          return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake, isAlive: (pid) => pid === 999999 });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(runReportIntakeCalled, false, 'refusal must happen before any downstream call');
+      assert.equal(process.exitCode, 1);
+      assert.ok(console_.errors.some((l) => l.includes('999999') && l.includes('daemon.lock')));
+    })
+  )
+);
+
+test(
+  'spo intake --force: overrides the daemon-lock refusal -- runReportIntake IS called despite a live lock',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let runReportIntakeCalled = false;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => {
+          runReportIntakeCalled = true;
+          return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--force']);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake, isAlive: () => true });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(runReportIntakeCalled, true, '--force must let intake actually run');
+    })
+  )
+);
+
+test(
+  'spo intake: a lock file whose pid is dead is not a refusal -- runReportIntake IS called',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 123456, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let runReportIntakeCalled = false;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => {
+          runReportIntakeCalled = true;
+          return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake, isAlive: () => false });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(runReportIntakeCalled, true);
+      assert.equal(process.exitCode, undefined);
+    })
+  )
+);
+
+test(
+  'spo intake: no lock file at all is not a refusal -- runReportIntake IS called, with the resolved journalRoot forwarded',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      let seenJournalRoot = null;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async (journalRoot) => {
+          seenJournalRoot = journalRoot;
+          return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs([]);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(seenJournalRoot, stateJournalRoot(stateDir), 'runReportIntake must receive the SAME journalRoot the guard checked');
+      assert.equal(process.exitCode, undefined);
+    })
+  )
+);
+
+// ---- cmdIntake: anti-evasion regressions (post-verification fix, F1) ------------------------
+//
+// F1 (verification, 2026-09-06): `spo intake --journal <empty-tmp>` walked straight past a REAL
+// live daemon lock because the guard checked only the resolved --journal path. Reproduced with a
+// real `acquireLock` + a real decoy `--journal` before the fix; reproduced here as a permanent
+// regression.
+
+test(
+  'spo intake: a --journal decoy cannot evade a live lock at the REAL default journal root',
+  withExitCodeReset(
+    withIsolatedStateDir(async (stateDir) => {
+      const realJournalRoot = stateJournalRoot(stateDir);
+      fs.mkdirSync(realJournalRoot, { recursive: true });
+      fs.writeFileSync(
+        lockPath(realJournalRoot),
+        JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      const decoyJournal = mkTmp('spo-intake-decoy-journal-'); // no lock here at all
+      let runReportIntakeCalled = false;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => {
+          runReportIntakeCalled = true;
+          return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--journal', decoyJournal]);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake, isAlive: (pid) => pid === 999999 });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(runReportIntakeCalled, false, 'a --journal decoy must not evade the real default lock check');
+      assert.equal(process.exitCode, 1);
+    })
+  )
+);
+
+test(
+  'spo intake: an explicit --journal pointed at a SECOND live daemon is also refused (belt-and-braces)',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      // The real default has NO lock here -- only the explicit --journal target does, simulating
+      // a maintainer who really did start a second daemon with --journal <secondDaemonJournal>.
+      const secondDaemonJournal = mkTmp('spo-intake-second-daemon-journal-');
+      fs.writeFileSync(
+        lockPath(secondDaemonJournal),
+        JSON.stringify({ host: os.hostname(), pid: 888888, mode: 'real', startedAt: new Date().toISOString() })
+      );
+      let runReportIntakeCalled = false;
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => {
+          runReportIntakeCalled = true;
+          return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+        },
+      };
+
+      const console_ = captureConsole();
+      try {
+        const opts = spo.parseArgs(['--journal', secondDaemonJournal]);
+        await spo.cmdIntake(opts, { reportIntake: fakeReportIntake, isAlive: (pid) => pid === 888888 });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(runReportIntakeCalled, false, 'an explicit --journal naming a live second daemon must still refuse');
+      assert.equal(process.exitCode, 1);
+      assert.ok(console_.errors.some((l) => l.includes('888888')));
+    })
+  )
 );
 
 // ---- cmdReports -----------------------------------------------------------------------------

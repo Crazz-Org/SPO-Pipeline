@@ -18,8 +18,9 @@
 // own productRepo comment records), but recette does not take it: this runner drives the task
 // through `drainQueueOnce` like a real daemon worker would, so the same lock already applies to
 // its WORKTREE/FINISH phases. The guard here is a coarser, earlier one: refusing to START while a
-// live daemon holds ITS OWN lock file (<repoRoot>/journal/daemon.lock, orchestrator/lock.js) --
-// checked here READ-ONLY (recette is not a daemon and must never create, touch, or release that
+// live daemon holds ITS OWN lock file (stateJournalRoot(resolveStateRoot())/daemon.lock, i.e.
+// ~/.spo-state/journal/daemon.lock by default -- orchestrator/state-root.js, orchestrator/lock.js)
+// -- checked here READ-ONLY (recette is not a daemon and must never create, touch, or release that
 // lock itself). `--force` overrides, loudly, for a maintainer who has confirmed by hand that
 // nothing is actually running. This is a best-effort check, not a mutex: it catches "I forgot the
 // daemon is running", not a daemon that starts a second after this check passes.
@@ -63,6 +64,7 @@ const path = require('path');
 const defaultConfig = require('./config');
 const { drainQueueOnce } = require('./state-machine');
 const { lockPath, processAlive } = require('./lock');
+const { resolveStateRoot, stateJournalRoot } = require('./state-root');
 const { runSync: armedRunSync, normalizeExit } = require('./board');
 const intake = require('./intake');
 // ACTION 7.2: the second driver. `driver: 'dispatcher'` runs the scenario's task(s) through the
@@ -892,8 +894,12 @@ function scenarioCapOverride(scenario, field) {
 // the plan of what it would do"). `opts.recetteDir` (default `<repoRoot>/.recette`) is the parent
 // of every run's own `<runId>/{journal,queue}` -- gitignored, never the live `journal/`/`queue/`
 // the daemon holds a lock on. `opts.productJournalRoot` is a test-only override for the safety
-// check's own target (default: `<repoRoot>/journal`, i.e. the REAL daemon's journal root,
-// regardless of where THIS run's own isolated journal lives).
+// check's own target (default: `stateJournalRoot(resolveStateRoot())`, i.e. `~/.spo-state/journal`
+// -- the REAL daemon's journal root per orchestrator/state-root.js, same resolution `bin/spo` and
+// `console/` already use -- regardless of where THIS run's own isolated journal lives). Resolved
+// INSIDE this function, on every call, not cached at module load: resolveStateRoot reads
+// SPO_STATE_DIR from process.env, and a caller (a test, in practice) that sets that var before
+// calling runRecette must see it honoured.
 //
 // `scenario` (optional, default null -- every existing call site that omits it, including every
 // test built before this parameter existed, resolves EXACTLY the global defaults it always did)
@@ -919,7 +925,7 @@ function resolveConfig(opts = {}, scenario = null) {
     runDir,
     journalRoot: path.join(runDir, 'journal'),
     queueDir: path.join(runDir, 'queue'),
-    productJournalRoot: opts.productJournalRoot || path.join(repoRoot, 'journal'),
+    productJournalRoot: opts.productJournalRoot || stateJournalRoot(resolveStateRoot()),
     capMs: opts.capMs || envInt('SPO_RECETTE_CAP_MS', scenarioCapOverride(scenario, 'capMs') || DEFAULT_CAP_MS),
     capLlmSteps: opts.capLlmSteps || envInt('SPO_RECETTE_CAP_LLM_STEPS', scenarioCapOverride(scenario, 'capLlmSteps') || DEFAULT_CAP_LLM_STEPS),
     // Test-only escape hatch: an arbitrary config-field override (e.g. spoBenchDir, productRepo,
