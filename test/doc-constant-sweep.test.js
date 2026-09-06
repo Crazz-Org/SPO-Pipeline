@@ -1377,7 +1377,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
   "doc/board-audit.md :: config.js:874",
-  "doc/board-audit.md :: orchestrator/steps/scripted.js:1351",
+  "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1100",
   "doc/state-machine-spec.md :: dispatcher.js:572-586",

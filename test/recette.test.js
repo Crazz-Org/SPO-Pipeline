@@ -201,6 +201,13 @@ function makeHappyPathSpawnSync({ calls } = {}) {
       if (args.includes('rev-parse') && args.includes('--abbrev-ref')) return ok('main\n');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${originMainSha}\n`);
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      // prepareJudgeInputs' committed-vs-not probe (steps/scripted.js). Measured: without this
+      // branch the call fell through to the `unhandled fake git call` fail(1) below -- which
+      // this fixture's own header promises is a LOUD failure, and which prepareJudgeInputs
+      // instead swallows by design (a failed rev-list degrades to the safe not-committed
+      // branch). The happy path modelled here has committed by VALIDATE (PUSH_PR runs first,
+      // doc/state-machine-spec.md's order), so a truthful fake says so: 1 commit ahead.
+      if (args.includes('rev-list') && args.includes('--count')) return ok('1\n');
       if (args.includes('worktree') && args.includes('list')) return ok(''); // nothing registered
       if (args.includes('worktree') && args.includes('add')) return ok('');
       if (args.includes('worktree') && args.includes('remove')) return ok('');
