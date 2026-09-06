@@ -1485,6 +1485,10 @@ function parsePrNumber(stdout) {
 // through the required "typecheck + tests" check.
 const RDO_CITATION_RE = /[\w.-]+\.pas:\d+/i;
 
+// The single RDO catalogue file, referenced both when deriving the diff truth below and in the
+// rdo-citation-missing ParkSignal detail -- one literal, two sites.
+const RDO_CATALOGUE_PATH = 'src/shared/rdo-members.ts';
+
 // Pulls citations out of a `git diff -U0` against rdo-members.ts: added lines only (`+`, not the
 // `+++` file-header line), keeping the whole source line -- not just the matched token -- so the
 // citation reads as the reviewer's own justification, not a bare filename:line pair. Stripped, in
@@ -1654,17 +1658,27 @@ async function realPushPr(ctx, deps = {}) {
   // below) so the citation search runs on what this attempt really changed.
   const changed = spawnStep(ctx, deps, 'PUSH_PR', 'git', ['-C', worktreePath, 'diff', '--name-only', 'origin/main...HEAD']);
   if (changed.exit !== 0) throw new ParkSignal('push-pr-failed', { step: 'diff-name-only', exit: changed.exit });
-  const touchesCatalogue = splitLines(changed.stdout).includes('src/shared/rdo-members.ts');
+  const touchesCatalogue = splitLines(changed.stdout).includes(RDO_CATALOGUE_PATH);
 
   // The diff is ground truth; intake.js's makeTask only ever infers touchesRdoMembers from the issue's
   // OWN TEXT (area === 'rdo' or a literal "rdo-members.ts" mention). Card #385 touched the
   // catalogue with neither, so this stayed false all the way through VALIDATE and
   // handleValidate's CITATION_VERIFIER step never ran. Correct it the moment the real diff
   // disagrees with what intake guessed, so the rest of this task's VALIDATE pass sees the truth.
+  //
+  // This promotion is ONE-WAY on purpose: touchesRdoMembers feeds IMPLEMENT's Opus escalation
+  // (step-contracts.js's shouldEscalate, strict `=== true`), and IMPLEMENT re-runs on this SAME
+  // ctx.task across the DIAGNOSE/VALIDATE-REJECT/CI-retry loops after this point -- lowering it
+  // back to false here would silently demote every later retry's IMPLEMENT from opus to sonnet.
+  // The diff-derived truth for the OTHER consumer (whether CITATION_VERIFIER should run) lives in
+  // ctx.task.rdoDiffTouched below instead, which is genuinely symmetric (set both directions).
   if (touchesCatalogue && !ctx.task.touchesRdoMembers) {
     ctx.task.touchesRdoMembers = true;
     appendEvent(ctx.taskDir, 'PUSH_PR', 'touches-rdo-members-rederived', { from: false, to: true });
   }
+
+  ctx.task.rdoDiffTouched = touchesCatalogue;
+  appendEvent(ctx.taskDir, 'PUSH_PR', 'rdo-diff-derived', { touched: touchesCatalogue, path: RDO_CATALOGUE_PATH });
 
   let citations = [];
   if (touchesCatalogue) {
@@ -1675,12 +1689,12 @@ async function realPushPr(ctx, deps = {}) {
       '-U0',
       'origin/main...HEAD',
       '--',
-      'src/shared/rdo-members.ts',
+      RDO_CATALOGUE_PATH,
     ]);
     citations = extractCitations(catalogueDiff.stdout);
     if (citations.length === 0) citations = extractCitationsFromCriterion(ctx.task && ctx.task.criterion);
     if (citations.length === 0) {
-      throw new ParkSignal('rdo-citation-missing', { file: 'src/shared/rdo-members.ts' });
+      throw new ParkSignal('rdo-citation-missing', { file: RDO_CATALOGUE_PATH });
     }
     appendEvent(ctx.taskDir, 'PUSH_PR', 'rdo-citation', { citations });
     // Same in-memory/journal split as touchesRdoMembers above: the journal event is what

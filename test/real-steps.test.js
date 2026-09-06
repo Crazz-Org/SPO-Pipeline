@@ -1693,6 +1693,148 @@ test('realPushPr: sets ctx.task.citations from the criterion fallback when the d
   assert.ok(ctx.task.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
 });
 
+// ---- rdoDiffTouched: symmetric, diff-derived, separate from touchesRdoMembers ------------------
+//
+// touchesRdoMembers stays a one-way (false -> true) promotion on purpose: it is the sole input to
+// IMPLEMENT's Opus escalation (step-contracts.js's shouldEscalate), and IMPLEMENT re-runs on the
+// SAME ctx.task across every DIAGNOSE/VALIDATE-REJECT/CI retry after PUSH_PR -- lowering it here
+// would silently demote those retries to sonnet. ctx.task.rdoDiffTouched is the new, genuinely
+// symmetric field (realPushPr records it both true and false) that handleValidate's
+// CITATION_VERIFIER trigger reads instead. See orchestrator/state-machine.js's
+// resolveRdoDiffTouched and orchestrator/task-values.js's lastJournaledRdoDiffTouched.
+
+// THE LOAD-BEARING TEST. Proves the Opus escalation at IMPLEMENT survives a diff that does NOT
+// touch the RDO catalogue. Deliberately does NOT inject or hand-set touchesRdoMembers after the
+// task is built: the escalation guard (step-contracts.js's shouldEscalate) reads
+// task.touchesRdoMembers, so setting that value again here would make a dead or bypassed guard
+// look green. Instead this drives the REAL inputs -- a real realPushPr call with an injected git
+// diff that omits the catalogue file, then a real runLlm('IMPLEMENT', ...) call on the SAME ctx
+// with an injected spawn -- and asserts on the spawned argv, not on resolveStepContract's return
+// value.
+test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the Opus escalation intact (touchesRdoMembers is never lowered)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-symmetry-wt-');
+  // Starting state only, from intake -- never touched again below.
+  const task = {
+    id: 'card-rdo-symmetry',
+    kind: 'card',
+    issue: 640,
+    criterion: 'rdo-members.ts already covered elsewhere',
+    worktreePath,
+    size: 'S',
+    touchesRdoMembers: true,
+  };
+  const ctx = testCtx({ id: 'card-rdo-symmetry', task, config });
+
+  const pushDeps = {
+    spawnSync: (command, args) => {
+      // The real diff genuinely does NOT touch the RDO catalogue.
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/other-file.ts\n');
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/640\n');
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, pushDeps);
+  assert.equal(next, 'GATE');
+
+  appendEvent(ctx.taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/plan.md',
+      invariants_path: '/tmp/invariants.md',
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    },
+  });
+
+  ctx.account = { name: 'default', configDir: null };
+  let seenArgv = null;
+  const llmDeps = {
+    spawnSync: (command, argv) => {
+      seenArgv = argv;
+      const reply = {
+        result: JSON.stringify({
+          summary: 'unrelated change',
+          files_changed: ['src/other-file.ts'],
+          invariants: [{ id: 'INV-1', status: 'HELD' }],
+          tests_run: ['npm run typecheck'],
+          all_green: true,
+        }),
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-rdo-symmetry',
+        modelUsage: { 'claude-opus-5': { costUSD: 0.01 } },
+        terminal_reason: 'success',
+        api_error_status: null,
+      };
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    },
+  };
+
+  const result = await runLlm(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', llmDeps);
+  assert.equal(result.ok, true);
+  const modelIdx = seenArgv.indexOf('--model');
+  assert.equal(seenArgv[modelIdx + 1], 'opus', 'IMPLEMENT must still escalate to opus even though the diff missed the catalogue');
+});
+
+test('realPushPr: a diff that does NOT touch the catalogue sets ctx.task.rdoDiffTouched to strict boolean false and journals rdo-diff-derived', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-diff-false-wt-');
+  const task = { id: 'card-rdo-diff-false', kind: 'card', issue: 641, title: 't', worktreePath, touchesRdoMembers: false };
+  const ctx = testCtx({ id: 'card-rdo-diff-false', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/other-file.ts\n');
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/641\n');
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.task.rdoDiffTouched, false);
+  assert.notEqual(ctx.task.rdoDiffTouched, undefined, 'must be a real boolean, not merely falsy');
+
+  const journal = readJournal(ctx.taskDir);
+  const derived = journal.find((e) => e.event === 'rdo-diff-derived');
+  assert.ok(derived, 'rdo-diff-derived must be journaled even when the diff misses the catalogue');
+  assert.equal(derived.touched, false);
+
+  // touchesRdoMembers stays false too -- the diff agrees with intake here, nothing to promote.
+  assert.equal(ctx.task.touchesRdoMembers, false);
+  assert.ok(!journal.some((e) => e.event === 'touches-rdo-members-rederived'));
+});
+
+test('realPushPr: a catalogue-touching diff with a citation sets ctx.task.rdoDiffTouched to true and journals rdo-diff-derived, alongside touchesRdoMembers staying true', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-rdo-diff-true-wt-');
+  const task = { id: 'card-rdo-diff-true', kind: 'card', issue: 642, title: 't', worktreePath, touchesRdoMembers: true };
+  const ctx = testCtx({ id: 'card-rdo-diff-true', task, config });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('diff') && args.includes('--name-only')) return ok('src/shared/rdo-members.ts\n');
+      if (args.includes('diff') && args.includes('-U0')) {
+        return ok('+  // AdmMembersRDO.pas:642 -- new wire member\n+  newMember: 1,\n');
+      }
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/642\n');
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.task.rdoDiffTouched, true);
+  assert.equal(ctx.task.touchesRdoMembers, true);
+
+  const journal = readJournal(ctx.taskDir);
+  const derived = journal.find((e) => e.event === 'rdo-diff-derived');
+  assert.ok(derived);
+  assert.equal(derived.touched, true);
+});
+
 // ---- End-to-end proof: realPushPr -> CITATION_VERIFIER no longer parks -----------------------
 //
 // Neither --dry-run nor --shadow can demonstrate this fix through the full daemon: PUSH_PR under

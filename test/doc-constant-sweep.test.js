@@ -1406,6 +1406,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/state-machine.js :: auto-pull.js:49-57",
   "orchestrator/state-machine.js :: park-loop.js:1262", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate
   "orchestrator/state-machine.js :: run.ts:63",
+  "orchestrator/state-machine.js :: step-contracts.js:326", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`
   "orchestrator/steps/llm.js :: intake.js:797-799",
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
@@ -2027,7 +2028,11 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // alone is enough to anchor it, and `reconcileExternalClosure` alone is what still anchors it
   // one line up, at park-loop.js:1261 ("...only reconcileExternalClosure runs for it.") -- see
   // ANCHOR_BLUNT_CITATIONS below for why that also makes it blunt, not merely anchored.
-  assert.equal(anchored, 28, `expected 28 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
+  // (resolveRdoDiffTouched's strict-boolean rationale). Re-measured: 29 verified (was 28), 2
+  // unanchorable (unchanged), 0 offenders. It anchors on `touchesRdoMembers` (camelCase), present
+  // verbatim on step-contracts.js:326 itself (`touchesRdoMembers === true`).
+  assert.equal(anchored, 29, `expected 29 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
@@ -2146,16 +2151,20 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // card #80 (2026-09-06): +1 citation, `orchestrator/state-machine.js :: park-loop.js:1262`,
   // single-line and BLUNT (see ANCHOR_BLUNT_CITATIONS above) -- blunt is 2 -> 3; discriminating
   // and ranges are unchanged.
+  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
+  // -- single-line, anchored on `touchesRdoMembers`, which appears on line 326 only (neither 325
+  // nor 327 mentions it), so it discriminates a one-line drift -- discriminating is 16 -> 17.
+  // blunt and ranges are unchanged.
   assert.deepEqual(
     blunt.map((b) => b.split(' -- ')[0]).sort(),
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
-  assert.equal(discriminating.length, 16, `expected 16 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
+  assert.equal(discriminating.length, 17, `expected 17 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
   assert.equal(ranges.length, 9, `expected 9 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 28, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (28).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 29, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (29).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

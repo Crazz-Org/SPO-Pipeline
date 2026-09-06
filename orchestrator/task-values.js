@@ -116,6 +116,21 @@ function lastJournaledCitations(taskDir) {
   return event ? event.citations : null;
 }
 
+// The `touched` boolean from the most recent {state: 'PUSH_PR', event: 'rdo-diff-derived',
+// touched, path} record journaled by realPushPr (orchestrator/steps/scripted.js), or undefined if
+// none exists yet (PUSH_PR hasn't run for this task). This is the restart-durable fallback for
+// ctx.task.rdoDiffTouched -- genuinely symmetric (recorded both true and false), unlike
+// touchesRdoMembers's one-way promotion, which stays reserved for IMPLEMENT's Opus escalation. A
+// daemon restart between PUSH_PR and VALIDATE rebuilds ctx.task from task.json and would
+// otherwise lose the in-memory value and fall back to intake's guess.
+function lastJournaledRdoDiffTouched(taskDir) {
+  const event = lastMatchingEvent(
+    taskDir,
+    (e) => e.state === 'PUSH_PR' && e.event === 'rdo-diff-derived' && typeof e.touched === 'boolean'
+  );
+  return event ? event.touched : undefined;
+}
+
 // The most recent {ts, state: 'PLAN', event: 'invariants-baseline', parseError, invariants,
 // issues} record handlePlan journaled (action 1.8, orchestrator/invariants.js's buildBaseline),
 // or null if PLAN never produced one -- a shadow/dry-run task never calls buildBaseline at all
@@ -269,6 +284,7 @@ module.exports = {
   lastResultPayload,
   lastResultEvent,
   lastJournaledCitations,
+  lastJournaledRdoDiffTouched,
   lastInvariantsBaseline,
   scratchDir,
   diffPath,
