@@ -18,7 +18,7 @@ const { execFileSync } = require('child_process');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { alertPark } = require('../orchestrator/park-alert');
-const { DAEMON, mkTmp, writeTask, readState } = require('./helpers');
+const { DAEMON, mkTmp, writeTask, readState, isolatedEnv } = require('./helpers');
 
 function fakeCtx(taskDir, parkAlertCmd) {
   return { id: 'task-1', taskDir, config: { parkAlertCmd } };
@@ -103,7 +103,7 @@ test('finalizePark: a shadow-mode park lands one `parked` event in <journalRoot>
   execFileSync(
     process.execPath,
     [DAEMON, '--shadow', '--once', '--queue', queueDir, '--journal', journalDir, '--deadline-ms', '15'],
-    { encoding: 'utf8', env: { ...process.env, SPO_PARK_ALERT_CMD: '/does/not/exist-alert' } }
+    { encoding: 'utf8', env: { ...isolatedEnv(), SPO_PARK_ALERT_CMD: '/does/not/exist-alert' } }
   );
 
   assert.equal(readState(journalDir, 'alert-park-demo').state, 'PARKED');

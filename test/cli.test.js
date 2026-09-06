@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { execFileSync } = require('child_process');
-const { mkTmp, writeTask, runDaemonOnce, runSpo, SPO_BIN } = require('./helpers');
+const { mkTmp, writeTask, runDaemonOnce, runSpo, SPO_BIN, isolatedEnv } = require('./helpers');
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
@@ -203,6 +203,7 @@ test('spo account clear-cooldown on an unknown account name exits non-zero and w
   try {
     execFileSync(process.execPath, [SPO_BIN, 'account', 'clear-cooldown', 'ghost', '--accounts-dir', accountsDir], {
       encoding: 'utf8',
+      env: isolatedEnv(),
     });
   } catch (err) {
     caught = err;
@@ -259,14 +260,14 @@ test('SPO_ACCOUNTS_DIR env var picks the pool directory when --accounts-dir is n
   const accountsDir = mkTmp('spo-accts-cli-envvar-');
   const out = execFileSync(process.execPath, [SPO_BIN, 'account', 'add', 'pool1'], {
     encoding: 'utf8',
-    env: { ...process.env, SPO_ACCOUNTS_DIR: accountsDir },
+    env: { ...isolatedEnv(), SPO_ACCOUNTS_DIR: accountsDir },
   });
   assert.match(out, /Created/);
   assert.ok(fs.existsSync(path.join(accountsDir, 'pool1')));
 
   const accountsOut = execFileSync(process.execPath, [SPO_BIN, 'accounts'], {
     encoding: 'utf8',
-    env: { ...process.env, SPO_ACCOUNTS_DIR: accountsDir },
+    env: { ...isolatedEnv(), SPO_ACCOUNTS_DIR: accountsDir },
   });
   assert.match(accountsOut, /pool1\s+enabled=true/);
 });

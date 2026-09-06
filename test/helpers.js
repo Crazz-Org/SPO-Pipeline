@@ -106,12 +106,41 @@ function isolatedEnv() {
   const accountsDir = mkTmp('spo-isolated-accounts-');
   writePoolDir(accountsDir, [{ name: 'isolated' }]);
 
+  // orchestrator/no-real-spawn-guard.js's own env var, set EXPLICITLY here (not left to the
+  // `...process.env` spread above to carry it) -- a call site that builds its own `env:` object
+  // from scratch instead of starting from this helper's return value must not silently drop it.
+  // Required lazily, here rather than at file scope, because this file's own top (lines 65-80) is
+  // line-pinned by test/doc-constant-sweep.test.js's EXPECTED_CITATIONS and must not shift.
+  const { SPO_NO_REAL_SPAWN } = require('../orchestrator/no-real-spawn-guard');
+
   return {
     ...process.env,
     SPO_PRODUCT_REPO: mkTmp('spo-isolated-product-'),
     SPO_WORKTREES_DIR: mkTmp('spo-isolated-worktrees-'),
     SPO_ACCOUNTS_DIR: accountsDir,
     SPO_BENCH_DIR: mkTmp('spo-isolated-bench-'),
+    // orchestrator/config.js's spoReportsDir falls back to `~/.spo-reports` when this is unset --
+    // every daemon/spo subprocess this suite spawns would otherwise write real report files into
+    // the maintainer's shared, real reports directory. Same fresh-mkdtempSync treatment as the
+    // other isolated paths above.
+    SPO_REPORTS_DIR: mkTmp('spo-isolated-reports-'),
+    // orchestrator/state-root.js's resolveStateRoot() falls back to `~/.spo-state` when this is
+    // unset -- every daemon/spo subprocess this suite spawns would otherwise resolve its
+    // queue/journal DEFAULT (when a call site passes no explicit --queue/--journal) to the
+    // maintainer's real, live state root. Verified before adding this: no test in this suite
+    // spawns a REAL child that relies on SPO_STATE_DIR resolving to the genuine machine default
+    // to exercise bin/spo's live-daemon-lock refusal (refuseIfDaemonLockHeld) -- every test that
+    // exercises that guard (test/intake.test.js, test/spo-triage.test.js, test/recette.test.js)
+    // calls the relevant command function IN-PROCESS and sets process.env.SPO_STATE_DIR itself
+    // (see each file's own withIsolatedStateDir), never going through a spawned child's `env:`
+    // option at all -- so this addition cannot silently neuter any of them. If a future test
+    // spawns a real `spo pull`/`spo intake` child to exercise that same refusal, it must pin the
+    // RESOLVED lock path explicitly (the same way withIsolatedStateDir does for the in-process
+    // tests) rather than rely on this default, and must show the assertion falls when the guard
+    // is revoked -- see bin/spo:1489-1497's own "ACCEPTED RESIDUAL" comment for why
+    // SPO_STATE_DIR is also the one thing that can walk a REAL spawned child past that guard.
+    SPO_STATE_DIR: mkTmp('spo-isolated-state-'),
+    [SPO_NO_REAL_SPAWN]: '1',
   };
 }
 

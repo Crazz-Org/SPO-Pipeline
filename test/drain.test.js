@@ -295,11 +295,16 @@ test('drain: a real SIGTERM to a real daemon process drains and exits 0', { time
     shadow: { gate: [0], prWait: [0], llm: { VALIDATE: { verdict: 'PASS' } }, delays: { IMPLEMENT: 2500 } },
   });
 
-  const env = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0', SPO_DRAIN_TIMEOUT_MS: '30000' };
+  // Named uniquely per env-building site in this file (envDrainReal/envDrainEsc/envSpawnHelper/
+  // envDrainWorker) rather than a repeated local `env` -- test/spawn-isolation-sweep.test.js's
+  // identifier resolution refuses to resolve a name with more than one declaration ANYWHERE in
+  // the file (fail-closed against shadowing, not scope-aware), so four functions each declaring
+  // their own `const env` would otherwise make every one of these sites read as unresolvable.
+  const envDrainReal = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0', SPO_DRAIN_TIMEOUT_MS: '30000' };
   const daemon = realSpawn(
     process.execPath,
     [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir, '--workers', '1'],
-    { env, stdio: ['ignore', 'ignore', 'pipe'] }
+    { env: envDrainReal, stdio: ['ignore', 'ignore', 'pipe'] }
   );
   let stderr = '';
   daemon.stderr.on('data', (b) => {
@@ -358,11 +363,11 @@ test('drain: a SECOND real SIGTERM stops immediately instead of waiting out the 
     shadow: { gate: [0], prWait: [0], llm: { VALIDATE: { verdict: 'PASS' } }, delays: { IMPLEMENT: 60000 } },
   });
 
-  const env = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0', SPO_DRAIN_TIMEOUT_MS: '120000' };
+  const envDrainEsc = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0', SPO_DRAIN_TIMEOUT_MS: '120000' };
   const daemon = realSpawn(
     process.execPath,
     [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir, '--workers', '1'],
-    { env, stdio: ['ignore', 'ignore', 'pipe'] }
+    { env: envDrainEsc, stdio: ['ignore', 'ignore', 'pipe'] }
   );
   let stderr = '';
   daemon.stderr.on('data', (b) => {
@@ -566,11 +571,11 @@ test('drain: a CLEAN drain still signals the scanner on the way out', { timeout:
 // branch). Each arm gets its own real process here.
 
 function spawnRealDaemon(queueDir, journalDir, envOverrides = {}, args = []) {
-  const env = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0', ...envOverrides };
+  const envSpawnHelper = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0', ...envOverrides };
   const daemon = realSpawn(
     process.execPath,
     [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir, '--workers', '1', ...args],
-    { env, stdio: ['ignore', 'ignore', 'pipe'] }
+    { env: envSpawnHelper, stdio: ['ignore', 'ignore', 'pipe'] }
   );
   let stderr = '';
   daemon.stderr.on('data', (b) => {
@@ -659,11 +664,11 @@ test('drain: a SIGTERM to a real --worker exits 143 -- a worker has no dispatche
   // `dispatcherHandle` is null in worker mode, so the handler must take the immediate-exit path.
   // Without that arm the handler calls requestDrain on null and throws a TypeError INSIDE a signal
   // handler -- the worker then dies uncaught rather than cleanly, on every single deploy.
-  const env = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0' };
+  const envDrainWorker = { ...isolatedEnv(), SPO_AUTO_PULL_MS: '0', SPO_AUTO_TRIAGE_MS: '0' };
   const worker = realSpawn(
     process.execPath,
     [DAEMON, '--shadow', '--worker', taskDir, '--queue', queueDir, '--journal', journalDir],
-    { env, stdio: ['ignore', 'ignore', 'pipe'] }
+    { env: envDrainWorker, stdio: ['ignore', 'ignore', 'pipe'] }
   );
   let stderr = '';
   worker.stderr.on('data', (b) => {

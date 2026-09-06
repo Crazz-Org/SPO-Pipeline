@@ -15,7 +15,7 @@ const { execFileSync } = require('child_process');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { tokenReport, todaySpend, computeLikelyCacheExpiries } = require('../orchestrator/tokens');
-const { SPO_BIN, REPO_ROOT, mkTmp } = require('./helpers');
+const { SPO_BIN, REPO_ROOT, mkTmp, isolatedEnv } = require('./helpers');
 
 const CONFIG_PATH = path.join(REPO_ROOT, 'orchestrator', 'config.js');
 
@@ -235,7 +235,7 @@ test('spo tokens: prints per-task rows, the aggregate, billable tokens per DONE 
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 100000, out: 5000 }], state: 'DONE' });
   seedTaskJournal(journalRoot, 'issue-2', { calls: [{ fresh: 50000, out: 2000 }], state: 'PARKED', parks: ['budget_exhausted'] });
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
   assert.match(out, /issue-1\s+DONE/);
   assert.match(out, /budget_exhausted/);
   assert.match(out, /billable tokens per DONE card:/);
@@ -292,7 +292,7 @@ test('spo tokens: a journal with no token data prints "n/a", never 0, plus a foo
   const journalRoot = mkTmp('spo-tokens-');
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ legacy: true }, { legacy: true }, { legacy: true }], state: 'DONE' });
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
 
   // Assert on the TASK ROW itself, not just the summary lines: the row is where a bare "0"
   // would be read as "this task used no tokens".
@@ -316,7 +316,7 @@ test('spo tokens: a journal WITH token data prints real numbers and no missing-d
   const journalRoot = mkTmp('spo-tokens-');
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 1000, cacheCreation: 500, out: 100 }], state: 'DONE' });
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
   assert.doesNotMatch(out, /n\/a/);
   assert.doesNotMatch(out, /carry no token data/);
   assert.match(out, /billable tokens per DONE card: 1\.6k/);
@@ -328,7 +328,7 @@ test('spo tokens: never prints a dollar figure', () => {
   const journalRoot = mkTmp('spo-tokens-');
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 100000, out: 5000 }], state: 'DONE' });
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
   assert.doesNotMatch(out, /\$\d/);
 });
 
@@ -336,7 +336,7 @@ test('spo tokens: formats large token counts readably (e.g. "k"/"M" suffixes), n
   const journalRoot = mkTmp('spo-tokens-');
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 215400, cacheRead: 3_500_000, out: 1200 }], state: 'DONE' });
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
   assert.match(out, /215\.4k/);
   assert.match(out, /3\.5M/);
 });
@@ -346,8 +346,8 @@ test('spo cost: prints a deprecation notice, then the same table `spo tokens` pr
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 100000, out: 5000 }], state: 'DONE' });
   seedTaskJournal(journalRoot, 'issue-2', { calls: [{ fresh: 50000, out: 2000 }], state: 'PARKED', parks: ['budget_exhausted'] });
 
-  const costOut = execFileSync(process.execPath, [SPO_BIN, 'cost', '--journal', journalRoot], { encoding: 'utf8' });
-  const tokensOut = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const costOut = execFileSync(process.execPath, [SPO_BIN, 'cost', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
+  const tokensOut = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
 
   assert.match(costOut, /deprecated/i);
   assert.match(costOut, /spo tokens/);
@@ -506,7 +506,7 @@ test('spo tokens: renders an `(intake)` row and names the intake calls in the to
   seedTaskJournal(journalRoot, 'issue-1', { calls: [{ fresh: 100000, out: 5000 }], state: 'DONE' });
   seedDaemonJournal(journalRoot, [{ step: 'TRIAGE_BUG_REPORT', fresh: 20000, out: 1000 }]);
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
   assert.match(out, /\(intake\)/);
   assert.match(out, /over 1 tasks \+ 1 intake call\(s\)/);
   // 105k task + 21k intake -- the aggregate, not the task journals alone.
@@ -518,7 +518,7 @@ test('spo tokens: a journal root with ONLY intake calls still prints a report, n
   const journalRoot = mkTmp('spo-tokens-intake-only-');
   seedDaemonJournal(journalRoot, [{ step: 'DRAFT_CARD', fresh: 700, out: 30 }]);
 
-  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8' });
+  const out = execFileSync(process.execPath, [SPO_BIN, 'tokens', '--journal', journalRoot], { encoding: 'utf8', env: isolatedEnv() });
   assert.doesNotMatch(out, /no task journals under/);
   assert.match(out, /\(intake\)/);
   assert.match(out, /billable 730/);
