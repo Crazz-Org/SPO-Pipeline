@@ -966,7 +966,17 @@ merge origin/main`, and success returns `'CHECK'` to re-run CHECK and re-gate.
 **MERGE** runs `gh pr merge <n> --repo <ghRepo> --merge` (enqueues; **never** `--delete-branch`
 — see CLAUDE.md and `test/real-steps.test.js`'s explicit assertion of its absence), then `npm
 run pr:wait -- <n>` in the worktree, with exactly one bounded re-wait on exit 4 ("still open"),
-identical to the shadow-mode bounded-wait logic.
+identical to the shadow-mode bounded-wait logic. **SPO-Pipeline#84:** on either non-landing path
+whose `probeMergeability` cause is `merge-conflict` or `merge-behind-base` — the two answers that
+mean `main` moved under the branch while it sat in the queue — `realMerge` makes one re-gate
+attempt (`regateAfterNonLanding`) before parking: re-run the same file-intersection test
+CI_CHECKS/GATE use against the bench verdict's `baseMain`, and on a genuine overlap, fetch and
+merge `origin/main` and return to CHECK instead of parking on the now-stale symptom. Any other
+cause, or anything that keeps the re-gate itself from completing (no verdict, no intersection, a
+fetch or merge failure, the shared `mainMovedRegateBudget` already spent), falls straight through
+to the original park, unchanged — the re-gate never masks or worsens a park, and never adds a
+second `gh pr view` call (it reuses the probe's own answer). See `merge-regate` above and
+`doc/state-machine-spec.md`'s MERGE row for the full detail.
 
 **FINISH** (action B1.4 gave it a new preamble, ahead of the pre-existing board-sync/teardown
 below) first fast-forwards `config.productRepo`'s own checkout to `origin/main` and, only when
@@ -2497,6 +2507,8 @@ task/daemon split itself).
 | `leftover-pr-lookup-failed` | task | the leftover sweep's `gh pr list` for the stale branch failed or returned unparsable JSON — the delete is refused rather than risk closing an invisible PR (`steps/scripted.js`). |
 | `leftover-remote-preserved` | task | the leftover sweep pushed the stale remote branch's unmerged tip to a `wip/` ref before deleting it (`steps/scripted.js`). |
 | `leftover-worktree-removed` | task | the leftover sweep removed (or pruned the registration of) a stale worktree directory (`steps/scripted.js`). |
+| `merge-regate` | task | SPO-Pipeline#84: `realMerge`'s own re-gate attempt on a non-landing `pr:wait`, run only when `probeMergeability`'s cause is `merge-conflict`/`merge-behind-base` — one event per outcome, `decision` naming which: `rev-parse-failed` (HEAD), `no-base-main` (no bench verdict for HEAD, or it carries no `baseMain`), `fetch-failed`, `diff-failed`, `no-intersection` (the branch and `origin/main`'s own moved files don't overlap — the original park stands), `budget-exhausted` (`config.mainMovedRegateBudget` already spent, shared with GATE/CI_CHECKS), `origin-main-rev-parse-failed` (the nightly-red guard is skipped, not fatal), `merge-failed` (the regate's own `git merge origin/main` conflicted — aborted and left clean), `spawn-park-suppressed` (one of the re-gate's own `spawnStep` calls THREW rather than returning — `git-timed-out` after its retry, or `command-killed-by-signal` from a deploy restart — and the throw was swallowed, `suppressedReason` naming it, so the caller's original GitHub-attested park still fires; `main-red-no-merge` is the one throw deliberately NOT suppressed), or `routed` (merged cleanly; `realMerge` returns `'CHECK'` and the caller's own park never fires). Every non-`routed` decision falls through to the pre-existing `parkFromMergeCause`/fallback park unchanged — this event never itself parks the card (`steps/scripted.js`). |
+| `merge-regate-abort-failed` | task | the re-gate's own `git merge --abort` (cleaning up a failed regate merge) itself exited non-zero or hit a spawn timeout — mirrors `gate-main-moved-abort-failed` above for the same cleanup step, one state over (`steps/scripted.js`). |
 | `no-worktree-change` | task | IMPLEMENT's `files_changed` claim was non-empty but `git status --porcelain` on the worktree came back clean — routes to DIAGNOSE (card #385's cross-check, `state-machine.js`). |
 | `orphan-scan-unknown-owner` | daemon | the daemon-startup orphan scan found a task `state.json` with no recognisable `owner.workerPid`/`owner.pid` — skipped rather than guessed at (`orphan-scan.js`). |
 | `park-anchor` | task | the retry/abandon scan boundary for this park cycle, journalled when `gh issue comment` FAILED so the card stays reachable (issue #77). Carries `at`, stamped **before** the `gh` call so a `retry` posted while it was in flight still counts, but appended **after** it so the anchor remains the worker's last journal event — the only thing stopping `unparkScan` acting on a park mid-write. A successful comment journals `park-comment` instead, and its numeric id is the sharper boundary (`park-loop.js`). |
