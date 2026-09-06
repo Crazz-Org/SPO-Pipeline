@@ -2191,8 +2191,9 @@ product-repo mutex (`orchestrator/product-repo-lock.js`, `config.js`'s own note 
 acquire it — WORKTREE's setup and FINISH's teardown already take the lock, the same `realWorktree`/
 `realFinish` code every driver runs (via `drainQueueOnce` for `driver: 'inline'`, via a real worker
 process for `driver: 'dispatcher'`). What recette adds on top is a coarser, earlier guard: refusing
-to *start* at all while a live daemon holds **its own** lock file, `<repoRoot>/journal/daemon.lock`
-(`orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
+to *start* at all while a live daemon holds **its own** lock file,
+`stateJournalRoot(resolveStateRoot())/daemon.lock` — `~/.spo-state/journal/daemon.lock` by default
+(`orchestrator/state-root.js`, `orchestrator/lock.js`) — 6.4's lock is scoped to one WORKTREE/FINISH call and says nothing about
 whether a daemon is running at all before recette begins. Checked read-only (recette reads the
 lock file and probes the pid's liveness the same way `lock.js`'s own stale-sweep does — it never
 calls `acquireLock`, which would create the lock itself). `--force` overrides, loudly, for a

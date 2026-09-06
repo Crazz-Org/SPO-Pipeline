@@ -14,8 +14,12 @@
 //
 // EXPLICIT FLAGS STILL WIN, UNCONDITIONALLY. `--journal` / `--queue` (daemon.js, bin/spo) and the
 // deps overrides (intake.js) bypass everything here -- the whole test suite is built on pointing
-// runs at throwaway directories, and recette.js builds its own run-scoped roots. This module only
-// decides the DEFAULT.
+// runs at throwaway directories, and recette.js builds its own run-scoped roots (journalRoot/
+// queueDir, under `.recette/<runId>/`). The exception is recette.js's `productJournalRoot` -- the
+// target of its live-daemon lock check, not one of its own run-scoped roots -- which defaults
+// THROUGH this module (`stateJournalRoot(resolveStateRoot())`) exactly like every other caller,
+// precisely so the check looks at the same place the real daemon's lock actually is. This module
+// only decides the DEFAULT.
 
 const fs = require('fs');
 const os = require('os');

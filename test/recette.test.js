@@ -372,6 +372,114 @@ test('a lock file whose pid is dead is not a refusal (liveDaemonHolder returns n
 });
 
 // ---------------------------------------------------------------------------------------------
+// Card #133: `productJournalRoot`'s DEFAULT (no opts.productJournalRoot at all) must resolve
+// through orchestrator/state-root.js -- `stateJournalRoot(resolveStateRoot())`, i.e.
+// `<SPO_STATE_DIR>/journal` -- exactly like `bin/spo` and `console/` already do, not the dead
+// `<repoRoot>/journal` the default used to hardcode (that path was emptied by the queue/journal
+// migration and can never hold a real lock again, so the safety check silently never fired).
+//
+// `withIsolatedStateDir` mirrors test/intake.test.js's/test/spo-triage.test.js's own helper of
+// the same name: `SPO_STATE_DIR` is the ONLY thing that actually redirects `resolveStateRoot()`,
+// so it is what isolates a test from this machine's real `~/.spo-state` (which may genuinely hold
+// a live daemon's lock right now) -- a `--journal`/`deps` override does not touch this default at
+// all, that is the entire point of this card.
+function withIsolatedStateDir(fn) {
+  return async () => {
+    const stateDir = mkTmp('spo-recette-state-');
+    const saved = process.env.SPO_STATE_DIR;
+    process.env.SPO_STATE_DIR = stateDir;
+    try {
+      await fn(stateDir);
+    } finally {
+      if (saved === undefined) delete process.env.SPO_STATE_DIR;
+      else process.env.SPO_STATE_DIR = saved;
+    }
+  };
+}
+
+// THE PATH-PINNING TEST. Not "it refuses" -- a test that only asserts refusal still goes green
+// with the OLD, dead `<repoRoot>/journal` default (nothing there ever refuses, so a test using an
+// injected productJournalRoot passes for an unrelated reason and a test using no override at all
+// never even ran before this card). This asserts the literal VALUE resolveConfig computed.
+//
+// `SPO_STATE_DIR` is set AFTER `require('../orchestrator/recette')` already ran at the top of this
+// file (module load happened long before this test body runs) -- proving the resolution happens
+// on every `resolveConfig` call, not once at require-time.
+test(
+  'recette: productJournalRoot with NO override resolves through state-root.js, following SPO_STATE_DIR set after require',
+  withIsolatedStateDir(async (stateDir) => {
+    const opts = baseOpts();
+    delete opts.productJournalRoot; // exercise the real default -- baseOpts() would otherwise pin it
+
+    const result = await recette.runRecette({ ...opts, dry: true }, {});
+
+    assert.equal(result.ok, true);
+    assert.equal(result.dry, true);
+    assert.equal(result.plan.productJournalRoot, path.join(stateDir, 'journal'));
+  })
+);
+
+// A refusal test on the REAL resolution path (no opts.productJournalRoot), pinning the lock path
+// too -- not just `refused === true`, which the dead default would also have failed on trivially
+// (any path check that reads nothing returns null, not a refusal) but for the wrong reason.
+test(
+  'recette: refuses against the REAL default productJournalRoot (no override), lock path pinned',
+  withIsolatedStateDir(async (stateDir) => {
+    const realJournalRoot = path.join(stateDir, 'journal');
+    fs.mkdirSync(realJournalRoot, { recursive: true });
+    fs.writeFileSync(
+      lockPath(realJournalRoot),
+      JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+    );
+
+    const opts = baseOpts();
+    delete opts.productJournalRoot;
+
+    let spawnCalled = false;
+    const result = await recette.runRecette(opts, {
+      isAlive: (pid) => pid === 999999,
+      spawnSync: () => { spawnCalled = true; return ok(''); },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.refused, true);
+    assert.equal(result.reason, 'daemon-lock-held');
+    assert.equal(result.detail.lockPath, lockPath(realJournalRoot));
+    assert.equal(result.detail.lockPath, path.join(stateDir, 'journal', 'daemon.lock'));
+    assert.equal(spawnCalled, false, 'refusal must happen before any spawn');
+  })
+);
+
+// opts.productJournalRoot must still win over the new default -- proven the strong way: a real
+// lock sits at the state-root default (would refuse, per the test just above, if it leaked
+// through), yet an explicit override elsewhere makes the run proceed WITHOUT --force. This is
+// also the exact shape every OTHER test in this file already relies on (baseOpts()'s own mkTmp
+// for productJournalRoot); this test is what proves that reliance is still warranted.
+test(
+  'recette: explicit opts.productJournalRoot still wins over the state-root.js default -- no refusal despite a real lock at the default',
+  withIsolatedStateDir(async (stateDir) => {
+    const realJournalRoot = path.join(stateDir, 'journal');
+    fs.mkdirSync(realJournalRoot, { recursive: true });
+    fs.writeFileSync(
+      lockPath(realJournalRoot),
+      JSON.stringify({ host: os.hostname(), pid: 999999, mode: 'real', startedAt: new Date().toISOString() })
+    );
+
+    const opts = baseOpts(); // baseOpts() pins its own throwaway productJournalRoot, no lock there
+    assert.notEqual(opts.productJournalRoot, realJournalRoot);
+
+    const calls = [];
+    const result = await recette.runRecette(opts, {
+      isAlive: () => true, // the real lock's pid WOULD read alive, if it were ever consulted
+      spawnSync: makeHappyPathSpawnSync({ calls }),
+    });
+
+    assert.notEqual(result.refused, true);
+    assert.ok(calls.length > 0, 'the override must let the run actually spawn, no --force needed');
+  })
+);
+
+// ---------------------------------------------------------------------------------------------
 // SPO_REMOTE_REPORT_URL refusal (Finding 1, post-verification) -- a dispatcher-driver scenario
 // spawns a real scanner process that inherits this process's own env, and
 // remote-report-pull.js's own first pull runs UNCONDITIONALLY on scanner startup, never gated by
