@@ -2569,9 +2569,9 @@ bin/spo account clear-cooldown <name>              # drop a locally-invented coo
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
 bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
 bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
-bin/spo pull [--limit <n>]                         # write queue/<seq>-issue-<n>.json for the top N claimable board cards
+bin/spo pull [--limit <n>] [--force]               # write queue/<seq>-issue-<n>.json for the top N claimable board cards (refuses while a live daemon holds the lock, --force overrides -- card #100)
 bin/spo pull-reports                               # STAGE 0: pull queued reports from a production deployment over HTTPS
-bin/spo intake [--limit <n>] [--reports-dir <dir>] # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above)
+bin/spo intake [--limit <n>] [--reports-dir <dir>] [--force]  # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above); refuses while a live daemon holds the lock, --force overrides (card #100)
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
 bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file); defaults to --dry (see "The recovery path" above)

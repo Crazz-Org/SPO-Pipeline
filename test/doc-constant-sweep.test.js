@@ -1333,7 +1333,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1141",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1150",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1364,7 +1364,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1141",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1150",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
@@ -1379,7 +1379,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:874",
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1100",
+  "doc/state-machine-spec.md :: bin/spo:1109",
   "doc/state-machine-spec.md :: dispatcher.js:572-586",
   "doc/state-machine-spec.md :: intake.js:797-799",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -2342,7 +2342,7 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1141 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1150 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
@@ -2368,7 +2368,13 @@ test('MUTATION PROOF: reverting bin/spo:1141 back to bin/spo:1129 (the drift thi
   // repetition is really saying is that a LINE-NUMBER citation into a file under active edit
   // cannot be kept true by discipline; it is a standing tax the symbol-citation conversion
   // (action M17) exists to retire, and this one has now been paid five times.
-  const reverted = normalized.replace('reached from `bin/spo:1141`', 'reached from `bin/spo:1129`');
+  //
+  // SIXTH catch, 2026-09-06: card #100's daemon-lock guard added lines above `cmdDashboard` (a
+  // shared `refuseIfDaemonLockHeld` helper plus wider `pull`/`intake` header comments), pushing
+  // `collectAll(sources)` down again, from :1141 to :1150. The canary stays `:1129` -- still
+  // wrong for the same reason FOURTH/FIFTH already established (mid-`cmdDashboard`, no `collect`-
+  // shaped candidate nearby), still the value that costs nothing to keep re-using. Paid six times.
+  const reverted = normalized.replace('reached from `bin/spo:1150`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');

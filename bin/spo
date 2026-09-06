@@ -112,21 +112,28 @@
 //                            instead (the hand-off point for an interactive session that
 //                            formalized its own card) -- still goes through review -> file.
 //                            Combines with --dry. Ignores any positional text when given.
-//   spo pull [--limit N]     Reads the product board's cheap pool read (`npm run board:claim`,
+//   spo pull [--limit N] [--force]
+//                            Reads the product board's cheap pool read (`npm run board:claim`,
 //                            never a claim, never a board write) and writes a local
 //                            queue/<seq>-issue-<n>.json task file for each of the top N
 //                            claimable candidates (default 5), skipping one already queued or
-//                            journaled. See orchestrator/intake.js.
+//                            journaled. See orchestrator/intake.js. Refuses to run while a live
+//                            daemon holds journal/daemon.lock, unless --force (card #100 --
+//                            same read-only guard `spo recette` uses, orchestrator/recette.js's
+//                            `liveDaemonHolder`).
 //   Human-first bug-report intake -- see orchestrator/README.md § Report intake for the full
 //   design. No LLM ever looks at a report until a maintainer has read it RAW and replied
 //   "confirm" on the issue -- three commands, one per stage:
-//   spo intake [--limit N] [--reports-dir <dir>]
+//   spo intake [--limit N] [--reports-dir <dir>] [--force]
 //                            Stage 1, MECHANICAL (zero LLM calls): renders each queued report
 //                            (~/.spo-reports, or --reports-dir/SPO_REPORTS_DIR) via SPO-WebClient's
 //                            `npm run report:card`, dedups it by anchorKey (a grep, not a
 //                            judgement), files a RAW card labeled report:raw, moves it to the
 //                            "Intake" board column, and posts confirm/discard instructions. See
-//                            orchestrator/report-intake.js.
+//                            orchestrator/report-intake.js. Refuses to run while a live daemon
+//                            holds journal/daemon.lock, unless --force (card #100 -- same
+//                            read-only guard `spo recette` uses, orchestrator/recette.js's
+//                            `liveDaemonHolder`).
 //   spo reports [--reports-dir <dir>]
 //                            Lists everything in <reports-dir>/pending/ -- the intake analogue
 //                            of `spo parked`. NOT one population: a raw card can be there
@@ -184,8 +191,9 @@
 // Flags (status): --bench-dir <dir>  (default: orchestrator/config.js's spoBenchDir,
 //   ~/.spo-bench -- dashboard's own bench path is separate, see cmdDashboard)
 // Flags (ask): --dry  --draft-file <path>
-// Flags (pull): --limit <n>  (default 5)
-// Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>
+// Flags (pull): --limit <n>  (default 5)  --force (override the daemon-lock refusal, card #100)
+// Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>  --force (override the
+//   daemon-lock refusal, card #100)
 // Flags (reports): --reports-dir <dir>
 // Flags (triage): --limit <n>  (default 3)  --file (actually act; default dry-run)
 //   --retry <issue>  (action 3.4 -- switches to the single-issue recovery path; --limit is
@@ -211,6 +219,7 @@ const remoteReportPull = require('../orchestrator/remote-report-pull');
 const { tokenReport, todaySpend, formatTokenCount } = require('../orchestrator/tokens');
 const recette = require('../orchestrator/recette');
 const retryChannel = require('../orchestrator/retry-channel');
+const { lockPath } = require('../orchestrator/lock');
 
 function parseArgs(argv) {
   const opts = {
@@ -1454,11 +1463,76 @@ async function cmdAsk(opts, deps = {}) {
   console.log(filed.url);
 }
 
+// Card #100 (consolidates 79.2): the daemon-lock guard shared by every state-mutating `spo`
+// subcommand that does NOT otherwise take orchestrator/lock.js's single-instance lock.
+// `cmdIntake`/`cmdPull` used to resolve directories and call straight into their side effects --
+// no lock read, no refusal, no `--force` -- so either one running while the daemon is live could
+// race the daemon's own scanner over the same files. Mirrors recette.js's own guard exactly (the
+// `if (!opts.force) { const holder = liveDaemonHolder(...); ... }` block in its `runRecette`) and
+// cmdRecette's refusal print (see below) for tone -- `liveDaemonHolder` is read-only, it never
+// creates the lock (its own header). Returns true when the caller must refuse and do nothing else
+// -- sets process.exitCode itself so call sites don't have to repeat that.
+//
+// ANTI-EVASION (post-verification fix, F1, 2026-09-06): a real daemon's lock lives wherever ITS
+// OWN argv resolved it -- normally `stateJournalRoot(resolveStateRoot())`, since production never
+// passes the daemon its own `--journal`. This process's `--journal` flag is a DIFFERENT argv, on a
+// DIFFERENT process; it changes what `resolveDirs(opts)` gives >this< command, and nothing about
+// where the daemon's lock actually is. Checking only `journalRoot` (the resolved arg) therefore let
+// `spo pull --journal <empty-tmp>` (or `spo intake --journal <empty-tmp>`) walk straight past a
+// live daemon while still writing into the shared queue/reports the daemon was draining -- caught
+// by verification, reproduced with a real `acquireLock` + a real `--journal` decoy before this
+// comment was written. Fixed by checking the REAL default UNCONDITIONALLY (nothing on this
+// process's own argv can move it) in addition to `journalRoot` when an explicit `--journal` makes
+// it different -- belt-and-braces the other way too: a maintainer who really did start a second
+// daemon on `--journal X` must have `spo pull --journal X` refuse against THAT lock as well.
+//
+// ACCEPTED RESIDUAL: "the real default" above is itself `stateJournalRoot(resolveStateRoot())`,
+// and `resolveStateRoot()` reads `SPO_STATE_DIR` from this process's own environment -- so
+// `SPO_STATE_DIR=<elsewhere> spo intake` still proceeds while a real daemon (started without that
+// override) holds its lock at the genuine default, and still consumes the shared `~/.spo-reports`
+// (`reportsDir` is independent of the state root entirely). This is inherent, not an oversight:
+// redefining the state root redefines what "the real default" even means to this process, so the
+// guard has no way left to learn where the daemon's lock actually is, and reaching this case
+// requires deliberately exporting an env var most invocations never touch. Accepted rather than
+// fixed.
+function refuseIfDaemonLockHeld(journalRoot, opts, deps, label) {
+  if (opts.force) return false;
+  const realDefaultJournalRoot = stateJournalRoot(resolveStateRoot());
+  const candidateRoots = journalRoot === realDefaultJournalRoot ? [realDefaultJournalRoot] : [realDefaultJournalRoot, journalRoot];
+  for (const root of candidateRoots) {
+    const holder = recette.liveDaemonHolder(root, deps);
+    if (!holder) continue;
+    console.error(
+      `spo ${label}: refused -- a live daemon (pid ${holder.pid} on ${holder.host}, mode ${holder.mode || '?'}, ` +
+        `since ${holder.startedAt || '?'}) holds ${lockPath(root)}. Running \`spo ${label}\` while the ` +
+        'daemon is live can race its own scanner over the same files. Pass --force to override once you have ' +
+        'confirmed by hand that nothing is actually running.'
+    );
+    process.exitCode = 1;
+    return true;
+  }
+  return false;
+}
+
 // `spo pull [--limit N]` -- reads the product board's cheap pool read (npm run board:claim,
 // never a claim, never a board write) and writes a local queue/<seq>-issue-<n>.json for each of
 // the top N claimable candidates (default 5), skipping one already queued or journaled. Never
 // runs `daemon.js` itself -- `spo pull` only ever populates queue/. `deps.intake`: see cmdAsk.
+// Refuses while a live daemon holds journal/daemon.lock, unless --force (card #100) -- checked
+// against the same journalRoot `resolveDirs` gives every other command (PLUS the real default
+// unconditionally -- see refuseIfDaemonLockHeld's own ANTI-EVASION note), which is also what
+// triggers `assertStateMigrated` here for the first time (see resolveDirs) -- a genuine behaviour
+// change for `spo pull`, harmless once state has been migrated (the normal, post-migration case).
+//
+// `{ journalRoot, queueDir }` are forwarded to `makeTask` below as its own `deps` (post-
+// verification fix, F1): `makeTask` (intake.js) resolves its OWN default root internally when
+// `deps.journalRoot`/`deps.queueDir` are absent, so passing `{}` (the previous shape) silently
+// ignored this command's own `--journal`/`--queue` flags -- the same gap that let the guard's
+// checked path and the actual WRITE path diverge. `pullBoard` takes no root deps at all: it only
+// spawns `npm run board:claim` against `deps.productRepo`, never touches queue/journal.
 async function cmdPull(opts, deps = {}) {
+  const { journalRoot, queueDir } = resolveDirs(opts);
+  if (refuseIfDaemonLockHeld(journalRoot, opts, deps, 'pull')) return;
   const intakeImpl = deps.intake || intake;
   const limit = opts.limit ? Number(opts.limit) : 5;
   const pulled = intakeImpl.pullBoard({});
@@ -1476,7 +1550,7 @@ async function cmdPull(opts, deps = {}) {
   }
 
   for (const candidate of top) {
-    const made = intakeImpl.makeTask(candidate, {});
+    const made = intakeImpl.makeTask(candidate, { journalRoot, queueDir });
     if (!made.ok) {
       console.error(`#${candidate.issue}: ${made.error}`);
       process.exitCode = 1;
@@ -1533,8 +1607,9 @@ async function cmdPullReports(opts, deps = {}) {
 // "discard" reply on the issue. Never runs `daemon.js`. `deps.reportIntake`: same test-only
 // override convention as `deps.intake` (cmdAsk/cmdPull).
 async function cmdIntake(opts, deps = {}) {
-  const reportIntakeImpl = deps.reportIntake || reportIntake;
   const { journalRoot } = resolveDirs(opts);
+  if (refuseIfDaemonLockHeld(journalRoot, opts, deps, 'intake')) return;
+  const reportIntakeImpl = deps.reportIntake || reportIntake;
   const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
   const limit = opts.limit ? Number(opts.limit) : reportIntakeImpl.DEFAULT_AUTO_INTAKE_LIMIT;
 
@@ -1849,8 +1924,8 @@ function printUsage() {
     [
       'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
-      '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>]',
-      '            intake: [--limit <n>] [--reports-dir <dir>]   reports: [--reports-dir <dir>]',
+      '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>] [--force]',
+      '            intake: [--limit <n>] [--reports-dir <dir>] [--force]   reports: [--reports-dir <dir>]',
       '            triage: [--limit <n>] [--file]   (defaults to --dry)   OR   triage --retry <issue> [--file]',
       '            recette: [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]',
     ].join('\n')
