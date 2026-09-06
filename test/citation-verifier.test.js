@@ -6,11 +6,37 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 
 const { mkTmp, writeTask, runDaemonOnce, readState, readJournal } = require('./helpers');
 
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- see test/no-real-spawn.js. Every test below this point that builds a ctx
+// directly (rather than spawning daemon.js as a subprocess, like the rest of this file) runs
+// shadowMode: true, so no spawn is ever reached -- this is belt-and-suspenders, matching every
+// other test file in the suite that requires the orchestrator directly.
+require('./no-real-spawn');
+const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
+const { appendEvent } = require('../orchestrator/journal');
+const { ParkSignal } = require('../orchestrator/park-signal');
+
 function citationEvents(journalDir, id) {
   return readJournal(journalDir, id).filter((e) => e.state === 'VALIDATE' && e.event === 'citation-verifier');
+}
+
+// Reads journal.jsonl straight off a taskDir, for the direct-ctx tests below (they build ctx via
+// buildCtx themselves rather than through runDaemonOnce's queue/journalDir/id convention).
+function taskJournal(taskDir) {
+  return fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+function validateShadowCtx(id, task, taskDir) {
+  return buildCtx(id, task, taskDir, { shadowMode: true, dryRun: false, stepDeadlineMs: 30000 });
 }
 
 test('shadow mode + no CITATION_VERIFIER fixture (cv === null) -> proceeds to the change-validator, journals source: no-fixture', () => {
@@ -419,4 +445,140 @@ test('touchesRdoMembers: true but no citations -> CITATION_VERIFIER never called
   assert.equal(skipped.length, 1, 'the skip must be journaled exactly once -- it is a real signal, not a silent path');
   assert.equal(skipped[0].touchesRdoMembers, true);
   assert.ok(events.some((e) => e.state === 'VALIDATE' && e.event === 'change-validator'), 'change-validator still ran');
+});
+
+// ---- resolveRdoDiffTouched: the trigger now reads the diff-derived field, not intake's guess ---
+//
+// 2026-09-06: realPushPr (orchestrator/steps/scripted.js) now journals a genuinely symmetric
+// ctx.task.rdoDiffTouched (both true and false) separate from touchesRdoMembers, which stays a
+// one-way intake guess reserved for IMPLEMENT's Opus escalation. handleValidate's trigger is
+// resolved from rdoDiffTouched first (in-memory, then journal-durable), falling back to
+// touchesRdoMembers only when PUSH_PR hasn't run yet. These four tests build ctx directly via
+// buildCtx (shadowMode: true, so nothing ever spawns) rather than through runDaemonOnce's
+// queue/intake path -- the intake path cannot express "PUSH_PR already ran and set rdoDiffTouched"
+// or "a restart happened, only the journal remembers it".
+
+test('handleValidate: rdoDiffTouched:false with intake touchesRdoMembers:true -> CITATION_VERIFIER never called, distinct not-rdo-diff skip journaled', async () => {
+  const taskDir = mkTmp('spo-validate-rdo-diff-false-');
+  const task = {
+    id: 'validate-rdo-diff-false',
+    kind: 'synthetic',
+    touchesRdoMembers: true,
+    rdoDiffTouched: false,
+    citations: ['RDOOpenSession — DServer/DirectoryServer.pas:143 — accessor get'],
+    shadow: {
+      llm: {
+        // A REJECT fixture that never runs cannot park -- 'MERGE' below is itself proof the
+        // verifier was never consulted, same technique the file's earlier guards use.
+        CITATION_VERIFIER: { verdict: 'REJECT' },
+        VALIDATE: { verdict: 'PASS' },
+      },
+    },
+  };
+  const ctx = validateShadowCtx('validate-rdo-diff-false', task, taskDir);
+
+  const next = await HANDLERS.VALIDATE(ctx);
+  assert.equal(next, 'MERGE', 'a REJECT fixture that never ran cannot park handleValidate');
+
+  const events = taskJournal(taskDir);
+  assert.equal(events.filter((e) => e.event === 'citation-verifier').length, 0);
+  const skipped = events.filter((e) => e.event === 'citation-verifier-skipped-not-rdo-diff');
+  assert.equal(skipped.length, 1, 'the not-rdo-diff skip must be journaled exactly once, distinct from the no-citations skip');
+  assert.equal(skipped[0].intakeGuess, true);
+});
+
+test('handleValidate restart durability: rdoDiffTouched absent from ctx.task, but a journaled rdo-diff-derived {touched:false} survives -> resolver uses the journal, CITATION_VERIFIER never called', async () => {
+  const taskDir = mkTmp('spo-validate-rdo-diff-restart-');
+  // Simulates a daemon restart between PUSH_PR and VALIDATE: the in-memory field is gone, but
+  // PUSH_PR's own journal record survives on disk. This appendEvent call is the real journal
+  // realPushPr would have written -- task-values.js's lastJournaledRdoDiffTouched is the real
+  // reader exercised through handleValidate below, not a stub.
+  appendEvent(taskDir, 'PUSH_PR', 'rdo-diff-derived', { touched: false, path: 'src/shared/rdo-members.ts' });
+
+  const task = {
+    id: 'validate-rdo-diff-restart',
+    kind: 'synthetic',
+    touchesRdoMembers: true, // intake's stale guess -- must NOT win over the journal
+    citations: ['RDOOpenSession — DServer/DirectoryServer.pas:143 — accessor get'],
+    shadow: {
+      llm: {
+        CITATION_VERIFIER: { verdict: 'REJECT' },
+        VALIDATE: { verdict: 'PASS' },
+      },
+    },
+  };
+  const ctx = validateShadowCtx('validate-rdo-diff-restart', task, taskDir);
+  assert.equal(ctx.task.rdoDiffTouched, undefined, 'the rebuilt task must not carry the in-memory field');
+
+  const next = await HANDLERS.VALIDATE(ctx);
+  assert.equal(next, 'MERGE');
+
+  const events = taskJournal(taskDir);
+  assert.equal(events.filter((e) => e.event === 'citation-verifier').length, 0);
+  assert.equal(events.filter((e) => e.event === 'citation-verifier-skipped-not-rdo-diff').length, 1);
+});
+
+test('handleValidate: no-PUSH_PR fallback -- neither rdoDiffTouched nor a journaled rdo-diff-derived event, touchesRdoMembers:true, citations available -> CITATION_VERIFIER IS called (today\'s behaviour preserved)', async () => {
+  const taskDir = mkTmp('spo-validate-rdo-diff-nopushpr-');
+  const task = {
+    id: 'validate-rdo-diff-nopushpr',
+    kind: 'synthetic',
+    touchesRdoMembers: true,
+    citations: ['RDOOpenSession — DServer/DirectoryServer.pas:143 — accessor get'],
+    shadow: {
+      llm: {
+        CITATION_VERIFIER: { verdict: 'REJECT' },
+        VALIDATE: { verdict: 'PASS' },
+      },
+    },
+  };
+  const ctx = validateShadowCtx('validate-rdo-diff-nopushpr', task, taskDir);
+
+  await assert.rejects(
+    () => HANDLERS.VALIDATE(ctx),
+    (err) => err instanceof ParkSignal && err.reason === 'citation-false'
+  );
+
+  const events = taskJournal(taskDir);
+  assert.equal(events.filter((e) => e.event === 'citation-verifier').length, 1, 'the REJECT reaching a park is itself proof CITATION_VERIFIER ran');
+});
+
+test('handleValidate: rdoDiffTouched as a non-boolean ("false" string or 0) is not coerced -- falls through to the journal fallback instead of being treated as false', async () => {
+  for (const nonBooleanValue of ['false', 0]) {
+    const taskDir = mkTmp('spo-validate-rdo-diff-strict-');
+    // The journal disagrees with the in-memory non-boolean value: if the resolver ever coerced
+    // rdoDiffTouched instead of requiring typeof === 'boolean', it would use this falsy value and
+    // skip, hiding the real journal signal (touched: true) underneath -- the same `=== true`
+    // strict-equality class of bug measured at step-contracts.js:326's shouldEscalate.
+    appendEvent(taskDir, 'PUSH_PR', 'rdo-diff-derived', { touched: true, path: 'src/shared/rdo-members.ts' });
+
+    const task = {
+      id: 'validate-rdo-diff-strict',
+      kind: 'synthetic',
+      touchesRdoMembers: false,
+      rdoDiffTouched: nonBooleanValue,
+      citations: ['RDOOpenSession — DServer/DirectoryServer.pas:143 — accessor get'],
+      shadow: {
+        llm: {
+          CITATION_VERIFIER: { verdict: 'PASS', entries: [] },
+          VALIDATE: { verdict: 'PASS' },
+        },
+      },
+    };
+    const ctx = validateShadowCtx('validate-rdo-diff-strict', task, taskDir);
+
+    const next = await HANDLERS.VALIDATE(ctx);
+    assert.equal(
+      next,
+      'MERGE',
+      `rdoDiffTouched=${JSON.stringify(nonBooleanValue)} must fall through to the journal fallback, not be coerced to falsy`
+    );
+
+    const events = taskJournal(taskDir);
+    assert.equal(
+      events.filter((e) => e.event === 'citation-verifier').length,
+      1,
+      `rdoDiffTouched=${JSON.stringify(nonBooleanValue)} must not short-circuit the boolean branch`
+    );
+  }
 });

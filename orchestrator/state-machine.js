@@ -30,7 +30,7 @@ const {
   writeReport,
   readLiveWorkerIds,
 } = require('./journal');
-const { scratchDir, lastResultPayload, lastJournaledCitations } = require('./task-values');
+const { scratchDir, lastResultPayload, lastJournaledCitations, lastJournaledRdoDiffTouched } = require('./task-values');
 const { buildBaseline } = require('./invariants');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
@@ -1012,9 +1012,29 @@ async function handleDiagnose(ctx) {
   return 'IMPLEMENT';
 }
 
-// VALIDATE: citation-verifier only when the task touches rdo-members.ts, then change-validator.
-// change-validator REJECT has its own budget (config.validateRejectBudget), separate from
-// DIAGNOSE's -- a false citation from citation-verifier parks immediately, no budget.
+// Resolves whether the REAL diff touches the RDO catalogue, for handleValidate's
+// CITATION_VERIFIER trigger -- deliberately separate from ctx.task.touchesRdoMembers, which stays
+// an intake guess promoted only one way (false -> true) because it also drives IMPLEMENT's Opus
+// escalation across retries (see the comment above the call site). Resolution order:
+//   1. ctx.task.rdoDiffTouched, strictly boolean -- same process, PUSH_PR already ran.
+//   2. task-values.js's lastJournaledRdoDiffTouched(ctx.taskDir), strictly boolean -- restart-
+//      durable fallback, for a --worker resume that rebuilt ctx.task from task.json.
+//   3. Boolean(ctx.task.touchesRdoMembers) -- PUSH_PR hasn't run yet for this task; preserves
+//      today's pre-PUSH_PR behaviour untouched.
+// The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
+// "false" or a number 0 must fall through to the next source rather than being silently coerced
+// (see step-contracts.js:326's own `touchesRdoMembers === true` for the class of bug this
+// forecloses).
+function resolveRdoDiffTouched(ctx) {
+  if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
+  const journaled = lastJournaledRdoDiffTouched(ctx.taskDir);
+  if (typeof journaled === 'boolean') return journaled;
+  return Boolean(ctx.task.touchesRdoMembers);
+}
+
+// VALIDATE: citation-verifier only when the REAL diff touches rdo-members.ts (resolveRdoDiffTouched),
+// then change-validator. change-validator REJECT has its own budget (config.validateRejectBudget),
+// separate from DIAGNOSE's -- a false citation from citation-verifier parks immediately, no budget.
 async function handleValidate(ctx) {
   // Kanban piloting: move to "Validation" once per VALIDATE entry, before either LLM call --
   // same reasoning as handleImplement's own moveCard (no realX(ctx, deps) split for an LLM step).
@@ -1028,47 +1048,58 @@ async function handleValidate(ctx) {
 
   // Action 5.3: citationVerdict/citationEntries survive past this block so the DIVERGES branch
   // below (before the 'MERGE' return) can route `entries` into a comment a human actually sees.
-  // Stay at their defaults (null/[]) whenever touchesRdoMembers is false -- the overwhelming
-  // majority of tasks, which never run citation-verifier at all.
+  // Stay at their defaults (null/[]) whenever the resolved diff truth (resolveRdoDiffTouched,
+  // below) is false -- the overwhelming majority of tasks, which never run citation-verifier at
+  // all.
   let citationVerdict = null;
   let citationEntries = [];
 
-  // 2026-09-04, interim: run the verifier only when there is something to verify.
+  // 2026-09-06: the verifier TRIGGER is now resolved from the diff, not from intake's guess.
   //
-  // WHY. Two different facts decide this block today and they can disagree. Whether the step RUNS
-  // is `ctx.task.touchesRdoMembers` -- an intake GUESS made from the card's own text
-  // (intake.js's makeTask: `area === 'rdo'` or a literal "rdo-members.ts" mention). Whether the
-  // step CAN run is whether `citations` exists -- and realPushPr only ever collects those when
-  // the REAL diff touched the catalogue. realPushPr corrects the guess false -> true when the
-  // diff disagrees (the `touches-rdo-members-rederived` event, added for card #385), but never
-  // true -> false, so an intake false positive survives all the way to here and meets an empty
-  // citations list.
+  // WHY. `ctx.task.touchesRdoMembers` is an intake GUESS made from the card's own text
+  // (intake.js's makeTask: `area === 'rdo'` or a literal "rdo-members.ts" mention) and realPushPr
+  // only ever promotes it false -> true when the real diff disagrees (the
+  // `touches-rdo-members-rederived` event, added for card #385) -- never true -> false, because
+  // that same field also feeds IMPLEMENT's Opus escalation (step-contracts.js's shouldEscalate)
+  // across every DIAGNOSE/VALIDATE-REJECT/CI retry that follows, and lowering it here would
+  // silently demote those retries to sonnet. So an intake false positive used to survive all the
+  // way to here and either meet an empty citations list (case: card #489, 2026-09-03 -- built,
+  // gated green, opened PR #659, then parked `prompt-missing-placeholder:citations` because its
+  // diff touched no catalogue file) or hide inside the same "no citations" skip as a genuine
+  // RDO-diff-with-missing-citation.
   //
-  // Measured: card #489 (2026-09-03) was implemented, passed every invariant, opened PR #659 and
-  // went CI-green -- then parked `prompt-missing-placeholder:citations` because its diff touched
-  // no catalogue file and no `rdo-citation` event was ever written (journal: 0 of them). Card
-  // #385 parked on the same reason pre-C1. The step has ONE successful execution in the project's
-  // history (#462).
-  //
-  // The availability test mirrors task-values.js's own resolution order exactly (in-memory first,
-  // journal fallback second) so this can never skip a call the placeholder fill would have
-  // satisfied. When the guess says RDO and no citations exist, the skip is journaled -- it is a
-  // real signal (either intake over-flagged, or an RDO change shipped uncited) and must not go
-  // silent. Fail-closed behaviour for every OTHER cv shape below is untouched.
-  //
-  // This is an INTERIM narrowing, not the fix: the fix is to make the trigger and the input come
-  // from the same source (the diff). See the SPO Factory card that carries this note.
+  // FIX: realPushPr now also journals a genuinely symmetric, diff-derived
+  // `ctx.task.rdoDiffTouched` (both true and false), separate from touchesRdoMembers. Resolve the
+  // trigger from THAT instead, in the order rdoDiffTouchedResolved documents: in-memory (same
+  // process) -> journal (restart-durable) -> touchesRdoMembers (PUSH_PR hasn't run yet -- keeps
+  // today's pre-PUSH_PR behaviour, which nothing above changes). An intake-guessed-true diff that
+  // turns out NOT to touch the catalogue now skips with its OWN distinct event
+  // (citation-verifier-skipped-not-rdo-diff) instead of being indistinguishable from a genuine
+  // missing-citation skip; citations still gate the call exactly as before when the diff DOES
+  // touch the catalogue.
+  const rdoDiffTouchedResolved = resolveRdoDiffTouched(ctx);
+
   const inMemoryCitations = Array.isArray(ctx.task.citations) && ctx.task.citations.length > 0;
   const citationsAvailable = inMemoryCitations || (lastJournaledCitations(ctx.taskDir) || []).length > 0;
 
-  if (ctx.task.touchesRdoMembers && !citationsAvailable) {
+  if (rdoDiffTouchedResolved === false) {
+    // Journal ONLY the disagreement (intake guessed RDO, the diff says otherwise) -- that is
+    // "case 1", the thing worth counting. A card whose guess was ALSO false is an ordinary
+    // non-RDO task: the overwhelming majority, silent here before this change and silent still,
+    // because an event on every card in the pipeline is noise, not signal.
+    if (ctx.task.touchesRdoMembers) {
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier-skipped-not-rdo-diff', {
+        intakeGuess: true,
+      });
+    }
+  } else if (!citationsAvailable) {
     appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier-skipped-no-citations', {
       touchesRdoMembers: true,
-      source: 'interim-narrowing-2026-09-04',
+      source: 'rdo-diff-derived-2026-09-06',
     });
   }
 
-  if (ctx.task.touchesRdoMembers && citationsAvailable) {
+  if (rdoDiffTouchedResolved === true && citationsAvailable) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
 
     // Fail-closed judge (2026-08-30 audit): the citation verifier has never actually been
