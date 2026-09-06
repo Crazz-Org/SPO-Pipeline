@@ -64,45 +64,80 @@
 // THE LIVE-WORKER TABLE (`live`, below) is the "not owned by a live worker" half of the taskDir
 // single-writer invariant journal.js's own header states in full (including its one pre-existing
 // exception, the C5 reconciler, and the cross-process staleness reasoning this correction added).
-// It now answers two separate questions in two separate ways:
+// It still answers the SAME two questions it always has, in the SAME two ways -- card #78 changed
+// NEITHER mechanism; it only added a THIRD question neither of them ever covered (below):
 //   1. takeNextTask must never start a queue file whose id matches a task a live worker already
 //      owns (state-machine.js's own `liveIds` parameter, threaded through from fillSlots below) --
 //      otherwise this module would rename a fresh queue entry straight over the live worker's own
 //      taskDir/task.json mid-run. Answered IN-MEMORY, in this same process, no staleness question
-//      at all -- fillSlots and takeNextTask both run here, serially.
-//   2. orphanScan (running in the SEPARATE scanner process) must never repark a task this table
-//      still lists -- the instant a worker process exits, its pid stops answering `isAlive`,
-//      which is EXACTLY the shape orphanScan looks for ("non-terminal state, dead owner").
-//      Answered CROSS-PROCESS: `publishLiveWorkerIds` (below) writes the current `live` id set to
-//      <journalRoot>/live-workers.json (journal.js's writeLiveWorkerIds, atomic tmp+rename) every
-//      time it changes, and the scanner reads it fresh every cycle (journal.js's
-//      readLiveWorkerIds, state-machine.js's runScanCycle). See journal.js's own header for the
-//      full staleness-direction reasoning; the short version is that the file is published ONLY
-//      after any crash-repark for a departing id has already fully landed on disk, so a scanner
-//      that reads a stale (still-listing-the-id) copy only ever defers, never races the repark.
-// handleExit below is ENTIRELY SYNCHRONOUS (no `await`, and finalizePark is itself synchronous),
-// so `live.delete(id)` and the matching `publishLiveWorkerIds` call are always the LAST things
-// that happen for a given exit, strictly after any repark it warranted -- see handleExit's own
-// comment.
+//      at all -- fillSlots and takeNextTask both run here, serially. Card #78 widened the SET
+//      fillSlots hands this check to the union of `live.keys()` and `reparking.keys()` (see that
+//      Map's own comment) -- a different, additional in-memory id this same check must also refuse.
+//   2. orphanScan (running in the SEPARATE scanner process) must never repark a task a live worker
+//      still owns -- the instant a worker process exits, its pid stops answering `isAlive`, which
+//      is EXACTLY the shape orphanScan looks for ("non-terminal state, dead owner"). Answered
+//      CROSS-PROCESS, UNCHANGED BY CARD #78: `publishLiveWorkerIds` (below) writes the current
+//      `live` id set to <journalRoot>/live-workers.json (journal.js's writeLiveWorkerIds, atomic
+//      tmp+rename) every time it changes, and the scanner reads it fresh every cycle (journal.js's
+//      readLiveWorkerIds, state-machine.js's runScanCycle) -- see orphan-scan.js's own two
+//      `liveWorkerIds.has(id)` checks. `reparking` is deliberately never folded into this file --
+//      see publishLiveWorkerIds' own comment for why.
+//
+// CARD #78 ADDED A THIRD QUESTION, and it is the one this table's OLD text here got wrong once a
+// crash repark stopped running in-process: "has THIS taskDir's crash already been claimed by some
+// other repark attempt?" The old text said live-workers.json "is published ONLY after any
+// crash-repark for a departing id has already fully landed on disk", which was true while a crash
+// reparked the task synchronously, IN-PROCESS, before `live.delete(id)` ever ran -- so a scanner
+// reading a stale (still-listing-the-id) copy could only ever defer, never race the repark. That
+// stopped being true the moment the park moved into a SPAWNED `daemon.js --repark-task` child
+// (reparkCrashedWorker, below): the id leaves `live` -- and live-workers.json -- the instant the
+// child is spawned, long before that child's own park has landed anything at all.
+// `live`/live-workers.json therefore cannot answer question 3; it was never built to track a
+// repark child (question 2, above, is unaffected by any of this -- it never asked about reparks in
+// the first place). The answer is a PER-TASK FILE instead: <taskDir>/repark-claim.json (journal.js's
+// writeReparkClaim/readReparkClaim/clearReparkClaim), written by reparkCrashedWorker (below)
+// SYNCHRONOUSLY, before it ever returns to handleExit, and cleared either by that same function's
+// own watchChild.then (on the child's exit) or by state-machine.js's reparkCrashedTask, running
+// INSIDE the child, as its own last statement -- whichever runs first; both are idempotent unlinks.
+// See journal.js's own header on those functions and orphan-scan.js's own header for the read side.
+//
+// handleExit below is still ENTIRELY SYNCHRONOUS (no `await`), but what that synchronicity closes
+// changed with question 3: NOT that a crash repark for a departing id has already landed on disk --
+// it has not; the park itself now runs in the spawned child, off this process's own thread, which
+// is the entire point of this action -- but that the CLAIM FILE for that repark has already landed
+// on disk before `live.delete(id)` (and the matching `publishLiveWorkerIds` call) ever runs. See
+// handleExit's own comment for the full ordering.
 //
 // SHUTDOWN: this module never installs its own signal handlers (daemon.js keeps those, per
 // CLAUDE.md's own division of responsibility). `killAllChildren` is exposed so daemon.js's
 // existing SIGINT/SIGTERM/`exit` machinery can call it synchronously from the SAME `process.once
-// ('exit', ...)` hook that already releases the lock -- see daemon.js's own integration. It
-// signals every live WORKER and the scanner, if any -- both are spawned `detached: true`, their
-// own process group; `process.kill(-pid, signal)` (the negative pid) therefore reaches each
-// group's own `claude` child too, not just the immediate `node --worker`/`--scanner` process, so
-// a killed child can never orphan a still-spending LLM call. Deliberately NOT `unref()`'d
-// anywhere -- the dispatcher (via `run()`'s own Promise.race) awaits every child's exit for as
-// long as it is willing to keep running at all.
+// ('exit', ...)` hook that already releases the lock -- see daemon.js's own integration. An
+// ORDINARY call -- the one daemon.js's exit hook makes, and the one run()'s own SIGTERM-then-wait
+// shutdown makes -- signals every live WORKER and the scanner, if any, and NEVER a repark child in
+// `reparking`: letting an in-flight park finish is strictly better than the half-written park a
+// killed one would leave (handleExit's own header). The one exception -- `{ includeReparking:
+// true }`, reachable only from reapSignalledChildren's own SIGKILL escalation -- is what keeps a
+// shutdown genuinely bounded even when a repark child itself hangs; see that function's own
+// comment. Every signalled child is spawned `detached: true`, its own process group;
+// `process.kill(-pid, signal)` (the negative pid) therefore reaches each group's own `claude`
+// child too, not just the immediate `node --worker`/`--scanner`/`--repark-task` process, so a
+// killed child can never orphan a still-spending LLM call. Deliberately NOT `unref()`'d anywhere --
+// the dispatcher (via `run()`'s own Promise.race) awaits every child's exit for as long as it is
+// willing to keep running at all.
 
 const fs = require('fs');
 const path = require('path');
 const { spawn: realSpawn } = require('child_process');
 
 const accounts = require('./accounts');
-const { appendDaemonEvent, writeLiveWorkerIds } = require('./journal');
-const { takeNextTask, reparkCrashedTask } = require('./state-machine');
+// writeReparkClaim/clearReparkClaim: card #78's own claim-file I/O -- see journal.js's header on
+// those functions for the full shape and the host/pid stamping. This module writes the claim (the
+// dispatcher is the only process that knows the repark child's pid at spawn time) and clears it
+// again on that child's exit; reparkCrashedTask (state-machine.js, running INSIDE the spawned
+// child) also clears it as its own last statement, on every exit path -- both are idempotent
+// unlinks, so whichever of the two runs first wins.
+const { appendDaemonEvent, writeLiveWorkerIds, writeReparkClaim, clearReparkClaim } = require('./journal');
+const { takeNextTask } = require('./state-machine');
 // Elapsed-duration measurement for exactly one thing below: how long a spawned scanner stayed
 // alive before it crashed, inside THIS process only -- see that module's own header, and
 // resolveScannerHealthyUptimeMs's comment, for why this is the right clock for that and the wrong
@@ -311,21 +346,31 @@ function buildScannerArgv(queueDir, journalRoot, config) {
   return argv;
 }
 
-// Reparks a crashed worker's task through the exact same buildCtx/finalizePark round trip
-// orphan-scan.js already uses (board move, park comment, report.md, daemon.jsonl 'parked' line --
-// see finalizePark's own header in state-machine.js) -- 'worker-crashed', with the exit code (and
-// signal, when this was a signal kill) in the detail, per action 6.3's own requirement: "the
-// dispatcher's exit handler is authoritative and reparks".
+// Builds the argv daemon.js's own --repark-task mode expects (see that file's header): the SAME
+// mode flag and queue/journal roots this dispatcher's own process was started with -- for the same
+// reason buildWorkerArgv forwards them: the repark's own finalizePark (a transient-retry branch is
+// unreachable from a park, but the board move / gh comment it DOES perform must land against the
+// SAME product repo and journal root this dispatcher's config names, not a throwaway). `--exit-code`
+// and `--signal` carry the dead worker's own exit through, into finalizePark's 'worker-crashed'
+// detail, exactly as the in-process call this replaces always passed them. Card #78 (this action):
+// the dispatcher used to call state-machine.js's reparkCrashedTask directly, in-process, on the
+// very thread finalizePark's own blocking spawnSync calls (measured worst case 2220s -- git push,
+// `npm run board:move`, `gh issue comment`) could freeze; this argv is what lets it spawn a child
+// to do that instead. See reparkCrashedWorker (inside createDispatcher, below) for the spawn/claim
+// call site this argv feeds.
 //
-// Card #78 moved the actual work into state-machine.js's exported `reparkCrashedTask` -- see that
-// function's own header for the state.json/lastState/terminal-state reasoning, none of which
-// changed. This is now a thin, still-synchronous call into it, called from handleExit exactly as
-// reparkCrashedWorker always was. THIS ACTION ONLY EXTRACTS THE FUNCTION: the dispatcher still
-// calls it in-process, on the very process finalizePark's own blocking spawnSync calls (measured
-// worst case 2220s -- git push, `npm run board:move`, `gh issue comment`) can still freeze. A
-// later action rewires this call site to spawn `daemon.js --repark-task` instead.
-function reparkCrashedWorker(id, taskDir, code, signal, queueDir, journalRoot, config) {
-  reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCode: code, signal });
+// `exitCode`/`signal` are omitted rather than forwarded as `null`/`undefined` text, same "omit a
+// missing/invalid value rather than forward garbage" convention buildWorkerArgv/buildScannerArgv
+// already use for `--workers` -- daemon.js's own parseArgs already defaults `opts.exitCode`/
+// `opts.signal` to null when the flag is absent, so omitting here changes nothing a present-but-
+// null value wouldn't already mean, it just keeps the argv shorter for the (common) signal-less
+// crash case.
+function buildReparkArgv(taskDir, queueDir, journalRoot, config, { exitCode, signal } = {}) {
+  const modeFlag = config.shadowMode ? '--shadow' : config.dryRun ? '--dry-run' : '--real';
+  const argv = [DAEMON_PATH, modeFlag, '--repark-task', taskDir, '--queue', queueDir, '--journal', journalRoot];
+  if (Number.isInteger(exitCode)) argv.push('--exit-code', String(exitCode));
+  if (signal) argv.push('--signal', String(signal));
+  return argv;
 }
 
 // createDispatcher(queueDir, journalRoot, config) -> {run, killAllChildren, stop}
@@ -353,6 +398,15 @@ function createDispatcher(queueDir, journalRoot, config) {
   const deps = (config && config.deps) || {};
   const spawnFn = deps.spawn || realSpawn;
   const spawnScannerFn = deps.spawnScanner || deps.spawn || realSpawn;
+  // Same injection idiom as spawn/spawnScanner above, for the THIRD child kind card #78 adds: a
+  // one-shot `daemon.js --repark-task` (buildReparkArgv). Falls back to `deps.spawn` before
+  // `realSpawn`, same fallback CHAIN spawnScannerFn uses and for the same reason: a test that wants
+  // every child real (worker, scanner AND repark) only has to inject one function. A test that
+  // instead sequences `deps.spawn` for a KNOWN NUMBER of WORKER crash codes, or hands it a fixture
+  // that only fakes a worker's own exit (spawnExit-style), must inject `deps.spawnRepark`
+  // separately -- exactly the same reason those tests already inject `deps.spawnScanner` rather
+  // than let the scanner's own spawn consume an entry meant for a worker.
+  const spawnReparkFn = deps.spawnRepark || deps.spawn || realSpawn;
   // Same injection idiom as spawn/spawnScanner above, for the ONE other real-world input the
   // scanner-crash-breaker fix reads: production always gets the real monotonicNowMs (an elapsed
   // wall-clock read -- see that module's own header for why it's the right measurement here and
@@ -368,6 +422,20 @@ function createDispatcher(queueDir, journalRoot, config) {
   const scannerHealthyUptimeMs = resolveScannerHealthyUptimeMs(config);
 
   const live = new Map(); // id -> {pid, taskDir} -- TASK-owning workers only, never the scanner
+  // id -> {pid, taskDir} -- card #78: a task whose crash is being reparked by a SPAWNED
+  // `daemon.js --repark-task` child, tracked separately from `live` because it answers a DIFFERENT
+  // question. `live` means "a worker owns this taskDir and is running the task machinery";
+  // `reparking` means "no worker owns it any more, but a park for it is in flight in a child of
+  // THIS process". The two must stay SEPARATE Maps, never merged into one table, because fillSlots'
+  // own slot arithmetic (`live.size >= k`) must keep gating on task-OWNING workers ALONE -- a repark
+  // child holds no worker slot and must not be charged against K (see fillSlots' own comment; a
+  // real repark can run up to ~37 minutes, and letting it occupy a slot for that long would
+  // reproduce a milder version of the very freeze this action removes). A single merged table could
+  // not answer "how many slots are occupied" and "which ids are off-limits to takeNextTask" with
+  // two different counts at once -- so the id-collision check (fillSlots' own comment on
+  // takeNextTask's `liveIds` argument) instead combines the two, read-only, into a throwaway Set at
+  // the one call site that needs the union, leaving each Map's own `.size` meaning exactly one thing.
+  const reparking = new Map();
   const pending = new Set(); // Set<Promise<void>>, one per in-flight child's own exit-watch chain
   let consecutiveCrashes = 0;
   let consecutiveScannerCrashes = 0;
@@ -413,6 +481,18 @@ function createDispatcher(queueDir, journalRoot, config) {
   // taskDir, so it has no business in a table whose whole purpose is taskDir ownership. See this
   // module's own header and journal.js's header for the full cross-process design and the
   // staleness-direction reasoning.
+  //
+  // `reparking` is ALSO never included here, and this is a card #78 DESIGN CHOICE, not an
+  // oversight: the claim file (<taskDir>/repark-claim.json, journal.js's writeReparkClaim) must be
+  // the SOLE thing that closes orphan-scan.js's double-repark race, so that revoking the claim
+  // write demonstrably REOPENS the race -- test/dispatcher.test.js's own claim-order test pins
+  // exactly that. Publishing a `live` UNION `reparking` set here would close the same race a SECOND
+  // way, silently, and the claim would then no longer be provably load-bearing. It also happens to
+  // be the more correct answer for auto-pull.js's own computeAutoPullBudget, which reads this exact
+  // file for worker headroom (`in-flight + queued <= K`): a task mid-repark owns no worker slot
+  // (fillSlots' own comment on why `live.size` alone still gates the slot arithmetic), so the slot
+  // genuinely IS free, and this file answering "how many WORKER slots are occupied" rather than
+  // "how many taskDirs are busy for any reason" is the honest question for that reader too.
   function publishLiveWorkerIds() {
     writeLiveWorkerIds(journalRoot, live.keys());
   }
@@ -422,7 +502,16 @@ function createDispatcher(queueDir, journalRoot, config) {
   // reaches each group's own `claude` child too. Renamed from an earlier `killAllWorkers` once
   // the scanner existed to supervise as well -- daemon.js's exit hook calls this one name for
   // both kinds of child now.
-  function killAllChildren(signal = 'SIGTERM') {
+  //
+  // `{ includeReparking }` (card #78, default false): a repark child (reparkCrashedWorker below) is
+  // NEVER touched by an ordinary call to this function -- daemon.js's own exit hook and run()'s own
+  // SIGTERM-then-wait shutdown both call it with the default, and that is deliberate: letting an
+  // in-flight park finish is strictly better than the half-written park (state.json PARKED with no
+  // park-comment anchor -- see handleExit's own header) a killed one would leave, unrecoverable by
+  // any later `retry`. The ONE caller that passes `includeReparking: true` is
+  // reapSignalledChildren's own SIGKILL escalation, below -- see that function's own comment for why
+  // a SIGKILL, and only a SIGKILL, is allowed to reach a repark child.
+  function killAllChildren(signal = 'SIGTERM', { includeReparking = false } = {}) {
     childrenSignalled = true;
     for (const { pid } of live.values()) {
       if (!pid) continue;
@@ -431,6 +520,16 @@ function createDispatcher(queueDir, journalRoot, config) {
       } catch {
         // Already dead, or (a spawn that raced this call) never actually got its own group yet --
         // best-effort, same posture as lock.js's own release-on-exit.
+      }
+    }
+    if (includeReparking) {
+      for (const { pid } of reparking.values()) {
+        if (!pid) continue;
+        try {
+          process.kill(-pid, signal);
+        } catch {
+          // Same best-effort posture as the worker loop above.
+        }
       }
     }
     killScanner(signal);
@@ -476,10 +575,20 @@ function createDispatcher(queueDir, journalRoot, config) {
   }
 
   // Handles ONE worker's exit, entirely synchronously (no `await` anywhere in this function) --
-  // see this module's own header for why that synchronicity is what makes the live-worker-table
-  // skip in orphanScan race-free rather than merely probabilistic: `live.delete(id)` (and the
-  // `publishLiveWorkerIds` call right after it) is the LAST thing this function does, run only
-  // after any crash repark this exit warrants has already fully landed on disk.
+  // see this module's own header for why that synchronicity still matters even though, since card
+  // #78, it is no longer what closes the orphanScan double-repark race. Before #78 it was: this
+  // function called finalizePark (also synchronous) IN-PROCESS, so a repark this exit warranted had
+  // fully landed on disk before `live.delete(id)` (and the `publishLiveWorkerIds` call right after
+  // it) ever ran, and no orphanScan pass -- indeed no other code in this process -- could interleave
+  // anywhere inside this function's own body. That claim is FALSE of the code below: the actual
+  // park now runs in a spawned `daemon.js --repark-task` child (reparkCrashedWorker, below), off
+  // this process's own thread, and has not even started -- let alone landed on disk -- by the time
+  // this function returns. What closes the race now is the CLAIM FILE reparkCrashedWorker writes
+  // (journal.js's writeReparkClaim), which IS still written synchronously, before `live.delete(id)`
+  // -- so a taskDir this table stops listing already has its repark-in-flight claim on disk for
+  // orphan-scan.js's own concurrent scan (a SEPARATE process) to find. The synchronicity that
+  // remains load-bearing is narrower than it used to be: not "the park landed", but "the claim
+  // landed" -- see journal.js's own header on writeReparkClaim/readReparkClaim for the other half.
   //
   // `stopReason` IS CHECKED FIRST, exactly as handleScannerExit already checked it, and the
   // asymmetry between the two was a defect, not a design. Once `stopReason` is set this
@@ -548,7 +657,7 @@ function createDispatcher(queueDir, journalRoot, config) {
     } else {
       consecutiveCrashes += 1;
       try {
-        reparkCrashedWorker(id, taskDir, code, signal, queueDir, journalRoot, config);
+        reparkCrashedWorker(id, taskDir, code, signal);
       } catch (err) {
         appendDaemonEvent(journalRoot, 'worker-crash-repark-failed', {
           id,
@@ -709,14 +818,120 @@ function createDispatcher(queueDir, journalRoot, config) {
     pending.add(p);
   }
 
+  // Card #78: reparks a crashed worker's task by SPAWNING a one-shot `daemon.js --repark-task`
+  // child (buildReparkArgv) rather than calling state-machine.js's reparkCrashedTask in-process, as
+  // this dispatcher always did before. That in-process call ran finalizePark -- preserveWorktreeWip
+  // (a `git` push) plus postParkComment's board move and `gh` comment, each a bounded-but-slow
+  // spawnSync -- on the very thread that holds the single-instance lock, refills worker slots, and
+  // services SIGTERM; measured worst case 2220s (config.js's own command timeouts), during which
+  // this dispatcher could do none of those three things. This function is what gets that off the
+  // dispatcher's own thread.
+  //
+  // Called from handleExit ONLY on a genuine crash (never on shutdown-signalled exits -- see that
+  // function's own header), always synchronously and never awaited: everything below either
+  // returns having done nothing durable, or has already written the claim file before it returns.
+  //
+  // ORDERING, on a successful spawn -- read top to bottom, because each step depends on the last
+  // having already happened:
+  //   1. spawn the child (spawnReparkFn) and confirm it actually has a pid;
+  //   2. writeReparkClaim(taskDir, ...) SYNCHRONOUSLY, before this function returns -- this is the
+  //      file orphan-scan.js's own concurrent scan (a SEPARATE process) reads to tell "already being
+  //      reparked" apart from "orphaned, needs a fresh repark" (see that module's own header). It
+  //      must exist on disk before `live.delete(id)` runs -- NOT the next line below (step 3, in
+  //      THIS function), but the statement in handleExit, a DIFFERENT function, that runs once this
+  //      whole function has returned to it -- or a scan landing in that exact window would see
+  //      neither a live worker nor a claim and repark the same task a second time.
+  //   3. record {pid, taskDir} in `reparking`, keyed by id -- this is the IN-MEMORY, THIS-PROCESS
+  //      answer to the identical question the claim file answers cross-process: fillSlots' own
+  //      takeNextTask call (below) must not hand a fresh queue entry for this exact id to a NEW
+  //      worker while this repark is still in flight, which the claim file alone cannot prevent
+  //      (takeNextTask and orphan-scan.js's claim check are different call sites entirely).
+  //   4. journal 'worker-crash-repark-spawned' and register the child's own exit-watch in `pending`
+  //      -- order between these two and step 3 does not matter, unlike 1->2->3, which does.
+  //
+  // A GRACEFUL DRAIN WAITS FOR THIS REPARK because of step 3, not step 4: run()'s own
+  // awaitInFlight loops on `live.size > 0 || reparking.size > 0` (see that function's own
+  // comment for the measured regression this closes), so the id staying in `reparking` is what
+  // makes the drain's own budget -- not the much shorter reap grace -- the thing spent waiting for
+  // it. `pending` (step 4) is not what makes the drain wait; it is what lets awaitInFlight's own
+  // `Promise.race` WAKE the instant this exact child exits, instead of polling blindly to the
+  // drain's full timeout every time -- the same "poll interval vs. exit-driven wake" distinction
+  // this module's own header draws for ordinary workers.
+  //
+  // On the child's own exit (whenever that is -- seconds in the ordinary case, up to the ~37-minute
+  // (2220s) worst case cited two paragraphs up, if every one of finalizePark's own spawnSync calls
+  // hits its full command timeout): remove `id` from `reparking`, clear the claim (clearReparkClaim -- idempotent;
+  // state-machine.js's reparkCrashedTask, running INSIDE that child, already clears it as its own
+  // last statement on every exit path, so this is normally a no-op backstop for a child that died
+  // before ever reaching that far), and journal 'worker-crash-repark-exit' with the child's own
+  // outcome.
+  //
+  // ON A SPAWN FAILURE (step 1 throws, or returns a child with no pid): journal
+  // 'worker-crash-repark-failed' with step: 'spawn' and return, WITHOUT writing a claim. This is
+  // deliberate, not merely "the best we can do": with no claim on disk, the task's taskDir is
+  // exactly the shape orphan-scan.js's own scan already knows how to recover -- non-terminal state,
+  // no live owner, no claim -- so the NEXT orphan scan reparks it as an ordinary orphan. Writing a
+  // claim for a child that was never actually spawned would instead hide the task from that scan
+  // (a "repark in flight" that is not, in fact, in flight) until the claim's pid happens to collide
+  // with a live process or a human notices the taskDir is stuck -- strictly worse than the fallback
+  // this already has.
+  function reparkCrashedWorker(id, taskDir, code, signal) {
+    const argv = buildReparkArgv(taskDir, queueDir, journalRoot, config, { exitCode: code, signal });
+    let child;
+    try {
+      child = spawnReparkFn(process.execPath, argv, { detached: true, stdio: 'ignore' });
+      if (!child || !child.pid) throw new Error('spawnRepark did not return a child with a pid');
+    } catch (err) {
+      appendDaemonEvent(journalRoot, 'worker-crash-repark-failed', {
+        id,
+        exitCode: code,
+        signal: signal || null,
+        step: 'spawn',
+        error: String((err && err.message) || err),
+      });
+      return;
+    }
+
+    writeReparkClaim(taskDir, { id, pid: child.pid, startedAt: new Date().toISOString() });
+    reparking.set(id, { pid: child.pid, taskDir });
+    appendDaemonEvent(journalRoot, 'worker-crash-repark-spawned', { id, pid: child.pid, taskDir });
+
+    const p = watchChild(child)
+      .then((result) => {
+        reparking.delete(id);
+        clearReparkClaim(taskDir);
+        appendDaemonEvent(journalRoot, 'worker-crash-repark-exit', {
+          id,
+          pid: child.pid,
+          code: result.code === undefined ? null : result.code,
+          signal: result.signal || null,
+        });
+      })
+      .finally(() => pending.delete(p));
+    pending.add(p);
+  }
+
   // Fills as many slots as K (re-clamped to healthy accounts, THIS instant) currently allows,
   // taking one task at a time via takeNextTask -- which is itself what makes "not the same task to
   // two workers" safe: the queue-file rename it performs is atomic, and this function calls it
   // serially (never concurrently with itself), so there is no race to fix here, only to preserve.
-  // takeNextTask's own `liveIds` parameter (state-machine.js) is handed the CURRENT `live` table on
-  // every call -- not once per fillSlots invocation -- so a slot freed by a worker that just
-  // finished (removed from `live` inside handleExit, which always completes before this function
-  // is called again) is immediately visible.
+  // takeNextTask's own `liveIds` parameter (state-machine.js) is handed the UNION of the CURRENT
+  // `live` table and `reparking` on every call -- not once per fillSlots invocation -- so a slot
+  // freed by a worker that just finished (removed from `live` inside handleExit, which always
+  // completes before this function is called again) is immediately visible.
+  //
+  // `reparking` MUST be in that union -- card #78 verification. `live.delete(id)` runs inside
+  // handleExit BEFORE this exit's crash repark has landed anywhere but a spawned child's own,
+  // not-yet-started process (see reparkCrashedWorker and handleExit's own header). Without
+  // `reparking` here, a queue entry for that SAME id that is eligible RIGHT NOW -- reachable through
+  // finalizePark's transient-retry branch, which writes a 60s-`notBefore` queue entry and returns
+  // before ever writing PARKED, so the id can be both mid-repark and freshly re-queued at once --
+  // reads a non-terminal state.json (UNDRAINABLE_STATES is TERMINAL_STATES minus PARKED, so a
+  // mid-repark task is never refused on that ground) and takeNextTask would `fs.renameSync` a fresh
+  // queue entry straight over task.json UNDER the repark child that is, at that exact moment, still
+  // reading it. `live.size` is deliberately left alone below -- the slot arithmetic must keep gating
+  // on task-OWNING workers only, so a slot frees at exactly the statement it always has; only the
+  // id-collision check takeNextTask performs needs the wider set.
   // A pool with ZERO healthy accounts clamps K to 0, and a clamp to 0 is not a smaller degree of
   // the same thing -- it is the dispatcher deciding to do no work at all, for as long as the
   // condition lasts. Before this, that decision was made silently on every poll and journalled
@@ -783,7 +998,7 @@ function createDispatcher(queueDir, journalRoot, config) {
       }
 
       if (live.size >= k) return;
-      const taken = takeNextTask(queueDir, journalRoot, new Set(live.keys()));
+      const taken = takeNextTask(queueDir, journalRoot, new Set([...live.keys(), ...reparking.keys()]));
       if (!taken) return;
       spawnOne(taken);
     }
@@ -872,10 +1087,21 @@ function createDispatcher(queueDir, journalRoot, config) {
     // so every worker still in `live` is one that was already mid-card when the signal landed.
     // Waiting for them is what converts "the deploy killed a card" into "the deploy took a few
     // more minutes", with no new infrastructure and no change to what a card does.
+    //
+    // `reparking.keys()` is folded into `inFlight`/`survivors` alongside `live.keys()` -- a crash's
+    // repark child is removed from `live` before this ever runs (handleExit's own header), so
+    // reading `live` alone would silently drop it from both events. This matters specifically at
+    // the TIMEOUT edge: awaitInFlight's own loop (see that function's own comment) now waits on
+    // `reparking.size` too, but if the repark ALSO outlives the full drain timeoutMs, `live` can
+    // already read empty while `reparking` still holds the id -- omitting it here would report
+    // `drained: true` for a park that is, at that exact instant, about to be SIGKILLed by
+    // reapSignalledChildren below. `live`/`reparking` never share an id at the same time (a task is
+    // either a live worker or a reparking child, never both), so a plain concatenation needs no
+    // dedupe.
     let waitedMs = 0;
     let survivors = [];
     if (drainRequest) {
-      const inFlight = [...live.keys()];
+      const inFlight = [...live.keys(), ...reparking.keys()];
       const timeoutMs = resolveDrainTimeoutMs(config);
       appendDaemonEvent(journalRoot, 'dispatcher-drain-start', {
         signal: drainRequest.signal || null,
@@ -883,7 +1109,7 @@ function createDispatcher(queueDir, journalRoot, config) {
         inFlight,
       });
       waitedMs = await awaitInFlight(timeoutMs);
-      survivors = [...live.keys()];
+      survivors = [...live.keys(), ...reparking.keys()];
     }
 
     // Circuit breaker tripped, or the drain's bound expired -- shut down the same way an external
@@ -933,6 +1159,37 @@ function createDispatcher(queueDir, journalRoot, config) {
   // kills the whole cgroup, so daemon.js's exit hook never runs, the single-instance lock file
   // leaks, and the next start has to stale-sweep it. Escalating HERE keeps the process's own exit
   // path intact, which is the whole difference between a bounded stop and a killed one.
+  //
+  // CARD #78 CORRECTION: this function's own SIGKILL escalation must reach a repark child too, or
+  // its "genuinely bounded" claim below is false for one. `pending` (what `all` awaits) has
+  // included a repark child's own watchChild promise since reparkCrashedWorker started adding it,
+  // but that alone never made THIS function wait FOR one -- `pending` only lets `all` (and
+  // awaitInFlight's own race, a separate mechanism -- see that function's own comment) resolve the
+  // instant a promise it already contains settles; it does not, by itself, keep this function from
+  // reaching the SIGKILL escalation while a repark is still running. `killAllChildren('SIGKILL')`,
+  // called with no arguments, never signals anything in `reparking` (see that function's own
+  // header: an ordinary call must never touch a repark child, so a park in progress is allowed to
+  // finish rather than being cut off half-written). Measured directly: a repark child with a REAL,
+  // signallable pid that ignores SIGTERM (the honest shape -- a pid-less spawn is a spawn FAILURE
+  // reparkCrashedWorker's own header already handles, journalled and returned before `reparking` or
+  // `pending` are ever touched, so it never reaches this function at all). With no `includeReparking`,
+  // `killAllChildren('SIGKILL')` never sends that pid anything -- it is absent from `live`, the only
+  // Map this function iterates by default -- so the pid was still alive and `run()` still had not
+  // resolved 6+ seconds after a drain was requested (the probe's own measurement bound), even though
+  // `dispatcher-kill-escalated` had already fired and correctly named it in `stillReparking`: the
+  // escalation ran, diagnosed the problem by name, and then signalled nothing. With
+  // `{ includeReparking: true }` (the fix below) the identical fixture's child was SIGKILLed and
+  // `run()` resolved in ~600ms. The fix is the one call below that passes `{ includeReparking: true
+  // }`: it is the ONLY place in this module a repark child is ever signalled, and SIGKILL is the right (and
+  // only) signal for it to receive here -- letting a park run to completion is strictly better than
+  // killing it (handleExit's own header), but a shutdown still has to end, and a repark child that
+  // has already had its full graceMs and still has not exited is exactly the "ignores everything
+  // but SIGKILL" case this function exists to bound. This function is reached in TWO shapes: a
+  // circuit-breaker trip (no drain at all -- a repark in flight gets exactly this graceMs, never
+  // the longer drain budget), and a GRACEFUL DRAIN whose own timeoutMs has ALSO expired with a
+  // repark still running -- awaitInFlight's own `reparking.size` check (a separate, later fix on
+  // this same card) is what makes the ordinary case wait out the drain's full budget instead of
+  // landing here at all; this escalation is the backstop for the two cases where that is not enough.
   async function reapSignalledChildren(graceMs) {
     if (pending.size === 0) return;
     const all = Promise.allSettled(pending);
@@ -945,20 +1202,38 @@ function createDispatcher(queueDir, journalRoot, config) {
     appendDaemonEvent(journalRoot, 'dispatcher-kill-escalated', {
       graceMs,
       stillLive: [...live.keys()],
+      stillReparking: [...reparking.keys()],
     });
-    killAllChildren('SIGKILL');
-    await all; // SIGKILL is not refusable, so this is genuinely bounded
+    killAllChildren('SIGKILL', { includeReparking: true });
+    await all; // SIGKILL is not refusable and now reaches every child in `pending`, repark included -- genuinely bounded
   }
 
-  // Waits for `live` to empty, up to timeoutMs; returns how long it actually waited. Woken by any
-  // child's exit, not merely by the poll -- so a card that finishes one second into a 45-minute
-  // bound ends the drain one second in, and a `systemctl restart` on an IDLE daemon costs nothing
-  // at all. Measured on the elapsed clock (monotonicNowMsFn, the same seam the scanner breaker
-  // uses), never Date.now(): a bound that a clock step could double or erase is not a bound.
+  // Waits for `live` AND `reparking` to both empty, up to timeoutMs; returns how long it actually
+  // waited. Woken by any child's exit, not merely by the poll -- so a card that finishes one second
+  // into a 45-minute bound ends the drain one second in, and a `systemctl restart` on an IDLE
+  // daemon costs nothing at all. Measured on the elapsed clock (monotonicNowMsFn, the same seam the
+  // scanner breaker uses), never Date.now(): a bound that a clock step could double or erase is not
+  // a bound.
+  //
+  // `reparking` MEASURED FIX (post-#78 verification): this loop used to check `live.size` alone,
+  // so a crash's repark child -- already removed from `live` the instant handleExit ran (see that
+  // function's own header) -- was invisible to the drain entirely. A graceful drain then returned
+  // the moment the last WORKER exited, spending none of its (up to 45-minute) budget on a repark
+  // that might still be running, and handed the child straight to reapSignalledChildren, which
+  // SIGKILLs it after `drainKillGraceMs` (production default 60s) -- against a repark whose own
+  // worst-case spawnSync budget is 2220s. Measured directly: a well-behaved 3s repark child, a
+  // 20000ms drain budget, a 500ms grace -- the drain returned in 521ms, `dispatcher-kill-escalated`
+  // fired with `stillReparking: [id]`, and the child was SIGKILLed mid-work. That is not a slow
+  // shutdown, it is the exact failure handleExit's own header cites as worse than waiting:
+  // finalizePark writes state.json PARKED BEFORE postParkComment posts the park-comment anchor, so
+  // a SIGKILL between those two leaves a PARKED card unparkScan can never find again. Checking
+  // `reparking.size` here is what spends the DRAIN's own budget on an in-flight park instead of the
+  // much shorter reap grace -- the SIGKILL escalation below is untouched and stays the final bound,
+  // reached only if the repark ALSO outlives the drain's full timeout.
   async function awaitInFlight(timeoutMs) {
     const startedAt = monotonicNowMsFn();
     const elapsed = () => monotonicNowMsFn() - startedAt;
-    while (live.size > 0) {
+    while (live.size > 0 || reparking.size > 0) {
       const remaining = timeoutMs - elapsed();
       if (remaining <= 0) break;
       const poll = cancellableSleep(Math.min(remaining, config.pollIntervalMs));
@@ -1023,4 +1298,5 @@ module.exports = {
   // for 6.3: that exact mutation survived the full 1249-test suite).
   buildWorkerArgv,
   buildScannerArgv,
+  buildReparkArgv, // exported for the same reason -- card #78's own direct unit test
 };

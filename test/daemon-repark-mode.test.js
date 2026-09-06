@@ -1,14 +1,18 @@
 'use strict';
 // Tests for orchestrator/daemon.js's `--repark-task <taskDir>` mode (card #78 -- see that file's
 // own header comment for the exit-code contract, and state-machine.js's reparkCrashedTask for the
-// park logic itself, extracted out of dispatcher.js's in-process reparkCrashedWorker so a future
-// action can move the call OFF the process holding the single-instance lock without changing
+// park logic itself, extracted out of dispatcher.js's in-process reparkCrashedWorker so a later
+// action could move the call OFF the process holding the single-instance lock without changing
 // what a repark actually does).
 //
-// THIS ACTION ONLY ADDS THE MODE. dispatcher.js still calls reparkCrashedTask in-process, not
-// through this flag -- these tests exercise the standalone `--repark-task` child directly, the
-// same way test/worker-mode.test.js exercises `--worker` directly, ahead of any dispatcher
-// rewiring.
+// dispatcher.js NOW SPAWNS THIS EXACT MODE for every crash repark (reparkCrashedWorker,
+// buildReparkArgv) -- the "this action only adds the mode, dispatcher.js still calls
+// reparkCrashedTask in-process" framing this file's own header used to carry described an earlier
+// action on this same card; it stopped being true once the dispatcher-side rewiring landed. These
+// tests still exercise the standalone `--repark-task` child DIRECTLY (never through a dispatcher),
+// the same way test/worker-mode.test.js exercises `--worker` directly -- see
+// test/dispatcher.test.js's own card #78 tests for the integration the dispatcher itself now
+// performs (spawning this child, the claim-file handoff, the takeNextTask/shutdown holes it closes).
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -427,3 +431,90 @@ test(
     assert.equal(failed.exitCode, 9);
   }
 );
+
+// ---- card #78 (dispatcher-side half): reparkCrashedTask clears its OWN repark claim -----------
+//
+// The dispatcher (orchestrator/dispatcher.js's reparkCrashedWorker) writes <taskDir>/
+// repark-claim.json BEFORE spawning this exact `--repark-task` child, and clears it again when
+// that child exits -- but that clear is a BACKSTOP, not the primary mechanism: state-machine.js's
+// own reparkCrashedTask function header (not this file's) says reparkCrashedTask itself clears the
+// claim as its own last statement, on every exit path, so orphan-scan.js's concurrent scan (a
+// THIRD, separate process) never has to wait for the dispatcher's own watchChild.then to run.
+// These three tests seed a claim BY HAND (the way the dispatcher would have, before spawning this
+// exact child) and prove reparkCrashedTask clears it on each of its three distinct exit paths,
+// with no dispatcher involved at all.
+const { writeReparkClaim, reparkClaimPath } = require('../orchestrator/journal');
+
+test(
+  '--repark-task: reparkCrashedTask clears its own repark claim after an ORDINARY park',
+  { timeout: 40000 },
+  () => {
+    const journalDir = mkTmp('spo-repark-claimclear-ok-j-');
+    const queueDir = mkTmp('spo-repark-claimclear-ok-q-');
+    const id = 'repark-claimclear-ok-1';
+    const taskDir = seedCrashedTask(journalDir, id, { state: 'IMPLEMENT' });
+    writeReparkClaim(taskDir, { id, pid: process.pid, startedAt: new Date().toISOString() });
+    assert.equal(fs.existsSync(reparkClaimPath(taskDir)), true, 'test setup: no claim was seeded');
+
+    const result = runReparkRaw(['--real', '--repark-task', taskDir, '--exit-code', '1', '--queue', queueDir, '--journal', journalDir]);
+    assert.equal(result.status, 0, `expected the repark child to exit 0, got ${JSON.stringify(result)}`);
+    assert.equal(readState(journalDir, id).state, 'PARKED');
+    assert.equal(
+      fs.existsSync(reparkClaimPath(taskDir)),
+      false,
+      'the repark claim outlived an ORDINARY park -- a later retry of the same taskDir would read a stale claim'
+    );
+  }
+);
+
+test(
+  '--repark-task: reparkCrashedTask clears its own repark claim even when task.json fails to read',
+  { timeout: 40000 },
+  () => {
+    const journalDir = mkTmp('spo-repark-claimclear-badtask-j-');
+    const queueDir = mkTmp('spo-repark-claimclear-badtask-q-');
+    const id = 'repark-claimclear-badtask-1';
+    const taskDir = path.join(journalDir, id);
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'task.json'), '{ this is not json');
+    writeReparkClaim(taskDir, { id, pid: process.pid, startedAt: new Date().toISOString() });
+
+    const result = runReparkRaw(['--real', '--repark-task', taskDir, '--exit-code', '1', '--queue', queueDir, '--journal', journalDir]);
+    assert.equal(result.status, 0, `expected exit 0 for a journalled task.json failure, got ${JSON.stringify(result)}`);
+    assert.equal(
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-failed' && e.id === id),
+      true
+    );
+    assert.equal(
+      fs.existsSync(reparkClaimPath(taskDir)),
+      false,
+      'the repark claim outlived a task.json read failure -- reparkCrashedTask\'s early return did not clear it'
+    );
+  }
+);
+
+for (const terminalState of ['DONE', 'PARKED', 'ABANDONED']) {
+  test(
+    `--repark-task: reparkCrashedTask clears its own repark claim on the already-${terminalState} short-circuit`,
+    { timeout: 40000 },
+    () => {
+      const journalDir = mkTmp(`spo-repark-claimclear-terminal-${terminalState.toLowerCase()}-j-`);
+      const queueDir = mkTmp('spo-repark-claimclear-terminal-q-');
+      const id = `repark-claimclear-terminal-${terminalState.toLowerCase()}-1`;
+      const taskDir = seedCrashedTask(journalDir, id, { state: terminalState });
+      writeReparkClaim(taskDir, { id, pid: process.pid, startedAt: new Date().toISOString() });
+
+      const result = runReparkRaw(['--real', '--repark-task', taskDir, '--exit-code', '1', '--queue', queueDir, '--journal', journalDir]);
+      assert.equal(result.status, 0, `expected exit 0, got ${JSON.stringify(result)}`);
+      assert.equal(
+        readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit-after-terminal' && e.id === id),
+        true
+      );
+      assert.equal(
+        fs.existsSync(reparkClaimPath(taskDir)),
+        false,
+        `the repark claim outlived an already-${terminalState} short-circuit -- a claim left on a terminal task is never cleaned by orphan-scan.js (it skips terminal tasks before ever looking at the claim) and would linger into a later retry of the same taskDir`
+      );
+    }
+  );
+}

@@ -2926,12 +2926,18 @@ test(
       run: () =>
         new Promise((resolve) => {
           // The task's own state.json goes PARKED (a reparked crash) essentially AT THE SAME
-          // TIME run() resolves with the breaker's own stopReason -- in the real dispatcher,
-          // reparkCrashedWorker and the stopReason assignment both happen inside the SAME
-          // synchronous handleExit call, so they are for-practical-purposes simultaneous. This is
-          // the race the review's own second branch names: "if the workers happen to crash and
-          // repark before the breaker sets stopReason, the tasks go PARKED, the watchdog exits
-          // recette-scenario-complete, and the breaker is dropped silently instead."
+          // TIME run() resolves with the breaker's own stopReason. Card #78 changed WHY this is
+          // plausible, not whether it is: the breaker's own `stopReason` assignment is still set
+          // synchronously inside handleExit (unchanged by this action), but the PARK itself now
+          // runs in a separately-spawned `daemon.js --repark-task` child (reparkCrashedWorker,
+          // dispatcher.js) -- so state.json reaching PARKED is no longer even IN the same
+          // synchronous call as `stopReason`, let alone simultaneous with it; it can land seconds
+          // later, or (per the drain in run()'s own shutdown path) even AFTER run() has already
+          // resolved. That makes the race this fixture simulates MORE plausible than the old
+          // in-process shape did, not less -- this is still the race the review's own second
+          // branch names: "if the workers happen to crash and repark before the breaker sets
+          // stopReason, the tasks go PARKED, the watchdog exits recette-scenario-complete, and the
+          // breaker is dropped silently instead."
           fs.mkdirSync(path.join(config.journalRoot, taskId), { recursive: true });
           fs.writeFileSync(path.join(config.journalRoot, taskId, 'state.json'), JSON.stringify({ state: 'PARKED', reason: 'worker-crashed' }));
           setTimeout(() => resolve(breakerStopReason), 30);

@@ -598,6 +598,24 @@ async function main() {
   // (state.json non-terminal, owner pid dead). A scanner that does not die before the next start
   // simply becomes a second live one until it does -- harmless (it takes no lock, owns no taskDir)
   // but not free, so the signal is still sent rather than left to whichever exit path is slower.
+  //
+  // CARD #78: a call made HERE is an ORDINARY `killAllChildren('SIGTERM')` -- no `{ includeReparking:
+  // true }` -- so a repark child (dispatcher.js's own `reparking`) is deliberately NEVER among the
+  // process groups this hook signals, for the identical reason an ordinary call anywhere else in
+  // dispatcher.js never touches one: letting an in-flight park finish is strictly better than the
+  // half-written park (state.json PARKED with no park-comment anchor) a killed one would leave.
+  // This hook can fire WHILE a repark is genuinely still in flight: the escape hatch below
+  // (`process.exit(code)` on a second SIGTERM, or a refused drain) exits immediately, without
+  // waiting for run()'s own drain-then-reap sequence to have bounded and cleared `reparking`
+  // first -- so a repark child spawned moments earlier can outlive this process's own exit,
+  // orphaned in its own detached process group, continuing to park its card on its own schedule.
+  // What eventually bounds THAT (this process is already gone, so dispatcher.js's own
+  // reapSignalledChildren SIGKILL escalation cannot): systemd's `TimeoutStopSec` (currently 2820s,
+  // scripts/daemon-install.sh -- see that file's own comment for the drainTimeoutMs +
+  // drainKillGraceMs + slack sum it is derived from), which SIGKILLs the WHOLE cgroup -- the
+  // orphaned repark child included -- once the unit itself has been stopping for that long. Until
+  // then, a lingering repark child is not a leak: it is still trying to finish the SAME park it
+  // would have finished under an orderly drain, just unsupervised.
   let lock = null;
   let dispatcherHandle = null;
   process.once('exit', () => {
