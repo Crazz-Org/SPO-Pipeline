@@ -85,6 +85,7 @@
 // spread-the-snapshot one.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 function appendEvent(taskDir, state, event, detail = {}) {
@@ -238,6 +239,81 @@ function readLiveWorkerIds(journalRoot) {
   return readLiveWorkersRaw(journalRoot).ids;
 }
 
+// reparkClaimPath/writeReparkClaim/readReparkClaim/clearReparkClaim -- action 6.8 (card #78)'s own
+// I/O for a repark claim: <taskDir>/repark-claim.json, `{id, pid, startedAt, host}`, same atomic
+// tmp-then-rename idiom as writeState/writeLiveWorkerIds above. This is the closure orphan-
+// scan.js's own header will describe once the dispatcher-side half of card #78 lands: a per-task
+// FILE, not an entry in live-workers.json, because daemon.js's own unconditional startup scan
+// (see orphan-scan.js's own header comment on its `liveWorkerIds` parameter for the exact call
+// site) calls orphanScan with NO liveWorkerIds argument at all (that table is stale by
+// construction -- the previous, dead daemon's file, not this one's), so live-workers.json can
+// never be the thing that tells THAT caller a repark is already in flight. A file living in the
+// one directory both callers already read (the taskDir itself, via state.json) works for both.
+//
+// `startedAt` is carried in the payload but NOT consulted by anything yet -- recorded now for a
+// future pid-reuse disambiguation (the same residual risk lock.js's own pid-liveness convention
+// already carries, see orphan-scan.js's comment on isAlive at its owner-pid check) this action
+// does not attempt to close. Do not read `startedAt` anywhere and claim it does more than sit in
+// the file until a later action actually consults it.
+//
+// `host` is stamped here (os.hostname(), never taken from the caller) rather than trusted from
+// whoever calls writeReparkClaim, the same posture writeLiveWorkerIds already takes with its own
+// `updatedAt` -- a fact this module can measure itself is never handed in as data. It exists so
+// orphan-scan.js can tell "this claim was written on THIS host" from "this claim belongs to a
+// task whose owner lives on some other host" before ever probing `pid` against the local process
+// table -- the exact same reason `owner.host !== os.hostname()` already gates the ordinary
+// owner-pid check a few lines below it. This is NOT multi-host support (nothing here makes a
+// foreign claim actionable); it only stops the claim check from answering a question -- "is this
+// pid alive" -- it has no way to evaluate for a pid that was never on this machine.
+function reparkClaimPath(taskDir) {
+  return path.join(taskDir, 'repark-claim.json');
+}
+
+function writeReparkClaim(taskDir, { id, pid, startedAt }) {
+  const target = reparkClaimPath(taskDir);
+  const tmp = path.join(taskDir, `.repark-claim.json.${process.pid}.${Date.now()}.tmp`);
+  const payload = { id, pid, startedAt, host: os.hostname() };
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(payload));
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // tmp was never created, or rename already moved it -- nothing to clean up either way.
+    }
+    throw err;
+  }
+  return payload;
+}
+
+// Tolerant read -> the parsed object, or null on anything else (missing file -- no claim has ever
+// been written for this task -- or an unparsable one, same "absence is not an error" posture
+// readLiveWorkerIds/readBenchReinstallOwed already apply to their own files). A read mid-rename is
+// impossible thanks to the atomic write above, but a reader that does not own this file should
+// never throw regardless.
+function readReparkClaim(taskDir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(reparkClaimPath(taskDir), 'utf8'));
+    return raw && typeof raw === 'object' ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+// Idempotent unlink -- never throws on ENOENT (no claim to clear is not an error, it is the
+// common case for every task that was never mid-repark) or on any other error clearing a file
+// that only ever gets in the way if it lingers.
+function clearReparkClaim(taskDir) {
+  try {
+    fs.unlinkSync(reparkClaimPath(taskDir));
+  } catch {
+    // Missing already (nothing to clear), or some other race -- either way, the caller's intent
+    // ("this claim must not exist any more") is satisfied by its absence, not by this call
+    // succeeding.
+  }
+}
+
 // benchReinstallOwedPath/writeBenchReinstallOwed/readBenchReinstallOwed/clearBenchReinstallOwed --
 // action B1.4 R1 (post-verification, third pass): the durable "a bench reinstall is owed" record,
 // <journalRoot>/bench-reinstall-owed.json, same atomic tmp-then-rename idiom as
@@ -351,6 +427,10 @@ module.exports = {
   writeLiveWorkerIds,
   readLiveWorkerIds,
   readLiveWorkersRaw,
+  reparkClaimPath,
+  writeReparkClaim,
+  readReparkClaim,
+  clearReparkClaim,
   benchReinstallOwedPath,
   writeBenchReinstallOwed,
   readBenchReinstallOwed,

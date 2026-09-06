@@ -43,7 +43,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { appendDaemonEvent } = require('./journal');
+const { appendDaemonEvent, readReparkClaim, clearReparkClaim } = require('./journal');
 const { listTaskIds, readJsonSafe } = require('./park-loop');
 const { processAlive } = require('./lock');
 
@@ -184,6 +184,44 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
       if (inQueue.has(id)) continue;
       if (liveWorkerIds && liveWorkerIds.has(id)) continue;
 
+      // Card #78's repark claim: a file in taskDir, not an entry in live-workers.json, because
+      // the unconditional startup scan cited a few lines above (this same file's own comment on
+      // the `liveWorkerIds`/`inQueueIds` parameters) is passed no liveWorkerIds at all -- see
+      // journal.js's own comment on writeReparkClaim for why. A live claim (its pid
+      // still answering isAlive) means some other repark path is already mid-flight on this exact
+      // taskDir; letting this scan proceed underneath it would be the same two-writers race the
+      // liveWorkerIds check just above exists to prevent. A claim whose pid is dead (or was never
+      // a valid pid at all) means that repark attempt died before finishing, or never validly
+      // claimed anything -- cleared here (in real mode only, see below) so this task is not wedged
+      // behind a claim nothing will ever come back to release, and control falls through to the
+      // normal orphan handling below.
+      const claim = readReparkClaim(taskDir);
+      // A claim written on another host can never be evaluated here: this process has no way to
+      // probe a foreign pid against ITS process table, only the local one -- see journal.js's own
+      // comment on writeReparkClaim's `host` field. A foreign claim is therefore neither treated
+      // as live nor cleared; it falls straight through, exactly as if no claim existed for this
+      // decision. This is NOT multi-host support -- it only stops this check from answering a
+      // question it has no evidence for.
+      if (claim && claim.host === os.hostname()) {
+        // A pid must be a positive integer before it is even worth asking isAlive about --
+        // process.kill(0, 0) and process.kill(-1, 0) (process groups) both succeed regardless of
+        // whether anything this module would call "the claim holder" is running, so a claim
+        // carrying 0, a negative number, or a non-numeric value would otherwise read as LIVE on
+        // every single pass, forever, with no ttl to ever release it. Such a claim is never live;
+        // it always takes the dead/stale path below.
+        const claimPidLive = Number.isInteger(claim.pid) && claim.pid > 0 && isAlive(claim.pid);
+        if (claimPidLive) {
+          appendDaemonEvent(journalRoot, 'orphan-scan-repark-in-flight', { id, pid: claim.pid, state: 'INTAKE' });
+          continue;
+        }
+        // shadow/dry-run must never write inside taskDir (this file's own header) -- clearing the
+        // claim file is exactly that, so it is skipped outside real mode. The event below is safe
+        // regardless: appendDaemonEvent only ever writes journalRoot's own daemon.jsonl, never
+        // anything under taskDir.
+        if (isRealMode(config)) clearReparkClaim(taskDir);
+        appendDaemonEvent(journalRoot, 'orphan-scan-repark-claim-stale', { id, pid: claim.pid, state: 'INTAKE' });
+      }
+
       const takenAt = takenAtMs(taskDir, taskFile);
       if (takenAt === null || Date.now() - takenAt < graceMs) continue;
 
@@ -215,6 +253,29 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
     if (TERMINAL_STATES.has(state.state)) continue;
     if (inQueue.has(id)) continue;
     if (liveWorkerIds && liveWorkerIds.has(id)) continue; // owned by a live worker -- see header above
+
+    // Card #78's repark claim -- same check and same reasoning as the never-started shape above
+    // (see that block's own comment for why this has to be a taskDir file rather than an entry in
+    // live-workers.json, why a foreign-host claim is neither honoured nor cleared, why a claim
+    // must carry a positive-integer pid before isAlive is even consulted, and why the clear itself
+    // is skipped outside real mode). A foreign-host claim here falls through to exactly the same
+    // place the ordinary `owner.host !== os.hostname()` check below already defers to -- that
+    // task's real owner record lives on that same other host too, for the identical reason.
+    // Deliberately NO ttl and NO new config knob: `isAlive` is this module's own liveness
+    // convention, the same one the ordinary owner-pid check just below already applies to
+    // `owner.workerPid`/`owner.pid` -- reusing it here inherits that check's existing pid-reuse
+    // residual (a dead pid recycled onto an unrelated live process before this scan runs) rather
+    // than introducing a new one.
+    const claim = readReparkClaim(taskDir);
+    if (claim && claim.host === os.hostname()) {
+      const claimPidLive = Number.isInteger(claim.pid) && claim.pid > 0 && isAlive(claim.pid);
+      if (claimPidLive) {
+        appendDaemonEvent(journalRoot, 'orphan-scan-repark-in-flight', { id, pid: claim.pid, state: state.state });
+        continue;
+      }
+      if (isRealMode(config)) clearReparkClaim(taskDir);
+      appendDaemonEvent(journalRoot, 'orphan-scan-repark-claim-stale', { id, pid: claim.pid, state: state.state });
+    }
 
     // Action 6.1 added a second owner shape: a worker-mode run (daemon.js --worker) writes
     // {host, workerPid, workerStartedAt} instead of the daemon's own {host, pid, lockStartedAt},

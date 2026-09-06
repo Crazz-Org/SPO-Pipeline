@@ -10,13 +10,23 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
-const { writeState, writeLiveWorkerIds, readLiveWorkerIds, liveWorkersPath } = require('../orchestrator/journal');
+const {
+  writeState,
+  writeLiveWorkerIds,
+  readLiveWorkerIds,
+  liveWorkersPath,
+  reparkClaimPath,
+  writeReparkClaim,
+  readReparkClaim,
+  clearReparkClaim,
+} = require('../orchestrator/journal');
 const { mkTmp } = require('./helpers');
 
 test('writeState: output is byte-identical to the pre-fix shape (pretty JSON + trailing newline)', () => {
@@ -208,4 +218,118 @@ test('writeLiveWorkerIds: a rename failure whose tmp file is ALSO already gone s
   } finally {
     fs.renameSync = origRename;
   }
+});
+
+// ---- card #78: reparkClaimPath/writeReparkClaim/readReparkClaim/clearReparkClaim -------------
+// See orchestrator/journal.js's own comment on these for the full design: a per-taskDir file
+// orphan-scan.js honours to skip a task whose crash-repark is already mid-flight in a child
+// process, closing the race the dispatcher's own synchronous ordering used to close before card
+// #78 moved that repark off the dispatcher's main thread.
+
+test('writeReparkClaim/readReparkClaim: round trip returns what was written, plus the host stamped automatically', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-roundtrip-');
+  writeReparkClaim(dir, { id: 'issue-9', pid: 12345, startedAt: '2026-09-06T00:00:00.000Z' });
+  assert.deepEqual(readReparkClaim(dir), {
+    id: 'issue-9',
+    pid: 12345,
+    startedAt: '2026-09-06T00:00:00.000Z',
+    host: os.hostname(),
+  });
+});
+
+// card #78, verifier addendum: `host` is stamped by writeReparkClaim itself (os.hostname(), never
+// trusted from a caller-supplied value) -- passing one in has no effect, the same posture
+// writeLiveWorkerIds already takes with its own `updatedAt`.
+test('writeReparkClaim: a caller-supplied `host` is ignored -- the file always carries this machine\'s own os.hostname()', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-hostignored-');
+  writeReparkClaim(dir, { id: 'issue-9', pid: 1, startedAt: 'x', host: 'some-other-machine' });
+  assert.equal(readReparkClaim(dir).host, os.hostname(), 'a caller-supplied host must never override the real local hostname');
+});
+
+test('readReparkClaim: a missing file reads as null, never a throw', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-missing-');
+  assert.equal(readReparkClaim(dir), null);
+});
+
+test('readReparkClaim: a corrupt file reads as null, never a throw', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-corrupt-');
+  fs.writeFileSync(reparkClaimPath(dir), '{ not json');
+  assert.equal(readReparkClaim(dir), null);
+});
+
+// Added by the action-2 verifier: journal.js's own contract for this function is "the parsed
+// object, or null on anything else", and its `raw && typeof raw === 'object'` guard is what
+// delivers the second half -- but nothing pinned it. A file holding well-formed JSON that is not
+// an object (`42`, `"hi"`, `null`) parses fine, so the try/catch above never fires; simplifying
+// the body to a bare `return JSON.parse(...)` passed the whole suite (mutation 13, SURVIVED)
+// while handing orphan-scan.js a truthy non-object claim to probe `.pid` on.
+test('readReparkClaim: well-formed JSON that is not an object still reads as null', () => {
+  for (const scalar of ['42', '"hi"', 'null', 'true']) {
+    const dir = mkTmp('spo-journal-reparkclaim-scalar-');
+    fs.writeFileSync(reparkClaimPath(dir), scalar);
+    assert.equal(readReparkClaim(dir), null, `a claim file holding ${scalar} must read as null, not as ${scalar}`);
+  }
+});
+
+test('clearReparkClaim: removes an existing claim file', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-clear-');
+  writeReparkClaim(dir, { id: 'issue-9', pid: 1, startedAt: 'x' });
+  assert.ok(fs.existsSync(reparkClaimPath(dir)));
+  clearReparkClaim(dir);
+  assert.equal(fs.existsSync(reparkClaimPath(dir)), false, 'claim file must be gone after clearReparkClaim');
+  assert.equal(readReparkClaim(dir), null);
+});
+
+test('clearReparkClaim: idempotent -- calling it again (or on a file that never existed) never throws', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-idempotent-');
+  assert.doesNotThrow(() => clearReparkClaim(dir), 'clearing a claim that was never written must not throw');
+  writeReparkClaim(dir, { id: 'issue-9', pid: 1, startedAt: 'x' });
+  clearReparkClaim(dir);
+  assert.doesNotThrow(() => clearReparkClaim(dir), 'a second clear on an already-cleared claim must not throw');
+});
+
+test('writeReparkClaim: the rename is atomic -- renameSync\'s target never existed before, and the source is already complete JSON', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-atomic-');
+  const origRename = fs.renameSync;
+  const calls = [];
+  fs.renameSync = (src, dest) => {
+    calls.push({ src, dest, srcContent: fs.readFileSync(src, 'utf8'), destExisted: fs.existsSync(dest) });
+    return origRename(src, dest);
+  };
+  try {
+    writeReparkClaim(dir, { id: 'issue-9', pid: 777, startedAt: '2026-09-06T00:00:00.000Z' });
+  } finally {
+    fs.renameSync = origRename;
+  }
+
+  assert.equal(calls.length, 1, 'writeReparkClaim must go through exactly one rename -- a direct writeFileSync to the target would call this 0 times');
+  assert.equal(calls[0].dest, reparkClaimPath(dir));
+  assert.equal(path.dirname(calls[0].src), dir, 'tmp file must be in the SAME directory as the target -- renameSync is not atomic across filesystems');
+  assert.equal(calls[0].destExisted, false, 'the target name did not exist an instant before this call');
+  // Complete, parsable JSON already, before the target name is ever visible under it -- a reader
+  // racing this write can never observe a half-written repark-claim.json.
+  const parsed = JSON.parse(calls[0].srcContent);
+  assert.deepEqual(parsed, { id: 'issue-9', pid: 777, startedAt: '2026-09-06T00:00:00.000Z', host: os.hostname() });
+});
+
+test('writeReparkClaim: no tmp file left behind after a clean write', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-notmp-');
+  writeReparkClaim(dir, { id: 'issue-9', pid: 1, startedAt: 'x' });
+  assert.deepEqual(fs.readdirSync(dir), ['repark-claim.json']);
+});
+
+test('writeReparkClaim: tmp file is cleaned up on the failure path (rename fails), error still propagates', () => {
+  const dir = mkTmp('spo-journal-reparkclaim-renamefail-');
+  // Make the target a directory instead of a file: renameSync(tmp, repark-claim.json) then fails
+  // EISDIR -- a real fs error unrelated to the atomic-write mechanism, standing in for "rename
+  // fails" generically, same idiom writeState/writeLiveWorkerIds's own failure-path tests use.
+  fs.mkdirSync(reparkClaimPath(dir));
+  assert.throws(() => writeReparkClaim(dir, { id: 'issue-9', pid: 1, startedAt: 'x' }), (err) => {
+    assert.equal(err.code, 'EISDIR');
+    return true;
+  });
+  // Only the pre-existing directory remains -- the tmp file the failed rename left dangling was
+  // cleaned up by the catch block's own unlink.
+  assert.deepEqual(fs.readdirSync(dir), ['repark-claim.json']);
+  assert.ok(fs.statSync(reparkClaimPath(dir)).isDirectory());
 });

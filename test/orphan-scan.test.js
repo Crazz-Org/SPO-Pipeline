@@ -15,7 +15,14 @@ const path = require('path');
 require('./no-real-spawn');
 const { shouldScanOrphans, orphanScan } = require('../orchestrator/orphan-scan');
 const { unparkScan } = require('../orchestrator/park-loop');
-const { appendEvent, appendDaemonEvent, writeState, writeLiveWorkerIds } = require('../orchestrator/journal');
+const {
+  appendEvent,
+  appendDaemonEvent,
+  writeState,
+  writeLiveWorkerIds,
+  writeReparkClaim,
+  readReparkClaim,
+} = require('../orchestrator/journal');
 const { runScanCycle, createScanTimers } = require('../orchestrator/state-machine');
 const { createScanState } = require('../orchestrator/comment-scan');
 const { runDaemonOnce, runDaemonDryRun } = require('./helpers');
@@ -1031,4 +1038,381 @@ test('orphanScan: orphanGraceMs of 0 means ZERO, not the four-minute default -- 
   const recovered = await orphanScan(queueDir, journalRoot, config, deps);
   const ids = recovered.map((r) => r.id).sort();
   assert.deepEqual(ids, ['issue-ordinary', 'issue-zero'], 'a grace of 0 was coerced back to the 4-minute default');
+});
+
+// ---- card #78: the repark claim -- honoured in BOTH orphan shapes -----------------------------
+// journal.js's writeReparkClaim/readReparkClaim/clearReparkClaim is the closure that replaces the
+// dispatcher's own synchronous-repark ordering once card #78 moves that repark into a short-lived
+// child process. `deps.isAlive` in every test below distinguishes real liveness (process.pid) from
+// dead (DEAD_PID or any other value) -- unlike most other tests in this file, it cannot just be
+// `() => false`, because that would make the claim's own pid look dead too and never exercise the
+// "claim is alive" branch at all.
+
+test('orphanScan: a task satisfying every orphan condition but carrying a claim whose pid is alive is NOT reparked, and orphan-scan-repark-in-flight is journalled', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-claim-live', { state: 'DIAGNOSE' });
+  writeReparkClaim(taskDir, { id: 'issue-claim-live', pid: process.pid, startedAt: new Date().toISOString() });
+
+  const config = testConfig();
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => {
+      throw new Error('must never spawn -- a task guarded by a live repark claim must not be reparked');
+    },
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [], 'a task with a live repark claim must not appear in the recovered list');
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'DIAGNOSE', 'state.json must be untouched while the claim is live');
+  assert.ok(fs.existsSync(path.join(taskDir, 'repark-claim.json')), 'the claim file itself must survive untouched while it is live');
+
+  assert.ok(
+    readDaemonEvents(journalRoot).some(
+      (e) => e.event === 'orphan-scan-repark-in-flight' && e.id === 'issue-claim-live' && e.pid === process.pid
+    ),
+    'expected orphan-scan-repark-in-flight to be journalled'
+  );
+});
+
+test('orphanScan: the same task with a claim whose pid is dead IS reparked, the claim file is gone afterwards, and orphan-scan-repark-claim-stale is journalled', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-claim-dead', { state: 'DIAGNOSE' });
+  writeReparkClaim(taskDir, { id: 'issue-claim-dead', pid: DEAD_PID, startedAt: new Date().toISOString() });
+
+  const config = testConfig();
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1'),
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-claim-dead', reason: 'task-orphaned-daemon-restart' }]);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+  assert.equal(readReparkClaim(taskDir), null, 'a stale claim must be cleared before the repark proceeds');
+
+  assert.ok(
+    readDaemonEvents(journalRoot).some(
+      (e) => e.event === 'orphan-scan-repark-claim-stale' && e.id === 'issue-claim-dead' && e.pid === DEAD_PID
+    ),
+    'expected orphan-scan-repark-claim-stale to be journalled'
+  );
+});
+
+test('orphanScan (never-started shape): a claim whose pid is alive blocks the repark, journalling orphan-scan-repark-in-flight', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-ns-claim-live');
+  writeReparkClaim(taskDir, { id: 'issue-ns-claim-live', pid: process.pid, startedAt: new Date().toISOString() });
+
+  const config = testConfig();
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => {
+      throw new Error('must never spawn -- a task guarded by a live repark claim must not be reparked');
+    },
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [], 'a never-started task with a live repark claim must not appear in the recovered list');
+  assert.equal(fs.existsSync(path.join(taskDir, 'state.json')), false, 'no state.json -- this task was left untouched, still claimed');
+  assert.ok(fs.existsSync(path.join(taskDir, 'repark-claim.json')), 'the claim file itself must survive untouched while it is live');
+
+  assert.ok(
+    readDaemonEvents(journalRoot).some(
+      (e) => e.event === 'orphan-scan-repark-in-flight' && e.id === 'issue-ns-claim-live' && e.pid === process.pid
+    )
+  );
+});
+
+test('orphanScan (never-started shape): a claim whose pid is dead is cleared and the task IS reparked, journalling orphan-scan-repark-claim-stale', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-ns-claim-dead');
+  writeReparkClaim(taskDir, { id: 'issue-ns-claim-dead', pid: DEAD_PID, startedAt: new Date().toISOString() });
+
+  const config = testConfig();
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1'),
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-ns-claim-dead', reason: 'task-orphaned-before-start' }]);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+  assert.equal(readReparkClaim(taskDir), null, 'a stale claim must be cleared before the repark proceeds');
+
+  assert.ok(
+    readDaemonEvents(journalRoot).some(
+      (e) => e.event === 'orphan-scan-repark-claim-stale' && e.id === 'issue-ns-claim-dead' && e.pid === DEAD_PID
+    )
+  );
+});
+
+// The whole reason the claim is a taskDir FILE and not a live-workers.json entry: daemon.js's own
+// unconditional startup call -- `await orphanScan(queueDir, journalRoot, config)`, run once on
+// every start regardless of mode, before runForever's own periodic scan ever begins -- passes NO
+// liveWorkerIds argument at all (that table is the previous, dead daemon's own file, stale by
+// construction at that point). A claim that only worked through a 5th-argument Set would be
+// invisible to exactly the caller this feature exists for.
+test('orphanScan: the claim is honoured even when called with NO liveWorkerIds argument at all -- the daemon.js unconditional-startup-call shape', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-startup-claim', { state: 'IMPLEMENT' });
+  writeReparkClaim(taskDir, { id: 'issue-startup-claim', pid: process.pid, startedAt: new Date().toISOString() });
+
+  const config = testConfig();
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => {
+      throw new Error('must never spawn -- a task guarded by a live repark claim must not be reparked');
+    },
+  };
+
+  // `deps` (4th arg) is this test's own way to inject isAlive/spawnSync mocks -- production's real
+  // call site (daemon.js's unconditional startup call) passes only 3 args, no deps override at
+  // all. The material point this call shares with that real one, and the one this test exists to
+  // pin, is what comes AFTER: no 5th arg (liveWorkerIds) and no 6th (inQueueIds) either.
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [], 'the claim must protect this task even with no liveWorkerIds table passed at all');
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'IMPLEMENT', 'state.json must be untouched while the claim is live');
+});
+
+test('orphanScan: a task with no repark claim at all still reparks normally (guards against the claim check accidentally skipping everything)', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-no-claim', { state: 'DIAGNOSE' });
+  assert.equal(readReparkClaim(taskDir), null, 'fixture bug: this task must have no claim file');
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-no-claim', reason: 'task-orphaned-daemon-restart' }]);
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+});
+
+test('orphanScan (never-started shape): a task with no repark claim at all still reparks normally', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-ns-no-claim');
+  assert.equal(readReparkClaim(taskDir), null, 'fixture bug: this task must have no claim file');
+
+  const config = testConfig();
+  const deps = { isAlive: () => false, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-ns-no-claim', reason: 'task-orphaned-before-start' }]);
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+});
+
+// ---- verifier fix round: shadow/dry-run must never clear a stale claim -----------------------
+// The header (and the never-started block's own comment, verbatim) promise shadow/dry-run touches
+// NOTHING under a task's own taskDir -- clearReparkClaim unlinks a file inside taskDir, so it must
+// be skipped outside real mode, exactly like every other taskDir write this file already gates on
+// isRealMode. The stale-claim detection and its own daemon.jsonl event (journalRoot-level, never
+// under taskDir) still fire -- only the actual unlink is withheld.
+
+test('orphanScan: dry-run mode with a claim whose pid is dead leaves the claim file on disk untouched, and still journals orphan-scan-would-repark', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-claim-dryrun', { state: 'DIAGNOSE' });
+  writeReparkClaim(taskDir, { id: 'issue-claim-dryrun', pid: DEAD_PID, startedAt: new Date().toISOString() });
+
+  const config = testConfig({ dryRun: true, real: false });
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => {
+      throw new Error('must never spawn -- dry-run mode never reaches finalizePark');
+    },
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-claim-dryrun', reason: 'task-orphaned-daemon-restart', wouldRepark: true }]);
+
+  assert.ok(
+    fs.existsSync(path.join(taskDir, 'repark-claim.json')),
+    'dry-run must never write inside taskDir -- the stale claim file must survive on disk, unlinked or not'
+  );
+  assert.ok(readReparkClaim(taskDir), 'the claim itself must still read back unmodified in dry-run mode');
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'DIAGNOSE', 'dry-run mode must never overwrite state.json with PARKED');
+
+  const events = readDaemonEvents(journalRoot);
+  assert.ok(
+    events.some((e) => e.event === 'orphan-scan-repark-claim-stale' && e.id === 'issue-claim-dryrun'),
+    'the stale-claim detection itself is a daemon.jsonl-only event and must still fire in dry-run mode'
+  );
+  assert.ok(events.some((e) => e.event === 'orphan-scan-would-repark' && e.id === 'issue-claim-dryrun'));
+});
+
+test('orphanScan (never-started shape): shadow mode with a claim whose pid is dead leaves the claim file on disk untouched, and still journals orphan-scan-would-repark', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-ns-claim-shadow');
+  writeReparkClaim(taskDir, { id: 'issue-ns-claim-shadow', pid: DEAD_PID, startedAt: new Date().toISOString() });
+
+  const config = testConfig({ shadowMode: true, real: false });
+  const deps = {
+    isAlive: (pid) => pid === process.pid,
+    spawnSync: () => {
+      throw new Error('must never spawn -- shadow mode never reaches finalizePark');
+    },
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-ns-claim-shadow', reason: 'task-orphaned-before-start', wouldRepark: true }]);
+
+  assert.ok(
+    fs.existsSync(path.join(taskDir, 'repark-claim.json')),
+    'shadow mode must never write inside taskDir -- the stale claim file must survive on disk, unlinked or not'
+  );
+  assert.equal(fs.existsSync(path.join(taskDir, 'state.json')), false, 'shadow mode must never write PARKED');
+
+  const events = readDaemonEvents(journalRoot);
+  assert.ok(events.some((e) => e.event === 'orphan-scan-repark-claim-stale' && e.id === 'issue-ns-claim-shadow'));
+  assert.ok(events.some((e) => e.event === 'orphan-scan-would-repark' && e.id === 'issue-ns-claim-shadow'));
+});
+
+// ---- verifier fix round: a claim's pid must be a positive integer before isAlive is consulted --
+// process.kill(0, 0) probes the CALLING process's own process group and process.kill(-1, 0)
+// probes every process this user can signal -- both succeed regardless of whether anything this
+// module would call "the claim holder" is even running, and there is no ttl to ever release a
+// claim stuck reading LIVE forever. Every case below sets deps.isAlive to answer TRUE for the
+// exact bad pid under test (never for the task's own dead owner pid, DEAD_PID, which must still
+// read as dead so the task is orphaned in the first place) -- standing in for that real
+// over-eager-success behaviour. These tests can only pass if the pid-validity guard rejects the
+// claim BEFORE isAlive is ever consulted with it; if the guard were removed, isAlive(badPid) would
+// answer true and the task would wrongly stay un-reparked.
+
+for (const [label, badPid] of [['zero', 0], ['negative', -1], ['non-numeric', 'not-a-pid']]) {
+  test(`orphanScan: a claim with pid ${JSON.stringify(badPid)} (${label}) is never treated as live -- the task IS reparked`, async () => {
+    const journalRoot = mkTmp('spo-orphan-journal-');
+    const queueDir = mkTmp('spo-orphan-queue-');
+    const id = `issue-claim-badpid-${label}`;
+    const taskDir = seedTask(journalRoot, id, { state: 'DIAGNOSE' });
+    writeReparkClaim(taskDir, { id, pid: badPid, startedAt: new Date().toISOString() });
+
+    const config = testConfig();
+    const deps = {
+      isAlive: (pid) => pid === badPid,
+      spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1'),
+    };
+
+    const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+    assert.deepEqual(recovered, [{ id, reason: 'task-orphaned-daemon-restart' }]);
+
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+    assert.equal(state.state, 'PARKED');
+    assert.equal(readReparkClaim(taskDir), null, 'an invalid-pid claim must be cleared before the repark proceeds');
+  });
+}
+
+test('orphanScan (never-started shape): a claim with pid 0 is never treated as live -- the task IS reparked', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTakenButNeverStarted(journalRoot, 'issue-ns-claim-badpid-zero');
+  writeReparkClaim(taskDir, { id: 'issue-ns-claim-badpid-zero', pid: 0, startedAt: new Date().toISOString() });
+
+  const config = testConfig();
+  const deps = { isAlive: (pid) => pid === 0, spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1') };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id: 'issue-ns-claim-badpid-zero', reason: 'task-orphaned-before-start' }]);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+  assert.equal(readReparkClaim(taskDir), null, 'an invalid-pid claim must be cleared before the repark proceeds');
+});
+
+// ---- verifier addendum: a claim written on another host can never be evaluated locally --------
+// journal.js's writeReparkClaim always stamps `host: os.hostname()` itself (never trusted from a
+// caller), so simulating a foreign claim here means writing the file directly rather than through
+// writeReparkClaim -- the same reason these two tests bypass it and build the JSON by hand.
+
+test('orphanScan: a claim written on a foreign host is neither treated as live nor cleared -- it falls through to the ordinary owner.host check, which defers to that same host', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const foreignHost = `not-${os.hostname()}`;
+  const id = 'issue-claim-foreign-host';
+  // The task's real owner is ALSO on that foreign host -- the existing `owner.host !==
+  // os.hostname()` check a few lines below the claim check is what actually defers this task; the
+  // claim check's own job here is only to not get in the way of that by acting on a pid it cannot
+  // evaluate.
+  const taskDir = seedTask(journalRoot, id, { state: 'DIAGNOSE', owner: { host: foreignHost, pid: process.pid, lockStartedAt: 'x' } });
+  fs.writeFileSync(
+    path.join(taskDir, 'repark-claim.json'),
+    JSON.stringify({ id, pid: process.pid, startedAt: new Date().toISOString(), host: foreignHost })
+  );
+
+  const config = testConfig();
+  const deps = {
+    isAlive: () => {
+      throw new Error('must never probe a pid this process cannot evaluate -- the claim (and the owner) are on a foreign host');
+    },
+    spawnSync: () => {
+      throw new Error('must never spawn -- a foreign-host-owned task must be left alone entirely');
+    },
+  };
+
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [], 'a task whose claim AND owner are on a different host must be left alone, not reparked');
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'DIAGNOSE', 'a foreign-host-owned task must be untouched');
+  assert.ok(
+    fs.existsSync(path.join(taskDir, 'repark-claim.json')),
+    'a foreign-host claim must survive -- this process has no evidence to clear it on'
+  );
+  assert.equal(readReparkClaim(taskDir).host, foreignHost, 'the surviving claim must be unmodified');
+});
+
+test('orphanScan (never-started shape): a claim written on a foreign host is neither treated as live nor cleared', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const foreignHost = `not-${os.hostname()}`;
+  const id = 'issue-ns-claim-foreign-host';
+  const taskDir = seedTakenButNeverStarted(journalRoot, id);
+  fs.writeFileSync(
+    path.join(taskDir, 'repark-claim.json'),
+    JSON.stringify({ id, pid: process.pid, startedAt: new Date().toISOString(), host: foreignHost })
+  );
+
+  const config = testConfig();
+  const deps = {
+    isAlive: () => {
+      throw new Error('must never probe a pid this process cannot evaluate -- the claim is on a foreign host');
+    },
+    spawnSync: () => ok('https://github.com/x/y/issues/385#issuecomment-1'),
+  };
+
+  // The never-started shape carries no owner record at all to defer a foreign host to -- a
+  // foreign claim here is simply never consulted, and the task ages out through the ordinary
+  // "never started" path exactly as if no claim existed. That is the honest limit of what a
+  // taskDir-local claim file buys: it is not multi-host support, and this single-daemon-per-
+  // journal-root pipeline never actually puts two different hosts' processes against the same
+  // journal root in the first place.
+  const recovered = await orphanScan(queueDir, journalRoot, config, deps);
+  assert.deepEqual(recovered, [{ id, reason: 'task-orphaned-before-start' }]);
+
+  assert.ok(
+    fs.existsSync(path.join(taskDir, 'repark-claim.json')),
+    'a foreign-host claim must survive -- this process never clears evidence it cannot evaluate'
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(taskDir, 'repark-claim.json'), 'utf8')).host,
+    foreignHost,
+    'the surviving claim must be unmodified'
+  );
 });
