@@ -4305,9 +4305,10 @@ test('prepareJudgeInputs: DIAGNOSE entered from GATE -- gate.log (written by rea
       calls.push({ command, args: [...args] });
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('1\n'); // 1 commit ahead -- genuinely committed
       if (args.includes('status') && args.includes('--porcelain')) return ok('');
       if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/y.ts b/y.ts\n+committed change\n');
-      if (args.includes('diff')) throw new Error('must not run a plain `git diff` -- HEAD != origin/main here');
+      if (args.includes('diff')) throw new Error('must not run a plain `git diff` -- rev-list says 1 commit ahead');
       return ok('');
     },
   };
@@ -4388,6 +4389,7 @@ test('prepareJudgeInputs: VALIDATE with a producible diff -- diff.patch exists a
     spawnSync: (command, args) => {
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('1\n'); // 1 commit ahead -- genuinely committed
       if (args.includes('status') && args.includes('--porcelain')) return ok('');
       if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/z.ts b/z.ts\n+validated change\n');
       return ok('');
@@ -4398,6 +4400,43 @@ test('prepareJudgeInputs: VALIDATE with a producible diff -- diff.patch exists a
   const result = prepareJudgeInputs(ctx, deps, { forState: 'VALIDATE' });
   assert.ok(result.diffProduced);
   assert.ok(fs.existsSync(diffPath(ctx.taskDir)));
+
+  // This test's NAME is a promise -- "a producible diff", "+validated change". `diffProduced`
+  // plus `existsSync` kept that promise vacuously: an EMPTY diff.patch satisfies both, and an
+  // empty diff.patch over a full worktree is the exact silent-false-verdict defect the
+  // committed-vs-not decision above this exists to prevent. Measured, not assumed: delete the
+  // `rev-list --count` line from this fake's spawnSync and the run flips to the plain-`git diff`
+  // branch, whose fall-through writes a BYTE-EMPTY diff.patch -- and the two assertions above
+  // still passed, 196/196 green. So assert the content, not merely the file.
+  const validateDiff = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.notEqual(
+    validateDiff.trim(),
+    '',
+    'diff.patch must not be empty -- an empty patch handed to VALIDATE is a silent false verdict, not a producible diff'
+  );
+  assert.match(validateDiff, /\+validated change/);
+
+  // ...and that the run never even journaled the empty-diff event, which is the same fact read
+  // from the other side (prepareJudgeInputs writes `diff-empty` only when the patch is blank).
+  const validateEvents = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l));
+  assert.equal(
+    validateEvents.filter((e) => e.event === 'diff-empty').length,
+    0,
+    'a producible diff must not journal diff-empty'
+  );
+
+  // The committed-vs-not probe must be journaled under the state it was prepared FOR -- a
+  // hardcoded state here would file VALIDATE's own spawns (and any ParkSignal spawnStep throws
+  // out of them) under DIAGNOSE, making the journal lie about which step stalled.
+  const revListSpawn = validateEvents.find(
+    (e) => e.event === 'spawn' && Array.isArray(e.argv) && e.argv.includes('rev-list')
+  );
+  assert.ok(revListSpawn, 'expected the rev-list spawn to be journaled');
+  assert.equal(revListSpawn.state, 'VALIDATE');
 
   // The follow-on LLM call (state-machine.js's handleValidate, same order: prepareJudgeInputs
   // before either LLM call) actually proceeds -- same direct-runLlm convention as the
@@ -4516,6 +4555,7 @@ test('prepareJudgeInputs: gate-report.md rendered from the bench verdict when pr
     spawnSync: (command, args) => {
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('1\n'); // 1 commit ahead -- genuinely committed
       if (args.includes('status') && args.includes('--porcelain')) return ok('');
       if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/g.ts b/g.ts\n+gate report test\n');
       return ok('');
@@ -4551,6 +4591,7 @@ test('prepareJudgeInputs: gate-report.md rendered from the bench verdict when pr
     spawnSync: (command, args) => {
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${otherHeadSha}\n`);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('1\n'); // 1 commit ahead -- genuinely committed
       if (args.includes('status') && args.includes('--porcelain')) return ok('');
       if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/h.ts b/h.ts\n+no verdict yet\n');
       return ok('');
@@ -4627,6 +4668,253 @@ test('prepareJudgeInputs: an empty diff is still written (the empty-IMPLEMENT ca
   const emptyEvent = journal.find((e) => e.event === 'diff-empty');
   assert.ok(emptyEvent, 'expected a diff-empty event, not a silent missing-input');
   assert.equal(emptyEvent.committed, false);
+});
+
+// ---- chantier 6 follow-up: committed-vs-not by `rev-list --count`, not by sha comparison -----
+//
+// Under K workers a SIBLING's fetch can advance origin/main while THIS branch still carries no
+// commit of its own -- HEAD != origin/main is then true for the wrong reason. These drive that
+// race exactly: origin/main and HEAD are given DIFFERENT shas (as a sibling's fetch would leave
+// them) while `git rev-list --count origin/main..HEAD` -- this branch's own commit count -- says
+// truthfully whether IMPLEMENT has committed.
+
+test('prepareJudgeInputs: the sibling-fetch race -- origin/main moved under a worker that never committed (rev-list --count == 0) -- diff.patch is the WORKING TREE, not origin/main...HEAD', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-race-wt-');
+  const task = { id: 'card-judge-race', kind: 'card', issue: 512, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-race', task, config });
+  ctx.cameFrom = 'CHECK';
+
+  // A sibling worker's fetch advanced origin/main -- these two shas now differ even though THIS
+  // branch never committed anything of its own.
+  const headSha = 'racehead00000000000000000000000000000000';
+  const siblingMovedMainSha = 'racemain00000000000000000000000000000000';
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${siblingMovedMainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('0\n'); // 0 commits ahead -- not committed
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) {
+        throw new Error(
+          'must not diff against origin/main...HEAD -- rev-list says 0 commits ahead, HEAD only ' +
+            'differs from origin/main because a sibling worker moved it'
+        );
+      }
+      if (args.includes('diff')) return ok('diff --git a/w.ts b/w.ts\n+working tree change, uncommitted\n');
+      return ok('');
+    },
+  };
+
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced);
+
+  const content = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.match(content, /working tree change, uncommitted/);
+  assert.ok(content.trim() !== '', 'must not be the empty patch the old sha-comparison defect would have produced');
+});
+
+test('prepareJudgeInputs: rev-list --count > 0 -- genuinely committed, diff.patch still comes from origin/main...HEAD', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-committed-wt-');
+  const task = { id: 'card-judge-committed', kind: 'card', issue: 513, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-committed', task, config });
+  ctx.cameFrom = 'GATE';
+  fs.writeFileSync(gateLogPath(ctx.taskDir), 'gate run output\n');
+
+  const headSha = 'committedhead000000000000000000000000000';
+  const mainSha = 'committedmain000000000000000000000000000';
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('2\n'); // 2 commits ahead -- genuinely committed
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) {
+        return ok('diff --git a/c.ts b/c.ts\n+committed change\n');
+      }
+      if (args.includes('diff')) throw new Error('must not run a plain `git diff` -- rev-list says 2 commits ahead');
+      return ok('');
+    },
+  };
+
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced);
+  const content = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.match(content, /committed change/);
+});
+
+test('prepareJudgeInputs: rev-list --count spawn fails -- degrades to the SAFE not-committed branch (plain `git diff`), never origin/main...HEAD', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-revlistfail-wt-');
+  const task = { id: 'card-judge-revlistfail', kind: 'card', issue: 514, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-revlistfail', task, config });
+  ctx.cameFrom = 'CHECK';
+
+  // Different shas -- if the fallback leaned the wrong way (defaulting to "committed" on a
+  // failed spawn) this would silently reproduce the very defect being fixed.
+  const headSha = 'revlistfailhead0000000000000000000000000';
+  const mainSha = 'revlistfailmain0000000000000000000000000';
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${mainSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return fail(128, 'fatal: bad revision');
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) {
+        throw new Error('must not diff against origin/main...HEAD -- the rev-list spawn failed, must degrade to SAFE');
+      }
+      if (args.includes('diff')) return ok('diff --git a/f.ts b/f.ts\n+safe fallback diff\n');
+      return ok('');
+    },
+  };
+
+  const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.ok(result.diffProduced);
+  const content = fs.readFileSync(diffPath(ctx.taskDir), 'utf8');
+  assert.match(content, /safe fallback diff/);
+});
+
+test('prepareJudgeInputs: pins the exact rev-list argv -- two dots and --count, never the three-dot diff form', () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-argvpin-wt-');
+  const task = { id: 'card-judge-argvpin', kind: 'card', issue: 515, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-argvpin', task, config });
+  ctx.cameFrom = 'CHECK';
+
+  const sameSha = 'argvpinsha00000000000000000000000000000000';
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${sameSha}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${sameSha}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('0\n');
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff')) return ok('');
+      return ok('');
+    },
+  };
+
+  prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+
+  const revListCall = calls.find((c) => c.command === 'git' && c.args.includes('rev-list'));
+  assert.ok(revListCall, 'expected a `git rev-list` call');
+  assert.deepEqual(revListCall.args, ['-C', worktreePath, 'rev-list', '--count', 'origin/main..HEAD']);
+});
+
+test('prepareJudgeInputs: rev-list exits 0 but stdout is unparsable -- every shape degrades to the SAFE not-committed branch', () => {
+  // The comment above the rev-list call promises that "a failed spawn OR UNPARSABLE STDOUT
+  // degrades to the SAFE (not-committed) branch". The exit-non-zero half of that promise has its
+  // own test above; this is the exit-ZERO half, which nothing covered -- and it is the half that
+  // decides what `parseInt`/`Number.isInteger` are actually FOR. Table-driven so the contract is
+  // stated as a population, not as one lucky sample.
+  const safeStdouts = [
+    ['empty', ''],
+    ['whitespace only', '   \n\t\n'],
+    ['a git error text delivered on stdout', 'fatal: bad revision \'origin/main..HEAD\'\n'],
+    ['a legitimate zero, trailing newline', '0\n'],
+    ['a legitimate zero, no newline', '0'],
+    ['a negative count git can never emit', '-1\n'],
+  ];
+  for (const [label, stdout] of safeStdouts) {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-judge-unparsable-wt-');
+    const task = { id: 'card-judge-unparsable', kind: 'card', issue: 516, worktreePath };
+    const ctx = testCtx({ id: 'card-judge-unparsable', task, config });
+    ctx.cameFrom = 'CHECK';
+    const deps = {
+      spawnSync: (command, args) => {
+        if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${'u'.repeat(40)}\n`);
+        if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${'v'.repeat(40)}\n`);
+        if (args.includes('rev-list') && args.includes('--count')) return ok(stdout);
+        if (args.includes('status') && args.includes('--porcelain')) return ok('');
+        if (args.includes('diff') && args.includes('origin/main...HEAD')) {
+          throw new Error(`must not diff origin/main...HEAD -- rev-list stdout was ${label}, which is not a positive count`);
+        }
+        if (args.includes('diff')) return ok('diff --git a/u.ts b/u.ts\n+safe working-tree diff\n');
+        return ok('');
+      },
+    };
+    const result = prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+    assert.ok(result.diffProduced, `${label}: expected a diff`);
+    assert.match(fs.readFileSync(diffPath(ctx.taskDir), 'utf8'), /safe working-tree diff/, label);
+  }
+
+  // ...and the mirror: a real positive count, however large, is genuinely committed. Pinned in
+  // the same test so "everything is safe" can never be the way this contract is satisfied.
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-bigcount-wt-');
+  const task = { id: 'card-judge-bigcount', kind: 'card', issue: 517, worktreePath };
+  const ctx = testCtx({ id: 'card-judge-bigcount', task, config });
+  ctx.cameFrom = 'CHECK';
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${'u'.repeat(40)}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${'v'.repeat(40)}\n`);
+      if (args.includes('rev-list') && args.includes('--count')) return ok('4211\n');
+      if (args.includes('status') && args.includes('--porcelain')) return ok('');
+      if (args.includes('diff') && args.includes('origin/main...HEAD')) return ok('diff --git a/b.ts b/b.ts\n+big count committed\n');
+      if (args.includes('diff')) throw new Error('must not run a plain `git diff` -- rev-list says 4211 commits ahead');
+      return ok('');
+    },
+  };
+  prepareJudgeInputs(ctx, deps, { forState: 'DIAGNOSE' });
+  assert.match(fs.readFileSync(diffPath(ctx.taskDir), 'utf8'), /big count committed/);
+});
+
+test('prepareJudgeInputs: origin/main does not resolve -- NO diff is attempted at all (the rev-parse existence gate), and VALIDATE parks', () => {
+  // `mainRes.stdout` is no longer read -- the `rev-parse origin/main` above survives purely as an
+  // EXISTENCE GATE, and nothing pinned what it gates. It is not vestigial: delete it and a
+  // missing origin/main falls through the failed rev-list into `committed = false`, which
+  // PRODUCES a working-tree diff.patch where HEAD produced none, turning a VALIDATE park into a
+  // silent pass. This is that gate, asserted from both sides.
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-judge-nomain-wt-');
+  const task = {
+    id: 'card-judge-nomain',
+    kind: 'card',
+    issue: 518,
+    title: 't',
+    criterion: 'c',
+    worktreePath,
+    touchesRdoMembers: false,
+    size: 'S',
+  };
+  const ctx = testCtx({ id: 'card-judge-nomain', task, config });
+  ctx.cameFrom = 'CHECK';
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${'n'.repeat(40)}\n`);
+      if (args.includes('rev-parse') && args.includes('origin/main')) {
+        return fail(128, "fatal: ambiguous argument 'origin/main': unknown revision");
+      }
+      if (args.includes('diff')) return ok('diff --git a/never.ts b/never.ts\n+must never be reached\n');
+      return ok('');
+    },
+  };
+
+  assert.throws(
+    () => prepareJudgeInputs(ctx, deps, { forState: 'VALIDATE' }),
+    (err) => err instanceof ParkSignal && err.reason === 'judge-inputs-missing' && err.detail.step === 'VALIDATE'
+  );
+  assert.equal(fs.existsSync(diffPath(ctx.taskDir)), false, 'no diff.patch may be written when origin/main is missing');
+  assert.equal(
+    calls.filter((c) => c.args.includes('diff')).length,
+    0,
+    'no `git diff` of ANY shape may be spawned once origin/main failed to resolve'
+  );
+  assert.equal(
+    calls.filter((c) => c.args.includes('rev-list')).length,
+    0,
+    'the gate must short-circuit BEFORE the rev-list, not lean on it failing too'
+  );
 });
 
 // ---- action 1.3 regression: shadow mode and --dry-run must never attempt any of this --------

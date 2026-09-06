@@ -561,17 +561,48 @@ function prepareJudgeInputs(ctx, deps, { forState }) {
       headSha = headRes.stdout.trim();
       const mainRes = spawnStep(ctx, deps, forState, 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
       if (mainRes.exit === 0) {
-        // Committed-vs-not by sha comparison. Exact while the daemon drains one task at a
-        // time: origin/main only moves in the shared .git when WORKTREE fetches, so within a
-        // run HEAD == origin/main means "IMPLEMENT has not committed yet". Under chantier 6's
-        // K workers this stops being exact -- a sibling worker's fetch can advance origin/main
-        // while this branch still has no commit of its own, and `diff origin/main...HEAD` would
-        // then resolve merge-base == HEAD and hand the judge an EMPTY patch over a full working
-        // tree. Replace with `git rev-list --count origin/main..HEAD` (0 == not committed),
-        // which is exact regardless of what origin/main does, when 6.4's product-repo mutex
-        // lands. Not changed now: unreachable single-threaded, and it would churn every
-        // judge-input test's fake spawn for a race that does not yet exist.
-        const committed = headSha !== mainRes.stdout.trim();
+        // Committed-vs-not USED to be decided by comparing HEAD's sha to origin/main's
+        // (mainRes.stdout, above -- no longer read; the `rev-parse origin/main` survives purely as
+        // an EXISTENCE GATE. It is load-bearing, not vestigial: this `if` is the ONLY thing that
+        // still refuses to attempt any diff when the ref is missing, exactly as before. Removing
+        // it would NOT be covered by the rev-list failing -- a failed rev-list degrades to
+        // `committed = false`, which produces a working-tree diff.patch where HEAD produced none,
+        // turning VALIDATE's `judge-inputs-missing` park into a silent pass. Pinned from both
+        // sides by real-steps.test.js's "origin/main does not resolve" test.) The sha comparison
+        // it used to feed was exact only while the daemon drained one task at a time: origin/main
+        // moves in the shared .git only when WORKTREE fetches, so within a single-threaded run
+        // (which the daemon no longer is, below) HEAD == origin/main meant
+        // "IMPLEMENT has not committed yet". Chantier 6 made that stop being exact -- under K
+        // workers a SIBLING's fetch can advance origin/main while THIS branch still carries no
+        // commit of its own, so HEAD != origin/main would be true for the wrong reason, flipping
+        // `committed` to true and handing `git diff origin/main...HEAD` a merge-base == HEAD,
+        // i.e. an EMPTY diff.patch over a worktree that holds all of IMPLEMENT's work -- silent:
+        // a false verdict, not an error. Both preconditions that used to defer this fix have now
+        // fallen: SPO_WORKERS=2 runs in production (doc/operating.md's tunables table; measured
+        // on the live journal 2026-09-04 -- overlapping worker-spawn records, issue-510 spawned
+        // while issue-507 still ran, issue-509 spawned while issue-508 still ran), and 6.4's
+        // product-repo mutex has landed (withProductRepoLock, further down this file).
+        //
+        // `git rev-list --count origin/main..HEAD` counts THIS branch's own commits ahead of
+        // origin/main -- "0" iff HEAD is (still) an ancestor of origin/main -- and is exact
+        // regardless of what a sibling worker does to origin/main meanwhile. A failed spawn or
+        // unparsable stdout degrades to the SAFE (not-committed) branch: a plain `git diff` of
+        // the working tree over-reports rather than hides it, and hiding IMPLEMENT's work is
+        // exactly the defect this replaces, so the fallback must never lean the other way.
+        //
+        // Measured, and not to be overstated: across the live journal, `diff-empty` fires 3
+        // times, every one with committed: false (the safe branch already in use). There is no
+        // recorded committed: true empty-patch case -- this closes a latent trap whose
+        // preconditions now hold, not an observed regression.
+        const revListRes = spawnStep(ctx, deps, forState, 'git', [
+          '-C',
+          worktreePath,
+          'rev-list',
+          '--count',
+          'origin/main..HEAD',
+        ]);
+        const aheadCount = revListRes.exit === 0 ? parseInt(revListRes.stdout.trim(), 10) : NaN;
+        const committed = Number.isInteger(aheadCount) && aheadCount > 0;
         const diffArgs = committed
           ? ['-C', worktreePath, 'diff', 'origin/main...HEAD']
           : ['-C', worktreePath, 'diff'];
