@@ -1137,6 +1137,17 @@ FINISH sends K-1 cards back through CHECK→GATE".
   intersection to bare movement. **The counter becomes configurable and its default stays at
   today's 1**, with the derivation written next to it. Revisit only if a nightly catches a
   cross-card regression.
+  *(Erratum 2026-09-06, SPO-Pipeline#84, commit `2a316af`: "does not fix the semantics it would be
+  built for" was slightly too absolute. A MERGE-only token does stop a sibling landing while this
+  card is itself inside MERGE, which covers the one incident on record (PR #632 landed while PR
+  #633 sat in the queue). It does not close the GATE→merge-queue-landing window: that window opens
+  at CI_CHECKS' intersection test and runs through VALIDATE and through the wait for the token, so
+  a sibling holding the token can land inside it and this card still enters MERGE gated against a
+  moved main. #84 closes that window at MERGE instead, far more cheaply, conditional on GitHub
+  attesting the base moved and only for the outcomes its probe can name. The claim still holds
+  unqualified for the disjoint-files, interacting-behaviour case, which is what this decision was
+  actually accepting. See `orchestrator/config.js`'s own 6.5 comment and
+  `doc/state-machine-spec.md`'s CI_CHECKS/MERGE rows for the corrected, current account.)*
 
 
 ## Before C6's actions: the suite had to be trustworthy first (#480, and two more)

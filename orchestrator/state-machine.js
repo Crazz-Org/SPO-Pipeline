@@ -1256,6 +1256,13 @@ async function handleValidate(ctx) {
 
 // MERGE: gh pr merge --merge (enqueue) + pr:wait; pr:wait exit 4 (still open) gets exactly one
 // bounded re-wait, never a loop. Exit 0 -> FINISH, anything else -> PARKED.
+//
+// SPO-Pipeline#84: this shadow twin deliberately carries no re-gate on the non-landing path --
+// shadow mode never probes GitHub at all (no probeMergeability equivalent here), so it can never
+// produce the `{kind: 'cause', reason: 'merge-conflict' | 'merge-behind-base'}` the real-mode
+// re-gate (steps/scripted.js's regateAfterNonLanding) is conditioned on. The divergence from
+// realMerge is inherited from #141, not created here; test/main-moved-and-merge.test.js's
+// "mainMoved"/"prWait" shadow-mode cases lock this function's current behaviour.
 async function handleMerge(ctx) {
   if (isRealMode(ctx)) {
     return callWithDeadline(ctx, 'MERGE', () => realMerge(ctx, ctx.deps));

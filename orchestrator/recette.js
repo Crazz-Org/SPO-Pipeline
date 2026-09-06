@@ -827,16 +827,28 @@ const SCENARIOS = {
 // REACHED it, unintentionally, at K=2: PR #632 (card 631) merged, moving origin/main, while PR
 // #633 (card 630) was already sitting in the merge queue. That is exactly the intersection window
 // main-moved-doc-log would have been built to exercise on purpose. It is STILL not a scenario
-// here, and the reason has changed: it is not scope/sequencing complexity any more, it is that
-// the pipeline does not yet re-gate that intersection -- card 630 PARKED
+// here, and the reason had changed: it was not scope/sequencing complexity any more, it was that
+// the pipeline did not yet re-gate that intersection -- card 630 PARKED
 // ('merge-queue-not-landing') instead of being re-gated against the new origin/main. The
 // intersection test that exists (test/gate-main-moved.test.js) runs realGate/realCiChecks at
-// CI_CHECKS, BEFORE a sibling's merge can land; nothing re-runs it in the GATE-to-merge-queue-
-// landing window where this incident actually happened, so the gap that window represents is
-// unprotected today. A scenario whose own documented "done" outcome is a park is not a gate
+// CI_CHECKS, BEFORE a sibling's merge can land; nothing re-ran it in the GATE-to-merge-queue-
+// landing window where this incident actually happened, so the gap that window represented was
+// unprotected at the time. A scenario whose own documented "done" outcome is a park is not a gate
 // scenario -- shipping one here would either be marked expected-to-fail (useless as a gate) or
-// would need the pipeline fix landed first. That pipeline/product fix is being filed separately,
-// not folded into this action; a live main-moved-doc-log scenario stays future work, gated on it.
+// would need the pipeline fix landed first.
+//
+// UPDATE (2026-09-06, SPO-Pipeline#84, commit 2a316af): that pipeline fix has landed.
+// `realMerge` now re-runs this same intersection test (`regateAfterNonLanding`) before parking,
+// conditioned on GitHub's own probe (#85's `probeMergeability`) attesting `merge-conflict` or
+// `merge-behind-base` -- which is the same fact GitHub's merge queue announced here at the time
+// ("This branch has conflicts that must be resolved"), though the probe post-dates this incident
+// and that PR's own park-time answer can no longer be read back, so this is an inference. The gate on
+// building a live main-moved-doc-log scenario is lifted: the "done outcome is a park" objection
+// above no longer holds for the case #84 covers. Still out of scope for THIS action -- building
+// that scenario is left for a future one -- and #84 itself is conditional, not a full close: a
+// non-landing PR whose cause GitHub's probe cannot resolve to `merge-conflict`/`merge-behind-base`
+// still parks unenriched, and the disjoint-files/interacting-behaviour gap config.js's own
+// `mainMovedRegateBudget` comment describes is untouched by it.
 
 function resolveScenario(name) {
   const key = name || 'trivial-doc-log';

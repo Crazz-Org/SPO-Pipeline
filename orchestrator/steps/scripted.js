@@ -2580,15 +2580,20 @@ async function realCiChecks(ctx, deps = {}) {
 // the park, issue-517's PR merged 17s BEFORE it. Routed through the same `spawnStep` every other
 // gh call in this file uses, so the probe is journalled and timeout-guarded identically.
 //
-// Post-verification (efficacy fix): GitHub computes `mergeable`/`mergeStateStatus` LAZILY -- the
-// FIRST `gh pr view` on a PR kicks off a background job and answers `UNKNOWN` on both fields; a
-// LATER read returns the real value once that job lands. `UNKNOWN` is therefore the EXPECTED
-// first answer, not a rare edge case: measured against real PRs on this account, 4 of 4 open PRs
+// Post-verification (efficacy fix): GitHub computes `mergeable`/`mergeStateStatus` LAZILY -- a
+// `gh pr view` on a PR whose cached computation has been invalidated kicks off a background job
+// and answers `UNKNOWN` on both fields; a LATER read returns the real value once that job lands.
+// Measured against real PRs on this account, 4 of 4 open PRs
 // returned `{"mergeStateStatus":"UNKNOWN","mergeable":"UNKNOWN"}` on the first read, and PR #134
 // and #691 both resolved to a definite `DIRTY`/`CONFLICTING` only on the SECOND read. Across 9
 // timed cold PRs, a definite answer arrived once ~1.55s of wall-clock had elapsed since the first
-// UNKNOWN -- regardless of how many calls were made (per-call latency measured 399-736ms). A probe
-// that reads exactly once therefore sees `UNKNOWN` almost every time in production, which
+// UNKNOWN -- regardless of how many calls were made (per-call latency measured 399-736ms). That is
+// NOT a general property of `gh pr view`: re-measured 2026-09-06 on all 13 then-open product PRs,
+// 0 of 13 first reads answered `UNKNOWN` -- a days-stale PR answers immediately. Neither
+// measurement is the state this probe actually runs in (a PR the merge queue has just been
+// touching, whose cached computation that activity invalidated), so the re-read stays justified on
+// the mechanism rather than on either count. A probe
+// that reads exactly once returns `UNKNOWN` on every such PR, which
 // degrades to `{kind: 'unknown'}` below and falls all the way back to the original SYMPTOM reason
 // (`merge-queue-not-landing` / `pr-closed-unmerged`) -- the very thing this whole action exists to
 // stop doing, reintroduced by reading too eagerly. So this re-reads, bounded to
@@ -2692,6 +2697,210 @@ function parkFromMergeCause(cause, detail) {
   throw new Error(`parkFromMergeCause: unrecognised cause reason ${JSON.stringify(cause.reason)}`);
 }
 
+// regateAfterNonLanding(ctx, deps, cause) -- SPO-Pipeline#84: the GATE->merge-queue-landing
+// window is never re-gated, so a sibling PR that merges while THIS one is still enqueued moves
+// `main` under it and MERGE parks on the SYMPTOM (`merge-conflict`/`merge-behind-base`, from
+// probeMergeability's own cause probe) rather than the actual cause -- a moved main, exactly the
+// intersection test realCiChecks and realGate's own main-moved paths already run earlier in the
+// task. This closes that one window, reusing the SAME intersection test, by attempting one
+// re-gate merge before the caller parks.
+//
+// Conditional, deliberately, on GitHub's OWN answer: `pr:wait` exit 4 means "still open after
+// 600s" against a merge queue GitHub itself allows up to 60 minutes (serial, one entry at a time)
+// -- the likely common cause of a [4,4] park is a sibling AHEAD of us in the queue, not a moved
+// main (an inference from that mechanism, not a measurement -- see below). An
+// unconditional re-gate would eject PRs that were about to land on their own. So this only ever
+// runs when `cause.kind === 'cause'` with reason `merge-conflict` or `merge-behind-base` -- both
+// mean "the base moved under this branch", but the two arms are not equally attested: measured
+// directly against the product repo's own open PRs, `mergeable: CONFLICTING`/`mergeStateStatus:
+// DIRTY` (`merge-conflict`) is 10 of 13; `mergeStateStatus: BEHIND` is 0 of 13 and appears nowhere
+// in the journal either (the ruleset's `strict_required_status_checks_policy: false` plausibly
+// suppresses it on this repo entirely). `BEHIND` stays in the condition because it is the identical
+// fact GitHub can in principle report, not because it was itself observed or measured -- unlike
+// `merge-conflict`, it is currently unattested traffic on this repo. Every other cause
+// (`merge-blocked`/`merge-pr-draft`/`merge-checks-failing`) or `unknown` returns `null`
+// immediately, before any spawn or journal, so the overwhelmingly common non-landing park stays
+// exactly as cheap as it was before this action. How often this re-gate fires in production is not
+// yet measurable: no `pr-mergeability` event exists in any journal (#141 shipped after every park
+// in the corpus), and most of the PRs a measurement would need have since changed state, which
+// permanently erases GitHub's answer for them -- #141's probe has to run in production first.
+//
+// Never derives its own answer to "did the base move" -- `cause` IS probeMergeability's already-
+// journalled read (#141), reused as-is. No second `gh pr view` here.
+//
+// Returns 'CHECK' when it merged a fresh `origin/main` and the caller should re-run CHECK.
+// Returns `null` in every other case -- rev-parse failure, no bench verdict, fetch failure, a
+// failed diff, no file intersection, the regate budget spent, an origin/main rev-parse failure
+// (skips the nightly guard, mirrors realGate), the merge itself conflicting, or a `spawnStep`
+// THROW swallowed by the guard below -- and the caller then falls through to its existing
+// `parkFromMergeCause(...)` unchanged. Per the same rule
+// `probeMergeability`'s own header states ("the probe must never mask a park"), this re-gate must
+// never make the park worse: it introduces NO new park reason of its own anywhere in this
+// function, and the ONE ParkSignal allowed out of it is `guardNightlyRed`'s `main-red-no-merge`
+// -- an EXISTING, shared reason whose propagation is correct (never merge from a red main).
+//
+// That last sentence is only true because of the guard wrapper below, and the wrapper is not
+// symmetry with realGate's own `merge --abort` try/catch -- it is the SAME doctrine applied to a
+// call site where realGate's exemption does not hold. realGate deliberately leaves its rev-parse
+// /fetch/merge spawns unwrapped, and says why: "a hung git there parks `git-timed-out` before any
+// routing decision has been made, which is honest". Here the routing decision is ALREADY MADE
+// before the first spawn -- the caller is holding GitHub's own attested cause and is one line
+// from parking on it -- so a `spawnStep` that throws (its retry-then-timeout ParkSignal
+// `git-timed-out`, or `command-killed-by-signal` when a deploy restart kills the child; both
+// TERMINAL, neither transient) would unwind straight out of `realMerge` and replace
+// `merge-conflict`/`merge-behind-base` with a reason naming this re-gate's own plumbing. Measured,
+// not modelled: a stub returning `{status: null, signal: 'SIGTERM'}` for the HEAD rev-parse, the
+// fetch, the diff, or the merge parks `command-killed-by-signal` in all four positions without
+// this wrapper. That is exactly the "a lookup documented as never parking parks the card" defect
+// realGate's own abort comment names, and this whole function is under a stricter promise than
+// realGate's block is. Journalled as `merge-regate {decision: 'spawn-park-suppressed'}` carrying
+// the reason it swallowed, so the suppression is never invisible.
+async function regateAfterNonLanding(ctx, deps, cause) {
+  if (
+    !(
+      cause.kind === 'cause' &&
+      (cause.reason === MERGE_CAUSE_REASONS.CONFLICT || cause.reason === MERGE_CAUSE_REASONS.BEHIND)
+    )
+  ) {
+    return null;
+  }
+  try {
+    return await regateAfterNonLandingUnguarded(ctx, deps, cause);
+  } catch (err) {
+    // A non-ParkSignal error is a real bug, not a failed lookup -- surface it, exactly as
+    // realGate's own abort catch does, rather than disguising it as "the re-gate declined".
+    if (!(err instanceof ParkSignal)) throw err;
+    if (err.reason === 'main-red-no-merge') throw err; // the one deliberate park (see above)
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', {
+      decision: 'spawn-park-suppressed',
+      suppressedReason: err.reason,
+      reason: cause.reason,
+    });
+    return null;
+  }
+}
+
+async function regateAfterNonLandingUnguarded(ctx, deps, cause) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+
+  // Deliberately NOT gitRevParse (below, CI_CHECKS-only): that helper hardcodes state 'CI_CHECKS'
+  // and throws ParkSignal('ci-checks-rev-parse-failed'), which would journal a MERGE-step failure
+  // under a CI_CHECKS reason.
+  const headRes = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+  if (headRes.exit !== 0) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', { decision: 'rev-parse-failed', exit: headRes.exit, reason: cause.reason });
+    return null;
+  }
+  const headSha = headRes.stdout.trim();
+
+  // No bench verdict for HEAD means there is NOTHING recorded to compare against, which is
+  // exactly how realCiChecks' own main-moved test reads the same absence ("treat as not moved",
+  // above). Never substitute another base via `git merge-base` or the reflog: an invented base
+  // would turn "we have no idea whether main moved" into a confident yes/no, and the yes side
+  // merges origin/main into a branch on nothing but a guess.
+  //
+  // Corrected during verification -- this comment previously claimed the gate was "load-bearing
+  // for the existing suite" and named test/gate-legs-reachability.test.js's
+  // "merge-queue-not-landing" case as depending on it. Both halves are false, measured: deleting
+  // the gate fails exactly ONE test (this action's own "no verdict on disk for HEAD"), and that
+  // reachability case never enters this function at all -- its fake leaves `gh pr view` unhandled,
+  // so probeMergeability degrades to `{kind: 'unknown'}` and the caller's `cause.kind === 'cause'`
+  // branch, the only caller of this helper, is never taken. Verified by instrumenting this
+  // function with a print and running that file: zero entries, nine tests green.
+  const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
+  const baseMain = verdict && verdict.baseMain;
+  if (!baseMain) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', { decision: 'no-base-main', reason: cause.reason });
+    return null;
+  }
+
+  // Deliberately differs from realGate's own no-baseMain fetch (which journals a failure and
+  // continues): GATE's fetch merely refreshes before a merge it will do anyway on a provably-
+  // unmergeable branch, whereas here the fetch IS the entire basis of the comparison -- comparing
+  // against a stale local `origin/main` would answer the wrong question entirely.
+  const fetch = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'fetch', 'origin', 'main']);
+  if (fetch.exit !== 0) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', { decision: 'fetch-failed', exit: fetch.exit, reason: cause.reason });
+    return null;
+  }
+
+  // The intersection, identical in shape to realCiChecks' own main-moved test above.
+  const diffMain = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'diff', '--name-only', `${baseMain}..origin/main`]);
+  const diffBranch = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'diff', '--name-only', 'origin/main...HEAD']);
+  if (diffMain.exit !== 0 || diffBranch.exit !== 0) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', {
+      decision: 'diff-failed',
+      diffMainExit: diffMain.exit,
+      diffBranchExit: diffBranch.exit,
+      reason: cause.reason,
+    });
+    return null;
+  }
+  const filesMain = new Set(splitLines(diffMain.stdout));
+  const filesBranch = splitLines(diffBranch.stdout);
+  const intersecting = filesBranch.filter((f) => filesMain.has(f));
+  if (intersecting.length === 0) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', { decision: 'no-intersection', reason: cause.reason });
+    return null;
+  }
+
+  // Same shared, configurable budget GATE's and CI_CHECKS' own main-moved paths already spend
+  // from (action 6.5) -- a move already spent from either of those blocks this one too. Never
+  // throws `main-moved-twice` here: that would replace GitHub's specific, actionable cause with a
+  // vaguer one -- falling through keeps `merge-conflict`/`merge-behind-base`.
+  const regateBudget = resolveMainMovedRegateBudget(config);
+  if (ctx.counters.mainMoveUsed >= regateBudget) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', {
+      decision: 'budget-exhausted',
+      mainMoveUsed: ctx.counters.mainMoveUsed,
+      mainMovedRegateBudget: regateBudget,
+      reason: cause.reason,
+    });
+    return null;
+  }
+
+  // Same nightly-red refusal GATE/CI_CHECKS already apply to their own main-moved merges -- call
+  // the SHARED guardNightlyRed rather than inlining the check: test/gate-legs-reachability.test.js
+  // pins the total count of ParkSignal throw sites for that reason at two -- the shared helper
+  // plus its shadow twin -- and an inlined check here would silently make that three. Mirrors
+  // realGate's own no-baseMain path above -- a rev-parse failure here is non-fatal and simply
+  // skips the guard, since the merge two lines below resolves the SAME ref and would fail the same
+  // way regardless.
+  const originMainRes = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+  if (originMainRes.exit === 0) {
+    guardNightlyRed(ctx, 'MERGE', config, originMainRes.stdout.trim());
+  } else {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', {
+      decision: 'origin-main-rev-parse-failed',
+      exit: originMainRes.exit,
+      reason: cause.reason,
+    });
+  }
+
+  ctx.counters.mainMoveUsed += 1;
+  const merge = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
+  if (merge.exit !== 0) {
+    // Mirror realGate's own abort block (this file, ~:2251) -- abort so the worktree is left clean;
+    // a failed abort must not be
+    // allowed to mask the fall-through to the caller's own (existing) park.
+    try {
+      spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'merge', '--abort']);
+    } catch (err) {
+      if (!(err instanceof ParkSignal)) throw err;
+      appendEvent(ctx.taskDir, 'MERGE', 'merge-regate-abort-failed', { reason: err.reason });
+    }
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', { decision: 'merge-failed', exit: merge.exit, reason: cause.reason });
+    return null;
+  }
+
+  // Reusing GATE's own event name (`main-moved-merge`, `{from: 'GATE'}`) with `from: 'MERGE'` --
+  // one event name across all three main-moved merge sites, not a fourth spelling of the same fact.
+  appendEvent(ctx.taskDir, 'MERGE', 'main-moved-merge', { from: 'MERGE' });
+  appendEvent(ctx.taskDir, 'MERGE', 'merge-regate', { decision: 'routed', reason: cause.reason, intersecting: intersecting.length });
+  return 'CHECK';
+}
+
 async function realMerge(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -2728,6 +2937,10 @@ async function realMerge(ctx, deps = {}) {
       });
     }
     if (cause.kind === 'cause') {
+      // SPO-Pipeline#84: one re-gate attempt, conditioned on GitHub's own reported cause, before
+      // believing it -- see regateAfterNonLanding's own header for the full rationale.
+      const routed = await regateAfterNonLanding(ctx, deps, cause);
+      if (routed === 'CHECK') return 'CHECK';
       parkFromMergeCause(cause, {
         exit: w1.exit,
         prState: cause.prState,
@@ -2756,6 +2969,10 @@ async function realMerge(ctx, deps = {}) {
       });
     }
     if (cause.kind === 'cause') {
+      // SPO-Pipeline#84: same re-gate attempt as the w1.exit === 1 leg above, sharing the one
+      // helper rather than duplicating the intersection-test body.
+      const routed = await regateAfterNonLanding(ctx, deps, cause);
+      if (routed === 'CHECK') return 'CHECK';
       parkFromMergeCause(cause, {
         lastExit: w2.exit,
         prState: cause.prState,
