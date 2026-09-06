@@ -200,7 +200,7 @@
 //   ignored with --retry; accepts a `#`-prefixed issue; --file still required to act)
 // Flags (recette): --scenario <name> (default trivial-doc-log)  --keep  --dry  --force
 //   --recette-dir <dir> (default <repo>/.recette)  --cap-ms <n>  --cap-llm-steps <n>
-
+require('../orchestrator/no-real-spawn-guard').installGuard();
 const fs = require('fs');
 const path = require('path');
 const os = require('os');

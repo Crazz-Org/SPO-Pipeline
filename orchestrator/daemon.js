@@ -72,7 +72,7 @@
 //               --shadow (refused below); if --dry-run is also given, --dry-run wins (same
 //               precedence as --shadow winning over --dry-run) -- see orchestrator/README.md
 //               "Real scripted steps".
-
+require('./no-real-spawn-guard').installGuard();
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
