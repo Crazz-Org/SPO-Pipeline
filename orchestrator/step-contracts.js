@@ -318,9 +318,9 @@ const STEP_CONTRACTS = {
   },
 };
 
-// task.touchesRdoMembers / task.size / task.escalate decide whether a step's model is escalated
-// this call. Never true for a step whose contract carries no escalatedModel at all (DIAGNOSE,
-// CITATION_VERIFIER).
+// task.touchesRdoMembers / task.size decide whether a step's model is escalated this call -- NOT
+// task.escalate, which nothing reads on any step (removed 2026-09-04). Never true for a step
+// whose contract carries no escalatedModel at all (DIAGNOSE, CITATION_VERIFIER).
 function shouldEscalate(stepDef, task) {
   if (!stepDef.escalatedModel) return false;
   if (task && task.touchesRdoMembers === true && stepDef.escalatesOn.includes('touchesRdoMembers')) return true;
