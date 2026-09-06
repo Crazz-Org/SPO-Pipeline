@@ -2412,7 +2412,7 @@ function createScanTimers() {
 // Set (journal.js's own tolerant-read posture), which is exactly today's "nothing to protect"
 // case -- byte-for-byte the same as passing `null` used to be, before this correction.
 //
-// Sequenced after queue/, not incidentally: auto-pull.js:49-57's computeAutoPullBudget reads
+// Sequenced after queue/, not incidentally: auto-pull.js:58-66's computeAutoPullBudget reads
 // `queued` before `inFlight` for this identical file pair (queue/, live-workers.json), and this
 // function now hoists the same two reads, in the same order, before calling orphanScan, instead
 // of leaving orphanScan to read queue/ itself after live-workers.json has already been read here.
@@ -2424,8 +2424,8 @@ async function runScanCycle(timers, queueDir, journalRoot, config, scanStates) {
   // retry/abandon reply starting next cycle, not a full extra poll later.
   if (shouldScanOrphans(timers.lastOrphanScanAt, Date.now(), config.orphanScanMs)) {
     timers.lastOrphanScanAt = Date.now();
-    // Read order: queue/ first, live-workers.json second -- auto-pull.js:49-57 settles this for
-    // this same file pair and computeAutoPullBudget (:154, :157-158) implements it. dispatcher.js's
+    // Read order: queue/ first, live-workers.json second -- auto-pull.js:58-66 settles this for
+    // this same file pair and computeAutoPullBudget (:163, :166-167) implements it. dispatcher.js's
     // fillSlots takes a task OUT of queue/ (takeNextTask's rename) and only THEN spawns and
     // publishes it as in-flight, so reading queue/ first means this scanner's own read pair can
     // only misread a task as belonging to neither place if BOTH reads land inside that narrow

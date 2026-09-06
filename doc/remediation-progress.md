@@ -1771,6 +1771,24 @@ evidence, rather than land concurrency changes in a remediation plan's final cha
 | [#82](https://github.com/Crazz-Org/SPO-Pipeline/issues/82) | `no-real-spawn` is parent-only | medium |
 | [#83](https://github.com/Crazz-Org/SPO-Pipeline/issues/83) | the reconciler's stale snapshot, and `orphanScan`'s inverted read order | low |
 
+> **CLOSED 2026-09-07, SPO-Pipeline#78.** `dispatcher.js`'s `reparkCrashedWorker` no longer calls
+> `finalizePark` synchronously, in-process, on the thread holding the single-instance lock -- it
+> spawns a short-lived `daemon.js --repark-task` child instead and returns; `finalizePark` itself
+> now runs inside that child, via `state-machine.js`'s `reparkCrashedTask`. The double-repark race
+> this used to close by construction (the dispatcher never dropped an id from `live` until its own
+> in-process park had already landed) is closed instead by a new per-task file,
+> `<taskDir>/repark-claim.json` (`journal.js`'s `writeReparkClaim`/`readReparkClaim`/
+> `clearReparkClaim`), written synchronously before the id leaves `live`, and honoured by
+> `orphan-scan.js`'s own concurrent scan (`orphan-scan-repark-in-flight`/
+> `orphan-scan-repark-claim-stale`). A `reparking` map keeps a mid-repark id IN the `liveIds` set
+> `takeNextTask` refuses on -- `fillSlots` hands it the union of `live.keys()` and
+> `reparking.keys()`, and `takeNextTask` skips any candidate that set already holds -- so the id
+> cannot be re-taken mid-park, all without touching worker-slot arithmetic (`live.size` alone
+> still gates the slots). A graceful drain now waits on `reparking` too, so the SIGKILL escalation
+> in `reapSignalledChildren` -- the one caller that passes `{ includeReparking: true }` to
+> `killAllChildren` -- reaches a repark child only after the drain's own budget is spent. No new park reason:
+> `worker-crashed` stays and stays terminal.
+
 ### The account cooldown, re-measured on the live pool
 
 The maintainer reported the pipeline calling an account stuck while the dashboard showed under

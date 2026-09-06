@@ -45,8 +45,13 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    worker and scanner process (`orchestrator/README.md` § "How much the daemon takes on at once"),
    the **primary** cover is the dispatcher's own exit handler: `dispatcher.js`'s `handleExit` →
    `reparkCrashedWorker` runs the exact same `buildCtx`/`finalizePark` round trip a normal
-   catch-all park uses, immediately and in-process, the moment a worker child exits abnormally —
-   reason `worker-crashed`, detail `{exitCode, signal}`. `orchestrator/orphan-scan.js` is now the
+   catch-all park uses, immediately, the moment a worker child exits abnormally — reason
+   `worker-crashed`, detail `{exitCode, signal}`. Card #78: that round trip no longer runs
+   in-process, on the thread holding the single-instance lock; `reparkCrashedWorker` spawns a
+   short-lived `daemon.js --repark-task` child instead and returns, and `finalizePark` itself runs
+   inside that child (`state-machine.js`'s `reparkCrashedTask`) — see `dispatcher.js`'s own header
+   for the `<taskDir>/repark-claim.json` handoff that keeps this race-free against `orphan-
+   scan.js`'s concurrent scan. `orchestrator/orphan-scan.js` is now the
    **fallback**, covering the case the dispatcher itself cannot: a `state.json` left on a
    non-terminal state with no `queue/` entry and a dead owner pid is reparked automatically
    (`task-orphaned-daemon-restart`) through the same `finalizePark` path (including restoring
@@ -62,13 +67,16 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    side effects, so both shapes only detect the orphan and journal
    `orphan-scan-would-repark` — neither ever parks. `handleExit` also
    deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
-   dispatcher's own shutdown** (`dispatcher.js:572-586`, `childrenSignalled && outcome === 'crashed'`
+   dispatcher's own shutdown** (`dispatcher.js:634-648`, `childrenSignalled && outcome === 'crashed'`
    — keyed on "did we actually signal this child", not on `stopReason`, since a DRAIN sets
    `stopReason` and then waits minutes having signalled nobody):
-   reparking from inside a process already SIGTERMed and about to be SIGKILLed risks a
-   `finalizePark` caught mid-write (state.json PARKED, no park-comment yet), which no later
-   scan can ever recover — deferring instead just leaves an ordinary non-terminal `state.json`
-   for orphan-scan to pick up cleanly next start. This is not a corner case: a merge's `git pull`
+   reparking here would spawn a fresh `daemon.js --repark-task` child in the middle of a shutdown
+   already under way, and that child would carry the same risk a synchronous in-process repark
+   used to carry directly — a `finalizePark` caught mid-write (state.json PARKED, no park-comment
+   yet) if `reapSignalledChildren`'s own SIGKILL escalation ever reaches it (the one caller that
+   signals a repark child at all — see `dispatcher.js`'s own comment on `{ includeReparking: true
+   }`), which no later scan can ever recover — deferring instead just leaves an ordinary
+   non-terminal `state.json` for orphan-scan to pick up cleanly next start. This is not a corner case: a merge's `git pull`
    SIGTERMing an in-flight card is this project's single most common shutdown, so the fallback
    above is the primary path for that one. See `orchestrator/README.md` § Orphan recovery.
    **Action 4.4:** the catch-all remains the error policy for every park reason except a closed,

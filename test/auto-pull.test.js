@@ -141,8 +141,14 @@ test('computeAutoPullBudget: a STALE (over-reporting) live-workers.json fails to
   const queueDir = mkTmp('spo-budget-queue5-');
   const journalRoot = mkTmp('spo-budget-journal5-');
   // Simulates dispatcher.js's own documented staleness direction: a worker exited a while ago,
-  // but the file still lists it (handleExit only publishes AFTER any repark it warrants has
-  // landed -- see dispatcher.js's own header). The scanner has no way to know the id is gone.
+  // but the file still lists it because this scanner's own read simply landed before the next
+  // publishLiveWorkerIds() write reached disk. CARD #78 CORRECTION: this comment used to explain
+  // the staleness as "handleExit only publishes AFTER any repark it warrants has landed" -- true
+  // only while a crash repark ran synchronously, in-process. It no longer does (see dispatcher.js's
+  // own header): handleExit drops the id and publishes the instant it has SPAWNED the repark
+  // child, not after that child's own park lands. The scenario this test exercises (a stale,
+  // over-reporting file) is still real and handled the same way; it just is not caused by a
+  // repark still landing. The scanner has no way to know the id is gone.
   writeLiveWorkerIds(journalRoot, ['issue-stale-1', 'issue-stale-2']);
 
   // Truth: only 0 workers are really alive, K=4 -- a perfectly fresh read would allow limit=4

@@ -40,9 +40,18 @@
 // same as 6.3 did for the SAME file:
 //   - OVER-reporting in-flight (the file still lists a worker that has already exited) makes
 //     this cycle see LESS headroom than truly exists -- under-pulls. Safe: self-corrects the
-//     moment dispatcher.js's handleExit publishes the departure (which it does only AFTER any
-//     repark that exit warranted has already landed -- see dispatcher.js's own header), and at
-//     worst costs one delayed cycle, exactly like orphanScan's own tolerance of the same file.
+//     moment dispatcher.js's handleExit publishes the departure, and at worst costs one delayed
+//     cycle, exactly like orphanScan's own tolerance of the same file. CARD #78 CORRECTION: this
+//     used to say the departure is published "only AFTER any repark that exit warranted has
+//     already landed" -- true only while a crash repark ran synchronously, in-process. It is
+//     FALSE now: handleExit drops the id from `live` (and publishes) the INSTANT it has spawned
+//     the repark child (reparkCrashedWorker), before that child's own park has done anything at
+//     all -- see dispatcher.js's own header. That is the CORRECT thing for THIS file's own
+//     purpose, not a new risk: a repark child holds no worker slot (dispatcher.js's `reparking`
+//     Map is tracked separately from `live` for exactly this reason -- see that Map's own
+//     comment), so the slot really IS free the moment the id leaves `live`, and this budget
+//     should count it as free at that same instant rather than wait for a park that has nothing
+//     to do with worker-slot headroom to finish first.
 //   - UNDER-reporting in-flight (the file doesn't yet list a worker dispatcher.js only just
 //     spawned) makes this cycle see MORE headroom than truly exists -- over-pulls. Unsafe: this
 //     is the direction that recreates the regression this action closes.

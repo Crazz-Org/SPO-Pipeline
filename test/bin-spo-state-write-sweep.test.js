@@ -48,8 +48,13 @@ require('./no-real-spawn');
 //      `state.json` literally.
 //   2. A `writeState(...)` call not prefixed by `accounts.` -- the shape a new subcommand would
 //      use if it imported orchestrator/journal.js's own writeState (the exact function
-//      state-machine.js's snapshot() and dispatcher.js's reparkCrashedWorker use to write a
-//      taskDir's state.json today) and called it, however it was imported: bare (destructured) or
+//      state-machine.js's snapshot() uses to write a taskDir's state.json today, on every ordinary
+//      transition AND on a crash repark's own finalizePark call -- CARD #78 CORRECTION: this used
+//      to also name dispatcher.js's reparkCrashedWorker as a writeState caller; it no longer is.
+//      reparkCrashedWorker now only SPAWNS a one-shot `daemon.js --repark-task` child and returns
+//      -- the write itself happens inside THAT child's process, via state-machine.js's
+//      reparkCrashedTask -> finalizePark -> snapshot() -> writeState, never on dispatcher.js's own
+//      thread) and called it, however it was imported: bare (destructured) or
 //      through a namespace object (`journal.writeState(...)`) -- bin/spo's OWN dominant import
 //      style is namespace objects (`accounts.`, `intake.`, `autoTriage.`, `reportIntake.`,
 //      `remoteReportPull.`, `recette.` -- bin/spo:180-189), so a namespaced `journal.writeState`

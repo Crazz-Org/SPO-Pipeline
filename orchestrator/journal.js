@@ -16,9 +16,18 @@
 // dispatcher.js's header): a scanner (orphan-scan.js's orphanScan, park-loop.js's unparkScan, or
 // anything else that walks journal/ rather than being handed one specific taskDir to run) may
 // only WRITE into a taskDir that is either
-//   (a) terminal -- state.json's state is DONE, PARKED, or ABANDONED, or
+//   (a) terminal -- state.json's state is DONE, PARKED, or ABANDONED,
 //   (b) whose owner is dead -- no live process (a worker, or pre-6.3 the daemon itself) still
-//       holds it, per orphan-scan.js's own pid-liveness check.
+//       holds it, per orphan-scan.js's own pid-liveness check, or
+//   (c) card #78: claimed by a repark child -- <taskDir>/repark-claim.json (writeReparkClaim/
+//       readReparkClaim below) names a pid that IS alive. A scanner must treat that taskDir as
+//       off-limits for the duration of the claim exactly as if a live worker still held it, even
+//       though state.json's own `owner` field already shows a dead pid (the crashed worker's).
+//       The repark child itself is not "a scanner" in the sense above -- like a worker, it is
+//       handed one specific taskDir to run and never walks journal/ -- so it is the one OTHER
+//       process (besides a worker or the daemon) that writes a non-terminal taskDir's state.json,
+//       and it does so exactly once, through the same finalizePark round trip orphan-scan.js's
+//       own recovery uses. See orphan-scan.js's own header for the read side of the claim check.
 //
 // THIS INVARIANT NOW CROSSES A PROCESS BOUNDARY. Blocking `claude` calls inside the scan cycle
 // (intake.js's callIntakeStepWithRotation, reached from auto-triage) measured at 3-3.5 minutes on
@@ -36,7 +45,7 @@
 // dispatcher.js's own `publishLiveWorkerIds`. The scanner reads it fresh with
 // `readLiveWorkerIds(journalRoot)` once per orphan scan (state-machine.js's runScanCycle) --
 // sequenced AFTER that same cycle's queue/ read, not at the top of the cycle, per the read-order
-// rule auto-pull.js:49-57 settles for this exact file pair (computeAutoPullBudget reads `queued`
+// rule auto-pull.js:58-66 settles for this exact file pair (computeAutoPullBudget reads `queued`
 // before `inFlight` for the same reason) -- and hands the result to orphanScan
 // as `liveWorkerIds` -- see orphan-scan.js's own comment on that parameter for what it protects.
 //
@@ -45,13 +54,22 @@
 //   - File says a task IS live, but the worker actually just died (the file hasn't caught up to
 //     the dispatcher's own in-memory `live.delete(id)` yet) -- SAFE. orphanScan simply skips this
 //     task for ONE MORE scan cycle; the next read picks up the dispatcher's now-current write, and
-//     nothing was lost -- a bounded delay in recovery, not a correctness violation. This is the
-//     direction the file exists to create ON PURPOSE: the dispatcher always finishes its own
-//     synchronous crash-repark (buildCtx/finalizePark, still dispatcher-side -- see
-//     dispatcher.js's handleExit) and only THEN rewrites the file to drop the id, so by the time
-//     an outside reader can ever see the id missing, that task's terminal state is ALREADY durable
-//     on disk. A scanner that raced the file update into this exact window still lists the id as
-//     live and defers, never touching a task the dispatcher is mid-reparking.
+//     nothing was lost -- a bounded delay in recovery, not a correctness violation.
+//     CARD #78 CORRECTION: this paragraph used to go on to say the file creates this direction ON
+//     PURPOSE because "the dispatcher always finishes its own synchronous crash-repark ... and
+//     only THEN rewrites the file to drop the id, so ... that task's terminal state is ALREADY
+//     durable on disk". That was true only while a crash was reparked synchronously, in-process.
+//     It is FALSE now: dispatcher.js's handleExit drops the id from `live` (and calls
+//     publishLiveWorkerIds) the INSTANT it has spawned the repark child (reparkCrashedWorker),
+//     long before that child's own finalizePark has written anything at all -- the park itself can
+//     still be running, off this process's own thread, minutes after the id is gone from this
+//     file. What actually closes the double-repark race now is a SEPARATE, per-task file,
+//     <taskDir>/repark-claim.json (writeReparkClaim/readReparkClaim below), which
+//     reparkCrashedWorker writes SYNCHRONOUSLY before `live.delete(id)` ever runs -- see that
+//     function's own header in dispatcher.js. This file (live-workers.json) still narrows the
+//     window -- a scanner that reads the id as live for one more cycle still defers, harmlessly --
+//     but it is no longer what makes deferring SAFE; the claim file is. See the reparkClaimPath
+//     section below for the full read/write shape.
 //   - File says a task is NOT live, but the worker is actually still running (a fresh spawn whose
 //     publish hasn't landed yet) -- also safe, but for a DIFFERENT reason: this is caught by
 //     orphanScan's PRIMARY mechanism, not by this file at all. A genuinely live worker's pid
@@ -95,7 +113,13 @@ function appendEvent(taskDir, state, event, detail = {}) {
 
 // A daemon-level counterpart to appendEvent, for events that belong to no single task -- auto-
 // pull.js's `auto-pull` cycle summary, lock.js/daemon.js's lock-takeover events, and, as of
-// action 6.3, dispatcher.js's `worker-spawn`/`worker-exit`/`parked` (crash repark) lines. Lives at
+// action 6.3, dispatcher.js's `worker-spawn`/`worker-exit` lines. CARD #78 CORRECTION: this used
+// to also name the crash repark's `parked` line as one of dispatcher.js's own -- it is not,
+// any more: dispatcher.js's own new lines are `worker-crash-repark-spawned`/
+// `worker-crash-repark-exit` (reparkCrashedWorker), and the `parked` line a crash repark itself
+// produces now comes from state-machine.js's reparkCrashedTask, running INSIDE the spawned
+// `daemon.js --repark-task` child -- a FOURTH process now capable of appending to this same file,
+// alongside the dispatcher, every worker, and the scanner. Lives at
 // <journalRoot>/daemon.jsonl, sibling to the per-task journal/<id>/ directories, same append-only
 // shape minus the `state` field (there is no state machine involved).
 //

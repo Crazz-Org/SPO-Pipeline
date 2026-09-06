@@ -111,20 +111,26 @@ function takenAtMs(taskDir, taskFile) {
 // itself: the instant a worker process actually exits, its pid genuinely stops answering
 // `isAlive`, so WITHOUT this check this scan would see exactly the same "non-terminal state, dead
 // owner pid" shape the dispatcher's own exit handler is (or is about to be) reparking through
-// finalizePark -- two independent writers racing the same journal.jsonl/state.json. dispatcher.js's
-// own header documents the precise ordering that makes this race-free: it only removes an id from
-// its live table AFTER its own repark (if any) has already completed, synchronously, with no
-// `await` in between.
+// finalizePark -- two independent writers racing the same journal.jsonl/state.json. CARD #78
+// CORRECTION: this used to go on to say dispatcher.js's own header documents an ordering that
+// makes this race-free on its own -- "it only removes an id from its live table AFTER its own
+// repark (if any) has already completed, synchronously, with no `await` in between". That stopped
+// being true the moment a crash repark started running in a SPAWNED `daemon.js --repark-task`
+// child instead of in-process: dispatcher.js's handleExit removes the id from `live` (and
+// publishes that departure) the INSTANT it has spawned the repark child, before that child's own
+// park has even started. What actually closes THIS race now is the repark-claim check a few lines
+// below (<taskDir>/repark-claim.json, journal.js's writeReparkClaim/readReparkClaim) -- see this
+// module's own two `claimPidLive` checks below, and dispatcher.js's own header for the write side.
 //
 // `inQueueIds` (a Set<string>, default null/none) lets a caller supply the queue/ read at a
 // controlled point in its OWN sequence rather than have this function read it itself, right here,
-// the instant it is entered. auto-pull.js:49-57's computeAutoPullBudget reads `queued` before
+// the instant it is entered. auto-pull.js:58-66's computeAutoPullBudget reads `queued` before
 // `inFlight` for this exact file pair (queue/, live-workers.json), and that is the settled rule:
 // read queue/ first, then live-workers.json, because dispatcher.js's fillSlots takes a task OUT
 // of queue/ before it spawns and publishes it as in-flight, so reading queue/ first narrows the
 // cross-process window in which a task can be misread as belonging to neither. state-machine.js's
 // runScanCycle hoists both reads into that order before calling orphanScan. `null`/absent means
-// "read it here yourself" -- which is what daemon.js:714's
+// "read it here yourself" -- which is what daemon.js:910's
 // unconditional startup crash-recovery scan relies on (it calls this function with no 5th/6th
 // argument at all, at a point where live-workers.json is stale by construction: the previous,
 // dead daemon's table, not yet cleared) and what every test that calls this function directly

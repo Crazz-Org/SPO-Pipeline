@@ -213,7 +213,7 @@ test('runScanCycle reads live-workers.json fresh and protects a listed id from o
   assert.equal(reparkedState.reason, 'task-orphaned-daemon-restart');
 });
 
-// card #102: consistency with auto-pull.js:49-57's settled read order for the SAME file pair
+// card #102: consistency with auto-pull.js:58-66's settled read order for the SAME file pair
 // (queue/, live-workers.json) -- read queue/ first, then live-workers.json, because
 // dispatcher.js's fillSlots takes a task OUT of queue/ before it spawns and publishes it as
 // in-flight, so reading queue/ first narrows the cross-process window in which a task can be

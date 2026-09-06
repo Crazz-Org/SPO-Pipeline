@@ -58,15 +58,17 @@
 //          reparkCrashedTask, the same buildCtx/finalizePark round trip a worker crash has always
 //          gone through, just no longer required to run on the process that holds the
 //          single-instance lock. `--exit-code <n>` and `--signal <s>` carry the dead worker's own
-//          exit through, into finalizePark's 'worker-crashed' detail, exactly as dispatcher.js's
-//          in-process reparkCrashedWorker always has. Takes no lock (same posture as --worker/
+//          exit through, into finalizePark's 'worker-crashed' detail, exactly as an in-process
+//          repark always did. Takes no lock (same posture as --worker/
 //          --scanner, and for the strongest possible reason here: the caller spawning this child
 //          is, by construction, the very process ALREADY HOLDING that lock). Never calls the
 //          `claude` CLI or needs an account (see the --real account-pool guard below, which skips
 //          itself for this mode). Mutually exclusive with --once, --worker and --scanner -- each
-//          selects a different, single "what this process itself is". THIS ACTION ONLY ADDS THE
-//          MODE: dispatcher.js still calls reparkCrashedTask in-process, not through this flag; a
-//          later action rewires that call site to spawn this child instead. Exit code:
+//          selects a different, single "what this process itself is". CARD #78 (this lot):
+//          dispatcher.js's reparkCrashedWorker now SPAWNS exactly this mode (buildReparkArgv)
+//          instead of calling reparkCrashedTask in-process, off the thread that holds the
+//          single-instance lock -- see dispatcher.js's own header for the claim-file handoff that
+//          makes that safe against orphan-scan.js's concurrent scan. Exit code:
 //            0  reparkCrashedTask ran to completion (whether it actually parked, or found the
 //               task already terminal and merely journalled -- both are success for this process)
 //            2  usage error: no <taskDir> path after the flag, or an argv that also names
@@ -311,8 +313,9 @@ async function runWorker(taskDirArg, config) {
 // this mode does: no takeNextTask, no runTask, no orphanScan -- reparkCrashedTask already does
 // everything a crash repark needs (read task.json, read state.json, buildCtx, finalizePark). This
 // function's entire job is to give that call a short-lived process of its own, off whichever
-// process is spawning it (today: none -- dispatcher.js still calls reparkCrashedTask in-process;
-// a later action rewires that call site to spawn this instead).
+// process is spawning it -- dispatcher.js's reparkCrashedWorker (see that file's own header) is
+// the one caller, spawning this exact mode instead of calling reparkCrashedTask in-process the
+// way it used to.
 //
 // `id` is the taskDir's own basename, not read off task.json: taskDir is join(journalRoot, id) by
 // construction (state-machine.js's takeNextTask), and reparkCrashedTask reads task.json itself,
@@ -807,17 +810,22 @@ async function main() {
     // reparkCrashedTask DOES build a ctx off this config (`buildCtx(id, task, taskDir, {...config,
     // queueDir, deps})`) and does NOT restore `owner` from the crashed task's state.json -- it
     // restores worktreePath, prNumber and the four counters only. So `owner: null` reaches
-    // snapshot() and lands in the parked state.json. Measured A/B on one fixture task, parked
-    // twice: dispatcher.js's in-process repark (today's path, config.owner = the lock holder)
-    // writes `"owner": {host, pid, lockStartedAt}`; this child writes `"owner": null`. That one
-    // field is the ONLY difference -- report.md is byte-identical.
+    // snapshot() and lands in the parked state.json. CARD #78 CORRECTION: this paragraph used to
+    // A/B this against "dispatcher.js's in-process repark (today's path, config.owner = the lock
+    // holder)" as though the two paths still coexisted -- they do not, as of this same card:
+    // dispatcher.js's reparkCrashedWorker now ALWAYS spawns this exact `--repark-task` child (see
+    // dispatcher.js's own header), so `owner: null` is the ONLY shape a crash repark ever writes
+    // now, not one arm of an A/B. The historical A/B measurement (one fixture task parked both
+    // ways; `"owner": {host, pid, lockStartedAt}` vs. `"owner": null`, report.md otherwise
+    // byte-identical) stands as a record of the gap this mode introduced before dispatcher.js was
+    // rewired to use it, not as a live comparison.
     //
     // Harmless, for the reason spelled out in the 6.3 note above: nothing reads `owner` off a
     // TERMINAL state.json (orphan-scan.js skips TERMINAL_STATES before its own `state.owner`
     // read; worker-status.js classifies PARKED as 'trailing' before its), and orphan-scan.js's
     // own reparks already ship this exact shape. It is a forensic loss, not a functional one --
-    // but it becomes live the day a later action rewires dispatcher.js to spawn this child, so
-    // it is a decision recorded here, not an accident.
+    // and it is live now, not a future one: every crash repark, real or a hand-run
+    // `--repark-task`, writes `owner: null`.
     owner: workerMode
       ? { host: os.hostname(), workerPid: process.pid, workerStartedAt: new Date().toISOString() }
       : scannerMode || reparkMode

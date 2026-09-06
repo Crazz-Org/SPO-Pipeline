@@ -73,17 +73,25 @@
 //     child_process.exec/execFile. If a real one is ever added, re-read this paragraph first.
 //
 // `spawn` (the async, non-callback one) is DELIBERATELY EXCLUDED, and this is not an oversight:
-// dispatcher.js itself is the one and only call site that uses it (`const { spawn: realSpawn } =
-// require('child_process')`, dispatcher.js:101), to launch its OWN worker/scanner children
-// (`spawn(process.execPath, [DAEMON_PATH, ...], {...})`, :729/:745) -- a re-exec of THIS SAME
-// daemon.js, not a git/gh/npm/claude command. That is legitimate, load-bearing infrastructure
-// needed in EVERY mode, including --shadow, and it runs in the PARENT (the continuous-mode
-// daemon itself), not only in an already-spawned child -- so patching it would not add defense in
-// depth against a mutated isRealMode gate, it would break the daemon's own ability to spawn
-// workers at all the moment this var is set (measured: it did, hanging test/dispatcher.test.js's
+// dispatcher.js is the module that uses it (`const { spawn: realSpawn } =
+// require('child_process')`, dispatcher.js:130) -- and, as of card #78, from THREE call sites, not
+// one. spawnOne (dispatcher.js:791) and spawnScanner (dispatcher.js:807) launch its OWN
+// worker/scanner children; reparkCrashedWorker (dispatcher.js:882) launches a THIRD kind, a
+// one-shot `daemon.js --repark-task` child that moves a crash's own park off the dispatcher's own
+// thread (see dispatcher.js's own header). All three are a re-exec of THIS SAME daemon.js, never a
+// git/gh/npm/claude command. That is legitimate, load-bearing infrastructure needed in EVERY mode,
+// including --shadow, and it runs in the PARENT (the continuous-mode daemon itself), not only in
+// an already-spawned child -- so patching it would not add defense in depth against a mutated
+// isRealMode gate, it would break the daemon's own ability to spawn workers (and repark children)
+// at all the moment this var is set (measured: it did, hanging test/dispatcher.test.js's
 // continuous-mode tests, before this exclusion was added). If a future call site ever starts
 // reaching git/gh/npm/claude through the async spawn(), extend this module then -- the same
 // precedent test/no-real-spawn.js's own header sets for its own, narrower scope.
+//
+// This file is NOT in the citation-guard's corpus (test/doc-constant-sweep.test.js), so its own
+// `file:line` references above are not machine-checked -- verified by hand against dispatcher.js
+// as of this same card (grep for `spawn: realSpawn`/`spawnFn(`/`spawnScannerFn(`/`spawnReparkFn(`
+// if they ever look stale).
 //
 // Since the whole module is a no-op unless the env var is set (see isEnabled below), this scope
 // carries no production risk either way: the live daemon never sets it, so none of this ever
