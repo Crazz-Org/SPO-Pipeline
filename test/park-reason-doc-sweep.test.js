@@ -43,8 +43,12 @@
 // guards, orphan-scan.js's pre-WORKTREE recovery path) pass a reason literal that was never a
 // `new ParkSignal(...)` anywhere -- a sweep that only scanned throws was structurally blind to
 // them. `finalizeParkSpans` (below) closes that gap the same way `parkSignalSpans` covers the
-// throw side: 6 `finalizePark(...)` call sites across orchestrator/** (state-machine.js ×3,
-// orphan-scan.js ×2, dispatcher.js ×1), one of which (`err.reason`) is a dynamic pass-through
+// throw side: 6 `finalizePark(...)` call sites across orchestrator/** (state-machine.js ×4,
+// orphan-scan.js ×2 -- CARD #78 CORRECTION: this used to read state-machine.js ×3/dispatcher.js
+// ×1, attributing `worker-crashed` to a dispatcher.js call site; that call moved INTO
+// state-machine.js's own reparkCrashedTask when card #78 took the crash repark off the
+// dispatcher's own thread, so all 4 non-orphan-scan.js sites are state-machine.js's now), one of
+// which (`err.reason`) is a dynamic pass-through
 // already covered by the throw-side scan, leaving 5 new literal reasons -- 2 already documented
 // (`worker-crashed`, `task-orphaned-daemon-restart`), 3 not (`task-orphaned-before-start`,
 // `state-machine-runaway`, `unrecognized-state`). A 7th reason, `abandoned-by-maintainer`, is
@@ -328,7 +332,10 @@ function parkSignalSpans(source) {
 // reason that no `ParkSignal` ever carries (`state-machine-runaway`, `unrecognized-state` --
 // state-machine.js's own dispatch-loop guards) or (`task-orphaned-before-start` --
 // orphan-scan.js's pre-WORKTREE recovery path; `task-orphaned-daemon-restart` is the same file's
-// sibling branch). `dispatcher.js`'s `worker-crashed` is a fourth. A sweep that only scanned
+// sibling branch), and `worker-crashed` is a fourth -- CARD #78 CORRECTION: this used to attribute
+// `worker-crashed` to a `dispatcher.js` finalizePark call; that call now lives in state-machine.js's
+// own reparkCrashedTask (dispatcher.js spawns a child that runs it, off its own thread, rather
+// than calling finalizePark itself). A sweep that only scanned
 // `new ParkSignal(...)` throws was blind to all of these -- this function closes that gap by
 // scanning for the sink's own call sites, the same balanced-paren + top-level-comma-split
 // technique parkSignalSpans uses, just reading the THIRD top-level argument (`reason`) instead of
@@ -552,12 +559,18 @@ test('every ParkSignal reason is documented in doc/state-machine-spec.md, or nam
   const ciCauseSource = blankComments(readSource(path.join('orchestrator', 'ci-cause-table.js')));
   const configSource = blankComments(readSource(path.join('orchestrator', 'config.js')));
 
-  // finalizeParkSiteCount: the SINK-side counterpart of siteCount above. dispatcher.js calls
-  // finalizePark directly and never mentions the string "ParkSignal" anywhere in the file -- the
-  // `!source.includes('ParkSignal')` skip below is correct for the THROW scan (it really has no
-  // `new ParkSignal(...)` sites) but would have been silently blind to dispatcher.js's own
-  // finalizePark call too, had this scan reused the same skip. It doesn't: this loop runs on
-  // every file regardless of whether it mentions ParkSignal.
+  // finalizeParkSiteCount: the SINK-side counterpart of siteCount above. This loop runs on EVERY
+  // file regardless of whether it mentions "ParkSignal" (the `!source.includes('ParkSignal')` skip
+  // below only gates the second, throw-side loop) -- a file that calls finalizePark directly, with
+  // no ParkSignal literal of its own anywhere in it, would otherwise be invisible to this sweep.
+  // CARD #78 CORRECTION: this comment used to name dispatcher.js's own direct finalizePark call as
+  // exactly that case. It no longer is: dispatcher.js's crash repark now runs off-thread, in a
+  // spawned `daemon.js --repark-task` child, and the finalizePark call itself moved WITH it, into
+  // state-machine.js's own reparkCrashedTask (`worker-crashed`, state-machine.js's fourth
+  // finalizePark site, alongside its own state-machine-runaway/unrecognized-state/err.reason
+  // sites) -- a file that already mentions ParkSignal on its own, so this specific example no
+  // longer demonstrates the general point. The general point still holds for any FUTURE file whose
+  // own finalizePark call carries no ParkSignal literal in the same file; today's corpus has none.
   let finalizeParkSiteCount = 0;
 
   for (const rel of files) {

@@ -8,6 +8,8 @@
 //                                          [--deadline-ms <n>] [--workers <n>]
 //             node orchestrator/daemon.js (--shadow | --dry-run | --real) --scanner
 //                                          [--queue <dir>] [--journal <dir>]
+//             node orchestrator/daemon.js --repark-task <taskDir> [--exit-code <n>] [--signal <s>]
+//                                          [--queue <dir>] [--journal <dir>]
 //
 // --once   drains the whole queue serially (filename order) and exits.
 // (absent) continuous mode: acquires the single-instance lock and runs the K-worker dispatcher
@@ -51,6 +53,32 @@
 //               6.3's classifier must therefore be "0/20/2/75 by name, EVERYTHING else = crashed"
 //               and not "1 = crashed", or a deploy-time SIGTERM (143) falls through it unhandled.
 //
+// --repark-task <taskDir>  card #78: a short-lived one-shot that parks exactly the ONE crashed
+//          task already sitting in <taskDir> and exits -- state-machine.js's exported
+//          reparkCrashedTask, the same buildCtx/finalizePark round trip a worker crash has always
+//          gone through, just no longer required to run on the process that holds the
+//          single-instance lock. `--exit-code <n>` and `--signal <s>` carry the dead worker's own
+//          exit through, into finalizePark's 'worker-crashed' detail, exactly as an in-process
+//          repark always did. Takes no lock (same posture as --worker/
+//          --scanner, and for the strongest possible reason here: the caller spawning this child
+//          is, by construction, the very process ALREADY HOLDING that lock). Never calls the
+//          `claude` CLI or needs an account (see the --real account-pool guard below, which skips
+//          itself for this mode). Mutually exclusive with --once, --worker and --scanner -- each
+//          selects a different, single "what this process itself is". CARD #78 (this lot):
+//          dispatcher.js's reparkCrashedWorker now SPAWNS exactly this mode (buildReparkArgv)
+//          instead of calling reparkCrashedTask in-process, off the thread that holds the
+//          single-instance lock -- see dispatcher.js's own header for the claim-file handoff that
+//          makes that safe against orphan-scan.js's concurrent scan. Exit code:
+//            0  reparkCrashedTask ran to completion (whether it actually parked, or found the
+//               task already terminal and merely journalled -- both are success for this process)
+//            2  usage error: no <taskDir> path after the flag, or an argv that also names
+//               --once / --worker / --scanner (all four branches pinned in
+//               test/daemon-repark-mode.test.js)
+//            non-zero (see journalUncaught / the catch below)  an unexpected throw -- journalled
+//               as 'worker-crash-repark-failed' with step: 'unexpected', same event name
+//               reparkCrashedTask itself uses for a task.json read failure, so both land in one
+//               place a maintainer would grep for.
+//
 // One of --shadow, --dry-run or --real is required:
 //   --shadow    every scripted/LLM step reads task.shadow fixtures. Never spawns a subprocess,
 //               never calls the `claude` CLI, never touches anything outside --queue/--journal.
@@ -79,7 +107,7 @@ const path = require('path');
 
 const defaultConfig = require('./config');
 const productRepoHold = require('./product-repo-hold');
-const { drainQueueOnce, runTask, runForever } = require('./state-machine');
+const { drainQueueOnce, runTask, runForever, reparkCrashedTask } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
 const { appendDaemonEvent, appendEvent } = require('./journal');
@@ -121,6 +149,16 @@ function parseArgs(argv) {
     // means "not given" -- a hand-run scanner never self-exits. See dispatcher.js's
     // buildScannerArgv and state-machine.js's runForever for the full reasoning.
     parentPid: null,
+    // Card #78: null = --repark-task not given at all; '' / undefined (falsy, but not null) =
+    // given with no path following it -- same "given vs. given-empty" convention as `worker`
+    // above, and main() tells the two apart the same way.
+    reparkTask: null,
+    // The dead worker's own exit, carried through into finalizePark's 'worker-crashed' detail --
+    // see reparkCrashedTask's own header (state-machine.js). null (never given) is a legitimate
+    // value here, not a parse failure: a hand-run repark (no real crash behind it) has no exit to
+    // report, and finalizePark's detail already tolerates `exitCode: null`.
+    exitCode: null,
+    signal: null,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -131,6 +169,9 @@ function parseArgs(argv) {
     else if (a === '--once') opts.once = true;
     else if (a === '--worker') opts.worker = argv[++i];
     else if (a === '--scanner') opts.scanner = true;
+    else if (a === '--repark-task') opts.reparkTask = argv[++i];
+    else if (a === '--exit-code') opts.exitCode = parseInt(argv[++i], 10);
+    else if (a === '--signal') opts.signal = argv[++i];
     else if (a === '--queue') opts.queue = argv[++i];
     else if (a === '--journal') opts.journal = argv[++i];
     else if (a === '--deadline-ms') opts.deadlineMs = parseInt(argv[++i], 10);
@@ -171,6 +212,14 @@ function printUsage() {
       '  --scanner         run the periodic real-mode scans forever, in this process, never the',
       '                    dispatcher\'s (see file header). Spawned/supervised by the dispatcher.',
       '                    Mutually exclusive with --once and --worker. Takes no lock.',
+      '  --repark-task <dir>  card #78: park the ONE already-crashed task in <dir> and exit (see',
+      '                    file header for the exit-code contract). Mutually exclusive with',
+      '                    --once, --worker and --scanner. Takes no lock -- the caller spawning',
+      '                    this child is, by construction, the process already holding it.',
+      '  --exit-code <n>   (with --repark-task) the dead worker\'s own exit code, carried into',
+      '                    finalizePark\'s \'worker-crashed\' detail.',
+      '  --signal <s>      (with --repark-task) the signal that killed the dead worker, if any,',
+      '                    carried into the same detail.',
       '  --queue <dir>     task queue directory (default: <repo>/queue)',
       '  --journal <dir>   per-task runtime/journal root (default: <repo>/journal)',
       '  --deadline-ms <n> per-step wall-clock deadline in ms (default: 120000)',
@@ -257,6 +306,50 @@ async function runWorker(taskDirArg, config) {
   if (finalState === 'DONE') return 0;
   if (finalState === 'PARKED') return 20; // an expected outcome, never conflated with a crash
   throw new Error(`orchestrator/daemon.js: --worker: runTask returned unexpected state ${finalState}`);
+}
+
+// Card #78: runs state-machine.js's reparkCrashedTask exactly once for the ONE task already
+// sitting in <taskDir> and returns the exit code main() should use. Deliberately the ONLY thing
+// this mode does: no takeNextTask, no runTask, no orphanScan -- reparkCrashedTask already does
+// everything a crash repark needs (read task.json, read state.json, buildCtx, finalizePark). This
+// function's entire job is to give that call a short-lived process of its own, off whichever
+// process is spawning it -- dispatcher.js's reparkCrashedWorker (see that file's own header) is
+// the one caller, spawning this exact mode instead of calling reparkCrashedTask in-process the
+// way it used to.
+//
+// `id` is the taskDir's own basename, not read off task.json: taskDir is join(journalRoot, id) by
+// construction (state-machine.js's takeNextTask), and reparkCrashedTask reads task.json itself,
+// inside its own try/catch, needing the id BEFORE it knows whether that read will even succeed
+// (a task.json read failure is one of its two journalled-and-returned outcomes -- see that
+// function's own header). Deriving id from a file that might not parse would make the id itself
+// unreliable in exactly the case this matters most.
+//
+// A bad <taskDir> is deliberately NOT surfaced as a usage error (2) the way runWorker's missing/
+// unreadable task.json is: reparkCrashedTask already has an established, journalled path for
+// that (`worker-crash-repark-failed`, step: 'task.json', then returns normally). Re-raising it
+// here would journal the identical failure a second time, under a different step name, for the
+// same root cause -- so only a throw reparkCrashedTask does NOT already catch reaches the catch
+// below, classified as 'unexpected' precisely because it is: a bug in this process, not a known
+// shape of "the task couldn't be read".
+async function runRepark(taskDirArg, exitCode, signal, queueDir, journalRoot, config) {
+  const taskDir = path.resolve(taskDirArg);
+  const id = path.basename(taskDir);
+  try {
+    reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCode, signal: signal || null });
+    return 0;
+  } catch (err) {
+    appendDaemonEvent(journalRoot, 'worker-crash-repark-failed', {
+      id,
+      exitCode,
+      signal: signal || null,
+      step: 'unexpected',
+      error: String((err && err.message) || err),
+    });
+    console.error(
+      `orchestrator/daemon.js: --repark-task: unexpected error reparking ${taskDir}: ${(err && err.stack) || err}`
+    );
+    return 1;
+  }
 }
 
 // ---- action 6.3 cross-action defect: a worker's crash used to leave NO record anywhere --------
@@ -371,11 +464,44 @@ async function main() {
     return;
   }
 
+  // Card #78: --repark-task is a fourth answer to "how do I not poll forever" -- see this file's
+  // own header for what it is. Same exit-2 usage-error posture, and mutually exclusive with each
+  // of --once/--worker/--scanner for the same reason those exclude each other: each selects a
+  // different, single "what this process itself is".
+  const reparkMode = opts.reparkTask !== null;
+  if (reparkMode && opts.once) {
+    console.error('orchestrator/daemon.js: --repark-task and --once are mutually exclusive (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+  if (reparkMode && !opts.reparkTask) {
+    console.error('orchestrator/daemon.js: --repark-task requires a <taskDir> path (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+  if (reparkMode && workerMode) {
+    console.error('orchestrator/daemon.js: --repark-task and --worker are mutually exclusive (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+  if (reparkMode && scannerMode) {
+    console.error('orchestrator/daemon.js: --repark-task and --scanner are mutually exclusive (see --help).');
+    process.exitCode = 2;
+    return;
+  }
+
   // --real is the one mode that actually calls the `claude` CLI (steps/llm.js's account-
   // rotation loop) -- refuse to even start if the pool has nothing registered, rather than let
   // every task park one at a time on the same NoAccountsRegisteredError. See doc/setup.md
   // § Accounts for how to add the first one (`spo account add <name>`).
-  if (opts.real) {
+  //
+  // Card #78: skipped entirely for --repark-task, even when paired with --real. A repark child
+  // never calls callLlmStep/leaseHealthyAccount -- reparkCrashedTask's only real-mode side effects
+  // are finalizePark's own (board move, park comment, wip push), none of which touch the account
+  // pool -- so refusing to start over an empty registry, or spending a `spo account sync-settings`
+  // pass across the whole pool, would block (and slow down) exactly the park this mode exists to
+  // get off the dispatcher's own thread, for a resource it never uses.
+  if (opts.real && !reparkMode) {
     const registry = accounts.readRegistry(defaultConfig.claudeAccountsDir);
     if (registry.length === 0) {
       console.error(
@@ -428,10 +554,14 @@ async function main() {
   // -- see journalUncaught's own comment above for why the child, not the dispatcher, is the one
   // that has to record this.
   crashContext = {
-    mode: workerMode ? 'worker' : scannerMode ? 'scanner' : 'dispatcher',
+    mode: workerMode ? 'worker' : scannerMode ? 'scanner' : reparkMode ? 'repark' : 'dispatcher',
     journalRoot,
-    taskDir: workerMode ? path.resolve(opts.worker) : null,
-    id: workerMode ? path.basename(path.resolve(opts.worker)) : null,
+    taskDir: workerMode ? path.resolve(opts.worker) : reparkMode ? path.resolve(opts.reparkTask) : null,
+    id: workerMode
+      ? path.basename(path.resolve(opts.worker))
+      : reparkMode
+        ? path.basename(path.resolve(opts.reparkTask))
+        : null,
   };
 
   // Single-instance lock, scoped to this journal root (orchestrator/lock.js) -- the same
@@ -471,6 +601,24 @@ async function main() {
   // (state.json non-terminal, owner pid dead). A scanner that does not die before the next start
   // simply becomes a second live one until it does -- harmless (it takes no lock, owns no taskDir)
   // but not free, so the signal is still sent rather than left to whichever exit path is slower.
+  //
+  // CARD #78: a call made HERE is an ORDINARY `killAllChildren('SIGTERM')` -- no `{ includeReparking:
+  // true }` -- so a repark child (dispatcher.js's own `reparking`) is deliberately NEVER among the
+  // process groups this hook signals, for the identical reason an ordinary call anywhere else in
+  // dispatcher.js never touches one: letting an in-flight park finish is strictly better than the
+  // half-written park (state.json PARKED with no park-comment anchor) a killed one would leave.
+  // This hook can fire WHILE a repark is genuinely still in flight: the escape hatch below
+  // (`process.exit(code)` on a second SIGTERM, or a refused drain) exits immediately, without
+  // waiting for run()'s own drain-then-reap sequence to have bounded and cleared `reparking`
+  // first -- so a repark child spawned moments earlier can outlive this process's own exit,
+  // orphaned in its own detached process group, continuing to park its card on its own schedule.
+  // What eventually bounds THAT (this process is already gone, so dispatcher.js's own
+  // reapSignalledChildren SIGKILL escalation cannot): systemd's `TimeoutStopSec` (currently 2820s,
+  // scripts/daemon-install.sh -- see that file's own comment for the drainTimeoutMs +
+  // drainKillGraceMs + slack sum it is derived from), which SIGKILLs the WHOLE cgroup -- the
+  // orphaned repark child included -- once the unit itself has been stopping for that long. Until
+  // then, a lingering repark child is not a leak: it is still trying to finish the SAME park it
+  // would have finished under an orderly drain, just unsupervised.
   let lock = null;
   let dispatcherHandle = null;
   process.once('exit', () => {
@@ -537,7 +685,13 @@ async function main() {
   // dispatcher that spawns and supervises it already holds one for the whole journal root, and a
   // second lock-holder (the scanner itself) would be exactly the two-daemons-on-one-queue
   // collision this lock exists to prevent, not a legitimate second instance.
-  if (!workerMode && !scannerMode) {
+  //
+  // Card #78: --repark-task joins them, for the strongest version of the same reason -- its
+  // whole point is to run OFF the process that holds this lock, so that process's own blocking
+  // finalizePark calls stop freezing it. Acquiring the lock here would hit LockHeldError against
+  // that very caller's own live lock and exit 1 -- the repark silently never happening, on the
+  // one journal root where it was needed most.
+  if (!workerMode && !scannerMode && !reparkMode) {
     try {
       lock = acquireLock(journalRoot, opts.shadow ? 'shadow' : opts.dryRun ? 'dry-run' : 'real');
     } catch (err) {
@@ -631,22 +785,64 @@ async function main() {
     // current at the moment of death sitting in state.json until the next restart's orphanScan
     // recovers it. If that scan stopped recognising the old shape, every one of those tasks
     // would be invisible forever.
-    // Action 6.3: a THIRD shape for --scanner -- `null`. A scanner never calls buildCtx to run a
-    // task of its own (orphanScan's own per-orphan buildCtx call restores that CRASHED task's
-    // owner from ITS OWN state.json, never from this config), so there is no identity this field
-    // needs to carry -- and, unlike the non-worker branch below, there is no `lock.holder` to read
-    // it from in the first place (the scanner never acquires one). buildCtx's own
-    // `(config && config.owner) || null` fallback already treats a missing owner as "unknown,
-    // never orphaned" for any ctx built off this config, which is exactly correct here.
+    // Action 6.3: a THIRD shape for --scanner -- `null`. A scanner never runs a task of its own,
+    // and, unlike the non-worker branch below, has no `lock.holder` to read an identity from in
+    // the first place (it never acquires one). Card #78 verification corrected what this comment
+    // used to claim next -- that orphanScan's per-orphan buildCtx call "restores that CRASHED
+    // task's owner from ITS OWN state.json". It does not: orphan-scan.js restores worktreePath,
+    // prNumber and the four counters onto that ctx, never `owner`, so ctx.owner falls back to
+    // THIS config's -- `null` -- and that is what snapshot() then writes into the orphan's parked
+    // state.json. The dead owner it read out of that task's state.json is preserved in the park
+    // DETAIL instead (`finalizePark(ctx, ..., { owner, lastUpdatedAt, recoveredBy })`), which is
+    // where a maintainer reading report.md finds it. Losing it from the snapshot is harmless
+    // because nothing reads `owner` off a TERMINAL state.json: orphan-scan.js `continue`s on
+    // TERMINAL_STATES before its own `state.owner` read, and worker-status.js classifies
+    // DONE/PARKED/ABANDONED as 'trailing' before its.
+    // Card #78: a FOURTH shape for --repark-task -- `null`, for the same two reasons as the
+    // scanner, and with the same measured consequence.
+    //
+    // The forcing one is structural: reparkMode never acquires the lock (see the guard above), so
+    // `lock` is still null on this line and the branch below would throw a TypeError on
+    // `lock.holder.host`. Verified by mutation: dropping `|| reparkMode` here fails 6 of the
+    // tests in test/daemon-repark-mode.test.js, every one of them on a non-zero child exit.
+    //
+    // The consequence, stated plainly because it is a real difference and not a no-op:
+    // reparkCrashedTask DOES build a ctx off this config (`buildCtx(id, task, taskDir, {...config,
+    // queueDir, deps})`) and does NOT restore `owner` from the crashed task's state.json -- it
+    // restores worktreePath, prNumber and the four counters only. So `owner: null` reaches
+    // snapshot() and lands in the parked state.json. CARD #78 CORRECTION: this paragraph used to
+    // A/B this against "dispatcher.js's in-process repark (today's path, config.owner = the lock
+    // holder)" as though the two paths still coexisted -- they do not, as of this same card:
+    // dispatcher.js's reparkCrashedWorker now ALWAYS spawns this exact `--repark-task` child (see
+    // dispatcher.js's own header), so `owner: null` is the ONLY shape a crash repark ever writes
+    // now, not one arm of an A/B. The historical A/B measurement (one fixture task parked both
+    // ways; `"owner": {host, pid, lockStartedAt}` vs. `"owner": null`, report.md otherwise
+    // byte-identical) stands as a record of the gap this mode introduced before dispatcher.js was
+    // rewired to use it, not as a live comparison.
+    //
+    // Harmless, for the reason spelled out in the 6.3 note above: nothing reads `owner` off a
+    // TERMINAL state.json (orphan-scan.js skips TERMINAL_STATES before its own `state.owner`
+    // read; worker-status.js classifies PARKED as 'trailing' before its), and orphan-scan.js's
+    // own reparks already ship this exact shape. It is a forensic loss, not a functional one --
+    // and it is live now, not a future one: every crash repark, real or a hand-run
+    // `--repark-task`, writes `owner: null`.
     owner: workerMode
       ? { host: os.hostname(), workerPid: process.pid, workerStartedAt: new Date().toISOString() }
-      : scannerMode
+      : scannerMode || reparkMode
         ? null
         : { host: lock.holder.host, pid: lock.holder.pid, lockStartedAt: lock.holder.startedAt },
   };
 
   if (workerMode) {
     process.exitCode = await runWorker(opts.worker, config);
+    return;
+  }
+
+  // Card #78: --repark-task runs exactly one call into state-machine.js's reparkCrashedTask and
+  // exits -- see runRepark's own header for the exit-code contract and this file's own header for
+  // why this mode exists at all.
+  if (reparkMode) {
+    process.exitCode = await runRepark(opts.reparkTask, opts.exitCode, opts.signal, queueDir, journalRoot, config);
     return;
   }
 

@@ -853,7 +853,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:140` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:150` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -2109,12 +2109,18 @@ A task whose owning daemon process dies mid-run (crash, hard kill, a losing race
 This section covers the **fallback** path only. The **primary** cover, since chantier 6 split the
 daemon into dispatcher/worker/scanner processes, is `dispatcher.js`'s `handleExit` →
 `reparkCrashedWorker`: the dispatcher notices a worker child exit abnormally and reparks it
-immediately, in-process, reason `worker-crashed` — no wait for a scan at all (see
-doc/state-machine-spec.md § Principles, Principle 2). The scanner-based mechanism below exists for
-what the dispatcher itself cannot cover: a worker killed during the dispatcher's OWN shutdown
-(deliberately not reparked in-process, since a park half-written by a process already being
-SIGKILLed can never be recovered later — `dispatcher.js:485-499`) and any owning daemon process
-that simply never comes back to run `handleExit` at all (a hard kill of the whole process tree).
+immediately, reason `worker-crashed` — no wait for a scan at all (see doc/state-machine-spec.md
+§ Principles, Principle 2). Card #78: that repark no longer runs in-process, on the thread holding
+the single-instance lock — `reparkCrashedWorker` spawns a short-lived `daemon.js --repark-task`
+child instead and returns immediately, with `finalizePark` itself running inside that child
+(`state-machine.js`'s `reparkCrashedTask`); see `dispatcher.js`'s own header for the
+`<taskDir>/repark-claim.json` handoff that keeps this safe against orphan-scan.js's concurrent
+scan. The scanner-based mechanism below exists for what the dispatcher itself cannot cover: a
+worker killed during the dispatcher's OWN shutdown (deliberately never reparked in that window —
+spawning a repark child mid-shutdown would only move the same risk into it, since a park half-
+written by a process about to be SIGKILLed can never be recovered later — `dispatcher.js:634-648`)
+and any owning daemon process that simply never comes back to run `handleExit` at all (a hard kill
+of the whole process tree).
 The shutdown case is this project's most common one in practice: a merge's `git pull` SIGTERMing
 an in-flight card.
 
@@ -2610,6 +2616,8 @@ task/daemon split itself).
 | `merge-regate` | task | SPO-Pipeline#84: `realMerge`'s own re-gate attempt on a non-landing `pr:wait`, run only when `probeMergeability`'s cause is `merge-conflict`/`merge-behind-base` — one event per outcome, `decision` naming which: `rev-parse-failed` (HEAD), `no-base-main` (no bench verdict for HEAD, or it carries no `baseMain`), `fetch-failed`, `diff-failed`, `no-intersection` (the branch and `origin/main`'s own moved files don't overlap — the original park stands), `budget-exhausted` (`config.mainMovedRegateBudget` already spent, shared with GATE/CI_CHECKS), `origin-main-rev-parse-failed` (the nightly-red guard is skipped, not fatal), `merge-failed` (the regate's own `git merge origin/main` conflicted — aborted and left clean), `spawn-park-suppressed` (one of the re-gate's own `spawnStep` calls THREW rather than returning — `git-timed-out` after its retry, or `command-killed-by-signal` from a deploy restart — and the throw was swallowed, `suppressedReason` naming it, so the caller's original GitHub-attested park still fires; `main-red-no-merge` is the one throw deliberately NOT suppressed), or `routed` (merged cleanly; `realMerge` returns `'CHECK'` and the caller's own park never fires). Every non-`routed` decision falls through to the pre-existing `parkFromMergeCause`/fallback park unchanged — this event never itself parks the card (`steps/scripted.js`). |
 | `merge-regate-abort-failed` | task | the re-gate's own `git merge --abort` (cleaning up a failed regate merge) itself exited non-zero or hit a spawn timeout — mirrors `gate-main-moved-abort-failed` above for the same cleanup step, one state over (`steps/scripted.js`). |
 | `no-worktree-change` | task | IMPLEMENT's `files_changed` claim was non-empty but `git status --porcelain` on the worktree came back clean — routes to DIAGNOSE (card #385's cross-check, `state-machine.js`). |
+| `orphan-scan-repark-claim-stale` | daemon | card #78: `orphan-scan.js` found a `<taskDir>/repark-claim.json` whose pid is not alive on this host (the repark child that wrote it died before finishing, or the claim was never valid) — cleared (real mode only) and the taskDir falls through to ordinary orphan handling (`orphan-scan.js`). |
+| `orphan-scan-repark-in-flight` | daemon | card #78: `orphan-scan.js` found a `<taskDir>/repark-claim.json` whose pid IS alive — a repark child (dispatcher.js's `reparkCrashedWorker`) is already mid-flight on this exact taskDir, so this scan skips it rather than racing a second writer onto the same `state.json` (`orphan-scan.js`). |
 | `orphan-scan-unknown-owner` | daemon | the daemon-startup orphan scan found a task `state.json` with no recognisable `owner.workerPid`/`owner.pid` — skipped rather than guessed at (`orphan-scan.js`). |
 | `park-anchor` | task | the retry/abandon scan boundary for this park cycle, journalled when `gh issue comment` FAILED so the card stays reachable (issue #77). Carries `at`, stamped **before** the `gh` call so a `retry` posted while it was in flight still counts, but appended **after** it so the anchor remains the worker's last journal event — the only thing stopping `unparkScan` acting on a park mid-write. A successful comment journals `park-comment` instead, and its numeric id is the sharper boundary (`park-loop.js`). |
 | `park-comment-skipped` | task | the PARKED-state board comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
@@ -2633,9 +2641,11 @@ task/daemon split itself).
 | `unpark-scan-backoff-skip` | task | `park-loop.js`'s own name for `comment-scan.js`'s shared `backoffSkip` event, reached when the unpark (retry/abandon) comment scan is still backed off from a recent `gh` failure (`park-loop.js`, via `comment-scan.js`). |
 | `validate-findings-post-skipped` | task | VALIDATE's findings comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `wip-preserve-failed` | task | `preserveWorktreeWip` could not commit/push a dirty worktree's diff to a `wip/` ref before a park (a spawn timeout, or a failed `git status`/`checkout --detach`/etc. step) — the park still proceeds without a wip ref (`steps/scripted.js`). |
-| `worker-crash-repark-failed` | daemon | the dispatcher's own attempt to repark a crashed worker's task itself failed (couldn't read `task.json`, or an unexpected error mid-repark) (`dispatcher.js`). |
+| `worker-crash-repark-exit` | daemon | card #78: the spawned `daemon.js --repark-task` child (`reparkCrashedWorker`'s own repark) exited; records its pid, code and signal. The dispatcher clears the repark claim and removes the id from `reparking` at this same point (`dispatcher.js`). |
+| `worker-crash-repark-failed` | daemon | a crash repark attempt failed. Three shapes, three sources: the dispatcher's own attempt to SPAWN the `--repark-task` child failed (`step: 'spawn'`, `dispatcher.js`'s `reparkCrashedWorker`); the spawned child couldn't read the crashed task's own `task.json` (`step: 'task.json'`, `state-machine.js`'s `reparkCrashedTask`, running inside that child); or an unexpected error hit either process's own synchronous call site (`step: 'unexpected'`, `dispatcher.js`'s `handleExit` catch, or `daemon.js`'s `--repark-task` entry point). |
+| `worker-crash-repark-spawned` | daemon | card #78: the dispatcher spawned a one-shot `daemon.js --repark-task` child to park a crashed worker's task off its own thread; records the id, the child's pid and the taskDir. Written synchronously, AFTER the repark claim file lands (`<taskDir>/repark-claim.json`) but, like the claim write itself, before `live.delete(id)` runs (`dispatcher.js`'s `reparkCrashedWorker`). |
 | `worker-exit` | daemon | a worker process exited; records its outcome (done/parked/crashed), code, and signal (`dispatcher.js`). |
-| `worker-exit-after-terminal` | daemon | a worker process produced exit-path activity after its task was already DONE/PARKED/ABANDONED on disk — not reparked, so a second writer never races the terminal state (`dispatcher.js`). |
+| `worker-exit-after-terminal` | daemon | a worker process produced exit-path activity after its task was already DONE/PARKED/ABANDONED on disk — not reparked, so a second writer never races the terminal state. Card #78: journalled by `state-machine.js`'s `reparkCrashedTask`, running inside the spawned `daemon.js --repark-task` child -- NOT by `dispatcher.js`, which no longer inspects the task's state itself. |
 | `worker-exit-during-shutdown` | daemon | a worker crashed while the daemon was already stopping — not counted against the crash-loop breaker (`dispatcher.js`). |
 | `worker-spawn` | daemon | the dispatcher spawned a new worker process for a claimed task; records its pid (`dispatcher.js`). |
 

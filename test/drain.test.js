@@ -60,6 +60,16 @@ function neverExitsSpawn(cmd, args, opts) {
   );
 }
 
+// Real `child_process.spawn`, isolated the same way every other daemon subprocess in this suite is
+// (test/helpers.js's isolatedEnv) -- see test/dispatcher.test.js's own copy of this helper. Card
+// #78: needed here as `deps.spawnRepark` wherever a test asserts on a repark ACTUALLY completing
+// (state.json reaching PARKED, reason 'worker-crashed') -- the park now runs in a spawned
+// `daemon.js --repark-task` child, and a fake `deps.spawn` fallback (one that ignores its own argv)
+// would never run it for real.
+function spawnIsolated(cmd, args, opts) {
+  return realSpawn(cmd, args, { ...opts, env: isolatedEnv() });
+}
+
 function baseConfig(overrides = {}) {
   const poolDir = mkTmp('spo-drain-pool-');
   writePoolDir(poolDir, [{ name: 'pool1' }]);
@@ -258,7 +268,14 @@ test('drain: a worker that crashes DURING the drain is reparked, not written off
   const dispatcher = createDispatcher(
     queueDir,
     journalDir,
-    baseConfig({ drainTimeoutMs: 15000, deps: { spawn: crashLate, spawnScanner: neverExitsSpawn } })
+    baseConfig({
+      drainTimeoutMs: 15000,
+      // Card #78: `spawnRepark: spawnIsolated` -- the repark now runs in a spawned
+      // `daemon.js --repark-task` child, not in this process; without this override it would fall
+      // back to `deps.spawn` (crashLate, which ignores its own argv), and state.json would never
+      // actually reach PARKED for this assertion to observe.
+      deps: { spawn: crashLate, spawnScanner: neverExitsSpawn, spawnRepark: spawnIsolated },
+    })
   );
   const runPromise = dispatcher.run();
   await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn'), 10000, 'worker-spawn');

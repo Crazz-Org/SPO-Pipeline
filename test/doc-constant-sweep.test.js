@@ -1337,7 +1337,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:128",
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:157",
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
@@ -1367,7 +1367,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1150",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
-  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:128",
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:157",
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293",
   "doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156",
@@ -1380,30 +1380,30 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1109",
-  "doc/state-machine-spec.md :: dispatcher.js:572-586",
+  "doc/state-machine-spec.md :: dispatcher.js:634-648",
   "doc/state-machine-spec.md :: intake.js:797-799",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:747",
-  "orchestrator/README.md :: dispatcher.js:485-499",
-  "orchestrator/README.md :: doc/state-machine-spec.md:140",
+  "orchestrator/README.md :: dispatcher.js:634-648",
+  "orchestrator/README.md :: doc/state-machine-spec.md:150",
   "orchestrator/README.md :: intake.js:797-799",
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
-  "orchestrator/invariants.js :: doc/state-machine-spec.md:140",
+  "orchestrator/invariants.js :: doc/state-machine-spec.md:150",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
-  "orchestrator/journal.js :: auto-pull.js:49-57",
-  "orchestrator/orphan-scan.js :: auto-pull.js:49-57",
-  "orchestrator/orphan-scan.js :: daemon.js:714",
+  "orchestrator/journal.js :: auto-pull.js:58-66",
+  "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
+  "orchestrator/orphan-scan.js :: daemon.js:910",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
   "orchestrator/park-loop.js :: intake.js:797-799",
-  "orchestrator/state-machine.js :: auto-pull.js:49-57",
-  "orchestrator/state-machine.js :: auto-pull.js:49-57",
+  "orchestrator/state-machine.js :: auto-pull.js:58-66",
+  "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: park-loop.js:1262", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/state-machine.js :: step-contracts.js:326", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`
@@ -1643,8 +1643,9 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // action was measured against the pinned corpus -- none hypothetical, all confirmed by reading
 // the current target line and fixed in passing, the same "unambiguous fix, per this action's own
 // brief" posture E5/E6/E12 already used in part 1.8/1.75/1.9: `config.js:615` (should be `:658`,
-// `productRepo`), `doc/state-machine-spec.md:98`/`:49` (two citations, both should be `:140`, the
-// CHECK row's own "invariant substring check" promise), `worker.ts:689`'s chain continuation
+// `productRepo`), `doc/state-machine-spec.md:98`/`:49` (two citations, both should be the CHECK
+// row's own "invariant substring check" promise -- `:140` when this note was written, `:150`
+// since card #78 added 8 lines above the table), `worker.ts:689`'s chain continuation
 // (should be `:922`, `purgeDone`'s real call site), `worker.ts:892` (should be `:1169`, the real
 // `SIGTERM` handler -- cited twice), `worker.ts:108`/`:110`/`:109-110` (each one line short of
 // the real `DONE_RETENTION_MS`/`MAX_LEASE_MINUTES`/`DEFAULT_LEASE_MINUTES` declarations),
@@ -1745,7 +1746,7 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //      files close together can rank the wrong one first. The clip-at-neighbouring-citation rule
 //      closes the worst version of this (a citation's own candidates leaking from an ADJACENT
 //      citation's sentence), but two candidates for the SAME citation can still be mis-ordered
-//      within one un-clipped span -- `account-lease.js:156`, `dispatcher.js:485-499`, and
+//      within one un-clipped span -- `account-lease.js:156`, `dispatcher.js:634-648`, and
 //      `verify-gate.js:308` on CITATION_ANCHOR_ALLOWLIST below are exactly this: a real, nearby
 //      identifier that turned out to belong to a different clause than the one being cited, not a
 //      wrong citation. Every one was read by hand and reasoned about below, not assumed.
@@ -1903,16 +1904,18 @@ const CITATION_ANCHOR_ALLOWLIST = {
     "nearest candidate ('tryCreate'/'linkSync') belongs to an earlier analogy about lock.js's " +
     "daemon.lock idiom, not to this citation's own content -- confirmed correct by hand: line " +
     '156 is where tryAcquireLease calls lock.acquireShortLock and closes.',
-  // "...a worker killed during the dispatcher's OWN shutdown (... `dispatcher.js:485-499`) and any
+  // "...a worker killed during the dispatcher's OWN shutdown (... `dispatcher.js:634-648`) and any
   // owning daemon process that simply never comes back to run `handleExit` at all...": `handleExit`
   // is the SECOND clause's subject (the daemon-never-returns case, uncited), not the first
-  // (dispatcher.js:485-499, the worker-killed-during-shutdown case this citation actually names).
-  // Confirmed correct: lines 485-499 are exactly the `worker-exit-during-shutdown` handling this
-  // prose describes.
-  'orchestrator/README.md :: dispatcher.js:485-499':
+  // (dispatcher.js:634-648, the worker-killed-during-shutdown case this citation actually names).
+  // Confirmed correct: lines 634-648 are exactly the `worker-exit-during-shutdown` handling this
+  // prose describes (re-measured for card #78; VERIFIER CORRECTION: this is a REPAIR, not a shift
+  // -- `main`:485-499 was `killScanner`, never the worker-exit-during-shutdown block, so the old
+  // pin was wrong before this lot moved the block at all).
+  'orchestrator/README.md :: dispatcher.js:634-648':
     "nearest candidate ('handleExit') is the SUBJECT OF THE NEXT CLAUSE in the same sentence (a " +
     "daemon that never runs handleExit at all), not of this citation -- confirmed correct by " +
-    'hand: lines 485-499 are the worker-exit-during-shutdown handling this prose actually names.',
+    'hand: lines 634-648 are the worker-exit-during-shutdown handling this prose actually names.',
   // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:308`'s capability-question
   // variant, where `required` can be empty...": the true subject is a PROSE PHRASE
   // ("capability-question variant"), not a code-shaped identifier -- `BLOCKED`/`GATE` are
@@ -1934,7 +1937,7 @@ test('CITATION_ANCHOR_ALLOWLIST holds exactly the entries this action explicitly
     Object.keys(CITATION_ANCHOR_ALLOWLIST).sort(),
     [
       'orchestrator/README.md :: account-lease.js:156',
-      'orchestrator/README.md :: dispatcher.js:485-499',
+      'orchestrator/README.md :: dispatcher.js:634-648',
       'orchestrator/steps/scripted.js :: verify-gate.js:308',
     ],
     'CITATION_ANCHOR_ALLOWLIST changed size or membership -- read the new/changed citation by ' +
@@ -2014,12 +2017,13 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
-  // card #102 (2026-09-05): +5 citations to auto-pull.js:49-57 (journal.js, orphan-scan.js,
-  // state-machine.js x2) and orphan-scan.js :: daemon.js:714, all in the anchor-checked corpus.
+  // card #102 (2026-09-05): +5 citations to auto-pull.js:58-66 (journal.js, orphan-scan.js,
+  // state-machine.js x2) and orphan-scan.js :: daemon.js:910 (card #102 pinned it :714), all in
+  // the anchor-checked corpus.
   // Re-measured: 27 verified (was 22), 2 unanchorable (unchanged), 0 offenders. All 5 new
-  // citations anchor -- each has a real symbol from auto-pull.js:49-57 (computeAutoPullBudget,
+  // citations anchor -- each has a real symbol from auto-pull.js:58-66 (computeAutoPullBudget,
   // queued, inFlight) placed close enough in the citing prose to out-rank any other nearby
-  // candidate; daemon.js:714 anchors on its own nearby prose. See EXPECTED_CITATIONS above for
+  // candidate; daemon.js:910 anchors on its own nearby prose. See EXPECTED_CITATIONS above for
   // the exact 5 additions.
   // card #80 (2026-09-06): +1 citation, `orchestrator/state-machine.js :: park-loop.js:1262`
   // (UNDRAINABLE_STATES's own header, explaining why ABANDONED is refused but PARKED is not).
@@ -2032,6 +2036,36 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // (resolveRdoDiffTouched's strict-boolean rationale). Re-measured: 29 verified (was 28), 2
   // unanchorable (unchanged), 0 offenders. It anchors on `touchesRdoMembers` (camelCase), present
   // verbatim on step-contracts.js:326 itself (`touchesRdoMembers === true`).
+  // card #78 (2026-09-07): no citation added or removed, but this action's own doc/comment fixes
+  // (correcting the now-false "crash repark runs in-process" claim across the tree) moved SEVEN
+  // already-pinned targets. VERIFIER CORRECTION (same card): the first cut of this note said FIVE
+  // and called every one "the SAME logical target, re-measured after this action's own edits added
+  // prose above it". Measured against `main`, three of those claims are false and two targets were
+  // missed outright, so the honest list is:
+  //   - auto-pull.js's read-order paragraph, :49-57 -> :58-66 (cited from journal.js,
+  //     orphan-scan.js and twice from state-machine.js -- one un-clipped span, moves together).
+  //     A TRUE pure shift: this action added 9 lines above it in the same file.
+  //   - doc/state-machine-spec.md's CHECK-table citation, :140 -> :150 (two citing files). NOT a
+  //     pure shift: this action's Principle-2 edits moved the table by 8 lines, and the old pin
+  //     :140 was the PLAN row, not the CHECK row (`main`:142 was CHECK). A pre-existing off-by-two
+  //     was repaired in the same edit; :150 IS the CHECK row today.
+  //   - dispatcher.js's worker-exit-during-shutdown block, :634-648, cited from BOTH docs. NOT
+  //     "two stale numbers for the same block": `main`:572-586 (doc/state-machine-spec.md's pin)
+  //     WAS that block, correctly; `main`:485-499 (orchestrator/README.md's pin) was `killScanner`.
+  //     Only the README pin was stale, and the lot's own dispatcher.js commits -- not this
+  //     documentation action -- moved the block to 634-648.
+  //   - daemon.js's unconditional startup orphanScan call, :714 -> :910 (cited from
+  //     orphan-scan.js). NOT a shift of 8: `main`:714 is `shadowMode: !!opts.shadow,` and the call
+  //     was already at `main`:902. A 188-line pre-existing drift, repaired here; :910 is the call.
+  //   - MISSED BY THE FIRST CUT, re-pinned by the verifier: doc/state-machine-spec.md:128, cited
+  //     from doc/bench-audit-2026-09-02.md AND doc/bench-plan-derived-2026-09-02.md. This action's
+  //     +8 lines in Principle 2 pushed that content to :136, leaving both pins stale; the bounds
+  //     check could not see it (the line still exists) and the anchor check never runs on those
+  //     two dated docs (ANCHOR_EXCLUDED_FILES). Both were ALREADY wrong before the shift -- their
+  //     prose names FINISH's "fast-forward the main checkout" promise, which is the FINISH row --
+  //     so they are re-pinned to :157, the row that actually carries it.
+  // Every current pin above was opened at its cited line and read by hand. `anchored` is unchanged
+  // at 29 (the two re-pinned bench-doc citations are anchor-excluded and count in neither number).
   assert.equal(anchored, 29, `expected 29 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
@@ -2070,15 +2104,23 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
 //     leaves a 32-line window still containing the same identifier; a range citation is
 //     bounds-checked and content-anchored, never line-discriminated. Counted, not hidden.
 const ANCHOR_BLUNT_CITATIONS = {
-  // README.md: "`doc/state-machine-spec.md:140` has always promised CHECK runs an invariant
+  // README.md: "`doc/state-machine-spec.md:150` has always promised CHECK runs an invariant
   // substring check". The target is the spec's own step TABLE, where `CHECK` is both a step name
-  // and the "next state" cell of the rows above it -- lines 138, 139, 140 and 142 all contain the
-  // bare word. The citation is correct (140 IS the CHECK row); no identifier-level rule can
-  // separate row 139 from row 140 when the discriminating token is the table's own column value.
-  'orchestrator/README.md :: doc/state-machine-spec.md:140':
-    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (138-140, 142) " +
-    '-- the anchor word is the column value itself, so :139 anchors as well as :140. Citation ' +
-    'confirmed correct by hand: 140 is the CHECK row.',
+  // and the "next state" cell of the rows above it -- lines 148, 149, 150 and 152 all contain the
+  // bare word. The citation is correct (150 IS the CHECK row); no identifier-level rule can
+  // separate row 149 from row 150 when the discriminating token is the table's own column value.
+  // Re-measured for card #78, then RE-re-measured by the verifier: this action's Principle-2 edits
+  // (above the table) shifted every row down by EIGHT lines, not ten -- the "was 138/139/140/142"
+  // the first cut recorded was copied from the previous comment, not measured; `main` really had
+  // the bare word on 140/141/142/144 and the CHECK ROW on 142, so the old pin :140 named the PLAN
+  // row. Measured on the file as it stands, `\bCHECK\b` occurs on 148, 149, 150, 152, 153, 154 and
+  // 156 -- more lines than the four this entry names, which does not change the verdict (the
+  // anchor word is the table's own column value, so no identifier-level rule can pick 150 out of
+  // its neighbours) and :150 IS the CHECK row.
+  'orchestrator/README.md :: doc/state-machine-spec.md:150':
+    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (148-150, 152) " +
+    '-- the anchor word is the column value itself, so :149 anchors as well as :150. Citation ' +
+    'confirmed correct by hand: 150 is the CHECK row.',
   // park-loop.js: "doc/remediation-progress.md:658 confirms the same referent under 'DIAGNOSE
   // surfacing'". Line 649 is the bullet's own heading line and 650 is its continuation, which
   // opens with the same word ("DIAGNOSE has no column..."). Correct citation, two-line bullet.
@@ -2102,7 +2144,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
   assert.deepEqual(
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
-      'orchestrator/README.md :: doc/state-machine-spec.md:140',
+      'orchestrator/README.md :: doc/state-machine-spec.md:150',
       'orchestrator/park-loop.js :: doc/remediation-progress.md:658',
       'orchestrator/state-machine.js :: park-loop.js:1262',
     ],
@@ -2144,9 +2186,10 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // canary had been covering for. Re-pointing that canary at a bigger mutation would have restored
   // the green and left all ten blind.
   // card #102 (2026-09-05): re-measured after +5 new citations (see the main anchor test's own
-  // note above). 4 of the 5 are ranges (auto-pull.js:49-57, cited from journal.js, orphan-scan.js,
+  // note above). 4 of the 5 are ranges (auto-pull.js:58-66, cited from journal.js, orphan-scan.js,
   // and twice from state-machine.js) -- ranges is 5 -> 9. The 5th (orphan-scan.js's own
-  // daemon.js:714) is single-line and discriminates -- discriminating is 15 -> 16. blunt is
+  // daemon.js:910, pinned :714 at the time) is single-line and discriminates -- discriminating
+  // is 15 -> 16. blunt is
   // unchanged (the same two pre-existing entries); no new citation landed in that population.
   // card #80 (2026-09-06): +1 citation, `orchestrator/state-machine.js :: park-loop.js:1262`,
   // single-line and BLUNT (see ANCHOR_BLUNT_CITATIONS above) -- blunt is 2 -> 3; discriminating

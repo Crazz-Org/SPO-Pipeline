@@ -26,7 +26,13 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const accounts = require('../orchestrator/accounts');
-const { writeState: writeTaskState, readLiveWorkerIds, writeLiveWorkerIds, liveWorkersPath } = require('../orchestrator/journal');
+const {
+  writeState: writeTaskState,
+  readLiveWorkerIds,
+  writeLiveWorkerIds,
+  liveWorkersPath,
+  reparkClaimPath,
+} = require('../orchestrator/journal');
 const { createDispatcher } = require('../orchestrator/dispatcher');
 const { takeNextTask } = require('../orchestrator/state-machine');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, DAEMON } = require('./helpers');
@@ -335,6 +341,14 @@ test('a worker that legitimately PARKs (exit 20) is not reparked by the dispatch
 
 // ---- 4. A worker exiting a crash code IS reparked worker-crashed, exit code in the detail
 
+// Card #78: the repark itself now runs in a SPAWNED `daemon.js --repark-task` child
+// (reparkCrashedWorker, dispatcher.js), not an in-process call -- so `deps.spawnRepark` must be
+// injected explicitly here, or it falls back to `deps.spawn` (spawnExit(7), a fake that ignores its
+// own argv and just exits 7) and the park this test asserts on would never actually happen.
+// spawnIsolated is the SAME real-`daemon.js`-child helper the K=1/K=2 tests above use for a real
+// worker; here it runs the real `--repark-task` mode instead, in shadow mode (baseConfig's own
+// default), so finalizePark's real-mode side effects (board move, gh comment) stay off, exactly as
+// they always were for this test.
 test('a worker exiting an unrecognized code IS reparked worker-crashed, with the exit code in the detail', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
@@ -342,7 +356,7 @@ test('a worker exiting an unrecognized code IS reparked worker-crashed, with the
 
   const config = baseConfig({
     claudeAccountsDir: onePoolDir(1),
-    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn },
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: spawnIsolated },
   });
   const dispatcher = createDispatcher(queueDir, journalDir, config);
   const runPromise = dispatcher.run();
@@ -370,22 +384,27 @@ test('a worker exiting an unrecognized code IS reparked worker-crashed, with the
 
 // ---- action 7.3: a worker exiting AFTER its taskDir is already terminal must NOT be reparked ----
 //
-// reparkCrashedWorker (dispatcher.js) checks state.json's state BEFORE ever calling finalizePark:
+// state-machine.js's reparkCrashedTask checks state.json's state BEFORE ever calling finalizePark:
 // DONE/PARKED/ABANDONED short-circuit straight to a bare `worker-exit-after-terminal` daemon
-// event and nothing else -- dispatcher.js's own header calls this the "believed unreachable, but
-// not asserted so" case of a worker producing more exit-path activity after its own outcome is
-// already durable on disk. It matters because finalizePark is NOT idempotent against a taskDir
-// that already has an outcome: calling it here would make the crash-repark path a SECOND writer
-// racing the terminal write that already legitimately happened -- overwriting a genuine DONE with
-// a spurious PARKED worker-crashed, and (worse, in the DONE case) posting a park comment on an
-// issue whose PR the pipeline may already have opened. A stray SIGKILL to a grandchild, or a
-// delayed OS signal after runTask's own process.exit(0) call racing its own cleanup, can still
-// reach this exact path for the SAME worker that owns the taskDir -- this check is the only thing
-// standing between that and a corrupted terminal task. (A DIFFERENT reachability this comment used
-// to also claim as unguarded -- a fresh queue entry duplicating an already-terminal taskDir --
-// is no longer live: card #80 made state-machine.js's takeNextTask itself refuse such a duplicate
-// before ever spawning a worker for it, so this test can no longer use a pre-existing terminal
-// state.json to get a worker claimed and spawned; see below.)
+// event and nothing else. Card #78 MOVED this check off dispatcher.js: reparkCrashedWorker
+// (dispatcher.js) now unconditionally spawns a `--repark-task` child for every crash -- the
+// terminal-state short-circuit this comment describes runs INSIDE that child (reparkCrashedTask),
+// never in the dispatcher's own process. What the dispatcher still guarantees is narrower: it
+// spawns the child at all (worker-crash-repark-spawned) and, on the child's own exit, clears the
+// claim and journals worker-crash-repark-exit -- it is state-machine.js's own header (and
+// test/daemon-repark-mode.test.js's terminal-state tests) that pin the short-circuit itself.
+// It matters because finalizePark is NOT idempotent against a taskDir that already has an
+// outcome: reparking it would make the crash-repark path a SECOND writer racing the terminal
+// write that already legitimately happened -- overwriting a genuine DONE with a spurious PARKED
+// worker-crashed, and (worse, in the DONE case) posting a park comment on an issue whose PR the
+// pipeline may already have opened. A stray SIGKILL to a grandchild, or a delayed OS signal after
+// runTask's own process.exit(0) call racing its own cleanup, can still reach this exact path for
+// the SAME worker that owns the taskDir -- this check is the only thing standing between that and
+// a corrupted terminal task. (A DIFFERENT reachability this comment used to also claim as
+// unguarded -- a fresh queue entry duplicating an already-terminal taskDir -- is no longer live:
+// card #80 made state-machine.js's takeNextTask itself refuse such a duplicate before ever
+// spawning a worker for it, so this test can no longer use a pre-existing terminal state.json to
+// get a worker claimed and spawned; see below.)
 test('a worker exiting non-zero AFTER its taskDir already reads DONE is journalled worker-exit-after-terminal, never reparked', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
@@ -397,9 +416,13 @@ test('a worker exiting non-zero AFTER its taskDir already reads DONE is journall
   // delay is what lets this test write state.json to DONE AFTER the claim (below) instead of
   // before it -- pre-seeding it before the claim would now (card #80) get the queue entry refused
   // by takeNextTask rather than claimed, so no worker would ever be spawned to exit non-zero.
+  //
+  // Card #78: `spawnRepark: spawnIsolated` -- the terminal-state short-circuit this test asserts on
+  // now runs inside the spawned `--repark-task` child, not this process, so the child must be REAL
+  // (a fake `deps.spawn` fallback would ignore its own argv and never check state.json at all).
   const config = baseConfig({
     claudeAccountsDir: onePoolDir(1),
-    deps: { spawn: spawnScannerAliveFor(300, 7), spawnScanner: neverExitsSpawn },
+    deps: { spawn: spawnScannerAliveFor(300, 7), spawnScanner: neverExitsSpawn, spawnRepark: spawnIsolated },
   });
   const dispatcher = createDispatcher(queueDir, journalDir, config);
   const runPromise = dispatcher.run();
@@ -446,6 +469,11 @@ test('a worker exiting non-zero AFTER its taskDir already reads DONE is journall
 // with `!!` instead of a numeric coercion passed the entire suite. A legacy pre-6.5 boolean is
 // covered here too -- the post-merge hook SIGTERMs this daemon on every deploy, so a card
 // mid-flight across the upgrade is the ordinary case.
+//
+// Card #78: `deps.spawnRepark: spawnIsolated` injected for the same reason the crash-classifier
+// test above needs it -- the actual restore-and-repark now happens in a spawned `--repark-task`
+// child, not in this process, so the fake `deps.spawn` (spawnExit(7)) must not also be handed the
+// repark spawn (it would ignore its argv and never actually restore or park anything).
 test('a crashed worker\'s repark preserves the COUNT in mainMoveUsed, and upgrades a pre-6.5 boolean instead of flattening it', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
@@ -467,7 +495,7 @@ test('a crashed worker\'s repark preserves the COUNT in mainMoveUsed, and upgrad
 
   const config = baseConfig({
     claudeAccountsDir: onePoolDir(1),
-    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn },
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: spawnIsolated },
   });
   const dispatcher = createDispatcher(queueDir, journalDir, config);
   const runPromise = dispatcher.run();
@@ -515,7 +543,13 @@ test('N consecutive crashes trip the circuit breaker; a PARK in between resets t
   const configA = baseConfig({
     claudeAccountsDir: onePoolDir(1),
     workerCrashLimit: 3,
-    deps: { spawn: spawnA, spawnScanner: neverExitsSpawn },
+    // Card #78: `spawnRepark` MUST be a separate, non-stateful function here. Every crash now also
+    // spawns a repark child, and if that fell back to `deps.spawn` (spawnA), each repark would
+    // consume the NEXT entry in spawnSequenceA -- silently desynchronizing which code each
+    // SUBSEQUENT worker gets (the crash/PARK/crash/crash pattern this test's whole premise rests
+    // on). spawnExit(1) here is a fixed, non-sequenced, fast-exiting real process -- exactly like
+    // spawnScanner's own `neverExitsSpawn` isolation, for the identical reason.
+    deps: { spawn: spawnA, spawnScanner: neverExitsSpawn, spawnRepark: spawnExit(1) },
   });
   const dispatcherA = createDispatcher(queueDir, journalDir, configA);
   const runA = dispatcherA.run();
@@ -1287,39 +1321,575 @@ test('a freed slot is refilled on the worker EXIT, not on the next poll tick -- 
   }
 });
 
-// SURVIVOR (deliberately NOT pinned as an ordering, pinned as the real invariant instead):
-// moving `live.delete(id)` to BEFORE the crash repark inside handleExit survived the whole suite.
-// It survived because it is an EQUIVALENT MUTATION, and dispatcher.js's own header currently
-// misattributes why: it says `live` entries being removed last is "what makes the skip [in
-// orphanScan] sufficient rather than merely probabilistic". It is not. handleExit is a fully
-// SYNCHRONOUS function and state-machine.js's finalizePark is a synchronous function, so no
-// orphanScan pass -- indeed no other code in this process at all -- can interleave anywhere inside
-// handleExit, whatever order its statements are in. The statement order is defensive, not
-// load-bearing; the SYNCHRONICITY is load-bearing, and nothing tested it. A future maintainer who
-// adds a single `await` inside handleExit (or makes finalizePark async) would keep the documented
-// ordering, believe the race is still closed, and be wrong. That is the invariant pinned here.
-test('handleExit is synchronous end to end -- the invariant that actually closes the orphanScan double-repark race, not the statement order', () => {
-  const { finalizePark } = require('../orchestrator/state-machine');
-  // 1. finalizePark must not be async: dispatcher.js calls it WITHOUT await, so an async
-  //    finalizePark would return a pending promise and let an orphanScan pass run before the park
-  //    ever landed on disk.
-  assert.notEqual(
-    finalizePark.constructor.name,
-    'AsyncFunction',
-    'finalizePark became async -- dispatcher.js calls it un-awaited inside handleExit, so the crash repark would no longer complete before the live-worker entry is dropped'
+// ---- card #78 (async repark): the old SURVIVOR above no longer protects anything -------------
+//
+// WHAT THE OLD TEST WAS. 'handleExit is synchronous end to end' pinned handleExit's own
+// synchronicity (`finalizePark` not async, no `await`/`async` in handleExit's source) as "the
+// invariant that actually closes the orphanScan double-repark race" -- true of the code that
+// existed then: handleExit called state-machine.js's reparkCrashedTask IN-PROCESS, so the whole
+// park (board move, park comment, report.md, state.json PARKED) had fully landed on disk before
+// `live.delete(id)` and the matching `publishLiveWorkerIds` call ever ran, and nothing in this
+// process could interleave anywhere inside handleExit's own body.
+//
+// WHY IT STOPPED BEING THE RIGHT MECHANISM. This action moves the park itself into a SPAWNED
+// `daemon.js --repark-task` child (reparkCrashedWorker, dispatcher.js) precisely so the blocking
+// spawnSync calls inside it (git push, `npm run board:move`, `gh issue comment` -- worst case
+// 2220s) stop freezing the dispatcher's own thread. After this change, handleExit's own
+// synchronicity is still real (nothing yields inside it) but it no longer implies the park is
+// durable -- it implies only that the CLAIM (journal.js's writeReparkClaim) is durable, and the
+// child that will actually run finalizePark has not even started when handleExit returns. Pinning
+// "finalizePark is not async" now pins a fact about a function dispatcher.js no longer calls at
+// all -- the assertions would keep passing forever while protecting nothing, exactly the kind of
+// survivor this suite exists to catch, just noticed by inspection instead of by mutation.
+//
+// WHAT REPLACED IT. Eight tests below, each pinning one piece of the actual closure: the claim
+// lands on disk before the id leaves live-workers.json (observed from files, not statement order);
+// the dispatcher process itself never runs the park; a repark in flight blocks a same-id queue
+// entry (hole #7); a shutdown with a repark in flight still bounds and returns (hole #9); a
+// GRACEFUL drain WAITS for an in-flight repark rather than killing it early (a measured regression
+// found after this list was first written -- see that test's own header); a spawn failure writes
+// no claim (two tests: a throw, and a childless "success"); and the claim is cleared on the
+// child's own exit.
+
+test('card #78: the repark CLAIM lands on disk before the id leaves live-workers.json -- the file-level ordering that replaced handleExit\'s old synchronicity guarantee', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-claimorder-q-');
+  const journalDir = mkTmp('spo-disp-claimorder-j-');
+  writeTask(queueDir, '0001-co.json', { id: 'disp-claimorder', kind: 'synthetic' });
+  const taskDir = path.join(journalDir, 'disp-claimorder');
+
+  // The repark child stays alive for a real, measurable window -- long enough that this test can
+  // observe "the id is gone from live-workers.json" WHILE the claim is still on disk, rather than
+  // racing a child that might already have exited (and cleared its own claim) by the time this
+  // test's poll runs.
+  const slowRepark = (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 800);'], { ...opts, stdio: 'ignore' });
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: slowRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    // Observed from OUTSIDE the dispatcher process, as files on disk -- not by reading
+    // dispatcher.js's own statement order the way the old SURVIVOR did.
+    await waitFor(() => !readLiveWorkerIds(journalDir).has('disp-claimorder'), 10000);
+    assert.equal(
+      fs.existsSync(reparkClaimPath(taskDir)),
+      true,
+      'the repark claim was not yet on disk when the id left live-workers.json -- orphan-scan.js\'s concurrent scan could repark this same task a second time'
+    );
+    const claim = JSON.parse(fs.readFileSync(reparkClaimPath(taskDir), 'utf8'));
+    assert.equal(claim.id, 'disp-claimorder');
+    assert.equal(typeof claim.pid, 'number');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('card #78: the dispatcher process itself never runs the park -- a crash spawns a child instead of calling finalizePark in-process', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-noinproc-q-');
+  const journalDir = mkTmp('spo-disp-noinproc-j-');
+  // kind: 'card', real mode -- the ONE fixture shape whose park reaches `ctx.deps.spawnSync`
+  // (state-machine.js's finalizePark -> park-loop.js's postParkComment -> board.js's moveCard's
+  // own `npm run board:move` spawnSync call, unconditional the moment ctx.task.kind === 'card').
+  // A 'synthetic' task (every other test in this file) makes ZERO spawnSync calls regardless of
+  // mode -- see test/daemon-repark-mode.test.js's own seedCrashedTask comment -- which would make
+  // this test pass by construction, proving nothing. This fixture is what makes it BITE: if
+  // reparkCrashedWorker ever regressed back to an in-process `reparkCrashedTask(...)` call using
+  // THIS dispatcher's own config (as it did before this action), the throwing spawnSync below
+  // would fire.
+  writeTask(queueDir, '0001-card.json', { id: 'disp-noinproc', kind: 'card', issue: 8888, title: 'x' });
+
+  let spawnSyncCalls = 0;
+  const throwingSpawnSync = () => {
+    spawnSyncCalls += 1;
+    throw new Error('deps.spawnSync must never be called inside the dispatcher process -- the park runs in a spawned child now');
+  };
+
+  const config = baseConfig({
+    real: true,
+    shadowMode: false,
+    dryRun: false,
+    claudeAccountsDir: onePoolDir(1),
+    // deps.spawnRepark deliberately NOT injected -- it falls back to deps.spawn (spawnExit(7)), a
+    // real but inert child that ignores its own argv. What actually gets parked is irrelevant to
+    // this test; only whether THIS process's own deps.spawnSync gets touched is.
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnSync: throwingSpawnSync },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-noinproc')
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  assert.equal(
+    spawnSyncCalls,
+    0,
+    'deps.spawnSync was called INSIDE the dispatcher process -- the park is running in-process again'
+  );
+  const spawned = readDaemonEvents(journalDir).find(
+    (e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-noinproc'
+  );
+  assert.ok(spawned, 'no worker-crash-repark-spawned event -- the crash was never delegated at all');
+  assert.equal(typeof spawned.pid, 'number', 'the spawned event must carry the child\'s own real pid');
+});
+
+test('hole #7 (card #78 verification): a repark held in flight blocks a fresh queue entry for the SAME id -- takeNextTask must not rename a queue file over a taskDir a repark child is still reading', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-hole7-q-');
+  const journalDir = mkTmp('spo-disp-hole7-j-');
+  writeTask(queueDir, '0001-h7.json', { id: 'disp-hole7', kind: 'synthetic' });
+  const taskDir = path.join(journalDir, 'disp-hole7');
+
+  // A repark child that stays alive for a full second -- long enough for this test to write a
+  // fresh, immediately-eligible queue entry for the SAME id and prove fillSlots does not take it
+  // while the repark is still in flight.
+  const slowRepark = (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 1000);'], { ...opts, stdio: 'ignore' });
+
+  const config = baseConfig({
+    workers: 2, // >1 so a free slot genuinely exists -- the block must come from the id check, not K
+    claudeAccountsDir: onePoolDir(2),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: slowRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-hole7')
+    );
+    const before = fs.readFileSync(path.join(taskDir, 'task.json'), 'utf8');
+
+    // Exactly the shape finalizePark's own transient-retry branch can produce: a fresh queue entry
+    // for the SAME id, eligible right now, written before the repark that would park this same
+    // task has even started.
+    writeTask(queueDir, '0002-h7-retry.json', { id: 'disp-hole7', kind: 'synthetic' });
+
+    // Several real poll ticks (config.pollIntervalMs is 30ms in baseConfig) -- enough for fillSlots
+    // to have wrongly taken it several times over if the fix were absent.
+    await sleep(300);
+
+    const after = fs.readFileSync(path.join(taskDir, 'task.json'), 'utf8');
+    assert.equal(
+      after,
+      before,
+      'task.json was overwritten UNDER the in-flight repark -- fillSlots did not honour the `reparking` ids'
+    );
+    assert.equal(
+      fs.existsSync(path.join(queueDir, '0002-h7-retry.json')),
+      true,
+      'the fresh queue entry must still be sitting in queue/, untaken, while the repark is in flight'
+    );
+    assert.equal(
+      readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn' && e.id === 'disp-hole7').length,
+      1,
+      'a SECOND worker was spawned for the same id while its repark was still in flight'
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('hole #9 (card #78 verification): a drain with a repark child in flight still returns from run() and journals dispatcher-drain-end, bounded by the SIGKILL escalation reaching the repark child', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-hole9-q-');
+  const journalDir = mkTmp('spo-disp-hole9-j-');
+  writeTask(queueDir, '0001-h9.json', { id: 'disp-hole9', kind: 'synthetic' });
+
+  // Ignores SIGTERM outright -- only SIGKILL ends it. This is the shape that hangs an unbounded
+  // shutdown; the fix's SIGKILL escalation (reapSignalledChildren's own `{ includeReparking: true
+  // }`) is what has to reach it.
+  const stubbornRepark = (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"], {
+      ...opts,
+      stdio: 'ignore',
+    });
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    // Both short bounds, not real-world values. `drainTimeoutMs` MUST be short here too, not just
+    // `drainKillGraceMs`: awaitInFlight now waits out this exact budget for an in-flight repark
+    // (this action's own fix) before ever reaching killAllChildren('SIGTERM')/reapSignalledChildren
+    // at all -- baseConfig's default (unset) would fall back to production's 45-minute
+    // drainTimeoutMs, and this stubborn child never exits on its own, so the drain WAIT alone would
+    // hang this test for 45 minutes before the SIGKILL escalation this test is actually about ever
+    // got a chance to run.
+    drainTimeoutMs: 300,
+    drainKillGraceMs: 300, // short bound, not a real-world value -- only needs to fire promptly
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: stubbornRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  await waitFor(() =>
+    readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-hole9')
   );
 
-  // 2. handleExit's own body must contain no suspension point. Read from source, the same way
-  //    test/gh-api-argv.test.js pins a call-site shape it cannot reach by mocking -- there is no
-  //    runtime probe for "this function never yields".
-  const src = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'dispatcher.js'), 'utf8');
-  const start = src.indexOf('  function handleExit(');
-  assert.notEqual(start, -1, 'handleExit not found -- this test needs updating with the refactor');
-  const end = src.indexOf('\n  }\n', start);
-  assert.notEqual(end, -1, 'could not find the end of handleExit');
-  const body = src.slice(start, end);
-  assert.equal(/\bawait\b/.test(body), false, 'handleExit gained an `await` -- an orphanScan pass can now interleave between the worker exit and its repark');
-  assert.equal(/\basync\b/.test(body), false, 'handleExit became async');
+  dispatcher.requestDrain({ signal: 'SIGTERM' });
+  // The load-bearing assertion IS that this resolves at all -- before this action's fix,
+  // killAllChildren('SIGKILL') never signalled a repark child, so a stubborn one hung run()
+  // forever and dispatcher-drain-end was never journalled. This test's own {timeout: 20000} is
+  // what turns that hang into a named failure instead of a silently stuck suite.
+  await runPromise;
+
+  const events = readDaemonEvents(journalDir);
+  assert.equal(
+    events.some((e) => e.event === 'dispatcher-kill-escalated'),
+    true,
+    'the SIGKILL escalation never fired'
+  );
+  assert.equal(
+    events.some((e) => e.event === 'dispatcher-drain-end'),
+    true,
+    'dispatcher-drain-end was never journalled -- the drain did not actually end'
+  );
+});
+
+// MEASURED REGRESSION (Opus verification, post-round-1): a GRACEFUL drain did not wait for an
+// in-flight repark at all. awaitInFlight's own loop checked `live.size` alone; a crash's repark
+// child is removed from `live` the instant handleExit runs (well before this test's own drain is
+// even requested), so the drain returned in ~1 poll tick, spent none of its (up to 45-minute, by
+// default) budget on the repark, and handed it straight to reapSignalledChildren -- which SIGKILLs
+// anything still in `pending` after only `drainKillGraceMs` (production default 60s; this repo's
+// own repark worst case is 2220s). Measured directly on a probe with a well-behaved 3s repark
+// child, a 20000ms drain budget and a 500ms grace: drain elapsed 521ms, `dispatcher-kill-escalated`
+// fired with `stillReparking` non-empty, and the child's own exit read `signal: "SIGKILL"` -- its
+// work never finished. That is not merely wasteful: finalizePark writes state.json PARKED BEFORE
+// postParkComment posts the park-comment anchor (finalizePark's own header), so a SIGKILL landing
+// between those two leaves a PARKED card unparkScan can never find again and a maintainer's `retry`
+// is never seen -- precisely the failure mode handleExit's own header names as the reason NOT to
+// repark during an ordinary shutdown, now reachable through the path meant to avoid it.
+//
+// This test proves the fix from the OUTSIDE: a well-behaved repark child that takes real,
+// measurable time to finish is neither cut off early NOR left to hang -- the drain waits out its
+// own budget for exactly as long as the child needs, then still returns.
+test('card #78 (fix): a graceful drain WAITS for an in-flight repark to finish its own work, instead of handing it to the (much shorter) reap grace', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-drainwaits-q-');
+  const journalDir = mkTmp('spo-disp-drainwaits-j-');
+  writeTask(queueDir, '0001-dw.json', { id: 'disp-drainwaits', kind: 'synthetic' });
+
+  const REPARK_MS = 2000;
+  // A well-behaved repark child: real, measurable work, then a CLEAN exit -- never signalled.
+  const slowCleanRepark = (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', `setTimeout(() => process.exit(0), ${REPARK_MS});`], { ...opts, stdio: 'ignore' });
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    drainTimeoutMs: 10000, // >> REPARK_MS -- the drain must have real room to wait it out
+    drainKillGraceMs: 300, // should never even be reached -- the child is expected to exit cleanly first
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: slowCleanRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  await waitFor(() =>
+    readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-drainwaits')
+  );
+
+  const startedAt = Date.now();
+  dispatcher.requestDrain({ signal: 'SIGTERM' });
+  await runPromise;
+  const elapsed = Date.now() - startedAt;
+
+  assert.ok(
+    elapsed >= REPARK_MS - 150,
+    `run() returned after only ${elapsed}ms -- the drain did not wait out the repark's own ${REPARK_MS}ms of work; it was cut off early`
+  );
+
+  const events = readDaemonEvents(journalDir);
+  assert.equal(
+    events.some((e) => e.event === 'dispatcher-kill-escalated'),
+    false,
+    'the SIGKILL escalation fired even though the repark child was well-behaved and given a generous drainTimeoutMs -- it was killed instead of waited for'
+  );
+  const reparkExit = events.find((e) => e.event === 'worker-crash-repark-exit' && e.id === 'disp-drainwaits');
+  assert.ok(reparkExit, 'no worker-crash-repark-exit event for the repark child');
+  assert.equal(reparkExit.code, 0, 'the repark child did not get to exit on its own terms');
+  assert.equal(reparkExit.signal, null, 'the repark child was signalled (SIGKILLed) -- its work was cut off rather than allowed to finish');
+
+  const drainEnd = events.find((e) => e.event === 'dispatcher-drain-end');
+  assert.ok(drainEnd, 'no dispatcher-drain-end event -- the drain never ended');
+  assert.equal(drainEnd.drained, true, 'a repark that finished cleanly on its own should read as a clean drain, not a lost survivor');
+  assert.ok(
+    drainEnd.waitedMs >= REPARK_MS - 150,
+    `dispatcher-drain-end reported waitedMs=${drainEnd.waitedMs}, expected at least ~${REPARK_MS}ms -- the drain's OWN budget must be what was spent waiting, not the (much shorter) reap grace`
+  );
+});
+
+test('card #78: a repark spawn THROW writes no claim and is journalled worker-crash-repark-failed, step: spawn -- orphanScan is the correct fallback', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-reparkfail-q-');
+  const journalDir = mkTmp('spo-disp-reparkfail-j-');
+  writeTask(queueDir, '0001-rf.json', { id: 'disp-reparkfail', kind: 'synthetic' });
+  const taskDir = path.join(journalDir, 'disp-reparkfail');
+
+  const throwingSpawnRepark = () => {
+    throw new Error('simulated spawn failure');
+  };
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: throwingSpawnRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-failed' && e.id === 'disp-reparkfail')
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const events = readDaemonEvents(journalDir);
+  const failed = events.find((e) => e.event === 'worker-crash-repark-failed' && e.id === 'disp-reparkfail');
+  assert.ok(failed, 'no worker-crash-repark-failed event');
+  assert.equal(failed.step, 'spawn', `expected step 'spawn', got ${JSON.stringify(failed)}`);
+  assert.equal(
+    events.some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-reparkfail'),
+    false
+  );
+  assert.equal(
+    fs.existsSync(reparkClaimPath(taskDir)),
+    false,
+    'a claim must never be written for a repark that was never actually spawned'
+  );
+});
+
+test('card #78: a repark spawn that returns NO PID (not a throw) is treated the same as a spawn failure', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-reparknopid-q-');
+  const journalDir = mkTmp('spo-disp-reparknopid-j-');
+  writeTask(queueDir, '0001-np.json', { id: 'disp-reparknopid', kind: 'synthetic' });
+  const taskDir = path.join(journalDir, 'disp-reparknopid');
+
+  // A "successful" spawn call that hands back an object with no pid -- e.g. a spawn that failed
+  // asynchronously via an 'error' event rather than throwing synchronously.
+  const noPidSpawnRepark = () => ({ pid: undefined, once() {}, kill() {} });
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: noPidSpawnRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-failed' && e.id === 'disp-reparknopid')
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+
+  const failed = readDaemonEvents(journalDir).find(
+    (e) => e.event === 'worker-crash-repark-failed' && e.id === 'disp-reparknopid'
+  );
+  assert.ok(failed, 'no worker-crash-repark-failed event');
+  assert.equal(failed.step, 'spawn');
+  assert.equal(fs.existsSync(reparkClaimPath(taskDir)), false, 'a claim must never be written for a childless "spawn"');
+});
+
+test('card #78: the repark claim is cleared once the repark child exits', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-reparkclear-q-');
+  const journalDir = mkTmp('spo-disp-reparkclear-j-');
+  writeTask(queueDir, '0001-rc.json', { id: 'disp-reparkclear', kind: 'synthetic' });
+  const taskDir = path.join(journalDir, 'disp-reparkclear');
+
+  // A real, fast-exiting, INERT repark child -- it never runs daemon.js/state-machine.js at all,
+  // so it can never clear the claim itself (reparkCrashedTask's own backstop clear never runs).
+  // This isolates the dispatcher's OWN watchChild.then clear as the thing under test.
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: spawnExit(0) },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-reparkclear')
+    );
+    assert.equal(fs.existsSync(reparkClaimPath(taskDir)), true, 'test setup: no claim was ever written');
+
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-exit' && e.id === 'disp-reparkclear')
+    );
+    assert.equal(
+      fs.existsSync(reparkClaimPath(taskDir)),
+      false,
+      'the repark claim outlived the child that owned it -- a later retry of the same taskDir would read a stale claim'
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// ---- VERIFIER ADDITIONS (card #78 action 3 adversarial verification) --------------------------
+//
+// Four mutations SURVIVED the action's own six new tests. Three of the four tests written against
+// them (SURVIVOR 2-4 below) still stand; each proved to kill its mutation, named in its own header.
+// SURVIVOR 1's own test was later deleted -- see the comment in its place immediately below.
+
+// The ordering this SURVIVOR 1 slot used to pin -- the claim write landing before handleExit's
+// live.delete(id)/publishLiveWorkerIds() -- is now pinned at RUNTIME by
+// test/repark-claim-publish-order.test.js, which spies on the real publish call and observes the
+// claim file's actual presence on disk at that instant. A source-scan was the wrong instrument for
+// it: verification found a behaviour-preserving refactor (extracting the claim write into a local
+// helper, still synchronous, still called from the same place) made the scan below FAIL on a no-op
+// change, while catching no mutation (a setImmediate deferral, the same violation written after the
+// publish, or removing the claim write entirely) that the runtime test does not already catch on
+// its own. A test that goes red on code it should accept, and stays green on nothing extra, is worse
+// than no test.
+
+// SURVIVOR 2: stamping the claim with the DISPATCHER's own pid instead of the repark child's
+// survived the whole suite -- 'the repark CLAIM lands on disk ...' only asserted `typeof claim.pid
+// === 'number'`. It is not equivalent: orphan-scan.js decides whether to honour or clear a claim
+// with `isAlive(claim.pid)`. With the child's pid, a dispatcher SIGKILLed mid-repark leaves a claim
+// whose pid (the still-running detached child) is alive, and the next daemon's scan correctly
+// defers. With the dispatcher's pid, that same claim reads DEAD, the scan clears it as stale and
+// reparks the task a second time -- concurrently with the child still parking it, which is exactly
+// the double repark the claim exists to prevent.
+test('card #78 (verifier): the claim carries the REPARK CHILD\'s pid, not the dispatcher\'s -- orphan-scan.js decides liveness from that field', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-claimpid-q-');
+  const journalDir = mkTmp('spo-disp-claimpid-j-');
+  writeTask(queueDir, '0001-cp.json', { id: 'disp-claimpid', kind: 'synthetic' });
+  const taskDir = path.join(journalDir, 'disp-claimpid');
+
+  const slowRepark = (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 1500);'], { ...opts, stdio: 'ignore' });
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: slowRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-claimpid')
+    );
+    const spawned = readDaemonEvents(journalDir).find(
+      (e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-claimpid'
+    );
+    const claim = JSON.parse(fs.readFileSync(reparkClaimPath(taskDir), 'utf8'));
+    assert.equal(
+      claim.pid,
+      spawned.pid,
+      'the claim\'s pid is not the spawned repark child\'s -- orphan-scan.js would be reading the liveness of the wrong process'
+    );
+    assert.notEqual(
+      claim.pid,
+      process.pid,
+      'the claim carries the DISPATCHER\'s own pid: a dispatcher killed mid-repark would leave a claim orphan-scan.js reads as dead and clears, reparking the task a second time under the child still parking it'
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// SURVIVOR 3: dropping `reparking.delete(id)` from the child's own exit handler survived the whole
+// suite. It is not equivalent: `reparking` is unioned into takeNextTask's liveIds (hole #7's fix),
+// so an id that never leaves it is refused off the queue FOREVER -- the maintainer's `retry`
+// comment re-queues the card and no worker is ever spawned for it again, silently, for the life of
+// the process.
+test('card #78 (verifier): once the repark child has exited, a fresh queue entry for that SAME id is taken again -- `reparking` is emptied, not leaked', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-reparkfree-q-');
+  const journalDir = mkTmp('spo-disp-reparkfree-j-');
+  writeTask(queueDir, '0001-rf2.json', { id: 'disp-reparkfree', kind: 'synthetic' });
+
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    // An inert, fast-exiting real child: what it parks is irrelevant, only that it exits.
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: spawnExit(0) },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-exit' && e.id === 'disp-reparkfree')
+    );
+    const spawnsBefore = readDaemonEvents(journalDir).filter(
+      (e) => e.event === 'worker-spawn' && e.id === 'disp-reparkfree'
+    ).length;
+
+    // Exactly what a maintainer's `retry` produces: a fresh, immediately-eligible queue entry for
+    // the same id, after the repark that parked it has finished.
+    writeTask(queueDir, '0002-rf2-retry.json', { id: 'disp-reparkfree', kind: 'synthetic' });
+
+    await waitFor(
+      () =>
+        readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn' && e.id === 'disp-reparkfree').length >
+        spawnsBefore,
+      8000
+    );
+    assert.ok(
+      readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn' && e.id === 'disp-reparkfree').length >
+        spawnsBefore,
+      'the id was never re-taken off the queue after its repark child exited -- it is stuck in `reparking` forever, so a `retry` for this card can never run again'
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// SURVIVOR 4: gating fillSlots' slot arithmetic on `live.size + reparking.size` instead of
+// `live.size` survived the whole suite. Hole #7's fix was specified as "union `reparking` into
+// takeNextTask's liveIds, WITHOUT changing the slot arithmetic", and the difference is the point of
+// this whole card: a repark child can run for up to 2220s (config.js's own command timeouts), and
+// letting it hold a worker slot for that long would put the dispatcher back to refusing new work
+// while a park runs -- a milder version of the very freeze this action exists to remove.
+test('card #78 (verifier): a repark in flight does NOT consume a worker slot -- fillSlots still gates on `live.size` alone', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-slotarith-q-');
+  const journalDir = mkTmp('spo-disp-slotarith-j-');
+  writeTask(queueDir, '0001-sa.json', { id: 'disp-slotarith-a', kind: 'synthetic' });
+
+  // K=1: with the correct arithmetic the crashed worker's slot frees the instant it exits, even
+  // though its repark is still running; with `live.size + reparking.size` it stays occupied for
+  // the repark child's whole lifetime and the second card never starts.
+  const slowRepark = (cmd, args, opts) =>
+    realSpawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 3000);'], { ...opts, stdio: 'ignore' });
+
+  const config = baseConfig({
+    workers: 1,
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(7), spawnScanner: neverExitsSpawn, spawnRepark: slowRepark },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() =>
+      readDaemonEvents(journalDir).some(
+        (e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-slotarith-a'
+      )
+    );
+    // A DIFFERENT card, queued while the first one's repark is unambiguously still in flight.
+    writeTask(queueDir, '0002-sb.json', { id: 'disp-slotarith-b', kind: 'synthetic' });
+
+    await waitFor(
+      () => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'disp-slotarith-b'),
+      2000
+    );
+    assert.equal(
+      readDaemonEvents(journalDir).some(
+        (e) => e.event === 'worker-crash-repark-exit' && e.id === 'disp-slotarith-a'
+      ),
+      false,
+      'test setup: the repark child exited before the second card was spawned, so this run proves nothing'
+    );
+    assert.ok(
+      readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'disp-slotarith-b'),
+      'the second card was not started while a repark was in flight -- the repark is holding a worker slot, which is the freeze this card exists to remove'
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
 });
 
 // SURVIVOR: emptying daemon.js's `process.once('exit', ...)` hook so it no longer calls
@@ -2296,6 +2866,21 @@ const DAEMON_FLAG_POLICY = {
   // NOT forwarded: --once drains a queue serially in-process, which is the mode the dispatcher
   // REPLACES; a child is never spawned in it.
   '--once': { worker: 'n/a: a worker runs exactly one task by construction', scanner: 'n/a' },
+  // Card #78: --repark-task/--exit-code/--signal select and feed a THIRD child kind -- a
+  // short-lived one-shot that parks exactly one already-crashed task (state-machine.js's
+  // reparkCrashedTask) -- which neither a worker nor a scanner is. dispatcher.js now DOES spawn
+  // this third kind (buildReparkArgv, reparkCrashedWorker) -- the "this action only adds the mode"
+  // framing this comment used to carry is stale; the rewiring landed in a later action on the same
+  // card. The rows below are still honestly 'n/a', for a DIFFERENT and still-true reason: these
+  // three flags are meaningful only to a --repark-task child, so neither buildWorkerArgv nor
+  // buildScannerArgv has any reason to ever forward them -- a worker and a scanner still resolve
+  // nothing for them, no matter how the repark child itself gets spawned. buildReparkArgv (this
+  // file's own tests, below) is the table this action actually needed, and it is a THIRD builder
+  // function, not a third column on this one -- this table only ever classified what a worker and
+  // a scanner resolve for a flag, and a repark child is neither.
+  '--repark-task': { worker: 'n/a: selects a third child kind, not a worker', scanner: 'n/a: selects a third child kind, not a scanner' },
+  '--exit-code': { worker: 'n/a: only meaningful to a --repark-task child', scanner: 'n/a: only meaningful to a --repark-task child' },
+  '--signal': { worker: 'n/a: only meaningful to a --repark-task child', scanner: 'n/a: only meaningful to a --repark-task child' },
   '--help': { worker: 'n/a', scanner: 'n/a' },
   '-h': { worker: 'n/a', scanner: 'n/a' },
 };
@@ -2344,6 +2929,37 @@ test('a worker child spawned by a --workers K dispatcher resolves K, and therefo
   const k = Number(argv[argv.indexOf('--workers') + 1]);
   assert.equal(waitBoundMs({ workers: k }), WORST_HOLD_MS, 'at K=2 a worker must be willing to wait out ONE other worst-case holder');
   assert.notEqual(waitBoundMs({ workers: k }), 0, 'a zero wait bound is the defect: the card parks instead of waiting');
+});
+
+// ---- card #78: buildReparkArgv, the third builder alongside buildWorkerArgv/buildScannerArgv ---
+
+test('buildReparkArgv: mode flag, taskDir, queue/journal roots and exit-code/signal are all forwarded', () => {
+  const { buildReparkArgv } = require('../orchestrator/dispatcher');
+  const argv = buildReparkArgv('/t', '/q', '/j', { real: true }, { exitCode: 7, signal: 'SIGKILL' });
+  assert.equal(argv[0].endsWith(path.join('orchestrator', 'daemon.js')), true);
+  assert.equal(argv.includes('--real'), true);
+  assert.equal(argv.includes('--repark-task'), true);
+  assert.equal(argv[argv.indexOf('--repark-task') + 1], '/t');
+  assert.equal(argv[argv.indexOf('--queue') + 1], '/q');
+  assert.equal(argv[argv.indexOf('--journal') + 1], '/j');
+  assert.equal(argv[argv.indexOf('--exit-code') + 1], '7');
+  assert.equal(argv[argv.indexOf('--signal') + 1], 'SIGKILL');
+});
+
+test('buildReparkArgv: shadow/dry-run precedence matches buildWorkerArgv/buildScannerArgv exactly', () => {
+  const { buildReparkArgv } = require('../orchestrator/dispatcher');
+  assert.equal(buildReparkArgv('/t', '/q', '/j', { shadowMode: true, dryRun: true, real: true }, {}).includes('--shadow'), true);
+  assert.equal(buildReparkArgv('/t', '/q', '/j', { shadowMode: false, dryRun: true, real: true }, {}).includes('--dry-run'), true);
+  assert.equal(buildReparkArgv('/t', '/q', '/j', { real: true }, {}).includes('--real'), true);
+});
+
+test('buildReparkArgv: a null exitCode/signal (a hand-run repark, or a signal-less crash) omits the flag rather than forwarding null/undefined text', () => {
+  const { buildReparkArgv } = require('../orchestrator/dispatcher');
+  const argv = buildReparkArgv('/t', '/q', '/j', { real: true }, { exitCode: null, signal: null });
+  assert.equal(argv.includes('--exit-code'), false);
+  assert.equal(argv.includes('--signal'), false);
+  // Same for the "no detail object at all" call shape.
+  assert.equal(buildReparkArgv('/t', '/q', '/j', { real: true }).includes('--exit-code'), false);
 });
 
 // ---- action 6.7 verification: the dispatcher stamps its own startup into daemon.jsonl ---------

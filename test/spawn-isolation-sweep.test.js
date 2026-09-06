@@ -446,6 +446,36 @@ const ALLOWLIST = new Map([
     },
   ],
   [
+    'repark-claim-publish-order.test.js',
+    {
+      reason:
+        'all three sites are `-e` inline one-liners standing in for a worker (writes a real ' +
+        'state.json, then exits a crash code), a repark-task child (a bare setTimeout -- this ' +
+        'file pins the PARENT\'s statement ordering, never the child\'s own work) and a scanner ' +
+        'stand-in (a long setTimeout, so the dispatcher\'s unconditional single scanner spawn and ' +
+        'its respawn/breaker loop stay out of the way) -- the same shape dispatcher.test.js\'s and ' +
+        'repark-race-demo.test.js\'s own worker/scanner stand-ins already take, and each derives ' +
+        'its env from isolatedEnv(). No daemon.js/bin/spo child is spawned by this file at all.',
+      patterns: ["'-e',"],
+    },
+  ],
+  [
+    'repark-race-demo.test.js',
+    {
+      reason:
+        'the crashed "worker" and the held/unheld repark-child launcher are both `-e` inline ' +
+        'one-liners standing in for a worker/repark-task child (writing a real state.json then ' +
+        'exiting a crash code; waiting on a release file then calling the real, exported ' +
+        'reparkCrashedTask) -- same shape as dispatcher.test.js\'s own worker/scanner stand-ins ' +
+        "above. The one genuinely production-shaped child this file spawns -- the real scanner, " +
+        "via spawnRealScannerFast -- forwards its executable as a bare `cmd` parameter (never a " +
+        "literal process.execPath/'node'/DAEMON/SPO_BIN token), the same shape dispatcher.test.js's " +
+        'own `spawnIsolated` helper already takes, so it is not a corpus site this sweep recognises ' +
+        'as an executable candidate at all -- it still derives its env from isolatedEnv() regardless.',
+      patterns: ["'-e',"],
+    },
+  ],
+  [
     'status-6.7.test.js',
     { reason: 'a trivial `-e` one-liner used only to mint a guaranteed-dead pid -- not daemon.js/bin/spo.', patterns: ["'-e',"] },
   ],
@@ -616,6 +646,8 @@ test('the ALLOWLIST and FILE_ALLOWLIST are pinned by name', () => {
       'product-repo-lock.test.js',
       'recette.test.js',
       'release-script.test.js',
+      'repark-claim-publish-order.test.js',
+      'repark-race-demo.test.js',
       'status-6.7.test.js',
       'tokens.test.js',
     ].sort(),
@@ -889,7 +921,12 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // And the converse sanity: every REAL (checked) site must be one of the files this action's
   // audit actually measured -- catches a genuinely new, unaudited daemon spawn silently joining
   // the corpus without anyone having looked at it.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'worker-mode.test.js']);
+  // Card #78 verification: daemon-repark-mode.test.js joined this corpus with the `--repark-task`
+  // mode. Its one spawning helper (runReparkRaw) was audited against this sweep's own four
+  // properties before being added here -- `env: { ...isolatedEnv(), ...envOverrides }`, so the
+  // env is present, derived from isolatedEnv() rather than a bare process.env, and every
+  // override a test layers on top is a fresh mkTmp dir (the empty account pool), never a real one.
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });
