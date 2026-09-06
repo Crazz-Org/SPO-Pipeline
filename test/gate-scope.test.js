@@ -42,6 +42,14 @@ const MENTIONS_BUT_TOLERATES_ABSENCE = {
     'reads config.productRepo only to build a worktree path; never resolves anything inside it (measured: passes with the repo absent)',
   'gate-scope.test.js':
     'this file IS the scanner -- it names the two env vars as the pattern it greps for, and never resolves either repo',
+  'no-real-spawn-guard.test.js':
+    "only asserts isolatedEnv()'s own SPO_PRODUCT_REPO override is truthy, never resolves a real repo on disk " +
+    '(measured 2026-09-06: `SPO_PRODUCT_REPO=/nonexistent/no-such-repo SPO_DEPLOY_REPO=/nonexistent/no-such-repo ' +
+    'node --test test/no-real-spawn-guard.test.js` -- 8 pass, 0 fail)',
+  'spawn-isolation-sweep.test.js':
+    'names both env vars only inside an assertion-failure message string listing what a naive env spread would leak, ' +
+    'never resolves either repo (measured 2026-09-06: `SPO_PRODUCT_REPO=/nonexistent/no-such-repo ' +
+    'SPO_DEPLOY_REPO=/nonexistent/no-such-repo node --test test/spawn-isolation-sweep.test.js` -- 11 pass, 0 fail)',
 };
 
 function readGateSh() {

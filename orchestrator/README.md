@@ -28,9 +28,9 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
   `git`/`npm`/`gh`/`claude` process — every real-mode test (`test/llm-real*.test.js`,
   `test/account-rotation.test.js`, `test/real-steps.test.js`) injects `deps.spawnSync` and calls
   the real-mode functions directly, never through `daemon.js`'s own child-process dispatch. That
-  guarantee stops at a process boundary, though: a test that spawns a real `daemon.js
-  --worker`/`--scanner` child reaches the real, unpatched `spawnSync` inside that child — see
-  "The hermeticity guarantee stops at a process boundary" below.
+  guarantee used to stop at a process boundary; `orchestrator/no-real-spawn-guard.js` now carries
+  it across one via the `SPO_NO_REAL_SPAWN` environment variable — see "The hermeticity guarantee
+  crosses the process boundary by environment" below.
 - Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
   missing). Point both at a temp dir to run an isolated batch — this is how the test suite
   works.
@@ -1253,9 +1253,10 @@ start with both); a non-`"card"` (e.g. `"synthetic"`) task is never gated by `--
 
 **First live run is maintainer-supervised.** No in-process test spawns a real `git`/`npm`/`gh`
 process — every test in `test/real-steps.test.js` injects `deps.spawnSync` and calls
-`realWorktree`/`realCheck`/... directly; that guarantee does not extend to tests that spawn a
-real `daemon.js --worker`/`--scanner` child (see "The hermeticity guarantee stops at a process
-boundary" below). The first time `daemon.js --real` actually drives
+`realWorktree`/`realCheck`/… directly; a test that spawns a real `daemon.js --worker`/`--scanner`
+child is covered separately, by the environment-propagated killswitch (see "The hermeticity
+guarantee crosses the process boundary by environment" below). The first time `daemon.js --real`
+actually drives
 a `kind: "card"` task against the real product repo and a real GitHub PR, a maintainer should be
 watching: it worktree-adds off `origin/main`, runs `npm ci`, claims a real board card, pushes a
 real branch, opens a real PR, and — on the happy path — merges it and removes its own worktree.
@@ -2858,20 +2859,26 @@ cleaning up, cleanup's idempotency (including when the injected `spawnSync` itse
 `evaluateAssertions` as a pure function -- including the one that hands it a `DONE` journal
 missing a required event and confirms the assertion set actually catches it, never rubber-stamping
 a run that merely reached `DONE`. None of them ever touch a real
-`git`, `npm`, `gh` or `claude` process in-process -- but that is not the same as "the whole suite
-never spawns one for real": a test that spawns a real `daemon.js --worker`/`--scanner` child
-reaches the real `spawnSync` inside that child, unpatched. See "The hermeticity guarantee stops
-at a process boundary" immediately below.
+`git`, `npm`, `gh` or `claude` process in-process -- and a test that spawns a real
+`daemon.js --worker`/`--scanner` child no longer escapes that: the child arms the same killswitch
+on itself from its inherited environment. See "The hermeticity guarantee crosses the process
+boundary by environment" immediately below.
 
-**The hermeticity guarantee stops at a process boundary.** `test/no-real-spawn.js` (the killswitch
-above) patches `child_process.spawnSync` in the parent test process only — it protects every call
-made in-process, but a test that spawns a real `daemon.js --worker`/`--scanner` child reaches the
-real `spawnSync` inside that child with no killswitch at all, since the patch was never applied to
-that process's own `child_process` module. This is a limitation of the guard's own design, not a
-bug in it (`test/no-real-spawn-sweep.test.js`'s file-by-file scan can only ever prove "this file
-requires the module first," never "nothing this file's tests spawn can reach `spawnSync`
-unpatched"), and it was proved the hard way during chantier 7: a mutation-testing round routed
-tests through real `daemon.js --worker` children and created a live worktree and branch in
-`/home/crazz/SPO-WebClient` while the `--real` daemon was running against it. Any future test that
-spawns the dispatcher or a worker/scanner child for real needs its own injection point or its own
-isolation — this suite does not give it one for free.
+**The hermeticity guarantee crosses the process boundary by environment.** `test/no-real-spawn.js`
+(the killswitch above) still patches `child_process.spawnSync` in the parent test process only —
+a patched function object means nothing to a separate process. What crosses the boundary is an
+environment variable: `orchestrator/no-real-spawn-guard.js` exports `SPO_NO_REAL_SPAWN`, and
+`orchestrator/daemon.js` and `bin/spo` call its `installGuard` as their first executable
+statement, so a spawned `daemon.js --worker`/`--scanner` child arms the killswitch on itself. It
+patches `spawnSync`, `execFileSync`, `execSync`, `execFile` and `exec`, but deliberately not the
+async `spawn` — that is `dispatcher.js`'s own worker/scanner launch mechanism, needed in every
+mode. It is inert unless the variable is set to a non-empty, non-`'0'` value; the live daemon
+never sets it. Two producers do: `test/no-real-spawn.js` sets it on `process.env` (inherited by
+any child spawned with no explicit `env:`), and `test/helpers.js`'s `isolatedEnv()` sets it
+explicitly, alongside `SPO_PRODUCT_REPO`, `SPO_WORKTREES_DIR` and `SPO_REPORTS_DIR`. This closes
+what chantier 7 proved the hard way: a mutation round routed tests through real
+`daemon.js --worker` children and created a live worktree and branch in the product repo while
+the `--real` daemon was running against it. The residual is the environment itself: a call site
+that builds its own `env:` object from scratch rather than from `isolatedEnv()` would still spawn
+an unguarded child — `test/spawn-isolation-sweep.test.js`, the isolation sweep over spawned-child
+call sites, is what now keeps that from happening unnoticed.

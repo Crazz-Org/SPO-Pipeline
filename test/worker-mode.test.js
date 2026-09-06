@@ -17,7 +17,7 @@ const path = require('path');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { lockPath } = require('../orchestrator/lock');
-const { DAEMON, mkTmp, runDaemonWorker, runDaemonRaw, readState } = require('./helpers');
+const { DAEMON, mkTmp, runDaemonWorker, runDaemonRaw, readState, isolatedEnv } = require('./helpers');
 
 // Writes <journalDir>/<id>/task.json directly -- the shape a dispatcher's takeNextTask would
 // have left behind, without a queue/ entry ever existing (worker mode never reads the queue).
@@ -396,7 +396,7 @@ function runCrashingWorker(journalDir, taskDir, throwSource) {
       // fix only worked because execFileSync happened to capture stderr, this test would be
       // proving the opposite of what it claims.
       stdio: ['ignore', 'ignore', 'ignore'],
-      env: { ...process.env, SPO_ACCOUNTS_DIR: mkTmp('spo-worker-accts-'), NODE_OPTIONS: `--require ${preload}` },
+      env: { ...isolatedEnv(), SPO_ACCOUNTS_DIR: mkTmp('spo-worker-accts-'), NODE_OPTIONS: `--require ${preload}` },
     });
     return 0;
   } catch (err) {

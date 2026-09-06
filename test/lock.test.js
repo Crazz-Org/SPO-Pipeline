@@ -242,7 +242,7 @@ test('daemon.js: another live process taking the lock file over stops the daemon
   const child = spawn(
     process.execPath,
     [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir],
-    { stdio: 'ignore', env: { ...process.env, SPO_LOCK_WATCH_MS: '30' } }
+    { stdio: 'ignore', env: { ...isolatedEnv(), SPO_LOCK_WATCH_MS: '30' } }
   );
 
   for (let i = 0; i < 100 && !fs.existsSync(lockPath(journalDir)); i++) {
@@ -429,6 +429,7 @@ test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook
   // No --once: the daemon polls forever until the signal.
   const child = spawn(process.execPath, [DAEMON, '--shadow', '--queue', queueDir, '--journal', journalDir], {
     stdio: 'ignore',
+    env: isolatedEnv(),
   });
   // Wait for the lock to appear (daemon startup), then terminate. Deadline-based and generous:
   // this waits on a real node process booting and requiring the whole orchestrator tree, which

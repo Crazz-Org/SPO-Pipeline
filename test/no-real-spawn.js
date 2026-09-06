@@ -57,6 +57,15 @@
 // module rather than adding a second, differently-shaped guard elsewhere.
 
 const cp = require('child_process');
+// orchestrator/no-real-spawn-guard.js -- the sibling half of this same killswitch, for a CHILD
+// process spawned by the daemon (dispatcher.js's workers/scanner) rather than for THIS in-process
+// node:test worker. That module patches its OWN, wider set of child_process functions, but only
+// when SPO_NO_REAL_SPAWN is actually set in the environment it reads -- it does nothing on its
+// own just by being required. `SPO_NO_REAL_SPAWN` here is the one shared constant (not a second
+// string literal) naming the var this file sets below, and test/helpers.js's isolatedEnv() sets
+// explicitly too, so any daemon/bin/spo child this suite spawns -- directly, or nested another
+// level through a real dispatcher -- arms the same guard on itself.
+const { SPO_NO_REAL_SPAWN } = require('../orchestrator/no-real-spawn-guard');
 
 function installNoRealSpawn() {
   cp.spawnSync = (command, args) => {
@@ -67,6 +76,12 @@ function installNoRealSpawn() {
         'never touch a real git/gh/npm/claude process.'
     );
   };
+  // Propagated by the ENVIRONMENT, not by this module-level patch (see no-real-spawn-guard.js's
+  // own header for why a patched function object means nothing to a different process): setting
+  // it on `process.env` here means it is inherited by ANY child this test file spawns that passes
+  // no explicit `env:` option at all (dispatcher.js's own worker/scanner spawn() calls are exactly
+  // that shape), not only the ones that go through test/helpers.js's isolatedEnv().
+  process.env[SPO_NO_REAL_SPAWN] = '1';
 }
 
 // No escape hatch is exported on purpose. Action 5.0's measurement ran the whole suite under a
