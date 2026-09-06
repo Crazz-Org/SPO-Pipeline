@@ -1751,6 +1751,9 @@ baked its own value in, so none read what production resolves.
   this suite makes stops at a process boundary. Proved the hard way: a mutation routed tests
   through real worker children and created a real worktree and branch in `/home/crazz/SPO-WebClient`
   while the `--real` daemon was running. Cleaned up, nothing pushed — but no guard stopped it.
+  *Resolved 2026-09-06 (lot11-82):* `orchestrator/no-real-spawn-guard.js` carries the killswitch
+  across the boundary via `SPO_NO_REAL_SPAWN`, armed by `daemon.js` and `bin/spo`; the trap as
+  written stood until then.
 
 ### Filed rather than fixed — the maintainer's decision, 2026-09-02
 
