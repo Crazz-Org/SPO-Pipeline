@@ -178,11 +178,19 @@ decision and the bounds that actually are enforced.
 [^rdo-wire]: `task.touchesRdoMembers` (`intake.js`'s `makeTask`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
     stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
     `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session-phase code — but only
-    detects a slice of it, and is set once at intake, before a plan exists. IMPLEMENT never sees
-    a rederivation against the plan or the real diff; PUSH_PR (`steps/scripted.js`) does
-    re-derive the flag from the real diff, but only for the literal file
-    `src/shared/rdo-members.ts`, and only in time to escalate the change-validator that follows
-    IMPLEMENT, not IMPLEMENT itself.
+    detects a slice of it, and is set once at intake, before a plan exists. No step ever
+    re-derives it against the *plan*; PUSH_PR (`steps/scripted.js`) does re-derive it from the
+    real diff, but only for the literal file `src/shared/rdo-members.ts` and only one way
+    (false→true). **On IMPLEMENT's first pass that correction arrives too late — PUSH_PR runs
+    after it — so the first IMPLEMENT sees the intake value alone. It is NOT too late for the
+    retries.** `runTask` carries one `ctx` across every hop and `steps/llm.js` re-reads
+    `ctx.task` at each call, so any IMPLEMENT re-entered afterwards — from `handleDiagnose`, from
+    `handleValidate` on a REJECT under budget, or from a Lint / Coverage-of-changed-lines CI
+    retry via `ci-cause-table.js`'s `classifyCiFailure` — runs with the corrected flag, and was
+    measured spawning `--model opus` on exactly that path. The promotion is one-way for this
+    reason: lowering it at
+    PUSH_PR would silently demote those retries to sonnet. The diff-derived truth for VALIDATE's
+    citation-verifier lives in the separate `rdoDiffTouched` field instead.
 
 Before any of the five calls above ever spawns, `steps/llm.js`'s real path fills the step's own
 `prompts/<file>.md` template against the values `task-values.js` derives for it

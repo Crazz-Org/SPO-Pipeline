@@ -354,9 +354,12 @@ A card task's own fields:
 `size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
 `EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
 for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
-PLAN entry); `escalate` is the generic "Opus 5 fallback" override every step but DIAGNOSE and
-CITATION_VERIFIER can read; `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and
-only when `touchesRdoMembers` is true. `citations` in the JSON above is shown as a hand-set task
+PLAN entry); `escalate` is **dead — nothing reads it on any step**. `shouldEscalate`
+(`step-contracts.js`) tests only `touchesRdoMembers === true` and `size === 'L'`; measured, a task
+carrying `escalate: true` (or `escalateFlag: true`) still resolves IMPLEMENT to sonnet. The
+"Opus 5 fallback" it used to name was only ever reachable through this flag and was removed
+2026-09-04. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and only when the
+diff-derived `rdoDiffTouched` says the real diff touched the catalogue. `citations` in the JSON above is shown as a hand-set task
 field for illustration, and a maintainer-supplied value there does still win, but in practice
 nothing sets it at intake: `steps/scripted.js`'s `realPushPr` is what actually populates it, from
 the real `git diff` against `origin/main` on `src/shared/rdo-members.ts` (falling back to the
