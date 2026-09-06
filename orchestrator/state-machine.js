@@ -32,6 +32,7 @@ const {
 } = require('./journal');
 const { scratchDir, lastResultPayload, lastJournaledCitations, lastJournaledRdoDiffTouched } = require('./task-values');
 const { buildBaseline } = require('./invariants');
+const { detectSpanConflicts } = require('./plan-span-guard');
 const { makeFixtureReader } = require('./fixture');
 const { ParkSignal } = require('./park-signal');
 const { detectProtectedFiles, PROTECTED_MATCH_CAP, PROTECTED_LINE_MAX_LENGTH } = require('./intake');
@@ -470,6 +471,73 @@ function guardDeclaredFiles(ctx, rawFilesToChange, provenance) {
   }
 }
 
+// Issue #112: the measured defect is PLAN sometimes freezing an invariant over a span its OWN
+// plan text goes on to reorder -- no IMPLEMENT can satisfy "keep this exact quote in place" and
+// "move this code" at once, and CHECK then routes the card into a whole DIAGNOSE/IMPLEMENT cycle
+// that no amount of retrying resolves (measured on the real corpus: #487/#488/#491/#508). The
+// action originally proposed dropping the offending invariant at PLAN time; measurement killed
+// that: the predicate matches 140 flags across 37 of the 53 cards whose own event history never
+// broke a single one, and 138 flags across 36 of the 49 of those that also merged cleanly (state
+// DONE or externallyResolved.via pr-merged) -- measured 2026-09-06, and the journal it is measured
+// against is a live daemon's history that grows card by card, so re-derive with
+// scripts/replay-plan-span-flags.js rather than trusting this count on a later day (see
+// orchestrator/README.md's own note on the same numbers). Dropping would therefore remove real
+// checks from cards that were fine. The shipped semantics are flag-at-PLAN,
+// honour-at-CHECK instead: this function only ever adds a `planSpanConflict` marker to a baseline
+// row (steps/scripted.js's runInvariantCheck is what actually relieves a broken invariant, and
+// only when every broken id in the event carries one). It must never park, never throw, never
+// change `resolved`/`mode`/`reason`/any other baseline field, and never alter handlePlan's return
+// value -- a detector defect is required to leave PLAN's outcome exactly as it is today, so the
+// whole call is wrapped in its own try/catch rather than trusting detectSpanConflicts's own
+// "pure, never throws" contract.
+//
+// Caps the number of conflicts this journals per card, same reasoning as PROTECTED_MATCH_CAP
+// above: journalled detail can flow into a GitHub comment body capped at 65536 chars.
+const PLAN_SPAN_CONFLICT_CAP = 50;
+
+function readPlanMarkdownForSpanCheck(planPath) {
+  try {
+    return fs.readFileSync(planPath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+// Mutates `baseline.invariants` rows in place (adding `planSpanConflict` where a finding matches
+// an id) and journals `invariants-plan-span-conflict` when at least one row was flagged -- silent
+// otherwise, matching how `invariants-declared-parsed-mismatch` above stays silent in the normal
+// case. Called BEFORE the caller journals `invariants-baseline`, so the flag rides along on the
+// very same baseline event CHECK will later read back.
+function annotatePlanSpanConflicts(ctx, baseline, planMarkdown) {
+  if (typeof planMarkdown !== 'string' || planMarkdown === '') return;
+
+  let findings;
+  try {
+    findings = detectSpanConflicts({
+      planMarkdown,
+      invariants: baseline.invariants || [],
+      worktreeRoot: ctx.task.worktreePath,
+    });
+  } catch {
+    return;
+  }
+  if (!Array.isArray(findings) || findings.length === 0) return;
+
+  const rowsById = new Map((baseline.invariants || []).map((row) => [row.id, row]));
+  const conflicts = [];
+  for (const finding of findings.slice(0, PLAN_SPAN_CONFLICT_CAP)) {
+    const row = finding && rowsById.get(finding.id);
+    if (!row) continue;
+    const planSpanConflict = { planSpan: finding.planSpan, planLine: finding.planLine, syntax: finding.syntax };
+    row.planSpanConflict = planSpanConflict;
+    conflicts.push({ id: finding.id, file: finding.file, ...planSpanConflict });
+  }
+
+  if (conflicts.length > 0) {
+    appendEvent(ctx.taskDir, 'PLAN', 'invariants-plan-span-conflict', { conflicts });
+  }
+}
+
 async function handlePlan(ctx) {
   // Action 3.1: a still-valid plan from an earlier run short-circuits everything below, including
   // the LLM call itself -- that IS the point, not an optimization bolted onto a call that still
@@ -503,6 +571,9 @@ async function handlePlan(ctx) {
     // payload, since that is the only declaration this run has.
     if (isRealMode(ctx) && ctx.task.worktreePath) {
       const baseline = buildBaseline(ctx.task.worktreePath, invariantsPath);
+      // #112: the reuse path's plan text lives on disk, not in `previousPayload` -- it was
+      // written to `planPath` by whichever earlier run actually produced it.
+      annotatePlanSpanConflicts(ctx, baseline, readPlanMarkdownForSpanCheck(planPath));
       appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
 
       const declaredIds = Array.isArray(previousPayload.invariant_ids) ? previousPayload.invariant_ids : [];
@@ -608,6 +679,8 @@ async function handlePlan(ctx) {
   // here and no longer does at CHECK time.
   if (isRealMode(ctx) && ctx.task.worktreePath) {
     const baseline = buildBaseline(ctx.task.worktreePath, invariantsPath);
+    // #112: fresh path, the plan text this run just produced is already in memory.
+    annotatePlanSpanConflicts(ctx, baseline, planMarkdown);
     appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
 
     // Canary against a silent parser/prompt divergence. The whole feature fails OPEN: if the

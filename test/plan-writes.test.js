@@ -17,6 +17,7 @@ const path = require('path');
 require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
+const { appendEvent } = require('../orchestrator/journal');
 const { writePoolDir } = require('./helpers');
 
 function mkTmp(prefix) {
@@ -404,4 +405,362 @@ test('handlePlan: PLAN declaring invariant ids the parser cannot find journals a
   const baseline = journal.find((e) => e.event === 'invariants-baseline');
   assert.ok(baseline);
   assert.equal(baseline.invariants.length, 0);
+});
+
+// ---- issue #112: PLAN-time plan-span-conflict flagging -----------------------------------------
+//
+// The measured defect: PLAN sometimes freezes an invariant over a span its OWN plan text goes on
+// to reorder, which no IMPLEMENT can satisfy -- CHECK then fails the invariant and the card burns
+// a full DIAGNOSE/IMPLEMENT cycle for something the plan already gave away. The shipped fix is
+// flag-at-PLAN, honour-at-CHECK (orchestrator/plan-span-guard.js's detectSpanConflicts is the
+// detector; annotatePlanSpanConflicts in state-machine.js is the wiring under test here): PLAN
+// never drops the invariant, never parks, never changes `resolved`/`mode` -- it only stamps a
+// `planSpanConflict` marker on the baseline row so CHECK (test/real-steps.test.js) can later
+// decide whether to relieve a break that marker predicted.
+
+test('handlePlan (real mode, fresh path): a plan that reorders the exact span an invariant just froze is flagged on the baseline row, and journals invariants-plan-span-conflict', async () => {
+  const worktreePath = mkTmp('spo-plan-span-conflict-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const accountsDir = mkTmp('spo-plan-span-conflict-accts-');
+  writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+
+  const invariantsMarkdown = [
+    '## INV-1',
+    'File: foo.js:1-3',
+    '>>> QUOTE',
+    'function foo() {\n  return 42;\n}',
+    '>>> END QUOTE',
+    '',
+  ].join('\n');
+  // Line 3 (1-based) names foo.js:2-6 -- overlaps INV-1's real (exact-match) span of foo.js:1-3.
+  const planMarkdown = '# Plan\n\nMove the code at foo.js:2-6 up.\n';
+
+  const deps = {
+    spawnSync: fakePlanSpawn({
+      plan_markdown: planMarkdown,
+      invariants_markdown: invariantsMarkdown,
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-span-conflict-1',
+    kind: 'card',
+    issue: 701,
+    title: 'Move the code',
+    criterion: 'the code moved',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = realPlanCtx({ id: 'card-span-conflict-1', task, taskDir: mkTmp('spo-plan-span-conflict-taskdir-'), accountsDir, deps });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+
+  const journal = readJournal(ctx.taskDir);
+  const baseline = journal.find((e) => e.event === 'invariants-baseline');
+  assert.ok(baseline);
+  const inv1 = baseline.invariants.find((i) => i.id === 'INV-1');
+  // resolved/mode/reason must be exactly what buildBaseline alone would have produced -- the flag
+  // rides alongside, it never replaces any of these.
+  assert.equal(inv1.resolved, true);
+  assert.equal(inv1.mode, 'exact');
+  assert.deepEqual(inv1.planSpanConflict, { planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' });
+
+  const conflictEvent = journal.find((e) => e.event === 'invariants-plan-span-conflict');
+  assert.ok(conflictEvent, 'expected invariants-plan-span-conflict to be journalled');
+  assert.deepEqual(conflictEvent.conflicts, [
+    { id: 'INV-1', file: 'foo.js', planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' },
+  ]);
+});
+
+test('handlePlan (real mode, fresh path): a plan that never mentions the invariant span at all leaves the baseline unflagged and journals no conflict event', async () => {
+  const worktreePath = mkTmp('spo-plan-span-noconflict-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const accountsDir = mkTmp('spo-plan-span-noconflict-accts-');
+  writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+
+  const invariantsMarkdown = [
+    '## INV-1',
+    'File: foo.js:1-3',
+    '>>> QUOTE',
+    'function foo() {\n  return 42;\n}',
+    '>>> END QUOTE',
+    '',
+  ].join('\n');
+  const planMarkdown = '# Plan\n\nAdd a brand new helper function elsewhere.\n';
+
+  const deps = {
+    spawnSync: fakePlanSpawn({
+      plan_markdown: planMarkdown,
+      invariants_markdown: invariantsMarkdown,
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-span-noconflict-1',
+    kind: 'card',
+    issue: 702,
+    title: 'Add a helper',
+    criterion: 'the helper exists',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = realPlanCtx({
+    id: 'card-span-noconflict-1',
+    task,
+    taskDir: mkTmp('spo-plan-span-noconflict-taskdir-'),
+    accountsDir,
+    deps,
+  });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+
+  const journal = readJournal(ctx.taskDir);
+  const baseline = journal.find((e) => e.event === 'invariants-baseline');
+  assert.ok(baseline);
+  const inv1 = baseline.invariants.find((i) => i.id === 'INV-1');
+  assert.equal(inv1.resolved, true);
+  assert.equal('planSpanConflict' in inv1, false, 'a plan with no matching span must never add the key at all');
+  assert.equal(journal.some((e) => e.event === 'invariants-plan-span-conflict'), false);
+});
+
+test('handlePlan (real mode, reuse path): a plan-span conflict is flagged too, reading the plan text from disk rather than from a payload field', async () => {
+  const worktreePath = mkTmp('spo-plan-span-reuse-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const taskDir = mkTmp('spo-plan-span-reuse-taskdir-');
+  const scratch = path.join(taskDir, 'scratch');
+  fs.mkdirSync(scratch, { recursive: true });
+  const planPath = path.join(scratch, 'plan-703.md');
+  const invariantsPath = path.join(scratch, 'invariants-703.md');
+  // Same shape as the fresh-path conflict test above -- foo.js:2-6 overlaps INV-1's foo.js:1-3.
+  fs.writeFileSync(planPath, '# Plan\n\nMove the code at foo.js:2-6 up.\n');
+  fs.writeFileSync(
+    invariantsPath,
+    ['## INV-1', 'File: foo.js:1-3', '>>> QUOTE', 'function foo() {\n  return 42;\n}', '>>> END QUOTE', ''].join('\n')
+  );
+
+  // Hand-built prior-run journal state, exactly what decidePlanReuse (state-machine.js) requires
+  // to reuse rather than re-run PLAN: a 'files-written' event carrying the matching baseMainSha,
+  // and a non-failure 'result' payload. This is fixture setup for the RE-USE PATH itself (already
+  // covered/trusted by test/plan-reuse*.test.js-style coverage elsewhere in this suite) -- the
+  // thing actually under test here, the plan-span flag, is still fully DERIVED: handlePlan reads
+  // planMarkdown back off `planPath` on disk and runs the real detector against it below.
+  appendEvent(taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha: 'sha-reuse-span-703' });
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: { ok: true, plan_path: planPath, invariants_path: invariantsPath, invariant_ids: ['INV-1'], check_commands: [] },
+  });
+
+  const task = {
+    id: 'card-span-reuse-1',
+    kind: 'card',
+    issue: 703,
+    worktreePath,
+    baseMainSha: 'sha-reuse-span-703',
+  };
+  const ctx = buildCtx('card-span-reuse-1', task, taskDir, { shadowMode: false, dryRun: false });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+
+  const journal = readJournal(taskDir);
+  assert.ok(journal.some((e) => e.event === 'plan-reused'), 'expected the reuse path to have actually been taken');
+
+  const baseline = journal.find((e) => e.event === 'invariants-baseline');
+  assert.ok(baseline);
+  const inv1 = baseline.invariants.find((i) => i.id === 'INV-1');
+  assert.deepEqual(inv1.planSpanConflict, { planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' });
+  assert.ok(journal.some((e) => e.event === 'invariants-plan-span-conflict'), 'reuse path must journal the conflict event too, same as the fresh path');
+});
+
+test('handlePlan (real mode, reuse path): an unreadable plan file never throws and simply leaves the baseline unflagged', async () => {
+  const worktreePath = mkTmp('spo-plan-span-reuse-nofile-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const taskDir = mkTmp('spo-plan-span-reuse-nofile-taskdir-');
+  const scratch = path.join(taskDir, 'scratch');
+  fs.mkdirSync(scratch, { recursive: true });
+  const planPath = path.join(scratch, 'plan-704.md');
+  const invariantsPath = path.join(scratch, 'invariants-704.md');
+  fs.writeFileSync(
+    invariantsPath,
+    ['## INV-1', 'File: foo.js:1-3', '>>> QUOTE', 'function foo() {\n  return 42;\n}', '>>> END QUOTE', ''].join('\n')
+  );
+  fs.writeFileSync(planPath, 'placeholder');
+  // decidePlanReuse's own condition 4 only STATS planPath (isFile() && size > 0) -- a mode-0 file
+  // still passes that, so this exercises annotatePlanSpanConflicts' OWN read guard specifically,
+  // not decidePlanReuse's file-existence gate (deleting the file instead would trip THAT gate
+  // first and never reach the code this test means to cover).
+  fs.chmodSync(planPath, 0o000);
+
+  appendEvent(taskDir, 'PLAN', 'files-written', { planPath, invariantsPath, baseMainSha: 'sha-reuse-span-704' });
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: { ok: true, plan_path: planPath, invariants_path: invariantsPath, invariant_ids: ['INV-1'], check_commands: [] },
+  });
+
+  const task = {
+    id: 'card-span-reuse-nofile-1',
+    kind: 'card',
+    issue: 704,
+    worktreePath,
+    baseMainSha: 'sha-reuse-span-704',
+  };
+  const ctx = buildCtx('card-span-reuse-nofile-1', task, taskDir, { shadowMode: false, dryRun: false });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+
+  const journal = readJournal(taskDir);
+  const baseline = journal.find((e) => e.event === 'invariants-baseline');
+  assert.ok(baseline);
+  const inv1 = baseline.invariants.find((i) => i.id === 'INV-1');
+  assert.equal('planSpanConflict' in inv1, false);
+  assert.equal(journal.some((e) => e.event === 'invariants-plan-span-conflict'), false);
+});
+
+test('handlePlan (real mode): a plan-span-guard detector failure is swallowed -- PLAN still reaches IMPLEMENT with an unflagged baseline (defensive wrapping, not the detector\'s own robustness)', async () => {
+  // orchestrator/plan-span-guard.js's detectSpanConflicts is itself written to never throw, on
+  // any input -- there is no plan_markdown string that forces a real throw through it, which
+  // makes "make the plan markdown pathological" unactionable as a way to exercise this. What is
+  // still real and worth pinning is state-machine.js's OWN defensive wrapping around the call
+  // (annotatePlanSpanConflicts's try/catch) -- if a future change to the detector, or to this
+  // wiring, ever lets an exception through, PLAN must keep behaving exactly as it does today
+  // rather than crashing the daemon (this file's own header: a handler-internal bug is not caught
+  // anywhere else). This is a deliberate injection of an UPSTREAM DEPENDENCY failure, done via a
+  // require.cache swap so state-machine.js is re-required against a patched plan-span-guard --
+  // NOT an injection of the value annotatePlanSpanConflicts derives (that is real, derived output
+  // in every other test in this section). Cache entries are restored in `finally` so no other
+  // test in this process ever sees the patched module.
+  const guardPath = require.resolve('../orchestrator/plan-span-guard');
+  const smPath = require.resolve('../orchestrator/state-machine');
+  const savedGuardEntry = require.cache[guardPath];
+  const savedSmEntry = require.cache[smPath];
+  delete require.cache[guardPath];
+  delete require.cache[smPath];
+
+  try {
+    const guardModule = require('../orchestrator/plan-span-guard');
+    guardModule.detectSpanConflicts = () => {
+      throw new Error('injected plan-span-guard failure');
+    };
+    const { HANDLERS: HANDLERS2, buildCtx: buildCtx2 } = require('../orchestrator/state-machine');
+
+    const worktreePath = mkTmp('spo-plan-span-guardthrows-wt-');
+    fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+    const accountsDir = mkTmp('spo-plan-span-guardthrows-accts-');
+    writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+
+    const invariantsMarkdown = [
+      '## INV-1',
+      'File: foo.js:1-3',
+      '>>> QUOTE',
+      'function foo() {\n  return 42;\n}',
+      '>>> END QUOTE',
+      '',
+    ].join('\n');
+
+    const deps = {
+      spawnSync: fakePlanSpawn({
+        plan_markdown: '# Plan\n\nMove the code at foo.js:2-6 up.\n',
+        invariants_markdown: invariantsMarkdown,
+        invariant_ids: ['INV-1'],
+        check_commands: ['npm run typecheck'],
+      }),
+    };
+    const task = {
+      id: 'card-span-guardthrows-1',
+      kind: 'card',
+      issue: 705,
+      title: 'Move the code',
+      criterion: 'the code moved',
+      worktreePath,
+      size: 'S',
+    };
+    const ctx = buildCtx2('card-span-guardthrows-1', task, mkTmp('spo-plan-span-guardthrows-taskdir-'), {
+      claudeAccountsDir: accountsDir,
+      stepDeadlineMs: 30000,
+      shadowMode: false,
+      dryRun: false,
+      deps,
+    });
+
+    const next = await HANDLERS2.PLAN(ctx);
+    assert.equal(next, 'IMPLEMENT');
+
+    const journal = readJournal(ctx.taskDir);
+    const baseline = journal.find((e) => e.event === 'invariants-baseline');
+    assert.ok(baseline, 'a throwing detector must still leave the baseline itself journalled');
+    const inv1 = baseline.invariants.find((i) => i.id === 'INV-1');
+    assert.equal('planSpanConflict' in inv1, false, 'a throwing detector must never leave a flag behind');
+    assert.equal(journal.some((e) => e.event === 'invariants-plan-span-conflict'), false);
+  } finally {
+    delete require.cache[guardPath];
+    delete require.cache[smPath];
+    if (savedGuardEntry) require.cache[guardPath] = savedGuardEntry;
+    if (savedSmEntry) require.cache[smPath] = savedSmEntry;
+  }
+});
+
+test('handlePlan (real mode): PLAN_SPAN_CONFLICT_CAP bounds BOTH the journalled conflicts array and the number of annotated baseline rows at 50', async () => {
+  // The journalled `invariants-plan-span-conflict` detail can flow into a GitHub comment capped at
+  // 65536 chars (state-machine.js's own note, same reasoning as PROTECTED_MATCH_CAP), so the cap
+  // has to bind on the EVENT; and a row annotated past the cap would be relieved at CHECK by a
+  // conflict the journal never recorded, so it has to bind on the ROWS too. 60 overlapping
+  // invariants -- more than the cap, and well under plan-span-guard.js's own MAX_FINDINGS of 200,
+  // so the 50 measured here is this wiring's cap and not the detector's.
+  const worktreePath = mkTmp('spo-plan-span-cap-wt-');
+  const lines = [];
+  for (let i = 1; i <= 60; i++) lines.push(`const v${i} = ${i};`);
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), lines.join('\n') + '\n');
+
+  const accountsDir = mkTmp('spo-plan-span-cap-accts-');
+  writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+
+  const blocks = [];
+  for (let i = 1; i <= 60; i++) {
+    blocks.push([`## INV-${i}`, `File: foo.js:${i}-${i}`, '>>> QUOTE', `const v${i} = ${i};`, '>>> END QUOTE', ''].join('\n'));
+  }
+  // One plan span covering the whole file: every one of the 60 invariants overlaps it.
+  const planMarkdown = '# Plan\n\nRewrite foo.js:1-60 from scratch.\n';
+
+  const deps = {
+    spawnSync: fakePlanSpawn({
+      plan_markdown: planMarkdown,
+      invariants_markdown: blocks.join(''),
+      invariant_ids: [],
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-span-cap-1',
+    kind: 'card',
+    issue: 709,
+    title: 'Rewrite foo.js',
+    criterion: 'foo.js rewritten',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = realPlanCtx({ id: 'card-span-cap-1', task, taskDir: mkTmp('spo-plan-span-cap-taskdir-'), accountsDir, deps });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+
+  const journal = readJournal(ctx.taskDir);
+  const baseline = journal.find((e) => e.event === 'invariants-baseline');
+  assert.equal(baseline.invariants.length, 60, 'all 60 invariants must still be in the baseline -- the cap bounds flagging, never the baseline itself');
+
+  const conflictEvent = journal.find((e) => e.event === 'invariants-plan-span-conflict');
+  assert.ok(conflictEvent);
+  assert.equal(conflictEvent.conflicts.length, 50, 'the journalled conflicts array must be capped at 50');
+
+  const flaggedRows = baseline.invariants.filter((i) => i.planSpanConflict);
+  assert.equal(flaggedRows.length, 50, 'row annotation must be capped at 50 too, not just the event');
 });

@@ -1425,11 +1425,41 @@ function runInvariantCheck(ctx, deps, worktreePath) {
     invariantsPath,
     baselineEvent.invariants || []
   );
+  // The journalled record of what actually broke is unconditional -- relief (below) is an
+  // additional event on top of this, never a rewrite of it.
   appendEvent(ctx.taskDir, 'CHECK', 'invariants-checked', {
     parseError: parseError || null,
     checkedIds,
     broken,
   });
+
+  // #112: PLAN may have flagged an invariant whose own plan text reorders the span it freezes
+  // (state-machine.js's annotatePlanSpanConflicts) -- a break no IMPLEMENT could have avoided.
+  // Relief requires EVERY broken id in THIS event to carry the flag. That is a deliberately
+  // conservative choice, NOT a corpus finding: replaying the shipped predicate over the 58-card
+  // journal, all 8 invariant-caused CHECK events are unanimous (every id in the event flagged, or
+  // none of them), so no real card discriminates `every` from `some`. The reason to pick `every`
+  // anyway is CHECK's own gate -- invariants.js's checkRegressions fails the WHOLE event on ANY
+  // broken id, never per-id -- so relieving on a partial match would credit a partial catch and
+  // wave the unflagged half of the event through with it. A baseline row journalled before this
+  // feature existed simply has no `planSpanConflict` key, so `rowsById.get` falling through to
+  // `undefined` here behaves exactly as today: not flagged, DIAGNOSE.
+  if (broken.length > 0) {
+    const rowsById = new Map((baselineEvent.invariants || []).map((row) => [row.id, row]));
+    const allFlagged = broken.every((b) => Boolean(rowsById.get(b.id) && rowsById.get(b.id).planSpanConflict));
+    if (allFlagged) {
+      const conflicts = broken.map((b) => {
+        const row = rowsById.get(b.id);
+        return { id: b.id, file: b.file, ...(row ? row.planSpanConflict : {}) };
+      });
+      appendEvent(ctx.taskDir, 'CHECK', 'invariants-span-conflict-relieved', {
+        ids: broken.map((b) => b.id),
+        conflicts,
+      });
+      return [];
+    }
+  }
+
   return broken;
 }
 

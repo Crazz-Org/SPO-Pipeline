@@ -1399,6 +1399,348 @@ test('realCheck: the invariants file itself missing/unparsable at CHECK time -> 
   assert.deepEqual(checked.broken, []);
 });
 
+// ---- issue #112: CHECK-time plan-span-conflict relief -------------------------------------------
+//
+// PLAN (state-machine.js's annotatePlanSpanConflicts, orchestrator/plan-span-guard.js's
+// detectSpanConflicts) may have already flagged an invariant whose own plan text reorders the
+// span it freezes -- a break no IMPLEMENT could have avoided. runInvariantCheck (steps/
+// scripted.js) is what actually honours that flag: relief requires EVERY broken id in the SAME
+// invariants-checked event to carry `planSpanConflict` on its baseline row. No card in the 58-card
+// corpus discriminates that rule from "any id flagged" -- all 8 invariant-caused CHECK events are
+// unanimous -- so the mixed case below is a constructed shape, not a replayed one; `every` is the
+// rule because CHECK's gate is whole-event (checkRegressions fails on ANY broken id), and relief on
+// a partial match would wave the unflagged half through. `invariants-checked` must keep
+// recording the true, unmodified broken array regardless of relief -- relief is an ADDITIONAL
+// event, never a rewrite of what actually broke.
+
+// A minimal real-mode PLAN spawnSync stand-in, same envelope as steps/llm.js's invokeClaudeReal
+// expects (mirrors test/plan-writes.test.js's own fakePlanSpawn, duplicated here rather than
+// imported since neither test file exports helpers to the other).
+function fakePlanSpawnEnvelope(planPayload) {
+  return () => ({
+    status: 0,
+    stdout: JSON.stringify({
+      result: JSON.stringify(planPayload),
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-plan-span-check',
+      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
+      terminal_reason: 'success',
+      api_error_status: null,
+    }),
+    stderr: '',
+    signal: null,
+  });
+}
+
+test('realCheck: a PLAN-flagged plan-span conflict is relieved end to end -- the flag is DERIVED via a real HANDLERS.PLAN call, then broken by editing the worktree, then relieved by realCheck', async () => {
+  const worktreePath = mkTmp('spo-real-check-span-e2e-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const accountsDir = mkTmp('spo-real-check-span-e2e-accts-');
+  writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+
+  const invariantsMarkdown = invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']);
+  // Line 3 (1-based) names foo.js:2-6 -- overlaps INV-1's real (exact-match) span of foo.js:1-3.
+  const planMarkdown = '# Plan\n\nMove the code at foo.js:2-6 up.\n';
+
+  const planDeps = {
+    spawnSync: fakePlanSpawnEnvelope({
+      plan_markdown: planMarkdown,
+      invariants_markdown: invariantsMarkdown,
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-span-e2e',
+    kind: 'card',
+    issue: 706,
+    title: 'Move the code',
+    criterion: 'the code moved',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = buildCtx('card-span-e2e', task, mkTmp('spo-real-check-span-e2e-taskdir-'), {
+    claudeAccountsDir: accountsDir,
+    stepDeadlineMs: 30000,
+    shadowMode: false,
+    dryRun: false,
+    deps: planDeps,
+  });
+
+  const planNext = await HANDLERS.PLAN(ctx);
+  assert.equal(planNext, 'IMPLEMENT');
+
+  // Sanity: the flag really was DERIVED by the real detector, not assumed by this test.
+  const planJournal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const baseline = planJournal.find((e) => e.event === 'invariants-baseline');
+  assert.ok(
+    baseline.invariants.find((i) => i.id === 'INV-1').planSpanConflict,
+    'expected the plan-span flag to have been derived at PLAN time'
+  );
+
+  // IMPLEMENT (simulated) did exactly what the plan said and moved the code -- the invariant's
+  // quote is gone from the file, same edit the pre-existing "broken invariant" test above makes.
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 99;\n}\n');
+
+  const checkCalls = [];
+  const checkDeps = { spawnSync: (command, args) => { checkCalls.push(args); return ok(''); } };
+  const checkNext = await realCheck(ctx, checkDeps);
+  assert.equal(checkNext, 'PUSH_PR', 'a fully-flagged break must be relieved, not routed to DIAGNOSE');
+  // The alias loop still runs -- relief clears the invariant gate, it does not short-circuit CHECK.
+  assert.deepEqual(checkCalls.slice(1).map((a) => a[1]), ['typecheck', 'lint', 'coverage:changed']);
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const checked = journal.find((e) => e.event === 'invariants-checked');
+  assert.ok(checked, 'expected invariants-checked to still be journalled');
+  // The record of what actually broke is unconditional -- relief never rewrites it.
+  assert.deepEqual(checked.broken, [{ id: 'INV-1', file: 'foo.js' }]);
+  assert.equal(journal.some((e) => e.event === 'check-failed' && e.alias === 'invariants'), false);
+
+  const relieved = journal.find((e) => e.event === 'invariants-span-conflict-relieved');
+  assert.ok(relieved, 'expected invariants-span-conflict-relieved to be journalled');
+  assert.deepEqual(relieved.ids, ['INV-1']);
+  assert.deepEqual(relieved.conflicts, [
+    { id: 'INV-1', file: 'foo.js', planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' },
+  ]);
+});
+
+test('realCheck: a mixed event (two invariants break, only one plan-span-flagged) still routes to DIAGNOSE, no relief event', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-span-partial-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+  fs.writeFileSync(path.join(worktreePath, 'bar.js'), 'function bar() {\n  return 7;\n}\n');
+
+  const task = { id: 'card-span-partial', kind: 'card', issue: 707, worktreePath };
+  const ctx = testCtx({ id: 'card-span-partial', task, config });
+
+  const invariantsPath = path.join(ctx.taskDir, 'scratch', 'invariants-707.md');
+  fs.mkdirSync(path.dirname(invariantsPath), { recursive: true });
+  fs.writeFileSync(
+    invariantsPath,
+    invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']) +
+      invariantsBlock('INV-2', 'bar.js:1-3', ['function bar() {\n  return 7;\n}'])
+  );
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { invariants_path: invariantsPath } });
+
+  // Fixture, not derived, and CONSTRUCTED rather than replayed: no card in the 58-card corpus ever
+  // produced a mixed event (see this section's header), so there is no real card to copy here.
+  // This test's whole point is the ALL-OR-NOTHING relief rule -- "relieve when ANY id is flagged"
+  // must turn it RED, and it is the only test that does -- so the baseline is hand-shaped to hold
+  // exactly one flagged row and one unflagged row side by side: a shape the real detector could
+  // produce, but reproducing it via real plan text would only re-test the detector itself (already
+  // covered by the end-to-end test above and by orchestrator/plan-span-guard.js's own test suite),
+  // not this all-or-nothing consultation rule. The rule under test is CHECK's own whole-event gate,
+  // not a corpus measurement.
+  const baseline = buildBaseline(worktreePath, invariantsPath);
+  const inv1 = baseline.invariants.find((i) => i.id === 'INV-1');
+  inv1.planSpanConflict = { planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' };
+  // INV-2 deliberately left unflagged.
+  appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+  // IMPLEMENT breaks BOTH quotes.
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 99;\n}\n');
+  fs.writeFileSync(path.join(worktreePath, 'bar.js'), 'function bar() {\n  return 99;\n}\n');
+
+  const deps = { spawnSync: (command, args) => ok('') };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'DIAGNOSE', 'one unflagged break in the event must still fail the whole event');
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const checked = journal.find((e) => e.event === 'invariants-checked');
+  assert.deepEqual(
+    checked.broken.map((b) => b.id).sort(),
+    ['INV-1', 'INV-2']
+  );
+  assert.equal(journal.some((e) => e.event === 'invariants-span-conflict-relieved'), false);
+  assert.ok(journal.some((e) => e.event === 'check-failed' && e.alias === 'invariants'));
+});
+
+test('realCheck: an old-shaped baseline row (journalled before #112, no planSpanConflict key at all) still routes a break to DIAGNOSE without throwing', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-span-oldshape-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-span-oldshape', kind: 'card', issue: 708, worktreePath };
+  const ctx = testCtx({ id: 'card-span-oldshape', task, config });
+
+  const invariantsPath = path.join(ctx.taskDir, 'scratch', 'invariants-708.md');
+  fs.mkdirSync(path.dirname(invariantsPath), { recursive: true });
+  fs.writeFileSync(invariantsPath, invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']));
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { invariants_path: invariantsPath } });
+
+  // Fixture, not derived: a pre-#112 journal simply never has the key, at all -- this is the
+  // backward-compatibility case the driver spec calls out explicitly as one where hand-shaping
+  // the row is the right thing (the row IS the fixture -- a real journal entry from before this
+  // action ever existed -- not the thing under test, which is runInvariantCheck's fallback).
+  const oldShapedBaseline = { parseError: null, invariants: [{ id: 'INV-1', file: 'foo.js', resolved: true, mode: 'exact' }] };
+  appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', oldShapedBaseline);
+
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 99;\n}\n');
+
+  const deps = { spawnSync: (command, args) => ok('') };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'DIAGNOSE');
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(journal.some((e) => e.event === 'invariants-span-conflict-relieved'), false);
+});
+
+test('realCheck: nothing broken at all -- a card carrying a plan-span-flagged row must NOT journal a relief event with zero ids', async () => {
+  // `[].every(...)` is `true`, so the `broken.length > 0` guard is the only thing standing between
+  // a perfectly clean CHECK and a spurious `invariants-span-conflict-relieved` line claiming to
+  // have relieved nothing. Every clean card on a flagged plan would carry one.
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-span-nobreak-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-span-nobreak', kind: 'card', issue: 710, worktreePath };
+  const ctx = testCtx({ id: 'card-span-nobreak', task, config });
+
+  const invariantsPath = path.join(ctx.taskDir, 'scratch', 'invariants-710.md');
+  fs.mkdirSync(path.dirname(invariantsPath), { recursive: true });
+  fs.writeFileSync(invariantsPath, invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']));
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { invariants_path: invariantsPath } });
+
+  const baseline = buildBaseline(worktreePath, invariantsPath);
+  baseline.invariants.find((i) => i.id === 'INV-1').planSpanConflict = { planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' };
+  appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+  // IMPLEMENT changed nothing the invariant froze -- the quote still resolves.
+  const deps = { spawnSync: (command, args) => ok('') };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'PUSH_PR');
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.deepEqual(journal.find((e) => e.event === 'invariants-checked').broken, []);
+  assert.equal(
+    journal.some((e) => e.event === 'invariants-span-conflict-relieved'),
+    false,
+    'no break means no relief event, however many rows carry a flag'
+  );
+});
+
+test('realCheck: a falsy planSpanConflict (null on the baseline row) does NOT count as flagged -- the break still routes to DIAGNOSE', async () => {
+  // Truthiness, not key presence: a row carrying `planSpanConflict: null` (an older/partial
+  // writer, or a journal round-trip that lost the object) must read as "not flagged". Keying
+  // relief on `'planSpanConflict' in row` instead would wave this break through.
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-check-span-falsy-wt-');
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const task = { id: 'card-span-falsy', kind: 'card', issue: 711, worktreePath };
+  const ctx = testCtx({ id: 'card-span-falsy', task, config });
+
+  const invariantsPath = path.join(ctx.taskDir, 'scratch', 'invariants-711.md');
+  fs.mkdirSync(path.dirname(invariantsPath), { recursive: true });
+  fs.writeFileSync(invariantsPath, invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']));
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { invariants_path: invariantsPath } });
+
+  const baseline = buildBaseline(worktreePath, invariantsPath);
+  baseline.invariants.find((i) => i.id === 'INV-1').planSpanConflict = null;
+  appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 99;\n}\n');
+
+  const deps = { spawnSync: (command, args) => ok('') };
+  const next = await realCheck(ctx, deps);
+  assert.equal(next, 'DIAGNOSE');
+
+  const journal = fs
+    .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(journal.some((e) => e.event === 'invariants-span-conflict-relieved'), false);
+  assert.ok(journal.some((e) => e.event === 'check-failed' && e.alias === 'invariants'));
+});
+
+test('realCheck: a broken id with NO matching baseline row is NOT flagged -- an unknown id can never buy relief for the event', async () => {
+  // Today `checkRegressions` only ever reports ids it read OUT of the baseline, so this branch is
+  // defensive rather than reachable through the live call path -- which is exactly why it needs
+  // pinning: the relief gate is the last thing between a broken invariant and PUSH_PR, and a
+  // future change to what `broken` may contain (an id read from the CURRENT invariants file, say)
+  // would silently turn `rowsById.get(id) === undefined` into a free pass if the gate treated a
+  // missing row as flagged. Injected the same way as the plan-span-guard failure test in
+  // test/plan-writes.test.js -- an UPSTREAM DEPENDENCY's output is replaced (invariants.js's
+  // checkRegressions) and steps/scripted.js re-required against it; nothing about the flag or the
+  // gate under test is stubbed. Cache entries are restored in `finally`.
+  const invPath = require.resolve('../orchestrator/invariants');
+  const scPath = require.resolve('../orchestrator/steps/scripted');
+  const savedInv = require.cache[invPath];
+  const savedSc = require.cache[scPath];
+  delete require.cache[invPath];
+  delete require.cache[scPath];
+
+  try {
+    const invModule = require('../orchestrator/invariants');
+    invModule.checkRegressions = () => ({
+      parseError: null,
+      checkedIds: ['INV-1'],
+      broken: [{ id: 'INV-GHOST', file: 'foo.js' }],
+    });
+    const { realCheck: realCheck2 } = require('../orchestrator/steps/scripted');
+
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-check-span-ghost-wt-');
+    fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+    const task = { id: 'card-span-ghost', kind: 'card', issue: 712, worktreePath };
+    const ctx = testCtx({ id: 'card-span-ghost', task, config });
+
+    const invariantsPath = path.join(ctx.taskDir, 'scratch', 'invariants-712.md');
+    fs.mkdirSync(path.dirname(invariantsPath), { recursive: true });
+    fs.writeFileSync(invariantsPath, invariantsBlock('INV-1', 'foo.js:1-3', ['function foo() {\n  return 42;\n}']));
+    appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { invariants_path: invariantsPath } });
+
+    // The one row in the baseline IS flagged -- so a gate that counted a missing row as flagged
+    // would see "every broken id flagged" and relieve, while the correct gate sees INV-GHOST
+    // resolve to no row at all.
+    const baseline = buildBaseline(worktreePath, invariantsPath);
+    baseline.invariants.find((i) => i.id === 'INV-1').planSpanConflict = { planSpan: { start: 2, end: 6 }, planLine: 3, syntax: 'path' };
+    appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
+
+    const deps = { spawnSync: (command, args) => ok('') };
+    const next = await realCheck2(ctx, deps);
+    assert.equal(next, 'DIAGNOSE', 'an unflagged (row-less) broken id must fail the whole event');
+
+    const journal = fs
+      .readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    assert.deepEqual(journal.find((e) => e.event === 'invariants-checked').broken, [{ id: 'INV-GHOST', file: 'foo.js' }]);
+    assert.equal(journal.some((e) => e.event === 'invariants-span-conflict-relieved'), false);
+  } finally {
+    delete require.cache[invPath];
+    delete require.cache[scPath];
+    if (savedInv) require.cache[invPath] = savedInv;
+    if (savedSc) require.cache[scPath] = savedSc;
+  }
+});
+
 test('regression: --dry-run CHECK never runs the invariant check either', async () => {
   const taskDir = mkTmp('spo-check-inv-dryrun-taskdir-');
   const task = { id: 'card-inv-dryrun', kind: 'card', issue: 85, worktreePath: mkTmp('spo-check-inv-dryrun-wt-') };

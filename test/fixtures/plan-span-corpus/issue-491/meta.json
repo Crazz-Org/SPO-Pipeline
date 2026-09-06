@@ -1,0 +1,7 @@
+{
+  "issue": 491,
+  "brokenIds": ["INV-5", "INV-6"],
+  "outcome": "DONE",
+  "prNumber": 678,
+  "source": "~/.spo-state/journal/issue-491/"
+}
