@@ -146,6 +146,66 @@ test(
   }
 );
 
+// card #78 verification: the test above (and every other test in this file) hand-writes its own
+// flags as string literals -- '--repark-task', '--exit-code', '--queue', '--journal' -- so it only
+// agrees with dispatcher.js's real buildReparkArgv because two files happen to spell the same
+// strings. Nothing joins the two halves: rename a flag inside buildReparkArgv and every test in
+// this file keeps passing while production silently stops reparking (dispatcher.js would spawn a
+// child that daemon.js's own argv parser no longer recognises as repark mode at all). This test
+// closes that gap by taking buildReparkArgv's ACTUAL return value -- never retyped -- and running
+// daemon.js with exactly that argv, the same way dispatcher.js's own reparkCrashedWorker does
+// (`spawnReparkFn(process.execPath, argv, ...)`, see that function's own body).
+test(
+  "buildReparkArgv's own output, run through daemon.js verbatim, really parks the task -- pins the argv contract between dispatcher.js and daemon.js",
+  { timeout: 40000 },
+  () => {
+    const { buildReparkArgv } = require('../orchestrator/dispatcher');
+    const defaultConfig = require('../orchestrator/config');
+
+    const journalDir = mkTmp('spo-repark-argv-j-');
+    const queueDir = mkTmp('spo-repark-argv-q-');
+    // Same fixture shape as the e2e test above: kind: 'synthetic', worktreePath: null, so
+    // finalizePark's real-mode side effects (postParkComment's `gh` call, preserveWorktreeWip's
+    // `git` call, park-alert.js's external command) all stay filesystem-only and this test makes
+    // zero spawnSync calls under test/no-real-spawn.js's killswitch.
+    const taskDir = seedCrashedTask(journalDir, 'repark-argv-contract-1', { state: 'IMPLEMENT' });
+
+    const config = { ...defaultConfig, shadowMode: false, dryRun: false, real: true };
+    const argv = buildReparkArgv(taskDir, queueDir, journalDir, config, { exitCode: 137, signal: 'SIGKILL' });
+
+    // buildReparkArgv's own first element is DAEMON_PATH itself -- dispatcher.js spawns this argv
+    // as `spawnReparkFn(process.execPath, argv, ...)`, i.e. argv is node's OWN argument list, not
+    // a full command line. Replicated here exactly, with no re-typed flag in between.
+    let result;
+    try {
+      const stdout = execFileSync(process.execPath, argv, {
+        encoding: 'utf8',
+        env: isolatedEnv(),
+        timeout: 30000,
+      });
+      result = { status: 0, stdout, stderr: '' };
+    } catch (err) {
+      result = { status: err.status, stdout: err.stdout || '', stderr: err.stderr || '' };
+    }
+    assert.equal(
+      result.status,
+      0,
+      `expected buildReparkArgv's own argv, run verbatim through daemon.js, to exit 0 -- got ${JSON.stringify(result)}`
+    );
+
+    const state = readState(journalDir, 'repark-argv-contract-1');
+    assert.equal(state.state, 'PARKED', `state.json never reached PARKED -- daemon.js did not recognise buildReparkArgv's own argv as repark mode, got state ${JSON.stringify(state)}`);
+    assert.equal(state.reason, 'worker-crashed', `expected reason 'worker-crashed', got ${state.reason}`);
+
+    const events = readJournal(journalDir, 'repark-argv-contract-1');
+    const parked = events.find((e) => e.event === 'parked');
+    assert.ok(parked, "no 'parked' event was ever journalled for this task");
+    assert.equal(parked.reason, 'worker-crashed');
+    assert.equal(parked.detail.exitCode, 137, `expected the dead worker's exit code (137), carried through buildReparkArgv's own --exit-code, in the park detail, got ${JSON.stringify(parked.detail)}`);
+    assert.equal(parked.detail.signal, 'SIGKILL');
+  }
+);
+
 test(
   '--repark-task does not take the single-instance lock -- the crashed task still parks while the real lock is held',
   { timeout: 40000 },

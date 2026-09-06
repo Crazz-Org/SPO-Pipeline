@@ -53,7 +53,7 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
-const { writeState: writeTaskState, reparkClaimPath } = require('../orchestrator/journal');
+const { writeState: writeTaskState, writeReparkClaim, reparkClaimPath } = require('../orchestrator/journal');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
@@ -215,11 +215,15 @@ function onePoolDir(n = 1) {
   return dir;
 }
 
+// Same convention (and same value) as test/orphan-scan.test.js's own DEAD_PID: above this box's
+// pid_max, so process.kill(pid, 0) can never find a live process behind it.
+const DEAD_PID = 999999;
+
 const CRASH_CODE = 13; // classifyWorkerExit(dispatcher.js): not 0, not 20 -- 'crashed', by name.
 
 test(
   'the repark-claim file closes the orphanScan/reparkCrashedWorker double-repark race -- exactly one park, and the real scanner really deferred',
-  { timeout: 20000 },
+  { timeout: 40000 }, // six 8000ms waits cannot fit inside 20000ms: a slow-but-successful wait would otherwise turn a named failure into an opaque node:test timeout
   async () => {
     const queueDir = mkTmp('spo-repark-race-q-');
     const journalDir = mkTmp('spo-repark-race-j-');
@@ -228,6 +232,42 @@ test(
     const releaseFile = path.join(journalDir, 'release-repark');
 
     writeTask(queueDir, '0001-race.json', { id, kind: 'synthetic' });
+
+    // NEGATIVE CONTROL (verifier addition). Without it this test cannot tell "the scanner deferred
+    // BECAUSE of this task's claim" from "this scanner defers every task it sees" or "the claim's
+    // isAlive probe is a rubber stamp" -- both mutations leave every assertion below green. A
+    // SECOND taskDir in the SAME journal root, orphaned in exactly the same shape (non-terminal
+    // state.json, dead owner pid on this host, backdated updatedAt, not in queue/) but carrying NO
+    // claim, must be reparked by the SAME scanner pass that defers the claimed one.
+    // Two controls, not one: the first has NO claim (kills "this scanner defers everything"), the
+    // second carries a claim whose pid is DEAD (kills "the claim's isAlive probe is a rubber
+    // stamp" -- a stale claim must be cleared and the task reparked, never honoured forever).
+    const controlId = 'repark-race-demo-control-1';
+    const controlDir = path.join(journalDir, controlId);
+    fs.mkdirSync(controlDir, { recursive: true });
+    fs.writeFileSync(path.join(controlDir, 'task.json'), JSON.stringify({ id: controlId, kind: 'synthetic' }));
+    writeTaskState(controlDir, {
+      id: controlId,
+      state: 'DIAGNOSE',
+      owner: { host: os.hostname(), workerPid: DEAD_PID, workerStartedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() },
+      updatedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      diagnoseAttempts: 0, validateRejects: 0, ciImplementRetries: 0, mainMoveUsed: 0,
+      prNumber: null, worktreePath: null,
+    });
+
+    const staleId = 'repark-race-demo-control-stale-1';
+    const staleDir = path.join(journalDir, staleId);
+    fs.mkdirSync(staleDir, { recursive: true });
+    fs.writeFileSync(path.join(staleDir, 'task.json'), JSON.stringify({ id: staleId, kind: 'synthetic' }));
+    writeTaskState(staleDir, {
+      id: staleId,
+      state: 'DIAGNOSE',
+      owner: { host: os.hostname(), workerPid: DEAD_PID, workerStartedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() },
+      updatedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      diagnoseAttempts: 0, validateRejects: 0, ciImplementRetries: 0, mainMoveUsed: 0,
+      prNumber: null, worktreePath: null,
+    });
+    writeReparkClaim(staleDir, { id: staleId, pid: DEAD_PID, startedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() });
 
     const config = {
       ...defaultConfig,
@@ -274,6 +314,33 @@ test(
         () => readDaemonEvents(journalDir).some((e) => e.event === 'orphan-scan-repark-in-flight' && e.id === id),
         8000,
         `orphan-scan-repark-in-flight for ${id} was never journalled -- the real scanner process never observed the live claim before this test released the held repark child, so 'exactly one park' below would be an accident, not a fact this test established`
+      );
+
+      // ...and that same scanner DOES repark the unclaimed control task. This is what makes the
+      // deferral above specific to the claim rather than to the scanner deferring everything.
+      await waitFor(
+        () => readState(journalDir, controlId).state === 'PARKED',
+        8000,
+        `the unclaimed control task ${controlId} was never reparked -- this scanner defers every task it sees, so deferring the CLAIMED task proves nothing about the claim`
+      );
+      assert.equal(
+        readState(journalDir, controlId).reason,
+        'task-orphaned-daemon-restart',
+        'the control task must be reparked by the SCANNER, with the scanner\'s own reason'
+      );
+
+      // ...and a task whose claim is STALE (dead pid) must be reparked too, its claim cleared --
+      // otherwise a claim nothing will ever come back to release wedges the taskDir forever.
+      await waitFor(
+        () => readState(journalDir, staleId).state === 'PARKED',
+        8000,
+        `the STALE-claim control task ${staleId} was never reparked -- a claim whose pid is dead is being honoured as live, so any claim wedges its taskDir forever`
+      );
+      assert.equal(readState(journalDir, staleId).reason, 'task-orphaned-daemon-restart');
+      assert.equal(
+        fs.existsSync(reparkClaimPath(staleDir)),
+        false,
+        'a stale claim must be CLEARED by the scan that overrode it'
       );
 
       // The task must still be non-terminal at this instant -- the claim deferred the scan, it did

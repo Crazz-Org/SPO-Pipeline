@@ -1730,53 +1730,20 @@ test('card #78: the repark claim is cleared once the repark child exits', { time
 
 // ---- VERIFIER ADDITIONS (card #78 action 3 adversarial verification) --------------------------
 //
-// Four mutations SURVIVED the action's own six new tests. Each of the four tests below was written
-// against one of them and proved to kill it; the mutation each one answers is named in its header.
+// Four mutations SURVIVED the action's own six new tests. Three of the four tests written against
+// them (SURVIVOR 2-4 below) still stand; each proved to kill its mutation, named in its own header.
+// SURVIVOR 1's own test was later deleted -- see the comment in its place immediately below.
 
-// SURVIVOR 1: moving the claim write to AFTER `publishLiveWorkerIds()` (deferring it out of
-// reparkCrashedWorker into the very last statement of handleExit) survived the whole suite. It
-// survived because 'the repark CLAIM lands on disk before the id leaves live-workers.json' POLLS
-// from outside the process: both writes are synchronous statements in the same tick, so by the
-// time any external observer looks, both have happened, whichever order they ran in. The window
-// the ordering closes is real but microscopic -- orphan-scan.js runs in a SEPARATE process and can
-// be scheduled between two statements of this one -- and there is no runtime probe for it, so it
-// is pinned from source, exactly as the 'handleExit is synchronous end to end' test this action
-// deleted pinned its own un-probeable invariant (and as test/gh-api-argv.test.js pins a call-site
-// shape it cannot reach by mocking).
-test('card #78 (verifier): the claim write is a STATEMENT inside reparkCrashedWorker, and handleExit ends at publishLiveWorkerIds -- the ordering the file-level test cannot observe', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'dispatcher.js'), 'utf8');
-
-  const rStart = src.indexOf('  function reparkCrashedWorker(');
-  assert.notEqual(rStart, -1, 'reparkCrashedWorker not found -- this test needs updating with the refactor');
-  const rEnd = src.indexOf('\n  }\n', rStart);
-  assert.notEqual(rEnd, -1, 'could not find the end of reparkCrashedWorker');
-  const reparkBody = src.slice(rStart, rEnd);
-
-  assert.match(
-    reparkBody,
-    /\n\s{4}writeReparkClaim\(taskDir,/,
-    'writeReparkClaim is no longer an unconditional STATEMENT in reparkCrashedWorker (deferred into a closure, or moved out entirely) -- the claim is no longer guaranteed to be on disk before handleExit drops the id from live-workers.json'
-  );
-  const iClaim = reparkBody.indexOf('writeReparkClaim(taskDir,');
-  const iTrack = reparkBody.indexOf('reparking.set(');
-  const iPending = reparkBody.indexOf('pending.add(');
-  assert.ok(iClaim < iTrack, 'the claim must be written BEFORE the id is tracked in `reparking`');
-  assert.ok(iTrack < iPending, 'the id must be tracked in `reparking` before the exit-watch is registered');
-
-  const hStart = src.indexOf('  function handleExit(');
-  assert.notEqual(hStart, -1, 'handleExit not found -- this test needs updating with the refactor');
-  const hEnd = src.indexOf('\n  }\n', hStart);
-  const handleBody = src.slice(hStart, hEnd);
-  assert.ok(
-    handleBody.indexOf('reparkCrashedWorker(') < handleBody.lastIndexOf('live.delete(id)'),
-    'handleExit calls reparkCrashedWorker AFTER dropping the id from `live` -- the claim would then land after the id is already gone from live-workers.json'
-  );
-  assert.match(
-    handleBody,
-    /live\.delete\(id\);[^\n]*\n\s*publishLiveWorkerIds\(\);\s*$/,
-    'handleExit no longer ENDS at `live.delete(id); publishLiveWorkerIds();` -- a statement added after them (a deferred claim write, say) reopens the orphanScan double-repark window'
-  );
-});
+// The ordering this SURVIVOR 1 slot used to pin -- the claim write landing before handleExit's
+// live.delete(id)/publishLiveWorkerIds() -- is now pinned at RUNTIME by
+// test/repark-claim-publish-order.test.js, which spies on the real publish call and observes the
+// claim file's actual presence on disk at that instant. A source-scan was the wrong instrument for
+// it: verification found a behaviour-preserving refactor (extracting the claim write into a local
+// helper, still synchronous, still called from the same place) made the scan below FAIL on a no-op
+// change, while catching no mutation (a setImmediate deferral, the same violation written after the
+// publish, or removing the claim write entirely) that the runtime test does not already catch on
+// its own. A test that goes red on code it should accept, and stays green on nothing extra, is worse
+// than no test.
 
 // SURVIVOR 2: stamping the claim with the DISPATCHER's own pid instead of the repark child's
 // survived the whole suite -- 'the repark CLAIM lands on disk ...' only asserted `typeof claim.pid

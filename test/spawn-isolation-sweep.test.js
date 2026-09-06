@@ -446,6 +446,20 @@ const ALLOWLIST = new Map([
     },
   ],
   [
+    'repark-claim-publish-order.test.js',
+    {
+      reason:
+        'all three sites are `-e` inline one-liners standing in for a worker (writes a real ' +
+        'state.json, then exits a crash code), a repark-task child (a bare setTimeout -- this ' +
+        'file pins the PARENT\'s statement ordering, never the child\'s own work) and a scanner ' +
+        'stand-in (a long setTimeout, so the dispatcher\'s unconditional single scanner spawn and ' +
+        'its respawn/breaker loop stay out of the way) -- the same shape dispatcher.test.js\'s and ' +
+        'repark-race-demo.test.js\'s own worker/scanner stand-ins already take, and each derives ' +
+        'its env from isolatedEnv(). No daemon.js/bin/spo child is spawned by this file at all.',
+      patterns: ["'-e',"],
+    },
+  ],
+  [
     'repark-race-demo.test.js',
     {
       reason:
@@ -632,6 +646,7 @@ test('the ALLOWLIST and FILE_ALLOWLIST are pinned by name', () => {
       'product-repo-lock.test.js',
       'recette.test.js',
       'release-script.test.js',
+      'repark-claim-publish-order.test.js',
       'repark-race-demo.test.js',
       'status-6.7.test.js',
       'tokens.test.js',
