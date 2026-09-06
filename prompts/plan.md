@@ -135,6 +135,27 @@ you are drafting the file content, not a description of it.
   happens to still resolve today, is worse than an honest miss: it puts a fact on record that
   IMPLEMENT is now bound to preserve. Quote only what you have actually verified in the file,
   never a paraphrase and never a guess.
+- An invariant may not quote a span this same plan orders changed. The invariants file freezes
+  what must NOT move; a line the plan tells IMPLEMENT to rewrite, insert into, or delete is by
+  definition not that.
+  - This is about the **line span**, not the file. Freezing a fact in a file the plan also
+    changes elsewhere is normal and expected — the `files_to_change` guidance above already
+    contemplates exactly that. What is forbidden is freezing the *specific region* the plan
+    targets.
+  - Insertion counts. The check is a contiguous-substring test: inserting a new line in the
+    MIDDLE of a quoted block breaks it just as surely as editing one of its lines, even though
+    every original line survives.
+  - Quote a stable neighbouring fact the change depends on instead — the enclosing component's
+    signature, the type the new field is added to, the helper being called — rather than the
+    block being edited. If nothing outside the change zone is worth freezing, write no invariant
+    for that file rather than freezing the change zone.
+  - The driver detects this overlap at PLAN time and records it against the invariant — nothing
+    is dropped, and the invariant is still checked exactly like any other. If it does break,
+    CHECK recognises the plan's own contradiction and lets the task continue instead of spending
+    a DIAGNOSE/IMPLEMENT cycle on it. That is not a reason to write one anyway: an invariant
+    flagged this way can never catch a genuine regression — the plan itself already announced
+    the exact hole — so freezing the wrong span still proves nothing, even when the driver
+    forgives its failure.
 - A command whose exit code is the thing being judged is never piped into `tail`/`head`/`grep`
   and never backgrounded with a trailing `&` — both destroy the code the driver needs to read.
   If a command's output must be trimmed, redirect to a file and let the reader filter the file,

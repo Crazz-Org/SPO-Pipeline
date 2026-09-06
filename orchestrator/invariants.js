@@ -40,10 +40,10 @@
 //   >>> END QUOTE
 //
 // - `## INV-<n>` is the block's id line.
-// - The next non-blank line is `File: <path>:<line>` or `File: <path>:<start>-<end>` -- the line
-//   spec is citation metadata only, never used for matching (the check is a substring test over
-//   the whole cited file's contents, not line-anchored -- IMPLEMENT is free to move a line within
-//   a file without that alone counting as breaking the invariant).
+// - The next non-blank line is `File: <path>:<line>` or `File: <path>:<start>-<end>` -- parsed
+//   into `declaredSpan` for callers, but still not used for matching itself (the check is a
+//   substring test over the whole cited file's contents, not line-anchored -- IMPLEMENT is free
+//   to move a line within a file without that alone counting as breaking the invariant).
 // - Everything between a literal `>>> QUOTE` line and the next literal `>>> END QUOTE` line is
 //   the quote, byte-for-byte (no trimming, no reflow) -- a delimiter that tolerates multi-line
 //   content and a quote containing ``` backtick fences ```, which a triple-backtick-fenced quote
@@ -66,6 +66,15 @@ const QUOTE_END = '>>> END QUOTE';
 // contain the quote within its first slice is reported unresolved, not crashed on.
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
+// Caps the `lineSpec` string written onto a resolveAll() ROW -- the one handlePlan journals
+// verbatim as part of `invariants-baseline` -- regardless of how long the raw `File:` line
+// PLAN wrote actually is. Parsing itself (parseLineSpec) still runs on the full, uncapped
+// string; only the value that flows into the journal (and from there, potentially, a GitHub
+// comment body capped at 65536 chars -- see PROTECTED_LINE_MAX_LENGTH in orchestrator/intake.js
+// for the established convention this mirrors) is bounded. Generous for any real line spec: a
+// legitimate one ("123" or "120-135") is under 20 characters.
+const LINE_SPEC_MAX_LENGTH = 64;
+
 function normalizeWhitespace(s) {
   return (s || '').replace(/\s+/g, ' ').trim();
 }
@@ -77,6 +86,31 @@ function splitFileLineSpec(spec) {
   const idx = spec.lastIndexOf(':');
   if (idx === -1) return { file: spec.trim(), lineSpec: null };
   return { file: spec.slice(0, idx).trim(), lineSpec: spec.slice(idx + 1).trim() };
+}
+
+// Parses a raw `lineSpec` string ("123", "120-135", tolerating surrounding whitespace, whitespace
+// around the dash, and an en/em dash as the separator -- PLAN prose has been observed using both)
+// into {start, end}, both positive integers with end >= start. Never throws, on any input
+// (including non-string). A reversed range ("135-120") is malformed, not "meant the other way
+// round" -- returned as null rather than silently swapped, so a caller can never trust a fabricated
+// span. Zero, negative, non-numeric, empty, or unparseable input -> null.
+function parseLineSpec(lineSpec) {
+  if (typeof lineSpec !== 'string') return null;
+  const trimmed = lineSpec.trim();
+  if (trimmed === '') return null;
+
+  const match = trimmed.match(/^(\d+)\s*(?:[-–—]\s*(\d+))?$/);
+  if (!match) return null;
+
+  const start = parseInt(match[1], 10);
+  const end = match[2] !== undefined ? parseInt(match[2], 10) : start;
+  if (start <= 0 || end <= 0 || end < start) return null;
+  // `parseInt` on an absurdly long digit string overflows to Infinity, which JSON.stringify --
+  // i.e. the journal -- silently turns into `null` on round-trip, handing a caller a truthy
+  // {start: null, end: null} object instead of the documented "both positive integers" or null.
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return null;
+
+  return { start, end };
 }
 
 // Parses `markdown` into {invariants: [{id, file, lineSpec, quote}], issues: [{id, reason}]}.
@@ -136,7 +170,7 @@ function parseInvariantsMarkdown(markdown) {
 
     seenIds.add(id);
     const quote = lines.slice(k + 1, endIdx).join('\n');
-    invariants.push({ id, file, lineSpec, quote });
+    invariants.push({ id, file, lineSpec, quote, declaredSpan: parseLineSpec(lineSpec) });
     i = endIdx; // resume scanning right after this block
   }
 
@@ -202,31 +236,53 @@ function readCapped(absFile) {
   }
 }
 
+// Counts '\n' characters in `str` over [0, endExclusive) without slicing/copying `str` -- used to
+// turn a substring offset into a 1-based line number for a file that may be up to MAX_FILE_BYTES.
+function countNewlines(str, endExclusive) {
+  let count = 0;
+  for (let i = 0; i < endExclusive; i++) {
+    if (str.charCodeAt(i) === 10) count++;
+  }
+  return count;
+}
+
 // Resolves one {file, quote} pair against `worktreeRoot`. Two match modes, tried in order
 // (requirement (c)): (1) an exact substring of the file's contents; (2) a whitespace-normalized
 // fallback (collapse whitespace runs on both sides) so indentation/reflow drift alone never
-// produces a false regression. Returns {resolved, mode: 'exact'|'normalized'|null, reason?} --
-// `reason` is set on every non-resolved outcome, for journaling.
+// produces a false regression. Returns {resolved, mode: 'exact'|'normalized'|null, reason?, span}
+// -- `reason` is set on every non-resolved outcome, for journaling; `span` is the 1-based
+// {start, end} line range the quote actually occupies in the file AS IT IS NOW, but ONLY for an
+// exact match -- whitespace normalization collapses runs and destroys any reliable offset back to
+// real file lines, so the normalized-match and every non-resolved outcome report `span: null`
+// rather than inventing one.
 function resolveInvariant(worktreeRoot, invariant) {
   const quote = (invariant && invariant.quote) || '';
-  if (quote.trim() === '') return { resolved: false, mode: null, reason: 'empty-quote' };
+  if (quote.trim() === '') return { resolved: false, mode: null, reason: 'empty-quote', span: null };
 
   const file = invariant && invariant.file;
   if (!isInsideWorktree(worktreeRoot, file)) {
-    return { resolved: false, mode: null, reason: 'outside-worktree' };
+    return { resolved: false, mode: null, reason: 'outside-worktree', span: null };
   }
 
   const content = readCapped(path.resolve(worktreeRoot, file));
-  if (content === null) return { resolved: false, mode: null, reason: 'file-unreadable' };
+  if (content === null) return { resolved: false, mode: null, reason: 'file-unreadable', span: null };
 
-  if (content.includes(quote)) return { resolved: true, mode: 'exact' };
+  const idx = content.indexOf(quote);
+  if (idx !== -1) {
+    const start = countNewlines(content, idx) + 1;
+    // A trailing '\n' belongs to the line it terminates -- the same convention `start` already
+    // follows for a LEADING '\n' (see the dedicated test below). Counting it as pushing the quote
+    // onto one more line would claim a line the quote's text never actually occupies.
+    const end = start + countNewlines(quote, quote.endsWith('\n') ? quote.length - 1 : quote.length);
+    return { resolved: true, mode: 'exact', span: { start, end } };
+  }
 
   const normalizedQuote = normalizeWhitespace(quote);
   if (normalizedQuote !== '' && normalizeWhitespace(content).includes(normalizedQuote)) {
-    return { resolved: true, mode: 'normalized' };
+    return { resolved: true, mode: 'normalized', span: null };
   }
 
-  return { resolved: false, mode: null, reason: 'not-found' };
+  return { resolved: false, mode: null, reason: 'not-found', span: null };
 }
 
 function readInvariantsFile(invariantsPath) {
@@ -251,6 +307,10 @@ function resolveAll(worktreeRoot, invariantsPath) {
   const resolved = invariants.map((inv) => {
     const r = resolveInvariant(worktreeRoot, inv);
     const row = { id: inv.id, file: inv.file, resolved: r.resolved, mode: r.mode };
+    const lineSpec = inv.lineSpec === undefined ? null : inv.lineSpec;
+    row.lineSpec = typeof lineSpec === 'string' ? lineSpec.slice(0, LINE_SPEC_MAX_LENGTH) : lineSpec;
+    row.declaredSpan = inv.declaredSpan || null;
+    row.span = r.span || null;
     if (!r.resolved) row.reason = r.reason;
     return row;
   });
@@ -304,6 +364,7 @@ function checkRegressions(worktreeRoot, invariantsPath, baselineInvariants) {
 
 module.exports = {
   parseInvariantsMarkdown,
+  parseLineSpec,
   isInsideWorktree,
   resolveInvariant,
   buildBaseline,

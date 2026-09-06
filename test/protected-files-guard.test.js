@@ -739,6 +739,28 @@ test('prompts/plan.md: the files_to_change instruction is numbered item 4 (kills
   assert.equal(match[1], '4');
 });
 
+test('prompts/plan.md: the Rules section forbids freezing an invariant over a span the plan itself changes (#112)', () => {
+  const planMd = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'plan.md'), 'utf8');
+  const rulesSection = planMd.slice(planMd.indexOf('## Rules'));
+  const flattened = rulesSection.replace(/\s+/g, ' ');
+
+  assert.match(
+    flattened,
+    /invariant[\s\S]{0,200}span[\s\S]{0,200}plan[\s\S]{0,200}chang/i,
+    'expected a Rules bullet prohibiting an invariant from freezing a span the plan changes'
+  );
+  assert.match(
+    flattened,
+    /contiguous-substring test/i,
+    'expected the rule to name the contiguous-substring test that insertion also breaks'
+  );
+  assert.match(
+    flattened,
+    /insert\w*[\s\S]{0,150}(?:middle|break)/i,
+    'expected the rule to call out that inserting into the middle of a quoted block breaks it too'
+  );
+});
+
 // =============================================================================================
 // ---- handlePlan: the JSON-encoded string shape -- #118, the defect that made the guard dead ---
 // =============================================================================================
