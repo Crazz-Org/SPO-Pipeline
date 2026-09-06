@@ -297,4 +297,4 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
   return recovered;
 }
 
-module.exports = { shouldScanOrphans, orphanScan, queuedIds };
+module.exports = { shouldScanOrphans, orphanScan, queuedIds, TERMINAL_STATES };

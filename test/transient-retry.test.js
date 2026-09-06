@@ -33,6 +33,7 @@ require('./no-real-spawn');
 const { buildCtx, finalizePark, takeNextTask, drainQueueOnce } = require('../orchestrator/state-machine');
 const { reEnqueueTask, unparkScan } = require('../orchestrator/park-loop');
 const { writeState } = require('../orchestrator/journal');
+const { queuedIds } = require('../orchestrator/orphan-scan');
 
 function mkTmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -75,6 +76,19 @@ function readJournal(taskDir) {
 
 function queuedFiles(queueDir) {
   return fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [];
+}
+
+// Reads <journalRoot>/daemon.jsonl directly -- distinct from this file's own daemonEvents(ctx)
+// above (which derives the path from a ctx.taskDir), because the disposal-failure test below has
+// a journalRoot but no ctx.
+function readDaemonJsonl(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
 }
 
 // Builds a ctx via the real buildCtx (so it carries every field finalizePark reads: config,
@@ -278,6 +292,20 @@ function writeQueueFile(queueDir, name, obj) {
   fs.writeFileSync(path.join(queueDir, name), JSON.stringify(obj, null, 2) + '\n');
 }
 
+// card #80 verification fix: mkTmp() itself always returns a UNIQUE directory (mkdtempSync), but
+// `path.dirname(that directory)` is just os.tmpdir() -- shared by every test in every run, past
+// and future. refuseDuplicateQueueEntry (state-machine.js) disposes into a SIBLING of queueDir, so
+// a bare `mkTmp('...-queue-')` queueDir would put every test's refused entries into the SAME
+// shared `os.tmpdir()/queue-refused/`, where a leftover file from an earlier run (or a concurrent
+// test) can satisfy a same-named `existsSync` assertion for the wrong reason -- measured: mutating
+// the disposal rename to `unlinkSync` still passed every disposal test on a dirty /tmp. Give each
+// test its OWN root and nest queue/ one level inside it, so the sibling queue-refused/ this
+// function creates is isolated to that root too.
+function mkIsolatedQueueDir() {
+  const root = mkTmp('spo-transient-takenext-root-');
+  return path.join(root, 'queue');
+}
+
 test('takeNextTask: skips an entry whose notBefore is in the future, takes a later eligible one', () => {
   const queueDir = mkTmp('spo-transient-takenext-queue-');
   const journalRoot = mkTmp('spo-transient-takenext-journal-');
@@ -352,6 +380,212 @@ test('takeNextTask: 0000-retry- priority is preserved when the retry IS eligible
 
   const taken = takeNextTask(queueDir, journalRoot);
   assert.equal(taken.id, 'x', 'the 0000-retry- entry must still win when it is actually due');
+});
+
+// ---- 7b: card #80 -- a queue entry duplicating a TERMINAL taskDir must be refused, not drained --
+//
+// takeNextTask used to have exactly two per-candidate checks (notBefore, liveIds) and nothing that
+// read <journalRoot>/<id>/state.json. A hand-filed queue entry, or a reEnqueueTask retry racing a
+// task that finishes between being queued and being taken, whose id matches an
+// already-DONE or already-ABANDONED taskDir would rename straight over its task.json, and
+// runTask's very first writeState (INTAKE snapshot) would then clobber the terminal state.json --
+// reproduced via `daemon.js --dry-run --once` before this fix, a DONE card's prNumber going 4321
+// -> null. PARKED is deliberately exempt (it is the retry channel: park-loop.js's reEnqueueTask and
+// finalizePark's transient auto-retry both rely on draining back over a PARKED taskDir) and so is
+// every non-terminal state. See UNDRAINABLE_STATES's own header comment in state-machine.js.
+
+function readJsonFile(p) {
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+test('takeNextTask: a DONE taskDir refuses a duplicate queue entry -- task.json and state.json untouched, entry moved to queue-refused/', () => {
+  const queueDir = mkIsolatedQueueDir();
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-done');
+  fs.mkdirSync(taskDir, { recursive: true });
+  writeState(taskDir, { id: 'card-done', state: 'DONE', prNumber: 4321, updatedAt: new Date().toISOString() });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 'card-done', title: 'original' }, null, 2));
+  const stateBefore = fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8');
+  const taskJsonBefore = fs.readFileSync(path.join(taskDir, 'task.json'), 'utf8');
+
+  writeQueueFile(queueDir, '0001-dup.json', { id: 'card-done', title: 'duplicate' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.equal(taken, null, 'nothing else eligible in queue/ -- the only candidate was refused');
+
+  // task.json is untouched -- the rename never happened.
+  assert.equal(fs.readFileSync(path.join(taskDir, 'task.json'), 'utf8'), taskJsonBefore);
+  // state.json is byte-identical -- this is the whole point of the card. Assert the full parsed
+  // object (including prNumber), not just that a write didn't happen to look different.
+  assert.equal(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'), stateBefore);
+  assert.deepEqual(readJsonFile(path.join(taskDir, 'state.json')), {
+    id: 'card-done',
+    state: 'DONE',
+    prNumber: 4321,
+    updatedAt: readJsonFile(path.join(taskDir, 'state.json')).updatedAt,
+  });
+
+  // Gone from queue/, present in the sibling queue-refused/ -- never a subdirectory of queueDir.
+  // The full LISTING, not existsSync of one known name: queueDir is isolated per-test (see
+  // mkIsolatedQueueDir), so this is exactly the refused entry and nothing a leftover run left behind.
+  assert.deepEqual(queuedFiles(queueDir), []);
+  const refusedDir = path.join(path.dirname(queueDir), 'queue-refused');
+  assert.deepEqual(fs.readdirSync(refusedDir).sort(), ['0001-dup.json'], 'refused entry must land in queue-refused/, and nothing else must be there');
+
+  const events = readJournal(taskDir);
+  const refusal = events.find((e) => e.event === 'duplicate-queue-entry-refused');
+  assert.ok(refusal, 'journal.jsonl must record the refusal');
+  assert.equal(refusal.state, 'DONE');
+  assert.equal(refusal.fromFile, '0001-dup.json');
+});
+
+test('takeNextTask: an ABANDONED taskDir refuses a duplicate queue entry the same way', () => {
+  const queueDir = mkIsolatedQueueDir();
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-abandoned');
+  fs.mkdirSync(taskDir, { recursive: true });
+  writeState(taskDir, { id: 'card-abandoned', state: 'ABANDONED', updatedAt: new Date().toISOString() });
+  writeQueueFile(queueDir, '0001-dup.json', { id: 'card-abandoned' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.equal(taken, null);
+  assert.deepEqual(queuedFiles(queueDir), []);
+  const refusedDir = path.join(path.dirname(queueDir), 'queue-refused');
+  assert.deepEqual(fs.readdirSync(refusedDir).sort(), ['0001-dup.json']);
+  assert.ok(readJournal(taskDir).some((e) => e.event === 'duplicate-queue-entry-refused' && e.state === 'ABANDONED'));
+});
+
+test('takeNextTask: a PARKED taskDir still DRAINS NORMALLY -- the retry channel regression guard', () => {
+  const queueDir = mkTmp('spo-transient-takenext-queue-');
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-parked');
+  fs.mkdirSync(taskDir, { recursive: true });
+  writeState(taskDir, { id: 'card-parked', state: 'PARKED', reason: 'claim-rate-limited', updatedAt: new Date().toISOString() });
+  writeQueueFile(queueDir, '0000-retry-1-card-parked.json', { id: 'card-parked' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.ok(taken, 'a PARKED taskDir must still be drainable -- it is the retry channel');
+  assert.equal(taken.id, 'card-parked');
+  assert.equal(fs.existsSync(path.join(taskDir, 'task.json')), true, 'task.json must have been renamed into place');
+  assert.deepEqual(queuedFiles(queueDir), []);
+});
+
+test('takeNextTask: a non-terminal state (GATE) drains normally', () => {
+  const queueDir = mkTmp('spo-transient-takenext-queue-');
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-gate');
+  fs.mkdirSync(taskDir, { recursive: true });
+  writeState(taskDir, { id: 'card-gate', state: 'GATE', updatedAt: new Date().toISOString() });
+  writeQueueFile(queueDir, '0001-card-gate.json', { id: 'card-gate' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.ok(taken, 'a non-terminal state must never be refused');
+  assert.equal(taken.id, 'card-gate');
+});
+
+test('takeNextTask: no journal dir at all drains normally -- the ordinary shape of fresh intake', () => {
+  const queueDir = mkTmp('spo-transient-takenext-queue-');
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  // Deliberately no mkdirSync(journalRoot/<id>) at all -- makeTask only creates a journal dir when
+  // one does not already exist, so a fresh card has none. A reader that throws here would break
+  // 100% of normal intake.
+  writeQueueFile(queueDir, '0001-fresh.json', { id: 'card-fresh' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.ok(taken, 'an absent state.json must fail OPEN, never refuse');
+  assert.equal(taken.id, 'card-fresh');
+});
+
+test('takeNextTask: a malformed/unreadable state.json drains normally -- fail open', () => {
+  const queueDir = mkTmp('spo-transient-takenext-queue-');
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-broken-state');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'state.json'), '{ not valid json at all');
+  writeQueueFile(queueDir, '0001-card-broken-state.json', { id: 'card-broken-state' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.ok(taken, 'a malformed state.json must fail OPEN, never refuse');
+  assert.equal(taken.id, 'card-broken-state');
+});
+
+test('takeNextTask: refusing one candidate does not stop the scan -- a healthy entry behind it is still taken', () => {
+  const queueDir = mkIsolatedQueueDir();
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const doneTaskDir = path.join(journalRoot, 'card-done-2');
+  fs.mkdirSync(doneTaskDir, { recursive: true });
+  writeState(doneTaskDir, { id: 'card-done-2', state: 'DONE', updatedAt: new Date().toISOString() });
+
+  writeQueueFile(queueDir, '0001-dup.json', { id: 'card-done-2' });
+  writeQueueFile(queueDir, '0002-healthy.json', { id: 'card-healthy' });
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.ok(taken, 'the scan must continue past a refused candidate');
+  assert.equal(taken.id, 'card-healthy');
+
+  const refusedDir = path.join(path.dirname(queueDir), 'queue-refused');
+  assert.deepEqual(fs.readdirSync(refusedDir).sort(), ['0001-dup.json']);
+});
+
+test('takeNextTask: a refused entry no longer inflates orphan-scan.js\'s queuedIds() -- constraint 5\'s anti-regression', () => {
+  const queueDir = mkIsolatedQueueDir();
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-done-3');
+  fs.mkdirSync(taskDir, { recursive: true });
+  writeState(taskDir, { id: 'card-done-3', state: 'DONE', updatedAt: new Date().toISOString() });
+  writeQueueFile(queueDir, '0001-dup.json', { id: 'card-done-3' });
+
+  assert.ok(queuedIds(queueDir).has('card-done-3'), 'sanity: present before the refusal runs');
+
+  const taken = takeNextTask(queueDir, journalRoot);
+
+  // Pin down WHY it's gone from queuedIds -- not because it drained (which would ALSO remove it
+  // from queue/, for the wrong reason, and pass this assertion even on reverted production code):
+  // nothing was taken, and no task.json was ever renamed into taskDir.
+  assert.equal(taken, null, 'the only candidate is a refused duplicate -- nothing should be taken');
+  assert.equal(fs.existsSync(path.join(taskDir, 'task.json')), false, 'a refused duplicate must never be renamed into the terminal taskDir');
+  assert.ok(!queuedIds(queueDir).has('card-done-3'), 'a refused duplicate must not linger in queue/ and inflate queue depth');
+});
+
+test('takeNextTask: a disposal failure never escapes to the drain loop, and is journalled rather than swallowed silently', () => {
+  const queueDir = mkIsolatedQueueDir();
+  const journalRoot = mkTmp('spo-transient-takenext-journal-');
+  const taskDir = path.join(journalRoot, 'card-done-4');
+  fs.mkdirSync(taskDir, { recursive: true });
+  writeState(taskDir, { id: 'card-done-4', state: 'DONE', prNumber: 555, updatedAt: new Date().toISOString() });
+  const stateBefore = fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8');
+  writeQueueFile(queueDir, '0001-dup.json', { id: 'card-done-4' });
+
+  // Force disposal to fail: pre-create the SIBLING path refuseDuplicateQueueEntry wants to
+  // mkdirSync as a REGULAR FILE, so `fs.mkdirSync(refusedDir, {recursive:true})` throws EEXIST --
+  // the exact probe this fix's own review called for.
+  const refusedDir = path.join(path.dirname(queueDir), 'queue-refused');
+  fs.writeFileSync(refusedDir, 'not a directory');
+
+  const taken = takeNextTask(queueDir, journalRoot);
+
+  // (a) the candidate is still refused, never taken/drained, disposal failure notwithstanding.
+  assert.equal(taken, null, 'a disposal failure must not fall through to draining the candidate');
+  assert.equal(fs.existsSync(path.join(taskDir, 'task.json')), false, 'never renamed into the terminal taskDir');
+  // The queue file is left in place (the rename that would remove it never got a chance to run --
+  // mkdirSync threw first) -- still not drained, which is the only safety property that matters.
+  assert.deepEqual(queuedFiles(queueDir), ['0001-dup.json']);
+
+  // (b) state.json is untouched.
+  assert.equal(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'), stateBefore);
+
+  // (c) the failure IS journalled -- on both channels, not swallowed by the catch.
+  const taskEvents = readJournal(taskDir);
+  const taskFailure = taskEvents.find((e) => e.event === 'duplicate-queue-entry-refusal-disposal-failed');
+  assert.ok(taskFailure, 'journal.jsonl must record the disposal failure, not go silent');
+  assert.equal(taskFailure.fromFile, '0001-dup.json');
+  assert.equal(taskFailure.state, 'DONE');
+  assert.ok(taskFailure.error, 'the underlying error message must be recorded');
+
+  const daemonJsonl = readDaemonJsonl(journalRoot);
+  const daemonFailure = daemonJsonl.find((e) => e.event === 'duplicate-queue-entry-refusal-disposal-failed');
+  assert.ok(daemonFailure, 'daemon.jsonl must record the disposal failure too');
+  assert.equal(daemonFailure.id, 'card-done-4');
 });
 
 // ---- 8: the maintainer retry path strips transientRetries and notBefore -----------------------

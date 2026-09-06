@@ -67,9 +67,10 @@ const {
   countRepeatedParks,
   readJournalLines,
   reEnqueueTask,
+  readJsonSafe,
 } = require('./park-loop');
 const { createScanState } = require('./comment-scan');
-const { shouldScanOrphans, orphanScan, queuedIds } = require('./orphan-scan');
+const { shouldScanOrphans, orphanScan, queuedIds, TERMINAL_STATES } = require('./orphan-scan');
 const { alertPark } = require('./park-alert');
 const { shouldAutoPull, runAutoPull } = require('./auto-pull');
 const { shouldAutoTriage, runAutoTriage } = require('./auto-triage');
@@ -1981,6 +1982,93 @@ function isQueueEntryEligibleNow(task, nowMs) {
   return !(notBeforeMs > nowMs);
 }
 
+// action #80: which terminal states must NEVER be drained over. Narrower than TERMINAL_STATES on
+// purpose: PARKED is the RETRY CHANNEL. A maintainer `retry` (park-loop.js's reEnqueueTask) and
+// finalizePark's own transient auto-retry both re-enqueue a task and rely on takeNextTask renaming
+// a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
+// retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
+// ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
+// gates a second time at park-loop.js:1262 (`if (state.state !== 'PARKED') continue;`), which
+// makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
+// refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
+// drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal
+// state added there is refused by default instead of silently drained.
+const UNDRAINABLE_STATES = new Set([...TERMINAL_STATES].filter((s) => s !== 'PARKED'));
+
+// action #80: a queue entry whose id names a taskDir already sitting in an UNDRAINABLE_STATES
+// state (DONE/ABANDONED) must never be taken -- takeNextTask's rename would overwrite task.json
+// and runTask's first writeState would clobber a terminal state.json. Refusing is not a park (this
+// function has no ctx to park with) -- it is disposal: move the queue file OUT of queue/ (never
+// leave it to spin forever or inflate queue depth -- see the callers of listQueueFiles/queuedIds)
+// into a SIBLING directory, `queue-refused/`, deliberately not a subdirectory of queueDir, so
+// listQueueFiles, bin/spo's queue-depth count, and orphan-scan.js's queuedIds() all stay blind to
+// it. No unlink precedent exists anywhere in this codebase (a duplicate could legitimately recur,
+// so it is kept, not destroyed) -- this mirrors auto-triage.js's IN_PROGRESS_DIRNAME claim-by-
+// rename idiom instead. Journals to journal.jsonl and daemon.jsonl only; state.json is never
+// touched, which is the entire point of the card. Wrapped in try/catch because this runs inside
+// the daemon's live scan cycle -- a disposal failure (e.g. a racing process, an uncreatable
+// queue-refused/) must never take the drain loop down with it; the candidate stays refused either
+// way, and the catch itself journals the failure (never silently) so the entry sticking in
+// queue/ across cycles is visible, not the same silent hole this card exists to close moved down
+// one level.
+function refuseDuplicateQueueEntry(queueDir, file, taskDir, terminalState, journalRoot) {
+  let dest = null;
+  try {
+    const refusedDir = path.join(path.dirname(queueDir), 'queue-refused');
+    fs.mkdirSync(refusedDir, { recursive: true });
+    dest = path.join(refusedDir, file);
+    if (fs.existsSync(dest)) {
+      const stem = path.basename(file, '.json');
+      let n = 1;
+      do {
+        dest = path.join(refusedDir, `${stem}.dup${n}.json`);
+        n += 1;
+      } while (fs.existsSync(dest));
+    }
+    fs.renameSync(path.join(queueDir, file), dest);
+    appendEvent(taskDir, terminalState, 'duplicate-queue-entry-refused', {
+      fromFile: file,
+      state: terminalState,
+      movedTo: dest,
+    });
+    appendDaemonEvent(journalRoot, 'duplicate-queue-entry-refused', {
+      id: path.basename(taskDir),
+      fromFile: file,
+      state: terminalState,
+      movedTo: dest,
+    });
+  } catch (err) {
+    // Disposal failed (queue-refused/ uncreatable, a losing race on the rename, etc.) -- the
+    // candidate is STILL refused either way (the caller's `continue` already skipped it; this
+    // file was simply never renamed into taskDir), but a silent catch here would recreate the
+    // exact hole this card exists to close, just moved one level down: the entry sticks in
+    // queue/ forever with nothing on either journal saying why. So journal it, best-effort, on
+    // BOTH channels -- each in its OWN try/catch so a failure writing to one (taskDir itself
+    // could be the thing that is gone or unwritable) can never suppress the other, and neither
+    // can ever escape back out to the drain loop. `dest` may still be null (mkdirSync/existsSync
+    // failed before a destination was even chosen) -- recorded as `attemptedMovedTo` either way.
+    const detail = {
+      fromFile: file,
+      state: terminalState,
+      attemptedMovedTo: dest,
+      error: String((err && err.message) || err),
+    };
+    try {
+      appendEvent(taskDir, terminalState, 'duplicate-queue-entry-refusal-disposal-failed', detail);
+    } catch {
+      // taskDir itself may be gone/unwritable -- daemon.jsonl below is the fallback record.
+    }
+    try {
+      appendDaemonEvent(journalRoot, 'duplicate-queue-entry-refusal-disposal-failed', {
+        id: path.basename(taskDir),
+        ...detail,
+      });
+    } catch {
+      // Nothing left to record to -- never let this reach the drain loop either way.
+    }
+  }
+}
+
 // Takes the earliest ELIGIBLE task file out of queue/ and into its own runtime dir,
 // journal/<id>/task.json -- moving it (not copying) is what makes "queue depth" mean "not yet
 // taken" for `spo status`, and what keeps a polling daemon from reprocessing it.
@@ -2033,12 +2121,25 @@ function takeNextTask(queueDir, journalRoot, liveIds = null) {
     const candidateId =
       candidateTask && candidateTask.id ? String(candidateTask.id) : path.basename(candidate, '.json');
     if (liveIds && liveIds.has(candidateId)) continue; // owned by a live worker right now -- see header above
+
+    // action #80: refuse a candidate that duplicates a taskDir already sitting in DONE/ABANDONED
+    // -- see UNDRAINABLE_STATES's header for exactly why PARKED and every non-terminal state are
+    // excluded from this check. Fails OPEN on an absent, unreadable, or malformed state.json (no
+    // journal dir at all is the ordinary shape of every fresh card -- readJsonSafe returns null,
+    // `candidateState && ...` short-circuits, this candidate drains exactly as before).
+    const candidateTaskDir = path.join(journalRoot, candidateId);
+    const candidateState = readJsonSafe(path.join(candidateTaskDir, 'state.json'));
+    if (candidateState && UNDRAINABLE_STATES.has(candidateState.state)) {
+      refuseDuplicateQueueEntry(queueDir, candidate, candidateTaskDir, candidateState.state, journalRoot);
+      continue;
+    }
+
     file = candidate;
     task = candidateTask;
     id = candidateId;
     break;
   }
-  if (!file) return null; // every entry is scheduled for later, or live-owned -- see the header comment above.
+  if (!file) return null; // every entry is scheduled for later, live-owned, or refused -- see above.
 
   const srcPath = path.join(queueDir, file);
   const taskDir = path.join(journalRoot, id);

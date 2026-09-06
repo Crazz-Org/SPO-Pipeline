@@ -1404,6 +1404,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/park-loop.js :: intake.js:797-799",
   "orchestrator/state-machine.js :: auto-pull.js:49-57",
   "orchestrator/state-machine.js :: auto-pull.js:49-57",
+  "orchestrator/state-machine.js :: park-loop.js:1262", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/steps/llm.js :: intake.js:797-799",
   "orchestrator/steps/scripted.js :: run.ts:63",
@@ -2019,7 +2020,14 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // queued, inFlight) placed close enough in the citing prose to out-rank any other nearby
   // candidate; daemon.js:714 anchors on its own nearby prose. See EXPECTED_CITATIONS above for
   // the exact 5 additions.
-  assert.equal(anchored, 27, `expected 27 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // card #80 (2026-09-06): +1 citation, `orchestrator/state-machine.js :: park-loop.js:1262`
+  // (UNDRAINABLE_STATES's own header, explaining why ABANDONED is refused but PARKED is not).
+  // Re-measured: 28 verified (was 27), 2 unanchorable (unchanged), 0 offenders. It anchors on
+  // 'PARKED' (quoted, const-shaped) and `reconcileExternalClosure` (camelCase) -- either one
+  // alone is enough to anchor it, and `reconcileExternalClosure` alone is what still anchors it
+  // one line up, at park-loop.js:1261 ("...only reconcileExternalClosure runs for it.") -- see
+  // ANCHOR_BLUNT_CITATIONS below for why that also makes it blunt, not merely anchored.
+  assert.equal(anchored, 28, `expected 28 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
@@ -2072,6 +2080,17 @@ const ANCHOR_BLUNT_CITATIONS = {
   'orchestrator/park-loop.js :: doc/remediation-progress.md:658':
     "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 649 and its own " +
     'continuation line 650. Citation confirmed correct by hand: 649 is the bullet heading.',
+  // state-machine.js: UNDRAINABLE_STATES's own header cites park-loop.js:1262 (`if
+  // (state.state !== 'PARKED') continue;`) for why ABANDONED's retry branch is unreachable. Line
+  // 1261, the comment immediately above the cited gate, reads "...only reconcileExternalClosure
+  // runs for it." -- `reconcileExternalClosure` ALONE is on that line ('PARKED' itself is on 1260
+  // and on the cited line 1262, not on 1261), and that one candidate is enough on its own to make
+  // the citation anchor a line up too. Citation confirmed correct by hand: 1262 IS the gate line.
+  'orchestrator/state-machine.js :: park-loop.js:1262':
+    "target's own preceding comment line (1261) already names 'reconcileExternalClosure' -- that " +
+    "one candidate alone anchors it a line up ('PARKED' itself is on 1260 and on the cited line " +
+    '1262, not on 1261). Citation confirmed correct by hand: 1262 is the ' +
+    '`if (state.state !== \'PARKED\') continue;` line.',
 };
 
 test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to discriminate one line -- no more, no fewer', () => {
@@ -2080,6 +2099,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
     [
       'orchestrator/README.md :: doc/state-machine-spec.md:140',
       'orchestrator/park-loop.js :: doc/remediation-progress.md:658',
+      'orchestrator/state-machine.js :: park-loop.js:1262',
     ],
     'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +
       'by hand and justify it here before pinning it, exactly as CITATION_ANCHOR_ALLOWLIST requires.'
@@ -2123,6 +2143,9 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // and twice from state-machine.js) -- ranges is 5 -> 9. The 5th (orphan-scan.js's own
   // daemon.js:714) is single-line and discriminates -- discriminating is 15 -> 16. blunt is
   // unchanged (the same two pre-existing entries); no new citation landed in that population.
+  // card #80 (2026-09-06): +1 citation, `orchestrator/state-machine.js :: park-loop.js:1262`,
+  // single-line and BLUNT (see ANCHOR_BLUNT_CITATIONS above) -- blunt is 2 -> 3; discriminating
+  // and ranges are unchanged.
   assert.deepEqual(
     blunt.map((b) => b.split(' -- ')[0]).sort(),
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
@@ -2132,7 +2155,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   assert.equal(ranges.length, 9, `expected 9 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 27, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (27).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 28, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (28).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

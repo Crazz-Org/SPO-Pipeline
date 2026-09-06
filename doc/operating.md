@@ -18,7 +18,7 @@ edits:
                          The services never read it.
 ~/.spo-releases/<sha>/   one immutable clone per release, detached at <sha>
 ~/.spo-current  ->  ~/.spo-releases/<sha>       what both units' ExecStart points at
-~/.spo-state/{queue,journal}                    all mutable state, outside every tree
+~/.spo-state/{queue,journal,queue-refused}      all mutable state, outside every tree
 ~/.claude-accounts/      the account pool          ~/.spo-worktrees/  product checkouts, per card
 ```
 
@@ -207,6 +207,11 @@ thousands of foreign failures. Always `node --test test/*.test.js`.
   them is a deliberate act, not routine tidying.
 - **`~/.spo-worktrees/issue-<n>/`** belong to cards that are parked or in flight. The WORKTREE step
   creates and destroys them; don't remove one by hand while its card is live.
+- **`~/.spo-state/queue-refused/`** holds queue entries `takeNextTask` refused because their id
+  duplicated an already-terminal (`DONE`/`ABANDONED`) taskDir — card #80. There is **no reaper**:
+  a duplicate can still arise from a hand-filed queue entry or a crash-recovery re-enqueue race
+  (`intake.js`'s own `taskAlreadyExists` already dedups the `spo pull`/auto-pull paths), so entries
+  are moved aside, never deleted. Safe to inspect or clear by hand; nothing reads this directory back.
 
 ---
 
