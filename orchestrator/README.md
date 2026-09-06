@@ -842,10 +842,14 @@ claim is always the last spawn.
 
 **CHECK** runs the invariant substring check FIRST, then `npm run typecheck`, `npm run lint`,
 `npm run coverage:changed` in that order in the worktree; the first non-zero exit (or, for the
-invariant check, the first non-empty `broken` list) journals `{event: 'check-failed', alias}`
-naming which one and returns `'DIAGNOSE'` (never PARKED) — the later aliases never run once one
-has failed. See "Invariant substring check (action 1.8)" below for the invariant check itself,
-run by `steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop.
+invariant check, `runInvariantCheck`'s own return list still non-empty after the issue #112
+relief described below) journals `{event: 'check-failed', alias}` naming which one and returns
+`'DIAGNOSE'` (never PARKED) — the later aliases never run once one has failed. A `checkRegressions`
+result whose ENTIRE `broken` list was flagged at PLAN as a span conflict is the one case that
+never reaches `check-failed` at all: `runInvariantCheck` relieves it first and returns `[]`. See
+"Invariant substring check (action 1.8)" below for the invariant check itself, run by
+`steps/scripted.js`'s `runInvariantCheck` before the `CHECK_ALIASES` loop, and "PLAN-time
+span-conflict flag, CHECK-time relief (issue #112)" further below for the relief itself.
 
 ### Invariant substring check (action 1.8)
 
@@ -866,7 +870,10 @@ until this action, neither was true. `orchestrator/invariants.js` is the whole o
   >>> END QUOTE
   ```
 
-  `parseInvariantsMarkdown` extracts `{id, file, lineSpec, quote}` per block; a block missing its
+  `parseInvariantsMarkdown` extracts `{id, file, lineSpec, quote, declaredSpan}` per block —
+  `declaredSpan` is `parseLineSpec(lineSpec)`, a `{start, end}` pair parsed straight off whatever
+  trails the last colon on the block's `File:` line (a single line number, or a `start-end` range;
+  `null` for zero, negative, reversed, or unparseable input) — a block missing its
   `File:` line or its `>>> END QUOTE` marker is skipped and named in `issues`, never thrown — the
   rest of the file still parses. Zero recognized blocks is valid (no invariants), not an error.
   The `>>> QUOTE` / `>>> END QUOTE` delimiter (rather than a triple-backtick fence) is deliberate:
@@ -886,7 +893,13 @@ until this action, neither was true. `orchestrator/invariants.js` is the whole o
 - **PLAN-time baseline (`buildBaseline`).** `handlePlan`, in real mode only, calls this
   immediately after writing `invariants-<issue>.md`, resolves every invariant against the
   freshly created worktree, and journals the return value verbatim as `{state: 'PLAN', event:
-  'invariants-baseline', parseError, invariants: [{id, file, resolved, mode}], issues}` —
+  'invariants-baseline', parseError, invariants: [{id, file, resolved, mode, lineSpec,
+  declaredSpan, span, planSpanConflict?}], issues}` — `span` is the RESOLVED `{start, end}` line
+  range the quote actually occupies in the file as PLAN found it, set only for an exact match
+  (`resolveInvariant`'s whitespace-normalized fallback collapses runs and destroys any reliable
+  offset back to real lines, so it and every non-resolved outcome report `span: null`);
+  `planSpanConflict` is set by a separate module, `plan-span-guard.js` — see "PLAN-time
+  span-conflict flag, CHECK-time relief" below — and is absent unless that module found one.
   `task-values.js`'s `lastInvariantsBaseline` is the reader side. An invariant that does not
   resolve here is **never a park and never a reason to re-run PLAN** — it is simply excluded
   from what CHECK will later verify (only `resolved: true` entries are ever checked again), which
@@ -912,6 +925,71 @@ until this action, neither was true. `orchestrator/invariants.js` is the whole o
   that is effectively free. It is also the most surgical signal DIAGNOSE can receive: it names
   the exact id and file a specific fact regressed in, where a bare typecheck/lint failure is
   usually already self-explanatory from the tool's own output and gains nothing from going first.
+
+### PLAN-time span-conflict flag, CHECK-time relief (issue #112)
+
+`orchestrator/plan-span-guard.js` is a second, independent module the invariant substring check
+above never called: a pure predicate answering the one question `invariants.js` itself never
+asks — does the SAME plan that froze an invariant's quote also order a change to the same line
+span, somewhere in its own prose? No `fs`, no spawning; markdown and a baseline in, findings out.
+
+- **`extractPlanSpans(planMarkdown, worktreeRoot)`.** Every line-range `plan_markdown` names,
+  attributed to a file, through three citation syntaxes measured on the 58-card journal corpus to
+  each carry defects the other two miss: a path attached directly to the citation (`path:N-M`,
+  47% of real spans), a bare `:N-M` under a path-bearing heading or after an earlier same-line
+  path (31%), and prose ("lines N-M", 22%). `normalizePath` makes a citation's raw path
+  comparable across the live-daemon absolute-worktree shape, the two legacy
+  `worktrees/issue-<n>/`/`.spo-worktrees/issue-<n>/` shapes, and a bare `./` prefix.
+- **`detectSpanConflicts({planMarkdown, invariants, worktreeRoot})`.** For each invariant with a
+  resolvable span (its RESOLVED `span` when present, else its `declaredSpan` — a fact IMPLEMENT
+  already broke is not excused by the plan's own prose), every plan span naming the SAME
+  normalized file is checked for plain overlap (`planStart <= invEnd && invStart <= planEnd`) — an
+  exhaustive search over 82,159 candidate refinements against the real corpus found none that
+  improves on this, and several that hurt it.
+- **Wiring (`state-machine.js`'s `annotatePlanSpanConflicts`, called from `handlePlan` right
+  before `invariants-baseline` is journalled, at both the reuse and the fresh-plan `buildBaseline`
+  sites).** A finding adds a `planSpanConflict: {planSpan, planLine, syntax}` marker onto the
+  matching baseline row IN PLACE — nothing is dropped, `resolved`/`mode`/`reason`/every other
+  baseline field is untouched, and a detector failure (or no findings at all) leaves `handlePlan`'s
+  return value exactly as if this module did not exist. At least one marked row also journals
+  `{state: 'PLAN', event: 'invariants-plan-span-conflict', conflicts: [{id, file, planSpan,
+  planLine, syntax}]}`.
+- **Relief (`steps/scripted.js`'s `runInvariantCheck`).** CHECK still re-resolves every baseline
+  invariant exactly as described above — the flag changes nothing about what breaks, only what
+  happens once something does. When `checkRegressions` reports a non-empty `broken` list, relief
+  fires only if EVERY broken id in that SAME `invariants-checked` event carries `planSpanConflict`
+  — journals `{state: 'CHECK', event: 'invariants-span-conflict-relieved', ids, conflicts}` and
+  returns `broken: []`, so the card proceeds to `PUSH_PR` instead of `DIAGNOSE`. One broken id
+  without the flag, in the same event as one that has it, still routes the WHOLE event to
+  DIAGNOSE — relief is all-or-nothing, never partial. That rule is a deliberate choice, not a
+  corpus finding: replayed over the 58-card journal, all 8 invariant-caused CHECK events are
+  unanimous (every broken id in the event flagged, or none of them), so no real card discriminates
+  `every` from `any`. `every` is picked because `checkRegressions` fails the WHOLE event on ANY
+  broken id, never per-id — relieving on a partial match would credit a partial catch and wave the
+  unflagged half of the event through with it.
+- **Measured (`scripts/replay-plan-span-flags.js`, replayed over the 58-card journal corpus).**
+  5 invariants were both flagged and actually broke — 487/INV-4, 488/INV-7, 491/INV-5, 491/INV-6,
+  508/INV-1, each a plan/invariant self-contradiction per its own card's ledger — and would have
+  been relieved; 7 of the corpus's 8 invariant-caused CHECK failures fall in that set. One broke
+  WITHOUT being flagged — 517/INV-13, whose plan names no line number for that file at all, so no
+  span-intersection rule can reach it; a documented blind spot, not a bug. The same predicate also
+  flags invariants on cards whose own event history never broke a single one — 140 flags across
+  37 of 53 such "clean" cards (any outcome: DONE, PARKED, or ABANDONED, the only requirement being
+  that no invariant ever broke), measured 2026-09-06. A narrower, more meaningful bucket restricts
+  that same "never broke" set to cards that additionally **merged cleanly** — `state.json`'s
+  `state === 'DONE'` OR `externallyResolved.via === 'pr-merged'` — and finds 138 flags across 36 of
+  49 such cards. In both buckets, not one of those invariants ever broke, so the flag was never
+  consulted and those cards ran exactly as they would have without it: the predicate is not
+  precise, and this doc does not claim it is. **These counts move**: the journal they are measured
+  against (`~/.spo-state/journal`, not git-tracked) is a live daemon's own history, growing card by
+  card as it runs — re-running `scripts/replay-plan-span-flags.js` on a later day will report a
+  different total; the qualitative finding (flags on clean and cleanly-merged cards alike are
+  numerous, and none of them have ever mattered) is what carries forward, not the exact counts. The
+  complementary
+  failure mode — a flagged invariant breaking because IMPLEMENT genuinely regressed something,
+  unrelated to the plan's own contradiction, which relief would then wrongly wave through — has
+  **zero instances in the corpus but is UNMEASURED, not proven zero**: 58 cards is not enough to
+  bound a rate this low.
 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
 <file>`, never the message inline on argv) and the PR body — `Closes #<issue>` plus a
@@ -2521,6 +2599,8 @@ task/daemon split itself).
 | `gate-main-moved-rev-parse-failed` | task | GATE's `git rev-parse origin/main` (checking whether the refreshed main is nightly-red) exited non-zero — the red-main guard is skipped, not fatal (`steps/scripted.js`). |
 | `gate-verdict` | task | the bench's verdict for this head sha (`{verdict, baseMain, merged}`) was read and journalled before GATE routes on it (`steps/scripted.js`). |
 | `invariants-declared-parsed-mismatch` | task | PLAN's declared `invariant_ids` count disagrees with the count `invariants.js` actually parsed from the worktree — a signal to go look at the parser, never a park (`state-machine.js`, two call sites). |
+| `invariants-plan-span-conflict` | task | issue #112: `orchestrator/plan-span-guard.js`'s `detectSpanConflicts` found at least one invariant whose frozen span overlaps a line range this same plan orders changed — records `conflicts: [{id, file, planSpan, planLine, syntax}]`; the matching `invariants-baseline` rows also carry the same marker as `planSpanConflict`. Never a park (`state-machine.js`'s `annotatePlanSpanConflicts`, called from `handlePlan`). |
+| `invariants-span-conflict-relieved` | task | issue #112: CHECK's `runInvariantCheck` found a non-empty `broken` list from `checkRegressions` where EVERY id carried `planSpanConflict` — records `ids`/`conflicts` and lets the task proceed to `PUSH_PR` (`broken` returned as `[]`) instead of routing to DIAGNOSE. One unflagged id alongside a flagged one still withholds this event and routes the whole event to DIAGNOSE as before (`steps/scripted.js`). |
 | `leftover-branch-deleted` | task | WORKTREE's retry-leftover sweep deleted a stale local `claude-pipe/<id>` branch it proved safe to drop (`steps/scripted.js`). |
 | `leftover-pr-closed` | task | the leftover sweep closed an open PR on the stale branch before deleting the remote ref (`steps/scripted.js`). |
 | `leftover-pr-lookup-failed` | task | the leftover sweep's `gh pr list` for the stale branch failed or returned unparsable JSON — the delete is refused rather than risk closing an invisible PR (`steps/scripted.js`). |

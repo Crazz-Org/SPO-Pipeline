@@ -153,6 +153,46 @@ Ledger per task (`journal/<task>/ledger.md`): one line per attempt —
 VALIDATE REJECT gets its own line, same shape but a distinct leading word so the two can never
 be confused: `validate-reject N | reasons | outcome` (action 1.6).
 
+**PLAN-time span-conflict flag, CHECK-time relief (issue #112).** The PLAN row's own invariant
+baseline (above) never asked whether the SAME plan that froze an invariant's quote also orders a
+change to that quote's own line span — no IMPLEMENT can satisfy both "keep this exact text" and
+"rewrite this region" at once, and until this action the contradiction only ever surfaced LATER,
+as a CHECK failure that cost a full DIAGNOSE/IMPLEMENT cycle to diagnose something the plan text
+already gave away. `orchestrator/plan-span-guard.js`'s `detectSpanConflicts` — a pure predicate,
+plain span overlap between an invariant's resolved (or, failing that, declared) span and any span
+the plan's own `plan_markdown` names for the same file, across the three citation syntaxes real
+plans use (a path attached to the citation, a bare `:N-M` under a path-bearing heading, or prose
+"lines N-M") — runs at PLAN time, right before `invariants-baseline` is journalled, and marks each
+matching baseline row `planSpanConflict: {planSpan, planLine, syntax}`. Nothing is dropped and
+nothing about the baseline's `resolved`/`mode` changes; a match also journals
+`invariants-plan-span-conflict` (`{conflicts: [{id, file, planSpan, planLine, syntax}]}`). CHECK
+still re-resolves every baseline invariant exactly as before — the flag changes nothing about
+what breaks. Only once `checkRegressions` reports a non-empty `broken` list does the flag matter:
+if EVERY broken id in that SAME `invariants-checked` event carries `planSpanConflict`, CHECK
+journals `invariants-span-conflict-relieved` (`{ids, conflicts}`) and lets the task proceed to
+`PUSH_PR` instead of `DIAGNOSE` — one broken id without the flag, alongside one that has it, still
+routes the whole event to DIAGNOSE (relief is all-or-nothing, never partial). Measured by
+replaying `scripts/replay-plan-span-flags.js` over the 58-card journal corpus: 5 invariants were
+both flagged and actually broke (487/INV-4, 488/INV-7, 491/INV-5, 491/INV-6, 508/INV-1, each a
+plan/invariant self-contradiction per its own card's ledger), accounting for 7 of the corpus's 8
+invariant-caused CHECK failures. One invariant broke WITHOUT being flagged — 517/INV-13, whose
+plan names no line number at all for the file it cites, so no span-intersection rule can reach
+it; a documented blind spot, not a bug the predicate is expected to close. The same predicate also
+flags invariants on cards whose own event history never broke a single one — 140 flags across 37
+of 53 such "clean" cards (any outcome: DONE, PARKED, or ABANDONED, the only requirement being that
+no invariant ever broke), measured 2026-09-06. A narrower, more meaningful bucket restricts that
+same "never broke" set to cards that additionally **merged cleanly** — `state.json`'s
+`state === 'DONE'` OR `externallyResolved.via === 'pr-merged'` — and finds 138 flags across 36 of
+49 such cards. In both buckets, not one of those invariants has ever broken, so the flag was never
+consulted there: the predicate is not precise, only useful when it fires on something that
+actually breaks. Both counts are re-derived with `scripts/replay-plan-span-flags.js` against a
+live, non-git-tracked journal (`~/.spo-state/journal`) that keeps growing, so re-measuring later
+will find different totals. The
+complementary risk — a flagged invariant breaking because IMPLEMENT genuinely regressed something
+unrelated to the plan's own contradiction, which relief would then wrongly excuse — has zero
+instances in this corpus but is **unmeasured, not proven zero**: 58 cards cannot bound a rate this
+low.
+
 ## Step contracts
 
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
