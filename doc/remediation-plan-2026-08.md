@@ -243,6 +243,13 @@ synthetic cards (a single lock, 3 worker exits, zero cross-task writes) + shadow
 **one healthy account** (excess workers wait or park, never share an account) + *(live
 recette via 2.9)* a supervised parallel batch of 2 S-sized cards.
 
+*(Erratum 2026-09-06, on action 6.5, SPO-Pipeline#84, commit `2a316af`: the GATE→merge-queue-
+landing window that decision left un-re-gated is now closed at MERGE, conditional on GitHub
+attesting the base moved — see `orchestrator/config.js`'s own 6.5 comment and
+`doc/state-machine-spec.md`'s CI_CHECKS/MERGE rows for the corrected, current account. The
+disjoint-files/interacting-behaviour case 6.5 was actually deciding on remains accepted, still
+nightly-backstopped.)*
+
 ---
 
 ## Chantier 7 — Truthfulness consolidation & docs

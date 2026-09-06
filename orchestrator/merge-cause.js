@@ -10,17 +10,21 @@
 // blocking one -- in which case the caller keeps the old symptom reason as a fallback, never
 // invents a cause GitHub did not actually give.
 //
-// UNKNOWN is the EXPECTED first answer, not an edge case: GitHub computes `mergeable` and
-// `mergeStateStatus` LAZILY, so the first `gh pr view` on a PR kicks off a background job and
-// answers `UNKNOWN` on both fields, with the real value only landing on a LATER read. Measured
-// against real PRs on this account: 4 of 4 open PRs read `UNKNOWN`/`UNKNOWN` on the first call,
-// and a definite answer arrived, across 9 timed cold PRs, only once ~1.55s of wall-clock had
-// elapsed since that first UNKNOWN -- not after any particular number of calls. That is why the
-// I/O half of this fix, `steps/scripted.js`'s `probeMergeability`, re-reads (bounded, sleeping
-// between reads) rather than trusting a single read: a single read sees `CLEAN`/`UNKNOWN` (this
-// module's own honest `unknown`) almost every time in production, which would make this whole
-// module a near-no-op. This file stays the pure classifier either way -- it has no opinion on how
-// many times its input was read, only on what a given reading means.
+// UNKNOWN can be GitHub's first answer, and is the one that matters here: GitHub computes
+// `mergeable` and `mergeStateStatus` LAZILY, so a `gh pr view` on a PR whose cached computation
+// has been invalidated kicks off a background job and answers `UNKNOWN` on both fields, with the
+// real value only landing on a LATER read. Measured against real PRs on this account: 4 of 4 open
+// PRs read `UNKNOWN`/`UNKNOWN` on the first call, and a definite answer arrived, across 9 timed
+// cold PRs, only once ~1.55s of wall-clock had elapsed since that first UNKNOWN -- not after any
+// particular number of calls. It is NOT a general property of `gh pr view`: re-measured 2026-09-06
+// on all 13 then-open product PRs, 0 of 13 first reads answered `UNKNOWN` -- a days-stale PR just
+// answers immediately. Neither measurement is the state this probe runs in (a PR the merge queue
+// has just been touching), which is why the I/O half of this fix, `steps/scripted.js`'s
+// `probeMergeability`, re-reads (bounded, sleeping between reads) rather than trusting a single
+// read: on any UNKNOWN it does hit, a single read degrades to this module's own honest `unknown`
+// and makes the whole module a near-no-op. See doc/state-machine-spec.md's MERGE row for both
+// measurements. This file stays the pure classifier either way -- it has no opinion on how many
+// times its input was read, only on what a given reading means.
 //
 // GitHub's own documented enums (case-tolerant and null/undefined-safe below -- a real `gh`
 // payload is always uppercase, but nothing here assumes a caller was equally careful):

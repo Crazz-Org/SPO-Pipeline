@@ -284,22 +284,50 @@ module.exports = {
   // other, and the main-moved test below (both realGate's and realCiChecks') only catches a
   // FILE-INTERSECTING move, not a bare one. Two ways to close that gap were considered and both
   // declined:
-  //   - a dispatcher-held MERGE admission token, measured at +42s/card at K=2 -- and it would
-  //     not even fix the semantics it was built for: card B still merges having never been gated
-  //     against card A, it only stops interleaving, which the GitHub merge queue already does.
+  //   - a dispatcher-held MERGE admission token, measured at +42s/card at K=2 -- declined on that
+  //     cost, which still stands. "Would not even fix the semantics it was built for" was slightly
+  //     too absolute as written (SPO-Pipeline#84). A MERGE-only token DOES prevent a sibling from
+  //     landing while this card is itself inside MERGE, which covers the one incident recette.js
+  //     records (PR #632 landed while PR #633 sat in the queue -- both cards in MERGE at once).
+  //     It does NOT close the window #84 is about: that window opens at realCiChecks' intersection
+  //     test and runs through VALIDATE and through the wait for the token itself, so a sibling
+  //     HOLDING the token can land inside it, and this card then enters MERGE gated against a main
+  //     that has already moved -- the same file-intersecting park, un-prevented. #84 closes that
+  //     whole window at MERGE instead (for the subset of outcomes GitHub's probe can name), and
+  //     far more cheaply: a `git fetch` + the same set comparison, conditioned on GitHub's own
+  //     probe attesting the base moved -- see realMerge's regateAfterNonLanding. For the gap this
+  //     block is actually about, below -- disjoint files, interacting behaviour -- the original
+  //     claim stands unqualified: no re-gate test, token or none, catches the interaction.
   //   - widening the intersection test to "main moved at all", the one option that WOULD buy the
   //     semantic safety -- costs ~6-8% more bench load, declined against an unquantified risk
   //     that already has a backstop (the nightly, which drives every merged main and would catch
   //     an interaction the pipeline missed).
   // So: accept the gap explicitly, the nightly is the accepted backstop, and this budget is
   // exactly what the CI_CHECKS/GATE spec rows now say ("configurable ... once at the default").
+  // Narrower than when this was written: #84 closed the file-intersecting case's own
+  // GATE-to-merge-queue-landing window at MERGE, conditional on GitHub attesting
+  // `merge-conflict`/`merge-behind-base`; what remains accepted here is the disjoint-files,
+  // interacting-behaviour case, plus any file-intersecting one whose cause that probe cannot name.
   //
   // THE NUMBER ITSELF is a MODEL, not a measurement, and is written down as one rather than
-  // dressed up as derived from data that does not exist: the corpus (journal/*/journal.jsonl,
-  // all 20 tasks) contains ZERO `main-moved` events, because today's daemon is single-threaded --
-  // it structurally cannot merge a sibling card's PR while another of its own cards is live, so
-  // K workers do not merely expose this path, they CREATE it. Over one card's own window the
-  // expected count of sibling merges is exactly K-1 (one per other worker, once per cycle).
+  // dressed up as derived from data that does not exist. It was derived against the THEN-20-task
+  // journal, which contained ZERO `main-moved` events -- because every one of those 20 tasks ran
+  // at K=1, structurally unable to merge a sibling card's PR while another of its own cards was
+  // live. Both halves of that premise have since changed, and the model has NOT been re-derived
+  // against them (re-verified 2026-09-06):
+  //   - K>1 has run for real. The daemon runs SPO_WORKERS=2 (see `WORKERS` above, doc/operating.md's
+  //     env table, and the live workers.conf systemd drop-in), and the daemon journal records
+  //     genuinely overlapping workers on 2026-09-04 -- issue-509 was spawned while issue-508 was
+  //     still running, among several such pairs.
+  //   - The corpus is no longer 20 tasks: the journal now holds 62 task directories, and two of
+  //     them park on the main-moved path under that K=2 run -- issue-510 `main-moved-conflict`
+  //     (GATE) and issue-509 `main-moved-merge-failed` (CI_CHECKS), both 2026-09-04. No
+  //     `main-moved-merge` SUCCESS event exists in any task, so the path's success arm is still
+  //     unobserved; but "the corpus contains zero main-moved events" is no longer true of the
+  //     path as a whole.
+  // So K workers do not merely expose this path, they CREATE it -- observed now, not only argued.
+  // Over one card's own window the expected count of sibling merges is exactly K-1 (one per other
+  // worker, once per cycle).
   //
   // The model: sibling merges as Poisson with lambda = (K-1) x exposure x intersectionRate,
   // "conservative" stated plainly rather than proven -- real sibling merges are quasi-periodic

@@ -2580,15 +2580,20 @@ async function realCiChecks(ctx, deps = {}) {
 // the park, issue-517's PR merged 17s BEFORE it. Routed through the same `spawnStep` every other
 // gh call in this file uses, so the probe is journalled and timeout-guarded identically.
 //
-// Post-verification (efficacy fix): GitHub computes `mergeable`/`mergeStateStatus` LAZILY -- the
-// FIRST `gh pr view` on a PR kicks off a background job and answers `UNKNOWN` on both fields; a
-// LATER read returns the real value once that job lands. `UNKNOWN` is therefore the EXPECTED
-// first answer, not a rare edge case: measured against real PRs on this account, 4 of 4 open PRs
+// Post-verification (efficacy fix): GitHub computes `mergeable`/`mergeStateStatus` LAZILY -- a
+// `gh pr view` on a PR whose cached computation has been invalidated kicks off a background job
+// and answers `UNKNOWN` on both fields; a LATER read returns the real value once that job lands.
+// Measured against real PRs on this account, 4 of 4 open PRs
 // returned `{"mergeStateStatus":"UNKNOWN","mergeable":"UNKNOWN"}` on the first read, and PR #134
 // and #691 both resolved to a definite `DIRTY`/`CONFLICTING` only on the SECOND read. Across 9
 // timed cold PRs, a definite answer arrived once ~1.55s of wall-clock had elapsed since the first
-// UNKNOWN -- regardless of how many calls were made (per-call latency measured 399-736ms). A probe
-// that reads exactly once therefore sees `UNKNOWN` almost every time in production, which
+// UNKNOWN -- regardless of how many calls were made (per-call latency measured 399-736ms). That is
+// NOT a general property of `gh pr view`: re-measured 2026-09-06 on all 13 then-open product PRs,
+// 0 of 13 first reads answered `UNKNOWN` -- a days-stale PR answers immediately. Neither
+// measurement is the state this probe actually runs in (a PR the merge queue has just been
+// touching, whose cached computation that activity invalidated), so the re-read stays justified on
+// the mechanism rather than on either count. A probe
+// that reads exactly once returns `UNKNOWN` on every such PR, which
 // degrades to `{kind: 'unknown'}` below and falls all the way back to the original SYMPTOM reason
 // (`merge-queue-not-landing` / `pr-closed-unmerged`) -- the very thing this whole action exists to
 // stop doing, reintroduced by reading too eagerly. So this re-reads, bounded to
@@ -2702,7 +2707,8 @@ function parkFromMergeCause(cause, detail) {
 //
 // Conditional, deliberately, on GitHub's OWN answer: `pr:wait` exit 4 means "still open after
 // 600s" against a merge queue GitHub itself allows up to 60 minutes (serial, one entry at a time)
-// -- the common cause of a [4,4] park is a sibling AHEAD of us in the queue, not a moved main. An
+// -- the likely common cause of a [4,4] park is a sibling AHEAD of us in the queue, not a moved
+// main (an inference from that mechanism, not a measurement -- see below). An
 // unconditional re-gate would eject PRs that were about to land on their own. So this only ever
 // runs when `cause.kind === 'cause'` with reason `merge-conflict` or `merge-behind-base` -- both
 // mean "the base moved under this branch", but the two arms are not equally attested: measured
