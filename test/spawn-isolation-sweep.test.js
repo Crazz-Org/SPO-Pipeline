@@ -889,7 +889,12 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // And the converse sanity: every REAL (checked) site must be one of the files this action's
   // audit actually measured -- catches a genuinely new, unaudited daemon spawn silently joining
   // the corpus without anyone having looked at it.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'worker-mode.test.js']);
+  // Card #78 verification: daemon-repark-mode.test.js joined this corpus with the `--repark-task`
+  // mode. Its one spawning helper (runReparkRaw) was audited against this sweep's own four
+  // properties before being added here -- `env: { ...isolatedEnv(), ...envOverrides }`, so the
+  // env is present, derived from isolatedEnv() rather than a bare process.env, and every
+  // override a test layers on top is a fresh mkTmp dir (the empty account pool), never a real one.
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });

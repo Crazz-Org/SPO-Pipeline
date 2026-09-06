@@ -2001,6 +2001,75 @@ function finalizePark(ctx, lastState, reason, detail) {
   }
 }
 
+// Reparks a crashed worker's task through the exact same buildCtx/finalizePark round trip
+// orphan-scan.js already uses (board move, park comment, report.md, daemon.jsonl 'parked' line --
+// see finalizePark's own header above) -- 'worker-crashed', with the exit code (and signal, when
+// this was a signal kill) in the detail, per action 6.3's own requirement: "the dispatcher's exit
+// handler is authoritative and reparks". Card #78 moved this out of dispatcher.js (which called
+// it in-process, on the process holding the single-instance lock -- exactly the process
+// finalizePark's own blocking spawnSync calls must never freeze) and into a standalone function so
+// a short-lived `daemon.js --repark-task` child (see that file's own header) can call it too,
+// off the dispatcher's own thread. dispatcher.js's `reparkCrashedWorker` still calls this
+// in-process today -- this action ONLY extracts the function; a later action rewires the
+// dispatcher to spawn the child instead.
+//
+// `lastState` is read from state.json when one exists (the worker got far enough into runTask to
+// write at least the INTAKE snapshot -- see state-machine.js's runTask, which writes it as its
+// very first statement) -- the same runtime-field restoration orphan-scan.js performs for the
+// identical reason (worktreePath/prNumber/the four counters are not on task.json, only on the
+// snapshot). A missing state.json (the worker died before runTask ever ran -- e.g. a usage error
+// this classifier deliberately still treats as "crashed", see classifyWorkerExit's own comment)
+// falls back to 'INTAKE': the earliest state a task can be parked FROM, and the honest answer when
+// nothing more specific was ever recorded.
+//
+// A task already showing a TERMINAL state (DONE/PARKED/ABANDONED) is left alone and merely
+// journalled -- this covers the (believed unreachable, but not asserted so) case of a worker
+// process producing more exit-path activity after its own outcome was already durable on disk;
+// reparking an already-terminal task would be a second, spurious writer racing whatever legitimate
+// state that terminal write represents, exactly what the single-writer invariant this module's own
+// header cites exists to prevent.
+function reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCode, signal }) {
+  let task;
+  try {
+    task = JSON.parse(fs.readFileSync(path.join(taskDir, 'task.json'), 'utf8'));
+  } catch (err) {
+    appendDaemonEvent(journalRoot, 'worker-crash-repark-failed', {
+      id,
+      exitCode,
+      signal: signal || null,
+      step: 'task.json',
+      error: String((err && err.message) || err),
+    });
+    return;
+  }
+
+  const state = readJsonSafe(path.join(taskDir, 'state.json'));
+  const lastState = (state && state.state) || 'INTAKE';
+  if (lastState === 'DONE' || lastState === 'PARKED' || lastState === 'ABANDONED') {
+    appendDaemonEvent(journalRoot, 'worker-exit-after-terminal', {
+      id,
+      exitCode,
+      signal: signal || null,
+      lastState,
+    });
+    return;
+  }
+
+  const ctx = buildCtx(id, task, taskDir, { ...config, queueDir, deps: (config && config.deps) || {} });
+  // Same runtime-only field restoration orphan-scan.js performs, for the same reason -- see that
+  // module's own comment on worktreePath/prNumber/the four counters.
+  ctx.task.worktreePath = (state && state.worktreePath) || null;
+  ctx.prNumber = (state && state.prNumber) || null;
+  ctx.counters.diagnoseAttempts = (state && state.diagnoseAttempts) || 0;
+  ctx.counters.validateRejects = (state && state.validateRejects) || 0;
+  ctx.counters.ciImplementRetries = (state && state.ciImplementRetries) || 0;
+  // Action 6.5: a COUNT, not a boolean -- same `Number(...) || 0` restore orphan-scan.js
+  // uses, and for the reason stated there (a pre-6.5 boolean still upgrades in place).
+  ctx.counters.mainMoveUsed = Number(state && state.mainMoveUsed) || 0;
+
+  finalizePark(ctx, lastState, 'worker-crashed', { exitCode, signal: signal || null });
+}
+
 // Runs one task through the state machine to completion (DONE or PARKED). Never throws for a
 // recognized outcome -- a ParkSignal anywhere in the handler chain is caught here and turned
 // into the PARKED terminal state. An unrecognized state name (HANDLERS[state] undefined,
@@ -2482,6 +2551,7 @@ module.exports = {
   callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
   buildCtx,
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
+  reparkCrashedTask, // exported for dispatcher.js (in-process, today) and daemon.js's --repark-task child (card #78)
   snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it
   isRealMode, // exported for orphan-scan.js -- shadow/dry-run must detect-and-journal only, never park
   TRANSIENT_RETRY_REASONS, // exported for console/plain-language.js's SELF_RETRYING pin (test/dashboard-deck.test.js) and test/park-reason-partition.test.js

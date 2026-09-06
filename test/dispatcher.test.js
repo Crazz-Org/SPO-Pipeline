@@ -2296,6 +2296,17 @@ const DAEMON_FLAG_POLICY = {
   // NOT forwarded: --once drains a queue serially in-process, which is the mode the dispatcher
   // REPLACES; a child is never spawned in it.
   '--once': { worker: 'n/a: a worker runs exactly one task by construction', scanner: 'n/a' },
+  // Card #78: --repark-task/--exit-code/--signal select and feed a THIRD child kind -- a
+  // short-lived one-shot that parks exactly one already-crashed task (state-machine.js's
+  // reparkCrashedTask) -- which neither a worker nor a scanner is. This action only adds the
+  // mode to daemon.js: dispatcher.js does not spawn a repark child yet (it still calls
+  // reparkCrashedTask in-process), so neither buildWorkerArgv nor buildScannerArgv has any
+  // reason to forward these to the kinds they DO build argv for, and 'n/a' below is honest for
+  // that reason, not a placeholder -- a later action that teaches dispatcher.js to spawn this
+  // kind must add a real 'repark' column here rather than leave these rows stale.
+  '--repark-task': { worker: 'n/a: selects a third child kind, not a worker', scanner: 'n/a: selects a third child kind, not a scanner' },
+  '--exit-code': { worker: 'n/a: only meaningful to a --repark-task child', scanner: 'n/a: only meaningful to a --repark-task child' },
+  '--signal': { worker: 'n/a: only meaningful to a --repark-task child', scanner: 'n/a: only meaningful to a --repark-task child' },
   '--help': { worker: 'n/a', scanner: 'n/a' },
   '-h': { worker: 'n/a', scanner: 'n/a' },
 };

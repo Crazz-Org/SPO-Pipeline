@@ -102,8 +102,7 @@ const { spawn: realSpawn } = require('child_process');
 
 const accounts = require('./accounts');
 const { appendDaemonEvent, writeLiveWorkerIds } = require('./journal');
-const { readJsonSafe } = require('./park-loop');
-const { takeNextTask, buildCtx, finalizePark } = require('./state-machine');
+const { takeNextTask, reparkCrashedTask } = require('./state-machine');
 // Elapsed-duration measurement for exactly one thing below: how long a spawned scanner stayed
 // alive before it crashed, inside THIS process only -- see that module's own header, and
 // resolveScannerHealthyUptimeMs's comment, for why this is the right clock for that and the wrong
@@ -315,64 +314,18 @@ function buildScannerArgv(queueDir, journalRoot, config) {
 // Reparks a crashed worker's task through the exact same buildCtx/finalizePark round trip
 // orphan-scan.js already uses (board move, park comment, report.md, daemon.jsonl 'parked' line --
 // see finalizePark's own header in state-machine.js) -- 'worker-crashed', with the exit code (and
-// signal, when this was a signal kill) in the detail, per this action's own requirement: "the
+// signal, when this was a signal kill) in the detail, per action 6.3's own requirement: "the
 // dispatcher's exit handler is authoritative and reparks".
 //
-// `lastState` is read from state.json when one exists (the worker got far enough into runTask to
-// write at least the INTAKE snapshot -- see state-machine.js's runTask, which writes it as its
-// very first statement) -- the same runtime-field restoration orphan-scan.js performs for the
-// identical reason (worktreePath/prNumber/the four counters are not on task.json, only on the
-// snapshot). A missing state.json (the worker died before runTask ever ran -- e.g. a usage error
-// this classifier deliberately still treats as "crashed", see classifyWorkerExit's own comment)
-// falls back to 'INTAKE': the earliest state a task can be parked FROM, and the honest answer when
-// nothing more specific was ever recorded.
-//
-// A task already showing a TERMINAL state (DONE/PARKED/ABANDONED) is left alone and merely
-// journalled -- this covers the (believed unreachable, but not asserted so) case of a worker
-// process producing more exit-path activity after its own outcome was already durable on disk;
-// reparking an already-terminal task would be a second, spurious writer racing whatever legitimate
-// state that terminal write represents, exactly what the single-writer invariant this module's own
-// header cites exists to prevent.
+// Card #78 moved the actual work into state-machine.js's exported `reparkCrashedTask` -- see that
+// function's own header for the state.json/lastState/terminal-state reasoning, none of which
+// changed. This is now a thin, still-synchronous call into it, called from handleExit exactly as
+// reparkCrashedWorker always was. THIS ACTION ONLY EXTRACTS THE FUNCTION: the dispatcher still
+// calls it in-process, on the very process finalizePark's own blocking spawnSync calls (measured
+// worst case 2220s -- git push, `npm run board:move`, `gh issue comment`) can still freeze. A
+// later action rewires this call site to spawn `daemon.js --repark-task` instead.
 function reparkCrashedWorker(id, taskDir, code, signal, queueDir, journalRoot, config) {
-  let task;
-  try {
-    task = JSON.parse(fs.readFileSync(path.join(taskDir, 'task.json'), 'utf8'));
-  } catch (err) {
-    appendDaemonEvent(journalRoot, 'worker-crash-repark-failed', {
-      id,
-      exitCode: code,
-      signal: signal || null,
-      step: 'task.json',
-      error: String((err && err.message) || err),
-    });
-    return;
-  }
-
-  const state = readJsonSafe(path.join(taskDir, 'state.json'));
-  const lastState = (state && state.state) || 'INTAKE';
-  if (lastState === 'DONE' || lastState === 'PARKED' || lastState === 'ABANDONED') {
-    appendDaemonEvent(journalRoot, 'worker-exit-after-terminal', {
-      id,
-      exitCode: code,
-      signal: signal || null,
-      lastState,
-    });
-    return;
-  }
-
-  const ctx = buildCtx(id, task, taskDir, { ...config, queueDir, deps: (config && config.deps) || {} });
-  // Same runtime-only field restoration orphan-scan.js performs, for the same reason -- see that
-  // module's own comment on worktreePath/prNumber/the four counters.
-  ctx.task.worktreePath = (state && state.worktreePath) || null;
-  ctx.prNumber = (state && state.prNumber) || null;
-  ctx.counters.diagnoseAttempts = (state && state.diagnoseAttempts) || 0;
-  ctx.counters.validateRejects = (state && state.validateRejects) || 0;
-  ctx.counters.ciImplementRetries = (state && state.ciImplementRetries) || 0;
-  // Action 6.5: a COUNT, not a boolean -- same `Number(...) || 0` restore orphan-scan.js
-  // uses, and for the reason stated there (a pre-6.5 boolean still upgrades in place).
-  ctx.counters.mainMoveUsed = Number(state && state.mainMoveUsed) || 0;
-
-  finalizePark(ctx, lastState, 'worker-crashed', { exitCode: code, signal: signal || null });
+  reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCode: code, signal });
 }
 
 // createDispatcher(queueDir, journalRoot, config) -> {run, killAllChildren, stop}
