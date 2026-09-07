@@ -70,16 +70,29 @@ const INTAKE_SRC = fs.readFileSync(path.join(REPO_ROOT, 'orchestrator', 'intake.
 // Checking functions -- exported at the bottom, unit-tested with fixtures in the second half.
 // =================================================================================================
 
-// Same idiom as gh-api-argv.test.js / no-real-spawn-sweep.test.js / park-reason-doc-sweep.test.js,
-// verbatim: comments blanked (never deleted), so byte offsets -- and therefore every regex match
-// position this file computes -- still line up with the real source, and prose that MENTIONS a
-// pattern (this file's own header does, repeatedly) is never mistaken for a real call site.
+// blankComments: comments blanked (never deleted), so byte offsets -- and therefore every regex
+// match position this file computes -- still line up with the real source, and prose that
+// MENTIONS a pattern (this file's own header does, repeatedly) is never mistaken for a real call
+// site.
+//
+// KEEP IN SYNC. This helper is not a pair, it is a family: SEVEN byte-identical copies live in
+// this suite -- test/bin-spo-state-write-sweep.test.js, test/doc-constant-sweep.test.js,
+// test/gh-api-argv.test.js, test/no-real-spawn-sweep.test.js, test/park-reason-doc-sweep.test.js,
+// test/park-reason-partition.test.js and test/prompt-contract-sweep.test.js. The duplication is
+// deliberate (each sweep file stands alone and requires nothing from another test file); the
+// drift is not. test/blank-comments-sync.test.js is the authority: it pins that roster, asserts
+// the copies are byte-identical, and runs the helper's behavioural contract against every one of
+// them. Fixing one copy and not the rest is the trap card #152 sets. The card names two files to
+// fix -- test/park-reason-doc-sweep.test.js and test/gh-api-argv.test.js -- but at 41e8d91 all
+// SEVEN carried the same block-first ordering (measured: 7 block-first, 0 line-first, and no
+// line-first copy anywhere in this repo's history). Following the card literally would have left
+// five copies under-detecting without going red.
 function blankComments(source) {
-  const withoutBlocks = source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
-  return withoutBlocks
+  const withoutLineComments = source
     .split('\n')
     .map((line) => (line.trimStart().startsWith('//') ? ' '.repeat(line.length) : line))
     .join('\n');
+  return withoutLineComments.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
 }
 
 // direction 1 -- every declared placeholder must be a key the step's deriver supplies.

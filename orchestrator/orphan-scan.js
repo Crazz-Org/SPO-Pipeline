@@ -130,7 +130,7 @@ function takenAtMs(taskDir, taskFile) {
 // of queue/ before it spawns and publishes it as in-flight, so reading queue/ first narrows the
 // cross-process window in which a task can be misread as belonging to neither. state-machine.js's
 // runScanCycle hoists both reads into that order before calling orphanScan. `null`/absent means
-// "read it here yourself" -- which is what daemon.js:910's
+// "read it here yourself" -- which is what daemon.js:912's
 // unconditional startup crash-recovery scan relies on (it calls this function with no 5th/6th
 // argument at all, at a point where live-workers.json is stale by construction: the previous,
 // dead daemon's table, not yet cleared) and what every test that calls this function directly

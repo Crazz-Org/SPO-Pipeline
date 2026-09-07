@@ -194,8 +194,14 @@ refuses instead, printing the `mv` commands (`orchestrator/state-root.js`).
 `gh api repos/Crazz-Org/<repo>/pulls/<n> -X PATCH`. And `gh api -f` is a POST unless
 `--method GET` is passed — that one killed the retry channel for a whole chantier.
 
-**Never bare `node --test`.** It descends into parked cards' product worktrees and reports
-thousands of foreign failures. Always `node --test test/*.test.js`.
+**Never bare `node --test`.** It runs every `.js` file under any directory literally named
+`test/`, not only `*.test.js`. Measured on this repo (Node v22.23.2): six non-test files under
+`test/`/`test/fixtures/` get swept in this way. Three (`test/helpers.js`, `test/no-real-spawn.js`,
+`test/fixtures/print-product-repo-lock-constants.js`) load and exit 0 cleanly — false passes, not
+real tests. The other three (`test/fixtures/lease-hold.js`, `test/fixtures/mark-limit-once.js`,
+`test/fixtures/product-repo-lock-hold.js`) expect argv a bare run never supplies and throw/reject
+before ever touching a lock file — false failures, not hangs; no lock is ever held. Always
+`node --test test/*.test.js`.
 
 ---
 
