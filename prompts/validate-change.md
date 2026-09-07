@@ -37,9 +37,12 @@ measurement, both directions, as `task.rdoDiffTouched` (`rdo-diff-derived` in th
 diff-derived field is what gates the citation-verifier ahead of you. `task.touchesRdoMembers`
 remains a separate, one-way (false→true) intake guess, because it also drives IMPLEMENT's Opus
 escalation across retries. On that flag the caller raises your **effort** to `xhigh` — it never
-changes your model (`step-contracts.js`: VALIDATE's `escalatedModel` is `null`). You are escalated
-to Opus 5 when Fable is unavailable — you never run as Sonnet 5: Sonnet is the executor, and a
-same-model judge tends to ratify precisely the misunderstandings its author had.
+changes your model (`step-contracts.js`: VALIDATE's `escalatedModel` is `null`). You always run as
+Fable 5 — never Sonnet 5: Sonnet is the executor, and a same-model judge tends to ratify precisely
+the misunderstandings its author had. There is no per-attempt fallback to another model either: a
+retry after an account limit (`state-machine.js`'s `callLlmStep`) rotates only the account leased
+for the call, re-resolving the same step's contract on the same task each time, so the model never
+changes across attempts.
 
 ## Payload
 

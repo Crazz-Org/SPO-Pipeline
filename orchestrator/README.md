@@ -31,9 +31,10 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
   guarantee used to stop at a process boundary; `orchestrator/no-real-spawn-guard.js` now carries
   it across one via the `SPO_NO_REAL_SPAWN` environment variable — see "The hermeticity guarantee
   crosses the process boundary by environment" below.
-- Defaults: `--queue` = `<repo>/queue`, `--journal` = `<repo>/journal` (both created if
-  missing). Point both at a temp dir to run an isolated batch — this is how the test suite
-  works.
+- Defaults: `--queue` = `~/.spo-state/queue`, `--journal` = `~/.spo-state/journal` (both created
+  if missing; `state-root.js`'s `DEFAULT_STATE_ROOT`, overridable with `SPO_STATE_DIR`, resolved
+  the same way by `daemon.js` and `bin/spo`). Point both at a temp dir to run an isolated batch —
+  this is how the test suite works.
 
 ## Task-file format
 
@@ -2357,8 +2358,12 @@ spawns nothing outside `/usr/bin`).
 The unit runs `--real` with auto-pull ON (5 min): installing it makes the daemon autonomous.
 Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` →
 `[Service]` / `Environment=SPO_AUTO_PULL_MS=0`. Stop:
-`systemctl --user stop spo-pipeline-daemon.service`. Re-run the installer after pulling
-daemon changes; it rebuilds nothing (no build step) and restarts.
+`systemctl --user stop spo-pipeline-daemon.service`. Deploying ordinary daemon code changes is
+`git pull` in `~/SPO-Pipeline` — that checkout only; the `post-merge` hook cuts a release and
+drain-restarts both units. The installer is a different thing: re-run `scripts/daemon-install.sh`
+only when the generated unit text itself changes (`KillMode`, `ExecStart`, …), and note that it
+ends in `enable --now` — it **starts** the daemon rather than draining it, so running it on every
+pull restarts production instead of deploying it safely. See `doc/operating.md` § Deploying.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
 default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
@@ -2808,11 +2813,20 @@ node scripts/usage-report.js > journal/usage-snapshot.json
 node --test --test-timeout=30000 test/*.test.js
 ```
 
-From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, so the
-moment a parked card holds a product worktree under `~/.spo-worktrees/issue-<n>/` it walks into
-SPO-WebClient's own TypeScript suites and reports thousands of foreign failures — 1926 tests /
-1168 failures with four parked cards, none of them this repo's. `worktrees/` is gitignored, so
-`git status` stays clean and the result reads as a catastrophic regression in code that is fine.
+From the repo root. **Do not run it bare.** Bare `node --test` auto-discovers recursively, but
+NOT into dot-directories — product worktrees have lived outside this repo since `769eac5`
+(`~/.spo-worktrees/issue-<n>/`), so a recursive walk rooted here cannot reach them at all
+(measured: a file under `.claude/worktrees/<slug>/test/` is skipped by a bare run). The real
+hazard is narrower: bare `node --test` runs every `.js` file under any directory named `test/`,
+not only `*.test.js`. Six non-test files in this repo's own `test/`/`test/fixtures/` qualify.
+Measured (Node v22.23.2, each given the no-argv shape a bare invocation actually gives it):
+`test/helpers.js`, `test/no-real-spawn.js`, and
+`test/fixtures/print-product-repo-lock-constants.js` load and exit 0 — reported as passing
+"tests" that test nothing. `test/fixtures/lease-hold.js`, `test/fixtures/mark-limit-once.js`, and
+`test/fixtures/product-repo-lock-hold.js` expect command-line argv a bare run never supplies;
+each throws or rejects before ever reaching a lock file (`path.join(undefined, …)` fails first)
+and exits non-zero — reported as failing "tests", not a hang, and no lock is ever held. Either
+way the result is misleading, not a genuine regression.
 `--test-timeout=30000` bounds a single test that hangs instead of letting the whole run stall
 (`doc/remediation-progress.md` pins the reference count at this invocation). **When reading the
 result — mutation testing especially — check `# fail` AND `# cancelled`, never `# fail` alone.**
