@@ -2359,11 +2359,15 @@ The unit runs `--real` with auto-pull ON (5 min): installing it makes the daemon
 Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` →
 `[Service]` / `Environment=SPO_AUTO_PULL_MS=0`. Stop:
 `systemctl --user stop spo-pipeline-daemon.service`. Deploying ordinary daemon code changes is
-`git pull` in `~/SPO-Pipeline` — that checkout only; the `post-merge` hook cuts a release and
-drain-restarts both units. The installer is a different thing: re-run `scripts/daemon-install.sh`
-only when the generated unit text itself changes (`KillMode`, `ExecStart`, …), and note that it
-ends in `enable --now` — it **starts** the daemon rather than draining it, so running it on every
-pull restarts production instead of deploying it safely. See `doc/operating.md` § Deploying.
+`git pull` in `~/SPO-Pipeline` — that checkout only; the `post-merge` hook hands the whole job to
+`scripts/release.sh`, which cuts `~/.spo-releases/<sha>`, moves `~/.spo-current` and drain-restarts
+the daemon and the dashboard. The installer is a different thing: re-run
+`scripts/daemon-install.sh` only when the generated unit text itself changes (`KillMode`,
+`ExecStart`, …). It is the box-provisioning command — an initial `release.sh --no-restart`, then
+`daemon-reload`, `enable --now`, an unconditional `restart`, then linger — not the deploy path.
+Its restart DOES drain (`KillMode=mixed`, `TimeoutStopSec=2820`), but it bypasses `release.sh`'s
+own handling of units that are stopped or already `deactivating`. See `doc/operating.md`
+§ Deploying.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
 default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
