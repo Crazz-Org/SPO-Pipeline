@@ -2363,11 +2363,12 @@ Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` 
 `scripts/release.sh`, which cuts `~/.spo-releases/<sha>`, moves `~/.spo-current` and drain-restarts
 the daemon and the dashboard. The installer is a different thing: re-run
 `scripts/daemon-install.sh` only when the generated unit text itself changes (`KillMode`,
-`ExecStart`, …). It is the box-provisioning command — an initial `release.sh --no-restart`, then
-`daemon-reload`, `enable --now`, an unconditional `restart`, then linger — not the deploy path.
-Its restart DOES drain (`KillMode=mixed`, `TimeoutStopSec=2820`), but it bypasses `release.sh`'s
-own handling of units that are stopped or already `deactivating`. See `doc/operating.md`
-§ Deploying.
+`ExecStart`, …). It ends in `enable --now` plus a **blocking** `systemctl restart`. That restart
+does drain (`KillMode=mixed`, `TimeoutStopSec=2820`) — but it blocks while it drains, unlike
+`release.sh`'s `restart --no-block`, which exists precisely so a 45-minute drain does not land on
+whoever ran the pull. Worse, `daemon-install.sh` derives its repo root from the script's own path
+and carries none of the `post-merge` hook's deploy-checkout and branch guards, so running it from
+an agent worktree cuts a release from THAT worktree's branch. See `doc/operating.md` § Deploying.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
 default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
