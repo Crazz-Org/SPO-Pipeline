@@ -72,9 +72,17 @@ function loadPromptSpec(promptFile) {
   return { text, header, body, placeholders: Array.from(seen) };
 }
 
-// An array value is joined ", " (invariant_ids, check_commands, citations, ...); anything else
-// is coerced to its own string form. undefined/null are never reached here -- they are caught
-// as "missing" before any substitution runs.
+// An array value is joined ", " (citations, ...); anything else is coerced to its own string
+// form. undefined/null are never reached here -- they are caught as "missing" before any
+// substitution runs.
+//
+// This comment used to name invariant_ids and check_commands as the examples of the array case,
+// and both are wrong: measured across every task dir's journal.jsonl on 2026-09-07, each arrives
+// from PLAN as a JSON-ENCODED STRING in 159 of 159 occurrences and 0 as a real array -- the same
+// wire shape #118 measured for files_to_change. So they fall to String(value) and render into
+// prompts/implement.md and prompts/validate-change.md verbatim as ["INV-1","INV-2"], never as
+// INV-1, INV-2. That is legible to the model and is left alone deliberately: normalizing here
+// changes the prompt text sent on every card. Recorded, not fixed.
 function stringifyValue(value) {
   if (Array.isArray(value)) return value.join(', ');
   return String(value);

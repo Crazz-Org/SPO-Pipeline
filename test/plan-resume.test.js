@@ -497,6 +497,41 @@ test('handlePlan (reuse path): journals a fresh PLAN invariants-baseline event, 
   assert.ok(baseline, 'reuse must still rebuild and journal an invariants-baseline event');
 });
 
+// ---- wire-shape fix, 2026-09-07: the reuse path reads invariant_ids off `previousPayload`, a
+// separate call site from the fresh-PLAN path above (see test/plan-writes.test.js's sibling
+// tests) and pinned independently here, driven through decidePlanReuse's own machinery
+// (priorPlanRun) rather than a hand-built fixture. Measured on the live journal corpus,
+// 2026-09-07: invariant_ids is a JSON-ENCODED STRING in 159/159 wire occurrences, never a real
+// array -- the shape `Array.isArray(previousPayload.invariant_ids) ? ... : []` rejected on every
+// card, which is why all 58 mismatch events on record carry `declared: 0`.
+test('handlePlan (reuse path): previousPayload.invariant_ids as a JSON-STRING (the real wire shape) is parsed into real declaredIds, not treated as zero declared', async () => {
+  const taskDir = mkTmp('spo-plan-resume-jsonstring-');
+  const worktreePath = mkTmp('spo-plan-resume-jsonstring-wt-');
+  // The real wire shape: a JSON-encoded string of two ids, not a real array.
+  const { invariantsPath } = priorPlanRun(taskDir, { baseMainSha: 'sha-X', invariantIds: '["INV-1", "INV-2"]' });
+  // priorPlanRun's default invariants markdown text ('# Invariants\n\nINV-1: ...\n') has no
+  // '## INV-<n>' blocks, so the parser finds nothing on disk -- overwrite it so this run's
+  // baseline parses zero ids and the mismatch (2 declared, 0 parsed) is unambiguous.
+  fs.writeFileSync(invariantsPath, '# Invariants\n\nINV-1 and INV-2 both hold, prose only, no blocks.\n');
+
+  const spawnSync = countingSpawn(planReplyEnvelope(validPlanPayload()));
+  const task = baseTask({ id: 'card-915', issue: 915, baseMainSha: 'sha-X' });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+
+  const next = await HANDLERS.PLAN(ctx);
+
+  assert.equal(next, 'IMPLEMENT');
+  assert.equal(spawnSync.callCount, 0, 'still a reuse -- the LLM step must not be invoked');
+
+  const journal = readJournal(taskDir);
+  const mismatch = journal.find((e) => e.event === 'invariants-declared-parsed-mismatch');
+  assert.ok(mismatch, 'expected the declared-vs-parsed canary to fire on the reuse path');
+  assert.equal(mismatch.declared, 2, 'the JSON string must be parsed, not treated as zero declared');
+  assert.equal(mismatch.parsed, 0);
+  assert.deepEqual(mismatch.declaredIds, ['INV-1', 'INV-2'], 'declaredIds must be the parsed-out ids, not the raw string');
+  assert.equal(mismatch.declaredShape, 'json-string');
+});
+
 // ---- (12) M4a: condition 4 must also guard the invariants file, not just the plan file --------
 
 test('handlePlan: invariants file missing on disk -> runs PLAN normally', async () => {
