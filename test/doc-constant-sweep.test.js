@@ -519,8 +519,8 @@ test('extractTopLevelSubcommands: reads a synthetic dispatch table, proving the 
 //   `spawnStep` genuinely appears in config.js, but ONLY inside its own comments (steps/
 //   scripted.js's spawnStep, quoted there in prose -- see this file's header on the class of bug
 //   this whole suite exists to catch: a doc SAYS something a re-reader would have to notice is
-//   false). blankComments (the same idiom test/park-reason-doc-sweep.test.js's own scanners use,
-//   copied verbatim below) now runs on the CITED file before the occurrence test, so a name that
+//   false). blankComments (the suite-wide helper, copied verbatim below and rostered in
+//   test/blank-comments-sync.test.js) now runs on the CITED file before the occurrence test, so a name that
 //   exists only in that file's own commentary about a DIFFERENT file's symbol no longer counts as
 //   "there". Comments in the CITING text are still left alone (unchanged from before) -- the
 //   citations themselves live in comments, so blanking those would blank away the thing being
@@ -556,19 +556,32 @@ function isCodeShapedIdentifier(ident) {
   return false;
 }
 
-// blankComments -- verbatim copy of gh-api-argv.test.js's / test/park-reason-doc-sweep.test.js's
-// idiom: blanks `/* */` blocks and whole-line `//` comments (preserving line numbers/lengths),
-// so an identifier that exists ONLY in the file's own commentary about code does not count as
-// "present" -- the M15b fix. An inline trailing `// comment` on a code line is not blanked (same
-// limitation the copied idiom already has everywhere else it's used in this suite) -- harmless
+// blankComments -- blanks whole-line `//` comments and then `/* */` blocks (in that order, and
+// preserving line numbers and column widths), so an identifier that exists ONLY in the file's
+// own commentary about code does not count as "present" -- the M15b fix. An inline trailing
+// `// comment` on a code line is not blanked (same limitation every copy of this helper has,
+// deliberately -- see the whole-line contract in test/blank-comments-sync.test.js) -- harmless
 // here since it can only ever make symbolDefinedIn MORE permissive, never hide a real phantom
 // that M15b's own mutation (a comment-only mention) already proves this catches.
+//
+// KEEP IN SYNC. This helper is not a pair, it is a family: SEVEN byte-identical copies live in
+// this suite -- test/bin-spo-state-write-sweep.test.js, test/doc-constant-sweep.test.js,
+// test/gh-api-argv.test.js, test/no-real-spawn-sweep.test.js, test/park-reason-doc-sweep.test.js,
+// test/park-reason-partition.test.js and test/prompt-contract-sweep.test.js. The duplication is
+// deliberate (each sweep file stands alone and requires nothing from another test file); the
+// drift is not. test/blank-comments-sync.test.js is the authority: it pins that roster, asserts
+// the copies are byte-identical, and runs the helper's behavioural contract against every one of
+// them. Fixing one copy and not the rest is the trap card #152 sets. The card names two files to
+// fix -- test/park-reason-doc-sweep.test.js and test/gh-api-argv.test.js -- but at 41e8d91 all
+// SEVEN carried the same block-first ordering (measured: 7 block-first, 0 line-first, and no
+// line-first copy anywhere in this repo's history). Following the card literally would have left
+// five copies under-detecting without going red.
 function blankComments(source) {
-  const withoutBlocks = source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
-  return withoutBlocks
+  const withoutLineComments = source
     .split('\n')
     .map((line) => (line.trimStart().startsWith('//') ? ' '.repeat(line.length) : line))
     .join('\n');
+  return withoutLineComments.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
 }
 
 // The filename group allows internal dots (`[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*`) so a multi-
