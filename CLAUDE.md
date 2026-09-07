@@ -64,6 +64,12 @@ The method is not optional and not re-invented per session — it is the plan's 
   the highest-value part of the loop; it repeatedly caught tests passing for the wrong reason.
 - **Subagents never commit.** The driver commits after verification: keeps "one commit per action"
   exact and stops parallel agents clobbering each other. One PR per chantier.
+- **Waiting for a subagent is not an activity** — `doc/driver-wait-protocol.md`. A finished subagent
+  wakes the session by itself (measured: 77 of 81 completion notifications landed on an *idle*
+  session), so end the turn and wait. Never hold the turn open with `echo idle`, a `ListAgents`
+  sweep, or `Monitor sleep 600`; block only on a real condition. And never read progress out of
+  `git status`: subagents don't commit, so the worktree is equally dirty at the builder's first
+  write and its last.
 - **One chantier at a time**, next starts only on a green gate: `node --test test/*.test.js`
   (never bare) + `daemon.js --dry-run` + the chantier's listed checks. *(live recette)* gates stop
   and ask the maintainer.
