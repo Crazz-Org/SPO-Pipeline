@@ -46,7 +46,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Killswitch first, textually before any orchestrator require -- test/no-real-spawn-sweep.test.js
@@ -60,6 +59,7 @@ require('./no-real-spawn');
 const { STEP_CONTRACTS } = require('../orchestrator/step-contracts');
 const { buildPromptValues } = require('../orchestrator/task-values');
 const { extractPlaceholders, splitHeaderAndBody } = require('../orchestrator/prompt-template');
+const { mkTmp } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const PROMPTS_DIR = path.join(REPO_ROOT, 'prompts');
@@ -240,7 +240,7 @@ function readmeRowProblems(row, contract) {
 // (task-values.js's own header: undefined/null is prompt-template.js's "missing" condition) --
 // that is what lets "derivable" mean more than "the key merely exists on the returned object".
 function makeSyntheticCtx() {
-  const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-sweep-'));
+  const taskDir = mkTmp('prompt-contract-sweep-');
   const planPayload = {
     plan_path: path.join(taskDir, 'scratch', 'plan-999.md'),
     invariants_path: path.join(taskDir, 'scratch', 'invariants-999.md'),
@@ -664,7 +664,7 @@ test('unusedDerivedValues: clean when every derived value is consumed', () => {
 });
 
 test('undeclaredBodyReferences: catches a body {{token}} the header never declared -- the 7bis.4 crash shape', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const dir = mkTmp('prompt-contract-fixture-');
   const promptFile = writeTempPrompt(
     dir,
     'fixture.md',
@@ -687,7 +687,7 @@ test('undeclaredBodyReferences: catches a body {{token}} the header never declar
 });
 
 test('undeclaredBodyReferences: clean when every body token is declared in the header', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const dir = mkTmp('prompt-contract-fixture-');
   const promptFile = writeTempPrompt(
     dir,
     'fixture.md',
@@ -759,7 +759,7 @@ test('findProseToolGrants: finds a "You hold" statement that line-wraps between 
 });
 
 test('evaluateContract: a divergence in the SECOND of two repeated prose grant statements is caught (not just the first)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const dir = mkTmp('prompt-contract-fixture-');
   const promptFile = writeTempPrompt(
     dir,
     'fixture-repeated-grant.md',
@@ -801,7 +801,7 @@ test('evaluateContract: a divergence in the SECOND of two repeated prose grant s
 });
 
 test('evaluateContract: a divergence in the FIRST of two repeated prose grant statements is also caught (not just the last)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const dir = mkTmp('prompt-contract-fixture-');
   const promptFile = writeTempPrompt(
     dir,
     'fixture-repeated-grant-2.md',
@@ -877,7 +877,7 @@ test('readmeRowProblems: clean when the row states model, escalation and tools c
 });
 
 test('evaluateContract: a fully synthetic contract with FOUR independent, deliberate divergences is caught and each is named', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const dir = mkTmp('prompt-contract-fixture-');
   const promptFile = writeTempPrompt(
     dir,
     'fixture-step.md',
@@ -923,7 +923,7 @@ test('evaluateContract: a fully synthetic contract with FOUR independent, delibe
 });
 
 test('evaluateContract: a fully consistent synthetic contract is clean', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-contract-fixture-'));
+  const dir = mkTmp('prompt-contract-fixture-');
   const promptFile = writeTempPrompt(
     dir,
     'fixture-clean.md',

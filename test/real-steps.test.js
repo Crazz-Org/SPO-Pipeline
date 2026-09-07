@@ -43,11 +43,8 @@ const { runLlm } = require('../orchestrator/steps/llm');
 const { formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
 const { buildBaseline } = require('../orchestrator/invariants');
-const { writePoolDir } = require('./helpers');
+const { writePoolDir, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

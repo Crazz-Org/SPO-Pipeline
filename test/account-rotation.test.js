@@ -8,7 +8,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -19,11 +18,8 @@ const { callLlmStep, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const accounts = require('../orchestrator/accounts');
 const { leaseFilePath } = require('../orchestrator/account-lease');
-const { writePoolDir } = require('./helpers');
+const { writePoolDir, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 // Discovery-based pool: one subdirectory per account (see orchestrator/accounts.js). `list` is
 // an array of {name, configDir, enabled} the way the old accounts.json shaped it -- this

@@ -25,7 +25,7 @@ const os = require('os');
 const { execFileSync } = require('child_process');
 // Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
 // for the incident that makes this load-bearing rather than tidy.
-const { gitEnv } = require('./helpers');
+const { gitEnv, mkTmp } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -1553,7 +1553,7 @@ test('extractCitations: the possessive "(line N)" shape is extracted with its fi
 // These two tests are hermetic (a throwaway git repo in tmpdir), so they pin the resolver's
 // contract rather than whatever happens to be on this machine's disk today.
 function makeFixtureRepo(layout) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-citation-resolver-'));
+  const root = mkTmp('spo-citation-resolver-');
   for (const [rel, body] of Object.entries(layout)) {
     const full = path.join(root, rel);
     fs.mkdirSync(path.dirname(full), { recursive: true });
@@ -2304,7 +2304,7 @@ test('mergedCandidates: falls back to a file-mention candidate ONLY when no iden
 });
 
 test('candidateFoundNear: a "const"/"file" candidate requires the EXACT cited line, never a neighbour', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
+  const dir = mkTmp('spo-anchor-fixture-');
   const file = path.join(dir, 'target.txt');
   fs.writeFileSync(file, ['line one', "status: 'BLOCKED',", 'line three'].join('\n'));
   // BLOCKED is on line 2 (1-indexed).
@@ -2319,7 +2319,7 @@ test('candidateFoundNear: a "const"/"file" candidate requires the EXACT cited li
 // mutation-proof canary below without a single line of THIS repo changing. Zero tolerance now
 // applies to every kind; if anyone reintroduces a band, this fails before the canary does.
 test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance either -- the neighbouring line must miss', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
+  const dir = mkTmp('spo-anchor-fixture-');
   const file = path.join(dir, 'target.txt');
   const lines = [];
   for (let i = 0; i < 20; i++) lines.push(i === 10 ? 'function runLive() {' : `line ${i}`);
@@ -2341,7 +2341,7 @@ test('candidateFoundNear: a "camel"/"snake" candidate gets NO line tolerance eit
 });
 
 test('candidateFoundNear: a "file" candidate matches by SUBSTRING, not \\b-bounded -- the exact reason bin/spo:1141 needs it ("collect" inside "collectAll")', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-anchor-fixture-'));
+  const dir = mkTmp('spo-anchor-fixture-');
   const file = path.join(dir, 'target.txt');
   fs.writeFileSync(file, ['line one', 'const data = collectAll(sources);', 'line three'].join('\n'));
   // "collect" never appears as its own whole word here -- only glued inside "collectAll". A

@@ -2830,6 +2830,20 @@ still deliberately lives outside `test/`, and now also outside the glob.
 
 All state-machine tests run in `--shadow` mode against `fs.mkdtempSync(os.tmpdir())`
 queue/journal directories — no shared state, no product-repo or bench interaction, no network.
+
+Every one of those directories comes from `test/helpers.js`'s `mkTmp()`, which is the suite's
+only door to `os.tmpdir()` and registers what it hands out; a single `process.on('exit')` in
+that file removes the lot with a synchronous `rmSync`. This works because the glob above is
+what runs the suite: `node --test <files>` forks one process per test **file**, so a
+module-scope registry in `helpers.js` is per-file by construction and the hook fires once per
+file, including when that file's tests fail. Before it (measured 2026-09-07) one green
+`scripts/gate.sh` run left **5617** new entries under `/tmp` and never removed one, 4174 of them
+from 37 files that had each re-derived their own three-line `mkTmp`; after, 100 — all of them
+temp *files* written by production code (`intake.js`'s `spo-card-comment-*`/`spo-card-body-*`/
+`spo-amend-body-*`, `report-intake.js`'s `spo-raw-report-*`) through their own `deps.tmpDir`
+seam, which no test passes today. `test/temp-dir-registry.test.js` proves the sweep happens (a
+real nested `node --test` child, with an unregistered directory alongside as the control);
+`test/temp-dir-sweep.test.js` is the standing guard that no file re-derives its own.
 `test/llm-real.test.js`, `test/llm-real-card.test.js` and `test/account-rotation.test.js`
 exercise **real-mode** LLM code (`invokeClaudeReal`, `callLlmStep`) and `test/real-steps.test.js`
 exercises the real-mode **scripted** functions ("Real scripted steps" above, now including each

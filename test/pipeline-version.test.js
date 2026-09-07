@@ -17,7 +17,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { execFileSync, spawn: realSpawn } = require('child_process');
 
@@ -42,7 +41,7 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8',
 // A throwaway repo with one commit. `-c` overrides rather than a config write so the box's own
 // user.name/user.email (and any commit.gpgsign) can neither be required nor disturbed.
 function mkRepo(prefix) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = mkTmp(prefix);
   execFileSync('git', ['init', '-q', '-b', 'main', '.'], { cwd: dir, env: gitEnv() });
   execFileSync(
     'git',
@@ -83,7 +82,7 @@ test('linked worktree (.git FILE + commondir): refs live in the common dir, and 
 });
 
 test('not a repo at all: {sha: null, ref: null}, never a throw', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-pv-none-'));
+  const dir = mkTmp('spo-pv-none-');
   assert.deepEqual(readPipelineVersion(dir), { sha: null, ref: null });
 });
 

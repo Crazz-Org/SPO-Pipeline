@@ -23,17 +23,16 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
 require('./no-real-spawn');
 
-const { gitEnv } = require('./helpers');
+const { gitEnv, mkTmp } = require('./helpers');
 
 const HOOK = process.env.SPO_POST_MERGE_HOOK || path.join(__dirname, '..', 'scripts', 'git-hooks', 'post-merge');
 
-const mk = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const mk = mkTmp;
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env: gitEnv() }).trim();
 
 // A checkout on `branch`, carrying a fake scripts/release.sh that records its invocation.

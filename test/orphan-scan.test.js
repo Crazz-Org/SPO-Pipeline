@@ -25,11 +25,8 @@ const {
 } = require('../orchestrator/journal');
 const { runScanCycle, createScanTimers } = require('../orchestrator/state-machine');
 const { createScanState } = require('../orchestrator/comment-scan');
-const { runDaemonOnce, runDaemonDryRun } = require('./helpers');
+const { runDaemonOnce, runDaemonDryRun, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

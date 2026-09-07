@@ -34,10 +34,8 @@ const { buildCtx, finalizePark, takeNextTask, drainQueueOnce } = require('../orc
 const { reEnqueueTask, unparkScan } = require('../orchestrator/park-loop');
 const { writeState } = require('../orchestrator/journal');
 const { queuedIds } = require('../orchestrator/orphan-scan');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

@@ -16,7 +16,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -33,10 +32,8 @@ const {
 } = require('../orchestrator/auto-pull');
 const { writeLiveWorkerIds } = require('../orchestrator/journal');
 const realConfig = require('../orchestrator/config');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
 }

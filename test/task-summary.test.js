@@ -9,7 +9,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -17,10 +16,8 @@ const path = require('path');
 // before the orchestrator require(s) below (test/no-real-spawn-sweep.test.js enforces the order).
 require('./no-real-spawn');
 const { summarizeTask, readJournalLines, formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function seedJournal(taskDir, lines) {
   fs.writeFileSync(path.join(taskDir, 'journal.jsonl'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');

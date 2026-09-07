@@ -27,6 +27,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { mkTmp } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const TEST_DIR = path.join(REPO_ROOT, 'test');
@@ -420,7 +421,7 @@ test('every test/*.test.js file that requires an orchestrator module installs th
 // already follows.
 
 function fixtureDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return mkTmp(prefix);
 }
 
 test('sweep fails a synthetic fixture that requires an orchestrator module without the killswitch', () => {

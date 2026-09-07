@@ -20,10 +20,8 @@ const {
 const { buildPromptValues } = require('../orchestrator/task-values');
 const { appendEvent } = require('../orchestrator/journal');
 const { STEP_CONTRACTS } = require('../orchestrator/step-contracts');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 // ---- extractPlaceholders / fillPromptTemplate, happy + missing path ----------------------
 

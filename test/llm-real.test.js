@@ -5,6 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { mkTmp } = require('./helpers');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
@@ -81,10 +82,9 @@ test('buildArgv: only the required fields -- optional flags omitted entirely', (
 });
 
 test('resolvePromptText: promptFile is read and used as the prompt text', () => {
-  const os = require('os');
-  const fs = require('fs');
+    const fs = require('fs');
   const path = require('path');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-promptfile-'));
+  const dir = mkTmp('spo-promptfile-');
   const file = path.join(dir, 'prompt.txt');
   fs.writeFileSync(file, 'from a file');
   assert.equal(resolvePromptText({ promptFile: file }), 'from a file');
@@ -691,9 +691,8 @@ test('invokeClaudeReal: an ordinary non-zero exit with no signal is neither time
 
 test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.account, journals llm-call', async () => {
   const fs = require('fs');
-  const os = require('os');
-  const path = require('path');
-  const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-llmreal-taskdir-'));
+    const path = require('path');
+  const taskDir = mkTmp('spo-llmreal-taskdir-');
 
   const payload = realShapedPayload({ result: 'plan complete' });
   let seenArgv = null;

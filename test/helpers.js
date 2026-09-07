@@ -35,7 +35,7 @@ function gitEnv() {
 }
 
 function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return registerTempDir(fs.mkdtempSync(path.join(os.tmpdir(), prefix))); // swept at exit -- see registerTempDir
 }
 
 // action 2.1b -- what Node's real spawnSync actually returns when its own `timeout` option kills
@@ -236,6 +236,65 @@ function readLedger(journalDir, id) {
   if (!fs.existsSync(p)) return '';
   return fs.readFileSync(p, 'utf8');
 }
+
+// ---- the temp-dir registry, and the one exit hook that sweeps it -----------------------------
+//
+// Every mkTmp() above hands out an fs.mkdtempSync(os.tmpdir()) directory that nothing ever
+// removed. Measured on 2026-09-07, before this registry existed: one `scripts/gate.sh` run (76
+// files, 2239 tests, green) left 5617 NEW entries under /tmp -- 1428 of them the six
+// isolatedEnv() paths alone, at 238 daemon spawns per run. They accumulate across every gate
+// run, every pre-push, every CI job, forever. /tmp on this box was already carrying 1471 entries
+// when the measurement started.
+//
+// The cheap fix is available because of how the suite is RUN. `scripts/gate.sh` ends in
+// `node --test "${files[@]}"`, and node:test's default isolation is 'process': it forks one child
+// per test FILE (verified on node v22.23.2 -- three files, three distinct pids, helpers.js
+// require'd once in each). So a module-scope registry here is per-file by construction, and one
+// `process.on('exit')` registered at require time fires exactly once per test file, after that
+// file's last test, with no per-test bookkeeping and no `after()` hook for 76 files to remember.
+//
+// The removal is fs.rmSync, not fs.rm: 'exit' handlers may not queue async work -- a promise or a
+// callback scheduled there never runs, and the sweep would silently do nothing.
+//
+// WHAT THIS DOES NOT COVER, deliberately, so nobody reads it as a guarantee:
+//   - A process killed by SIGKILL, or one that never reaches a normal exit, runs no handler.
+//     A timed-out `runDaemonWorkerRun` child is killed that way; its own registry dies with it.
+//     This reduces the leak, it does not make os.tmpdir() self-cleaning.
+//   - Temp paths built by PRODUCTION code rather than by this helper (intake.js's
+//     `spo-card-comment-*`/`spo-card-body-*`/`spo-amend-body-*` files, report-intake.js's
+//     `spo-raw-report-*`) are outside it -- they are files the product writes, and a test that
+//     wants them swept must pass an explicit `tmpDir` that came from mkTmp.
+//   - A directory registered here is removed EVEN IF the test already removed it (force: true) or
+//     moved it. Registration is one-way; there is no unregister, because nothing in this suite
+//     hands a mkTmp() path to anything that outlives the test file's own process.
+//
+// test/temp-dir-registry.test.js proves the sweep actually happens -- including on a test file
+// that FAILS -- by running a real `node --test` child and checking the directory is gone, with an
+// unregistered fs.mkdtempSync directory in the same fixture as the control that survives.
+// test/temp-dir-sweep.test.js is the standing guard that no test file re-derives its own
+// mkdtempSync helper and slips back out of the registry.
+const TEMP_DIRS = new Set();
+
+// Not exported: mkTmp() is the only caller, and an exported way to register an arbitrary path
+// would be an invitation to keep creating directories the other way and remember to register
+// them -- which is the habit this whole block exists to remove.
+function registerTempDir(dir) {
+  TEMP_DIRS.add(dir);
+  return dir;
+}
+
+process.on('exit', () => {
+  for (const dir of TEMP_DIRS) {
+    // Never throw from an exit handler: a directory left un-removable (a fixture that chmod'd
+    // itself, a mount, a race with a child still exiting) must cost a leaked directory, not turn
+    // a green test file into a non-zero exit with no failing test name to point at.
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+    } catch {
+      /* leaked, not fatal -- see above */
+    }
+  }
+});
 
 module.exports = {
   gitEnv,

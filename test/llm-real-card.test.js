@@ -6,7 +6,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -15,10 +14,8 @@ const path = require('path');
 require('./no-real-spawn');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { ParkSignal } = require('../orchestrator/park-signal');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function fakeSpawnSync(responder) {
   return (command, argv, opts) => responder(command, argv, opts);
