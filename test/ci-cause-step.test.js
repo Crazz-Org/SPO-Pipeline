@@ -10,7 +10,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -22,10 +21,8 @@ const { realCiChecks } = require('../orchestrator/steps/scripted');
 const { HANDLERS, buildCtx, snapshot } = require('../orchestrator/state-machine');
 const { writeState } = require('../orchestrator/journal');
 const { ParkSignal } = require('../orchestrator/park-signal');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

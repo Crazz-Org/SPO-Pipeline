@@ -10,7 +10,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -20,11 +19,8 @@ require('./no-real-spawn');
 const { COLUMN_BY_STATE, moveCard, moveIssueToColumn, runSync } = require('../orchestrator/board');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
-const { timeoutResult } = require('./helpers');
+const { timeoutResult, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
 }

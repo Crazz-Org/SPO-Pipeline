@@ -13,6 +13,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { mkTmp } = require('./helpers');
 
 require('./no-real-spawn');
 
@@ -26,7 +27,7 @@ const {
   UnmigratedStateError,
 } = require('../orchestrator/state-root');
 
-const mk = (prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+const mk = mkTmp;
 
 // A repo-shaped directory with real daemon-written state in it.
 function withLegacyState(root, { daemonLog = true, card = true, queued = false } = {}) {

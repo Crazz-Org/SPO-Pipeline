@@ -131,6 +131,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const { mkTmp } = require('./helpers');
 
 const TEST_DIR = __dirname;
 
@@ -480,6 +481,22 @@ const ALLOWLIST = new Map([
     { reason: 'a trivial `-e` one-liner used only to mint a guaranteed-dead pid -- not daemon.js/bin/spo.', patterns: ["'-e',"] },
   ],
   [
+    'temp-dir-registry.test.js',
+    {
+      reason:
+        "both sites spawn a NESTED `node --test` over a fixture test file that file itself just " +
+        'wrote into an mkTmp directory -- the only way to observe a per-file exit handler, which ' +
+        'by definition runs after this process\'s own last assertion. The argv is ' +
+        "`['--test', <fixture>]`: it never names daemon.js/bin/spo, and the fixture it runs " +
+        'requires nothing but node:test and test/helpers.js. Its env is gitEnv() with ' +
+        'NODE_TEST_CONTEXT deleted rather than isolatedEnv(), deliberately: isolatedEnv() would ' +
+        'mint six more throwaway directories per call to isolate a child that reads none of them, ' +
+        'and the one variable that actually matters to a nested test runner is the one gitEnv() ' +
+        'does not touch.',
+      patterns: ["'--test',"],
+    },
+  ],
+  [
     'tokens.test.js',
     {
       reason:
@@ -649,6 +666,7 @@ test('the ALLOWLIST and FILE_ALLOWLIST are pinned by name', () => {
       'repark-claim-publish-order.test.js',
       'repark-race-demo.test.js',
       'status-6.7.test.js',
+      'temp-dir-registry.test.js',
       'tokens.test.js',
     ].sort(),
     'ALLOWLIST gained or lost an entry without this pin being updated'
@@ -841,7 +859,7 @@ test('helpers.isolatedEnv() isolates SPO_STATE_DIR to a fresh temp directory, ne
 
 function fixtureDir(prefix) {
   const os = require('os');
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return mkTmp(prefix);
 }
 
 // Embeds `pattern` verbatim into a syntactically valid argv literal, so a fixture "ok" call's own
@@ -871,7 +889,7 @@ function classifyFixtureFile(dir, file) {
 }
 
 test("every ALLOWLIST entry's own pattern(s) exempt only their own shape -- never an unrelated, genuinely broken call in the same file", () => {
-  // Loops ALL twelve entries and every pattern within each, not one hardcoded file: a rejected
+  // Loops EVERY entry and every pattern within each, not one hardcoded file: a rejected
   // earlier cut of this test exercised dispatcher.test.js alone, so an allowlisted file outside
   // that one hardcoded name could have its pattern silently widened with nothing here to notice.
   for (const [file, entry] of ALLOWLIST) {

@@ -9,7 +9,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -29,7 +28,7 @@ const {
 } = require('../orchestrator/park-loop');
 const { createScanState } = require('../orchestrator/comment-scan');
 const { appendEvent, writeState } = require('../orchestrator/journal');
-const { timeoutResult } = require('./helpers');
+const { timeoutResult, mkTmp } = require('./helpers');
 
 // `gh api` pagination rides in the path's query string, not in `-f page=N` argv elements -- a `-f`
 // field would flip the call from GET to POST against the create-comment endpoint (see
@@ -45,9 +44,6 @@ function pageParamOf(args) {
 }
 
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
 }

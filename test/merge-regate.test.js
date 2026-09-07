@@ -12,16 +12,12 @@ require('./no-real-spawn');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 const { realMerge } = require('../orchestrator/steps/scripted');
 const { buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
-
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
+const { mkTmp, writePoolDir } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -503,7 +499,6 @@ test('regate: pins the exact git argv the re-gate spawns, in order, and the jour
 // has to be driven through `runTask` and cannot be established by calling the step function.
 
 const { runTask } = require('../orchestrator/state-machine');
-const { mkTmp: helperMkTmp, writePoolDir } = require('./helpers');
 
 const LAP_ORIGIN_MAIN_SHA = 'a'.repeat(40);
 const LAP_HEAD_SHA = 'b'.repeat(40);
@@ -592,16 +587,16 @@ function lapCommonSpawnSync(command, args, mainMovedFiles) {
 }
 
 function lapConfig(overrides = {}) {
-  const accts = helperMkTmp('spo-regate-lap-accts-');
+  const accts = mkTmp('spo-regate-lap-accts-');
   writePoolDir(accts, [{ name: 'default' }]);
   return {
     shadowMode: false,
     dryRun: false,
     real: true,
     productRepo: '/fake/home/SPO-WebClient',
-    pipelineWorktreesDir: helperMkTmp('spo-regate-lap-worktrees-'),
+    pipelineWorktreesDir: mkTmp('spo-regate-lap-worktrees-'),
     ghRepo: 'Crazz-Org/SPO-WebClient',
-    spoBenchDir: helperMkTmp('spo-regate-lap-bench-'),
+    spoBenchDir: mkTmp('spo-regate-lap-bench-'),
     stepDeadlineMs: 30000,
     ciChecksMaxPolls: 3,
     ciChecksPollIntervalMs: 1,
@@ -612,7 +607,7 @@ function lapConfig(overrides = {}) {
 }
 
 test('runTask (real mode, card): MERGE re-gates on a CONFLICTING probe and the card really walks CHECK -> PUSH_PR (PR REUSED, gh pr create never called) -> GATE -> CI_CHECKS -> VALIDATE -> MERGE a second time, where the spent budget makes it park on the ORIGINAL merge-conflict rather than loop', async () => {
-  const taskDir = helperMkTmp('spo-regate-lap-taskdir-');
+  const taskDir = mkTmp('spo-regate-lap-taskdir-');
   const config = lapConfig();
 
   // The bench verdict for HEAD is deliberately NOT on disk while lap 1's CI_CHECKS runs -- its

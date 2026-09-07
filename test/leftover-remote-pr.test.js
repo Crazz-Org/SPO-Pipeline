@@ -31,10 +31,8 @@ require('./no-real-spawn');
 const { realWorktree } = require('../orchestrator/steps/scripted');
 const { buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
+const { mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

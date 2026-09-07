@@ -18,7 +18,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
@@ -29,11 +28,8 @@ const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
 const { lastResultPayload } = require('../orchestrator/task-values');
 const { realWorktree } = require('../orchestrator/steps/scripted');
-const { writePoolDir } = require('./helpers');
+const { writePoolDir, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function readJournal(taskDir) {
   return fs

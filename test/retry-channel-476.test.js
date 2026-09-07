@@ -21,7 +21,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 require('./no-real-spawn');
@@ -31,11 +30,8 @@ const retryChannel = require('../orchestrator/retry-channel');
 const { writeState, appendEvent } = require('../orchestrator/journal');
 const { collectJournalTasks, collectServices, applyRetryChannelStats } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
-const { runSpo } = require('./helpers');
+const { runSpo, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

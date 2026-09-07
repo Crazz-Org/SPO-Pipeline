@@ -24,11 +24,8 @@ const { buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 // The accurate spawnSync timeout signature (ETIMEDOUT + kill signal) -- see command-timeout.js's
 // measured table for why a bare signal is NOT that, and is an external kill instead.
-const { timeoutResult } = require('./helpers');
+const { timeoutResult, mkTmp } = require('./helpers');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };

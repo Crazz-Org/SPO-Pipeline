@@ -31,7 +31,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 // Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
 // for the incident that makes this load-bearing rather than tidy.
-const { gitEnv } = require('./helpers');
+const { gitEnv, mkTmp } = require('./helpers');
 
 // Killswitch first, textually, before the orchestrator require below -- see test/no-real-spawn.js's
 // own header and test/no-real-spawn-sweep.test.js's standing guard over this exact ordering rule.
@@ -124,7 +124,7 @@ test('console/collect.js still reads the heartbeat by CONTENT, never by mtime --
 // dropping it misreads every pre-B5.2 heartbeat as corrupt. That exact bug bit B5.2's own first
 // implementation on the WebClient side before its own tests caught it.
 test('heartbeatAgeMs reads BOTH on-disk shapes -- the legacy bare epoch and B5.2s payload', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spo-heartbeat-shapes-'));
+  const dir = mkTmp('spo-heartbeat-shapes-');
   const file = path.join(dir, 'heartbeat');
   const now = 1_000_000;
 

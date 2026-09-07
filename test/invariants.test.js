@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { mkTmp } = require('./helpers');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
@@ -23,9 +24,6 @@ const {
   checkRegressions,
 } = require('../orchestrator/invariants');
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function block(id, fileSpec, quoteLines) {
   return [`## ${id}`, `File: ${fileSpec}`, '>>> QUOTE', ...quoteLines, '>>> END QUOTE', ''].join('\n');
