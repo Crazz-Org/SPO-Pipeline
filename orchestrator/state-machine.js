@@ -539,6 +539,30 @@ function annotatePlanSpanConflicts(ctx, baseline, planMarkdown) {
   }
 }
 
+// The ONE place `invariant_ids` is normalized for the declared-vs-parsed canary below, mirroring
+// how #118 made guardDeclaredFiles the one place `files_to_change` is normalized (see that
+// function's own header). Before this fix the two canary call sites each ran their own inline
+// `Array.isArray(x.invariant_ids) ? x.invariant_ids : []` -- the identical shape bug #118 fixed
+// for files_to_change, unpropagated here. Measured on the live journal corpus (every task dir's
+// journal.jsonl under ~/.spo-state/journal) on 2026-09-07: invariant_ids occurs 159 times on the
+// wire and is a JSON-ENCODED STRING in all 159, never a real array -- the same wire shape
+// files_to_change turned out to have. Array.isArray therefore rejected the field's own shape on
+// every card, so `declared` was always 0 and `declaredIds` always []: of the 58
+// invariants-declared-parsed-mismatch events on record, all 58 fire with declared: 0 against
+// parsed values from 4 to 33. The canary has never once compared two real numbers -- every firing
+// to date is an artifact of the shape test, not a signal about the parser it exists to watch.
+//
+// normalizeFindingsPayload (park-loop.js) is reused rather than reimplemented, same as
+// guardDeclaredFiles does. What counts as a DECLARATION is 'array' and 'json-string' only --
+// everything else (absent, null, an object, a bare unparsable string) is no declaration, an empty
+// list, same fail-open posture guardDeclaredFiles already established for the sibling field.
+// Never throws.
+function normalizeDeclaredInvariantIds(rawInvariantIds) {
+  const declared = normalizeFindingsPayload(rawInvariantIds);
+  const isList = declared.shape === 'array' || declared.shape === 'json-string';
+  return { declaredIds: isList ? declared.items : [], shape: declared.shape };
+}
+
 async function handlePlan(ctx) {
   // Action 3.1: a still-valid plan from an earlier run short-circuits everything below, including
   // the LLM call itself -- that IS the point, not an optimization bolted onto a call that still
@@ -577,7 +601,7 @@ async function handlePlan(ctx) {
       annotatePlanSpanConflicts(ctx, baseline, readPlanMarkdownForSpanCheck(planPath));
       appendEvent(ctx.taskDir, 'PLAN', 'invariants-baseline', baseline);
 
-      const declaredIds = Array.isArray(previousPayload.invariant_ids) ? previousPayload.invariant_ids : [];
+      const { declaredIds, shape: declaredShape } = normalizeDeclaredInvariantIds(previousPayload.invariant_ids);
       const parsedIds = (baseline.invariants || []).map((inv) => inv.id);
       if (declaredIds.length !== parsedIds.length) {
         appendEvent(ctx.taskDir, 'PLAN', 'invariants-declared-parsed-mismatch', {
@@ -586,6 +610,11 @@ async function handlePlan(ctx) {
           declaredIds,
           parsedIds,
           issues: baseline.issues || [],
+          // normalizeDeclaredInvariantIds's own shape verdict (see its header, 2026-09-07): a
+          // real empty declaration ('[]', shape json-string, e.g. a docs-only plan) and a broken
+          // one (unparsable-string, absent, json-string-object, ...) both collapse to `declared:
+          // 0` above, and this is the only field on the event that tells them apart.
+          declaredShape,
         });
       }
     }
@@ -692,7 +721,14 @@ async function handlePlan(ctx) {
     // mismatch is free to detect and is the one signal that would surface such a regression.
     // Journalled, deliberately never a park: PLAN's prose and its id list disagreeing is not
     // grounds to fail a card, it is grounds to go look at the parser.
-    const declaredIds = Array.isArray(payload.invariant_ids) ? payload.invariant_ids : [];
+    //
+    // invariant_ids arrives the same JSON-ENCODED-STRING way files_to_change does (#118) --
+    // measured 159/159 on the live journal corpus, 2026-09-07 -- so this used to be
+    // `Array.isArray(payload.invariant_ids) ? ... : []`, which rejected the field's own wire
+    // shape on every card and made every one of the 58 mismatch events on record fire with
+    // `declared: 0` against real `parsed` counts (4..33): never a signal about the parser, only
+    // about the shape test. See normalizeDeclaredInvariantIds's own header above.
+    const { declaredIds, shape: declaredShape } = normalizeDeclaredInvariantIds(payload.invariant_ids);
     const parsedIds = (baseline.invariants || []).map((inv) => inv.id);
     if (declaredIds.length !== parsedIds.length) {
       appendEvent(ctx.taskDir, 'PLAN', 'invariants-declared-parsed-mismatch', {
@@ -701,6 +737,9 @@ async function handlePlan(ctx) {
         declaredIds,
         parsedIds,
         issues: baseline.issues || [],
+        // See the reuse path's identical comment above -- declaredShape is the only field that
+        // tells a real empty declaration apart from a broken one once both read declared: 0.
+        declaredShape,
       });
     }
   }

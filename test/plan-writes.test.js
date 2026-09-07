@@ -403,6 +403,164 @@ test('handlePlan: PLAN declaring invariant ids the parser cannot find journals a
   assert.equal(baseline.invariants.length, 0);
 });
 
+// ---- wire-shape fix, 2026-09-07: invariant_ids arrives JSON-ENCODED-STRING on the wire, exactly
+// like files_to_change (#118) -- measured 159/159 on the live journal corpus. The canary's
+// `Array.isArray(payload.invariant_ids) ? ... : []` test rejected that shape on every card, so
+// `declared` was always 0 and none of the 58 mismatch events on record ever compared two real
+// numbers. These tests pin state-machine.js's normalizeDeclaredInvariantIds against the shape
+// production actually sends, not the array shape the pre-existing tests above use.
+
+test('handlePlan: PLAN declaring invariant ids as a JSON-STRING (the real wire shape) that matches what the parser finds does NOT trip the canary -- pins the fix (fails under the old Array.isArray test: declared 0 vs parsed 2)', async () => {
+  const worktreePath = mkTmp('spo-plan-canary-jsonstring-match-wt-');
+  const accountsDir = mkTmp('spo-plan-canary-jsonstring-match-accounts-');
+  writePoolDir(accountsDir, [{ name: 'acct-1', oauthToken: 'tok' }]);
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const invariantsMarkdown = [
+    '## INV-1',
+    'File: foo.js:1-3',
+    '>>> QUOTE',
+    'function foo() {\n  return 42;\n}',
+    '>>> END QUOTE',
+    '',
+    '## INV-2',
+    'File: foo.js:99',
+    '>>> QUOTE',
+    'this text was never in foo.js',
+    '>>> END QUOTE',
+    '',
+  ].join('\n');
+
+  const deps = {
+    spawnSync: fakePlanSpawn({
+      plan_markdown: '# Plan\n\nDo the thing.\n',
+      invariants_markdown: invariantsMarkdown,
+      // The real wire shape: a JSON-encoded string, not a real array.
+      invariant_ids: '["INV-1", "INV-2"]',
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-canary-jsonmatch-1',
+    kind: 'card',
+    issue: 603,
+    title: 'Do the thing',
+    criterion: 'the thing is done',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = realPlanCtx({
+    id: 'card-canary-jsonmatch-1',
+    task,
+    taskDir: mkTmp('spo-plan-canary-jsonmatch-taskdir-'),
+    accountsDir,
+    deps,
+  });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(
+    !journal.some((e) => e.event === 'invariants-declared-parsed-mismatch'),
+    'declared (2, from the parsed JSON string) equals parsed (2) -- the canary must stay silent'
+  );
+});
+
+test('handlePlan: PLAN declaring invariant ids as a JSON-STRING with a genuine count mismatch fires the canary with real numbers on both sides, and declaredIds holds the parsed-out ids, not the raw string', async () => {
+  const worktreePath = mkTmp('spo-plan-canary-jsonstring-mismatch-wt-');
+  const accountsDir = mkTmp('spo-plan-canary-jsonstring-mismatch-accounts-');
+  writePoolDir(accountsDir, [{ name: 'acct-1', oauthToken: 'tok' }]);
+  fs.writeFileSync(path.join(worktreePath, 'a.js'), 'const x = 1;\n');
+
+  const deps = {
+    spawnSync: fakePlanSpawn({
+      plan_markdown: '# Plan\n\nDo the thing.\n',
+      // No ## INV-<n> blocks at all -- the parser finds nothing.
+      invariants_markdown: '# Invariants\n\nINV-1, INV-2 and INV-3 all hold in a.js.\n',
+      invariant_ids: '["INV-1", "INV-2", "INV-3"]',
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-canary-jsonmismatch-1',
+    kind: 'card',
+    issue: 604,
+    title: 'Do the thing',
+    criterion: 'the thing is done',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = realPlanCtx({
+    id: 'card-canary-jsonmismatch-1',
+    task,
+    taskDir: mkTmp('spo-plan-canary-jsonmismatch-taskdir-'),
+    accountsDir,
+    deps,
+  });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT', 'a parser/prompt divergence must never park the card');
+
+  const journal = readJournal(ctx.taskDir);
+  const mismatch = journal.find((e) => e.event === 'invariants-declared-parsed-mismatch');
+  assert.ok(mismatch, 'expected the declared-vs-parsed canary to fire');
+  assert.equal(mismatch.declared, 3);
+  assert.equal(mismatch.parsed, 0);
+  assert.deepEqual(mismatch.declaredIds, ['INV-1', 'INV-2', 'INV-3'], 'declaredIds must be the parsed-out ids, not the raw JSON string');
+  assert.equal(mismatch.declaredShape, 'json-string');
+});
+
+test('handlePlan: PLAN declaring invariant ids as a bare unparsable string is not a declaration -- still journals the mismatch, still does not park, and declaredShape distinguishes it from a real empty declaration', async () => {
+  const worktreePath = mkTmp('spo-plan-canary-unparsable-wt-');
+  const accountsDir = mkTmp('spo-plan-canary-unparsable-accounts-');
+  writePoolDir(accountsDir, [{ name: 'acct-1', oauthToken: 'tok' }]);
+  fs.writeFileSync(path.join(worktreePath, 'foo.js'), 'function foo() {\n  return 42;\n}\n');
+
+  const invariantsMarkdown = ['## INV-1', 'File: foo.js:1-3', '>>> QUOTE', 'function foo() {\n  return 42;\n}', '>>> END QUOTE', ''].join('\n');
+
+  const deps = {
+    spawnSync: fakePlanSpawn({
+      plan_markdown: '# Plan\n\nDo the thing.\n',
+      invariants_markdown: invariantsMarkdown,
+      // Not JSON, not an array -- a shape that is neither 'array' nor 'json-string', so it is no
+      // declaration at all (normalizeDeclaredInvariantIds treats it as declaredIds: []).
+      invariant_ids: 'INV-1',
+      check_commands: ['npm run typecheck'],
+    }),
+  };
+
+  const task = {
+    id: 'card-canary-unparsable-1',
+    kind: 'card',
+    issue: 605,
+    title: 'Do the thing',
+    criterion: 'the thing is done',
+    worktreePath,
+    size: 'S',
+  };
+  const ctx = realPlanCtx({
+    id: 'card-canary-unparsable-1',
+    task,
+    taskDir: mkTmp('spo-plan-canary-unparsable-taskdir-'),
+    accountsDir,
+    deps,
+  });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT', 'a non-declaration shape must never park the card');
+
+  const journal = readJournal(ctx.taskDir);
+  const mismatch = journal.find((e) => e.event === 'invariants-declared-parsed-mismatch');
+  assert.ok(mismatch, 'expected the canary to fire -- declared 0 vs parsed 1');
+  assert.equal(mismatch.declared, 0);
+  assert.equal(mismatch.parsed, 1);
+  assert.deepEqual(mismatch.declaredIds, []);
+  assert.equal(mismatch.declaredShape, 'unparsable-string', 'must be distinguishable from a real empty declaration ("[]", shape json-string)');
+});
+
 // ---- issue #112: PLAN-time plan-span-conflict flagging -----------------------------------------
 //
 // The measured defect: PLAN sometimes freezes an invariant over a span its OWN plan text goes on

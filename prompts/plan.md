@@ -76,9 +76,9 @@ you are drafting the file content, not a description of it.
      field of the reply, not something derived from the markdown for you: VALIDATE is handed the
      list and checks the change against it, and the driver compares your list against what it
      actually parsed out of `invariants_markdown`. The two disagreeing is journalled as
-     `invariants-declared-parsed-mismatch` and means one of them is wrong — most often eight
-     well-formed blocks alongside an empty list, which silently tells VALIDATE there is nothing
-     to hold the change to.
+     `invariants-declared-parsed-mismatch` and means one of them is wrong — an empty list (`[]`)
+     alongside well-formed blocks is the worst case, since it silently tells VALIDATE there is
+     nothing to hold the change to. Declare accurately regardless of how many blocks you wrote.
 3. **Runnable check commands** — not prose, not "run the tests": commands the driver or the
    IMPLEMENT step execute verbatim and read an **exit code** from, never printed text. In this
    order:
