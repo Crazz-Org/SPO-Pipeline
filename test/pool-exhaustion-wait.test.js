@@ -88,6 +88,19 @@ function readState(taskDir) {
   return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
 }
 
+// readReportDetail(taskDir) -- state.json carries only {reason, lastState, state}, never `detail`
+// (journal.js's writeState); the full park detail lives in report.md's fenced ```json block
+// (journal.js's writeReport), which is also what postParkComment reads to build the gh comment a
+// maintainer actually sees. Parsed back out here rather than re-deriving it from the journal,
+// since the journal's own `pool-wait-cap-exceeded` event only carries the SUBSET this action
+// journals explicitly, not the full merged evidence detail.
+function readReportDetail(taskDir) {
+  const body = fs.readFileSync(path.join(taskDir, 'report.md'), 'utf8');
+  const m = /```json\n([\s\S]*?)\n```/.exec(body);
+  assert.ok(m, 'report.md must carry a fenced ```json detail block');
+  return JSON.parse(m[1]);
+}
+
 // ==== part 1: poolCooldownDeadlineMs, exercised directly -- both keys, both types, pinned =======
 
 test('poolCooldownDeadlineMs: earliestCooldownUntil (epoch-ms number) is used directly -- issue-486 shape', () => {
@@ -219,20 +232,151 @@ for (const [reason, detail] of [
   });
 }
 
-// ==== part 4: the cap binds, and binds BEFORE the wait =============================================
+// ==== part 4: the cap binds, and binds BEFORE the wait; card #119 action 1.3: exceeding it is its
+// OWN reason, carrying the evidence, and is never re-enqueued (the loop guard) =====================
 
-test('finalizePark: accumulated wait already at the cap -> parks, does NOT re-enqueue (worst case: exactly today\'s behaviour)', () => {
+test('finalizePark: accumulated wait over the cap -> parks under the NEW cap-exceeded reason, never the original, and does NOT re-enqueue', () => {
   const config = testConfig(); // poolExhaustionWaitCapMs: 12h
   const ctx = buildParkCtx({ config, task: { poolWaitMs: 12 * 60 * 60 * 1000, poolWaitAttempts: 3 } });
-  const deadlineMs = Date.now() + 60 * 60 * 1000; // a fresh, ordinary 1h cooldown
+  const deadlineMs = Date.now() + 60 * 60 * 1000; // a fresh, ordinary 1h cooldown -- accumulated = 13h, 1h over the 12h cap
+  const originalDetail = { cooldownUntilIso: new Date(deadlineMs).toISOString() };
 
-  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(deadlineMs).toISOString() });
+  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-after-retry', originalDetail);
 
   const state = readState(ctx.taskDir);
   assert.equal(state.state, 'PARKED', 'the cap binds -- this must be an ordinary park');
-  assert.equal(state.reason, 'all-accounts-cooling-after-retry');
+  assert.equal(
+    state.reason,
+    'all-accounts-cooling-wait-cap-exceeded',
+    'action 1.3: cap-exceeded gets its OWN reason -- never falls through under the original one'
+  );
   assert.equal(queuedFiles(config.queueDir).length, 0);
-  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait'));
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait'), 'no wait was taken');
+
+  // The evidence (this action's spec, item 2): accumulated wait, the number of waits already
+  // TAKEN (this blocked one does not count), the cap that was exceeded, the deadline that would
+  // have been waited for, and the ORIGINAL family reason -- plus the original detail's own fields,
+  // preserved alongside the new ones. state.json itself never carries `detail` (journal.js's
+  // writeState) -- report.md is where the full merged detail lands (readReportDetail's own header).
+  const reportDetail = readReportDetail(ctx.taskDir);
+  assert.equal(reportDetail.originalReason, 'all-accounts-cooling-after-retry');
+  assert.equal(reportDetail.capMs, config.poolExhaustionWaitCapMs);
+  assert.ok(Math.abs(reportDetail.accumulatedWaitMs - 13 * 60 * 60 * 1000) < 5000);
+  assert.equal(reportDetail.poolWaitAttempts, 3);
+  assert.equal(reportDetail.deadlineMs, deadlineMs);
+  assert.equal(reportDetail.cooldownUntilIso, originalDetail.cooldownUntilIso, "the ORIGINAL detail's own fields survive alongside the new evidence fields");
+
+  const evt = readJournal(ctx.taskDir).find((e) => e.event === 'pool-wait-cap-exceeded');
+  assert.ok(evt, 'pool-wait-cap-exceeded must be journalled');
+  assert.equal(evt.reason, 'all-accounts-cooling-after-retry', 'the journal event names the ORIGINAL reason, not the new one');
+  assert.equal(evt.capMs, config.poolExhaustionWaitCapMs);
+  assert.equal(evt.accumulatedWaitMs, reportDetail.accumulatedWaitMs);
+});
+
+// "Make it loud" (this action's spec, item 3): a cap-exceeded park must reach the SAME park-alert
+// path as any other park, carrying the NEW reason, not the original one. Verified by actually
+// configuring `parkAlertCmd` and inspecting the spawnSync call finalizePark's own alertPark makes
+// -- not assumed from reading park-alert.js's source. park-alert.js's alertPark is reason-agnostic
+// (it forwards whatever `reason` finalizePark hands it, with no allowlist anywhere in the path), so
+// this also stands as the proof that claim is true for this specific reason, not just in general.
+test('finalizePark: a cap-exceeded park reaches the park-alert path, carrying the NEW reason', () => {
+  const spawnCalls = [];
+  const config = testConfig({ parkAlertCmd: 'fake-park-alert-cmd' });
+  const ctx = buildParkCtx({
+    config,
+    task: { poolWaitMs: 12 * 60 * 60 * 1000, poolWaitAttempts: 3 },
+    deps: {
+      spawnSync: (cmd, args) => {
+        spawnCalls.push({ cmd, args });
+        return ok('');
+      },
+    },
+  });
+  const deadlineMs = Date.now() + 60 * 60 * 1000;
+
+  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(deadlineMs).toISOString() });
+
+  assert.equal(readState(ctx.taskDir).reason, 'all-accounts-cooling-wait-cap-exceeded', 'sanity: this really is the cap-exceeded park');
+  const alertCall = spawnCalls.find((c) => c.cmd === 'fake-park-alert-cmd');
+  assert.ok(alertCall, 'park-alert.js\'s alertDaemon must have spawned parkAlertCmd for this park -- no reason-based filter exists in that path');
+  assert.equal(alertCall.args[1], 'all-accounts-cooling-wait-cap-exceeded', 'the alert must carry the NEW reason, not the original one that triggered the wait');
+  const evt = readJournal(ctx.taskDir).find((e) => e.event === 'park-alert');
+  assert.ok(evt, 'park-alert must be journalled for this park, same as any other');
+  assert.equal(evt.reason, 'all-accounts-cooling-wait-cap-exceeded');
+});
+
+// THE LOOP GUARD -- this action's spec calls this "the single most important test in this
+// action": if poolCooldownDeadlineMs ever stopped excluding this reason BY NAME, a cap-exceeded
+// park carrying the original deadline in its own evidence detail (deliberately kept, see the test
+// above) would be re-enqueued forever the next time it is parked through finalizePark -- the exact
+// unbounded hang the cap exists to prevent, reintroduced by the cap's own park.
+test('LOOP GUARD: finalizePark called with the cap-exceeded reason itself, and a detail carrying a valid future deadline, still parks -- never re-enqueues', () => {
+  const config = testConfig();
+  const ctx = buildParkCtx({ config });
+  const futureDeadline = Date.now() + 60 * 60 * 1000;
+
+  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-wait-cap-exceeded', {
+    earliestCooldownUntil: futureDeadline,
+    accumulatedWaitMs: 13 * 60 * 60 * 1000,
+    poolWaitAttempts: 3,
+    capMs: config.poolExhaustionWaitCapMs,
+    deadlineMs: futureDeadline,
+    originalReason: 'all-accounts-cooling-after-retry',
+  });
+
+  const state = readState(ctx.taskDir);
+  assert.equal(state.state, 'PARKED', 'must park -- never re-enqueue a reason that carries no recoverable deadline by construction');
+  assert.equal(state.reason, 'all-accounts-cooling-wait-cap-exceeded');
+  assert.equal(queuedFiles(config.queueDir).length, 0, 'no queue entry must ever be written for this reason');
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait'), 'the wait branch must never fire for this reason');
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait-cap-exceeded'), 'the cap check itself must never re-run for a reason that is already the cap sink');
+});
+
+test('poolCooldownDeadlineMs: all-accounts-cooling-wait-cap-exceeded always resolves to null, explicitly, even with a valid deadline in its detail', () => {
+  const futureDeadline = Date.now() + 60000;
+  assert.equal(poolCooldownDeadlineMs('all-accounts-cooling-wait-cap-exceeded', {}), null);
+  assert.equal(
+    poolCooldownDeadlineMs('all-accounts-cooling-wait-cap-exceeded', { earliestCooldownUntil: futureDeadline }),
+    null,
+    'a deadline sitting right there in the detail must not be honoured -- this is the loop guard'
+  );
+  assert.equal(
+    poolCooldownDeadlineMs('all-accounts-cooling-wait-cap-exceeded', { cooldownUntilIso: new Date(futureDeadline).toISOString() }),
+    null,
+    'the ISO-string key must not be honoured either'
+  );
+});
+
+// The boundary: accumulated exactly AT the cap still waits (`<=`, not `<`); one millisecond over
+// it does not. `waitMs` is pinned to 0 (deadlineMs == "now" at call time, and time only moves
+// forward) so the boundary is exact and not at the mercy of wall-clock scheduling jitter between
+// the test computing `deadlineMs` and finalizePark computing its own `now`.
+test('finalizePark: accumulated wait exactly AT the cap still waits -- the cap is inclusive', () => {
+  const config = testConfig();
+  const cap = config.poolExhaustionWaitCapMs;
+  const ctx = buildParkCtx({ config, task: { poolWaitMs: cap } });
+
+  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date().toISOString() });
+
+  assert.equal(readState(ctx.taskDir), null, 'accumulated === cap must still wait, not park');
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.equal(requeued.poolWaitMs, cap, 'accumulated must land exactly on the cap for this boundary to mean anything');
+});
+
+test('finalizePark: accumulated wait one millisecond OVER the cap does not wait -- parks under the cap-exceeded reason', () => {
+  const config = testConfig();
+  const cap = config.poolExhaustionWaitCapMs;
+  const ctx = buildParkCtx({ config, task: { poolWaitMs: cap + 1 } });
+
+  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date().toISOString() });
+
+  const state = readState(ctx.taskDir);
+  assert.equal(state.state, 'PARKED', 'accumulated === cap + 1ms must not wait');
+  assert.equal(state.reason, 'all-accounts-cooling-wait-cap-exceeded');
+  assert.equal(queuedFiles(config.queueDir).length, 0);
+  assert.equal(readReportDetail(ctx.taskDir).accumulatedWaitMs, cap + 1);
 });
 
 test('finalizePark: accumulated wait one millisecond under the cap still waits', () => {
@@ -317,7 +461,7 @@ for (const [label, modeOverrides] of [
 
 // ==== part 8: the wait is NOT the transient-retry budget -- pins the proof in this action's spec ===
 
-test('none of the four account-pool park reasons is on TRANSIENT_RETRY_REASONS', () => {
+test('none of the account-pool park reasons (five, since action 1.3) is on TRANSIENT_RETRY_REASONS', () => {
   for (const { match } of ACCOUNT_POOL_PARK_REASON_FAMILY) {
     assert.equal(TRANSIENT_RETRY_REASONS.has(match), false, `${match} must not be on the transient-retry allowlist -- see this action's spec for why a naive add fails 7 of 7`);
   }

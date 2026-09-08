@@ -134,7 +134,7 @@ These three rows are examples, not the full picture — every park reason the co
 now classified. The source of truth is `orchestrator/state-machine.js`'s `TRANSIENT_RETRY_REASONS`
 (auto-retried within budget) and, on the human-only side — a maintainer must act, typically a
 `retry` comment or a fix — `TERMINAL_PARK_REASONS`, `TERMINAL_PARK_REASON_PREFIXES` and
-`ACCOUNT_POOL_PARK_REASON_FAMILY` (the four account-pool reasons, declared together in one place);
+`ACCOUNT_POOL_PARK_REASON_FAMILY` (the five account-pool reasons, declared together in one place);
 `classifyParkReason(reason)` returns `'transient' | 'terminal' | 'unclassified'` by checking all
 four. Enforcement lives in
 `test/park-reason-partition.test.js`: it source-scans every reason the code can actually produce

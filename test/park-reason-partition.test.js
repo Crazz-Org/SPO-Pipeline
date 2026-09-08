@@ -424,12 +424,28 @@ test('NO DEAD ENTRIES: every literal in TERMINAL_PARK_REASONS is actually produc
 // three places (three literals on TERMINAL_PARK_REASONS, one prefix on
 // TERMINAL_PARK_REASON_PREFIXES). Action 1.1 collapsed them into ACCOUNT_POOL_PARK_REASON_FAMILY,
 // a single declared list, and isAccountPoolParkReason(reason), the predicate classifyParkReason
-// now consults as its own step. These tests pin the two directions of the rename-safety property
-// that collapse is supposed to buy: every `all-accounts-*` reason the source can actually produce
-// is matched by the family (nothing slipped through the refactor uncovered), and every declared
-// family member corresponds to something the source still produces (no dead member left behind).
-// `no-accounts-registered` is deliberately excluded throughout -- it is not `all-accounts-*` and
-// is not a member of this family (see ACCOUNT_POOL_PARK_REASON_FAMILY's own header).
+// now consults as its own step. Action 1.3 added a fifth member (`all-accounts-cooling-wait-cap-
+// exceeded`, the pool-wait mechanism's own cap sink) with no producer anywhere else to begin with.
+// These tests pin the two directions of the rename-safety property that collapse is supposed to
+// buy: every `all-accounts-*` reason the source can actually produce is matched by the family
+// (nothing slipped through the refactor uncovered), and every declared family member corresponds
+// to something the source still produces (no dead member left behind). `no-accounts-registered`
+// is deliberately excluded throughout -- it is not `all-accounts-*` and is not a member of this
+// family (see ACCOUNT_POOL_PARK_REASON_FAMILY's own header).
+
+// capExceededProduced(stateMachineSource) -- card #119 action 1.3's fifth family member is
+// unlike its four siblings: it is not thrown via `new ParkSignal(...)` and it is not passed as a
+// literal into an external `finalizePark(...)` call either, so neither collectRequiredReasons()'s
+// throw-side scan nor its sink-side scan (which explicitly treats finalizePark's own declaration
+// as not-a-call-site) can see it. It is produced by finalizePark's OWN pool-wait branch,
+// reassigning its `reason` local to this literal once the accumulated wait would exceed
+// config.poolExhaustionWaitCapMs. Mirrors the account-lease.js second-producer fix a few actions
+// ago (see this test file's own header above): read the actual producing statement directly out
+// of state-machine.js's source rather than leaving this family's fifth member invisible to both
+// completeness checks below.
+function capExceededProduced(blankedStateMachineSource) {
+  return /\breason\s*=\s*'all-accounts-cooling-wait-cap-exceeded'/.test(blankedStateMachineSource);
+}
 
 test('ACCOUNT POOL FAMILY -- COMPLETENESS: every all-accounts-* reason the code can produce is matched by isAccountPoolParkReason', () => {
   const { required } = collectRequiredReasons();
@@ -467,7 +483,16 @@ test('ACCOUNT POOL FAMILY -- COMPLETENESS: every all-accounts-* reason the code 
       'this scan has gone dead and should be removed on purpose rather than left passing vacuously'
   );
 
-  const unmatched = [...scannedAccountPoolReasons, ...leaseProduced].filter((r) => !isAccountPoolParkReason(r));
+  const stateMachineSrc = blankComments(fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'state-machine.js'), 'utf8'));
+  const capExceeded = capExceededProduced(stateMachineSrc) ? ['all-accounts-cooling-wait-cap-exceeded'] : [];
+  assert.ok(
+    capExceeded.length === 1,
+    "expected orchestrator/state-machine.js to still reassign `reason = 'all-accounts-cooling-wait-cap-exceeded'` " +
+      'in finalizePark\'s pool-wait branch -- if that shape changed, this scan has gone dead and should be ' +
+      'removed on purpose rather than left passing vacuously'
+  );
+
+  const unmatched = [...scannedAccountPoolReasons, ...leaseProduced, ...capExceeded].filter((r) => !isAccountPoolParkReason(r));
   assert.deepEqual(
     unmatched,
     [],
@@ -480,11 +505,19 @@ test('ACCOUNT POOL FAMILY -- NO DEAD MEMBERS: every declared family member is st
   const { required } = collectRequiredReasons();
   const scannedAccountPoolReasons = [...required.keys()].filter((r) => r.startsWith('all-accounts-'));
 
+  // The fifth member (action 1.3) is invisible to collectRequiredReasons() by construction (see
+  // capExceededProduced's own header above) -- scanned here the same targeted way the COMPLETENESS
+  // test above scans account-lease.js for the second `all-accounts-leased` producer.
+  const stateMachineSrc = blankComments(fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'state-machine.js'), 'utf8'));
+  const producible = capExceededProduced(stateMachineSrc)
+    ? [...scannedAccountPoolReasons, 'all-accounts-cooling-wait-cap-exceeded']
+    : scannedAccountPoolReasons;
+
   // For a literal member, the scan records the member's own string. For the prefix member, the
   // scan records the bare prefix itself (resolveAccountPoolReasons resolves the ternary's dynamic
   // branch to `{kind: 'prefix', value: 'all-accounts-cooling-until-'}`, not a timestamped
   // instance) -- so `match` is what to look for either way.
-  const dead = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((member) => !scannedAccountPoolReasons.includes(member.match));
+  const dead = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((member) => !producible.includes(member.match));
   assert.deepEqual(
     dead.map((m) => m.match),
     [],
@@ -493,12 +526,13 @@ test('ACCOUNT POOL FAMILY -- NO DEAD MEMBERS: every declared family member is st
   );
 });
 
-test('ACCOUNT POOL FAMILY -- rename-safety, positive: all four members classify terminal via the family, none is transient', () => {
+test('ACCOUNT POOL FAMILY -- rename-safety, positive: all five members classify terminal via the family, none is transient', () => {
   const representative = {
     'all-accounts-leased': 'all-accounts-leased',
     'all-accounts-cooling-unknown': 'all-accounts-cooling-unknown',
     'all-accounts-cooling-until-': 'all-accounts-cooling-until-2026-09-04T20:33:05.932Z',
     'all-accounts-cooling-after-retry': 'all-accounts-cooling-after-retry',
+    'all-accounts-cooling-wait-cap-exceeded': 'all-accounts-cooling-wait-cap-exceeded',
   };
   for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
     const sample = representative[member.match];
@@ -524,7 +558,7 @@ test('ACCOUNT POOL FAMILY -- absorption guard, negative: a brand-new all-account
 // literal member, the member's own string PLUS a suffix must NOT match.
 test('ACCOUNT POOL FAMILY -- a literal member matches by exact equality, never by prefix: a suffixed variant is not absorbed', () => {
   const literals = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((m) => m.kind === 'literal');
-  assert.ok(literals.length >= 3, `expected the family's literal members, found ${literals.length}`);
+  assert.ok(literals.length >= 4, `expected the family's literal members (four, since action 1.3's cap-exceeded sink), found ${literals.length}`);
   for (const member of literals) {
     const suffixed = `${member.match}-extra`;
     assert.equal(

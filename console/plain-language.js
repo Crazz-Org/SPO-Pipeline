@@ -153,6 +153,7 @@ const PARK_REASONS = {
   // --- accounts and quota ---------------------------------------------------------------
   'all-accounts-cooling-after-retry': 'Every Claude account was out of quota, even after waiting.',
   'all-accounts-leased': 'Every account was busy on another card for longer than the wait allows.',
+  'all-accounts-cooling-wait-cap-exceeded': 'Every Claude account was out of quota for so long that it gave up waiting.',
   'no-accounts-registered': 'There are no Claude accounts configured to run this.',
   'claim-rate-limited': 'GitHub rate-limited the attempt to claim the card.',
 

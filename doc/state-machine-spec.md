@@ -334,10 +334,32 @@ separate repos with no shared runtime.
   once the cooldown clears, no maintainer `retry` reply required. This is a mechanism separate
   from the transient-retry budget described elsewhere in this spec, with its own cap
   (`config.poolExhaustionWaitCapMs`, 12h) tracked as the task's ACCUMULATED wait rather than a
-  fixed retry count; once accumulated wait exceeds the cap, the park falls straight through to an
-  ordinary park. `all-accounts-cooling-unknown` and `all-accounts-leased` never wait this way —
+  fixed retry count. `all-accounts-cooling-unknown` and `all-accounts-leased` never wait this way —
   neither carries a recoverable deadline (no cooldown ever recorded a time; a lease, not a
   cooldown) — and both still park exactly as they did before this action.
+- **Exceeding the cap is its own park reason, carrying the evidence** (card #119, action 1.3):
+  before this action, once the accumulated wait would exceed `poolExhaustionWaitCapMs` the park
+  fell straight through, silently, under the SAME reason the original cooling park carried — a
+  maintainer reading it could not tell "the pool blipped and we parked immediately" apart from
+  "the machine waited most of a day and gave up." `finalizePark` now reassigns the park to its own
+  reason, `all-accounts-cooling-wait-cap-exceeded` — a fifth `ACCOUNT_POOL_PARK_REASON_FAMILY`
+  member, classified terminal like its four siblings but produced differently: it is never thrown
+  as a `ParkSignal`, it is `finalizePark`'s own pool-wait branch reassigning its `reason` local.
+  Its park detail carries the accumulated wait, the number of waits already taken, the cap that was
+  exceeded, the deadline that would have been waited for, and the ORIGINAL family reason that
+  triggered the wait (accounts.js's pick() or this file's own `all-accounts-cooling-after-retry`)
+  — so the original evidence is never thrown away. No cooldown deadline is ever recoverable from
+  this reason itself, by construction: `poolCooldownDeadlineMs` returns `null` for it explicitly,
+  checked by name before either detail key is read, regardless of what its own evidence detail
+  carries. This is the loop guard the cap exists to protect — without it, a cap-exceeded park whose
+  detail happens to carry the original deadline would be re-enqueued forever the next time it is
+  parked, reintroducing the exact unbounded hang the cap exists to prevent. The cap's basis (do not
+  re-derive; measured against this lot's banked corpus) is two independent real numbers: the
+  longest genuine pool-wide outage, 7.12h (merging all 12 `account-cooldown` intervals pool-wide
+  into 7 episodes — 1.00h ×5, 5.00h, 7.12h), and the worst accumulated single-card wait, 5.00h
+  (issue-497); the observed maximum number of re-enqueues for any one card is 2. NEVER cite
+  16.69h — that figure does not reproduce: the whole-cluster span is 16.63h, but it contains a
+  ~3.6h window in which the pool was not limited at all, so it is not an outage duration.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
@@ -448,7 +470,12 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   which of the three resolution steps supplied the deadline (`earliestCooldownUntil`,
   `cooldownUntilIso`, or `reason-suffix`); `pool-wait-failed`, `{reason, attempt, error}`, when
   that write failed and the task fell through to an ordinary park instead — same shape and same
-  reasoning as `transient-retry-failed`, a SEPARATE mechanism with its own budget).
+  reasoning as `transient-retry-failed`, a SEPARATE mechanism with its own budget; and, since card
+  #119 action 1.3, `pool-wait-cap-exceeded`, `{reason, poolWaitAttempts, accumulatedWaitMs, capMs,
+  deadlineMs}`, journalled right after `parked` when the accumulated wait WOULD exceed the cap —
+  `reason` here is the ORIGINAL family reason that triggered the wait, not the new
+  `all-accounts-cooling-wait-cap-exceeded` reason the task actually parks under; this event is the
+  audit trail for the cap binding, the park's own `reason`/detail carry the rest of the evidence).
 - `journal/daemon.jsonl` — the daemon-scoped sibling of the per-task journals (dispatcher
   `worker-spawn`/`worker-exit`, the intake/confirm/triage scanners' own
   `report-intake`/`report-confirmed`/`report-triaged`/`auto-triage` events), and since
@@ -745,7 +772,7 @@ idempotency contract.
 Every park reason the code can produce is classified either transient (`TRANSIENT_RETRY_REASONS`,
 keyed on the exact reason string) or terminal — the latter across three declarations:
 `TERMINAL_PARK_REASONS` (exact string), `TERMINAL_PARK_REASON_PREFIXES` (`startsWith`), and
-`ACCOUNT_POOL_PARK_REASON_FAMILY`, which holds the four account-pool reasons together in one place
+`ACCOUNT_POOL_PARK_REASON_FAMILY`, which holds the five account-pool reasons together in one place
 so that the *classification* side of renaming or splitting any of them is a single-list edit. (The
 rename itself is not: the producer and the partition test's own representative sample must move
 too, and the test fails by name until they do.) Disjointness and full coverage are enforced by
