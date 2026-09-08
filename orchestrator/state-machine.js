@@ -1864,11 +1864,14 @@ const TERMINAL_PARK_REASON_PREFIXES = [
 // ACCOUNT_POOL_PARK_REASON_FAMILY -- the four park reasons the account pool (accounts.js's
 // pick(), rethrown by account-lease.js's lease-and-rotate loop, plus this file's own
 // `all-accounts-cooling-after-retry` a few lines above) can produce when no account is currently
-// usable. Card #119 action 1.1 introduced this as the SINGLE place any of the four strings is
-// written in production code, replacing the three-way split that used to exist (three literals on
-// TERMINAL_PARK_REASONS, one prefix on TERMINAL_PARK_REASON_PREFIXES) -- see TERMINAL_PARK_
-// REASONS's own header for why that split was a defect: a rename or a split of any one of the
-// four used to require finding and editing the right one of three scattered spots by hand.
+// usable. Card #119 action 1.1 introduced this as the single place any of the four strings is
+// CLASSIFIED -- not the single place each is written: the PRODUCERS are unavoidably elsewhere
+// (accounts.js's pick() builds three of them, account-lease.js rethrows one, and this file throws
+// `all-accounts-cooling-after-retry` itself). What this replaces is the three-way split of the
+// classification side (three literals on TERMINAL_PARK_REASONS, one prefix on
+// TERMINAL_PARK_REASON_PREFIXES) -- see TERMINAL_PARK_REASONS's own header for why that split was
+// a defect: a rename or a split of any one of the four used to require finding and editing the
+// right one of three scattered spots by hand.
 //
 // Each member's `kind` says how it matches (`literal`: exact equality; `prefix`:
 // `reason.startsWith(match)`, same convention as TERMINAL_PARK_REASON_PREFIXES above -- never a
@@ -1883,7 +1886,7 @@ const ACCOUNT_POOL_PARK_REASON_FAMILY = [
   {
     match: 'all-accounts-leased',
     kind: 'literal',
-    why: 'every registered, enabled account is currently leased by another card; no cooldown deadline is carried on the park detail -- the lease itself is the only bound, and it is not recoverable from this reason string.',
+    why: 'every enabled account that is currently HEALTHY is leased by a live sibling -- NOT every registered account: pick() throws this whenever healthyCount > 0 and all of those healthy ones were excluded, so a pool of one cooling account plus one leased account reports `leased`, and the cooling one is registered, enabled, and not leased. No cooldown deadline is recoverable: the lease frees on its own schedule and nothing writes a deadline for it.',
   },
   {
     match: 'all-accounts-cooling-unknown',

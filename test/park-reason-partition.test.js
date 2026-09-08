@@ -7,8 +7,9 @@
 // bucket ("nobody decided") a test failure instead of silence, by scanning the SOURCE for every
 // reason the code can actually produce and requiring each one to land in exactly one of:
 //   - orchestrator/state-machine.js's TRANSIENT_RETRY_REASONS (auto-retried)
-//   - orchestrator/state-machine.js's TERMINAL_PARK_REASONS, or a TERMINAL_PARK_REASON_PREFIXES
-//     rule (human-only, no automatic retry)
+//   - orchestrator/state-machine.js's TERMINAL_PARK_REASONS, a TERMINAL_PARK_REASON_PREFIXES
+//     rule, or -- for the `all-accounts-*` account-pool reasons -- a member of
+//     ACCOUNT_POOL_PARK_REASON_FAMILY (all human-only, no automatic retry)
 //
 // ---- why this duplicates test/park-reason-doc-sweep.test.js's scanning code, rather than
 // importing it -------------------------------------------------------------------------------
@@ -358,7 +359,8 @@ test('COVERAGE: every park reason the code can produce is classified transient o
       offenders.push(
         `'${reason}'${info.isPrefix ? ' (prefix family)' : ''} -- produced at ${info.sites.slice(0, 3).join(', ')}` +
           `${info.sites.length > 3 ? `, +${info.sites.length - 3} more` : ''}: ` +
-          'decide explicitly whether it retries: add it to TRANSIENT_RETRY_REASONS or TERMINAL_PARK_REASONS'
+          'decide explicitly whether it retries: add it to TRANSIENT_RETRY_REASONS, TERMINAL_PARK_REASONS, ' +
+          'TERMINAL_PARK_REASON_PREFIXES, or -- for an `all-accounts-*` reason -- ACCOUNT_POOL_PARK_REASON_FAMILY'
       );
     }
   }
@@ -438,7 +440,34 @@ test('ACCOUNT POOL FAMILY -- COMPLETENESS: every all-accounts-* reason the code 
     `expected at least 4 distinct all-accounts-* reasons/prefixes in the source scan, found ${scannedAccountPoolReasons.length} -- has a resolver stopped matching accounts.js/state-machine.js?`
   );
 
-  const unmatched = scannedAccountPoolReasons.filter((r) => !isAccountPoolParkReason(r));
+  // collectRequiredReasons() alone is NOT complete for this family, and the gap was measured
+  // rather than guessed: it keys off `new ParkSignal(...)` call sites, and orchestrator/
+  // account-lease.js contains none -- yet it is a SECOND producer of `all-accounts-leased`, via
+  // `new accountsModule.AllAccountsLeasedError('all-accounts-leased', detail)`. That call is also
+  // invisible to park-reason-doc-sweep's resolveAccountPoolReasons, whose regex requires an
+  // UNQUALIFIED `new AllAccountsLeasedError(`. Renaming that one call site left this whole file
+  // green (14/14) during this action's verification. So scan account-lease.js directly, allowing
+  // an optional `<ident>.` qualifier on the constructor.
+  //
+  // Comments are skipped line-wise (the same `trimStart().startsWith('//')` idiom the deck's own
+  // sweep uses) because this file discusses the family in prose -- it writes the bare shorthand
+  // `all-accounts-cooling`, which is NOT a reason any code produces. A scan fooled by that would
+  // demand a family member that does not exist.
+  const leaseSrc = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'account-lease.js'), 'utf8');
+  const leaseProduced = new Set();
+  for (const line of leaseSrc.split('\n')) {
+    if (line.trimStart().startsWith('//')) continue;
+    for (const m of line.matchAll(/new\s+(?:[A-Za-z_$][\w$]*\s*\.\s*)?[A-Za-z_$][\w$]*Error\(\s*'(all-accounts-[a-z0-9-]*)'/g)) {
+      leaseProduced.add(m[1]);
+    }
+  }
+  assert.ok(
+    leaseProduced.size >= 1,
+    'expected account-lease.js to still produce at least one all-accounts-* reason -- if it no longer does, ' +
+      'this scan has gone dead and should be removed on purpose rather than left passing vacuously'
+  );
+
+  const unmatched = [...scannedAccountPoolReasons, ...leaseProduced].filter((r) => !isAccountPoolParkReason(r));
   assert.deepEqual(
     unmatched,
     [],
@@ -483,6 +512,30 @@ test('ACCOUNT POOL FAMILY -- rename-safety, positive: all four members classify 
 test('ACCOUNT POOL FAMILY -- absorption guard, negative: a brand-new all-accounts-* reason is NOT absorbed', () => {
   assert.equal(isAccountPoolParkReason('all-accounts-brand-new-thing'), false);
   assert.equal(classifyParkReason('all-accounts-brand-new-thing'), 'unclassified');
+});
+
+// The `kind` field is the whole point of the family list: a `literal` member matches by EXACT
+// equality, only the `prefix` member matches by startsWith. Nothing above pins that -- the guard
+// immediately above uses 'all-accounts-brand-new-thing', which shares no member's prefix, so it
+// stays green even if every member were matched with startsWith. That mutation was introduced
+// deliberately during this action's verification and SURVIVED the whole suite (2326/0), silently
+// absorbing 'all-accounts-leased-extra' & co. as `terminal` -- exactly the failure mode
+// isAccountPoolParkReason's own header forbids. These are the assertions that kill it: for every
+// literal member, the member's own string PLUS a suffix must NOT match.
+test('ACCOUNT POOL FAMILY -- a literal member matches by exact equality, never by prefix: a suffixed variant is not absorbed', () => {
+  const literals = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((m) => m.kind === 'literal');
+  assert.ok(literals.length >= 3, `expected the family's literal members, found ${literals.length}`);
+  for (const member of literals) {
+    const suffixed = `${member.match}-extra`;
+    assert.equal(
+      isAccountPoolParkReason(suffixed),
+      false,
+      `'${suffixed}' must NOT match: '${member.match}' is a \`literal\` member and literals match by exact ` +
+        `equality. If this fails, isAccountPoolParkReason has started matching literals with startsWith, ` +
+        `which silently absorbs any longer reason built on a member's name as terminal.`
+    );
+    assert.equal(classifyParkReason(suffixed), 'unclassified', `classifyParkReason('${suffixed}') should be 'unclassified'`);
+  }
 });
 
 test("ACCOUNT POOL FAMILY -- no-accounts-registered is excluded: it is not all-accounts-*, and stays a plain TERMINAL_PARK_REASONS literal", () => {

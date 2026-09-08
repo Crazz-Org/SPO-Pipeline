@@ -746,7 +746,9 @@ Every park reason the code can produce is classified either transient (`TRANSIEN
 keyed on the exact reason string) or terminal — the latter across three declarations:
 `TERMINAL_PARK_REASONS` (exact string), `TERMINAL_PARK_REASON_PREFIXES` (`startsWith`), and
 `ACCOUNT_POOL_PARK_REASON_FAMILY`, which holds the four account-pool reasons together in one place
-so that renaming or splitting any of them is a single-list edit. Disjointness and full coverage are
-enforced by `test/park-reason-partition.test.js`.
+so that the *classification* side of renaming or splitting any of them is a single-list edit. (The
+rename itself is not: the producer and the partition test's own representative sample must move
+too, and the test fails by name until they do.) Disjointness and full coverage are enforced by
+`test/park-reason-partition.test.js`.
 SPO-Pipeline#85's five GitHub-mergeability-cause reasons (`merge-conflict`, `merge-blocked`,
 `merge-behind-base`, `merge-pr-draft`, `merge-checks-failing`) are all terminal.
