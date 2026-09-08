@@ -511,6 +511,171 @@ test('reviewCard: a malformed reply is NOT retried', async () => {
   assert.equal(result.retriedAfterTimeout, undefined);
 });
 
+// ---- reviewCard: the split recommendation fails open (action 5.1) ------------------------------
+//
+// A card judged too big must never come back as an error -- losing a real finding because it was
+// big is strictly worse than filing it big. See prompts/review-card.md's § 4 addition.
+
+test('reviewCard: a split recommendation parses as an ordinary FILE_AMENDED, verdict intact -- a recommended split must never become an error', async () => {
+  const SPLIT_REVIEW = {
+    verdict: 'FILE_AMENDED',
+    corrections: ['split into two cards: (1) gateway reconnect banner, (2) client badge render'],
+    first_comment_markdown:
+      '### Card review\n\nThis reads as two independent changes; recommend splitting into two cards.',
+  };
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(realShapedReply(SPLIT_REVIEW)),
+      stderr: '',
+      signal: null,
+    })),
+  };
+
+  const result = await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.review.verdict, 'FILE_AMENDED');
+  assert.deepEqual(result.review.corrections, SPLIT_REVIEW.corrections);
+});
+
+test('reviewCard: a reply naming no split at all still parses cleanly, and REVIEW_REQUIRED never grew a split field', async () => {
+  assert.deepEqual(intake.REVIEW_REQUIRED, ['verdict', 'corrections', 'first_comment_markdown']);
+
+  const PLAIN_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+  const deps = {
+    accountsDir: poolDir(),
+    spawnSync: fakeSpawnSync(() => ({
+      status: 0,
+      stdout: JSON.stringify(realShapedReply(PLAIN_REVIEW)),
+      stderr: '',
+      signal: null,
+    })),
+  };
+
+  const result = await intake.reviewCard(VALID_DRAFT, deps);
+  assert.equal(result.ok, true);
+});
+
+// ---- prompts/review-card.md § 4: the splitting addition, scoped to the new block --------------
+//
+// Mutation testing on the previous version of this test (a single whole-file regex) found it
+// vacuous: § 0 (around line 70) already carries the pre-existing sentence "as `FILE_AMENDED`,
+// **never** `DO_NOT_FILE` on desirability grounds", so a whole-file match on that vocabulary pair
+// is satisfied by § 0 alone and proves nothing about the § 4 addition -- deleting or inverting
+// the new sentence left the old test green. Slice the file down to the § 4 section itself before
+// asserting anything, the same idiom test/prompt-contract-sweep.test.js uses to slice
+// orchestrator/intake.js between named markers -- and, symmetrically, throw loudly if a marker
+// is missing rather than silently widen the slice (that silent widening is exactly the defect
+// being fixed here, just one level up: a slice with no boundary is a whole-file match by another
+// name).
+function sliceReviewCardSection(startMarker, endMarker) {
+  const promptText = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'review-card.md'), 'utf8');
+  const start = promptText.indexOf(startMarker);
+  if (start === -1) {
+    throw new Error(`intake.test.js: marker not found in prompts/review-card.md: ${startMarker}`);
+  }
+  const end = promptText.indexOf(endMarker, start + startMarker.length);
+  if (end === -1) {
+    throw new Error(`intake.test.js: end marker not found in prompts/review-card.md: ${endMarker}`);
+  }
+  return promptText.slice(start, end);
+}
+
+function reviewCardSplitSection() {
+  return sliceReviewCardSection(
+    '### 4 · Is the weight right, and the ground named?',
+    '## Your verdict — one of three'
+  );
+}
+
+test('prompts/review-card.md § 4: the "is this N cards" question and its three tells are named', () => {
+  const slice = reviewCardSplitSection();
+
+  // The general "this is N cards" question, not just the pre-existing area-collision sentence.
+  assert.match(slice, /N cards/);
+
+  // The three tells, pinned on short stable tokens rather than whole sentences: deleting any one
+  // of them must fail this test, but rewording around them (bold vs code-quoting, "and" vs
+  // em-dash, clause reordering) must not.
+  assert.match(slice, /subsystems/i); // tell 1: several subsystems, not one
+  assert.match(slice, /X and Y/); // tell 2: "X and Y" -- a conjunction, not one change
+  assert.match(slice, /independent acceptance criteria/i); // tell 3
+});
+
+test('prompts/review-card.md § 4: the fail-open direction is stated, and its inversion is absent', () => {
+  const slice = reviewCardSplitSection();
+
+  // Positive: the verdict vocabulary itself, scoped to § 4 so it cannot be satisfied by § 0's
+  // own, unrelated instance of the same pair (see comment above). Killed by deleting the
+  // sentence outright.
+  assert.match(slice, /FILE_AMENDED[`*,\s]*never[`*\s]*DO_NOT_FILE/);
+  // Killed by the inversion mutation ("`DO_NOT_FILE`, never `FILE_AMENDED`") -- the exact
+  // opposite promise. Asserted separately from the line above so an inversion cannot pass by
+  // having the positive phrase coincidentally still match some other, unrelated text in the
+  // slice: this pins the ABSENCE of the reversed order, not just the presence of the forward one.
+  assert.doesNotMatch(slice, /DO_NOT_FILE[`*,\s]*never[`*\s]*FILE_AMENDED/);
+
+  // The "never" is bound to SIZE/SCOPE grounds only, and checks 1-2 keep their own DO_NOT_FILE.
+  // Without that qualifier the instruction reads as "an oversized card is always FILE_AMENDED",
+  // which would order the reviewer to file a card it has just found to be a duplicate, or whose
+  // claim does not hold against the code -- § 0 qualifies its own "never" the same way, for the
+  // same reason.
+  //
+  // The first cut of this pin was `/checks 1-2[\s\S]{0,160}DO_NOT_FILE/`, and it was the same
+  // vacuity class as the bug this whole test was written to fix: it pinned TOKEN CO-OCCURRENCE
+  // inside a window, not meaning. Two mutations that destroy the rule kept it green --
+  // "checks 1-2 **no longer** keep their own DO_NOT_FILE" (the exact inversion), and gutting the
+  // parenthetical entirely while leaving both tokens in place. Meanwhile it died on three
+  // harmless rewordings. So pin the operative clause, the enumeration, and the absence of a
+  // negation separately:
+
+  // (a) WHICH ground the "never" is bound to. Deleting just this clause survived the old pin.
+  assert.match(slice, /on size or scope grounds/i);
+
+  // (b) checks 1-2 retain DO_NOT_FILE, with their cases named -- gutting the parenthetical drops
+  //     the enumeration even if the bare tokens survive. Tolerates "1-2", "1 and 2", and either
+  //     dash, and is case-insensitive; those variants are reformattings, not meaning changes.
+  assert.match(slice, /checks\s+1\s*(?:[\u2013\u2014-]|and)\s*2/i);
+  assert.match(slice, /duplicate/i);
+  assert.match(slice, /already fixed/i);
+
+  // (c) and that retention must not be negated. "checks 1-2 no longer keep their own
+  //     DO_NOT_FILE" satisfies every co-occurrence assertion above while telling the reviewer
+  //     the exact opposite. Nothing in § 4 legitimately says "no longer", or "never keep".
+  assert.doesNotMatch(slice, /no longer/i);
+  assert.doesNotMatch(slice, /never\s+(?:keep|keeps|yield|yields|retain|retains)/i);
+
+  // (d) and the retention stated POSITIVELY as an ordered subject-verb-object pin, because (c)
+  //     is a blocklist and a blocklist is whack-a-mole: "checks 1-2 DO NOT keep their own
+  //     DO_NOT_FILE", "...LOSE their own...", "...ARE SUPERSEDED here..." all walk past (c)
+  //     while inverting the rule. This one line closes that whole verb family at no cost to the
+  //     capitalisation / "1 and 2" tolerance above.
+  //
+  //     KNOWN LIMIT, recorded rather than chased: these pins hold the retention clause's
+  //     presence, subject and verb. They do NOT hold its predicate, and they cannot detect a
+  //     nullifying condition appended after it -- flipping the enumeration ("...already fixed is
+  //     NOT DO_NOT_FILE") or appending "...only while the card is not oversized" both leave the
+  //     clause textually intact and subvert it downstream. Closing those needs a reader, not a
+  //     regex.
+  assert.match(slice, /checks\s+1\s*(?:[\u2013\u2014-]|and)\s*2\s+keep their own[\s\S]{0,20}DO_NOT_FILE/i);
+});
+
+test('prompts/review-card.md § 4: "when unsure, file it" cannot be satisfied by its own negation', () => {
+  const slice = reviewCardSplitSection();
+
+  // The naive regex /not sure[\s\S]{0,80}file it/ is insufficient: "not sure, hold the card
+  // back: do not file it" -- the exact inversion -- also contains "not sure" followed within 80
+  // characters by the substring "file it", so it passes that regex too. The actual instruction
+  // text negates a DIFFERENT clause ("do not hold the card back", not "do not file it"), so
+  // anchor there instead and separately forbid "do not" landing next to "file it".
+  // Pinned as an ORDERED pair, not two independent tokens: keeping "do not hold the card back"
+  // while swapping the imperative ("file it" -> "withhold it") inverts the instruction and left
+  // an earlier, token-only version of this assertion green.
+  assert.match(slice, /do not hold the card back[\s\S]{0,40}file it/i);
+  assert.doesNotMatch(slice, /do not\s+file it/i);
+});
+
 // ---- fileCard: mechanical corrections + gh argv shapes -----------------------------------------
 
 test('fileCard: FILE_AMENDED applies mechanical category/size/area corrections, leaves prose alone', () => {
@@ -582,6 +747,51 @@ test('fileCard: FILE_AMENDED applies mechanical category/size/area corrections, 
   // area was corrected mechanically, not left at the draft's own "client".
   assert.ok(!create.argv.includes('cat:feature'));
   assert.ok(!create.argv.includes('size:S'));
+});
+
+test('fileCard: a FILE_AMENDED verdict whose only correction is a split recommendation still files -- fileCard refuses a verdict, never a correction\'s content', () => {
+  const spawnCalls = [];
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push({ command, argv });
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return {
+          status: 0,
+          stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/900\n',
+          stderr: '',
+          signal: null,
+        };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+
+  const review = {
+    verdict: 'FILE_AMENDED',
+    // Deliberately adversarial: the split prose carries its own "size: S" / "size: M" tokens,
+    // mid-sentence -- the exact shape a naive scan of `corrections` could mistake for a
+    // mechanical field:value correction.
+    corrections: ['split into two cards: (1) gateway reconnect banner — size: S, (2) client badge render — size: M'],
+    first_comment_markdown: '### Card review\n\nRecommend splitting into two cards.',
+  };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.issueNumber, 900);
+  assert.equal(spawnCalls.length, 2); // create + comment -- same as any other FILE_AMENDED
+
+  // The split recommendation rides in `corrections` as prose, never as a label: this action's
+  // central claim, and nothing above pinned it. MECHANICAL_CORRECTION_RE is anchored ^...$ over
+  // the WHOLE correction string, so "size: S" embedded mid-sentence inside the split text never
+  // qualifies -- applyMechanicalCorrections leaves VALID_DRAFT's own category/size untouched, and
+  // those (not anything parsed out of the split prose) are what must reach `gh issue create`.
+  const [create] = spawnCalls;
+  assert.ok(create.argv.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(create.argv.includes(`size:${VALID_DRAFT.size}`));
+  // The split's own "size: M" (card 2) must never surface as a label in its own right -- proof
+  // the embedded field:value was left as prose, not silently picked up.
+  assert.ok(!create.argv.includes('size:M'));
 });
 
 test('applyMechanicalCorrections: an unrecognized value under a known field is left as prose', () => {
