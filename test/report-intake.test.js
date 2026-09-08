@@ -160,6 +160,61 @@ test('runReportIntake: happy path -- files a raw card, moves the column, comment
   assert.match(daemonLog, /"issue":501/);
 });
 
+// Action 3.1 (Lot 3): report-intake.js:300 binds moveReportTo's return value into the
+// report-intake event's own `pendingPath` field. Before this action that value was ALWAYS a
+// string (even on the swallowed-ENOENT race, moveReportTo used to return a fabricated `dest` that
+// was never actually there) -- now it can be `null`, and this is the one place in the whole
+// pipeline that binding is observable: the journal event itself. Forces ENOENT on the SAME rename
+// runReportIntake's happy-path test above exercises (moveReportTo's move into pending/), so this
+// is a reachability test for report-intake.js's own call site, not a re-test of moveReportTo's
+// unit behaviour (that lives in test/auto-triage.test.js).
+test('runReportIntake: the pending/ move racing another disposal (ENOENT) records pendingPath: null on the report-intake event -- never a fabricated path -- and journals report-move-source-missing', async () => {
+  const spoReportsDir = mkTmp('spo-reportintake-move-missing-');
+  const journalRoot = mkTmp('spo-reportintake-move-missing-journal-');
+  const reportPath = writeReport(spoReportsDir, '2026-09-01T10-00-00-000Z_mobile_vanish.json');
+
+  const deps = makeIntakeDeps({});
+
+  const origRename = fs.renameSync;
+  fs.renameSync = (src, dest) => {
+    if (src === reportPath) {
+      const err = new Error('simulated: source already gone');
+      err.code = 'ENOENT';
+      throw err;
+    }
+    return origRename(src, dest);
+  };
+  let result;
+  try {
+    result = await runReportIntake(
+      journalRoot,
+      { spoReportsDir, productRepo: '/fake/repo', ghRepo: 'x/y', reportIntakeColumn: 'Intake', reportIntakeLabel: 'report:raw', autoIntakeLimit: 3 },
+      deps
+    );
+  } finally {
+    fs.renameSync = origRename;
+  }
+
+  assert.equal(result.filed, 1, 'the card is still filed -- only the pending/ move raced another disposal');
+
+  const daemonLog = fs
+    .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+
+  const intakeEvent = daemonLog.find((e) => e.event === 'report-intake' && e.issue === 501);
+  assert.ok(intakeEvent, 'expected a report-intake event for issue 501');
+  assert.equal(intakeEvent.pendingPath, null, 'must record null -- the source vanished, so there is no path to vouch for');
+  assert.ok('pendingPath' in intakeEvent, 'the field must be present (as null), not silently omitted -- see report-intake.js:300\'s own comment for why');
+
+  const missingEvent = daemonLog.find((e) => e.event === 'report-move-source-missing');
+  assert.ok(missingEvent, 'expected a report-move-source-missing event');
+  assert.equal(missingEvent.from, reportPath);
+  assert.match(missingEvent.to, /pending/);
+  assert.match(missingEvent.disposition, /^intake: #501 —/);
+});
+
 test('runReportIntake: threads kind through into the report-intake journal event', async () => {
   const spoReportsDir = mkTmp('spo-reportintake-1b-');
   const journalRoot = mkTmp('spo-reportintake-journal1b-');
@@ -471,6 +526,46 @@ test('reportConfirmScan: "discard" reply -> closes the issue, archives the repor
   assert.equal(fs.existsSync(pendingPath), false);
   const archived = path.join(spoReportsDir, 'archive', 'r2.json');
   assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), /^discarded: #22 —/);
+});
+
+// Action 3.1 (Lot 3): reportConfirmScan's discard branch calls `moveReportTo(entry.pendingPath,
+// ...)` directly -- entry.pendingPath here is a report-intake event's own `pendingPath` field,
+// read straight off daemon.jsonl, with NO claim step in between (unlike auto-triage.js's
+// claimReport/routeConfirmedReport flow, which auto-triage.js's own tests cover separately). That
+// field can now BE `null` (moveReportTo's own swallowed-ENOENT branch, if stage 1's pending-move
+// itself raced another disposal) -- and `moveReportTo`'s first move is `path.basename(reportPath)`,
+// which throws a TypeError, uncaught, on a bare `null`. `gh issue close` still succeeds in this
+// scenario (the raw card itself is real and closeable even though its report file is gone), so
+// this path is reachable on a genuine production sequence: intake binds `pendingPath: null` ->
+// a maintainer later replies "discard" -> `gh issue close` succeeds -> the discard branch hands
+// the null straight to moveReportTo.
+test('reportConfirmScan: "discard" on a report-intake entry with pendingPath: null does not throw -- discards cleanly and journals report-move-source-missing with from/to both null', async () => {
+  const spoReportsDir = mkTmp('spo-confirmscan-2b-nullpending-');
+  const journalRoot = mkTmp('spo-confirmscan-journal2b-nullpending-');
+  appendDaemonEvent(journalRoot, 'report-intake', { reportFile: 'r2b.json', pendingPath: null, issue: 23, commentId: 100 });
+
+  let closeCalled = false;
+  const deps = confirmDeps({
+    comments: [{ id: 101, user: { login: 'Crazz-E' }, body: 'discard, duplicate report' }],
+    closeResponder: () => { closeCalled = true; return ok(''); },
+  });
+  const result = await reportConfirmScan(journalRoot, { spoReportsDir, ghRepo: 'x/y' }, deps);
+
+  assert.equal(result.discarded, 1, 'the discard must still complete -- there is no throw to abort it');
+  assert.equal(closeCalled, true);
+
+  const events = daemonEvents(journalRoot);
+  const discardedEvent = events.find((e) => e.event === 'report-discarded' && e.issue === 23);
+  assert.ok(discardedEvent, 'expected a report-discarded event even though the report file was already gone');
+
+  const missingEvent = events.find((e) => e.event === 'report-move-source-missing');
+  assert.ok(missingEvent, 'expected a report-move-source-missing event');
+  // Strictly null and PRESENT -- not merely falsy, and not silently omitted by the JSONL
+  // round-trip (JSON.stringify keeps an explicit `null` value; only `undefined` would vanish).
+  assert.ok('from' in missingEvent, '`from` must be present on the event, not omitted');
+  assert.ok('to' in missingEvent, '`to` must be present on the event, not omitted');
+  assert.equal(missingEvent.from, null);
+  assert.equal(missingEvent.to, null, 'there is no source path to derive a destination basename from');
 });
 
 test('reportConfirmScan: a comment before the anchor, or matching neither word, is ignored', async () => {

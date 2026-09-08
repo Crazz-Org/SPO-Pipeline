@@ -246,7 +246,7 @@ async function runReportIntake(journalRoot, config, deps = {}) {
           results.push({ file, outcome: 'error', error: commented.error });
           continue;
         }
-        moveReportTo(reportPath, path.join(spoReportsDir, 'archive'), `duplicate: #${existingIssue} — ${today}`);
+        moveReportTo(reportPath, path.join(spoReportsDir, 'archive'), `duplicate: #${existingIssue} — ${today}`, journalRoot);
         appendDaemonEvent(journalRoot, 'report-intake-duplicate', { issue: existingIssue, reportFile: file });
         duplicates++;
         results.push({ file, outcome: 'duplicate', issueNumber: existingIssue });
@@ -297,7 +297,20 @@ async function runReportIntake(journalRoot, config, deps = {}) {
       continue;
     }
 
-    const pendingPath = moveReportTo(reportPath, path.join(spoReportsDir, 'pending'), `intake: #${issueNumber} — ${today}`);
+    // moveReportTo can now return `null` (its swallowed-ENOENT branch -- see that function's own
+    // header in auto-triage.js): the source report vanished before this move could complete, so
+    // there is no real path to vouch for. `pendingPath` here is used for NOTHING but this journal
+    // field -- grepped every use of this binding, and reportConfirmScan/routeConfirmedReport/
+    // processConfirmedReport all read it back off the EVENT (entry.pendingPath), never off this
+    // local variable directly. Writing `null` rather than omitting the field is deliberate: an
+    // absent field reads, to a maintainer or to any future reader that just checks `'pendingPath'
+    // in entry`, as an OLDER event shape that never carried one at all -- indistinguishable from
+    // "we didn't try". `null` says "we tried, and could not vouch for it", which is what actually
+    // happened, and auto-triage.js's own `retryHeldReport` already guards `if (!pendingPath ||
+    // !isFile(pendingPath))` (and this action's own new guards in auto-triage.js's
+    // claimReport/routeConfirmedReport) already treat a falsy pendingPath as an anticipated shape,
+    // not a new one to react badly to.
+    const pendingPath = moveReportTo(reportPath, path.join(spoReportsDir, 'pending'), `intake: #${issueNumber} — ${today}`, journalRoot);
     appendDaemonEvent(journalRoot, 'report-intake', {
       reportFile: file,
       pendingPath,
@@ -439,7 +452,7 @@ async function reportConfirmScan(journalRoot, config, deps = {}, scanState = com
       });
       continue; // stays pending, retried next scan
     }
-    moveReportTo(entry.pendingPath, path.join(spoReportsDir, 'archive'), `discarded: #${entry.issue} — ${today}`);
+    moveReportTo(entry.pendingPath, path.join(spoReportsDir, 'archive'), `discarded: #${entry.issue} — ${today}`, journalRoot);
     appendDaemonEvent(journalRoot, 'report-discarded', { issue: entry.issue, discardCommentId: match.id });
     discarded++;
   }

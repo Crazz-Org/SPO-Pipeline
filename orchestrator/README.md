@@ -1846,7 +1846,14 @@ path" below; a retried one carries `retriedFrom`/`retriedAt` alongside the usual
 `report-discarded` (stage 2 outcomes) / `report-confirm-scan-truncated` / `report-confirm-scan-
 ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan.js facts, action
 2.7 -- `comment-scan-collaborators-unreadable` / `comment-scan-collaborators-stale` are shared
-with `unparkScan` and carry a `scanner` field instead), `report-triaged` / `report-held` / `auto-triage` /
+with `unparkScan` and carry a `scanner` field instead), `report-move-source-missing` (action 3.1,
+Lot 3 -- `auto-triage.js`'s own shared `moveReportTo` helper, journaled from EVERY one of its five
+call sites across stage 1 and stage 3 alike: the report file it was told to move was already
+gone, not the board-move failure `report-intake-move-failed` names above. `{from, to,
+disposition}`; `to` is `null` when there was no source path at all to derive a destination from.
+Usually a tolerated race (a concurrent disposal already won), not a failure to act on -- but can
+also be a genuine miss with no source ever found, which this event does not itself distinguish;
+see `moveReportTo`'s own header in `auto-triage.js` for both cases), `report-triaged` / `report-held` / `auto-triage` /
 `report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
 `report-triage-reclaimed` / `report-triage-error` / `report-held-mechanical` /
 `report-triage-backoff` (stage 3) -- all to `journal/daemon.jsonl`, the
