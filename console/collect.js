@@ -1141,9 +1141,13 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } 
   return result;
 }
 
-// sessionId -> {taskId, state, title, steps} -- the join used to attribute a token-usage
-// transcript file (named <sessionId>.jsonl) back to the SPO task that produced it. Pure, no I/O
-// -- consumes the already-collected journalTasks array.
+// sessionId -> {taskId, state, title, steps} -- the join used to attribute token usage back to
+// the SPO task that produced it, keyed on the session id rather than on a single file: a
+// session's usage can be spread across several physical transcript files that all carry that
+// same session id (its own <sessionId>.jsonl plus any subagent transcripts under
+// <sessionId>/subagents/, see console/usage-scan.js's scanFile/listCandidateFiles), and this
+// index needs only the id to fold all of them back onto one task. Pure, no I/O -- consumes the
+// already-collected journalTasks array.
 function buildSessionIndex(journalTasks) {
   const index = {};
   for (const t of journalTasks || []) {

@@ -1,7 +1,10 @@
 'use strict';
 // console/usage-scan.js -- incremental, streaming token-usage scanner for the live dashboard's
 // "tokens per task/model" section. A SELECTIVE extraction of scripts/usage-report.js's file
-// walk + message.id dedup (that script is untouched -- it stays the offline analysis tool).
+// walk (that script is untouched -- it stays the offline analysis tool). The message.id dedup
+// is NOT shared between the two: usage-report.js keeps the FIRST occurrence of an id,
+// this module keeps the LAST (see scanFile's header for why) -- the two scripts' dedup totals
+// diverge on any transcript whose streamed usage grows across occurrences of the same id.
 // Neither script carries a dollar figure anywhere: usage-report.js's own header records the
 // 2026-08-31 maintainer decision retiring its $$$ estimate (the pool is a Claude Max quota, not
 // metered API billing, so a dollar figure never meant money spent -- see
@@ -18,6 +21,12 @@ const readline = require('readline');
 
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// A `subagents` directory nests further for workflow-spawned agents
+// (`subagents/workflows/<wf_id>/agent-<hash>.jsonl`) -- this caps how deep listSubagentFiles
+// below will follow that nesting. Deep enough for any layout seen on this machine (2 levels)
+// with headroom to spare; shallow enough that a pathological or cyclic layout can't make one
+// scan() call walk forever.
+const MAX_SUBAGENT_WALK_DEPTH = 8;
 
 // ---- the ONE "today" rule (action 5.5, item C) -------------------------------------------------
 //
@@ -68,10 +77,24 @@ function mergeAgg(dst, src) {
 // Streams one .jsonl transcript file, dedups by message.id, returns per-file aggregate:
 // {sessionId, account, lastTs, models: {model: agg}}. Never throws -- unreadable files yield an
 // empty aggregate.
+//
+// Dedup keeps the LAST occurrence of an id, not the first. In a SUBAGENT transcript the CLI
+// rewrites an assistant message as it streams, so the same message.id appears on several
+// consecutive lines with a growing `output_tokens`; input/cache-creation/cache-read never vary
+// across occurrences of the same id (measured on the real corpus), and output_tokens is
+// monotonically non-decreasing, so last == max. In a MAIN session transcript this does not
+// happen: duplicate ids occur, but their usage is identical, so first-wins and last-wins agree
+// to the token there (measured 2026-09-08: 662 top-level SPO transcripts, billable 199,294,970
+// and output 38,088,746 under BOTH dedup directions). The direction therefore only matters for
+// the subagent files this module now reads -- on the control session whose pre-fix figure was
+// 48.2% under, the dedup accounts for 15.8% of the gap (42,953 of 271,089) and the subagent walk
+// for the other 84.2%. So each id's {model, usage} pair is buffered and OVERWRITTEN by every
+// later occurrence, and only applied to the aggregate once, after the file has finished
+// streaming -- still O(unique ids in this file) memory, not O(lines).
 async function scanFile(filePath, account) {
   const sessionId = path.basename(filePath, '.jsonl');
   const agg = { sessionId, account, lastTs: null, models: {}, msgs: 0, dupes: 0 };
-  const seen = new Set();
+  const lastById = new Map(); // id -> {model, usage} of its LAST occurrence seen so far
 
   let rl;
   try {
@@ -90,25 +113,35 @@ async function scanFile(filePath, account) {
       }
       const u = o.message && o.message.usage;
       if (!u) continue;
-      const id = (o.message && o.message.id) || o.uuid;
-      if (id) {
-        if (seen.has(id)) {
-          agg.dupes++;
-          continue;
-        }
-        seen.add(id);
-      }
+
       const sid = o.sessionId || sessionId;
       if (sid) agg.sessionId = sid;
       if (o.timestamp) agg.lastTs = o.timestamp;
 
+      const id = (o.message && o.message.id) || o.uuid;
       const model = (o.message && o.message.model) || 'unknown';
-      const m = (agg.models[model] = agg.models[model] || emptyModelAgg());
-      addAgg(m, u);
-      agg.msgs++;
+
+      if (id) {
+        if (lastById.has(id)) agg.dupes++;
+        // Overwrite model+usage together, as one unit, so the pair applied at the end is
+        // always the one actual occurrence they came from together -- never a later usage
+        // paired with an earlier model.
+        lastById.set(id, { model, usage: u });
+      } else {
+        // Nothing to dedup an id-less line against -- apply it immediately, same as before.
+        const m = (agg.models[model] = agg.models[model] || emptyModelAgg());
+        addAgg(m, u);
+        agg.msgs++;
+      }
     }
   } catch {
     /* stream error mid-file -- keep whatever was accumulated so far */
+  }
+
+  for (const { model, usage } of lastById.values()) {
+    const m = (agg.models[model] = agg.models[model] || emptyModelAgg());
+    addAgg(m, usage);
+    agg.msgs++;
   }
 
   return agg;
@@ -123,6 +156,30 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
   const cache = new Map(); // absPath -> {mtimeMs, size, agg}
   let lastIndex = null;
   let stats = { cachedFiles: 0, lastScanMs: null, lastScanAt: null, filesScanned: 0, filesReused: 0 };
+
+  // Recursively collects every *.jsonl at any depth under `dir` (a session's `subagents`
+  // directory), so a deeper layout -- e.g. `subagents/workflows/<wf_id>/agent-<hash>.jsonl` from
+  // a workflow-spawned agent, not just the flat `subagents/agent-<hash>.jsonl` -- is not silently
+  // skipped. Never follows a symlinked directory (avoids a cycle turning this into an infinite
+  // walk) and stops at MAX_SUBAGENT_WALK_DEPTH regardless. Guarded by try/catch at every
+  // readdirSync so a missing/unreadable directory anywhere in the tree is skipped silently, same
+  // as the rest of this function.
+  function listJsonlFilesRecursive(dir, depth, out) {
+    if (depth > MAX_SUBAGENT_WALK_DEPTH) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.isFile() && e.name.endsWith('.jsonl')) {
+        out.push(path.join(dir, e.name));
+      } else if (e.isDirectory() && !e.isSymbolicLink()) {
+        listJsonlFilesRecursive(path.join(dir, e.name), depth + 1, out);
+      }
+    }
+  }
 
   function listCandidateFiles() {
     const files = []; // [{absPath, account}]
@@ -139,12 +196,25 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
       for (const dir of projectDirs) {
         let entries;
         try {
-          entries = fs.readdirSync(dir);
+          entries = fs.readdirSync(dir, { withFileTypes: true });
         } catch {
           continue;
         }
         for (const e of entries) {
-          if (e.endsWith('.jsonl')) files.push({ absPath: path.join(dir, e), account: root.account });
+          if (e.isFile() && e.name.endsWith('.jsonl')) {
+            files.push({ absPath: path.join(dir, e.name), account: root.account });
+          } else if (e.isDirectory()) {
+            // <projectDir>/<parentSessionId>/subagents/agent-<hash>.jsonl -- a subagent's own
+            // transcript, and it can nest deeper still: a workflow-spawned agent lands at
+            // <projectDir>/<parentSessionId>/subagents/workflows/<wf_id>/agent-<hash>.jsonl.
+            // Every line in either layout carries `sessionId` set to the PARENT session's id
+            // (scanFile already folds that onto the parent via `agg.sessionId = sid`), so walking
+            // the whole `subagents` subtree is the whole fix -- no new attribution logic needed.
+            const subagentsDir = path.join(dir, e.name, 'subagents');
+            const subFiles = [];
+            listJsonlFilesRecursive(subagentsDir, 0, subFiles);
+            for (const absPath of subFiles) files.push({ absPath, account: root.account });
+          }
         }
       }
     }
@@ -187,13 +257,22 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
     const bySession = {};
     const byModel = {};
     const byAccount = {};
-    // byDay: a re-key of the SAME cached aggregates by the calendar day of each file's last
-    // message -- zero extra I/O, this is the console/usage-rollups.js persistence layer's raw
-    // material (see that module's header for why a day needs a durable copy at all). A session
-    // straddling midnight is attributed whole to its end day -- an accepted approximation,
-    // orchestrator steps run minutes, not days. 'local' (ambient, non-pooled usage -- see
-    // discoverUsageRoots below) is excluded: the trend this feeds is about the daemon's own
-    // operating cost, and ad-hoc sessions on this machine aren't part of that.
+    // byDay: a re-key by the calendar day of each SESSION's last message -- zero extra I/O
+    // beyond what bySession already built, this is the console/usage-rollups.js persistence
+    // layer's raw material (see that module's header for why a day needs a durable copy at
+    // all). A session straddling midnight is attributed whole to its end day -- an accepted
+    // approximation, orchestrator steps run minutes, not days. 'local' (ambient, non-pooled
+    // usage -- see discoverUsageRoots below) is excluded: the trend this feeds is about the
+    // daemon's own operating cost, and ad-hoc sessions on this machine aren't part of that.
+    //
+    // Keyed on the SESSION, deliberately not on the cached FILE: a session that used subagents
+    // has one file per subagent (`<project>/<sessionId>/subagents/agent-*.jsonl`) plus its own
+    // main file, all of which fold into ONE bySession entry above (every subagent line already
+    // carries its PARENT session's id -- see scanFile's header). `sessions` here is this
+    // block's own denominator for buildTrendViews's avgWeightPerSession; counting cached files
+    // instead of distinct sessions would silently turn that into a file count and corrupt every
+    // trend figure and durable rollup built on it. So this walks bySession -- already exactly
+    // one entry per session id -- not cache.values().
     const byDay = {};
     let totalMsgs = 0;
     let totalDupes = 0;
@@ -215,17 +294,18 @@ function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_
         const aModel = (aEntry[model] = aEntry[model] || emptyModelAgg());
         mergeAgg(aModel, m);
       }
+    }
 
+    for (const sEntry of Object.values(bySession)) {
       // LOCAL calendar day, not a UTC slice -- see this file's "the ONE 'today' rule" header.
-      const date = agg.lastTs ? localDateKey(agg.lastTs) : null;
-      if (date && agg.account !== 'local') {
-        const dEntry = (byDay[date] = byDay[date] || { sessions: 0, msgs: 0, models: {} });
-        dEntry.sessions++;
-        dEntry.msgs += agg.msgs;
-        for (const [model, m] of Object.entries(agg.models)) {
-          const dModel = (dEntry.models[model] = dEntry.models[model] || emptyModelAgg());
-          mergeAgg(dModel, m);
-        }
+      const date = sEntry.lastTs ? localDateKey(sEntry.lastTs) : null;
+      if (!date || sEntry.account === 'local') continue;
+      const dEntry = (byDay[date] = byDay[date] || { sessions: 0, msgs: 0, models: {} });
+      dEntry.sessions++;
+      for (const [model, m] of Object.entries(sEntry.models)) {
+        dEntry.msgs += m.msgs;
+        const dModel = (dEntry.models[model] = dEntry.models[model] || emptyModelAgg());
+        mergeAgg(dModel, m);
       }
     }
 
@@ -292,6 +372,10 @@ function buildTokenViews(usageIndex, sessionIndex, { topTasks = 30 } = {}) {
   const sIndex = sessionIndex || {};
 
   const byTaskRaw = {}; // taskId -> {taskId, state, title, models: {model: agg}}
+  // unattributed.sessions++ below does NOT have the byDay file-vs-session trap: it walks
+  // usageIndex.bySession, which scan() already builds as one entry per distinct session id
+  // (a session's main file and any subagent files are merged into that single entry before
+  // this function ever sees the index), so this counts sessions correctly with no change needed.
   const unattributed = { sessions: 0, agg: emptyModelAgg() };
 
   for (const [sessionId, session] of Object.entries(usageIndex.bySession || {})) {
