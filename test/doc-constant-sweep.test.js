@@ -170,24 +170,36 @@ const PINS = [
         contains: "accountLeaseWaitMs: positiveMsFromEnv('SPO_ACCOUNT_LEASE_WAIT_MS', MAX_LEASE_AGE_MS),",
       },
       { file: 'doc/state-machine-spec.md', contains: '**63 min** — `MAX_LEASE_AGE_MS`' },
-      { file: 'orchestrator/README.md', contains: '`MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×' },
+      {
+        file: 'orchestrator/README.md',
+        // Extended through the full formula (2026-09-08, verifier's B5 finding): the old string
+        // stopped one token before the constant name, which is exactly why "2 x LLM_STEP_DEADLINE_MS
+        // plus 10% slack" (arithmetically false: 2 x 900,000 + 10% = 31.5 min, not 63) sat here
+        // swept green. Proven load-bearing: reverting this line to the old wording turns this pin
+        // red by name (measured 2026-09-08).
+        contains: '`MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×\n`MAX_LLM_STEP_DEADLINE_MS` plus 10% slack',
+      },
     ],
   },
   {
-    name: 'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, four of the five LLM steps', // action 1.x / 2.1
+    name: 'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, three of the five LLM steps', // action 1.x / 2.1 / 2.2
     checks: [
       { file: 'orchestrator/step-contracts.js', contains: 'const LLM_STEP_DEADLINE_MS = 900000;' },
       { file: 'doc/state-machine-spec.md', contains: '| 900000ms / 15min |' },
     ],
   },
   {
-    // PLAN is the one step off the default (2026-09-04). Card #486 (size:L, the only card ever to
+    // PLAN was the one step off the default (2026-09-04). Card #486 (size:L, the only card ever to
     // reach PLAN's `L -> high` row) failed three times, twice on deadline kills at ~825s of measured
     // wall clock, and terminal-parked llm-transport-failed:PLAN -- the pipeline could not plan an
-    // L card at all. This row exists so the raise cannot drift from the spec table that states it.
-    name: 'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN gets 1800000ms / 30min',
+    // L card at all. IMPLEMENT joined it (action 2.2, card #158): 7 of the 9 deadline kills in the
+    // whole corpus are IMPLEMENT's own, and its longest completed calls journalled 885-920s against
+    // the old 900000ms cap (pre-monotonic-clock figures, see steps/llm.js). This row exists so
+    // neither raise can drift from the spec table that states it.
+    name: 'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN and IMPLEMENT get 1800000ms / 30min',
     checks: [
       { file: 'orchestrator/step-contracts.js', contains: 'PLAN: 1800000, // 30 min' },
+      { file: 'orchestrator/step-contracts.js', contains: 'IMPLEMENT: 1800000, // 30 min' },
       { file: 'doc/state-machine-spec.md', contains: '| 1800000ms / 30min |' },
     ],
   },
@@ -249,8 +261,8 @@ test('every pinned documented constant matches a literal in both the code and th
   assert.deepEqual(
     PINS.map((p) => p.name).sort(),
     [
-      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, four of the five LLM steps',
-      'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN gets 1800000ms / 30min',
+      'LLM_STEP_DEADLINE_MS (900000ms / 15min) -- the default, three of the five LLM steps',
+      'LLM_STEP_DEADLINE_MS_BY_STEP: PLAN and IMPLEMENT get 1800000ms / 30min',
       'account cooldown: escalation window (2 hours)',
       'account cooldown: overloaded (5 minutes, flat, never escalates)',
       'account cooldown: usage escalated (5 hours)',
@@ -1389,7 +1401,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
-  "doc/board-audit.md :: config.js:893", // re-pinned from :874 -- card #119 action 1.2 added 19 lines to config.js above reportIntakeColumn (poolExhaustionWaitCapMs), a true pure shift
+  "doc/board-audit.md :: config.js:900", // re-pinned from :893 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above reportIntakeColumn, a true pure shift; content byte-identical at :900
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1109",
@@ -1398,7 +1410,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
-  "orchestrator/README.md :: config.js:766", // re-pinned from :747 -- card #119 action 1.2 added 19 lines to config.js above productRepo (poolExhaustionWaitCapMs), a true pure shift
+  "orchestrator/README.md :: config.js:773", // re-pinned from :766 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above productRepo, a true pure shift; content byte-identical at :773
   "orchestrator/README.md :: dispatcher.js:634-648",
   "orchestrator/README.md :: doc/state-machine-spec.md:150",
   "orchestrator/README.md :: intake.js:797-799",
@@ -1419,7 +1431,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: park-loop.js:1283", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Both are pure shifts: the cited line is byte-identical at every one of the three numbers.
   "orchestrator/state-machine.js :: run.ts:63",
-  "orchestrator/state-machine.js :: step-contracts.js:326", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`
+  "orchestrator/state-machine.js :: step-contracts.js:432", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`; re-pinned from :408 (2026-09-08, verifier's B1-B4 repair pass) -- action 2.2 of card #158 grew step-contracts.js's LLM_STEP_DEADLINE_MS_BY_STEP/MAX_LEASE_AGE_MS comments by a further 24 lines (the monotonic-clock caveat and the PLAN-precedent counter-evidence) above this line; a true pure shift, content byte-identical at :432.
   "orchestrator/steps/llm.js :: intake.js:797-799",
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",

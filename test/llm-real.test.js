@@ -530,6 +530,132 @@ test('invokeClaudeReal: passes deadlineMs through to spawnSync as its timeout op
   assert.equal(seenTimeout, 5000);
 });
 
+// ---- invokeClaudeReal: durationS must be measured on a monotonic clock, not Date.now() ------
+// Card #158, 2026-09-08: the old code read Date.now() before and after spawnSync, but the
+// deadline that actually kills the call is spawnOpts.timeout, enforced by libuv's MONOTONIC
+// timer -- a different clock. This host steps Date.now() -- a WSL2 clock-sync artifact (see
+// orchestrator/monotonic-clock.js's own header for the measured -2515ms jump), not something
+// this file claims a cause for -- so the two clocks can disagree about how much time passed for
+// the same spawn.
+//
+// Corpus evidence (~/.spo-state/journal/, measured 2026-09-08): all 9 deadline-killed calls were
+// armed with the identical 900,000ms deadline, and the 8 that carry a duration_s at all (the
+// 9th, issue-385 on 2026-08-30, predates the field) ranged, under the old Date.now()-based
+// measurement, 818.536s-960.461s -- from 81.5s under to 60.5s over a bound that is identical by
+// construction. issue-517 (2026-09-05T02:03:20.692Z) is the decisive case: a SUCCESSFUL call
+// (ok: true, 123 turns, never killed) journalled 920.322s against its own 900,000ms deadline --
+// the monotonic timer that actually gates spawnSync never fired, so realtime alone said it
+// should have.
+//
+// The isolation axis below is a realtime clock jump injected through the fake spawnSync, not the
+// clock reading the fix itself uses -- asserting against an injected hrtime would prove nothing
+// (the guard's own knob). Each test's responder LEAVES the patched Date.now in place when it
+// returns -- the code under test takes its own Date.now() reading AFTER spawnSync returns (the
+// old `(Date.now() - startedAt) / 1000` line), so restoring inside the responder would undo the
+// jump before that second reading ever happened, silently turning the test into decoration (it
+// would pass even against the reverted, un-fixed code -- exactly the failure mode the revert
+// check below exists to catch). Restoration happens only in the outer try/finally, after
+// invokeClaudeReal has returned, so a failing assertion still cannot leak the patch into the
+// rest of this suite.
+
+test('invokeClaudeReal: durationS ignores a forward Date.now() jump during the call (issue-517 shape)', async () => {
+  const realDateNow = Date.now;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      // Realtime runs 80s ahead of monotonic time while claude is "running" -- issue-517's
+      // shape: a call that finished quickly on the clock libuv's timeout actually uses, but
+      // whose Date.now()-based reading made it look like it took 80s longer than it did. Left
+      // patched on return -- the code under test reads Date.now() again AFTER spawnSync returns
+      // (the old `(Date.now() - startedAt) / 1000` line), so restoring here would undo the jump
+      // before that read ever happens. The outer try/finally below is what restores it.
+      Date.now = () => realDateNow() + 80000;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+  };
+  try {
+    const result = await invokeClaudeReal(
+      { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+      deps
+    );
+    assert.equal(result.ok, true);
+    // < 1, not < 5: the fake spawn is sub-millisecond, so real durationS is ~0 -- this also
+    // catches a hardcoded-1-second durationS, which a looser bound would let through silently.
+    assert.ok(result.durationS < 1, `expected durationS < 1s (real elapsed time), got ${result.durationS}`);
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test('invokeClaudeReal: durationS ignores a backward Date.now() jump and is never negative (issue-385/#492 shape)', async () => {
+  // issue-385 (2026-08-30) and its siblings on the "under" side of the corpus spread (81.5s,
+  // 78.5s, 75.5s, 74.8s under the 900,000ms bound) are the mirror case: realtime LAGGING
+  // monotonic made a call killed at exactly its 900,000ms deadline look as if it had been cut up
+  // to ~81s short. A -80s Date.now() step reproduces that direction; duration_s must never go
+  // negative regardless of which way the realtime clock steps.
+  const realDateNow = Date.now;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      // Left patched on return -- see the sibling forward-jump test's comment for why restoring
+      // here (before the code under test's post-spawn Date.now() read) would undo the point.
+      Date.now = () => realDateNow() - 80000;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+  };
+  try {
+    const result = await invokeClaudeReal(
+      { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+      deps
+    );
+    assert.equal(result.ok, true);
+    // >= 0 alone would also pass for a sign-flipped durationS on a sub-millisecond fake spawn
+    // (-0 >= 0 is true) -- Object.is rejects that mutant too.
+    assert.ok(
+      result.durationS >= 0 && !Object.is(result.durationS, -0),
+      `duration_s must never be negative, got ${result.durationS}`
+    );
+    assert.ok(result.durationS < 5, `expected durationS < 5s (real elapsed time), got ${result.durationS}`);
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test('invokeClaudeReal: the decisive issue-517 case -- a call spawnSync did not kill never reports more than its armed deadline', async () => {
+  // issue-517, 2026-09-05T02:03:20.692Z: ok:true, 123 turns, never killed -- yet the old
+  // Date.now()-based duration_s (920.322s) exceeded its own 900,000ms armed deadline. That is
+  // impossible under the monotonic clock spawnOpts.timeout actually enforces: a call spawnSync
+  // let succeed cannot have taken longer than the timeout that would otherwise have killed it.
+  const realDateNow = Date.now;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      // Realtime runs far past the armed deadline while the (monotonically fast) call succeeds
+      // -- the exact shape that made the old code's duration_s exceed a deadline that never
+      // fired. Left patched on return -- see the first test in this block's comment for why.
+      Date.now = () => realDateNow() + 950000;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+  };
+  try {
+    const result = await invokeClaudeReal(
+      {
+        promptText: 'hi',
+        model: 'haiku',
+        effort: 'low',
+        cwd: '/tmp',
+        account: { name: 'default', configDir: null },
+        deadlineMs: 900000,
+      },
+      deps
+    );
+    assert.equal(result.ok, true);
+    assert.ok(
+      result.durationS <= 900,
+      `a call spawnSync did not kill cannot report more than its 900000ms deadline, got ${result.durationS}s`
+    );
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
 // ---- invokeClaudeReal: telling a deadline kill apart from a real spawn failure --------------
 // Card #449, 2026-08-30: a deadline kill sets BOTH spawnResult.error (ETIMEDOUT) AND
 // spawnResult.signal, and the old code tested `error` first, so every deadline kill was reported

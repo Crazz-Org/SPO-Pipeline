@@ -16,8 +16,9 @@
 // time out or its own timing-sensitive assertion read wrong, without the suite going red for the
 // right reason.
 //
-// THE FIX, and the ONE THING TO NEVER DO TO IT: measure ELAPSED DURATIONS -- "how long have I
-// been retrying" -- with this monotonic clock, in bounded wait loops ONLY. Never use it for a
+// THE FIX, and the ONE THING TO NEVER DO TO IT: measure ELAPSED DURATIONS -- a bounded wait
+// loop's "how long have I been retrying", or a single spawn's "how long did this call take"
+// (steps/llm.js's duration_s) -- with this monotonic clock. Never use it for a
 // WALL-CLOCK TIMESTAMP: anything written to disk or compared ACROSS PROCESSES (a lease's
 // `startedAt`, an account's `cooldownUntil`, a queue entry's `notBefore`, orphan-scan.js's grace
 // window against `state.json`'s `updatedAt`) must stay Date.now()-based, because

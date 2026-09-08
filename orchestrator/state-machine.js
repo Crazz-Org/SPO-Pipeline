@@ -1136,7 +1136,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:326's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:432's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;

@@ -16,10 +16,11 @@
 //     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
 //     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
 //     numTurns, durationS, raw}. `deps.spawnSync` is an injection point for tests (and nothing
-//     else) -- production code never passes it. `durationS` (seconds, wall clock measured around
-//     the spawn itself) is journaled as `duration_s` -- doc/state-machine-spec.md's Observability
-//     section already documented that field before any code wrote it (measured 2026-09-01: zero
-//     of the 19 corpus journals' llm-call events carried it); true as of this change.
+//     else) -- production code never passes it. `durationS` (seconds, measured with
+//     process.hrtime.bigint() around the spawn itself, NOT Date.now()) is journaled as
+//     `duration_s` -- doc/state-machine-spec.md's Observability section already documented that
+//     field before any code wrote it (measured 2026-09-01: zero of the 19 corpus journals'
+//     llm-call events carried it); true as of this change.
 //
 //     Token accounting (maintainer decision, 2026-08-31): the pool is Claude Max SUBSCRIPTION
 //     accounts with a quota, never metered API billing, so a dollar figure never meant money
@@ -92,6 +93,7 @@ const { resolveStepContract, deadlineMsForStep } = require('../step-contracts');
 const { isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
+const { monotonicNowMs } = require('../monotonic-clock');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
 
@@ -410,13 +412,35 @@ async function invokeClaudeReal(opts, deps = {}) {
   // (promptText/argv/env prep above is sub-millisecond and not what a maintainer means by "how
   // long did this call take"), and captured BEFORE any of the branches below so every one of
   // them -- success, spawn error, signal kill, deadline timeout, parse failure -- reports the
-  // real wall-clock time this attempt burned. That matters most for exactly the failure a
+  // real elapsed time this attempt burned. That matters most for exactly the failure a
   // maintainer is most likely to be staring at: a deadline-killed call still ran for the full
   // deadline, and previously that cost was invisible (ZERO_TOKENS records tokens as 0, which is
   // honest, but said nothing about time spent).
-  const startedAt = Date.now();
+  //
+  // Monotonic clock (card #158), not Date.now(). The bound this measurement is checked
+  // against -- spawnOpts.timeout, armed a few lines above -- is enforced by libuv with a
+  // monotonic timer; Date.now() reads CLOCK_REALTIME, a clock this host demonstrably steps (14
+  // `spawn` events in this same corpus journal a negative elapsed time, down to -2,440ms --
+  // orchestrator/steps/scripted.js's own timing, a sibling symptom of the same stepping clock).
+  // The two can disagree about how much time passed for the same spawn. Measured against the
+  // per-issue journals under ~/.spo-state/journal/ (2026-09-08): all 9 deadline-killed calls in
+  // the corpus were armed with the identical 900,000ms deadline, and the 8 that carry a
+  // duration_s at all (the 9th, issue-385 on 2026-08-30, predates the field) ranged, under the
+  // old Date.now()-based measurement, 818.536s-960.461s -- from 81.5s under to 60.5s over a bound
+  // that is identical by construction. The decisive case is issue-517
+  // (2026-09-05T02:03:20.692Z): a successful IMPLEMENT (ok: true, 123 turns, never killed)
+  // journalled 920.322s against its own 900,000ms deadline under the old clock -- the monotonic
+  // timer that actually gates spawnSync never fired, so a call that provably finished under its
+  // deadline reported having run past it. process.hrtime.bigint() reads the same clock class
+  // libuv's timeout enforces (CLOCK_MONOTONIC vs the loop's CLOCK_MONOTONIC_COARSE -- one
+  // timebase, different read granularity), so a duration_s computed from it can no longer
+  // disagree with the deadline that produced it the way Date.now() did. A residual of tick
+  // granularity plus spawn/reap overhead remains: measured 2026-09-08, a 700ms deadline reports
+  // 703-706ms. That is milliseconds against a 900s bound. This does not repair any duration_s
+  // already written to a journal; the corpus figures above stay artefacts of the old clock.
+  const startedAtMs = monotonicNowMs();
   const spawnResult = spawnSyncFn('claude', argv, spawnOpts);
-  const durationS = (Date.now() - startedAt) / 1000;
+  const durationS = (monotonicNowMs() - startedAtMs) / 1000;
   const rawExit = spawnResult.status === undefined ? null : spawnResult.status;
 
   // Deadline kill FIRST, before the generic `error` branch. When spawnOpts.timeout fires, Node
@@ -733,9 +757,9 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       promptFile: override.promptFile,
       cwd,
       account,
-      // Per-step (PLAN 1800000ms, every other step 900000ms). This legacy override path has no
-      // resolved contract to read the figure off, so it asks step-contracts directly -- same
-      // source, so the two paths can never disagree about how long a PLAN may run.
+      // Per-step (PLAN and IMPLEMENT 1800000ms, every other step 900000ms). This legacy override
+      // path has no resolved contract to read the figure off, so it asks step-contracts directly
+      // -- same source, so the two paths can never disagree about how long a call may run.
       deadlineMs: deadlineMsForStep(stepName),
     };
 

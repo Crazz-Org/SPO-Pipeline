@@ -206,19 +206,19 @@ low.
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
 | PLAN | Fable 5 — no escalation (the promised "Opus 5 fallback" was unreachable and was removed 2026-09-04) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 900000ms / 15min |
+| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
 | DIAGNOSE | Opus 5 (was Fable 5 until 2026-09-04) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
 | VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when the diff touches the RDO wire | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
 
-The deadline is the same figure for all five rows — `step-contracts.js`'s `LLM_STEP_DEADLINE_MS`,
-the `spawnSync` timeout `invokeClaudeReal` arms for every one of these calls
-(`orchestrator/steps/llm.js`) — but that figure governs real mode only. `state-machine.js` still
-wraps every LLM step in the outer `callWithDeadline` (`deadline.js`) using the generic
-`stepDeadlineMs` (120000ms; no `stepDeadlineMsByState` entry exists for any LLM state), which is
-inert in real mode (a JS timer cannot preempt the blocking `spawnSync` that `LLM_STEP_DEADLINE_MS`
-already bounds) but live in shadow mode, where a fixture delay races that 120s timer instead of
-the 900000ms figure above. There is no per-step or per-size USD budget: `maxBudgetUsd` is plumbed
+The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LLM_STEP_DEADLINE_MS_BY_STEP`
+overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
+CITATION_VERIFIER, VALIDATE) take `LLM_STEP_DEADLINE_MS`'s own 900000ms default. Whichever figure
+applies is the `spawnSync` timeout `invokeClaudeReal` arms for that call (`orchestrator/steps/llm.js`)
+— but it governs real mode only. `state-machine.js` still wraps every LLM step in the outer
+`callWithDeadline` (`deadline.js`) using the generic `stepDeadlineMs` (120000ms; no `stepDeadlineMsByState`
+entry exists for any LLM state), which is inert in real mode (a JS timer cannot preempt the blocking
+`spawnSync` that the step's own deadline already bounds) but live in shadow mode, where a fixture delay races that 120s timer instead of whichever wall-clock figure the row above states. There is no per-step or per-size USD budget: `maxBudgetUsd` is plumbed
 end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
@@ -455,10 +455,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   fresh input + cache-creation + output, cache-read reported separately, never summed in).
   `duration_s` was documented here well before any code wrote it — action 5.4 measured
   2026-09-01 that zero of the 19 corpus journals' `llm-call` events carried it, and made it
-  true the same day: `orchestrator/steps/llm.js`'s `invokeClaudeReal` now measures wall-clock
-  seconds around the `claude` spawn itself and reports it on every branch (success, spawn
+  true the same day: `orchestrator/steps/llm.js`'s `invokeClaudeReal` measures the seconds a
+  call burned around the `claude` spawn itself and reports it on every branch (success, spawn
   error, external signal, and — the one a maintainer most wants — a deadline timeout, which
-  still burned the full deadline even though it produced no result).
+  still burned the full deadline even though it produced no result). The reading is taken on a
+  monotonic clock (`process.hrtime.bigint()`, via `orchestrator/monotonic-clock.js` — card #158,
+  2026-09-08; 5.4 itself used `Date.now()`), the same clock class libuv uses to enforce the
+  `spawnSync` deadline, so a duration and the deadline bounding it can no longer disagree the
+  way a realtime reading and that deadline once did.
   Account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the

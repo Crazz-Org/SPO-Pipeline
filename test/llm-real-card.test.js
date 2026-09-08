@@ -106,6 +106,88 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   assert.equal(call.durationS, undefined, 'spelled duration_s, not camelCase -- the spec documents duration_s');
 });
 
+// Card #158, 2026-09-08: pins the fix (orchestrator/steps/llm.js now reads
+// orchestrator/monotonic-clock.js's monotonicNowMs(), not Date.now(), for durationS) on the
+// JOURNALLED field, not just on invokeClaudeReal's return value -- test/llm-real.test.js pins the
+// return value directly; this one drives the real journal-append path (runLlm -> appendEvent) end
+// to end and reads the llm-call event back out, reusing this file's own journal-reading helpers
+// (fs/path, already exercised by the test above) rather than adding a second route through runLlm
+// elsewhere. Also pins the journalled format (whole milliseconds, at most 3 decimals) on the
+// value's decimal string, since neither arithmetic value nor the existing tests guard that shape.
+test('PLAN real card path: duration_s in the journalled llm-call event is never negative, even when Date.now() steps backward during the call (issue-385/#492 shape)', async () => {
+  const taskDir = mkTmp('spo-card-plan-duration-');
+  const task = {
+    kind: 'card',
+    issue: 100,
+    title: 'Add another widget',
+    criterion: 'the widget renders',
+    worktreePath: '/tmp/worktree-100',
+    size: 'S',
+  };
+
+  const realDateNow = Date.now;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      // Realtime lagging monotonic -- issue-385/#492's shape (see llm-real.test.js's own
+      // comment block for the corpus numbers this encodes). Left patched on return -- the code
+      // under test reads Date.now() again AFTER spawnSync returns (the old
+      // `(Date.now() - startedAt) / 1000` line), so restoring here would undo the jump before
+      // that read ever happens. The outer try/finally below is what restores it.
+      Date.now = () => realDateNow() - 80000;
+      // A short busy-wait on the REAL monotonic clock (untouched by the Date.now patch above),
+      // so the call's true elapsed time is a few whole milliseconds, never exactly 0. Needed for
+      // the non-negativity assertion below to be load-bearing THROUGH the journal: a
+      // sign-flipped duration_s of exactly -0 survives in memory but round-trips through
+      // JSON.stringify/JSON.parse (journal.jsonl) as +0 -- JSON has no negative zero -- which
+      // would make a sub-millisecond fake spawn's mutant undetectable on the journalled value
+      // even with an Object.is(-0) check. A genuinely negative (non-zero) duration_s has no such
+      // blind spot: JSON preserves the sign on every value except -0 itself.
+      const spinUntil = process.hrtime.bigint() + 3000000n; // ~3ms, real hrtime
+      while (process.hrtime.bigint() < spinUntil) {
+        // busy-wait
+      }
+      const reply = realShapedReply({
+        plan_markdown: '# Plan\n\nAdd another widget.\n',
+        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+        invariant_ids: [],
+        check_commands: ['npm run typecheck'],
+      });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  let result;
+  try {
+    result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  } finally {
+    Date.now = realDateNow;
+  }
+  assert.equal(result.ok, true);
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const call = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(call);
+  assert.equal(typeof call.duration_s, 'number');
+  // >= 0 alone would also pass for a sign-flipped duration_s on a sub-millisecond fake spawn
+  // (-0 >= 0 is true) -- Object.is rejects that mutant too.
+  assert.ok(
+    call.duration_s >= 0 && !Object.is(call.duration_s, -0),
+    `duration_s must never be negative, got ${call.duration_s}`
+  );
+  // The journalled format is unchanged: integer-milliseconds/1000, at most 3 decimal places
+  // (e.g. `920.322`, never `920.3220134567`). Checked on the decimal STRING, not by reasoning
+  // about the arithmetic that produced it -- float multiplication is not safe for that.
+  assert.match(
+    String(call.duration_s),
+    /^\d+(\.\d{1,3})?$/,
+    `duration_s must stay whole milliseconds, got ${call.duration_s}`
+  );
+});
+
 test('IMPLEMENT real card path escalates to opus when task.touchesRdoMembers is true', async () => {
   const taskDir = mkTmp('spo-card-implement-rdo-');
   const { appendEvent } = require('../orchestrator/journal');
