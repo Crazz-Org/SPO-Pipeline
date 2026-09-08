@@ -966,6 +966,187 @@ test('drainQueueOnce: a queue holding nothing but a future notBefore terminates,
   });
 });
 
+// ---- 15b (card #137, Lot 3, 3.2a): takeNextTask's claim (fs.mkdirSync/fs.renameSync) used to run
+//          unguarded AFTER the selection loop broke -- a throw there crashed the worker/dispatch
+//          path (neither drainQueueOnce's `for(;;)` nor dispatcher.js's fillSlots catches
+//          anything). lock.js:4-11 already reproduced the ENOENT shape of this in production
+//          (2026-08-29); what survives that fix is a solitary environment failure (EXDEV/EPERM/
+//          ENOSPC), injected below via a real fs.renameSync throw -- never by calling the guard's
+//          own catch block directly. ----------------------------------------------------------
+
+test('takeNextTask: a claim that throws (EXDEV) is journalled and skipped -- the next eligible entry is still taken', () => {
+  const queueDir = mkTmp('spo-transient-claim-queue-');
+  const journalRoot = mkTmp('spo-transient-claim-journal-');
+  writeQueueFile(queueDir, '0001-a.json', { id: 'claim-a', kind: 'card', issue: 1 });
+  writeQueueFile(queueDir, '0002-b.json', { id: 'claim-b', kind: 'card', issue: 2 });
+
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(from).endsWith('0001-a.json')) {
+      const err = new Error('EXDEV: cross-device link not permitted, rename');
+      err.code = 'EXDEV';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  let taken;
+  try {
+    taken = takeNextTask(queueDir, journalRoot);
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.ok(taken, 'the second, healthy entry should still have been claimed -- one broken candidate must not abort the whole call');
+  assert.equal(taken.id, 'claim-b');
+  assert.equal(fs.existsSync(path.join(queueDir, '0001-a.json')), true, 'the broken candidate is left in place, not lost or moved aside');
+  assert.equal(fs.existsSync(path.join(queueDir, '0002-b.json')), false, 'the healthy candidate WAS taken out of queue/');
+
+  const failEvt = readDaemonJsonl(journalRoot).find((e) => e.event === 'queue-claim-failed');
+  assert.ok(failEvt, 'no queue-claim-failed journalled -- the throw would otherwise have been silent');
+  assert.equal(failEvt.id, 'claim-a');
+  assert.equal(failEvt.fromFile, '0001-a.json');
+  assert.match(failEvt.error, /EXDEV/);
+});
+
+test('takeNextTask: every candidate failing its claim returns null exactly once per candidate -- bounded, not a hot loop', () => {
+  const queueDir = mkTmp('spo-transient-claimall-queue-');
+  const journalRoot = mkTmp('spo-transient-claimall-journal-');
+  writeQueueFile(queueDir, '0001-a.json', { id: 'claim-all-a', kind: 'card', issue: 1 });
+  writeQueueFile(queueDir, '0002-b.json', { id: 'claim-all-b', kind: 'card', issue: 2 });
+
+  const realRename = fs.renameSync;
+  let attempts = 0;
+  fs.renameSync = (from, to, ...rest) => {
+    attempts += 1;
+    const err = new Error('ENOSPC: no space left on device, rename');
+    err.code = 'ENOSPC';
+    throw err;
+  };
+  let result;
+  try {
+    result = takeNextTask(queueDir, journalRoot);
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.equal(result, null, 'nothing takeable -- both candidates failed their claim');
+  // `files` is a fixed list read once at the top of takeNextTask: this is the property that makes
+  // a persistently failing entry bounded rather than hot. If the guard retried the SAME candidate
+  // in a loop instead of moving on, this count would never settle at 2.
+  assert.equal(attempts, 2, 'exactly one claim attempt per candidate, not a retry loop on either one');
+  assert.equal(fs.existsSync(path.join(queueDir, '0001-a.json')), true);
+  assert.equal(fs.existsSync(path.join(queueDir, '0002-b.json')), true);
+  assert.equal(readDaemonJsonl(journalRoot).filter((e) => e.event === 'queue-claim-failed').length, 2);
+});
+
+test('drainQueueOnce: a claim that keeps failing terminates the cycle instead of spinning', () => {
+  // Mirrors the "future notBefore" test above -- same liveness claim (a `null` from takeNextTask
+  // stops `drainQueueOnce`'s `for(;;)` exactly like an empty queue), different trigger.
+  const queueDir = mkTmp('spo-transient-claimdrain-queue-');
+  const journalRoot = mkTmp('spo-transient-claimdrain-journal-');
+  writeQueueFile(queueDir, '0001-broken.json', { id: 'claim-drain-broken', kind: 'card', issue: 1 });
+
+  const realRename = fs.renameSync;
+  let renameCalls = 0;
+  fs.renameSync = (from, to, ...rest) => {
+    renameCalls += 1;
+    const err = new Error('EPERM: operation not permitted, rename');
+    err.code = 'EPERM';
+    throw err;
+  };
+  let resultsPromise;
+  try {
+    resultsPromise = drainQueueOnce(queueDir, journalRoot, testConfig({ queueDir }));
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  return resultsPromise.then((r) => {
+    assert.deepEqual(r, [], 'nothing was drained -- the sole entry could not be claimed');
+    assert.equal(renameCalls, 1, 'drainQueueOnce called takeNextTask exactly once for this cycle, not spun');
+    assert.deepEqual(queuedFiles(queueDir), ['0001-broken.json'], 'the broken entry is still there, untaken, for the next cycle');
+  });
+});
+
+// ---- 15c (verification round 1): the guard covers BOTH statements of the claim, not just the ---
+//       rename -- and does not defeat ITSELF when its own journal write also fails ---------------
+
+test('takeNextTask: a claim that throws on mkdirSync (EACCES) is journalled and skipped, same as a renameSync throw', () => {
+  const queueDir = mkTmp('spo-transient-claimmkdir-queue-');
+  const journalRoot = mkTmp('spo-transient-claimmkdir-journal-');
+  writeQueueFile(queueDir, '0001-a.json', { id: 'claim-mkdir-a', kind: 'card', issue: 1 });
+  writeQueueFile(queueDir, '0002-b.json', { id: 'claim-mkdir-b', kind: 'card', issue: 2 });
+
+  const brokenTaskDir = path.join(journalRoot, 'claim-mkdir-a');
+  const realMkdir = fs.mkdirSync;
+  fs.mkdirSync = (p, ...rest) => {
+    if (String(p) === brokenTaskDir) {
+      const err = new Error('EACCES: permission denied, mkdir');
+      err.code = 'EACCES';
+      throw err;
+    }
+    return realMkdir(p, ...rest);
+  };
+  let taken;
+  try {
+    taken = takeNextTask(queueDir, journalRoot);
+  } finally {
+    fs.mkdirSync = realMkdir;
+  }
+
+  assert.ok(taken, 'the second, healthy entry should still have been claimed');
+  assert.equal(taken.id, 'claim-mkdir-b');
+  assert.equal(fs.existsSync(path.join(queueDir, '0001-a.json')), true, 'the broken candidate is left in place');
+
+  const failEvt = readDaemonJsonl(journalRoot).find((e) => e.event === 'queue-claim-failed');
+  assert.ok(failEvt, 'no queue-claim-failed journalled for an mkdirSync failure -- the guard must cover both statements of the claim');
+  assert.equal(failEvt.id, 'claim-mkdir-a');
+  assert.match(failEvt.error, /EACCES/);
+});
+
+// Verification finding: `appendDaemonEvent` (journal.js) does its OWN `mkdirSync` + `appendFileSync`
+// -- on the exact filesystem-level failures this guard exists for (ENOSPC/EPERM/EROFS), that write
+// can throw too. An unwrapped `appendDaemonEvent` call inside the catch would let THAT throw escape
+// instead, defeating the guard on precisely the case it documents. Proves the fix: BOTH the claim
+// AND its own journal write fail at once, and takeNextTask must still not throw.
+test('takeNextTask: a claim failure whose OWN journal write also fails does not escape to the caller', () => {
+  const queueDir = mkTmp('spo-transient-claimjournalfail-queue-');
+  const journalRoot = mkTmp('spo-transient-claimjournalfail-journal-');
+  writeQueueFile(queueDir, '0001-a.json', { id: 'claim-jf-a', kind: 'card', issue: 1 });
+
+  const realRename = fs.renameSync;
+  const realAppendFile = fs.appendFileSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(from).endsWith('0001-a.json')) {
+      const err = new Error('EXDEV: cross-device link not permitted, rename');
+      err.code = 'EXDEV';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  fs.appendFileSync = (p, ...rest) => {
+    if (String(p).endsWith('daemon.jsonl')) {
+      const err = new Error('ENOSPC: no space left on device, write');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realAppendFile(p, ...rest);
+  };
+  let taken;
+  let threw = null;
+  try {
+    taken = takeNextTask(queueDir, journalRoot);
+  } catch (err) {
+    threw = err;
+  } finally {
+    fs.renameSync = realRename;
+    fs.appendFileSync = realAppendFile;
+  }
+
+  assert.equal(threw, null, `takeNextTask must not throw even when its own journal write also fails: ${threw && threw.message}`);
+  assert.equal(taken, null, 'nothing else in the queue to fall back to');
+});
+
 // ---- 16: action B3.4 round 2 -- the nine reasons the exit-1/2/3 split introduced, pinned one ----
 //         by one so a flipped classification (either direction) fails exactly this test ----------
 //

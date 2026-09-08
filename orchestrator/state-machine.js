@@ -2631,7 +2631,10 @@ function refuseDuplicateQueueEntry(queueDir, file, taskDir, terminalState, journ
 // only the ONE file it selects. `null` is returned when the queue is non-empty but every entry is
 // scheduled for later -- drainQueueOnce's `for (;;)` loop below breaks on a `null` the exact same
 // way it already breaks on an empty queue, so the daemon just polls again next cycle rather than
-// spinning.
+// spinning. Card #137 (Lot 3, 3.2a): `null` is ALSO returned once every remaining candidate's own
+// claim (mkdirSync/renameSync) has thrown -- see the guard just above the claim below for the
+// environment-failure class this covers and why journalling-and-moving-on, not retrying in place,
+// is what keeps that path bounded too.
 // action 6.3: `liveIds` (a Set<string>, default null/none) is the dispatcher's own live-worker
 // table -- the ids currently owned by a worker process it has spawned and not yet seen exit. A
 // candidate whose derived id is in that set is SKIPPED, exactly like a not-yet-eligible
@@ -2654,9 +2657,6 @@ function takeNextTask(queueDir, journalRoot, liveIds = null) {
   if (files.length === 0) return null;
 
   const nowMs = Date.now();
-  let file = null;
-  let task = null;
-  let id = null;
   for (const candidate of files) {
     const candidateRaw = fs.readFileSync(path.join(queueDir, candidate), 'utf8');
     let candidateTask;
@@ -2682,20 +2682,68 @@ function takeNextTask(queueDir, journalRoot, liveIds = null) {
       continue;
     }
 
-    file = candidate;
-    task = candidateTask;
-    id = candidateId;
-    break;
+    // card #137 (Lot 3, 3.2a): the claim rename used to sit unguarded after this loop broke, so a
+    // throw here crashed the worker/dispatch path -- neither drainQueueOnce's `for(;;)` nor
+    // dispatcher.js's fillSlots catches anything. lock.js's own WHY header already reproduced the
+    // ENOENT shape of this in production (2026-08-29): two daemons racing the SAME journalRoot, where the
+    // loser's renameSync throws once the winner has already moved the file into ITS OWN taskDir --
+    // that race is what lock.js's singleton mutex eliminated, by removing the second daemon
+    // entirely, not by handling the error. What is STILL reachable today is not that race: it is a
+    // genuine environment failure on a solitary claim -- EXDEV (queueDir and journalRoot on
+    // different filesystems) or EPERM/ENOSPC on the target -- where nobody else touches the file
+    // and it is still sitting at `candidateSrcPath` right after the catch. Either way the file is
+    // simply not takeable by this process right now, which is exactly the shape
+    // refuseDuplicateQueueEntry's caller above already handles: journal it and `continue` to the
+    // next candidate, rather than aborting the whole call. That keeps one stuck entry from
+    // starving every OTHER eligible entry behind it in the same queue, and it cannot spin: `files`
+    // is a fixed list read once at the top, so the loop still terminates after at most
+    // `files.length` iterations even if every remaining candidate fails the same way (e.g. the
+    // whole queueDir is on a bad filesystem). The stuck entry itself is left in queue/ -- not moved
+    // aside -- so it is retried, and rejournalled, on every subsequent call until the underlying
+    // environment issue clears; `drainQueueOnce`/`fillSlots` both already treat a `null` return
+    // (nothing takeable this call) as "stop for now", not "retry immediately", so this never spins
+    // WITHIN one call. Across calls it is not free, though, and the honest number is worth stating
+    // rather than glossing: `takeNextTask` is called once per poll (config.pollIntervalMs, 5s by
+    // default) at minimum, so a permanently stuck entry journals roughly one `queue-claim-failed`
+    // line every 5s -- about 17,280/day -- and MORE than that if healthy entries sort behind it,
+    // because `drainQueueOnce`'s own `for(;;)` calls `takeNextTask` again after every task it
+    // finishes, re-attempting (and re-journalling) the stuck entry once per successful drain in the
+    // same cycle before it reaches the next healthy candidate. Bounded per call, and the same shape
+    // `duplicate-queue-entry-refusal-disposal-failed` already accepts for the identical reason, so
+    // it stays -- but it is a real, sustained cost on a broken filesystem, not merely "a poll".
+    //
+    // `mkdirSync` succeeding before `renameSync` fails leaves an EMPTY `<journalRoot>/<id>/` behind
+    // (harmless to every reader here -- `readJsonSafe` on its missing `state.json` returns `null`,
+    // so this candidate is simply re-evaluated next time), but it is not inert everywhere: intake.js
+    // `taskAlreadyExists` treats a bare `fs.existsSync(journalRoot/<id>)` as "already filed" with no
+    // further check, so auto-pull will not re-file this card by id while the directory sits there --
+    // harmless only because the ORIGINAL queue entry is still in `queue/`, waiting to be retried.
+    const candidateSrcPath = path.join(queueDir, candidate);
+    try {
+      fs.mkdirSync(candidateTaskDir, { recursive: true });
+      fs.renameSync(candidateSrcPath, path.join(candidateTaskDir, 'task.json'));
+    } catch (err) {
+      // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the
+      // EXACT filesystem-level failures this catch exists for (ENOSPC/EPERM/EROFS), that write can
+      // throw too, and an unwrapped call here would let THAT throw escape back to the drain loop,
+      // defeating the whole guard on the case it documents. refuseDuplicateQueueEntry (above) is
+      // the precedent: its own disposal-failure catch wraps every journal write in its own
+      // try/catch for the identical reason. Best-effort; never let this escape either way.
+      try {
+        appendDaemonEvent(journalRoot, 'queue-claim-failed', {
+          id: candidateId,
+          fromFile: candidate,
+          error: String((err && err.message) || err),
+        });
+      } catch {
+        // Nothing left to record to -- never let this reach the drain loop either way.
+      }
+      continue;
+    }
+    appendEvent(candidateTaskDir, 'INTAKE', 'taken', { fromFile: candidate });
+    return { id: candidateId, task: candidateTask, taskDir: candidateTaskDir };
   }
-  if (!file) return null; // every entry is scheduled for later, live-owned, or refused -- see above.
-
-  const srcPath = path.join(queueDir, file);
-  const taskDir = path.join(journalRoot, id);
-  fs.mkdirSync(taskDir, { recursive: true });
-  fs.renameSync(srcPath, path.join(taskDir, 'task.json'));
-  appendEvent(taskDir, 'INTAKE', 'taken', { fromFile: file });
-
-  return { id, task, taskDir };
+  return null; // every entry is scheduled for later, live-owned, refused, or failed its claim -- see above.
 }
 
 // action 4.4: `queueDir` is added onto the config every runTask/finalizePark call in this drain
