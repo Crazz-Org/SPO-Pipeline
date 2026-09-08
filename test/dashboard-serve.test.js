@@ -207,3 +207,112 @@ test('the usage-scan timer merges byDay into journal/usage-rollups.json, and /ap
   const json = JSON.parse(res.body);
   assert.match(json.fragments.tokens, /today \(partial\)/);
 });
+
+// ---- card #137 (Lot 3, 3.2b): the usage-scan timer's runScan chain used to end in a bare
+//      `.catch(() => {})` -- a throw anywhere on it (scan() rejecting, or mergeRollups/
+//      saveRollups throwing synchronously inside the .then, most concretely saveRollups' own
+//      fs.renameSync) was swallowed whole: nothing crashes, but the tokens trend's persisted
+//      history silently stops advancing with no signal anywhere that it stopped. The failure is
+//      injected via a real fs.renameSync throw scoped to the rollups file's own rename target,
+//      never by calling the guard's own catch block directly. --------------------------------
+
+test('the usage-scan timer journals usage-rollups-scan-failed when saveRollups\' renameSync throws, and the server keeps answering requests', async (t) => {
+  const journalRoot = mkTmp('spo-serve-rollupsfail-journal-');
+  const { localDateKey } = require('../console/usage-scan');
+  const today = localDateKey(Date.now());
+  const rollupsPath = path.join(journalRoot, 'usage-rollups.json');
+
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to) === rollupsPath) {
+      const err = new Error('EPERM: operation not permitted, rename');
+      err.code = 'EPERM';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+
+  let server;
+  try {
+    server = await startServer(
+      { journalRoot },
+      { systemSampler: fakeSystemSampler(), prodProbe: null, usageScanner: fakeUsageScannerWithByDay(today), dataTtlMs: 0 }
+    );
+    t.after(() => server.close());
+    // Same fixed-delay wait as the happy-path test above -- past USAGE_SCAN_DELAY_MS.
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.equal(fs.existsSync(rollupsPath), false, 'the write failed exactly as injected -- no rollups file landed');
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, /"event":"usage-rollups-scan-failed"/, 'no usage-rollups-scan-failed journalled -- the throw would otherwise have been silent');
+  assert.match(daemonLog, /EPERM/);
+
+  // Nothing crashed: the server (and its timer) must still be alive and answering.
+  const res = await get(server, '/api/data');
+  assert.equal(res.status, 200);
+});
+
+// Verification precedent (card #137, 3.2a): appendDaemonEvent does its own mkdirSync +
+// appendFileSync, so on the EXACT filesystem-level failure this catch exists for
+// (ENOSPC/EPERM/EROFS), that write can throw too -- and runScan's `.catch` callback has nothing
+// above it in the promise chain to catch a second throw, so an unwrapped appendDaemonEvent call
+// here would become an unhandled promise rejection instead (this chain is never awaited by
+// anything in serve.js), which crashes the whole process by default. Proves the fix: BOTH
+// saveRollups AND its own journal write fail at once, and nothing may escape.
+test('the usage-scan timer does not crash (no unhandled rejection) when BOTH saveRollups and its own daemon-event journal write fail', async (t) => {
+  const journalRoot = mkTmp('spo-serve-rollupsfail2-journal-');
+  const { localDateKey } = require('../console/usage-scan');
+  const today = localDateKey(Date.now());
+  const rollupsPath = path.join(journalRoot, 'usage-rollups.json');
+
+  const realRename = fs.renameSync;
+  const realAppendFile = fs.appendFileSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to) === rollupsPath) {
+      const err = new Error('ENOSPC: no space left on device, rename');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  fs.appendFileSync = (p, ...rest) => {
+    if (String(p).endsWith('daemon.jsonl')) {
+      const err = new Error('ENOSPC: no space left on device, write');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realAppendFile(p, ...rest);
+  };
+
+  let leaked = null;
+  const onLeak = (err) => {
+    leaked = err;
+  };
+  process.on('uncaughtException', onLeak);
+  process.on('unhandledRejection', onLeak);
+
+  let server;
+  try {
+    server = await startServer(
+      { journalRoot },
+      { systemSampler: fakeSystemSampler(), prodProbe: null, usageScanner: fakeUsageScannerWithByDay(today), dataTtlMs: 0 }
+    );
+    t.after(() => server.close());
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+  } finally {
+    fs.renameSync = realRename;
+    fs.appendFileSync = realAppendFile;
+    process.off('uncaughtException', onLeak);
+    process.off('unhandledRejection', onLeak);
+  }
+
+  assert.equal(leaked, null, `must not crash even when the journal write also fails: ${leaked && leaked.message}`);
+  assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false, 'the journal write failed too -- nothing landed either way');
+
+  const res = await get(server, '/api/data');
+  assert.equal(res.status, 200);
+});

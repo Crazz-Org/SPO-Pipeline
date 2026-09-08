@@ -140,7 +140,18 @@ const path = require('path');
 require('./no-real-spawn');
 
 const REPO_ROOT = path.join(__dirname, '..');
-const SCAN_DIRS = ['orchestrator'];
+// `console` added, card #137 repair round (Lot 3, 3.2b): the dashboard server started making its
+// own appendDaemonEvent call (console/serve.js's `usage-rollups-scan-failed`) once it began
+// requiring orchestrator/journal.js -- a direction already established elsewhere (collect.js,
+// render-deck.js, live-step.js, render.js all `require('../orchestrator/...')`). Before widening,
+// measured what adding the directory would surface: exactly ONE appendDaemonEvent call site in
+// all of `console/**` (that same one), already documented, and zero `new ParkSignal(...)` sites at
+// all (the four `ParkSignal` hits in console/plain-language.js are prose in comments describing
+// the orchestrator's own reasons, not throw sites) -- confirmed both by running the widened sweep
+// (0 offenders) and by a positive control (temporarily undocumenting that one event and watching
+// the sweep flag it by name). Below the "revert and leave a sentence" threshold, so this directory
+// is now swept for real rather than carrying a footnote saying it wasn't.
+const SCAN_DIRS = ['orchestrator', 'console'];
 const SCAN_FILES = ['bin/spo'];
 const SPEC_PATH = path.join(REPO_ROOT, 'doc', 'state-machine-spec.md');
 

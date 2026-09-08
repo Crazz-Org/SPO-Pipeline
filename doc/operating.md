@@ -25,7 +25,7 @@ edits:
 | unit | what it is |
 |---|---|
 | `spo-pipeline-daemon.service` | the orchestrator. Claims cards, runs the state machine, spends money. |
-| `spo-pipeline-dashboard.service` | read-only console on `http://localhost:8090/` |
+| `spo-pipeline-dashboard.service` | console on `http://localhost:8090/` — claims no cards, spends no money, but does write small state of its own into the same `~/.spo-state` tree (par-times.json/usage-rollups.json on their own timers, and an occasional daemon.jsonl event on a write failure, card #137) |
 
 ---
 

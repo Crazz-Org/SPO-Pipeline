@@ -26,6 +26,7 @@ const { refreshParTimes } = require('./par-times');
 const { createSystemSampler } = require('./system');
 const { createUsageScanner, buildTokenViews, buildTrendViews, localDateKey } = require('./usage-scan');
 const { loadRollups, mergeRollups, saveRollups } = require('./usage-rollups');
+const { appendDaemonEvent } = require('../orchestrator/journal');
 
 const DEFAULT_DATA_TTL_MS = 5000;
 // The flight deck's own cache. Far shorter than the 30s data cache because `/` is a live view of
@@ -212,6 +213,18 @@ function createDashboardServer(sources, opts = {}) {
       parTimer = setInterval(runPar, parRefreshMs);
       if (parTimer.unref) parTimer.unref();
     }
+    // card #137 (Lot 3, 3.2b): this whole chain used to end in `.catch(() => {})` -- a throw
+    // anywhere in it (usageScanner.scan() rejecting, or mergeRollups/saveRollups throwing
+    // synchronously inside the .then, most concretely saveRollups' own fs.renameSync on an
+    // ENOSPC/EPERM/EROFS host) was swallowed whole. Nothing crashes -- the timer just reschedules
+    // itself next cycle -- but the tokens trend's persisted history silently stops advancing, and
+    // console/collect.js's collectTrend (the static-mode fallback) keeps reading the same stale
+    // file forever with no signal anywhere that it stopped moving. The event is emitted HERE, at
+    // this call site, rather than inside saveRollups itself: saveRollups is a small, otherwise
+    // pure-ish console helper with no journalRoot in scope today, and narrowing the fix to just
+    // its own renameSync would leave mergeRollups' (and scan()'s own) failures on this exact same
+    // chain just as silent as before -- an empty catch that only half-stops being empty is still
+    // the same defect for the other two thirds of it.
     const runScan = () =>
       usageScanner
         .scan()
@@ -224,7 +237,22 @@ function createDashboardServer(sources, opts = {}) {
           rollups = mergeRollups(rollups, idx.byDay, { todayDate: localDateKey(Date.now()) });
           saveRollups(rollupsPath, rollups);
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (!sources.journalRoot) return; // nothing to record to -- same guard rollupsPath itself uses above.
+          // Verification precedent (card #137, 3.2a): appendDaemonEvent does its own mkdirSync +
+          // appendFileSync, so on the EXACT filesystem-level failure this catch exists for
+          // (ENOSPC/EPERM/EROFS), that write can throw too -- and this callback has nothing above
+          // it in the promise chain to catch that second throw, so it would become an unhandled
+          // rejection instead, which crashes the process on a bare setInterval/setTimeout
+          // callback. Best-effort; never let this escape either way.
+          try {
+            appendDaemonEvent(sources.journalRoot, 'usage-rollups-scan-failed', {
+              error: String((err && err.message) || err),
+            });
+          } catch {
+            // Nothing left to record to -- never let this reach the timer callback either.
+          }
+        });
     usageScanDelayTimer = setTimeout(() => {
       runScan();
       usageScanTimer = setInterval(runScan, usageScanMs);

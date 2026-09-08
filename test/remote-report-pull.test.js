@@ -274,3 +274,258 @@ test('runRemoteReportPull: a list reply exceeding remoteReportPullLimit only pul
   const result = await runRemoteReportPull(journalRoot, baseConfig(spoReportsDir, { remoteReportPullLimit: 1 }), { http, token: TOKEN });
   assert.equal(result.pulled, 1);
 });
+
+// ---- card #137 (Lot 3, 3.2b + repair round): the write+rename that lands a fetched report
+//      locally used to sit outside every try/catch in this loop -- unlike the fetch immediately
+//      above it, whose own try/catch already treats a failure as one candidate's problem. A throw
+//      here used to abort the whole `for` loop, costing every remaining candidate in the cycle,
+//      not just the one that failed. Repair round: verification measured that in daemon mode
+//      (startRemoteReportPullLoop's tick(), the only caller that actually runs continuously) the
+//      `errors` array this function returns has no reader at all -- only `bin/spo`'s interactive
+//      cmdPullReports prints it -- so BOTH the fetch catch and the write+rename catch now also
+//      journal `remote-report-land-failed` (`stage: 'fetch'` | `'land'`), not just errors.push.
+//      Every failure below is injected via a real fs.renameSync/fs.mkdirSync/http throw scoped to
+//      one candidate, never by calling a guard's own catch block directly. --------------------
+
+test('runRemoteReportPull: a renameSync failure landing one file costs only that file -- the next candidate is still pulled AND acked', async () => {
+  const journalRoot = mkTmp('spo-pull-journal13-');
+  const spoReportsDir = mkTmp('spo-pull-q13-');
+  const bytes = Buffer.from('{}');
+  const hash = sha256(bytes);
+  const reports = [FILE_A, FILE_B].map((f) => ({ file: f, bytes: bytes.length, sha256: hash }));
+  const acked = [];
+
+  // Tracks which file each /ack call was for, from the request body -- runRemoteReportPull's own
+  // ack call carries `file` in its JSON body, not the URL.
+  const httpWithAckTracking = fakeHttp((url, opts) => {
+    if (url.endsWith('/list')) return ok(200, { ok: true, reports });
+    if (url.includes('/fetch')) return ok(200, bytes);
+    if (url.endsWith('/ack')) {
+      acked.push(JSON.parse(opts.body).file);
+      return ok(200, { ok: true });
+    }
+    throw new Error(`unexpected url ${url}`);
+  });
+
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to) === path.join(spoReportsDir, FILE_A)) {
+      const err = new Error('EPERM: operation not permitted, rename');
+      err.code = 'EPERM';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  let result;
+  try {
+    result = await runRemoteReportPull(journalRoot, baseConfig(spoReportsDir), { http: httpWithAckTracking, token: TOKEN });
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  // FILE_A: cost exactly its own candidate -- not pulled, not acked, recorded in errors AND now
+  // journalled (repair round -- `errors` alone is invisible in daemon mode).
+  assert.equal(fs.existsSync(path.join(spoReportsDir, FILE_A)), false, 'FILE_A never landed -- the write failed exactly as injected');
+  assert.equal(fs.existsSync(path.join(spoReportsDir, `${FILE_A}.part`)), true, 'the .part file is deliberately left behind -- see the source comment');
+  assert.ok(
+    result.errors.some((e) => e.file === FILE_A && /EPERM/.test(e.error)),
+    'FILE_A\'s renameSync failure must be recorded in errors -- the throw would otherwise have been silent'
+  );
+  assert.ok(!acked.includes(FILE_A), 'FILE_A must not be acked -- it never actually landed');
+
+  // FILE_B: the whole point of this test -- a single candidate could not tell `continue` from
+  // `break`. FILE_B must still be pulled AND acked despite FILE_A's failure earlier in the loop.
+  assert.equal(fs.readFileSync(path.join(spoReportsDir, FILE_B), 'utf8'), bytes.toString('utf8'), 'FILE_B must still have been pulled');
+  assert.ok(acked.includes(FILE_B), 'FILE_B must still have been acked');
+
+  assert.equal(result.pulled, 1);
+  assert.equal(result.acked, 1);
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.doesNotMatch(daemonLog, new RegExp(`"event":"remote-report-pulled","file":"${FILE_A}"`), 'FILE_A must not be journalled as pulled');
+  assert.match(daemonLog, new RegExp(`"event":"remote-report-pulled","file":"${FILE_B}"`), 'FILE_B must be journalled as pulled');
+  assert.match(
+    daemonLog,
+    new RegExp(`"event":"remote-report-land-failed","file":"${FILE_A}","error":"[^"]*EPERM[^"]*","stage":"land"`),
+    'FILE_A\'s renameSync failure must be journalled as remote-report-land-failed, stage land -- daemon mode has no other reader of `errors`'
+  );
+});
+
+test('runRemoteReportPull: a mkdirSync failure preparing spoReportsDir is recorded the same way as a renameSync failure', async () => {
+  const journalRoot = mkTmp('spo-pull-journal14-');
+  const spoReportsDir = mkTmp('spo-pull-q14-');
+  const bytes = Buffer.from('{}');
+  const hash = sha256(bytes);
+
+  const http = fakeHttp((url) => {
+    if (url.endsWith('/list')) return ok(200, { ok: true, reports: [{ file: FILE_A, bytes: bytes.length, sha256: hash }] });
+    if (url.includes('/fetch')) return ok(200, bytes);
+    throw new Error(`should not ack when the write never happened: ${url}`);
+  });
+
+  const realMkdir = fs.mkdirSync;
+  fs.mkdirSync = (p, ...rest) => {
+    if (String(p) === spoReportsDir) {
+      const err = new Error('EACCES: permission denied, mkdir');
+      err.code = 'EACCES';
+      throw err;
+    }
+    return realMkdir(p, ...rest);
+  };
+  let result;
+  try {
+    result = await runRemoteReportPull(journalRoot, baseConfig(spoReportsDir), { http, token: TOKEN });
+  } finally {
+    fs.mkdirSync = realMkdir;
+  }
+
+  assert.equal(fs.existsSync(path.join(spoReportsDir, FILE_A)), false);
+  assert.ok(
+    result.errors.some((e) => e.file === FILE_A && /EACCES/.test(e.error)),
+    'the guard must cover mkdirSync, not just renameSync -- both statements of the write can fail independently'
+  );
+  assert.equal(result.pulled, 0);
+  assert.equal(result.acked, 0);
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(
+    daemonLog,
+    new RegExp(`"event":"remote-report-land-failed","file":"${FILE_A}","error":"[^"]*EACCES[^"]*","stage":"land"`),
+    'an mkdirSync failure must be journalled with stage land too, same as renameSync'
+  );
+});
+
+test('runRemoteReportPull: a fetch failure is journalled as remote-report-land-failed (stage: fetch), and the next candidate is still pulled AND acked', async () => {
+  const journalRoot = mkTmp('spo-pull-journal17-');
+  const spoReportsDir = mkTmp('spo-pull-q17-');
+  const bytes = Buffer.from('{}');
+  const hash = sha256(bytes);
+  const reports = [FILE_A, FILE_B].map((f) => ({ file: f, bytes: bytes.length, sha256: hash }));
+  const acked = [];
+
+  const http = fakeHttp((url, opts) => {
+    if (url.endsWith('/list')) return ok(200, { ok: true, reports });
+    if (url.includes('/fetch')) {
+      if (url.includes(encodeURIComponent(FILE_A))) {
+        const err = new Error('ECONNRESET: socket hang up');
+        err.code = 'ECONNRESET';
+        throw err;
+      }
+      return ok(200, bytes);
+    }
+    if (url.endsWith('/ack')) {
+      acked.push(JSON.parse(opts.body).file);
+      return ok(200, { ok: true });
+    }
+    throw new Error(`unexpected url ${url}`);
+  });
+
+  const result = await runRemoteReportPull(journalRoot, baseConfig(spoReportsDir), { http, token: TOKEN });
+
+  // FILE_A: the fetch itself never landed any bytes -- recorded in errors AND journalled, same
+  // shape as a land-stage failure, distinguished only by `stage`.
+  assert.equal(fs.existsSync(path.join(spoReportsDir, FILE_A)), false);
+  assert.ok(
+    result.errors.some((e) => e.file === FILE_A && /ECONNRESET/.test(e.error)),
+    'FILE_A\'s fetch failure must be recorded in errors'
+  );
+  assert.ok(!acked.includes(FILE_A));
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(
+    daemonLog,
+    new RegExp(`"event":"remote-report-land-failed","file":"${FILE_A}","error":"[^"]*ECONNRESET[^"]*","stage":"fetch"`),
+    'FILE_A\'s fetch failure must be journalled with stage fetch -- a fetch failure was silent in daemon mode before this repair round'
+  );
+
+  // FILE_B: batch survives a fetch failure exactly as it survives a land failure.
+  assert.equal(fs.readFileSync(path.join(spoReportsDir, FILE_B), 'utf8'), bytes.toString('utf8'));
+  assert.ok(acked.includes(FILE_B));
+  assert.equal(result.pulled, 1);
+  assert.equal(result.acked, 1);
+});
+
+// Verification precedent (card #137, 3.2a's own defect class): appendDaemonEvent does its own
+// mkdirSync + appendFileSync, so on the EXACT filesystem-level failure the land catch exists for
+// (ENOSPC/EPERM/EROFS), that write can throw too. TWO candidates on purpose -- M2 (verification's
+// own mutation) proved a single-candidate version of this test cannot tell `continue` from `break`
+// when the guard is defeated: FILE_A's own journal write is made to fail exactly once (the daemon
+// log did not exist yet, so this is deterministically its first append), FILE_B's own successful
+// `remote-report-pulled`/`remote-report-acked` writes are left alone so the test can tell "FILE_B
+// still landed" apart from "the whole log is broken".
+test('runRemoteReportPull: a land failure whose OWN journal write also fails does not reject the whole call -- the next candidate is still pulled AND acked', async () => {
+  const journalRoot = mkTmp('spo-pull-journal18-');
+  const spoReportsDir = mkTmp('spo-pull-q18-');
+  const bytes = Buffer.from('{}');
+  const hash = sha256(bytes);
+  const reports = [FILE_A, FILE_B].map((f) => ({ file: f, bytes: bytes.length, sha256: hash }));
+  const acked = [];
+
+  const http = fakeHttp((url, opts) => {
+    if (url.endsWith('/list')) return ok(200, { ok: true, reports });
+    if (url.includes('/fetch')) return ok(200, bytes);
+    if (url.endsWith('/ack')) {
+      acked.push(JSON.parse(opts.body).file);
+      return ok(200, { ok: true });
+    }
+    throw new Error(`unexpected url ${url}`);
+  });
+
+  const realRename = fs.renameSync;
+  const realAppendFile = fs.appendFileSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to) === path.join(spoReportsDir, FILE_A)) {
+      const err = new Error('ENOSPC: no space left on device, rename');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  let daemonAppendCalls = 0;
+  fs.appendFileSync = (p, ...rest) => {
+    if (String(p).endsWith('daemon.jsonl')) {
+      daemonAppendCalls += 1;
+      // FILE_A is processed first and its renameSync failure is the very first daemon.jsonl
+      // append attempted this run -- fail ONLY that one, so FILE_B's own (successful) journal
+      // writes are left intact and provable.
+      if (daemonAppendCalls === 1) {
+        const err = new Error('ENOSPC: no space left on device, write');
+        err.code = 'ENOSPC';
+        throw err;
+      }
+    }
+    return realAppendFile(p, ...rest);
+  };
+
+  let result;
+  let threw = null;
+  try {
+    result = await runRemoteReportPull(journalRoot, baseConfig(spoReportsDir), { http, token: TOKEN });
+  } catch (err) {
+    threw = err;
+  } finally {
+    fs.renameSync = realRename;
+    fs.appendFileSync = realAppendFile;
+  }
+
+  assert.equal(threw, null, `runRemoteReportPull must not reject even when its own journal write also fails: ${threw && threw.message}`);
+  // Sanity on the injection itself: FILE_A's land-failed attempt (the one made to fail) plus
+  // FILE_B's own pulled+acked writes (left alone) -- 3 total appends attempted against daemon.jsonl.
+  assert.equal(daemonAppendCalls, 3, 'sanity: expected exactly 3 daemon.jsonl append attempts (FILE_A land-failed + FILE_B pulled + FILE_B acked)');
+
+  // FILE_A: never landed, never acked -- both its own failures were swallowed, not escaped.
+  assert.equal(fs.existsSync(path.join(spoReportsDir, FILE_A)), false);
+  assert.ok(!acked.includes(FILE_A));
+
+  // FILE_B: the whole point -- a single-candidate version of this test cannot tell `continue`
+  // from `break` when the guard is defeated. FILE_B must still be pulled AND acked, AND its own
+  // journal writes (unaffected by the one-shot append failure above) must be present.
+  assert.equal(fs.readFileSync(path.join(spoReportsDir, FILE_B), 'utf8'), bytes.toString('utf8'));
+  assert.ok(acked.includes(FILE_B));
+  assert.equal(result.pulled, 1);
+  assert.equal(result.acked, 1);
+
+  const daemonLog = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  assert.match(daemonLog, new RegExp(`"event":"remote-report-pulled","file":"${FILE_B}"`), 'FILE_B\'s own journal writes must have gone through normally');
+  assert.doesNotMatch(daemonLog, new RegExp(`"file":"${FILE_A}"`), 'FILE_A\'s own journal write failed too -- nothing about it landed in daemon.jsonl');
+});

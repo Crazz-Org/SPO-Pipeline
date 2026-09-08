@@ -1838,7 +1838,9 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `autoTriageBackoffCeilingMs` | 2h (`SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS`) | action 3.3 -- absolute ceiling on the doubling above |
 
 Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-failed` /
-`remote-report-rejected` (stage 0), `report-intake` / `report-intake-duplicate` /
+`remote-report-rejected` / `remote-report-land-failed` (card #137, Lot 3 -- the fetch or the
+write+rename that lands one candidate locally threw; `stage` distinguishes the two, and this
+candidate alone is skipped/retried next cycle, never the whole batch) (stage 0), `report-intake` / `report-intake-duplicate` /
 `report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` (also
 reused by action 3.4's `spo triage --retry <issue>` to re-open a held report -- see "The recovery
 path" below; a retried one carries `retriedFrom`/`retriedAt` alongside the usual
@@ -2588,8 +2590,10 @@ task (action 2.5).
 only these files (plus `queue/` for depth, and the account pool, `~/.spo-bench`,
 `~/.spo-reports` for their own sections) — they hold no state of their own. Several other
 subcommands DO write local or live state: `account add`/`account enable`/`account disable`/
-`account clear-cooldown` touch the account pool and `state.json`/`daemon.jsonl`; `ask`/`pull`/
-`intake`/`triage --file`/`recette` write to real GitHub. See `bin/spo`'s own header comment.
+`account clear-cooldown` touch the account pool and `state.json`/`daemon.jsonl`; `dashboard`
+writes `par-times.json`/`usage-rollups.json` and, on a write failure (card #137), appends to
+`daemon.jsonl`; `ask`/`pull`/`intake`/`triage --file`/`recette` write to real GitHub. See
+`bin/spo`'s own header comment.
 
 ### Journal event literals
 
@@ -2656,6 +2660,7 @@ task/daemon split itself).
 | `pr-mergeability` | task | SPO-Pipeline#85: real-mode `realMerge`'s own `gh pr view --json state,mergeable,mergeStateStatus` probe, run on a `pr:wait` failure before parking on it — records `exit`/`prState`/`mergeable`/`mergeStateStatus` (`null` for whatever it could not read; a non-zero exit or a thrown error leaves all three `null`). Post-verification: `UNKNOWN` can be GitHub's own first answer (`mergeable`/`mergeStateStatus` are computed lazily, so a PR the merge queue has just been touching answers `UNKNOWN` until the recomputation lands — measured 4 of 4 on one round of open PRs, and 0 of 13 on a 2026-09-06 re-measurement of days-stale ones; see `doc/state-machine-spec.md`'s MERGE row), so one `probeMergeability` call can append UP TO THREE of these events, one per bounded re-read attempt — each carries its own `attempt` (1-3), and the loop stops journalling further attempts the moment one of them lands a definite answer or a terminal PR state. Deliberately `prState`, not `state` — journal.js's own `appendEvent` builds its record as `{ts, state, event, ...detail}`, so a detail field literally named `state` would silently clobber the outer `state: 'MERGE'`. Never written by the shadow-mode `handleMerge` twin, which has no GitHub to ask (`steps/scripted.js`'s `probeMergeability`; see `doc/state-machine-spec.md`'s MERGE row and `orchestrator/merge-cause.js`). |
 | `pr-reused` | task | PUSH_PR found an already-open PR for this branch and reused it (patching its body) instead of creating a new one (`steps/scripted.js`). |
 | `remote-branch-cleaned` | task | the leftover sweep's final step: the stale remote branch was deleted (`git push origin --delete`) once any PR was closed and the tip preserved or vouched for (`steps/scripted.js`). |
+| `remote-report-land-failed` | daemon | card #137 repair round (Lot 3, 3.2b): one candidate's fetch, or the write+rename that lands its bytes locally, threw — `stage` (`'fetch'` \| `'land'`) says which. `errors` (this same result's own per-file array) has exactly one reader in the repo, `bin/spo`'s interactive `cmdPullReports`, so in daemon mode this was the only signal at all; only THIS candidate is skipped and retried next cycle, the rest of the batch is unaffected (`remote-report-pull.js`). |
 | `remote-report-pull-failed` | daemon | a periodic remote-report pull tick failed — either the pull itself reported `ok: false`, or the call threw (`remote-report-pull.js`). |
 | `report-confirm-scan-ignored-author` | daemon | `report-intake.js`'s own name for `comment-scan.js`'s shared `ignoredAuthor` event, reached by the confirm/discard comment scan (`report-intake.js`, via `comment-scan.js`). |
 | `report-intake-cycle` | daemon | one report-intake pass filed, deduplicated, or otherwise disposed of at least one report; summarises `processed`/`filed`/`duplicates`/`schemaVersion`/`errors` for the cycle (`report-intake.js`). |
@@ -2668,6 +2673,7 @@ task/daemon split itself).
 | `unpark-scan-ok` | task | the unpark (retry/abandon) comment scan reached GitHub, journalled ONLY when that is a change of outcome: the first proven-live scan of this park cycle, or a recovery from a standing `unpark-scan-failed` streak (`afterFailures` says which, and `firstFailedAt` dates the streak it ends). Never per-cycle — a healthy scan that has already said so writes nothing. Project-2 card #476: before it a successful scan journalled nothing at all, so an old failure streak in a journal's tail could not be told apart from a channel that had recovered silently, and "the retry channel is alive" was only ever inferrable from an ABSENCE of failures (`park-loop.js`; the rule deciding when it is an outcome change is `retry-channel.js`'s `shouldJournalScanOk`). |
 | `unpark-scan-backoff-skip` | task | `park-loop.js`'s own name for `comment-scan.js`'s shared `backoffSkip` event, reached when the unpark (retry/abandon) comment scan is still backed off from a recent `gh` failure (`park-loop.js`, via `comment-scan.js`). |
 | `unpark-requeue-failed` | daemon | card #137: `unparkScan` found a maintainer's `retry` comment but `reEnqueueTask` threw writing the queue entry — the same environment class as `queue-claim-failed` above (reEnqueueTask's own per-writer tmp-name discriminator already closed its ENOENT trigger). The `unparked-by-maintainer` marker is deliberately WITHHELD on this path: writing it anyway would satisfy the effect-before-marker ordering's own reasoning in reverse (a marker with no effect reads as handled but is never redone). `findParkAnchor`'s `alreadyHandled` therefore still sees no marker, so the next `unparkScan` cycle re-scans and retries the same re-enqueue from scratch once the failure clears (`park-loop.js`). |
+| `usage-rollups-scan-failed` | daemon | card #137 (Lot 3, 3.2b): the live dashboard's usage-scan timer's own chain — `usageScanner.scan()`, then `mergeRollups`/`saveRollups` — threw or rejected; the tokens trend's durable `usage-rollups.json` silently stopped advancing until now, with nothing anywhere saying so (`console/serve.js`). |
 | `validate-findings-post-skipped` | task | VALIDATE's findings comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `wip-preserve-failed` | task | `preserveWorktreeWip` could not commit/push a dirty worktree's diff to a `wip/` ref before a park (a spawn timeout, or a failed `git status`/`checkout --detach`/etc. step) — the park still proceeds without a wip ref (`steps/scripted.js`). |
 | `worker-crash-repark-exit` | daemon | card #78: the spawned `daemon.js --repark-task` child (`reparkCrashedWorker`'s own repark) exited; records its pid, code and signal. The dispatcher clears the repark claim and removes the id from `reparking` at this same point (`dispatcher.js`). |
