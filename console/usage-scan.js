@@ -617,4 +617,21 @@ function discoverUsageRoots(accountsDir) {
   return roots;
 }
 
-module.exports = { createUsageScanner, buildTokenViews, buildTrendViews, discoverUsageRoots, localDateKey };
+module.exports = {
+  createUsageScanner,
+  buildTokenViews,
+  buildTrendViews,
+  discoverUsageRoots,
+  localDateKey,
+  DEFAULT_MAX_FILE_BYTES,
+  // scanFile is exported for orchestrator/token-recovery.js (token-ledger lot, action 4.3): that
+  // module recovers billable tokens for a killed/unparsable `claude` call from the session
+  // transcript it left on disk, and it deliberately reuses THIS reader rather than writing a
+  // second one -- this repo's token-accounting code is emphatic that there is exactly one ledger
+  // and one definition of "billable" (see this file's own header, and orchestrator/tokens.js's),
+  // and a second transcript reader would let the two silently drift apart (a dedup-direction fix
+  // applied to one and not the other, for instance). Sharing the function makes that structurally
+  // impossible: the dashboard's live scan and the recovery path can never disagree about what a
+  // given transcript file contains.
+  scanFile,
+};

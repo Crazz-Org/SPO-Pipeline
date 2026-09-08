@@ -275,8 +275,10 @@ test('todaySpend: counts only today\'s llm-call events, excludes tokensSource:nu
     // does fold it in passed the whole suite -- on the live corpus it turns issue-471's 194.4k
     // into 1.68M, an 8.7x inflation of the headline number `spo status` prints.
     { ts: todayIso, state: 'PLAN', event: 'llm-call', tokensSource: 'modelUsage', freshInputTokens: 100, cacheCreationTokens: 50, cacheReadTokens: 900000, outputTokens: 20 },
-    // A killed/E2BIG call: numeric billableTokens-shaped fields all 0, tokensSource: null --
-    // must be excluded from "reported", never counted as a genuine zero.
+    // A call claude never started (E2BIG etc.), or a killed/signalled/unparsable call whose own
+    // transcript recovery also found nothing (token-ledger lot action 4.3): numeric
+    // billableTokens-shaped fields all 0, tokensSource: null -- must be excluded from "reported",
+    // never counted as a genuine zero.
     { ts: todayIso, state: 'PLAN', event: 'llm-call', tokensSource: null, freshInputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0 },
   ]);
   writeStateJson(dir, { id: 'issue-700', state: 'DONE' });

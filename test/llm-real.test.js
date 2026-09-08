@@ -19,6 +19,7 @@ const {
   extractTokens,
   classifyFailure,
   cannedDryRunPayload,
+  maybeRecoverTokens,
 } = require('../orchestrator/steps/llm');
 
 function realShapedPayload(overrides = {}) {
@@ -1441,4 +1442,408 @@ test('cannedDryRunPayload: an unrecognized step falls to the defensive default -
   assert.equal(payload.foo, null);
   assert.equal(payload.bar, null);
   assert.equal(payload.baz, null);
+});
+
+// ---- token-ledger lot, action 4.3: token recovery wiring -------------------------------------
+//
+// invokeClaudeReal's own maybeRecoverTokens (exported for these tests) attempts recovery when
+// BOTH conditions hold on the branch's own result: tokensSource is falsy AND sessionId is a
+// non-empty string. deps.recoverSessionTokens is the injection point (this file's existing
+// deps.spawnSync/deps.randomUUID convention) -- every test below injects a fake so none of them
+// touch the real filesystem via orchestrator/token-recovery.js's default export.
+
+function timeoutSpawnResult(overrides = {}) {
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  return { error: timeoutErr, status: 143, stdout: '', stderr: '', signal: null, ...overrides };
+}
+
+const RECOVERED_SAMPLE = Object.freeze({
+  tokensSource: 'transcript',
+  freshInputTokens: 1000,
+  cacheCreationTokens: 200,
+  cacheReadTokens: 50,
+  outputTokens: 300,
+  billableTokens: 1500,
+  transcriptFilesRead: 2,
+  // Non-zero on purpose (Fix 7): pins that maybeRecoverTokens/runLlm carry this completeness
+  // signal through to the journal too, including the "some files were lost" case, not only the
+  // "0 skipped" happy path.
+  transcriptFilesSkipped: 1,
+});
+
+test('invokeClaudeReal: a deadline-killed call whose injected recovery succeeds returns tokensSource: "transcript" and the recovered numbers', async () => {
+  const deps = {
+    spawnSync: fakeSpawnSync(() => timeoutSpawnResult()),
+    randomUUID: () => 'deadline-recovered-uuid',
+    recoverSessionTokens: async () => ({ ...RECOVERED_SAMPLE }),
+  };
+
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: '/tmp/acct' }, deadlineMs: 5000 },
+    deps
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.sessionId, 'deadline-recovered-uuid');
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.freshInputTokens, 1000);
+  assert.equal(result.cacheCreationTokens, 200);
+  assert.equal(result.cacheReadTokens, 50);
+  assert.equal(result.outputTokens, 300);
+  assert.equal(result.billableTokens, 1500);
+});
+
+test('runLlm real kind:"card" path: a deadline-killed call whose recovery succeeds journals tokensSource: "transcript" and the recovered numbers (read from journal.jsonl, not the return value)', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const taskDir = mkTmp('spo-llmreal-recovery-cardpath-taskdir-');
+  const worktreePath = mkTmp('spo-llmreal-recovery-cardpath-worktree-');
+
+  let recoverCalls = 0;
+  let recoverArgs = null;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => timeoutSpawnResult()),
+    randomUUID: () => 'card-path-recovered-uuid',
+    recoverSessionTokens: async (opts) => {
+      recoverCalls += 1;
+      recoverArgs = opts;
+      return { ...RECOVERED_SAMPLE };
+    },
+  };
+
+  const ctx = {
+    shadowMode: false,
+    dryRun: false,
+    taskDir,
+    account: { name: 'acct-recover', configDir: '/tmp/acct-recover-config' },
+    task: {
+      id: 'card-recover',
+      kind: 'card',
+      issue: 9001,
+      title: 'Recover killed-call tokens',
+      criterion: 'tokens are recovered',
+      worktreePath,
+      size: 'S',
+      touchesRdoMembers: false,
+    },
+  };
+
+  const result = await runLlm(ctx, 'PLAN', 'llm.PLAN', deps);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.billableTokens, 1500);
+  assert.equal(recoverCalls, 1);
+  assert.equal(recoverArgs.sessionId, 'card-path-recovered-uuid');
+  assert.equal(recoverArgs.accountConfigDir, '/tmp/acct-recover-config');
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const llmCallEvent = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(llmCallEvent, 'expected an llm-call journal event');
+  assert.equal(llmCallEvent.sessionId, 'card-path-recovered-uuid');
+  assert.equal(llmCallEvent.tokensSource, 'transcript');
+  assert.equal(llmCallEvent.freshInputTokens, 1000);
+  assert.equal(llmCallEvent.cacheCreationTokens, 200);
+  assert.equal(llmCallEvent.cacheReadTokens, 50);
+  assert.equal(llmCallEvent.outputTokens, 300);
+  assert.equal(llmCallEvent.billableTokens, 1500);
+  // Fix 7: the completeness signal recoverSessionTokens computes must reach the journal too, not
+  // just the six token fields -- transcriptFilesSkipped non-zero here (RECOVERED_SAMPLE) pins the
+  // "some files were lost" case, not only the "0 skipped" happy path.
+  assert.equal(llmCallEvent.transcriptFilesRead, 2);
+  assert.equal(llmCallEvent.transcriptFilesSkipped, 1);
+});
+
+// ---- Fix 2 (M10c/M10d, finding F2): two of the five recovery branches were unpinned -----------
+// Recovery is wired to five branches (deadline kill, external signal kill, unparsable stdout,
+// is_error/non-zero-exit, and a success with no modelUsage) -- only the deadline kill, is_error and
+// success branches had a recovery-injected test before this fix. These two close the gap.
+
+test('invokeClaudeReal: unparsable stdout with injected recovery -- recovery is called once with the generated sessionId, and the result carries tokensSource: "transcript"', async () => {
+  let recoverCalls = 0;
+  let recoverArgs = null;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: 'not json', stderr: '', signal: null })),
+    randomUUID: () => 'unparsable-uuid',
+    recoverSessionTokens: async (opts) => {
+      recoverCalls += 1;
+      recoverArgs = opts;
+      return { ...RECOVERED_SAMPLE };
+    },
+  };
+
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+
+  assert.equal(recoverCalls, 1, 'recovery must be attempted exactly once for an unparsable-stdout call');
+  assert.equal(recoverArgs.sessionId, 'unparsable-uuid');
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.sessionId, 'unparsable-uuid');
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.billableTokens, 1500);
+});
+
+test('invokeClaudeReal: an external signal kill (SIGKILL, no error) with injected recovery -- killedBySignal stays true AND tokensSource becomes "transcript", the classification undisturbed by recovery', async () => {
+  let recoverCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: null, signal: 'SIGKILL', stdout: '', stderr: '' })),
+    randomUUID: () => 'sigkill-recovered-uuid',
+    recoverSessionTokens: async () => {
+      recoverCalls += 1;
+      return { ...RECOVERED_SAMPLE };
+    },
+  };
+
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null } }, // no deadlineMs
+    deps
+  );
+
+  assert.equal(recoverCalls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.killedBySignal, true);
+  assert.equal(result.signal, 'SIGKILL');
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.billableTokens, 1500);
+});
+
+test('invokeClaudeReal: E2BIG never calls the injected recovery function -- claude never started, sessionId stays null, tokensSource stays null', async () => {
+  const e2big = new Error('spawnSync claude E2BIG');
+  e2big.code = 'E2BIG';
+  let recoverCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: e2big, status: null, stdout: '', stderr: '', signal: null })),
+    recoverSessionTokens: async () => {
+      recoverCalls += 1;
+      return { ...RECOVERED_SAMPLE };
+    },
+  };
+
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+
+  assert.equal(recoverCalls, 0, 'recovery must never be attempted when claude never started');
+  assert.equal(result.sessionId, null);
+  assert.equal(result.tokensSource, null);
+  assert.equal(result.billableTokens, 0);
+});
+
+test('invokeClaudeReal: an unreadable oauthTokenFile never calls the injected recovery function either -- claude never started', async () => {
+  let recoverCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null })),
+    recoverSessionTokens: async () => {
+      recoverCalls += 1;
+      return { ...RECOVERED_SAMPLE };
+    },
+  };
+
+  const result = await invokeClaudeReal(
+    {
+      promptText: 'hi',
+      model: 'haiku',
+      cwd: '/tmp',
+      account: { name: 'acct-missing-token', configDir: null, oauthTokenFile: '/nonexistent/spo-lot4-token-ledger/gone' },
+    },
+    deps
+  );
+
+  assert.equal(recoverCalls, 0);
+  assert.equal(result.sessionId, null);
+  assert.equal(result.tokensSource, null);
+});
+
+// ---- A5: recovery is informational only, never a control-flow change ---------------------------
+
+test('maybeRecoverTokens (A5): every non-token field is returned byte-identical whether recovery finds something or returns null', async () => {
+  // A fixed, realistic "deadline kill" shape -- the exact object invokeClaudeReal's own deadline
+  // branch builds, captured once so durationS (a live wall-clock measurement, not something this
+  // module recomputes) cannot introduce flakiness into the comparison below: both calls read the
+  // SAME base object, proving maybeRecoverTokens itself never rewrites a non-token field, rather
+  // than proving two independent live spawns happened to measure the same duration.
+  const base = Object.freeze({
+    ok: false,
+    kind: 'error',
+    timedOut: true,
+    deadlineMs: 900000,
+    error: 'llm.js: claude ran but exceeded the 900000ms deadline and was killed (signal SIGTERM)',
+    sessionId: 'a5-fixed-session-id',
+    tokensSource: null,
+    freshInputTokens: 0,
+    cacheCreationTokens: 0,
+    cacheReadTokens: 0,
+    outputTokens: 0,
+    billableTokens: 0,
+    cacheCreationEphemeral1h: 0,
+    cacheCreationEphemeral5m: 0,
+    numTurns: undefined,
+    durationS: 812.345,
+    raw: 143,
+  });
+  const opts = { account: { name: 'default', configDir: '/tmp/acct' } };
+
+  const withoutRecovery = await maybeRecoverTokens({ ...base }, opts, { recoverSessionTokens: async () => null });
+  const withRecovery = await maybeRecoverTokens({ ...base }, opts, { recoverSessionTokens: async () => ({ ...RECOVERED_SAMPLE }) });
+
+  // Fix 7 extended this list: transcriptFilesRead/transcriptFilesSkipped are recovery-owned
+  // fields exactly like the six token fields -- present only when recovery actually ran and
+  // found something, absent (never a false 0) otherwise.
+  const TOKEN_FIELDS = [
+    'tokensSource',
+    'freshInputTokens',
+    'cacheCreationTokens',
+    'cacheReadTokens',
+    'outputTokens',
+    'billableTokens',
+    'transcriptFilesRead',
+    'transcriptFilesSkipped',
+  ];
+  const stripTokenFields = (obj) => {
+    const copy = { ...obj };
+    for (const f of TOKEN_FIELDS) delete copy[f];
+    return copy;
+  };
+
+  assert.deepEqual(stripTokenFields(withoutRecovery), stripTokenFields(base));
+  assert.deepEqual(stripTokenFields(withRecovery), stripTokenFields(base));
+  assert.equal(withoutRecovery.tokensSource, null);
+  assert.equal(withoutRecovery.billableTokens, 0);
+  assert.equal(withoutRecovery.transcriptFilesRead, undefined);
+  assert.equal(withoutRecovery.transcriptFilesSkipped, undefined);
+  assert.equal(withRecovery.tokensSource, 'transcript');
+  assert.equal(withRecovery.billableTokens, 1500);
+  assert.equal(withRecovery.transcriptFilesRead, 2);
+  assert.equal(withRecovery.transcriptFilesSkipped, 1);
+  // cacheCreationEphemeral1h/5m are not part of what a transcript recovery collects -- they stay
+  // whatever the original ZERO_TOKENS shape had them at (0), not overwritten to anything else.
+  assert.equal(withRecovery.cacheCreationEphemeral1h, 0);
+  assert.equal(withRecovery.cacheCreationEphemeral5m, 0);
+});
+
+test('invokeClaudeReal (A5, live spawn): a deadline kill\'s kind/ok/error/timedOut/deadlineMs/numTurns/raw are identical whether recovery succeeds or returns null', async () => {
+  const spawnFn = fakeSpawnSync(() => timeoutSpawnResult({ signal: 'SIGTERM' }));
+  const opts = { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 5000 };
+
+  const resultNull = await invokeClaudeReal(opts, {
+    spawnSync: spawnFn,
+    randomUUID: () => 'a5-live-uuid',
+    recoverSessionTokens: async () => null,
+  });
+  const resultRecovered = await invokeClaudeReal(opts, {
+    spawnSync: spawnFn,
+    randomUUID: () => 'a5-live-uuid',
+    recoverSessionTokens: async () => ({ ...RECOVERED_SAMPLE }),
+  });
+
+  for (const field of ['kind', 'ok', 'error', 'timedOut', 'deadlineMs', 'numTurns', 'raw', 'sessionId']) {
+    assert.deepEqual(resultRecovered[field], resultNull[field], `field "${field}" must not depend on whether recovery ran`);
+  }
+  assert.equal(resultNull.tokensSource, null);
+  assert.equal(resultRecovered.tokensSource, 'transcript');
+});
+
+// ---- A3: the recovery decision is structural (sessionId + tokensSource), never a text scan -----
+//
+// Regression fixtures, both real corpus cases: issue-439 and issue-247 journalled
+// "llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT" -- text that says "failed to
+// spawn" for calls that in fact ran and were deadline-killed (that message predates the fix that
+// split timeouts out of the generic spawn-failure branch, PR referenced in this file's own
+// deadline-kill comment). This constructs exactly that historical shape -- an error string
+// containing "failed to spawn claude" alongside a real sessionId and tokensSource: null -- and
+// proves maybeRecoverTokens still recovers it: the decision reads sessionId/tokensSource only,
+// never `result.error`.
+
+test('maybeRecoverTokens (A3, issue-439/issue-247 regression): a "failed to spawn claude" error message with a real sessionId is still recovered -- error text is never consulted', async () => {
+  const legacyMisclassifiedShape = {
+    ok: false,
+    kind: 'error',
+    error: 'llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT',
+    sessionId: 'issue-439-and-247-fixture-session-id',
+    tokensSource: null,
+    freshInputTokens: 0,
+    cacheCreationTokens: 0,
+    cacheReadTokens: 0,
+    outputTokens: 0,
+    billableTokens: 0,
+    numTurns: undefined,
+    durationS: 900.001,
+    raw: null,
+  };
+
+  let recoverCalls = 0;
+  const result = await maybeRecoverTokens(
+    legacyMisclassifiedShape,
+    { account: { name: 'default', configDir: '/tmp/acct' } },
+    {
+      recoverSessionTokens: async (opts) => {
+        recoverCalls += 1;
+        assert.equal(opts.sessionId, 'issue-439-and-247-fixture-session-id');
+        return { ...RECOVERED_SAMPLE };
+      },
+    }
+  );
+
+  assert.equal(recoverCalls, 1, 'recovery must be attempted regardless of what result.error says');
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.billableTokens, 1500);
+  // The error text itself is untouched -- recovery is informational only (A5).
+  assert.equal(result.error, 'llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT');
+});
+
+// ---- a successful call that reported no modelUsage is also recovered ---------------------------
+
+test('invokeClaudeReal: a SUCCESSFUL call that reported no modelUsage at all is also recovered, not only killed/signalled/unparsable calls', async () => {
+  const payload = realShapedPayload({ modelUsage: undefined });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 0, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+    randomUUID: () => 'success-no-modelusage-uuid',
+    recoverSessionTokens: async (opts) => {
+      // The CLI's own reported session_id ('sess-123', from realShapedPayload) wins over the
+      // generated one -- see invokeClaudeReal's own comment on reportedSessionId. Recovery must
+      // be attempted against THAT id, not the generated one.
+      assert.equal(opts.sessionId, 'sess-123');
+      return { ...RECOVERED_SAMPLE };
+    },
+  };
+
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.billableTokens, 1500);
+});
+
+// ---- an is_error/non-zero-exit reply with a sessionId is recovered the same way -----------------
+
+test('invokeClaudeReal: an is_error reply (non-zero exit, real sessionId, no modelUsage) is also recovered', async () => {
+  const payload = realShapedPayload({ is_error: true, modelUsage: undefined, result: 'boom' });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+    randomUUID: () => 'is-error-no-modelusage-uuid',
+    recoverSessionTokens: async () => ({ ...RECOVERED_SAMPLE }),
+  };
+
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.tokensSource, 'transcript');
+  assert.equal(result.billableTokens, 1500);
 });

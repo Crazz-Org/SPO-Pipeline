@@ -1425,7 +1425,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: daemon.js:912",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
-  "orchestrator/park-loop.js :: doc/remediation-progress.md:658",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:664", // re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines to remediation-progress.md's C5-findings section above this bullet, a true pure shift; content byte-identical at :664
   "orchestrator/park-loop.js :: intake.js:797-799",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
@@ -2146,12 +2146,14 @@ const ANCHOR_BLUNT_CITATIONS = {
     "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (148-150, 152) " +
     '-- the anchor word is the column value itself, so :149 anchors as well as :150. Citation ' +
     'confirmed correct by hand: 150 is the CHECK row.',
-  // park-loop.js: "doc/remediation-progress.md:658 confirms the same referent under 'DIAGNOSE
-  // surfacing'". Line 649 is the bullet's own heading line and 650 is its continuation, which
-  // opens with the same word ("DIAGNOSE has no column..."). Correct citation, two-line bullet.
-  'orchestrator/park-loop.js :: doc/remediation-progress.md:658':
-    "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 649 and its own " +
-    'continuation line 650. Citation confirmed correct by hand: 649 is the bullet heading.',
+  // park-loop.js: "doc/remediation-progress.md:664 confirms the same referent under 'DIAGNOSE
+  // surfacing'" (re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines above this bullet in
+  // remediation-progress.md, a true pure shift). Line 664 is the bullet's own heading line and 665
+  // is its continuation, which opens with the same word ("DIAGNOSE has no column..."). Correct
+  // citation, two-line bullet.
+  'orchestrator/park-loop.js :: doc/remediation-progress.md:664':
+    "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 664 and its own " +
+    'continuation line 665. Citation confirmed correct by hand: 664 is the bullet heading.',
   // state-machine.js: UNDRAINABLE_STATES's own header cites park-loop.js:1283 (`if
   // (state.state !== 'PARKED') continue;`) for why ABANDONED's retry branch is unreachable. Line
   // 1272, the comment immediately above the cited gate, reads "...only reconcileExternalClosure
@@ -2173,7 +2175,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
       'orchestrator/README.md :: doc/state-machine-spec.md:150',
-      'orchestrator/park-loop.js :: doc/remediation-progress.md:658',
+      'orchestrator/park-loop.js :: doc/remediation-progress.md:664',
       'orchestrator/state-machine.js :: park-loop.js:1283',
     ],
     'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +

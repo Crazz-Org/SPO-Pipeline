@@ -2468,17 +2468,26 @@ dashboard's tokens trend never had this gap — `console/usage-scan.js` streams
 reported separately and never folded into that total: on a quota plan a cache read is nearly
 free while fresh input and a cache write are not, and cache-read tokens dominate raw counts by
 orders of magnitude (`console/usage-scan.js`'s own header) — a single "total tokens" number
-would just be measuring cache hit rate, not the thing worth watching. `tokensSource` is
-`'modelUsage'` when at least one recognized field was found there, else `null` — so a reader
-can tell "zero tokens" from "not reported" (a killed/E2BIG call that never got a `modelUsage`
-block at all).
+would just be measuring cache hit rate, not the thing worth watching. `extractTokens()` sets
+`tokensSource` to `'modelUsage'` when at least one recognized field was found in the CLI's own
+reply, else `null`. Token-ledger lot action 4.3 adds a second source: when the CLI reply carried
+none but the call still ran -- any branch that produced a real session id: a deadline kill, an
+external signal kill, unparsable stdout, an `is_error`/non-zero-exit reply, or a successful call
+whose own `modelUsage` was empty -- `token-recovery.js`'s `recoverSessionTokens` reads the
+call's own session transcript back off disk and, when it finds usage rows, sets
+`tokensSource: 'transcript'` instead. `tokensSource` stays `null` only when neither source had
+anything — most durably for a call `claude` never actually started at all (E2BIG and the other
+spawn-never-started failures, which mint no session and so leave no transcript to recover) — so a
+reader can still tell "zero tokens" from "not reported", now across two sources instead of one.
 
 **"n/a" means not reported, not zero.** `spo tokens` prints `n/a` — never `0` — in the token
 columns of any task whose `llm-call` events carry no `tokensSource`, and closes the report with a
 footer naming how many of the run's calls lacked the fields. Two things land there: journals
 written **before** token capture shipped (2026-08-31), whose events recorded only the retired
-`costUsd`, and a call killed before a `modelUsage` block existed (deadline kill, E2BIG, non-JSON
-stdout — `tokensSource: null`). `billableTokensPerDoneCard` is `null` (rendered `n/a`) whenever
+`costUsd`, and a call for which NEITHER `modelUsage` nor a recovered transcript had anything —
+durably true for E2BIG and the other spawn-never-started failures (`tokensSource: null`), and true
+for a deadline kill/signal kill/non-JSON stdout only when its own transcript recovery also came up
+empty. `billableTokensPerDoneCard` is `null` (rendered `n/a`) whenever
 *no* call reported tokens, because a per-card figure computed off journals with no token data is
 a false measurement rather than a small one. **Every historical journal in this repo is in that
 state** — `spo tokens` over `journal/` reports `n/a` throughout until the current build has run
