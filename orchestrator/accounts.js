@@ -139,12 +139,17 @@ class AllAccountsCoolingError extends Error {
 // would otherwise be pick()-able (enabled, not cooling) is in that set -- i.e. every HEALTHY
 // account is currently leased by another live worker, as opposed to AllAccountsCoolingError
 // (every enabled account has a cooldownUntil in the future). The distinction matters because the
-// two park differently: a cooling account is never worth waiting on (state-machine.js/intake.js
-// never even construct this error's caller with a wait loop for that case), but a leased account
+// two park differently: a cooling account is never worth a BLOCKING, in-process wait
+// (state-machine.js/intake.js never construct this error's caller with a wait LOOP for that case
+// -- a 1h or 5h cooldown would pin the process for hours, doing nothing), but a leased account
 // legitimately might free up within the bound orchestrator/account-lease.js's leaseHealthyAccount
 // waits -- see that module's own header and doc/remediation-progress.md's C6 decision record for
 // why per-step leasing makes waiting the right default instead of parking immediately the way
-// AllAccountsCoolingError does.
+// AllAccountsCoolingError does. Since card #119 action 1.2, a cooling park IS worth a DEFERRED
+// wait when its deadline is recoverable -- see doc/state-machine-spec.md's Account pool section
+// -- but that mechanism lives entirely in state-machine.js's finalizePark, downstream of the
+// ParkSignal this error becomes; nothing in THIS module, or in leaseHealthyAccount's own blocking
+// loop, changed.
 class AllAccountsLeasedError extends Error {
   constructor(reason, detail = {}) {
     super(reason);

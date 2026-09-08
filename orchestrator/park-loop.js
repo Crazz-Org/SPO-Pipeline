@@ -804,6 +804,17 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // call site duplicates this read/strip/write: finalizePark reuses this exact function and hands
 // its two fields in through `extra`, which is merged into the SAME single write.
 //
+// Action 1.2 (card #119): `poolWaitMs`/`poolWaitAttempts` are stripped for the identical reason,
+// by the identical mechanism -- finalizePark's separate pool-exhaustion-wait branch hands them in
+// through the same `extra` parameter, and unparkScan's `retry` reply strips them the same way it
+// already strips `transientRetries`. The maintainer-facing property is the same one 4.4's own
+// paragraph below states for the transient budget, restated because it is easy to assume "an
+// exhausted allowance is exhausted" instead of re-deriving it: `poolWaitMs` accumulates how many
+// hours the MACHINE has waited on the account pool UNATTENDED, against `config.
+// poolExhaustionWaitCapMs` -- it is never a ceiling on a human who has now looked at the park
+// reason and typed `retry`. A human's retry always starts the wait allowance fresh, exactly as it
+// already restores the transient-retry budget to zero.
+//
 // `extra` exists precisely so that the queue entry is never observable without them, and that is
 // a correctness requirement, not tidiness. 4.4's first cut wrote the file here and then had
 // finalizePark read it back, patch `transientRetries`/`notBefore` on and write it a second time.
@@ -859,7 +870,7 @@ let reEnqueueTmpSeq = 0;
 
 function reEnqueueTask(queueDir, taskDir, id, extra = {}, key = null, priorityClass = 't') {
   const original = readJsonSafe(path.join(taskDir, 'task.json')) || {};
-  const { worktreePath, branch, baseMainSha, transientRetries, notBefore, ...rest } = original;
+  const { worktreePath, branch, baseMainSha, transientRetries, notBefore, poolWaitMs, poolWaitAttempts, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
   // Card #43: fall back to Date.now() for anything that isn't a finite number, `null` default
   // included -- see the header comment for why this must never throw.

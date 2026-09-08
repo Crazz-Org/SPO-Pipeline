@@ -1913,6 +1913,61 @@ function isAccountPoolParkReason(reason) {
   return ACCOUNT_POOL_PARK_REASON_FAMILY.some(({ match, kind }) => (kind === 'literal' ? reason === match : reason.startsWith(match)));
 }
 
+// poolCooldownDeadlineMs(reason, detail) -> epoch-ms number, or null when no deadline can be
+// recovered. Card #119 action 1.2: the account-pool family's two cooling members carry a real
+// wall-clock deadline (see ACCOUNT_POOL_PARK_REASON_FAMILY's own `why` strings), but the two
+// PRODUCERS of that deadline -- accounts.js's pick() and this file's own callLlmStep -- disagree
+// on both the KEY and the TYPE: pick() writes `earliestCooldownUntil` as an epoch-ms NUMBER,
+// callLlmStep's `all-accounts-cooling-after-retry` throw writes `cooldownUntilIso` as an ISO
+// STRING. A resolver that reads only one of the two silently fails on whichever park reason uses
+// the other -- see the banked corpus measurement in this action's spec (5 of 7 real events use
+// one key, 2 of 7 use the other; no event carries both) -- so both are read, in this order:
+//
+//   1. `detail.earliestCooldownUntil`, when it is a finite number -- pick()'s own shape, used
+//      directly, no parsing.
+//   2. `detail.cooldownUntilIso`, when it is a string `Date.parse` resolves to a finite number --
+//      callLlmStep's own shape.
+//   3. LAST RESORT, and only for the `all-accounts-cooling-until-<ISO>` prefix member: parse the
+//      ISO suffix back out of the reason STRING itself. accounts.js's pick() builds both the
+//      reason string's suffix and `earliestCooldownUntil` from the exact same `earliestCooldown`
+//      value in the same statement, so this is the same number by construction, not a guess --
+//      it exists so that a park whose deadline is sitting in plain sight in its own reason string
+//      can never be parked for want of a detail key (an older journal entry, a detail object
+//      trimmed by some other layer, ...).
+//
+// `all-accounts-cooling-unknown` and `all-accounts-leased` resolve to `null` UNCONDITIONALLY --
+// structurally, not merely because their real producers happen never to populate the two detail
+// keys today. The first has no cooldown to report a time for at all (every account disabled, or
+// none ever registered a cooldown), and the second is a LEASE, not a cooldown -- there is no
+// deadline to recover, a lease frees on its own schedule. That is a scope boundary this action
+// draws on purpose, not a gap: the caller (finalizePark) treats a `null` return as "park exactly
+// as today," which is the correct, honest behaviour for both, and it must hold even if some other
+// layer ever attaches a stray `earliestCooldownUntil`/`cooldownUntilIso` to one of these two
+// reasons' detail by accident -- so the two steps below are gated on the reason being one of the
+// two members that CAN carry a deadline (the `-until-` prefix, or the `-after-retry` literal)
+// before either detail key is even read.
+function poolCooldownDeadlineMs(reason, detail) {
+  const prefixMember = ACCOUNT_POOL_PARK_REASON_FAMILY.find((m) => m.match === 'all-accounts-cooling-until-');
+  const isUntilPrefix = prefixMember && typeof reason === 'string' && reason.startsWith(prefixMember.match);
+  const isAfterRetry = reason === 'all-accounts-cooling-after-retry';
+  if (!isUntilPrefix && !isAfterRetry) return null;
+
+  if (detail && Number.isFinite(detail.earliestCooldownUntil)) {
+    return detail.earliestCooldownUntil;
+  }
+  if (detail && typeof detail.cooldownUntilIso === 'string') {
+    const parsed = Date.parse(detail.cooldownUntilIso);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  // LAST RESORT, and only for the `-until-` prefix member (see the numbered list above): parse
+  // the ISO suffix back out of the reason STRING itself.
+  if (isUntilPrefix) {
+    const parsed = Date.parse(reason.slice(prefixMember.match.length));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 // classifyParkReason(reason) -> 'transient' | 'terminal' | 'unclassified'. The single source of
 // truth test/park-reason-partition.test.js's source sweep checks every producible reason against.
 // Exact-match first (cheap, and the overwhelming majority of reasons), then the account-pool
@@ -2045,6 +2100,101 @@ function finalizePark(ctx, lastState, reason, detail) {
       if (requeuedFile) {
         appendEvent(ctx.taskDir, lastState, 'transient-retry', { reason, attempt, delayMs, notBefore });
         return; // not parked -- see the header comment above; every write below is skipped.
+      }
+    }
+  }
+
+  // action 1.2 (card #119): pool-exhaustion WAIT -- a SEPARATE branch from the transient-retry one
+  // above, parallel to it in shape but sharing none of its budget (transientRetryBudget) or delay
+  // table (transientRetryDelaysMs): this is not a fixed backoff, it is a re-enqueue timed to the
+  // ACTUAL cooldown deadline the account pool already told us about. Eligibility, checked in this
+  // order, matches the transient branch's own reasoning (real mode only; a queue directory must be
+  // available; never throw -- this runs inside runTask's own ParkSignal catch, and C3 already
+  // shipped the "finalizePark throws, daemon dies" shape once, via preserveWorktreeWip):
+  //   - isRealMode(ctx) -- a dry-run or shadow run has no real queue/ worth writing into, and
+  //     writing to one anyway would leave a synthetic/fixture task sitting where a `--real` daemon
+  //     polls next.
+  //   - isAccountPoolParkReason(reason) -- only the four-member family declared above; anything
+  //     else falls straight through, unconditionally.
+  //   - poolCooldownDeadlineMs(reason, detail) returns a deadline, not null -- `all-accounts-
+  //     cooling-unknown` and `all-accounts-leased` always return null here (see that function's
+  //     own header) and so always fall through to the ordinary park below, exactly as today; that
+  //     is the deliberate scope boundary, not an oversight.
+  //   - a queue directory is configured (same `typeof queueDir === 'string' && queueDir !== ''`
+  //     guard as the transient branch, same reasoning: no queue to write to means no wait).
+  if (isRealMode(ctx) && isAccountPoolParkReason(reason)) {
+    const deadlineMs = poolCooldownDeadlineMs(reason, detail);
+    const poolQueueDir = ctx.config && ctx.config.queueDir;
+    if (deadlineMs !== null && typeof poolQueueDir === 'string' && poolQueueDir !== '') {
+      const now = Date.now();
+      const waitMs = Math.max(0, deadlineMs - now);
+      // Accumulated across every pool-wait this task has already taken -- carried forward on the
+      // re-enqueued task.json as `poolWaitMs`, absent (a fresh task, or one that has never taken
+      // this branch) treated as 0. This is what makes the cap a cap on the TASK's total unattended
+      // wait, not merely on any one wait -- a task that has already waited 11h and now hits a
+      // fresh 2h cooldown must not get a 13th hour just because THIS SINGLE wait is short.
+      const priorWaitMs = (ctx.task && Number.isFinite(ctx.task.poolWaitMs) ? ctx.task.poolWaitMs : 0) || 0;
+      const accumulated = priorWaitMs + waitMs;
+      const cap = (ctx.config && Number.isFinite(ctx.config.poolExhaustionWaitCapMs) && ctx.config.poolExhaustionWaitCapMs) || 0;
+      // The cap must bind BEFORE the wait: exceeding it falls straight through to the ordinary
+      // park immediately below, unconditionally -- this `if` is simply false and every line after
+      // it runs exactly as it always has. Worst case of this whole branch, by construction: today's
+      // behaviour, unchanged. Action 1.3 makes this fall-through loud and distinguishable from an
+      // ordinary park; this action only makes the cap bind.
+      if (accumulated <= cap) {
+        const priorAttempts = (ctx.task && Number.isFinite(ctx.task.poolWaitAttempts) ? ctx.task.poolWaitAttempts : 0) || 0;
+        const attempt = priorAttempts + 1;
+        const notBefore = new Date(now + waitMs).toISOString();
+        const deadlineSource =
+          detail && Number.isFinite(detail.earliestCooldownUntil)
+            ? 'earliestCooldownUntil'
+            : detail && typeof detail.cooldownUntilIso === 'string' && Number.isFinite(Date.parse(detail.cooldownUntilIso))
+              ? 'cooldownUntilIso'
+              : 'reason-suffix';
+
+        // Queue entry first, journal line second, return gated on the write having actually
+        // happened -- same ordering, and the same correctness reasoning, as the transient-retry
+        // branch above and reEnqueueTask's own header comment (park-loop.js): journalling
+        // `pool-wait` before the write exists would let a failed write leave behind a record of a
+        // wait that does not exist, on a card that is also not parked -- invisible everywhere.
+        // Falling through to the ordinary park instead costs one honest park comment and keeps
+        // every reader's view of this card true.
+        //
+        // Maintainer-priority fix: priorityClass 't' -- this is the MACHINE's own wait, never
+        // allowed to sort ahead of a maintainer's explicit 'h'-classed retry, regardless of which
+        // numeric key is smaller.
+        //
+        // 'pool-wait' is a NEW event name, distinct from 'transient-retry', so the two mechanisms
+        // stay tellable apart in the journal -- a reader must never have to infer which one fired
+        // from the reason string alone.
+        let requeuedFile = null;
+        try {
+          requeuedFile = reEnqueueTask(
+            poolQueueDir,
+            ctx.taskDir,
+            ctx.id,
+            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore },
+            attempt,
+            't'
+          );
+        } catch (err) {
+          appendEvent(ctx.taskDir, lastState, 'pool-wait-failed', {
+            reason,
+            attempt,
+            error: String((err && err.message) || err),
+          });
+        }
+        if (requeuedFile) {
+          appendEvent(ctx.taskDir, lastState, 'pool-wait', {
+            reason,
+            attempt,
+            waitMs,
+            accumulatedWaitMs: accumulated,
+            notBefore,
+            deadlineSource,
+          });
+          return; // not parked -- every write below is skipped, same as the transient branch.
+        }
       }
     }
   }
@@ -2284,7 +2434,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1262 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1273 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal
@@ -2681,7 +2831,8 @@ module.exports = {
   TERMINAL_PARK_REASONS, // exported for test/park-reason-partition.test.js's coverage/disjointness/no-dead-entries sweep
   TERMINAL_PARK_REASON_PREFIXES, // exported for the same sweep -- the one remaining non-literal reason family
   ACCOUNT_POOL_PARK_REASON_FAMILY, // exported for test/park-reason-partition.test.js's family-completeness sweep
-  isAccountPoolParkReason, // exported alongside the family -- test/park-reason-partition.test.js and action 1.2's future behaviour both read it
+  isAccountPoolParkReason, // exported alongside the family -- test/park-reason-partition.test.js and action 1.2's pool-wait branch both read it
+  poolCooldownDeadlineMs, // exported for action 1.2's own tests -- the epoch-ms/ISO-string/reason-suffix deadline resolver, pinned independently of finalizePark's re-enqueue plumbing
   classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
   isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
 };

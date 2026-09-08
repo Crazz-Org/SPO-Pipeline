@@ -326,6 +326,18 @@ separate repos with no shared runtime.
   currently available) and from `all-accounts-cooling-after-retry` below (which fires only once
   every account in one full rotation pass was actually tried and limited, not merely found
   cooling before a single call was attempted).
+- **A cooling park is now a deferred wait, not just a park** (card #119, action 1.2): whenever the
+  deadline is recoverable from the park detail — `all-accounts-cooling-until-<ISO>` and
+  `all-accounts-cooling-after-retry` both carry one, by the two bullets above and below —
+  `state-machine.js`'s `finalizePark` re-enqueues the task with `notBefore` set to that exact
+  deadline instead of parking it outright: the worker exits, and the card comes back on its own
+  once the cooldown clears, no maintainer `retry` reply required. This is a mechanism separate
+  from the transient-retry budget described elsewhere in this spec, with its own cap
+  (`config.poolExhaustionWaitCapMs`, 12h) tracked as the task's ACCUMULATED wait rather than a
+  fixed retry count; once accumulated wait exceeds the cap, the park falls straight through to an
+  ordinary park. `all-accounts-cooling-unknown` and `all-accounts-leased` never wait this way —
+  neither carries a recoverable deadline (no cooldown ever recorded a time; a lease, not a
+  cooldown) — and both still park exactly as they did before this action.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
@@ -361,7 +373,8 @@ separate repos with no shared runtime.
   `ParkSignal('all-accounts-cooling-after-retry', {attempts, lastResult, cooldownUntilIso})`,
   thrown by `callLlmStep` itself once its attempt loop runs out of accounts — carries the last
   cooldown's own ISO timestamp explicitly rather than relying on `pick()`'s own reason string,
-  which that path never reaches.
+  which that path never reaches. That same `cooldownUntilIso` is what the deferred wait above
+  (card #119, action 1.2) reads as this reason's deadline.
 - This rotation rule is not daemon-only: `orchestrator/intake.js`'s three maintainer/auto-triage
   LLM steps (draftCard, reviewCard, triageBugReport) follow it too, via their own
   `callIntakeStepWithRotation` helper — same pick/call/cool/rotate mechanics as
@@ -391,15 +404,18 @@ separate repos with no shared runtime.
   deterministic first-fit, invisible under the pre-C6 single-threaded daemon and a real bug once
   a worker and the scanner can run at once. A lease is per-step, not per-task, released the
   instant the one LLM call it wraps finishes; a healthy account currently leased by another live
-  process is `AllAccountsLeasedError`, worth a bounded wait (`config.accountLeaseWaitMs`, default
-  **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the age at which a lease is swept as
-  dead — never the ~90–265s a sibling's own step is *usually* measured at: a waiter has to outlast
-  the longest a sibling can *legitimately* hold the lease, not its typical duration, and the old
-  5-minute default was found wrong in C6 verification for exactly that reason — it gave up while a
-  legitimate holder was still alive and un-sweepable for up to 26.5 more minutes, parking a healthy
-  card `all-accounts-leased`) — distinct from
-  `AllAccountsCoolingError` (a cooldown, never worth waiting on) — and parks `all-accounts-leased`
-  if that wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
+  process is `AllAccountsLeasedError`, worth a bounded, BLOCKING in-process wait
+  (`config.accountLeaseWaitMs`, default **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the
+  age at which a lease is swept as dead — never the ~90–265s a sibling's own step is *usually*
+  measured at: a waiter has to outlast the longest a sibling can *legitimately* hold the lease, not
+  its typical duration, and the old 5-minute default was found wrong in C6 verification for exactly
+  that reason — it gave up while a legitimate holder was still alive and un-sweepable for up to
+  26.5 more minutes, parking a healthy card `all-accounts-leased`) — distinct from
+  `AllAccountsCoolingError` (a cooldown: still never worth a BLOCKING wait — the worker sleeping
+  in-process for a 1h or 5h cooldown would pin the process for hours, doing nothing — but, since
+  card #119 action 1.2, worth a DEFERRED one: the worker exits and the task is re-enqueued with
+  `notBefore` set to the cooldown's own deadline, see the Account pool bullets above) — and parks
+  `all-accounts-leased` if the lease wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
   `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns), since
   clamping K on lease churn — a lease frees every 90–265s — would make K flap on every single LLM
   call.
@@ -425,7 +441,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
   `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
-  failed and the task fell through to an ordinary park instead).
+  failed and the task fell through to an ordinary park instead), and pool-exhaustion waits (card
+  #119 action 1.2 — `pool-wait`, `{reason, attempt, waitMs, accumulatedWaitMs, notBefore,
+  deadlineSource}`, journalled the same way, right after `parked`, once the queue entry carrying
+  the deferred `notBefore` is written — the task never reaches `PARKED`; `deadlineSource` names
+  which of the three resolution steps supplied the deadline (`earliestCooldownUntil`,
+  `cooldownUntilIso`, or `reason-suffix`); `pool-wait-failed`, `{reason, attempt, error}`, when
+  that write failed and the task fell through to an ordinary park instead — same shape and same
+  reasoning as `transient-retry-failed`, a SEPARATE mechanism with its own budget).
 - `journal/daemon.jsonl` — the daemon-scoped sibling of the per-task journals (dispatcher
   `worker-spawn`/`worker-exit`, the intake/confirm/triage scanners' own
   `report-intake`/`report-confirmed`/`report-triaged`/`auto-triage` events), and since
