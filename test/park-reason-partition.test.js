@@ -7,8 +7,9 @@
 // bucket ("nobody decided") a test failure instead of silence, by scanning the SOURCE for every
 // reason the code can actually produce and requiring each one to land in exactly one of:
 //   - orchestrator/state-machine.js's TRANSIENT_RETRY_REASONS (auto-retried)
-//   - orchestrator/state-machine.js's TERMINAL_PARK_REASONS, or a TERMINAL_PARK_REASON_PREFIXES
-//     rule (human-only, no automatic retry)
+//   - orchestrator/state-machine.js's TERMINAL_PARK_REASONS, a TERMINAL_PARK_REASON_PREFIXES
+//     rule, or -- for the `all-accounts-*` account-pool reasons -- a member of
+//     ACCOUNT_POOL_PARK_REASON_FAMILY (all human-only, no automatic retry)
 //
 // ---- why this duplicates test/park-reason-doc-sweep.test.js's scanning code, rather than
 // importing it -------------------------------------------------------------------------------
@@ -48,6 +49,8 @@ const {
   TRANSIENT_RETRY_REASONS,
   TERMINAL_PARK_REASONS,
   TERMINAL_PARK_REASON_PREFIXES,
+  ACCOUNT_POOL_PARK_REASON_FAMILY,
+  isAccountPoolParkReason,
   classifyParkReason,
 } = require('../orchestrator/state-machine');
 
@@ -356,7 +359,8 @@ test('COVERAGE: every park reason the code can produce is classified transient o
       offenders.push(
         `'${reason}'${info.isPrefix ? ' (prefix family)' : ''} -- produced at ${info.sites.slice(0, 3).join(', ')}` +
           `${info.sites.length > 3 ? `, +${info.sites.length - 3} more` : ''}: ` +
-          'decide explicitly whether it retries: add it to TRANSIENT_RETRY_REASONS or TERMINAL_PARK_REASONS'
+          'decide explicitly whether it retries: add it to TRANSIENT_RETRY_REASONS, TERMINAL_PARK_REASONS, ' +
+          'TERMINAL_PARK_REASON_PREFIXES, or -- for an `all-accounts-*` reason -- ACCOUNT_POOL_PARK_REASON_FAMILY'
       );
     }
   }
@@ -414,6 +418,166 @@ test('NO DEAD ENTRIES: every literal in TERMINAL_PARK_REASONS is actually produc
   );
 });
 
+// ---- ACCOUNT_POOL_PARK_REASON_FAMILY (card #119 action 1.1) -------------------------------------
+//
+// orchestrator/state-machine.js used to scatter the account pool's four terminal reasons across
+// three places (three literals on TERMINAL_PARK_REASONS, one prefix on
+// TERMINAL_PARK_REASON_PREFIXES). Action 1.1 collapsed them into ACCOUNT_POOL_PARK_REASON_FAMILY,
+// a single declared list, and isAccountPoolParkReason(reason), the predicate classifyParkReason
+// now consults as its own step. Action 1.3 added a fifth member (`all-accounts-cooling-wait-cap-
+// exceeded`, the pool-wait mechanism's own cap sink) with no producer anywhere else to begin with.
+// These tests pin the two directions of the rename-safety property that collapse is supposed to
+// buy: every `all-accounts-*` reason the source can actually produce is matched by the family
+// (nothing slipped through the refactor uncovered), and every declared family member corresponds
+// to something the source still produces (no dead member left behind). `no-accounts-registered`
+// is deliberately excluded throughout -- it is not `all-accounts-*` and is not a member of this
+// family (see ACCOUNT_POOL_PARK_REASON_FAMILY's own header).
+
+// capExceededProduced(stateMachineSource) -- card #119 action 1.3's fifth family member is
+// unlike its four siblings: it is not thrown via `new ParkSignal(...)` and it is not passed as a
+// literal into an external `finalizePark(...)` call either, so neither collectRequiredReasons()'s
+// throw-side scan nor its sink-side scan (which explicitly treats finalizePark's own declaration
+// as not-a-call-site) can see it. It is produced by finalizePark's OWN pool-wait branch,
+// reassigning its `reason` local to this literal once the accumulated wait would exceed
+// config.poolExhaustionWaitCapMs. Mirrors the account-lease.js second-producer fix a few actions
+// ago (see this test file's own header above): read the actual producing statement directly out
+// of state-machine.js's source rather than leaving this family's fifth member invisible to both
+// completeness checks below.
+function capExceededProduced(blankedStateMachineSource) {
+  return /\breason\s*=\s*'all-accounts-cooling-wait-cap-exceeded'/.test(blankedStateMachineSource);
+}
+
+test('ACCOUNT POOL FAMILY -- COMPLETENESS: every all-accounts-* reason the code can produce is matched by isAccountPoolParkReason', () => {
+  const { required } = collectRequiredReasons();
+  const scannedAccountPoolReasons = [...required.keys()].filter((r) => r.startsWith('all-accounts-'));
+
+  assert.ok(
+    scannedAccountPoolReasons.length >= 4,
+    `expected at least 4 distinct all-accounts-* reasons/prefixes in the source scan, found ${scannedAccountPoolReasons.length} -- has a resolver stopped matching accounts.js/state-machine.js?`
+  );
+
+  // collectRequiredReasons() alone is NOT complete for this family, and the gap was measured
+  // rather than guessed: it keys off `new ParkSignal(...)` call sites, and orchestrator/
+  // account-lease.js contains none -- yet it is a SECOND producer of `all-accounts-leased`, via
+  // `new accountsModule.AllAccountsLeasedError('all-accounts-leased', detail)`. That call is also
+  // invisible to park-reason-doc-sweep's resolveAccountPoolReasons, whose regex requires an
+  // UNQUALIFIED `new AllAccountsLeasedError(`. Renaming that one call site left this whole file
+  // green (14/14) during this action's verification. So scan account-lease.js directly, allowing
+  // an optional `<ident>.` qualifier on the constructor.
+  //
+  // Comments are skipped line-wise (the same `trimStart().startsWith('//')` idiom the deck's own
+  // sweep uses) because this file discusses the family in prose -- it writes the bare shorthand
+  // `all-accounts-cooling`, which is NOT a reason any code produces. A scan fooled by that would
+  // demand a family member that does not exist.
+  const leaseSrc = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'account-lease.js'), 'utf8');
+  const leaseProduced = new Set();
+  for (const line of leaseSrc.split('\n')) {
+    if (line.trimStart().startsWith('//')) continue;
+    for (const m of line.matchAll(/new\s+(?:[A-Za-z_$][\w$]*\s*\.\s*)?[A-Za-z_$][\w$]*Error\(\s*'(all-accounts-[a-z0-9-]*)'/g)) {
+      leaseProduced.add(m[1]);
+    }
+  }
+  assert.ok(
+    leaseProduced.size >= 1,
+    'expected account-lease.js to still produce at least one all-accounts-* reason -- if it no longer does, ' +
+      'this scan has gone dead and should be removed on purpose rather than left passing vacuously'
+  );
+
+  const stateMachineSrc = blankComments(fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'state-machine.js'), 'utf8'));
+  const capExceeded = capExceededProduced(stateMachineSrc) ? ['all-accounts-cooling-wait-cap-exceeded'] : [];
+  assert.ok(
+    capExceeded.length === 1,
+    "expected orchestrator/state-machine.js to still reassign `reason = 'all-accounts-cooling-wait-cap-exceeded'` " +
+      'in finalizePark\'s pool-wait branch -- if that shape changed, this scan has gone dead and should be ' +
+      'removed on purpose rather than left passing vacuously'
+  );
+
+  const unmatched = [...scannedAccountPoolReasons, ...leaseProduced, ...capExceeded].filter((r) => !isAccountPoolParkReason(r));
+  assert.deepEqual(
+    unmatched,
+    [],
+    `all-accounts-* reason(s) produced by the code but NOT matched by isAccountPoolParkReason -- ` +
+      `update ACCOUNT_POOL_PARK_REASON_FAMILY in orchestrator/state-machine.js:\n  ${unmatched.join('\n  ')}`
+  );
+});
+
+test('ACCOUNT POOL FAMILY -- NO DEAD MEMBERS: every declared family member is still producible by the code', () => {
+  const { required } = collectRequiredReasons();
+  const scannedAccountPoolReasons = [...required.keys()].filter((r) => r.startsWith('all-accounts-'));
+
+  // The fifth member (action 1.3) is invisible to collectRequiredReasons() by construction (see
+  // capExceededProduced's own header above) -- scanned here the same targeted way the COMPLETENESS
+  // test above scans account-lease.js for the second `all-accounts-leased` producer.
+  const stateMachineSrc = blankComments(fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'state-machine.js'), 'utf8'));
+  const producible = capExceededProduced(stateMachineSrc)
+    ? [...scannedAccountPoolReasons, 'all-accounts-cooling-wait-cap-exceeded']
+    : scannedAccountPoolReasons;
+
+  // For a literal member, the scan records the member's own string. For the prefix member, the
+  // scan records the bare prefix itself (resolveAccountPoolReasons resolves the ternary's dynamic
+  // branch to `{kind: 'prefix', value: 'all-accounts-cooling-until-'}`, not a timestamped
+  // instance) -- so `match` is what to look for either way.
+  const dead = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((member) => !producible.includes(member.match));
+  assert.deepEqual(
+    dead.map((m) => m.match),
+    [],
+    `dead entry/entries in ACCOUNT_POOL_PARK_REASON_FAMILY (declared but no longer, or never, ` +
+      `producible by the code -- remove them from orchestrator/state-machine.js): ${dead.map((m) => m.match).join(', ')}`
+  );
+});
+
+test('ACCOUNT POOL FAMILY -- rename-safety, positive: all five members classify terminal via the family, none is transient', () => {
+  const representative = {
+    'all-accounts-leased': 'all-accounts-leased',
+    'all-accounts-cooling-unknown': 'all-accounts-cooling-unknown',
+    'all-accounts-cooling-until-': 'all-accounts-cooling-until-2026-09-04T20:33:05.932Z',
+    'all-accounts-cooling-after-retry': 'all-accounts-cooling-after-retry',
+    'all-accounts-cooling-wait-cap-exceeded': 'all-accounts-cooling-wait-cap-exceeded',
+  };
+  for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
+    const sample = representative[member.match];
+    assert.ok(sample, `no representative sample wired up for family member '${member.match}' -- add one to this test`);
+    assert.equal(isAccountPoolParkReason(sample), true, `isAccountPoolParkReason('${sample}') should be true`);
+    assert.equal(classifyParkReason(sample), 'terminal', `classifyParkReason('${sample}') should be 'terminal'`);
+    assert.equal(TRANSIENT_RETRY_REASONS.has(sample), false, `'${sample}' must not be on TRANSIENT_RETRY_REASONS`);
+  }
+});
+
+test('ACCOUNT POOL FAMILY -- absorption guard, negative: a brand-new all-accounts-* reason is NOT absorbed', () => {
+  assert.equal(isAccountPoolParkReason('all-accounts-brand-new-thing'), false);
+  assert.equal(classifyParkReason('all-accounts-brand-new-thing'), 'unclassified');
+});
+
+// The `kind` field is the whole point of the family list: a `literal` member matches by EXACT
+// equality, only the `prefix` member matches by startsWith. Nothing above pins that -- the guard
+// immediately above uses 'all-accounts-brand-new-thing', which shares no member's prefix, so it
+// stays green even if every member were matched with startsWith. That mutation was introduced
+// deliberately during this action's verification and SURVIVED the whole suite (2326/0), silently
+// absorbing 'all-accounts-leased-extra' & co. as `terminal` -- exactly the failure mode
+// isAccountPoolParkReason's own header forbids. These are the assertions that kill it: for every
+// literal member, the member's own string PLUS a suffix must NOT match.
+test('ACCOUNT POOL FAMILY -- a literal member matches by exact equality, never by prefix: a suffixed variant is not absorbed', () => {
+  const literals = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((m) => m.kind === 'literal');
+  assert.ok(literals.length >= 4, `expected the family's literal members (four, since action 1.3's cap-exceeded sink), found ${literals.length}`);
+  for (const member of literals) {
+    const suffixed = `${member.match}-extra`;
+    assert.equal(
+      isAccountPoolParkReason(suffixed),
+      false,
+      `'${suffixed}' must NOT match: '${member.match}' is a \`literal\` member and literals match by exact ` +
+        `equality. If this fails, isAccountPoolParkReason has started matching literals with startsWith, ` +
+        `which silently absorbs any longer reason built on a member's name as terminal.`
+    );
+    assert.equal(classifyParkReason(suffixed), 'unclassified', `classifyParkReason('${suffixed}') should be 'unclassified'`);
+  }
+});
+
+test("ACCOUNT POOL FAMILY -- no-accounts-registered is excluded: it is not all-accounts-*, and stays a plain TERMINAL_PARK_REASONS literal", () => {
+  assert.equal(isAccountPoolParkReason('no-accounts-registered'), false);
+  assert.equal(TERMINAL_PARK_REASONS.has('no-accounts-registered'), true);
+  assert.equal(classifyParkReason('no-accounts-registered'), 'terminal');
+});
+
 // ---- the rename trap, directly --------------------------------------------------------------
 //
 // Pins the exact failure mode this file exists to catch: a reason produced by code but present in
@@ -451,11 +615,12 @@ test('classifyParkReason: a reason on TERMINAL_PARK_REASONS classifies as termin
   }
 });
 
-test('classifyParkReason: the two dynamic terminal prefix families classify as terminal for a representative instance, not just the bare prefix', () => {
-  assert.equal(classifyParkReason('all-accounts-cooling-until-2026-09-05T19:32:33.350Z'), 'terminal');
-  assert.equal(classifyParkReason('prompt-missing-placeholder:files_to_change'), 'terminal');
+test('classifyParkReason: the two dynamic terminal prefix families (one on ACCOUNT_POOL_PARK_REASON_FAMILY, one on TERMINAL_PARK_REASON_PREFIXES) classify as terminal for a representative instance, not just the bare prefix', () => {
+  assert.equal(classifyParkReason('all-accounts-cooling-until-2026-09-05T19:32:33.350Z'), 'terminal'); // ACCOUNT_POOL_PARK_REASON_FAMILY, since action 1.1 (card #119)
+  assert.equal(classifyParkReason('prompt-missing-placeholder:files_to_change'), 'terminal'); // still TERMINAL_PARK_REASON_PREFIXES
   // A string that merely CONTAINS a prefix without starting with it must not match (substring vs.
-  // startsWith -- TERMINAL_PARK_REASON_PREFIXES's own header states this is a startsWith test).
+  // startsWith -- both ACCOUNT_POOL_PARK_REASON_FAMILY's and TERMINAL_PARK_REASON_PREFIXES's own
+  // headers state this is a startsWith test).
   assert.equal(classifyParkReason('should-not-match-all-accounts-cooling-until-2026'), 'unclassified');
 });
 

@@ -740,8 +740,12 @@ entries lost), the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses t
 create is exactly the defect that idiom replaced, not a shortcut this path still takes.
 
 A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
-**bounded wait** (`config.accountLeaseWaitMs`) before parking `all-accounts-leased` — distinct
-from `AllAccountsCoolingError` (a cooldown, never worth waiting on; that still parks immediately).
+**bounded, blocking, in-process wait** (`config.accountLeaseWaitMs`) before parking
+`all-accounts-leased` — distinct from `AllAccountsCoolingError` (a cooldown: still never worth a
+BLOCKING wait, since a 1h or 5h cooldown would pin the process for hours doing nothing — but,
+since card #119 action 1.2, worth a DEFERRED one instead: the worker exits and the task is
+re-enqueued with `notBefore` set to the cooldown's own deadline, see
+doc/state-machine-spec.md's Account pool section).
 The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×
 `LLM_STEP_DEADLINE_MS` plus 10% slack) — the age at which a lease is presumed dead and swept
 regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That distinction
@@ -800,7 +804,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:747`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:766`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via

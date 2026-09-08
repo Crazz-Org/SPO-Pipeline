@@ -1389,7 +1389,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
-  "doc/board-audit.md :: config.js:874",
+  "doc/board-audit.md :: config.js:893", // re-pinned from :874 -- card #119 action 1.2 added 19 lines to config.js above reportIntakeColumn (poolExhaustionWaitCapMs), a true pure shift
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1109",
@@ -1398,7 +1398,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
-  "orchestrator/README.md :: config.js:747",
+  "orchestrator/README.md :: config.js:766", // re-pinned from :747 -- card #119 action 1.2 added 19 lines to config.js above productRepo (poolExhaustionWaitCapMs), a true pure shift
   "orchestrator/README.md :: dispatcher.js:634-648",
   "orchestrator/README.md :: doc/state-machine-spec.md:150",
   "orchestrator/README.md :: intake.js:797-799",
@@ -1417,7 +1417,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/park-loop.js :: intake.js:797-799",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
-  "orchestrator/state-machine.js :: park-loop.js:1262", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate
+  "orchestrator/state-machine.js :: park-loop.js:1283", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Both are pure shifts: the cited line is byte-identical at every one of the three numbers.
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/state-machine.js :: step-contracts.js:326", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`
   "orchestrator/steps/llm.js :: intake.js:797-799",
@@ -2140,16 +2140,19 @@ const ANCHOR_BLUNT_CITATIONS = {
   'orchestrator/park-loop.js :: doc/remediation-progress.md:658':
     "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 649 and its own " +
     'continuation line 650. Citation confirmed correct by hand: 649 is the bullet heading.',
-  // state-machine.js: UNDRAINABLE_STATES's own header cites park-loop.js:1262 (`if
+  // state-machine.js: UNDRAINABLE_STATES's own header cites park-loop.js:1283 (`if
   // (state.state !== 'PARKED') continue;`) for why ABANDONED's retry branch is unreachable. Line
-  // 1261, the comment immediately above the cited gate, reads "...only reconcileExternalClosure
-  // runs for it." -- `reconcileExternalClosure` ALONE is on that line ('PARKED' itself is on 1260
-  // and on the cited line 1262, not on 1261), and that one candidate is enough on its own to make
-  // the citation anchor a line up too. Citation confirmed correct by hand: 1262 IS the gate line.
-  'orchestrator/state-machine.js :: park-loop.js:1262':
-    "target's own preceding comment line (1261) already names 'reconcileExternalClosure' -- that " +
-    "one candidate alone anchors it a line up ('PARKED' itself is on 1260 and on the cited line " +
-    '1262, not on 1261). Citation confirmed correct by hand: 1262 is the ' +
+  // 1272, the comment immediately above the cited gate, reads "...only reconcileExternalClosure
+  // runs for it." -- `reconcileExternalClosure` ALONE is on that line ('PARKED' itself is on 1271
+  // and on the cited line 1273, not on 1272), and that one candidate is enough on its own to make
+  // the citation anchor a line up too. Citation confirmed correct by hand: 1273 IS the gate line.
+  // Re-pinned from :1262 for card #119 action 1.2, which added 11 lines to reEnqueueTask's own
+  // header comment (documenting the poolWaitMs/poolWaitAttempts strip) above this gate -- a true
+  // pure shift, same target, same shape.
+  'orchestrator/state-machine.js :: park-loop.js:1283':
+    "target's own preceding comment line (1272) already names 'reconcileExternalClosure' -- that " +
+    "one candidate alone anchors it a line up ('PARKED' itself is on 1271 and on the cited line " +
+    '1273, not on 1272). Citation confirmed correct by hand: 1273 is the ' +
     '`if (state.state !== \'PARKED\') continue;` line.',
 };
 
@@ -2159,7 +2162,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
     [
       'orchestrator/README.md :: doc/state-machine-spec.md:150',
       'orchestrator/park-loop.js :: doc/remediation-progress.md:658',
-      'orchestrator/state-machine.js :: park-loop.js:1262',
+      'orchestrator/state-machine.js :: park-loop.js:1283',
     ],
     'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +
       'by hand and justify it here before pinning it, exactly as CITATION_ANCHOR_ALLOWLIST requires.'
@@ -2207,6 +2210,10 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // card #80 (2026-09-06): +1 citation, `orchestrator/state-machine.js :: park-loop.js:1262`,
   // single-line and BLUNT (see ANCHOR_BLUNT_CITATIONS above) -- blunt is 2 -> 3; discriminating
   // and ranges are unchanged.
+  // card #119 action 1.2 (2026-09-08): no citation added or removed, but this action's own edit to
+  // park-loop.js's reEnqueueTask header comment shifted the ABOVE citation's target from :1262 to
+  // :1273 (a true pure shift -- see ANCHOR_BLUNT_CITATIONS's own updated entry). Still BLUNT, same
+  // shape, same reasoning; blunt/discriminating/ranges counts are unchanged by this.
   // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
   // -- single-line, anchored on `touchesRdoMembers`, which appears on line 326 only (neither 325
   // nor 327 mentions it), so it discriminates a one-line drift -- discriminating is 16 -> 17.

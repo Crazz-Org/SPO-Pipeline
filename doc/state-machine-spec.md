@@ -326,6 +326,40 @@ separate repos with no shared runtime.
   currently available) and from `all-accounts-cooling-after-retry` below (which fires only once
   every account in one full rotation pass was actually tried and limited, not merely found
   cooling before a single call was attempted).
+- **A cooling park is now a deferred wait, not just a park** (card #119, action 1.2): whenever the
+  deadline is recoverable from the park detail — `all-accounts-cooling-until-<ISO>` and
+  `all-accounts-cooling-after-retry` both carry one, by the two bullets above and below —
+  `state-machine.js`'s `finalizePark` re-enqueues the task with `notBefore` set to that exact
+  deadline instead of parking it outright: the worker exits, and the card comes back on its own
+  once the cooldown clears, no maintainer `retry` reply required. This is a mechanism separate
+  from the transient-retry budget described elsewhere in this spec, with its own cap
+  (`config.poolExhaustionWaitCapMs`, 12h) tracked as the task's ACCUMULATED wait rather than a
+  fixed retry count. `all-accounts-cooling-unknown` and `all-accounts-leased` never wait this way —
+  neither carries a recoverable deadline (no cooldown ever recorded a time; a lease, not a
+  cooldown) — and both still park exactly as they did before this action.
+- **Exceeding the cap is its own park reason, carrying the evidence** (card #119, action 1.3):
+  before this action, once the accumulated wait would exceed `poolExhaustionWaitCapMs` the park
+  fell straight through, silently, under the SAME reason the original cooling park carried — a
+  maintainer reading it could not tell "the pool blipped and we parked immediately" apart from
+  "the machine waited most of a day and gave up." `finalizePark` now reassigns the park to its own
+  reason, `all-accounts-cooling-wait-cap-exceeded` — a fifth `ACCOUNT_POOL_PARK_REASON_FAMILY`
+  member, classified terminal like its four siblings but produced differently: it is never thrown
+  as a `ParkSignal`, it is `finalizePark`'s own pool-wait branch reassigning its `reason` local.
+  Its park detail carries the accumulated wait, the number of waits already taken, the cap that was
+  exceeded, the deadline that would have been waited for, and the ORIGINAL family reason that
+  triggered the wait (accounts.js's pick() or this file's own `all-accounts-cooling-after-retry`)
+  — so the original evidence is never thrown away. No cooldown deadline is ever recoverable from
+  this reason itself, by construction: `poolCooldownDeadlineMs` returns `null` for it explicitly,
+  checked by name before either detail key is read, regardless of what its own evidence detail
+  carries. This is the loop guard the cap exists to protect — without it, a cap-exceeded park whose
+  detail happens to carry the original deadline would be re-enqueued forever the next time it is
+  parked, reintroducing the exact unbounded hang the cap exists to prevent. The cap's basis (do not
+  re-derive; measured against this lot's banked corpus) is two independent real numbers: the
+  longest genuine pool-wide outage, 7.12h (merging all 12 `account-cooldown` intervals pool-wide
+  into 7 episodes — 1.00h ×5, 5.00h, 7.12h), and the worst accumulated single-card wait, 5.00h
+  (issue-497); the observed maximum number of re-enqueues for any one card is 2. NEVER cite
+  16.69h — that figure does not reproduce: the whole-cluster span is 16.63h, but it contains a
+  ~3.6h window in which the pool was not limited at all, so it is not an outage duration.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
@@ -361,7 +395,8 @@ separate repos with no shared runtime.
   `ParkSignal('all-accounts-cooling-after-retry', {attempts, lastResult, cooldownUntilIso})`,
   thrown by `callLlmStep` itself once its attempt loop runs out of accounts — carries the last
   cooldown's own ISO timestamp explicitly rather than relying on `pick()`'s own reason string,
-  which that path never reaches.
+  which that path never reaches. That same `cooldownUntilIso` is what the deferred wait above
+  (card #119, action 1.2) reads as this reason's deadline.
 - This rotation rule is not daemon-only: `orchestrator/intake.js`'s three maintainer/auto-triage
   LLM steps (draftCard, reviewCard, triageBugReport) follow it too, via their own
   `callIntakeStepWithRotation` helper — same pick/call/cool/rotate mechanics as
@@ -391,15 +426,18 @@ separate repos with no shared runtime.
   deterministic first-fit, invisible under the pre-C6 single-threaded daemon and a real bug once
   a worker and the scanner can run at once. A lease is per-step, not per-task, released the
   instant the one LLM call it wraps finishes; a healthy account currently leased by another live
-  process is `AllAccountsLeasedError`, worth a bounded wait (`config.accountLeaseWaitMs`, default
-  **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the age at which a lease is swept as
-  dead — never the ~90–265s a sibling's own step is *usually* measured at: a waiter has to outlast
-  the longest a sibling can *legitimately* hold the lease, not its typical duration, and the old
-  5-minute default was found wrong in C6 verification for exactly that reason — it gave up while a
-  legitimate holder was still alive and un-sweepable for up to 26.5 more minutes, parking a healthy
-  card `all-accounts-leased`) — distinct from
-  `AllAccountsCoolingError` (a cooldown, never worth waiting on) — and parks `all-accounts-leased`
-  if that wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
+  process is `AllAccountsLeasedError`, worth a bounded, BLOCKING in-process wait
+  (`config.accountLeaseWaitMs`, default **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the
+  age at which a lease is swept as dead — never the ~90–265s a sibling's own step is *usually*
+  measured at: a waiter has to outlast the longest a sibling can *legitimately* hold the lease, not
+  its typical duration, and the old 5-minute default was found wrong in C6 verification for exactly
+  that reason — it gave up while a legitimate holder was still alive and un-sweepable for up to
+  26.5 more minutes, parking a healthy card `all-accounts-leased`) — distinct from
+  `AllAccountsCoolingError` (a cooldown: still never worth a BLOCKING wait — the worker sleeping
+  in-process for a 1h or 5h cooldown would pin the process for hours, doing nothing — but, since
+  card #119 action 1.2, worth a DEFERRED one: the worker exits and the task is re-enqueued with
+  `notBefore` set to the cooldown's own deadline, see the Account pool bullets above) — and parks
+  `all-accounts-leased` if the lease wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
   `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns), since
   clamping K on lease churn — a lease frees every 90–265s — would make K flap on every single LLM
   call.
@@ -425,7 +463,19 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
   a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
   `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
-  failed and the task fell through to an ordinary park instead).
+  failed and the task fell through to an ordinary park instead), and pool-exhaustion waits (card
+  #119 action 1.2 — `pool-wait`, `{reason, attempt, waitMs, accumulatedWaitMs, notBefore,
+  deadlineSource}`, journalled the same way, right after `parked`, once the queue entry carrying
+  the deferred `notBefore` is written — the task never reaches `PARKED`; `deadlineSource` names
+  which of the three resolution steps supplied the deadline (`earliestCooldownUntil`,
+  `cooldownUntilIso`, or `reason-suffix`); `pool-wait-failed`, `{reason, attempt, error}`, when
+  that write failed and the task fell through to an ordinary park instead — same shape and same
+  reasoning as `transient-retry-failed`, a SEPARATE mechanism with its own budget; and, since card
+  #119 action 1.3, `pool-wait-cap-exceeded`, `{reason, poolWaitAttempts, accumulatedWaitMs, capMs,
+  deadlineMs}`, journalled right after `parked` when the accumulated wait WOULD exceed the cap —
+  `reason` here is the ORIGINAL family reason that triggered the wait, not the new
+  `all-accounts-cooling-wait-cap-exceeded` reason the task actually parks under; this event is the
+  audit trail for the cap binding, the park's own `reason`/detail carry the rest of the evidence).
 - `journal/daemon.jsonl` — the daemon-scoped sibling of the per-task journals (dispatcher
   `worker-spawn`/`worker-exit`, the intake/confirm/triage scanners' own
   `report-intake`/`report-confirmed`/`report-triaged`/`auto-triage` events), and since
@@ -719,8 +769,13 @@ idempotency contract.
 
 ## Park-reason classification
 
-Every park reason the code can produce is classified either transient (`TRANSIENT_RETRY_REASONS`)
-or terminal (`TERMINAL_PARK_REASONS` / `TERMINAL_PARK_REASON_PREFIXES`), both keyed on the exact
-reason string; disjointness and full coverage are enforced by `test/park-reason-partition.test.js`.
+Every park reason the code can produce is classified either transient (`TRANSIENT_RETRY_REASONS`,
+keyed on the exact reason string) or terminal — the latter across three declarations:
+`TERMINAL_PARK_REASONS` (exact string), `TERMINAL_PARK_REASON_PREFIXES` (`startsWith`), and
+`ACCOUNT_POOL_PARK_REASON_FAMILY`, which holds the five account-pool reasons together in one place
+so that the *classification* side of renaming or splitting any of them is a single-list edit. (The
+rename itself is not: the producer and the partition test's own representative sample must move
+too, and the test fails by name until they do.) Disjointness and full coverage are enforced by
+`test/park-reason-partition.test.js`.
 SPO-Pipeline#85's five GitHub-mergeability-cause reasons (`merge-conflict`, `merge-blocked`,
 `merge-behind-base`, `merge-pr-draft`, `merge-checks-failing`) are all terminal.

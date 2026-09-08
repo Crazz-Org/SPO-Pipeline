@@ -266,6 +266,25 @@ module.exports = {
   // visible in the journal, not just "retrying".
   transientRetryDelaysMs: [60 * 1000, 5 * 60 * 1000],
 
+  // ---- action 1.2 (card #119): the pool-exhaustion WAIT cap -- a SEPARATE mechanism from
+  // transientRetryBudget/transientRetryDelaysMs above, sharing none of its budget or delay table.
+  // A cooling account-pool park (state-machine.js's ACCOUNT_POOL_PARK_REASON_FAMILY, when a
+  // deadline is recoverable -- poolCooldownDeadlineMs) is re-enqueued with `notBefore` set to that
+  // deadline instead of parking outright, PROVIDED the accumulated wait for this task
+  // (ctx.task.poolWaitMs) does not EXCEED this cap -- the test is `<=`, so exactly at the cap
+  // still waits; past it, the card parks `all-accounts-cooling-wait-cap-exceeded` (action 1.3).
+  //
+  // poolExhaustionWaitCapMs: 12 hours. Basis, measured against this lot's banked corpus (do not
+  // re-derive; see this action's own spec) -- two independent numbers, both real:
+  //   - the longest genuine pool-wide outage measured is 7.12h: merging all 12 `account-cooldown`
+  //     intervals pool-wide gives 7 episodes -- 1.00h x5, 5.00h, 7.12h;
+  //   - the worst accumulated single-card wait in the corpus is 5.00h (issue-497).
+  // 12h covers the worst OF EITHER measurement with headroom to spare, without being so large that
+  // a task can sit re-enqueued for the better part of a day. NEVER cite 16.69h here -- that figure
+  // does not reproduce: the whole-cluster span is 16.63h, but it contains a ~3.6h window in which
+  // the pool was not limited at all, so it is not an outage duration.
+  poolExhaustionWaitCapMs: 12 * 60 * 60 * 1000,
+
   // CI_CHECKS -> IMPLEMENT retry budget: a separate counter from diagnoseBudget and
   // validateRejectBudget (action 4.3). Before this action, ci-cause-table.js classified on the
   // check NAME, which -- see that file's header -- was never one GitHub Actions actually

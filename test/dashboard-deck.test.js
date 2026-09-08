@@ -331,7 +331,13 @@ test('every literal ParkSignal reason in the orchestrator has a plain-language s
   }
   assert.ok(reasons.size >= 60, `expected the full park-reason set, found ${reasons.size}`);
 
-  const dynamic = (r) => r.startsWith('all-accounts-cooling') || r.startsWith('llm-transport-failed');
+  // Only `all-accounts-cooling-until-<ISO>` is genuinely unenumerable (accounts.js's pick()
+  // appends a timestamp, so the reason can never repeat exactly). `all-accounts-cooling-unknown`,
+  // `all-accounts-cooling-after-retry` and `all-accounts-cooling-wait-cap-exceeded` are ordinary
+  // literals with their own PARK_REASONS entries -- a blanket `all-accounts-cooling` prefix here
+  // excused all three from ever being required to have one, which is exactly how
+  // `all-accounts-cooling-unknown` went missing a sentence unnoticed (card #119 action 1.4).
+  const dynamic = (r) => r.startsWith('all-accounts-cooling-until-') || r.startsWith('llm-transport-failed');
   const missing = [...reasons].filter((r) => !dynamic(r) && !PARK_REASONS[r]);
   assert.deepEqual(missing, [], `park reasons with no plain-language sentence: ${missing.join(', ')}`);
 });
@@ -342,6 +348,55 @@ test("the deck's self-retrying set matches the orchestrator's own, so the deck c
   const listed = [...block.slice(0, block.indexOf(']);')).matchAll(/'([a-z-]+)'/g)].map((m) => m[1]);
   const { SELF_RETRYING } = require('../console/plain-language');
   assert.deepEqual([...SELF_RETRYING].sort(), listed.sort());
+
+  // The mirror above only constrains the LITERAL set -- it says nothing about the reasons
+  // reasonText() handles by prefix rather than by table lookup. That is exactly the hole that let
+  // the cooling branch hardcode `selfRetrying: true` and still pass a test named to forbid
+  // precisely that: the branch never went near SELF_RETRYING, so nothing here noticed. Close it by
+  // checking EVERY reason the orchestrator can actually produce -- not a second hand-typed table,
+  // but the orchestrator's own exported functions, the same ones production code calls.
+  const {
+    TRANSIENT_RETRY_REASONS,
+    ACCOUNT_POOL_PARK_REASON_FAMILY,
+    poolCooldownDeadlineMs,
+  } = require('../orchestrator/state-machine');
+  const { reasonText } = require('../console/plain-language');
+
+  // TRANSIENT_RETRY_REASONS already contains every `llm-transport-failed:<STEP>` literal
+  // (state-machine.js builds it that way), so this one loop covers both the plain transient
+  // reasons and that second dynamic family in one pass.
+  for (const r of TRANSIENT_RETRY_REASONS) {
+    assert.equal(reasonText(r).selfRetrying, true, `${r} is in TRANSIENT_RETRY_REASONS but reasonText says it is not self-retrying`);
+  }
+
+  // The account-pool family: a representative instance per member (the prefix member gets a real
+  // ISO suffix), checked against poolCooldownDeadlineMs -- the orchestrator's OWN answer to "does
+  // this reason carry a recoverable wait deadline", which is exactly the fact that determines
+  // whether action 1.2's pool-wait branch re-enqueues it instead of parking it. A detail object
+  // carrying both shapes poolCooldownDeadlineMs reads is supplied for every member; its own
+  // structural gate (checked first, by reason name, before either detail key is read -- see that
+  // function's header) is what makes the other three resolve to null regardless of this detail.
+  //
+  // The oracle is pinned at ONE point in the input space, deliberately, and saying so is the
+  // honest version of this comment: reasonText's answer is a function of the reason alone, while
+  // poolCooldownDeadlineMs's is a function of (reason, detail). The two provably disagree at
+  // ('all-accounts-cooling-after-retry', {}) -- no detail, so no deadline, so no wait -- which the
+  // detail chosen here hides. That input is not live-producible today (callLlmStep's throw site
+  // always writes cooldownUntilIso), so this is a BOUNDED oracle rather than a wrong one; a change
+  // that let that throw omit the key would need this test rethought, not merely re-run.
+  const detail = {
+    earliestCooldownUntil: Date.parse('2026-09-05T19:32:33.350Z'),
+    cooldownUntilIso: '2026-09-05T19:32:33.350Z',
+  };
+  for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
+    const instance = member.kind === 'prefix' ? `${member.match}2026-09-05T19:32:33.350Z` : member.match;
+    const expected = poolCooldownDeadlineMs(instance, detail) !== null;
+    assert.equal(
+      reasonText(instance).selfRetrying,
+      expected,
+      `${instance}: reasonText says selfRetrying=${reasonText(instance).selfRetrying}, but the orchestrator's own poolCooldownDeadlineMs says ${expected}`
+    );
+  }
 });
 
 test('reasonText handles the two dynamic reason families by prefix, and degrades honestly on an unknown one', () => {
@@ -359,6 +414,142 @@ test('reasonText handles the two dynamic reason families by prefix, and degrades
   assert.equal(unknown.text, 'some brand new reason');
 
   assert.equal(reasonText('diagnose-budget-exhausted').selfRetrying, false);
+
+  // The account-pool family's other three members: no deadline exists (cooling-unknown), a lease
+  // rather than a cooldown (leased), or this IS the give-up (cap-exceeded) -- none of the three
+  // comes back on its own, and each now has its own sentence (card #119 action 1.4).
+  assert.equal(reasonText('all-accounts-cooling-unknown').selfRetrying, false);
+  assert.equal(reasonText('all-accounts-leased').selfRetrying, false);
+  assert.equal(reasonText('all-accounts-cooling-wait-cap-exceeded').selfRetrying, false);
+  // ...while the family's OTHER deadline-carrying member matches `-until-`'s own verdict -- fixing
+  // the false statement in the direction that was previously wrong: today this reason falls
+  // through to the table and reports `selfRetrying: false`, which told the maintainer to intervene
+  // on a card already scheduled to return on its own.
+  assert.equal(reasonText('all-accounts-cooling-after-retry').selfRetrying, true);
+});
+
+// Repairs from action 1.4's adversarial verification (36 mutations, 22 killed, 14 survived). The
+// BEHAVIOUR above is well pinned -- every drift that would make the deck promise a retry that will
+// never come is caught. What survived is everything else about the mirror: its membership, its
+// matching convention, its sentences, and the deadline text.
+test("the deck's account-pool mirror has exactly the orchestrator's own members, matched the same way", () => {
+  const { ACCOUNT_POOL_PARK_REASON_FAMILY } = require('../orchestrator/state-machine');
+  const { ACCOUNT_POOL_SELF_RETRYING } = require('../console/plain-language');
+
+  // MEMBERSHIP, pinned by deepEqual -- the way SELF_RETRYING is pinned against
+  // TRANSIENT_RETRY_REASONS. Before this, deleting four of the five mirror members left the suite
+  // green: the deck's fallback also answers `selfRetrying: false`, so the PROMISE stayed correct
+  // while the member silently lost its sentence and its declared `kind`. A behavioural pin alone
+  // cannot see that, because both sides of the drift give the same answer.
+  const shape = (list) => list.map(({ match, kind }) => `${kind}:${match}`).sort();
+  assert.deepEqual(
+    shape(ACCOUNT_POOL_SELF_RETRYING),
+    shape(ACCOUNT_POOL_PARK_REASON_FAMILY),
+    'console/plain-language.js mirrors orchestrator/state-machine.js here -- a member added, removed or ' +
+      'given a different `kind` there must be mirrored, or the deck silently stops describing it'
+  );
+});
+
+test('the deck matches a literal family member by exact equality and a prefix member by startsWith -- never a substring', () => {
+  // The same gap that survived on the ORCHESTRATOR side earlier in this lot, reproduced verbatim
+  // in the deck's own copy: accountPoolMember's comment states the convention ("never a substring
+  // test") and nothing enforced it. Matching literals with startsWith, or prefixes with includes,
+  // both survived the whole suite.
+  // Asserted against accountPoolMember directly. Through reasonText the literal case is
+  // unreachable -- the table branch is gated on an exact `PARK_REASONS[reason]` lookup, so a
+  // literal matched with startsWith would change no observable answer, and the mutation is an
+  // equivalent one there. The convention is still a real contract this file states, so it is
+  // pinned where it can actually be observed.
+  const { accountPoolMember } = require('../console/plain-language');
+
+  assert.equal(accountPoolMember('all-accounts-leased').match, 'all-accounts-leased', 'sanity: the exact literal matches');
+  assert.equal(accountPoolMember('all-accounts-leased-extra'), undefined, "a literal member's name plus a suffix is NOT that member");
+  assert.equal(accountPoolMember('all-accounts-cooling-unknown-and-more'), undefined);
+  assert.equal(accountPoolMember('all-accounts-cooling-after-retry-v2'), undefined);
+
+  assert.equal(
+    accountPoolMember('all-accounts-cooling-until-2026-09-05T19:32:33.350Z').kind,
+    'prefix',
+    'sanity: the prefix member matches an instance carrying a timestamp'
+  );
+  assert.equal(
+    accountPoolMember('nope-all-accounts-cooling-until-2026-09-05T19:32:33.350Z'),
+    undefined,
+    'a string merely CONTAINING the prefix must not match it -- startsWith, never includes'
+  );
+  // ...and the same string must not be described as a known reason by the deck either, which is
+  // the reachable consequence of the prefix half of the convention.
+  assert.equal(reasonText('nope-all-accounts-cooling-until-2026-09-05T19:32:33.350Z').known, false);
+});
+
+test("the deck's llm-transport-failed answer is derived from the orchestrator's step list, not hardcoded true", () => {
+  // The second dynamic family had the SAME defect as the cooling branch and it outlived action
+  // 1.4: `selfRetrying: true` returned unconditionally, never consulting TRANSIENT_RETRY_REASONS.
+  // Verification demonstrated it concretely -- narrow TRANSIENT_RETRY_LLM_STEPS by one step, add
+  // that reason to TERMINAL_PARK_REASONS so the narrowing is deliberate, and the deck goes on
+  // promising a retry for a now-terminal reason with nothing failing. The guard above could not
+  // see it: it only iterates reasons that ARE in the set, so it checks one direction.
+  const { TRANSIENT_RETRY_REASONS } = require('../orchestrator/state-machine');
+  const { SELF_RETRYING_LLM_STEPS } = require('../console/plain-language');
+  const PREFIX = 'llm-transport-failed:';
+
+  // The orchestrator's own list, read back out of the set it builds rather than re-typed here.
+  const orchestratorSteps = [...TRANSIENT_RETRY_REASONS]
+    .filter((r) => r.startsWith(PREFIX))
+    .map((r) => r.slice(PREFIX.length));
+  assert.deepEqual(
+    [...SELF_RETRYING_LLM_STEPS].sort(),
+    orchestratorSteps.sort(),
+    "console/plain-language.js mirrors state-machine.js's TRANSIENT_RETRY_LLM_STEPS -- narrowing that " +
+      'list without narrowing this one leaves the deck promising a retry for a step that is now terminal'
+  );
+
+  // Both directions, against the orchestrator's own membership -- including a step deliberately
+  // NOT in the set, which is the direction that was unpinned.
+  for (const step of [...orchestratorSteps, 'CITATION_VERIFIER', 'BRAND_NEW_STEP']) {
+    const reason = `${PREFIX}${step}`;
+    assert.equal(
+      reasonText(reason).selfRetrying,
+      TRANSIENT_RETRY_REASONS.has(reason),
+      `${reason}: the deck says selfRetrying=${reasonText(reason).selfRetrying}, the orchestrator says ${TRANSIENT_RETRY_REASONS.has(reason)}`
+    );
+  }
+
+  // A step with no retry must not be told it will try again on its own.
+  assert.ok(!/try again on its own/.test(reasonText(`${PREFIX}CITATION_VERIFIER`).text));
+  assert.match(reasonText(`${PREFIX}PLAN`).text, /try again on its own/);
+});
+
+test('every account-pool family member has its own plain-language sentence', () => {
+  // Three of the five are never discovered by the literal-`ParkSignal(...)` sweep above (they are
+  // thrown as typed Errors, or built as a template, or reassigned), so deleting any of their
+  // sentences survived. `all-accounts-cooling-unknown` had no sentence at all until action 1.4 --
+  // exactly the gap this pins shut.
+  const { ACCOUNT_POOL_PARK_REASON_FAMILY } = require('../orchestrator/state-machine');
+  for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
+    const instance = member.kind === 'prefix' ? `${member.match}2026-09-05T19:32:33.350Z` : member.match;
+    const { text, known } = reasonText(instance);
+    assert.equal(known, true, `${instance} has no plain-language sentence`);
+    assert.ok(text.length > 20 && /[.!]$/.test(text), `${instance}'s sentence is not a written sentence: ${JSON.stringify(text)}`);
+    // reasonText's last-resort fallback is the slug with its punctuation opened out. Compare
+    // against that exact string rather than guessing at its shape -- a real sentence CAN contain a
+    // hyphen (the `-until-` member's own sentence quotes an ISO date).
+    assert.notEqual(text, instance.replace(/[-:]/g, ' '), `${instance} fell through to the slug fallback rather than a written sentence`);
+  }
+});
+
+test('the cooling deadline is read out of the reason string, and a bad one degrades instead of lying', () => {
+  // formatCooldownDeadline was entirely untested: returning null always, or a time a full day
+  // wrong, both survived -- the only text assertion was /out of quota/, which matches either
+  // branch. A deadline shown to a maintainer is exactly the kind of claim that must not drift.
+  const withDeadline = reasonText('all-accounts-cooling-until-2026-09-05T19:32:33.350Z');
+  assert.match(withDeadline.text, /2026-09-05 19:32:33 UTC/, 'the deadline in the reason string is shown to the maintainer');
+  assert.equal(withDeadline.selfRetrying, true);
+
+  const unparseable = reasonText('all-accounts-cooling-until-not-a-timestamp');
+  assert.equal(unparseable.known, true, 'still a recognised family member');
+  assert.equal(unparseable.selfRetrying, true, 'and still self-retrying');
+  assert.ok(!/UTC/.test(unparseable.text), 'but no invented time -- it falls back to the generic sentence');
 });
 
 // ---- rendering -------------------------------------------------------------------------------

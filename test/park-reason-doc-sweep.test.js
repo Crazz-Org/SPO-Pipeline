@@ -442,6 +442,22 @@ function resolveAbandonedByMaintainerReason(source) {
   return [{ kind: 'literal', value: m[1] }];
 }
 
+// resolveCapExceededReason(stateMachineSource) -- card #119 action 1.3's fifth account-pool
+// family member reaches neither scan above either: it is not thrown as a `new ParkSignal(...)`
+// and it is not passed as a literal into an external `finalizePark(...)` call (finalizeParkSpans
+// deliberately treats finalizePark's own declaration/body as not-a-call-site). It is produced by
+// finalizePark's OWN pool-wait branch, reassigning its `reason` local to this literal once the
+// accumulated wait would exceed config.poolExhaustionWaitCapMs -- read directly off that
+// assignment, the same "read the actual producer" idiom resolveAbandonedByMaintainerReason above
+// uses for the other reason that reaches neither scan.
+function resolveCapExceededReason(source) {
+  const m = /\breason\s*=\s*'(all-accounts-cooling-wait-cap-exceeded)'/.exec(source);
+  if (!m) {
+    return [{ kind: 'unresolved', value: "state-machine.js: the cap-exceeded reassignment shape changed -- no `reason = 'all-accounts-cooling-wait-cap-exceeded'` found" }];
+  }
+  return [{ kind: 'literal', value: m[1] }];
+}
+
 // classifyReasonArg(argText) -> one of:
 //   {kind: 'literal', value}          -- a plain string; value must appear verbatim in the spec
 //   {kind: 'prefix', value}           -- a template with a static prefix; value must appear as a
@@ -682,6 +698,16 @@ test('every ParkSignal reason is documented in doc/state-machine-spec.md, or nam
     else record(r.value, false, 'orchestrator/park-loop.js (direct state.json write, not thrown)');
   }
 
+  // resolveCapExceededReason: card #119 action 1.3's fifth account-pool family member -- also
+  // reaches neither scan above, for the same reason abandoned-by-maintainer does not: it is never
+  // thrown as a ParkSignal and never passed as a literal into an external finalizePark(...) call.
+  // See that function's own comment.
+  const stateMachineSourceForCap = blankComments(readSource(path.join('orchestrator', 'state-machine.js')));
+  for (const r of resolveCapExceededReason(stateMachineSourceForCap)) {
+    if (r.kind === 'unresolved') unresolvedDynamic.push(`orchestrator/state-machine.js: ${r.value}`);
+    else record(r.value, false, "orchestrator/state-machine.js (finalizePark's own pool-wait branch, reassigned not thrown)");
+  }
+
   // Floors, same reasoning as gh-api-argv.test.js's siteCount>=4 and no-real-spawn-sweep.test.js's
   // checked>=40: if either number drops well below what was actually measured for this action
   // (2026-09-02: 94 `new ParkSignal(...)` call sites, 6 `finalizePark(...)` sink call sites, 70
@@ -745,6 +771,13 @@ test('every ParkSignal reason is documented in doc/state-machine-spec.md, or nam
   for (const r of finalizeParkSinkFamily) {
     assert.ok(required.has(r), `finalizePark sink scan did not contribute '${r}' -- has finalizeParkSpans or resolveAbandonedByMaintainerReason stopped matching?`);
   }
+  // Card #119 action 1.3: the fifth account-pool family member, resolved the same targeted way as
+  // abandoned-by-maintainer above (reassigned, never thrown). Named individually for the same
+  // reason as every other family in this block.
+  assert.ok(
+    required.has('all-accounts-cooling-wait-cap-exceeded'),
+    "resolveCapExceededReason did not contribute 'all-accounts-cooling-wait-cap-exceeded' -- has finalizePark's cap-exceeded reassignment shape changed?"
+  );
 
   const spec = fs.readFileSync(SPEC_PATH, 'utf8');
   const offenders = [];

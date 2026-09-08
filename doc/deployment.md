@@ -132,15 +132,19 @@ it to be at an `await`; `issue-488` is that case, and the other four are not.
 
 These three rows are examples, not the full picture — every park reason the code can produce is
 now classified. The source of truth is `orchestrator/state-machine.js`'s `TRANSIENT_RETRY_REASONS`
-(auto-retried within budget) and `TERMINAL_PARK_REASONS` / `TERMINAL_PARK_REASON_PREFIXES`
-(human-only — a maintainer must act, typically a `retry` comment or a fix); `classifyParkReason(reason)`
-returns `'transient' | 'terminal' | 'unclassified'` by checking both. Enforcement lives in
+(auto-retried within budget) and, on the human-only side — a maintainer must act, typically a
+`retry` comment or a fix — `TERMINAL_PARK_REASONS`, `TERMINAL_PARK_REASON_PREFIXES` and
+`ACCOUNT_POOL_PARK_REASON_FAMILY` (the five account-pool reasons, declared together in one place);
+`classifyParkReason(reason)` returns `'transient' | 'terminal' | 'unclassified'` by checking all
+four. Enforcement lives in
 `test/park-reason-partition.test.js`: it source-scans every reason the code can actually produce
-and fails, naming the reason and its file:line, if that reason is in neither set — the guard
+and fails, naming the reason and its file:line, if that reason is in none of them — the guard
 against the documented rename trap (splitting or renaming a reason silently makes the new name
 terminal by omission, exactly what happened to `gate-non-attesting`'s four children before B3.4
-round 2 caught it). Do not hand-maintain a longer table here; read the two sets in
-`state-machine.js` instead.
+round 2 caught it). Do not hand-maintain a longer table here; read the four declarations in
+`state-machine.js` instead — two of them are `Set`s (`TRANSIENT_RETRY_REASONS`,
+`TERMINAL_PARK_REASONS`) and two are arrays (`TERMINAL_PARK_REASON_PREFIXES`,
+`ACCOUNT_POOL_PARK_REASON_FAMILY`).
 
 The drop-in's claim is therefore wrong in the common case and understates the good one. **The
 drop-in is a live systemd file, not a repo file, so this document does not edit it** — see §6 for

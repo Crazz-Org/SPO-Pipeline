@@ -6,7 +6,7 @@
 // elsewhere in this repo. First, the same wording is wanted in more than one place -- the deck
 // today, the park comment park-loop.js posts to GitHub tomorrow -- and a second copy is a second
 // thing to forget to update. Second, a dictionary that lives in a table can be TESTED for
-// completeness: test/plain-language.test.js asserts that every state state-machine.js dispatches
+// completeness: test/dashboard-deck.test.js asserts that every state state-machine.js dispatches
 // and every reason a ParkSignal can carry has an entry here, so a new state cannot land without
 // its sentence. A sentence buried in a template literal cannot be checked that way.
 //
@@ -138,7 +138,7 @@ const STATES = {
 // `all-accounts-cooling-until-<iso>` and `llm-transport-failed:<STEP>`.
 //
 // The list is exhaustive against `grep -o "ParkSignal('...'" orchestrator/` as of 2026-09-04
-// (66 distinct reasons); test/plain-language.test.js re-runs that grep so a new ParkSignal
+// (66 distinct reasons); test/dashboard-deck.test.js re-runs that grep so a new ParkSignal
 // cannot ship without its sentence.
 const PARK_REASONS = {
   // --- budgets: the card ran out of lives -----------------------------------------------
@@ -151,8 +151,12 @@ const PARK_REASONS = {
   'main-moved-twice': 'Someone else merged to main twice while this card was working.',
 
   // --- accounts and quota ---------------------------------------------------------------
-  'all-accounts-cooling-after-retry': 'Every Claude account was out of quota, even after waiting.',
+  'all-accounts-cooling-after-retry':
+    'Every Claude account was out of quota, even after waiting. It will start again on its own once one frees up.',
+  'all-accounts-cooling-unknown':
+    'Every Claude account is disabled, or none are registered as usable. There is no cooldown to wait out.',
   'all-accounts-leased': 'Every account was busy on another card for longer than the wait allows.',
+  'all-accounts-cooling-wait-cap-exceeded': 'Every Claude account was out of quota for so long that it gave up waiting.',
   'no-accounts-registered': 'There are no Claude accounts configured to run this.',
   'claim-rate-limited': 'GitHub rate-limited the attempt to claim the card.',
 
@@ -242,9 +246,23 @@ const PARK_REASONS = {
 // The reasons the daemon retries on its own, mirrored from state-machine.js's
 // TRANSIENT_RETRY_REASONS. NOT re-derived and NOT the source of truth -- the deck reads this to
 // decide whether to say "it will try again on its own" or "it is waiting for you", and
-// test/plain-language.test.js pins it against the orchestrator's own set so a rename there
+// test/dashboard-deck.test.js pins it against the orchestrator's own set so a rename there
 // cannot silently make the deck lie. (That failure mode is real: TRANSIENT_RETRY_REASONS keys on
 // the string, so splitting a reason into two names quietly makes every new name terminal.)
+//
+// The account-pool family is deliberately NOT folded into this set -- state-machine.js's own
+// TRANSIENT_RETRY_REASONS excludes it too (see that const's header there), because "comes back on
+// its own" splits WITHIN the family rather than being one answer for it. ACCOUNT_POOL_SELF_RETRYING
+// below is that family's own mirror, kept separate for the same reason SELF_RETRYING itself is
+// kept separate from PARK_REASONS: a rename or a split must be caught, not silently absorbed.
+// SELF_RETRYING_LLM_STEPS -- mirrors state-machine.js's TRANSIENT_RETRY_LLM_STEPS, the list it
+// builds the `llm-transport-failed:<STEP>` members of TRANSIENT_RETRY_REASONS from. Mirrored, not
+// required, for the same reason as the two tables around it; test/dashboard-deck.test.js pins it
+// against the orchestrator's own list in both directions, so narrowing that list without
+// narrowing this one fails by name instead of quietly leaving the deck promising a retry for a
+// step that has become terminal.
+const SELF_RETRYING_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
+
 const SELF_RETRYING = new Set([
   'claim-rate-limited',
   'gate-non-attesting',
@@ -254,6 +272,58 @@ const SELF_RETRYING = new Set([
   'gate-abandoned',
   'gate-stale',
 ]);
+
+// ACCOUNT_POOL_SELF_RETRYING -- mirrors state-machine.js's ACCOUNT_POOL_PARK_REASON_FAMILY (card
+// #119 action 1.1), same five members, same `match`/`kind` shape. NOT re-derived, same convention
+// and same reason as SELF_RETRYING above (a runtime `require` of orchestrator/state-machine.js
+// from this file would invert the dependency this module's header already commits to avoiding) --
+// test/dashboard-deck.test.js pins this mirror against the orchestrator's own
+// ACCOUNT_POOL_PARK_REASON_FAMILY in TWO independent ways, and it needs both -- a point action
+// 1.4's verification made by measurement. The BEHAVIOURAL pin (every member's `selfRetrying`
+// checked against poolCooldownDeadlineMs, the orchestrator's own answer) catches every drift that
+// would make the deck promise a retry that never comes, which is the failure this table exists to
+// prevent. But it is blind to drift where both sides answer `false` for different reasons:
+// deleting four of these five members left the whole suite green, because reasonText's fallback
+// also returns `selfRetrying: false` -- the member just silently lost its sentence. So MEMBERSHIP
+// is pinned separately, by deepEqual on `kind:match`, the way SELF_RETRYING is pinned against
+// TRANSIENT_RETRY_REASONS. Neither pin subsumes the other.
+//
+// Unlike TRANSIENT_RETRY_REASONS/SELF_RETRYING, this family does NOT get one answer: action 1.2
+// (card #119) re-enqueues at the cooldown deadline only the two members that actually carry one
+// (`all-accounts-cooling-until-<ISO>` and `all-accounts-cooling-after-retry`, per
+// state-machine.js's own poolCooldownDeadlineMs); the other three -- no deadline exists
+// (`all-accounts-cooling-unknown`), a lease rather than a cooldown (`all-accounts-leased`), or
+// this IS the give-up (`all-accounts-cooling-wait-cap-exceeded`) -- never come back unattended.
+// This is why reasonText() below must DERIVE selfRetrying from this table rather than hardcode a
+// literal in the branch that handles the dynamic `-until-` member: a `true` written there once
+// could not tell that `-after-retry` also deserves it, or that the other three do not.
+const ACCOUNT_POOL_SELF_RETRYING = [
+  { match: 'all-accounts-leased', kind: 'literal', selfRetrying: false },
+  { match: 'all-accounts-cooling-unknown', kind: 'literal', selfRetrying: false },
+  { match: 'all-accounts-cooling-until-', kind: 'prefix', selfRetrying: true },
+  { match: 'all-accounts-cooling-after-retry', kind: 'literal', selfRetrying: true },
+  { match: 'all-accounts-cooling-wait-cap-exceeded', kind: 'literal', selfRetrying: false },
+];
+
+// accountPoolMember(reason) -> the matching ACCOUNT_POOL_SELF_RETRYING entry, or undefined if
+// `reason` is not a member of the family at all. Same matching convention as the orchestrator's
+// own isAccountPoolParkReason: a literal member matches by exact equality, a prefix member by
+// `reason.startsWith(match)` -- never a substring test.
+function accountPoolMember(reason) {
+  return ACCOUNT_POOL_SELF_RETRYING.find(({ match, kind }) => (kind === 'literal' ? reason === match : reason.startsWith(match)));
+}
+
+// formatCooldownDeadline(iso) -> a human-readable UTC stamp, or null if `iso` does not parse. Used
+// only for the `-until-` prefix member, whose deadline is the ISO suffix of the reason STRING
+// itself (already in hand -- no plumbing invented to fetch it). The `-after-retry` sibling's
+// deadline lives only in the park detail, which reasonText(reason) never receives (its one caller,
+// render-deck.js's renderOutcome, calls it with `outcome.reason` alone) -- so that member's
+// sentence stays generic rather than inventing a detail parameter no caller has to give it.
+function formatCooldownDeadline(iso) {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+}
 
 function stateInfo(state) {
   return STATES[state] || STATES.UNKNOWN;
@@ -267,10 +337,20 @@ function reasonText(reason) {
     return { text: 'It stopped without recording a reason.', selfRetrying: false, known: false };
   }
 
-  if (reason.startsWith('all-accounts-cooling-until-')) {
+  // The prefix member is found THROUGH accountPoolMember, and its prefix comes from the mirror --
+  // this branch used to repeat the literal `'all-accounts-cooling-until-'` itself, which made it a
+  // third copy of a string that already lives in two places, and made accountPoolMember's matching
+  // convention unreachable from here (action 1.4's verification found the `.includes()` mutation
+  // survived for exactly that reason: the branch never asked the helper whether the reason
+  // matched, only whether its own hardcoded literal did).
+  const poolMember = accountPoolMember(reason);
+  if (poolMember && poolMember.kind === 'prefix') {
+    const when = formatCooldownDeadline(reason.slice(poolMember.match.length));
     return {
-      text: 'Every Claude account is out of quota. It will start again on its own once one frees up.',
-      selfRetrying: true,
+      text: when
+        ? `Every Claude account is out of quota. It will start again on its own at ${when}.`
+        : 'Every Claude account is out of quota. It will start again on its own once one frees up.',
+      selfRetrying: poolMember.selfRetrying,
       known: true,
     };
   }
@@ -278,17 +358,36 @@ function reasonText(reason) {
   if (reason.startsWith('llm-transport-failed:')) {
     const step = reason.slice('llm-transport-failed:'.length);
     const label = STATES[step] ? STATES[step].label.toLowerCase() : step;
+    // Derived, not hardcoded. This branch used to return `selfRetrying: true` for EVERY step,
+    // which is only accidentally right: TRANSIENT_RETRY_REASONS contains this family for the four
+    // steps in TRANSIENT_RETRY_LLM_STEPS and no others. Action 1.4's verification demonstrated the
+    // gap concretely -- narrow that list by one step, add the reason to TERMINAL_PARK_REASONS to
+    // make the narrowing deliberate, and the deck goes on promising a retry for a reason that is
+    // now terminal, with nothing failing. Same defect as the cooling branch's own hardcoded
+    // `true`, one family over.
+    const selfRetrying = SELF_RETRYING_LLM_STEPS.includes(step);
     return {
-      text: `The call to Claude for “${label}” never came back. It will try again on its own.`,
-      selfRetrying: true,
+      text: selfRetrying
+        ? `The call to Claude for “${label}” never came back. It will try again on its own.`
+        : `The call to Claude for “${label}” never came back.`,
+      selfRetrying,
       known: true,
     };
   }
 
   const hit = PARK_REASONS[reason];
-  if (hit) return { text: hit, selfRetrying: SELF_RETRYING.has(reason), known: true };
+  if (hit) {
+    const member = accountPoolMember(reason);
+    return { text: hit, selfRetrying: member ? member.selfRetrying : SELF_RETRYING.has(reason), known: true };
+  }
 
   return { text: reason.replace(/[-:]/g, ' '), selfRetrying: false, known: false };
 }
 
-module.exports = { STATES, PARK_REASONS, SELF_RETRYING, stateInfo, reasonText };
+// accountPoolMember is exported for test/dashboard-deck.test.js only. Its literal-vs-prefix
+// convention cannot be reached through reasonText's TABLE branch -- that branch is gated on an
+// exact `PARK_REASONS[reason]` lookup, so by the time accountPoolMember is called the reason is
+// already an exact key and matching a literal with startsWith would change nothing. Rather than
+// leave the convention pinned by nothing (action 1.4's verification found both mutations
+// surviving), it is asserted directly against this function.
+module.exports = { STATES, PARK_REASONS, SELF_RETRYING, SELF_RETRYING_LLM_STEPS, ACCOUNT_POOL_SELF_RETRYING, accountPoolMember, stateInfo, reasonText };
