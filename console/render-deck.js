@@ -375,7 +375,8 @@ function nextLabel(card, cur) {
 
 // The wall-clock ceiling the orchestrator arms for this step, so the meter's full width is a
 // real number rather than a guess. Scripted steps carry per-state deadlines in config; LLM
-// steps carry step-contracts.js's own (PLAN has a 30-minute override, everything else 15).
+// steps carry step-contracts.js's own (PLAN and IMPLEMENT both have a 30-minute override,
+// DIAGNOSE and VALIDATE 15).
 function stepDeadlineMs(state) {
   try {
     const { deadlineMsForStep } = require('../orchestrator/step-contracts');

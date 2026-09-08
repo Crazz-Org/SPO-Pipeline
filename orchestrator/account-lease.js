@@ -67,9 +67,9 @@ const LEASE_SUFFIX = '.json';
 // /proc/sys/kernel/pid_max is 4194304, not the historical 32768, so recycling is ~128x rarer than
 // the number most pid-reuse folklore assumes) but unbounded and self-perpetuating when it happens.
 //
-// DERIVED from step-contracts.js's LLM_STEP_DEADLINE_MS, never restated as its own literal, so a
-// future edit to that constant moves this bound with it instead of silently drifting past it --
-// the same anti-drift rule config.js already applies to CI_CHECKS' deadline.
+// DERIVED from step-contracts.js's MAX_LLM_STEP_DEADLINE_MS (the running maximum across every
+// per-step override, not the LLM_STEP_DEADLINE_MS default alone), never restated as its own
+// literal, so a future edit to either constant moves this bound with it instead of drifting past it.
 //
 // Why 2x and not 1x: one lease can span TWO `claude` calls, not one. Measured, not assumed --
 // intake.js's callIntakeStepWithRotation runs its same-account timeout retry INSIDE the lease's
@@ -77,8 +77,8 @@ const LEASE_SUFFIX = '.json';
 // state-machine.js's callLlmStep is bounded the same way by construction (callWithDeadline's two
 // attempts both sit inside the lease's try/finally); it happens to measure 1 today only because a
 // blocking spawnSync's resolution microtask always drains before callWithDeadline's timer can
-// fire, which is an implementation detail no bound should lean on. Each individual call is capped
-// by spawnSync's own `timeout`, armed with LLM_STEP_DEADLINE_MS at steps/llm.js's spawnOpts.
+// fire, which is an implementation detail no bound should lean on. Each call is capped by
+// spawnSync's own `timeout`, armed with that step's deadlineMsForStep (LLM_STEP_DEADLINE_MS, or its override) at spawnOpts.
 //
 // The +10% slack covers the non-spawn work the lease also spans -- prompt assembly, the JSON parse
 // of up to 64 MiB of stdout, and the journal writes around it -- and is expressed as a fraction so

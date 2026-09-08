@@ -18,6 +18,7 @@ const {
   EFFORT_BY_SIZE,
   IMPLEMENT_EFFORT_BY_SIZE,
   LLM_STEP_DEADLINE_MS,
+  LLM_STEP_DEADLINE_MS_BY_STEP,
   MAX_LLM_STEP_DEADLINE_MS,
 } = require('../orchestrator/step-contracts');
 const { WORKTREE_SIDE_STEPS } = require('../orchestrator/config');
@@ -182,15 +183,36 @@ test('resolveStepContract: PLAN and IMPLEMENT do not share one size->effort map'
   assert.equal(STEP_CONTRACTS.IMPLEMENT.effortBySize, IMPLEMENT_EFFORT_BY_SIZE);
 });
 
-// PLAN is the only step with a longer deadline, and MAX_LEASE_AGE_MS must follow the LONGEST one --
-// deriving it from the default would understate the worst legitimate hold and reintroduce the C6
+// PLAN and IMPLEMENT (action 2.2, card #158) both carry a longer deadline than the other three
+// steps, and MAX_LEASE_AGE_MS must follow the LONGEST one -- deriving it from the default (or from
+// either literal in isolation) would understate the worst legitimate hold and reintroduce the C6
 // defect where a waiter gives up while the holder is still alive.
-test('resolveStepContract: PLAN carries a longer deadline than every other step', () => {
+test('resolveStepContract: PLAN and IMPLEMENT both carry the raised 1,800,000ms deadline; the rest keep the default', () => {
   assert.equal(resolveStepContract('PLAN', { size: 'L' }).deadlineMs, 1800000);
-  for (const step of ['IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
+  assert.equal(resolveStepContract('IMPLEMENT', { size: 'L' }).deadlineMs, 1800000);
+  for (const step of ['DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
     assert.equal(resolveStepContract(step, { size: 'L' }).deadlineMs, LLM_STEP_DEADLINE_MS, `${step} must keep the default`);
   }
-  assert.equal(MAX_LLM_STEP_DEADLINE_MS, 1800000, 'the lease bound must derive from the longest deadline, not the default');
+  // Two different guards, verified by mutation to catch two different things -- neither one alone
+  // is enough. Confirmed: stripping both assertions and adding `FUTURE_STEP: 3600000` to the map
+  // still passed 22/0 with only the literal below restored, and the recomputed check ALONE cannot
+  // ever fail against a mutated map, because MAX_LLM_STEP_DEADLINE_MS is DEFINED by this exact
+  // expression in step-contracts.js -- recomputing the same formula here is tautological against
+  // any map contents, so it guards a different mistake: MAX_LLM_STEP_DEADLINE_MS being replaced by
+  // a hand-written literal that then silently drifts from the map (e.g. someone "simplifies" the
+  // `Math.max(...)` to a number and forgets to update it when a new override is added).
+  const recomputedMax = Math.max(LLM_STEP_DEADLINE_MS, ...Object.values(LLM_STEP_DEADLINE_MS_BY_STEP));
+  assert.equal(MAX_LLM_STEP_DEADLINE_MS, recomputedMax, 'MAX_LLM_STEP_DEADLINE_MS must track the map, not drift from it');
+  // THIS is the assertion that fails the moment a future override raises any step's deadline past
+  // 1,800,000ms without whoever made that change re-checking what it does to the lease bound: a
+  // hardcoded expected value that does NOT move with the map, unlike MAX_LLM_STEP_DEADLINE_MS
+  // itself. Verified by mutation: adding `FUTURE_STEP: 3600000` to LLM_STEP_DEADLINE_MS_BY_STEP
+  // fails exactly this line ("expected 1800000, got 3600000"), never the recomputed one above.
+  assert.equal(
+    MAX_LLM_STEP_DEADLINE_MS,
+    1800000,
+    'PLAN and IMPLEMENT tie at 1,800,000ms today -- the max must land there because of Math.max, not by coincidence'
+  );
 });
 
 test('resolveStepContract: DIAGNOSE/CITATION_VERIFIER/VALIDATE are pinned high regardless of size', () => {

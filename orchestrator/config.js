@@ -703,12 +703,19 @@ module.exports = {
   // waiter must outlast is not the duration a step USUALLY takes, it is the longest a sibling can
   // LEGITIMATELY hold the lease, and that is a bound this codebase already states:
   //
-  //   sibling worker, one two-attempt LLM step   2 x LLM_STEP_DEADLINE_MS  = 30   min
-  //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS    = 10   min
-  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS          = 63   min
+  //   sibling worker, one two-attempt LLM step   2 x MAX_LLM_STEP_DEADLINE_MS = 60   min
+  //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS       = 10   min
+  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS             = 63   min
+  //
+  // The first row reads 60 min, not the 30 min this table once stated -- that 30-minute figure was
+  // LLM_STEP_DEADLINE_MS's own default, true only before PLAN's 2026-09-04 override and
+  // IMPLEMENT's own (step-contracts.js, action 2.2) each raised the worst legitimate hold to
+  // MAX_LLM_STEP_DEADLINE_MS instead. MAX_LEASE_AGE_MS is derived from that running maximum for
+  // exactly this reason: the 63-minute figure on the third row already tracked the raise without
+  // an edit here; only this table's prose had drifted from the code it describes.
   //
   // Against a 5-minute wait every one of those is longer. A worker at K=2 therefore gave up while
-  // the holder was still legitimately alive AND still un-sweepable for up to another 26.5 minutes,
+  // the holder was still legitimately alive AND still un-sweepable for up to another 58 minutes,
   // and parked `all-accounts-leased` -- the exact park class per-step leasing exists to avoid. The
   // real pool is 2 accounts against 3 contenders (2 workers + the scanner), so this is an ordinary
   // operating point, not an exotic one.

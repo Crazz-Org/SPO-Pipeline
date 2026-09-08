@@ -17,8 +17,9 @@
 //   - maxBudgetUsd: always undefined below (see the comment above resolveStepContract's own
 //     `maxBudgetUsd: undefined` for the maintainer's reasoning) -- not scaled by task.size the
 //     way effort is, and no per-task override field is read anywhere. state-machine-spec.md's
-//     Step contracts table names the bound that actually exists instead: a uniform per-step
-//     wall-clock deadline (LLM_STEP_DEADLINE_MS below).
+//     Step contracts table names the bound that actually exists instead: a per-step wall-clock
+//     deadline (LLM_STEP_DEADLINE_MS / LLM_STEP_DEADLINE_MS_BY_STEP below) -- no longer uniform
+//     across steps since PLAN's 2026-09-04 override and IMPLEMENT's action-2.2 one below.
 //   - permissionMode: chosen so a step whose contract is "read-only" never needs a human
 //     approval prompt it cannot answer (headless -p), and the one step with edit tools
 //     (IMPLEMENT) auto-accepts them since nothing reviews a diff before the mechanical checks.
@@ -89,8 +90,10 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // issue-247 with reason plan-invalid. This is the same family of bug PR #14 fixed for
 // intake.js's draftCard/reviewCard (INTAKE_DEADLINE_MS); this constant is steps/llm.js's
 // equivalent for the daemon's five LLM steps (PLAN, IMPLEMENT, DIAGNOSE, CITATION_VERIFIER,
-// VALIDATE). 900000ms (15 minutes) gives a real call room to finish under even an L-sized
-// $12 budget before the process itself is killed. config.js's stepDeadlineMs is untouched and
+// VALIDATE) -- the default every one of them falls back to. LLM_STEP_DEADLINE_MS_BY_STEP below
+// now overrides two of the five (PLAN, IMPLEMENT), so this 900000ms (15 minutes) figure alone
+// governs only the other three (DIAGNOSE, CITATION_VERIFIER, VALIDATE); it still gives a real call
+// room to finish under even an L-sized $12 budget before the process itself is killed. config.js's stepDeadlineMs is untouched and
 // stays state-machine.js's outer callWithDeadline retry-once-then-park bookkeeping value
 // (deadline.js) for every step, scripted or LLM -- but that JS timer is a no-op against a
 // scripted step's own blocking spawnSync (steps/scripted.js), which is bounded instead by
@@ -98,12 +101,14 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // changes what invokeClaudeReal's own spawnSync timeout is armed with for an LLM call.
 const LLM_STEP_DEADLINE_MS = 900000;
 
-// LLM_STEP_DEADLINE_MS_BY_STEP -- per-step overrides of the figure above. Only PLAN has one.
+// LLM_STEP_DEADLINE_MS_BY_STEP -- per-step overrides of the figure above. PLAN and IMPLEMENT both
+// carry one now (IMPLEMENT's own entry and its record are below PLAN's); DIAGNOSE,
+// CITATION_VERIFIER and VALIDATE still take the default.
 //
 // WHY. 900000ms is not enough for PLAN on an L-sized card, and the pipeline could not plan one at
 // all. Card #486 (size:L) was, before this raise, the only card ever to reach PLAN's `L -> high`
 // row. Before the raise (commit 98fc04b, 2026-09-04T05:57:43Z), three attempts failed, zero
-// reported tokens each: two killed AT the 900,000ms deadline (the ~825s reported is a pre-#158
+// reported tokens each: two killed BY the 900,000ms deadline (the ~825s reported is a pre-#158
 // Date.now() artefact -- both actually ran at least the full 900,000ms, see action 2.1, commit
 // e327171) and one a transport error (unparsable stdout, exit 143); the card terminal-parked
 // `llm-transport-failed:PLAN`. Two more attempts followed a retry on 2026-09-04, both AFTER the
@@ -117,18 +122,23 @@ const LLM_STEP_DEADLINE_MS = 900000;
 // before.
 //
 // Only PLAN moves, and "every other step has room to spare against 900s" no longer describes them
-// all -- and, per the evidence below, never fully did. IMPLEMENT's longest completed call is
-// 920.322s (issue-517, ok: true), with 887.420s (issue-671) and 885.435s (issue-497) also above
-// the figure this override was written against. #492's 870.510s (SUCCEEDED) was cited as the
-// former maximum and the reason IMPLEMENT was left alone -- but that argument was already false
-// when written: this override landed 2026-09-04T05:57:43Z (commit 98fc04b), and #492's own FIRST
-// IMPLEMENT attempt had been killed AT the deadline six hours earlier (2026-09-04T00:02:36Z); the
-// surviving 870.510s call was that attempt's retry. issue-385 carries two more IMPLEMENT kills
-// that also predate the override (2026-08-30T20:21:31Z, 2026-09-03T22:01:56Z). DIAGNOSE peaked at
-// 215.4s (issue-516); VALIDATE at 336.9s (issue-507). Seven IMPLEMENT calls (plus #486's two
-// above) are now killed AT the 900,000ms deadline. IMPLEMENT no longer has room to spare, and the
-// record above says it never demonstrably did; this paragraph stands as that record, not as a
-// decision about what to do next.
+// all -- and, per the evidence below, never fully did. IMPLEMENT's longest completed call
+// journalled 920.322s (issue-517, ok: true), with 887.420s (issue-671) and 885.435s (issue-497)
+// also above the figure this override was written against -- all three pre-monotonic-clock
+// Date.now() readings (action 2.1, commit e327171), so "above" here means within that clock's own
+// tens-of-seconds drift of the cap, not proven to exceed it; see the caveat in action 2.2's own
+// paragraph below for what that drift does and does not put in doubt. #492's 870.510s (SUCCEEDED)
+// was cited as the former maximum and the reason IMPLEMENT was left alone -- but that argument was
+// already false when written: this override landed 2026-09-04T05:57:43Z (commit 98fc04b), and
+// #492's own FIRST IMPLEMENT attempt had been killed BY the deadline six hours earlier
+// (2026-09-04T00:02:36Z); the surviving 870.510s call was that attempt's retry. issue-385 carries
+// two more IMPLEMENT kills that also predate the override (2026-08-30T20:21:31Z,
+// 2026-09-03T22:01:56Z). DIAGNOSE peaked at 215.4s (issue-516); VALIDATE at 336.9s (issue-507).
+// Seven IMPLEMENT calls (plus #486's two above) are now killed BY the 900,000ms deadline --
+// unlike the completion figures above, a kill is the monotonic timer firing (`timedOut: true`),
+// never a duration_s reading, so the clock issue does not touch this count. IMPLEMENT no longer
+// has room to spare, and the record above says it never demonstrably did; this paragraph stands as
+// that record, not as a decision about what to do next.
 //
 // This is a bet, and a bounded one: #486's calls were KILLED mid-flight, so we know 900s was not
 // enough and do NOT know that 1800s is. If PLAN at `high` still times out, the journal says so,
@@ -138,8 +148,69 @@ const LLM_STEP_DEADLINE_MS = 900000;
 // 993.903s, issue-515) -- a proxy for what an L card might cost at `medium`, not proof of it,
 // since M and L are a different size row entirely. The cost of being wrong is ~3 x 1800s of wall
 // clock before the transient-retry budget parks the card.
+//
+// ACTION 2.2 (card #158) ACTS ON THE IMPLEMENT RECORD ABOVE instead of leaving it as a record with
+// no decision attached. IMPLEMENT's entry below is the identical 1,800,000ms PLAN's is, not an
+// independently-chosen number.
+//
+// Measured against the corpus at large, not just the kills: of 80 IMPLEMENT calls carrying a
+// duration_s, 71 completed (ok:true) and run median 262.8s / p90 495.7s -- 29% of the 900,000ms
+// cap at the median, so the cap binds only the tail.
+//
+// THE CLOCK CAVEAT, stated once, here, because it bears on every duration_s figure below: every
+// duration_s below predates card #158's monotonic-clock fix (e327171) and is a Date.now() reading;
+// the observed disagreement with the monotonic timer reaches tens of seconds. That is immaterial
+// to the median and p90 above, which sit multiples away from the cap, and immaterial to the seven
+// kills below, which are the monotonic timer firing (`timedOut: true`) and not a duration_s
+// reading at all. It is material only to figures within that drift of 900,000ms -- so no argument
+// below rests on one.
+//
+// That tail runs at the cap's order of magnitude, though the corpus cannot say how close: every
+// duration_s here was computed with Date.now(), which this same card's e327171 replaced after
+// finding it can disagree with the monotonic timer gating spawnSync by tens of seconds on a 900s
+// bound. issue-517's journalled 920.322s is that commit's own counter-example -- a successful,
+// never-killed IMPLEMENT whose true elapsed was under the cap the monotonic timer never fired on.
+// Three completions (issue-517, issue-671, issue-497) journalled 885-920s against 900,000ms; no
+// pre-fix figure pins the tail closer than that.
+//
+// The load-bearing evidence is the seven kills, which the clock caveat above does not touch: 6 of
+// the 80 duration_s-carrying calls were killed BY the deadline (issue-385, issue-492, issue-515
+// x2, issue-516, issue-518); a 7th IMPLEMENT kill (issue-385, 2026-08-30T20:21:31Z) predates the
+// duration_s field and is not in that 80. Counting it, IMPLEMENT accounts for 7 of the 9 deadline
+// kills in the whole corpus; the other 2 are PLAN's own #486 pair above, both before PLAN's raise,
+// and no PLAN call has been cut since.
+//
+// WHAT THE CORPUS CANNOT ESTABLISH, stated plainly rather than implied: that 1,800,000ms would
+// have saved those seven. A killed call has no completion time -- there is no measurement of how
+// long any of them would have taken to finish, only that 900,000ms was not enough. That is a bet,
+// the same shape as PLAN's own bet above. #492 is the one case with a real number on both sides of
+// a kill: its FIRST IMPLEMENT attempt was killed at 818.536s, and the RETRY of the SAME work on the
+// SAME account needed 870.510s to finish -- inside 900,000ms, so it shows a second attempt can cost
+// more than the first, not that 1,800,000ms is enough for a call that could not finish even once.
+//
+// THE PRECEDENT, AND ITS LIMIT. PLAN's identical raise is followed by two completions the old
+// 900,000ms cap would have killed -- 993.903s (issue-515, effort medium) and 1,123.965s
+// (issue-516, effort high) -- and no PLAN call has been cut since, over the ~2 days the corpus
+// covers; #486 itself still fails PLAN twice post-raise (478.203s, 572.243s, effort high), for
+// reasons other than the deadline. That is real evidence a 30-minute deadline can turn a kill into
+// a completion. It is not proof for IMPLEMENT: PLAN's own
+// population is a different step, a different effort ladder and a different size mix, and action
+// 2.3's commit on this file -- which corrected this same comment's own numbers after they were
+// found wrong -- is the record of what happens on this project when a figure measured on one
+// population is offered as proof about another. Precedent that a longer deadline can work; not
+// proof that this one works for IMPLEMENT specifically.
+//
+// WHY 1,800,000 AND NOT MORE: it is the largest value that leaves MAX_LLM_STEP_DEADLINE_MS below
+// -- and therefore MAX_LEASE_AGE_MS and config.js's accountLeaseWaitMs -- exactly where PLAN's own
+// raise already put them (Math.max is unmoved when a second entry ties the first, not merely when
+// it stays lower). Any value above 1,800,000ms here would raise the lease bound along with it, an
+// effect this action is not asking for and has not measured. THE COST OF BEING WRONG IS BOUNDED:
+// a genuinely stuck IMPLEMENT now burns 30 minutes of wall clock instead of 15 before the
+// transient-retry budget parks the card -- the same shape as PLAN's own "cost of being wrong"
+// paragraph above.
 const LLM_STEP_DEADLINE_MS_BY_STEP = {
   PLAN: 1800000, // 30 min
+  IMPLEMENT: 1800000, // 30 min -- see the comment immediately above for the measurement and the bet
 };
 
 // The longest any single LLM call may legitimately run, across every step. MAX_LEASE_AGE_MS below
@@ -170,12 +241,21 @@ function deadlineMsForStep(stepName) {
 // single C6 bound derived from an OBSERVED maximum (measured step durations of 90-265s -> a
 // 5-minute wait) instead of from the bound it actually waits on. This constant IS that bound: a
 // lease younger than it is legitimately held and cannot be swept, and a sibling worker's own
-// two-attempt LLM step can legitimately hold one for 2 x LLM_STEP_DEADLINE_MS = 30 minutes. A
-// 5-minute waiter therefore gave up while the holder was still legitimately alive and still
-// un-sweepable for another 26.5 minutes, and parked the exact park class per-step leasing was
-// built to avoid. Deriving the wait from this constant makes the wait outlast every legitimate
-// hold by construction -- the same asymmetry product-repo-lock.js states for its own wait bound:
-// waiting too long only delays a card, giving up too early parks a healthy one.
+// two-attempt LLM step can legitimately hold one for 2 x MAX_LLM_STEP_DEADLINE_MS = 60 minutes --
+// not the 30 minutes this comment stated before PLAN's 2026-09-04 override and IMPLEMENT's own
+// above each raised the worst legitimate hold past LLM_STEP_DEADLINE_MS's default; that 30-minute
+// figure was this comment restating the DEFAULT rather than the MAXIMUM, the exact drift the
+// derivation two lines below was written to make impossible for the bound itself (only the prose
+// above it still drifted). A 5-minute waiter therefore gave up while the holder was still
+// legitimately alive and still un-sweepable for another 58 minutes, not 26.5 -- and parked the
+// exact park class per-step leasing was built to avoid. The conclusion this constant exists to
+// guarantee is unchanged either way: 63 minutes still outlasts the 60-minute worst legitimate
+// hold, by construction, whichever step (or steps) contribute the longer deadline -- which is
+// exactly why MAX_LEASE_AGE_MS is derived from MAX_LLM_STEP_DEADLINE_MS (the running maximum
+// across every override) below, never from LLM_STEP_DEADLINE_MS (the default) or from a literal.
+// Deriving the wait from this constant makes the wait outlast every legitimate hold by
+// construction -- the same asymmetry product-repo-lock.js states for its own wait bound: waiting
+// too long only delays a card, giving up too early parks a healthy one.
 const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10);
 
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
@@ -399,8 +479,9 @@ function resolveStepContract(stepName, task = {}) {
     escalated,
     effort,
     effortEscalated,
-    // Per-step, not the module default: PLAN gets 1800000ms, every other step 900000ms. steps/llm.js
-    // arms invokeClaudeReal's spawnSync timeout with this rather than reading the constant itself.
+    // Per-step, not the module default: PLAN and IMPLEMENT get 1800000ms, every other step
+    // 900000ms. steps/llm.js arms invokeClaudeReal's spawnSync timeout with this rather than
+    // reading the constant itself.
     deadlineMs: deadlineMsForStep(stepName),
     allowedTools: stepDef.allowedTools,
     permissionMode: stepDef.permissionMode,

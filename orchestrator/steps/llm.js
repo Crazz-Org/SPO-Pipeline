@@ -757,9 +757,9 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       promptFile: override.promptFile,
       cwd,
       account,
-      // Per-step (PLAN 1800000ms, every other step 900000ms). This legacy override path has no
-      // resolved contract to read the figure off, so it asks step-contracts directly -- same
-      // source, so the two paths can never disagree about how long a PLAN may run.
+      // Per-step (PLAN and IMPLEMENT 1800000ms, every other step 900000ms). This legacy override
+      // path has no resolved contract to read the figure off, so it asks step-contracts directly
+      // -- same source, so the two paths can never disagree about how long a call may run.
       deadlineMs: deadlineMsForStep(stepName),
     };
 
