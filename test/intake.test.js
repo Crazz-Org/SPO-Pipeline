@@ -645,6 +645,20 @@ test('prompts/review-card.md § 4: the fail-open direction is stated, and its in
   //     the exact opposite. Nothing in § 4 legitimately says "no longer", or "never keep".
   assert.doesNotMatch(slice, /no longer/i);
   assert.doesNotMatch(slice, /never\s+(?:keep|keeps|yield|yields|retain|retains)/i);
+
+  // (d) and the retention stated POSITIVELY as an ordered subject-verb-object pin, because (c)
+  //     is a blocklist and a blocklist is whack-a-mole: "checks 1-2 DO NOT keep their own
+  //     DO_NOT_FILE", "...LOSE their own...", "...ARE SUPERSEDED here..." all walk past (c)
+  //     while inverting the rule. This one line closes that whole verb family at no cost to the
+  //     capitalisation / "1 and 2" tolerance above.
+  //
+  //     KNOWN LIMIT, recorded rather than chased: these pins hold the retention clause's
+  //     presence, subject and verb. They do NOT hold its predicate, and they cannot detect a
+  //     nullifying condition appended after it -- flipping the enumeration ("...already fixed is
+  //     NOT DO_NOT_FILE") or appending "...only while the card is not oversized" both leave the
+  //     clause textually intact and subvert it downstream. Closing those needs a reader, not a
+  //     regex.
+  assert.match(slice, /checks\s+1\s*(?:[\u2013\u2014-]|and)\s*2\s+keep their own[\s\S]{0,20}DO_NOT_FILE/i);
 });
 
 test('prompts/review-card.md § 4: "when unsure, file it" cannot be satisfied by its own negation', () => {
