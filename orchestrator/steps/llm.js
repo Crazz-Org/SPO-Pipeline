@@ -9,14 +9,21 @@
 //
 // Real mode spawns `claude -p ...` and parses its `--output-format json` stdout. Two layers:
 //
-//   invokeClaudeReal(opts, deps) -- the primitive. Takes exactly the per-call inputs the spec
-//     lists (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
-//     promptText|promptFile, cwd, account, deadlineMs), builds argv, spawns with the resolved
+//   invokeClaudeReal(opts, deps) -- the primitive. Takes the per-call inputs the spec lists
+//     (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
+//     promptText|promptFile, cwd, account, deadlineMs) plus one more (action 4.1, token-ledger
+//     lot): an optional opts.sessionId, a caller-supplied UUID-v4 string used verbatim instead of
+//     generating one (see the sessionId paragraph below). Builds argv, spawns with the resolved
 //     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
 //     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
 //     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
-//     numTurns, durationS, raw}. `deps.spawnSync` is an injection point for tests (and nothing
-//     else) -- production code never passes it. `durationS` (seconds, measured with
+//     numTurns, durationS, raw}. `sessionId` is set on every branch representing a spawn that was
+//     at least attempted (success, deadline kill, external signal, unparsable stdout) and null
+//     only when `claude` never started at all (an unreadable `oauthTokenFile`, or a spawn failure
+//     such as ENOENT/EACCES/E2BIG) -- see invokeClaudeReal's own inline comment for why each
+//     branch draws the line where it does. `deps.spawnSync` and `deps.randomUUID` are the two
+//     injection points for tests (and nothing else) -- production code never passes either.
+//     `durationS` (seconds, measured with
 //     process.hrtime.bigint() around the spawn itself, NOT Date.now()) is journaled as
 //     `duration_s` -- doc/state-machine-spec.md's Observability section already documented that
 //     field before any code wrote it (measured 2026-09-01: zero of the 19 corpus journals'
@@ -84,6 +91,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { randomUUID } = require('crypto');
 
 const { sleep } = require('./scripted');
 const config = require('../config');
@@ -126,9 +134,14 @@ function resolvePromptText(opts) {
 }
 
 // Builds the argv for `claude`. Flag order:
-//   -p --model <model> --effort <effort> --output-format json
+//   -p --model <model> --effort <effort> --output-format json [--session-id <uuid>]
 //   [--max-budget-usd <n>] [--allowedTools <tools>] [--permission-mode <mode>]
 //   [--json-schema <schema-json>]
+// --session-id is conditional, like the flags after it: pushed only when opts.sessionId is a
+// non-empty string. invokeClaudeReal is the only caller that ever supplies one -- it generates
+// the id itself (or uses the one the caller passed in opts.sessionId) immediately before the
+// spawn, so a killed or unparsable call can still be tied back to the `claude` session that
+// actually ran (see invokeClaudeReal's own comment on the token-ledger action this is for).
 // --max-budget-usd is conditional, like the other three: pushed only when opts.maxBudgetUsd is a
 // number. No daemon or intake path supplies it -- the only caller that does is the hand-run
 // scripts/smoke-llm.js (see doc/state-machine-spec.md / orchestrator/README.md § Budgets).
@@ -150,6 +163,7 @@ function buildArgv(opts) {
   if (opts.model) argv.push('--model', opts.model);
   if (opts.effort) argv.push('--effort', opts.effort);
   argv.push('--output-format', 'json');
+  if (typeof opts.sessionId === 'string' && opts.sessionId !== '') argv.push('--session-id', opts.sessionId);
   if (typeof opts.maxBudgetUsd === 'number') argv.push('--max-budget-usd', String(opts.maxBudgetUsd));
   if (opts.allowedTools) {
     const tools = Array.isArray(opts.allowedTools) ? opts.allowedTools.join(' ') : opts.allowedTools;
@@ -360,13 +374,24 @@ function limitKindForFailure(parsed) {
   return undefined;
 }
 
+// UUID-v4 shape check for opts.sessionId, used ONLY in invokeClaudeReal's resolution below --
+// deliberately NOT shared with buildArgv's own `typeof === 'string' && !== ''` guard, and
+// buildArgv must stay exactly that loose: runLlm's dry-run branch calls buildArgv directly with
+// the stable literal placeholder '<generated-at-spawn>' (see runLlm), which is not a UUID and
+// must still make it into the displayed argv. Factoring one shared predicate here would make
+// buildArgv reject that placeholder and silently break the dry-run artifact. The real `claude`
+// CLI's own `--help` says a supplied --session-id "must be a valid UUID", and rejects a
+// malformed one with exit 1 before any API call -- this regex is that same shape, checked before
+// the value ever reaches argv, not after.
+const SESSION_ID_UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 // The real-mode primitive: spawn `claude -p`, parse its JSON, classify, return. Never throws on
 // a failed/limited/malformed call -- those come back as {ok: false, kind, ...}; only a
 // programming error (bad opts) throws.
 async function invokeClaudeReal(opts, deps = {}) {
   const spawnSyncFn = deps.spawnSync || spawnSync;
+  const randomUUIDFn = deps.randomUUID || randomUUID;
   const promptText = resolvePromptText(opts);
-  const argv = buildArgv(opts);
 
   const env = { ...process.env, ...NONINTERACTIVE_ENV_DEFAULTS };
   if (opts.account && opts.account.configDir) {
@@ -391,6 +416,41 @@ async function invokeClaudeReal(opts, deps = {}) {
       };
     }
   }
+
+  // Session id (token-ledger lot, action 4.1). Generated HERE -- after the oauthTokenFile read
+  // above has already returned on failure, and immediately before the spawn below -- on purpose:
+  // the oauthTokenFile branch represents a call that never started (no `claude` process, no
+  // session transcript on disk), so it must keep reporting sessionId: null rather than a freshly
+  // minted id for a session that never existed. Every branch from here on represents a spawn that
+  // was at least attempted, so an id generated at this point is always honest.
+  //
+  // opts.sessionId, when the caller already supplied one (non-empty string), is used verbatim and
+  // nothing is generated -- deps.randomUUID (falling back to node's own crypto.randomUUID,
+  // following this file's existing deps.spawnSync injection convention) is not even called in
+  // that case, which the tests pin with a call counter.
+  //
+  // A supplied sessionId that is a non-empty string but NOT UUID-v4 shaped is a programming
+  // error, not a call failure: it would sail past buildArgv's looser guard, reach `claude
+  // --session-id`, and make the CLI exit 1 before any API call (per its own --help: "must be a
+  // valid UUID"). Left unguarded, that exit-1 falls into the "claude stdout was not valid JSON"
+  // branch below, which reports a *parse* failure for what is actually an *argument* fault --
+  // this file's own header already documents being burned by exactly that class of misdiagnosis
+  // twice. So this throws here, before any spawn, the same way a missing prompt already throws in
+  // resolvePromptText above -- this file's header's "only a programming error (bad opts) throws"
+  // contract, applied to the one opts field this action added.
+  let sessionId;
+  if (typeof opts.sessionId === 'string' && opts.sessionId !== '') {
+    if (!SESSION_ID_UUID_V4_RE.test(opts.sessionId)) {
+      throw new TypeError(
+        `llm.js: invokeClaudeReal opts.sessionId must be a valid UUID (claude --session-id ` +
+          `requires one and exits 1 before any API call otherwise) -- got ${JSON.stringify(opts.sessionId)}`
+      );
+    }
+    sessionId = opts.sessionId;
+  } else {
+    sessionId = randomUUIDFn();
+  }
+  const argv = buildArgv({ ...opts, sessionId });
 
   const spawnOpts = {
     cwd: opts.cwd,
@@ -508,7 +568,9 @@ async function invokeClaudeReal(opts, deps = {}) {
       timedOut: true,
       deadlineMs: spawnOpts.timeout,
       error: `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`,
-      sessionId: null,
+      // claude was spawned and ran (that's the whole premise of a deadline kill) -- the
+      // transcript exists on disk under this id even though the call was cut off.
+      sessionId,
       ...ZERO_TOKENS,
       numTurns: undefined,
       durationS,
@@ -544,7 +606,9 @@ async function invokeClaudeReal(opts, deps = {}) {
         ? `llm.js: claude was killed by signal ${spawnResult.signal} after ${durationS}s, inside its ` +
           `${spawnOpts.timeout}ms deadline (the deadline never fired) -- an external kill, not a timeout`
         : `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
-      sessionId: null,
+      // Same reasoning as the deadline-kill branch above: claude was spawned and ran (something
+      // else signalled it), so the transcript exists under this id.
+      sessionId,
       ...ZERO_TOKENS,
       numTurns: undefined,
       durationS,
@@ -553,7 +617,12 @@ async function invokeClaudeReal(opts, deps = {}) {
   }
 
   if (spawnResult.error) {
-    // A REAL spawn failure: ENOENT (no `claude` on PATH), EACCES, EAGAIN...
+    // A REAL spawn failure: ENOENT (no `claude` on PATH), EACCES, E2BIG, EAGAIN... `claude` was
+    // NEVER STARTED in any of these cases, so no session transcript exists anywhere on disk --
+    // reporting the generated id here would be a false measurement (exactly what this action
+    // exists to avoid: a follow-up action recovers spend from the session transcript named by
+    // this id, and an E2BIG call -- 3 recorded in this corpus on one card -- must read as
+    // unrecoverable, not as a recoverable id pointing at nothing).
     return {
       ok: false,
       kind: 'error',
@@ -580,7 +649,16 @@ async function invokeClaudeReal(opts, deps = {}) {
       ok: false,
       kind: 'error',
       error: `llm.js: claude stdout was not valid JSON (exit ${exit})`,
-      sessionId: null,
+      // claude exited without the ETIMEDOUT/signal shapes checked above, but that does NOT mean
+      // it always ran long enough to write a session transcript: this branch is also where the
+      // CLI lands when it rejects its OWN argv and exits before creating a session at all (an
+      // unrecognised flag from a future CLI version, for instance -- the TypeError this function
+      // throws on a malformed opts.sessionId closes the one route to this we control, but not
+      // every route). So this id is
+      // the one `claude` was ASKED to use, not a guarantee that a transcript under it exists --
+      // a downstream reader must treat a missing transcript for this id as "not measured", never
+      // as "measured zero".
+      sessionId,
       ...ZERO_TOKENS,
       numTurns: undefined,
       durationS,
@@ -589,7 +667,13 @@ async function invokeClaudeReal(opts, deps = {}) {
   }
 
   const tokens = extractTokens(parsed.modelUsage);
-  const sessionId = parsed.session_id || parsed.uuid || null;
+  // The CLI's own reported id wins over the one we generated and asked it to use: in practice
+  // they are the same value (we passed sessionId via --session-id above), but the CLI is the
+  // authority on what it actually named the session on disk, so if it ever disagrees the
+  // transcript is filed under ITS answer, not ours. Falls back to the generated id only when the
+  // reply carries neither `session_id` nor `uuid` (a call that ran without ever being asked to
+  // report one in its own reply's expected shape).
+  const reportedSessionId = parsed.session_id || parsed.uuid || sessionId;
   const numTurns = parsed.num_turns;
 
   if (parsed.is_error || exit !== 0) {
@@ -602,7 +686,7 @@ async function invokeClaudeReal(opts, deps = {}) {
       // so omitting the key on a plain 'error' costs nothing.
       ...(kind === 'limit' ? { limitKind: limitKindForFailure(parsed) } : {}),
       result: parsed.result,
-      sessionId,
+      sessionId: reportedSessionId,
       ...tokens,
       numTurns,
       durationS,
@@ -612,7 +696,7 @@ async function invokeClaudeReal(opts, deps = {}) {
     };
   }
 
-  return { ok: true, result: parsed.result, sessionId, ...tokens, numTurns, durationS, raw: exit };
+  return { ok: true, result: parsed.result, sessionId: reportedSessionId, ...tokens, numTurns, durationS, raw: exit };
 }
 
 // snake_case -> camelCase, e.g. "root_cause" -> "rootCause". Used to bridge one real gap: every
@@ -827,7 +911,20 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   };
 
   if (ctx.dryRun) {
-    const argv = buildArgv(opts);
+    // A dry run never spawns `claude`, so `opts` here carries no sessionId (only
+    // invokeClaudeReal ever generates or validates one, immediately before a real spawn -- see
+    // its own comment). Calling buildArgv(opts) unmodified would then omit --session-id entirely,
+    // showing an argv that is not what a real call would actually use -- this artifact's whole
+    // stated purpose is to show the argv.
+    //
+    // The fix is a STABLE LITERAL PLACEHOLDER, never a generated UUID: minting a real, joinable
+    // id here would fabricate a session that never existed -- the identical error the
+    // oauthTokenFile branch above already refuses to produce (a recoverable-looking id pointing
+    // at nothing), except self-inflicted on every single dry run instead of one failure mode. A
+    // downstream token-ledger action joining on it would then read "lost session" instead of "no
+    // call was made". A fixed literal is also stable across runs, so artifact diffs stay clean
+    // and no churning id enters a committed path.
+    const argv = buildArgv({ ...opts, sessionId: '<generated-at-spawn>' });
     const dryrunFile = writeDryRunArtifact(ctx.taskDir, stepName, argv, promptText);
     appendEvent(ctx.taskDir, stepName, 'dry-run', {
       step: stepName,

@@ -81,6 +81,120 @@ test('buildArgv: only the required fields -- optional flags omitted entirely', (
   assert.deepEqual(argv, ['-p', '--model', 'sonnet', '--effort', 'medium', '--output-format', 'json']);
 });
 
+// ---- buildArgv: --session-id (action 4.1, token-ledger lot) --------------------------------
+
+test('buildArgv: includes --session-id right after --output-format json when opts.sessionId is a non-empty string', () => {
+  const argv = buildArgv({ promptText: 'hi', model: 'sonnet', effort: 'medium', sessionId: 'sid-abc' });
+  assert.deepEqual(argv, [
+    '-p',
+    '--model',
+    'sonnet',
+    '--effort',
+    'medium',
+    '--output-format',
+    'json',
+    '--session-id',
+    'sid-abc',
+  ]);
+});
+
+test('buildArgv: omits --session-id entirely when opts.sessionId is absent, undefined, null, or empty string', () => {
+  const base = { promptText: 'hi', model: 'sonnet', effort: 'medium' };
+  const expected = ['-p', '--model', 'sonnet', '--effort', 'medium', '--output-format', 'json'];
+  assert.deepEqual(buildArgv(base), expected); // absent entirely
+  assert.deepEqual(buildArgv({ ...base, sessionId: undefined }), expected);
+  assert.deepEqual(buildArgv({ ...base, sessionId: null }), expected);
+  assert.deepEqual(buildArgv({ ...base, sessionId: '' }), expected);
+});
+
+test('buildArgv: --session-id sits before the other optional flags, at a pinned position, when all are present', () => {
+  const argv = buildArgv({
+    promptText: 'hi',
+    model: 'haiku',
+    effort: 'low',
+    sessionId: 'sid-full',
+    maxBudgetUsd: 0.1,
+    allowedTools: ['Read', 'Grep'],
+    permissionMode: 'plan',
+    jsonSchema: { type: 'object' },
+  });
+  assert.deepEqual(argv, [
+    '-p',
+    '--model',
+    'haiku',
+    '--effort',
+    'low',
+    '--output-format',
+    'json',
+    '--session-id',
+    'sid-full',
+    '--max-budget-usd',
+    '0.1',
+    '--allowedTools',
+    'Read Grep',
+    '--permission-mode',
+    'plan',
+    '--json-schema',
+    '{"type":"object"}',
+  ]);
+});
+
+// Mutation-testing fixes M1/M5: the `typeof opts.sessionId === 'string' && opts.sessionId !== ''`
+// guard was never pinned against a non-string TRUTHY sessionId (a number, boolean, object,
+// array) -- under a mutant that drops or loosens the typeof check, buildArgv would push a
+// non-string value straight into argv (or, in invokeClaudeReal's resolution, the function would
+// report a sessionId that was never actually passed to the CLI -- precisely the falsehood this
+// whole action exists to eliminate).
+
+test('buildArgv: a non-string truthy sessionId is rejected -- no --session-id in argv at all', () => {
+  const base = { promptText: 'hi', model: 'sonnet', effort: 'medium' };
+  const expected = ['-p', '--model', 'sonnet', '--effort', 'medium', '--output-format', 'json'];
+  for (const nonString of [12345, true, {}, ['x']]) {
+    assert.deepEqual(
+      buildArgv({ ...base, sessionId: nonString }),
+      expected,
+      `a non-string sessionId (${JSON.stringify(nonString)}) must not reach argv`
+    );
+  }
+});
+
+test('invokeClaudeReal: a non-string truthy opts.sessionId is treated as absent -- a fresh id is generated, passed to argv, and reported, all in agreement', async () => {
+  let seenArgv = null;
+  let randomUUIDCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      seenArgv = argv;
+      return {
+        status: 0,
+        stdout: JSON.stringify(realShapedPayload({ session_id: undefined, uuid: undefined })),
+        stderr: '',
+        signal: null,
+      };
+    }),
+    randomUUID: () => {
+      randomUUIDCalls += 1;
+      return 'GENERATED';
+    },
+  };
+  const result = await invokeClaudeReal(
+    {
+      promptText: 'hi',
+      model: 'haiku',
+      effort: 'low',
+      cwd: '/tmp',
+      account: { name: 'default', configDir: null },
+      sessionId: 12345, // non-string truthy -- must NOT count as caller-supplied
+    },
+    deps
+  );
+  // The invariant is the pairing: whatever id was reported must be the SAME id that was passed
+  // to the CLI, and a non-string sessionId must not short-circuit generation.
+  assert.equal(randomUUIDCalls, 1, 'a non-string sessionId does not count as caller-supplied');
+  const idx = seenArgv.indexOf('--session-id');
+  assert.equal(seenArgv[idx + 1], 'GENERATED');
+  assert.equal(result.sessionId, 'GENERATED');
+});
+
 test('resolvePromptText: promptFile is read and used as the prompt text', () => {
     const fs = require('fs');
   const path = require('path');
@@ -373,6 +487,290 @@ test('invokeClaudeReal: falls back to uuid when session_id is absent', async () 
     deps
   );
   assert.equal(result.sessionId, 'uuid-456');
+});
+
+// ---- invokeClaudeReal: session id generation (action 4.1, token-ledger lot) -----------------
+//
+// --session-id is passed nowhere in this repo before this action (verified by grep). The id is
+// generated (or taken verbatim from opts.sessionId) immediately before the spawn, and passed to
+// `claude` as --session-id, so a killed or unparsable call can still be tied back to the session
+// transcript that call actually wrote to disk.
+
+test('invokeClaudeReal: generates a session id via deps.randomUUID and passes it to the spawn argv as --session-id', async () => {
+  let seenArgv = null;
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      seenArgv = argv;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+    randomUUID: () => 'generated-uuid-1',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  const idx = seenArgv.indexOf('--session-id');
+  assert.notEqual(idx, -1, 'expected --session-id in argv');
+  assert.equal(seenArgv[idx + 1], 'generated-uuid-1');
+  assert.equal(result.ok, true);
+});
+
+// Mutation-testing fix M14: every test above injects deps.randomUUID and asserts against the
+// injected literal, so none of them ever exercises the REAL generator (node's own
+// crypto.randomUUID, the production fallback when deps.randomUUID is absent). If that ever
+// returned something falsy/malformed, buildArgv's guard would drop --session-id entirely, claude
+// would run with no session id requested, and every failure branch would silently go back to
+// reporting null -- the whole action reverted to a no-op with this suite still fully green. This
+// is the only assertion in the suite that would catch a non-UUID-shaped id, which the real CLI
+// (per its own --help) rejects outright.
+test('invokeClaudeReal: with deps.randomUUID absent, the PRODUCTION generator (crypto.randomUUID) still passes a UUID-v4-shaped --session-id', async () => {
+  let seenArgv = null;
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      seenArgv = argv;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+    // deps.randomUUID deliberately absent -- only spawnSync is injected.
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  const idx = seenArgv.indexOf('--session-id');
+  assert.notEqual(idx, -1, 'the production path must still pass --session-id when deps.randomUUID is not injected');
+  assert.match(
+    seenArgv[idx + 1],
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    'the real crypto.randomUUID output must be UUID-v4 shaped'
+  );
+  assert.equal(result.ok, true);
+});
+
+test('invokeClaudeReal: opts.sessionId, when supplied, is used verbatim and deps.randomUUID is never called', async () => {
+  let seenArgv = null;
+  let randomUUIDCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      seenArgv = argv;
+      return {
+        status: 0,
+        stdout: JSON.stringify(realShapedPayload({ session_id: undefined, uuid: undefined })),
+        stderr: '',
+        signal: null,
+      };
+    }),
+    randomUUID: () => {
+      randomUUIDCalls += 1;
+      return 'should-never-be-used';
+    },
+  };
+  const result = await invokeClaudeReal(
+    {
+      promptText: 'hi',
+      model: 'haiku',
+      effort: 'low',
+      cwd: '/tmp',
+      account: { name: 'default', configDir: null },
+      // Must be UUID-v4 shaped (see Fix 4's throw below on a malformed caller-supplied id).
+      sessionId: '11111111-1111-4111-8111-111111111111',
+    },
+    deps
+  );
+  assert.equal(randomUUIDCalls, 0);
+  const idx = seenArgv.indexOf('--session-id');
+  assert.equal(seenArgv[idx + 1], '11111111-1111-4111-8111-111111111111');
+  assert.equal(result.sessionId, '11111111-1111-4111-8111-111111111111');
+});
+
+test('invokeClaudeReal: success branch prefers the CLI-reported session_id over the generated id when they differ', async () => {
+  const payload = realShapedPayload({ session_id: 'cli-reported-id' });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 0, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+    randomUUID: () => 'generated-id-that-should-lose',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.sessionId, 'cli-reported-id');
+  assert.notEqual(result.sessionId, 'generated-id-that-should-lose');
+});
+
+test('invokeClaudeReal: success branch falls back to the generated id when the reply carries neither session_id nor uuid', async () => {
+  const payload = realShapedPayload({ session_id: undefined, uuid: undefined });
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 0, stdout: JSON.stringify(payload), stderr: '', signal: null })),
+    randomUUID: () => 'generated-fallback-id',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.sessionId, 'generated-fallback-id');
+});
+
+test('invokeClaudeReal: an unreadable oauthTokenFile returns sessionId: null and never generates one -- claude was never spawned', async () => {
+  let spawnCalls = 0;
+  let randomUUIDCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      spawnCalls += 1;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+    randomUUID: () => {
+      randomUUIDCalls += 1;
+      return 'should-not-be-generated';
+    },
+  };
+  const result = await invokeClaudeReal(
+    {
+      promptText: 'hi',
+      model: 'haiku',
+      effort: 'low',
+      cwd: '/tmp',
+      account: {
+        name: 'acct-missing-token',
+        configDir: null,
+        oauthTokenFile: '/nonexistent/spo-lot4-token-ledger/does-not-exist',
+      },
+    },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.match(result.error, /cannot read oauthTokenFile/);
+  assert.equal(result.sessionId, null);
+  assert.equal(spawnCalls, 0); // claude was never spawned
+  assert.equal(randomUUIDCalls, 0); // no id generated for a session that never existed
+});
+
+test('invokeClaudeReal: a deadline kill returns the generated session id (claude ran and was killed, so its transcript exists) -- kind/ok/timedOut/deadlineMs/error are unchanged from before this action', async () => {
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: timeoutErr, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' })),
+    randomUUID: () => 'gen-deadline-id',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 5000 },
+    deps
+  );
+  assert.equal(result.sessionId, 'gen-deadline-id');
+  // A5 pin: everything else about this branch is exactly what it was before this action.
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.timedOut, true);
+  assert.equal(result.killedBySignal, undefined);
+  assert.equal(result.deadlineMs, 5000);
+  assert.equal(
+    result.error,
+    'llm.js: claude ran but exceeded the 5000ms deadline and was killed (signal SIGTERM)'
+  );
+  assert.equal(result.raw, 143);
+});
+
+test('invokeClaudeReal: an external signal kill returns the generated session id -- kind/ok/killedBySignal/signal/error are unchanged from before this action', async () => {
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: null, stdout: '', stderr: '', signal: 'SIGTERM' })),
+    randomUUID: () => 'gen-killed-id',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null } }, // no deadlineMs
+    deps
+  );
+  assert.equal(result.sessionId, 'gen-killed-id');
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.timedOut, undefined);
+  assert.equal(result.killedBySignal, true);
+  assert.equal(result.signal, 'SIGTERM');
+  assert.equal(result.error, 'llm.js: claude was killed by signal SIGTERM (no deadline was armed)');
+});
+
+test('invokeClaudeReal: unparsable stdout returns the generated session id -- claude exited, its transcript exists', async () => {
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: 'not json at all', stderr: 'boom', signal: null })),
+    randomUUID: () => 'gen-unparsable-id',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', effort: 'low', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.sessionId, 'gen-unparsable-id');
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.error, 'llm.js: claude stdout was not valid JSON (exit 1)');
+});
+
+test('invokeClaudeReal: a generic spawn failure (ENOENT) keeps sessionId null -- claude was never started, so no transcript exists', async () => {
+  const enoent = new Error('spawnSync claude ENOENT');
+  enoent.code = 'ENOENT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: enoent, status: null, stdout: '', stderr: '', signal: null })),
+    randomUUID: () => 'should-not-appear-in-result',
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null }, deadlineMs: 5000 },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.sessionId, null);
+  assert.notEqual(result.sessionId, 'should-not-appear-in-result');
+});
+
+test('invokeClaudeReal: E2BIG keeps sessionId null -- claude never started (argv too large for exec), so a future recovery action must treat this call as unrecoverable, not recovered-as-zero', async () => {
+  const e2big = new Error('spawnSync claude E2BIG');
+  e2big.code = 'E2BIG';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: e2big, status: null, stdout: '', stderr: '', signal: null })),
+  };
+  const result = await invokeClaudeReal(
+    { promptText: 'hi', model: 'haiku', cwd: '/tmp', account: { name: 'default', configDir: null } },
+    deps
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.equal(result.sessionId, null);
+  assert.match(result.error, /failed to spawn claude/);
+});
+
+// Fix 4 (defect, not a mutant): a malformed opts.sessionId string passes buildArgv's loose
+// typeof/non-empty guard untouched, reaches `claude --session-id <bad-value>`, and makes the CLI
+// exit 1 before any API call (per its own --help: "must be a valid UUID"). Left unguarded, that
+// would land in the "claude stdout was not valid JSON" branch -- a *parse* failure reported for
+// what is actually an *argument* fault, the exact misdiagnosis class this file's own header
+// documents being burned by twice. invokeClaudeReal's contract is "only a programming error (bad
+// opts) throws" -- a malformed sessionId is exactly that, so it must throw, not spawn.
+test('invokeClaudeReal: a non-UUID opts.sessionId string throws a TypeError naming the field and value -- never reaches spawnSync', async () => {
+  let spawnCalls = 0;
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      spawnCalls += 1;
+      return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    }),
+  };
+  await assert.rejects(
+    () =>
+      invokeClaudeReal(
+        {
+          promptText: 'hi',
+          model: 'haiku',
+          effort: 'low',
+          cwd: '/tmp',
+          account: { name: 'default', configDir: null },
+          sessionId: 'not-a-uuid',
+        },
+        deps
+      ),
+    (err) => {
+      assert.ok(err instanceof TypeError, 'expected a TypeError');
+      assert.match(err.message, /sessionId/);
+      assert.match(err.message, /not-a-uuid/);
+      return true;
+    }
+  );
+  assert.equal(spawnCalls, 0, 'claude must never be spawned on a malformed sessionId');
 });
 
 test('invokeClaudeReal: is_error + api_error_status 429 -> {ok:false, kind:"limit"}', async () => {
@@ -862,6 +1260,116 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
   assert.equal(llmCallEvent.account, 'acct-x');
   assert.equal(llmCallEvent.ok, true);
   assert.equal(llmCallEvent.sessionId, 'sess-123');
+});
+
+// The success-path test above proves the legacy override path's journal write carries an id when
+// invokeClaudeReal returns ok:true -- it says nothing about a FAILED call on this same path. This
+// test drives runLlm's legacy ctx.task.llm.<step> override branch through a deadline-killed spawn
+// and reads the id back out of the journal file on disk (never off the return value), pinning
+// that a killed call's generated sessionId reaches the ledger, not just invokeClaudeReal's return.
+test('runLlm legacy ctx.task.llm.<step> override path: a deadline-killed call still journals the generated sessionId, with tokensSource null (read back from journal.jsonl, not from the return value)', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const taskDir = mkTmp('spo-llmreal-legacy-deadline-taskdir-');
+
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: timeoutErr, status: 143, stdout: '', stderr: '', signal: null })),
+    randomUUID: () => '11111111-2222-4333-8444-555555555555',
+  };
+
+  const ctx = {
+    shadowMode: false,
+    taskDir,
+    config: { stepDeadlineMs: 30000 },
+    account: { name: 'acct-x', configDir: null },
+    task: {
+      id: 't1',
+      llm: {
+        PLAN: { model: 'fable', effort: 'medium', promptText: 'plan this', maxBudgetUsd: 1 },
+      },
+    },
+  };
+
+  const result = await runLlm(ctx, 'PLAN', 'llm.PLAN', deps);
+
+  // Confirm this call actually took the deadline-kill branch -- not a stand-in for the journal
+  // assertions below, which are the actual deliverable.
+  assert.equal(result.timedOut, true);
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const llmCallEvent = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(llmCallEvent, 'expected an llm-call journal event');
+  assert.equal(llmCallEvent.sessionId, '11111111-2222-4333-8444-555555555555');
+  assert.equal(llmCallEvent.ok, false);
+  // A killed call reported no tokens -- the distinction the next action (token ledger) builds on.
+  assert.equal(llmCallEvent.tokensSource, null);
+});
+
+// Fix 6 (driver's verification pass): every test above this line exercises invokeClaudeReal's
+// RETURN VALUE, or the legacy ctx.task.llm.<step> override path's journal write -- none of them
+// prove the REAL `kind: "card"` path's journal write carries the id, and that write is a
+// SEPARATE line of code (`sessionId: raw.sessionId` in runLlm's card branch) from the one the
+// test above pins. "the function returns the right value" is not "production journals it" -- see
+// this repo's own doctrine on severing a dispatch from what it's supposed to prove reachable.
+// This test drives runLlm's real card path (no ctx.task.llm override) through a deadline-killed
+// spawn and reads the id back out of the journal file on disk, not out of runLlm's return value.
+test('runLlm real kind:"card" path: a deadline-killed call still journals the non-null generated sessionId (read back from journal.jsonl, not from the return value)', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const taskDir = mkTmp('spo-llmreal-cardpath-taskdir-');
+  const worktreePath = mkTmp('spo-llmreal-cardpath-worktree-');
+
+  const timeoutErr = new Error('spawnSync claude ETIMEDOUT');
+  timeoutErr.code = 'ETIMEDOUT';
+  const deps = {
+    spawnSync: fakeSpawnSync(() => ({ error: timeoutErr, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' })),
+    randomUUID: () => 'card-path-deadline-uuid',
+  };
+
+  const ctx = {
+    shadowMode: false,
+    dryRun: false,
+    taskDir,
+    account: { name: 'acct-cardpath', configDir: null },
+    task: {
+      id: 'card-fix6',
+      kind: 'card',
+      issue: 8877,
+      title: 'Add a status badge',
+      criterion: 'a badge appears',
+      worktreePath,
+      size: 'S',
+      touchesRdoMembers: false,
+    },
+  };
+
+  const result = await runLlm(ctx, 'PLAN', 'llm.PLAN', deps);
+
+  // The return value (already pinned by test/llm-real.test.js's invokeClaudeReal-level deadline
+  // test above) -- checked here too only to confirm this call actually took the deadline-kill
+  // branch, not to stand in for the journal assertion below.
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const llmCallEvent = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(llmCallEvent, 'expected an llm-call journal event');
+  assert.equal(llmCallEvent.step, 'PLAN');
+  assert.equal(llmCallEvent.ok, false);
+  // The actual deliverable: the id invokeClaudeReal generated and asked `claude` to use is the
+  // one that landed in the journal line on disk -- not null, not undefined, exactly the injected
+  // uuid.
+  assert.equal(llmCallEvent.sessionId, 'card-path-deadline-uuid');
 });
 
 // ---- regression: #452's E2BIG (a big prompt must never land in argv) -----------------------

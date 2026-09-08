@@ -86,7 +86,7 @@ test('dry-run demo: a card task reaches DONE with dryrun-<STATE>.md for every LL
   ]);
 });
 
-test('dry-run demo: dryrun-PLAN.md shows the real argv (--model/--effort/--json-schema) and the filled prompt', () => {
+test('dry-run demo: dryrun-PLAN.md shows the argv (--model/--effort/--json-schema/--session-id) and the filled prompt -- --session-id carries the stable placeholder, never a fabricated real id, since a dry run never spawns claude', () => {
   const queueDir = mkTmp('spo-queue-dryrun-argv-');
   const journalDir = mkTmp('spo-journal-dryrun-argv-');
   const worktreePath = mkTmp('spo-dryrun-argv-worktree-');
@@ -114,6 +114,14 @@ test('dry-run demo: dryrun-PLAN.md shows the real argv (--model/--effort/--json-
   assert.match(content, /medium/); // size "M" -> effort "medium"
   assert.match(content, /--json-schema/);
   assert.match(content, /plan_markdown/); // PLAN's output contract, inside the json-schema
+
+  // A dry run never spawns `claude`, so no real session id exists to show -- steps/llm.js's
+  // runLlm builds the displayed argv with the stable literal placeholder '<generated-at-spawn>'
+  // instead (never a generated UUID, which would fabricate a real, joinable id for a call that
+  // never happened). Previously --session-id was omitted from this artifact entirely, which this
+  // test did not catch even though its own name claimed to show "the real argv".
+  assert.match(content, /--session-id/);
+  assert.match(content, /<generated-at-spawn>/);
 
   assert.match(content, /## filled prompt/);
   assert.match(content, new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
