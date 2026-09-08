@@ -606,3 +606,28 @@ Found while fixing the two sweeps' own survived mutations; neither is closed her
    directory away from the sweep that would otherwise catch its drift. 7bis.3's own two docs
    (`doc/state-machine-spec.md`, `orchestrator/README.md`) do not include it, and no other
    mechanism does either.
+
+## 9 · A citation class the sweep structurally cannot pin (card #119 lot 1, 2026-09-08)
+
+`console/plain-language.js` cites `test/dashboard-deck.test.js` three times — at its header, at
+`PARK_REASONS`, and at `SELF_RETRYING` — naming the guards that enforce each table's completeness.
+Those citations were previously pointing at `test/plain-language.test.js`, **a file that does not
+exist**, and had rotted unnoticed for as long as they shipped.
+
+They can rot again, and nothing will catch it, for two independent structural reasons:
+
+1. `console/plain-language.js` is not in `test/doc-constant-sweep.test.js`'s `CORPUS_FILES`, so no
+   citation in it is checked at all.
+2. Even if it were, that sweep deliberately skips citation targets under `test/` — so a citation
+   *to* a test file is outside its remit by design.
+
+The three citations are therefore accurate today, verified by hand (each named property was
+confirmed genuinely enforced in `test/dashboard-deck.test.js` before the citation was redirected),
+and unprotected tomorrow: renaming that test file, or moving one of the three guards out of it,
+leaves three false citations and a green suite.
+
+Registered rather than fixed. Closing it means either adding `console/` files to `CORPUS_FILES` —
+which pulls a large surface into a pin set sized for `doc/` prose — or teaching the sweep to
+resolve test-file targets, which is the same "parse what the citation claims" mechanism §8.1
+already registered as too large to attempt. The cheap mitigation is the one taken: the citations
+name a file, not a `file:line`, so only a rename or a move breaks them, not an ordinary edit.

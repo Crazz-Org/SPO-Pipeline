@@ -255,6 +255,14 @@ const PARK_REASONS = {
 // its own" splits WITHIN the family rather than being one answer for it. ACCOUNT_POOL_SELF_RETRYING
 // below is that family's own mirror, kept separate for the same reason SELF_RETRYING itself is
 // kept separate from PARK_REASONS: a rename or a split must be caught, not silently absorbed.
+// SELF_RETRYING_LLM_STEPS -- mirrors state-machine.js's TRANSIENT_RETRY_LLM_STEPS, the list it
+// builds the `llm-transport-failed:<STEP>` members of TRANSIENT_RETRY_REASONS from. Mirrored, not
+// required, for the same reason as the two tables around it; test/dashboard-deck.test.js pins it
+// against the orchestrator's own list in both directions, so narrowing that list without
+// narrowing this one fails by name instead of quietly leaving the deck promising a retry for a
+// step that has become terminal.
+const SELF_RETRYING_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
+
 const SELF_RETRYING = new Set([
   'claim-rate-limited',
   'gate-non-attesting',
@@ -350,9 +358,19 @@ function reasonText(reason) {
   if (reason.startsWith('llm-transport-failed:')) {
     const step = reason.slice('llm-transport-failed:'.length);
     const label = STATES[step] ? STATES[step].label.toLowerCase() : step;
+    // Derived, not hardcoded. This branch used to return `selfRetrying: true` for EVERY step,
+    // which is only accidentally right: TRANSIENT_RETRY_REASONS contains this family for the four
+    // steps in TRANSIENT_RETRY_LLM_STEPS and no others. Action 1.4's verification demonstrated the
+    // gap concretely -- narrow that list by one step, add the reason to TERMINAL_PARK_REASONS to
+    // make the narrowing deliberate, and the deck goes on promising a retry for a reason that is
+    // now terminal, with nothing failing. Same defect as the cooling branch's own hardcoded
+    // `true`, one family over.
+    const selfRetrying = SELF_RETRYING_LLM_STEPS.includes(step);
     return {
-      text: `The call to Claude for “${label}” never came back. It will try again on its own.`,
-      selfRetrying: true,
+      text: selfRetrying
+        ? `The call to Claude for “${label}” never came back. It will try again on its own.`
+        : `The call to Claude for “${label}” never came back.`,
+      selfRetrying,
       known: true,
     };
   }
@@ -372,4 +390,4 @@ function reasonText(reason) {
 // already an exact key and matching a literal with startsWith would change nothing. Rather than
 // leave the convention pinned by nothing (action 1.4's verification found both mutations
 // surviving), it is asserted directly against this function.
-module.exports = { STATES, PARK_REASONS, SELF_RETRYING, ACCOUNT_POOL_SELF_RETRYING, accountPoolMember, stateInfo, reasonText };
+module.exports = { STATES, PARK_REASONS, SELF_RETRYING, SELF_RETRYING_LLM_STEPS, ACCOUNT_POOL_SELF_RETRYING, accountPoolMember, stateInfo, reasonText };

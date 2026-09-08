@@ -376,6 +376,14 @@ test("the deck's self-retrying set matches the orchestrator's own, so the deck c
   // carrying both shapes poolCooldownDeadlineMs reads is supplied for every member; its own
   // structural gate (checked first, by reason name, before either detail key is read -- see that
   // function's header) is what makes the other three resolve to null regardless of this detail.
+  //
+  // The oracle is pinned at ONE point in the input space, deliberately, and saying so is the
+  // honest version of this comment: reasonText's answer is a function of the reason alone, while
+  // poolCooldownDeadlineMs's is a function of (reason, detail). The two provably disagree at
+  // ('all-accounts-cooling-after-retry', {}) -- no detail, so no deadline, so no wait -- which the
+  // detail chosen here hides. That input is not live-producible today (callLlmStep's throw site
+  // always writes cooldownUntilIso), so this is a BOUNDED oracle rather than a wrong one; a change
+  // that let that throw omit the key would need this test rethought, not merely re-run.
   const detail = {
     earliestCooldownUntil: Date.parse('2026-09-05T19:32:33.350Z'),
     cooldownUntilIso: '2026-09-05T19:32:33.350Z',
@@ -472,6 +480,44 @@ test('the deck matches a literal family member by exact equality and a prefix me
   // ...and the same string must not be described as a known reason by the deck either, which is
   // the reachable consequence of the prefix half of the convention.
   assert.equal(reasonText('nope-all-accounts-cooling-until-2026-09-05T19:32:33.350Z').known, false);
+});
+
+test("the deck's llm-transport-failed answer is derived from the orchestrator's step list, not hardcoded true", () => {
+  // The second dynamic family had the SAME defect as the cooling branch and it outlived action
+  // 1.4: `selfRetrying: true` returned unconditionally, never consulting TRANSIENT_RETRY_REASONS.
+  // Verification demonstrated it concretely -- narrow TRANSIENT_RETRY_LLM_STEPS by one step, add
+  // that reason to TERMINAL_PARK_REASONS so the narrowing is deliberate, and the deck goes on
+  // promising a retry for a now-terminal reason with nothing failing. The guard above could not
+  // see it: it only iterates reasons that ARE in the set, so it checks one direction.
+  const { TRANSIENT_RETRY_REASONS } = require('../orchestrator/state-machine');
+  const { SELF_RETRYING_LLM_STEPS } = require('../console/plain-language');
+  const PREFIX = 'llm-transport-failed:';
+
+  // The orchestrator's own list, read back out of the set it builds rather than re-typed here.
+  const orchestratorSteps = [...TRANSIENT_RETRY_REASONS]
+    .filter((r) => r.startsWith(PREFIX))
+    .map((r) => r.slice(PREFIX.length));
+  assert.deepEqual(
+    [...SELF_RETRYING_LLM_STEPS].sort(),
+    orchestratorSteps.sort(),
+    "console/plain-language.js mirrors state-machine.js's TRANSIENT_RETRY_LLM_STEPS -- narrowing that " +
+      'list without narrowing this one leaves the deck promising a retry for a step that is now terminal'
+  );
+
+  // Both directions, against the orchestrator's own membership -- including a step deliberately
+  // NOT in the set, which is the direction that was unpinned.
+  for (const step of [...orchestratorSteps, 'CITATION_VERIFIER', 'BRAND_NEW_STEP']) {
+    const reason = `${PREFIX}${step}`;
+    assert.equal(
+      reasonText(reason).selfRetrying,
+      TRANSIENT_RETRY_REASONS.has(reason),
+      `${reason}: the deck says selfRetrying=${reasonText(reason).selfRetrying}, the orchestrator says ${TRANSIENT_RETRY_REASONS.has(reason)}`
+    );
+  }
+
+  // A step with no retry must not be told it will try again on its own.
+  assert.ok(!/try again on its own/.test(reasonText(`${PREFIX}CITATION_VERIFIER`).text));
+  assert.match(reasonText(`${PREFIX}PLAN`).text, /try again on its own/);
 });
 
 test('every account-pool family member has its own plain-language sentence', () => {
