@@ -418,7 +418,11 @@ function chip(inner, cls = '', title = '') {
 // PREFIX figure is the one further from chance and therefore the one most worth a sceptic's
 // attention -- cited alongside the outcome figure, not left out, for exactly that reason. Spend
 // tracks a card's SIZE, not its TROUBLE: a card that spends a lot is often just a big card, not a
-// struggling one. There is deliberately no threshold, no alert and no colour-means-bad on this
+// struggling one. Those two figures are the arbitration's; an independent recount during this lot,
+// drawing the cohort from state.json instead (42 rankable cards, 34 DONE / 8 PARKED), scored the
+// outcome AUC at 0.4485. The exact value moves with how the cohort is drawn and the conclusion does
+// not: every cohort tried lands below 0.5, and the median PARKED card spends slightly MORE than the
+// median DONE card, which is the opposite of what a "high spend means trouble" rule would need. There is deliberately no threshold, no alert and no colour-means-bad on this
 // chip at any value -- the criterion this tooltip exists to satisfy is falsified the moment
 // someone starts reading the completed figure as a sign the card is doing well or badly, not by
 // any false-positive rate (this figure makes no prediction to be wrong about).

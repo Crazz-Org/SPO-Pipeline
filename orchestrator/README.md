@@ -2504,6 +2504,64 @@ and runs uncapped; see that file's own comment for the (still-current) maintaine
 behind it. See § Budgets (above) for what actually is enforced — `stepDeadlineMs`,
 `LLM_STEP_DEADLINE_MS`, the two retry budgets, and recette's own caps.
 
+**The flight deck's "spent this run" chip carries no threshold, no alert, at any value — this is
+deliberate, and it is the single most likely thing for a future session to undo.** The card that
+built the chip (token-ledger lot, SPO-Pipeline#107) originally asked for exactly that: an alert
+when a card's cumulative spend crossed a configured number. Measured against the real corpus, the
+premise did not survive: ranking every terminal card's final billable tokens against its DONE/PARKED
+outcome scores a ROC AUC of **0.4706**; ranking spend-so-far at the card's last state transition
+before it finished (a check that spend-in-progress cannot even flag a card already in trouble)
+scores **0.3706** — both essentially chance (0.5 = uninformative), and unchanged by this lot's own
+accounting repair. Those two figures are the arbitration's own, and the exact value moves a little
+with how the cohort is drawn: an independent recount during this lot, counting a card terminal from
+its `state.json` (42 rankable cards, 34 DONE / 8 PARKED), scored the outcome AUC at **0.4485**. The
+*conclusion* is insensitive to that choice — every cohort tried lands below 0.5, and the median
+PARKED card spends slightly MORE than the median DONE card (360.6k against 293.0k), which is the
+opposite of what a "high spend means trouble" rule needs to be true. Do not quote either figure as
+exact without saying which cohort produced it. The card's original acceptance clause — *"the chosen threshold fires on #488 and
+#492 and on nothing that merged cleanly"* — was dropped as unsatisfiable: at the suggested 500,000,
+a threshold fires on 14 of the 44 rankable corpus cards (32%), and 11 of those 14 reached DONE with
+a merged PR — so the rule cannot both fire on the two cards it was asked to catch and stay silent on
+everything that shipped cleanly, at that value or any other. Cumulative
+billable tokens is abandoned as a proxy for trouble, not merely as a badly-tuned one: the sweep from
+200k to 1M has no knee, and the ten top-spending cards and the six cards actually cut at a deadline
+overlap in only three — spend tracks a card's *size*, not its *trouble*. And the work a threshold
+would most want to notice is structurally invisible to it: every one of the nine deadline-cut calls
+journalled zero tokens, so before this lot repaired the ledger they weighed nothing in the very
+quantity the rule would have measured. So the chip states
+cost, never risk: no colour means "bad", no comparison against a limit, and the tooltip cites both
+AUC figures rather than the more-favorable one alone. This property is enforced mechanically, not
+just documented — `test/dashboard-deck.test.js` pins that the chip's markup carries no threshold
+wording at all and is invariant in magnitude (no branch keyed on the figure's size), so a
+reintroduced alert fails the suite before it fails a reader. **The criterion is not "no false
+positives", since the figure predicts nothing — it is wrong the moment anyone starts reading the
+completed number as a health signal.**
+
+**What the token-ledger lot corrected about its own inputs, briefly, because these are the kind of
+fact a later session re-derives wrongly:**
+
+- A transcript-recovered figure (`tokensSource: 'transcript'`, above) is a lower bound, but a close
+  one on the one control session available to check it: **~0.7% under `modelUsage`, not the ~8.3%**
+  gap this card's own arbitration once recorded as unexplained. That gap was two defects in the
+  *reader*, not in the transcripts themselves — the dashboard's usage scanner was skipping subagent
+  transcripts entirely, and deduping a streamed rewrite of the same `message.id` by keeping the
+  FIRST occurrence instead of the last (`console/usage-scan.js`'s own header has the full
+  before/after numbers). With both fixed, cache-creation and cache-read on the control session match
+  the CLI's own `modelUsage` to the token, and billable is 0.686% under. Real, not zero — do not
+  round it away — but not the double-digit gap once on record.
+- **Locating a killed call's transcript by session id only (action 4.1) is load-bearing — do not add
+  a retroactive time-window fallback.** Matching by "closest session started near the call's own
+  timestamp" happened to be unique across all 20 corpus calls this lot measured, but that is a
+  property of that corpus, not a guarantee: two back-to-back kills within roughly two minutes of
+  each other collapse into two candidates each under a window that loose. `token-recovery.js` locates
+  a transcript by exact session id and nothing else — which only works because action 4.1 generates
+  that id before the `claude` spawn, specifically so a killed call still has one to be found by.
+- **`maxFileBytes` (`console/usage-scan.js`, reused by `token-recovery.js`) caps bytes read per
+  file, not per session.** The worst real session measured is a 16.4 MB main transcript plus a
+  99-file, 71.9 MB subagent tree — read in full in about a second, so this is not a performance
+  problem today. But nothing bounds the *aggregate* a pathological session (an unusually deep or
+  wide subagent fan-out) could present, and a per-file cap alone would not catch it.
+
 **Cache-expiry flag (advisory only).** The `claude` CLI's prompt cache has (at least) two
 ephemeral TTL tiers — 5 minutes and 1 hour (`config.js`'s `cacheTtlMs`, currently the observed
 1-hour tier this pipeline's calls land in). When the gap between two calls sharing a cached

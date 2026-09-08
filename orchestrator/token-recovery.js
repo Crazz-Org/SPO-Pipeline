@@ -25,6 +25,14 @@
 // `-home-crazz--spo-worktrees-issue-N` shapes exist in the real corpus for what should be the same
 // kind of path. Searching by filename sidesteps that rule entirely.
 //
+// Also NOT by a time-window match ("the session that started closest to this call's own
+// timestamp"): that happened to be unique across every corpus call measured, but is a property of
+// that corpus, not a guarantee -- two kills close enough together collapse into ambiguous
+// candidates under a loose-enough window. This module works only because
+// orchestrator/steps/llm.js's invokeClaudeReal mints `sessionId` BEFORE spawning `claude`, so a
+// killed call still has an id to be found by. See orchestrator/README.md's Tokens section for the
+// measured numbers behind this.
+//
 // ---- roots searched, in order -------------------------------------------------------------------
 //
 //   1. accountConfigDir's own `projects` directory -- the account the call actually ran under
@@ -220,6 +228,11 @@ function buildRoots({ accountConfigDir, accountsDir, homeDir, discoverUsageRoots
 // deps.scanFile and deps.discoverUsageRoots -- though no test in this lot needs to override
 // either: the test plan builds real temp directory trees and reads them with the real functions,
 // the same way production does.
+//
+// `maxFileBytes` caps bytes read PER FILE, not per session -- nothing here bounds the aggregate a
+// session with an unusually deep or wide subagent fan-out could present. Fine on every real
+// session measured so far (see orchestrator/README.md's Tokens section for the worst one on
+// record); not a guarantee for one that hasn't happened yet.
 async function recoverSessionTokens(opts = {}, deps = {}) {
   const { sessionId, accountConfigDir, maxFileBytes } = opts;
   if (typeof sessionId !== 'string' || sessionId === '') return null;
