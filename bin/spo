@@ -57,8 +57,8 @@
 //                            metric, not a budget -- there is no dollar figure anywhere here.
 //                            "n/a" in a token column means NOT REPORTED, never zero: journals
 //                            written before token capture shipped (2026-08-31) carry no token
-//                            fields at all, and a killed/E2BIG call journals
-//                            `tokensSource: null` -- a footer names how many calls lacked them.
+//                            fields at all; a call `claude` never started (E2BIG etc.) stays
+//                            `tokensSource: null` -- a killed/signalled/unparsable call is tried against its transcript first (action 4.3).
 //   spo cost                 DEPRECATED alias for `spo tokens` (dollars were retired as the
 //                            headline metric, 2026-08-31) -- prints a one-line notice, then the
 //                            same table. Kept only because some docs/gates still say "watching
@@ -932,11 +932,11 @@ function cmdTokens(opts) {
     const expiries = t.likelyCacheExpiries.length ? `x${t.likelyCacheExpiries.length}` : '';
     const parksParts = [];
     if (t.parkReasons.length) parksParts.push(`${t.parkReasons.length} [${t.parkReasons.join(', ')}]`);
-    // A task whose llm-calls reported NO token fields at all (every journal written before
-    // token capture shipped; a run of killed/E2BIG calls) prints "n/a", never 0 -- a 0 there is
+    // A task whose llm-calls reported NO token fields at all (a journal from before token
+    // capture shipped, a call claude never started such as E2BIG, or a killed call whose own
+    // transcript recovery also found nothing) prints "n/a", never 0 -- a 0 there is
     // indistinguishable from "this task genuinely used no tokens", which would be a false
-    // measurement rather than a missing one. orchestrator/tokens.js's llmCallsWithTokens (from
-    // each event's own `tokensSource`) is what makes the two distinguishable.
+    // measurement, not a missing one. tokens.js's llmCallsWithTokens makes the two distinguishable.
     const cell = (n) => (t.llmCallsWithTokens === 0 ? 'n/a' : formatTokenCount(n));
     console.log(
       `${t.id.padEnd(idWidth)}  ${t.state.padEnd(7)}  ${String(t.llmCalls).padStart(5)}  ` +
@@ -993,17 +993,17 @@ function cmdTokens(opts) {
 
   // The footer that keeps this report honest. `llm-call` events written before token capture
   // shipped (2026-08-31) carry only the retired `costUsd` and no `tokensSource` at all, and a
-  // killed/E2BIG call journals `tokensSource: null` -- both are "not reported", NOT zero. Say so
-  // out loud rather than letting a table of 0s (or n/a) be read as "this pipeline used no
-  // tokens".
+  // call `claude` never started (E2BIG etc.) still journals `tokensSource: null` -- both are
+  // "not reported", NOT zero, though a killed/signalled/unparsable call tries recovery first
+  // (action 4.3). Say so rather than letting a table of 0s (or n/a) read as "no tokens used".
   if (report.llmCallsWithoutTokens > 0) {
     console.log('');
     console.log(
       `note: ${report.llmCallsWithoutTokens} of ${report.llmCalls} llm-call events carry no token data ` +
         `(no \`tokensSource\`, or \`tokensSource: null\`) and are NOT counted above -- "n/a" means ` +
         'not reported, not zero. Journals written before token capture shipped (2026-08-31) recorded ' +
-        'only the now-retired dollar figure; a deadline-killed or E2BIG call never gets a token block ' +
-        'at all. Only calls made by the current build report tokens.'
+        'only the now-retired dollar figure; a call claude never started (E2BIG etc.) never gets a ' +
+        'token block, and a killed/signalled/unparsable call only lands here if recovery found nothing.'
     );
   }
 }

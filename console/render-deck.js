@@ -399,9 +399,42 @@ function trimNarration(text, max = 200) {
   return (cut === -1 ? tail : tail.slice(cut + 2)).trim();
 }
 
-function chip(inner, cls = '') {
-  return `<span class="chip ${cls}">${inner}</span>`;
+function chip(inner, cls = '', title = '') {
+  return `<span class="chip ${cls}"${title ? ` title="${esc(title)}"` : ''}>${inner}</span>`;
 }
+
+// The tooltip on the "spent this run" chip (renderCard below). Said here, once, rather than
+// inlined at the call site, so the wording used in the `title=` attribute and the claim this
+// module's header would otherwise have to repeat stay the same string.
+//
+// This is the thing the arbitration that re-specified this chip requires be said WHERE A READER
+// WILL FIND IT: token spend is cost visibility, not a health signal. Measured on the real corpus
+// (every terminal card in ~/.spo-state/journal, DONE vs PARKED as the outcome label, ROC AUC of
+// each card's final billableTokens ranking against that label -- 'outcome'; the same ranking
+// computed instead over just the tokens spent up to the point of the card's LAST state
+// transition before it finished -- 'prefix', a check that spend-so-far cannot even predict a
+// card already in trouble): outcome AUC 0.4706, prefix AUC 0.3706 -- both essentially chance
+// (0.5 = uninformative), byte-identical before and after this lot's arithmetic repair. The
+// PREFIX figure is the one further from chance and therefore the one most worth a sceptic's
+// attention -- cited alongside the outcome figure, not left out, for exactly that reason. Spend
+// tracks a card's SIZE, not its TROUBLE: a card that spends a lot is often just a big card, not a
+// struggling one. Those two figures are the arbitration's; an independent recount during this lot,
+// drawing the cohort from state.json instead (42 rankable cards, 34 DONE / 8 PARKED), scored the
+// outcome AUC at 0.4485. The exact value moves with how the cohort is drawn and the conclusion does
+// not: every cohort tried lands below 0.5, and the median PARKED card spends slightly MORE than the
+// median DONE card, which is the opposite of what a "high spend means trouble" rule would need. There is deliberately no threshold, no alert and no colour-means-bad on this
+// chip at any value -- the criterion this tooltip exists to satisfy is falsified the moment
+// someone starts reading the completed figure as a sign the card is doing well or badly, not by
+// any false-positive rate (this figure makes no prediction to be wrong about).
+//
+// Separately: this chip counts the CURRENT run's CLOSED splits only. `spo tokens` sums every
+// call across every run a card has ever had (retries included), so the two surfaces can and do
+// disagree by a wide margin on a card that has been retried -- that is stated in the tooltip too,
+// rather than left for a reader to discover as an unexplained mismatch.
+const SPENT_TOKENS_TOOLTIP =
+  'Cost visibility, not a health signal: spend tracks a card’s size, not its trouble ' +
+  '(measured outcome AUC 0.4706, prefix AUC 0.3706 — both essentially chance) — this run only; ' +
+  '`spo tokens` totals every run of the card.';
 
 // ---- splits --------------------------------------------------------------------------------
 
@@ -466,7 +499,14 @@ function splitNote(s, isLive) {
   if (d.prNumber) bits.push(`PR #${esc(d.prNumber)}`);
   if (d.rootCause) bits.push(`&ldquo;${esc(trimNarration(d.rootCause, 90))}&rdquo;`);
   if (typeof d.numTurns === 'number') bits.push(`${d.numTurns} turns`);
-  if (typeof d.billableTokens === 'number' && d.billableTokens > 0) bits.push(esc(formatTokenCount(d.billableTokens)));
+  // Same A4 discipline as the chip (renderSpendChip below): a split whose ledger is incomplete
+  // (a not-measured or recovered call sits in it) never shows a bare figure here either -- the
+  // reader who follows the chip's "spend only partly recorded" down to the split that is short
+  // must not find an unqualified number on the very row it is pointing at. `> 0` (unchanged)
+  // already keeps a genuine 0 out of this line entirely.
+  if (typeof d.billableTokens === 'number' && d.billableTokens > 0) {
+    bits.push((d.notMeasuredCalls || d.recoveredCalls ? 'at least ' : '') + esc(formatTokenCount(d.billableTokens)));
+  }
   if (!bits.length && s.sentBack) bits.push('sent back');
   return bits.join(' &middot; ');
 }
@@ -497,6 +537,80 @@ function renderOutcome(card) {
   </div>`;
 }
 
+// ---- token spend (the "spent this run" chip) ------------------------------------------------
+//
+// summarizeSpend(run) walks the run's CLOSED splits only -- exactly what the old spentTokens
+// reducer did, the live/open split's spend stays deliberately unreported (the "+ live call
+// unreported" note below covers it) -- and folds collect.js's buildRun's per-split
+// measured/recovered/notMeasured call counts into one shape renderSpendChip can read without
+// re-deriving any of that module's own "absence, never 0" discipline. `tokens` therefore stays
+// `null`, not `0`, until at least one split has carried a real numeric billableTokens.
+function summarizeSpend(run) {
+  let tokens = null;
+  let measuredCalls = 0;
+  let recoveredCalls = 0;
+  let notMeasuredCalls = 0;
+  if (run) {
+    for (const s of run.splits) {
+      const d = s.detail || {};
+      if (typeof d.billableTokens === 'number') {
+        tokens = (typeof tokens === 'number' ? tokens : 0) + d.billableTokens;
+      }
+      measuredCalls += d.measuredCalls || 0;
+      recoveredCalls += d.recoveredCalls || 0;
+      notMeasuredCalls += d.notMeasuredCalls || 0;
+    }
+  }
+  return { tokens, measuredCalls, recoveredCalls, notMeasuredCalls, totalCalls: measuredCalls + recoveredCalls + notMeasuredCalls };
+}
+
+// renderSpendChip(spend, liveCallPending) -> '' or one <span class="chip">...</span>.
+//
+// A4 (this lot's acceptance clause): "never render a bare figure for a card whose ledger is
+// incomplete." A reader must not be able to mistake a lower bound, or an unknown, for a
+// completed total -- so the figure alone (as today) is shown only once every call in the run has
+// reported a number; a recovered call downgrades it to an explicit "at least"; any not-measured
+// call replaces the bare figure with a stated count of what is missing. No chip at all appears
+// before any call has closed, and none of these branches ever spells out a threshold, an alert,
+// or a colour that means "bad" -- see SPENT_TOKENS_TOOLTIP, which is the other half of this.
+function renderSpendChip(spend, liveCallPending) {
+  const { tokens, recoveredCalls, notMeasuredCalls, totalCalls } = spend;
+  if (totalCalls === 0) return ''; // no llm-call event has closed in this run yet -- nothing to say
+  const live = liveCallPending ? ' <span class="chip-dim">+ live call unreported</span>' : '';
+
+  if (notMeasuredCalls > 0) {
+    const missing = `<span class="chip-dim">${notMeasuredCalls} call${notMeasuredCalls === 1 ? '' : 's'} not measured</span>`;
+    // "not recorded" is a fact worth showing; "0" (or any other bare figure) would be a false
+    // one -- so when there is nothing numeric at all, say only the fact; when there is a partial
+    // figure, qualify it as a floor rather than presenting it as the whole.
+    //
+    // This is NOT keyed on the figure's magnitude (a "0 gets different wording" branch here would
+    // itself be the threshold-shaped bug the mechanism-invariance test below exists to catch): the
+    // "at least 0" trap a not-measured call with a spurious billableTokens: 0 could otherwise
+    // cause is closed upstream instead, in collect.js's buildRun -- a not-measured call's own
+    // billableTokens is never trusted into the sum (see that function's own comment), so a split
+    // whose ONLY call was not measured reaches this function with `tokens: null`, never `0`, and
+    // takes the branch below exactly like any other "nothing numeric at all" case.
+    const body =
+      typeof tokens === 'number'
+        ? `spend only partly recorded this run &middot; at least <b>${esc(formatTokenCount(tokens))}</b> &middot; ${missing}`
+        : `spend not recorded this run &middot; ${missing}`;
+    return chip(`${body}${live}`, '', SPENT_TOKENS_TOOLTIP);
+  }
+
+  if (typeof tokens !== 'number') return ''; // every call reported a source but somehow no figure -- say nothing rather than invent one
+
+  if (recoveredCalls > 0) {
+    return chip(
+      `spent this run <b>at least ${esc(formatTokenCount(tokens))}</b> <span class="chip-dim">(${recoveredCalls} call${recoveredCalls === 1 ? '' : 's'} recovered from the transcript)</span>${live}`,
+      '',
+      SPENT_TOKENS_TOOLTIP
+    );
+  }
+
+  return chip(`spent this run <b>${esc(formatTokenCount(tokens))}</b>${live}`, '', SPENT_TOKENS_TOOLTIP);
+}
+
 // ---- one card ----------------------------------------------------------------------------------
 
 function renderCard(card, data, nowMs) {
@@ -520,9 +634,7 @@ function renderCard(card, data, nowMs) {
   // On-track states only: DIAGNOSE is a detour, not a checkpoint, and counting it produced
   // "13 of 12 checkpoints" on a card that had been sent back once.
   const cleared = run ? new Set(run.splits.map((s) => s.state).filter((s) => orderIndex(s) !== null)).size : 0;
-  const spentTokens = run
-    ? run.splits.reduce((sum, s) => sum + ((s.detail && s.detail.billableTokens) || 0), 0)
-    : 0;
+  const spend = summarizeSpend(run);
   const liveCallPending = !!(run && run.current && ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'].includes(run.current.state));
 
   const statusPill =
@@ -535,13 +647,8 @@ function renderCard(card, data, nowMs) {
           : `<span class="pill pill-parked">Handed back</span>`;
 
   const foot = [];
-  if (spentTokens > 0) {
-    foot.push(
-      chip(
-        `spent this run <b>${esc(formatTokenCount(spentTokens))}</b>${liveCallPending ? ' <span class="chip-dim">+ live call unreported</span>' : ''}`
-      )
-    );
-  }
+  const spendChip = renderSpendChip(spend, liveCallPending);
+  if (spendChip) foot.push(spendChip);
   if (card.workerPid) {
     foot.push(
       chip(
@@ -668,4 +775,7 @@ module.exports = {
   shortId,
   stepDeadlineMs,
   ICON_SPRITE,
+  summarizeSpend,
+  renderSpendChip,
+  splitNote,
 };

@@ -213,10 +213,52 @@ function buildRun(lines) {
     const d = open.detail;
 
     switch (ev) {
-      case 'llm-call':
+      case 'llm-call': {
+        // Token bookkeeping runs for EVERY llm-call event, success or failure -- a failed call
+        // (a deadline kill, an external signal kill) can still carry real recovered tokens
+        // (tokensSource: 'transcript') read back from the session transcript by
+        // orchestrator/steps/llm.js's maybeRecoverTokens. Dropping those on the failure branch
+        // below (as this used to) silently threw away exactly the spend that lot recovered.
+        //
+        // tokensSource has exactly three meanings (orchestrator/steps/llm.js's header):
+        //   'modelUsage' -- measured, straight from the CLI's own reply
+        //   'transcript' -- recovered from the transcript: real, but a LOWER BOUND
+        //   null, or the field absent entirely (a legacy event predating instrumentation) --
+        //     not measured at all
+        // Counted per split so a caller (render-deck.js) can tell "every call reported" apart
+        // from "some call did not" without re-walking the journal.
+        if (e.tokensSource === 'modelUsage') d.measuredCalls = (d.measuredCalls || 0) + 1;
+        else if (e.tokensSource === 'transcript') d.recoveredCalls = (d.recoveredCalls || 0) + 1;
+        else d.notMeasuredCalls = (d.notMeasuredCalls || 0) + 1;
+        // SUMMED across every call in the split, never overwritten -- a state visited three times
+        // (a retried IMPLEMENT) must report the total of all three calls, not just the last one's
+        // figure. Absence, never 0, is preserved: a split with no numeric billableTokens ANYWHERE
+        // stays null (same rule task-summary.js's hasTokenData and bin/spo's cmdTask apply), so it
+        // stays distinguishable from a split whose calls genuinely summed to zero.
+        //
+        // EXCEPT when tokensSource is EXPLICITLY null (not merely absent): extractTokens sets
+        // tokensSource to null only when it ran and found no usage field on ANY entry at all
+        // (orchestrator/steps/llm.js's own header) -- so a numeric billableTokens sitting on such
+        // an event is a stale/legacy artifact, never a real measurement, and summing it in
+        // produced the "at least 0" trap on render-deck.js's spend chip: a split whose only call
+        // was not measured but happened to carry billableTokens: 0 (19 such events measured in
+        // the real corpus, e.g. issue-515) was indistinguishable, downstream, from a split that
+        // genuinely measured zero. This check is narrower than "not measured" as a
+        // CLASSIFICATION just above (which also covers tokensSource being entirely ABSENT -- a
+        // legacy event that predates the tokensSource field itself, whose billableTokens is a
+        // real, if unlabelled, figure from before this classification existed, and must still be
+        // summed): `=== null` only, never a bare falsy check, is what tells "explicitly nothing
+        // found" apart from "field never existed".
+        d.billableTokens =
+          e.tokensSource !== null && typeof e.billableTokens === 'number'
+            ? (typeof d.billableTokens === 'number' ? d.billableTokens : 0) + e.billableTokens
+            : d.billableTokens ?? null;
+
         // Only a SUCCESSFUL call describes the work; a failed attempt (an account limit, a
         // transport failure) is counted separately so the deck can say "2nd attempt at this
-        // call" without pretending the first one produced anything.
+        // call" without pretending the first one produced anything. Unchanged from before this
+        // lot except that the token bookkeeping above now runs ahead of this branch instead of
+        // being skipped by it.
         if (e.ok === false) {
           d.failedCalls = (d.failedCalls || 0) + 1;
           if (e.model) d.model = e.model;
@@ -226,12 +268,24 @@ function buildRun(lines) {
         d.model = e.model || d.model || null;
         d.effort = e.effort || d.effort || null;
         d.account = e.account || d.account || null;
-        d.numTurns = typeof e.numTurns === 'number' ? e.numTurns : d.numTurns ?? null;
-        // Absence, never 0 -- an event predating the field is not a call that cost nothing.
-        // Same rule task-summary.js's hasTokenData and bin/spo's cmdTask already apply.
-        d.billableTokens = typeof e.billableTokens === 'number' ? e.billableTokens : d.billableTokens ?? null;
-        d.durationS = typeof e.duration_s === 'number' ? e.duration_s : d.durationS ?? null;
+        // SUMMED across every successful call in the split, same rule as billableTokens just
+        // above (action 4.4 remediation): a state visited more than once within one split (a step
+        // that retries its own CLI invocation internally, no transition in between) must report
+        // the total turns/seconds across every call, not just the last one's figure. Before this,
+        // billableTokens summed while these two stayed last-wins, so a split's own row could show
+        // a turn/duration count that covered only ONE of the calls whose tokens it was reporting
+        // the total for -- two numbers on the same row, silently meaning different spans. Absence,
+        // never 0, is preserved exactly as billableTokens preserves it.
+        d.numTurns =
+          typeof e.numTurns === 'number'
+            ? (typeof d.numTurns === 'number' ? d.numTurns : 0) + e.numTurns
+            : d.numTurns ?? null;
+        d.durationS =
+          typeof e.duration_s === 'number'
+            ? (typeof d.durationS === 'number' ? d.durationS : 0) + e.duration_s
+            : d.durationS ?? null;
         break;
+      }
       case 'pr-created':
         d.prNumber = e.prNumber ?? null;
         break;
@@ -1141,9 +1195,13 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } 
   return result;
 }
 
-// sessionId -> {taskId, state, title, steps} -- the join used to attribute a token-usage
-// transcript file (named <sessionId>.jsonl) back to the SPO task that produced it. Pure, no I/O
-// -- consumes the already-collected journalTasks array.
+// sessionId -> {taskId, state, title, steps} -- the join used to attribute token usage back to
+// the SPO task that produced it, keyed on the session id rather than on a single file: a
+// session's usage can be spread across several physical transcript files that all carry that
+// same session id (its own <sessionId>.jsonl plus any subagent transcripts under
+// <sessionId>/subagents/, see console/usage-scan.js's scanFile/listCandidateFiles), and this
+// index needs only the id to fold all of them back onto one task. Pure, no I/O -- consumes the
+// already-collected journalTasks array.
 function buildSessionIndex(journalTasks) {
   const index = {};
   for (const t of journalTasks || []) {

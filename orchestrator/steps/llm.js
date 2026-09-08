@@ -9,14 +9,21 @@
 //
 // Real mode spawns `claude -p ...` and parses its `--output-format json` stdout. Two layers:
 //
-//   invokeClaudeReal(opts, deps) -- the primitive. Takes exactly the per-call inputs the spec
-//     lists (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
-//     promptText|promptFile, cwd, account, deadlineMs), builds argv, spawns with the resolved
+//   invokeClaudeReal(opts, deps) -- the primitive. Takes the per-call inputs the spec lists
+//     (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
+//     promptText|promptFile, cwd, account, deadlineMs) plus one more (action 4.1, token-ledger
+//     lot): an optional opts.sessionId, a caller-supplied UUID-v4 string used verbatim instead of
+//     generating one (see the sessionId paragraph below). Builds argv, spawns with the resolved
 //     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
 //     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
 //     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
-//     numTurns, durationS, raw}. `deps.spawnSync` is an injection point for tests (and nothing
-//     else) -- production code never passes it. `durationS` (seconds, measured with
+//     numTurns, durationS, raw}. `sessionId` is set on every branch representing a spawn that was
+//     at least attempted (success, deadline kill, external signal, unparsable stdout) and null
+//     only when `claude` never started at all (an unreadable `oauthTokenFile`, or a spawn failure
+//     such as ENOENT/EACCES/E2BIG) -- see invokeClaudeReal's own inline comment for why each
+//     branch draws the line where it does. `deps.spawnSync` and `deps.randomUUID` are the two
+//     injection points for tests (and nothing else) -- production code never passes either.
+//     `durationS` (seconds, measured with
 //     process.hrtime.bigint() around the spawn itself, NOT Date.now()) is journaled as
 //     `duration_s` -- doc/state-machine-spec.md's Observability section already documented that
 //     field before any code wrote it (measured 2026-09-01: zero of the 19 corpus journals'
@@ -28,9 +35,16 @@
 //     defensively from modelUsage by extractTokens() below. "billable-weighted" = fresh input +
 //     cache-creation + output; cache-READ is reported separately and never folded into that
 //     total (near-free on a quota plan, and it dominates raw counts by orders of magnitude --
-//     see console/usage-scan.js's own header). tokensSource is 'modelUsage' when at least one
-//     recognized field was found, else null -- so a reader can tell "zero tokens" from "not
-//     reported" (a killed/E2BIG call that never got a modelUsage block at all).
+//     see console/usage-scan.js's own header). extractTokens() itself sets tokensSource to
+//     'modelUsage' when at least one recognized field was found there, else null -- so a reader
+//     can tell "zero tokens" from "not reported". Token-ledger lot, action 4.3: a null result from
+//     extractTokens is no longer necessarily invokeClaudeReal's LAST word on the subject --
+//     maybeRecoverTokens() then attempts to recover from the session transcript (tokensSource:
+//     'transcript') for any branch that generated a real sessionId, which by construction excludes
+//     the two branches where claude never started at all (an unreadable oauthTokenFile, and a
+//     generic spawn failure such as ENOENT/EACCES/E2BIG) -- those keep tokensSource: null and
+//     billableTokens: 0 unconditionally, because no transcript can exist for a session that was
+//     never created. See maybeRecoverTokens' own comment for the full contract.
 //
 //   runLlm(ctx, stepName, fixtureKey, deps) -- the existing shadow-mode entry point every state-
 //     machine handler already calls. Its shadow branch is untouched. Its real branch has two
@@ -84,6 +98,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { randomUUID } = require('crypto');
 
 const { sleep } = require('./scripted');
 const config = require('../config');
@@ -94,6 +109,7 @@ const { isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
 const { monotonicNowMs } = require('../monotonic-clock');
+const { recoverSessionTokens: recoverSessionTokensDefault } = require('../token-recovery');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
 
@@ -126,9 +142,14 @@ function resolvePromptText(opts) {
 }
 
 // Builds the argv for `claude`. Flag order:
-//   -p --model <model> --effort <effort> --output-format json
+//   -p --model <model> --effort <effort> --output-format json [--session-id <uuid>]
 //   [--max-budget-usd <n>] [--allowedTools <tools>] [--permission-mode <mode>]
 //   [--json-schema <schema-json>]
+// --session-id is conditional, like the flags after it: pushed only when opts.sessionId is a
+// non-empty string. invokeClaudeReal is the only caller that ever supplies one -- it generates
+// the id itself (or uses the one the caller passed in opts.sessionId) immediately before the
+// spawn, so a killed or unparsable call can still be tied back to the `claude` session that
+// actually ran (see invokeClaudeReal's own comment on the token-ledger action this is for).
 // --max-budget-usd is conditional, like the other three: pushed only when opts.maxBudgetUsd is a
 // number. No daemon or intake path supplies it -- the only caller that does is the hand-run
 // scripts/smoke-llm.js (see doc/state-machine-spec.md / orchestrator/README.md § Budgets).
@@ -150,6 +171,7 @@ function buildArgv(opts) {
   if (opts.model) argv.push('--model', opts.model);
   if (opts.effort) argv.push('--effort', opts.effort);
   argv.push('--output-format', 'json');
+  if (typeof opts.sessionId === 'string' && opts.sessionId !== '') argv.push('--session-id', opts.sessionId);
   if (typeof opts.maxBudgetUsd === 'number') argv.push('--max-budget-usd', String(opts.maxBudgetUsd));
   if (opts.allowedTools) {
     const tools = Array.isArray(opts.allowedTools) ? opts.allowedTools.join(' ') : opts.allowedTools;
@@ -277,6 +299,69 @@ function tokenFieldsFrom(raw) {
   };
 }
 
+// Token-ledger lot, action 4.3: recovers billable tokens for a call that really ran (sessionId
+// set) but reported no modelUsage block (tokensSource: null) -- a deadline kill, an external
+// signal kill, unparsable stdout, an is_error/non-zero-exit reply, or even a SUCCESSFUL call whose
+// modelUsage happened to be empty/absent all land here identically. The decision to attempt
+// recovery is made STRUCTURALLY -- sessionId is a non-empty string, tokensSource is falsy -- never
+// by reading `error`/`result` text (see orchestrator/token-recovery.js's own header, and
+// test/token-recovery.test.js's issue-439/issue-247 regression fixtures: a message that says
+// "failed to spawn claude" for a call that in fact ran and was deadline-killed must not suppress
+// recovery). token-recovery.js's recoverSessionTokens reads the session transcript `claude` itself
+// wrote under that id and sums it through the SAME reader console/usage-scan.js's live dashboard
+// uses (scanFile), so this can never disagree with that ledger.
+//
+// A5 (informational only, pinned by test/llm-real.test.js): every field on `result` other than the
+// eight recovery-owned fields (tokensSource, freshInputTokens, cacheCreationTokens,
+// cacheReadTokens, outputTokens, billableTokens, transcriptFilesRead, transcriptFilesSkipped) is
+// returned byte-identical whether recovery finds something, finds nothing, or is never attempted
+// at all (sessionId absent/null, or tokensSource already set) -- this function never touches
+// kind/ok/error/timedOut/killedBySignal/deadlineMs/numTurns/durationS/raw.
+//
+// deps.recoverSessionTokens is the injection point, following this file's existing
+// deps.spawnSync/deps.randomUUID convention -- production passes nothing and gets the real module.
+// Never throws itself: recoverSessionTokens's own contract is "never throw" (see its header), and
+// the try/catch here is a backstop against that contract ever regressing, consistent with this
+// file's own "only a programming error (bad opts) throws" rule.
+//
+// The guard below reads `result.tokensSource` FALSY, never `=== null`: extractTokens/ZERO_TOKENS
+// always set it to exactly `null` when nothing was found, but a result object that simply OMITS
+// the field entirely (undefined) must be treated the same way -- unmeasured, not skip-recovery --
+// which is the safer of the two readings (a stricter `=== null` check would silently skip recovery
+// for any future caller/shape that leaves the field absent instead of null).
+async function maybeRecoverTokens(result, opts, deps) {
+  if (result.tokensSource || typeof result.sessionId !== 'string' || result.sessionId === '') {
+    return result;
+  }
+  const recoverFn = deps.recoverSessionTokens || recoverSessionTokensDefault;
+  let recovered = null;
+  try {
+    recovered = await recoverFn({
+      sessionId: result.sessionId,
+      accountConfigDir: opts.account && opts.account.configDir,
+    });
+  } catch {
+    recovered = null;
+  }
+  if (!recovered) return result;
+  return {
+    ...result,
+    tokensSource: recovered.tokensSource,
+    freshInputTokens: recovered.freshInputTokens,
+    cacheCreationTokens: recovered.cacheCreationTokens,
+    cacheReadTokens: recovered.cacheReadTokens,
+    outputTokens: recovered.outputTokens,
+    billableTokens: recovered.billableTokens,
+    // The one completeness signal recoverSessionTokens computes and this function used to drop on
+    // the floor (token-ledger lot, action 4.3 fix): without these two, the journal records
+    // "recovered N tokens" with no way to tell 1 file read from 1-of-100, the other 99 lost to an
+    // error -- see token-recovery.js's own header on recoverSessionTokens for exactly which routes
+    // increment transcriptFilesSkipped.
+    transcriptFilesRead: recovered.transcriptFilesRead,
+    transcriptFilesSkipped: recovered.transcriptFilesSkipped,
+  };
+}
+
 // Action 3.5, replacing a `/limit|overloaded|rate/i` scan over the free text of parsed.result /
 // parsed.terminal_reason (incident: any failure message merely containing "rate" -- "invalid
 // rate parameter", "could not generate", "accurate output required", "corporate" -- was
@@ -360,13 +445,24 @@ function limitKindForFailure(parsed) {
   return undefined;
 }
 
+// UUID-v4 shape check for opts.sessionId, used ONLY in invokeClaudeReal's resolution below --
+// deliberately NOT shared with buildArgv's own `typeof === 'string' && !== ''` guard, and
+// buildArgv must stay exactly that loose: runLlm's dry-run branch calls buildArgv directly with
+// the stable literal placeholder '<generated-at-spawn>' (see runLlm), which is not a UUID and
+// must still make it into the displayed argv. Factoring one shared predicate here would make
+// buildArgv reject that placeholder and silently break the dry-run artifact. The real `claude`
+// CLI's own `--help` says a supplied --session-id "must be a valid UUID", and rejects a
+// malformed one with exit 1 before any API call -- this regex is that same shape, checked before
+// the value ever reaches argv, not after.
+const SESSION_ID_UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 // The real-mode primitive: spawn `claude -p`, parse its JSON, classify, return. Never throws on
 // a failed/limited/malformed call -- those come back as {ok: false, kind, ...}; only a
 // programming error (bad opts) throws.
 async function invokeClaudeReal(opts, deps = {}) {
   const spawnSyncFn = deps.spawnSync || spawnSync;
+  const randomUUIDFn = deps.randomUUID || randomUUID;
   const promptText = resolvePromptText(opts);
-  const argv = buildArgv(opts);
 
   const env = { ...process.env, ...NONINTERACTIVE_ENV_DEFAULTS };
   if (opts.account && opts.account.configDir) {
@@ -391,6 +487,41 @@ async function invokeClaudeReal(opts, deps = {}) {
       };
     }
   }
+
+  // Session id (token-ledger lot, action 4.1). Generated HERE -- after the oauthTokenFile read
+  // above has already returned on failure, and immediately before the spawn below -- on purpose:
+  // the oauthTokenFile branch represents a call that never started (no `claude` process, no
+  // session transcript on disk), so it must keep reporting sessionId: null rather than a freshly
+  // minted id for a session that never existed. Every branch from here on represents a spawn that
+  // was at least attempted, so an id generated at this point is always honest.
+  //
+  // opts.sessionId, when the caller already supplied one (non-empty string), is used verbatim and
+  // nothing is generated -- deps.randomUUID (falling back to node's own crypto.randomUUID,
+  // following this file's existing deps.spawnSync injection convention) is not even called in
+  // that case, which the tests pin with a call counter.
+  //
+  // A supplied sessionId that is a non-empty string but NOT UUID-v4 shaped is a programming
+  // error, not a call failure: it would sail past buildArgv's looser guard, reach `claude
+  // --session-id`, and make the CLI exit 1 before any API call (per its own --help: "must be a
+  // valid UUID"). Left unguarded, that exit-1 falls into the "claude stdout was not valid JSON"
+  // branch below, which reports a *parse* failure for what is actually an *argument* fault --
+  // this file's own header already documents being burned by exactly that class of misdiagnosis
+  // twice. So this throws here, before any spawn, the same way a missing prompt already throws in
+  // resolvePromptText above -- this file's header's "only a programming error (bad opts) throws"
+  // contract, applied to the one opts field this action added.
+  let sessionId;
+  if (typeof opts.sessionId === 'string' && opts.sessionId !== '') {
+    if (!SESSION_ID_UUID_V4_RE.test(opts.sessionId)) {
+      throw new TypeError(
+        `llm.js: invokeClaudeReal opts.sessionId must be a valid UUID (claude --session-id ` +
+          `requires one and exits 1 before any API call otherwise) -- got ${JSON.stringify(opts.sessionId)}`
+      );
+    }
+    sessionId = opts.sessionId;
+  } else {
+    sessionId = randomUUIDFn();
+  }
+  const argv = buildArgv({ ...opts, sessionId });
 
   const spawnOpts = {
     cwd: opts.cwd,
@@ -502,18 +633,26 @@ async function invokeClaudeReal(opts, deps = {}) {
     const detail = spawnResult.signal
       ? `signal ${spawnResult.signal}`
       : (spawnResult.error && (spawnResult.error.code || spawnResult.error.message)) || 'no signal reported';
-    return {
-      ok: false,
-      kind: 'error',
-      timedOut: true,
-      deadlineMs: spawnOpts.timeout,
-      error: `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`,
-      sessionId: null,
-      ...ZERO_TOKENS,
-      numTurns: undefined,
-      durationS,
-      raw: rawExit,
-    };
+    return await maybeRecoverTokens(
+      {
+        ok: false,
+        kind: 'error',
+        timedOut: true,
+        deadlineMs: spawnOpts.timeout,
+        error: `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`,
+        // claude was spawned and ran (that's the whole premise of a deadline kill) -- the
+        // transcript exists on disk under this id even though the call was cut off, which is
+        // exactly what maybeRecoverTokens above tries to read back (token-ledger lot, action
+        // 4.3): tokensSource stays null here only until that recovery attempt runs.
+        sessionId,
+        ...ZERO_TOKENS,
+        numTurns: undefined,
+        durationS,
+        raw: rawExit,
+      },
+      opts,
+      deps
+    );
   }
 
   // An external kill: an operator's `kill`, an OOM kill, a service manager stopping the worker.
@@ -532,28 +671,39 @@ async function invokeClaudeReal(opts, deps = {}) {
   // children, so this branch is rarer BY CONSTRUCTION than it was -- which lowers the urgency of
   // classifying it and changes nothing about whether the classification is correct.
   if (isSpawnKilled(spawnResult)) {
-    return {
-      ok: false,
-      kind: 'error',
-      killedBySignal: true,
-      signal: spawnResult.signal,
-      ...(deadlineArmed ? { deadlineMs: spawnOpts.timeout } : {}),
-      // When a deadline WAS armed, the fact that node did not raise ETIMEDOUT is itself the
-      // proof the deadline never fired -- so "inside" is measured, not assumed.
-      error: deadlineArmed
-        ? `llm.js: claude was killed by signal ${spawnResult.signal} after ${durationS}s, inside its ` +
-          `${spawnOpts.timeout}ms deadline (the deadline never fired) -- an external kill, not a timeout`
-        : `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
-      sessionId: null,
-      ...ZERO_TOKENS,
-      numTurns: undefined,
-      durationS,
-      raw: rawExit,
-    };
+    return await maybeRecoverTokens(
+      {
+        ok: false,
+        kind: 'error',
+        killedBySignal: true,
+        signal: spawnResult.signal,
+        ...(deadlineArmed ? { deadlineMs: spawnOpts.timeout } : {}),
+        // When a deadline WAS armed, the fact that node did not raise ETIMEDOUT is itself the
+        // proof the deadline never fired -- so "inside" is measured, not assumed.
+        error: deadlineArmed
+          ? `llm.js: claude was killed by signal ${spawnResult.signal} after ${durationS}s, inside its ` +
+            `${spawnOpts.timeout}ms deadline (the deadline never fired) -- an external kill, not a timeout`
+          : `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
+        // Same reasoning as the deadline-kill branch above: claude was spawned and ran (something
+        // else signalled it), so the transcript exists under this id -- see maybeRecoverTokens.
+        sessionId,
+        ...ZERO_TOKENS,
+        numTurns: undefined,
+        durationS,
+        raw: rawExit,
+      },
+      opts,
+      deps
+    );
   }
 
   if (spawnResult.error) {
-    // A REAL spawn failure: ENOENT (no `claude` on PATH), EACCES, EAGAIN...
+    // A REAL spawn failure: ENOENT (no `claude` on PATH), EACCES, E2BIG, EAGAIN... `claude` was
+    // NEVER STARTED in any of these cases, so no session transcript exists anywhere on disk --
+    // reporting the generated id here would be a false measurement (exactly what this action
+    // exists to avoid: a follow-up action recovers spend from the session transcript named by
+    // this id, and an E2BIG call -- 3 recorded in this corpus on one card -- must read as
+    // unrecoverable, not as a recoverable id pointing at nothing).
     return {
       ok: false,
       kind: 'error',
@@ -576,43 +726,70 @@ async function invokeClaudeReal(opts, deps = {}) {
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    return {
-      ok: false,
-      kind: 'error',
-      error: `llm.js: claude stdout was not valid JSON (exit ${exit})`,
-      sessionId: null,
-      ...ZERO_TOKENS,
-      numTurns: undefined,
-      durationS,
-      raw: exit,
-    };
+    return await maybeRecoverTokens(
+      {
+        ok: false,
+        kind: 'error',
+        error: `llm.js: claude stdout was not valid JSON (exit ${exit})`,
+        // claude exited without the ETIMEDOUT/signal shapes checked above, but that does NOT mean
+        // it always ran long enough to write a session transcript: this branch is also where the
+        // CLI lands when it rejects its OWN argv and exits before creating a session at all (an
+        // unrecognised flag from a future CLI version, for instance -- the TypeError this function
+        // throws on a malformed opts.sessionId closes the one route to this we control, but not
+        // every route). So this id is
+        // the one `claude` was ASKED to use, not a guarantee that a transcript under it exists --
+        // maybeRecoverTokens's own search returning null (rather than a zero-filled object) is
+        // exactly how "not measured" stays distinguishable from "measured zero" for this branch.
+        sessionId,
+        ...ZERO_TOKENS,
+        numTurns: undefined,
+        durationS,
+        raw: exit,
+      },
+      opts,
+      deps
+    );
   }
 
   const tokens = extractTokens(parsed.modelUsage);
-  const sessionId = parsed.session_id || parsed.uuid || null;
+  // The CLI's own reported id wins over the one we generated and asked it to use: in practice
+  // they are the same value (we passed sessionId via --session-id above), but the CLI is the
+  // authority on what it actually named the session on disk, so if it ever disagrees the
+  // transcript is filed under ITS answer, not ours. Falls back to the generated id only when the
+  // reply carries neither `session_id` nor `uuid` (a call that ran without ever being asked to
+  // report one in its own reply's expected shape).
+  const reportedSessionId = parsed.session_id || parsed.uuid || sessionId;
   const numTurns = parsed.num_turns;
 
   if (parsed.is_error || exit !== 0) {
     const kind = classifyFailure(parsed);
-    return {
-      ok: false,
-      kind,
-      // Only present on a 'limit' classification -- see limitKindForFailure's own comment.
-      // accounts.markLimit treats an absent/unrecognised limitKind as the usage-tier fail-safe,
-      // so omitting the key on a plain 'error' costs nothing.
-      ...(kind === 'limit' ? { limitKind: limitKindForFailure(parsed) } : {}),
-      result: parsed.result,
-      sessionId,
-      ...tokens,
-      numTurns,
-      durationS,
-      apiErrorStatus: parsed.api_error_status,
-      terminalReason: parsed.terminal_reason,
-      raw: exit,
-    };
+    return await maybeRecoverTokens(
+      {
+        ok: false,
+        kind,
+        // Only present on a 'limit' classification -- see limitKindForFailure's own comment.
+        // accounts.markLimit treats an absent/unrecognised limitKind as the usage-tier fail-safe,
+        // so omitting the key on a plain 'error' costs nothing.
+        ...(kind === 'limit' ? { limitKind: limitKindForFailure(parsed) } : {}),
+        result: parsed.result,
+        sessionId: reportedSessionId,
+        ...tokens,
+        numTurns,
+        durationS,
+        apiErrorStatus: parsed.api_error_status,
+        terminalReason: parsed.terminal_reason,
+        raw: exit,
+      },
+      opts,
+      deps
+    );
   }
 
-  return { ok: true, result: parsed.result, sessionId, ...tokens, numTurns, durationS, raw: exit };
+  return await maybeRecoverTokens(
+    { ok: true, result: parsed.result, sessionId: reportedSessionId, ...tokens, numTurns, durationS, raw: exit },
+    opts,
+    deps
+  );
 }
 
 // snake_case -> camelCase, e.g. "root_cause" -> "rootCause". Used to bridge one real gap: every
@@ -772,6 +949,12 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       account: account && account.name,
       sessionId: result.sessionId,
       ...tokenFieldsFrom(result),
+      // Present only on a call maybeRecoverTokens actually recovered (undefined otherwise, which
+      // JSON.stringify drops from the journal line, same convention as duration_s below) -- see
+      // maybeRecoverTokens' own comment for why these two are carried alongside the six token
+      // fields instead of folded into tokenFieldsFrom.
+      transcriptFilesRead: result.transcriptFilesRead,
+      transcriptFilesSkipped: result.transcriptFilesSkipped,
       numTurns: result.numTurns,
       // duration_s: spelled with the underscore doc/state-machine-spec.md's Observability
       // section already used to describe this event, not tokenFieldsFrom's camelCase convention
@@ -827,7 +1010,20 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   };
 
   if (ctx.dryRun) {
-    const argv = buildArgv(opts);
+    // A dry run never spawns `claude`, so `opts` here carries no sessionId (only
+    // invokeClaudeReal ever generates or validates one, immediately before a real spawn -- see
+    // its own comment). Calling buildArgv(opts) unmodified would then omit --session-id entirely,
+    // showing an argv that is not what a real call would actually use -- this artifact's whole
+    // stated purpose is to show the argv.
+    //
+    // The fix is a STABLE LITERAL PLACEHOLDER, never a generated UUID: minting a real, joinable
+    // id here would fabricate a session that never existed -- the identical error the
+    // oauthTokenFile branch above already refuses to produce (a recoverable-looking id pointing
+    // at nothing), except self-inflicted on every single dry run instead of one failure mode. A
+    // downstream token-ledger action joining on it would then read "lost session" instead of "no
+    // call was made". A fixed literal is also stable across runs, so artifact diffs stay clean
+    // and no churning id enters a committed path.
+    const argv = buildArgv({ ...opts, sessionId: '<generated-at-spawn>' });
     const dryrunFile = writeDryRunArtifact(ctx.taskDir, stepName, argv, promptText);
     appendEvent(ctx.taskDir, stepName, 'dry-run', {
       step: stepName,
@@ -848,6 +1044,10 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     account: account.name,
     sessionId: raw.sessionId,
     ...tokenFieldsFrom(raw),
+    // See the override branch above for why these two ride alongside tokenFieldsFrom rather than
+    // inside it.
+    transcriptFilesRead: raw.transcriptFilesRead,
+    transcriptFilesSkipped: raw.transcriptFilesSkipped,
     numTurns: raw.numTurns,
     duration_s: raw.durationS, // see the override branch above for why this is snake_case
     ok: raw.ok,
@@ -923,4 +1123,8 @@ module.exports = {
   withCamelAliases,
   cannedDryRunPayload,
   NONINTERACTIVE_ENV_DEFAULTS,
+  // Exported for test/llm-real.test.js's A3/A5 pins (token-ledger lot, action 4.3): both need to
+  // exercise the recovery DECISION directly, against a fixed synthetic result object, without a
+  // live spawn's own timing jitter (durationS) making a byte-for-byte comparison flaky.
+  maybeRecoverTokens,
 };

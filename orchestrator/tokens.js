@@ -116,11 +116,16 @@ function readTaskTokens(journalRoot, id, { cacheTtlMs } = {}) {
     if (event.event === 'llm-call') {
       llmCalls += 1;
       // `tokensSource` is the ONLY honest "did this call report tokens at all" marker (see
-      // steps/llm.js's extractTokens): 'modelUsage' when the CLI carried at least one
-      // recognized field, null on a call that died before one existed (deadline kill, E2BIG,
-      // non-JSON stdout), and ABSENT ENTIRELY on every journal written before token capture
-      // shipped -- those events carry the retired `costUsd` and nothing else. All three of the
-      // latter must read as "not reported", never as a genuine zero: without this counter
+      // steps/llm.js's extractTokens/maybeRecoverTokens): 'modelUsage' when the CLI's own reply
+      // carried at least one recognized field, 'transcript' when that was absent but
+      // token-ledger lot action 4.3 recovered real numbers from the session transcript instead --
+      // any branch that still produced a real sessionId: a deadline kill, an external signal
+      // kill, unparsable stdout, an is_error/non-zero-exit reply, or a successful call whose own
+      // modelUsage was empty -- null when NEITHER source had anything (an E2BIG or other
+      // spawn failure claude never started, or a recovery attempt that found nothing), and
+      // ABSENT ENTIRELY on every journal written before token capture shipped -- those events
+      // carry the retired `costUsd` and nothing else. The null and absent cases must read as
+      // "not reported", never as a genuine zero: without this counter
       // `spo tokens` over a pre-change journal prints a full table of 0s that is
       // indistinguishable from "this run used no tokens", which is the single most misleading
       // thing this report could say. bin/spo's cmdTokens prints "n/a" (not 0) for a task with
@@ -207,8 +212,10 @@ function readTaskTokens(journalRoot, id, { cacheTtlMs } = {}) {
 
 // One `llm-call` event folded into a mutable accumulator. `tokensSource` -- never
 // `typeof billableTokens === 'number'` -- is the honest "did this call report tokens at all"
-// marker: a killed/E2BIG call journals a numeric zero that is NOT the same fact as "reported
-// zero". See readTaskTokens's own comment for the full rationale, not repeated here.
+// marker: an event with no recoverable tokensSource at all (E2BIG and the other spawn-never-
+// started failures, or a recovery attempt that found nothing) journals a numeric zero that is
+// NOT the same fact as "reported zero". See readTaskTokens's own comment for the full rationale,
+// not repeated here.
 function accumulateLlmCall(acc, event) {
   acc.llmCalls += 1;
   if (typeof event.tokensSource === 'string' && event.tokensSource) acc.llmCallsWithTokens += 1;
@@ -383,10 +390,11 @@ function startOfDay(now) {
 // Sums the SAME `llm-call` fields tokenReport does (no second ledger, no second definition of
 // "billable"), filtered to events whose `ts` falls on `now`'s local calendar day. Every honesty
 // rule tokenReport/cmdTokens already enforce applies here verbatim: `tokensSource` is the marker
-// for "did this call report tokens at all", never `typeof billableTokens === 'number'` (a
-// killed/E2BIG call journals a numeric `billableTokens: 0` via ZERO_TOKENS, which is not the same
-// fact as "reported zero tokens" -- see steps/llm.js's own header). The caller renders "n/a", not
-// "0", when `llmCallsWithTokens === 0`.
+// for "did this call report tokens at all", never `typeof billableTokens === 'number'` (an
+// unrecovered killed/E2BIG call journals a numeric `billableTokens: 0` via ZERO_TOKENS, which is
+// not the same fact as "reported zero tokens" -- see steps/llm.js's own header on
+// maybeRecoverTokens for when a killed call's zero gets replaced by a real recovered number
+// instead). The caller renders "n/a", not "0", when `llmCallsWithTokens === 0`.
 //
 // Erratum CLOSED, 2026-09-04 (SPO-Pipeline#117). This used to scan the per-task journals only,
 // and journal/daemon.jsonl -- where the intake stages run -- carried ZERO `llm-call` events of

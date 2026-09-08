@@ -146,14 +146,23 @@ function summarizeTask(taskDir) {
       // `tokensSource` is the marker, NOT `typeof billableTokens === 'number'` -- and the
       // difference is the whole erratum, re-measured. steps/llm.js journals an `llm-call` for
       // EVERY call including the failed ones (unconditionally, before its own `if (!raw.ok)
-      // return`), and every failure path returns ...ZERO_TOKENS = `{tokensSource: null,
-      // billableTokens: 0, ...}`. So a deadline-killed, E2BIG or spawn-failed call writes a
-      // numeric `billableTokens: 0`, and keying on the number would call that "token data" and
-      // print `0` on the card -- reading as "this card was free" for a card that burned a whole
-      // transport failure. orchestrator/tokens.js's own header calls `tokensSource` "the ONLY
-      // honest 'did this call report tokens at all' marker" and bin/spo already prints `n/a`,
-      // not `0`, for exactly these events. This module printing `0` where the CLI prints `n/a`
-      // for the same journal is the disagreement 5.4 exists to end, not to create.
+      // return`) -- and every failure path that never saw a `modelUsage` block returns
+      // ...ZERO_TOKENS = `{tokensSource: null, billableTokens: 0, ...}` (an `is_error` reply that
+      // DID carry one keeps its real figures -- extractTokens reads `parsed.modelUsage`
+      // regardless of exit status; measured on the live corpus: 5 `ok:false` `llm-call` events
+      // carry `tokensSource: 'modelUsage'`, not null). Token-ledger lot action 4.3's
+      // maybeRecoverTokens then tries to replace a genuine null/0 with a real number read back
+      // from the session transcript for any failure branch that still has a sessionId (a deadline
+      // kill, an external signal kill, unparsable stdout, or an `is_error`/non-zero-exit reply
+      // whose own modelUsage was empty) -- only a call claude never actually started (E2BIG and
+      // the other spawn-never-started failures) or a recovery attempt that found nothing keeps
+      // `tokensSource: null`. Keying on the number instead of the marker would call an
+      // unrecovered zero "token data" and print `0` on the card -- reading as "this card was
+      // free" for a card that burned a whole transport failure. orchestrator/tokens.js's own
+      // header calls `tokensSource` "the ONLY honest 'did this call report tokens at all'
+      // marker" and bin/spo already prints `n/a`, not `0`, for exactly these events. This module
+      // printing `0` where the CLI prints `n/a` for the same journal is the disagreement 5.4
+      // exists to end, not to create.
       //
       // The `tokensSource === undefined` arm keeps the 107 legacy events (costUsd/numTurns, no
       // tokensSource field at all) behaving as they did: if such an event ever carried a numeric

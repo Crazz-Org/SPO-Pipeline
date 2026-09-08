@@ -133,6 +133,12 @@ review, is what found it**:
 - **"0 tokens" and "not recorded" were the same value.** Every failed LLM call journals
   `{tokensSource: null, billableTokens: 0}`, so keying on the number printed `0` on a card that
   burned a transport failure, disagreeing with `spo tokens`'s `n/a` for the same journal.
+  (Frozen as of this entry's date, per this file's own header — no longer the whole picture even
+  measured at the time: an `is_error`/non-zero-exit reply whose own `modelUsage` was non-empty
+  already kept `tokensSource: 'modelUsage'`, not null. And since token-ledger lot action 4.3, a
+  failed call with a real `sessionId` may instead recover `tokensSource: 'transcript'` from its
+  own session transcript — see `orchestrator/task-summary.js`'s current header for the accurate
+  rule.)
 - **A feature that would not have surfaced the outage it was built for.** 5.4's failing-scan
   counter broke on `unpark-scan-backoff-skip`, and the real journal interleaves
   `failed, skip, …, failed`. It reported the 33-hour, 238-failure outage as "x1 since 19:52:07".
