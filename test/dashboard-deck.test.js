@@ -331,7 +331,13 @@ test('every literal ParkSignal reason in the orchestrator has a plain-language s
   }
   assert.ok(reasons.size >= 60, `expected the full park-reason set, found ${reasons.size}`);
 
-  const dynamic = (r) => r.startsWith('all-accounts-cooling') || r.startsWith('llm-transport-failed');
+  // Only `all-accounts-cooling-until-<ISO>` is genuinely unenumerable (accounts.js's pick()
+  // appends a timestamp, so the reason can never repeat exactly). `all-accounts-cooling-unknown`,
+  // `all-accounts-cooling-after-retry` and `all-accounts-cooling-wait-cap-exceeded` are ordinary
+  // literals with their own PARK_REASONS entries -- a blanket `all-accounts-cooling` prefix here
+  // excused all three from ever being required to have one, which is exactly how
+  // `all-accounts-cooling-unknown` went missing a sentence unnoticed (card #119 action 1.4).
+  const dynamic = (r) => r.startsWith('all-accounts-cooling-until-') || r.startsWith('llm-transport-failed');
   const missing = [...reasons].filter((r) => !dynamic(r) && !PARK_REASONS[r]);
   assert.deepEqual(missing, [], `park reasons with no plain-language sentence: ${missing.join(', ')}`);
 });
@@ -342,6 +348,47 @@ test("the deck's self-retrying set matches the orchestrator's own, so the deck c
   const listed = [...block.slice(0, block.indexOf(']);')).matchAll(/'([a-z-]+)'/g)].map((m) => m[1]);
   const { SELF_RETRYING } = require('../console/plain-language');
   assert.deepEqual([...SELF_RETRYING].sort(), listed.sort());
+
+  // The mirror above only constrains the LITERAL set -- it says nothing about the reasons
+  // reasonText() handles by prefix rather than by table lookup. That is exactly the hole that let
+  // the cooling branch hardcode `selfRetrying: true` and still pass a test named to forbid
+  // precisely that: the branch never went near SELF_RETRYING, so nothing here noticed. Close it by
+  // checking EVERY reason the orchestrator can actually produce -- not a second hand-typed table,
+  // but the orchestrator's own exported functions, the same ones production code calls.
+  const {
+    TRANSIENT_RETRY_REASONS,
+    ACCOUNT_POOL_PARK_REASON_FAMILY,
+    poolCooldownDeadlineMs,
+  } = require('../orchestrator/state-machine');
+  const { reasonText } = require('../console/plain-language');
+
+  // TRANSIENT_RETRY_REASONS already contains every `llm-transport-failed:<STEP>` literal
+  // (state-machine.js builds it that way), so this one loop covers both the plain transient
+  // reasons and that second dynamic family in one pass.
+  for (const r of TRANSIENT_RETRY_REASONS) {
+    assert.equal(reasonText(r).selfRetrying, true, `${r} is in TRANSIENT_RETRY_REASONS but reasonText says it is not self-retrying`);
+  }
+
+  // The account-pool family: a representative instance per member (the prefix member gets a real
+  // ISO suffix), checked against poolCooldownDeadlineMs -- the orchestrator's OWN answer to "does
+  // this reason carry a recoverable wait deadline", which is exactly the fact that determines
+  // whether action 1.2's pool-wait branch re-enqueues it instead of parking it. A detail object
+  // carrying both shapes poolCooldownDeadlineMs reads is supplied for every member; its own
+  // structural gate (checked first, by reason name, before either detail key is read -- see that
+  // function's header) is what makes the other three resolve to null regardless of this detail.
+  const detail = {
+    earliestCooldownUntil: Date.parse('2026-09-05T19:32:33.350Z'),
+    cooldownUntilIso: '2026-09-05T19:32:33.350Z',
+  };
+  for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
+    const instance = member.kind === 'prefix' ? `${member.match}2026-09-05T19:32:33.350Z` : member.match;
+    const expected = poolCooldownDeadlineMs(instance, detail) !== null;
+    assert.equal(
+      reasonText(instance).selfRetrying,
+      expected,
+      `${instance}: reasonText says selfRetrying=${reasonText(instance).selfRetrying}, but the orchestrator's own poolCooldownDeadlineMs says ${expected}`
+    );
+  }
 });
 
 test('reasonText handles the two dynamic reason families by prefix, and degrades honestly on an unknown one', () => {
@@ -359,6 +406,18 @@ test('reasonText handles the two dynamic reason families by prefix, and degrades
   assert.equal(unknown.text, 'some brand new reason');
 
   assert.equal(reasonText('diagnose-budget-exhausted').selfRetrying, false);
+
+  // The account-pool family's other three members: no deadline exists (cooling-unknown), a lease
+  // rather than a cooldown (leased), or this IS the give-up (cap-exceeded) -- none of the three
+  // comes back on its own, and each now has its own sentence (card #119 action 1.4).
+  assert.equal(reasonText('all-accounts-cooling-unknown').selfRetrying, false);
+  assert.equal(reasonText('all-accounts-leased').selfRetrying, false);
+  assert.equal(reasonText('all-accounts-cooling-wait-cap-exceeded').selfRetrying, false);
+  // ...while the family's OTHER deadline-carrying member matches `-until-`'s own verdict -- fixing
+  // the false statement in the direction that was previously wrong: today this reason falls
+  // through to the table and reports `selfRetrying: false`, which told the maintainer to intervene
+  // on a card already scheduled to return on its own.
+  assert.equal(reasonText('all-accounts-cooling-after-retry').selfRetrying, true);
 });
 
 // ---- rendering -------------------------------------------------------------------------------
