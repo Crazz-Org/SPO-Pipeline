@@ -860,6 +860,241 @@ test('unparkScan: idempotent -- a second scan (state.json still PARKED) never re
   assert.equal(queued.length, 1, 'only the first scan re-enqueues');
 });
 
+// card #137 (Lot 3, 3.2a): the `retry` branch's own `reEnqueueTask` call at park-loop.js:1372 used
+// to sit outside every try/catch on the path back to runScanCycle -- a throw there killed the
+// scanner process. reEnqueueTask's own ENOENT trigger is already closed (its per-writer tmp-name
+// discriminator); what survives is a solitary environment failure writing into `queueDir`
+// (EXDEV/EPERM/ENOSPC), injected below via a real fs.renameSync throw scoped to `queueDir` --
+// never by calling the guard's own catch block directly. `readDaemonEvents` below reads
+// `daemon.jsonl` directly, the same shape test/transient-retry.test.js's own `readDaemonJsonl`
+// uses, because there is no ctx/taskDir-scoped helper for it in this file yet.
+function readDaemonEvents(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('unparkScan: a reEnqueueTask that throws is journalled, and the unparked-by-maintainer marker is WITHHELD (effect-before-marker, #77 class)', async () => {
+  const queueDir = mkTmp('spo-unpark-fail-queue-');
+  const journalRoot = mkTmp('spo-unpark-fail-journal-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-909', { issue: 909, commentId: 500 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([{ id: 510, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to).startsWith(queueDir)) {
+      const err = new Error('EPERM: operation not permitted, rename');
+      err.code = 'EPERM';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  try {
+    await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.deepEqual(
+    fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : [],
+    [],
+    'the write failed exactly as injected -- no queue entry landed'
+  );
+
+  const journal = readJournal(taskDir);
+  assert.equal(
+    journal.some((e) => e.event === 'unparked-by-maintainer'),
+    false,
+    'the marker must be WITHHELD when the effect failed -- a marker with no effect is never redone'
+  );
+
+  const failEvt = readDaemonEvents(journalRoot).find((e) => e.event === 'unpark-requeue-failed');
+  assert.ok(failEvt, 'no unpark-requeue-failed journalled -- the throw would otherwise have been silent');
+  assert.equal(failEvt.id, 'card-909');
+  assert.equal(failEvt.retryCommentId, 510);
+  assert.match(failEvt.error, /EPERM/);
+});
+
+test('unparkScan: once the failure clears, the NEXT scan redoes the re-enqueue from scratch (the maintainer\'s retry is never lost)', async () => {
+  const queueDir = mkTmp('spo-unpark-retry2-queue-');
+  const journalRoot = mkTmp('spo-unpark-retry2-journal-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-910', { issue: 910, commentId: 600 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([{ id: 610, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to).startsWith(queueDir)) {
+      const err = new Error('ENOSPC: no space left on device, rename');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  try {
+    await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  } finally {
+    fs.renameSync = realRename;
+  }
+  assert.equal(
+    readJournal(taskDir).some((e) => e.event === 'unparked-by-maintainer'),
+    false,
+    'first scan must not have marked it handled'
+  );
+
+  // Second scan, failure cleared (real fs.renameSync restored). findParkAnchor's alreadyHandled is
+  // still false, so this must redo the effect from scratch, exactly like an ordinary first-time
+  // retry.
+  await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+
+  const queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+  assert.equal(queued.length, 1, 'the second scan re-enqueued the task');
+  assert.equal(
+    queued[0],
+    `0000-retry-h-${'610'.padStart(20, '0')}-card-910.json`,
+    'carries the retry comment id under the human priority class, same as an ordinary unpark'
+  );
+  assert.equal(
+    readJournal(taskDir).some((e) => e.event === 'unparked-by-maintainer'),
+    true,
+    'the second, successful scan must record the marker'
+  );
+});
+
+// ---- verification round 1: the guard covers BOTH statements reEnqueueTask can throw from, and --
+//      does not defeat ITSELF when its own journal write also fails -----------------------------
+
+test('unparkScan: a reEnqueueTask that throws on mkdirSync (queueDir uncreatable) is journalled, marker withheld', async () => {
+  const queueDir = mkTmp('spo-unpark-mkdirfail-queue-');
+  const journalRoot = mkTmp('spo-unpark-mkdirfail-journal-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-911', { issue: 911, commentId: 700 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([{ id: 710, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  const realMkdir = fs.mkdirSync;
+  fs.mkdirSync = (p, ...rest) => {
+    if (String(p) === queueDir) {
+      const err = new Error('EACCES: permission denied, mkdir');
+      err.code = 'EACCES';
+      throw err;
+    }
+    return realMkdir(p, ...rest);
+  };
+  try {
+    await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  } finally {
+    fs.mkdirSync = realMkdir;
+  }
+
+  assert.equal(
+    readJournal(taskDir).some((e) => e.event === 'unparked-by-maintainer'),
+    false,
+    'the marker must be WITHHELD when reEnqueueTask threw on its own mkdirSync'
+  );
+  const failEvt = readDaemonEvents(journalRoot).find((e) => e.event === 'unpark-requeue-failed');
+  assert.ok(failEvt, 'no unpark-requeue-failed journalled for an mkdirSync failure -- the guard must cover the whole reEnqueueTask call');
+  assert.equal(failEvt.id, 'card-911');
+  assert.match(failEvt.error, /EACCES/);
+});
+
+// Verification finding: `appendDaemonEvent` (journal.js) does its OWN `mkdirSync` + `appendFileSync`
+// -- on the exact filesystem-level failures this guard exists for (ENOSPC/EPERM/EROFS), that write
+// can throw too. An unwrapped `appendDaemonEvent` call inside the catch would let THAT throw escape
+// out of `unparkScan` instead, which `runScanCycle` awaits uncaught -- defeating the guard on
+// precisely the case it documents. Proves the fix: BOTH `reEnqueueTask` AND its own journal write
+// fail at once, and `unparkScan` must still resolve rather than reject.
+test('unparkScan: a reEnqueueTask failure whose OWN journal write also fails does not reject the scan', async () => {
+  const queueDir = mkTmp('spo-unpark-jf-queue-');
+  const journalRoot = mkTmp('spo-unpark-jf-journal-');
+  const taskDir = parkedTaskDir(journalRoot, 'card-912', { issue: 912, commentId: 800 });
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) {
+        return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      }
+      if (command === 'gh' && args[0] === 'api') {
+        return ok(
+          JSON.stringify([{ id: 810, user: { login: 'Crazz-E' }, created_at: '2026-08-29T00:00:00Z', body: 'retry' }])
+        );
+      }
+      return ok('');
+    },
+  };
+
+  const realRename = fs.renameSync;
+  const realAppendFile = fs.appendFileSync;
+  fs.renameSync = (from, to, ...rest) => {
+    if (String(to).startsWith(queueDir)) {
+      const err = new Error('EPERM: operation not permitted, rename');
+      err.code = 'EPERM';
+      throw err;
+    }
+    return realRename(from, to, ...rest);
+  };
+  fs.appendFileSync = (p, ...rest) => {
+    if (String(p).endsWith('daemon.jsonl')) {
+      const err = new Error('ENOSPC: no space left on device, write');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realAppendFile(p, ...rest);
+  };
+  let rejected = null;
+  try {
+    await unparkScan(queueDir, journalRoot, { ghRepo: 'Crazz-Org/SPO-WebClient' }, deps);
+  } catch (err) {
+    rejected = err;
+  } finally {
+    fs.renameSync = realRename;
+    fs.appendFileSync = realAppendFile;
+  }
+
+  assert.equal(rejected, null, `unparkScan must not reject even when its own journal write also fails: ${rejected && rejected.message}`);
+  assert.equal(
+    readJournal(taskDir).some((e) => e.event === 'unparked-by-maintainer'),
+    false,
+    'the marker must still be withheld -- the effect never landed'
+  );
+});
+
 test('unparkScan: an "abandon" comment marks the task ABANDONED (terminal) and posts a one-line ack, never re-enqueues', async () => {
   const queueDir = mkTmp('spo-unpark-queue3-');
   const journalRoot = mkTmp('spo-unpark-journal3-');

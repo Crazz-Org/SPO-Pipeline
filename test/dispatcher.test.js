@@ -579,6 +579,15 @@ test('N consecutive crashes trip the circuit breaker; a PARK in between resets t
   assert.equal(stopReasonB.reason, 'worker-crash-circuit-breaker');
   assert.equal(stopReasonB.consecutiveCrashes, 3);
   assert.equal(stopReasonB.crashLimit, 3);
+
+  // Action 3.3: `dispatcher-stopped` fires on the WORKER breaker path too -- the same journal
+  // call as the drain and scanner-breaker paths (dispatcher.js's single return point), proven
+  // here independently rather than assumed from those other tests.
+  const stoppedB = readDaemonEvents(journalDirB).find((e) => e.event === 'dispatcher-stopped');
+  assert.ok(stoppedB, 'no dispatcher-stopped');
+  assert.equal(stoppedB.reason, 'worker-crash-circuit-breaker');
+  assert.equal(stoppedB.consecutiveCrashes, 3);
+  assert.equal(stoppedB.crashLimit, 3);
 });
 
 // ---- 6b. A worker killed BY THIS DISPATCHER'S OWN SHUTDOWN is not a crash (cross-action defect)
@@ -2147,8 +2156,74 @@ test('a crashed scanner is respawned immediately, up to its own scannerCrashLimi
   const events = readDaemonEvents(journalDir);
   assert.equal(events.filter((e) => e.event === 'scanner-spawn').length, 2, 'expected exactly 2 spawns -- the initial one plus one respawn, then the breaker stops a third');
   assert.equal(events.filter((e) => e.event === 'scanner-crashed').length, 2);
-  // Never counted against, or confused with, the WORKER breaker's own fields.
-  assert.equal(events.some((e) => e.event === 'worker-crashed' || e.reason === 'worker-crash-circuit-breaker'), false);
+  // Action 3.3: `dispatcher-stopped` fires on the SCANNER breaker path, carrying `stopReason`
+  // flat -- this is what makes the disjunct below real (see it for the full reasoning).
+  const stopped = events.find((e) => e.event === 'dispatcher-stopped');
+  assert.ok(stopped, 'no dispatcher-stopped');
+  assert.equal(stopped.reason, 'scanner-crash-circuit-breaker');
+  // The breaker's own numbers must ride the event too, not just its `reason`. Verification found
+  // that dropping every payload field ON THIS PATH ALONE survived the whole suite: `reason` was
+  // asserted here, and the drain path's own fields were asserted in test/drain.test.js, so the
+  // scanner breaker could have journalled a bare `{reason}` and nothing would have noticed -- on
+  // the one path card #79 is actually about. These are the three fields a maintainer reads to
+  // answer "how many, in a row, against what limit" once the daemon has stopped.
+  assert.equal(stopped.consecutiveScannerCrashes, 2);
+  assert.equal(stopped.totalScannerCrashes, 2);
+  assert.equal(stopped.scannerCrashLimit, 2);
+  // Repaired, action 3.3 (this action): both disjuncts here used to be dead -- no event named
+  // `worker-crashed` is ever emitted (the real ones are `worker-exit`, `worker-crash-repark-*`),
+  // and no daemon event carried a top-level `reason` field at all. With `dispatcher-stopped` now
+  // journalling `stopReason` flat, `reason` is real, so this checks what the test's own name
+  // promises: the SCANNER breaker's trip is never confused with, or counted against, the WORKER
+  // breaker's. No worker ever ran in this scanner-only test (no queued tasks), so `worker-exit`
+  // must never appear either.
+  assert.equal(events.some((e) => e.event === 'worker-exit' || e.reason === 'worker-crash-circuit-breaker'), false);
+});
+
+// Verification finding pattern, reused from takeNextTask's own sibling test
+// ("a claim failure whose OWN journal write also fails does not escape to the caller",
+// test/transient-retry.test.js): `appendDaemonEvent` does its OWN `mkdirSync` + `appendFileSync`,
+// so on the exact ENOSPC/EPERM/EROFS class of failure the new try/catch (action 3.3) exists to
+// survive, the journal write itself can throw -- and an unwrapped call would let THAT throw
+// escape run(), turning a clean shutdown into a crash on the way out. Only the `dispatcher-stopped`
+// write is made to fail here (matched on its own JSON content), not every daemon.jsonl write --
+// an unconditional failure would also break the UNGUARDED `dispatcher-start` call at the top of
+// run(), which is not what this guard covers and would prove nothing about it.
+test("run(): a journal write failure on dispatcher-stopped ITSELF does not escape run() -- the guard's own worst case", async () => {
+  const queueDir = mkTmp('spo-disp-stopjournalfail-q-');
+  const journalDir = mkTmp('spo-disp-stopjournalfail-j-');
+  const config = baseConfig({
+    claudeAccountsDir: onePoolDir(1),
+    deps: { spawn: spawnExit(0), spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+
+  const realAppendFile = fs.appendFileSync;
+  fs.appendFileSync = (p, data, ...rest) => {
+    if (String(p).endsWith('daemon.jsonl') && String(data).includes('"event":"dispatcher-stopped"')) {
+      const err = new Error('ENOSPC: no space left on device, write');
+      err.code = 'ENOSPC';
+      throw err;
+    }
+    return realAppendFile(p, data, ...rest);
+  };
+
+  let stopReason;
+  let threw = null;
+  try {
+    dispatcher.stop();
+    stopReason = await runPromise;
+  } catch (err) {
+    threw = err;
+  } finally {
+    fs.appendFileSync = realAppendFile;
+  }
+
+  assert.equal(threw, null, `run() must not throw even when its own dispatcher-stopped journal write fails: ${threw && threw.message}`);
+  assert.equal(stopReason.reason, 'stop-requested', 'the caller still gets its stopReason back even though the journal write for it failed');
+  // Best-effort, not silently recorded some other way: the event really is missing.
+  assert.equal(readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-stopped'), false);
 });
 
 // ---- consecutiveScannerCrashes must mean CONSECUTIVE (this action's own fix) ------------------
@@ -2270,11 +2345,6 @@ test('the breaker does NOT trip when crashes are separated by healthy uptime, ev
       crashes.every((e) => e.consecutiveScannerCrashes === 1),
       `every crash here follows healthy uptime, so consecutiveScannerCrashes must read 1 on all of them, got ${JSON.stringify(crashes.map((e) => e.consecutiveScannerCrashes))}`
     );
-    assert.equal(
-      readDaemonEvents(journalDir).some((e) => e.reason === 'scanner-crash-circuit-breaker'),
-      false,
-      'the breaker must never have tripped'
-    );
 
     // Positive confirmation that run() is genuinely still active, not merely "hasn't resolved
     // yet": stop() only sets stopReason if nothing has already set it (dispatcher.js's own `if
@@ -2284,6 +2354,29 @@ test('the breaker does NOT trip when crashes are separated by healthy uptime, ev
     dispatcher.stop();
     const stopReason = await runPromise;
     assert.equal(stopReason.reason, 'stop-requested', 'the dispatcher must have still been running when stop() was called');
+
+    // MOVED here, action 3.3 (this action): this used to sit above, BEFORE dispatcher.stop() /
+    // await runPromise -- at that point run() had not returned yet (its `for (;;)` loop was still
+    // spinning), so `dispatcher-stopped` could not exist in the journal regardless of whether the
+    // breaker had tripped, making the check vacuous no matter what it read: repairing only the
+    // `reason` field (item 1 of this action) would not have given it teeth on its own, since the
+    // event it reads from simply wasn't written yet at that point in the test. Checked here,
+    // AFTER `run()` has actually returned and journalled `dispatcher-stopped` (this action, item
+    // 1), it is a genuinely independent confirmation of the same fact the assertion above proves
+    // from the return value: it reads the JOURNAL record instead, so a bug that mislabelled the
+    // WRITTEN event without touching the returned stopReason -- or vice versa -- would be caught
+    // by one of these two assertions and not the other.
+    assert.equal(
+      readDaemonEvents(journalDir).some((e) => e.reason === 'scanner-crash-circuit-breaker'),
+      false,
+      'the breaker must never have tripped'
+    );
+
+    // Positive half of the same read: `dispatcher-stopped` genuinely fired, on the STOP-REQUESTED
+    // path specifically (dispatcher.stop() above), not merely absent-of-breaker by construction.
+    const stopped = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-stopped');
+    assert.ok(stopped, 'no dispatcher-stopped');
+    assert.equal(stopped.reason, 'stop-requested');
   } finally {
     dispatcher.stop();
     await runPromise;

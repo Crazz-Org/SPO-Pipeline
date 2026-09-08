@@ -42,6 +42,12 @@ const {
   IN_PROGRESS_DIRNAME,
 } = require('../orchestrator/auto-triage');
 const { appendDaemonEvent } = require('../orchestrator/journal');
+// Same module object auto-triage.js itself holds (`const intake = require('./intake')`) -- a
+// property assigned onto it here (`intake.triageBugReport = spy`) is visible to auto-triage.js's
+// own `intake.triageBugReport(...)` call sites too, since those are live property lookups at call
+// time, not a destructured local captured at require time. Used ONLY by the spy test below, and
+// always restored afterward in a `finally`.
+const intake = require('../orchestrator/intake');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -1042,6 +1048,115 @@ test('runAutoTriage: a dry run never sweeps in-progress/, even when a stale clai
   assert.equal(fs.existsSync(path.join(inProgressDir, file)), true, 'a dry run must not reclaim a stale in-progress file');
 });
 
+// Action 3.1 (Lot 3): a falsy `pendingPath` reaching claimReport is now REACHABLE, not merely
+// hypothetical -- moveReportTo's own swallowed-ENOENT branch (above) returns `null` instead of a
+// fabricated `dest`, and that `null` can ride a report-intake -> report-confirmed event pair all
+// the way here as `entry.pendingPath`. Before that change `path.basename` below never saw
+// anything but a string; a bare `null`/`undefined` would throw a TypeError OUTSIDE the
+// try/catch, uncaught, straight through `processConfirmedReport` into `runAutoTriage`'s own loop
+// (which has none either -- see the comment on this guard in claimReport itself). Direct check
+// first: the primitive returns the ordinary "lost claim" shape, never throws.
+test('claimReport: a falsy pendingPath (reachable via moveReportTo\'s own null-return) is an ordinary lost claim, not a throw', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-falsy-');
+  assert.deepEqual(claimReport(spoReportsDir, null), { claimed: false });
+  assert.deepEqual(claimReport(spoReportsDir, undefined), { claimed: false });
+  assert.deepEqual(claimReport(spoReportsDir, ''), { claimed: false });
+});
+
+// Reachability, not unit: the guard above proves claimReport itself is safe -- it does not prove
+// the daemon ever benefits, or that the report does not silently vanish from view instead of
+// merely being retried. Drives a real (non-dry) runAutoTriage cycle over a `report-confirmed`
+// event whose `pendingPath` is `null` (exactly the shape report-intake.js's own binding can now
+// produce) TWICE, since the whole point of `already-claimed` (as opposed to a terminal event) is
+// that the report stays eligible and is retried, not silently dropped after one cycle. Without
+// the guard, cycle 1 throws `path.basename(null)` out of processConfirmedReport, uncaught by
+// runAutoTriage, which is the same "kills the whole daemon" class as the ENOENT reachability test
+// above.
+test('runAutoTriage: a report-confirmed event with pendingPath: null is "already-claimed" every cycle -- never throws, never a terminal event', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-null-pending-');
+  const journalRoot = mkTmp('spo-autotriage-null-pending-journal-');
+  confirmedEntry(journalRoot, { issue: 741, pendingPath: null, kind: null });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+  const deps = { accountsDir: poolDir(), spawnSync: () => ok('') };
+
+  const first = await runAutoTriage(journalRoot, config, deps, { dry: false });
+  assert.equal(first.ok, true, 'the cycle must complete, not throw');
+  assert.equal(first.results.length, 1);
+  assert.equal(first.results[0].outcome, 'already-claimed');
+
+  const second = await runAutoTriage(journalRoot, config, deps, { dry: false });
+  assert.equal(second.ok, true, 'a SECOND cycle must also complete -- the report stays eligible, not silently dropped');
+  assert.equal(second.results.length, 1);
+  assert.equal(second.results[0].outcome, 'already-claimed');
+
+  const events = daemonEvents(journalRoot).map((e) => e.event);
+  assert.ok(!events.includes('report-triaged'), 'must never reach a filed/duplicate disposition');
+  assert.ok(!events.includes('report-held'), 'must never reach a held disposition');
+  assert.ok(!events.includes('report-held-mechanical'), 'must never reach a mechanical hold either -- claimReport never even calls triageBugReport');
+});
+
+// The SECOND falsy-pendingPath guard, in routeConfirmedReport: real (non-dry) calls never reach
+// it (claimReport above already refuses to claim, so processConfirmedReport returns
+// 'already-claimed' before routeConfirmedReport is even called) -- but `opts.dry` calls
+// routeConfirmedReport directly with the UNCLAIMED entry (processConfirmedReport's own `if (dry)
+// return routeConfirmedReport(...)`), so a `report-confirmed` event with `pendingPath: null`
+// reaches it unmodified under `spo triage --dry`. Without the guard, `entry.pendingPath` (null)
+// flows into `intake.triageBugReport` -> `fillPromptTemplate`'s placeholder check
+// (prompt-template.js:99, `values[name] === null` counts as missing) -> a thrown
+// MissingPlaceholderError, uncaught here. Direct check first, same shape as claimReport's own
+// pair above: processConfirmedReport(..., {dry:true}) returns the mechanical-failure shape,
+// never throws.
+test('processConfirmedReport --dry: a report-confirmed event with pendingPath: null fails mechanically (TRIAGE_BUG_REPORT step), never throws', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-null-pending-dry-unit-');
+  const journalRoot = mkTmp('spo-autotriage-null-pending-dry-unit-journal-');
+  const entry = { issue: 742, pendingPath: null, commentId: 1, kind: null };
+
+  const result = await processConfirmedReport(
+    entry,
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo' },
+    { accountsDir: poolDir(), spawnSync: () => ok('') },
+    { dry: true }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.step, 'TRIAGE_BUG_REPORT');
+  assert.match(result.error, /no pendingPath recorded/);
+});
+
+// Reachability + the spy the driver asked for: proves triageBugReport is never even ATTEMPTED,
+// not merely that its eventual failure is caught. `intake` above is the SAME module object
+// auto-triage.js's own `require('./intake')` holds, so patching `intake.triageBugReport` here is
+// visible to routeConfirmedReport's own `intake.triageBugReport(...)` call.
+test('runAutoTriage --dry: a report-confirmed event with pendingPath: null never calls intake.triageBugReport at all', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-null-pending-dry-');
+  const journalRoot = mkTmp('spo-autotriage-null-pending-dry-journal-');
+  confirmedEntry(journalRoot, { issue: 743, pendingPath: null, kind: null });
+
+  const origTriageBugReport = intake.triageBugReport;
+  let calls = 0;
+  intake.triageBugReport = (...args) => {
+    calls++;
+    return origTriageBugReport(...args);
+  };
+  try {
+    const result = await runAutoTriage(
+      journalRoot,
+      { spoReportsDir, productRepo: '/fake/repo' },
+      { accountsDir: poolDir(), spawnSync: () => ok('') },
+      { dry: true }
+    );
+    assert.equal(calls, 0, 'triageBugReport must never be called -- there is no report file to read');
+    assert.equal(result.ok, true, 'the preview cycle must complete, not throw');
+    assert.equal(result.results.length, 1);
+    assert.equal(result.results[0].outcome, 'error');
+    assert.match(result.results[0].error, /no pendingPath recorded/);
+  } finally {
+    intake.triageBugReport = origTriageBugReport;
+  }
+});
+
 // D1: fs.renameSync PRESERVES mtime, and a report file is named for when the player filed it,
 // then sits in pending/ awaiting a human confirm -- hours or days. So the sidecar-less fallback
 // read that original mtime, judged every fresh claim instantly stale, and could reclaim a LIVE
@@ -1074,16 +1189,32 @@ test('claimReport: stamps the claimed file\'s mtime, so an OLD report is not ins
   assert.equal(fs.existsSync(claim.path), true);
 });
 
+function daemonEvents(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
 // moveReportTo's own fs.renameSync is guarded the same way claimReport's is, just above: ENOENT
 // means a concurrent disposal already won the race and moved reportPath to dest first (a stale
 // claim reclaimed back to pending/ mid-archive, or two runners racing the same confirmed report),
-// so it is not an error -- moveReportTo returns dest and leaves the winner's disposition sidecar
-// alone. Any other rename error (EXDEV across filesystems, EPERM, ...) still propagates: there is
-// no "someone else already handled it" story for those, and swallowing them would hide a real
-// filesystem problem. Monkey-patching fs.renameSync (same spy idiom test/journal.test.js already
-// uses for this exact call) is the only deterministic way to land inside the guard.
-test('moveReportTo: an ENOENT rename (already moved by a concurrent disposal) is swallowed -- returns dest, leaves the existing disposition file alone', () => {
+// so it is not an error. Action 3.1 (Lot 3): this used to return `dest` (a path that is NOT
+// there) as if the move had succeeded, indistinguishable from success to every caller. It now
+// returns `null` and journals a distinct `report-move-source-missing` event via the new 4th
+// `journalRoot` parameter, so a caller that binds the return value (report-intake.js:300) records
+// "could not vouch for this" instead of a fabricated path. Any other rename error (EXDEV across
+// filesystems, EPERM, ...) still propagates: there is no "someone else already handled it" story
+// for those, and swallowing them would hide a real filesystem problem, and no event is journaled
+// for them either -- an event named "source missing" would be a lie about what actually happened.
+// Monkey-patching fs.renameSync (same spy idiom test/journal.test.js already uses for this exact
+// call) is the only deterministic way to land inside the guard.
+test('moveReportTo: an ENOENT rename (already moved by a concurrent disposal) is swallowed -- returns null, journals report-move-source-missing, leaves the existing disposition file alone', () => {
   const spoReportsDir = mkTmp('spo-autotriage-movereport-enoent-');
+  const journalRoot = mkTmp('spo-autotriage-movereport-enoent-journal-');
   const targetDir = path.join(spoReportsDir, 'archive');
   fs.mkdirSync(targetDir, { recursive: true });
   const reportPath = path.join(spoReportsDir, 'in-progress', '2026-09-01T00-00-00-000Z_desktop_race.json');
@@ -1102,18 +1233,25 @@ test('moveReportTo: an ENOENT rename (already moved by a concurrent disposal) is
     return origRename(src, d);
   };
   try {
-    const result = moveReportTo(reportPath, targetDir, 'duplicate: #2 — 2026-09-01');
-    assert.equal(result, dest, 'ENOENT must be treated as "already moved", returning dest rather than throwing');
+    const result = moveReportTo(reportPath, targetDir, 'duplicate: #2 — 2026-09-01', journalRoot);
+    assert.equal(result, null, 'ENOENT must be treated as "already moved" but no longer vouched-for -- null, not a fabricated dest');
   } finally {
     fs.renameSync = origRename;
   }
 
   // The loser must not clobber the winner's disposition line.
   assert.equal(fs.readFileSync(`${dest}.disposition.txt`, 'utf8'), 'filed: #1 — 2026-09-01\n');
+
+  const events = daemonEvents(journalRoot).filter((e) => e.event === 'report-move-source-missing');
+  assert.equal(events.length, 1, 'expected exactly one report-move-source-missing event');
+  assert.equal(events[0].from, reportPath);
+  assert.equal(events[0].to, dest);
+  assert.equal(events[0].disposition, 'duplicate: #2 — 2026-09-01');
 });
 
-test('moveReportTo: a non-ENOENT rename failure (e.g. EXDEV) still propagates -- never swallowed', () => {
+test('moveReportTo: a non-ENOENT rename failure (e.g. EXDEV) still propagates unchanged -- never swallowed, no event journaled', () => {
   const spoReportsDir = mkTmp('spo-autotriage-movereport-exdev-');
+  const journalRoot = mkTmp('spo-autotriage-movereport-exdev-journal-');
   const targetDir = path.join(spoReportsDir, 'archive');
   const reportPath = path.join(spoReportsDir, 'in-progress', '2026-09-01T00-00-00-000Z_desktop_exdev.json');
 
@@ -1124,7 +1262,41 @@ test('moveReportTo: a non-ENOENT rename failure (e.g. EXDEV) still propagates --
     throw simulated;
   };
   try {
-    assert.throws(() => moveReportTo(reportPath, targetDir, 'filed: #3 — 2026-09-01'), (err) => err === simulated);
+    assert.throws(() => moveReportTo(reportPath, targetDir, 'filed: #3 — 2026-09-01', journalRoot), (err) => err === simulated);
+  } finally {
+    fs.renameSync = origRename;
+  }
+
+  assert.deepEqual(daemonEvents(journalRoot), [], 'a genuine rename error must never journal report-move-source-missing');
+});
+
+// Reachability for report-intake.js:300's own binding lives in test/report-intake.test.js
+// (runReportIntake drives the real call site) -- this file only unit-tests moveReportTo directly.
+
+test('moveReportTo: a journalling failure (appendDaemonEvent throws) must not make moveReportTo itself throw', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-movereport-journalfail-');
+  const targetDir = path.join(spoReportsDir, 'archive');
+  fs.mkdirSync(targetDir, { recursive: true });
+  const reportPath = path.join(spoReportsDir, 'in-progress', '2026-09-01T00-00-00-000Z_desktop_journalfail.json');
+  const dest = path.join(targetDir, path.basename(reportPath));
+
+  const origRename = fs.renameSync;
+  fs.renameSync = (src, d) => {
+    if (src === reportPath && d === dest) {
+      const err = new Error('simulated: source already gone');
+      err.code = 'ENOENT';
+      throw err;
+    }
+    return origRename(src, d);
+  };
+  // A journalRoot that cannot possibly be written to (appendDaemonEvent's own fs.mkdirSync will
+  // throw against a path that is itself a FILE, not a directory) -- the closest real-world analog
+  // to a wedged/full disk, without needing to monkey-patch appendDaemonEvent itself.
+  const unwritableJournalRoot = path.join(spoReportsDir, 'not-a-directory.txt');
+  fs.writeFileSync(unwritableJournalRoot, 'not a directory');
+  try {
+    const result = moveReportTo(reportPath, targetDir, 'duplicate: #4 — 2026-09-01', unwritableJournalRoot);
+    assert.equal(result, null, 'the swallow itself must still succeed even though journalling it failed');
   } finally {
     fs.renameSync = origRename;
   }

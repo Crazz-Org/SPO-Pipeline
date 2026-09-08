@@ -29,7 +29,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { appendEvent, writeState } = require('./journal');
+const { appendEvent, appendDaemonEvent, writeState } = require('./journal');
 const { moveCard } = require('./board');
 const { armTimeout } = require('./command-timeout');
 const commentScan = require('./comment-scan');
@@ -736,12 +736,12 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // collide with every OTHER keyless retry for this task. As of this fix that fallback is DEAD IN
 // PRODUCTION -- it exists purely as a never-throw backstop for a hypothetical future third caller
 // that forgets to pass a key, not as a path either real call site is expected to take. It must
-// stay dead-code-safe regardless: this function has no try/catch, its `unparkScan` call site has
-// none (finalizePark's, in state-machine.js, does wrap its own call in one -- 'transient-retry-
-// failed' on catch), and neither does `runScanCycle` -- so a throw on the unparkScan path still
-// kills the scanner process, and the fallback must never throw. A future caller that omits `key`
-// gets today's non-idempotent-but-harmless behaviour silently, with no test watching for it --
-// that is an accepted residual risk, not an oversight.
+// stay dead-code-safe regardless: this function itself still has no try/catch. Card #137 (Lot
+// 3, 3.2a, 2026-09-08): the `unpark` call site below (unparkScan's `retry` branch) is now
+// guarded instead, like finalizePark's own call site in state-machine.js ('transient-retry-
+// failed' on catch) -- both the call AND its own journal-write fallback are wrapped, so nothing
+// escapes to `runScanCycle` any more, even if the journal write itself also fails. The fallback
+// above must still never throw: a caller that omits `key` gets non-idempotent-but-harmless behaviour.
 //
 // The key segment is zero-padded to a fixed width of 20 because `listQueueFiles` sorts by plain
 // filename string, not numeric value: unpadded, `0000-retry-9-x` sorts AFTER `0000-retry-10-x`.
@@ -849,8 +849,8 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // retry compute the SAME final name -- by design, so the second write overwrites the first
 // instead of double-enqueuing -- but under the OLD tmp naming (derived from the final name) they
 // would also compute the SAME temp name. Measured: the loser's `renameSync` throws `ENOENT` once
-// the winner has already renamed its own tmp file away, and with no try/catch anywhere up the
-// stack from here to `runScanCycle`, that kills the scanner process. `unparkScan` being `async`
+// the winner has already renamed its own tmp file away -- which used to kill the scanner process
+// outright (card #137 guarded the `unpark` call site; see above). `unparkScan` being `async`
 // means two invocations can interleave inside one process (a real daemon can also run unparkScan
 // and finalizePark against the same task around the same time), so the temp name carries its own
 // per-writer, per-call discriminator (`process.pid` plus a module-level counter -- the pid alone
@@ -1369,7 +1369,47 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
       // Maintainer-priority fix: priorityClass 'h' -- a maintainer's OWN retry always outranks any
       // bounded auto-retry finalizePark might have queued, regardless of which key is numerically
       // smaller. See reEnqueueTask's header for why the two callers cannot share one key space.
-      reEnqueueTask(queueDir, taskDir, id, {}, match.id, 'h');
+      //
+      // card #137 (Lot 3, 3.2a): this call site sat outside every try/catch on the path back to
+      // runScanCycle (see :741 and :853 above -- unlike finalizePark's own two `reEnqueueTask`
+      // call sites in state-machine.js, which are already guarded), so a throw here
+      // used to kill the scanner process. reEnqueueTask's own ENOENT trigger (two writers computing
+      // the same tmp name) was already closed by the per-writer discriminator in its header -- what
+      // is still reachable is the same environment class as takeNextTask's guard above it in this
+      // lot: EXDEV/EPERM/ENOSPC writing into `queueDir`. There is no "winner" to defer to here --
+      // reEnqueueTask's tmp-name discriminator means no other writer is racing this call for the
+      // SAME file, so a throw means the write to `queueDir` itself failed and nothing landed there.
+      // The guard MUST NOT write the marker on that path: the ordering rule two comments up says
+      // effect before marker, and a failed effect with a written marker is exactly the #77-class
+      // hole that ordering exists to prevent -- the card would read as already unparked while
+      // nothing was ever queued to work it. So on failure this only journals (on the daemon
+      // channel -- `taskDir`'s own PARKED-scoped channel would otherwise read as if this park cycle
+      // continued normally) and `continue`s WITHOUT the marker: findParkAnchor's `alreadyHandled`
+      // stays false, so the next unparkScan cycle finds the same anchor un-acted-on and retries the
+      // comment scan and this re-enqueue from scratch -- the maintainer's `retry` remains re-doable
+      // for as long as the failure persists, exactly like a human retry after any other park.
+      let requeuedFile = null;
+      try {
+        requeuedFile = reEnqueueTask(queueDir, taskDir, id, {}, match.id, 'h');
+      } catch (err) {
+        // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the
+        // EXACT filesystem-level failures this catch exists for (ENOSPC/EPERM/EROFS), that write
+        // can throw too, and an unwrapped call here would let THAT throw escape out of unparkScan,
+        // which `runScanCycle` awaits uncaught -- defeating the whole guard on the case it
+        // documents. Same shape as `refuseDuplicateQueueEntry`'s own disposal-failure catch
+        // (state-machine.js). Best-effort; never let this escape either way.
+        try {
+          appendDaemonEvent(journalRoot, 'unpark-requeue-failed', {
+            id,
+            issue: task.issue,
+            retryCommentId: match.id,
+            error: String((err && err.message) || err),
+          });
+        } catch {
+          // Nothing left to record to -- never let this reach runScanCycle either way.
+        }
+      }
+      if (!requeuedFile) continue; // marker withheld -- see comment above; next scan redoes the effect.
       appendEvent(taskDir, 'PARKED', 'unparked-by-maintainer', { retryCommentId: match.id });
       continue;
     }

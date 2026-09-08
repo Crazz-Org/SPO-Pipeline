@@ -2,11 +2,11 @@
 'use strict';
 // spo -- the read-only subcommands (status/task/parked/resume/tokens/reports) read ONLY the
 // journals under journal/<id>/ and never touch state.json. Several other subcommands DO write:
-// `account add`/`account sync-settings` mkdir and sync local settings; `account enable`/
-// `account disable` write marker files; `account clear-cooldown` rewrites state.json and appends
-// to daemon.jsonl; `dashboard` writes a file or binds a listener; `ask`/`pull`/`intake`/
-// `triage --file` file real GitHub issues; `recette` creates and deletes real issues, branches,
-// PRs and worktrees.
+// `account add`/`account sync-settings` mkdir and sync local settings; `account enable`/`account
+// disable` write marker files; `account clear-cooldown` rewrites state.json and appends to
+// daemon.jsonl; `dashboard` writes par-times.json/usage-rollups.json and, on a write failure
+// (#137), appends to daemon.jsonl; `ask`/`pull`/`intake`/`triage --file` file real GitHub
+// issues; `recette` creates and deletes real issues, branches, PRs and worktrees.
 //
 //   spo status              queue depth, bench queue depth (~/.spo-bench/spool,running), account
 //                            health + cooldowns, today's billable-weighted spend (with its own

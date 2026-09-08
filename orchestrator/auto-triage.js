@@ -150,8 +150,8 @@ function listQueuedReports(spoReportsDir) {
     .map((name) => path.join(spoReportsDir, name));
 }
 
-// moveReportTo(reportPath, targetDir, dispositionLine) -- mv into targetDir/ and write the
-// one-line disposition sidecar beside it (triage-report.md § 6's convention, `<file>
+// moveReportTo(reportPath, targetDir, dispositionLine, journalRoot) -- mv into targetDir/ and
+// write the one-line disposition sidecar beside it (triage-report.md § 6's convention, `<file>
 // .disposition.txt`), so a maintainer reading the target dir later sees the identical shape
 // whether a human or this pipeline moved it there. Shared by report-intake.js (-> pending/,
 // -> archive/ on discard) and this file (-> archive/ on duplicate/filed).
@@ -161,18 +161,61 @@ function listQueuedReports(spoReportsDir) {
 // claim reclaimed back to pending/ mid-archive, or, for report-intake.js's own unmutexed stage-1
 // call sites, two runners racing the same queued report -- the same class of race
 // processConfirmedReport's `finally` and claimReport already tolerate, so it is "already done",
-// not an error, and the winner's sidecar is left alone. It can ALSO mean the source never
-// existed, in which case this returns a dest that is not there and writes no sidecar: a
-// deliberate trade, because the alternative is the scan-loop death documented in
-// processConfirmedReport's `finally`, below. Any other error is rethrown unchanged.
-function moveReportTo(reportPath, targetDir, dispositionLine) {
+// not an error, and the winner's sidecar is left alone.
+//
+// It can ALSO mean the source never existed at all -- not a race, a genuine miss -- and that case
+// used to be indistinguishable from the one above: this function returned `dest` (a path that is
+// NOT there) exactly as if the move had succeeded, silently, to every caller. It no longer is:
+// this branch journals a distinct `report-move-source-missing` event (via the new `journalRoot`
+// 4th parameter -- positional and optional, like every JS parameter; nothing enforces a caller
+// supplies it except test/move-report-to-argv.test.js's own source sweep, which fails any call
+// site passing fewer than four arguments) and returns `null` instead of `dest`, so a caller that
+// binds the return value (report-intake.js's own `pendingPath` binding on its pending-move call)
+// records "we tried and could not vouch for this" rather than fabricating a path. Every caller
+// that discards the return value is unaffected either way. Any other rename error (EXDEV, EPERM,
+// ...) still propagates unchanged -- there is no "already done" story for those, and swallowing
+// them would hide a real filesystem problem.
+//
+// The journal write is wrapped in its own try/catch: journalling a TOLERATED race must never
+// itself become a new, untolerated throw -- that would reintroduce the exact scan-loop death this
+// ENOENT swallow exists to avoid (see processConfirmedReport's `finally`, below).
+//
+// `reportPath` itself can now be falsy on entry: report-intake.js's discard branch reads a
+// pending `report-intake` event's own `pendingPath` field straight off daemon.jsonl (no claim
+// step in between, unlike auto-triage.js's flow) and passes it here as `reportPath`, and that
+// field can now BE `null` -- this function's own doing, from a PRIOR call's swallowed-ENOENT
+// return. `path.basename(null)` throws a TypeError, uncaught, if reached -- so that case is
+// handled up front, before `path.basename` is ever called, with the identical "already gone"
+// journal-and-swallow story as the ENOENT branch below (there is no `dest` to report in this
+// case: without a source there is nothing to compute a basename from).
+function moveReportTo(reportPath, targetDir, dispositionLine, journalRoot) {
   fs.mkdirSync(targetDir, { recursive: true });
+  if (!reportPath) {
+    try {
+      appendDaemonEvent(journalRoot, 'report-move-source-missing', { from: reportPath || null, to: null, disposition: dispositionLine });
+    } catch {
+      // Best effort only -- see the ENOENT branch below for why this must never throw.
+    }
+    return null;
+  }
   const base = path.basename(reportPath);
   const dest = path.join(targetDir, base);
   try {
     fs.renameSync(reportPath, dest);
   } catch (err) {
-    if (err && err.code === 'ENOENT') return dest;
+    if (err && err.code === 'ENOENT') {
+      try {
+        appendDaemonEvent(journalRoot, 'report-move-source-missing', {
+          from: reportPath,
+          to: dest,
+          disposition: dispositionLine,
+        });
+      } catch {
+        // Best effort only -- see this function's own header for why a journalling failure here
+        // must never turn a tolerated race into a thrown error.
+      }
+      return null;
+    }
     throw err;
   }
   fs.writeFileSync(path.join(targetDir, `${base}.disposition.txt`), `${dispositionLine}\n`);
@@ -234,6 +277,16 @@ function removeClaimSidecar(claimedPath) {
 function claimReport(spoReportsDir, pendingPath) {
   const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
   fs.mkdirSync(inProgressDir, { recursive: true });
+  // A falsy pendingPath is now reachable here: moveReportTo's swallowed-ENOENT branch (above)
+  // returns `null` rather than a fabricated dest, and that `null` can ride a report-intake ->
+  // report-confirmed event pair all the way to processConfirmedReport's own `entry.pendingPath`.
+  // Before that change this was always a (wrong, but string) path, so `path.basename` below never
+  // saw anything but a string; a bare `null`/`undefined` throws a TypeError OUTSIDE the try/catch
+  // just below, uncaught, straight through processConfirmedReport into runAutoTriage's loop -- the
+  // exact "kills the whole daemon over a bookkeeping race" class this file's other comments warn
+  // about (see the `finally` in processConfirmedReport). Treat it as an ordinary lost claim
+  // instead: nothing to rename in the first place.
+  if (!pendingPath) return { claimed: false };
   const dest = path.join(inProgressDir, path.basename(pendingPath));
   try {
     fs.renameSync(pendingPath, dest);
@@ -616,7 +669,7 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
     }
   }
 
-  moveReportTo(entry.pendingPath, archiveDir, `filed: #${entry.issue} — ${today}`);
+  moveReportTo(entry.pendingPath, archiveDir, `filed: #${entry.issue} — ${today}`, journalRoot);
   appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'filed' });
   return { ok: true, outcome: 'filed', issueNumber: entry.issue, url: amended.url };
 }
@@ -673,6 +726,21 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
     return reviewAndFile(entry, built.draft, journalRoot, config, deps, opts, today);
   }
 
+  // Real (non-dry) calls never reach here with a falsy entry.pendingPath: processConfirmedReport
+  // only calls routeConfirmedReport with claimedEntry, whose pendingPath is claimReport's own
+  // `claim.path` -- and claimReport now refuses to claim a falsy path at all (see its own comment
+  // above). A `dry` run, though, calls routeConfirmedReport directly with the UNCLAIMED entry (see
+  // processConfirmedReport's `if (dry) return routeConfirmedReport(...)`), so a report-confirmed
+  // event carrying `pendingPath: null` (moveReportTo's swallowed-ENOENT branch, above) reaches
+  // here unmodified under `spo triage --dry`. Without this guard that null flows into
+  // fillPromptTemplate's placeholder check (prompt-template.js), which treats `null` as "missing"
+  // and throws MissingPlaceholderError -- uncaught here, unlike a wrong-but-string path, which
+  // used to just make the LLM's own file read fail as an ordinary reproduction miss. Fail the same
+  // mechanical-failure-shaped way every other TRIAGE_BUG_REPORT problem does instead.
+  if (!entry.pendingPath) {
+    return { ok: false, error: 'no pendingPath recorded for this report (source file vanished before the intake move could complete)', step: 'TRIAGE_BUG_REPORT' };
+  }
+
   // `journalRoot`: TRIAGE_BUG_REPORT's own `llm-call` event -- see reviewAndFile's call to
   // reviewCard for the rationale, not repeated here.
   const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, { ...deps, journalRoot });
@@ -707,7 +775,7 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
       deps
     );
     if (!closed.ok) return { ok: false, error: closed.error, step: 'POST_DUPLICATE_CLOSE_COMMENT' };
-    moveReportTo(entry.pendingPath, archiveDir, `duplicate: #${triaged.issue_number} — ${today}`);
+    moveReportTo(entry.pendingPath, archiveDir, `duplicate: #${triaged.issue_number} — ${today}`, journalRoot);
     appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'duplicate', duplicateOf: triaged.issue_number });
     return { ok: true, outcome: 'duplicate', issueNumber: triaged.issue_number };
   }

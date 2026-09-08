@@ -7,9 +7,10 @@
 # SPO-Pipeline checkout that should host the server after pulling dashboard changes -- it
 # restarts the unit.
 #
-# Unlike the orchestrator daemon, the dashboard server (bin/spo dashboard --serve) only reads
-# local state to render HTML -- it does not spawn gh or claude -- so it needs no extra PATH
-# entries beyond node itself.
+# Unlike the orchestrator daemon, the dashboard server (bin/spo dashboard --serve) mostly reads
+# local state to render HTML -- it does write a couple of small files of its own (par-times.json
+# on its own timer, and now an occasional daemon.jsonl event on a write failure, card #137) -- but
+# it does not spawn gh or claude, so it needs no extra PATH entries beyond node itself.
 
 set -euo pipefail
 

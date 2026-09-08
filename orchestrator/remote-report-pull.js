@@ -169,6 +169,17 @@ async function runRemoteReportPull(journalRoot, config, deps = {}) {
     const alreadyLocal = fs.existsSync(localPath);
 
     if (!alreadyLocal) {
+      // card #137 repair round (Lot 3, 3.2b): this catch used to be errors.push + continue with no
+      // journal write of its own, matched to look consistent with the write+rename catch below it
+      // -- but `errors` has exactly one reader in the whole repo, `bin/spo`'s cmdPullReports (the
+      // interactive CLI path). `startRemoteReportPullLoop`'s tick() only ever inspects
+      // `result.ok`, which this function returns true regardless of any per-file errors -- so in
+      // daemon mode, where this loop actually runs continuously, a fetch failure was exactly as
+      // invisible as the land failure below used to be. The closer sibling was never this catch's
+      // OWN silence, it was `remote-report-ack-failed` three statements down: an ack failure
+      // already journals. Both directions of "this file did not land locally this cycle" now do
+      // too, distinguished by `stage` on the SAME event name (see the write+rename catch below for
+      // why one event name, not two).
       let fetched;
       try {
         fetched = await http.httpRequest(`${remoteReportUrl}/fetch?file=${encodeURIComponent(file)}`, {
@@ -179,6 +190,17 @@ async function runRemoteReportPull(journalRoot, config, deps = {}) {
         });
       } catch (err) {
         errors.push({ file, error: err.message });
+        // Verification precedent (card #137, 3.2a): appendDaemonEvent does its own mkdirSync +
+        // appendFileSync, so on the exact filesystem-level failure a NEIGHBORING catch in this
+        // same loop exists for, that write can throw too. This catch is reached by a NETWORK
+        // failure, not a filesystem one, but the guard costs nothing and keeps every appendDaemonEvent
+        // call site in this function held to the same never-let-it-escape standard. Best-effort;
+        // never let this escape either way.
+        try {
+          appendDaemonEvent(journalRoot, 'remote-report-land-failed', { file, error: err.message, stage: 'fetch' });
+        } catch {
+          // Nothing left to record to -- never let this reach the drain loop either.
+        }
         continue; // retried next cycle
       }
       if (fetched.status !== 200 || fetched.truncated) {
@@ -196,10 +218,42 @@ async function runRemoteReportPull(journalRoot, config, deps = {}) {
         continue;
       }
 
-      fs.mkdirSync(spoReportsDir, { recursive: true });
+      // card #137 (Lot 3, 3.2b): this write+rename used to sit outside every try/catch in this
+      // loop -- unlike the fetch immediately above, whose own try/catch already treats a failure
+      // as one candidate's problem (errors.push + continue), a throw here (EXDEV/EPERM/ENOSPC
+      // landing bytes into spoReportsDir) used to escape the whole `for` loop, aborting
+      // runRemoteReportPull for every remaining candidate this cycle -- one bad filesystem write
+      // costing the entire batch, not just this file. All three statements (mkdirSync,
+      // writeFileSync, renameSync) are covered, the same way card #137's own claim guard in
+      // state-machine.js covers both of ITS statements: mkdirSync succeeding while renameSync
+      // fails is exactly as reachable as the reverse. On failure this now journals
+      // `remote-report-land-failed` with `stage: 'land'` -- the SAME event name the fetch catch
+      // above uses with `stage: 'fetch'`, one pipeline-stage name (list -> fetch -> land -> ack)
+      // rather than two near-duplicate events for "this file did not land locally this cycle". A
+      // `.part` file can be left behind on a renameSync failure -- deliberately not cleaned up,
+      // same posture as journal.js's writeState leaving its own tmp file on a crash:
+      // `listQueuedReports` only ever globs `*.json`, never `*.part`, so it is inert to every
+      // reader, and this exact writeFileSync overwrites it outright the next time this same file
+      // is retried -- there is nothing here that isn't already handled by the next cycle.
       const partPath = `${localPath}.part`;
-      fs.writeFileSync(partPath, fetched.body);
-      fs.renameSync(partPath, localPath); // atomic -- listQueuedReports never sees a half file
+      try {
+        fs.mkdirSync(spoReportsDir, { recursive: true });
+        fs.writeFileSync(partPath, fetched.body);
+        fs.renameSync(partPath, localPath); // atomic -- listQueuedReports never sees a half file
+      } catch (err) {
+        errors.push({ file, error: err.message });
+        // Verification fix (card #137, 3.2a's own defect class): appendDaemonEvent does its own
+        // mkdirSync + appendFileSync -- on the EXACT filesystem-level failure this catch exists
+        // for (ENOSPC/EPERM/EROFS), that write can throw too, and an unwrapped call here would let
+        // THAT throw escape the whole `for` loop right back into the failure this catch exists to
+        // contain. Best-effort; never let this escape either way.
+        try {
+          appendDaemonEvent(journalRoot, 'remote-report-land-failed', { file, error: err.message, stage: 'land' });
+        } catch {
+          // Nothing left to record to -- never let this reach the drain loop either.
+        }
+        continue; // retried next cycle -- the remaining candidates in THIS cycle are unaffected
+      }
       appendDaemonEvent(journalRoot, 'remote-report-pulled', { file, sha256: gotSha });
       pulled++;
     }

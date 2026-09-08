@@ -118,6 +118,15 @@ test('drain: an in-flight card runs to completion instead of being killed', { ti
   assert.deepEqual(end.survivors, []);
   assert.equal(stopReason.drained, true);
 
+  // Action 3.3: run() returning journals `dispatcher-stopped` with `stopReason` spread flat --
+  // on the DRAIN path specifically, proving the journal record matches what the caller's own
+  // `await runPromise` already got back (`stopReason` above).
+  const stopped = events.find((e) => e.event === 'dispatcher-stopped');
+  assert.ok(stopped, 'no dispatcher-stopped');
+  assert.equal(stopped.reason, 'drain-requested');
+  assert.equal(stopped.drained, true);
+  assert.deepEqual(stopped.survivors, []);
+
   // The card exited 0 on its own. Killed, it would have been (code null, signal SIGTERM) -- which
   // is exactly what this test was red with before the drain existed.
   const exitEvt = events.find((e) => e.event === 'worker-exit' && e.id === 'drain-a');
