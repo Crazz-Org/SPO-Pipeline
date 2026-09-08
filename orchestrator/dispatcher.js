@@ -732,6 +732,31 @@ function createDispatcher(queueDir, journalRoot, config) {
   // "ever". A maintainer reading daemon.jsonl now gets both numbers, correctly labelled, rather
   // than one number under two different implied meanings depending on which event they happen to
   // be looking at.
+  //
+  // RECORDED, action 3.3, NOT ACTED ON -- an argument about the HEIGHT of scannerHealthyUptimeMs
+  // (60s in production, config.js's Math.max(ORPHAN_SCAN_MS, UNPARK_SCAN_MS)), not about the shape
+  // of this counter, and out of scope for this action either way: auto-triage genuinely runs on
+  // the scanner's own process (state-machine.js's runForever), createScanTimers() seeds
+  // `lastAutoTriageAt: null` so every fresh scanner is immediately due, and runAutoTriage really
+  // does spawn a real `claude` child when it finds work -- so a crash landing while that spawn is
+  // in flight is unconditionally read as "healthy" at a 60s bar even if the crash came seconds
+  // after the spawn started. The bar was never tested against THAT case; it was tested against a
+  // near-instant `spawnExit` crash (this file's own mock-clock tests above). But the trigger is
+  // conditional, not standing: runAutoTriage only spawns when `findConfirmedAwaitingTriage` returns
+  // something, and with nothing pending the cycle returns in milliseconds -- so the argument holds
+  // only for crashes AFTER such a call has actually started, not for every crash on this path.
+  //
+  // AND it holds only where auto-triage runs at all, which is NOT this repo's own default:
+  // `shouldAutoTriage` returns false outright whenever `autoTriageMs <= 0`, and config.js's
+  // default for it is 0. Production reaches the case above only because an out-of-repo systemd
+  // drop-in (`~/.config/systemd/user/spo-pipeline-daemon.service.d/`) sets SPO_AUTO_TRIAGE_MS to a
+  // non-zero value; a stock checkout never spawns from this path and the argument is vacuous
+  // there. Stated because the argument reads as unconditional without it, and a future reader
+  // weighing the bar needs to know its premise lives outside the tree.
+  //
+  // Neither rejected option (a `totalScannerCrashes` ceiling, a windowed/decaying counter) touched
+  // this either -- both operate on the counter's shape, and this is a claim about the constant it
+  // is compared against. Left for a future card to weigh, not decided here.
   function handleScannerExit({ code, signal, spawnError }) {
     const startedAtMonotonicMs = scanner ? scanner.startedAtMonotonicMs : null;
     scanner = null;
@@ -1131,13 +1156,55 @@ function createDispatcher(queueDir, journalRoot, config) {
       // the exotic one -- doc/deployment.md 2.2 measured a signalled worker running a full park to
       // completion. `signalled` is what the deploy interrupted; `outcomes` is what actually became
       // of them, which is the fact a maintainer is really asking for.
-      appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {
-        drained: survivors.length === 0,
-        waitedMs,
-        survivors,
-        outcomes: postSignalOutcomes.filter((o) => survivors.includes(o.id)),
-      });
+      //
+      // Action 3.3, from verification: this write is wrapped for a reason specific to its
+      // POSITION, not merely for symmetry with the guarded `dispatcher-stopped` emit below.
+      // `appendDaemonEvent` does its own mkdirSync + appendFileSync, so on the ENOSPC/EPERM/EROFS
+      // class that emit exists to report, an unwrapped throw HERE rejects out of `run()` a few
+      // statements early and `dispatcher-stopped` never lands at all -- the drain path would lose
+      // the very record the action adds, on exactly the failure it is meant to record. Guarding
+      // the later emit while leaving this one bare would have capped the guard's value to the
+      // three non-drain paths without saying so.
+      try {
+        appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {
+          drained: survivors.length === 0,
+          waitedMs,
+          survivors,
+          outcomes: postSignalOutcomes.filter((o) => survivors.includes(o.id)),
+        });
+      } catch {
+        // Best-effort, same posture as every other journal write added in this lot: nothing left
+        // to record to, and never let it escape -- least of all past the stop event below.
+      }
       stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };
+    }
+
+    // Action 3.3: the single place every stop path converges -- drain, `stop-requested`, the
+    // worker-crash breaker and the scanner-crash breaker all set `stopReason` and then fall
+    // through to this same return, so journalling here covers all four with one call rather than
+    // one at each of the four assignment sites. Before this, the single most important event in
+    // this subsystem existed only on stderr (daemon.js's `dispatcher stopped itself -- <JSON>`)
+    // and as exit code 1; daemon.jsonl was structurally unable to show it. `appendDaemonEvent`
+    // spreads `detail` flat, so `stopReason` itself lands as the event's own fields (`reason`,
+    // plus whichever breaker/drain fields that particular stop path added) rather than nested
+    // under a `detail` key.
+    //
+    // `stopReason` is unreachable as null/undefined here in practice -- the only way out of the
+    // `for (;;)` loop above is its own `if (stopReason) break`, so control never reaches this
+    // return with `stopReason` still unset -- but guarded anyway rather than assuming that
+    // invariant holds forever: a null stop reason has nothing meaningful to journal, so it simply
+    // does not.
+    if (stopReason) {
+      try {
+        appendDaemonEvent(journalRoot, 'dispatcher-stopped', stopReason);
+      } catch {
+        // Best-effort, same shape as the queue-claim guard (state-machine.js's takeNextTask) and
+        // the two fs.renameSync sites in 62b3871/ae12962: appendDaemonEvent does mkdirSync +
+        // appendFileSync, so on the exact ENOSPC/EPERM/EROFS class of failure this call exists to
+        // report, the write itself can throw -- and unwrapped, that would turn a clean shutdown
+        // into a crash on the way out, defeating this action on its own worst case. Nothing left
+        // to record to; never let this escape either way.
+      }
     }
     return stopReason;
   }
