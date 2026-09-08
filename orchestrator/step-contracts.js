@@ -66,8 +66,9 @@ const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 // the experiment will have answered no, which is a result worth having either way.
 //
 // PLAN deliberately keeps the shared map. Its cost is essentially all per-turn (fit over 9 real
-// calls: fixed ~= 0, 4,531/turn, R^2 = 0.89), and its `L -> high` row is already the one
-// configuration that has never completed -- see LLM_STEP_DEADLINE_MS_BY_STEP.
+// calls: fixed ~= 0, 4,531/turn, R^2 = 0.89), and its `L -> high` row was the one configuration
+// that had never completed, until #516 completed it twice post-raise (864.152s, 1123.965s, both
+// `ok: true`) -- see LLM_STEP_DEADLINE_MS_BY_STEP.
 const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
 
 const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
@@ -100,21 +101,43 @@ const LLM_STEP_DEADLINE_MS = 900000;
 // LLM_STEP_DEADLINE_MS_BY_STEP -- per-step overrides of the figure above. Only PLAN has one.
 //
 // WHY. 900000ms is not enough for PLAN on an L-sized card, and the pipeline could not plan one at
-// all. Card #486 (size:L) is the only card ever to reach PLAN's `L -> high` row: three attempts,
-// three failures, two of them deadline kills at ~825s of measured wall clock, zero reported
-// tokens each. It terminal-parked `llm-transport-failed:PLAN` after burning ~33 minutes. The
-// effort ladder measured over the same corpus is PLAN low ~158s -> medium ~339s -> high >=825s,
-// roughly x2.1 per step, against a deadline that does not move with it.
+// all. Card #486 (size:L) was, before this raise, the only card ever to reach PLAN's `L -> high`
+// row. Before the raise (commit 98fc04b, 2026-09-04T05:57:43Z), three attempts failed, zero
+// reported tokens each: two killed AT the 900,000ms deadline (the ~825s reported is a pre-#158
+// Date.now() artefact -- both actually ran at least the full 900,000ms, see action 2.1, commit
+// e327171) and one a transport error (unparsable stdout, exit 143); the card terminal-parked
+// `llm-transport-failed:PLAN`. Two more attempts followed a retry on 2026-09-04, both AFTER the
+// raise (already running against 1,800,000ms) and both failing only on Fable account-cooling, not
+// the deadline -- #486's own state.json still reads
+// `all-accounts-cooling-until-2026-09-04T20:33:05.932Z` today. The effort ladder is PLAN low
+// median 179.9s (n=29) -> medium median 352.7s (n=20) -> high 864.2s/1123.97s (n=2, both #516,
+// post-raise, SUCCEEDED) -- PLAN's effort is a pure function of size (S -> low, M -> medium, L ->
+// high, by construction, no exceptions in this corpus), so the ladder measures effort and size
+// growing together, not effort alone -- x1.96 then x2.82 per step, not the constant "x2.1" claimed
+// before.
 //
-// Only PLAN moves. Every other step has room to spare against 900s: IMPLEMENT's longest real call
-// was 871s (#492, and that one SUCCEEDED -- it is the reason this is a raise for PLAN rather than
-// a cut for everyone), DIAGNOSE peaked at 142s, VALIDATE at 124s.
+// Only PLAN moves, and "every other step has room to spare against 900s" no longer describes them
+// all -- and, per the evidence below, never fully did. IMPLEMENT's longest completed call is
+// 920.322s (issue-517, ok: true), with 887.420s (issue-671) and 885.435s (issue-497) also above
+// the figure this override was written against. #492's 870.510s (SUCCEEDED) was cited as the
+// former maximum and the reason IMPLEMENT was left alone -- but that argument was already false
+// when written: this override landed 2026-09-04T05:57:43Z (commit 98fc04b), and #492's own FIRST
+// IMPLEMENT attempt had been killed AT the deadline six hours earlier (2026-09-04T00:02:36Z); the
+// surviving 870.510s call was that attempt's retry. issue-385 carries two more IMPLEMENT kills
+// that also predate the override (2026-08-30T20:21:31Z, 2026-09-03T22:01:56Z). DIAGNOSE peaked at
+// 215.4s (issue-516); VALIDATE at 336.9s (issue-507). Seven IMPLEMENT calls (plus #486's two
+// above) are now killed AT the 900,000ms deadline. IMPLEMENT no longer has room to spare, and the
+// record above says it never demonstrably did; this paragraph stands as that record, not as a
+// decision about what to do next.
 //
 // This is a bet, and a bounded one: #486's calls were KILLED mid-flight, so we know 900s was not
-// enough and do NOT know that 1800s is. If PLAN at `high` still times out, the journal says so and
-// the evidence-backed fallback is PLAN's own `L -> medium` (proven: max 567s observed), not more
-// deadline. The cost of being wrong is ~3 x 1800s of wall clock before the transient-retry budget
-// parks the card.
+// enough and do NOT know that 1800s is. If PLAN at `high` still times out, the journal says so,
+// and the cheaper thing to try before more deadline is PLAN's own `L -> medium` -- except that row
+// has never run: PLAN's effort is bySize, so no L-sized card has ever called PLAN at `medium` in
+// this corpus. The nearest evidence is the `M -> medium` row itself (n=20, median 352.7s, max
+// 993.903s, issue-515) -- a proxy for what an L card might cost at `medium`, not proof of it,
+// since M and L are a different size row entirely. The cost of being wrong is ~3 x 1800s of wall
+// clock before the transient-retry budget parks the card.
 const LLM_STEP_DEADLINE_MS_BY_STEP = {
   PLAN: 1800000, // 30 min
 };
@@ -301,10 +324,13 @@ const STEP_CONTRACTS = {
     // Fixed by escalating the lever that actually points up: EFFORT. The model stays Fable on
     // every path, and the RDO wire buys `xhigh` instead of `high`.
     //
-    // Why xhigh is safe here: VALIDATE is the cheapest and fastest step in the pipeline -- 6/6
-    // successful calls, mean 57.8k billable, mean 77s, max 124s against a 900000ms deadline. There
-    // is an order of magnitude of headroom, which is why this step (not PLAN, where effort `high`
-    // already blew the deadline) is where the first use of an effort above `high` belongs.
+    // Why xhigh is safe here: the escalation has already run -- 5 `xhigh` VALIDATE calls (#385,
+    // #489, #507, #640 x2), all `ok: true`, mean 245.84s, mean 98.6k billable, max 336.852s
+    // (issue-507) against a 900000ms deadline: roughly 2.7x headroom against the slowest call
+    // measured, not the order of magnitude an earlier draft claimed. VALIDATE is not the cheapest
+    // or fastest step in the pipeline -- DIAGNOSE is both (n=26, mean 100.1s, 53.6k billable) --
+    // but VALIDATE at `xhigh` still has real room, which is why this step (not PLAN, where effort
+    // `high` already blew the deadline) is where the first use of an effort above `high` landed.
     escalatedModel: null,
     escalatesOn: [],
     escalatedEffort: 'xhigh',

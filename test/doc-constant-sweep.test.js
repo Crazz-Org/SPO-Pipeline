@@ -1419,7 +1419,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: park-loop.js:1283", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Both are pure shifts: the cited line is byte-identical at every one of the three numbers.
   "orchestrator/state-machine.js :: run.ts:63",
-  "orchestrator/state-machine.js :: step-contracts.js:326", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`
+  "orchestrator/state-machine.js :: step-contracts.js:352", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`; re-pinned from :326 (2026-09-08) -- action 2.3 of card #158 grew step-contracts.js's IMPLEMENT_EFFORT_BY_SIZE/LLM_STEP_DEADLINE_MS_BY_STEP/VALIDATE-escalation comments by 26 lines total, above this line; a true pure shift, content byte-identical at :352.
   "orchestrator/steps/llm.js :: intake.js:797-799",
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
