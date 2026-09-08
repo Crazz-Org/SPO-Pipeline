@@ -131,6 +131,26 @@ is a correction like any other — name the row you would use and why the *major
 lands there (`docs` first, `ci` last and the catch-all; where two rows could match, the earlier
 row wins). A card that genuinely spans two blocking areas is two cards.
 
+That is one instance of a wider question: is this actually N cards, filed as one? Three tells,
+readable straight off the draft, are enough to call it — no code read required:
+
+- the acceptance criterion spans **several subsystems**, not one;
+- the title or body reads as "**X and Y**" — two changes joined by a conjunction, not one change
+  with two effects;
+- it carries **several independent acceptance criteria**, each one satisfiable, and verifiable, on
+  its own.
+
+This is a text-only judgement — you have not read the code the split would touch, so name it as a
+recommendation, not a finding of fact. When you are not sure, do not hold the card back over it:
+file it, and say plainly in `first_comment_markdown` that you are unsure. A card judged oversized
+is **`FILE_AMENDED`, never `DO_NOT_FILE`, on size or scope grounds** (checks 1–2 keep their own
+`DO_NOT_FILE` — a claim that does not hold, a duplicate, or something already fixed is still
+`DO_NOT_FILE`, however many cards it should have been) — `corrections` names the split, one line
+per card the draft should become, each with its own scope; restate it in `first_comment_markdown`
+too, since the corrections list alone will not carry it through to a human skimming the issue.
+Losing a real finding because it arrived big is strictly worse than filing it big — the split is a
+recommendation for whoever reads the board next, never a gate that keeps the card off it.
+
 ## Your verdict — one of three
 
 | `verdict` | Meaning | What happens next |
