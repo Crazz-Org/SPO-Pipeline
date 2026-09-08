@@ -34,7 +34,7 @@ function collectDeckAt(journalRoot, now) {
 }
 const { computeParTimes, shouldRecompute, percentile, orderIndex, TRACK_ORDER } = require('../console/par-times');
 const { STATES, PARK_REASONS, reasonText, stateInfo } = require('../console/plain-language');
-const { renderLiveInner, clock, signedClock, pace, trimNarration } = require('../console/render-deck');
+const { renderLiveInner, clock, signedClock, pace, trimNarration, summarizeSpend, renderSpendChip, splitNote } = require('../console/render-deck');
 const { renderDashboard } = require('../console/render');
 
 // ---- fixture helpers ------------------------------------------------------------------------
@@ -171,6 +171,86 @@ test('buildRun marks a reused step, so a skipped PLAN is never credited with the
   const plan = run.splits.find((s) => s.state === 'PLAN');
   assert.equal(plan.detail.reused, true);
   assert.equal(plan.ms, 0);
+});
+
+// ---- token ledger (action 4.4: buildRun sums a split's calls, and counts what each reported) --
+
+test('buildRun SUMS every llm-call in a split rather than keeping only the last one -- the core defect this action fixes', () => {
+  // Three calls in the same IMPLEMENT visit (no transition between them, exactly what a step
+  // that retries its own CLI invocation internally produces). Chosen so sum (1000+2000+5000
+  // = 8000) and last-wins (5000) are unmistakably different numbers.
+  const run = buildRun([
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'IMPLEMENT' },
+    { ts: T(2), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 1000, ok: true },
+    { ts: T(3), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 2000, ok: true },
+    { ts: T(4), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 5000, ok: true },
+    { ts: T(5), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+  ]);
+  const impl = run.splits.find((s) => s.state === 'IMPLEMENT');
+  assert.equal(impl.detail.billableTokens, 8000, 'summed, not the last call\'s 5000');
+  assert.equal(impl.detail.measuredCalls, 3);
+});
+
+test('a FAILED call that carries recovered tokens is counted -- dropping it was defect 3 this action fixes -- and failedCalls still increments', () => {
+  const run = buildRun([
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'IMPLEMENT' },
+    // A deadline kill: the CLI never returned a modelUsage block (ok: false) but
+    // maybeRecoverTokens found real spend in the session transcript.
+    { ts: T(2), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'transcript', billableTokens: 4000, ok: false },
+    { ts: T(3), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 1000, ok: true },
+    { ts: T(4), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+  ]);
+  const impl = run.splits.find((s) => s.state === 'IMPLEMENT');
+  assert.equal(impl.detail.billableTokens, 5000, 'the failed call\'s recovered 4000 is counted alongside the successful 1000');
+  assert.equal(impl.detail.failedCalls, 1, 'attempts are still counted exactly as before');
+  assert.equal(impl.detail.recoveredCalls, 1);
+  assert.equal(impl.detail.measuredCalls, 1);
+});
+
+test('a split that never carried a numeric billableTokens stays exactly null, distinguishable from a split that genuinely summed to exactly 0', () => {
+  const run = buildRun([
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'PLAN' },
+    // A legacy-shaped event: no tokensSource field, no billableTokens field at all.
+    { ts: T(2), state: 'PLAN', event: 'llm-call', model: 'fable', ok: true },
+    { ts: T(3), state: 'PLAN', event: 'transition', to: 'IMPLEMENT' },
+    // A real call that genuinely reported a zero-cost result.
+    { ts: T(4), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 0, ok: true },
+    { ts: T(5), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+  ]);
+  const plan = run.splits.find((s) => s.state === 'PLAN');
+  const impl = run.splits.find((s) => s.state === 'IMPLEMENT');
+  assert.equal(plan.detail.billableTokens, null, 'no numeric figure was ever seen -- absence, not a lie');
+  assert.equal(impl.detail.billableTokens, 0, 'a genuine zero must survive as 0, not be confused with "never measured"');
+  assert.notEqual(plan.detail.billableTokens, impl.detail.billableTokens);
+  // The legacy event (no tokensSource field at all) counts as not-measured, per this action's spec.
+  assert.equal(plan.detail.notMeasuredCalls, 1);
+  assert.equal(impl.detail.measuredCalls, 1);
+});
+
+// Fix 12 (this lot's own remediation): billableTokens sums across calls in a split; numTurns and
+// durationS must sum the same way, or the two figures on one split row silently mean different
+// spans (one call's turns next to two calls' tokens). No consumer (par-times.js, render.js,
+// render-deck.js) depends on last-wins semantics for either field -- both are read only by
+// splitNote's own display line, which now reports the same total the tokens figure does.
+test('buildRun sums numTurns and durationS across every call in a split, exactly like billableTokens', () => {
+  const run = buildRun([
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'IMPLEMENT' },
+    { ts: T(2), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 1000, numTurns: 12, duration_s: 90, ok: true },
+    { ts: T(3), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 2000, numTurns: 11, duration_s: 89, ok: true },
+    { ts: T(4), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+  ]);
+  const impl = run.splits.find((s) => s.state === 'IMPLEMENT');
+  assert.equal(impl.detail.billableTokens, 3000);
+  assert.equal(impl.detail.numTurns, 23, 'summed, not the last call\'s 11');
+  assert.equal(impl.detail.durationS, 179, 'summed, not the last call\'s 89');
 });
 
 test('normalizeRootCause keeps a sentence, drops "null", and unwraps the JSON-object shape the model sometimes answers with', () => {
@@ -573,6 +653,235 @@ function deckData(over = {}) {
   return { ...data, ...over };
 }
 
+// ---- the "spent this run" chip (action 4.4 -- A4 is the falsification test below) -----------
+//
+// summarizeSpend/renderSpendChip are exercised directly against hand-built split shapes rather
+// than through a full journal fixture: the point under test is the RENDERING rule (never a bare
+// figure over an incomplete ledger), not buildRun's own bookkeeping (covered above).
+function split(detail) {
+  return { detail };
+}
+
+test('a run mixing measured and recovered calls renders a lower-bound marker, and the total is the sum of both', () => {
+  const run = { splits: [split({ billableTokens: 1000, measuredCalls: 1 }), split({ billableTokens: 2000, recoveredCalls: 1 })] };
+  const spend = summarizeSpend(run);
+  assert.equal(spend.tokens, 3000);
+
+  const html = renderSpendChip(spend, false);
+  assert.match(html, /at least/i, 'a recovered figure is marked as a floor, not presented as exact');
+  assert.match(html, /recovered from the transcript/);
+  assert.match(html, /3\.0k|3000/); // the SUM of 1000 + 2000, not either call alone
+});
+
+test("A4 falsification test -- a run with a not-measured call never renders a bare number; it states what is unaccounted for", () => {
+  // Fix 5 (F4): measuredCalls and notMeasuredCalls are deliberately DIFFERENT numbers (3 vs 1),
+  // not the coincidentally-equal 1-and-1 this test used to use -- a display bug that read the
+  // wrong counter (e.g. printed measuredCalls where notMeasuredCalls belongs) would still pass
+  // "1 call not measured" if both counters happened to be 1.
+  const run = {
+    splits: [
+      split({ billableTokens: 1000, measuredCalls: 3 }),
+      split({ billableTokens: null, notMeasuredCalls: 1 }),
+    ],
+  };
+  const spend = summarizeSpend(run);
+  assert.equal(spend.notMeasuredCalls, 1);
+  assert.equal(spend.measuredCalls, 3);
+
+  const html = renderSpendChip(spend, false);
+  // The falsifying shape: a bare "spent this run <b>1000</b>" with nothing qualifying it. Assert
+  // the actual chip is never that shape, and that it names the gap in the ledger instead.
+  assert.doesNotMatch(html, /^<span class="chip[^"]*"[^>]*>spent this run <b>[\d.,kM]+<\/b>\s*<\/span>$/);
+  assert.match(html, /1 call not measured/);
+  assert.doesNotMatch(html, /3 calls not measured/, 'the missing-calls count must come from notMeasuredCalls, not measuredCalls');
+  assert.match(html, /at least/i, 'the partial figure it does show is marked as a floor');
+});
+
+test('a run where nothing was measured renders no figure at all -- specifically not "0"', () => {
+  const run = { splits: [split({ billableTokens: null, notMeasuredCalls: 2 })] };
+  const spend = summarizeSpend(run);
+  assert.equal(spend.tokens, null);
+
+  const html = renderSpendChip(spend, false);
+  assert.match(html, /spend not recorded/);
+  assert.doesNotMatch(html, /<b>/, 'no figure is bolded -- there is nothing to show as a number');
+  assert.doesNotMatch(html, />\s*0\s*<|<b>0/, 'and specifically never the false claim "0"');
+});
+
+test('a run with no llm-call event yet renders no chip at all', () => {
+  assert.equal(renderSpendChip(summarizeSpend(null), false), '');
+  assert.equal(renderSpendChip(summarizeSpend({ splits: [] }), false), '');
+});
+
+// Fix 3: a call with tokensSource: null and billableTokens: 0 (19 such events measured in the
+// real corpus, e.g. issue-515) must not drive the partial variant to "at least 0" -- a numeric
+// zero dressed up as a measured lower bound is exactly the 0-vs-not-recorded confusion this whole
+// card exists to remove, reappearing on a new surface.
+//
+// The fix lives in collect.js's buildRun, not here: a not-measured call's billableTokens is never
+// trusted into a split's sum (see that function's own comment), so this exact real-corpus shape
+// reaches summarizeSpend/renderSpendChip with `tokens: null`, never `0` -- and those two functions
+// are deliberately UNCHANGED for this case (see renderSpendChip's own comment on why a
+// magnitude-keyed branch here would itself be the threshold-shaped bug the mechanism-invariance
+// test below exists to catch). Exercised through buildRun, not the hand-built `split()` helper,
+// because the fix is upstream of it.
+test('a not-measured call carrying a stale billableTokens: 0 never drives the chip to "at least 0"', () => {
+  const run = buildRun([
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'PLAN' },
+    // The real-corpus anomaly: tokensSource null (not measured) but billableTokens: 0 present.
+    { ts: T(2), state: 'PLAN', event: 'llm-call', tokensSource: null, billableTokens: 0, ok: true },
+    { ts: T(3), state: 'PLAN', event: 'transition', to: 'CHECK' },
+  ]);
+  const plan = run.splits.find((s) => s.state === 'PLAN');
+  assert.equal(plan.detail.billableTokens, null, "a not-measured call's own billableTokens is never trusted into the sum");
+  assert.equal(plan.detail.notMeasuredCalls, 1);
+
+  const spend = summarizeSpend({ splits: [plan] });
+  assert.equal(spend.tokens, null);
+
+  const html = renderSpendChip(spend, false);
+  assert.doesNotMatch(html, /at least/i, 'a floor of exactly 0 says nothing -- it must not be presented as one');
+  assert.doesNotMatch(html, />\s*0\s*<|<b>0/, 'and specifically never the bare claim "0"');
+  assert.match(html, /spend not recorded this run/);
+  assert.match(html, /1 call not measured/);
+});
+
+// Fix 6 (F7): summarizeSpend's own `tokens` must not silently drop a genuinely-measured 0 -- a
+// truthiness check in place of `typeof ... === 'number'` would survive every other test here
+// (they all use non-zero figures) while quietly turning a real 0 into `null`.
+test('summarizeSpend pins a genuinely-measured 0 as 0, not null', () => {
+  const spend = summarizeSpend({ splits: [split({ billableTokens: 0, measuredCalls: 1 })] });
+  assert.equal(spend.tokens, 0);
+});
+
+// Fix 7 (F9): totalCalls === 0 is an early-return guard in its own right, not merely a consequence
+// of `tokens` also being non-numeric in every other test above -- so it needs a shape where the
+// two are pulled apart: a hand-built spend with a real numeric `tokens` but no call counters at
+// all (unreachable through summarizeSpend from real splits, which never produces that combination,
+// but exactly what the guard itself must be proof against regardless of how a caller got there).
+test('renderSpendChip renders nothing when totalCalls is 0, even if a numeric tokens value is present', () => {
+  const html = renderSpendChip({ tokens: 5000, measuredCalls: 0, recoveredCalls: 0, notMeasuredCalls: 0, totalCalls: 0 }, false);
+  assert.equal(html, '', 'the totalCalls===0 guard must fire on its own, not merely ride along with the tokens check below it');
+});
+
+// Fix 8 (F10): the "+ live call unreported" note had no assertion anywhere.
+test('a pending live call is noted on the chip as unreported', () => {
+  const spend = summarizeSpend({ splits: [split({ billableTokens: 1000, measuredCalls: 1 })] });
+  const html = renderSpendChip(spend, true);
+  assert.match(html, /live call unreported/);
+  assert.doesNotMatch(renderSpendChip(spend, false), /live call unreported/, 'and absent when nothing is pending');
+});
+
+test('the spend chip never carries a threshold, an alert, or a "bad" colour -- there is deliberately no limit in this card', () => {
+  const scenarios = [
+    summarizeSpend({ splits: [split({ billableTokens: 5000, measuredCalls: 1 })] }),
+    summarizeSpend({ splits: [split({ billableTokens: 5000, recoveredCalls: 1 })] }),
+    summarizeSpend({ splits: [split({ billableTokens: 5000, measuredCalls: 1 }), split({ billableTokens: null, notMeasuredCalls: 1 })] }),
+    summarizeSpend({ splits: [split({ billableTokens: null, notMeasuredCalls: 1 })] }),
+  ];
+  for (const spend of scenarios) {
+    const html = renderSpendChip(spend, false);
+    assert.doesNotMatch(html, /chip-warn/, 'no colour that means "bad"');
+    assert.doesNotMatch(html, /threshold|too (much|many)|exceed|over budget|limit reached|alert/i, 'no comparison against a limit');
+  }
+  // Every non-empty variant carries the same tooltip -- said once, where a reader will find it.
+  for (const spend of scenarios) {
+    assert.match(renderSpendChip(spend, false), /title="[^"]*not a health signal[^"]*"/);
+  }
+});
+
+// Fix 2: the test above checks today's OUTPUT (no "chip-warn" string, no keyword). That is a
+// cheap first net but it only catches a threshold someone happens to phrase the same way this
+// test already knows about -- adding `tokens > 100000 ? 'chip-warn' : ''` to the chip passes every
+// other assertion in this file, because every fixture above uses billableTokens: 5000. This test
+// checks the MECHANISM instead: render every variant across nine orders of magnitude and assert
+// the markup is byte-identical once the formatted figure itself is masked out. Any rule keyed on
+// the SIZE of the number, at any value, in any variant -- a colour, a word, an extra element --
+// makes one of these renderings differ from the others.
+test('the spend chip has no threshold MECHANISM: its markup is invariant in magnitude', () => {
+  // A threshold of any kind -- a colour, a word, an extra element -- is a function of the VALUE.
+  // So render each variant across nine orders of magnitude and assert every rendering is
+  // byte-identical once the formatted figure is masked out. Any rule keyed on how big the number
+  // is, at any value, in any variant, makes one of these differ from the others.
+  const MAGNITUDES = [0, 1, 999, 5000, 99999, 100000, 100001, 1000000, 50000000, Number.MAX_SAFE_INTEGER];
+  const variants = {
+    measured:  (t) => ({ tokens: t, measuredCalls: 1, recoveredCalls: 0, notMeasuredCalls: 0, totalCalls: 1 }),
+    recovered: (t) => ({ tokens: t, measuredCalls: 0, recoveredCalls: 1, notMeasuredCalls: 0, totalCalls: 1 }),
+    partial:   (t) => ({ tokens: t, measuredCalls: 1, recoveredCalls: 0, notMeasuredCalls: 1, totalCalls: 2 }),
+  };
+  for (const [name, mk] of Object.entries(variants)) {
+    const skeletons = new Set(
+      MAGNITUDES.map((t) => renderSpendChip(mk(t), false).replace(/<b>[^<]*<\/b>/g, '<b>#</b>'))
+    );
+    assert.equal(skeletons.size, 1, `${name}: markup changed with the SIZE of the number -- something is keyed on the value`);
+  }
+});
+
+// Fix 9 (F8 + verdict d): both AUC figures must be cited, not just the outcome one -- the omitted
+// prefix figure (0.3706) is FURTHER from chance than the outcome one (0.4706), so it is the
+// figure a sceptic would seize on; citing only the friendlier-looking number was mildly
+// self-serving. Pinned as literals: neither number appears anywhere else in the repo, and
+// mutating 0.4706 -> 0.9706 was measured to pass the whole suite before this test existed.
+test('the tooltip cites both measured AUC figures, pinned against silent drift', () => {
+  const spend = summarizeSpend({ splits: [split({ billableTokens: 5000, measuredCalls: 1 })] });
+  const html = renderSpendChip(spend, false);
+  assert.match(html, /0\.4706/, 'the outcome AUC');
+  assert.match(html, /0\.3706/, 'the prefix AUC -- the more-informative-looking figure, must not be the one left out');
+});
+
+// Fix 10 (verdict c): the chip (current run, closed splits only) and `spo tokens` (every call,
+// every run the card has ever had) can disagree by up to 3x on a retried real card -- stated in
+// the tooltip so the mismatch reads as documented behaviour, not an unexplained bug.
+test('the tooltip states the chip is this-run-only, distinct from spo tokens\' all-runs total', () => {
+  const spend = summarizeSpend({ splits: [split({ billableTokens: 5000, measuredCalls: 1 })] });
+  const html = renderSpendChip(spend, false);
+  assert.match(html, /this run only/i);
+  assert.match(html, /spo tokens/);
+});
+
+// Fix 4: summarizeSpend accumulates measuredCalls/recoveredCalls/notMeasuredCalls with `+=` across
+// every split in the run. No fixture anywhere else in this file has calls in more than one split,
+// so mutating each `+=` to `=` (keeping only the LAST split's counters) survived the whole suite --
+// measured against the real journal, that mutant changes 52 of 62 cards and, on several, drops the
+// chip entirely (issue-385, issue-247, issue-671 all lose it; issue-201 shows "1 call not
+// measured" instead of 6). A run with calls spread across two splits -- a PLAN split and an
+// IMPLEMENT split -- is the NORMAL shape, not an edge case.
+test('summarizeSpend sums call counters ACROSS splits, not just within the last one', () => {
+  const run = {
+    splits: [
+      split({ billableTokens: 1000, measuredCalls: 1, notMeasuredCalls: 1 }),
+      split({ billableTokens: 2000, measuredCalls: 1, notMeasuredCalls: 1 }),
+    ],
+  };
+  const spend = summarizeSpend(run);
+  assert.equal(spend.notMeasuredCalls, 2, 'a `=` mutant would keep only the last split\'s 1');
+  assert.equal(spend.measuredCalls, 2);
+  assert.equal(spend.totalCalls, 4);
+});
+
+// Fix 1: A4 is falsified as shipped on splitNote -- the per-split <small> note on a track row --
+// which kept rendering a bare per-split figure even after renderSpendChip itself was fixed.
+// Verified on the real journal: card issue-671's Plan row is the split HOLDING the not-measured
+// call, and it showed "204.8k" unqualified while the chip above it said the ledger was short. The
+// row a reader consults next to find WHERE the ledger is short is the one that must not lie.
+test('splitNote marks its own figure as a floor when the split it belongs to has an incomplete ledger', () => {
+  const complete = splitNote({ state: 'IMPLEMENT', detail: { billableTokens: 5000, measuredCalls: 1 } }, false);
+  assert.doesNotMatch(complete, /at least/i, 'a fully-measured split states its figure plainly');
+
+  const partial = splitNote({ state: 'PLAN', detail: { billableTokens: 5000, measuredCalls: 1, notMeasuredCalls: 1 } }, false);
+  assert.match(partial, /at least/i, 'a split holding a not-measured call must qualify its own figure as a floor');
+
+  const recovered = splitNote({ state: 'DIAGNOSE', detail: { billableTokens: 5000, recoveredCalls: 1 } }, false);
+  assert.match(recovered, /at least/i, 'a recovered-only split is also a floor, not an exact figure');
+
+  // The existing `> 0` guard (unchanged by this fix) already keeps a genuine 0 off this line
+  // entirely -- confirmed here so Fix 1 and Fix 3 are not accidentally in tension.
+  const zero = splitNote({ state: 'PLAN', detail: { billableTokens: 0, notMeasuredCalls: 1 } }, false);
+  assert.doesNotMatch(zero, /at least 0|\b0\b/, 'a zero figure alongside a not-measured call still shows nothing numeric');
+});
+
 test('renderLiveInner draws the running card: its track, its lives, what is happening now, and its splits', () => {
   const html = renderLiveInner(deckData());
 
@@ -594,8 +903,10 @@ test('renderLiveInner draws the running card: its track, its lives, what is happ
 test('renderLiveInner never claims a completion percentage, and labels its meter with the three real numbers', () => {
   const html = renderLiveInner(deckData());
   // The bar is elapsed against par -- see render-deck.js. If it ever gains a "% done" label,
-  // that is a number nobody has.
-  assert.doesNotMatch(html, /% done|complete/i);
+  // that is a number nobody has. `\bcomplet` (not a bare `complete`) so this still catches
+  // "complete"/"completed"/"completion"/"80% complete" but stops rejecting "incomplete" -- the
+  // most accurate word for a short ledger, and one this lot's own spend chip has reason to use.
+  assert.doesNotMatch(html, /% done|\bcomplet/i);
   assert.match(html, /usual |no par yet/);
   assert.match(html, /gives up |no deadline/);
 });
