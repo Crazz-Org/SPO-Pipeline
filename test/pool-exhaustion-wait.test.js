@@ -177,7 +177,13 @@ test('finalizePark: all-accounts-cooling-until-<ISO> with earliestCooldownUntil 
 
   const queued = queuedFiles(config.queueDir);
   assert.equal(queued.length, 1);
-  assert.match(queued[0], /^0000-retry-/);
+  // Priority CLASS, not merely the `0000-retry-` prefix. The branch's own comment asserts this
+  // wait is "never allowed to sort ahead of a maintainer's explicit 'h'-classed retry", and
+  // nothing pinned it: flipping the pool branch's priorityClass from 't' to 'h' survived the whole
+  // suite during action 1.2's verification, while the identical mutation on the transient branch
+  // was killed. A machine wait sorting ahead of a human's retry is the one thing the class exists
+  // to prevent.
+  assert.match(queued[0], /^0000-retry-t-/, "the machine's own wait must be class 't', never the human 'h'");
   const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
   assert.equal(requeued.id, 'card-1');
   assert.equal(requeued.notBefore, new Date(deadlineMs).toISOString(), 'notBefore must equal the deadline exactly, not now + a fixed delay');
@@ -476,7 +482,15 @@ test('finalizePark: a cooling wait happens even when transientRetries is already
   assert.equal(readState(ctx.taskDir), null, 'the pool-wait mechanism has its own, separate budget');
   assert.equal(queuedFiles(config.queueDir).length, 1);
   const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queuedFiles(config.queueDir)[0]), 'utf8'));
-  assert.equal('transientRetries' in requeued, false, 'the exhausted transient budget must not itself have been carried forward by this path');
+  // CORRECTED by action 1.2's adversarial verification. This assertion originally required the
+  // OPPOSITE -- that the pool path drop `transientRetries` -- and that is a defect, not a
+  // property: dropping it means a pool wait silently RESTORES the exhausted transient budget, so a
+  // task alternating pool-wait and transient-retry retries unattended forever. reEnqueueTask's own
+  // header names that exact shape ("an unbounded retry loop, which is the one thing the budget
+  // exists to prevent"). The two mechanisms are independent in their BUDGETS -- which is what this
+  // test's name is about, and it still holds: the wait fires with the transient budget exhausted --
+  // but neither machine mechanism may reset the other's counter. Only a human `retry` does that.
+  assert.equal(requeued.transientRetries, 2, 'an exhausted transient budget stays exhausted across a pool wait');
 });
 
 // ==== part 9: the eligibility check never throws and never fires without a real budget/queue ======
@@ -528,4 +542,90 @@ test('finalizePark: a re-enqueue that actually fails parks honestly and journals
 test('config.js: poolExhaustionWaitCapMs holds the value this action specifies (12h)', () => {
   const prodConfig = require('../orchestrator/config');
   assert.equal(prodConfig.poolExhaustionWaitCapMs, 12 * 60 * 60 * 1000);
+});
+
+// ==== part 11: regressions from action 1.2's adversarial verification ===========================
+//
+// Two properties the original build got RIGHT in code and left unpinned, plus one it got wrong.
+// Each mutation below survived the full suite when it was introduced during verification.
+
+test('finalizePark: a deadline already in the past clamps to a zero wait -- it must never DECREMENT the accumulator', () => {
+  // `Math.max(0, deadlineMs - now)` was unpinned. Dropping the clamp lets a past deadline produce
+  // a NEGATIVE waitMs, which subtracts from poolWaitMs -- so repeated stale deadlines drive the
+  // accumulator below zero and the 12h cap never binds again. A past deadline is realistic, not
+  // contrived: the cooldown can expire between pick()'s check and finalizePark being reached.
+  const config = testConfig();
+  const ctx = buildParkCtx({ config, task: { id: 'card-1', poolWaitMs: 60 * 60 * 1000, poolWaitAttempts: 1 } });
+  const pastDeadline = Date.now() - 5 * 60 * 1000;
+
+  finalizePark(ctx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(pastDeadline).toISOString() });
+
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1, 'an expired cooldown is still a wait -- of zero -- not a park');
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.ok(
+    requeued.poolWaitMs >= 60 * 60 * 1000,
+    `the accumulator must never go backwards: was 3600000, now ${requeued.poolWaitMs}`
+  );
+  const evt = readJournal(ctx.taskDir).find((e) => e.event === 'pool-wait');
+  assert.equal(evt.waitMs, 0, 'a past deadline is a zero wait, never a negative one');
+  assert.ok(Date.parse(requeued.notBefore) <= Date.now() + 1000, 'notBefore is now, so the card is eligible immediately');
+});
+
+test("a transient retry must NOT reset the pool-wait allowance -- the cap is across the task's whole life", () => {
+  // The bug this pins: reEnqueueTask strips poolWaitMs/poolWaitAttempts from EVERY caller, so
+  // before the fix an unrelated transient retry silently wiped an 11h accumulated pool wait and
+  // the cap started over. Measured on a real `gate-stale` park during verification.
+  const config = testConfig();
+  const elevenHours = 11 * 60 * 60 * 1000;
+  const ctx = buildParkCtx({ config, task: { id: 'card-1', poolWaitMs: elevenHours, poolWaitAttempts: 3 } });
+
+  finalizePark(ctx, 'GATE', 'gate-stale', {});
+
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.ok(readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'), 'this is the transient mechanism firing');
+  assert.equal(requeued.transientRetries, 1);
+  assert.equal(requeued.poolWaitMs, elevenHours, 'the pool-wait accumulator survives an unrelated transient retry');
+  assert.equal(requeued.poolWaitAttempts, 3, 'and so does its attempt count');
+});
+
+test('a pool wait must NOT reset the transient-retry budget -- the leak is symmetric', () => {
+  const config = testConfig();
+  const ctx = buildParkCtx({ config, task: { id: 'card-1', transientRetries: 2 } });
+  const deadlineMs = Date.now() + 30 * 60 * 1000;
+
+  finalizePark(ctx, 'PLAN', `all-accounts-cooling-until-${new Date(deadlineMs).toISOString()}`, {
+    earliestCooldownUntil: deadlineMs,
+  });
+
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.ok(readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait'), 'this is the pool mechanism firing');
+  assert.equal(requeued.transientRetries, 2, 'an exhausted transient budget stays exhausted across a pool wait');
+});
+
+test('only a HUMAN retry resets either allowance: reEnqueueTask called without extra strips both', () => {
+  // The other half of the property: the strip in reEnqueueTask is correct, it is just not for the
+  // machine's own branches. unparkScan calls it with no counters in `extra`, and that is what
+  // makes a maintainer's `retry` always able to make progress.
+  const journalRoot = mkTmp('spo-poolwait-human-');
+  const taskDir = path.join(journalRoot, 'card-1');
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(taskDir, 'task.json'),
+    JSON.stringify({ id: 'card-1', poolWaitMs: 11 * 60 * 60 * 1000, poolWaitAttempts: 3, transientRetries: 2, notBefore: '2099-01-01T00:00:00.000Z' })
+  );
+  const queueDir = mkTmp('spo-poolwait-human-queue-');
+
+  const file = reEnqueueTask(queueDir, taskDir, 'card-1', {}, 7, 'h');
+
+  const written = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(written.poolWaitMs, undefined, 'a human retry restores the full wait allowance');
+  assert.equal(written.poolWaitAttempts, undefined);
+  assert.equal(written.transientRetries, undefined, 'and the full transient budget');
+  assert.equal(written.notBefore, undefined, 'and starts immediately');
+  assert.match(path.basename(file), /^0000-retry-h-/, "a human's retry is class 'h'");
 });

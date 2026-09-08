@@ -815,6 +815,16 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // reason and typed `retry`. A human's retry always starts the wait allowance fresh, exactly as it
 // already restores the transient-retry budget to zero.
 //
+// THE CONSEQUENCE THAT IS EASY TO MISS, and was missed: this strip applies to EVERY caller, so a
+// machine mechanism re-enqueueing for its OWN reason also wipes the OTHER mechanism's counter
+// unless it carries it forward. Measured during action 1.2's adversarial verification: a task
+// sitting at `poolWaitMs` = 11h that took an unrelated `gate-stale` transient retry came back with
+// `poolWaitMs` absent, so the 12h pool-exhaustion cap silently reset and the next cooling park
+// waited a full 5h again. The leak was symmetric -- a pool wait likewise restored the transient
+// budget. Both of finalizePark's branches now carry the other's fields through `extra`, so the
+// strip below means what this header says it means: only a HUMAN `retry` resets an allowance.
+// Anything added to this destructure in future is subject to the same rule.
+//
 // `extra` exists precisely so that the queue entry is never observable without them, and that is
 // a correctness requirement, not tidiness. 4.4's first cut wrote the file here and then had
 // finalizePark read it back, patch `transientRetries`/`notBefore` on and write it a second time.

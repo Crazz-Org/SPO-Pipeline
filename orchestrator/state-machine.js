@@ -2124,7 +2124,20 @@ function finalizePark(ctx, lastState, reason, detail) {
       // is smaller.
       let requeuedFile = null;
       try {
-        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore }, attempt, 't');
+        // The pool-wait accumulator is carried FORWARD here, explicitly. reEnqueueTask strips
+        // `poolWaitMs`/`poolWaitAttempts` from every caller -- which is right for a human `retry`
+        // (it restores the full allowance) and WRONG for a machine retry: without these two lines
+        // an unrelated transient retry silently resets the 12h pool-exhaustion cap, so a task that
+        // has already waited 11h comes back with a fresh, empty allowance. Measured during action
+        // 1.2's adversarial verification: a task at poolWaitMs=11h taking a `gate-stale` transient
+        // retry produced a queue entry with poolWaitMs absent, and the next cooling park then
+        // waited a full 5h at poolWaitAttempts 1. The cap is only "across the task's whole life"
+        // because these are carried; a `?? undefined` would put the key back as undefined, so
+        // each is spread in only when the task actually has one.
+        const carriedPoolWait = {};
+        if (ctx.task && Number.isFinite(ctx.task.poolWaitMs)) carriedPoolWait.poolWaitMs = ctx.task.poolWaitMs;
+        if (ctx.task && Number.isFinite(ctx.task.poolWaitAttempts)) carriedPoolWait.poolWaitAttempts = ctx.task.poolWaitAttempts;
+        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore, ...carriedPoolWait }, attempt, 't');
       } catch (err) {
         appendEvent(ctx.taskDir, lastState, 'transient-retry-failed', {
           reason,
@@ -2207,13 +2220,30 @@ function finalizePark(ctx, lastState, reason, detail) {
         // 'pool-wait' is a NEW event name, distinct from 'transient-retry', so the two mechanisms
         // stay tellable apart in the journal -- a reader must never have to infer which one fired
         // from the reason string alone.
+        //
+        // The queue FILENAME this produces (`0000-retry-t-<attempt>-<id>.json`) can repeat one the
+        // transient branch above would produce for the same attempt number, and that is fine, for
+        // the reason the transient branch's own Card #43 paragraph gives: finalizePark RETURNS
+        // after either branch fires, so the task's next park cannot happen until takeNextTask has
+        // already consumed the earlier entry out of queue/ -- there is nothing left to collide
+        // with. A human `retry` uses class 'h', a different name entirely. Stated here rather than
+        // silently inherited, because a reader of THIS branch should not have to find the argument
+        // twenty lines up in a different one.
+        //
+        // The transient counter is carried FORWARD here for the mirror of the reason the transient
+        // branch carries the pool-wait accumulator: reEnqueueTask strips `transientRetries` from
+        // every caller, so without this a pool wait would silently restore the transient retry
+        // budget -- a machine mechanism resetting another machine mechanism's bound. Only the
+        // human `retry` path is meant to reset either.
         let requeuedFile = null;
         try {
+          const carriedTransient = {};
+          if (ctx.task && Number.isFinite(ctx.task.transientRetries)) carriedTransient.transientRetries = ctx.task.transientRetries;
           requeuedFile = reEnqueueTask(
             poolQueueDir,
             ctx.taskDir,
             ctx.id,
-            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore },
+            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore, ...carriedTransient },
             attempt,
             't'
           );
@@ -2506,7 +2536,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1273 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1283 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal

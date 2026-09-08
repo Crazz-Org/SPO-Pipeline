@@ -271,8 +271,8 @@ module.exports = {
   // A cooling account-pool park (state-machine.js's ACCOUNT_POOL_PARK_REASON_FAMILY, when a
   // deadline is recoverable -- poolCooldownDeadlineMs) is re-enqueued with `notBefore` set to that
   // deadline instead of parking outright, PROVIDED the accumulated wait for this task
-  // (ctx.task.poolWaitMs) stays under this cap; past it, finalizePark falls straight through to
-  // the ordinary park.
+  // (ctx.task.poolWaitMs) does not EXCEED this cap -- the test is `<=`, so exactly at the cap
+  // still waits; past it, the card parks `all-accounts-cooling-wait-cap-exceeded` (action 1.3).
   //
   // poolExhaustionWaitCapMs: 12 hours. Basis, measured against this lot's banked corpus (do not
   // re-derive; see this action's own spec) -- two independent numbers, both real:
