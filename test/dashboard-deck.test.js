@@ -420,6 +420,92 @@ test('reasonText handles the two dynamic reason families by prefix, and degrades
   assert.equal(reasonText('all-accounts-cooling-after-retry').selfRetrying, true);
 });
 
+// Repairs from action 1.4's adversarial verification (36 mutations, 22 killed, 14 survived). The
+// BEHAVIOUR above is well pinned -- every drift that would make the deck promise a retry that will
+// never come is caught. What survived is everything else about the mirror: its membership, its
+// matching convention, its sentences, and the deadline text.
+test("the deck's account-pool mirror has exactly the orchestrator's own members, matched the same way", () => {
+  const { ACCOUNT_POOL_PARK_REASON_FAMILY } = require('../orchestrator/state-machine');
+  const { ACCOUNT_POOL_SELF_RETRYING } = require('../console/plain-language');
+
+  // MEMBERSHIP, pinned by deepEqual -- the way SELF_RETRYING is pinned against
+  // TRANSIENT_RETRY_REASONS. Before this, deleting four of the five mirror members left the suite
+  // green: the deck's fallback also answers `selfRetrying: false`, so the PROMISE stayed correct
+  // while the member silently lost its sentence and its declared `kind`. A behavioural pin alone
+  // cannot see that, because both sides of the drift give the same answer.
+  const shape = (list) => list.map(({ match, kind }) => `${kind}:${match}`).sort();
+  assert.deepEqual(
+    shape(ACCOUNT_POOL_SELF_RETRYING),
+    shape(ACCOUNT_POOL_PARK_REASON_FAMILY),
+    'console/plain-language.js mirrors orchestrator/state-machine.js here -- a member added, removed or ' +
+      'given a different `kind` there must be mirrored, or the deck silently stops describing it'
+  );
+});
+
+test('the deck matches a literal family member by exact equality and a prefix member by startsWith -- never a substring', () => {
+  // The same gap that survived on the ORCHESTRATOR side earlier in this lot, reproduced verbatim
+  // in the deck's own copy: accountPoolMember's comment states the convention ("never a substring
+  // test") and nothing enforced it. Matching literals with startsWith, or prefixes with includes,
+  // both survived the whole suite.
+  // Asserted against accountPoolMember directly. Through reasonText the literal case is
+  // unreachable -- the table branch is gated on an exact `PARK_REASONS[reason]` lookup, so a
+  // literal matched with startsWith would change no observable answer, and the mutation is an
+  // equivalent one there. The convention is still a real contract this file states, so it is
+  // pinned where it can actually be observed.
+  const { accountPoolMember } = require('../console/plain-language');
+
+  assert.equal(accountPoolMember('all-accounts-leased').match, 'all-accounts-leased', 'sanity: the exact literal matches');
+  assert.equal(accountPoolMember('all-accounts-leased-extra'), undefined, "a literal member's name plus a suffix is NOT that member");
+  assert.equal(accountPoolMember('all-accounts-cooling-unknown-and-more'), undefined);
+  assert.equal(accountPoolMember('all-accounts-cooling-after-retry-v2'), undefined);
+
+  assert.equal(
+    accountPoolMember('all-accounts-cooling-until-2026-09-05T19:32:33.350Z').kind,
+    'prefix',
+    'sanity: the prefix member matches an instance carrying a timestamp'
+  );
+  assert.equal(
+    accountPoolMember('nope-all-accounts-cooling-until-2026-09-05T19:32:33.350Z'),
+    undefined,
+    'a string merely CONTAINING the prefix must not match it -- startsWith, never includes'
+  );
+  // ...and the same string must not be described as a known reason by the deck either, which is
+  // the reachable consequence of the prefix half of the convention.
+  assert.equal(reasonText('nope-all-accounts-cooling-until-2026-09-05T19:32:33.350Z').known, false);
+});
+
+test('every account-pool family member has its own plain-language sentence', () => {
+  // Three of the five are never discovered by the literal-`ParkSignal(...)` sweep above (they are
+  // thrown as typed Errors, or built as a template, or reassigned), so deleting any of their
+  // sentences survived. `all-accounts-cooling-unknown` had no sentence at all until action 1.4 --
+  // exactly the gap this pins shut.
+  const { ACCOUNT_POOL_PARK_REASON_FAMILY } = require('../orchestrator/state-machine');
+  for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
+    const instance = member.kind === 'prefix' ? `${member.match}2026-09-05T19:32:33.350Z` : member.match;
+    const { text, known } = reasonText(instance);
+    assert.equal(known, true, `${instance} has no plain-language sentence`);
+    assert.ok(text.length > 20 && /[.!]$/.test(text), `${instance}'s sentence is not a written sentence: ${JSON.stringify(text)}`);
+    // reasonText's last-resort fallback is the slug with its punctuation opened out. Compare
+    // against that exact string rather than guessing at its shape -- a real sentence CAN contain a
+    // hyphen (the `-until-` member's own sentence quotes an ISO date).
+    assert.notEqual(text, instance.replace(/[-:]/g, ' '), `${instance} fell through to the slug fallback rather than a written sentence`);
+  }
+});
+
+test('the cooling deadline is read out of the reason string, and a bad one degrades instead of lying', () => {
+  // formatCooldownDeadline was entirely untested: returning null always, or a time a full day
+  // wrong, both survived -- the only text assertion was /out of quota/, which matches either
+  // branch. A deadline shown to a maintainer is exactly the kind of claim that must not drift.
+  const withDeadline = reasonText('all-accounts-cooling-until-2026-09-05T19:32:33.350Z');
+  assert.match(withDeadline.text, /2026-09-05 19:32:33 UTC/, 'the deadline in the reason string is shown to the maintainer');
+  assert.equal(withDeadline.selfRetrying, true);
+
+  const unparseable = reasonText('all-accounts-cooling-until-not-a-timestamp');
+  assert.equal(unparseable.known, true, 'still a recognised family member');
+  assert.equal(unparseable.selfRetrying, true, 'and still self-retrying');
+  assert.ok(!/UTC/.test(unparseable.text), 'but no invented time -- it falls back to the generic sentence');
+});
+
 // ---- rendering -------------------------------------------------------------------------------
 
 function deckData(over = {}) {

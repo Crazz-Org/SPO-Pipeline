@@ -270,8 +270,15 @@ const SELF_RETRYING = new Set([
 // and same reason as SELF_RETRYING above (a runtime `require` of orchestrator/state-machine.js
 // from this file would invert the dependency this module's header already commits to avoiding) --
 // test/dashboard-deck.test.js pins this mirror against the orchestrator's own
-// ACCOUNT_POOL_PARK_REASON_FAMILY plus poolCooldownDeadlineMs, the same way it pins SELF_RETRYING
-// against TRANSIENT_RETRY_REASONS.
+// ACCOUNT_POOL_PARK_REASON_FAMILY in TWO independent ways, and it needs both -- a point action
+// 1.4's verification made by measurement. The BEHAVIOURAL pin (every member's `selfRetrying`
+// checked against poolCooldownDeadlineMs, the orchestrator's own answer) catches every drift that
+// would make the deck promise a retry that never comes, which is the failure this table exists to
+// prevent. But it is blind to drift where both sides answer `false` for different reasons:
+// deleting four of these five members left the whole suite green, because reasonText's fallback
+// also returns `selfRetrying: false` -- the member just silently lost its sentence. So MEMBERSHIP
+// is pinned separately, by deepEqual on `kind:match`, the way SELF_RETRYING is pinned against
+// TRANSIENT_RETRY_REASONS. Neither pin subsumes the other.
 //
 // Unlike TRANSIENT_RETRY_REASONS/SELF_RETRYING, this family does NOT get one answer: action 1.2
 // (card #119) re-enqueues at the cooldown deadline only the two members that actually carry one
@@ -322,14 +329,20 @@ function reasonText(reason) {
     return { text: 'It stopped without recording a reason.', selfRetrying: false, known: false };
   }
 
-  if (reason.startsWith('all-accounts-cooling-until-')) {
-    const member = accountPoolMember(reason);
-    const when = formatCooldownDeadline(reason.slice('all-accounts-cooling-until-'.length));
+  // The prefix member is found THROUGH accountPoolMember, and its prefix comes from the mirror --
+  // this branch used to repeat the literal `'all-accounts-cooling-until-'` itself, which made it a
+  // third copy of a string that already lives in two places, and made accountPoolMember's matching
+  // convention unreachable from here (action 1.4's verification found the `.includes()` mutation
+  // survived for exactly that reason: the branch never asked the helper whether the reason
+  // matched, only whether its own hardcoded literal did).
+  const poolMember = accountPoolMember(reason);
+  if (poolMember && poolMember.kind === 'prefix') {
+    const when = formatCooldownDeadline(reason.slice(poolMember.match.length));
     return {
       text: when
         ? `Every Claude account is out of quota. It will start again on its own at ${when}.`
         : 'Every Claude account is out of quota. It will start again on its own once one frees up.',
-      selfRetrying: member ? member.selfRetrying : true,
+      selfRetrying: poolMember.selfRetrying,
       known: true,
     };
   }
@@ -353,4 +366,10 @@ function reasonText(reason) {
   return { text: reason.replace(/[-:]/g, ' '), selfRetrying: false, known: false };
 }
 
-module.exports = { STATES, PARK_REASONS, SELF_RETRYING, ACCOUNT_POOL_SELF_RETRYING, stateInfo, reasonText };
+// accountPoolMember is exported for test/dashboard-deck.test.js only. Its literal-vs-prefix
+// convention cannot be reached through reasonText's TABLE branch -- that branch is gated on an
+// exact `PARK_REASONS[reason]` lookup, so by the time accountPoolMember is called the reason is
+// already an exact key and matching a literal with startsWith would change nothing. Rather than
+// leave the convention pinned by nothing (action 1.4's verification found both mutations
+// surviving), it is asserted directly against this function.
+module.exports = { STATES, PARK_REASONS, SELF_RETRYING, ACCOUNT_POOL_SELF_RETRYING, accountPoolMember, stateInfo, reasonText };
