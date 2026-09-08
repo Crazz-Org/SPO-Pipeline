@@ -1695,7 +1695,8 @@ const TRANSIENT_RETRY_REASONS = new Set([
 // governed entirely by TRANSIENT_RETRY_REASONS/isTransientRetryReason, unchanged.
 //
 // Most reasons here are plain literals -- the overwhelming majority of park reasons in this
-// codebase are. Three families are NOT plain literals and are called out explicitly:
+// codebase are. A handful of families are called out explicitly below, either because their
+// members are not plain literals or because their shape needs explaining:
 //
 //   - `llm-transport-failed:<STEP>` -- generated from TRANSIENT_RETRY_LLM_STEPS above and already
 //     TRANSIENT for all four steps that currently exist (PLAN/IMPLEMENT/DIAGNOSE/VALIDATE). No
@@ -1706,28 +1707,36 @@ const TRANSIENT_RETRY_REASONS = new Set([
 //     command-timeout.js's classifyCommand: git, gh, npm-ci, npm-gate, npm-run, bench-install,
 //     plus the `command` fallback classifyCommand returning null implies) -- none of these seven
 //     is transient, so all seven are listed below as plain literals rather than a prefix rule:
-//     unlike `all-accounts-cooling-until-<ISO>` below, every value in this family is a bounded,
+//     unlike `prompt-missing-placeholder:<name>` below, every value in this family is a bounded,
 //     enumerable, non-timestamped string, so there is no reason to prefer a prefix match over
 //     listing them out (and listing them out is what makes a new command-timeout class show up as
 //     an undocumented LITERAL rather than silently absorbed into an existing prefix, the same
 //     argument TRANSIENT_RETRY_LLM_STEPS's own header already makes for `llm-transport-failed`).
-//   - `all-accounts-cooling-until-<ISO>` (accounts.js's pick()) carries a timestamp, so it can
-//     NEVER be matched by exact string -- it is covered by TERMINAL_PARK_REASON_PREFIXES below,
-//     not by a literal.
-//   - `prompt-missing-placeholder:<name>` (steps/llm.js) carries an arbitrary placeholder name --
-//     also covered by TERMINAL_PARK_REASON_PREFIXES, for the same reason.
+//   - `prompt-missing-placeholder:<name>` (steps/llm.js) carries an arbitrary placeholder name, so
+//     it can never be matched by exact string -- it is covered by TERMINAL_PARK_REASON_PREFIXES
+//     below, not by a literal.
+//
+// The account-pool family (`all-accounts-leased`, `all-accounts-cooling-unknown`,
+// `all-accounts-cooling-until-<ISO>`, `all-accounts-cooling-after-retry`) is deliberately NOT
+// listed in either TERMINAL_PARK_REASONS or TERMINAL_PARK_REASON_PREFIXES: all four are terminal,
+// but they are declared once, together, as ACCOUNT_POOL_PARK_REASON_FAMILY below (near
+// TERMINAL_PARK_REASON_PREFIXES), and classifyParkReason consults that family as its own explicit
+// step. Three of the four used to be plain literals here and the fourth used to be a
+// TERMINAL_PARK_REASON_PREFIXES entry -- action 1.1 (card #119) moved all four into one place so a
+// rename or split of any of them is a single-file, single-list change instead of three scattered
+// ones. `no-accounts-registered` is NOT a member of that family (registered accounts existing but
+// currently unusable vs. no accounts registered at all are different facts, and the latter has no
+// cooldown to wait out) and stays a plain literal below.
 //
 // Reasons produced only as SINKS (finalizePark called directly, never via a thrown ParkSignal) or
 // written straight to state.json (park-loop.js's abandon-reply reconciler) are included below too
 // -- classifyParkReason has no notion of "how the reason reached PARKED", only what the string is.
 const TERMINAL_PARK_REASONS = new Set([
-  // ---- account pool exhaustion (accounts.js, rethrown as a ParkSignal via this file's own
-  // `err.reason`/`err.detail` pass-through above) -- a human registers/re-enables an account or
-  // waits out a cooldown; none of this is a fact about the moment that a retry could outrun.
+  // ---- account pool exhaustion, the ONE member of this family that is not part of
+  // ACCOUNT_POOL_PARK_REASON_FAMILY below (see this const's own header) -- the registry itself is
+  // empty, a fact about configuration rather than about leases or cooldowns, so a human must
+  // register an account; there is nothing to wait out.
   'no-accounts-registered',
-  'all-accounts-leased',
-  'all-accounts-cooling-unknown',
-  'all-accounts-cooling-after-retry',
 
   // ---- INTAKE / plan-time guards
   'invalid-task-json',
@@ -1836,30 +1845,84 @@ const TERMINAL_PARK_REASONS = new Set([
   'abandoned-by-maintainer', // park-loop.js's abandon-reply reconciler, written straight to state.json
 ]);
 
-// TERMINAL_PARK_REASON_PREFIXES -- the two families whose values can never be enumerated as exact
-// literals (see TERMINAL_PARK_REASONS's own header). Each entry's `prefix` is matched with
-// `reason.startsWith(prefix)`, never a substring test, so a reason that merely CONTAINS one of
-// these strings without starting with it (unlikely given the hyphen/colon punctuation, but not
-// impossible) is correctly left unclassified rather than silently absorbed.
+// TERMINAL_PARK_REASON_PREFIXES -- the family whose values can never be enumerated as exact
+// literals (see TERMINAL_PARK_REASONS's own header). `prefix` is matched with
+// `reason.startsWith(prefix)`, never a substring test, so a reason that merely CONTAINS this
+// string without starting with it (unlikely given the colon punctuation, but not impossible) is
+// correctly left unclassified rather than silently absorbed. The account-pool family's own prefix
+// member (`all-accounts-cooling-until-<ISO>`) used to live here; it moved to
+// ACCOUNT_POOL_PARK_REASON_FAMILY below, alongside its three literal siblings, so
+// classifyParkReason checks that family as its own explicit step instead of folding it into this
+// list.
 const TERMINAL_PARK_REASON_PREFIXES = [
-  {
-    prefix: 'all-accounts-cooling-until-',
-    why: 'accounts.js pick() appends the earliest cooldown\'s own ISO timestamp; the reason can never repeat exactly, so it cannot be a Set member.',
-  },
   {
     prefix: 'prompt-missing-placeholder:',
     why: 'steps/llm.js appends the missing placeholder name, which is not enumerable up front.',
   },
 ];
 
+// ACCOUNT_POOL_PARK_REASON_FAMILY -- the four park reasons the account pool (accounts.js's
+// pick(), rethrown by account-lease.js's lease-and-rotate loop, plus this file's own
+// `all-accounts-cooling-after-retry` a few lines above) can produce when no account is currently
+// usable. Card #119 action 1.1 introduced this as the SINGLE place any of the four strings is
+// written in production code, replacing the three-way split that used to exist (three literals on
+// TERMINAL_PARK_REASONS, one prefix on TERMINAL_PARK_REASON_PREFIXES) -- see TERMINAL_PARK_
+// REASONS's own header for why that split was a defect: a rename or a split of any one of the
+// four used to require finding and editing the right one of three scattered spots by hand.
+//
+// Each member's `kind` says how it matches (`literal`: exact equality; `prefix`:
+// `reason.startsWith(match)`, same convention as TERMINAL_PARK_REASON_PREFIXES above -- never a
+// substring test) and `why` states in one sentence what the member means and whether a cooldown
+// deadline is recoverable from the park detail, for a later action (1.2) that hangs behaviour off
+// this predicate.
+//
+// This is deliberately NOT a blanket `all-accounts-` prefix rule -- see isAccountPoolParkReason's
+// own comment for why a brand-new, undeclared `all-accounts-<something>` reason must still
+// classify as 'unclassified'.
+const ACCOUNT_POOL_PARK_REASON_FAMILY = [
+  {
+    match: 'all-accounts-leased',
+    kind: 'literal',
+    why: 'every registered, enabled account is currently leased by another card; no cooldown deadline is carried on the park detail -- the lease itself is the only bound, and it is not recoverable from this reason string.',
+  },
+  {
+    match: 'all-accounts-cooling-unknown',
+    kind: 'literal',
+    why: 'every account is disabled, or the registry has no enabled entries at all; there is no cooldown to wait out (disablement is a human action), so no deadline is recoverable from this reason.',
+  },
+  {
+    match: 'all-accounts-cooling-until-',
+    kind: 'prefix',
+    why: 'accounts.js pick() appends the earliest cooldown\'s own ISO timestamp, so the reason can never repeat exactly and cannot be a Set member; the deadline IS recoverable, from the park detail\'s `earliestCooldownUntil` (epoch MS, unlike the after-retry sibling\'s ISO string) and, failing that, from the ISO suffix of this reason string itself -- pick() builds both from the same value.',
+  },
+  {
+    match: 'all-accounts-cooling-after-retry',
+    kind: 'literal',
+    why: 'this file\'s own bounded in-process retry (the ParkSignal thrown a few lines above) tried every account in one rotation pass and was limited on all of them; the reason string carries no timestamp, but the deadline IS recoverable from the park detail -- that throw site sets `cooldownUntilIso` (an ISO STRING, unlike pick()\'s `earliestCooldownUntil`, which is epoch ms).',
+  },
+];
+
+// isAccountPoolParkReason(reason) -> boolean. A literal member matches by exact equality, a
+// prefix member by `reason.startsWith(match)` -- never a substring test. Deliberately NOT a
+// blanket `reason.startsWith('all-accounts-')` rule: a brand-new, undeclared
+// `all-accounts-<something>` reason must still classify as 'unclassified' via classifyParkReason
+// below, the same rename-trap argument TERMINAL_PARK_REASONS's own header already makes for the
+// `<commandClass>-timed-out` family -- listing the four members out is what makes a fifth show up
+// as undocumented rather than silently absorbed.
+function isAccountPoolParkReason(reason) {
+  return ACCOUNT_POOL_PARK_REASON_FAMILY.some(({ match, kind }) => (kind === 'literal' ? reason === match : reason.startsWith(match)));
+}
+
 // classifyParkReason(reason) -> 'transient' | 'terminal' | 'unclassified'. The single source of
 // truth test/park-reason-partition.test.js's source sweep checks every producible reason against.
-// Exact-match first (cheap, and the overwhelming majority of reasons), then the prefix rules
-// above; anything matching neither is 'unclassified' -- exactly the rename-trap failure mode this
-// mechanism exists to catch, surfaced as data instead of silence.
+// Exact-match first (cheap, and the overwhelming majority of reasons), then the account-pool
+// family, then the remaining prefix rule; anything matching none of these is 'unclassified' --
+// exactly the rename-trap failure mode this mechanism exists to catch, surfaced as data instead of
+// silence.
 function classifyParkReason(reason) {
   if (TRANSIENT_RETRY_REASONS.has(reason)) return 'transient';
   if (TERMINAL_PARK_REASONS.has(reason)) return 'terminal';
+  if (isAccountPoolParkReason(reason)) return 'terminal';
   if (TERMINAL_PARK_REASON_PREFIXES.some(({ prefix }) => reason.startsWith(prefix))) return 'terminal';
   return 'unclassified';
 }
@@ -2616,7 +2679,9 @@ module.exports = {
   isRealMode, // exported for orphan-scan.js -- shadow/dry-run must detect-and-journal only, never park
   TRANSIENT_RETRY_REASONS, // exported for console/plain-language.js's SELF_RETRYING pin (test/dashboard-deck.test.js) and test/park-reason-partition.test.js
   TERMINAL_PARK_REASONS, // exported for test/park-reason-partition.test.js's coverage/disjointness/no-dead-entries sweep
-  TERMINAL_PARK_REASON_PREFIXES, // exported for the same sweep -- the two non-literal reason families
+  TERMINAL_PARK_REASON_PREFIXES, // exported for the same sweep -- the one remaining non-literal reason family
+  ACCOUNT_POOL_PARK_REASON_FAMILY, // exported for test/park-reason-partition.test.js's family-completeness sweep
+  isAccountPoolParkReason, // exported alongside the family -- test/park-reason-partition.test.js and action 1.2's future behaviour both read it
   classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
   isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
 };

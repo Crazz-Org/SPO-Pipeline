@@ -48,6 +48,8 @@ const {
   TRANSIENT_RETRY_REASONS,
   TERMINAL_PARK_REASONS,
   TERMINAL_PARK_REASON_PREFIXES,
+  ACCOUNT_POOL_PARK_REASON_FAMILY,
+  isAccountPoolParkReason,
   classifyParkReason,
 } = require('../orchestrator/state-machine');
 
@@ -414,6 +416,81 @@ test('NO DEAD ENTRIES: every literal in TERMINAL_PARK_REASONS is actually produc
   );
 });
 
+// ---- ACCOUNT_POOL_PARK_REASON_FAMILY (card #119 action 1.1) -------------------------------------
+//
+// orchestrator/state-machine.js used to scatter the account pool's four terminal reasons across
+// three places (three literals on TERMINAL_PARK_REASONS, one prefix on
+// TERMINAL_PARK_REASON_PREFIXES). Action 1.1 collapsed them into ACCOUNT_POOL_PARK_REASON_FAMILY,
+// a single declared list, and isAccountPoolParkReason(reason), the predicate classifyParkReason
+// now consults as its own step. These tests pin the two directions of the rename-safety property
+// that collapse is supposed to buy: every `all-accounts-*` reason the source can actually produce
+// is matched by the family (nothing slipped through the refactor uncovered), and every declared
+// family member corresponds to something the source still produces (no dead member left behind).
+// `no-accounts-registered` is deliberately excluded throughout -- it is not `all-accounts-*` and
+// is not a member of this family (see ACCOUNT_POOL_PARK_REASON_FAMILY's own header).
+
+test('ACCOUNT POOL FAMILY -- COMPLETENESS: every all-accounts-* reason the code can produce is matched by isAccountPoolParkReason', () => {
+  const { required } = collectRequiredReasons();
+  const scannedAccountPoolReasons = [...required.keys()].filter((r) => r.startsWith('all-accounts-'));
+
+  assert.ok(
+    scannedAccountPoolReasons.length >= 4,
+    `expected at least 4 distinct all-accounts-* reasons/prefixes in the source scan, found ${scannedAccountPoolReasons.length} -- has a resolver stopped matching accounts.js/state-machine.js?`
+  );
+
+  const unmatched = scannedAccountPoolReasons.filter((r) => !isAccountPoolParkReason(r));
+  assert.deepEqual(
+    unmatched,
+    [],
+    `all-accounts-* reason(s) produced by the code but NOT matched by isAccountPoolParkReason -- ` +
+      `update ACCOUNT_POOL_PARK_REASON_FAMILY in orchestrator/state-machine.js:\n  ${unmatched.join('\n  ')}`
+  );
+});
+
+test('ACCOUNT POOL FAMILY -- NO DEAD MEMBERS: every declared family member is still producible by the code', () => {
+  const { required } = collectRequiredReasons();
+  const scannedAccountPoolReasons = [...required.keys()].filter((r) => r.startsWith('all-accounts-'));
+
+  // For a literal member, the scan records the member's own string. For the prefix member, the
+  // scan records the bare prefix itself (resolveAccountPoolReasons resolves the ternary's dynamic
+  // branch to `{kind: 'prefix', value: 'all-accounts-cooling-until-'}`, not a timestamped
+  // instance) -- so `match` is what to look for either way.
+  const dead = ACCOUNT_POOL_PARK_REASON_FAMILY.filter((member) => !scannedAccountPoolReasons.includes(member.match));
+  assert.deepEqual(
+    dead.map((m) => m.match),
+    [],
+    `dead entry/entries in ACCOUNT_POOL_PARK_REASON_FAMILY (declared but no longer, or never, ` +
+      `producible by the code -- remove them from orchestrator/state-machine.js): ${dead.map((m) => m.match).join(', ')}`
+  );
+});
+
+test('ACCOUNT POOL FAMILY -- rename-safety, positive: all four members classify terminal via the family, none is transient', () => {
+  const representative = {
+    'all-accounts-leased': 'all-accounts-leased',
+    'all-accounts-cooling-unknown': 'all-accounts-cooling-unknown',
+    'all-accounts-cooling-until-': 'all-accounts-cooling-until-2026-09-04T20:33:05.932Z',
+    'all-accounts-cooling-after-retry': 'all-accounts-cooling-after-retry',
+  };
+  for (const member of ACCOUNT_POOL_PARK_REASON_FAMILY) {
+    const sample = representative[member.match];
+    assert.ok(sample, `no representative sample wired up for family member '${member.match}' -- add one to this test`);
+    assert.equal(isAccountPoolParkReason(sample), true, `isAccountPoolParkReason('${sample}') should be true`);
+    assert.equal(classifyParkReason(sample), 'terminal', `classifyParkReason('${sample}') should be 'terminal'`);
+    assert.equal(TRANSIENT_RETRY_REASONS.has(sample), false, `'${sample}' must not be on TRANSIENT_RETRY_REASONS`);
+  }
+});
+
+test('ACCOUNT POOL FAMILY -- absorption guard, negative: a brand-new all-accounts-* reason is NOT absorbed', () => {
+  assert.equal(isAccountPoolParkReason('all-accounts-brand-new-thing'), false);
+  assert.equal(classifyParkReason('all-accounts-brand-new-thing'), 'unclassified');
+});
+
+test("ACCOUNT POOL FAMILY -- no-accounts-registered is excluded: it is not all-accounts-*, and stays a plain TERMINAL_PARK_REASONS literal", () => {
+  assert.equal(isAccountPoolParkReason('no-accounts-registered'), false);
+  assert.equal(TERMINAL_PARK_REASONS.has('no-accounts-registered'), true);
+  assert.equal(classifyParkReason('no-accounts-registered'), 'terminal');
+});
+
 // ---- the rename trap, directly --------------------------------------------------------------
 //
 // Pins the exact failure mode this file exists to catch: a reason produced by code but present in
@@ -451,11 +528,12 @@ test('classifyParkReason: a reason on TERMINAL_PARK_REASONS classifies as termin
   }
 });
 
-test('classifyParkReason: the two dynamic terminal prefix families classify as terminal for a representative instance, not just the bare prefix', () => {
-  assert.equal(classifyParkReason('all-accounts-cooling-until-2026-09-05T19:32:33.350Z'), 'terminal');
-  assert.equal(classifyParkReason('prompt-missing-placeholder:files_to_change'), 'terminal');
+test('classifyParkReason: the two dynamic terminal prefix families (one on ACCOUNT_POOL_PARK_REASON_FAMILY, one on TERMINAL_PARK_REASON_PREFIXES) classify as terminal for a representative instance, not just the bare prefix', () => {
+  assert.equal(classifyParkReason('all-accounts-cooling-until-2026-09-05T19:32:33.350Z'), 'terminal'); // ACCOUNT_POOL_PARK_REASON_FAMILY, since action 1.1 (card #119)
+  assert.equal(classifyParkReason('prompt-missing-placeholder:files_to_change'), 'terminal'); // still TERMINAL_PARK_REASON_PREFIXES
   // A string that merely CONTAINS a prefix without starting with it must not match (substring vs.
-  // startsWith -- TERMINAL_PARK_REASON_PREFIXES's own header states this is a startsWith test).
+  // startsWith -- both ACCOUNT_POOL_PARK_REASON_FAMILY's and TERMINAL_PARK_REASON_PREFIXES's own
+  // headers state this is a startsWith test).
   assert.equal(classifyParkReason('should-not-match-all-accounts-cooling-until-2026'), 'unclassified');
 });
 

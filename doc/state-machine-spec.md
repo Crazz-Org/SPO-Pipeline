@@ -719,8 +719,11 @@ idempotency contract.
 
 ## Park-reason classification
 
-Every park reason the code can produce is classified either transient (`TRANSIENT_RETRY_REASONS`)
-or terminal (`TERMINAL_PARK_REASONS` / `TERMINAL_PARK_REASON_PREFIXES`), both keyed on the exact
-reason string; disjointness and full coverage are enforced by `test/park-reason-partition.test.js`.
+Every park reason the code can produce is classified either transient (`TRANSIENT_RETRY_REASONS`,
+keyed on the exact reason string) or terminal — the latter across three declarations:
+`TERMINAL_PARK_REASONS` (exact string), `TERMINAL_PARK_REASON_PREFIXES` (`startsWith`), and
+`ACCOUNT_POOL_PARK_REASON_FAMILY`, which holds the four account-pool reasons together in one place
+so that renaming or splitting any of them is a single-list edit. Disjointness and full coverage are
+enforced by `test/park-reason-partition.test.js`.
 SPO-Pipeline#85's five GitHub-mergeability-cause reasons (`merge-conflict`, `merge-blocked`,
 `merge-behind-base`, `merge-pr-draft`, `merge-checks-failing`) are all terminal.

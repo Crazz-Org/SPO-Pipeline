@@ -132,9 +132,11 @@ it to be at an `await`; `issue-488` is that case, and the other four are not.
 
 These three rows are examples, not the full picture — every park reason the code can produce is
 now classified. The source of truth is `orchestrator/state-machine.js`'s `TRANSIENT_RETRY_REASONS`
-(auto-retried within budget) and `TERMINAL_PARK_REASONS` / `TERMINAL_PARK_REASON_PREFIXES`
-(human-only — a maintainer must act, typically a `retry` comment or a fix); `classifyParkReason(reason)`
-returns `'transient' | 'terminal' | 'unclassified'` by checking both. Enforcement lives in
+(auto-retried within budget) and, on the human-only side — a maintainer must act, typically a
+`retry` comment or a fix — `TERMINAL_PARK_REASONS`, `TERMINAL_PARK_REASON_PREFIXES` and
+`ACCOUNT_POOL_PARK_REASON_FAMILY` (the four account-pool reasons, declared together in one place);
+`classifyParkReason(reason)` returns `'transient' | 'terminal' | 'unclassified'` by checking all
+four. Enforcement lives in
 `test/park-reason-partition.test.js`: it source-scans every reason the code can actually produce
 and fails, naming the reason and its file:line, if that reason is in neither set — the guard
 against the documented rename trap (splitting or renaming a reason silently makes the new name
