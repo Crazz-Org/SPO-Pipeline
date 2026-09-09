@@ -1422,6 +1422,8 @@ const EXPECTED_CITATIONS = [
   "orchestrator/auto-triage.js :: state-machine.js:2923",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
+  "orchestrator/dispatcher.js :: daemon.js:607",
+  "orchestrator/dispatcher.js :: daemon.js:626-627",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:150",
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/journal.js :: auto-pull.js:58-66",
@@ -2099,7 +2101,21 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // best-effort appendDaemonEvent-try/catch precedent. `appendDaemonEvent` sits inside every one of
   // the three citations' own same-sentence anchor windows, so all three anchor on it directly --
   // no CITATION_ANCHOR_ALLOWLIST entry and no unanchorable bump needed. 29 -> 32.
-  assert.equal(anchored, 32, `expected 32 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // card #162 (2026-09-09, found while gating card #164): action 1 of the lot 162-164/164 pair
+  // added two citations to dispatcher.js's own best-effort catch{} around `dispatcher-stopped`'s
+  // emit -- `daemon.js:607` and `daemon.js:626` -- without updating EXPECTED_CITATIONS or either
+  // count below (the gate for that action was not run to green before this action started).
+  // Re-measured by hand: `daemon.js:607` anchors directly -- both nearby candidates
+  // (`killAllChildren`/camel, `SIGTERM`/const) appear verbatim on line 607 itself
+  // ("a call made HERE is an ORDINARY `killAllChildren('SIGTERM')`"). `daemon.js:626` on its own
+  // does NOT -- line 626 is only `process.once('exit', () => {`, and the two candidates the
+  // heuristic finds nearby (from the NEXT clause, describing what the hook does once it fires)
+  // are not on that single line. NOT put on CITATION_ANCHOR_ALLOWLIST for this: the citation was
+  // simply too narrow, not unverifiable -- `killAllChildren('SIGTERM')` IS the very next line, so
+  // the fix is widening the citation itself to the range that actually contains what it names,
+  // `daemon.js:626-627`, not exempting it from the check. Re-pinned in dispatcher.js and
+  // EXPECTED_CITATIONS accordingly. Both now anchor with zero offenders. 32 -> 34.
+  assert.equal(anchored, 34, `expected 34 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
@@ -2254,16 +2270,25 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // `appendDaemonEvent` (see the main anchor test's own note above). `appendDaemonEvent` does not
   // appear on any neighbouring line of any of the three targets, so all three discriminate a
   // one-line drift -- discriminating is 17 -> 20. blunt and ranges are unchanged.
+  // card #162 (2026-09-09, found while gating card #164): +2, `orchestrator/dispatcher.js ::
+  // daemon.js:607` and `:: daemon.js:626-627` (see the main anchor test's own note above for why
+  // the second is a range, re-pinned rather than allowlisted). `daemon.js:607` is single-line,
+  // anchored on both `killAllChildren` and `SIGTERM` verbatim on line 607 itself; neither survives
+  // a shift to 606 (blank comment line) or 608 (`reparking`, neither candidate) --
+  // discriminates a one-line drift in both directions. discriminating is 20 -> 21.
+  // `daemon.js:626-627` is a genuine RANGE (`c.start !== c.stop`), blunt by construction like every
+  // other range in this corpus (see this section's own header) -- ranges is 9 -> 10. blunt is
+  // unchanged.
   assert.deepEqual(
     blunt.map((b) => b.split(' -- ')[0]).sort(),
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
-  assert.equal(discriminating.length, 20, `expected 20 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
-  assert.equal(ranges.length, 9, `expected 9 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
+  assert.equal(discriminating.length, 21, `expected 21 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
+  assert.equal(ranges.length, 10, `expected 10 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 32, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (32).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 34, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (34).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

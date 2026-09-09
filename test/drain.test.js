@@ -118,9 +118,11 @@ test('drain: an in-flight card runs to completion instead of being killed', { ti
   assert.deepEqual(end.survivors, []);
   assert.equal(stopReason.drained, true);
 
-  // Action 3.3: run() returning journals `dispatcher-stopped` with `stopReason` spread flat --
-  // on the DRAIN path specifically, proving the journal record matches what the caller's own
-  // `await runPromise` already got back (`stopReason` above).
+  // Action 3.3: `dispatcher-stopped` is journalled with `stopReason` spread flat, hoisted (card
+  // #162) to land right after the drain merge and before the kill+reap rather than at run()'s own
+  // return -- on the DRAIN path specifically, proving the journal record matches what the
+  // caller's own `await runPromise` eventually got back (`stopReason` above): nothing mutates
+  // `stopReason` between this earlier emit and that later return.
   const stopped = events.find((e) => e.event === 'dispatcher-stopped');
   assert.ok(stopped, 'no dispatcher-stopped');
   assert.equal(stopped.reason, 'drain-requested');
@@ -852,4 +854,107 @@ test('breaker: a straggler that ignores SIGTERM is escalated on the circuit-brea
     'a breaker trip is not a drain and must not journal one'
   );
   assert.ok(elapsed < 15000, `run() took ${elapsed}ms -- the breaker path is not bounded`);
+});
+
+// ---- 16. `dispatcher-stopped` is hoisted ahead of the kill+reap (card #162) -----------------------
+
+// REDESIGNED (this action's own verification finding): the first cut of this test discriminated
+// on a wall-clock margin (a `waitFor` budget comfortably shorter than the reap's own grace), which
+// reads as deterministic in isolation but is not -- measured over a real full-suite run (8 cores,
+// no `taskset`; `taskset` was itself the wrong regime and suppresses exactly this class of flake),
+// base 6fc0c23 was 0/10 and the branch was 3/10, with this test failing 1/10 on the assertion "run()
+// had already resolved by the time dispatcher-stopped appeared" -- scheduler starvation under
+// full-suite I/O closed the margin the test needed. CAUSAL, NOT TEMPORAL, this time: the property
+// card #162 actually adds is an ORDER in the journal, and `dispatcher-kill-escalated` is emitted
+// FROM INSIDE `reapSignalledChildren`, at the exact instant the grace expires -- the same blocking
+// step a systemd `TimeoutStopSec` SIGKILL would land inside. In the fixed world `dispatcher-stopped`
+// is written before that call ever starts; in the reverted (pre-#162) world it is written only
+// after `reapSignalledChildren` has already returned, which is strictly after that escalation
+// event fired. Comparing the two events' INDEXES in daemon.jsonl, once run() has fully resolved,
+// encodes exactly that -- with zero dependence on the scheduler, since nothing is racing a clock.
+test('drain: dispatcher-stopped precedes dispatcher-kill-escalated and dispatcher-drain-end in the journal (card #162)', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-drain-hoist-q-');
+  const journalDir = mkTmp('spo-drain-hoist-j-');
+  writeTask(queueDir, '0001-a.json', { id: 'drain-hoist', kind: 'synthetic' });
+
+  // MUST genuinely ignore SIGTERM (installs a no-op handler) -- `neverExitsSpawn` is NOT a
+  // substitute here. It installs no signal handler at all, so a bare SIGTERM kills it via the
+  // default action (measured this session: `process.kill(-pid,'SIGTERM')` against it exits within
+  // 1s), which would never force the escalation this test needs `dispatcher-kill-escalated` for.
+  //
+  // READY FILE, written immediately AFTER the handler is installed -- removes the last timing
+  // dependency from this test, which had migrated from the discriminating ASSERTION (fixed
+  // already) into its PRECONDITION. `worker-spawn` (dispatcher.js:817-818's own event) fires
+  // SYNCHRONOUSLY inside `spawnOne`, the instant the child's handle is created -- which says
+  // nothing about whether the freshly spawned OS process has actually finished booting node and
+  // reached this script's own `process.on('SIGTERM', ...)` line yet. Waiting on `worker-spawn`
+  // alone left a race between the drain's SIGTERM and that handler's installation: an EARLIER cut
+  // of this test relied on `drainTimeoutMs: 200` alone as headroom for that boot and measured
+  // 2/10 failures under a loaded full-suite run, `no dispatcher-kill-escalated -- the straggler
+  // was never actually escalated` -- the SIGTERM occasionally won the race and killed the child on
+  // the default disposition before the handler existed, starving this test's own precondition
+  // rather than exercising the code under test. Waiting for this file instead makes the handler's
+  // existence a fact on disk, not a margin, so the precondition cannot starve at any load. (The
+  // same exposure exists in this file's section 10 test, which relies on the same
+  // `drainTimeoutMs: 200` margin without a ready file -- left as is here; that is a separate
+  // card's cleanup, not this one's.)
+  const readyDir = mkTmp('spo-drain-hoist-ready-');
+  const readyFile = path.join(readyDir, 'sigterm-handler-installed');
+  const ignoresSigterm = (cmd, args, opts) =>
+    realSpawn(
+      process.execPath,
+      [
+        '-e',
+        `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(readyFile)}, ''); setTimeout(() => process.exit(0), 60000);`,
+      ],
+      { ...opts, stdio: 'ignore' }
+    );
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    // Matched to this file's own idiom for this straggler shape (section 10's `drainTimeoutMs:
+    // 200, drainKillGraceMs: 300`). The ready file above removes the boot-race these numbers used
+    // to paper over, but they are left unchanged rather than tightened further -- this test's
+    // speed was never the point, and there is no reason to invent a new pair of numbers with no
+    // measurement behind them.
+    baseConfig({ drainTimeoutMs: 200, drainKillGraceMs: 300, deps: { spawn: ignoresSigterm, spawnScanner: neverExitsSpawn } })
+  );
+
+  const runPromise = dispatcher.run();
+  // Readiness waits only -- NEITHER is the discriminator (see the index comparison below).
+  await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn'), 10000, 'worker-spawn');
+  await waitFor(() => fs.existsSync(readyFile), 10000, "straggler's SIGTERM handler installed");
+  dispatcher.requestDrain({ signal: 'SIGTERM' });
+
+  // Let the whole shutdown run to completion -- drain bound, kill, reap, escalation, drain-end,
+  // stopped -- before reading anything back. Every spawned child (the straggler, SIGKILLed by the
+  // escalation; the scanner, killed by `requestDrain`'s own `killScanner`) is dead by this point.
+  const stopReason = await runPromise;
+  assert.equal(stopReason.reason, 'drain-requested');
+
+  const events = readDaemonEvents(journalDir);
+  const stoppedIdx = events.findIndex((e) => e.event === 'dispatcher-stopped');
+  const escalatedIdx = events.findIndex((e) => e.event === 'dispatcher-kill-escalated');
+  const drainEndIdx = events.findIndex((e) => e.event === 'dispatcher-drain-end');
+
+  assert.notEqual(stoppedIdx, -1, 'no dispatcher-stopped');
+  assert.notEqual(
+    escalatedIdx,
+    -1,
+    'no dispatcher-kill-escalated -- the straggler was never actually escalated, so this run proves nothing about ordering'
+  );
+  assert.notEqual(drainEndIdx, -1, 'no dispatcher-drain-end');
+
+  // THE DISCRIMINATING ASSERTION: an ORDER in the journal, not a wall-clock margin. See this
+  // test's own header comment for why these two comparisons distinguish the fixed world from the
+  // reverted one regardless of how the scheduler treated this run.
+  assert.ok(
+    stoppedIdx < escalatedIdx,
+    `dispatcher-stopped (index ${stoppedIdx}) must precede dispatcher-kill-escalated (index ${escalatedIdx}) -- it did not`
+  );
+  assert.ok(
+    stoppedIdx < drainEndIdx,
+    `dispatcher-stopped (index ${stoppedIdx}) must precede dispatcher-drain-end (index ${drainEndIdx}) -- it did not`
+  );
 });
