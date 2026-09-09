@@ -268,12 +268,20 @@ function removeClaimSidecar(claimedPath) {
   }
 }
 
-// claimReport(spoReportsDir, pendingPath) -> {claimed: true, path} | {claimed: false}
+// claimReport(spoReportsDir, pendingPath) ->
+//   {claimed: true, path} |
+//   {claimed: false, reason: 'no-pending-path'} |
+//   {claimed: false, reason: 'source-missing'}
 //
 // One atomic fs.renameSync, same primitive and same race semantics as takeNextTask's queue
 // claim: exactly one caller's rename succeeds (its source existed), every other caller racing
 // the SAME pendingPath gets ENOENT (their source vanished under them) and is told `claimed:
-// false` -- never a throw, never a crash, the loser just has nothing left to do.
+// false` -- never a throw, never a crash, the loser just has nothing left to do. The two false
+// branches are told apart by `reason`: a genuine lost race (ENOENT -- 'source-missing') looks
+// identical to a report whose file was never real to begin with (falsy pendingPath --
+// 'no-pending-path') to a caller that only checks `claimed`, but processConfirmedReport's
+// unclaimable-report discriminator (below) needs to reason about them differently, so both
+// branches now say which one happened.
 function claimReport(spoReportsDir, pendingPath) {
   const inProgressDir = path.join(spoReportsDir, IN_PROGRESS_DIRNAME);
   fs.mkdirSync(inProgressDir, { recursive: true });
@@ -286,12 +294,12 @@ function claimReport(spoReportsDir, pendingPath) {
   // exact "kills the whole daemon over a bookkeeping race" class this file's other comments warn
   // about (see the `finally` in processConfirmedReport). Treat it as an ordinary lost claim
   // instead: nothing to rename in the first place.
-  if (!pendingPath) return { claimed: false };
+  if (!pendingPath) return { claimed: false, reason: 'no-pending-path' };
   const dest = path.join(inProgressDir, path.basename(pendingPath));
   try {
     fs.renameSync(pendingPath, dest);
   } catch (err) {
-    if (err && err.code === 'ENOENT') return { claimed: false };
+    if (err && err.code === 'ENOENT') return { claimed: false, reason: 'source-missing' };
     throw err;
   }
   // Stamp the claim time onto the file itself, BEFORE the sidecar exists. fs.renameSync PRESERVES
@@ -443,11 +451,24 @@ function findConfirmedAwaitingTriage(journalRoot, limit) {
     // regardless of the hold. It deliberately does NOT gate on the backoff/cap machinery being
     // "correct" -- it is a terminal disposition, same class as report-triaged/report-held, not a
     // retry signal.
+    //
+    // this action: report-held-unclaimable joins the set for the identical reason, one class
+    // further. isClaimLive (above processConfirmedReport, below) already tells a genuine lost
+    // race (still `already-claimed`, correctly retried by nobody -- the winner's own terminal
+    // event lands separately) apart from a report whose file is simply gone and unclaimable by
+    // anyone; report-held-unclaimable is what processConfirmedReport journals for the second case.
+    // Without it HERE, that terminal event would exist on the journal but findConfirmedAwaitingTriage
+    // would still return the same issue every cycle forever -- the exact loop this action exists to
+    // close, just relocated one level down from "no journal event at all" to "a journal event that
+    // nothing reads".
     const handledLater = lines
       .slice(i + 1)
       .some(
         (e) =>
-          (e.event === 'report-triaged' || e.event === 'report-held' || e.event === 'report-held-mechanical') &&
+          (e.event === 'report-triaged' ||
+            e.event === 'report-held' ||
+            e.event === 'report-held-mechanical' ||
+            e.event === 'report-held-unclaimable') &&
           e.issue === issue
       );
     if (!handledLater) confirmed.push(lines[i]);
@@ -799,9 +820,13 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
 // processConfirmedReport(entry, journalRoot, config, deps, opts) -- the public entry point:
 // claims entry.pendingPath (claimReport, above) BEFORE routeConfirmedReport ever gets a chance to
 // spend an LLM call, so a second runner racing the SAME report-confirmed entry (the daemon's own
-// timer and a hand-run `spo triage --file`, or two overlapping daemon cycles) loses the rename,
-// is told `already-claimed`, and returns without calling triageBugReport/reviewCard at all --
-// see this file's "action 2.6" section header above for the incident this closes.
+// timer and a hand-run `spo triage --file`, or two overlapping daemon cycles) loses the rename
+// and returns without calling triageBugReport/reviewCard at all -- see this file's "action 2.6"
+// section header above for the incident this closes. A lost rename is told `already-claimed`
+// ONLY when isClaimLive (below) confirms a live runner is actually behind it; otherwise there was
+// never anyone to lose the race TO (the file is simply gone, or was never real), and that is
+// `held-unclaimable` instead -- see isClaimLive's own header for the two cases and why they used
+// to be indistinguishable.
 //
 // `opts.dry` claims nothing: routeConfirmedReport still runs triageBugReport/reviewCard so a
 // preview shows the real verdict (unchanged behaviour), but a dry run must never take the file
@@ -872,16 +897,153 @@ function handleMechanicalFailure(issue, failure, journalRoot, deps) {
   };
 }
 
+// isClaimLive(entry, journalRoot, config) -- action 3.5 (this action): claimReport's own
+// `{claimed: false}` used to mean exactly one thing to processConfirmedReport -- "another runner
+// won the race a moment ago". It has always meant two: a genuine lost race (a live runner's own
+// rename won the SAME pendingPath between findConfirmedAwaitingTriage's scan and this call) or a
+// report whose file is simply gone and was never claimed by anyone (deleted by hand, cleaned up
+// out of band, or a pendingPath that was never real -- moveReportTo's own swallowed-ENOENT
+// null-return, above). Both used to be reported identically as `already-claimed`, and neither one
+// wrote a journal event, so findConfirmedAwaitingTriage's "confirmed, no later handled event" scan
+// returned the SAME issue every cycle forever for the second case -- see this file's header at the
+// top of processConfirmedReport's own section for the incident measured against real code. This
+// function tells the two apart so processConfirmedReport can give the second one a terminal
+// disposition instead of retrying it into eternity.
+//
+// Two independent signals, OR'd -- either one being true means a live runner is (or very recently
+// was) actually holding this report, so `already-claimed` is still the true story:
+//
+//   (a) a file physically sits at spoReportsDir/in-progress/<basename(pendingPath)> right now --
+//       the SAME probe retryHeldReport's own precondition 3 already does (see its `claimedPath`
+//       check, below in this file) before it will call a report "currently claimed by a running
+//       triage cycle". Not computable when pendingPath itself is falsy: nothing was ever moved
+//       anywhere in that case, so there is no in-progress/ file to find and no race to lose.
+//
+//   (b) a report-triage-claimed event for this issue exists LATER in daemon.jsonl than the last
+//       report-confirmed for this issue -- the identical anchor+"events since" idiom
+//       mechanicalFailureHistory already uses, above -- AND that event's own `ts` is younger than
+//       the claim grace window (config.triageClaimGraceMs, default DEFAULT_TRIAGE_CLAIM_GRACE_MS).
+//
+// The staleness bound on (b) is load-bearing, not decorative -- it must be read as part of the
+// contract, not an optional refinement. Without it: a winner that crashes anywhere between
+// claimReport's own rename succeeding (which journals report-triage-claimed immediately, in
+// processConfirmedReport below) and its eventual report-triaged/report-held write leaves signal
+// (b) true FOREVER -- the claimed event is already on the journal and nothing ever appends the
+// terminal event a later scan would need to see this as handled instead. Unbounded, this function
+// would keep calling that shape a live race indefinitely, and the loop this whole action exists to
+// close would simply move rather than end.
+//
+// That window is NOT a handful of synchronous statements -- it is the full triageBugReport/
+// reviewCard LLM call, minutes for a real reproduction (this file's header above
+// processConfirmedReport's own section, :229). The 4-minute default grace does not need to outlast
+// that window, though, because it is not what keeps this call correct while a claim is genuinely
+// live: signal (a) does, for as long as pendingPath is available, with no time bound at all -- in
+// the ordinary case (same host, a readable sidecar, a live pid -- reclaimStaleClaims, :376-380) the
+// physical in-progress/ file sits there for the entire LLM call, so a claim on the SAME path is not
+// mistaken for stale merely because the reproduction runs long. That is not unconditional, though:
+// reclaimStaleClaims runs at the top of every real cycle and WILL move the same file back at
+// graceMs on the no-readable-sidecar mtime fallback (:388-397), and at graceMs *
+// TRIAGE_CLAIM_CEILING_MULTIPLE for a foreign host whose pid this host cannot probe (:386).
+// Signal (b)'s bound only has to carry the case signal (a) cannot compute at all: an entry with no
+// pendingPath of its own (claim.reason === 'no-pending-path') whose issue is nonetheless being
+// claimed right now under a DIFFERENT confirmed-report record for the same issue. There, and only
+// there, a reproduction that outlives the 4-minute grace can make THIS entry read held-unclaimable
+// while the duplicate is still legitimately running -- a real, narrow false hold. `spo triage
+// --retry` (retryHeldReport's own HANDLED_EVENTS, below) recovers it ONLY if the sibling's own
+// report-confirmed is the newest one on record for the issue when a human runs it -- precondition
+// 3 reads the pendingPath off whichever report-confirmed is newest, not off the held record
+// itself, so a held anchor that is still the newest confirm is refused as "missing from pending/"
+// the same as any other unclaimable hold. Erring short still costs less than erring long: a
+// spurious hold next to the winner's own terminal event, not a crashed claim this function keeps
+// calling live forever.
+function isClaimLive(entry, journalRoot, config) {
+  const pendingPath = entry.pendingPath;
+  if (pendingPath) {
+    const claimedPath = path.join(config.spoReportsDir, IN_PROGRESS_DIRNAME, path.basename(pendingPath));
+    if (fs.existsSync(claimedPath)) return true;
+  }
+
+  const lines = readDaemonEvents(journalRoot);
+  let anchorIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].event === 'report-confirmed' && lines[i].issue === entry.issue) {
+      anchorIdx = i;
+      break;
+    }
+  }
+  if (anchorIdx === -1) return false;
+
+  const claims = lines.slice(anchorIdx + 1).filter((e) => e.event === 'report-triage-claimed' && e.issue === entry.issue);
+  if (claims.length === 0) return false;
+  const lastClaimedAtMs = Date.parse(claims[claims.length - 1].ts);
+  if (Number.isNaN(lastClaimedAtMs)) return false;
+
+  const graceMs =
+    config && config.triageClaimGraceMs !== undefined ? config.triageClaimGraceMs : DEFAULT_TRIAGE_CLAIM_GRACE_MS;
+  return Date.now() - lastClaimedAtMs < graceMs;
+}
+
 async function processConfirmedReport(entry, journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   if (dry) return routeConfirmedReport(entry, journalRoot, config, deps, opts);
 
   const claim = claimReport(config.spoReportsDir, entry.pendingPath);
   if (!claim.claimed) {
-    // Lost the race: another runner's rename won between findConfirmedAwaitingTriage's scan and
-    // this call. Not an error -- the winner's own report-triaged/report-held event will show up
-    // on the journal once it finishes; nothing for this caller to do but skip.
-    return { ok: true, outcome: 'already-claimed' };
+    if (isClaimLive(entry, journalRoot, config)) {
+      // Lost the race: another runner's rename won between findConfirmedAwaitingTriage's scan and
+      // this call. Not an error -- the winner's own report-triaged/report-held event will show up
+      // on the journal once it finishes; nothing for this caller to do but skip.
+      return { ok: true, outcome: 'already-claimed' };
+    }
+    // No live runner is holding this report, so `claim.reason` names something unrecoverable:
+    // either there was never a pendingPath to claim ('no-pending-path') or the file that was
+    // supposed to be there is simply gone and nobody is working it ('source-missing' -- deleted
+    // by hand, cleaned up out of band, or a report-intake -> report-confirmed pair that carried a
+    // path moveReportTo already knew was never real). "Re-file it" is impossible -- the report
+    // content left with the file. "Journal it and skip it" without a terminal event is exactly
+    // what this branch used to do, and does not fix the loop: findConfirmedAwaitingTriage would
+    // return the same issue again next cycle, forever, burning one of config.autoTriageLimit slots
+    // for a report that can never become claimable. So this is a HOLD -- the same disposition
+    // class as report-held-mechanical: not a verdict on the report's content, but a terminal
+    // "the pipeline cannot advance this any further" the way a confirmed report a human already
+    // asked for still deserves, composing with the existing `spo triage --retry` channel (which
+    // already refuses a report whose file is missing with an accurate, specific message -- see
+    // retryHeldReport's own precondition 3, below in this file). See
+    // findConfirmedAwaitingTriage's own comment on report-held-unclaimable for why it had to join
+    // the handled-set for this to actually terminate the loop, and retryHeldReport's own
+    // HANDLED_EVENTS comment for why it had to join THAT set too.
+    //
+    // report-held-unclaimable is a daemon.jsonl REPORT event, not a card park reason --
+    // TRANSIENT_RETRY_REASONS (state-machine.js) is read only by classifyParkReason/
+    // isTransientRetryReason -> finalizePark, and park-reason-partition.test.js sweeps only
+    // `new ParkSignal(...)`/`finalizePark(...)` call sites in orchestrator/ + bin/spo -- this
+    // event is never constructed through either, so it is out of that universe by construction
+    // (verified: grepped both use sites, neither reaches this event name).
+    //
+    // TRAP for the next editor: appendDaemonEvent does its own mkdirSync + appendFileSync, and
+    // this branch exists specifically to survive the ENOSPC/EPERM/EROFS class of filesystem
+    // failure -- the exact class that write can itself throw on. runAutoTriage has no try/catch of
+    // its own, so an unwrapped throw here would kill the whole daemon over the bookkeeping this
+    // branch was written to make survivable. Best-effort; if the write fails the loop simply
+    // resumes next cycle with nothing better available -- the identical appendDaemonEvent
+    // precedent guards park-loop.js:1396, the same appendDaemonEvent guard sits at
+    // remote-report-pull.js:193, and appendDaemonEvent again at state-machine.js:2923 (plus this
+    // file's own moveReportTo).
+    const reason =
+      claim.reason === 'no-pending-path'
+        ? 'no pendingPath was ever recorded for this report (the source file vanished before the intake move could complete)'
+        : 'the report file is missing from pending/ and no live runner is claiming it (deleted or moved out of band)';
+    try {
+      appendDaemonEvent(journalRoot, 'report-held-unclaimable', {
+        issue: entry.issue,
+        reason: claim.reason,
+        pendingPath: entry.pendingPath || null,
+      });
+    } catch {
+      // Best effort only -- see this branch's own TRAP comment above for why this must never
+      // escape into runAutoTriage's uncaught path.
+    }
+    return { ok: true, outcome: 'held-unclaimable', reason };
   }
   appendDaemonEvent(journalRoot, 'report-triage-claimed', { issue: entry.issue, path: claim.path });
 
@@ -944,6 +1106,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   let duplicates = 0;
   let held = 0;
   let heldMechanical = 0;
+  let heldUnclaimable = 0;
   let alreadyClaimed = 0;
   let backoffSkipped = 0;
 
@@ -994,6 +1157,9 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
     else if (outcome.outcome === 'held-mechanical') {
       held++;
       heldMechanical++;
+    } else if (outcome.outcome === 'held-unclaimable') {
+      held++;
+      heldUnclaimable++;
     } else held++;
     results.push({ issue: entry.issue, ...outcome });
   }
@@ -1006,6 +1172,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
       duplicates,
       held,
       heldMechanical,
+      heldUnclaimable,
       alreadyClaimed,
       backoffSkipped,
       errors: errors.length,
@@ -1021,6 +1188,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
     duplicates,
     held,
     heldMechanical,
+    heldUnclaimable,
     alreadyClaimed,
     backoffSkipped,
     errors,
@@ -1052,20 +1220,32 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
 // PRECONDITIONS, all checked before anything is appended:
 //   1. `issue` must have a report-confirmed event on record at all -- otherwise there is nothing
 //      to re-confirm.
-//   2. Its most recent handled-event (report-triaged / report-held / report-held-mechanical -- the
-//      SAME "handled" vocabulary findConfirmedAwaitingTriage/mechanicalFailureHistory already use)
-//      must actually be a HOLD. Refused if it is report-triaged: the report was already filed or
-//      dispositioned as a duplicate, and re-running would re-file or re-comment on something
-//      already settled. Refused if there is no handled-event at all -- the issue is ALREADY
-//      eligible, and appending a second report-confirmed would put it in `top` TWICE in one cycle,
-//      burning two of three autoTriageLimit slots on one report. processConfirmedReport's claim
-//      mutex degrades that shape safely to `already-claimed` rather than crashing, but a command
-//      whose whole purpose is recovery must never manufacture the waste on its own.
+//   2. Its most recent handled-event (report-triaged / report-held / report-held-mechanical /
+//      report-held-unclaimable -- the SAME "handled" vocabulary findConfirmedAwaitingTriage/
+//      mechanicalFailureHistory already use, HANDLED_EVENTS below, kept as a SEPARATE literal set
+//      since this file has no shared constant between the two -- see findConfirmedAwaitingTriage's
+//      own comment) must actually be a HOLD. Refused if it is report-triaged: the report was
+//      already filed or dispositioned as a duplicate, and re-running would re-file or re-comment on
+//      something already settled. Refused if there is no handled-event at all -- the issue is
+//      ALREADY eligible, and appending a second report-confirmed would put it in `top` TWICE in one
+//      cycle, burning two of three autoTriageLimit slots on one report. processConfirmedReport's
+//      claim mutex degrades that shape safely to `already-claimed` rather than crashing, but a
+//      command whose whole purpose is recovery must never manufacture the waste on its own.
+//      report-held-unclaimable is a genuine HOLD by this precondition's own rule (not report-
+//      triaged), so it reaches precondition 3 below -- which is exactly where it is refused, since
+//      an unclaimable report's file is by definition never coming back to pending/. Without
+//      report-held-unclaimable in HANDLED_EVENTS this precondition would see NO handled-event for
+//      such an issue and refuse with "already eligible for triage" instead -- factually false (the
+//      report is provably not eligible; nothing will ever claim it) and useless to a maintainer
+//      trying to understand why `--retry` won't take.
 //   3. The report file recorded on that report-confirmed event must still exist. Held reports are
 //      restored to their ORIGINAL pending/ path by processConfirmedReport's `finally`, so it
 //      should be there -- if it is not, re-confirming anyway would loop straight back to a fresh
 //      mechanical failure (nothing for claimReport to rename), which is exactly the dead end this
-//      command exists to escape, not recreate.
+//      command exists to escape, not recreate. For a report-held-unclaimable anchor this is not a
+//      race to explain away: the file is gone for good, so this precondition's own refusal message
+//      ("report file is missing from pending/ ... cannot re-inject a report that no longer exists")
+//      is simply the accurate, permanent answer for that case.
 //
 // The re-confirm is journalled REGARDLESS of whether the courtesy comment posts -- 3.3's D1 lesson
 // (a `gh` outage must never veto a mechanism built to survive `gh` outages) applied here: the hold
@@ -1099,7 +1279,18 @@ async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {})
   // (a confirmed report is routed exactly once before it becomes eligible again) -- scanning for
   // the last rather than stopping at the first is defensive against a journal shape this function
   // has never had to reason about before.
-  const HANDLED_EVENTS = new Set(['report-triaged', 'report-held', 'report-held-mechanical']);
+  //
+  // report-held-unclaimable is in this set for the same reason report-held-mechanical is: without
+  // it, an issue whose most recent event is report-held-unclaimable reads to this precondition as
+  // "no handled-event at all" -- the ALREADY-ELIGIBLE refusal below fires with the false claim
+  // "already eligible for triage (no handled outcome since its last report-confirmed)" for a
+  // report that is provably NOT eligible and never will be. With it here, this issue instead falls
+  // through to a genuine HOLD (handled.event !== 'report-triaged') and is refused by precondition 3
+  // below with the true, specific reason: its file is missing from pending/ and always will be.
+  // There is no shared constant with findConfirmedAwaitingTriage's own handled-set (above in this
+  // file) -- the vocabulary is duplicated between the two, deliberately left that way here (out of
+  // scope for this action; a future refactor could unify them).
+  const HANDLED_EVENTS = new Set(['report-triaged', 'report-held', 'report-held-mechanical', 'report-held-unclaimable']);
   let handled = null;
   for (let i = anchorIdx + 1; i < lines.length; i++) {
     if (lines[i].issue === issue && HANDLED_EVENTS.has(lines[i].event)) handled = lines[i];
@@ -1122,7 +1313,8 @@ async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {})
     };
   }
 
-  // handled.event is report-held or report-held-mechanical from here on -- a genuine hold.
+  // handled.event is report-held, report-held-mechanical, or report-held-unclaimable from here on
+  // -- a genuine hold.
   const retriedFrom = handled.event;
 
   // Precondition 3: the report file this issue's confirm anchor points at must still be sitting

@@ -814,6 +814,13 @@ test('processConfirmedReport: a second concurrent runner finds the report alread
   assert.equal(spawned, false, 'triageBugReport must never be called for an already-claimed report');
   // The loser must not disturb the winner's claim.
   assert.equal(fs.existsSync(claimedPath), true);
+  // This action's own addition: a genuine lost race must stay a genuine lost race -- terminating
+  // it as held-unclaimable would be worse than the starvation loop this action exists to close,
+  // since it would end a report a live runner is actually still working.
+  assert.ok(
+    !daemonEvents(journalRoot).some((e) => e.event === 'report-held-unclaimable'),
+    'a live race must never be terminated as held-unclaimable'
+  );
 });
 
 test('processConfirmedReport: filed/duplicate/held/do-not-file all move the file OUT of in-progress/ to the right destination', async () => {
@@ -1058,21 +1065,37 @@ test('runAutoTriage: a dry run never sweeps in-progress/, even when a stale clai
 // first: the primitive returns the ordinary "lost claim" shape, never throws.
 test('claimReport: a falsy pendingPath (reachable via moveReportTo\'s own null-return) is an ordinary lost claim, not a throw', () => {
   const spoReportsDir = mkTmp('spo-autotriage-claim-falsy-');
-  assert.deepEqual(claimReport(spoReportsDir, null), { claimed: false });
-  assert.deepEqual(claimReport(spoReportsDir, undefined), { claimed: false });
-  assert.deepEqual(claimReport(spoReportsDir, ''), { claimed: false });
+  assert.deepEqual(claimReport(spoReportsDir, null), { claimed: false, reason: 'no-pending-path' });
+  assert.deepEqual(claimReport(spoReportsDir, undefined), { claimed: false, reason: 'no-pending-path' });
+  assert.deepEqual(claimReport(spoReportsDir, ''), { claimed: false, reason: 'no-pending-path' });
+});
+
+// The ENOENT branch is told apart from the falsy-pendingPath branch above by `reason` -- this
+// action's own discriminator (processConfirmedReport's isClaimLive) needs to tell a genuine lost
+// race from an unrecoverable missing source, and the two used to be indistinguishable from
+// claimReport's own return shape alone.
+test('claimReport: a pendingPath whose source file does not exist is a lost claim tagged reason: source-missing', () => {
+  const spoReportsDir = mkTmp('spo-autotriage-claim-enoent-');
+  const pendingPath = path.join(spoReportsDir, 'pending', 'nonexistent.json');
+  assert.deepEqual(claimReport(spoReportsDir, pendingPath), { claimed: false, reason: 'source-missing' });
 });
 
 // Reachability, not unit: the guard above proves claimReport itself is safe -- it does not prove
-// the daemon ever benefits, or that the report does not silently vanish from view instead of
-// merely being retried. Drives a real (non-dry) runAutoTriage cycle over a `report-confirmed`
-// event whose `pendingPath` is `null` (exactly the shape report-intake.js's own binding can now
-// produce) TWICE, since the whole point of `already-claimed` (as opposed to a terminal event) is
-// that the report stays eligible and is retried, not silently dropped after one cycle. Without
-// the guard, cycle 1 throws `path.basename(null)` out of processConfirmedReport, uncaught by
-// runAutoTriage, which is the same "kills the whole daemon" class as the ENOENT reachability test
-// above.
-test('runAutoTriage: a report-confirmed event with pendingPath: null is "already-claimed" every cycle -- never throws, never a terminal event', async () => {
+// the daemon ever benefits, or that the report does not loop forever instead of terminating.
+// Drives a real (non-dry) runAutoTriage cycle over a `report-confirmed` event whose `pendingPath`
+// is `null` (exactly the shape report-intake.js's own binding can now produce) TWICE.
+//
+// REVERSED, deliberately, from this test's own former self (which asserted "already-claimed"
+// every cycle, forever -- the rationale then was "the report stays eligible ... not silently
+// dropped after one cycle"). That reasoning is right for a genuine race (someone else IS holding
+// the file, so of course it stays eligible until they finish) and wrong for a report whose
+// pendingPath was never real: nothing is holding it, nothing ever WILL claim it, and "stays
+// eligible forever" for that shape is not a safety property -- it is exactly the starved-slot loop
+// this action exists to close (three ghost entries like this one can crowd a healthy confirmed
+// report out of config.autoTriageLimit's top-N slice forever; see auto-triage.js's own
+// isClaimLive/processConfirmedReport comments for the measured incident). So cycle 1 must now
+// terminate it (`held-unclaimable`, reason `no-pending-path`) and cycle 2 must not see it again.
+test('runAutoTriage: a report-confirmed event with pendingPath: null is held-unclaimable on the first cycle and gone from the scan on the second', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-null-pending-');
   const journalRoot = mkTmp('spo-autotriage-null-pending-journal-');
   confirmedEntry(journalRoot, { issue: 741, pendingPath: null, kind: null });
@@ -1083,17 +1106,26 @@ test('runAutoTriage: a report-confirmed event with pendingPath: null is "already
   const first = await runAutoTriage(journalRoot, config, deps, { dry: false });
   assert.equal(first.ok, true, 'the cycle must complete, not throw');
   assert.equal(first.results.length, 1);
-  assert.equal(first.results[0].outcome, 'already-claimed');
+  assert.equal(first.results[0].outcome, 'held-unclaimable');
+  assert.match(first.results[0].reason, /no pendingPath/);
+
+  const events = daemonEvents(journalRoot);
+  const heldEvent = events.find((e) => e.event === 'report-held-unclaimable' && e.issue === 741);
+  assert.ok(heldEvent, 'expected a report-held-unclaimable event for issue 741');
+  assert.equal(heldEvent.reason, 'no-pending-path');
+  assert.equal(heldEvent.pendingPath, null);
+  assert.ok(!events.some((e) => e.event === 'report-triaged'), 'must never reach a filed/duplicate disposition');
+  assert.ok(!events.some((e) => e.event === 'report-held'), 'must never reach a reproduction-verdict hold');
+  assert.ok(!events.some((e) => e.event === 'report-held-mechanical'), 'must never reach a mechanical hold either -- claimReport never even calls triageBugReport');
+
+  // findConfirmedAwaitingTriage must now treat this issue as handled -- the whole point of the
+  // fix. A tautological re-read of the journal we just wrote would pass in both the fixed and the
+  // broken world, so pin this against the scan's own literal output, not against daemonEvents().
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
 
   const second = await runAutoTriage(journalRoot, config, deps, { dry: false });
-  assert.equal(second.ok, true, 'a SECOND cycle must also complete -- the report stays eligible, not silently dropped');
-  assert.equal(second.results.length, 1);
-  assert.equal(second.results[0].outcome, 'already-claimed');
-
-  const events = daemonEvents(journalRoot).map((e) => e.event);
-  assert.ok(!events.includes('report-triaged'), 'must never reach a filed/duplicate disposition');
-  assert.ok(!events.includes('report-held'), 'must never reach a held disposition');
-  assert.ok(!events.includes('report-held-mechanical'), 'must never reach a mechanical hold either -- claimReport never even calls triageBugReport');
+  assert.equal(second.ok, true, 'a second cycle must also complete without throwing');
+  assert.equal(second.results.length, 0, 'the held-unclaimable issue must not be scanned again');
 });
 
 // The SECOND falsy-pendingPath guard, in routeConfirmedReport: real (non-dry) calls never reach
@@ -1426,6 +1458,169 @@ test('processConfirmedReport: a kind:"suggestion" report is claimed too -- a sec
   assert.equal(result.outcome, 'already-claimed');
   assert.equal(spawned, false, 'reviewCard must never run for an already-claimed suggestion');
   assert.equal(fs.existsSync(claimedPath), true, "the loser must not disturb the winner's claim");
+  // This action's own addition -- see the "second concurrent runner" test above for why this
+  // matters: a live race must never be mistaken for an unclaimable report.
+  assert.ok(
+    !daemonEvents(journalRoot).some((e) => e.event === 'report-held-unclaimable'),
+    'a live race must never be terminated as held-unclaimable'
+  );
+});
+
+// ---- this action: report-held-unclaimable (the starved-slot fix) -----------------------------
+// Three ghost `report-confirmed` entries whose pendingPath files were never real used to crowd a
+// healthy confirmed report out of config.autoTriageLimit's top-N slice FOREVER: claimReport
+// returned `{claimed: false}` on each one, every cycle, with no journal event and no terminal
+// disposition, so findConfirmedAwaitingTriage kept returning the SAME three ghosts every cycle,
+// starving out any real report behind them in the queue -- see auto-triage.js's own
+// isClaimLive/processConfirmedReport comments for the measured incident this closes. These tests
+// drive the real fix end to end, and pin the one detail (the staleness bound on a live claim) that
+// keeps a genuine race from being wrongly terminated.
+
+test('runAutoTriage: three unclaimable ghosts are held on cycle 1, freeing the slot for the healthy report on cycle 2', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-unclaimable-slot-');
+  const journalRoot = mkTmp('spo-autotriage-unclaimable-slot-journal-');
+
+  // Three ghosts, oldest first -- pendingPath points at a file that was never written.
+  const ghostIssues = [950, 951, 952];
+  for (const issue of ghostIssues) {
+    confirmedEntry(journalRoot, {
+      issue,
+      pendingPath: path.join(spoReportsDir, 'pending', `ghost-${issue}.json`),
+      kind: null,
+    });
+  }
+  // The one healthy confirmed report, ordered AFTER the three ghosts -- its file is real.
+  const healthyPendingPath = writePendingReport(spoReportsDir, '2026-09-01T00-00-00-000Z_desktop_healthy.json');
+  confirmedEntry(journalRoot, { issue: 953, pendingPath: healthyPendingPath, kind: null });
+
+  const config = { spoReportsDir, productRepo: '/fake/repo', autoTriageLimit: 3 };
+  // A ghost must never spend a spawn of any kind -- claimReport fails synchronously before
+  // routeConfirmedReport is ever reached. Throwing here makes that assumption loud, not silent.
+  const noSpawnDeps = { accountsDir: poolDir(), spawnSync: () => { throw new Error('must not spawn for a ghost'); } };
+
+  // Cycle 1: the three ghosts fill the limit=3 slice; the healthy report is not even reached.
+  const first = await runAutoTriage(journalRoot, config, noSpawnDeps, { dry: false });
+  assert.equal(first.ok, true);
+  assert.equal(first.results.length, 3);
+  assert.deepEqual(first.results.map((r) => r.issue), ghostIssues);
+  for (const r of first.results) {
+    assert.equal(r.outcome, 'held-unclaimable', `issue ${r.issue} should be held-unclaimable`);
+  }
+
+  const events = daemonEvents(journalRoot);
+  for (const issue of ghostIssues) {
+    assert.ok(
+      events.some((e) => e.event === 'report-held-unclaimable' && e.issue === issue),
+      `expected a report-held-unclaimable event for issue ${issue}`
+    );
+  }
+
+  // Cycle 2: pin against findConfirmedAwaitingTriage's own literal output, not against the journal
+  // we just wrote (a tautological re-read of daemon.jsonl holds in both the fixed and the broken
+  // world -- a previous lot shipped exactly that mistake and verification caught it).
+  const stillAwaiting = findConfirmedAwaitingTriage(journalRoot, 10);
+  assert.deepEqual(stillAwaiting.map((e) => e.issue), [953], 'only the healthy report should remain eligible');
+
+  const fileDeps = makeDeps({
+    claudeReplies: [
+      { outcome: 'draft', draft: VALID_DRAFT },
+      { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
+    ],
+    npmResponder: () => ok(''),
+  });
+  const second = await runAutoTriage(journalRoot, config, fileDeps, { dry: false });
+  assert.equal(second.ok, true);
+  // The slot-release proof: a literal filed count plus real filesystem state, not a journal re-read.
+  assert.equal(second.filed, 1, 'the healthy report must actually get filed once the ghosts stop crowding it out');
+  assert.equal(fs.existsSync(healthyPendingPath), false, 'the healthy report file must be gone from pending/');
+  assert.equal(
+    fs.existsSync(path.join(spoReportsDir, 'archive', path.basename(healthyPendingPath))),
+    true,
+    'the healthy report file must be filed into archive/'
+  );
+});
+
+test('processConfirmedReport: pendingPath: null is held-unclaimable with reason "no-pending-path" on the event', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-unclaimable-nullpath-');
+  const journalRoot = mkTmp('spo-autotriage-unclaimable-nullpath-journal-');
+  const entry = { issue: 954, pendingPath: null, commentId: 1, kind: null };
+
+  const deps = { accountsDir: poolDir(), spawnSync: () => { throw new Error('must not spawn'); } };
+  const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'held-unclaimable');
+
+  const heldEvent = daemonEvents(journalRoot).find((e) => e.event === 'report-held-unclaimable');
+  assert.ok(heldEvent);
+  assert.equal(heldEvent.issue, 954);
+  assert.equal(heldEvent.reason, 'no-pending-path');
+  assert.equal(heldEvent.pendingPath, null);
+});
+
+// The staleness bound on isClaimLive's report-triage-claimed signal, pinned directly: same shape
+// (a file in NEITHER pending/ nor in-progress/, a report-triage-claimed event on record for the
+// issue), the only variable is how OLD that claim event is relative to config.triageClaimGraceMs.
+// Without the bound, isClaimLive would treat ANY report-triage-claimed event after the anchor as
+// proof of a live claim forever, and the second case below would wrongly stay "already-claimed"
+// -- deleting the bound would make this test fail, which is the point.
+test('processConfirmedReport: a report-triage-claimed within the grace window keeps a missing-file report "already-claimed"', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-staleness-fresh-');
+  const journalRoot = mkTmp('spo-autotriage-staleness-fresh-journal-');
+  // Neither pending/ nor in-progress/ has this file -- isClaimLive's signal (a) is unavailable.
+  const pendingPath = path.join(spoReportsDir, 'pending', 'gone.json');
+
+  confirmedEntry(journalRoot, { issue: 955, pendingPath, kind: null });
+  // A winner's claim from 60 seconds ago -- well inside DEFAULT_TRIAGE_CLAIM_GRACE_MS (4 minutes).
+  appendDaemonEventAt(
+    journalRoot,
+    'report-triage-claimed',
+    { issue: 955, path: pendingPath },
+    new Date(Date.now() - 60 * 1000).toISOString()
+  );
+
+  const deps = { accountsDir: poolDir(), spawnSync: () => ok('') };
+  const result = await processConfirmedReport(
+    { issue: 955, pendingPath, commentId: 1, kind: null },
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo' },
+    deps,
+    { dry: false }
+  );
+
+  assert.equal(result.outcome, 'already-claimed');
+  assert.ok(
+    !daemonEvents(journalRoot).some((e) => e.event === 'report-held-unclaimable'),
+    'a fresh claim must never be terminated as held-unclaimable'
+  );
+});
+
+test('processConfirmedReport: a report-triage-claimed past the grace window no longer counts as a live claim -- held-unclaimable', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-staleness-stale-');
+  const journalRoot = mkTmp('spo-autotriage-staleness-stale-journal-');
+  const pendingPath = path.join(spoReportsDir, 'pending', 'gone.json');
+
+  confirmedEntry(journalRoot, { issue: 956, pendingPath, kind: null });
+  // A claim from an hour ago -- the winner crashed between the rename and its own terminal write;
+  // nothing will ever finish this claim. Well past DEFAULT_TRIAGE_CLAIM_GRACE_MS (4 minutes).
+  appendDaemonEventAt(
+    journalRoot,
+    'report-triage-claimed',
+    { issue: 956, path: pendingPath },
+    new Date(Date.now() - 60 * 60 * 1000).toISOString()
+  );
+
+  const deps = { accountsDir: poolDir(), spawnSync: () => { throw new Error('must not spawn'); } };
+  const result = await processConfirmedReport(
+    { issue: 956, pendingPath, commentId: 1, kind: null },
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo' },
+    deps,
+    { dry: false }
+  );
+
+  assert.equal(result.outcome, 'held-unclaimable');
+  assert.ok(daemonEvents(journalRoot).some((e) => e.event === 'report-held-unclaimable' && e.issue === 956));
 });
 
 // ---- action 3.3: mechanical-failure cap + backoff -----------------------------------------
@@ -2286,6 +2481,33 @@ test('retryHeldReport: refused when the report file is missing from pending/', a
   const result = await retryHeldReport(journalRoot, 3012, config, {}, { dry: false });
   assert.equal(result.ok, false);
   assert.match(result.error, /report file is missing from pending\//);
+});
+
+// HANDLED_EVENTS (above) must include report-held-unclaimable, not just report-held/
+// report-held-mechanical: without it, precondition 2 sees NO handled event since the anchor for
+// an issue that is provably never coming back, and refuses with the "already eligible for triage"
+// wording -- which is simply false for a report whose file is gone for good.
+test('retryHeldReport: a report-held-unclaimable anchor is refused with the ACCURATE "missing from pending/" reason, never the false "already eligible"', async () => {
+  const spoReportsDir = mkTmp('spo-autotriage-retry-unclaimable-');
+  const journalRoot = mkTmp('spo-autotriage-retry-unclaimable-journal-');
+  const pendingPath = path.join(spoReportsDir, 'pending', 'ghost.json'); // never written
+  const deps = { accountsDir: poolDir(), spawnSync: () => { throw new Error('must not spawn'); } };
+  const config = { spoReportsDir, productRepo: '/fake/repo' };
+
+  confirmedEntry(journalRoot, { issue: 957, pendingPath, kind: null });
+  const held = await processConfirmedReport(
+    { issue: 957, pendingPath, commentId: 1, kind: null }, journalRoot, config, deps, { dry: false }
+  );
+  assert.equal(held.outcome, 'held-unclaimable', 'setup: the report must actually reach the unclaimable hold');
+
+  const retry = await retryHeldReport(journalRoot, 957, config, deps);
+  assert.equal(retry.ok, false);
+  assert.doesNotMatch(
+    retry.error,
+    /already eligible for triage/,
+    'report-held-unclaimable must be in retryHeldReport HANDLED_EVENTS -- without it this refusal is factually false'
+  );
+  assert.match(retry.error, /report file is missing from pending\//);
 });
 
 // N5: fs.existsSync alone returns true for a DIRECTORY too -- action 3.1 already fixed the
