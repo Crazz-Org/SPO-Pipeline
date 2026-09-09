@@ -497,9 +497,12 @@ test('handlePlan (reuse path): journals a fresh PLAN invariants-baseline event, 
 // separate call site from the fresh-PLAN path above (see test/plan-writes.test.js's sibling
 // tests) and pinned independently here, driven through decidePlanReuse's own machinery
 // (priorPlanRun) rather than a hand-built fixture. Measured on the live journal corpus,
-// 2026-09-07: invariant_ids is a JSON-ENCODED STRING in 159/159 wire occurrences, never a real
-// array -- the shape `Array.isArray(previousPayload.invariant_ids) ? ... : []` rejected on every
-// card, which is why all 58 mismatch events on record carry `declared: 0`.
+// 2026-09-07 (re-derived Lot 6, 2026-09-08): invariant_ids is a JSON-ENCODED STRING in 159/159
+// wire occurrences, never a real array -- 158 of those 159 are in a `PLAN/result` event and the
+// 159th is in a `PLAN/parked` event; `previousPayload` here is always a prior result payload, so
+// the population this reuse path actually reads is 158 of 158. The shape
+// `Array.isArray(previousPayload.invariant_ids) ? ... : []` rejected on every card, which is why
+// all 58 mismatch events on record carry `declared: 0`.
 test('handlePlan (reuse path): previousPayload.invariant_ids as a JSON-STRING (the real wire shape) is parsed into real declaredIds, not treated as zero declared', async () => {
   const taskDir = mkTmp('spo-plan-resume-jsonstring-');
   const worktreePath = mkTmp('spo-plan-resume-jsonstring-wt-');

@@ -544,10 +544,15 @@ function annotatePlanSpanConflicts(ctx, baseline, planMarkdown) {
 // function's own header). Before this fix the two canary call sites each ran their own inline
 // `Array.isArray(x.invariant_ids) ? x.invariant_ids : []` -- the identical shape bug #118 fixed
 // for files_to_change, unpropagated here. Measured on the live journal corpus (every task dir's
-// journal.jsonl under ~/.spo-state/journal) on 2026-09-07: invariant_ids occurs 159 times on the
-// wire and is a JSON-ENCODED STRING in all 159, never a real array -- the same wire shape
-// files_to_change turned out to have. Array.isArray therefore rejected the field's own shape on
-// every card, so `declared` was always 0 and `declaredIds` always []: of the 58
+// journal.jsonl under ~/.spo-state/journal) on 2026-09-07 (re-derived Lot 6, 2026-09-08):
+// invariant_ids occurs 159 times on the wire and is a JSON-ENCODED STRING in all 159, never a
+// real array -- the same wire shape files_to_change turned out to have. 158 of those 159 are in
+// a `PLAN/result` event; the 159th is in a `PLAN/parked` event (issue-483, `plan-invalid`), which
+// neither of this function's two call sites ever reaches -- both are fed a PLAN *result* payload
+// (handlePlan's own `payload`, and the reuse path's `lastResultPayload`), so 158 of 158 is the
+// population that actually reaches here.
+// Array.isArray therefore rejected the field's own shape on every card, so `declared` was always
+// 0 and `declaredIds` always []: of the 58
 // invariants-declared-parsed-mismatch events on record, all 58 fire with declared: 0 against
 // parsed values from 4 to 33. The canary has never once compared two real numbers -- every firing
 // to date is an artifact of the shape test, not a signal about the parser it exists to watch.
@@ -723,7 +728,10 @@ async function handlePlan(ctx) {
     // grounds to fail a card, it is grounds to go look at the parser.
     //
     // invariant_ids arrives the same JSON-ENCODED-STRING way files_to_change does (#118) --
-    // measured 159/159 on the live journal corpus, 2026-09-07 -- so this used to be
+    // measured 158 of 158 successful PLAN `result` payloads on the live journal corpus, 2026-09-07
+    // (159 occurrences exist on the wire; the 159th is in a `PLAN/parked` event this call site
+    // never sees, since `payload` here is always a result payload -- re-derived Lot 6, 2026-09-08)
+    // -- so this used to be
     // `Array.isArray(payload.invariant_ids) ? ... : []`, which rejected the field's own wire
     // shape on every card and made every one of the 58 mismatch events on record fire with
     // `declared: 0` against real `parsed` counts (4..33): never a signal about the parser, only

@@ -77,12 +77,26 @@ function loadPromptSpec(promptFile) {
 // substitution runs.
 //
 // This comment used to name invariant_ids and check_commands as the examples of the array case,
-// and both are wrong: measured across every task dir's journal.jsonl on 2026-09-07, each arrives
-// from PLAN as a JSON-ENCODED STRING in 159 of 159 occurrences and 0 as a real array -- the same
-// wire shape #118 measured for files_to_change. So they fall to String(value) and render into
+// and both are wrong: measured across every task dir's journal.jsonl on 2026-09-07 (re-derived
+// Lot 6, 2026-09-08), each arrives from PLAN as a JSON-ENCODED STRING in 158 of 158 successful
+// PLAN `result` payloads and 0 as a real array -- the same wire shape #118 measured for
+// files_to_change. (159 occurrences of invariant_ids exist on the wire; the 159th is in a
+// `PLAN/parked` event, which task-values.js's `event === 'result'` reader never sees -- so 158 of
+// 158 is the population that reaches a prompt.) So they fall to String(value) and render into
 // prompts/implement.md and prompts/validate-change.md verbatim as ["INV-1","INV-2"], never as
-// INV-1, INV-2. That is legible to the model and is left alone deliberately: normalizing here
-// changes the prompt text sent on every card. Recorded, not fixed.
+// INV-1, INV-2.
+//
+// #153 proposed normalizing this so the model sees INV-1, INV-2 instead. Measured, not fixed --
+// and the measurement says don't: IMPLEMENT already named back every declared invariant id in
+// 100 of 101 answerable runs and collapsed a check_commands list 0 times in 104, so there is no
+// behavioural cost to leave on the table. Against that, 158 of 1,093 declared check commands
+// (14.5%, across 30 of 59 task dirs) contain a comma -- joining check_commands on ", " would make
+// 23 of 157 non-empty lists (14.6%) unrecoverable by splitting on ", ", where the JSON form's
+// `","` delimiter stays unambiguous. For check_commands specifically, the proposed fix is a measured
+// regression, not a neutral tidy-up, so normalizing here is left alone deliberately: it would
+// also change the prompt text sent on every card. `citations` (CITATION_VERIFIER) is the one
+// genuine array reaching this function -- 2 occurrences in the corpus -- and the join(', ')
+// branch above exists to keep serving it.
 function stringifyValue(value) {
   if (Array.isArray(value)) return value.join(', ');
   return String(value);
