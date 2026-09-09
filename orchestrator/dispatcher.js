@@ -1062,7 +1062,8 @@ function createDispatcher(queueDir, journalRoot, config) {
     // is NEVER written, because the new process's flag started false. daemon.jsonl is then left
     // with a bare `dispatcher-idle-no-healthy-accounts` as its newest dispatcher edge, forever,
     // and any reader that answers "is the dispatcher idle right now" by walking back to the most
-    // recent edge (bin/spo's computeDispatcherIdleStatus) reports a permanent false alarm --
+    // recent edge (bin/spo's computeDispatcherStatus, renamed by card #164; was
+    // computeDispatcherIdleStatus) reports a permanent false alarm --
     // measured at "IDLE since 191h06m ago" against a fixture whose daemon was demonstrably busy.
     // This event is the boundary that reader stops at: an idle edge older than the newest
     // dispatcher start says nothing about the CURRENT process. It is self-healing rather than
@@ -1135,6 +1136,64 @@ function createDispatcher(queueDir, journalRoot, config) {
       });
       waitedMs = await awaitInFlight(timeoutMs);
       survivors = [...live.keys(), ...reparking.keys()];
+      stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };
+    }
+
+    // Action 3.3 (card #162 hoist): the single place every stop path converges -- drain,
+    // `stop-requested`, the worker-crash breaker and the scanner-crash breaker all set
+    // `stopReason` before control ever reaches here (each assignment site guards itself with its
+    // own `!stopReason` check, and the drain merge immediately above -- the last of the four to
+    // run -- only ever spreads onto whichever of them got there first), so journalling here still
+    // covers all four with one call rather than one at each assignment site. It is no longer
+    // run()'s single RETURN -- that stays several statements below, past the kill and the reap --
+    // but it is still the single point every stop path passes through, and now the last thing
+    // that happens before anything else does. Before this action, the single most important event
+    // in this subsystem existed only on stderr (daemon.js's `dispatcher stopped itself -- <JSON>`)
+    // and as exit code 1; daemon.jsonl was structurally unable to show it. `appendDaemonEvent`
+    // spreads `detail` flat, so `stopReason` itself lands as the event's own fields (`reason`,
+    // plus whichever breaker/drain fields that particular stop path added) rather than nested
+    // under a `detail` key.
+    //
+    // DELIBERATELY AHEAD OF `killAllChildren`/`reapSignalledChildren` BELOW, not merely left where
+    // it first landed: `reapSignalledChildren` awaits, so it is the first point in this function
+    // that genuinely yields the event loop, and a systemd `TimeoutStopSec` SIGKILL
+    // (scripts/daemon-install.sh) lands exactly there if a straggler outlives its grace. Margin:
+    // `drainTimeoutMs` 2700s + `drainKillGraceMs` 60s (config.js's DRAIN_TIMEOUT_MS /
+    // DRAIN_KILL_GRACE_MS) against `TimeoutStopSec=2820` leaves 60s of slack for the reap itself --
+    // raise either tunable without raising TimeoutStopSec to match, and that slack is exactly what
+    // the reap eats into, which is why this record is written before the reap starts rather than
+    // after it finishes: the one shutdown record that explains a SIGKILL cannot itself depend on
+    // outliving one.
+    //
+    // `stopReason` is unreachable as null/undefined here in practice -- the only way out of the
+    // `for (;;)` loop above is its own `if (stopReason) break`, so control never reaches this
+    // point with `stopReason` still unset -- but guarded anyway rather than assuming that
+    // invariant holds forever: a null stop reason has nothing meaningful to journal, so it simply
+    // does not.
+    if (stopReason) {
+      try {
+        appendDaemonEvent(journalRoot, 'dispatcher-stopped', stopReason);
+      } catch {
+        // Best-effort, same shape as the queue-claim guard (state-machine.js's takeNextTask) and
+        // the two fs.renameSync sites in 62b3871/ae12962: appendDaemonEvent does mkdirSync +
+        // appendFileSync, so on the exact ENOSPC/EPERM/EROFS class of failure this call exists to
+        // report, the write itself can throw -- and unwrapped, that would turn a clean shutdown
+        // into a crash on the way out, defeating this action on its own worst case. Nothing left
+        // to record to; never let this escape either way.
+        //
+        // WORSE since card #162's hoist than when this guard was first written: `killAllChildren`
+        // and `reapSignalledChildren` both run AFTER this emit now, so an escaping throw here
+        // would skip both. daemon.js's own `process.once('exit')` hook (daemon.js:626-627) still fires
+        // an ordinary `killAllChildren('SIGTERM')`, so live workers and the scanner are at least
+        // signalled on the way out -- but nothing REAPS them: no bounded wait, no SIGKILL
+        // escalation, so a straggler that ignores SIGTERM is handed straight back to systemd's
+        // cgroup kill, the exact outcome `reapSignalledChildren` exists to prevent. A reparking
+        // child is signalled by neither (that hook passes no `includeReparking`, daemon.js:607).
+        // Measured in-process, where no such exit hook exists: with this guard deleted the test
+        // fails its assertion and then never exits. One process survives -- the scanner stand-in,
+        // un-signalled because `killAllChildren` was skipped; it never exits on its own and its
+        // live handle holds the test process's event loop open.
+      }
     }
 
     // Circuit breaker tripped, or the drain's bound expired -- shut down the same way an external
@@ -1158,13 +1217,14 @@ function createDispatcher(queueDir, journalRoot, config) {
       // of them, which is the fact a maintainer is really asking for.
       //
       // Action 3.3, from verification: this write is wrapped for a reason specific to its
-      // POSITION, not merely for symmetry with the guarded `dispatcher-stopped` emit below.
+      // POSITION, not merely for symmetry with the guarded `dispatcher-stopped` emit above --
       // `appendDaemonEvent` does its own mkdirSync + appendFileSync, so on the ENOSPC/EPERM/EROFS
-      // class that emit exists to report, an unwrapped throw HERE rejects out of `run()` a few
-      // statements early and `dispatcher-stopped` never lands at all -- the drain path would lose
-      // the very record the action adds, on exactly the failure it is meant to record. Guarding
-      // the later emit while leaving this one bare would have capped the guard's value to the
-      // three non-drain paths without saying so.
+      // class that emit exists to report, an unwrapped throw HERE still rejects out of `run()` and
+      // turns a clean shutdown into a crash on its way out. CORRECTED after card #162's hoist: it
+      // no longer costs the `dispatcher-stopped` record the way it used to -- that event is now
+      // written BEFORE this one, ahead of the kill and the reap, so it is already on disk by the
+      // time this write could fail. What an unwrapped throw here would still cost is this record
+      // itself, `drain-end`, the one fact this particular write exists to add.
       try {
         appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {
           drained: survivors.length === 0,
@@ -1174,36 +1234,7 @@ function createDispatcher(queueDir, journalRoot, config) {
         });
       } catch {
         // Best-effort, same posture as every other journal write added in this lot: nothing left
-        // to record to, and never let it escape -- least of all past the stop event below.
-      }
-      stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };
-    }
-
-    // Action 3.3: the single place every stop path converges -- drain, `stop-requested`, the
-    // worker-crash breaker and the scanner-crash breaker all set `stopReason` and then fall
-    // through to this same return, so journalling here covers all four with one call rather than
-    // one at each of the four assignment sites. Before this, the single most important event in
-    // this subsystem existed only on stderr (daemon.js's `dispatcher stopped itself -- <JSON>`)
-    // and as exit code 1; daemon.jsonl was structurally unable to show it. `appendDaemonEvent`
-    // spreads `detail` flat, so `stopReason` itself lands as the event's own fields (`reason`,
-    // plus whichever breaker/drain fields that particular stop path added) rather than nested
-    // under a `detail` key.
-    //
-    // `stopReason` is unreachable as null/undefined here in practice -- the only way out of the
-    // `for (;;)` loop above is its own `if (stopReason) break`, so control never reaches this
-    // return with `stopReason` still unset -- but guarded anyway rather than assuming that
-    // invariant holds forever: a null stop reason has nothing meaningful to journal, so it simply
-    // does not.
-    if (stopReason) {
-      try {
-        appendDaemonEvent(journalRoot, 'dispatcher-stopped', stopReason);
-      } catch {
-        // Best-effort, same shape as the queue-claim guard (state-machine.js's takeNextTask) and
-        // the two fs.renameSync sites in 62b3871/ae12962: appendDaemonEvent does mkdirSync +
-        // appendFileSync, so on the exact ENOSPC/EPERM/EROFS class of failure this call exists to
-        // report, the write itself can throw -- and unwrapped, that would turn a clean shutdown
-        // into a crash on the way out, defeating this action on its own worst case. Nothing left
-        // to record to; never let this escape either way.
+        // to record to, and never let it escape.
       }
     }
     return stopReason;

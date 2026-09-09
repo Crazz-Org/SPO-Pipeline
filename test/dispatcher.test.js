@@ -581,8 +581,10 @@ test('N consecutive crashes trip the circuit breaker; a PARK in between resets t
   assert.equal(stopReasonB.crashLimit, 3);
 
   // Action 3.3: `dispatcher-stopped` fires on the WORKER breaker path too -- the same journal
-  // call as the drain and scanner-breaker paths (dispatcher.js's single return point), proven
-  // here independently rather than assumed from those other tests.
+  // call as the drain and scanner-breaker paths, which all still converge on this one emit even
+  // though it is no longer at run()'s own return: card #162 hoisted it ahead of `killAllChildren`
+  // and `reapSignalledChildren`. Proven here independently rather than assumed from those other
+  // tests.
   const stoppedB = readDaemonEvents(journalDirB).find((e) => e.event === 'dispatcher-stopped');
   assert.ok(stoppedB, 'no dispatcher-stopped');
   assert.equal(stoppedB.reason, 'worker-crash-circuit-breaker');
@@ -2185,8 +2187,13 @@ test('a crashed scanner is respawned immediately, up to its own scannerCrashLimi
 // test/transient-retry.test.js): `appendDaemonEvent` does its OWN `mkdirSync` + `appendFileSync`,
 // so on the exact ENOSPC/EPERM/EROFS class of failure the new try/catch (action 3.3) exists to
 // survive, the journal write itself can throw -- and an unwrapped call would let THAT throw
-// escape run(), turning a clean shutdown into a crash on the way out. Only the `dispatcher-stopped`
-// write is made to fail here (matched on its own JSON content), not every daemon.jsonl write --
+// escape run(), turning a clean shutdown into a crash on the way out. WORSE since card #162's
+// hoist than when this guard was first written: `killAllChildren`/`reapSignalledChildren` both run
+// AFTER this emit now, so an escaping throw here would skip both, leaving this test's own
+// `neverExitsSpawn` scanner child un-signalled -- and its still-referenced handle keeps this
+// file's process alive, so the assertion fails and the run then never exits -- a hang, not a
+// verdict. Only the `dispatcher-stopped` write is made to fail here (matched on its own JSON
+// content), not every daemon.jsonl write --
 // an unconditional failure would also break the UNGUARDED `dispatcher-start` call at the top of
 // run(), which is not what this guard covers and would prove nothing about it.
 test("run(): a journal write failure on dispatcher-stopped ITSELF does not escape run() -- the guard's own worst case", async () => {
@@ -2361,8 +2368,9 @@ test('the breaker does NOT trip when crashes are separated by healthy uptime, ev
     // breaker had tripped, making the check vacuous no matter what it read: repairing only the
     // `reason` field (item 1 of this action) would not have given it teeth on its own, since the
     // event it reads from simply wasn't written yet at that point in the test. Checked here,
-    // AFTER `run()` has actually returned and journalled `dispatcher-stopped` (this action, item
-    // 1), it is a genuinely independent confirmation of the same fact the assertion above proves
+    // after `run()` has returned, and therefore after the `dispatcher-stopped` write too -- which
+    // card #162 hoisted to land just ahead of the kill and the reap, not at the return itself --
+    // this is a genuinely independent confirmation of the same fact the assertion above proves
     // from the return value: it reads the JOURNAL record instead, so a bug that mislabelled the
     // WRITTEN event without touching the returned stopReason -- or vice versa -- would be caught
     // by one of these two assertions and not the other.
@@ -3061,9 +3069,10 @@ test('buildReparkArgv: a null exitCode/signal (a hand-run repark, or a signal-le
 // drives is EDGE-triggered. A restart destroys that memory, so if the pool goes idle, the daemon
 // restarts (this project's post-merge hook SIGTERMs it on every merge), and the pool then
 // recovers, the `returned` edge is never written -- leaving a bare idle edge as daemon.jsonl's
-// newest dispatcher event forever. bin/spo's computeDispatcherIdleStatus answers "is the
-// dispatcher idle right now" by walking back to the newest edge, so without a startup boundary it
-// reported a permanent false alarm (measured: "IDLE since 191h06m ago" on a busy fixture).
+// newest dispatcher event forever. bin/spo's computeDispatcherStatus (renamed by card #164; was
+// computeDispatcherIdleStatus) answers "is the dispatcher idle right now" by walking back to the
+// newest edge, so without a startup boundary it reported a permanent false alarm (measured: "IDLE
+// since 191h06m ago" on a busy fixture).
 test('the dispatcher writes a dispatcher-start event at startup -- the boundary `spo status` stops its idle walk at', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-start-q-');
   const journalDir = mkTmp('spo-disp-start-j-');

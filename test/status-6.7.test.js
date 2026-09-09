@@ -651,3 +651,88 @@ test('a genuine idle edge AFTER the newest dispatcher-start still reports -- the
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
   assert.match(out, /dispatcher: IDLE since 10m ago -- no healthy accounts \(queue depth 5, earliest cooldown 2026-09-02T03:00:00\.000Z\)/);
 });
+
+// ---- card #164: a dead dispatcher process must read STOPPED, not IDLE -----------------------
+
+test('card #164: a dispatcher-stopped event LATER than a standing idle edge reports STOPPED, not IDLE', () => {
+  const journalDir = mkTmp('spo-164-stopped-after-idle-');
+  const queueDir = mkTmp('spo-164-stopped-after-idle-queue-');
+  fs.mkdirSync(journalDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(journalDir, 'daemon.jsonl'),
+    [
+      JSON.stringify({ ts: '2026-09-09T18:00:00.000Z', event: 'dispatcher-idle-no-healthy-accounts', healthy: 0, queued: 3 }),
+      JSON.stringify({
+        ts: '2026-09-09T18:35:41.944Z',
+        event: 'dispatcher-stopped',
+        reason: 'drain-requested',
+        signal: 'SIGTERM',
+        drained: true,
+        waitedMs: 0,
+        survivors: [],
+      }),
+    ].join('\n') + '\n'
+  );
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.doesNotMatch(out, /dispatcher: IDLE/);
+  assert.match(out, /dispatcher: STOPPED since .+ ago -- reason: drain-requested/);
+});
+
+test('card #164: dispatcher-stopped then dispatcher-start then a NEW idle edge reads IDLE again', () => {
+  const journalDir = mkTmp('spo-164-restart-then-idle-');
+  const queueDir = mkTmp('spo-164-restart-then-idle-queue-');
+  fs.mkdirSync(journalDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(journalDir, 'daemon.jsonl'),
+    [
+      JSON.stringify({ ts: '2026-09-09T18:00:00.000Z', event: 'dispatcher-idle-no-healthy-accounts', healthy: 0, queued: 3 }),
+      JSON.stringify({ ts: '2026-09-09T18:35:41.944Z', event: 'dispatcher-stopped', reason: 'drain-requested', signal: 'SIGTERM', drained: true, waitedMs: 0, survivors: [] }),
+      JSON.stringify({ ts: '2026-09-09T18:36:10.000Z', event: 'dispatcher-start', pid: 1161848, workers: 2 }),
+      JSON.stringify({ ts: new Date(Date.now() - 5 * 60 * 1000).toISOString(), event: 'dispatcher-idle-no-healthy-accounts', healthy: 0, queued: 7 }),
+    ].join('\n') + '\n'
+  );
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.doesNotMatch(out, /dispatcher: STOPPED/);
+  assert.match(out, /dispatcher: IDLE since 5m ago -- no healthy accounts \(queue depth 7/);
+});
+
+test('card #164: dispatcher-stopped with no idle edge at all still reports STOPPED -- the common real case', () => {
+  const journalDir = mkTmp('spo-164-stopped-no-idle-');
+  const queueDir = mkTmp('spo-164-stopped-no-idle-queue-');
+  fs.mkdirSync(journalDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(journalDir, 'daemon.jsonl'),
+    JSON.stringify({
+      ts: '2026-09-09T18:35:41.944Z',
+      event: 'dispatcher-stopped',
+      reason: 'drain-requested',
+      signal: 'SIGTERM',
+      drained: true,
+      waitedMs: 0,
+      survivors: [],
+    }) + '\n'
+  );
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.doesNotMatch(out, /dispatcher: IDLE/);
+  assert.match(out, /dispatcher: STOPPED since .+ ago -- reason: drain-requested \(signal SIGTERM, drained clean, waited 0ms\)/);
+});
+
+test('card #164: dispatcher-stopped followed by dispatcher-start and nothing else prints NO dispatcher line -- running, nothing to report', () => {
+  const journalDir = mkTmp('spo-164-stopped-then-start-');
+  const queueDir = mkTmp('spo-164-stopped-then-start-queue-');
+  fs.mkdirSync(journalDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(journalDir, 'daemon.jsonl'),
+    [
+      JSON.stringify({ ts: '2026-09-09T18:35:41.944Z', event: 'dispatcher-stopped', reason: 'drain-requested', signal: 'SIGTERM', drained: true, waitedMs: 0, survivors: [] }),
+      JSON.stringify({ ts: '2026-09-09T18:36:10.000Z', event: 'dispatcher-start', pid: 1161848, workers: 2 }),
+    ].join('\n') + '\n'
+  );
+
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.doesNotMatch(out, /dispatcher: IDLE/);
+  assert.doesNotMatch(out, /dispatcher: STOPPED/);
+});
