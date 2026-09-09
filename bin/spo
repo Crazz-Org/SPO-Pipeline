@@ -32,9 +32,12 @@
 //                            (see orchestrator/journal.js's readLiveWorkersRaw). Also new: a
 //                            `dispatcher: IDLE ...` line when the pool has no healthy accounts
 //                            right now (edge-triggered off daemon.jsonl, silent once recovered),
-//                            and an `account-cooldown: N degraded write(s) ...` line naming which
-//                            accounts hit the pool-state-lock fallback (action 6.2) -- both
-//                            omitted entirely when there is nothing to report.
+//                            a `dispatcher: STOPPED since <age> ago -- reason: ...` line when
+//                            daemon.jsonl's newest dispatcher edge is a `dispatcher-stopped` with
+//                            no later `dispatcher-start` (card #164), and an `account-cooldown: N
+//                            degraded write(s) ...` line naming which accounts hit the
+//                            pool-state-lock fallback (action 6.2) -- all three omitted entirely
+//                            when there is nothing to report.
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl. Every
 //                            `llm-call` line also carries an explicit `duration=<n>s` (action
 //                            6.7, closing project-2 card #478 -- action 5.4's own `duration_s`
@@ -470,7 +473,7 @@ function readTaskAccount(lines) {
   return null;
 }
 
-// computeDispatcherIdleStatus(daemonEvents) -- dispatcher.js's own `dispatcher-idle-no-healthy-
+// computeDispatcherStatus(daemonEvents) -- dispatcher.js's own `dispatcher-idle-no-healthy-
 // accounts` / `dispatcher-healthy-accounts-returned` pair (fillSlots's poolIdleDetail) is EDGE-
 // TRIGGERED: one line when the pool first has zero healthy accounts, one line when it recovers,
 // nothing in between (no matter how many fillSlots passes happen while still idle). So "is the
@@ -480,7 +483,24 @@ function readTaskAccount(lines) {
 // the most recent relevant marker" shape as retry-channel.js's summarizeUnparkScanTail, for the same
 // reason: this is daemon.jsonl's OWN edge history, not a poll of current pool health (`spo
 // status`'s own account rows already do that separately, from the pool's state.json).
-function computeDispatcherIdleStatus(daemonEvents) {
+//
+// Card #164: a dead PROCESS is a fourth marker, not a variant of "idle" -- `dispatcher-stopped`
+// (action 3.3's single stop-path convergence point in dispatcher.js's run(), written on
+// drain/stop-requested/either crash breaker) means there is no dispatcher left to be idle or
+// healthy, so it must outrank a standing idle edge rather than being read as one. PRECEDENCE,
+// walking backwards from the tail, first match wins -- renamed from computeDispatcherIdleStatus
+// because it now reports a status, not just an idle flag:
+//   dispatcher-healthy-accounts-returned  -> null (healthy right now, nothing to report)
+//   dispatcher-start                      -> null (hard boundary -- see the comment on this
+//                                            branch below; also what makes a `dispatcher-stopped`
+//                                            followed by a fresh `dispatcher-start` read as
+//                                            running again, for free, since the start is then the
+//                                            newest of the two and this walk never reaches the
+//                                            stop beneath it)
+//   dispatcher-stopped                    -> {status: 'stopped', event: ev} -- the process is dead
+//   dispatcher-idle-no-healthy-accounts   -> {status: 'idle', event: ev}
+//   (falls off the end)                   -> null
+function computeDispatcherStatus(daemonEvents) {
   for (let i = daemonEvents.length - 1; i >= 0; i--) {
     const ev = daemonEvents[i];
     if (!ev) continue;
@@ -490,9 +510,13 @@ function computeDispatcherIdleStatus(daemonEvents) {
     // MEMORY, so an idle edge written by an earlier process says nothing about the current one --
     // and because a restart resets that flag to false, the matching `returned` edge is never
     // written after a restart at all. Without this line, one idle edge plus one restart (this
-    // project restarts the daemon on every merge) made `spo status` claim IDLE forever.
+    // project restarts the daemon on every merge) made `spo status` claim IDLE forever. The same
+    // reasoning is why it must be checked before `dispatcher-stopped` is even reachable in a later
+    // (i.e. earlier-in-the-walk) iteration: once a start has been seen, nothing before it -- stopped
+    // or idle alike -- describes the CURRENT process.
     if (ev.event === 'dispatcher-start') return null;
-    if (ev.event === 'dispatcher-idle-no-healthy-accounts') return ev;
+    if (ev.event === 'dispatcher-stopped') return { status: 'stopped', event: ev };
+    if (ev.event === 'dispatcher-idle-no-healthy-accounts') return { status: 'idle', event: ev };
   }
   return null;
 }
@@ -802,12 +826,14 @@ function cmdStatus(opts) {
     console.log(`workers: ${liveWorkerRows} live (subset of active: above)${staleNote}${trailingNote}  (${publishedNote})`);
   }
 
-  // action 6.7: dispatcher's own idle/recovered edge, read off daemon.jsonl's tail -- see
-  // computeDispatcherIdleStatus's own header. Prints nothing at all when the pool is healthy (or
-  // was never observed to be otherwise) -- an "OK" line for a condition that has never fired
-  // would just be noise on every single healthy status call.
-  const idleEvent = computeDispatcherIdleStatus(readDaemonEventsTail(journalRoot));
-  if (idleEvent) {
+  // action 6.7 (extended by card #164): dispatcher's own idle/stopped/recovered edge, read off
+  // daemon.jsonl's tail -- see computeDispatcherStatus's own header for the precedence. Prints
+  // nothing at all when the pool is healthy, is a process that hasn't reported anything yet, or
+  // was never observed to be otherwise -- an "OK" line for a condition that has never fired would
+  // just be noise on every single healthy status call.
+  const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot));
+  if (dispatcherStatus && dispatcherStatus.status === 'idle') {
+    const idleEvent = dispatcherStatus.event;
     const idleAgeMs = idleEvent.ts ? now - Date.parse(idleEvent.ts) : null;
     const idleAge = Number.isFinite(idleAgeMs) ? formatRemaining(idleAgeMs) : '?';
     const cooldownNote =
@@ -816,6 +842,30 @@ function cmdStatus(opts) {
     console.log(
       `dispatcher: IDLE since ${idleAge} ago -- no healthy accounts (queue depth ${idleEvent.queued ?? '?'}${cooldownNote})`
     );
+  } else if (dispatcherStatus && dispatcherStatus.status === 'stopped') {
+    const stoppedEvent = dispatcherStatus.event;
+    const stoppedAgeMs = stoppedEvent.ts ? now - Date.parse(stoppedEvent.ts) : null;
+    const stoppedAge = Number.isFinite(stoppedAgeMs) ? formatRemaining(stoppedAgeMs) : '?';
+    const reason = stoppedEvent.reason || 'unknown';
+    // `stopReason` lands on the event spread flat (dispatcher.js's action 3.3 comment) -- these
+    // are the path-specific fields it can carry on top of `reason`, folded in only when present
+    // rather than assuming any one stop path.
+    const extraParts = [];
+    if (stoppedEvent.signal) extraParts.push(`signal ${stoppedEvent.signal}`);
+    if (typeof stoppedEvent.drained === 'boolean') {
+      extraParts.push(
+        stoppedEvent.drained ? 'drained clean' : `drained incomplete (${(stoppedEvent.survivors || []).length} survivor(s))`
+      );
+    }
+    if (typeof stoppedEvent.waitedMs === 'number') extraParts.push(`waited ${stoppedEvent.waitedMs}ms`);
+    if (typeof stoppedEvent.consecutiveCrashes === 'number') {
+      extraParts.push(`consecutiveCrashes ${stoppedEvent.consecutiveCrashes}/${stoppedEvent.crashLimit}`);
+    }
+    if (typeof stoppedEvent.consecutiveScannerCrashes === 'number') {
+      extraParts.push(`scannerCrashes ${stoppedEvent.consecutiveScannerCrashes}/${stoppedEvent.scannerCrashLimit}`);
+    }
+    const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+    console.log(`dispatcher: STOPPED since ${stoppedAge} ago -- reason: ${reason}${extraNote}`);
   }
 
   // action 6.7: account-cooldown's own `degraded` flag -- see this loop's own scan above for

@@ -1062,7 +1062,8 @@ function createDispatcher(queueDir, journalRoot, config) {
     // is NEVER written, because the new process's flag started false. daemon.jsonl is then left
     // with a bare `dispatcher-idle-no-healthy-accounts` as its newest dispatcher edge, forever,
     // and any reader that answers "is the dispatcher idle right now" by walking back to the most
-    // recent edge (bin/spo's computeDispatcherIdleStatus) reports a permanent false alarm --
+    // recent edge (bin/spo's computeDispatcherStatus, renamed by card #164; was
+    // computeDispatcherIdleStatus) reports a permanent false alarm --
     // measured at "IDLE since 191h06m ago" against a fixture whose daemon was demonstrably busy.
     // This event is the boundary that reader stops at: an idle edge older than the newest
     // dispatcher start says nothing about the CURRENT process. It is self-healing rather than

@@ -1358,7 +1358,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1150",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1200",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1389,7 +1389,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1150",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1200",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:157",
@@ -1404,7 +1404,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:900", // re-pinned from :893 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above reportIntakeColumn, a true pure shift; content byte-identical at :900
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1109",
+  "doc/state-machine-spec.md :: bin/spo:1159",
   "doc/state-machine-spec.md :: dispatcher.js:634-648",
   "doc/state-machine-spec.md :: intake.js:797-799",
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -2475,7 +2475,7 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1150 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1200 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
@@ -2507,7 +2507,16 @@ test('MUTATION PROOF: reverting bin/spo:1150 back to bin/spo:1129 (the drift thi
   // `collectAll(sources)` down again, from :1141 to :1150. The canary stays `:1129` -- still
   // wrong for the same reason FOURTH/FIFTH already established (mid-`cmdDashboard`, no `collect`-
   // shaped candidate nearby), still the value that costs nothing to keep re-using. Paid six times.
-  const reverted = normalized.replace('reached from `bin/spo:1150`', 'reached from `bin/spo:1129`');
+  //
+  // SEVENTH catch, 2026-09-09: card #164's stopped-vs-idle fix (`computeDispatcherStatus`, née
+  // `computeDispatcherIdleStatus`, plus its caller, plus the file's own `spo status` inventory
+  // documenting the new STOPPED line) added 50 lines above `cmdDashboard`, pushing
+  // `collectAll(sources)` down again, from :1150 to :1200. The canary stays `:1129` -- re-checked
+  // empirically against the new file rather than assumed: the new line 1129 falls inside
+  // `cmdResume`'s own header comment ("under journal/); if that exists, lists every recorded LLM
+  // step (journal event..."), nowhere near `cmdDashboard` and containing no "collect"-shaped
+  // candidate, so it still fails for the right reason. Paid seven times.
+  const reverted = normalized.replace('reached from `bin/spo:1200`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
