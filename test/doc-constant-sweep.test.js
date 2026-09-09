@@ -1417,6 +1417,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
+  "orchestrator/auto-triage.js :: park-loop.js:1396",
+  "orchestrator/auto-triage.js :: remote-report-pull.js:193",
+  "orchestrator/auto-triage.js :: state-machine.js:2923",
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/invariants.js :: doc/state-machine-spec.md:150",
@@ -2091,12 +2094,26 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   //     so they are re-pinned to :157, the row that actually carries it.
   // Every current pin above was opened at its cited line and read by hand. `anchored` is unchanged
   // at 29 (the two re-pinned bench-doc citations are anchor-excluded and count in neither number).
-  assert.equal(anchored, 29, `expected 29 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // card #161 (2026-09-09): +3 anchored citations, `orchestrator/auto-triage.js :: park-loop.js:1396`,
+  // `:: remote-report-pull.js:193` and `:: state-machine.js:2923`, all three to the identical
+  // best-effort appendDaemonEvent-try/catch precedent. `appendDaemonEvent` sits inside every one of
+  // the three citations' own same-sentence anchor windows, so all three anchor on it directly --
+  // no CITATION_ANCHOR_ALLOWLIST entry and no unanchorable bump needed. 29 -> 32.
+  assert.equal(anchored, 32, `expected 32 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
   // citation. The population SHRANK -- which is the direction this pin is happy to move in; it
-  // exists to stop "cannot verify" growing.
+  // exists to stop "cannot verify" growing SILENTLY, not to stop it growing at all -- a genuinely
+  // unverifiable citation is still added by name, read by hand, and justified here, same as every
+  // other pin in this file.
+  // card #161 (2026-09-09): +2 citations, `orchestrator/auto-triage.js :: park-loop.js:1396` and
+  // `:: remote-report-pull.js:193`, both to the identical best-effort appendDaemonEvent-try/catch
+  // precedent (a third, state-machine.js:2923, cites the same precedent). The prose was written so
+  // `appendDaemonEvent` itself falls inside each citation's same-sentence anchor window rather than
+  // being clipped off by an adjacent citation. Re-measured: 32 anchored (was 29 -- see the pin
+  // above), 2 unanchorable (unchanged), 0 offenders -- all three new citations anchor on
+  // `appendDaemonEvent` itself, not on an allowlist entry.
   assert.equal(unanchorable, 2, `expected exactly 2 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
   assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
 });
@@ -2232,16 +2249,21 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // -- single-line, anchored on `touchesRdoMembers`, which appears on line 326 only (neither 325
   // nor 327 mentions it), so it discriminates a one-line drift -- discriminating is 16 -> 17.
   // blunt and ranges are unchanged.
+  // card #161 (2026-09-09): +3 citations, `orchestrator/auto-triage.js :: park-loop.js:1396`,
+  // `:: remote-report-pull.js:193` and `:: state-machine.js:2923`, each single-line and anchored on
+  // `appendDaemonEvent` (see the main anchor test's own note above). `appendDaemonEvent` does not
+  // appear on any neighbouring line of any of the three targets, so all three discriminate a
+  // one-line drift -- discriminating is 17 -> 20. blunt and ranges are unchanged.
   assert.deepEqual(
     blunt.map((b) => b.split(' -- ')[0]).sort(),
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
-  assert.equal(discriminating.length, 17, `expected 17 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
+  assert.equal(discriminating.length, 20, `expected 20 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
   assert.equal(ranges.length, 9, `expected 9 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 29, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (29).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 32, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (32).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

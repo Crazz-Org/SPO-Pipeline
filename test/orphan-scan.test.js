@@ -333,18 +333,24 @@ test('runScanCycle (real call site): reads queue/ before live-workers.json on ev
 // check can fire this cycle, isolating the one call site under test from the five others in the
 // same function. Proven by a real, filesystem-only side effect (auto-triage.js's own
 // runAutoTriage appends a summary 'auto-triage' daemon event whenever it disposes of anything,
-// including an 'already-claimed' outcome for a report-confirmed entry whose pendingPath never
+// including a 'held-unclaimable' outcome for a report-confirmed entry whose pendingPath never
 // existed) rather than by mocking auto-triage.js itself -- see orchestrator/auto-triage.js's
-// claimReport, which turns a missing pendingPath into {claimed:false} -> outcome:'already-claimed'
-// with no spawn of any kind, so this never touches a real claude/gh/npm process.
+// claimReport/isClaimLive: a missing pendingPath with no live claimant is a terminal
+// held-unclaimable, not the "already-claimed" this test used to expect (that outcome is now
+// reserved for a genuine race with a live runner -- see isClaimLive's own header for why the two
+// had to be told apart), with no spawn of any kind either way, so this never touches a real
+// claude/gh/npm process.
 test('runScanCycle: calls runAutoTriage when shouldAutoTriage is due, and records timers.lastAutoTriageAt', async () => {
   const journalRoot = mkTmp('spo-scancycle-autotriage-journal-');
   const queueDir = mkTmp('spo-scancycle-autotriage-queue-');
 
-  // A confirmed report whose pendingPath was never written -- claimReport's fs.renameSync throws
-  // ENOENT, caught, `{claimed: false}` -> processConfirmedReport returns 'already-claimed' -> the
-  // 'auto-triage' summary event gets appended (alreadyClaimed > 0). No report content is ever
-  // read, and nothing spawns -- see this test's own header comment.
+  // A confirmed report whose pendingPath was never written, and no report-triage-claimed event
+  // for it either -- claimReport's fs.renameSync throws ENOENT, caught,
+  // {claimed: false, reason: 'source-missing'}; isClaimLive finds no in-progress/ file and no
+  // recent claim event, so processConfirmedReport journals report-held-unclaimable and returns
+  // 'held-unclaimable' -> the 'auto-triage' summary event gets appended (held > 0,
+  // heldUnclaimable > 0). No report content is ever read, and nothing spawns -- see this test's
+  // own header comment.
   appendDaemonEvent(journalRoot, 'report-confirmed', {
     issue: 9001,
     pendingPath: path.join(journalRoot, 'nonexistent-pending-report.json'),
@@ -381,10 +387,11 @@ test('runScanCycle: calls runAutoTriage when shouldAutoTriage is due, and record
   const summary = readDaemonEvents(journalRoot).find((e) => e.event === 'auto-triage');
   assert.ok(summary, 'expected runAutoTriage to have actually run and journalled its summary -- proves the call happened, not just the timer check');
   assert.equal(summary.processed, 1);
-  assert.equal(summary.alreadyClaimed, 1);
+  assert.equal(summary.alreadyClaimed, 0);
   assert.equal(summary.filed, 0);
   assert.equal(summary.duplicates, 0);
-  assert.equal(summary.held, 0);
+  assert.equal(summary.held, 1);
+  assert.equal(summary.heldUnclaimable, 1);
 });
 
 test('orphanScan -> unparkScan: a maintainer retry on the reparked issue re-enqueues it (the full loop #385 needed by hand)', async () => {

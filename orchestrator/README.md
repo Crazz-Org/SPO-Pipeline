@@ -1669,21 +1669,50 @@ atomic `fs.renameSync` into `~/.spo-reports/in-progress/` -- the identical primi
 `state-machine.js`'s `takeNextTask` already uses to claim a `queue/` entry -- BEFORE
 `routeConfirmedReport` gets anywhere near an LLM call. `rename()` is atomic: exactly one caller's
 rename succeeds, every other caller racing the same `pendingPath` gets `ENOENT` (its source
-vanished under it) and returns `{ok: true, outcome: 'already-claimed'}` -- no `triageBugReport`
-call, no journal write, no crash. A dry run (`opts.dry`) claims nothing at all, by design: a
-preview must never block the real run. Whatever the routed outcome does NOT archive itself
-(`filed`/`duplicate` move the file to `archive/`; everything else -- `held`, `DO_NOT_FILE`, any
-mechanical failure -- leaves it exactly where it was) is restored to its original `pending/` path
-once `processConfirmedReport` returns, so the "recoverable, not stranded" behaviour the table
-above describes is unchanged; the file is just routed through `in-progress/` on the way.
+vanished under it). A dry run (`opts.dry`) claims nothing at all, by design: a preview must never
+block the real run. Whatever the routed outcome does NOT archive itself (`filed`/`duplicate` move
+the file to `archive/`; everything else -- `held`, `DO_NOT_FILE`, any mechanical failure -- leaves
+it exactly where it was) is restored to its original `pending/` path once
+`processConfirmedReport` returns, so the "recoverable, not stranded" behaviour the table above
+describes is unchanged; the file is just routed through `in-progress/` on the way.
+
+**A lost rename is `already-claimed` only when a live runner is actually behind it.** Before the
+starved-slot fix below existed, EVERY lost rename returned `{ok: true, outcome: 'already-claimed'}`
+unconditionally -- no journal write, no crash, but also no way to tell a genuine race (someone else
+really is holding the file) from a report whose file was simply never there to claim (deleted by
+hand, moved out of band, or a `pendingPath` `moveReportTo` already knew was never real -- see
+`report-move-source-missing` below). `processConfirmedReport` now calls a small discriminator,
+`isClaimLive`, before trusting that story: a file physically sitting in `in-progress/`, OR a
+`report-triage-claimed` event for the issue younger than `config.triageClaimGraceMs` (the same
+grace window and default as the crash-recovery paragraph below), either one means a live runner
+really is holding it and `already-claimed` is the true story. Neither signal firing means nobody
+is or ever will be claiming this report, and the outcome is `held-unclaimable` instead -- see
+"The starved-slot fix" below.
 
 Every claim is journaled as `report-triage-claimed` (`{issue, path}`) -- a trace in
 `daemon.jsonl` for anyone reading it, though note **no CLI or dashboard surfaces it yet**:
 `spo reports` scans only `pending/`, and `console/collect.js` ignores both new events, so a
 report sitting in `in-progress/` is visible only via `ls ~/.spo-reports/in-progress/`. Surfacing
 it belongs with the `spo status` work in chantier 5. `findConfirmedAwaitingTriage`'s own
-"handled" rule is unchanged (it still only checks `report-triaged`/`report-held`); the claim
-event is purely informational, the rename itself is the real gate.
+"handled" rule now checks `report-triaged`/`report-held`/`report-held-mechanical`/
+`report-held-unclaimable`; the claim event itself is still purely informational -- the rename is
+the real gate, `isClaimLive` is what tells apart what the failed rename MEANT.
+
+**The starved-slot fix.** A `report-confirmed` entry whose `pendingPath` was never real (a bad
+binding upstream, a file deleted by hand, `moveReportTo`'s own swallowed-ENOENT `null`) used to
+return `already-claimed` on EVERY cycle, forever, with no journal event -- so
+`findConfirmedAwaitingTriage` kept returning that same entry every cycle, crowding real confirmed
+reports out of `config.autoTriageLimit`'s top-N slice indefinitely (three such ghosts are enough to
+starve a healthy report out of the default limit of 3 completely). `processConfirmedReport` now
+gives that shape a terminal disposition instead: when `claimReport` fails AND `isClaimLive` finds
+no live claimant, it journals `report-held-unclaimable` (`{issue, reason, pendingPath}`, `reason`
+one of `claimReport`'s own two false-return reasons -- `no-pending-path` or `source-missing`) and
+returns `{ok: true, outcome: 'held-unclaimable', reason}`. "Re-file it" is impossible (the report
+content left with the file); "journal it and skip it" without a terminal event is exactly the
+behaviour this closes. This is the same disposition CLASS as `report-held-mechanical` -- not a
+verdict on the report's content, a statement that the pipeline cannot advance this report any
+further -- and it composes with `spo triage --retry`, which already refuses a report whose file is
+missing from `pending/` with an accurate, specific message (see "The recovery path" below).
 
 **Crash recovery.** A process that dies mid-triage (a killed daemon, a killed `spo triage
 --file`) strands its claim in `in-progress/` forever unless something sweeps it back --
@@ -1836,7 +1865,7 @@ inside a `claude -p` session with `cwd = config.productRepo`, same as before.
 | `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
-| `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs` |
+| `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs`. Also read by `isClaimLive` (this action): a `report-triage-claimed` event older than this no longer counts as a live claim, which is what lets a report whose file is otherwise unreachable move from `already-claimed` to `held-unclaimable` instead of looping forever |
 | `autoTriageBackoffBaseMs` | `autoTriageMs` if > 0, else 15 min (`SPO_AUTO_TRIAGE_BACKOFF_BASE_MS`) | action 3.3 -- wait before the first retry after a mechanical failure, doubled per additional failure since the report's confirm anchor; see "The mechanical-failure cap + backoff" above |
 | `autoTriageBackoffCeilingMs` | 2h (`SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS`) | action 3.3 -- absolute ceiling on the doubling above |
 
@@ -1858,7 +1887,12 @@ gone, not the board-move failure `report-intake-move-failed` names above. `{from
 disposition}`; `to` is `null` when there was no source path at all to derive a destination from.
 Usually a tolerated race (a concurrent disposal already won), not a failure to act on -- but can
 also be a genuine miss with no source ever found, which this event does not itself distinguish;
-see `moveReportTo`'s own header in `auto-triage.js` for both cases), `report-triaged` / `report-held` / `auto-triage` /
+see `moveReportTo`'s own header in `auto-triage.js` for both cases. `report-move-source-missing`
+names the CAUSE -- a `pendingPath` that never pointed at a real file, at the moment `moveReportTo`
+tried to act on it -- while `report-held-unclaimable` (below) ends the LOOP that cause creates once
+`claimReport`/`isClaimLive` establish nobody is ever going to claim that same path either: one
+names the miss, the other terminates the report it happens to), `report-triaged` / `report-held` /
+`report-held-unclaimable` / `auto-triage` /
 `report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
 `report-triage-reclaimed` / `report-triage-error` / `report-held-mechanical` /
 `report-triage-backoff` (stage 3) -- all to `journal/daemon.jsonl`, the
@@ -1879,7 +1913,14 @@ skipped in a dry run too. Only `report-triage-error` is actually COUNTED since t
 issue); `report-held-mechanical` is the terminal disposition the count feeds INTO once it reaches
 `MECHANICAL_FAILURE_CAP`, not itself a thing anything counts -- once one is journaled,
 `findConfirmedAwaitingTriage` stops surfacing the report at all, so there is nothing left to count
-it against until a fresh `report-confirmed` moves the anchor forward regardless.
+it against until a fresh `report-confirmed` moves the anchor forward regardless. `report-held-unclaimable`
+(this action) is the same shape as `report-held-mechanical` in every respect that matters here: it
+is `runAutoTriage`'s dry-run guard (`processConfirmedReport`'s claim path is skipped entirely for
+`opts.dry`, so this never fires in a preview), it joins `findConfirmedAwaitingTriage`'s handled set,
+and it feeds the `auto-triage` summary's own `heldUnclaimable` counter (folded into `held`, mirroring
+`heldMechanical`) rather than being counted BY anything else -- there is no cap or backoff to feed,
+since there is nothing to retry: `claim.reason` (`no-pending-path` or `source-missing`) already says
+why, permanently.
 
 A hard process kill mid-triage is recovered by `reclaimStaleClaims` (action 2.6, above) and
 journals `report-triage-reclaimed`, NOT `report-triage-error` -- so a daemon crash-loop is
@@ -1898,14 +1939,30 @@ anchor+"handled later" idiom `park-loop.js`'s `findParkAnchor` already establish
 from a per-task `journal.jsonl` to this flat daemon-level log.
 
 **The recovery path (action 3.4): `spo triage --retry <issue>`.** Before this action, a report
-that reached HOLD was a confirmed dead end -- `findConfirmedAwaitingTriage` treats all three hold
+that reached HOLD was a confirmed dead end -- `findConfirmedAwaitingTriage` treats all hold
 shapes as handled, the report file sits in `pending/` (restored there by
 `processConfirmedReport`'s own `finally`) forever, and nothing short of hand-editing
-`daemon.jsonl` brought it back. The three shapes this recovers: `report-held` with a real negative
-reproduction verdict (`not-reproduced`/`insufficient`/`schema-version`), `report-held` with
+`daemon.jsonl` brought it back. The three shapes this ACTUALLY recovers: `report-held` with a real
+negative reproduction verdict (`not-reproduced`/`insufficient`/`schema-version`), `report-held` with
 `outcome: 'do-not-file'` (`reviewCard` said no), and `report-held-mechanical` (action 3.3's three
 mechanical strikes). `buildMechanicalHoldComment` already promised `spo triage --retry <issue>` as
 the way out before this action existed to make that promise true.
+
+A fourth shape, `report-held-unclaimable` (this action), is in `retryHeldReport`'s own
+`HANDLED_EVENTS` set (precondition 2) so an issue whose last event is `report-held-unclaimable`
+correctly reads as "a genuine hold", not "already eligible for triage" -- but whether `--retry`
+actually RECOVERS it depends on which `report-confirmed` record is newest, not on the held record
+itself: precondition 3 reads the pending-file path off the ANCHOR (the newest `report-confirmed`
+for the issue at the moment `--retry` runs), not off whichever record was the one that actually
+went unclaimable. Two duplicate-confirm orderings for the same issue (see `isClaimLive`'s own
+comment in `auto-triage.js` for how a ghost record with no `pendingPath` and a live sibling both
+reach `report-confirmed` for one issue): if the ghost holds unclaimable while a LATER sibling
+confirm still carries a real file, that sibling is the anchor and `--retry` genuinely recovers it
+(`{outcome: 'would-retry', retriedFrom: 'report-held-unclaimable'}`). If the ghost's own confirm is
+the newest one on record -- the sibling having confirmed and been superseded earlier -- the anchor
+has no `pendingPath` and precondition 3 refuses with its accurate, specific "report file is missing
+from `pending/` ... cannot re-inject a report that no longer exists", a permanent dead end for that
+issue. Both are real; which one a maintainer hits is not visible from the hold event alone.
 
 *The mechanism* (`retryHeldReport` in `auto-triage.js`) is deliberately not a new event type: it
 appends a FRESH `report-confirmed` event for the issue, carrying the same shape
