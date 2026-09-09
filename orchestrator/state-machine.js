@@ -1002,6 +1002,99 @@ function chargeCiImplementRetry(ctx, next) {
   return next;
 }
 
+// Action (2026-09-09 remediation): a minority of real DIAGNOSE results serialize the model's
+// WHOLE reply contract into the `root_cause` string instead of returning a bare sentence -- the
+// model answered `root_cause: "{\"root_cause\": \"...\", \"category\": \"...\", \"suggested_fix\":
+// \"...\"}"` (a JSON object, itself stringified, nested one level inside the field diagnose.md
+// declares as a plain sentence). See doc/state-machine-spec.md's DIAGNOSE row for the dated
+// corpus measurement this is based on. Left unwrapped this has (at least) four silent
+// consequences: (1) top-level `category`/`suggestedFix` both read null, so IMPLEMENT never sees
+// the "required amendment to the plan" task-values.js's diagnosisSummary threads through; (2) the
+// duplicate-root-cause guard keys on the exact `rootCause` string (prompts/diagnose.md's own
+// documented contract -- "a plain exact string match against the causes already seen for this
+// task" -- STAYS true after this fix, the string being compared is just the unwrapped one now),
+// and the guard CANNOT fire on the raw nested blob unless two attempts happen to serialize their
+// wrapper identically (key order, whitespace, and every field byte-for-byte) -- which the wire
+// gives no guarantee of, so in general the guard is defeated and the card burns attempts toward
+// `diagnose-budget-exhausted` instead of parking on the first repeat; (3) `appendLedgerLine`
+// wrote the raw JSON into ledger.md, a human-facing file; (4) `'{"root_cause": null, ...}'` is a
+// non-empty STRING, so the null branch below (the documented "no new cause" answer) was evaded
+// even when the nested cause genuinely was null.
+//
+// unwrapNestedDiagnoseContract is a pure classifier for one `rootCause`/`root_cause` VALUE
+// (whatever hasRootCauseKey below resolved it to, so it already only runs when a root-cause key
+// was present at all). It is deliberately conservative -- an ordinary prose cause, including one
+// that happens to start with a brace-like character sequence that is not actually JSON, must
+// never be reinterpreted -- and it unwraps exactly ONE level: a nested `root_cause` that is
+// itself a JSON string is left as-is (out of scope for this fix; nothing in the measured corpus
+// nests two levels deep). It also only ever unwraps a SCALAR nested cause (a string or `null` --
+// diagnose.md's own two documented shapes for `root_cause`): an object-shaped nested cause
+// (`{"root_cause": {"detail": "x"}}`) is left un-unwrapped instead, because unwrapping it would
+// hand the duplicate guard (a `Set` keyed on `===`/reference equality for anything but a
+// primitive) an object that can never equal a later, structurally-identical-but-distinct one --
+// permanently defeating the very guard this fix exists to restore, the opposite of the intent.
+// The recovered cause, when it IS a string, is also collapsed to one line (every run of
+// whitespace -- including an embedded `\n`, which `JSON.parse` decodes from the wire's `\\n`
+// escape -- to a single space, then trimmed) before being handed back: diagnose.md's own header
+// declares `root_cause` as one line, so a nested reply is held to the same one-line contract a
+// flat reply already is, and `appendLedgerLine`'s "one ledger line per attempt" invariant holds
+// either way.
+//
+// Applies ONLY inside unwrapNestedDiagnoseContract's nested branch below -- the flat path (an
+// ordinary prose cause, including a multi-line one) is never routed through this, so a multi-line
+// FLAT cause reaches ledger.md exactly as it does today.
+function collapseToOneLine(s) {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+// Exported for direct unit tests (test/diagnose-nested-contract.test.js) -- see its own shape
+// table for every verdict this returns.
+function unwrapNestedDiagnoseContract(value) {
+  if (typeof value !== 'string') {
+    return { nested: false, shape: 'flat', rootCause: value, category: null, suggestedFix: null, reason: null };
+  }
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{')) {
+    return { nested: false, shape: 'flat', rootCause: value, category: null, suggestedFix: null, reason: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    // Starts with '{' but is not valid JSON -- an ordinary prose cause that happens to open with
+    // a brace is not this bug. Pass through UNCHANGED, exactly today's behaviour.
+    return { nested: false, shape: 'unparsable-string', rootCause: value, category: null, suggestedFix: null, reason: null };
+  }
+  if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
+    const shape = parsed === null ? 'json-string-null' : Array.isArray(parsed) ? 'json-string-array' : `json-string-${typeof parsed}`;
+    return { nested: false, shape, rootCause: value, category: null, suggestedFix: null, reason: null };
+  }
+  const hasNestedKey =
+    Object.prototype.hasOwnProperty.call(parsed, 'root_cause') || Object.prototype.hasOwnProperty.call(parsed, 'rootCause');
+  if (!hasNestedKey) {
+    // A JSON object that parses fine but is not shaped like DIAGNOSE's own contract -- left
+    // alone, same reasoning as the unparsable-string case above.
+    return { nested: false, shape: 'json-string-no-root-cause', rootCause: value, category: null, suggestedFix: null, reason: null };
+  }
+  const nestedRootCause = Object.prototype.hasOwnProperty.call(parsed, 'root_cause') ? parsed.root_cause : parsed.rootCause;
+  if (typeof nestedRootCause !== 'string' && nestedRootCause !== null) {
+    // diagnose.md documents exactly two shapes for root_cause: a string, or null. Anything else
+    // nested here (an object, a number, an array, ...) is not a shape this fix targets -- leaving
+    // it un-unwrapped keeps the duplicate guard's Set keyed on values `===` can compare
+    // meaningfully, rather than handing it an object two structurally-identical replies would
+    // never `===`-match, which would silently re-break the very guard this action restores.
+    return { nested: false, shape: 'nested-contract-nonscalar', rootCause: value, category: null, suggestedFix: null, reason: null };
+  }
+  return {
+    nested: true,
+    shape: 'nested-contract',
+    rootCause: typeof nestedRootCause === 'string' ? collapseToOneLine(nestedRootCause) : nestedRootCause,
+    category: parsed.category || null,
+    suggestedFix: parsed.suggested_fix || parsed.suggestedFix || null,
+    reason: parsed.reason || null,
+  };
+}
+
 // DIAGNOSE budget: at most config.diagnoseBudget attempts, and any root cause seen before
 // (this task only) parks immediately, even under budget. Ledger gets a line for every attempt,
 // including the one that trips either rule.
@@ -1078,16 +1171,53 @@ async function handleDiagnose(ctx) {
       : result.root_cause
     : undefined;
 
-  if (hasRootCauseKey && rootCauseValue === null) {
-    // The documented "no new cause" answer. Append the ledger line for the attempt first (same
-    // order the rest of this function already follows: journal, then ledger, then park), never
-    // fabricate a cause, never retry IMPLEMENT on it.
+  // Action (2026-09-09): unwrap a nested DIAGNOSE contract, exactly one level, before anything
+  // below reads rootCauseValue -- see unwrapNestedDiagnoseContract's own header comment for the
+  // defect this closes. On every shape this returns `nested: false`, `unwrapped.rootCause ===
+  // rootCauseValue` and every branch below is byte-identical to before this action -- the FLAT
+  // (ordinary prose, including prose that merely starts with '{') behaviour is unchanged.
+  const unwrapped = hasRootCauseKey
+    ? unwrapNestedDiagnoseContract(rootCauseValue)
+    : { nested: false, shape: 'absent', rootCause: rootCauseValue, category: null, suggestedFix: null, reason: null };
+
+  if (unwrapped.nested) {
+    // Journalled BEFORE the null-branch decision below so both the null and the prose paths are
+    // covered -- the issue asks that incidence be readable from a grep, not only from a
+    // transcript. `diagnose-nested-contract` is documented in doc/state-machine-spec.md's
+    // DIAGNOSE section and orchestrator/README.md's journal-event-literals table.
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-nested-contract', {
+      attempt: attemptN,
+      shape: unwrapped.shape,
+      recoveredCategory: !!unwrapped.category,
+      recoveredSuggestedFix: !!unwrapped.suggestedFix,
+      nestedRootCauseNull: unwrapped.rootCause === null,
+    });
+    // Daemon-level sibling of the per-task event above, same idiom finalizePark's own `parked`
+    // daemon.jsonl line already uses (path.dirname(ctx.taskDir) recovers journalRoot without
+    // threading a new parameter through ctx) -- one grep on daemon.jsonl now shows cross-card
+    // incidence instead of requiring a transcript-by-transcript read.
+    appendDaemonEvent(path.dirname(ctx.taskDir), 'diagnose-nested-contract', {
+      id: ctx.id,
+      attempt: attemptN,
+      shape: unwrapped.shape,
+    });
+  }
+
+  const effectiveRootCauseValue = unwrapped.nested ? unwrapped.rootCause : rootCauseValue;
+
+  if (hasRootCauseKey && effectiveRootCauseValue === null) {
+    // The documented "no new cause" answer -- reachable directly (`root_cause: null`) or, since
+    // this action, through one level of nesting (`root_cause: '{"root_cause": null, ...}'`).
+    // Append the ledger line for the attempt first (same order the rest of this function already
+    // follows: journal, then ledger, then park), never fabricate a cause, never retry IMPLEMENT
+    // on it.
+    const nullReason = unwrapped.nested ? unwrapped.reason || result.reason || null : result.reason || null;
     appendEvent(ctx.taskDir, 'DIAGNOSE', 'result', {
       attempt: attemptN,
-      payload: { rootCause: null, reason: result.reason || null },
+      payload: { rootCause: null, reason: nullReason },
     });
     appendLedgerLine(ctx.taskDir, attemptN, '(no new cause)', 'parked (no new cause)');
-    throw new ParkSignal('diagnose-no-new-cause', { attempt: attemptN, reason: result.reason || null });
+    throw new ParkSignal('diagnose-no-new-cause', { attempt: attemptN, reason: nullReason });
   }
 
   // root_cause absent entirely (neither key present) is not one of diagnose.md's two documented
@@ -1104,9 +1234,13 @@ async function handleDiagnose(ctx) {
   //
   // A falsy-but-present root_cause (notably "") is deliberately NOT fabricated over: it flows
   // through as-is, so repeating it trips the duplicate guard instead of evading it.
-  const rootCause = hasRootCauseKey ? rootCauseValue : `unspecified-cause-${attemptN}`;
-  const category = (result && result.category) || null;
-  const suggestedFix = (result && result.suggestedFix) || null;
+  const rootCause = hasRootCauseKey ? effectiveRootCauseValue : `unspecified-cause-${attemptN}`;
+  // Top-level wins if truthy (today's behaviour, unchanged); the nested contract's own
+  // category/suggested_fix -- unwrapped.category/unwrapped.suggestedFix, both null on every
+  // non-nested shape -- fill the gap the real defect leaves (top-level `category`/`suggestedFix`
+  // both null when the whole contract was nested in `root_cause`).
+  const category = (result && result.category) || unwrapped.category || null;
+  const suggestedFix = (result && result.suggestedFix) || unwrapped.suggestedFix || null;
   // Journal category/suggestedFix alongside rootCause -- task-values.js's IMPLEMENT derivation
   // (buildPromptValues) reads this same 'result' event back so the next IMPLEMENT attempt
   // actually sees what DIAGNOSE found, instead of re-reading only the original PLAN and
@@ -2993,4 +3127,5 @@ module.exports = {
   poolCooldownDeadlineMs, // exported for action 1.2's own tests -- the epoch-ms/ISO-string/reason-suffix deadline resolver, pinned independently of finalizePark's re-enqueue plumbing
   classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
   isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
+  unwrapNestedDiagnoseContract, // exported for test/diagnose-nested-contract.test.js's direct unit tests of every shape verdict
 };
