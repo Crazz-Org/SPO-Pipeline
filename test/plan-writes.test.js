@@ -404,11 +404,14 @@ test('handlePlan: PLAN declaring invariant ids the parser cannot find journals a
 });
 
 // ---- wire-shape fix, 2026-09-07: invariant_ids arrives JSON-ENCODED-STRING on the wire, exactly
-// like files_to_change (#118) -- measured 159/159 on the live journal corpus. The canary's
-// `Array.isArray(payload.invariant_ids) ? ... : []` test rejected that shape on every card, so
-// `declared` was always 0 and none of the 58 mismatch events on record ever compared two real
-// numbers. These tests pin state-machine.js's normalizeDeclaredInvariantIds against the shape
-// production actually sends, not the array shape the pre-existing tests above use.
+// like files_to_change (#118) -- measured 158 of 158 successful PLAN `result` payloads on the
+// live journal corpus (re-derived Lot 6, 2026-09-08; 159 occurrences exist on the wire, but the
+// 159th is in a `PLAN/parked` event this call site's `payload` -- always a result payload --
+// never carries). The canary's `Array.isArray(payload.invariant_ids) ? ... : []` test rejected
+// that shape on every card, so `declared` was always 0 and none of the 58 mismatch events on
+// record ever compared two real numbers. These tests pin state-machine.js's
+// normalizeDeclaredInvariantIds against the shape production actually sends, not the array shape
+// the pre-existing tests above use.
 
 test('handlePlan: PLAN declaring invariant ids as a JSON-STRING (the real wire shape) that matches what the parser finds does NOT trip the canary -- pins the fix (fails under the old Array.isArray test: declared 0 vs parsed 2)', async () => {
   const worktreePath = mkTmp('spo-plan-canary-jsonstring-match-wt-');

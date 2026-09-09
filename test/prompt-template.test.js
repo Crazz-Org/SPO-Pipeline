@@ -102,6 +102,128 @@ test('fillPromptTemplate: an empty array is a valid value, not "missing" (zero i
   assert.ok(!/\{\{\w+\}\}/.test(filled));
 });
 
+// ---- stringifyValue: pin the measured JSON-STRING decision from #153 (won't-fix), 2026-09-08 ---
+// #153 proposed joining invariant_ids/check_commands with ", " like the array branch. Measured on
+// the live journal corpus and closed as won't-fix: 158/158 successful PLAN result payloads send
+// these fields as a JSON-ENCODED STRING, never a real array, and normalizing that string here
+// would be a regression for check_commands (14.5% of declared commands contain a comma, so
+// join(", ") is not losslessly reversible). The three tests below pin the three distinct shapes
+// stringifyValue must tell apart, and the fourth makes the round-trip hazard that justifies the
+// decision executable rather than just asserted in a comment.
+
+test('fillPromptTemplate: a JSON-ENCODED STRING (the real PLAN wire shape) passes through verbatim, NOT re-joined as INV-1, INV-2', () => {
+  const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
+    issue_number: 1,
+    worktree: '/tmp/w',
+    task_criterion: 'c',
+    plan_path: '/tmp/scratch/plan-1.md',
+    invariants_path: '/tmp/scratch/invariants-1.md',
+    invariant_ids: '["INV-1","INV-2"]',
+    check_commands: '["npm run typecheck","npm run lint"]',
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
+  });
+  assert.ok(filled.includes('["INV-1","INV-2"]'), 'the JSON-encoded string must render verbatim');
+  assert.ok(!filled.includes('INV-1, INV-2'), 'must NOT be re-joined as a comma-space list');
+});
+
+test('fillPromptTemplate: a genuine ARRAY still joins with ", " (the citations path must keep working)', () => {
+  const filled = fillPromptTemplate(STEP_CONTRACTS.CITATION_VERIFIER.promptFile, {
+    diff_path: '/tmp/diff.patch',
+    spo_original_path: '/tmp/SPO-Original',
+    citations: ['AdmMembersRDO.pas:512', 'AdmMembersRDO.pas:640'],
+  });
+  assert.ok(filled.includes('AdmMembersRDO.pas:512, AdmMembersRDO.pas:640'));
+});
+
+test('fillPromptTemplate: a plain (non-JSON) string value passes through unchanged, no double-encode or re-join', () => {
+  const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
+    issue_number: 1,
+    worktree: '/tmp/w',
+    task_criterion: 'c',
+    plan_path: '/tmp/scratch/plan-1.md',
+    invariants_path: '/tmp/scratch/invariants-1.md',
+    invariant_ids: 'INV-1',
+    check_commands: 'npm run typecheck',
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
+  });
+  assert.ok(filled.includes('INV-1'));
+  assert.ok(!filled.includes('"INV-1"'), 'a plain string must not be re-quoted/double-encoded');
+  assert.ok(filled.includes('npm run typecheck'));
+});
+
+test('fillPromptTemplate: the regression guard -- check_commands containing commas round-trip through JSON but NOT through join(", ").split(", ")', () => {
+  // Realistic declared commands, one of which contains a comma inside its own argument list.
+  const commands = ['node -e "a(1, 2)"', 'npm run lint'];
+
+  // The rendering stringifyValue actually produces for the real PLAN wire shape: a JSON-encoded
+  // string, passed straight through and rendered verbatim.
+  const jsonEncoded = JSON.stringify(commands);
+  const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
+    issue_number: 1,
+    worktree: '/tmp/w',
+    task_criterion: 'c',
+    plan_path: '/tmp/scratch/plan-1.md',
+    invariants_path: '/tmp/scratch/invariants-1.md',
+    invariant_ids: '["INV-1"]',
+    check_commands: jsonEncoded,
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
+  });
+  assert.ok(filled.includes(jsonEncoded), 'the JSON-encoded string renders verbatim');
+  const recovered = JSON.parse(jsonEncoded);
+  assert.deepEqual(recovered, commands, 'JSON parses back into exactly the original N commands');
+
+  // The rejected #153 fix: join the real array with ", " (what the array branch does), then try
+  // to recover the list by splitting on the same separator. This is the lossy path -- it must NOT
+  // reproduce the original list, which is exactly why normalizing here would be a regression.
+  const joined = commands.join(', ');
+  const badRecovery = joined.split(', ');
+  assert.notDeepEqual(badRecovery, commands, 'join(", ").split(", ") must NOT recover the original list');
+  assert.equal(badRecovery.length, 3, 'the embedded comma splits one command into two, corrupting the count');
+});
+
+// The end-to-end guard. The four tests above bind to stringifyValue, but #153's own "Scope"
+// section names the task-values.js seam FIRST -- and a normalization done there renders
+// INV-1, INV-2 into the prompt with stringifyValue untouched, which every assertion above would
+// miss (measured: that mutation survived the whole suite). So pin the property where it actually
+// matters -- the text IMPLEMENT is handed -- deriving the values the way production does, from a
+// journalled PLAN result carrying the real wire shape.
+test('PLAN result -> buildPromptValues -> fillPromptTemplate: the JSON-string wire shape reaches IMPLEMENT verbatim, joined nowhere along the way', () => {
+  const taskDir = mkTmp('spo-values-wire-shape-');
+  // The shape PLAN actually sends: a JSON-ENCODED STRING, 158 of 158 successful result payloads
+  // on the live corpus, never a real array. The existing buildPromptValues tests pass real
+  // arrays, which is exactly why they cannot catch this.
+  // Single-quoted on purpose: JSON.stringify escapes inner double quotes, and the point here is
+  // the embedded COMMA, not the escaping. This shape appears verbatim in the rendered prompt.
+  const commands = ["node -e 'a(1, 2)'", 'npm run lint'];
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/scratch/plan-7.md',
+      invariants_path: '/tmp/scratch/invariants-7.md',
+      invariant_ids: '["INV-1","INV-2"]',
+      check_commands: JSON.stringify(commands),
+    },
+  });
+  const ctx = {
+    taskDir,
+    task: { issue: 7, criterion: 'the thing is fixed', worktreePath: '/tmp/worktree-7' },
+  };
+
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.equal(values.invariant_ids, '["INV-1","INV-2"]', 'derivation must not join or re-shape the wire value');
+
+  const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, values);
+  assert.ok(filled.includes('["INV-1","INV-2"]'), 'the rendered prompt carries the JSON form verbatim');
+  assert.ok(!filled.includes('INV-1, INV-2'), 'the rendered prompt must NOT carry the joined form');
+  // check_commands is where joining is lossy: its first command contains a comma of its own, so a
+  // ", "-joined rendering cannot be split back into two commands.
+  assert.ok(filled.includes(commands[0]), 'the command survives rendering with its own comma intact');
+  assert.ok(
+    !filled.includes(commands.join(', ')),
+    'check_commands must NOT be joined on ", " -- the embedded comma makes that rendering ambiguous'
+  );
+});
+
 // ---- task-values.js: placeholder derivation for a kind:"card" task -----------------------
 
 test('buildPromptValues: PLAN reads straight off the task + taskDir, nothing from the journal yet', () => {
