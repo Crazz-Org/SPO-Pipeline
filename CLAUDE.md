@@ -97,7 +97,7 @@ tunables, and the traps. Four things not to rediscover:
 - **A stop DRAINS** (up to 45 min); a second signal stops now. So a deploy delays a card rather
   than killing it.
 - **Anything in the generated systemd unit needs `scripts/daemon-install.sh` re-run**, not just a
-  pull — and that script *starts* the daemon.
+  pull — that script *starts* the daemon, refusing (exit non-zero) outside that checkout and branch.
 - **The services never read a checkout you edit**; state is `~/.spo-state/{queue,journal}`.
 
 The `git stash` stack is shared across all worktrees, and several sessions can run in

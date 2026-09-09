@@ -133,7 +133,10 @@ scripts/release.sh --no-restart # cut and switch, leave the services running the
 > scripts/daemon-install.sh && scripts/dashboard-install.sh
 > ```
 > `daemon-install.sh` ends in `enable --now` — **it starts the daemon.** Set `SPO_AUTO_PULL_MS=0`
-> first if the box should come back idle.
+> first if the box should come back idle. `daemon-install.sh` refuses (exit non-zero, nothing
+> written) unless the script it runs lives in the deploy checkout (`SPO_SOURCE_REPO`, default
+> `~/SPO-Pipeline`) on the deploy branch (`SPO_DEPLOY_BRANCH`, default `main`) — the same two
+> variables `post-merge` honours. `dashboard-install.sh` is not guarded.
 
 ### Rolling back
 
@@ -223,7 +226,12 @@ before ever touching a lock file — false failures, not hangs; no lock is ever 
 
 ## Tunables
 
-All are systemd `Environment=` settings, read at daemon start.
+Most are systemd `Environment=` settings, read at daemon start. The last two,
+`SPO_SOURCE_REPO`/`SPO_DEPLOY_BRANCH`, are the exception: they are read by `post-merge`, by
+`scripts/daemon-install.sh`, and (since both callers exec it) by `scripts/release.sh` too — whose
+own default for `SPO_SOURCE_REPO` differs from the other two: its own script's repo, not
+`$HOME/SPO-Pipeline`. None of the three is read by the daemon process; together they govern the
+deploy and the install.
 
 | variable | default | what it does |
 |---|---|---|
@@ -233,8 +241,8 @@ All are systemd `Environment=` settings, read at daemon start.
 | `SPO_DRAIN_KILL_GRACE_MS` | 60000 | grace for a signalled straggler before SIGKILL |
 | `SPO_STATE_DIR` | `~/.spo-state` | queue + journal |
 | `SPO_RELEASE_KEEP` | 5 | releases retained |
-| `SPO_SOURCE_REPO` | `~/SPO-Pipeline` | the one checkout allowed to deploy |
-| `SPO_DEPLOY_BRANCH` | `main` | the branch a deploy may come from |
+| `SPO_SOURCE_REPO` | `~/SPO-Pipeline` | the one checkout allowed to deploy or install |
+| `SPO_DEPLOY_BRANCH` | `main` | the branch a deploy or install may come from |
 
 `TimeoutStopSec` in the unit must stay **≥ `SPO_DRAIN_TIMEOUT_MS` + `SPO_DRAIN_KILL_GRACE_MS`**, or
 systemd SIGKILLs the cgroup mid-drain — which skips the daemon's exit hook and leaks its lock file.

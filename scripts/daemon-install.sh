@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # One-time install of the pipeline daemon as a systemd --user service.
 #
-# Mirrors SPO-WebClient's scripts/bench-install.sh (the proven model on this machine): run it
-# FROM the SPO-Pipeline checkout that should host the daemon, re-run it after pulling daemon
-# changes (it restarts). Supervision model: systemd restarts a dead daemon (Restart=always,
+# Mirrors SPO-WebClient's scripts/bench-install.sh (the proven model on this machine): run it from
+# the checkout NAMED as the deploy checkout (SPO_SOURCE_REPO, default $HOME/SPO-Pipeline) on the
+# deploy branch (SPO_DEPLOY_BRANCH, default main) -- not chosen by wherever you happen to stand.
+# scripts/lib/deploy-guard.sh refuses to install from any other tree or branch. Re-run it after
+# pulling daemon changes (it restarts). Supervision model: systemd restarts a dead daemon (Restart=always,
 # rate-limited so a genuine config error stops instead of looping); the single-instance lock
 # (orchestrator/lock.js) makes the unit and any hand-run daemon mutually exclusive, and a
 # crashed daemon's stale lock is swept on the next start.
@@ -28,6 +30,27 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ONE CHECKOUT MAY INSTALL THE DAEMON, AND IT IS NOT WHICHEVER ONE YOU HAPPEN TO RUN THIS FROM.
+# Run from an agent worktree under .claude/worktrees/<slug>/, this script would otherwise cut a
+# release from -- and point the live service at -- that worktree's own branch. The rule is shared,
+# not reinvented here: scripts/git-hooks/post-merge guards the exact same hazard on every `git
+# pull`, and both callers source scripts/lib/deploy-guard.sh so the rule cannot silently diverge
+# between the two places it is enforced.
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/deploy-guard.sh"
+if ! deploy_guard_check "$REPO"; then
+  {
+    echo "!! daemon-install.sh: refusing to install -- $DEPLOY_GUARD_REASON"
+    echo "!!   tree seen:       $DEPLOY_GUARD_TREE"
+    echo "!!   tree expected:   $DEPLOY_GUARD_SOURCE_REPO"
+    echo "!!   branch seen:     $DEPLOY_GUARD_BRANCH"
+    echo "!!   branch expected: $DEPLOY_GUARD_DEPLOY_BRANCH"
+    echo "!!   nothing was written, no release was cut, no service was touched."
+    echo "!!   if this is deliberate, override with SPO_SOURCE_REPO=... and/or SPO_DEPLOY_BRANCH=..."
+  } >&2
+  exit 1
+fi
+
 # The symlink the unit runs from, and the releases it points into. Overridable for tests and for
 # anyone running a second pipeline on one box; see scripts/release.sh for the same two names.
 CURRENT_LINK="${SPO_CURRENT_LINK:-$HOME/.spo-current}"

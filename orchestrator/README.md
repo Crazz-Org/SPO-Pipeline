@@ -2369,9 +2369,10 @@ a park, or a failed assertion are all `1`.
 
 ## Running as a service
 
-`bash scripts/daemon-install.sh` (run from the checkout that should host the daemon) installs
-`spo-pipeline-daemon.service` as a systemd `--user` unit, mirroring the bench worker's
-`bench-install.sh`: `Restart=always` with a start-rate limit (a refuse-to-start — empty
+`bash scripts/daemon-install.sh` (refuses unless the script it runs lives in the deploy checkout,
+named below, on the deploy branch) installs `spo-pipeline-daemon.service` as a systemd `--user`
+unit, mirroring the bench worker's `bench-install.sh`: `Restart=always` with a start-rate limit
+(a refuse-to-start — empty
 account pool, held lock — stops after five tries instead of looping), linger enabled, and an
 **explicit PATH** including `~/.local/bin`, because the daemon spawns the `claude` CLI and the
 systemd user PATH does not reach it (the bench unit gets away without this only because it
@@ -2388,9 +2389,13 @@ the daemon and the dashboard. The installer is a different thing: re-run
 `ExecStart`, …). It ends in `enable --now` plus a **blocking** `systemctl restart`. That restart
 does drain (`KillMode=mixed`, `TimeoutStopSec=2820`) — but it blocks while it drains, unlike
 `release.sh`'s `restart --no-block`, which exists precisely so a 45-minute drain does not land on
-whoever ran the pull. Worse, `daemon-install.sh` derives its repo root from the script's own path
-and carries none of the `post-merge` hook's deploy-checkout and branch guards, so running it from
-an agent worktree cuts a release from THAT worktree's branch. See `doc/operating.md` § Deploying.
+whoever ran the pull. `daemon-install.sh` derives its repo root from the script's own path, so run
+from an agent worktree under `.claude/worktrees/`, it would cut a release from that worktree's
+branch and point the live service at it — exactly the hazard the `post-merge` hook guards on every
+`git pull`. Both now share one check, `scripts/lib/deploy-guard.sh`: the deploy checkout is named
+(`SPO_SOURCE_REPO`, default `~/SPO-Pipeline`) and the deploy branch is named (`SPO_DEPLOY_BRANCH`,
+default `main`), not inferred from where either is run, and `daemon-install.sh` refuses (exit
+non-zero, nothing written) outside them. See `doc/operating.md` § Deploying.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
 default nonzero (see "Report intake" above), so a freshly installed unit already files raw report

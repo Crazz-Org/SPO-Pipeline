@@ -360,7 +360,7 @@ All three exposures above close outright, and the self-update case stops arising
 |---|---|
 | `orchestrator/state-root.js` | `queue/` and `journal/` default to `~/.spo-state` (`SPO_STATE_DIR`). Explicit `--queue`/`--journal` still win outright. |
 | `scripts/release.sh` | build a release, switch, prune, roll back, restart. `--list`, `--rollback`, `--no-restart`. |
-| `scripts/daemon-install.sh`, `scripts/dashboard-install.sh` | units run from `~/.spo-current`; the daemon installer cuts the initial release. |
+| `scripts/daemon-install.sh`, `scripts/dashboard-install.sh` | units run from `~/.spo-current`; the daemon installer cuts the initial release, and refuses (via `scripts/lib/deploy-guard.sh`) outside the deploy checkout and branch — `dashboard-install.sh` is not guarded. |
 | `scripts/git-hooks/post-merge` | decides *whether* to deploy, then delegates everything else to `release.sh`. |
 
 **`git clone --local`, not `git worktree add`.** A linked worktree keeps its administrative data
@@ -393,6 +393,10 @@ exactly as a pull in the main checkout does (measured 2026-09-04). While the hoo
 services that was untidy; cutting a release there would **deploy that agent's branch**. So the
 deploy checkout is named (`SPO_SOURCE_REPO`, default `~/SPO-Pipeline`) rather than inferred, the
 branch is checked (`SPO_DEPLOY_BRANCH`, default `main`), and every other tree is skipped out loud.
+The check itself is not the hook's alone: it lives in `scripts/lib/deploy-guard.sh`, shared with
+`scripts/daemon-install.sh`, which refuses on the same rule outside the same checkout and branch
+— at a non-zero exit, where the hook skips at 0 so a pull is never aborted — one rule, so a
+hand-run install and a `git pull` can never disagree about which tree may deploy.
 
 **`GIT_*` is stripped in both scripts.** A git hook exports `GIT_DIR`, so unstripped, every
 `git clone`/`git -C` in `release.sh` would act on the hook's repository rather than the one named
