@@ -477,21 +477,30 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   `spawnSync` deadline, so a duration and the deadline bounding it can no longer disagree the
   way a realtime reading and that deadline once did.
   Account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
-  `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled right after `parked` on
-  a bounded-retry-eligible reason, once the queue entry is written — the task never reaches the
-  `PARKED` state itself; `transient-retry-failed`, `{reason, attempt, error}`, when that write
-  failed and the task fell through to an ordinary park instead), and pool-exhaustion waits (card
-  #119 action 1.2 — `pool-wait`, `{reason, attempt, waitMs, accumulatedWaitMs, notBefore,
-  deadlineSource}`, journalled the same way, right after `parked`, once the queue entry carrying
-  the deferred `notBefore` is written — the task never reaches `PARKED`; `deadlineSource` names
-  which of the three resolution steps supplied the deadline (`earliestCooldownUntil`,
-  `cooldownUntilIso`, or `reason-suffix`); `pool-wait-failed`, `{reason, attempt, error}`, when
-  that write failed and the task fell through to an ordinary park instead — same shape and same
-  reasoning as `transient-retry-failed`, a SEPARATE mechanism with its own budget; and, since card
-  #119 action 1.3, `pool-wait-cap-exceeded`, `{reason, poolWaitAttempts, accumulatedWaitMs, capMs,
-  deadlineMs}`, journalled right after `parked` when the accumulated wait WOULD exceed the cap —
-  `reason` here is the ORIGINAL family reason that triggered the wait, not the new
-  `all-accounts-cooling-wait-cap-exceeded` reason the task actually parks under; this event is the
+  `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled on the re-enqueue itself,
+  once the queue entry is written, with NO `parked` line — the task never reaches the `PARKED`
+  state at all, it comes back around through `takeNextTask`; card #178: an earlier version of this
+  mechanism journalled a `parked` line immediately before `transient-retry`, which made
+  `countRepeatedParks` and `decidePlanReuse` (`orchestrator/park-loop.js` and
+  `orchestrator/state-machine.js` respectively) treat a bounded auto-retry as a real park — fixed
+  by dropping that line, since `transient-retry` already names the re-enqueue with its attempt,
+  delay and `notBefore` (the park `detail` it does not carry is journalled by the producing step);
+  `transient-retry-failed`, `{reason, attempt, error}`, when
+  that write failed and the task fell through to an ordinary park instead), and pool-exhaustion
+  waits (card #119 action 1.2 — `pool-wait`, `{reason, attempt, waitMs, accumulatedWaitMs,
+  notBefore, deadlineSource}`, journalled the same way, on the re-enqueue with NO `parked` line,
+  once the queue entry carrying the deferred `notBefore` is written — the task never reaches
+  `PARKED`, same card #178 fix as `transient-retry` above; `deadlineSource` names which of the
+  three resolution steps supplied the deadline (`earliestCooldownUntil`, `cooldownUntilIso`, or
+  `reason-suffix`); `pool-wait-failed`, `{reason, attempt, error}`, when that write failed and the
+  task fell through to an ordinary park instead — same shape and same reasoning as
+  `transient-retry-failed`, a SEPARATE mechanism with its own budget; and, since card #119 action
+  1.3, `pool-wait-cap-exceeded`, `{reason, poolWaitAttempts, accumulatedWaitMs, capMs, deadlineMs}`,
+  journalled when the accumulated wait WOULD exceed the cap — `reason` here is
+  the ORIGINAL family reason that triggered the wait, not the new
+  `all-accounts-cooling-wait-cap-exceeded` reason the task actually parks under; this event IS one
+  that reaches PARKED (the cap sink falls through to the ordinary park, unlike the two re-enqueue
+  paths above), so it is journalled right before the one real `parked` line; this event is the
   audit trail for the cap binding, the park's own `reason`/detail carry the rest of the evidence).
 - `journal/daemon.jsonl` — the daemon-scoped sibling of the per-task journals (dispatcher
   `worker-spawn`/`worker-exit`, the intake/confirm/triage scanners' own

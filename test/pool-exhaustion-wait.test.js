@@ -336,6 +336,11 @@ test('LOOP GUARD: finalizePark called with the cap-exceeded reason itself, and a
   assert.equal(queuedFiles(config.queueDir).length, 0, 'no queue entry must ever be written for this reason');
   assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait'), 'the wait branch must never fire for this reason');
   assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'pool-wait-cap-exceeded'), 'the cap check itself must never re-run for a reason that is already the cap sink');
+  // Card #178 sibling check: this reason never reaches the :2420 re-enqueue emit that was deleted
+  // (poolCooldownDeadlineMs returns null for it BEFORE either detail key is read, gating the whole
+  // pool branch at :2333-2335), so it must be entirely unaffected by that fix -- exactly one real
+  // `parked` line, same as always.
+  assert.equal(readJournal(ctx.taskDir).filter((e) => e.event === 'parked').length, 1, 'a real park -- exactly one parked line, unaffected by the re-enqueue emit removal');
 });
 
 test('poolCooldownDeadlineMs: all-accounts-cooling-wait-cap-exceeded always resolves to null, explicitly, even with a valid deadline in its detail', () => {
@@ -763,28 +768,28 @@ test('T2 (card #173, over-count): a capped park followed by a DIFFERENT (ordinar
   assert.ok(!journal2.some((e) => e.event === 'park-repeat'), 'no park-repeat event for a streak of 1');
 });
 
-test('T3: exactly one `parked` line per finalizePark call, on every path -- both re-enqueue-SUCCESS paths, cap-exceeded, re-enqueue-failure, and ordinary', () => {
-  // (a) transient-retry re-enqueued (early return): this path never reaches the pool-wait
-  // branch's cap-exceeded reassignment at all, so its own `appendEvent(..., 'parked', ...)` --
-  // added inside `if (requeuedFile) {` alongside the fix -- must be the ONLY parked line, and
-  // must carry the reason this call was made with, unreassigned.
+test('T3 (card #178, phantom park): ZERO `parked` lines on either re-enqueue-SUCCESS path, exactly one on cap-exceeded, re-enqueue-failure, and ordinary', () => {
+  // (a) transient-retry re-enqueued (early return): this path never reaches PARKED at all -- it
+  // comes back around through takeNextTask -- so it must journal NO `parked` line, only its own
+  // `transient-retry` event. An earlier version of finalizePark journalled a `parked` line here
+  // too (immediately before `transient-retry`), which is exactly the card #178 defect: two bounded
+  // auto-retries followed by one genuine park under the same reason+detail made countRepeatedParks
+  // (park-loop.js) return 3 instead of 1, firing `park-repeat` on a card's first-ever real park.
   const transConfig = testConfig();
   const transCtx = buildParkCtx({ config: transConfig });
   finalizePark(transCtx, 'WORKTREE', 'claim-rate-limited', { exit: 4 });
   const transJournal = readJournal(transCtx.taskDir);
   assert.ok(transJournal.some((e) => e.event === 'transient-retry'), 'sanity: this really is the transient-retry re-enqueue-success path');
-  assert.equal(transJournal.filter((e) => e.event === 'parked').length, 1, 'transient-retry re-enqueue-success path');
-  assert.equal(transJournal.find((e) => e.event === 'parked').reason, 'claim-rate-limited', 'unreassigned -- this path never reaches the cap-exceeded branch');
+  assert.equal(transJournal.filter((e) => e.event === 'parked').length, 0, 'transient-retry re-enqueue-success path must journal no parked line -- the card was not parked');
 
-  // (b) pool-wait re-enqueued (early return): same shape as (a), for the sibling branch's own
-  // `appendEvent(..., 'parked', ...)` added inside ITS `if (requeuedFile) {`.
+  // (b) pool-wait re-enqueued (early return): same shape as (a), for the sibling branch -- must
+  // also journal no `parked` line, only its own `pool-wait` event.
   const poolConfig = testConfig();
   const poolCtx = buildParkCtx({ config: poolConfig });
   finalizePark(poolCtx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(Date.now() + 60000).toISOString() });
   const poolJournal = readJournal(poolCtx.taskDir);
   assert.ok(poolJournal.some((e) => e.event === 'pool-wait'), 'sanity: this really is the pool-wait re-enqueue-success path');
-  assert.equal(poolJournal.filter((e) => e.event === 'parked').length, 1, 'pool-wait re-enqueue-success path');
-  assert.equal(poolJournal.find((e) => e.event === 'parked').reason, 'all-accounts-cooling-after-retry', 'unreassigned -- this path never reaches the cap-exceeded branch');
+  assert.equal(poolJournal.filter((e) => e.event === 'parked').length, 0, 'pool-wait re-enqueue-success path must journal no parked line -- the card was not parked');
 
   // (c) cap-exceeded
   const capConfig = testConfig();

@@ -2189,12 +2189,35 @@ function finalizePark(ctx, lastState, reason, detail) {
   // runs, recorded the ORIGINAL pool reason for every capped park while state.json, report.md,
   // daemon.jsonl, alertPark, and postParkComment all recorded the reassigned one, so a capped
   // park's own journal line never matched itself and countRepeatedParks (park-loop.js) silently
-  // under-counted it (see this action's own header/spec for the measured symptom). The two
-  // re-enqueue branches immediately below never reach the reassignment -- each emits its own
-  // `parked` line, under the reason it was called with, before its own retry/wait event, so the
-  // per-call order (parked, then the evidence for why it isn't a park after all) is unchanged for
-  // those two paths. The ordinary park path's `parked` line is emitted once, after the branches
-  // close (see the comment there).
+  // under-counted it (see this action's own header/spec for the measured symptom).
+  //
+  // Card #178 (phantom park): the two re-enqueue branches immediately below journal ONLY their own
+  // `transient-retry` / `pool-wait` event -- never a `parked` line, because a card that takes
+  // either branch is NOT parked; it is re-enqueued and comes back around through takeNextTask.
+  // This used to be a `parked` line emitted right before that event, on the theory that it recorded
+  // "the reason this attempt ended", but a `parked` event in this journal is exactly what nine
+  // separate readers (countRepeatedParks in park-loop.js, called from this function at the
+  // ordinary park below, and decidePlanReuse in this file, among them) treat as proof the task
+  // actually reached the PARKED state -- and it hadn't. Two bounded, silent auto-retries followed
+  // by one genuine budget-exhausted park under the SAME reason+detail made countRepeatedParks
+  // return 3 instead of 1, firing `park-repeat` on a card's first-ever real park; and
+  // decidePlanReuse's own condition 6 (its header comment, above) reads the MOST RECENT `parked`
+  // event to decide whether the plan on disk is still safe to reuse -- a phantom one from a
+  // re-enqueue could shadow an earlier, genuinely plan-invalidating park and flip that verdict
+  // from refuse (null) to reuse. `transient-retry`/`pool-wait` already name the re-enqueue with its
+  // own attempt, delay and `notBefore` (`{reason, attempt, delayMs, notBefore}` / `{reason,
+  // attempt, waitMs, accumulatedWaitMs, notBefore, deadlineSource}`), so any reader that needs a
+  // "this run cycle ended in a re-enqueue, not a park" boundary already has one to key on, and a
+  // new event name would only duplicate it. They are deliberately NOT a superset: the deleted
+  // line's `detail` is not carried. For every `gate-*` transient reason the producing step already
+  // journals its own detail-bearing event before throwing (steps/scripted.js), and
+  // `claim-rate-limited`'s `exit` is on the `spawn` event; the one field genuinely dropped is
+  // `all-accounts-cooling-after-retry`'s `lastResult` (state-machine.js's own pool ParkSignal),
+  // which carries the whole LLM reply string and has no business being spooled into journal.jsonl
+  // on a re-enqueue that is not a park. The ordinary park path's `parked` line -- the only one this
+  // function ever appends to the PER-TASK journal (the daemon.jsonl `parked` line further down is a
+  // separate feed) -- is emitted once, after both branches close (see the comment there), which is
+  // also the only place a real PARKED state.json/report.md gets written.
   //
   // action 4.4: eligibility for the bounded auto-retry above, checked BEFORE any of the ordinary
   // park machinery below (the board move, the park comment, the PARKED state.json/report.md) --
@@ -2299,11 +2322,9 @@ function finalizePark(ctx, lastState, reason, detail) {
         });
       }
       if (requeuedFile) {
-        // Journalled here, not at the top of finalizePark (see that comment) -- this path never
-        // reaches the cap-exceeded reassignment below, so `reason` is still exactly the value
-        // this call was made with. Order preserved: `parked` still precedes `transient-retry`,
-        // matching every existing reader of this journal (test/transient-retry.test.js).
-        appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
+        // Card #178: no `parked` line here -- this path never reaches PARKED at all, it
+        // re-enqueues. `transient-retry` alone (see finalizePark's own header comment) is the
+        // complete, correct record of this run cycle.
         appendEvent(ctx.taskDir, lastState, 'transient-retry', { reason, attempt, delayMs, notBefore });
         return; // not parked -- see the header comment above; every write below is skipped.
       }
@@ -2413,11 +2434,9 @@ function finalizePark(ctx, lastState, reason, detail) {
           });
         }
         if (requeuedFile) {
-          // Journalled here, not at the top of finalizePark (see that comment) -- this path
-          // returns before reaching the cap-exceeded reassignment in the enclosing `else` below,
-          // so `reason` is still exactly the value this call was made with. Order preserved:
-          // `parked` still precedes `pool-wait`, mirroring the transient-retry branch above.
-          appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
+          // Card #178: no `parked` line here, mirroring the transient-retry branch above -- this
+          // path also returns before reaching PARKED. `pool-wait` alone (see finalizePark's own
+          // header comment) is the complete, correct record of this run cycle.
           appendEvent(ctx.taskDir, lastState, 'pool-wait', {
             reason,
             attempt,
@@ -2474,9 +2493,9 @@ function finalizePark(ctx, lastState, reason, detail) {
   // reason, while countRepeatedParks (just below) was called with the reassigned cap reason, so
   // neither line matched the query and the streak counted 0 instead of 2. One emit here, after
   // the reassignment, is what makes the journal's reason and countRepeatedParks' query the same
-  // string. The two re-enqueue branches above never reach this line -- each journals its own
-  // `parked` event, under its own (unreassigned) reason, immediately before returning; see the
-  // comments there.
+  // string. Card #178: the two re-enqueue branches above never reach this line at all, and journal
+  // no `parked` event of their own -- see finalizePark's own header comment for why a `parked` line
+  // for a card that was not parked is a defect, not a redundant record.
   appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
 
   // Loop breaker for card #385's exact failure mode: branch-unmerged-leftover parked four times
