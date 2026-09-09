@@ -29,7 +29,7 @@ const {
   ACCOUNT_POOL_PARK_REASON_FAMILY,
   TRANSIENT_RETRY_REASONS,
 } = require('../orchestrator/state-machine');
-const { reEnqueueTask } = require('../orchestrator/park-loop');
+const { reEnqueueTask, countRepeatedParks } = require('../orchestrator/park-loop');
 const { mkTmp } = require('./helpers');
 
 function ok(stdout = '') {
@@ -628,4 +628,183 @@ test('only a HUMAN retry resets either allowance: reEnqueueTask called without e
   assert.equal(written.transientRetries, undefined, 'and the full transient budget');
   assert.equal(written.notBefore, undefined, 'and starts immediately');
   assert.match(path.basename(file), /^0000-retry-h-/, "a human's retry is class 'h'");
+});
+
+// ==== part 12: card #173 -- the journal must name the reason a park ACTUALLY parks under =========
+//
+// finalizePark used to journal `parked` as its FIRST statement, before the cap-exceeded branch's
+// `reason`/`detail` reassignment further down had run. Every other reader of a capped park
+// (state.json, report.md, daemon.jsonl, alertPark, postParkComment) read the REASSIGNED reason;
+// the per-task journal alone kept naming the ORIGINAL pool reason. MEASURED: two successive
+// byte-identical capped parks both journalled the ORIGINAL pool reason, while countRepeatedParks
+// (whose own header documents "the park just journaled by the caller is itself included and
+// always matches itself, so the result is never less than 1") was CALLED, at the bottom of
+// finalizePark, with the reassigned cap reason -- so neither journalled line matched the query
+// and the streak counted 0 instead of 2. The fix moves the single `parked` emit for the
+// ordinary/cap-exceeded paths to after the cap branch closes, so it observes the reassignment and
+// journals the same string the query is made with. Both tests below are built to FAIL if that
+// emit is ever moved back to the top of finalizePark -- see each test's own comment for the exact
+// failure shape under that mutation.
+
+test('T1 (card #173, under-count): two successive byte-identical capped parks are counted by countRepeatedParks, and fire park-repeat', () => {
+  const config = testConfig(); // poolExhaustionWaitCapMs: 12h
+  const cap = config.poolExhaustionWaitCapMs;
+  // priorWaitMs already over the cap, and a PAST deadline (waitMs clamps to 0 via
+  // `Math.max(0, deadlineMs - now)`) -- so `accumulated === priorWaitMs` exactly, on both calls,
+  // with no millisecond drift from wall-clock timing between the two finalizePark calls. Same
+  // ctx/ctx.task for both calls: finalizePark never mutates ctx.task, so priorWaitMs/priorAttempts
+  // read identically both times.
+  const ctx = buildParkCtx({ config, task: { poolWaitMs: cap + 1, poolWaitAttempts: 3 } });
+  const pastDeadline = Date.now() - 5 * 60 * 1000;
+  const reason = 'all-accounts-cooling-after-retry';
+  const detail = { cooldownUntilIso: new Date(pastDeadline).toISOString() };
+
+  finalizePark(ctx, 'PLAN', reason, detail);
+  finalizePark(ctx, 'PLAN', reason, detail);
+
+  const journal = readJournal(ctx.taskDir);
+  const parkedEvents = journal.filter((e) => e.event === 'parked');
+  assert.equal(parkedEvents.length, 2, 'exactly one parked line per finalizePark call');
+  for (const evt of parkedEvents) {
+    assert.equal(
+      evt.reason,
+      'all-accounts-cooling-wait-cap-exceeded',
+      'the journal must name the REASSIGNED cap reason -- under the pre-fix mutation this reads the original pool reason instead'
+    );
+  }
+  assert.deepEqual(parkedEvents[0].detail, parkedEvents[1].detail, 'same task, same input, same clamped-to-zero wait -- the reassigned detail must be byte-identical across both runs');
+
+  // Query with the LITERAL cap reason and a detail object CONSTRUCTED HERE, independent of the
+  // journal -- exactly what finalizePark's own countRepeatedParks call is made with, after the
+  // cap-exceeded reassignment (accumulated = priorWaitMs + 0, since the deadline is in the past;
+  // deadlineMs is this test's own `pastDeadline`, byte-identical to what
+  // `poolCooldownDeadlineMs` recovers from `cooldownUntilIso`). Reading reason/detail back OUT OF
+  // THE JOURNAL instead (as an earlier version of this test did) is tautological: under the
+  // mutation the journal is self-consistent too (both lines carry the ORIGINAL reason), so a
+  // query built from the journal's own lines still returns 2 and the assertion cannot fail.
+  const expectedReason = 'all-accounts-cooling-wait-cap-exceeded';
+  const expectedDetail = {
+    cooldownUntilIso: detail.cooldownUntilIso,
+    accumulatedWaitMs: cap + 1,
+    poolWaitAttempts: 3,
+    capMs: cap,
+    deadlineMs: pastDeadline,
+    originalReason: reason,
+  };
+  const count = countRepeatedParks(journal, expectedReason, expectedDetail);
+  assert.equal(
+    count,
+    2,
+    "countRepeatedParks' own documented invariant: the park just journaled is itself included, so it is never less than 1 -- two identical capped parks in a row must count as 2"
+  );
+
+  const repeatEvents = journal.filter((e) => e.event === 'park-repeat');
+  assert.equal(repeatEvents.length, 1, 'a park-repeat event must fire once the streak reaches 2');
+  assert.equal(repeatEvents[0].reason, 'all-accounts-cooling-wait-cap-exceeded');
+  assert.equal(repeatEvents[0].repeat, 2);
+});
+
+test('T2 (card #173, over-count): a capped park followed by a DIFFERENT (ordinary) park under the original reason must not be counted as a repeat', () => {
+  // Same taskDir for both calls (so the journal accumulates across them), two different ctx
+  // objects (buildParkCtx always mints a fresh taskDir, so this one is built by hand).
+  const journalRoot = mkTmp('spo-poolwait-journal-');
+  const taskDir = path.join(journalRoot, 'card-1');
+  fs.mkdirSync(taskDir, { recursive: true });
+
+  const cap = testConfig().poolExhaustionWaitCapMs;
+  const pastDeadline = Date.now() - 5 * 60 * 1000;
+  // The `-until-` family member: its deadline is recoverable from the REASON SUFFIX itself
+  // (poolCooldownDeadlineMs's last-resort parse), so `detail` carries NO deadline keys at all and
+  // can be byte-identical between the capped park and the ordinary park that follows it.
+  const reason = `all-accounts-cooling-until-${new Date(pastDeadline).toISOString()}`;
+  const detail = { checkedAccounts: ['a'] };
+
+  // park 1: queueDir present, poolWaitMs already over the cap -> enters the pool branch, CAPPED,
+  // reason/detail reassigned.
+  const config1 = testConfig();
+  const ctx1 = buildCtx(
+    'card-1',
+    { id: 'card-1', kind: 'card', issue: 1, title: 'x', poolWaitMs: cap + 1, poolWaitAttempts: 3 },
+    taskDir,
+    { ...config1, deps: { spawnSync: () => ok('') } }
+  );
+  finalizePark(ctx1, 'PLAN', reason, detail);
+
+  const parked1 = readJournal(taskDir).filter((e) => e.event === 'parked');
+  assert.equal(parked1.length, 1);
+  assert.equal(parked1[0].reason, 'all-accounts-cooling-wait-cap-exceeded', 'sanity: park 1 really is the capped park');
+
+  // park 2: the SAME reason string and SAME detail as the call above, but no queueDir configured
+  // -- the pool branch's own inner guard (`typeof poolQueueDir === 'string' && poolQueueDir !== ''`,
+  // the same guard test/pool-exhaustion-wait.test.js's own "a config with no queueDir parks
+  // honestly" test exercises) fails before the cap is even checked, so this call never enters the
+  // pool branch at all and falls straight through to the ordinary park under the ORIGINAL reason
+  // and detail it was called with -- unreassigned.
+  const { queueDir, ...config2 } = testConfig();
+  const ctx2 = buildCtx('card-1', { id: 'card-1', kind: 'card', issue: 1, title: 'x' }, taskDir, {
+    ...config2,
+    deps: { spawnSync: () => ok('') },
+  });
+  finalizePark(ctx2, 'PLAN', reason, detail);
+
+  const journal2 = readJournal(taskDir);
+  const parked2 = journal2.filter((e) => e.event === 'parked');
+  assert.equal(parked2.length, 2, 'exactly one parked line per finalizePark call');
+  assert.equal(parked2[1].reason, reason, 'park 2 must journal the ORIGINAL until-reason -- it never entered the cap branch');
+  assert.deepEqual(parked2[1].detail, detail, 'and the exact detail it was called with, with no deadline keys added');
+  assert.notEqual(parked2[1].reason, parked1[0].reason, 'sanity: the two parks really do carry different reasons');
+
+  // Under the pre-fix mutation (journal at the top of finalizePark), park 1 would journal the
+  // ORIGINAL until-reason with this same detail (the reassignment had not happened yet when the
+  // journal line was written), and park 2 journals the identical until-reason/detail again --
+  // count 2, park-repeat fires, and this assertion fails.
+  const count = countRepeatedParks(journal2, parked2[1].reason, parked2[1].detail);
+  assert.equal(count, 1, 'park 2 is not a repeat of park 1 -- they park under different reasons and must not be conflated');
+  assert.ok(!journal2.some((e) => e.event === 'park-repeat'), 'no park-repeat event for a streak of 1');
+});
+
+test('T3: exactly one `parked` line per finalizePark call, on every path -- both re-enqueue-SUCCESS paths, cap-exceeded, re-enqueue-failure, and ordinary', () => {
+  // (a) transient-retry re-enqueued (early return): this path never reaches the pool-wait
+  // branch's cap-exceeded reassignment at all, so its own `appendEvent(..., 'parked', ...)` --
+  // added inside `if (requeuedFile) {` alongside the fix -- must be the ONLY parked line, and
+  // must carry the reason this call was made with, unreassigned.
+  const transConfig = testConfig();
+  const transCtx = buildParkCtx({ config: transConfig });
+  finalizePark(transCtx, 'WORKTREE', 'claim-rate-limited', { exit: 4 });
+  const transJournal = readJournal(transCtx.taskDir);
+  assert.ok(transJournal.some((e) => e.event === 'transient-retry'), 'sanity: this really is the transient-retry re-enqueue-success path');
+  assert.equal(transJournal.filter((e) => e.event === 'parked').length, 1, 'transient-retry re-enqueue-success path');
+  assert.equal(transJournal.find((e) => e.event === 'parked').reason, 'claim-rate-limited', 'unreassigned -- this path never reaches the cap-exceeded branch');
+
+  // (b) pool-wait re-enqueued (early return): same shape as (a), for the sibling branch's own
+  // `appendEvent(..., 'parked', ...)` added inside ITS `if (requeuedFile) {`.
+  const poolConfig = testConfig();
+  const poolCtx = buildParkCtx({ config: poolConfig });
+  finalizePark(poolCtx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(Date.now() + 60000).toISOString() });
+  const poolJournal = readJournal(poolCtx.taskDir);
+  assert.ok(poolJournal.some((e) => e.event === 'pool-wait'), 'sanity: this really is the pool-wait re-enqueue-success path');
+  assert.equal(poolJournal.filter((e) => e.event === 'parked').length, 1, 'pool-wait re-enqueue-success path');
+  assert.equal(poolJournal.find((e) => e.event === 'parked').reason, 'all-accounts-cooling-after-retry', 'unreassigned -- this path never reaches the cap-exceeded branch');
+
+  // (c) cap-exceeded
+  const capConfig = testConfig();
+  const capCtx = buildParkCtx({ config: capConfig, task: { poolWaitMs: capConfig.poolExhaustionWaitCapMs + 1, poolWaitAttempts: 1 } });
+  finalizePark(capCtx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(Date.now() + 60000).toISOString() });
+  assert.equal(readJournal(capCtx.taskDir).filter((e) => e.event === 'parked').length, 1, 'cap-exceeded path');
+
+  // (d) re-enqueue-failure (pool-wait-failed): a blocked queueDir makes reEnqueueTask throw.
+  const blocker = path.join(mkTmp('spo-poolwait-blocked-'), 'not-a-dir');
+  fs.writeFileSync(blocker, 'x');
+  const failConfig = testConfig({ queueDir: path.join(blocker, 'queue') });
+  const failCtx = buildParkCtx({ config: failConfig });
+  finalizePark(failCtx, 'PLAN', 'all-accounts-cooling-after-retry', { cooldownUntilIso: new Date(Date.now() + 60000).toISOString() });
+  const failJournal = readJournal(failCtx.taskDir);
+  assert.equal(failJournal.filter((e) => e.event === 'parked').length, 1, 're-enqueue-failure path');
+  assert.ok(failJournal.some((e) => e.event === 'pool-wait-failed'), 'sanity: this really is the failure path');
+
+  // (e) ordinary park -- no branch taken at all (an unrelated, non-pool, non-transient reason).
+  const ordConfig = testConfig();
+  const ordCtx = buildParkCtx({ config: ordConfig });
+  finalizePark(ordCtx, 'PLAN', 'plan-invalid', {});
+  assert.equal(readJournal(ordCtx.taskDir).filter((e) => e.event === 'parked').length, 1, 'ordinary park path');
 });

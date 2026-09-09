@@ -2183,8 +2183,19 @@ function isTransientRetryReason(reason, detail) {
 }
 
 function finalizePark(ctx, lastState, reason, detail) {
-  appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
-
+  // action 4.4 / card #173: NOT journalled here. The journal must name the reason this call
+  // ACTUALLY parks under, and the pool-wait branch's cap-exceeded `else` further down reassigns
+  // `reason`/`detail` -- journalling at this point in the function, before that reassignment ever
+  // runs, recorded the ORIGINAL pool reason for every capped park while state.json, report.md,
+  // daemon.jsonl, alertPark, and postParkComment all recorded the reassigned one, so a capped
+  // park's own journal line never matched itself and countRepeatedParks (park-loop.js) silently
+  // under-counted it (see this action's own header/spec for the measured symptom). The two
+  // re-enqueue branches immediately below never reach the reassignment -- each emits its own
+  // `parked` line, under the reason it was called with, before its own retry/wait event, so the
+  // per-call order (parked, then the evidence for why it isn't a park after all) is unchanged for
+  // those two paths. The ordinary park path's `parked` line is emitted once, after the branches
+  // close (see the comment there).
+  //
   // action 4.4: eligibility for the bounded auto-retry above, checked BEFORE any of the ordinary
   // park machinery below (the board move, the park comment, the PARKED state.json/report.md) --
   // a card that takes this branch is not parked and must not look parked to `spo parked`, the
@@ -2288,6 +2299,11 @@ function finalizePark(ctx, lastState, reason, detail) {
         });
       }
       if (requeuedFile) {
+        // Journalled here, not at the top of finalizePark (see that comment) -- this path never
+        // reaches the cap-exceeded reassignment below, so `reason` is still exactly the value
+        // this call was made with. Order preserved: `parked` still precedes `transient-retry`,
+        // matching every existing reader of this journal (test/transient-retry.test.js).
+        appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
         appendEvent(ctx.taskDir, lastState, 'transient-retry', { reason, attempt, delayMs, notBefore });
         return; // not parked -- see the header comment above; every write below is skipped.
       }
@@ -2397,6 +2413,11 @@ function finalizePark(ctx, lastState, reason, detail) {
           });
         }
         if (requeuedFile) {
+          // Journalled here, not at the top of finalizePark (see that comment) -- this path
+          // returns before reaching the cap-exceeded reassignment in the enclosing `else` below,
+          // so `reason` is still exactly the value this call was made with. Order preserved:
+          // `parked` still precedes `pool-wait`, mirroring the transient-retry branch above.
+          appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
           appendEvent(ctx.taskDir, lastState, 'pool-wait', {
             reason,
             attempt,
@@ -2442,6 +2463,21 @@ function finalizePark(ctx, lastState, reason, detail) {
       }
     }
   }
+
+  // THE single `parked` line for every path that falls through to here (the ordinary park, the
+  // cap-exceeded park, and either re-enqueue that threw) -- placed after both branches close
+  // specifically so it observes whatever `reason`/`detail` the cap-exceeded `else` above
+  // reassigned them to. Card #173: journalling this at the TOP of finalizePark instead recorded
+  // the ORIGINAL pool reason in the per-task journal while every other reader of a capped park
+  // (state.json, report.md, daemon.jsonl, alertPark, postParkComment) recorded the reassigned
+  // one -- measured: two successive byte-identical capped parks both journalled the ORIGINAL pool
+  // reason, while countRepeatedParks (just below) was called with the reassigned cap reason, so
+  // neither line matched the query and the streak counted 0 instead of 2. One emit here, after
+  // the reassignment, is what makes the journal's reason and countRepeatedParks' query the same
+  // string. The two re-enqueue branches above never reach this line -- each journals its own
+  // `parked` event, under its own (unreassigned) reason, immediately before returning; see the
+  // comments there.
+  appendEvent(ctx.taskDir, lastState, 'parked', { reason, detail });
 
   // Loop breaker for card #385's exact failure mode: branch-unmerged-leftover parked four times
   // in a row, byte-identical reason and detail every time, because each preserveWorktreeWip
