@@ -153,7 +153,13 @@ test('finalizePark: claim-rate-limited, budget unused -> queued for retry (not p
   assert.ok(Date.parse(requeued.notBefore) <= Date.now() + 60000 + 5000, 'notBefore must reflect the 60s delay, not the 300s one');
 
   const events = readJournal(ctx.taskDir);
-  assert.ok(events.some((e) => e.event === 'parked' && e.reason === 'claim-rate-limited'), 'the parked event still fires first');
+  // Card #178 (phantom park): this used to assert the opposite -- that a `parked` line fires
+  // first, immediately before `transient-retry`. That contradicted this very file's own
+  // `daemonEvents(ctx)` invariant a few tests down ("daemon.jsonl must not claim a park that did
+  // not happen"): the per-task journal must not claim one either, for the identical reason -- the
+  // card was never parked, it was re-enqueued. A `parked` line here is exactly what
+  // countRepeatedParks and decidePlanReuse (state-machine.js) read as proof of a real park.
+  assert.ok(!events.some((e) => e.event === 'parked'), 'no parked event on the re-enqueue path -- the card was not parked');
   const retryEvt = events.find((e) => e.event === 'transient-retry');
   assert.ok(retryEvt);
   assert.equal(retryEvt.reason, 'claim-rate-limited');
