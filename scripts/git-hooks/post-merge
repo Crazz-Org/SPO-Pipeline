@@ -33,21 +33,23 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OB
 # untidy when the hook only restarted services; under the release layout it would be a live
 # hazard, because cutting a release from an agent worktree would DEPLOY THAT WORKTREE'S BRANCH.
 #
-# So the deploy checkout is named, not inferred, and every other tree is skipped out loud.
+# So the deploy checkout is named, not inferred, and every other tree is skipped out loud. The
+# check itself lives in scripts/lib/deploy-guard.sh, shared with scripts/daemon-install.sh -- one
+# rule, so the hook and the installer can never silently disagree about which tree may deploy.
+GUARD_LIB="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/deploy-guard.sh"
+if [ ! -r "$GUARD_LIB" ]; then
+  echo "!! post-merge: $GUARD_LIB missing or unreadable -- nothing deployed" >&2
+  exit 0
+fi
+# shellcheck source=../lib/deploy-guard.sh
+source "$GUARD_LIB"
+
 HERE="$(pwd -P)"
-SOURCE_REPO="$(cd "${SPO_SOURCE_REPO:-$HOME/SPO-Pipeline}" 2>/dev/null && pwd -P || echo "${SPO_SOURCE_REPO:-$HOME/SPO-Pipeline}")"
-DEPLOY_BRANCH="${SPO_DEPLOY_BRANCH:-main}"
-
-if [ "$HERE" != "$SOURCE_REPO" ]; then
-  echo "== post-merge: $HERE is not the deploy checkout ($SOURCE_REPO) -- nothing deployed"
+if ! deploy_guard_check "$HERE"; then
+  echo "== post-merge: $DEPLOY_GUARD_REASON -- nothing deployed"
   exit 0
 fi
-
-branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-if [ "$branch" != "$DEPLOY_BRANCH" ]; then
-  echo "== post-merge: $SOURCE_REPO is on '$branch', not '$DEPLOY_BRANCH' -- nothing deployed"
-  exit 0
-fi
+SOURCE_REPO="$DEPLOY_GUARD_SOURCE_REPO"
 
 RELEASE_SH="$SOURCE_REPO/scripts/release.sh"
 if [ ! -x "$RELEASE_SH" ]; then
