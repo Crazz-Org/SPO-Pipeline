@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# deploy-guard.sh -- "which tree may deploy", checked once and shared by the two callers that must
-# never be allowed to drift apart on the answer: scripts/daemon-install.sh (refuses to INSTALL the
-# unit from the wrong tree) and scripts/git-hooks/post-merge (refuses to DEPLOY a `git pull` from
-# the wrong tree). Each caller used to carry its own private copy of this check -- the hook had
-# one, the installer had none at all, and a duplicated (or missing) guard is exactly the hazard
-# this file exists to close: run daemon-install.sh from an agent worktree and it would deploy that
-# worktree's branch to the live service.
+# deploy-guard.sh -- "which tree may deploy", checked once and shared by the three callers that must
+# never be allowed to drift apart on the answer: scripts/daemon-install.sh and
+# scripts/dashboard-install.sh (each refuses to INSTALL its unit from the wrong tree) and
+# scripts/git-hooks/post-merge (refuses to DEPLOY a `git pull` from the wrong tree). Each caller
+# used to carry its own private copy of this check -- the hook had one, the installers had none at
+# all, and a duplicated (or missing) guard is exactly the hazard this file exists to close: run
+# daemon-install.sh from an agent worktree and it would deploy that worktree's branch to the live
+# service.
 #
 # Sourced, not executed: functions only, no side effect beyond the variables documented below, and
 # it NEVER calls `exit`. This file is sourced both by a script running under `set -euo pipefail`
@@ -18,9 +19,9 @@
 # that nothing at FILE scope, outside the function, can itself fail.
 #
 # It also deliberately does NOT decide the exit status of a refusal -- that is each caller's own
-# call, and the two disagree on purpose: the hook must treat a refusal as "skip, exit 0" so a pull
-# is never aborted by it, while the installer must treat the very same refusal as "exit non-zero"
-# so it can never be mistaken for a successful install.
+# call, and they disagree on purpose: the hook must treat a refusal as "skip, exit 0" so a pull is
+# never aborted by it, while the two installers must treat the very same refusal as "exit
+# non-zero" so it can never be mistaken for a successful install.
 
 # deploy_guard_check <tree>
 #

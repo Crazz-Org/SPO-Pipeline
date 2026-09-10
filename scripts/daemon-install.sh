@@ -35,8 +35,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # Run from an agent worktree under .claude/worktrees/<slug>/, this script would otherwise cut a
 # release from -- and point the live service at -- that worktree's own branch. The rule is shared,
 # not reinvented here: scripts/git-hooks/post-merge guards the exact same hazard on every `git
-# pull`, and both callers source scripts/lib/deploy-guard.sh so the rule cannot silently diverge
-# between the two places it is enforced.
+# pull`, and all three callers source scripts/lib/deploy-guard.sh so the rule cannot silently diverge
+# between the three places it is enforced.
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/deploy-guard.sh"
 if ! deploy_guard_check "$REPO"; then
   {

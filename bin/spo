@@ -104,12 +104,12 @@
 //                            --dry reports what would change and writes nothing. Run
 //                            automatically by `spo account add` and at every --real daemon
 //                            start. See doc/permissions.md.
-//   spo ask <text…>          Intake, fast lane: joins remaining argv as the free-text request,
+//   spo ask [--repo <owner/name>] <text…>  Intake, fast lane: joins remaining argv as the free-text request,
 //                            drafts a card (DRAFT_CARD, Sonnet 5), sends it to review-card
 //                            (Fable 5, the neutral judge), then files it on FILE/FILE_AMENDED or
 //                            prints the reason and files nothing on DO_NOT_FILE. See
 //                            orchestrator/intake.js and orchestrator/README.md § Intake.
-//                            --dry prints the draft + review verdict and files nothing.
+//                            --dry prints the draft + review verdict (and, action 184/185, the target repo/board intent) and files nothing. A LEADING `--repo <owner/name>` (or `--repo=<owner/name>`; anywhere else in argv is refused -- see extractRepoFlag) targets that repo, and its board too if one is mapped (orchestrator/project-board.js), instead of the default.
 //                            --draft-file <path>  Intake, brainstorm lane: skips the DRAFT_CARD
 //                            LLM call and reads an already-written draft JSON from <path>
 //                            instead (the hand-off point for an interactive session that
@@ -1424,9 +1424,12 @@ function cmdAccountClearCooldown(name, opts) {
 // <path>` is the brainstorm lane instead: an interactive session has already formalized its own
 // draft JSON, so this skips the DRAFT_CARD LLM call entirely (see orchestrator/intake.js's
 // loadDraftFile) and goes straight to review -> file. `--dry` (either lane) prints the draft +
-// verdict and files nothing. Exit 0 for every JUDGED outcome (FILE/FILE_AMENDED/DO_NOT_FILE);
-// non-zero only for a mechanical failure (no account, a bad LLM reply, a malformed --draft-file,
-// a failed gh call).
+// verdict and files nothing. Exit 0 for every JUDGED outcome (FILE/FILE_AMENDED/DO_NOT_FILE),
+// including a FILE/FILE_AMENDED that lands on no board because no project is mapped for its repo
+// (SHOULD-FIX, action 184/185: reported on stderr, not a failure); non-zero only for a mechanical
+// failure (no account, a bad LLM reply, a malformed --draft-file, a failed gh call, a malformed or
+// misplaced `--repo` -- see extractRepoFlag's own header -- or a board placement that failed for a
+// repo that IS mapped, action 184/185's own invisible-card guard).
 //
 // A stderr line, printed whenever draftCard/reviewCard retried after a deadline timeout, so the
 // maintainer sees the step ran twice instead of it silently costing double -- the interactive
@@ -1441,12 +1444,105 @@ function logRetryIfAny(stepName, result) {
   }
 }
 
+// extractRepoFlag(argsArray) -- action 184/185 (post-verification fix, F1-F4): `spo ask --repo
+// <owner/name>` pulls its target repo out of opts._ rather than out of parseArgs (near the top of
+// this file, well above the doc-constant-sweep-pinned lines this function sits beside) -- see
+// CLAUDE.md's own bin/spo line-number trap: test/doc-constant-sweep.test.js pins two specific
+// lines of this file by exact content (this comment deliberately does not spell them out as a
+// `file:N` pair -- doing so would itself register as a fresh citation for that same sweep to
+// verify), and parseArgs sits entirely above the earlier of the two, so no line may be inserted or
+// deleted there. `--repo` (both `--repo VALUE` and `--repo=VALUE`) is unrecognized by parseArgs,
+// so it lands as an ordinary entry (or two) in opts._ (parseArgs's own `else opts._.push(a)`
+// catch-all).
+//
+// DESIGN (F3/F4 -- the original version of this function spliced out the FIRST `--repo` pair
+// wherever it sat in argv, which let `--repo` embedded in the middle of prose silently retarget
+// the card AND silently mangle the request text around it -- the worst of the four defects this
+// fix addresses, because it fails with no complaint at all). The fix is a strict one: `--repo` is
+// recognised ONLY when it is the very first token of argsArray, either as `--repo VALUE` (two
+// tokens) or `--repo=VALUE` (one token). Once that leading form (if any) is consumed, every
+// remaining token is scanned for a stray `--repo`/`--repo=...` -- ANYWHERE in there, whether it is
+// a second flag (duplicate) or a flag that was never leading to begin with (prose, or a trailing
+// flag after the request text), is refused as a hard usage error rather than silently swallowed or
+// silently left as prose. This deliberately drops the old trailing-flag convenience
+// (`spo ask fix it --repo X`) -- an extractor that sometimes eats prose is worse than one that
+// refuses anything it cannot place unambiguously.
+//
+// Returns {rest, raw, stray}: `raw` is `undefined` when no leading `--repo` was present (the
+// byte-identical default path), `null` when a leading `--repo` was present with nothing after it
+// (argv ran out mid-flag -- malformed, not "no flag"), otherwise the string that followed it
+// (still unvalidated against REPO_SHAPE_RE below -- shape validation is the caller's job). `stray`
+// is `null` when no misplaced/duplicate `--repo` token was found in the remainder, otherwise the
+// exact offending token -- the caller must refuse on this BEFORE looking at `raw` at all, since a
+// stray token past a valid leading `--repo` (the duplicate case) still carries a well-formed `raw`.
+function extractRepoFlag(argsArray) {
+  const first = argsArray[0];
+  let raw;
+  let rest;
+  if (first === '--repo') {
+    if (argsArray.length === 1) {
+      raw = null;
+      rest = [];
+    } else {
+      raw = argsArray[1];
+      rest = argsArray.slice(2);
+    }
+  } else if (typeof first === 'string' && first.startsWith('--repo=')) {
+    raw = first.slice('--repo='.length);
+    rest = argsArray.slice(1);
+  } else {
+    raw = undefined;
+    rest = argsArray;
+  }
+
+  const strayIdx = rest.findIndex((a) => typeof a === 'string' && (a === '--repo' || a.startsWith('--repo=')));
+  const stray = strayIdx === -1 ? null : rest[strayIdx];
+  return { rest, raw, stray };
+}
+
+// REPO_SHAPE_RE -- `owner/name`: exactly one '/' separating two non-empty runs of GitHub-legal
+// repo characters. Anything else (empty, no slash, multiple slashes, embedded whitespace) is
+// refused outright -- a malformed --repo must never silently resolve to the default instead.
+const REPO_SHAPE_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
 // `deps.intake` is a test-only override (default: the real orchestrator/intake.js module) --
 // same injection convention as everywhere else in this repo, applied at this one extra layer so
 // the test suite can drive the real CLI wiring (parseArgs -> cmdAsk's own dry/DO_NOT_FILE/filing
-// branches) against a fake intake module instead of a real `claude`/`gh` spawn.
+// branches) against a fake intake module instead of a real `claude`/`gh` spawn. `deps.projectBoard`
+// is the same convention for orchestrator/project-board.js, required lazily right here (not at
+// this file's own top, for the same line-pinning reason extractRepoFlag's header explains) so a
+// test can drive it against a fake instead of a real `gh api graphql` spawn.
 async function cmdAsk(opts, deps = {}) {
   const intakeImpl = deps.intake || intake;
+  const projectBoardImpl = deps.projectBoard || require('../orchestrator/project-board');
+
+  // See extractRepoFlag's own header. Both checks below are refused BEFORE any token-spending
+  // DRAFT_CARD/REVIEW_CARD call, same posture as the draftFile/requestText usage checks further
+  // down -- a malformed or misplaced --repo must not silently fall through to filing against the
+  // default repo, and must not silently fall through to being treated as request text either.
+  const { rest: askArgs, raw: repoRaw, stray } = extractRepoFlag(opts._);
+  // F3/F4: a `--repo` (or `--repo=...`) token found anywhere other than the leading position --
+  // whether that is a genuine duplicate past a valid leading flag, or a `--repo` that was never
+  // leading at all (prose, or a trailing flag after the request text) -- is refused before `raw`
+  // is even looked at, so a duplicate's well-formed leading value can never mask this.
+  if (stray) {
+    console.error(
+      `spo ask: --repo must come first -- it is only recognized as the very first token(s) of the ` +
+        `command, before any request text. Found "${stray}" later in the arguments. Use ` +
+        '`spo ask --repo <owner/name> <request text>` or `spo ask --repo=<owner/name> <request text>` instead.'
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (repoRaw === null || (repoRaw !== undefined && !REPO_SHAPE_RE.test(repoRaw))) {
+    console.error(
+      `spo ask: --repo requires an "owner/name" value (got ${JSON.stringify(repoRaw)}) -- note that ` +
+        'flags spo already recognizes (like --dry) are parsed out of the arguments before --repo ever ' +
+        'sees them, so the value shown here may really be the first word of your request text'
+    );
+    process.exitCode = 1;
+    return;
+  }
   // `spo ask` spends real tokens on DRAFT_CARD and REVIEW_CARD, and used to leave no record of
   // it anywhere: passing journalRoot is what makes intake.js journal each call's own `llm-call`
   // event into daemon.jsonl, so `spo tokens` / `spo status` count an interactive filing the same
@@ -1464,9 +1560,9 @@ async function cmdAsk(opts, deps = {}) {
     }
     draft = loaded.draft;
   } else {
-    const requestText = opts._.join(' ').trim();
+    const requestText = askArgs.join(' ').trim();
     if (!requestText) {
-      console.error('usage: spo ask <text…> | spo ask --draft-file <path>  [--dry]');
+      console.error('usage: spo ask [--repo <owner/name>] <text…> | spo ask --draft-file <path>  [--dry]');
       process.exitCode = 1;
       return;
     }
@@ -1489,7 +1585,23 @@ async function cmdAsk(opts, deps = {}) {
   }
   const review = reviewed.review;
 
+  // Computed unconditionally (dry or not) -- board placement (action 184/185) only ever runs for
+  // a repo project-board.js's own table maps (never SPO-WebClient/config.ghRepo -- its "Auto-add
+  // to project" workflow is what is meant to land a freshly filed issue in Todo; see intake.js's
+  // fileCard header and project-board.js's own, on how far that is actually confirmed). Off the
+  // repo actually used, not off whether --repo was passed, so an explicit
+  // `--repo <config.ghRepo's own value>` is ALSO a no-op board call, not a redundant one racing
+  // the workflow.
+  const effectiveGhRepo = repoRaw || defaultConfig.ghRepo;
+  const wouldPlaceOnBoard = Boolean(projectBoardImpl.projectNumberForRepo(effectiveGhRepo));
+
   if (opts.dry) {
+    // SHOULD-FIX (action 184/185): the dry-run output used to say nothing about --repo at all --
+    // a maintainer sanity-checking a filing before spending the tokens had no way to see which
+    // repo, or whether it would land on a board, from --dry output alone.
+    console.log(
+      `--repo: ${effectiveGhRepo} (${wouldPlaceOnBoard ? 'board placement would be attempted' : 'no board placement would be attempted'})`
+    );
     console.log('--- draft ---');
     console.log(JSON.stringify(draft, null, 2));
     console.log('--- review ---');
@@ -1503,12 +1615,40 @@ async function cmdAsk(opts, deps = {}) {
     return;
   }
 
-  const filed = intakeImpl.fileCard(draft, review, {});
+  const filed = intakeImpl.fileCard(draft, review, repoRaw ? { ghRepo: repoRaw } : {});
   if (!filed.ok) {
     console.error(filed.error);
     process.exitCode = 1;
     return;
   }
+
+  if (wouldPlaceOnBoard) {
+    const placed = projectBoardImpl.placeOnBoard(filed.issueNumber, effectiveGhRepo, deps);
+    if (!placed.ok) {
+      // The issue itself was filed successfully -- still tell the maintainer where it landed --
+      // but board placement failing is exactly the invisible-card defect this action exists to
+      // kill, so it is loud on stderr and non-zero on exit, never a silent partial success.
+      console.log(`${review.verdict}: filed #${filed.issueNumber}`);
+      console.log(filed.url);
+      console.error(
+        `spo ask: filed #${filed.issueNumber} (${filed.url}) but board placement failed: ${placed.error} -- ` +
+          'the card exists but is NOT correctly placed on the board (no/wrong Status = invisible); fix it by hand.'
+      );
+      process.exitCode = 1;
+      return;
+    }
+  } else if (repoRaw !== undefined) {
+    // SHOULD-FIX (action 184/185): an unmapped-but-valid --repo target files fine but touches no
+    // board at all -- say so explicitly on stderr (exit stays 0: filing itself succeeded) so a
+    // maintainer cannot mistake "no board complaint" for "the card was placed". Gated on
+    // `repoRaw !== undefined` so the byte-identical no-`--repo` default path (which is ALSO
+    // unmapped, on purpose -- see the comment above) prints nothing extra.
+    console.error(
+      `spo ask: filed #${filed.issueNumber} (${filed.url}) into ${effectiveGhRepo} -- no board placement ` +
+        'was attempted (no project is mapped for that repo); the card is NOT on any project board.'
+    );
+  }
+
   console.log(`${review.verdict}: filed #${filed.issueNumber}`);
   console.log(filed.url);
 }
@@ -1974,7 +2114,7 @@ function printUsage() {
     [
       'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
-      '            ask: [--dry] [--draft-file <path>]   pull: [--limit <n>] [--force]',
+      '            ask: [--repo <owner/name>|--repo=<owner/name>, LEADING only] [--dry] [--draft-file <path>]   pull: [--limit <n>] [--force]',
       '            intake: [--limit <n>] [--reports-dir <dir>] [--force]   reports: [--reports-dir <dir>]',
       '            triage: [--limit <n>] [--file]   (defaults to --dry)   OR   triage --retry <issue> [--file]',
       '            recette: [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]',
@@ -2058,4 +2198,18 @@ if (require.main === module) {
   run();
 }
 
-module.exports = { parseArgs, cmdAsk, cmdPull, cmdPullReports, cmdIntake, cmdReports, cmdTriage, cmdRecette, main };
+// extractRepoFlag exported for test/intake.test.js's own unit-level assertions on the four
+// action-184/185 parsing defects (F1-F4) -- see that function's own header. Not used by any other
+// module; cmdAsk is the only production call site.
+module.exports = {
+  parseArgs,
+  cmdAsk,
+  cmdPull,
+  cmdPullReports,
+  cmdIntake,
+  cmdReports,
+  cmdTriage,
+  cmdRecette,
+  extractRepoFlag,
+  main,
+};

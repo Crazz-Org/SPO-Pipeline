@@ -23,6 +23,10 @@ const spo = require('../bin/spo');
 const orchestratorConfig = require('../orchestrator/config');
 const { lockPath } = require('../orchestrator/lock');
 const { stateJournalRoot, stateQueueDir } = require('../orchestrator/state-root');
+// A genuine daemon-side consumer of config.ghRepo -- see "the daemon-untouched pin" section far
+// below for why this is required here rather than intake.js's fileCard (fileCard has exactly one
+// caller in the whole codebase, bin/spo's cmdAsk -- not a daemon call site at all).
+const parkLoop = require('../orchestrator/park-loop');
 
 function fakeSpawnSync(responder) {
   return (command, args, opts) => responder(command, args, opts);
@@ -1771,6 +1775,28 @@ function withExitCodeReset(fn) {
   };
 }
 
+// noNetworkProjectBoard() -- a `deps.projectBoard` fake with no `gh` reachability at all: this
+// repo's own rule (CLAUDE.md / the driver brief) is "inject the deps", not "rely on
+// test/no-real-spawn.js's killswitch as a backstop". Every cmdAsk test below that does NOT pass
+// its own `deps.projectBoard` override falls through to the REAL `orchestrator/project-board.js`
+// (bin/spo's own `deps.projectBoard || require(...)`) -- harmless today only because
+// PROJECT_NUMBER_BY_REPO has no entry for the default repo (Crazz-Org/SPO-WebClient), so
+// `projectNumberForRepo` returns null and `placeOnBoard` (the only function in that module that
+// actually spawns `gh`) is never reached. That is an accident of the CURRENT mapping table, not a
+// guarantee this test file enforces -- a future entry added for SPO-WebClient (or a bug in
+// `projectNumberForRepo` itself) would silently arm a real `gh api graphql` spawn from these
+// tests, caught only by the killswitch, if at all. Passing this fake removes that dependency
+// entirely: `projectNumberForRepo` always answers null (so `wouldPlaceOnBoard` is always false)
+// and `placeOnBoard` throws immediately if anything ever reaches it.
+function noNetworkProjectBoard() {
+  return {
+    projectNumberForRepo: () => null,
+    placeOnBoard: () => {
+      throw new Error('noNetworkProjectBoard: placeOnBoard must not be called by this test');
+    },
+  };
+}
+
 // Card #100 post-verification fix (F1): `refuseIfDaemonLockHeld` (bin/spo) ALWAYS checks the REAL
 // default journal root -- `stateJournalRoot(resolveStateRoot())` -- in addition to whatever
 // `--journal` a command's own opts resolve to (its own ANTI-EVASION note explains why: nothing on
@@ -1819,7 +1845,7 @@ test(
     const console_ = captureConsole();
     try {
       const opts = spo.parseArgs(['add', 'a', 'status', 'badge', '--dry']);
-      await spo.cmdAsk(opts, { intake: fakeIntake });
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
     } finally {
       console_.restore();
     }
@@ -1850,7 +1876,7 @@ test(
     const console_ = captureConsole();
     try {
       const opts = spo.parseArgs(['some', 'request', 'text']);
-      await spo.cmdAsk(opts, { intake: fakeIntake });
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
     } finally {
       console_.restore();
     }
@@ -1880,7 +1906,7 @@ test(
     const console_ = captureConsole();
     try {
       const opts = spo.parseArgs(['some', 'request']);
-      await spo.cmdAsk(opts, { intake: fakeIntake });
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
     } finally {
       console_.restore();
     }
@@ -1915,7 +1941,7 @@ test(
     const console_ = captureConsole();
     try {
       const opts = spo.parseArgs(['--draft-file', '/tmp/some-draft.json']);
-      await spo.cmdAsk(opts, { intake: fakeIntake });
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
     } finally {
       console_.restore();
     }
@@ -1943,7 +1969,7 @@ test(
     const console_ = captureConsole();
     try {
       const opts = spo.parseArgs(['--draft-file', '/tmp/x.json']);
-      await spo.cmdAsk(opts, { intake: fakeIntake });
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
     } finally {
       console_.restore();
     }
@@ -2552,7 +2578,7 @@ test(
     const console_ = captureConsole();
     try {
       const opts = spo.parseArgs(['add', 'a', 'badge', '--dry', '--journal', journalDir]);
-      await spo.cmdAsk(opts, { intake: fakeIntake });
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
     } finally {
       console_.restore();
     }
@@ -2563,3 +2589,718 @@ test(
     ]);
   })
 );
+
+// ---- spo ask --repo <owner/name> + board placement (action 184/185) --------------------------
+//
+// `--repo` is NOT a parseArgs flag (bin/spo:227-289 is above test/doc-constant-sweep.test.js's
+// line-pinned `bin/spo:1159`/`:1200` citations, and that test forbids inserting or deleting a
+// line there) -- cmdAsk pulls it back out of opts._ itself (bin/spo's own extractRepoFlag, right
+// above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
+// cmdAsk test in this file, never reimplementing the extraction here.
+//
+// Board placement goes through `deps.projectBoard` -- the same injection convention as
+// `deps.intake` -- so these tests never spawn a real `gh` process; orchestrator/project-board.js
+// has its own full gh-argv-level coverage in test/project-board.test.js.
+
+test(
+  'spo ask: no --repo resolves the default (Crazz-Org/SPO-WebClient) and makes NO board call',
+  withExitCodeReset(async () => {
+    let fileCardDeps = null;
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({
+        ok: true,
+        review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' },
+      }),
+      fileCard: (draft, review, deps) => {
+        fileCardDeps = deps;
+        return { ok: true, issueNumber: 42, url: 'https://github.com/Crazz-Org/SPO-WebClient/issues/42' };
+      },
+    };
+    // cmdAsk always CONSULTS the mapping table (so an explicit `--repo config.ghRepo` is also a
+    // no-op rather than a special case) -- what must never happen for the default path is an
+    // actual board MUTATION, so only placeOnBoard throws here.
+    const fakeProjectBoard = {
+      projectNumberForRepo: (ghRepo) => {
+        assert.equal(ghRepo, 'Crazz-Org/SPO-WebClient');
+        return null;
+      },
+      placeOnBoard: () => {
+        throw new Error('placeOnBoard must not be called for the byte-identical default path');
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['some', 'request', 'text']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(process.exitCode, undefined);
+    assert.deepEqual(fileCardDeps, {});
+    assert.ok(console_.logs.some((l) => l.includes('filed #42')));
+  })
+);
+
+test(
+  'spo ask --repo Crazz-Org/SPO-Pipeline: files into SPO-Pipeline and places the card on its board',
+  withExitCodeReset(async () => {
+    let fileCardDeps = null;
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({
+        ok: true,
+        review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' },
+      }),
+      fileCard: (draft, review, deps) => {
+        fileCardDeps = deps;
+        return { ok: true, issueNumber: 77, url: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/77' };
+      },
+    };
+    let placeOnBoardArgs = null;
+    const fakeProjectBoard = {
+      projectNumberForRepo: (ghRepo) => (ghRepo === 'Crazz-Org/SPO-Pipeline' ? 2 : null),
+      placeOnBoard: (issueNumber, ghRepo, deps) => {
+        placeOnBoardArgs = { issueNumber, ghRepo, deps };
+        return { ok: true, itemId: 'PVTI_x', statusName: 'Todo' };
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'Crazz-Org/SPO-Pipeline', 'some', 'request', 'text']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(process.exitCode, undefined);
+    // fileCard's own `gh issue create --repo <repo>` argv is intake.js's concern (already
+    // covered by "fileCard: FILE_AMENDED applies..." above); this asserts cmdAsk threads the
+    // flag's value through to fileCard's deps at all.
+    assert.deepEqual(fileCardDeps, { ghRepo: 'Crazz-Org/SPO-Pipeline' });
+    assert.ok(placeOnBoardArgs);
+    assert.equal(placeOnBoardArgs.issueNumber, 77);
+    assert.equal(placeOnBoardArgs.ghRepo, 'Crazz-Org/SPO-Pipeline');
+    assert.ok(console_.logs.some((l) => l.includes('filed #77')));
+  })
+);
+
+test(
+  'spo ask --repo <malformed>: refused before any LLM call, non-zero exit',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'not-a-repo-shape', 'some', 'text']);
+      await spo.cmdAsk(opts, { intake: fakeIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.errors.some((l) => l.includes('--repo requires an "owner/name" value')));
+  })
+);
+
+test(
+  // Renamed from a pre-F3/F4 version of this test that drove `['some', 'text', '--repo']` --
+  // under the OLD (splice-anywhere) extractRepoFlag that was "the no-value case, wherever --repo
+  // sits"; under the new leading-only design that exact argv is actually the F4 trailing-flag
+  // case (covered separately below), not a "no value" case at all -- a genuinely leading `--repo`
+  // with nothing after it (argv running out entirely) is the only way to hit "no value" now.
+  'spo ask --repo (no value, leading, argv runs out): refused as malformed, not silently treated as "no flag"',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo']);
+      await spo.cmdAsk(opts, { intake: fakeIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.errors.some((l) => l.includes('--repo requires an "owner/name" value (got null)')));
+  })
+);
+
+// ---- F1: --repo=VALUE (equals form) -----------------------------------------------------------
+
+test('extractRepoFlag: --repo=VALUE (equals form) is recognized leading, with identical rest/raw shape to the space-separated form', () => {
+  const equalsForm = spo.extractRepoFlag(['--repo=Crazz-Org/SPO-Pipeline', 'fix', 'it']);
+  assert.deepEqual(equalsForm, { rest: ['fix', 'it'], raw: 'Crazz-Org/SPO-Pipeline', stray: null });
+
+  const spaceForm = spo.extractRepoFlag(['--repo', 'Crazz-Org/SPO-Pipeline', 'fix', 'it']);
+  assert.deepEqual(spaceForm, { rest: ['fix', 'it'], raw: 'Crazz-Org/SPO-Pipeline', stray: null });
+});
+
+test(
+  'spo ask --repo=Crazz-Org/SPO-Pipeline: files into SPO-Pipeline, places on the board, and the flag token never leaks into the drafted request text',
+  withExitCodeReset(async () => {
+    let draftCardText = null;
+    let fileCardDeps = null;
+    const fakeIntake = {
+      draftCard: async (text) => {
+        draftCardText = text;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: (draft, review, deps) => {
+        fileCardDeps = deps;
+        return { ok: true, issueNumber: 201, url: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/201' };
+      },
+    };
+    let placeOnBoardArgs = null;
+    const fakeProjectBoard = {
+      projectNumberForRepo: (ghRepo) => (ghRepo === 'Crazz-Org/SPO-Pipeline' ? 2 : null),
+      placeOnBoard: (issueNumber, ghRepo, deps) => {
+        placeOnBoardArgs = { issueNumber, ghRepo };
+        return { ok: true, itemId: 'PVTI_eq', statusName: 'Todo' };
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo=Crazz-Org/SPO-Pipeline', 'fix', 'it']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(process.exitCode, undefined);
+    // The token spent on the LLM draft call must be the request text alone -- not the flag that
+    // targeted the filing, which used to leak straight into it and get billed to the drafter.
+    assert.equal(draftCardText, 'fix it');
+    assert.ok(!draftCardText.includes('--repo'));
+    assert.deepEqual(fileCardDeps, { ghRepo: 'Crazz-Org/SPO-Pipeline' });
+    assert.ok(placeOnBoardArgs);
+    assert.equal(placeOnBoardArgs.issueNumber, 201);
+    assert.equal(placeOnBoardArgs.ghRepo, 'Crazz-Org/SPO-Pipeline');
+    assert.ok(console_.logs.some((l) => l.includes('filed #201')));
+  })
+);
+
+// Same value, driven all the way through the real intake.fileCard -- the literal `gh issue
+// create` argv the spec asks for, not just the deps object cmdAsk hands to a fake fileCard above.
+test('extractRepoFlag + the real intake.fileCard: a --repo=VALUE-extracted raw value becomes the literal `gh issue create --repo <value>` argv', () => {
+  const { raw, rest, stray } = spo.extractRepoFlag(['--repo=Crazz-Org/SPO-Pipeline', 'fix', 'it']);
+  assert.equal(stray, null);
+  assert.equal(raw, 'Crazz-Org/SPO-Pipeline');
+  assert.equal(rest.join(' '), 'fix it');
+
+  const spawnCalls = [];
+  const deps = {
+    ghRepo: raw,
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/301\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create);
+  assert.equal(create[create.indexOf('--repo') + 1], 'Crazz-Org/SPO-Pipeline');
+  // The literal flag token never appears anywhere in the argv -- only its already-extracted value.
+  assert.ok(!create.some((a) => typeof a === 'string' && a.startsWith('--repo=')));
+});
+
+// ---- F2: duplicate --repo ----------------------------------------------------------------------
+
+test(
+  'spo ask --repo A --repo B: a duplicate --repo is a hard usage error -- exit non-zero, loud, no LLM/draft call',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    let placeOnBoardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+    const fakeProjectBoard = {
+      projectNumberForRepo: () => 2,
+      placeOnBoard: () => {
+        placeOnBoardCalled = true;
+        return { ok: true, itemId: 'x', statusName: 'Todo' };
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'Crazz-Org/SPO-Pipeline', '--repo', 'Crazz-Org/SPO-Deploy', 'fix', 'it']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(placeOnBoardCalled, false);
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.errors.some((l) => l.includes('--repo must come first')));
+    assert.ok(console_.errors.some((l) => l.includes('--repo')));
+  })
+);
+
+// ---- F3: --repo embedded in prose (not leading) ------------------------------------------------
+
+test(
+  'spo ask document --repo a/b please: a --repo that is not leading is a hard usage error -- no retarget, no mangled request text, no filing, no board call, drafter never invoked',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    let fileCardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => {
+        fileCardCalled = true;
+        return { ok: true, issueNumber: 1, url: 'x' };
+      },
+    };
+    const fakeProjectBoard = {
+      projectNumberForRepo: () => {
+        throw new Error('the mapping table must not even be consulted -- cmdAsk must refuse before reaching it');
+      },
+      placeOnBoard: () => {
+        throw new Error('placeOnBoard must not be called');
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['document', '--repo', 'a/b', 'please']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(fileCardCalled, false);
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.errors.some((l) => l.includes('--repo must come first')));
+  })
+);
+
+// ---- F4: trailing --repo after request text -----------------------------------------------------
+
+test(
+  'spo ask fix it --repo Crazz-Org/SPO-Pipeline: the old trailing form is now a hard usage error with "must come first" guidance',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['fix', 'it', '--repo', 'Crazz-Org/SPO-Pipeline']);
+      await spo.cmdAsk(opts, { intake: fakeIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(process.exitCode, 1);
+    const msg = console_.errors.find((l) => l.includes('--repo must come first'));
+    assert.ok(msg, 'expected a "--repo must come first" guidance message');
+    // Tells the user exactly what to type instead.
+    assert.ok(msg.includes('spo ask --repo <owner/name>') || msg.includes('spo ask --repo=<owner/name>'));
+  })
+);
+
+test(
+  'spo ask fix it --repo=Crazz-Org/SPO-Pipeline: the equals form is refused the same way when trailing',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['fix', 'it', '--repo=Crazz-Org/SPO-Pipeline']);
+      await spo.cmdAsk(opts, { intake: fakeIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.errors.some((l) => l.includes('--repo must come first')));
+  })
+);
+
+// ---- F5: case-insensitive board mapping (the invisible-card defect this card exists to kill) ---
+
+test(
+  'spo ask --repo crazz-org/spo-pipeline (lowercase): board placement IS attempted, against project 2, with Status read back -- no invisible card',
+  withExitCodeReset(async () => {
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 555, url: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/555' }),
+    };
+
+    // Deliberately does NOT override deps.projectBoard -- this drives cmdAsk against the REAL
+    // orchestrator/project-board.js, so a case-insensitivity regression in that module's own
+    // mapping lookup (not just in a test fixture standing in for it) would be caught here. Every
+    // `gh` call placeOnBoard makes is faked via deps.spawnSync instead (the module's own
+    // injection convention, armTimeout's `deps.spawnSync`).
+    const ghCalls = [];
+    const FAKE_PROJECT_ID = 'PVT_lower_9f2c';
+    const FAKE_STATUS_FIELD_ID = 'PVTSSF_lower_7a01';
+    const FAKE_TODO_OPTION_ID = 'opt_lower_todo_3e91';
+    const FAKE_ISSUE_NODE_ID = 'I_lower_c001';
+    const FAKE_ITEM_ID = 'PVTI_lower_dead22';
+    function graphqlVar(args, name) {
+      const prefix = `${name}=`;
+      const hit = args.find((a) => typeof a === 'string' && a.startsWith(prefix));
+      return hit ? hit.slice(prefix.length) : undefined;
+    }
+    const spawnSync = fakeSpawnSync((command, args) => {
+      ghCalls.push(args);
+      if (command !== 'gh') return { status: 1, stdout: '', stderr: 'unexpected command', signal: null };
+      if (args[0] === 'project' && args[1] === 'view') {
+        assert.equal(args[2], '2', 'the project number resolved for the lowercase repo must be 2, same as the canonical casing');
+        return { status: 0, stdout: JSON.stringify({ id: FAKE_PROJECT_ID }), stderr: '', signal: null };
+      }
+      if (args[0] === 'project' && args[1] === 'field-list') {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            fields: [
+              {
+                id: FAKE_STATUS_FIELD_ID,
+                name: 'Status',
+                options: [{ id: FAKE_TODO_OPTION_ID, name: 'Todo' }],
+              },
+            ],
+          }),
+          stderr: '',
+          signal: null,
+        };
+      }
+      if (args[0] === 'issue' && args[1] === 'view') {
+        // The issue is looked up on the repo AS THE USER TYPED IT (lowercase) -- this module
+        // resolves the PROJECT case-insensitively, it does not rewrite what goes to `gh`.
+        assert.equal(args[args.indexOf('--repo') + 1], 'crazz-org/spo-pipeline');
+        return { status: 0, stdout: JSON.stringify({ id: FAKE_ISSUE_NODE_ID }), stderr: '', signal: null };
+      }
+      if (args[0] === 'api' && args[1] === 'graphql') {
+        const query = graphqlVar(args, 'query');
+        if (query.includes('addProjectV2ItemById')) {
+          return { status: 0, stdout: JSON.stringify({ data: { addProjectV2ItemById: { item: { id: FAKE_ITEM_ID } } } }), stderr: '', signal: null };
+        }
+        if (query.includes('updateProjectV2ItemFieldValue')) {
+          return { status: 0, stdout: JSON.stringify({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: FAKE_ITEM_ID } } } }), stderr: '', signal: null };
+        }
+        if (query.includes('fieldValueByName')) {
+          return { status: 0, stdout: JSON.stringify({ data: { node: { fieldValueByName: { name: 'Todo' } } } }), stderr: '', signal: null };
+        }
+      }
+      return { status: 1, stdout: '', stderr: `unexpected gh args: ${args.join(' ')}`, signal: null };
+    });
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'crazz-org/spo-pipeline', 'fix', 'it']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, spawnSync });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(process.exitCode, undefined, 'a lowercase --repo that DOES map must not be reported as a failure');
+    assert.ok(console_.logs.some((l) => l.includes('filed #555')));
+    assert.ok(!console_.errors.some((l) => l.includes('board placement failed')));
+    // The read-back query actually ran -- board placement was really attempted, not skipped.
+    const readBackCalls = ghCalls.filter(
+      (a) => a[0] === 'api' && a.some((tok) => typeof tok === 'string' && tok.includes('fieldValueByName'))
+    );
+    assert.equal(readBackCalls.length, 1);
+  })
+);
+
+// ---- SHOULD-FIX: an unmapped-but-valid --repo target is filed but explicitly reported as NOT placed ----
+
+test(
+  'spo ask --repo Crazz-Org/Unmapped: files, makes no board call, and prints an explicit stderr note (exit stays 0)',
+  withExitCodeReset(async () => {
+    let placeOnBoardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 909, url: 'https://github.com/Crazz-Org/Unmapped/issues/909' }),
+    };
+    const fakeProjectBoard = {
+      projectNumberForRepo: (ghRepo) => (ghRepo === 'Crazz-Org/Unmapped' ? null : 2),
+      placeOnBoard: () => {
+        placeOnBoardCalled = true;
+        return { ok: true, itemId: 'x', statusName: 'Todo' };
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'Crazz-Org/Unmapped', 'fix', 'it']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(placeOnBoardCalled, false);
+    assert.equal(process.exitCode, undefined, 'filing succeeded -- exit stays 0 even though no board placement was attempted');
+    assert.ok(console_.logs.some((l) => l.includes('filed #909')));
+    assert.ok(console_.errors.some((l) => l.includes('no board placement') && l.includes('909')));
+  })
+);
+
+// ---- SHOULD-FIX: --dry says which repo and whether a board placement would be attempted --------
+
+test(
+  'spo ask --dry --repo Crazz-Org/SPO-Pipeline: dry output names the target repo and says a board placement would be attempted',
+  withExitCodeReset(async () => {
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => {
+        throw new Error('--dry must never file');
+      },
+    };
+    const fakeProjectBoard = {
+      projectNumberForRepo: (ghRepo) => (ghRepo === 'Crazz-Org/SPO-Pipeline' ? 2 : null),
+      placeOnBoard: () => {
+        throw new Error('--dry must never place on the board');
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'Crazz-Org/SPO-Pipeline', 'fix', 'it', '--dry']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(process.exitCode, undefined);
+    assert.ok(console_.logs.some((l) => l.includes('Crazz-Org/SPO-Pipeline') && l.includes('board placement would be attempted')));
+  })
+);
+
+test(
+  'spo ask --dry (no --repo): dry output names the default repo and says no board placement would be attempted',
+  withExitCodeReset(async () => {
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => {
+        throw new Error('--dry must never file');
+      },
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['fix', 'it', '--dry']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: noNetworkProjectBoard() });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(process.exitCode, undefined);
+    assert.ok(console_.logs.some((l) => l.includes(orchestratorConfig.ghRepo) && l.includes('no board placement would be attempted')));
+  })
+);
+
+// ---- SHOULD-FIX: `--repo --dry x` message reflects what actually happened -----------------------
+
+test(
+  'spo ask --repo --dry x: the malformed-value message notes that --dry was parsed out separately, not left as an unexplained "got x"',
+  withExitCodeReset(async () => {
+    let draftCardCalled = false;
+    const fakeIntake = {
+      draftCard: async () => {
+        draftCardCalled = true;
+        return { ok: true, draft: VALID_DRAFT };
+      },
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      // parseArgs consumes --dry as its own flag BEFORE extractRepoFlag ever sees opts._, so
+      // opts._ is ['--repo', 'x'] here -- 'x' is what extractRepoFlag reads as --repo's value.
+      const opts = spo.parseArgs(['--repo', '--dry', 'x']);
+      assert.deepEqual(opts._, ['--repo', 'x']);
+      assert.equal(opts.dry, true);
+      await spo.cmdAsk(opts, { intake: fakeIntake });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(draftCardCalled, false);
+    assert.equal(process.exitCode, 1);
+    const msg = console_.errors.find((l) => l.includes('--repo requires an "owner/name" value'));
+    assert.ok(msg, 'expected the malformed-value message');
+    assert.ok(msg.includes('got "x"'));
+    assert.ok(msg.includes('--dry'), 'the message should explain that --dry was parsed out separately, not silently folded into the value');
+  })
+);
+
+test(
+  'spo ask --repo Crazz-Org/SPO-Pipeline: a failed board placement is filed but reported loudly and non-zero',
+  withExitCodeReset(async () => {
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async () => ({ ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } }),
+      fileCard: () => ({ ok: true, issueNumber: 88, url: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/88' }),
+    };
+    const fakeProjectBoard = {
+      projectNumberForRepo: () => 2,
+      placeOnBoard: () => ({ ok: false, error: 'placeOnBoard: read back Status="(empty)" for item PVTI_x' }),
+    };
+
+    const console_ = captureConsole();
+    try {
+      const opts = spo.parseArgs(['--repo', 'Crazz-Org/SPO-Pipeline', 'some', 'text']);
+      await spo.cmdAsk(opts, { intake: fakeIntake, projectBoard: fakeProjectBoard });
+    } finally {
+      console_.restore();
+    }
+
+    // The card exists -- still reported -- but the run is a failure: an invisible card must
+    // never look like a silent success.
+    assert.equal(process.exitCode, 1);
+    assert.ok(console_.logs.some((l) => l.includes('filed #88')));
+    assert.ok(console_.errors.some((l) => l.includes('board placement failed')));
+    assert.ok(console_.errors.some((l) => l.includes('#88')));
+  })
+);
+
+// ---- the daemon-untouched pin ------------------------------------------------------------------
+//
+// Explicitly demanded by action 184/185: this card is NOT "unhardcode ghRepo", and nothing about
+// `spo ask --repo` may change what the DAEMON resolves. Recon found no existing test pinning the
+// shipped `orchestrator/config.js`'s `ghRepo` value directly -- every daemon fixture hardcodes its
+// OWN copy of the string, so a change to config.js's real value could pass the whole suite
+// silently. This pins the real, shipped config object, then proves TWO things separately:
+//
+//   1. (below) intake.fileCard, given deps carrying no ghRepo, still resolves against the real
+//      shipped config -- this is the byte-identical INTERACTIVE default path (`spo ask` with no
+//      `--repo`, bin/spo's cmdAsk), not a daemon call site: `grep -rn 'fileCard(' orchestrator/
+//      bin/` returns exactly one call site, cmdAsk itself. An earlier version of this comment
+//      claimed fileCard was called "exactly how state-machine.js/auto-triage.js call it" -- that
+//      was false (neither module calls fileCard at all; verified by the same grep) and has been
+//      corrected here rather than left standing.
+//   2. (further below) a genuine daemon-side call site -- park-loop.js's postParkComment, reached
+//      from state-machine.js's finalizePark on every real park, with NO --repo/ghRepo override in
+//      sight anywhere on that path -- resolving the SAME shipped config object into its own `gh`
+//      argv. This is the actual daemon-resolution guarantee the card asked for.
+//
+// Neither test relies on "reverting the bin/spo change makes this pass": neither imports bin/spo,
+// cmdAsk, or --repo at all.
+test('the interactive default path: config.ghRepo is still Crazz-Org/SPO-WebClient, and intake.fileCard (deps carrying no ghRepo -- the byte-identical `spo ask` default path\'s own shape) still resolves it', () => {
+  assert.equal(orchestratorConfig.ghRepo, 'Crazz-Org/SPO-WebClient');
+
+  const spawnCalls = [];
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/999\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps); // deps carries NO ghRepo -- cmdAsk's own no-`--repo` shape
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create, 'gh issue create was never called');
+  assert.equal(create[create.indexOf('--repo') + 1], 'Crazz-Org/SPO-WebClient');
+  assert.equal(create[create.indexOf('--repo') + 1], orchestratorConfig.ghRepo);
+});
+
+// The genuine daemon-side pin: postParkComment (orchestrator/park-loop.js) is reached from
+// state-machine.js's finalizePark on every real park -- no worktree, no `--repo`, no bin/spo
+// anywhere on that path -- and it builds its own `gh issue comment --repo <ghRepo> ...` argv off
+// `ctx.config.ghRepo`. Passing the REAL, shipped `orchestratorConfig` object as `ctx.config` (not
+// a test's own copy of the string) proves the daemon's actual config resolution, not a fixture's
+// imitation of it. `ctx.task.worktreePath`/`ctx.config.productRepo` are both left unset on
+// purpose: board.js's moveCard (postParkComment's first step) then has no cwd to move from and
+// journals a `board-move-skipped` no-op instead of spawning `npm` -- keeping this fixture to
+// exactly the one `gh` call under test, same minimal ctx shape as park-loop.test.js's own
+// action-2.1b timeout tests (`{ task: { issue }, taskDir, config }`, no worktreePath).
+test('the daemon: a real daemon-side call site (park-loop.js\'s postParkComment) resolves the REAL shipped config.ghRepo into its own gh argv', () => {
+  assert.equal(orchestratorConfig.ghRepo, 'Crazz-Org/SPO-WebClient');
+
+  const taskDir = mkTmp('spo-daemon-ghrepo-pin-taskdir-');
+  const ctx = { task: { issue: 12345 }, taskDir, config: orchestratorConfig };
+  const spawnCalls = [];
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push({ command, argv });
+      if (command === 'gh' && argv[0] === 'issue' && argv[1] === 'comment') {
+        return {
+          status: 0,
+          stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/12345#issuecomment-1\n',
+          stderr: '',
+          signal: null,
+        };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+
+  parkLoop.postParkComment(ctx, deps, { reason: 'x', detail: {}, lastState: 'WORKTREE' });
+
+  const commentCall = spawnCalls.find((c) => c.command === 'gh' && c.argv[0] === 'issue' && c.argv[1] === 'comment');
+  assert.ok(commentCall, 'gh issue comment was never called');
+  assert.equal(commentCall.argv[commentCall.argv.indexOf('--repo') + 1], 'Crazz-Org/SPO-WebClient');
+  assert.equal(commentCall.argv[commentCall.argv.indexOf('--repo') + 1], orchestratorConfig.ghRepo);
+});

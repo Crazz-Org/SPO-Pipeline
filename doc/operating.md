@@ -136,7 +136,7 @@ scripts/release.sh --no-restart # cut and switch, leave the services running the
 > first if the box should come back idle. `daemon-install.sh` refuses (exit non-zero, nothing
 > written) unless the script it runs lives in the deploy checkout (`SPO_SOURCE_REPO`, default
 > `~/SPO-Pipeline`) on the deploy branch (`SPO_DEPLOY_BRANCH`, default `main`) — the same two
-> variables `post-merge` honours. `dashboard-install.sh` is not guarded.
+> variables `post-merge` honours; `dashboard-install.sh` shares the same guard now.
 
 ### Rolling back
 
