@@ -1601,17 +1601,44 @@ test('card #78 (fix): a graceful drain WAITS for an in-flight repark to finish i
     readDaemonEvents(journalDir).some((e) => e.event === 'worker-crash-repark-spawned' && e.id === 'disp-drainwaits')
   );
 
-  const startedAt = Date.now();
   dispatcher.requestDrain({ signal: 'SIGTERM' });
   await runPromise;
-  const elapsed = Date.now() - startedAt;
 
-  assert.ok(
-    elapsed >= REPARK_MS - 150,
-    `run() returned after only ${elapsed}ms -- the drain did not wait out the repark's own ${REPARK_MS}ms of work; it was cut off early`
-  );
-
+  // REMOVED (card #182 cleanup): this used to compare `Date.now() - startedAt` (two raw wall-clock
+  // reads taken in THIS test) against REPARK_MS, to prove run() waited out the repark's own work
+  // instead of being cut off early. Unreliable on this WSL2 box, whose Date.now() steps backward
+  // ~2.85s every ~29.4s (measured in card #182; monotonic-clock.js's header carries the independent
+  // -2515ms measurement) -- a step landing between `startedAt` and the read after `runPromise`
+  // resolves can make `elapsed` read smaller than the real time that passed, failing this assertion
+  // for a reason that has nothing to do with whether the wait actually happened.
+  //
+  // ORDER, NOT DURATION -- but not the first pairing tried. An order fact built from
+  // 'worker-crash-repark-exit' vs 'dispatcher-drain-end' does NOT discriminate: run()'s drain block
+  // always runs `killAllChildren` + `await reapSignalledChildren` between `awaitInFlight` returning
+  // and 'dispatcher-drain-end' being journalled (dispatcher.js:1206-1207, 1229), and
+  // reapSignalledChildren itself blocks on the repark child's exit (naturally or via its own SIGKILL
+  // escalation) before returning -- so repark-exit precedes drain-end in BOTH the correct world and a
+  // mutant that drops `reparking.size > 0` from awaitInFlight's own wait condition. Measured before
+  // this assertion existed: that mutant failed on 'dispatcher-kill-escalated' below and on
+  // `drainEnd.drained` (false, `waitedMs` ~0) -- never on a repark-exit/drain-end order check, which
+  // is why that pairing was rejected. It now fails here, on the order assertion itself.
+  //
+  // 'dispatcher-stopped' (dispatcher.js:1175) is the anchor that DOES discriminate: it is journalled
+  // the instant `awaitInFlight` returns, strictly BEFORE `killAllChildren`/the reap (dispatcher.js
+  // :1206-1207) ever run -- so in the buggy mutant above, 'dispatcher-stopped' is written before the
+  // repark child has any chance to exit, while in the correct world `awaitInFlight` cannot return
+  // (so 'dispatcher-stopped' cannot be written) until 'worker-crash-repark-exit' already has: that
+  // event is appended synchronously inside the same watchChild().then() body that deletes the id from
+  // `reparking` (dispatcher.js:925-932, no `await` in between), so it is on disk before the very next
+  // check of `reparking.size` can see it empty.
   const events = readDaemonEvents(journalDir);
+  const reparkExitIdx = events.findIndex((e) => e.event === 'worker-crash-repark-exit' && e.id === 'disp-drainwaits');
+  const stoppedIdx = events.findIndex((e) => e.event === 'dispatcher-stopped');
+  assert.ok(reparkExitIdx >= 0 && stoppedIdx >= 0, 'both ordering anchors must exist');
+  assert.ok(
+    reparkExitIdx < stoppedIdx,
+    `the drain stopped waiting (index ${stoppedIdx}) before the repark child exited (index ${reparkExitIdx})`
+  );
   assert.equal(
     events.some((e) => e.event === 'dispatcher-kill-escalated'),
     false,

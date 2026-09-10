@@ -75,7 +75,6 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
     task: { id: 't1', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan it' } } },
   });
 
-  const before = Date.now();
   let call = 0;
   const spawnSync = () => {
     call += 1;
@@ -98,12 +97,30 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
 
   const state = accounts.readState(accountsDir);
   assert.ok(state['acct-a'], 'acct-a should be cooling');
-  assert.ok(state['acct-a'].cooldownUntil > Date.now());
-  // 429 -> limitKind 'usage' -> R1's PROBE tier (1h) on a first-ever hit for this account, not
-  // the escalated 5h tier and not the 5-minute overloaded tier.
-  assert.ok(
-    state['acct-a'].cooldownUntil >= before + accounts.USAGE_PROBE_COOLDOWN_MS,
-    'a first 429 must cool the account for the 1-hour probe tier'
+  // FACT, NOT MARGIN: this used to compare `state['acct-a'].cooldownUntil` against two raw
+  // Date.now() reads taken in THIS test (`before`, and a fresh one here) -- but `markLimit` takes no
+  // injectable clock through `callLlmStep` (state-machine.js:168 passes it exactly 3 args); `pick()`'s
+  // is injectable as `deps.leaseNow`, but that same value also freezes the lease-wait clock
+  // (account-lease.js:211), which `callLlmStep` cannot override independently, so it is not usable
+  // here either. There is no way for the test to pin the `now` markLimit's default parameter
+  // (accounts.js:585) actually reads. On this WSL2 box, where Date.now() steps backward ~2.85s every
+  // ~29.4s (measured in card #182; monotonic-clock.js's header carries the independent -2515ms
+  // measurement), markLimit's internal read can land strictly BEFORE the test's own `before` read
+  // even though it happened chronologically after it, making the old `>=` comparison fail for a
+  // reason that has nothing to do with which tier was chosen.
+  // computeLimitUpdate (accounts.js:462-502) writes `cooldownUntil` and `lastUsageLimitAt` from
+  // the SAME single internal `now` snapshot, so comparing the two fields PRODUCTION wrote against
+  // each other establishes the identical "1-hour probe tier, not the 5-hour escalated one" fact
+  // exactly, with no clock read on the test's own side at all.
+  assert.equal(
+    typeof state['acct-a'].lastUsageLimitAt,
+    'number',
+    'a first usage hit must record lastUsageLimitAt'
+  );
+  assert.equal(
+    state['acct-a'].cooldownUntil,
+    state['acct-a'].lastUsageLimitAt + accounts.USAGE_PROBE_COOLDOWN_MS,
+    'a first 429 must cool the account for exactly the 1-hour probe tier, anchored to its own lastUsageLimitAt'
   );
   assert.ok(!state['acct-b'], 'acct-b should not be cooling');
 
@@ -131,9 +148,14 @@ test('429 (usage limit) through callLlmStep on an account whose PROBE already ex
   writeRegistry(accountsDir, [{ name: 'acct-a', configDir: null, enabled: true }]);
 
   const now = Date.now();
-  const lastUsageLimitAt = now - 5000; // well within ESCALATION_WINDOW_MS
+  const lastUsageLimitAt = now - 5000; // well within ESCALATION_WINDOW_MS (7,200,000ms) -- safe margin
+  // cooldownUntil is 1h in the past, not just-expired: this WSL2 box's Date.now() steps backward
+  // ~2.85s every ~29.4s (measured in card #182), so a `now - 1000` margin here is not safe -- a step
+  // landing between this read and pick()'s own could make pick() still read acct-a as cooling,
+  // throw AllAccountsCoolingError before markLimit ever runs, and fail this test's assertions below
+  // for a reason that has nothing to do with escalation.
   accounts.writeState(accountsDir, {
-    'acct-a': { cooldownUntil: now - 1000, lastUsageLimitAt, usageLimitStreak: 1 }, // already expired -> pick()-able
+    'acct-a': { cooldownUntil: now - 3600_000, lastUsageLimitAt, usageLimitStreak: 1 }, // already expired -> pick()-able
   });
 
   const ctx = makeCtx({
@@ -152,7 +174,15 @@ test('429 (usage limit) through callLlmStep on an account whose PROBE already ex
   await assert.rejects(() => callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync }), ParkSignal);
 
   const state = accounts.readState(accountsDir);
-  assert.ok(state['acct-a'].cooldownUntil >= now + accounts.USAGE_ESCALATED_COOLDOWN_MS, 'must escalate to the 5h tier');
+  // Same fix as the probe-tier test above: an exact relationship between the two fields
+  // markLimit's OWN internal `now` snapshot wrote (accounts.js's computeLimitUpdate,
+  // cooldownUntil = now + ms, lastUsageLimitAt = now), instead of comparing against this test's
+  // own `now` -- which was captured before the call and is not what markLimit actually read.
+  assert.equal(
+    state['acct-a'].cooldownUntil,
+    state['acct-a'].lastUsageLimitAt + accounts.USAGE_ESCALATED_COOLDOWN_MS,
+    'must escalate to exactly the 5h tier, anchored to its own lastUsageLimitAt'
+  );
   assert.equal(state['acct-a'].usageLimitStreak, 2);
 
   const journalLines = fs
@@ -179,7 +209,6 @@ test('529 (overloaded) on the first account cools it for 5 minutes only, and rot
     task: { id: 't1', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan it' } } },
   });
 
-  const before = Date.now();
   let call = 0;
   const spawnSync = () => {
     call += 1;
@@ -204,11 +233,19 @@ test('529 (overloaded) on the first account cools it for 5 minutes only, and rot
 
   const state = accounts.readState(accountsDir);
   assert.ok(state['acct-a'], 'acct-a should be cooling');
-  const cooldownMsWritten = state['acct-a'].cooldownUntil - before;
-  assert.ok(
-    cooldownMsWritten <= accounts.OVERLOADED_COOLDOWN_MS + 5000,
-    `a 529 must cool the account for the short 5-minute overloaded tier, not the 5-hour usage tier (got ~${cooldownMsWritten}ms)`
-  );
+  // The `cooldownMsWritten = state['acct-a'].cooldownUntil - before` margin this replaced compared
+  // a value PRODUCTION wrote (from its own internal, uninjectable `now`, accounts.js:585) against a
+  // `before` read in THIS test -- unreliable on this WSL2 box, whose Date.now() steps backward
+  // ~2.85s every ~29.4s (measured in card #182; monotonic-clock.js's header carries the independent
+  // -2515ms measurement). Unlike the usage/probe path, the overloaded branch of computeLimitUpdate
+  // (accounts.js:470-471, 480-481) writes no lastUsageLimitAt to anchor an exact equality against, so
+  // there is no clock-free field on `state['acct-a']` alone to compare here. `cooldownEvent.cooldownMs`
+  // below pins only the JOURNAL EVENT, not the persisted state -- the field `pick()` (accounts.js:364-365)
+  // actually consults to decide account health is `state['acct-a'].cooldownUntil`, on disk, which
+  // `cooldownMs` says nothing about on its own. What pins THAT, with no clock read at all:
+  // computeLimitUpdate writes both `cooldownUntil` and the event's own `cooldownUntil` field
+  // (accounts.js:477, 496) from the same `const cooldownUntil`, so asserting the persisted value
+  // equals the journalled event's `cooldownUntil` is exact and clock-free.
   assert.ok(!state['acct-b'], 'acct-b should not be cooling');
 
   const journalLines = fs
@@ -219,6 +256,11 @@ test('529 (overloaded) on the first account cools it for 5 minutes only, and rot
   const cooldownEvent = journalLines.find((e) => e.event === 'account-cooldown');
   assert.ok(cooldownEvent, 'expected an account-cooldown journal event');
   assert.equal(cooldownEvent.account, 'acct-a');
+  assert.equal(
+    state['acct-a'].cooldownUntil,
+    cooldownEvent.cooldownUntil,
+    'the persisted cooldown must be exactly the one the journalled event reported'
+  );
   assert.equal(cooldownEvent.cooldownMs, accounts.OVERLOADED_COOLDOWN_MS);
 });
 
