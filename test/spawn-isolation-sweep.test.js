@@ -944,7 +944,13 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // properties before being added here -- `env: { ...isolatedEnv(), ...envOverrides }`, so the
   // env is present, derived from isolatedEnv() rather than a bare process.env, and every
   // override a test layers on top is a fresh mkTmp dir (the empty account pool), never a real one.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'worker-mode.test.js']);
+  // SPO-Pipeline#170 (2026-09-10): usage-report.test.js's CLI smoke test spawns
+  // `node scripts/usage-report.js --roots=<fixture>` via execFileSync -- not daemon.js or bin/spo,
+  // so it touches none of helpers.js's isolated per-test paths regardless of what they resolve
+  // to, but it still carries `env: isolatedEnv()` (the simpler of "isolate" or "justify an
+  // allowlist entry" here) so it passes this sweep's own four properties the same way every
+  // other audited site does.
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });
