@@ -447,10 +447,24 @@ test('drain: a straggler that ignores SIGTERM is SIGKILLed, not waited on foreve
   // reap was bounded, run() sat in `await Promise.allSettled(pending)` until this process chose to
   // exit -- 60s here -- with systemd's cgroup SIGKILL as the only backstop, which skips
   // daemon.js's exit hook and leaks the lock file.
+  //
+  // READY FILE, written immediately AFTER the handler is installed (card #183; the same shape as
+  // section 16's) -- `worker-spawn` fires synchronously inside `spawnOne`, the instant the child's
+  // handle is created, which says nothing about whether the freshly spawned OS process has
+  // actually finished booting node and reached this script's own `process.on('SIGTERM', ...)` line
+  // yet. Waiting on `worker-spawn` alone raced the drain's SIGTERM against that installation: when
+  // the SIGTERM won, the child died on the default disposition, no escalation happened, and this
+  // test failed on its own precondition (`no dispatcher-kill-escalated -- the reap waited on an
+  // unkillable child`). Waiting for this file instead makes the handler's existence a fact on disk.
+  const readyDir = mkTmp('spo-drain-esc2-ready-');
+  const readyFile = path.join(readyDir, 'sigterm-handler-installed');
   const ignoresSigterm = (cmd, args, opts) =>
     realSpawn(
       process.execPath,
-      ['-e', "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 60000);"],
+      [
+        '-e',
+        `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(readyFile)}, ''); setTimeout(() => process.exit(0), 60000);`,
+      ],
       { ...opts, stdio: 'ignore' }
     );
 
@@ -461,6 +475,7 @@ test('drain: a straggler that ignores SIGTERM is SIGKILLed, not waited on foreve
   );
   const runPromise = dispatcher.run();
   await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn'), 10000, 'worker-spawn');
+  await waitFor(() => fs.existsSync(readyFile), 10000, "straggler's SIGTERM handler installed");
 
   dispatcher.requestDrain({ signal: 'SIGTERM' });
   const startedAt = Date.now();
@@ -895,9 +910,9 @@ test('drain: dispatcher-stopped precedes dispatcher-kill-escalated and dispatche
   // the default disposition before the handler existed, starving this test's own precondition
   // rather than exercising the code under test. Waiting for this file instead makes the handler's
   // existence a fact on disk, not a margin, so the precondition cannot starve at any load. (The
-  // same exposure exists in this file's section 10 test, which relies on the same
-  // `drainTimeoutMs: 200` margin without a ready file -- left as is here; that is a separate
-  // card's cleanup, not this one's.)
+  // same exposure existed in this file's section 10 test, which relied on the same
+  // `drainTimeoutMs: 200` margin without a ready file -- fixed in card #183 with the identical
+  // ready-file shape.)
   const readyDir = mkTmp('spo-drain-hoist-ready-');
   const readyFile = path.join(readyDir, 'sigterm-handler-installed');
   const ignoresSigterm = (cmd, args, opts) =>
