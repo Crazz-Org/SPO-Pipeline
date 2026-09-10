@@ -15,6 +15,31 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ONE CHECKOUT MAY INSTALL THE DASHBOARD, AND IT IS NOT WHICHEVER ONE YOU HAPPEN TO RUN THIS FROM.
+# Run from an agent worktree under .claude/worktrees/<slug>/, this script would otherwise overwrite
+# the LIVE unit file with that worktree's own copy of the heredoc below, then enable/restart the
+# live service from it. Unlike scripts/daemon-install.sh it cannot repoint the service AT the
+# worktree -- the unit's ExecStart is $CURRENT_LINK and no release is cut here -- and the two
+# `ln -sf` at the end cannot even complete: a worktree's .git is a FILE, so they fail with "Not a
+# directory" under `set -e`, leaving the unit already rewritten and the service already restarted.
+# The rule is shared, not reinvented here: scripts/git-hooks/post-merge and
+# scripts/daemon-install.sh enforce the same one, and all three source scripts/lib/deploy-guard.sh
+# so it cannot silently diverge between the three places it is enforced.
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/deploy-guard.sh"
+if ! deploy_guard_check "$REPO"; then
+  {
+    echo "!! dashboard-install.sh: refusing to install -- $DEPLOY_GUARD_REASON"
+    echo "!!   tree seen:       $DEPLOY_GUARD_TREE"
+    echo "!!   tree expected:   $DEPLOY_GUARD_SOURCE_REPO"
+    echo "!!   branch seen:     $DEPLOY_GUARD_BRANCH"
+    echo "!!   branch expected: $DEPLOY_GUARD_DEPLOY_BRANCH"
+    echo "!!   nothing was written, no service was touched."
+    echo "!!   if this is deliberate, override with SPO_SOURCE_REPO=... and/or SPO_DEPLOY_BRANCH=..."
+  } >&2
+  exit 1
+fi
+
 CURRENT_LINK="${SPO_CURRENT_LINK:-$HOME/.spo-current}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/spo-pipeline-dashboard.service"

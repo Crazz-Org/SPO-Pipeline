@@ -34,8 +34,8 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OB
 # hazard, because cutting a release from an agent worktree would DEPLOY THAT WORKTREE'S BRANCH.
 #
 # So the deploy checkout is named, not inferred, and every other tree is skipped out loud. The
-# check itself lives in scripts/lib/deploy-guard.sh, shared with scripts/daemon-install.sh -- one
-# rule, so the hook and the installer can never silently disagree about which tree may deploy.
+# check lives in scripts/lib/deploy-guard.sh, shared by scripts/daemon-install.sh and
+# scripts/dashboard-install.sh -- one rule, so the hook and installers never silently disagree.
 GUARD_LIB="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/deploy-guard.sh"
 if [ ! -r "$GUARD_LIB" ]; then
   echo "!! post-merge: $GUARD_LIB missing or unreadable -- nothing deployed" >&2

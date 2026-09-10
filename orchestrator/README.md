@@ -2449,10 +2449,11 @@ does drain (`KillMode=mixed`, `TimeoutStopSec=2820`) — but it blocks while it 
 whoever ran the pull. `daemon-install.sh` derives its repo root from the script's own path, so run
 from an agent worktree under `.claude/worktrees/`, it would cut a release from that worktree's
 branch and point the live service at it — exactly the hazard the `post-merge` hook guards on every
-`git pull`. Both now share one check, `scripts/lib/deploy-guard.sh`: the deploy checkout is named
-(`SPO_SOURCE_REPO`, default `~/SPO-Pipeline`) and the deploy branch is named (`SPO_DEPLOY_BRANCH`,
-default `main`), not inferred from where either is run, and `daemon-install.sh` refuses (exit
-non-zero, nothing written) outside them. See `doc/operating.md` § Deploying.
+`git pull`. The hook, `daemon-install.sh` and `dashboard-install.sh` now share one check,
+`scripts/lib/deploy-guard.sh`: the deploy checkout is named (`SPO_SOURCE_REPO`, default
+`~/SPO-Pipeline`) and the deploy branch is named (`SPO_DEPLOY_BRANCH`, default `main`), not
+inferred from where any of the three is run, and both installers refuse (exit non-zero, nothing
+written) outside them. See `doc/operating.md` § Deploying.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
 default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
