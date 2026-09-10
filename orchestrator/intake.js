@@ -8,8 +8,8 @@
 //                    `spo ask --draft-file <path>`.
 //   reviewCard -- the existing review-card step: draft -> a FILE/FILE_AMENDED/DO_NOT_FILE verdict,
 //                 via prompts/review-card.md. Both lanes above feed the same reviewCard.
-//   fileCard   -- applies review's mechanical corrections, then `gh issue create` + `gh issue
-//                 comment` (the first comment is the review verdict, verbatim).
+//   fileCard   -- applies review's mechanical corrections, then reads the target repo's label
+//                 inventory (`gh label list`), then `gh issue create` + `gh issue comment` (verdict, verbatim).
 //   postIssueComment -- `gh issue comment` against a temp file, extracted out of fileCard so
 //                 auto-triage.js's duplicate-report path (a comment on an EXISTING issue, no new
 //                 issue) reuses the same spawn instead of a second implementation.
@@ -633,16 +633,39 @@ function postIssueComment(issueNumber, markdown, deps = {}) {
   return { ok: true, commentFile, commentId: parseCommentId(commentResult.stdout) };
 }
 
-// fileCard(draft, review, deps) -- applies review's mechanical corrections, writes the body and
-// first-comment files under os.tmpdir(), then runs exactly the two gh commands CLAUDE.md's
-// intake flow names:
-//   gh issue create --repo <repo> --title <t> --body-file <f> --label cat:<category> --label
-//                    size:<S|M|L>
+// fileCard(draft, review, deps) -- applies review's mechanical corrections, writes the body
+// file under os.tmpdir(), then reads the target repo's own label inventory via `gh label
+// list --repo <repo> --limit 500 --json name` (same injected runner every gh call here uses)
+// before running (the first-comment file below is written later, inside postIssueComment):
+//   gh issue create --repo <repo> --title <t> --body-file <f> [--label cat:<category>]
+//                    [--label size:<S|M|L>]
 //   gh issue comment <n> --repo <repo> --body-file <f>
-// (the board's own auto-add workflow moves the new issue to Todo -- this never touches the
-// board directly). Returns {ok: true, issueNumber, url} or {ok: false, error}. Refuses to run at
-// all for a DO_NOT_FILE verdict -- the caller (bin/spo) is expected to have already skipped that
-// case, but this is the one place a wrong caller cannot accidentally file a card nobody wanted.
+// Each requested label (`cat:<category>`, `size:<size>`) is checked against that inventory by an
+// exact, case-sensitive match on the literal name. Issue #196: `spo ask --repo
+// Crazz-Org/SPO-Pipeline` used to pass `--label cat:... --label size:...` unconditionally, and
+// `gh issue create` exits non-zero on a label the target repo doesn't have, so nothing filed.
+// Three outcomes, decided per label list read:
+//   - inventory read OK, label PRESENT -> `--label` ships.
+//   - inventory read OK, label ABSENT  -> skipped; one `deps.log` line names the label and repo.
+//   - inventory UNKNOWN (a non-zero exit, unparseable stdout, or a non-array parse) -> BOTH
+//     requested labels ship anyway, unverified, with one combined `deps.log` announcement that
+//     the inventory could not be read and `gh issue create` may therefore fail. This is the
+//     reverse of the label-inventory-filter action's original fallback, which skipped both here
+//     -- reversed because a transient `gh label list` failure must never silently strip labels
+//     from a repo -- such as SPO-WebClient -- that has both families: makeTask (this repo's own
+//     queue builder) defaults a missing `size:` label to 'M' rather than erroring, so a
+//     stripped size becomes a silent wrong budget instead of a loud failure, and the card also
+//     loses its `cat:` classification with nothing else recording it.
+// An array that parses but yields no usable `name` string for a member (no `name` key, or a bare
+// string) simply contributes nothing to the known set -- that inventory WAS read, so this is not
+// the UNKNOWN case above: an absent label from it is skipped and announced exactly like any other
+// absent label. `--limit 500` also truncates a larger repo, so a present label can still read as
+// absent that way. Every skip, and the UNKNOWN case, is announced via `deps.log` (defaults to
+// `console.log`); nothing is printed when every requested label is confirmed present. The board's
+// own auto-add workflow is meant to move the new issue to Todo -- this never touches the board
+// directly. Returns {ok: true, issueNumber, url} or {ok: false, error}. Refuses to run at all for
+// a DO_NOT_FILE verdict -- the caller (bin/spo) is expected to have already skipped that case, but
+// this is the one place a wrong caller cannot accidentally file a card nobody wanted.
 function fileCard(draft, review, deps = {}) {
   if (!review || (review.verdict !== 'FILE' && review.verdict !== 'FILE_AMENDED')) {
     return { ok: false, error: `fileCard: refusing to file for verdict "${review && review.verdict}"` };
@@ -650,12 +673,64 @@ function fileCard(draft, review, deps = {}) {
 
   const ghRepo = deps.ghRepo || config.ghRepo;
   const tmpDir = deps.tmpDir || os.tmpdir();
+  const log = deps.log || console.log;
 
   const { applied } = applyMechanicalCorrections(draft, review.corrections);
 
   const stamp = `${Date.now()}-${process.pid}`;
   const bodyFile = path.join(tmpDir, `spo-card-body-${stamp}.md`);
   fs.writeFileSync(bodyFile, applied.body_markdown || '');
+
+  // Label inventory: read BEFORE `gh issue create` so we know which of the two requested labels
+  // (if either) the target repo actually has. Verdict on the call is by exit code, project
+  // convention; only on exit 0 is stdout (structured `--json name` output, a payload, never a
+  // text verdict) parsed, and only inside a try/catch -- a malformed payload is handled exactly
+  // like a non-zero exit, not thrown.
+  const catLabel = `cat:${applied.category}`;
+  const sizeLabel = `size:${applied.size}`;
+  const requestedLabels = [catLabel, sizeLabel];
+
+  const labelListResult = runSync(deps, 'gh', [
+    'label',
+    'list',
+    '--repo',
+    ghRepo,
+    '--limit',
+    '500',
+    '--json',
+    'name',
+  ]);
+  const labelListExit = normalizeExit(labelListResult);
+  let knownLabelNames = null;
+  if (labelListExit === 0) {
+    try {
+      const parsedLabels = JSON.parse(labelListResult.stdout);
+      if (Array.isArray(parsedLabels)) {
+        knownLabelNames = new Set(
+          parsedLabels.map((entry) => entry && entry.name).filter((name) => typeof name === 'string')
+        );
+      }
+    } catch (e) {
+      // stdout didn't parse -- falls through to the UNKNOWN-inventory branch below.
+    }
+  }
+
+  const labelArgs = [];
+  if (knownLabelNames === null) {
+    log(
+      `fileCard: label inventory for ${ghRepo} could not be read -- filing with ` +
+        `${requestedLabels.join(' and ')} unverified; \`gh issue create\` may fail if ${ghRepo} lacks them`
+    );
+    labelArgs.push('--label', catLabel, '--label', sizeLabel);
+  } else {
+    for (const label of requestedLabels) {
+      if (knownLabelNames.has(label)) {
+        labelArgs.push('--label', label);
+      } else {
+        log(`fileCard: skipping label "${label}" -- not present on ${ghRepo}`);
+      }
+    }
+  }
 
   const createResult = runSync(deps, 'gh', [
     'issue',
@@ -666,10 +741,7 @@ function fileCard(draft, review, deps = {}) {
     applied.title,
     '--body-file',
     bodyFile,
-    '--label',
-    `cat:${applied.category}`,
-    '--label',
-    `size:${applied.size}`,
+    ...labelArgs,
   ]);
   const createExit = normalizeExit(createResult);
   if (createExit !== 0) {

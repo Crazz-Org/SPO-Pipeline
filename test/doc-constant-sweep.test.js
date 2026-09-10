@@ -1406,14 +1406,14 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1159",
   "doc/state-machine-spec.md :: dispatcher.js:634-648",
-  "doc/state-machine-spec.md :: intake.js:797-799",
+  "doc/state-machine-spec.md :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:773", // re-pinned from :766 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above productRepo, a true pure shift; content byte-identical at :773
   "orchestrator/README.md :: dispatcher.js:634-648",
   "orchestrator/README.md :: doc/state-machine-spec.md:150",
-  "orchestrator/README.md :: intake.js:797-799",
+  "orchestrator/README.md :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
   "orchestrator/README.md :: lock.js:255",
   "orchestrator/README.md :: lock.js:257-288",
   "orchestrator/README.md :: lock.js:289",
@@ -1431,13 +1431,13 @@ const EXPECTED_CITATIONS = [
   "orchestrator/orphan-scan.js :: daemon.js:912",
   "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:664", // re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines to remediation-progress.md's C5-findings section above this bullet, a true pure shift; content byte-identical at :664
-  "orchestrator/park-loop.js :: intake.js:797-799",
+  "orchestrator/park-loop.js :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: park-loop.js:1283", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Both are pure shifts: the cited line is byte-identical at every one of the three numbers.
   "orchestrator/state-machine.js :: run.ts:63",
   "orchestrator/state-machine.js :: step-contracts.js:432", // rdo-symmetry: resolveRdoDiffTouched's strict-boolean rationale cites shouldEscalate's own `touchesRdoMembers === true`; re-pinned from :408 (2026-09-08, verifier's B1-B4 repair pass) -- action 2.2 of card #158 grew step-contracts.js's LLM_STEP_DEADLINE_MS_BY_STEP/MAX_LEASE_AGE_MS comments by a further 24 lines (the monotonic-clock caveat and the PLAN-precedent counter-evidence) above this line; a true pure shift, content byte-identical at :432.
-  "orchestrator/steps/llm.js :: intake.js:797-799",
+  "orchestrator/steps/llm.js :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:308",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
@@ -2048,6 +2048,13 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // pinned by NAME, not by floor -- constraint 2 in this action's own brief: "cannot verify" must
   // never silently grow into an escape hatch, so the unanchorable population is capped here
   // exactly like PINS/EXPECTED_CITATIONS above.
+  // Note (2026-09-10): the `intake.js:797-799` half of that first-named citation has since moved
+  // twice on the live file -- to :854-856 by issue #196's own label-inventory-filter action, then
+  // to :869-871 by this repair round's UNKNOWN-inventory reversal and header rewrite -- see
+  // EXPECTED_CITATIONS above for the current string. This paragraph is left naming the citation
+  // as it read at the time of the original measurement; the stale string here does not affect
+  // what the sweep checks because CORPUS_FILES excludes `test/**` entirely (see ~:629-632 above),
+  // not because of this file's own CITATION_ANCHOR_ALLOWLIST membership.
   // card #102 (2026-09-05): +5 citations to auto-pull.js:58-66 (journal.js, orphan-scan.js,
   // state-machine.js x2) and orphan-scan.js :: daemon.js:910 (card #102 pinned it :714), all in
   // the anchor-checked corpus.
