@@ -687,6 +687,17 @@ test('fileCard: FILE_AMENDED applies mechanical category/size/area corrections, 
   const deps = {
     spawnSync: fakeSpawnSync((command, argv) => {
       spawnCalls.push({ command, argv });
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        // The target repo carries both label families, including the CORRECTED names -- this
+        // test's own point is that the corrected category/size (not the draft's original ones)
+        // reach `gh issue create`, so the inventory must know about the corrected names.
+        return {
+          status: 0,
+          stdout: JSON.stringify([{ name: 'cat:latent-trap' }, { name: 'size:L' }]),
+          stderr: '',
+          signal: null,
+        };
+      }
       if (argv[0] === 'issue' && argv[1] === 'create') {
         return {
           status: 0,
@@ -711,8 +722,10 @@ test('fileCard: FILE_AMENDED applies mechanical category/size/area corrections, 
   assert.equal(result.issueNumber, 321);
   assert.equal(result.url, 'https://github.com/Crazz-Org/SPO-WebClient/issues/321');
 
-  assert.equal(spawnCalls.length, 2);
-  const [create, comment] = spawnCalls;
+  assert.equal(spawnCalls.length, 3);
+  const [labelList, create, comment] = spawnCalls;
+
+  assert.deepEqual(labelList.argv, ['label', 'list', '--repo', 'Crazz-Org/SPO-WebClient', '--limit', '500', '--json', 'name']);
 
   assert.equal(create.command, 'gh');
   assert.deepEqual(create.argv, [
@@ -758,6 +771,16 @@ test('fileCard: a FILE_AMENDED verdict whose only correction is a split recommen
   const deps = {
     spawnSync: fakeSpawnSync((command, argv) => {
       spawnCalls.push({ command, argv });
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        // Inventory carries VALID_DRAFT's own (uncorrected) category/size labels -- this test's
+        // draft never gets a mechanical category/size correction, only the adversarial prose one.
+        return {
+          status: 0,
+          stdout: JSON.stringify([{ name: `cat:${VALID_DRAFT.category}` }, { name: `size:${VALID_DRAFT.size}` }]),
+          stderr: '',
+          signal: null,
+        };
+      }
       if (argv[0] === 'issue' && argv[1] === 'create') {
         return {
           status: 0,
@@ -783,14 +806,14 @@ test('fileCard: a FILE_AMENDED verdict whose only correction is a split recommen
 
   assert.equal(result.ok, true);
   assert.equal(result.issueNumber, 900);
-  assert.equal(spawnCalls.length, 2); // create + comment -- same as any other FILE_AMENDED
+  assert.equal(spawnCalls.length, 3); // label list + create + comment -- same as any other FILE_AMENDED
 
   // The split recommendation rides in `corrections` as prose, never as a label: this action's
   // central claim, and nothing above pinned it. MECHANICAL_CORRECTION_RE is anchored ^...$ over
   // the WHOLE correction string, so "size: S" embedded mid-sentence inside the split text never
   // qualifies -- applyMechanicalCorrections leaves VALID_DRAFT's own category/size untouched, and
   // those (not anything parsed out of the split prose) are what must reach `gh issue create`.
-  const [create] = spawnCalls;
+  const create = spawnCalls.find((c) => c.argv[0] === 'issue' && c.argv[1] === 'create');
   assert.ok(create.argv.includes(`cat:${VALID_DRAFT.category}`));
   assert.ok(create.argv.includes(`size:${VALID_DRAFT.size}`));
   // The split's own "size: M" (card 2) must never surface as a label in its own right -- proof
@@ -817,6 +840,7 @@ test('fileCard: refuses to run for a DO_NOT_FILE verdict, never spawns', () => {
 test('fileCard: gh issue create failure -> clear error, never attempts the comment', () => {
   const spawnCalls = [];
   const deps = {
+    log: () => {}, // UNKNOWN-inventory announcement is expected here; not under test in this fixture
     spawnSync: fakeSpawnSync((command, argv) => {
       spawnCalls.push(argv);
       return { status: 1, stdout: '', stderr: 'gh: some failure', signal: null };
@@ -826,7 +850,10 @@ test('fileCard: gh issue create failure -> clear error, never attempts the comme
 
   const result = intake.fileCard(VALID_DRAFT, review, deps);
   assert.equal(result.ok, false);
-  assert.equal(spawnCalls.length, 1); // never reached the comment call
+  // The single unconditional non-zero responder also fails the label-list read (-> UNKNOWN
+  // inventory, both labels ship unverified) before `gh issue create` itself fails -- 2 calls,
+  // never a third for the comment.
+  assert.equal(spawnCalls.length, 2);
 });
 
 // ---- action 2.1b: intake.js's own gh/npm spawns are now bounded too --------------------------
@@ -841,6 +868,7 @@ test('fileCard: gh issue create failure -> clear error, never attempts the comme
 test('fileCard: a timed-out gh issue create never throws -- reported as an error with timedOut: true, never attempts the comment', () => {
   const spawnCalls = [];
   const deps = {
+    log: () => {}, // UNKNOWN-inventory announcement is expected here; not under test in this fixture
     spawnSync: fakeSpawnSync((command, argv) => {
       spawnCalls.push(argv);
       return timeoutResult();
@@ -851,7 +879,367 @@ test('fileCard: a timed-out gh issue create never throws -- reported as an error
   const result = intake.fileCard(VALID_DRAFT, review, deps);
   assert.equal(result.ok, false);
   assert.equal(result.timedOut, true);
-  assert.equal(spawnCalls.length, 1);
+  // Same shape as the plain-failure test above: the label-list read times out first (-> UNKNOWN
+  // inventory, both labels ship unverified), then `gh issue create` itself times out -- 2 calls.
+  assert.equal(spawnCalls.length, 2);
+});
+
+// ---- issue #196: fileCard's label inventory filter ---------------------------------------------
+//
+// `gh issue create` exits non-zero on a `--label` the target repo doesn't have -- before this
+// fix, fileCard passed `cat:<category>`/`size:<size>` unconditionally, so `spo ask --repo
+// Crazz-Org/SPO-Pipeline` (10 labels, nine GitHub defaults plus `accessibility`, no `cat:`/`size:`
+// family at all) could never file anything. fileCard now reads the target repo's own label
+// inventory (`gh label list --repo <repo> --limit 500 --json name`) through the same injected
+// runner, before `gh issue create`, and appends `--label <name>` only for a label that inventory
+// positively confirms present; when the inventory itself can't be determined, both requested
+// labels ship anyway, unverified (see fileCard's own header comment for the three-way split).
+// Most of the tests below assert on the ARGV actually handed to the fake `gh issue create` (never
+// just the return value) and/or on the skip- or unknown-inventory text fileCard writes via the
+// injected `deps.log` -- as an `includes()` substring, never an exact match; a few assert only
+// one of those two things, or neither -- see each test's own name and body.
+
+function labelListResponse(names) {
+  return { status: 0, stdout: JSON.stringify(names.map((name) => ({ name }))), stderr: '', signal: null };
+}
+
+test('fileCard: target repo has BOTH cat:/size: labels -- both survive in the create argv, nothing announced', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse(['cat:feature', 'size:S', 'bug', 'enhancement']);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/501\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create.includes('--label'));
+  assert.ok(create.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(create.includes(`size:${VALID_DRAFT.size}`));
+  // Every requested label existed -- no skip noise.
+  assert.deepEqual(logs, []);
+});
+
+test('fileCard: target repo has NEITHER label family (the #196 shape, Crazz-Org/SPO-Pipeline) -- both skipped, no --label reaches argv, each skip named on stdout', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'Crazz-Org/SPO-Pipeline',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        // SPO-Pipeline's 10 labels, measured 2026-09-10 -- nine GitHub defaults plus
+        // `accessibility`; no cat:/size: family.
+        return labelListResponse([
+          'accessibility', 'bug', 'documentation', 'duplicate', 'enhancement',
+          'good first issue', 'help wanted', 'invalid', 'question', 'wontfix',
+        ]);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/196\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(!create.includes('--label'));
+  assert.ok(!create.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(!create.includes(`size:${VALID_DRAFT.size}`));
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'no log named the skipped cat: label');
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'no log named the skipped size: label');
+  assert.ok(logs.some((l) => l.includes('Crazz-Org/SPO-Pipeline')), 'no log named the repo');
+});
+
+// D2 (#196 reproduced with a green suite): a mutation that hardcodes the `gh label list` argv's
+// `--repo` to `config.ghRepo` (dropping the `deps.ghRepo || config.ghRepo` fallback) leaves every
+// OTHER fixture in this file green, for fixture-specific reasons rather than one shared cause. Two
+// examples: `extractRepoFlag + the real intake.fileCard: ...` (below, ~:3196) injects
+// `deps.ghRepo` and asserts on the `gh issue create` argv, but never inspects the label-list argv
+// at all, so the mutation is invisible to it; the `#196 shape` test above (~:935) also injects
+// `deps.ghRepo`, but its fake label-list responder answers the same ten-label inventory whichever
+// `--repo` it is handed, so reading the wrong repo's inventory changes nothing observable. This is
+// the one test that discriminates: `deps.ghRepo` (the injected target, SPO-Pipeline, no cat:/size:
+// family) differs from `config.ghRepo` (the real shipped default, SPO-WebClient, mirrored here
+// with BOTH families present), and the fake inventory answers according to whichever `--repo` the
+// label-list argv actually carries -- so if fileCard ever reads the wrong repo's inventory, the
+// wrong family shows up as "known" and both labels wrongly survive into the `gh issue create`
+// argv.
+test('fileCard: label-list argv is built off deps.ghRepo, not config.ghRepo -- the #196 regression, pinned directly on the argv', () => {
+  assert.notEqual(orchestratorConfig.ghRepo, 'Crazz-Org/SPO-Pipeline');
+
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'Crazz-Org/SPO-Pipeline',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        const repoArg = argv[argv.indexOf('--repo') + 1];
+        // The real shipped default (SPO-WebClient) answers with BOTH families present; the
+        // injected target (SPO-Pipeline) answers with NEITHER -- so reading the wrong repo's
+        // inventory is visible in the outcome, not just in the argv.
+        if (repoArg === orchestratorConfig.ghRepo) {
+          return labelListResponse(['cat:feature', 'size:S', 'bug']);
+        }
+        return labelListResponse(['bug', 'enhancement']);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/196\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const labelList = spawnCalls.find((argv) => argv[0] === 'label' && argv[1] === 'list');
+  assert.ok(labelList, 'gh label list was never called');
+  assert.equal(
+    labelList[labelList.indexOf('--repo') + 1],
+    deps.ghRepo,
+    'label-list argv read the wrong repo -- config.ghRepo leaked in instead of deps.ghRepo'
+  );
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(!create.includes('--label'), 'SPO-Pipeline has neither family -- no --label should reach argv');
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)));
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)));
+});
+
+// D3: every fixture above shares the SAME case between the two sides of
+// `knownLabelNames.has(label)` (VALID_DRAFT's `size:S` and the FILE_AMENDED fixture's `size:L`
+// both use an uppercase letter, and every fixture's `cat:` side -- all lowercase -- is spelled
+// identically on both sides too), so a mutation making the match case-insensitive
+// (`n.toLowerCase() === label.toLowerCase()`) is unpinned by all of them -- lowercasing two
+// strings that already agree is a no-op. Re-measured 2026-09-10 by running exactly that mutation:
+// 129/130 green, KILLED by the test immediately below, `fileCard: label match is case-sensitive
+// ...`. Pin it directly: a mixed-case inventory against the lowercase-requested labels must
+// still skip both (an exact, case-sensitive match).
+test('fileCard: label match is case-sensitive -- a mixed-case inventory does not satisfy a lowercase request', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse(['Cat:Feature', 'Size:S']);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/507\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(!create.includes('--label'), 'a case-insensitive match let a --label through -- argv should have none');
+  assert.ok(!create.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(!create.includes(`size:${VALID_DRAFT.size}`));
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'no log named the skipped cat: label');
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'no log named the skipped size: label');
+});
+
+test('fileCard: target repo has EXACTLY ONE of the two labels -- the present one survives, the missing one is skipped and named', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        // Has cat: but no size: family.
+        return labelListResponse([`cat:${VALID_DRAFT.category}`, 'bug']);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/502\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(!create.includes(`size:${VALID_DRAFT.size}`));
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'no log named the skipped size: label');
+  assert.ok(!logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'the present cat: label was announced as skipped');
+});
+
+test('fileCard: label inventory read fails (non-zero exit) -- UNKNOWN inventory, BOTH labels ship unverified, the unknown-inventory case is announced', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return { status: 1, stdout: '', stderr: 'gh: not found', signal: null };
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/503\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create.includes(`cat:${VALID_DRAFT.category}`), 'UNKNOWN inventory must still pass the requested cat: label');
+  assert.ok(create.includes(`size:${VALID_DRAFT.size}`), 'UNKNOWN inventory must still pass the requested size: label');
+  assert.equal(logs.length, 1);
+  assert.ok(logs[0].includes('Crazz-Org/SPO-WebClient'));
+  assert.ok(logs[0].includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(logs[0].includes(`size:${VALID_DRAFT.size}`));
+});
+
+test('fileCard: label inventory read exits 0 but stdout is not valid JSON -- treated the same as an unknown inventory, both labels ship unverified', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return { status: 0, stdout: 'not json at all', stderr: '', signal: null };
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/504\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create.includes(`cat:${VALID_DRAFT.category}`), 'UNKNOWN inventory must still pass the requested cat: label');
+  assert.ok(create.includes(`size:${VALID_DRAFT.size}`), 'UNKNOWN inventory must still pass the requested size: label');
+  assert.equal(logs.length, 1);
+});
+
+test('fileCard: no deps.log injected -- defaults to console.log (captured via the suite\'s captureConsole helper)', () => {
+  const deps0 = {
+    ghRepo: 'Crazz-Org/SPO-Pipeline',
+    spawnSync: fakeSpawnSync((command, argv) => {
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse(['bug']); // neither cat:/size: present
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/505\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const console_ = captureConsole();
+  let result;
+  try {
+    result = intake.fileCard(VALID_DRAFT, review, deps0);
+  } finally {
+    console_.restore();
+  }
+  assert.equal(result.ok, true);
+  assert.ok(console_.logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)));
+});
+
+test('fileCard: target repo has BOTH families but neither REQUESTED MEMBER -- exact match, not family/prefix match: both skipped, no --label reaches argv', () => {
+  // Every fixture above either has the exact requested label or has no member of that label's
+  // family at all -- neither one distinguishes an exact match on `knownLabelNames.has(label)`
+  // from a family/prefix match (e.g. "does some `cat:` label exist"). This fixture does: the
+  // inventory carries `cat:defect` and `size:L` -- both families present -- while the draft
+  // (VALID_DRAFT) asks for `cat:feature`/`size:S`, neither of which is in the inventory. Under a
+  // prefix/family match both would wrongly survive into argv; under the real exact match neither
+  // does.
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse(['cat:defect', 'size:L']);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/506\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(!create.includes('--label'), 'a family/prefix match let a --label through -- argv should have none');
+  assert.ok(!create.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(!create.includes(`size:${VALID_DRAFT.size}`));
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'no log named the skipped cat: label');
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'no log named the skipped size: label');
+});
+
+test('fileCard: target repo has ONLY size: (reverse of the existing cat:-only case) -- size: survives, cat: is skipped and named', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        // Has size: but no cat: family.
+        return labelListResponse([`size:${VALID_DRAFT.size}`, 'bug']);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/507\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  assert.ok(create.includes(`size:${VALID_DRAFT.size}`));
+  assert.ok(!create.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'no log named the skipped cat: label');
+  assert.ok(!logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'the present size: label was announced as skipped');
 });
 
 // ---- triageBugReport: outcome parsing, including the string-encoded-draft recovery -------------
