@@ -244,7 +244,25 @@ test('pruning keeps the newest N and NEVER removes the current or previous relea
   // release four times with no ref -- every call cut HEAD, i.e. the same release four times, and
   // the assertion below failed against a "previous" that had never been built. A test that builds
   // one release and checks the retention of four proves nothing about retention.
-  for (const s of shas) release(w, [s], { SPO_RELEASE_KEEP: '2' });
+  //
+  // FACT, NOT MARGIN: prune_releases (scripts/release.sh:118-133) orders candidates by
+  // `ls -1dt "$RELEASES_DIR"/<dir>/` -- directory MTIME, not creation order. `cmd_release`'s own
+  // `mv -T "$tmp" "$dest"` (release.sh:170) renames the built tree into place, and a same-filesystem
+  // rename preserves the source directory's mtime rather than resetting it, so a release's mtime is
+  // set by its git clone+checkout, not by when this loop happens to read it back. Four releases cut
+  // back to back can land inside the same mtime tick on a filesystem with coarse (e.g. 1s)
+  // resolution, and `ls -t`'s tie-break between two equal mtimes is implementation-defined -- not
+  // chronological -- so the wrong release could be the one counted past KEEP. Giving each release an
+  // explicit, well-separated mtime the instant it is built removes that tie outright: the anchor is
+  // an hour in the past, so every SUBSEQUENT release this loop builds (mv -T always leaves a real
+  // "now" mtime on the one just cut, ahead of this call's own fs.utimesSync) sorts unambiguously
+  // after all of these, with no dependency on how coarse the filesystem's clock is.
+  const mtimeBase = Date.now() - 3600_000;
+  shas.forEach((s, i) => {
+    release(w, [s], { SPO_RELEASE_KEEP: '2' });
+    const t = new Date(mtimeBase + i * 60_000);
+    fs.utimesSync(path.join(w.releases, s), t, t);
+  });
   assert.equal(
     fs.readdirSync(w.releases).filter((f) => /^[0-9a-f]{40}$/.test(f)).length >= 2,
     true,

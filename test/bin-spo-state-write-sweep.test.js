@@ -25,8 +25,8 @@ require('./no-real-spawn');
 // it. This test is that enforcement.
 //
 // SCOPE: bin/spo itself, plus every console/*.js module it actually delegates dashboard rendering
-// to (bin/spo:178-179's `require('../console/collect')`/`require('../console/render')`, and
-// bin/spo:1070-1074's `--serve`-only `require('../console/serve')`/`.../system`/`.../prod-version`/
+// to (bin/spo:210-211's `require('../console/collect')`/`require('../console/render')`, and
+// bin/spo:1174-1177's `--serve`-only `require('../console/serve')`/`.../system`/`.../prod-version`/
 // `.../usage-scan`) -- a write one module deeper than bin/spo itself is just as real a violation of
 // the invariant above and would otherwise be invisible to a sweep that only ever opened bin/spo.
 // console/usage-rollups.js is included one level deeper still, for a different reason: it is
@@ -57,7 +57,7 @@ require('./no-real-spawn');
 //      thread) and called it, however it was imported: bare (destructured) or
 //      through a namespace object (`journal.writeState(...)`) -- bin/spo's OWN dominant import
 //      style is namespace objects (`accounts.`, `intake.`, `autoTriage.`, `reportIntake.`,
-//      `remoteReportPull.`, `recette.` -- bin/spo:180-189), so a namespaced `journal.writeState`
+//      `remoteReportPull.`, `recette.` -- bin/spo:212-223), so a namespaced `journal.writeState`
 //      is if anything the MORE likely future spelling, not an edge case to special-case away.
 //      `accounts.writeState(...)` is the one deliberate exclusion: it writes the claude-accounts
 //      POOL's own state.json (cooldowns/disabled markers), a completely different file under a
