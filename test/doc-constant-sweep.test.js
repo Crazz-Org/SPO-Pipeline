@@ -1443,6 +1443,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
   "orchestrator/steps/scripted.js :: worker.ts:1542",
   "prompts/README.md :: plan.md:103",
+  "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18",
 ];
 
 test('every file:line citation in the 65-file corpus resolves, or is on the named allowlist', () => {
@@ -2115,7 +2116,13 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // the fix is widening the citation itself to the range that actually contains what it names,
   // `daemon.js:626-627`, not exempting it from the check. Re-pinned in dispatcher.js and
   // EXPECTED_CITATIONS accordingly. Both now anchor with zero offenders. 32 -> 34.
-  assert.equal(anchored, 34, `expected 34 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
+  // SPO-Pipeline#170 (2026-09-10): +1 citation, `scripts/usage-report.js :: orchestrator/token-
+  // recovery.js:10-18`, added to usage-report.js's own header when it started sharing
+  // console/usage-scan.js's discovery/dedup logic instead of carrying a diverging copy (the
+  // "exactly one reader" argument that range makes). It anchors: `scanFile` (line 12) and
+  // `reader` (lines 12, 15, 16) appear verbatim within lines 10-18 (the paragraph the citation
+  // targets), so the heuristic finds a candidate in range. 34 -> 35.
+  assert.equal(anchored, 35, `expected 35 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
   // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
@@ -2279,16 +2286,20 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // `daemon.js:626-627` is a genuine RANGE (`c.start !== c.stop`), blunt by construction like every
   // other range in this corpus (see this section's own header) -- ranges is 9 -> 10. blunt is
   // unchanged.
+  // SPO-Pipeline#170 (2026-09-10): +1 citation, `scripts/usage-report.js :: orchestrator/token-
+  // recovery.js:10-18` (see the main anchor test's own note above) -- a genuine RANGE
+  // (`c.start !== c.stop`), blunt by construction like every other range in this corpus. ranges is
+  // 10 -> 11. discriminating and blunt are unchanged.
   assert.deepEqual(
     blunt.map((b) => b.split(' -- ')[0]).sort(),
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
   assert.equal(discriminating.length, 21, `expected 21 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
-  assert.equal(ranges.length, 10, `expected 10 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
+  assert.equal(ranges.length, 11, `expected 11 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
-  assert.equal(discriminating.length + blunt.length + ranges.length, 34, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (34).');
+  assert.equal(discriminating.length + blunt.length + ranges.length, 35, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (35).');
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

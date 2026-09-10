@@ -13,8 +13,8 @@
 // module for this purpose (see its own export comment). There is exactly one definition of
 // "billable" (fresh input + cache-creation + output, cache-read reported separately -- see
 // orchestrator/steps/llm.js's own header) and exactly one reader of a transcript file; a second
-// reader here would let the two silently drift apart the way console/usage-scan.js's own header
-// warns scripts/usage-report.js's dedup direction already has.
+// reader here would let the two silently drift apart the way console/usage-scan.js and
+// scripts/usage-report.js once did, until SPO-Pipeline#170 made them share one reader.
 //
 // ---- locate by session id, never by slugifying cwd --------------------------------------------
 //

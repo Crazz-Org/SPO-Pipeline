@@ -1,10 +1,18 @@
 'use strict';
 // console/usage-scan.js -- incremental, streaming token-usage scanner for the live dashboard's
-// "tokens per task/model" section. A SELECTIVE extraction of scripts/usage-report.js's file
-// walk (that script is untouched -- it stays the offline analysis tool). The message.id dedup
-// is NOT shared between the two: usage-report.js keeps the FIRST occurrence of an id,
-// this module keeps the LAST (see scanFile's header for why) -- the two scripts' dedup totals
-// diverge on any transcript whose streamed usage grows across occurrences of the same id.
+// "tokens per task/model" section, and (as of 2026-09-10, SPO-Pipeline#170) the ONE place the
+// corpus-wide candidate walk is implemented: listJsonlFilesRecursive and listCandidateFiles below
+// are exported and imported by scripts/usage-report.js (the offline analysis tool) rather than
+// re-walked there a second time. (orchestrator/token-recovery.js's locate-one-session-by-id walk
+// deliberately mirrors listJsonlFilesRecursive rather than importing it -- see its own comment;
+// this fix does not touch that.) The message.id dedup direction is ALSO now shared -- both
+// scripts keep the LAST occurrence of an id (see scanFile's header for why) -- so the two no
+// longer diverge on that axis; scripts/usage-report.js's own header carries the measured, dated
+// attribution of what that fix changed and enumerates what still deliberately differs between the
+// two tools (incremental caching vs one-shot, the maxFileBytes cap, account attribution, default
+// root scope). They used to diverge (first-wins vs last-wins, and usage-report.js never walked
+// subagent transcripts at all) -- that history, and the numbers it produced, are what
+// SPO-Pipeline#170 fixed.
 // Neither script carries a dollar figure anywhere: usage-report.js's own header records the
 // 2026-08-31 maintainer decision retiring its $$$ estimate (the pool is a Claude Max quota, not
 // metered API billing, so a dollar figure never meant money spent -- see
@@ -52,6 +60,84 @@ function localDateKey(input) {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+// Recursively collects every *.jsonl at any depth under `dir` (a session's `subagents`
+// directory), so a deeper layout -- e.g. `subagents/workflows/<wf_id>/agent-<hash>.jsonl` from a
+// workflow-spawned agent, not just the flat `subagents/agent-<hash>.jsonl` -- is not silently
+// skipped. Never follows a symlinked directory (avoids a cycle turning this into an infinite
+// walk) and stops at MAX_SUBAGENT_WALK_DEPTH regardless. Guarded by try/catch at every
+// readdirSync so a missing/unreadable directory anywhere in the tree is skipped silently, same as
+// the rest of this module.
+//
+// Module-scope (not a closure inside createUsageScanner) because it closes over nothing but the
+// MAX_SUBAGENT_WALK_DEPTH constant above -- there was never a reason this needed roots/filter, and
+// keeping it free-standing is what lets it be exported and reused by scripts/usage-report.js (see
+// this file's own header) without a second, drifting copy.
+function listJsonlFilesRecursive(dir, depth, out) {
+  if (depth > MAX_SUBAGENT_WALK_DEPTH) return;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (e.isFile() && e.name.endsWith('.jsonl')) {
+      out.push(path.join(dir, e.name));
+    } else if (e.isDirectory() && !e.isSymbolicLink()) {
+      listJsonlFilesRecursive(path.join(dir, e.name), depth + 1, out);
+    }
+  }
+}
+
+// listCandidateFiles({roots, filter}) -- roots: [{path, account}]. filter: an optional substring
+// a project directory name must contain (null/falsy = every directory). Returns every *.jsonl
+// candidate across all roots: top-level `<root>/<projectDir>/*.jsonl` plus, for every session
+// directory found alongside those files, its `subagents` subtree (any depth, via
+// listJsonlFilesRecursive above). Pure -- no cache, no mtime/size comparison, just the walk --
+// which is exactly what makes it the one shared discovery primitive both createUsageScanner below
+// (the live, incremental scanner) and scripts/usage-report.js (the offline, one-shot CLI) can
+// call without either re-deriving the walk. See this file's own header for why there is exactly
+// one of these.
+function listCandidateFiles({ roots = [], filter = null } = {}) {
+  const files = []; // [{absPath, account}]
+  for (const root of roots) {
+    let dirEntries;
+    try {
+      dirEntries = fs.readdirSync(root.path, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const projectDirs = dirEntries
+      .filter((d) => d.isDirectory() && (!filter || d.name.includes(filter)))
+      .map((d) => path.join(root.path, d.name));
+    for (const dir of projectDirs) {
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith('.jsonl')) {
+          files.push({ absPath: path.join(dir, e.name), account: root.account });
+        } else if (e.isDirectory()) {
+          // <projectDir>/<parentSessionId>/subagents/agent-<hash>.jsonl -- a subagent's own
+          // transcript, and it can nest deeper still: a workflow-spawned agent lands at
+          // <projectDir>/<parentSessionId>/subagents/workflows/<wf_id>/agent-<hash>.jsonl. Every
+          // line in either layout carries `sessionId` set to the PARENT session's id (scanFile
+          // already folds that onto the parent via `agg.sessionId = sid`), so walking the whole
+          // `subagents` subtree is the whole fix -- no new attribution logic needed.
+          const subagentsDir = path.join(dir, e.name, 'subagents');
+          const subFiles = [];
+          listJsonlFilesRecursive(subagentsDir, 0, subFiles);
+          for (const absPath of subFiles) files.push({ absPath, account: root.account });
+        }
+      }
+    }
+  }
+  return files;
 }
 
 function emptyModelAgg() {
@@ -151,79 +237,16 @@ async function scanFile(filePath, account) {
 // optional substring a project directory name must contain (null = every directory). Keeps a
 // Map<absFilePath, {mtimeMs, size, agg}> cache; scan() only re-reads a file whose stat changed,
 // and recomposes the global aggregates from the cache every call (never accumulates
-// incrementally, to avoid drift on file removal/edit).
+// incrementally, to avoid drift on file removal/edit). Discovery itself (listCandidateFiles) is
+// the module-scope function above, not a closure here -- see this file's own header for why.
 function createUsageScanner({ roots = [], filter = null, maxFileBytes = DEFAULT_MAX_FILE_BYTES } = {}) {
   const cache = new Map(); // absPath -> {mtimeMs, size, agg}
   let lastIndex = null;
   let stats = { cachedFiles: 0, lastScanMs: null, lastScanAt: null, filesScanned: 0, filesReused: 0 };
 
-  // Recursively collects every *.jsonl at any depth under `dir` (a session's `subagents`
-  // directory), so a deeper layout -- e.g. `subagents/workflows/<wf_id>/agent-<hash>.jsonl` from
-  // a workflow-spawned agent, not just the flat `subagents/agent-<hash>.jsonl` -- is not silently
-  // skipped. Never follows a symlinked directory (avoids a cycle turning this into an infinite
-  // walk) and stops at MAX_SUBAGENT_WALK_DEPTH regardless. Guarded by try/catch at every
-  // readdirSync so a missing/unreadable directory anywhere in the tree is skipped silently, same
-  // as the rest of this function.
-  function listJsonlFilesRecursive(dir, depth, out) {
-    if (depth > MAX_SUBAGENT_WALK_DEPTH) return;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (e.isFile() && e.name.endsWith('.jsonl')) {
-        out.push(path.join(dir, e.name));
-      } else if (e.isDirectory() && !e.isSymbolicLink()) {
-        listJsonlFilesRecursive(path.join(dir, e.name), depth + 1, out);
-      }
-    }
-  }
-
-  function listCandidateFiles() {
-    const files = []; // [{absPath, account}]
-    for (const root of roots) {
-      let dirEntries;
-      try {
-        dirEntries = fs.readdirSync(root.path, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      const projectDirs = dirEntries
-        .filter((d) => d.isDirectory() && (!filter || d.name.includes(filter)))
-        .map((d) => path.join(root.path, d.name));
-      for (const dir of projectDirs) {
-        let entries;
-        try {
-          entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch {
-          continue;
-        }
-        for (const e of entries) {
-          if (e.isFile() && e.name.endsWith('.jsonl')) {
-            files.push({ absPath: path.join(dir, e.name), account: root.account });
-          } else if (e.isDirectory()) {
-            // <projectDir>/<parentSessionId>/subagents/agent-<hash>.jsonl -- a subagent's own
-            // transcript, and it can nest deeper still: a workflow-spawned agent lands at
-            // <projectDir>/<parentSessionId>/subagents/workflows/<wf_id>/agent-<hash>.jsonl.
-            // Every line in either layout carries `sessionId` set to the PARENT session's id
-            // (scanFile already folds that onto the parent via `agg.sessionId = sid`), so walking
-            // the whole `subagents` subtree is the whole fix -- no new attribution logic needed.
-            const subagentsDir = path.join(dir, e.name, 'subagents');
-            const subFiles = [];
-            listJsonlFilesRecursive(subagentsDir, 0, subFiles);
-            for (const absPath of subFiles) files.push({ absPath, account: root.account });
-          }
-        }
-      }
-    }
-    return files;
-  }
-
   async function scan() {
     const t0 = Date.now();
-    const files = listCandidateFiles();
+    const files = listCandidateFiles({ roots, filter });
     const seenPaths = new Set();
     let filesScanned = 0;
     let filesReused = 0;
@@ -624,6 +647,15 @@ module.exports = {
   discoverUsageRoots,
   localDateKey,
   DEFAULT_MAX_FILE_BYTES,
+  // listJsonlFilesRecursive / listCandidateFiles are exported for scripts/usage-report.js
+  // (SPO-Pipeline#170): the offline CLI's own discovery used to be a second, undeclared copy of
+  // this walk -- two levels only, no subagent recursion -- which is exactly how it came to
+  // silently under-read the corpus (see scripts/usage-report.js's own header for the measured
+  // gap that fixed). Sharing the function is the same rationale orchestrator/token-recovery.js's
+  // header already gives for sharing scanFile: exactly one implementation of "which files belong
+  // to this scan", so the two callers cannot drift on it again the way they just did.
+  listJsonlFilesRecursive,
+  listCandidateFiles,
   // scanFile is exported for orchestrator/token-recovery.js (token-ledger lot, action 4.3): that
   // module recovers billable tokens for a killed/unparsable `claude` call from the session
   // transcript it left on disk, and it deliberately reuses THIS reader rather than writing a
