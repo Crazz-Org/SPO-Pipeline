@@ -2048,15 +2048,23 @@ the option is ever lost and needs recreating.
 GitHub issue, and from the product board to a local `queue/` task file -- behind `bin/spo`'s
 `ask` and `pull` commands, and (for the brainstorm lane) the `.claude/commands/SPO-Draft.md`
 interactive-session command. Neither `bin/spo` command runs `daemon.js` or drives a task through
-the lifecycle above; `spo ask` only files an issue (the board's own auto-add workflow puts it in
-Todo), and `spo pull` only writes `queue/` files for a later `daemon.js --real` run to drain.
+the lifecycle above. By default (no `--repo`), `spo ask` only files an issue (project 1's own
+auto-add workflow is configured to put it in Todo; `doc/board-audit.md` reads that workflow as
+enabled but could not read its target field, so treat Todo as its intent, not a measurement).
+`--repo <owner/name>` files into another repo instead, and if `orchestrator/project-board.js`
+maps that repo (SPO-Pipeline/SPO-Deploy → project 2) it also places the card on that board
+itself with Status=Todo, verified by reading the field back; an unmapped repo files with no
+board call at all, and says so on stderr. **`--repo` is only recognised ahead of the request
+text** (`spo ask --repo <owner/name> <text…>`, or `--repo=<owner/name>`) — a `--repo` anywhere
+later, or a second one, is a usage error and files nothing. `spo pull` only writes `queue/`
+files for a later `daemon.js --real` run to drain.
 
 **The maintainer flow, end to end:**
 
 ```
 spo ask "<request>"     -- file a card from a request (or /SPO-Draft, see below)
    |
-   v  (the board's auto-add workflow moves the new issue to Todo)
+   v  (the board's auto-add workflow is the thing meant to move it to Todo)
 npm run board:claim      -- (in the product repo) the priority order `spo pull` reads
    |
    v
@@ -2080,7 +2088,8 @@ spo triage [--limit N]   -- STAGE 3: reproduce/route/dedup/draft the CONFIRMED r
                              SAME reviewCard gate `spo ask` uses, then amendCard (edits the raw
                              card in place) and a move to Todo
    |
-   v  (same board auto-add -> Todo as spo ask)
+   v  (same board auto-add -> Todo as spo ask's SPO-WebClient default -- neither spo intake nor
+      spo triage takes a --repo flag)
 npm run board:claim  ->  spo pull  ->  daemon.js --real     -- (as above)
 ```
 
@@ -2832,8 +2841,8 @@ bin/spo accounts [--accounts-dir <dir>]            # list the account pool: name
 bin/spo account add <name> [--accounts-dir <dir>]  # create the pool slot, print the guided setup steps
 bin/spo account clear-cooldown <name>              # drop a locally-invented cooldown (and its escalation state)
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
-bin/spo ask <text…> [--dry]                        # draft -> review -> file a card (see "Intake" above)
-bin/spo ask --draft-file <path> [--dry]             # same, skipping DRAFT_CARD (brainstorm lane)
+bin/spo ask [--repo <owner/name>] <text…> [--dry]  # draft -> review -> file a card (see "Intake" above); --repo only ahead of <text…>, later/duplicate = usage error
+bin/spo ask [--repo <owner/name>] --draft-file <path> [--dry]  # same, skipping DRAFT_CARD (brainstorm lane)
 bin/spo pull [--limit <n>] [--force]               # write queue/<seq>-issue-<n>.json for the top N claimable board cards (refuses while a live daemon holds the lock, --force overrides -- card #100)
 bin/spo pull-reports                               # STAGE 0: pull queued reports from a production deployment over HTTPS
 bin/spo intake [--limit <n>] [--reports-dir <dir>] [--force]  # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above); refuses while a live daemon holds the lock, --force overrides (card #100)

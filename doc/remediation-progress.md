@@ -820,6 +820,17 @@ SPO-Pipeline or SPO-Deploy → project 2. **No remediation-plan work goes on pro
 enabled, so anything the intake produces lands in the daemon's queue by default and has to be
 moved off straight away.
 
+> **Partly superseded, 2026-09-10 (action 184/185).** `spo ask` gained a `--repo <owner/name>`
+> flag — recognised only ahead of the request text (`spo`'s own flags, `--dry` and
+> `--draft-file`, are parsed out first), and a hard usage error anywhere else. Targeting a repo
+> that `orchestrator/project-board.js` maps (currently SPO-Pipeline, SPO-Deploy) files the issue
+> there and places it on project 2 itself with Status=Todo, verified by reading the field back
+> — no manual move needed for a card filed that way. The paragraph above still describes the
+> default (`spo ask` with no `--repo`): same repo, same reliance on project 1's auto-add
+> workflow, still no board call of its own. Filing behaviour there is
+> unchanged; what differs is cosmetic — a `--repo: …` line added to `--dry` output, and the
+> flag now shown in the empty-request usage line.
+
 Filing them found two things worth keeping. `review-card` caught a citation of "SPO-Pipeline PR
 #444" for the heartbeat removal — it is **Crazz-Org/SPO-WebClient PR #444**, and it checked both
 repos to say so. And drafting #480 meant reproducing the flake rather than citing it, which turned
