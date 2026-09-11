@@ -615,10 +615,10 @@ test('DEFECT: a dead owner pid still says so explicitly -- the OTHER stale cause
 
 test('DEFECT: an idle edge older than the newest dispatcher-start is not the CURRENT dispatcher\'s state', () => {
   // `idleNoHealthyAccounts` is in-memory, and the idle/returned pair is edge-triggered -- so a
-  // restart between the two (this project restarts the daemon on every merge) means the
-  // `returned` edge is never written at all, and a backwards walk to the newest edge claims IDLE
-  // forever. Measured before the fix: "dispatcher: IDLE since 191h06m ago" on a fixture whose
-  // daemon was demonstrably busy afterwards.
+  // restart between the two (a deploy -- `git pull` in the deploy checkout, never a GitHub merge
+  // alone -- restarts a running daemon) means the `returned` edge is never written at all, and a
+  // backwards walk to the newest edge claims IDLE forever. Measured before the fix: "dispatcher:
+  // IDLE since 191h06m ago" on a fixture whose daemon was demonstrably busy afterwards.
   const journalDir = mkTmp('spo-6.7v-idle-restart-');
   const queueDir = mkTmp('spo-6.7v-idle-restart-queue-');
   fs.mkdirSync(journalDir, { recursive: true });

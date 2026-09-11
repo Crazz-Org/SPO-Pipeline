@@ -276,11 +276,11 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_
 //                            intake.js's makeTask only detects a slice of that
 //                            (`area === 'rdo' || /rdo-members\.ts/.test(body)`), once at
 //                            intake, before a plan exists.
-//                            Per the spec's own Step
-//                            contracts table this applies to IMPLEMENT and to VALIDATE's
-//                            change-validator (its escalation is stated explicitly in the
-//                            prompt file validate-change.md itself, not just the table) --
-//                            NOT to PLAN. See the note on the PLAN entry below.
+//                            As a MODEL signal this applies to IMPLEMENT only; VALIDATE's
+//                            change-validator reads the same flag through `escalatesEffortOn`
+//                            (effort high -> xhigh, model unchanged -- see its entry and
+//                            shouldEscalateEffort). Neither applies to PLAN. See the note
+//                            on the PLAN entry below.
 //   - 'lSize'             -- task.size === 'L', IMPLEMENT only ("... or L-sized task").
 const STEP_CONTRACTS = {
   PLAN: {

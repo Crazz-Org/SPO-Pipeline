@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# post-merge -- THE DEPLOY. `git pull` in the deploy checkout fires this; nothing else deploys.
-# A merge on GitHub deploys nothing, and neither does a pull in any other worktree.
+# post-merge -- THE DEPLOY. git fires this whenever `git merge` or `git pull` finishes a merge on its
+# own, in ANY worktree: a fast-forward, a merge commit or a --squash. Never for a no-op, a pull that
+# rebases local commits, or a merge stopped by a conflict or --no-commit, even once it is committed.
+# It deploys only in the deploy checkout on the deploy branch. A merge on GitHub deploys nothing.
 #
 # Installed as a symlink at .git/hooks/post-merge by daemon-install.sh and dashboard-install.sh.
 #

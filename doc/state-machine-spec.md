@@ -76,15 +76,15 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    yet) if `reapSignalledChildren`'s own SIGKILL escalation ever reaches it (the one caller that
    signals a repark child at all — see `dispatcher.js`'s own comment on `{ includeReparking: true
    }`), which no later scan can ever recover — deferring instead just leaves an ordinary
-   non-terminal `state.json` for orphan-scan to pick up cleanly next start. This is not a corner case: a merge's `git pull`
-   SIGTERMing an in-flight card is this project's single most common shutdown, so the fallback
-   above is the primary path for that one. See `orchestrator/README.md` § Orphan recovery.
+   non-terminal `state.json` for orphan-scan to pick up cleanly next start. Since the drain, a deploy's pull drain-restarts the daemon
+   (`scripts/release.sh`; the unit's `KillMode=mixed`), so an in-flight card reaches this fallback
+   only if it outlives the drain bound (`config.js`'s drain timeout, default 45 min) or a second signal forces an immediate stop. See `orchestrator/README.md` § Orphan recovery.
    **Action 4.4:** the catch-all remains the error policy for every park reason except a closed,
    named allowlist of ones that are facts about the *world at that instant*, not about the card —
-   `claim-rate-limited` (a board-claim rate limit), `gate-non-attesting` (action 4.2's bench-
-   attested-nothing park), `gate-live-blocked` (action B2.3's world-lock/rate-limit BLOCKED park —
-   see the GATE row below), and the `llm-transport-failed:<STEP>` family (PLAN/IMPLEMENT/DIAGNOSE/
-   VALIDATE, exact strings — never a prefix match). Those are auto-retried a bounded number of
+   `claim-rate-limited`, `gate-non-attesting` (action 4.2), `gate-live-blocked` (action B2.3),
+   three of B3.4's four splits of non-attesting — `gate-environment`, `gate-interrupted`,
+   `gate-abandoned` — plus B3.4's new `gate-stale` park (see the GATE row below), and the
+   `llm-transport-failed:<STEP>` family (PLAN/IMPLEMENT/DIAGNOSE/VALIDATE, exact strings — never a prefix match). Those are auto-retried a bounded number of
    times (`config.transientRetryBudget`, default 2) with a journalled backoff
    (`config.transientRetryDelaysMs`, 1 min then 5 min, carried as an absolute `notBefore` on the
    re-queued task rather than a `sleep` — since chantier 6 split worker execution out into its own
@@ -212,7 +212,7 @@ low.
 | IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
 | DIAGNOSE | Opus 5 (was Fable 5 until 2026-09-04) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
-| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when the diff touches the RDO wire | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when `task.touchesRdoMembers` is true (`step-contracts.js`'s `escalatesEffortOn`) — an intake guess that the real diff can only raise false→true, and only in memory for the rest of that run (a re-enqueue or resume rebuilds the task from `task.json`'s intake value), so an intake-true call gets xhigh even if the diff never touches the RDO wire | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
 
 The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LLM_STEP_DEADLINE_MS_BY_STEP`
 overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
@@ -595,8 +595,10 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
   `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1190`)
-  is a generated static HTML page reading the same local journals, and already ships alongside
-  the CLI rather than after it.
+  writes static HTML (the flight deck, plus `health.html` beside it) from the same local surfaces
+  or, with `--serve`, runs a live HTTP server (`console/serve.js`) over those surfaces plus host
+  CPU/memory and an outbound production-version probe (`--no-prod` turns it off); either way it
+  already ships alongside the CLI rather than after it.
 - Nothing polls GitHub for state that has a local surface (verdicts, nightly, journals).
 
 ## Design consequences from the measured improvisation (v1.1)

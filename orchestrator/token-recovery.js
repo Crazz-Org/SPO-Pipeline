@@ -2,9 +2,10 @@
 // token-recovery.js -- token-ledger lot, action 4.3: recovers billable tokens for an `llm-call`
 // that really ran (a `sessionId` was minted and `claude` was spawned) but reported no `modelUsage`
 // block, so orchestrator/steps/llm.js's extractTokens returned ZERO_TOKENS (`tokensSource: null,
-// billableTokens: 0`) even though the call spent real tokens. Measured on the real corpus (action
-// 4.2): 20 such calls hold 4,144,490 billable tokens recorded as zero; the ledger reads
-// 19,434,656 and should read 23,579,146.
+// billableTokens: 0`) even though the call spent real tokens. MEASURED (2026-09-08, action 4.3,
+// commit 4d38a2ac): 20 such calls held 4,144,490 billable tokens recorded as zero; the ledger
+// read 19,434,656 and should have read 23,579,146. That is a dated snapshot of the mutable
+// ~/.spo-state/journal corpus, not a live figure; for today's ledger, run `bin/spo tokens`.
 //
 // The fix is not a second accounting path: `claude` itself writes every call's usage into the
 // session's own JSONL transcript on disk (the same file console/usage-scan.js streams for the
@@ -58,9 +59,12 @@
 // Returns null when nothing recoverable was found: no file matched `sessionId` anywhere, or one or
 // more files matched but not a single usage row was parsed out of any of them. Returns a real
 // object -- `billableTokens` genuinely 0 included -- the moment at least one usage row was parsed,
-// even if every field on it is 0. That is not a hypothetical: 4 of the 20 corpus calls this action
-// exists for recover exactly 0, because their transcript holds one assistant message with an
-// all-zero usage block -- a real measurement, not an absence. Distinguishing "found rows summing
+// even if every field on it is 0. That is not a hypothetical: on the 2026-09-08 corpus snapshot
+// this module was built against (action 4.3, commit 4d38a2ac), 4 of the 20 calls recovered
+// exactly 0, because their transcript held one assistant message with an all-zero usage block --
+// a real measurement, not an absence. SPO-Pipeline#197 re-ran the recovery on 2026-09-10 over the
+// `tokensSource: null` calls that carry a `sessionId` -- 4 calls -- and all 4 recovered exactly 0.
+// Distinguishing "found rows summing
 // to 0" from "found no rows" is the reason this module exists at all; a truthy test on the total
 // would silently erase that distinction (see the header on orchestrator/steps/llm.js's
 // extractTokens for the sibling rule this mirrors: `tokensSource` is the marker, never a truthy

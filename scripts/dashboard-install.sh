@@ -3,9 +3,12 @@
 #
 # Same model as scripts/daemon-install.sh (the orchestrator daemon unit): systemd restarts a
 # dead server (Restart=always, rate-limited so a genuine config error stops instead of
-# looping), survives reboot via `loginctl enable-linger`. Re-run this script from the
-# SPO-Pipeline checkout that should host the server after pulling dashboard changes -- it
-# restarts the unit.
+# looping), survives reboot via `loginctl enable-linger`.
+#
+# Deploying dashboard code is a `git pull` in the deploy checkout (scripts/release.sh restarts
+# this unit too, if active or enabled). Re-run this script only when the unit text changes, from
+# the deploy checkout on the deploy branch (scripts/lib/deploy-guard.sh refuses anything else);
+# it runs `enable --now` + `restart`.
 #
 # Unlike the orchestrator daemon, the dashboard server (bin/spo dashboard --serve) mostly reads
 # local state to render HTML -- it does write a couple of small files of its own (par-times.json
@@ -96,9 +99,10 @@ fi
 sleep 2
 systemctl --user --no-pager --lines=8 status spo-pipeline-dashboard.service || true
 
-# Restart-on-update: a git post-merge hook restarts this unit (and spo-pipeline-daemon.service
-# if present) right after `git pull`/merge lands new code. Symlinked, not copied, so hook
-# edits made in the repo take effect on the next merge without re-running this script.
+# Restart-on-update: a `git pull`/merge that lands new code in the deploy checkout fires the
+# post-merge hook, which runs scripts/release.sh: it restarts this unit AND
+# spo-pipeline-daemon.service, each only if it is active or enabled (one test, applied to both).
+# Symlinked, not copied, so hook edits in the repo take effect on the next pull without re-running it.
 echo "== wiring post-merge hook (restart on git pull)"
 ln -sf "$REPO/scripts/git-hooks/post-merge" "$REPO/.git/hooks/post-merge"
 

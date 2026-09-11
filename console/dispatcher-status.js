@@ -146,8 +146,9 @@ function computeDispatcherStatus(daemonEvents, { isAlive, now, killGraceMs } = {
     // boundary for this walk. The idle flag driving these two events lives in the dispatcher's
     // MEMORY, so an idle edge written by an earlier process says nothing about the current one --
     // and because a restart resets that flag to false, the matching `returned` edge is never
-    // written after a restart at all. Without this line, one idle edge plus one restart (this
-    // project restarts the daemon on every merge) made `spo status` claim IDLE forever. The same
+    // written after a restart at all. Without this line, one idle edge plus one restart (a deploy
+    // -- a `git pull` that lands commits in the deploy checkout -- restarts a running daemon; a
+    // GitHub merge alone restarts nothing) made `spo status` claim IDLE forever. The same
     // reasoning is why it must be checked before `dispatcher-stopped` (or a drain-start) is even
     // reachable in a later (i.e. earlier-in-the-walk) iteration: once a start has been seen,
     // nothing before it -- stopped, draining or idle alike -- describes the CURRENT process.

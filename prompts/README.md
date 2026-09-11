@@ -24,7 +24,7 @@ read out of order.
 | Step | Prompt file | Model | Effort | Tools | Ground |
 |---|---|---|---|---|---|
 | PLAN | `plan.md` | Fable 5 — no escalation at all (the "Opus 5 fallback" both docs used to promise was only ever reachable through `task.escalate`, which nothing sets; removed 2026-09-04) | per task `Size` S/M/L → low/medium/high | `Read, Grep, Glob, Bash(ro)` | reads `{{worktree}}`; holds no write tool at all -- returns `plan_markdown`/`invariants_markdown`, the driver writes both under `{{scratch_dir}}`; also returns `files_to_change` (action 3.2 — **absolute** paths under `{{worktree}}`, `plan.md:103`, distinct from paths it merely reads or cites) |
-| IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on `task.touchesRdoMembers`, set once at intake from the issue's Area field or a literal `rdo-members.ts` mention in its body — narrower than the full wire rule's `src/shared/rdo-*`/`src/server/rdo.ts`/session-phase set, and promoted false→true, never lowered, by PUSH_PR when the real diff touches `src/shared/rdo-members.ts`, so the escalation stays armed for the IMPLEMENT retries that follow — on an `L`-sized task, `step-contracts.js`'s `escalatesOn: ['touchesRdoMembers', 'lSize']`) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
+| IMPLEMENT | `implement.md` | Sonnet 5 (Opus 5 on `task.touchesRdoMembers`, set once at intake from the issue's Area field or a literal `rdo-members.ts` mention in its body — narrower than the full wire rule's `src/shared/rdo-*`/`src/server/rdo.ts`/session-phase set, and promoted false→true, never lowered, by PUSH_PR (which runs AFTER IMPLEMENT) when the real diff touches `src/shared/rdo-members.ts` — armed only for the IMPLEMENT retries that follow within that SAME worker run: the promotion lives in `ctx.task`, never written back to `task.json`, so a crash/repark or a `retry` re-enqueue rebuilds `ctx.task` from `task.json`'s original intake guess and loses it — on an `L`-sized task, `step-contracts.js`'s `escalatesOn: ['touchesRdoMembers', 'lSize']`) | per `Size` | full edit tools | reads and writes `{{worktree}}` only |
 | DIAGNOSE | `diagnose.md` | Opus 5 (moved off Fable 5 on 2026-09-04 — half the token price, and four of five steps on Fable meant one Fable-only quota limit cooled the whole account for every model; not a quality change, DIAGNOSE was 8/8 post-C1) | high | `Read, Grep, Bash(ro)` | reads `{{diff_path}}`, `{{gate_log_path}}`, `{{ledger_path}}` |
 | VALIDATE — citation-verifier | `verify-citations.md` | Fable 5 | high | `Read, Grep` (product + `~/SPO-Original`, read-only) | reads the diff and the server-side Pascal declarations under `{{spo_original_path}}` (today: `Kernel/`; `Rdo/Server/` is the RDO transport layer — dispatch machinery, not the game-object declarations a catalogue entry cites); runs only when the REAL diff touched the RDO catalogue — PUSH_PR's diff-derived `task.rdoDiffTouched`, resolved by `state-machine.js`'s `resolveRdoDiffTouched`, not intake's `touchesRdoMembers` guess — and always before `validate-change.md` |
 | VALIDATE — change-validator | `validate-change.md` | Fable 5 — never Sonnet 5 (the executor may not judge itself), and never Opus 5 either: the wire rule escalates **effort**, not model (Fable is the more capable tier, so `fable → opus` made the judge weaker exactly where the stakes are highest — observed on card #462) | high, **xhigh** on the wire rule | `Read, Grep, Glob, Bash(ro)` | reads `{{diff_path}}`, `{{invariants_path}}`, `{{gate_report_path}}` |
@@ -34,8 +34,10 @@ read out of order.
 
 Every "high"/"low"/"medium" effort and every model choice above is what the *caller* passes as
 `--model` / `--effort` on the `claude -p` invocation — nothing in a prompt file selects its own
-model. The one exception a prompt states explicitly is the RDO wire escalation, because the
-executing step needs to know it may be running as Opus rather than assume Sonnet.
+model or effort. Two prompts state their own RDO wire escalation explicitly, because each needs
+to know which side of it applies to it: `implement.md` states the **model** escalation (it may be
+running as Opus rather than assume Sonnet), and `validate-change.md` states the **effort**
+escalation (xhigh — its model never changes).
 
 ## Placeholder conventions
 

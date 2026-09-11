@@ -512,8 +512,10 @@ test('extractTopLevelSubcommands: reads a synthetic dispatch table, proving the 
 //
 // doc/comment-corpus-audit-2026-09-03.md's E5: a comment reads "`<file>.js`'s `<ident>`" -- a
 // possessive naming a specific symbol another file supposedly exports -- and `<ident>` is not
-// actually defined there. 3 sites / 2 symbols, both fixed in passing as part of this action (an
-// unambiguous rename, per this action's own brief):
+// actually defined there. Historical record (action 9.2, 2026-09-03 -- the four file:line
+// citations below describe where the STALE text was found at that time, not what those lines say
+// today): 3 sites / 2 symbols, both fixed in passing as part of this action (an unambiguous
+// rename, per this action's own brief):
 //   - bin/spo:407-408 and bin/spo:715 both said "state-machine.js's isEligibleNow"; the real
 //     function is `isQueueEntryEligibleNow` (orchestrator/state-machine.js).
 //   - orchestrator/state-machine.js:202 and orchestrator/README.md:441 both said "intake.js's
@@ -553,15 +555,17 @@ test('extractTopLevelSubcommands: reads a synthetic dispatch table, proving the 
 //   incidental unbacktick'd prose). Backticks are now optional around both the filename and the
 //   identifier, so both shapes are read as the same citation.
 //
-// Widening the scan surfaced 3 real matches that are not phantom SYMBOL citations at all --
-// isCodeShapedIdentifier's CONST_CASE heuristic (3+ leading uppercase letters) also matches
-// ordinary capitalized prose emphasis, which the possessive shape happens to precede in three
-// places (`lock.js`'s `SECOND` idiom -- ordinal "a second, simpler idiom", not a constant;
-// `config.js`'s `OWN` -- emphasis on "own", not an identifier; `intake.js`'s `LLM` -- "the intake
-// LLM steps", not a symbol). Reworded at the source (product-repo-lock.js:28, recette.js:125,
-// bin/spo:1875) rather than allowlisted: these were never real symbol citations to begin with, so
-// an allowlist entry would misrepresent them as reviewed-and-accepted phantoms instead of what
-// they are, three sentences that happened to fall into a regex's blind spot.
+// Historical record (action 9.2, 2026-09-03 -- the file:line pairs below name where each
+// sentence sat AT THAT TIME; none of this is re-checked today, so treat the numbers as archive,
+// not as live citations): widening the scan surfaced 3 real matches that are not phantom SYMBOL
+// citations at all -- isCodeShapedIdentifier's CONST_CASE heuristic (3+ leading uppercase letters)
+// also matches ordinary capitalized prose emphasis, which the possessive shape happens to precede
+// in three places (`lock.js`'s `SECOND` idiom -- ordinal "a second, simpler idiom", not a
+// constant; `config.js`'s `OWN` -- emphasis on "own", not an identifier; `intake.js`'s `LLM` --
+// "the intake LLM steps", not a symbol). Reworded at the source (product-repo-lock.js:28,
+// recette.js:125, bin/spo:1875) rather than allowlisted: these were never real symbol citations
+// to begin with, so an allowlist entry would misrepresent them as reviewed-and-accepted phantoms
+// instead of what they are, three sentences that happened to fall into a regex's blind spot.
 function isCodeShapedIdentifier(ident) {
   if (/^[A-Z][A-Z0-9_]{2,}$/.test(ident)) return true; // CONST_CASE
   if (/[a-z][A-Z]/.test(ident) && ident.length >= 5) return true; // camelCase
@@ -1666,12 +1670,20 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //     which reverts the fix in memory and proves the check reds on the original bug.
 //   - `bin/spo:1090-1093` -- drifted to :1137 through unrelated edits over the life of the file.
 //     CITATION_RE could not even SEE this one before this action (`bin/spo` has no extension);
-//     widening it (see that constant, above) is what let this check find it at all. Fixed here
-//     (both dated-record sites now read `:1129` -- `:1137` when this was written; project-2 card
-//     #476 moved `collectAll`'s call site once, and SPO-Pipeline#117's intake-token journalling
-//     moved it again on 2026-09-04, the same check catching each one) -- also proven via
-//     mutation-proof canary below, whose own mutation had to be re-pointed at `:1102` when the
-//     original `:1090-1093` started anchoring for an accidental reason (see it for the detail).
+//     widening it (see that constant, above) is what let this check find it at all. Fixed here to
+//     `:1137`; SPO-WebClient#476 then moved `collectAll`'s call site to `:1102`, and
+//     SPO-Pipeline#117's intake-token journalling moved it to `:1129` on 2026-09-04. Neither move
+//     was caught by the corpus-wide anchor test (both bench docs sit in ANCHOR_EXCLUDED_FILES) nor
+//     by EXPECTED_CITATIONS (which pins the docs' own citation text and never reads bin/spo): each
+//     was caught by the mutation-proof canary below, whose second half anchors
+//     bench-plan-derived's real citation against the real bin/spo directly, outside that
+//     exclusion. The canary's own mutation had to be re-pointed at `:1102` (later `:1129`) when
+//     the original `:1090-1093` started anchoring for an accidental reason (see it for the
+//     detail). `bin/spo` has grown further since; each later move was caught the same way, and
+//     since card #186 also by the collectAll test further below (both bench docs must cite the
+//     SAME bin/spo line, and that line must name collectAll), which reads the real bin/spo line
+//     both docs cite. Both dated-record sites now read `:1231` (pinned in EXPECTED_CITATIONS
+//     above).
 //
 // Widening the resolver (E1, the fix that made part 2 read the real product tree instead of a
 // stale nested worktree) plus THIS check together found nine more real, live drifts while this

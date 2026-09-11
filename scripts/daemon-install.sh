@@ -4,8 +4,12 @@
 # Mirrors SPO-WebClient's scripts/bench-install.sh (the proven model on this machine): run it from
 # the checkout NAMED as the deploy checkout (SPO_SOURCE_REPO, default $HOME/SPO-Pipeline) on the
 # deploy branch (SPO_DEPLOY_BRANCH, default main) -- not chosen by wherever you happen to stand.
-# scripts/lib/deploy-guard.sh refuses to install from any other tree or branch. Re-run it after
-# pulling daemon changes (it restarts). Supervision model: systemd restarts a dead daemon (Restart=always,
+# scripts/lib/deploy-guard.sh refuses to install from any other tree or branch.
+#
+# Do NOT re-run it to deploy: `git pull` in the deploy checkout is the deploy (post-merge ->
+# scripts/release.sh). Re-run this script only when the generated unit text below changes; it runs
+# `enable --now` + a blocking `restart`, so it re-enables and STARTS the daemon even if it was
+# deliberately disabled. Supervision model: systemd restarts a dead daemon (Restart=always,
 # rate-limited so a genuine config error stops instead of looping); the single-instance lock
 # (orchestrator/lock.js) makes the unit and any hand-run daemon mutually exclusive, and a
 # crashed daemon's stale lock is swept on the next start.
@@ -189,9 +193,10 @@ fi
 sleep 2
 systemctl --user --no-pager --lines=8 status spo-pipeline-daemon.service || true
 
-# Restart-on-update: a git post-merge hook restarts this unit (and spo-pipeline-dashboard.service
-# if present) right after `git pull`/merge lands new code. Symlinked, not copied, so hook
-# edits made in the repo take effect on the next merge without re-running this script.
+# Restart-on-update: a `git pull`/merge that lands new code in the deploy checkout fires the
+# post-merge hook, which runs scripts/release.sh: it restarts this unit AND
+# spo-pipeline-dashboard.service, each only if it is active or enabled (one test, applied to both).
+# Symlinked, not copied, so hook edits in the repo take effect on the next pull without re-running it.
 echo "== wiring post-merge hook (restart on git pull)"
 ln -sf "$REPO/scripts/git-hooks/post-merge" "$REPO/.git/hooks/post-merge"
 

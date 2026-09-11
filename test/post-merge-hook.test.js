@@ -1,8 +1,10 @@
 'use strict';
 // Tests for scripts/git-hooks/post-merge -- THE DEPLOY.
 //
-// `git pull` in the deploy checkout fires this hook, and nothing else deploys: not a merge on
-// GitHub, not a pull in any other worktree.
+// git fires this hook whenever `git merge`/`git pull` finishes a merge on its own, in ANY worktree
+// (not a no-op, a pull that rebases local commits, or a conflicted/--no-commit merge even once
+// committed); it deploys only in the deploy checkout on the deploy branch. A merge on GitHub
+// deploys nothing.
 //
 // ITS JOB SHRANK, AND THAT IS WHAT THIS FILE NOW COVERS. It used to restart the units itself, and
 // owned all the "is-active vs is-enabled, deactivating, --no-block, say the skip out loud" logic.

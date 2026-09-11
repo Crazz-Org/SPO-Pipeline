@@ -343,8 +343,9 @@ function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, n
 
   // Dead pid, over-age (when the caller opted into maxAgeMs), or an unreadable/torn file: stale.
   // Both rules are kept, and the pid rule is NOT subordinate to the age one: a dead pid is swept
-  // immediately because that is the COMMON case (the post-merge deploy hook SIGTERMs this tree,
-  // orphaning any lease mid-step), and making it wait out the age bound would be a plain
+  // immediately because that is the COMMON case (a deploy SIGTERMs the scanner on its first signal
+  // and a worker past drainTimeoutMs or on a second, and a holder killed mid-call can leave its lease
+  // behind), and making it wait out the age bound would be a plain
   // regression. Sweep and retry exactly once -- a second EEXIST
   // here means a racing acquirer won the sweep, and that racer is alive by construction (it just
   // created the file), so this attempt simply loses, same as the live-holder case above.
