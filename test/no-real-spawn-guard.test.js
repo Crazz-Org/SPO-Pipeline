@@ -228,37 +228,50 @@ function runProbedDaemonOnce(env) {
 // (recette.js among them, unconditional, regardless of which subcommand -- or none -- is given).
 //
 // WHY "no subcommand at all" is SUFFICIENT, not just convenient: bin/spo's own top-of-file
-// requires -- `const recette = require('../orchestrator/recette');`, itself requiring
-// `./state-machine`, which unconditionally requires `./steps/scripted` and `./command-timeout` at
-// ITS OWN top -- run at MODULE LOAD, before `main()` ever inspects `process.argv` to decide which
-// subcommand (if any) was asked for. Verified directly, not assumed:
+// requires -- `const intake = require('../orchestrator/intake');`, unconditional -- pull in
+// command-timeout.js at MODULE LOAD (through intake.js -> steps/llm.js -> steps/scripted.js ->
+// board.js, whose own require of `./command-timeout` is the actual first load), before `main()`
+// ever inspects `process.argv` to decide which subcommand (if any) was asked for. Verified
+// directly, not assumed:
 //   $ grep -n "require(" bin/spo | grep -c orchestrator   # 16 (15 top-level, plus the lazy
-//                                                         # project-board one at :1470)
-//   $ grep -n "^const recette = require" bin/spo          # unconditional, not inside any `if`
+//                                                         # project-board one at :1548)
+//   $ grep -n "^const intake = require" bin/spo           # unconditional, not inside any `if`
 // So "no subcommand" reaches the exact same require graph -- and therefore the exact same
 // command-timeout.js spawnSync capture -- as any real subcommand would, without this test needing
 // to fabricate a safe-to-run one. Verified, not assumed, that today's requires are the ONLY ones
-// gating this: 21 top-level requires sit at bin/spo:206-226 (unconditional, above `main()`), and
-// the only LAZY requires anywhere in the file are `console/serve|system|prod-version|usage-scan|
-// par-times` around :1127-1158, none of which touches a spawn function, and
-// `orchestrator/project-board` at :1470 (`cmdAsk`'s own `deps.projectBoard ||` fallback) -- that
-// one DOES require `./command-timeout` (project-board.js:42), but only ever as a cache hit:
-// bin/spo's top-level requires already load command-timeout.js before main() runs (measured via
-// require.cache: first through the direct `intake` require, intake.js -> steps/llm.js ->
-// steps/scripted.js -> board.js; the `recette` chain reaches it again as a cache hit), so its lazy
-// require here can never be the FIRST thing to destructure the real spawnSync.
+// gating this: 21 top-level `require()` calls sit at bin/spo:217-237 -- installGuard's own
+// require on 217, then 20 `const … = require(…)` -- unconditional, above `main()`, and the only
+// LAZY requires anywhere in the file are
+// `console/serve|system|prod-version|usage-scan` (inside `cmdDashboard`'s `--serve` branch) and
+// `console/par-times` (inside `cmdDashboard`'s `generateOnce()`), none of which itself touches a
+// spawn function, and `orchestrator/project-board` (inside `cmdAsk`'s own `deps.projectBoard ||`
+// fallback) -- that one DOES touch a spawn function of its own (project-board.js's placeOnBoard
+// reaches `armTimeout` through the module's `runSync`, which defaults to the REAL
+// `child_process.spawnSync` whenever `deps.spawnSync` is not injected -- project-board.js:42,92;
+// command-timeout.js:151-160), but its own require of `./command-timeout` is only ever a cache
+// hit: bin/spo's top-level `intake` require already loads command-timeout.js before `main()` runs
+// (through intake.js -> steps/llm.js -> steps/scripted.js -> board.js, whose own require of
+// `./command-timeout` is the first load; intake.js's direct require of it is itself already a
+// cache hit), so project-board's lazy require here can never be the FIRST thing to destructure
+// the real spawnSync -- it only re-fetches the already-cached, already-guarded export from
+// `require.cache`.
 //
-// THIS IS ALSO THE TEST'S OWN BLIND SPOT, worth flagging for whoever touches bin/spo next: if a
-// future change makes any of TODAY's unconditional requires LAZY (e.g. moving
-// `require('../orchestrator/recette')` inside `if (cmd === 'recette')`), this test would keep
-// passing while silently testing nothing -- command-timeout.js would no longer be loaded (or its
-// spawnSync captured) until a real subcommand ran, and this probe never asks for one. THE REMEDY,
-// concretely: add an assertion inside the probe's own exit hook (buildProbeScript above) that pins
-// the entry point's own `require.cache` -- e.g. `Object.keys(require.cache).some(p =>
-// p.endsWith('command-timeout.js'))` -- asserted true BEFORE calling armTimeout. That directly
-// checks "was command-timeout.js ever loaded by this run" instead of inferring it from bin/spo's
-// current require graph by eye, and it would fail by name the moment a lazy-require refactor moves
-// the load somewhere this probe's argv (no subcommand) no longer reaches.
+// THIS DOES NOT ACTUALLY LEAVE THE TEST WITH A SINGLE-POINT-OF-FAILURE BLIND SPOT, measured with
+// a load probe (require each bin/spo top-level module alone, in a fresh `node -e`, and check
+// `Object.keys(require.cache)` for `command-timeout.js`): `orchestrator/intake`,
+// `orchestrator/auto-triage`, `orchestrator/report-intake`, `orchestrator/remote-report-pull` AND
+// `orchestrator/recette` each independently load command-timeout.js on their own -- every one of
+// the five ultimately requires `./intake` and/or `./board`, and both of THOSE require
+// `./command-timeout` directly, unconditionally, at their own top (intake.js:46, board.js:44). So
+// making any ONE of the five lazy (e.g. moving `require('../orchestrator/recette')` inside
+// `if (cmd === 'recette')`) would NOT silently defeat this probe -- the other four still load
+// command-timeout.js unconditionally before `main()` runs. Only moving ALL FIVE lazy in the same
+// change would. A belt-and-braces check would still be worth having regardless (an assertion
+// inside the probe's own exit hook -- buildProbeScript above -- that pins the entry point's own
+// `require.cache`, e.g. `Object.keys(require.cache).some(p => p.endsWith('command-timeout.js'))`
+// asserted true BEFORE calling armTimeout, checking "was command-timeout.js ever loaded by this
+// run" directly instead of inferring it from bin/spo's require graph by eye), but it would be
+// hardening against a five-module coincidence, not a fix for a gap this test has today.
 function runProbedBinSpo(env) {
   return runProbedEntrypoint(SPO_BIN, [], env);
 }
