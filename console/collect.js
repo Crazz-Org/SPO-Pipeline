@@ -160,6 +160,10 @@ function buildRun(lines) {
       ms: Math.max(0, Date.parse(at) - Date.parse(open.enteredAt)),
       attempt: open.attempt,
       sentBack,
+      // Narrower than sentBack: only a split that FAILED into DIAGNOSE. A VALIDATE reject or a
+      // PUSH_PR -> WORKTREE restart also moves the card backwards, but nothing in them failed a
+      // check -- the deck draws this one red and keeps those orange.
+      failed: nextState === 'DIAGNOSE',
       offTrack: orderIndex(open.state) === null,
       detail: open.detail,
     });
@@ -196,6 +200,7 @@ function buildRun(lines) {
           ms: Math.max(0, Date.parse(e.ts) - Date.parse(open.enteredAt)),
           attempt: open.attempt,
           sentBack: false,
+          failed: false,
           offTrack: orderIndex(open.state) === null,
           detail: open.detail,
         });
@@ -302,6 +307,20 @@ function buildRun(lines) {
         d.invariantsChecked = Array.isArray(e.checkedIds) ? e.checkedIds.length : null;
         d.invariantsBroken = Array.isArray(e.broken) ? e.broken.length : null;
         break;
+      // What a failing step failed ON, read off the event each one journals before it routes to
+      // DIAGNOSE: CHECK names the npm alias (or 'invariants', with the broken ids), CI_CHECKS the
+      // GitHub check. GATE's verdict and IMPLEMENT's no-op change are read just below.
+      case 'check-failed':
+        d.failedCheck = {
+          name: e.alias || e.check || null,
+          exit: typeof e.exit === 'number' ? e.exit : null,
+          broken: Array.isArray(e.broken) ? e.broken.length : null,
+        };
+        break;
+      case 'empty-implement':
+      case 'no-worktree-change':
+        d.noChange = true;
+        break;
       case 'change-validator':
         d.verdict = e.verdict || null;
         break;
@@ -315,6 +334,15 @@ function buildRun(lines) {
         break;
       case 'gate-verdict':
         d.gateVerdict = e.verdict || null;
+        // The journalled `verdict` is the bench's whole verdict OBJECT; its own `verdict` field is
+        // the PASS/FAIL word (all 6 measured gate-verdict events, 2026-09-11). Kept separately so
+        // the deck can name it without printing the object.
+        d.gateResult =
+          e.verdict && typeof e.verdict === 'object'
+            ? (typeof e.verdict.verdict === 'string' && e.verdict.verdict) || null
+            : typeof e.verdict === 'string'
+              ? e.verdict
+              : null;
         break;
       case 'result': {
         // DIAGNOSE's `rootCause` is not always prose. Measured over the corpus it arrives in
@@ -325,6 +353,10 @@ function buildRun(lines) {
         // rather than printing a JSON fragment at a reader.
         const raw = e.payload && e.payload.rootCause;
         d.rootCause = normalizeRootCause(raw) || d.rootCause || null;
+        // DIAGNOSE's own one-word verdict ("flaky", "infra", ...). 16 of the 40 results measured
+        // 2026-09-11 left it null or the literal string "null" -- absent then, never printed.
+        const category = e.payload && e.payload.category;
+        if (typeof category === 'string' && category.trim() && category.trim() !== 'null') d.category = category.trim();
         break;
       }
       default:

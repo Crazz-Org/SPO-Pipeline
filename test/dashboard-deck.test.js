@@ -1040,3 +1040,174 @@ test('stateInfo falls back to UNKNOWN rather than throwing on a state it has nev
   assert.equal(stateInfo('VALIDATE').judge, true);
   assert.equal(stateInfo('CHECK').judge, undefined);
 });
+
+// ---- a failed step and its Diagnose box -------------------------------------------------------
+//
+// issue-518's run 4 as journalled on 2026-09-11: CHECK failed coverage:changed, DIAGNOSE called it
+// flaky, and the card went back to IMPLEMENT. Measured over the live corpus the step that fails
+// into DIAGNOSE is IMPLEMENT itself 33 times, CHECK 9, CI_CHECKS 7 and GATE 6, and DIAGNOSE hands
+// back to IMPLEMENT 43 times out of 43 -- so the box must handle a zero-width span as well as a
+// long one, and must never be anchored under IMPLEMENT whatever failed (the defect it replaces).
+const { renderTrack, renderSplits } = require('../console/render-deck');
+
+function failedCheckRun() {
+  return [
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(20), state: 'WORKTREE', event: 'transition', to: 'PLAN' },
+    { ts: T(200), state: 'PLAN', event: 'transition', to: 'IMPLEMENT' },
+    { ts: T(400), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+    { ts: T(401), state: 'CHECK', event: 'invariants-checked', checkedIds: ['INV-1', 'INV-2'], broken: [] },
+    { ts: T(650), state: 'CHECK', event: 'check-failed', alias: 'coverage:changed', exit: 1 },
+    { ts: T(650), state: 'CHECK', event: 'transition', to: 'DIAGNOSE' },
+    { ts: T(1100), state: 'DIAGNOSE', event: 'result', payload: { rootCause: 'One load-sensitive suite the diff never touches.', category: 'flaky' } },
+    { ts: T(1100), state: 'DIAGNOSE', event: 'transition', to: 'IMPLEMENT' },
+  ];
+}
+
+// The class of the tile whose label is `label` ("tile-failed", "tile-done tile-judge", ...).
+function tileClass(html, label) {
+  const group = html.split('<g class="tile ').slice(1).find((g) => g.includes(`>${label}</text>`));
+  assert.ok(group, `no tile labelled ${label}`);
+  return group.slice(0, group.indexOf('"'));
+}
+function labelX(html, label) {
+  const m = new RegExp(`class="tile-label" x="([\\d.]+)"[^>]*>${label}</text>`).exec(html);
+  assert.ok(m, `no label ${label}`);
+  return Number(m[1]);
+}
+function detourGeometry(html) {
+  const box = /class="tile tile-detour[^"]*">[\s\S]*?<rect class="tile-face" x="([\d.-]+)" y="[\d.]+" width="([\d.]+)"/.exec(html);
+  const drop = /class="fail-arc" d="M([\d.]+),/.exec(html);
+  const rise = /class="detour-arc" d="M([\d.]+),/.exec(html);
+  assert.ok(box && drop && rise, 'the Diagnose box and both of its arrows are drawn');
+  return { left: Number(box[1]), right: Number(box[1]) + Number(box[2]), dropX: Number(drop[1]), riseX: Number(rise[1]) };
+}
+const trackOf = (lines) => renderTrack({ id: 'issue-518', run: buildRun(lines) }, Date.parse(T(5000)));
+const HALF_STEP = 95 / 2;
+
+test('buildRun marks only a split that failed into DIAGNOSE as failed, and keeps what failed and what DIAGNOSE concluded', () => {
+  const run = buildRun(failedCheckRun());
+  const check = run.splits.find((s) => s.state === 'CHECK');
+  assert.equal(check.failed, true);
+  assert.deepEqual(check.detail.failedCheck, { name: 'coverage:changed', exit: 1, broken: null });
+  assert.equal(run.splits.find((s) => s.state === 'DIAGNOSE').detail.category, 'flaky');
+
+  // A VALIDATE reject moves the card backwards but failed nothing; the IMPLEMENT that went to
+  // DIAGNOSE did.
+  const looping = buildRun(loopingRun());
+  const validate = looping.splits.find((s) => s.state === 'VALIDATE');
+  assert.equal(validate.sentBack, true);
+  assert.equal(validate.failed, false);
+  assert.equal(looping.splits.filter((s) => s.state === 'IMPLEMENT')[1].failed, true);
+});
+
+test("buildRun reads each failing step's own event, and drops a category the model left as \"null\"", () => {
+  const failInto = (state, ev) =>
+    buildRun([
+      { ts: T(0), state, event: 'taken' },
+      { ts: T(1), state, ...ev },
+      { ts: T(2), state, event: 'transition', to: 'DIAGNOSE' },
+      { ts: T(3), state: 'DIAGNOSE', event: 'result', payload: { rootCause: 'x', category: 'null' } },
+    ]);
+  assert.equal(failInto('CI_CHECKS', { event: 'check-failed', check: 'CodeQL', step: null }).splits[0].detail.failedCheck.name, 'CodeQL');
+  assert.deepEqual(failInto('CHECK', { event: 'check-failed', alias: 'invariants', broken: ['INV-2', 'INV-5'] }).splits[0].detail.failedCheck, { name: 'invariants', exit: null, broken: 2 });
+  assert.equal(failInto('IMPLEMENT', { event: 'empty-implement', filesChanged: '[]' }).splits[0].detail.noChange, true);
+  const gate = failInto('GATE', { event: 'gate-verdict', headSha: 'abc', verdict: { verdict: 'FAIL', head: 'abc' } });
+  assert.equal(gate.splits[0].detail.gateResult, 'FAIL');
+  assert.equal(gate.current.detail.category, undefined);
+});
+
+test('a failed step is red and names its failing check, and the Diagnose box runs from it back to Write the code', () => {
+  const html = trackOf(failedCheckRun());
+  assert.equal(tileClass(html, 'Test'), 'tile-failed');
+  assert.match(html, /class="fail-caption"[^>]*>coverage:changed<\/text>/);
+  assert.equal(tileClass(html, 'Write the code'), 'tile-current');
+
+  const w = labelX(html, 'Write the code');
+  const t = labelX(html, 'Test');
+  const g = detourGeometry(html);
+  assert.equal(g.dropX, t, 'the red arrow leaves the step that failed');
+  assert.equal(g.riseX, w, 'the orange arrow returns to the step the card went back to');
+  assert.ok(g.left < w && g.left > w - HALF_STEP, 'the box starts under Write the code');
+  assert.ok(g.right > t && g.right < t + HALF_STEP, 'and ends under Test, not beyond');
+  assert.match(html, /class="detour-box-label"[^>]*>Diagnose<\/text>/);
+  assert.match(html, /class="detour-box-sub"[^>]*>flaky<\/text>/);
+});
+
+test('a GATE failure draws its box out to Full test run, and the steps it passed on the way are only stale', () => {
+  const html = trackOf([
+    ...failedCheckRun().slice(0, 5),
+    { ts: T(500), state: 'CHECK', event: 'transition', to: 'PUSH_PR' },
+    { ts: T(510), state: 'PUSH_PR', event: 'transition', to: 'GATE' },
+    { ts: T(700), state: 'GATE', event: 'gate-verdict', headSha: 'abc', verdict: { verdict: 'FAIL', head: 'abc' } },
+    { ts: T(700), state: 'GATE', event: 'transition', to: 'DIAGNOSE' },
+    { ts: T(900), state: 'DIAGNOSE', event: 'transition', to: 'IMPLEMENT' },
+  ]);
+  assert.ok(tileClass(html, 'Full test run').startsWith('tile-failed'));
+  assert.match(html, /class="fail-caption"[^>]*>verdict FAIL<\/text>/);
+  assert.equal(tileClass(html, 'Test'), 'tile-stale');
+  assert.equal(tileClass(html, 'Open PR'), 'tile-stale');
+
+  const gx = labelX(html, 'Full test run');
+  const g = detourGeometry(html);
+  assert.equal(g.dropX, gx);
+  assert.equal(g.riseX, labelX(html, 'Write the code'));
+  assert.ok(g.right > gx && g.right < gx + HALF_STEP);
+});
+
+test('once the redo gets past the failed step it is an ordinary tile again, and the box stays as the record', () => {
+  const html = trackOf([
+    ...failedCheckRun(),
+    { ts: T(1300), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+    { ts: T(1400), state: 'CHECK', event: 'transition', to: 'PUSH_PR' },
+  ]);
+  assert.equal(tileClass(html, 'Test'), 'tile-done');
+  assert.doesNotMatch(html, /tile-failed|fail-caption/);
+  assert.match(html, /tile-detour/);
+});
+
+test('while Diagnose is running, the failed step is red and the box says it is running', () => {
+  const html = trackOf(failedCheckRun().slice(0, 8));
+  assert.equal(tileClass(html, 'Test'), 'tile-failed');
+  assert.match(html, /class="tile tile-detour detour-live"/);
+  assert.match(html, /class="detour-box-sub"[^>]*>running now<\/text>/);
+});
+
+test('an IMPLEMENT that fails into DIAGNOSE and comes straight back gets two arrows side by side under its own tile', () => {
+  const html = trackOf(loopingRun());
+  const w = labelX(html, 'Write the code');
+  const g = detourGeometry(html);
+  assert.ok(g.dropX > w && g.riseX < w, 'side by side, never drawn on top of each other');
+  assert.ok(g.left < w - 24 && g.right > w + 24, 'the box is wide enough for its label even on a zero-width span');
+  // The VALIDATE reject in the same run failed nothing, and IMPLEMENT is running again.
+  assert.doesNotMatch(html, /tile-failed/);
+});
+
+test('a run that never went to DIAGNOSE draws no box and keeps the short track', () => {
+  const html = trackOf(failedCheckRun().slice(0, 5));
+  assert.doesNotMatch(html, /tile-detour|fail-arc|tile-failed/);
+  assert.match(html, /viewBox="0 0 [\d.]+ 190"/);
+});
+
+test('the split that failed is a red row leading with what failed; a reject stays an orange send-back', () => {
+  const failed = renderSplits({ run: buildRun(failedCheckRun()) }, null, Date.parse(T(1200)));
+  const rows = (html) => html.split('<div class="split ').slice(1);
+  const testRow = rows(failed).find((r) => r.includes('split-name">Test'));
+  assert.ok(testRow.startsWith('split-failed'));
+  assert.match(testRow, /<b>failed: coverage:changed \(exit 1\)<\/b>/);
+  assert.match(rows(failed).find((r) => r.includes('split-name">Diagnose')), /flaky/);
+
+  const looping = renderSplits({ run: buildRun(loopingRun()) }, null, Date.parse(T(1300)));
+  assert.ok(rows(looping).find((r) => r.includes('split-name">Review')).startsWith('split-back'));
+});
+
+test('the box rises to wherever the journal says DIAGNOSE sent the card, not to a hardcoded Write the code', () => {
+  // Every measured DIAGNOSE returned to IMPLEMENT; the box still reads the transition rather than
+  // assuming it, so a future route back to PLAN is drawn as what it is.
+  const lines = failedCheckRun();
+  lines[lines.length - 1] = { ...lines[lines.length - 1], to: 'PLAN' };
+  const html = trackOf(lines);
+  assert.equal(detourGeometry(html).riseX, labelX(html, 'Plan'));
+  assert.equal(tileClass(html, 'Test'), 'tile-failed');
+});

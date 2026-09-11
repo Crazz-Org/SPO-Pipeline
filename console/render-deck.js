@@ -120,10 +120,12 @@ function icon(id, size, cls = '') {
 
 // ---- the track ----------------------------------------------------------------------------
 //
-// One tile per TRACK_ORDER position, plus a DIAGNOSE badge below when the card has been sent
-// there. Tile status, all derived from the run rather than assumed:
+// One tile per TRACK_ORDER position, plus a Diagnose box below when the card has been sent there
+// (see renderDetour). Tile status, all derived from the run rather than assumed:
 //
 //   done    -- visited, and the card is still ahead of it
+//   failed  -- the step whose failure sent the card to DIAGNOSE, not gone through again since: red,
+//              with a cross, and what it failed on printed under its label
 //   stale   -- visited, but the card has since been sent back BEFORE it: it will have to be
 //              redone, so it is drawn dimmed rather than as an achievement
 //   current -- the split running now (oversized, ringed)
@@ -163,8 +165,11 @@ function renderTrack(card, nowMs) {
   const geo = trackGeometry();
   const litTo = geo[Math.min(posIndex, geo.length - 1)].cx;
   const lastCx = geo[geo.length - 1].cx;
-  const diagnoseVisits = visits.get('DIAGNOSE') || 0;
-  const height = diagnoseVisits ? 236 : 190;
+  const detour = latestDetour(run);
+  // The step whose failure is still unanswered: it failed into DIAGNOSE and the card has not been
+  // back through it since. Once the redo reaches it again it is an ordinary tile once more.
+  const failedState = detour && detour.stillFailed ? detour.from.state : null;
+  const height = detour ? 268 : 190;
 
   const tiles = geo
     .map(({ state, cx }, i) => {
@@ -172,8 +177,11 @@ function renderTrack(card, nowMs) {
       const n = visits.get(state) || 0;
       const isCurrent = state === currentState;
       const isVisited = n > 0;
+      // Never the current tile: latestDetour already stops calling a step failed once the card
+      // is back in it.
+      const isFailed = state === failedState;
       const isStale = isVisited && !isCurrent && i > posIndex;
-      const status = isCurrent ? 'current' : isStale ? 'stale' : isVisited ? 'done' : 'locked';
+      const status = isCurrent ? 'current' : isFailed ? 'failed' : isStale ? 'stale' : isVisited ? 'done' : 'locked';
       const w = isCurrent ? CUR_W : TILE_W;
       const x = cx - w / 2;
       const y = TRACK_Y - w / 2;
@@ -184,31 +192,27 @@ function renderTrack(card, nowMs) {
       const ring = isCurrent
         ? `<rect class="tile-ring" x="${x - 7}" y="${y - 7}" width="${w + 14}" height="${w + 14}" rx="24"/>`
         : '';
-      const attemptBadge =
-        n > 1
+      const attemptBadge = isFailed
+        ? `<g class="fail-badge" transform="translate(${cx + w / 2 - 4},${y + 2})"><circle r="9"/><path d="M-3.2,-3.2 L3.2,3.2 M3.2,-3.2 L-3.2,3.2"/></g>`
+        : n > 1
           ? `<g class="tile-attempts" transform="translate(${cx + w / 2 - 4},${y + 2})"><circle r="9"/><text y="3.5">${n}</text></g>`
           : '';
+      // Under a failed tile, what it failed on -- the short form; the split row carries the exit.
+      const failedOn = isFailed ? failureText(detour.from.detail, { short: true }) : null;
+      const caption = failedOn
+        ? `<text class="fail-caption" x="${cx}" y="${TRACK_Y + w / 2 + 35}">${esc(clip(failedOn, 18))}</text>`
+        : '';
       return `<g class="tile tile-${status}${info.judge ? ' tile-judge' : ''}">
         ${ring}${shape}
         <svg class="tile-icon" x="${cx - iconSize / 2}" y="${TRACK_Y - iconSize / 2}" width="${iconSize}" height="${iconSize}"><use href="#${info.icon}"></use></svg>
         ${attemptBadge}
         <text class="tile-label" x="${cx}" y="${TRACK_Y + w / 2 + 20}">${esc(info.label)}</text>
+        ${caption}
       </g>`;
     })
     .join('');
 
-  const diagnose = diagnoseVisits
-    ? (() => {
-        const dInfo = stateInfo('DIAGNOSE');
-        const dx = geo[3].cx; // under IMPLEMENT, which is where every diagnose returns to
-        return `<g class="tile tile-detour">
-          <path class="detour-arc" d="M${dx + 30},${TRACK_Y + 34} C${dx + 30},${TRACK_Y + 78} ${dx - 4},${TRACK_Y + 78} ${dx - 4},${TRACK_Y + 44}" marker-end="url(#deck-arrow)"/>
-          <circle class="tile-face" cx="${dx + 46}" cy="${TRACK_Y + 62}" r="21"/>
-          <svg class="tile-icon" x="${dx + 33}" y="${TRACK_Y + 49}" width="26" height="26"><use href="#${dInfo.icon}"></use></svg>
-          <text class="tile-label" x="${dx + 46}" y="${TRACK_Y + 100}">${esc(dInfo.label)}${diagnoseVisits > 1 ? ` &times;${diagnoseVisits}` : ''}</text>
-        </g>`;
-      })()
-    : '';
+  const diagnose = detour ? renderDetour(detour, geo) : '';
 
   const runner = current
     ? `<g class="runner" transform="translate(${litTo},34)">
@@ -218,20 +222,113 @@ function renderTrack(card, nowMs) {
       </g>`
     : '';
 
-  return `<div class="deck-track"><svg viewBox="0 0 ${lastCx + 60} ${height}" role="img" aria-label="${esc(trackAria(card, visits, currentState))}">
-    <defs><marker id="deck-arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="arrow-head"/></marker></defs>
+  return `<div class="deck-track"><svg viewBox="0 0 ${lastCx + 60} ${height}" role="img" aria-label="${esc(trackAria(card, visits, currentState, failedState))}">
+    <defs><marker id="deck-arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="arrow-head"/></marker><marker id="deck-arrow-red" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" class="arrow-head-red"/></marker></defs>
     <rect class="track-bed" x="46" y="${TRACK_Y - 4}" width="${lastCx - 46}" height="8" rx="4"/>
     <rect class="track-lit" x="46" y="${TRACK_Y - 4}" width="${Math.max(0, litTo - 46)}" height="8" rx="4"/>
     ${diagnose}${tiles}${runner}
   </svg></div>`;
 }
 
-function trackAria(card, visits, currentState) {
+function trackAria(card, visits, currentState, failedState) {
   const cleared = [...visits.keys()].filter((s) => s !== currentState).length;
   const info = currentState ? stateInfo(currentState) : null;
+  const failed = failedState ? `, ${stateInfo(failedState).label} failed` : '';
   return info
-    ? `${cleared} checkpoints cleared, now at ${info.label}`
-    : `${cleared} checkpoints cleared, run finished`;
+    ? `${cleared} checkpoints cleared${failed}, now at ${info.label}`
+    : `${cleared} checkpoints cleared${failed}, run finished`;
+}
+
+// ---- the Diagnose box ----------------------------------------------------------------------
+//
+// A failure sends the card off the track to DIAGNOSE, which hands it back to an earlier step. The
+// box sits under the stretch of track that failure sent back -- from the step the card returned
+// to, out to the step that failed -- so its width says how much has to be redone. A red arrow
+// drops into it from the step that failed; an orange dashed one rises out of it to the step the
+// card returned to. Only the latest trip is drawn: earlier ones are counted in its label and
+// listed in the splits.
+const DETOUR_TOP = TRACK_Y + 102;
+const DETOUR_H = 46;
+const DETOUR_MIN_W = 143; // two tile centres one step apart, plus 24px either side
+
+// The latest trip through DIAGNOSE, read off the run. `from` is the split that failed into it and
+// `toState` where it sent the card back. While DIAGNOSE is still running that is not known yet, so
+// IMPLEMENT is assumed: measured 2026-09-11, DIAGNOSE returned to IMPLEMENT 43 times out of 43.
+function latestDetour(run) {
+  const splits = (run && run.splits) || [];
+  const current = run && run.current;
+  const live = !!(current && current.state === 'DIAGNOSE');
+  let k = live ? splits.length : -1;
+  for (let i = splits.length - 1; !live && i >= 0; i--) {
+    if (splits[i].state === 'DIAGNOSE') {
+      k = i;
+      break;
+    }
+  }
+  if (k < 0) return null;
+  const from = splits[k - 1] || null;
+  const after = live ? null : splits[k + 1] || current || null;
+  const fromIndex = from ? orderIndex(from.state) : null;
+  const revisited =
+    !!from && (splits.slice(k + 1).some((s) => s.state === from.state) || !!(current && current.state === from.state));
+  return {
+    live,
+    from,
+    fromIndex,
+    toState: after ? after.state : 'IMPLEMENT',
+    diagnose: live ? current : splits[k],
+    visits: splits.filter((s) => s.state === 'DIAGNOSE').length + (live ? 1 : 0),
+    // The failure stays unanswered until the card has been back through the step that failed.
+    stillFailed: fromIndex !== null && !revisited,
+  };
+}
+
+// What a failed split failed on, in the journal's own words -- null when the journal did not say.
+// `short` is the form printed under a tile, without the exit code.
+function failureText(detail, { short = false } = {}) {
+  const d = detail || {};
+  const f = d.failedCheck;
+  if (f && f.name === 'invariants') {
+    return short || typeof f.broken !== 'number' ? 'invariants broken' : `invariants: ${f.broken} broken`;
+  }
+  if (f && f.name) return short || typeof f.exit !== 'number' ? f.name : `${f.name} (exit ${f.exit})`;
+  if (d.gateResult) return `verdict ${d.gateResult}`;
+  if (d.noChange) return 'no change made';
+  return null;
+}
+
+function clip(text, max) {
+  const s = String(text);
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function renderDetour(detour, geo) {
+  const toIndex = orderIndex(detour.toState);
+  const tx = geo[toIndex === null ? orderIndex('IMPLEMENT') : toIndex].cx;
+  const sx = detour.fromIndex === null ? tx : geo[detour.fromIndex].cx;
+  // A step that fails into DIAGNOSE and comes straight back to itself (IMPLEMENT: 33 of the 55
+  // entries measured 2026-09-11) would draw both arrows on one line -- set them side by side.
+  const same = sx === tx;
+  const dropX = same ? sx + 12 : sx;
+  const riseX = same ? tx - 12 : tx;
+  let left = Math.min(sx, tx) - 24;
+  let right = Math.max(sx, tx) + 24;
+  if (right - left < DETOUR_MIN_W) {
+    const mid = (left + right) / 2;
+    left = mid - DETOUR_MIN_W / 2;
+    right = mid + DETOUR_MIN_W / 2;
+  }
+  const d = (detour.diagnose && detour.diagnose.detail) || {};
+  const sub = detour.live ? 'running now' : d.category ? clip(d.category, Math.floor((right - left - 49) / 5.5)) : '';
+  const title = `Diagnose${detour.visits > 1 ? ` &times;${detour.visits}` : ''}`;
+  return `<g class="tile tile-detour${detour.live ? ' detour-live' : ''}">
+    <path class="fail-arc" d="M${dropX},${TRACK_Y + 70} L${dropX},${DETOUR_TOP - 5}" marker-end="url(#deck-arrow-red)"/>
+    <path class="detour-arc" d="M${riseX},${DETOUR_TOP} L${riseX},${TRACK_Y + 71}" marker-end="url(#deck-arrow)"/>
+    <rect class="tile-face" x="${left}" y="${DETOUR_TOP}" width="${right - left}" height="${DETOUR_H}" rx="10"/>
+    <svg class="tile-icon" x="${left + 12}" y="${DETOUR_TOP + 12}" width="22" height="22"><use href="#${stateInfo('DIAGNOSE').icon}"></use></svg>
+    <text class="detour-box-label" x="${left + 41}" y="${DETOUR_TOP + (sub ? 20 : 27)}">${title}</text>
+    ${sub ? `<text class="detour-box-sub" x="${left + 41}" y="${DETOUR_TOP + 35}">${esc(sub)}</text>` : ''}
+  </g>`;
 }
 
 function shortId(id) {
@@ -472,7 +569,9 @@ function splitRow(s, parTimes, isLive, nowMs) {
   // inside par; start showing the overrun the moment it is late, which is when the number
   // actually means something.
   if (isLive && p.deltaMs !== null && p.deltaMs <= 0) p = { band: 'unknown', deltaMs: null };
-  const cls = isLive ? 'split-live' : s.sentBack ? 'split-back' : 'split-done';
+  // A split that failed into DIAGNOSE is red; one merely sent back (a reject, a restart) stays
+  // orange; DIAGNOSE itself, off the track, carries the detour's orange icon.
+  const cls = isLive ? 'split-live' : s.failed ? 'split-failed' : s.sentBack ? 'split-back' : s.offTrack ? 'split-detour' : 'split-done';
   const attempt = s.attempt > 1 ? ` <span class="split-attempt">#${s.attempt}</span>` : '';
   const note = splitNote(s, isLive);
   return `<div class="split ${cls}">
@@ -490,6 +589,13 @@ function splitNote(s, isLive) {
   const d = s.detail || {};
   if (d.reused) return 'reused from the previous run — not re-run';
   const bits = [];
+  // The failure leads: "12 invariants, 0 broken" on a CHECK that failed coverage:changed reads
+  // as a pass, which is exactly what the row used to say.
+  if (s.failed) {
+    const what = failureText(d);
+    bits.push(`<b>failed${what ? `: ${esc(what)}` : ''}</b>`);
+  }
+  if (d.category) bits.push(esc(d.category));
   if (d.verdict === 'REJECT') bits.push('rejected it — sent back');
   else if (d.verdict) bits.push(esc(String(d.verdict).toLowerCase().replace(/_/g, ' ')));
   if (typeof d.invariantsChecked === 'number') {
