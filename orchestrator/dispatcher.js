@@ -1156,6 +1156,12 @@ function createDispatcher(queueDir, journalRoot, config) {
           inFlight,
           pid: process.pid,
           reason: (stopReason && stopReason.reason) || null,
+          // Card #188 follow-up: the grace the reap below will actually use once this wait ends
+          // (`resolveDrainKillGraceMs(config)`, the SAME resolver `reapSignalledChildren` is
+          // handed further down in run()) -- carried on the event itself so a reader
+          // (console/dispatcher-status.js's computeDispatcherStatus) can bound an unconcluded
+          // drain's own age without having to assume the READER's config matches the WRITER's.
+          killGraceMs: resolveDrainKillGraceMs(config),
         });
       } catch {
         // Best-effort, same posture as the other journal writes on this shutdown path.

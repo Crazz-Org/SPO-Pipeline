@@ -126,6 +126,16 @@ test('drain: an in-flight card runs to completion instead of being killed', { ti
   // wrote the event -- the most direct proof the new field reaches production code, independent
   // of section 17's own end-to-end real-daemon coverage.
   assert.equal(start.pid, process.pid, 'dispatcher-drain-start must carry the writing process\'s own pid');
+  // KILL GRACE (card #188 follow-up): the grace the reap that follows this wait will actually use
+  // (`resolveDrainKillGraceMs(config)`, dispatcher.js's own resolver), carried on the event itself
+  // so a reader can bound an unconcluded drain's own age without assuming its config matches the
+  // writer's. `baseConfig()` above does not override `drainKillGraceMs`, so this must read exactly
+  // `defaultConfig.drainKillGraceMs` -- the same value the reap itself would resolve to.
+  assert.equal(
+    start.killGraceMs,
+    defaultConfig.drainKillGraceMs,
+    'dispatcher-drain-start must carry the grace the reap will actually use'
+  );
   // REASON (driver decision, card #188): read off the in-memory `stopReason` at drain time
   // (`(stopReason && stopReason.reason) || null`) rather than assumed -- here `requestDrain` is
   // the only thing that ever set `stopReason` (no prior `stop()` call), so it must read exactly
@@ -1241,7 +1251,7 @@ test('drain: a real daemon SIGKILLed inside the drain wait reads DRAINING while 
 
     const deadSpoOut = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
     assert.match(deadSpoOut, /dispatcher: STOPPED/, `expected a STOPPED line once the process is dead: ${deadSpoOut}`);
-    assert.match(deadSpoOut, /died inside the drain wait/, `expected the died-inside-the-drain wording: ${deadSpoOut}`);
+    assert.match(deadSpoOut, /drain never concluded/, `expected the drain-never-concluded wording: ${deadSpoOut}`);
 
     const deadDeck = collectAll({ journalRoot: journalDir, queueDir, spoReportsDir: mkTmp('spo-drain-died-reports2-') });
     assert.equal(deadDeck.services.workers.status, 'stopped');
@@ -1255,7 +1265,7 @@ test('drain: a real daemon SIGKILLed inside the drain wait reads DRAINING while 
     // slip past a bare /STOPPED/ check.
     assert.match(
       deadTile,
-      /died inside the drain wait \(drain started .* ago\), no dispatcher-stopped recorded/,
+      /drain never concluded \(drain started .* ago\), no dispatcher-stopped recorded; process gone or past its drain bound/,
       `expected the tile's own diedDraining caption: ${deadTile}`
     );
     // The SAME deadDeck through the real production assembly -- catches a mutant where a
@@ -1265,8 +1275,8 @@ test('drain: a real daemon SIGKILLed inside the drain wait reads DRAINING while 
     const deadFragments = renderDataFragments(deadDeck);
     assert.match(
       deadFragments.reports,
-      /process died inside the drain wait \(no dispatcher-stopped recorded\)/,
-      `expected the Bug Reports drain-history line to say the process died: ${deadFragments.reports}`
+      /drain never concluded -- process gone or past its drain bound \(no dispatcher-stopped recorded\)/,
+      `expected the Bug Reports drain-history line to say the drain never concluded: ${deadFragments.reports}`
     );
     assert.doesNotMatch(
       deadFragments.reports,
@@ -1281,8 +1291,8 @@ test('drain: a real daemon SIGKILLed inside the drain wait reads DRAINING while 
     const healthPageHtml = renderHealthPage(deadDeck);
     assert.match(
       healthPageHtml,
-      /process died inside the drain wait \(no dispatcher-stopped recorded\)/,
-      `expected renderHealthPage's own Bug Reports fragment to say the process died: ${healthPageHtml.slice(0, 2000)}`
+      /drain never concluded -- process gone or past its drain bound \(no dispatcher-stopped recorded\)/,
+      `expected renderHealthPage's own Bug Reports fragment to say the drain never concluded: ${healthPageHtml.slice(0, 2000)}`
     );
   } finally {
     // Always attempted, regardless of where a failure happened above -- a live-assertion failure
@@ -1398,5 +1408,5 @@ test('drain: a SECOND real SIGTERM (the process.exit(143) escape hatch) leaves t
 
   const deadSpoOut = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
   assert.match(deadSpoOut, /dispatcher: STOPPED/, `expected a STOPPED line: ${deadSpoOut}`);
-  assert.match(deadSpoOut, /died inside the drain wait/, `expected the died-inside-the-drain wording: ${deadSpoOut}`);
+  assert.match(deadSpoOut, /drain never concluded/, `expected the drain-never-concluded wording: ${deadSpoOut}`);
 });

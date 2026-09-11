@@ -785,7 +785,7 @@ function renderServicesInner(services, accounts, prod) {
     const inFlightNote = typeof workersDispatcher.inFlight === 'number' ? ` (${workersDispatcher.inFlight} in flight at drain start)` : '';
     workersCls = tileClass('stopped');
     workersBig = '—';
-    workersCaption = `stopped — died inside the drain wait (drain started ${ageKnown ? fmtAgeMs(ageMs) : '?'} ago), no dispatcher-stopped recorded${inFlightNote}`;
+    workersCaption = `stopped — drain never concluded (drain started ${ageKnown ? fmtAgeMs(ageMs) : '?'} ago), no dispatcher-stopped recorded; process gone or past its drain bound${inFlightNote}`;
   } else if (workers.status === 'stopped') {
     const reason = workersDispatcher.reason || 'unknown';
     const extraParts = [];
@@ -1100,8 +1100,9 @@ function renderReportsInner(reports, workersDispatcher) {
     if (drainStart && !endMatchesStart) {
       const stoppedSince = lastStopped && lastStopped.ts && drainStart.ts && Date.parse(lastStopped.ts) >= Date.parse(drainStart.ts);
       const startedSince = lastStart && lastStart.ts && drainStart.ts && Date.parse(lastStart.ts) >= Date.parse(drainStart.ts);
-      // Card #188: `dispatcher-stopped` is never written for a process that died inside the
-      // drain wait, so `stoppedSince` alone stays false forever for that case -- without this
+      // Card #188: an unconcluded drain has no `dispatcher-stopped` (its process gone, or the
+      // drain past its own bound with none recorded), so `stoppedSince` alone stays false forever
+      // for that case -- without this
       // check the fallback below kept reading "in progress" for a drain whose process was
       // already gone (the journal observation this card starts from). `wd.diedDraining` is the
       // Workers tile's own verdict on THIS SAME open drain (both read off the same daemonEvents).
@@ -1110,7 +1111,7 @@ function renderReportsInner(reports, workersDispatcher) {
         stoppedSince || startedSince
           ? ', no drain-end recorded'
           : diedDraining
-            ? ', process died inside the drain wait (no dispatcher-stopped recorded)'
+            ? ', drain never concluded -- process gone or past its drain bound (no dispatcher-stopped recorded)'
             : `, in progress (${escapeHtml(drainStart.inFlight || 0)} in flight)`;
     } else if (drainEnd) {
       endPart = `, ended ${escapeHtml(drainEnd.ts || '?')} (${drainEnd.drained ? 'drained clean' : `${escapeHtml(drainEnd.survivors || 0)} survivor(s)`})`;

@@ -927,7 +927,24 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
   // uid, and `process.kill(pid, 0)` throws EPERM for a pid that is alive but not signalable --
   // `processAlive` reads that identically to ESRCH ("gone"), which would misreport a live-but-
   // foreign dispatcher as dead (`pidExists`'s own header in orchestrator/lock.js).
-  const dispatcher = computeDispatcherStatus(events, { isAlive: pidExists });
+  //
+  // `now`/`killGraceMs` (card #188 follow-up) are ALSO injected here, never read inside
+  // computeDispatcherStatus itself -- `now` is collectAll's own `now` snapshot, the one it also
+  // hands collectServices, applyRetryChannelStats and collectReportPipeline, threaded through as
+  // this function's `now` parameter, never a fresh clock read here, and `killGraceMs` is this process's own
+  // `orchestrator/config.js`'s `drainKillGraceMs`, required lazily here (same pattern as this
+  // file's other config reads -- see collectAll's own `spoReportsDir` fallback and
+  // `collectReportPipeline`'s `result.pull.configured`, both below) so a test context with no
+  // config module reachable degrades to "no bound" rather than throwing. Together they let a
+  // reader bound an UNCONCLUDED drain-start past its own `timeoutMs` plus that grace as STOPPED
+  // even when a reused pid would otherwise read it alive forever.
+  let killGraceMs;
+  try {
+    killGraceMs = require('../orchestrator/config').drainKillGraceMs;
+  } catch {
+    /* config module unavailable in this test context -- no bound applies, same as a missing `now` */
+  }
+  const dispatcher = computeDispatcherStatus(events, { isAlive: pidExists, now, killGraceMs });
   if (dispatcher && dispatcher.status === 'stopped') {
     services.workers.status = 'stopped';
   } else if (dispatcher && dispatcher.status === 'draining') {
