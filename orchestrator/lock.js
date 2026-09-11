@@ -76,6 +76,27 @@ function processAlive(pid) {
   }
 }
 
+// pidExists(pid) -- card #188's dispatcher-status.js's computeDispatcherStatus needs "is this pid
+// gone", not "is this pid ours to signal", and `processAlive` above answers the wrong question for
+// that: `process.kill(pid, 0)` throws EPERM for a pid that is alive but owned by another user (this
+// probe: `pid 1`, init/systemd, on any non-root run), and `processAlive` reads that identically to
+// ESRCH (the pid genuinely does not exist) -- both read `false`. Fed to computeDispatcherStatus as
+// `isAlive`, that would report a live-but-foreign dispatcher pid as `diedDraining: true`, which is
+// exactly the false-STOPPED-while-alive inversion card #164/#188 exist to prevent. `pidExists`
+// keeps ESRCH as "gone" but reads EPERM as "still there" (the kernel only refuses a signal to a
+// process that exists), so a pid this process cannot signal is never misreported as dead.
+// `processAlive` is unchanged for its existing callers (lock and lease stale-sweeps, orphan-scan,
+// worker-status, …), which probe pids written by processes of this same install and Unix user, so
+// EPERM does not arise there in this deployment; changing its contract is outside this card.
+function pidExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return !!err && err.code === 'EPERM';
+  }
+}
+
 // One exclusive-create attempt. Returns true when this process created the file.
 //
 // Was a bare `open(..., 'wx')`: atomic, but it creates an EMPTY file and the content lands in a
@@ -358,6 +379,7 @@ module.exports = {
   LockHeldError,
   LockLostError,
   processAlive,
+  pidExists,
   watchLock,
   acquireShortLock,
   releaseShortLock,

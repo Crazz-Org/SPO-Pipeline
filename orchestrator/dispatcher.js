@@ -1130,11 +1130,36 @@ function createDispatcher(queueDir, journalRoot, config) {
     if (drainRequest) {
       const inFlight = [...live.keys(), ...reparking.keys()];
       const timeoutMs = resolveDrainTimeoutMs(config);
-      appendDaemonEvent(journalRoot, 'dispatcher-drain-start', {
-        signal: drainRequest.signal || null,
-        timeoutMs,
-        inFlight,
-      });
+      // `pid` (card #188): same source as `dispatcher-start`'s own `pid` field above, and for the
+      // same reason -- a reader (console/dispatcher-status.js's computeDispatcherStatus) must be
+      // able to tell a live drain from a process that died inside the wait without depending on
+      // the matching `dispatcher-start` still being inside its own bounded read window. Wrapped
+      // for the same reason as the `dispatcher-stopped`/`dispatcher-drain-end` emits below --
+      // appendDaemonEvent does its own mkdirSync + appendFileSync, so on the ENOSPC/EPERM/EROFS
+      // class of failure this record exists to survive, an unwrapped throw here would reject
+      // run() itself and skip the wait entirely, turning a graceful drain into a crash before it
+      // ever started. Best-effort; nothing left to record to, so nothing escapes either way.
+      //
+      // `reason` (card #188, driver decision): `stopReason` is ALREADY set by this point -- either
+      // by `requestDrain` (which only ever sets it to `{reason: 'drain-requested', signal}` when
+      // nothing else has, `if (!stopReason)` (`requestDrain`, below)) or by an EARLIER `stop()`
+      // call that landed before `requestDrain` did (in-process API: recette.js calls stop() but
+      // never requestDrain, and daemon.js never calls stop(), so from daemon.js this reads
+      // 'drain-requested' in practice); a breaker's own assignment cannot precede a drain this
+      // way -- it and the loop's drain gate run in one microtask chain. Reading `stopReason.reason`
+      // here (rather than assuming every drain is `'drain-requested'`) records the ACTUAL decision
+      // instead of asking a reader to infer it.
+      try {
+        appendDaemonEvent(journalRoot, 'dispatcher-drain-start', {
+          signal: drainRequest.signal || null,
+          timeoutMs,
+          inFlight,
+          pid: process.pid,
+          reason: (stopReason && stopReason.reason) || null,
+        });
+      } catch {
+        // Best-effort, same posture as the other journal writes on this shutdown path.
+      }
       waitedMs = await awaitInFlight(timeoutMs);
       survivors = [...live.keys(), ...reparking.keys()];
       stopReason = { ...stopReason, drained: survivors.length === 0, waitedMs, survivors };

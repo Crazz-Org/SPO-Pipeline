@@ -17,10 +17,24 @@ const path = require('path');
 // and ../console/* requires below (test/no-real-spawn-sweep.test.js enforces this ordering).
 require('./no-real-spawn');
 
+const { spawn: realSpawn } = require('child_process');
 const { mkTmp, runSpo } = require('./helpers');
 const { collectAll, collectReportPipeline } = require('../console/collect');
 const { renderDashboard, renderServicesInner, renderReportsInner } = require('../console/render');
 const { computeDispatcherStatus } = require('../console/dispatcher-status');
+const { processAlive, pidExists } = require('../orchestrator/lock');
+
+// Card #188: a genuinely dead-but-real pid, for the 'diedDraining' unit cases below -- spawnSync
+// is the real one this file's own no-real-spawn guard (required above) always throws on, so a
+// dead pid is obtained the sanctioned way instead: a real ASYNC spawn() (never patched -- see that
+// module's own "scope: spawnSync only" header), awaited to exit, its pid then provably free.
+function deadPid() {
+  return new Promise((resolve, reject) => {
+    const child = realSpawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    child.on('exit', () => resolve(child.pid));
+    child.on('error', reject);
+  });
+}
 
 const REPO_ROOT = path.join(__dirname, '..');
 
@@ -101,6 +115,185 @@ test('computeDispatcherStatus: [dispatcher-idle-no-healthy-accounts, dispatcher-
 test('computeDispatcherStatus: a null entry in the array is skipped, not thrown on', () => {
   const result = computeDispatcherStatus([null, { event: 'dispatcher-idle-no-healthy-accounts', queued: 1 }, null]);
   assert.equal(result.status, 'idle');
+});
+
+// ---- unit: card #188's `dispatcher-drain-start` branch ----------------------------------------
+// A drain-start with no later dispatcher-stopped/dispatcher-drain-end must never read as null
+// (the pre-#188 bug: a region nothing could read) and must never read 'stopped' without positive
+// liveness evidence (card #164's own inversion, reapplied here).
+
+test('computeDispatcherStatus: [dispatcher-start(pid alive), dispatcher-drain-start(same pid)] -> draining, never stopped', () => {
+  const result = computeDispatcherStatus(
+    [
+      { event: 'dispatcher-start', pid: 111 },
+      { event: 'dispatcher-drain-start', pid: 111, signal: 'SIGTERM', inFlight: ['a'] },
+    ],
+    { isAlive: (pid) => pid === 111 }
+  );
+  assert.equal(result.status, 'draining');
+  assert.notEqual(result.status, 'stopped');
+});
+
+test('computeDispatcherStatus: [dispatcher-start(pid dead), dispatcher-drain-start(same pid)] -> stopped, diedDraining true', async () => {
+  const pid = await deadPid();
+  const result = computeDispatcherStatus(
+    [
+      { event: 'dispatcher-start', pid },
+      { event: 'dispatcher-drain-start', pid, signal: 'SIGTERM', inFlight: ['a'] },
+    ],
+    { isAlive: processAlive }
+  );
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.diedDraining, true);
+});
+
+test('computeDispatcherStatus: a drain-start with no isAlive injected -> draining (never stopped without evidence)', () => {
+  const result = computeDispatcherStatus([{ event: 'dispatcher-start', pid: 222 }, { event: 'dispatcher-drain-start', pid: 222 }]);
+  assert.equal(result.status, 'draining');
+});
+
+test("computeDispatcherStatus: a LEGACY pid-less drain-start resolves the pid off the nearest earlier dispatcher-start, and reads stopped when that process is dead", async () => {
+  const pid = await deadPid();
+  const result = computeDispatcherStatus(
+    [
+      { event: 'dispatcher-start', pid },
+      // no `pid` field -- as a pre-#188 record on disk would look
+      { event: 'dispatcher-drain-start', signal: 'SIGTERM', inFlight: ['a'] },
+    ],
+    { isAlive: processAlive }
+  );
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.diedDraining, true);
+});
+
+test('computeDispatcherStatus: a pid-less drain-start with NO earlier dispatcher-start in the array -> draining (pid unresolvable, never a false stopped)', () => {
+  const result = computeDispatcherStatus([{ event: 'dispatcher-drain-start', signal: 'SIGTERM', inFlight: ['a'] }], {
+    isAlive: () => false,
+  });
+  assert.equal(result.status, 'draining');
+});
+
+test('computeDispatcherStatus: [drain-start, dispatcher-stopped] -> stopped, diedDraining NOT set (an ordinary concluded stop)', () => {
+  const result = computeDispatcherStatus(
+    [
+      { event: 'dispatcher-start', pid: 333 },
+      { event: 'dispatcher-drain-start', pid: 333, signal: 'SIGTERM', inFlight: ['a'] },
+      { event: 'dispatcher-stopped', reason: 'drain-requested', drained: true },
+    ],
+    { isAlive: () => true }
+  );
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.diedDraining, undefined);
+});
+
+test('computeDispatcherStatus: [drain-start, dispatcher-start] -> null (a fresh start outranks an old drain, same as an old stop)', () => {
+  const result = computeDispatcherStatus([
+    { event: 'dispatcher-start', pid: 444 },
+    { event: 'dispatcher-drain-start', pid: 444, signal: 'SIGTERM', inFlight: ['a'] },
+    { event: 'dispatcher-start', pid: 555 },
+  ]);
+  assert.equal(result, null);
+});
+
+test('computeDispatcherStatus: [dispatcher-idle-no-healthy-accounts, drain-start] -> draining (the idle edge does not outrank a fresher drain)', () => {
+  const result = computeDispatcherStatus(
+    [
+      { event: 'dispatcher-idle-no-healthy-accounts', queued: 1 },
+      { event: 'dispatcher-drain-start', pid: 666, signal: 'SIGTERM', inFlight: ['a'] },
+    ],
+    { isAlive: () => true }
+  );
+  assert.equal(result.status, 'draining');
+});
+
+// `pid 1` (init/systemd) is ALIVE but, on any non-root run, not
+// signalable by this process -- `process.kill(1, 0)` throws EPERM, and the plain `processAlive`
+// (orchestrator/lock.js) reads that identically to ESRCH ("gone"), which would have made this
+// read `stopped`+`diedDraining: true` for a dispatcher pid that is very much alive: exactly the
+// false-STOPPED-while-alive inversion card #164/#188 exist to prevent. `pidExists`
+// (orchestrator/lock.js) is the fix -- it reads EPERM as "still there" -- and this pins the
+// result holds the SAME both ways: as root (`process.kill(1, 0)` itself succeeds, no EPERM at
+// all) and as a normal user (EPERM, caught and read as alive).
+test('computeDispatcherStatus: pidExists(1) reads EPERM as alive, so a drain-start on pid 1 (init/systemd) reads draining, never diedDraining, root or not', () => {
+  const result = computeDispatcherStatus([{ event: 'dispatcher-drain-start', pid: 1, signal: 'SIGTERM', inFlight: ['a'] }], {
+    isAlive: pidExists,
+  });
+  assert.equal(result.status, 'draining');
+  assert.notEqual(result.diedDraining, true);
+});
+
+// The unit test above proves computeDispatcherStatus itself, but the REAL call sites (bin/spo's
+// cmdStatus, console/collect.js's applyWorkerStats) each still had to be edited by hand to inject
+// pidExists instead of processAlive -- a mutant reverting either call site's `pidExists` injection
+// back to `processAlive` would go uncaught by that unit test alone: pid 1 is EPERM for a non-root
+// user, so `processAlive(1)` reads false ("gone"), misreporting the drain as diedDraining/STOPPED.
+// This drives the real journal file through the REAL `spo status` binary and the REAL collectAll,
+// never calling computeDispatcherStatus directly. On a non-root run (CI's case) it can only pass
+// if BOTH production injection sites are still `pidExists`; as root, pid 1 is alive to
+// `processAlive` too, so the test still passes but cannot tell the two apart. Holds root or not:
+// `pid 1` (init/systemd) is always alive, EPERM or no EPERM.
+test('a real daemon.jsonl with a drain-start on pid 1 reads DRAINING on both spo status and the deck, root or not', () => {
+  const journalRoot = mkTmp('spo-188-pid1-j-');
+  const queueDir = mkTmp('spo-188-pid1-q-');
+  writeDaemonEvents(journalRoot, [
+    { ts: '2026-09-10T00:00:00.000Z', event: 'dispatcher-start', pid: 1, workers: 1 },
+    {
+      ts: '2026-09-10T00:01:00.000Z',
+      event: 'dispatcher-drain-start',
+      pid: 1,
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'drain-requested',
+    },
+  ]);
+
+  const out = runSpo(['status', '--journal', journalRoot, '--queue', queueDir]);
+  assert.match(out, /dispatcher: DRAINING/, `expected a DRAINING line: ${out}`);
+  assert.doesNotMatch(out, /STOPPED/, `must not read pid 1 as dead: ${out}`);
+
+  const data = collectAll({ journalRoot, queueDir, spoReportsDir: mkTmp('spo-188-pid1-reports-') });
+  assert.equal(data.services.workers.status, 'draining');
+});
+
+// A `spo status` that ignored a drain-start's own `reason` and always printed 'drain-requested'
+// went undetected: no test read the rendered STOPPED line for a died-inside-the-drain event
+// carrying a non-default reason. These two read the real CLI output. (A write site that hardcodes
+// 'drain-requested' is caught separately, by drain.test.js's section 1c.)
+
+test("spo status on a died-inside-the-drain fixture prints the event's OWN reason, not a hardcoded 'drain-requested'", async () => {
+  const journalRoot = mkTmp('spo-188-reason-dead-j-');
+  const queueDir = mkTmp('spo-188-reason-dead-q-');
+  const pid = await deadPid();
+  writeDaemonEvents(journalRoot, [
+    { ts: '2026-09-10T00:00:00.000Z', event: 'dispatcher-start', pid, workers: 1 },
+    {
+      ts: '2026-09-10T00:01:00.000Z',
+      event: 'dispatcher-drain-start',
+      pid,
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'wall-clock-cap-exceeded',
+    },
+  ]);
+
+  const out = runSpo(['status', '--journal', journalRoot, '--queue', queueDir]);
+  assert.match(out, /dispatcher: STOPPED/, `expected a STOPPED line for a dead pid: ${out}`);
+  assert.match(out, /reason: wall-clock-cap-exceeded/, `expected the event's OWN reason, not a hardcoded one: ${out}`);
+});
+
+test("a LEGACY pid-less, reason-less drain-start (written before card #188) still falls back to 'drain-requested' -- the one case that IS a guess", async () => {
+  const journalRoot = mkTmp('spo-188-reason-legacy-j-');
+  const queueDir = mkTmp('spo-188-reason-legacy-q-');
+  const pid = await deadPid();
+  writeDaemonEvents(journalRoot, [
+    { ts: '2026-09-10T00:00:00.000Z', event: 'dispatcher-start', pid, workers: 1 },
+    // No `pid`, no `reason` -- exactly the shape a pre-#188 record on disk has.
+    { ts: '2026-09-10T00:01:00.000Z', event: 'dispatcher-drain-start', signal: 'SIGTERM', inFlight: ['a'] },
+  ]);
+
+  const out = runSpo(['status', '--journal', journalRoot, '--queue', queueDir]);
+  assert.match(out, /dispatcher: STOPPED/, `expected a STOPPED line (legacy pid resolves off dispatcher-start, which is dead): ${out}`);
+  assert.match(out, /reason: drain-requested/, `expected the inferred fallback for a legacy record with no reason field: ${out}`);
 });
 
 // ---- THE DISCRIMINATOR: card #186's own reason for existing -----------------------------------
