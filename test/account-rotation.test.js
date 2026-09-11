@@ -99,18 +99,24 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
   assert.ok(state['acct-a'], 'acct-a should be cooling');
   // FACT, NOT MARGIN: this used to compare `state['acct-a'].cooldownUntil` against two raw
   // Date.now() reads taken in THIS test (`before`, and a fresh one here) -- but `markLimit` takes no
-  // injectable clock through `callLlmStep` (state-machine.js:168 passes it exactly 3 args); `pick()`'s
-  // is injectable as `deps.leaseNow`, but that same value also freezes the lease-wait clock
-  // (account-lease.js:211), which `callLlmStep` cannot override independently, so it is not usable
-  // here either. There is no way for the test to pin the `now` markLimit's default parameter
-  // (accounts.js:585) actually reads. On this WSL2 box, where Date.now() steps backward ~2.85s every
-  // ~29.4s (measured in card #182; monotonic-clock.js's header carries the independent -2515ms
-  // measurement), markLimit's internal read can land strictly BEFORE the test's own `before` read
-  // even though it happened chronologically after it, making the old `>=` comparison fail for a
-  // reason that has nothing to do with which tier was chosen.
-  // computeLimitUpdate (accounts.js:462-502) writes `cooldownUntil` and `lastUsageLimitAt` from
-  // the SAME single internal `now` snapshot, so comparing the two fields PRODUCTION wrote against
-  // each other establishes the identical "1-hour probe tier, not the 5-hour escalated one" fact
+  // injectable clock through `callLlmStep` (production passes it exactly three args, so its `now`
+  // parameter defaults to markLimit's own real Date.now() read). `pick()`'s clock IS injectable as
+  // `deps.leaseNow` -- but that would not help pin this value: markLimit's `now` is a separate
+  // Date.now() read that callLlmStep gives the test no way to inject, so nothing forwarded through
+  // `deps.leaseNow` ever reaches it. (True side note: a frozen `deps.leaseNow` would also drive
+  // leaseHealthyAccount's lease-wait clock, `elapsedNowMs`; it doesn't matter here because this
+  // test's pick() finds an unleased healthy account immediately both times, so the wait is never
+  // entered.) Nothing callLlmStep's deps accept reaches markLimit's `now`; pinning it could be done
+  // with, e.g., a global Date stub (node:test mock.timers) or swapping `accounts.markLimit` on the
+  // shared module object -- both work, and neither is needed, because comparing the two fields
+  // production wrote is exact without any clock stub. On this WSL2 box, where Date.now() steps
+  // backward ~2.85s every ~29.4s (measured in card #182; monotonic-clock.js's header carries the
+  // independent -2515ms measurement), markLimit's internal read can land strictly BEFORE the test's
+  // own `before` read even though it happened chronologically after it, making the old `>=`
+  // comparison fail for a reason that has nothing to do with which tier was chosen.
+  // computeLimitUpdate sets both `cooldownUntil` and `lastUsageLimitAt` from the SAME single
+  // internal `now` snapshot (markLimit persists them), so comparing the two fields PRODUCTION wrote
+  // against each other establishes the identical "1-hour probe tier, not the 5-hour escalated one" fact
   // exactly, with no clock read on the test's own side at all.
   assert.equal(
     typeof state['acct-a'].lastUsageLimitAt,
@@ -138,11 +144,18 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
 });
 
 test('429 (usage limit) through callLlmStep on an account whose PROBE already expired inside the escalation window -> the 5h escalated tier', async () => {
-  // Simulates the exact scenario R1 exists for: acct-a probed an hour ago (lastUsageLimitAt),
-  // its cooldown has already elapsed (cooldownUntil in the past, so pick() considers it healthy
-  // again), and it immediately re-limits -- real wall-clock "now" (via callLlmStep -> pick() ->
-  // markLimit, none of which take an injectable clock) is used throughout, so the seeded
-  // lastUsageLimitAt is set relative to Date.now() rather than to a fixed test constant.
+  // Simulates the scenario R1 exists for: acct-a's last usage hit (lastUsageLimitAt, seeded 5 s
+  // ago -- well inside the 2h escalation window) is recent, its cooldown has already elapsed
+  // (cooldownUntil seeded in the past, so pick() considers it healthy again), and it immediately
+  // re-limits. pick()'s clock is injectable as deps.leaseNow, but markLimit's is not injectable
+  // through callLlmStep -- and markLimit's own real Date.now() read is what decides escalation
+  // (computeLimitUpdate compares it against the seeded lastUsageLimitAt), and that same read is
+  // the value written as lastUsageLimitAt and as cooldownUntil's base, regardless of anything
+  // callLlmStep forwards. That is why real wall-clock "now" is used throughout, so the seeded
+  // lastUsageLimitAt is set relative to Date.now() rather than to a fixed test constant. (True
+  // side note: an injected deps.leaseNow would also drive leaseHealthyAccount's lease-wait clock,
+  // elapsedNowMs; irrelevant here, since this test's one unleased account is picked on the very
+  // first try, so the wait is never entered.)
   const taskDir = mkTmp('spo-rotate-escalate-taskdir-');
   const accountsDir = mkTmp('spo-rotate-escalate-accts-');
   writeRegistry(accountsDir, [{ name: 'acct-a', configDir: null, enabled: true }]);
@@ -234,7 +247,8 @@ test('529 (overloaded) on the first account cools it for 5 minutes only, and rot
   const state = accounts.readState(accountsDir);
   assert.ok(state['acct-a'], 'acct-a should be cooling');
   // The `cooldownMsWritten = state['acct-a'].cooldownUntil - before` margin this replaced compared
-  // a value PRODUCTION wrote (from its own internal, uninjectable `now`, accounts.js:585) against a
+  // a value PRODUCTION wrote (from markLimit's own `now` parameter, which callLlmStep never forwards
+  // a value for, so it defaults to a real Date.now() read) against a
   // `before` read in THIS test -- unreliable on this WSL2 box, whose Date.now() steps backward
   // ~2.85s every ~29.4s (measured in card #182; monotonic-clock.js's header carries the independent
   // -2515ms measurement). Unlike the usage/probe path, the overloaded branch of computeLimitUpdate
