@@ -58,6 +58,14 @@ mkdir -p "$UNIT_DIR"
 cat > "$UNIT" <<UNITEOF
 [Unit]
 Description=SPO pipeline dashboard server (bin/spo dashboard --serve)
+# StartLimitIntervalSec/StartLimitBurst are [Unit] directives, not [Service] ones: in [Service]
+# systemd drops StartLimitIntervalSec ("Unknown key name ... ignoring") and the restart window
+# falls back to its own 10s default, not the 300s below. Same mechanism, documented at length in
+# scripts/daemon-install.sh's own [Unit] comment for the sibling unit that had the identical bug.
+# A refuse-to-start (port already bound) exits immediately; five tries in five minutes then stop,
+# instead of looping on a config error forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 # Same release symlink the daemon unit uses -- see scripts/daemon-install.sh's own comment. The
@@ -68,10 +76,6 @@ WorkingDirectory=$CURRENT_LINK
 ExecStart=$NODE_BIN $CURRENT_LINK/bin/spo dashboard --serve --port $PORT
 Restart=always
 RestartSec=5
-# A refuse-to-start (port already bound) exits immediately; five tries in five minutes then
-# stop, instead of looping on a config error forever.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 Environment=HOME=$HOME
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 
