@@ -1423,7 +1423,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: lock.js:289",
   "orchestrator/auto-triage.js :: park-loop.js:1396",
   "orchestrator/auto-triage.js :: remote-report-pull.js:193",
-  "orchestrator/auto-triage.js :: state-machine.js:2923",
+  "orchestrator/auto-triage.js :: state-machine.js:3006", // re-pinned from :2923 -- card #174 net +83 (89 added, 6 removed: `git diff --numstat`) across state-machine.js's handleValidate REJECT branch (reasonsKeyPresent/salvage/contract-violation/collapseToOneLine reuse) and collapseToOneLine's own header comment, both above this appendDaemonEvent precedent, a true pure shift; content byte-identical at :3006.
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/dispatcher.js :: daemon.js:607",

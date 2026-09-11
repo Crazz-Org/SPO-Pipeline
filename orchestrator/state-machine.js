@@ -1040,9 +1040,13 @@ function chargeCiImplementRetry(ctx, next) {
 // flat reply already is, and `appendLedgerLine`'s "one ledger line per attempt" invariant holds
 // either way.
 //
-// Applies ONLY inside unwrapNestedDiagnoseContract's nested branch below -- the flat path (an
-// ordinary prose cause, including a multi-line one) is never routed through this, so a multi-line
-// FLAT cause reaches ledger.md exactly as it does today.
+// Within DIAGNOSE, this applies ONLY inside unwrapNestedDiagnoseContract's nested branch below -- the
+// DIAGNOSE flat path (an ordinary prose cause, including a multi-line one) is never routed
+// through it, so a multi-line FLAT DIAGNOSE cause reaches ledger.md exactly as it does today.
+// Card #174 reuses this same function for a SEPARATE call site, handleValidate's REJECT branch
+// (a multi-line bare-string `reasons` salvage, or a multi-line entry in a `reasons` array, is the
+// identical one-line problem for a different prompt's identical "one line" contract) -- see that
+// branch's own comment for what it collapses and why.
 function collapseToOneLine(s) {
   return s.replace(/\s+/g, ' ').trim();
 }
@@ -1508,8 +1512,37 @@ async function handleValidate(ctx) {
     // corpus carry `findings` as a JSON-encoded string, so a validator that encodes `reasons` the
     // same way had it silently discarded here. On #640 that emptied the one field IMPLEMENT and
     // DIAGNOSE had to work from: the next IMPLEMENT was handed a REJECT with nothing to act on,
-    // and DIAGNOSE then blamed the validator for the emptiness this line had produced.
-    const reasons = normalizeFindingsPayload(result.reasons).items.filter(Boolean);
+    // and DIAGNOSE then blamed the validator for the emptiness this line had produced. This action
+    // (card #174) extends the same fix one shape further: a validator reply that sends its one
+    // line of prose as a bare, non-JSON string (no array, no JSON wrapper) used to fall into
+    // normalizeFindingsPayload's 'unparsable-string' shape and vanish to `items: []` exactly like
+    // #640's own case -- salvaged below instead of discarded.
+    //
+    // `result.reasons` is read on the RAW payload -- before normalization -- because
+    // normalizeFindingsPayload collapses "the key was never sent" (shape 'absent') and "the key
+    // was sent as an empty array" (shape 'array', items []) to the same `items: []`, and telling
+    // those two apart is the whole point of the contract-violation check below (validate-change.md
+    // requires REJECT to carry "exactly one" reason).
+    const reasonsKeyPresent = !!(result && typeof result === 'object' && Object.prototype.hasOwnProperty.call(result, 'reasons'));
+    const reasonsNorm = normalizeFindingsPayload(result.reasons);
+    // Salvage: a bare non-JSON string IS the validator's one-line reason, not a malformed payload
+    // -- only normalizeFindingsPayload has no shape for prose that isn't wrapped in an array or
+    // valid JSON, so it reports 'unparsable-string' with no items. A blank/whitespace-only string
+    // is not a reason and is left to the contract-violation check below, same as every other
+    // zero-usable-reasons shape. collapseToOneLine (defined above, for handleDiagnose's nested-
+    // contract unwrap) is reused here: a multi-line bare string is exactly the shape it exists to
+    // flatten, and appendLedgerLine's "one ledger line per attempt" invariant needs it here too.
+    const rawReasonsCollapsed = typeof result.reasons === 'string' ? collapseToOneLine(result.reasons) : '';
+    const salvagedReason = reasonsNorm.shape === 'unparsable-string' && rawReasonsCollapsed !== '' ? rawReasonsCollapsed : null;
+    // "Usable" = a non-empty string once internal whitespace (including embedded newlines) is
+    // collapsed to single spaces and the ends are trimmed -- matching validate-change.md's "one
+    // line" the same way collapseToOneLine already does for DIAGNOSE's nested `root_cause`. A
+    // non-string item (the array-of-objects shape) or a whitespace-only string is not usable and
+    // must never reach the ledger as "[object Object]" or a blank line; collapsing does not judge
+    // whether a reason is a GOOD one line, only that it physically occupies one.
+    const reasons = salvagedReason
+      ? [salvagedReason]
+      : reasonsNorm.items.filter((item) => typeof item === 'string' && item.trim() !== '').map((item) => collapseToOneLine(item));
     // normalizeFindingsPayload, not `Array.isArray(...) ? ... : []`, and this is the eighth
     // production bug of its class in this project. Measured 2026-09-01: ALL 16 `change-validator`
     // events in the 19-journal corpus carry `findings` as a JSON-ENCODED STRING, never an array --
@@ -1525,13 +1558,63 @@ async function handleValidate(ctx) {
       payload: { reasons, findings },
     });
 
+    // Contract check against validate-change.md's own rule for REJECT ("**exactly one** entry:
+    // the root cause in one line, exactly as it should appear on the ledger"). This is a JOURNALED
+    // DEVIATION, not a park. step-contracts.js's VALIDATE outputContract requires the KEY, and
+    // llm.js's own missing-key check (`key in parsedPayload`) turns a reply that omits it
+    // ENTIRELY into `llm-transport-failed:VALIDATE` before handleValidate ever reads a verdict
+    // (see test/validate-reject-reasons-contract.test.js's test (f)) -- so the
+    // `reasonsKeyPresent: false` shape below reaches here only via a shadow-mode fixture: the
+    // legacy `ctx.task.llm.<step>` override returns invokeClaudeReal's raw `{ok, result:<string>}`
+    // shape with no top-level `verdict` at all, so it parks `validate-unrecognized-verdict`
+    // instead of ever reaching this branch, and --dry-run's canned VALIDATE payload
+    // (steps/llm.js's cannedDryRunPayload) is always `{verdict:'PASS', reasons:['[dry-run] no
+    // verdict rendered'], findings:[]}` -- a REJECT can never happen under --dry-run at all. But
+    // `key in parsedPayload` checks PRESENCE only, not shape: a real, live validator reply that
+    // sends `reasons: null`, `[]`, `"[]"`, a bare non-JSON string, or an array of non-string
+    // entries satisfies the contract check and reaches here exactly the same as a shadow fixture
+    // would (measured: `reasons: null` from a real-shaped `claude` reply lands here with
+    // `reasonsKeyPresent: true`, `reasonsShape: 'null'`, same as a synthetic null shadow fixture
+    // would -- see test (c-1-real)). None of these is a case where turning "not exactly one" into
+    // a park would be right -- a REAL validator sending a malformed shape is still the same
+    // evidence-losing failure #640 was, just a different cause, and a token-burning retry-vs-park
+    // loses the verdict entirely instead of keeping it on the record. It is recorded here instead,
+    // once, so the record shows what shape actually arrived, whatever reached this line produced
+    // it. The happy path (exactly one usable reason, including the salvaged-string and
+    // JSON-encoded-string shapes above) journals nothing new here -- unchanged from before this
+    // action.
+    const usableCount = reasons.length;
+    if (usableCount !== 1) {
+      try {
+        appendEvent(ctx.taskDir, 'VALIDATE', 'reject-reasons-contract-violation', {
+          attempt: attemptN,
+          reasonsKeyPresent,
+          reasonsShape: reasonsNorm.shape,
+          usableCount,
+        });
+      } catch {
+        // Best-effort record of a shape mismatch -- never let a failure to WRITE that record
+        // change the REJECT's own control flow (the retry-vs-budget-park decision below), the
+        // same belt-and-suspenders discipline postValidateFindingsComment's own call site already
+        // applies to a best-effort `gh` comment.
+      }
+    }
+
     const budgetExhausted = attemptN >= ctx.config.validateRejectBudget;
     const outcome = budgetExhausted ? 'parked (validate-reject-budget-exhausted)' : 'retry (validate reject)';
     // Ledger line distinct from a DIAGNOSE attempt's own ("attempt N | ..."): 'validate-reject'
     // as the line's `kind` (journal.js's appendLedgerLine) so the two are never confused when
     // both appear in the same ledger.md, per validate-change.md's own instruction that `reasons`
     // for a REJECT is "the root cause in one line, exactly as it should appear on the ledger".
-    appendLedgerLine(ctx.taskDir, attemptN, reasons.length ? reasons.join('; ') : '(no reason given)', outcome, 'validate-reject');
+    // Zero usable reasons carries the raw shape alongside "(no reason given" (kept as a literal
+    // prefix -- test/prompt-template.test.js's own `/\(no reason given\)/` match is against a
+    // separate, task-values.js diagnosisSummary string, not this ledger line, so it is
+    // unaffected) so a reader of ledger.md (DIAGNOSE reads this file, per its own ledger_path
+    // placeholder) can tell "the validator sent none" (`reasonsShape: 'array'`/'null'/etc.) from
+    // "the pipeline lost it" -- the exact ambiguity card #640 could not resolve from the ledger
+    // alone.
+    const ledgerReason = reasons.length ? reasons.join('; ') : `(no reason given; reasons shape: ${reasonsNorm.shape})`;
+    appendLedgerLine(ctx.taskDir, attemptN, ledgerReason, outcome, 'validate-reject');
 
     if (budgetExhausted) {
       throw new ParkSignal('validate-reject-budget-exhausted', { rejects: attemptN });

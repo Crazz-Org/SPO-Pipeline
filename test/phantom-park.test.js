@@ -306,7 +306,12 @@ test('T-C: the pool-wait re-enqueue path journals no `parked` line', () => {
 //
 // poolCooldownDeadlineMs returns null for 'all-accounts-cooling-wait-cap-exceeded' by NAME, before
 // either detail key is read (its own header comment), and the pool branch is gated on that at
-// state-machine.js:2333-2335 -- strictly BEFORE the deleted :2420 emit. So a finalizePark call with
+// state-machine.js:2436-2439 (`if (isRealMode(ctx) && isAccountPoolParkReason(reason))`, the
+// `poolCooldownDeadlineMs(reason, detail)` call, and `if (deadlineMs !== null && ...)` -- the
+// three checks this sentence names. Re-pinned from :2333-2335, which cited the block's own
+// header COMMENT above the gate, not the gate itself -- card #174 added lines to handleValidate's
+// REJECT branch above this point, unrelated to the mis-citation) -- strictly BEFORE the
+// deleted :2420 emit. So a finalizePark call with
 // this reason must never reach the pool branch's re-enqueue at all, regardless of whether the
 // detail carries a live, future deadline -- it must fall straight through to the ordinary park,
 // exactly as before this fix. The cap is set explicitly: without it `cap` resolves to 0, the
