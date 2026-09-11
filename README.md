@@ -58,7 +58,8 @@ tunables, and the traps that have already cost something.
 
 ```bash
 bin/spo status                                       # queue, accounts, spend, every card
-systemctl --user stop spo-pipeline-daemon.service    # DRAINS: in-flight cards finish first
+systemctl --user stop spo-pipeline-daemon.service    # DRAINS: in-flight cards finish first,
+                                                      #   up to 45 min by default (SPO_DRAIN_TIMEOUT_MS)
 systemctl --user kill -s TERM spo-pipeline-daemon.service   # ...second signal = stop now
 cd ~/SPO-Pipeline && git pull                        # THE deploy: cuts a release, moves the
                                                      # symlink, drain-restarts. That checkout only.
@@ -83,8 +84,9 @@ source of truth (same philosophy as `~/.spo-bench/`):
   debugging with `claude --resume <sessionId>`;
 - account events (limit hit, cooldown, recovery) are journal events too;
 - `spo status` / `spo task <id>` render the journals + `~/.spo-bench/` verdicts/nightly/queue
-  as text; `spo dashboard` renders the same surfaces as self-contained static HTML
-  (`console/render.js` + `console/collect.js`, see `orchestrator/README.md` § Dashboard).
+  as text; `spo dashboard` renders the same surfaces as self-contained static HTML, or a live
+  HTTP dashboard with `--serve` (`console/render.js` + `console/collect.js` + `console/serve.js`,
+  see `orchestrator/README.md` § Dashboard).
   The console is two pages. **`/` is the flight deck**: the card running right now, drawn as a
   run along the twelve-state track — every checkpoint it has cleared, every time it has been
   sent back, how long this visit is taking against the measured median of every previous one,

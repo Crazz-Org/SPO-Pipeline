@@ -259,9 +259,9 @@ against the product source, not by guesswork:
   bench job that `job.ts` refuses as a duplicate -> exit 2 -> the card parks `gate-dirty-tree`:
   a busy bench reported as a dirty worktree that is perfectly clean. Now 7800s, and `npm-gate`
   is the one command never retried.
-- **The chantier-gate command was unusable.** Bare `node --test` walks into any parked card's
-  product worktree under `~/.spo-worktrees/issue-<n>/` and runs SPO-WebClient's TypeScript suites:
-  1926 tests / 1168 failures with four parked cards. Use `node --test test/*.test.js`.
+- **The chantier-gate command was unusable.** Bare `node --test` walked into any parked card's
+  product worktree (then under the non-dot `<repo>/worktrees/`; `769eac5` later moved the
+  default to `~/.spo-worktrees`) and ran SPO-WebClient's TypeScript suites: 1926 tests / 1168 failures with four parked cards. Use `node --test test/*.test.js`.
 
 **2.1's scope was insufficient for its own stated purpose**, so 2.1b was added: four modules
 spawned `gh`/`npm` through private `runSync`s with no timeout, and `board.js`'s `moveCard` is
@@ -511,10 +511,10 @@ a real array; only the live model serialises it.
 
 ## Operational facts that cost time to learn
 
-- **Merging restarts the daemon.** A post-merge hook `systemctl restart`s daemon + dashboard on
-  every `git pull` in main. It SIGTERMs any in-flight `claude`, which parks the card
-  `llm-transport-failed:<STEP>`. **Check for in-flight tasks before merging.** `systemctl --user
-  mask` does NOT work here (the units are real files); just re-run `stop` after each pull.
+- **A `git pull` in `~/SPO-Pipeline` deploys (a merge on GitHub alone does not).** post-merge
+  runs `scripts/release.sh`, which restarts (`--no-block`) each active-or-enabled unit; the
+  daemon's restart drains, so in-flight cards finish first (`config.drainTimeoutMs`, default
+  45 min); a second signal stops at once. To keep the daemon down across pulls, `stop` AND `disable` it — `release.sh` skips a unit that is neither active nor enabled.
 - **The suite could contaminate the live product repo.** Fixed via `SPO_PRODUCT_REPO` /
   `SPO_WORKTREES_DIR`, set by `test/helpers.js` for every daemon subprocess. Before that, a
   mutation-testing round left 44 real worktrees and 61 branches in `~/SPO-WebClient`, invisible
@@ -917,7 +917,8 @@ sixth one was caught by the production journal within minutes of deploying.
 
 **Nothing is in flight.** Queue empty, no open PRs from C5's own work, no worktrees left behind.
 Merging this needs a `git pull` in `/home/crazz/SPO-Pipeline` to reach the daemon — the merge alone
-deploys nothing, and the pull SIGTERMs any in-flight card.
+deploys nothing, and the pull SIGTERMs any in-flight card (pre-drain, 2026-09-01; since the drain
+landed a pull drain-restarts, and an in-flight card finishes first unless it outlives the default 45 min bound).
 
 ## C6's own measurement — the funnel re-derived, 2026-09-01
 
@@ -1515,8 +1516,10 @@ replay holes predates all of it.
 ### Six things that will bite C7 specifically
 
 - **The suite has no per-test timeout.** Several mutations "pass" by hanging for 100–150 s. Run
-  `node --test --test-timeout=30000 test/*.test.js`. Never bare — bare walks into parked cards'
-  product worktrees and reports ~1168 foreign failures.
+  `node --test --test-timeout=30000 test/*.test.js`. Never bare — (2026-09-02: bare walked into
+  parked cards' product worktrees and reported ~1168 foreign failures; since those left the repo
+  under `769eac5`, the live reason is that bare also runs the six non-test helper/fixture `.js`
+  files under `test/` as tests, false passes and false failures.)
 - **Run a NEGATIVE timezone offset.** `TZ=Pacific/Niue` (UTC−11) found a real pre-existing failure
   at HEAD that UTC and UTC+14 had both missed — a fixture assuming two instants five hours apart
   share a local day, which no pair can across a 26-hour offset range.

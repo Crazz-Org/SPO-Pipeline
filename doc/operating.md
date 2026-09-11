@@ -132,7 +132,7 @@ scripts/release.sh --no-restart # cut and switch, leave the services running the
 > ```bash
 > scripts/daemon-install.sh && scripts/dashboard-install.sh
 > ```
-> `daemon-install.sh` ends in `enable --now` — **it starts the daemon.** Set `SPO_AUTO_PULL_MS=0`
+> `daemon-install.sh` runs `enable --now` — **it starts the daemon.** Set `SPO_AUTO_PULL_MS=0`
 > first if the box should come back idle. `daemon-install.sh` refuses (exit non-zero, nothing
 > written) unless the script it runs lives in the deploy checkout (`SPO_SOURCE_REPO`, default
 > `~/SPO-Pipeline`) on the deploy branch (`SPO_DEPLOY_BRANCH`, default `main`) — the same two

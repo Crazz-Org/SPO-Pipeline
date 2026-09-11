@@ -634,8 +634,8 @@ test('orphanScan: prNumber and ALL FOUR counters are still restored from state.j
 });
 
 // Action 6.5, the upgrade case: every state.json written before 6.5 holds a BOOLEAN here (all 21
-// real files under journal/*/ did at the time of the change), and the post-merge hook SIGTERMs
-// the daemon on every deploy -- so a card mid-flight across the upgrade is the ordinary case, not
+// real files under journal/*/ did at the time of the change), and before the drain every deploy
+// cut the cards in flight -- so a card mid-flight across the upgrade was the ordinary case, not
 // an exotic one. A legacy `true` must restore as the 1 the new code would have written, and a
 // legacy `false` as 0, so the field's type in state.json converges on a number instead of
 // alternating with whatever the last writer happened to be.

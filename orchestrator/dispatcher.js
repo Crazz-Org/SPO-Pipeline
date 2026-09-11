@@ -1057,8 +1057,8 @@ function createDispatcher(queueDir, journalRoot, config) {
     // Action 6.7 verification fix. `idleNoHealthyAccounts` below is IN-MEMORY state, and the
     // dispatcher-idle/-returned pair it drives is EDGE-triggered: exactly one line when the pool
     // first has no healthy account, exactly one when it recovers. A restart destroys that memory
-    // -- so if the pool goes idle, the daemon is then restarted (which this project does on every
-    // single merge: the post-merge hook SIGTERMs it), and the pool recovers, the `returned` edge
+    // -- so if the pool goes idle, the daemon is restarted by a deploy (a `git pull` landing commits
+    // in the deploy checkout, never a GitHub merge alone), and the pool recovers, the `returned` edge
     // is NEVER written, because the new process's flag started false. daemon.jsonl is then left
     // with a bare `dispatcher-idle-no-healthy-accounts` as its newest dispatcher edge, forever,
     // and any reader that answers "is the dispatcher idle right now" by walking back to the most

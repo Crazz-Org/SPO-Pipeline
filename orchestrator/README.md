@@ -373,20 +373,21 @@ A card task's own fields:
   "worktreePath": "/home/crazz/.spo-worktrees/card-123",
   "size": "S",
   "touchesRdoMembers": false,
-  "escalate": false,
   "citations": ["ObjectAt — RDOObjectServer.pas:118 — function, 2 args"],
   "spoOriginalPath": "/home/crazz/SPO-Original"
 }
 ```
 
-`size` (`S`/`M`/`L`) drives effort for PLAN/IMPLEMENT (`step-contracts.js`'s
-`EFFORT_BY_SIZE`; there is no per-size budget table — see § Budgets); `touchesRdoMembers` is the RDO wire-rule escalation flag
-for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
-PLAN entry); `escalate` is **dead — nothing reads it on any step**. `shouldEscalate`
-(`step-contracts.js`) tests only `touchesRdoMembers === true` and `size === 'L'`; measured, a task
-carrying `escalate: true` (or `escalateFlag: true`) still resolves IMPLEMENT to sonnet. The
-"Opus 5 fallback" it used to name was only ever reachable through this flag and was removed
-2026-09-04. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and only when the
+`size` drives effort for PLAN and IMPLEMENT — PLAN through `step-contracts.js`'s shared
+`EFFORT_BY_SIZE` (low/medium/high), IMPLEMENT through its own `IMPLEMENT_EFFORT_BY_SIZE`
+(medium/medium/high: a labelled experiment whose revert criterion sits in that map's comment);
+there is no per-size budget table — see § Budgets. `touchesRdoMembers` is the RDO wire-rule
+escalation flag for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
+PLAN entry). The sample above no longer carries `escalate`: the field is **dead — nothing reads
+it on any step**. `shouldEscalate` (`step-contracts.js`) tests only `touchesRdoMembers === true`
+and `size === 'L'`; measured, a task carrying `escalate: true` (or `escalateFlag: true`) still
+resolves IMPLEMENT to sonnet. The "Opus 5 fallback" it used to name was only ever reachable
+through this flag and was removed 2026-09-04. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and only when the
 diff-derived `rdoDiffTouched` says the real diff touched the catalogue. `citations` in the JSON above is shown as a hand-set task
 field for illustration, and a maintainer-supplied value there does still win, but in practice
 nothing sets it at intake: `steps/scripted.js`'s `realPushPr` is what actually populates it, from
@@ -1364,8 +1365,11 @@ Everything below this heading describes what happens when a task actually parks.
 (`state-machine.js`) checks one thing FIRST, before any of it: whether `ctx.config.real` is set
 and the reason is one of a closed allowlist -- `claim-rate-limited`, `gate-non-attesting` (unless
 its detail says the bench's verdicts directory itself is missing, which is a permanent
-misconfiguration, not a transient fault) and the four `llm-transport-failed:*` reasons -- with
-the per-task `transientRetries` counter still under `config.transientRetryBudget` (default **2**).
+misconfiguration, not a transient fault), `gate-live-blocked`, three of B3.4's four splits of
+`gate-non-attesting` -- `gate-environment`, `gate-interrupted`, `gate-abandoned` (the fourth,
+`gate-worker-dirty-checkout`, is deliberately terminal) -- B3.4's new `gate-stale` park, and the
+four `llm-transport-failed:*` reasons -- with the per-task `transientRetries` counter still under
+`config.transientRetryBudget` (default **2**).
 If so, the task is silently re-enqueued instead of parked: no board move, no `Parked` comment, no
 `state.json` PARKED write -- nothing the rest of this section describes happens. It waits
 `config.transientRetryDelaysMs` (default `[60s, 5min]`, indexed by attempt) before it is eligible
@@ -1945,8 +1949,10 @@ why, permanently.
 
 A hard process kill mid-triage is recovered by `reclaimStaleClaims` (action 2.6, above) and
 journals `report-triage-reclaimed`, NOT `report-triage-error` -- so a daemon crash-loop is
-NEITHER capped NOR backed off by this mechanism. This is a real, reachable path: merging a PR
-restarts the daemon, which since the drain landed (doc/deployment.md) lets an in-flight card
+NEITHER capped NOR backed off by this mechanism. This is a real, reachable path: a `git pull` or
+local merge that lands commits (fast-forward or merge commit) on the clean deploy checkout's deploy
+branch runs `scripts/release.sh`, whose `restart_units` restarts the daemon if it is active or enabled;
+since the drain landed (doc/deployment.md) that lets an in-flight card
 finish before exiting -- but a card still running past `config.drainTimeoutMs`, and a triage in
 progress (which the drain does not wait for: it lives in the SCANNER, killed first), are still cut. The
 gap is deliberate, not an oversight: counting a reclaim toward the mechanical-failure cap would
@@ -2239,8 +2245,10 @@ spawning a repark child mid-shutdown would only move the same risk into it, sinc
 written by a process about to be SIGKILLed can never be recovered later — `dispatcher.js:634-648`)
 and any owning daemon process that simply never comes back to run `handleExit` at all (a hard kill
 of the whole process tree).
-The shutdown case is this project's most common one in practice: a merge's `git pull` SIGTERMing
-an in-flight card.
+A deploy produces that shutdown case only for a card that outlives the drain: the pull's
+drain-restart lets in-flight cards finish (bounded by the drain timeout, default 45 min), and a
+worker is signalled only if it outlives
+that bound or the operator sends a second signal.
 
 `orchestrator/orphan-scan.js` closes that remaining gap: every `state.json` snapshot now carries an
 `owner: {host, pid, lockStartedAt}` (set once, from `daemon.js`'s own lock holder), and a task
@@ -2481,7 +2489,7 @@ Auto-pull off for the unit: `systemctl --user edit spo-pipeline-daemon.service` 
 `scripts/release.sh`, which cuts `~/.spo-releases/<sha>`, moves `~/.spo-current` and drain-restarts
 the daemon and the dashboard. The installer is a different thing: re-run
 `scripts/daemon-install.sh` only when the generated unit text itself changes (`KillMode`,
-`ExecStart`, …). It ends in `enable --now` plus a **blocking** `systemctl restart`. That restart
+`ExecStart`, …). It runs `enable --now` plus a **blocking** `systemctl restart`. That restart
 does drain (`KillMode=mixed`, `TimeoutStopSec=2820`) — but it blocks while it drains, unlike
 `release.sh`'s `restart --no-block`, which exists precisely so a 45-minute drain does not land on
 whoever ran the pull. `daemon-install.sh` derives its repo root from the script's own path, so run

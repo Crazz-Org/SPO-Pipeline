@@ -427,9 +427,10 @@ test('leasedAccountNames: applies the SAME age rule as tryAcquireLease -- an ove
 });
 
 test('a DEAD pid is still swept immediately, without waiting out the age bound', () => {
-  // The common case, not the exotic one: the post-merge deploy hook SIGTERMs this tree, orphaning
-  // any lease mid-step. Making that wait 31 minutes would be a plain regression, so both rules
-  // have to stay -- pid OR age, never age alone.
+  // The common case, not the exotic one: a holder killed mid-call can leave its lease behind -- a
+  // deploy SIGTERMs the scanner on its first signal, a worker past drainTimeoutMs or on a second.
+  // Making that wait out the age bound (MAX_LEASE_AGE_MS) would be a plain regression, so
+  // both rules have to stay -- pid OR age, never age alone.
   const poolDir = writePoolDir(mkTmp('spo-lease-age-deadpid-'), [{ name: 'acct-a' }]);
   fs.writeFileSync(leaseFilePath(poolDir, 'acct-a'), leaseAged(1000, 999999)); // one second old, pid gone
 
@@ -532,8 +533,8 @@ test('leaseHealthyAccount: opts.monotonicNowMs drives the elapsed bound independ
 // `all-accounts-leased`. It shipped as 5 minutes, justified against MEASURED step durations
 // (90-265s) rather than against the bound it actually waits on. Every other C6 ceiling is derived
 // from its bound; this one was not, and the gap is not academic: a sibling's own two-attempt LLM
-// step can legitimately hold a lease for 2 x MAX_LLM_STEP_DEADLINE_MS = 30 min, and nothing may sweep
-// that lease until MAX_LEASE_AGE_MS = 31.5 min. A 5-minute waiter gave up while the holder was
+// step can legitimately hold a lease for 2 x MAX_LLM_STEP_DEADLINE_MS = 60 min, and nothing may sweep
+// that lease until MAX_LEASE_AGE_MS = 63 min. A 5-minute waiter gave up while the holder was
 // still legitimately alive and still un-sweepable, and parked the exact park class per-step
 // leasing was built to avoid.
 test('accountLeaseWaitMs OUTLASTS every legitimate lease hold -- derived from MAX_LEASE_AGE_MS, not from an observed maximum', () => {

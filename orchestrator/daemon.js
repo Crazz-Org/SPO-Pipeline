@@ -42,13 +42,13 @@
 //            2  usage error (no path, unreadable taskDir/task.json)
 //            75 LockLostError propagated (kept for symmetry with the non-worker catch-all
 //               below; unreachable in practice since a worker never wires config.lockLost)
-//            130/143 killed by SIGINT/SIGTERM -- NOT a code runWorker returns, but reachable and
-//               routine, so 6.3 must handle it rather than be surprised by it. The SIGINT/SIGTERM
-//               handlers registered below apply to a worker exactly as they do to a daemon, and
-//               the post-merge deploy hook SIGTERMs this tree on every merge. Measured, not
-//               inferred: SIGTERM to a `--worker` mid-IMPLEMENT exits 143 and leaves state.json
-//               at IMPLEMENT with this worker's own owner stamped on it -- which is precisely
-//               what orphanScan recovers on the next --real start, so the card is not lost.
+//            130/143 killed by SIGINT/SIGTERM -- NOT a code runWorker returns, but reachable in
+//               production, so 6.3 must handle it rather than be surprised by it. The SIGINT/SIGTERM
+//               handlers registered below run in a worker too, and with no dispatcher to drain a
+//               worker exits 130/143 on its first signal. E.g. a stop or deploy (`git pull` in the
+//               deploy checkout), rare since the drain: KillMode=mixed SIGTERMs only the dispatcher,
+//               which SIGTERMs a worker's group (killAllChildren) past drainTimeoutMs or on a 2nd signal.
+//               Measured mid-IMPLEMENT: exit 143, state.json left at IMPLEMENT for orphanScan to repark.
 //            1  anything else -- an uncaught error; this is what 6.3 reads as "crashed, repark".
 //               6.3's classifier must therefore be "0/20/2/75 by name, EVERYTHING else = crashed"
 //               and not "1 = crashed", or a deploy-time SIGTERM (143) falls through it unhandled.

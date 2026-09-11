@@ -153,7 +153,7 @@ the correction to apply.
 The drain (§3) makes all three rare by construction: a card is only signalled at all if it is still
 running when the bound expires.
 
-### 2.3 Found in passing: `isSpawnTimeout` calls any external signal a timeout — NOT changed
+### 2.3 Found in passing: `isSpawnTimeout` called any external signal a timeout — fixed since (PR #127, command-timeout.js; PR #132, steps/llm.js)
 
 `command-timeout.js`:
 
@@ -452,7 +452,7 @@ systemctl --user stop spo-pipeline-daemon.service
 #    ...wait for `inactive` (not `deactivating`) if you want the pull to redeploy.
 
 # 1. if the box should come back idle, set auto-pull off FIRST -- daemon-install.sh below
-#    ends in `enable --now`, i.e. it starts the daemon.
+#    runs `enable --now`, i.e. it starts the daemon.
 systemctl --user edit spo-pipeline-daemon.service    # [Service] / Environment=SPO_AUTO_PULL_MS=0
 
 # 2. deploy the code
