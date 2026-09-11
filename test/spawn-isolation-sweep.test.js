@@ -726,17 +726,31 @@ test('every real-spawn call site in test/ carries an `env:` option', () => {
   // at 57, but dropping park-alert.test.js (1 site) alone, or park-alert.test.js AND
   // worker-mode.test.js TOGETHER, both stay at or above 58 -- any combination of losses summing
   // to <=2 slips through silently, not just any single small file. Pinned per file instead, over
-  // just the seven files that actually contribute to the CHECKED (non-allowlisted) corpus --
+  // the eight files this ledger currently pins from the CHECKED (non-allowlisted) corpus --
   // losing any one of them, however small, now reddens by name instead of only nudging a total.
+  // Not every contributing file is pinned here: daemon-repark-mode.test.js (2 sites) and
+  // usage-report.test.js (1 site) are real, checked, audited corpus files (see
+  // auditedRealCorpusFiles below) that are not pinned in this ledger; both were added to that
+  // audited set alone, before this ledger's dispatcher-status-deck.test.js entry, and no record
+  // says why they were not also pinned here.
   //
   // MAINTENANCE COST, stated rather than hidden: adding or removing a legitimate real-spawn call
-  // site in any of these seven files means editing the matching count below, not just the global
+  // site in any of these eight files means editing the matching count below, not just the global
   // floor above -- that edit is deliberate by design (a count that silently drifted would defeat
   // the point), but the next author needs to know where: this object, by filename.
   const EXPECTED_SITE_COUNT_PER_FILE = {
     'cli.test.js': 3,
+    // Card #186/#188: deadPid()'s own `realSpawn(process.execPath, ['-e', ''], { stdio: 'ignore',
+    // env: isolatedEnv() })` -- the one real-spawn site in this file, minting a guaranteed-dead
+    // pid for the drain-liveness tests below it.
+    'dispatcher-status-deck.test.js': 1,
     'dispatcher.test.js': 6,
-    'drain.test.js': 4,
+    // Card #188 (section 17): two real daemon.js children joined this file's corpus -- the
+    // SIGKILL-inside-the-drain-wait test's own launch (`{ env: envDrainDied, ... }`) and the
+    // second-SIGTERM variant's launch (`{ env: envDrainDied2, ... }`), each with its env built as
+    // `{ ...isolatedEnv(), ... }`. Audited before this count moved: both were already
+    // isolatedEnv()-derived, so nothing but this ledger needed to change for them.
+    'drain.test.js': 6,
     'lock.test.js': 4,
     'park-alert.test.js': 1,
     'tokens.test.js': 9,
@@ -950,7 +964,14 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // to, but it still carries `env: isolatedEnv()` (the simpler of "isolate" or "justify an
   // allowlist entry" here) so it passes this sweep's own four properties the same way every
   // other audited site does.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  // Card #186/#188: dispatcher-status-deck.test.js's own deadPid() spawns a trivial
+  // `realSpawn(process.execPath, ['-e', ''], ...)` one-liner -- the same "mint a guaranteed-dead
+  // pid" shape status-6.7.test.js's ALLOWLIST entry already covers, but left here as a fully
+  // checked corpus site (env: isolatedEnv()) rather than a new allowlist pattern: isolating it
+  // costs six throwaway (exit-swept) temp directories per call (test/helpers.js:106-142, the same
+  // cost the temp-dir-registry ALLOWLIST entry above cites for skipping it elsewhere), and this
+  // keeps the file with no allowlist entry of its own.
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });

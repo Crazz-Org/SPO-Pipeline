@@ -18,7 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const accountsModule = require('../orchestrator/accounts');
-const { processAlive } = require('../orchestrator/lock');
+const { processAlive, pidExists } = require('../orchestrator/lock');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
 const { HEARTBEAT_STALE_MS, heartbeatAgeMs: benchHeartbeatAgeMs } = require('../orchestrator/bench-heartbeat');
 const { summarizeUnparkScanTail } = require('../orchestrator/retry-channel');
@@ -919,9 +919,36 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
   services.workers.ageMs = worker.ageMs;
 
   const events = daemonEvents || readDaemonEventsTail(journalRoot);
-  const dispatcher = computeDispatcherStatus(events);
+  // `isAlive: pidExists` (card #188) is what lets a `dispatcher-drain-start` with no later
+  // conclusion resolve to 'draining' (its process is not provably dead) instead of a false
+  // 'stopped' -- see console/dispatcher-status.js's own header. `pidExists`, not the `processAlive`
+  // already required into this module above (for the separate Daemon-tile lock-holder probe,
+  // unchanged): the dispatcher pid this deck reads about is not necessarily this process's own
+  // uid, and `process.kill(pid, 0)` throws EPERM for a pid that is alive but not signalable --
+  // `processAlive` reads that identically to ESRCH ("gone"), which would misreport a live-but-
+  // foreign dispatcher as dead (`pidExists`'s own header in orchestrator/lock.js).
+  //
+  // `now`/`killGraceMs` (card #188 follow-up) are ALSO injected here, never read inside
+  // computeDispatcherStatus itself -- `now` is collectAll's own `now` snapshot, the one it also
+  // hands collectServices, applyRetryChannelStats and collectReportPipeline, threaded through as
+  // this function's `now` parameter, never a fresh clock read here, and `killGraceMs` is this process's own
+  // `orchestrator/config.js`'s `drainKillGraceMs`, required lazily here (same pattern as this
+  // file's other config reads -- see collectAll's own `spoReportsDir` fallback and
+  // `collectReportPipeline`'s `result.pull.configured`, both below) so a test context with no
+  // config module reachable degrades to "no bound" rather than throwing. Together they let a
+  // reader bound an UNCONCLUDED drain-start past its own `timeoutMs` plus that grace as STOPPED
+  // even when a reused pid would otherwise read it alive forever.
+  let killGraceMs;
+  try {
+    killGraceMs = require('../orchestrator/config').drainKillGraceMs;
+  } catch {
+    /* config module unavailable in this test context -- no bound applies, same as a missing `now` */
+  }
+  const dispatcher = computeDispatcherStatus(events, { isAlive: pidExists, now, killGraceMs });
   if (dispatcher && dispatcher.status === 'stopped') {
     services.workers.status = 'stopped';
+  } else if (dispatcher && dispatcher.status === 'draining') {
+    services.workers.status = 'draining';
   } else if (dispatcher && dispatcher.status === 'idle') {
     services.workers.status = 'idle';
   } else {
@@ -939,6 +966,18 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
       survivors: Array.isArray(ev.survivors) ? ev.survivors.length : null,
       queued: typeof ev.queued === 'number' ? ev.queued : null,
       earliestCooldownUntil: ev.earliestCooldownUntil || null,
+      // Card #188: `inFlight`/`timeoutMs` are non-null only on a 'draining' or diedDraining
+      // 'stopped' reading (they exist only on `dispatcher-drain-start`, never on `dispatcher-
+      // stopped`); `signal` is filled by BOTH -- a `dispatcher-drain-start` carries its own, and
+      // so does a concluded drain's `dispatcher-stopped` (`stopReason` spread flat, dispatcher.js's
+      // action 3.3 comment); `reason` (above) is filled by both too, now that `dispatcher-drain-
+      // start` carries its own `reason` read from `stopReason` at drain time (driver decision,
+      // card #188) rather than only ever being inferred. `diedDraining` (below) is always present
+      // on this object, `true` only for the died-inside-the-wait reading.
+      signal: ev.signal || null,
+      inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.length : null,
+      timeoutMs: typeof ev.timeoutMs === 'number' ? ev.timeoutMs : null,
+      diedDraining: dispatcher.diedDraining === true,
     };
   } else {
     services.workers.dispatcher = null;
@@ -1125,7 +1164,12 @@ const REJECT_REASON_WHITELIST = new Set(['unsafe-filename', 'oversize', 'sha256-
 //     comment names this exact hazard) all leave a `dispatcher-drain-start` with no matching end.
 //     If a later `dispatcher-stopped` or `dispatcher-start` exists at or after that drain's own
 //     start, the drain is provably not still running -- render.js reads `lastStart`/`lastStopped`
-//     for exactly that check, never for liveness.
+//     for exactly that check. Card #188's one exception: a process that dies INSIDE the wait
+//     writes neither a later `dispatcher-stopped` nor a `dispatcher-start` (nothing observed it to
+//     write either), so `lastStart`/`lastStopped` alone cannot tell that case apart from a
+//     genuinely still-running drain -- for that one fact render.js reads `wd.diedDraining`, the
+//     Workers tile's own already-computed liveness verdict (`applyWorkerStats` below, via
+//     computeDispatcherStatus), passed in as a second argument rather than re-derived here.
 function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now(), events } = {}) {
   const result = {
     queuedIntake: 0,

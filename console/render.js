@@ -655,7 +655,7 @@ body[data-stale="1"] #offline-banner { display: block; }
 // `stopped`/`idle` (card #186) are workers.status values ONLY -- console/collect.js's
 // applyWorkerStats sets them from console/dispatcher-status.js's computeDispatcherStatus, the same
 // derivation `spo status`'s STOPPED/IDLE lines read, so this word choice matches the CLI exactly.
-const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'BACKED UP', stale: 'STALE', down: 'DOWN', unknown: 'UNKNOWN', stopped: 'STOPPED', idle: 'IDLE' };
+const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'BACKED UP', stale: 'STALE', down: 'DOWN', unknown: 'UNKNOWN', stopped: 'STOPPED', idle: 'IDLE', draining: 'DRAINING' };
 
 function svcTile({ name, status, cls, big, bigUnit, caption, timestamp }) {
   const pulse = cls === 'tile-green' ? ' pulse' : '';
@@ -761,15 +761,32 @@ function renderServicesInner(services, accounts, prod) {
   // why. Colored locally rather than through the shared tileClass() -- see that function's own
   // comment on why 'idle' cannot be folded in there without repainting the retry-channel tile,
   // which already uses that word for an unrelated, neutral meaning.
+  //
+  // Card #188: 'draining' is a FIFTH status, distinct from 'stopped' -- the process is not
+  // provably dead, still (as far as this reading can tell) holding in-flight cards open, so
+  // painting it tile-red (the same color a dead dispatcher gets) would read as an outage that
+  // isn't one. Not tile-green either (it is not ordinary operation) -- reuses 'tile-orange', the
+  // same "attention, not alarm" color 'idle' already uses for a different reason. `diedDraining`
+  // (workers.status still reads 'stopped' for it -- console/collect.js's applyWorkerStats -- with
+  // the flag carried on `workersDispatcher`) is the one 'stopped' sub-case with no reliable stop
+  // TIME: a drain-start is written only after `requestDrain` accepted a drain (dispatcher.js's
+  // run(), gated on `drainRequest`), before the wait even begins, so its own `ts` is the START of
+  // the drain, never the moment the process actually died -- captioning it "stopped <age> ago"
+  // would state a fact nobody measured, so this caption drops the "since <age> ago" shape entirely.
   const workersDispatcher = workers.dispatcher || {};
-  // A stop/idle event with no parseable `ts` has no age to report; the since/ago clause is dropped
-  // entirely rather than rendering a dangling age suffix with no age in front of it.
+  // A stop/idle/drain event with no parseable `ts` has no age to report; the since/ago clause is
+  // dropped entirely rather than rendering a dangling age suffix with no age in front of it.
   const ageMs = workersDispatcher.sinceAgeMs;
   const ageKnown = typeof ageMs === 'number' && Number.isFinite(ageMs);
   let workersCls;
   let workersBig;
   let workersCaption;
-  if (workers.status === 'stopped') {
+  if (workers.status === 'stopped' && workersDispatcher.diedDraining) {
+    const inFlightNote = typeof workersDispatcher.inFlight === 'number' ? ` (${workersDispatcher.inFlight} in flight at drain start)` : '';
+    workersCls = tileClass('stopped');
+    workersBig = '—';
+    workersCaption = `stopped — drain never concluded (drain started ${ageKnown ? fmtAgeMs(ageMs) : '?'} ago), no dispatcher-stopped recorded; process gone or past its drain bound${inFlightNote}`;
+  } else if (workers.status === 'stopped') {
     const reason = workersDispatcher.reason || 'unknown';
     const extraParts = [];
     if (typeof workersDispatcher.drained === 'boolean') {
@@ -783,6 +800,11 @@ function renderServicesInner(services, accounts, prod) {
     workersCls = tileClass('stopped');
     workersBig = '—';
     workersCaption = `stopped${ageKnown ? ` ${fmtAgeMs(ageMs)} ago` : ''} — reason: ${reason}${extraNote}`;
+  } else if (workers.status === 'draining') {
+    const inFlightNote = typeof workersDispatcher.inFlight === 'number' ? `${workersDispatcher.inFlight} in flight at drain start` : 'waiting for in-flight cards';
+    workersCls = 'tile-orange';
+    workersBig = '—';
+    workersCaption = `draining${ageKnown ? ` since ${fmtAgeMs(ageMs)} ago` : ''} — ${inFlightNote}`;
   } else if (workers.status === 'idle') {
     workersCls = 'tile-orange';
     workersBig = workers.present ? fmtInt(workers.count) : '—';
@@ -1009,12 +1031,18 @@ function renderDaemonStatsInner(daemonStats) {
 
 // ---- 5. bug reports -------------------------------------------------------------------------
 
-function renderReportsInner(reports) {
+function renderReportsInner(reports, workersDispatcher) {
   const r = reports || {};
   const cycle = r.lastIntakeCycle;
   const w = r.last24h || {};
   const pull = r.pull || {};
   const dispatcherHistory = r.dispatcher || {};
+  // Card #188: `workersDispatcher` is `services.workers.dispatcher` (console/collect.js's
+  // applyWorkerStats), the SAME status computeDispatcherStatus already derived for the Workers
+  // tile -- passed in, not re-derived, so this history line and that tile can never disagree
+  // about whether a drain's process is still alive. Optional (defaults to `{}`) so a caller
+  // (or an existing test) passing only `reports` keeps today's "in progress" wording exactly.
+  const wd = workersDispatcher || {};
 
   const cycleLine = cycle
     ? `<p class="meta">last intake cycle (${escapeHtml(cycle.ts || '?')}): ${escapeHtml(cycle.processed)} processed, ${escapeHtml(cycle.filed)} filed, ${escapeHtml(cycle.duplicates)} duplicates${cycle.errors ? `, <strong>${escapeHtml(cycle.errors)} errors</strong>` : ''}</p>`
@@ -1034,8 +1062,11 @@ function renderReportsInner(reports) {
       : '';
 
   // A minimal drain summary, shown only when this pipeline has ever seen one -- the dispatcher's
-  // CURRENT liveness is the Workers tile's job (console/dispatcher-status.js), never re-derived
-  // here; this is history only (console/collect.js's own header on `result.dispatcher`).
+  // CURRENT liveness is the Workers tile's job (console/dispatcher-status.js); this line is
+  // history (console/collect.js's own header on `result.dispatcher`), EXCEPT for one fact it
+  // cannot get from history alone -- whether an unconcluded drain's process has since died (card
+  // #188) -- which is why `wd.diedDraining` (the Workers tile's own already-computed verdict,
+  // not a second liveness probe) is read below rather than re-derived here.
   //
   // `lastDrainStart`/`lastDrainEnd` are each the most recent occurrence of THEIR OWN event kind,
   // independently -- collect.js's switch never pairs them. Rendering them side by side
@@ -1069,8 +1100,19 @@ function renderReportsInner(reports) {
     if (drainStart && !endMatchesStart) {
       const stoppedSince = lastStopped && lastStopped.ts && drainStart.ts && Date.parse(lastStopped.ts) >= Date.parse(drainStart.ts);
       const startedSince = lastStart && lastStart.ts && drainStart.ts && Date.parse(lastStart.ts) >= Date.parse(drainStart.ts);
+      // Card #188: an unconcluded drain has no `dispatcher-stopped` (its process gone, or the
+      // drain past its own bound with none recorded), so `stoppedSince` alone stays false forever
+      // for that case -- without this
+      // check the fallback below kept reading "in progress" for a drain whose process was
+      // already gone (the journal observation this card starts from). `wd.diedDraining` is the
+      // Workers tile's own verdict on THIS SAME open drain (both read off the same daemonEvents).
+      const diedDraining = wd.diedDraining === true;
       endPart =
-        stoppedSince || startedSince ? ', no drain-end recorded' : `, in progress (${escapeHtml(drainStart.inFlight || 0)} in flight)`;
+        stoppedSince || startedSince
+          ? ', no drain-end recorded'
+          : diedDraining
+            ? ', drain never concluded -- process gone or past its drain bound (no dispatcher-stopped recorded)'
+            : `, in progress (${escapeHtml(drainStart.inFlight || 0)} in flight)`;
     } else if (drainEnd) {
       endPart = `, ended ${escapeHtml(drainEnd.ts || '?')} (${drainEnd.drained ? 'drained clean' : `${escapeHtml(drainEnd.survivors || 0)} survivor(s)`})`;
     } else {
@@ -1363,7 +1405,7 @@ function renderDataFragments(data) {
   return {
     services: renderServicesInner(d.services, d.accounts, d.prod),
     daemon: renderDaemonStatsInner(d.daemonStats),
-    reports: renderReportsInner(d.reports),
+    reports: renderReportsInner(d.reports, d.services && d.services.workers && d.services.workers.dispatcher),
     accounts: renderAccountsInner(d.accounts, d.tokens),
     tokens: renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta),
     secondary: renderSecondaryInner(d),
@@ -1589,7 +1631,7 @@ function renderHealthPage(data, opts = {}) {
     body: `${frag('services', renderServicesInner(d.services, d.accounts, d.prod))}
 ${frag('daemon', renderDaemonStatsInner(d.daemonStats))}
 ${frag('system', renderSystemInner(d.system))}
-${frag('reports', renderReportsInner(d.reports))}
+${frag('reports', renderReportsInner(d.reports, d.services && d.services.workers && d.services.workers.dispatcher))}
 ${frag('accounts', renderAccountsInner(d.accounts, d.tokens))}
 <hr class="section-divider">
 ${frag('tokens', renderTokensInner(d.tokens, d.usageSnapshot, d.trend, d.usageSnapshotMeta))}

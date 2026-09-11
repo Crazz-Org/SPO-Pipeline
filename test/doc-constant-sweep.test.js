@@ -932,7 +932,7 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
 //      live site: orchestrator/bench-queue-wait.js's own header, citing the product's `job.ts`'s
 //      `purgeDone`.
 //   3. A bare backtick `` `:N` `` (or, in a JS comment, "at :N") immediately after a real
-//      citation established the file -- `` `account-lease.js:156` -> `lock.js:255` ... -> `:289`
+//      citation established the file -- `` `account-lease.js:156` -> `lock.js:276` ... -> `:310`
 //      tryCreate `` (orchestrator/README.md) chains three citations to two files without
 //      repeating the second filename. CHAIN_RE below, resolved against the nearest PRECEDING
 //      real citation within PROXIMITY_CHARS -- far enough to catch a same-sentence chain, close
@@ -1362,7 +1362,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1153",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1231",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1393,7 +1393,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1153",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1231",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:157",
@@ -1408,7 +1408,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:900", // re-pinned from :893 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above reportIntakeColumn, a true pure shift; content byte-identical at :900
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1112",
+  "doc/state-machine-spec.md :: bin/spo:1190",
   "doc/state-machine-spec.md :: dispatcher.js:634-648",
   "doc/state-machine-spec.md :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -1418,9 +1418,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: dispatcher.js:634-648",
   "orchestrator/README.md :: doc/state-machine-spec.md:150",
   "orchestrator/README.md :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
-  "orchestrator/README.md :: lock.js:255",
-  "orchestrator/README.md :: lock.js:257-288",
-  "orchestrator/README.md :: lock.js:289",
+  "orchestrator/README.md :: lock.js:276",
+  "orchestrator/README.md :: lock.js:278-309",
+  "orchestrator/README.md :: lock.js:310",
   "orchestrator/auto-triage.js :: park-loop.js:1396",
   "orchestrator/auto-triage.js :: remote-report-pull.js:193",
   "orchestrator/auto-triage.js :: state-machine.js:3006", // re-pinned from :2923 -- card #174 net +83 (89 added, 6 removed: `git diff --numstat`) across state-machine.js's handleValidate REJECT branch (reasonsKeyPresent/salvage/contract-violation/collapseToOneLine reuse) and collapseToOneLine's own header comment, both above this appendDaemonEvent precedent, a true pure shift; content byte-identical at :3006.
@@ -1930,7 +1930,7 @@ function candidateFoundNear(cand, targetPath, startLine, stopLine) {
 // exactly finding 3 in this section's header ("what this check still cannot see").
 const CITATION_ANCHOR_ALLOWLIST = {
   // "...the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too (`account-lease.js:156`
-  // -> `lock.js:255` `acquireShortLock` -> `:289` `tryCreate`)": `tryCreate`/`linkSync` describe
+  // -> `lock.js:276` `acquireShortLock` -> `:310` `tryCreate`)": `tryCreate`/`linkSync` describe
   // `lock.js`'s daemon.lock idiom BY ANALOGY, two citations away in the same sentence -- not
   // account-lease.js:156's own content (`tryAcquireLease`'s closing brace, genuinely unnamed in
   // this prose). Confirmed correct: line 156 is exactly where `tryAcquireLease`
@@ -2497,7 +2497,7 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1153 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1231 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
@@ -2547,7 +2547,56 @@ test('MUTATION PROOF: reverting bin/spo:1153 back to bin/spo:1129 (the drift thi
   // file: line 1129 now falls at `const { createProdProbe } = require('../console/prod-version');`,
   // inside the `--serve` require block, still no "collect"-shaped candidate nearby, so it still
   // fails for the right reason. Paid eight times.
-  const reverted = normalized.replace('reached from `bin/spo:1153`', 'reached from `bin/spo:1129`');
+  //
+  // NINTH catch, 2026-09-11 (card #188): the drain-that-dies-inside-the-wait fix added a
+  // `DRAINING`/`diedDraining` branch to `spo status`'s own dispatcher-line rendering, plus 5 more
+  // lines in this file's own top-of-file subcommand inventory documenting it, both above
+  // `cmdDashboard`, pushing `collectAll(sources)` down again, from :1153 to :1192. The canary
+  // stays `:1129` -- re-checked empirically against the new file: line 1129 is now a blank line
+  // inside `cmdResume` (between `resolveDirs`'s destructure and its `fs.existsSync` check), still
+  // no "collect"-shaped candidate nearby, so it still fails for the right reason. Paid nine times.
+  //
+  // TENTH catch, 2026-09-11, same card: EPERM handling and prose fixes added further lines above
+  // `cmdDashboard` (the `pidExists` doc comment, the `DRAINING`/STOPPED header rewording, the
+  // `diedDraining` reason/caption rewrite), pushing `collectAll(sources)` down again, from :1192
+  // to :1207. The canary stays `:1129` -- re-checked empirically against the new file: line 1129
+  // now falls inside `cmdParked`'s reconciled-rows printing (`if (reconciledRows.length) {`),
+  // still no "collect"-shaped candidate nearby, so it still fails for the right reason. Paid ten
+  // times.
+  //
+  // ELEVENTH catch, 2026-09-11, same card: the rewording of `cmdStatus`'s `pidExists` comment (5
+  // lines -> 6) added one net line above `cmdDashboard`, pushing `collectAll(sources)` from :1207
+  // to :1208. The canary stays `:1129` -- re-checked empirically against the new file: line 1129
+  // now falls at the closing `}` of `cmdParked`'s `if (abandonedRows.length) {` block, still no
+  // "collect"-shaped candidate nearby, so it still fails for the right reason. Paid eleven times.
+  //
+  // TWELFTH catch, 2026-09-11, same card (the drain-that-reads-DRAINING-forever follow-up): the
+  // dispatcher-drain-start age bound (`now`/`killGraceMs` injected into computeDispatcherStatus,
+  // plus the matching rewording of `spo status`'s own top-of-file subcommand inventory, the
+  // DRAINING-branch comment, and the diedDraining-branch comment) added 21 net lines above
+  // `cmdDashboard` (measured at the time: `git diff --stat -- bin/spo` read 35 insertions, 14 deletions),
+  // pushing `collectAll(sources)` down again, from :1208 to :1229. The canary stays `:1129` -- re-
+  // checked empirically against the new file: line 1129 is now the closing `}` of `cmdParked`'s
+  // reconciled-row branch (`if ((state.state === 'PARKED' || state.state === 'ABANDONED') &&
+  // state.externallyResolved) { ... continue; }`) — the content that sat at :1108 before this
+  // change, 21 lines earlier than the ELEVENTH catch's own :1129 target, since this change's
+  // insertions all land above it — still no "collect"-shaped candidate nearby, so it still fails
+  // for the right reason. Paid twelve times.
+  //
+  // THIRTEENTH catch, 2026-09-11, same follow-up (a verification round): the rewording of `spo
+  // status`'s top-of-file subcommand inventory (+1 line) and of the diedDraining-branch comment
+  // (+1 line) added 2 net lines above `cmdDashboard` -- the caption swap itself and the
+  // DRAINING-branch comment are net 0, and this round's `timeoutMs >= 0` guard and dashboard
+  // captions live in console/dispatcher-status.js and console/render.js, not bin/spo (measured:
+  // `git diff --numstat -- bin/spo` now reads 33 insertions, 10 deletions, 23 net against HEAD =
+  // the TWELFTH catch's 21 plus these 2), pushing `collectAll(sources)` down again, from :1229 to
+  // :1231.
+  // The canary stays `:1129` -- re-checked empirically against the new file: line 1129 is now
+  // `      );`, the closing paren of `cmdParked`'s reconciled-row `reconciledRows.push(...)` call
+  // -- 2 lines above the TWELFTH catch's own construct, which this round's +2 pushed from :1129 to
+  // :1131 (`    }`, the same reconciled-row branch's closing brace) -- still no "collect"-shaped
+  // candidate nearby, so it still fails for the right reason. Paid thirteen times.
+  const reverted = normalized.replace('reached from `bin/spo:1231`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
@@ -2562,18 +2611,18 @@ test('MUTATION PROOF: reverting bin/spo:1153 back to bin/spo:1129 (the drift thi
   const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
   assert.equal(found, false, 'the stale bin/spo:1129 citation must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact class of bug that motivated it');
 
-  // And the fixed text (:1153, actually on disk) must anchor cleanly, via the SAME substring-
+  // And the fixed text (:1208, actually on disk) must anchor cleanly, via the SAME substring-
   // matched 'file' candidate ("collect", from `console/collect.js`) -- proving both that the
   // check discriminates the specific drift in both directions AND that the 'file' kind's
   // substring matching (see candidateFoundNear's own fixture test) is what makes it possible at
   // all: "collect" is never a \b-bounded whole word at the real call site, only a substring of
   // `collectAll`.
-  const cites1153 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
-  const c1153 = cites1153[0];
-  const candidates1153 = mergedCandidates(normalized, c1153.idx, c1153.end, null, null, c1153.file);
-  assert.equal(candidates1153[0] && candidates1153[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
-  const found1153 = candidates1153.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1153.start, c1153.stop));
-  assert.equal(found1153, true, 'the real, fixed :1153 citation must anchor cleanly');
+  const cites1208 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
+  const c1208 = cites1208[0];
+  const candidates1208 = mergedCandidates(normalized, c1208.idx, c1208.end, null, null, c1208.file);
+  assert.equal(candidates1208[0] && candidates1208[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
+  const found1208 = candidates1208.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1208.start, c1208.stop));
+  assert.equal(found1208, true, 'the real, fixed :1208 citation must anchor cleanly');
 });
 
 // Card #186 verification: both doc/bench-audit-2026-09-02.md and doc/bench-plan-derived-2026-09-02.md

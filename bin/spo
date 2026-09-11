@@ -32,11 +32,22 @@
 //                            (see orchestrator/journal.js's readLiveWorkersRaw). Also new: a
 //                            `dispatcher: IDLE ...` line when the pool has no healthy accounts
 //                            right now (edge-triggered off daemon.jsonl, silent once recovered),
-//                            a `dispatcher: STOPPED since <age> ago -- reason: ...` line when
-//                            daemon.jsonl's newest dispatcher edge is a `dispatcher-stopped` with
-//                            no later `dispatcher-start` (card #164), and an `account-cooldown: N
+//                            a `dispatcher: DRAINING since <age> ago ...` line when the newest
+//                            dispatcher edge is an UNCONCLUDED `dispatcher-drain-start` not past
+//                            its own wait bound (or with that bound not evaluable -- card #188
+//                            follow-up: `timeoutMs` plus the reap's own kill grace) and the
+//                            process is not provably dead (alive, or no pid to check -- card
+//                            #188), a `dispatcher: STOPPED since <age> ago -- reason: ...` line
+//                            when daemon.jsonl's newest dispatcher edge is a concluded
+//                            `dispatcher-stopped` with no later `dispatcher-start` (card #164) --
+//                            or, worded without a stop time (`dispatcher: STOPPED -- drain never
+//                            concluded (drain started <age> ago; ...)`), an unconcluded
+//                            `dispatcher-drain-start` whose process the liveness probe reports
+//                            gone, OR whose own wait bound has expired with no conclusion
+//                            recorded (card #188 follow-up, `diedDraining` either way) -- and an
+//                            `account-cooldown: N
 //                            degraded write(s) ...` line naming which accounts hit the
-//                            pool-state-lock fallback (action 6.2) -- all three omitted entirely
+//                            pool-state-lock fallback (action 6.2) -- all four omitted entirely
 //                            when there is nothing to report.
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl. Every
 //                            `llm-call` line also carries an explicit `duration=<n>s` (action
@@ -223,7 +234,7 @@ const remoteReportPull = require('../orchestrator/remote-report-pull');
 const { tokenReport, todaySpend, formatTokenCount } = require('../orchestrator/tokens');
 const recette = require('../orchestrator/recette');
 const retryChannel = require('../orchestrator/retry-channel');
-const { lockPath } = require('../orchestrator/lock');
+const { lockPath, pidExists } = require('../orchestrator/lock');
 
 function parseArgs(argv) {
   const opts = {
@@ -779,12 +790,31 @@ function cmdStatus(opts) {
     console.log(`workers: ${liveWorkerRows} live (subset of active: above)${staleNote}${trailingNote}  (${publishedNote})`);
   }
 
-  // action 6.7 (extended by card #164): dispatcher's own idle/stopped/recovered edge, read off
-  // daemon.jsonl's tail -- see computeDispatcherStatus's own header for the precedence. Prints
-  // nothing at all when the pool is healthy, is a process that hasn't reported anything yet, or
-  // was never observed to be otherwise -- an "OK" line for a condition that has never fired would
-  // just be noise on every single healthy status call.
-  const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot));
+  // action 6.7 (extended by card #164, then #188): dispatcher's own idle/draining/stopped/
+  // recovered edge, read off daemon.jsonl's tail -- see computeDispatcherStatus's own header for
+  // the precedence. Prints nothing at all when the pool is healthy, is a process that hasn't
+  // reported anything yet, or was never observed to be otherwise -- an "OK" line for a condition
+  // that has never fired would just be noise on every single healthy status call. `isAlive:
+  // pidExists` (orchestrator/lock.js) is what lets a `dispatcher-drain-start` with no later
+  // conclusion resolve to DRAINING (its process is not provably dead) instead of STOPPED -- see
+  // computeDispatcherStatus's own header for why that has to be injected rather than assumed.
+  // `pidExists`, not `processAlive`: the dispatcher's own pid is not necessarily this CLI
+  // invocation's own uid (a maintainer's shell running `spo status` against a daemon running
+  // under a different Unix user than this shell, e.g. a system unit with `User=`), and
+  // `process.kill(pid, 0)` throws EPERM for a pid that is alive but not signalable --
+  // `processAlive` reads that the same as ESRCH ("gone"), which would misreport a live-but-foreign
+  // dispatcher as dead. `pidExists` reads EPERM as "still there". `now`/`killGraceMs` (card #188
+  // follow-up) are ALSO injected here, never read inside computeDispatcherStatus itself: `now` is
+  // this same `Date.now()` snapshot (declared once, above, and reused for every age computation in
+  // this function) rather than a fresh clock read, and `killGraceMs` is this process's own
+  // `defaultConfig.drainKillGraceMs` -- together they let a reader bound an UNCONCLUDED drain-start
+  // past its own `timeoutMs` plus that grace as STOPPED even when a reused pid would otherwise read
+  // it alive forever (a dead-but-pid-reused daemon does not print DRAINING indefinitely any more).
+  const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot), {
+    isAlive: pidExists,
+    now,
+    killGraceMs: defaultConfig.drainKillGraceMs,
+  });
   if (dispatcherStatus && dispatcherStatus.status === 'idle') {
     const idleEvent = dispatcherStatus.event;
     const idleAgeMs = idleEvent.ts ? now - Date.parse(idleEvent.ts) : null;
@@ -795,30 +825,78 @@ function cmdStatus(opts) {
     console.log(
       `dispatcher: IDLE since ${idleAge} ago -- no healthy accounts (queue depth ${idleEvent.queued ?? '?'}${cooldownNote})`
     );
+  } else if (dispatcherStatus && dispatcherStatus.status === 'draining') {
+    // Card #188: a `dispatcher-drain-start` with no later `dispatcher-stopped`/`dispatcher-drain-
+    // end`, and its process is not PROVABLY dead (`pidExists` said alive, or there was no pid to
+    // check at all) -- the wait (up to `timeoutMs`, dispatcher.js's `resolveDrainTimeoutMs`) reads
+    // as genuinely in progress. Not STOPPED: absent positive evidence the process is gone, printing
+    // STOPPED here would tell an operator it is safe to act on a process that might still be there
+    // (card #164's own inversion, now applied to this fourth state too). Card #188 follow-up: this
+    // branch is only reached once computeDispatcherStatus's own age-vs-bound check (`now` and
+    // `killGraceMs`, injected above) has already found the drain-start not past its own
+    // `timeoutMs` + kill grace (or with that bound not evaluable) -- past that bound the
+    // 'stopped'/diedDraining branch below is reached instead, regardless of pid liveness.
+    const drainEvent = dispatcherStatus.event;
+    const drainAgeMs = drainEvent.ts ? now - Date.parse(drainEvent.ts) : null;
+    const drainAge = Number.isFinite(drainAgeMs) ? formatRemaining(drainAgeMs) : '?';
+    const extraParts = [];
+    if (drainEvent.signal) extraParts.push(`signal ${drainEvent.signal}`);
+    if (Array.isArray(drainEvent.inFlight)) extraParts.push(`${drainEvent.inFlight.length} in flight at drain start`);
+    if (typeof drainEvent.timeoutMs === 'number') extraParts.push(`bound ${drainEvent.timeoutMs}ms`);
+    const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+    console.log(`dispatcher: DRAINING since ${drainAge} ago -- waiting for in-flight cards${extraNote}`);
   } else if (dispatcherStatus && dispatcherStatus.status === 'stopped') {
     const stoppedEvent = dispatcherStatus.event;
     const stoppedAgeMs = stoppedEvent.ts ? now - Date.parse(stoppedEvent.ts) : null;
     const stoppedAge = Number.isFinite(stoppedAgeMs) ? formatRemaining(stoppedAgeMs) : '?';
-    const reason = stoppedEvent.reason || 'unknown';
-    // `stopReason` lands on the event spread flat (dispatcher.js's action 3.3 comment) -- these
-    // are the path-specific fields it can carry on top of `reason`, folded in only when present
-    // rather than assuming any one stop path.
-    const extraParts = [];
-    if (stoppedEvent.signal) extraParts.push(`signal ${stoppedEvent.signal}`);
-    if (typeof stoppedEvent.drained === 'boolean') {
-      extraParts.push(
-        stoppedEvent.drained ? 'drained clean' : `drained incomplete (${(stoppedEvent.survivors || []).length} survivor(s))`
+    if (dispatcherStatus.diedDraining) {
+      // Card #188: this STOPPED reading came off the `dispatcher-drain-start` record itself -- no
+      // `dispatcher-stopped` was ever written, because the process died inside the wait (card #188
+      // follow-up: OR the wait's own `timeoutMs` + kill grace has since elapsed with no conclusion
+      // recorded, `diedDraining` does not distinguish the two, so this caption states only what both
+      // prove. In the bound case death is inferred, not measured: under the installed unit,
+      // TimeoutStopSec SIGKILLs the process at most 60s past the bound; outside it, a SIGSTOPped or
+      // suspended process may still be alive).
+      // Never worded "STOPPED since <age> ago": nobody recorded a stop time, only a DRAIN start time --
+      // `stoppedAge` above is the age of the drain-start event, not of the (unknown) moment the
+      // process actually died, and captioning it as a stop time would state a fact nobody measured.
+      // `reason` (driver decision, card #188): read off the event's own `ev.reason` field when
+      // present (dispatcher.js's run() now writes it from the in-memory `stopReason` at drain
+      // time, so this is the ACTUAL decision, not an assumption). Only a record written BEFORE
+      // that field existed has none -- for that legacy shape alone, 'drain-requested' is used as
+      // an INFERRED fallback: a drain-start is written only after `requestDrain` has accepted a
+      // drain (dispatcher.js's run(), gated on `drainRequest`), and on every pre-#188 record that
+      // was the only way a drain ever started, so it is the best available guess, not a read fact.
+      const reason = stoppedEvent.reason || 'drain-requested';
+      const extraParts = [];
+      if (stoppedEvent.signal) extraParts.push(`signal ${stoppedEvent.signal}`);
+      if (Array.isArray(stoppedEvent.inFlight)) extraParts.push(`${stoppedEvent.inFlight.length} in flight at drain start`);
+      const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+      console.log(
+        `dispatcher: STOPPED -- drain never concluded (drain started ${stoppedAge} ago; no dispatcher-stopped recorded; process gone or past its drain bound; reason: ${reason})${extraNote}`
       );
+    } else {
+      const reason = stoppedEvent.reason || 'unknown';
+      // `stopReason` lands on the event spread flat (dispatcher.js's action 3.3 comment) -- these
+      // are the path-specific fields it can carry on top of `reason`, folded in only when present
+      // rather than assuming any one stop path.
+      const extraParts = [];
+      if (stoppedEvent.signal) extraParts.push(`signal ${stoppedEvent.signal}`);
+      if (typeof stoppedEvent.drained === 'boolean') {
+        extraParts.push(
+          stoppedEvent.drained ? 'drained clean' : `drained incomplete (${(stoppedEvent.survivors || []).length} survivor(s))`
+        );
+      }
+      if (typeof stoppedEvent.waitedMs === 'number') extraParts.push(`waited ${stoppedEvent.waitedMs}ms`);
+      if (typeof stoppedEvent.consecutiveCrashes === 'number') {
+        extraParts.push(`consecutiveCrashes ${stoppedEvent.consecutiveCrashes}/${stoppedEvent.crashLimit}`);
+      }
+      if (typeof stoppedEvent.consecutiveScannerCrashes === 'number') {
+        extraParts.push(`scannerCrashes ${stoppedEvent.consecutiveScannerCrashes}/${stoppedEvent.scannerCrashLimit}`);
+      }
+      const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+      console.log(`dispatcher: STOPPED since ${stoppedAge} ago -- reason: ${reason}${extraNote}`);
     }
-    if (typeof stoppedEvent.waitedMs === 'number') extraParts.push(`waited ${stoppedEvent.waitedMs}ms`);
-    if (typeof stoppedEvent.consecutiveCrashes === 'number') {
-      extraParts.push(`consecutiveCrashes ${stoppedEvent.consecutiveCrashes}/${stoppedEvent.crashLimit}`);
-    }
-    if (typeof stoppedEvent.consecutiveScannerCrashes === 'number') {
-      extraParts.push(`scannerCrashes ${stoppedEvent.consecutiveScannerCrashes}/${stoppedEvent.scannerCrashLimit}`);
-    }
-    const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
-    console.log(`dispatcher: STOPPED since ${stoppedAge} ago -- reason: ${reason}${extraNote}`);
   }
 
   // action 6.7: account-cooldown's own `degraded` flag -- see this loop's own scan above for
