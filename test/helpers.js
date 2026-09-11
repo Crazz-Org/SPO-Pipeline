@@ -137,7 +137,7 @@ function isolatedEnv() {
     // spawns a real `spo pull`/`spo intake` child to exercise that same refusal, it must pin the
     // RESOLVED lock path explicitly (the same way withIsolatedStateDir does for the in-process
     // tests) rather than rely on this default, and must show the assertion falls when the guard
-    // is revoked -- see bin/spo:1679-1687's own "ACCEPTED RESIDUAL" comment for why
+    // is revoked -- see bin/spo:1632-1640's own "ACCEPTED RESIDUAL" comment for why
     // SPO_STATE_DIR is also the one thing that can walk a REAL spawned child past that guard.
     SPO_STATE_DIR: mkTmp('spo-isolated-state-'),
     [SPO_NO_REAL_SPAWN]: '1',

@@ -973,16 +973,20 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
 // text), the three doc/accepted-gaps.md §3b running logs (doc/remediation-progress.md,
 // doc/improvisation-analysis.md, doc/remediation-plan-2026-08.md), and
 // doc/comment-corpus-audit-2026-09-03.md (9.1's own deliverable, written AFTER the corpus it
-// measured -- not part of what it measured). 66 files: the 65 of doc/accepted-gaps.md §3d's own
+// measured -- not part of what it measured). 67 files: the 65 of doc/accepted-gaps.md §3d's own
 // count, plus `orchestrator/retry-channel.js`, added by project-2 card #476 (the unpark scan's
-// health rule, factored out of bin/spo when the card gave it a third reader). A file added to or
-// removed from this scope is a deliberate act -- update this array in the same change, by name,
-// the same way PINS's name list above works.
+// health rule, factored out of bin/spo when the card gave it a third reader), plus
+// `console/dispatcher-status.js`, added by card #186 when computeDispatcherStatus was factored
+// out of bin/spo into its own module so bin/spo's `spo status` and console/collect.js's dashboard
+// deck could share one derivation instead of each carrying a copy. A file added to or removed
+// from this scope is a deliberate act -- update this array in the same change, by name, the same
+// way PINS's name list above works.
 const CORPUS_FILES = [
   'README.md',
   'accounts/spo-test-accounts.yml',
   'bin/spo',
   'console/collect.js',
+  'console/dispatcher-status.js',
   'console/prod-version.js',
   'console/render.js',
   'console/serve.js',
@@ -1350,7 +1354,7 @@ function extractCitations(text) {
 // see before, and 13 line-number corrections part 2.5's anchor check below found and fixed in
 // passing -- see that section's header for the full list, including the two real-drift cases
 // that motivated it): the exact sorted set of `${file} :: ${citation}` this corpus holds, widened
-// regex + all 65 files + line-unwrap + chain resolution. Not a floor -- a citation added anywhere
+// regex + all 67 files + line-unwrap + chain resolution. Not a floor -- a citation added anywhere
 // in the corpus (a real one, or a new narrative aside shaped like one) must be added HERE, by
 // name, in the same change, the same way PINS's name list above works. See the test below for
 // what happens when this array and the live corpus disagree.
@@ -1358,7 +1362,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1200",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1153",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1389,7 +1393,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1200",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1153",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:157",
@@ -1404,7 +1408,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:900", // re-pinned from :893 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above reportIntakeColumn, a true pure shift; content byte-identical at :900
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1159",
+  "doc/state-machine-spec.md :: bin/spo:1112",
   "doc/state-machine-spec.md :: dispatcher.js:634-648",
   "doc/state-machine-spec.md :: intake.js:869-871", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines) -- this repair round's UNKNOWN-inventory reversal (Task A) and fileCard header-comment rewrite added a further 15 lines to intake.js's fileCard, above triageBugReport's own header comment; both are true pure shifts, content byte-identical at :869-871.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -1446,13 +1450,13 @@ const EXPECTED_CITATIONS = [
   "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18",
 ];
 
-test('every file:line citation in the 65-file corpus resolves, or is on the named allowlist', () => {
+test('every file:line citation in the 67-file corpus resolves, or is on the named allowlist', () => {
   // Immediate, named diagnosis if a file is added to or dropped from CORPUS_FILES without
   // updating this pin -- the EXPECTED_CITATIONS deepEqual below would also catch it (every
   // citation that file held would vanish from `found`), but that failure reads as "which
   // citations changed," not "the corpus scope itself changed." Checked first so the more likely
   // cause is named up front.
-  assert.equal(CORPUS_FILES.length, 66, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
+  assert.equal(CORPUS_FILES.length, 67, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
 
   const found = [];
   for (const rel of CORPUS_FILES) {
@@ -1469,7 +1473,7 @@ test('every file:line citation in the 65-file corpus resolves, or is on the name
   // FINDING (this action): a numeric floor cannot say WHICH citation died, added, or drifted --
   // gate C7's own history and this suite's E18 finding are both about exactly that failure mode.
   // deepEqual against the exact pinned set fails by NAME (assert.deepEqual's own diff) the moment
-  // a single citation is added, removed, or reworded anywhere in the 65-file corpus.
+  // a single citation is added, removed, or reworded anywhere in the 67-file corpus.
   assert.deepEqual(
     foundKeys,
     EXPECTED_CITATIONS,
@@ -2493,7 +2497,7 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1200 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1153 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
@@ -2534,7 +2538,16 @@ test('MUTATION PROOF: reverting bin/spo:1200 back to bin/spo:1129 (the drift thi
   // `cmdResume`'s own header comment ("under journal/); if that exists, lists every recorded LLM
   // step (journal event..."), nowhere near `cmdDashboard` and containing no "collect"-shaped
   // candidate, so it still fails for the right reason. Paid seven times.
-  const reverted = normalized.replace('reached from `bin/spo:1200`', 'reached from `bin/spo:1129`');
+  //
+  // EIGHTH catch, 2026-09-11: card #186 moved `computeDispatcherStatus` (with its own header
+  // comment) OUT of bin/spo entirely, into console/dispatcher-status.js, so bin/spo's `spo status`
+  // and console/collect.js's dashboard deck could share one derivation instead of each carrying a
+  // copy. Removing those 47 lines above `cmdDashboard` pulled `collectAll(sources)` back UP this
+  // time, from :1200 to :1153. The canary stays `:1129` -- re-checked empirically against the new
+  // file: line 1129 now falls at `const { createProdProbe } = require('../console/prod-version');`,
+  // inside the `--serve` require block, still no "collect"-shaped candidate nearby, so it still
+  // fails for the right reason. Paid eight times.
+  const reverted = normalized.replace('reached from `bin/spo:1153`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
@@ -2549,18 +2562,78 @@ test('MUTATION PROOF: reverting bin/spo:1200 back to bin/spo:1129 (the drift thi
   const found = top.some((cand) => candidateFoundNear(cand, resolved.target, c.start, c.stop));
   assert.equal(found, false, 'the stale bin/spo:1129 citation must be reported as an anchor failure -- if this assertion fails, the check cannot catch the exact class of bug that motivated it');
 
-  // And the fixed text (:1135, actually on disk) must anchor cleanly, via the SAME substring-
+  // And the fixed text (:1153, actually on disk) must anchor cleanly, via the SAME substring-
   // matched 'file' candidate ("collect", from `console/collect.js`) -- proving both that the
   // check discriminates the specific drift in both directions AND that the 'file' kind's
   // substring matching (see candidateFoundNear's own fixture test) is what makes it possible at
   // all: "collect" is never a \b-bounded whole word at the real call site, only a substring of
   // `collectAll`.
-  const cites1102 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
-  const c1102 = cites1102[0];
-  const candidates1102 = mergedCandidates(normalized, c1102.idx, c1102.end, null, null, c1102.file);
-  assert.equal(candidates1102[0] && candidates1102[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
-  const found1102 = candidates1102.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1102.start, c1102.stop));
-  assert.equal(found1102, true, 'the real, fixed :1102 citation must anchor cleanly');
+  const cites1153 = extractCitations(normalized).filter((c2) => !c2.unanchored && c2.file === 'bin/spo');
+  const c1153 = cites1153[0];
+  const candidates1153 = mergedCandidates(normalized, c1153.idx, c1153.end, null, null, c1153.file);
+  assert.equal(candidates1153[0] && candidates1153[0].kind, 'file', 'this proof is only meaningful if the real candidate is the cross-file "file"-kind mention it is meant to exercise');
+  const found1153 = candidates1153.slice(0, ANCHOR_TOPK).some((cand) => candidateFoundNear(cand, resolved.target, c1153.start, c1153.stop));
+  assert.equal(found1153, true, 'the real, fixed :1153 citation must anchor cleanly');
+});
+
+// Card #186 verification: both doc/bench-audit-2026-09-02.md and doc/bench-plan-derived-2026-09-02.md
+// are in ANCHOR_EXCLUDED_FILES, so neither citation's own content is checked by the anchor layer
+// above -- only by the bounds check (part 2) and, for bench-plan-derived alone, the MUTATION PROOF
+// immediately above this one. bench-audit's own `bin/spo:N` citation had NOTHING checking that its
+// number actually names the right line: a CONSISTENT wrong re-pin (the doc's text and
+// EXPECTED_CITATIONS moved together to the same wrong number) would satisfy every existing test in
+// this file and still ship green. This test reads the real bin/spo content at the line each doc
+// cites -- not EXPECTED_CITATIONS, which a consistent re-pin would also have changed -- so it
+// cannot be fooled by that move. `binSpoLineNamesCollectAll` is shared with its own mutation proof
+// immediately below, so a change that made the real check vacuous (e.g. always returning true)
+// would be caught there too.
+function binSpoLineNamesCollectAll(lineNumber) {
+  const resolved = resolveCitationTarget('bin/spo');
+  if (!resolved.target) return { resolved: false, named: false, line: '' };
+  const spoLines = fs.readFileSync(resolved.target, 'utf8').split('\n');
+  const line = spoLines[lineNumber - 1] || '';
+  return { resolved: true, named: line.includes('collectAll'), line };
+}
+
+test('bench-audit and bench-plan-derived cite the SAME bin/spo line for "console/collect.js reached from bin/spo:N", and that line actually names collectAll', () => {
+  const auditNormalized = normalizeWrap(stripFences(read('doc/bench-audit-2026-09-02.md')));
+  const planNormalized = normalizeWrap(stripFences(read('doc/bench-plan-derived-2026-09-02.md')));
+  const auditCite = extractCitations(auditNormalized).find((c) => c.file === 'bin/spo');
+  const planCite = extractCitations(planNormalized).find((c) => c.file === 'bin/spo');
+  assert.ok(auditCite, 'expected a bin/spo:N citation in doc/bench-audit-2026-09-02.md');
+  assert.ok(planCite, 'expected a bin/spo:N citation in doc/bench-plan-derived-2026-09-02.md');
+  assert.deepEqual(
+    [auditCite.start, auditCite.stop],
+    [planCite.start, planCite.stop],
+    'the two dated bench docs describe the SAME fact (console/collect.js reached from bin/spo) and must cite the SAME line'
+  );
+
+  const check = binSpoLineNamesCollectAll(auditCite.start);
+  assert.ok(check.resolved, 'bin/spo must resolve for this check to mean anything');
+  assert.ok(
+    check.named,
+    `bin/spo:${auditCite.start} (the line both bench docs cite) must contain "collectAll" -- it does not: "${check.line.trim()}"`
+  );
+});
+
+test('mutation proof: a CONSISTENT wrong re-pin of the bench-audit citation (moved one line past the real target) is still caught, because that line does not name collectAll', () => {
+  const auditRaw = read('doc/bench-audit-2026-09-02.md');
+  const realCite = extractCitations(normalizeWrap(stripFences(auditRaw))).find((c) => c.file === 'bin/spo');
+  assert.ok(realCite, 'fixture precondition: doc/bench-audit-2026-09-02.md must currently cite a bin/spo:N line');
+  // Derived from the REAL cited line, not hand-typed, so a future shift needs no bump here.
+  const wrongLine = realCite.start + 1;
+  const mutatedRaw = auditRaw.replace(`reached from \`bin/spo:${realCite.start}\``, `reached from \`bin/spo:${wrongLine}\``);
+  assert.notEqual(mutatedRaw, auditRaw, 'fixture precondition: the real file must still contain the text this test mutates');
+
+  const mutatedCite = extractCitations(normalizeWrap(stripFences(mutatedRaw))).find((c) => c.file === 'bin/spo');
+  assert.equal(mutatedCite.start, wrongLine, 'the mutation must have actually changed the parsed line');
+
+  const check = binSpoLineNamesCollectAll(wrongLine);
+  assert.equal(
+    check.named,
+    false,
+    `bin/spo:${wrongLine} must NOT contain "collectAll" for this proof to mean anything -- if it does, this proof needs a different offset`
+  );
 });
 
 // ---- part 3: dangling doc/*.md path reference check (E3, action 9.2) ---------------------------
@@ -2599,7 +2672,7 @@ test('DANGLING_DOC_REF_ALLOWLIST holds exactly the paths this action found dangl
   );
 });
 
-test('every bare "doc/<name>.md" reference in the 65-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
+test('every bare "doc/<name>.md" reference in the 67-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
   const found = new Map(); // path -> [rel,...]
   for (const rel of CORPUS_FILES) {
     const src = read(rel);

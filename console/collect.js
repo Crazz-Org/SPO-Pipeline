@@ -22,6 +22,7 @@ const { processAlive } = require('../orchestrator/lock');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
 const { HEARTBEAT_STALE_MS, heartbeatAgeMs: benchHeartbeatAgeMs } = require('../orchestrator/bench-heartbeat');
 const { summarizeUnparkScanTail } = require('../orchestrator/retry-channel');
+const { computeDispatcherStatus } = require('./dispatcher-status');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
@@ -695,7 +696,7 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
     // live-workers.json id against its own task's state.json terminal-or-not, exactly like
     // bin/spo does), never a second, independently-derived total -- see that module's header for
     // the double-count hazard this avoids repeating for a second surface.
-    workers: { status: 'unknown', present: false, count: 0, staleCount: 0, trailingCount: 0, updatedAt: null, ageMs: null },
+    workers: { status: 'unknown', present: false, count: 0, staleCount: 0, trailingCount: 0, updatedAt: null, ageMs: null, dispatcher: null },
     // Project-2 card #476: the maintainer's retry/abandon channel. AGGREGATE ONLY, same rule as
     // `workers` above -- this module's header ("per-task detail duplicates the GitHub Projects
     // board") is why it counts cards instead of listing them, and bin/spo's cmdStatus stays the
@@ -819,16 +820,27 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
   return services;
 }
 
-// applyWorkerStats(services, journalRoot, journalTasks, now) -- action 6.7. Mutates
-// `services.workers` in place with the SAME classification bin/spo's cmdStatus renders per row
-// (orchestrator/worker-status.js's describeLiveWorkers), filtered to `isCardKind` tasks only --
-// the same filter collectDaemonStats already applies to its own `active` count (see that
-// function's header on the one real demo/synthetic task in the live corpus). Without this
-// filter, a live worker running a `kind: "synthetic"` task (only reachable today via a test
-// fixture driving the real dispatcher against a demo card outside `spo recette`'s own isolated
+// applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents) -- action 6.7,
+// extended by card #186. Mutates `services.workers` in place with the SAME classification bin/spo's
+// cmdStatus renders per row (orchestrator/worker-status.js's describeLiveWorkers), filtered to
+// `isCardKind` tasks only -- the same filter collectDaemonStats already applies to its own `active`
+// count (see that function's header on the one real demo/synthetic task in the live corpus).
+// Without this filter, a live worker running a `kind: "synthetic"` task (only reachable today via a
+// test fixture driving the real dispatcher against a demo card outside `spo recette`'s own isolated
 // journal dir -- production traffic never does this) would inflate this tile's count past
 // `daemonStats.active`, which is exactly the kind of "two counts of almost-the-same-set silently
 // disagree" drift action 5.4 item G already had to close once for the parking-rate denominator.
+//
+// Card #186: `worker.present ? 'ok' : 'unknown'` alone could not tell a STOPPED dispatcher from a
+// genuinely IDLE one -- a dispatcher that published live-workers.json and then stopped still reads
+// present:true, count:0, identical to one that is up and idle. `daemonEvents` (the daemon.jsonl
+// tail, read once by collectAll and passed in here -- see that function's own comment on why) is
+// handed to console/dispatcher-status.js's computeDispatcherStatus, the SAME derivation `spo
+// status`'s own STOPPED/IDLE lines read, so this tile and the CLI can never disagree about which
+// state the dispatcher is in. 'stopped' and 'idle' outrank the present/absent rule below; when
+// neither applies, that rule is unchanged. `daemonEvents` defaults to a fresh read here so this
+// function stays usable standalone -- every existing status-6.7 test calls it with no fifth
+// argument at all.
 // collectDeck(journalRoot, journalTasks, now) -> the cards the flight deck renders, newest
 // activity first. One entry per `onDeck` card kind:'card' (a report/triage task is not a run
 // along the track and has no splits to draw), each carrying the run built in collectJournalTasks
@@ -886,7 +898,7 @@ function collectDeck(journalRoot, journalTasks, now = Date.now()) {
     .sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
 }
 
-function applyWorkerStats(services, journalRoot, journalTasks, now) {
+function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents) {
   if (!journalRoot) return services;
   const kindById = new Map((journalTasks || []).map((t) => [t.id, t]));
   const worker = describeLiveWorkers(journalRoot, null, now);
@@ -905,7 +917,32 @@ function applyWorkerStats(services, journalRoot, journalTasks, now) {
   services.workers.trailingCount = worker.counts.trailing;
   services.workers.updatedAt = worker.updatedAt;
   services.workers.ageMs = worker.ageMs;
-  services.workers.status = worker.present ? 'ok' : 'unknown';
+
+  const events = daemonEvents || readDaemonEventsTail(journalRoot);
+  const dispatcher = computeDispatcherStatus(events);
+  if (dispatcher && dispatcher.status === 'stopped') {
+    services.workers.status = 'stopped';
+  } else if (dispatcher && dispatcher.status === 'idle') {
+    services.workers.status = 'idle';
+  } else {
+    services.workers.status = worker.present ? 'ok' : 'unknown';
+  }
+  if (dispatcher) {
+    const ev = dispatcher.event;
+    const sinceMs = ev.ts ? Date.parse(ev.ts) : NaN;
+    services.workers.dispatcher = {
+      status: dispatcher.status,
+      since: ev.ts || null,
+      sinceAgeMs: Number.isFinite(sinceMs) ? Math.max(0, now - sinceMs) : null,
+      reason: ev.reason || null,
+      drained: typeof ev.drained === 'boolean' ? ev.drained : null,
+      survivors: Array.isArray(ev.survivors) ? ev.survivors.length : null,
+      queued: typeof ev.queued === 'number' ? ev.queued : null,
+      earliestCooldownUntil: ev.earliestCooldownUntil || null,
+    };
+  } else {
+    services.workers.dispatcher = null;
+  }
   return services;
 }
 
@@ -1065,8 +1102,31 @@ const REJECT_REASON_WHITELIST = new Set(['unsafe-filename', 'oversize', 'sha256-
 // remote-report-pull.js). Returns ONLY counters and statuses -- never a file path, a URL, a
 // token, or any free-text field a human or GitHub wrote (report-held's `reason`,
 // remote-report-ack-failed's `error`): those can carry secrets or production URLs, and this
-// object is rendered straight into public-ish HTML.
-function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } = {}) {
+// object is rendered straight into public-ish HTML. Card #186: also walks the SAME daemon-events
+// tail for two unrelated things, `events` (an optional pre-read tail -- collectAll passes the one
+// it already read for applyWorkerStats, so a single collectAll call never reads daemon.jsonl
+// twice; omitted, this function still reads its own, unchanged from before) lets it do so without
+// a second 1 MB read:
+//   - `report-held-mechanical`/`report-held-unclaimable` (auto-triage.js's own two distinct
+//     terminal-hold outcomes -- see HANDLED_EVENTS there) counted into their OWN last24h fields,
+//     never folded into `held`, which stays the generic report-held count it always was.
+//   - `dispatcher-idle-no-healthy-accounts`/`dispatcher-drain-start`/`dispatcher-stopped`/
+//     `dispatcher-drain-end`/`dispatcher-start` (dispatcher.js) recorded as HISTORY -- the most
+//     recent occurrence of each, in `result.dispatcher` -- for the deck to show alongside the
+//     report pipeline's own 24h figures. This is a record of what happened, never a second
+//     liveness derivation: whether the dispatcher is stopped or idle RIGHT NOW is answered only by
+//     console/dispatcher-status.js's computeDispatcherStatus (applyWorkerStats's job, in
+//     collectAll), the same walk-backwards-first-match rule `spo status` uses -- duplicating that
+//     logic here, even loosely, is exactly the "two counts of almost-the-same-set silently
+//     disagree" drift this module's other headers already warn against. `lastStart` exists ONLY so
+//     console/render.js's drain summary can tell an OPEN drain (still genuinely in progress) from
+//     one whose `dispatcher-drain-end` was simply never written -- a crash, OOM, or a systemd
+//     TimeoutStopSec SIGKILL landing during dispatcher.js's own post-stop reap (that reap's own
+//     comment names this exact hazard) all leave a `dispatcher-drain-start` with no matching end.
+//     If a later `dispatcher-stopped` or `dispatcher-start` exists at or after that drain's own
+//     start, the drain is provably not still running -- render.js reads `lastStart`/`lastStopped`
+//     for exactly that check, never for liveness.
+function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now(), events } = {}) {
   const result = {
     queuedIntake: 0,
     pendingConfirm: 0,
@@ -1083,6 +1143,8 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } 
       triagedFiled: 0,
       triagedDuplicate: 0,
       held: 0,
+      heldMechanical: 0,
+      heldUnclaimable: 0,
       promoteFailed: 0,
     },
     pull: {
@@ -1094,6 +1156,13 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } 
       ackFailed24h: 0,
       rejected24h: 0,
       lastRejectReason: null,
+    },
+    dispatcher: {
+      lastIdle: null,
+      lastDrainStart: null,
+      lastStopped: null,
+      lastDrainEnd: null,
+      lastStart: null,
     },
   };
 
@@ -1127,10 +1196,10 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } 
     }
   }
 
-  const events = readDaemonEventsTail(journalRoot);
+  const daemonEvents = events || readDaemonEventsTail(journalRoot);
   const windowStart = now - DAY_MS;
 
-  for (const e of events) {
+  for (const e of daemonEvents) {
     const ts = e.ts ? Date.parse(e.ts) : NaN;
     const inWindow = Number.isFinite(ts) && ts >= windowStart;
 
@@ -1167,8 +1236,51 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now() } 
       case 'report-held':
         if (inWindow) result.last24h.held++;
         break;
+      case 'report-held-mechanical':
+        if (inWindow) result.last24h.heldMechanical++;
+        break;
+      case 'report-held-unclaimable':
+        if (inWindow) result.last24h.heldUnclaimable++;
+        break;
       case 'report-promote-failed':
         if (inWindow) result.last24h.promoteFailed++;
+        break;
+      case 'dispatcher-idle-no-healthy-accounts':
+        result.dispatcher.lastIdle = {
+          ts: e.ts || null,
+          queued: typeof e.queued === 'number' ? e.queued : null,
+          earliestCooldownUntil: e.earliestCooldownUntil || null,
+        };
+        break;
+      case 'dispatcher-drain-start':
+        result.dispatcher.lastDrainStart = {
+          ts: e.ts || null,
+          signal: e.signal || null,
+          inFlight: Array.isArray(e.inFlight) ? e.inFlight.length : 0,
+        };
+        break;
+      case 'dispatcher-stopped':
+        result.dispatcher.lastStopped = {
+          ts: e.ts || null,
+          reason: e.reason || 'unknown',
+          drained: typeof e.drained === 'boolean' ? e.drained : null,
+          survivors: Array.isArray(e.survivors) ? e.survivors.length : 0,
+        };
+        break;
+      case 'dispatcher-drain-end':
+        result.dispatcher.lastDrainEnd = {
+          ts: e.ts || null,
+          drained: typeof e.drained === 'boolean' ? e.drained : null,
+          waitedMs: typeof e.waitedMs === 'number' ? e.waitedMs : null,
+          survivors: Array.isArray(e.survivors) ? e.survivors.length : 0,
+        };
+        break;
+      // History only, for the open-drain check above -- `dispatcher-start` already drives
+      // computeDispatcherStatus's own liveness walk (console/dispatcher-status.js); recording its
+      // ts here a second time is not a second liveness derivation, only a timestamp for render.js
+      // to compare against `lastDrainStart.ts`.
+      case 'dispatcher-start':
+        result.dispatcher.lastStart = { ts: e.ts || null };
         break;
       case 'remote-report-pulled':
         result.pull.lastPulledAt = e.ts || result.pull.lastPulledAt;
@@ -1237,11 +1349,16 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
   })();
   const usageSnapshot = collectUsageSnapshot(journalRoot);
   const now = Date.now();
+  // Card #186: the daemon-events tail is read ONCE here and handed to both consumers below --
+  // applyWorkerStats (dispatcher liveness) and collectReportPipeline (24h counters plus dispatcher
+  // history) -- rather than each calling readDaemonEventsTail(journalRoot) on its own, which would
+  // be a second bounded-but-still-real read of the same file on every collectAll call.
+  const daemonEvents = readDaemonEventsTail(journalRoot);
   // action 6.7: `applyWorkerStats` needs `journalTasks` (for its own `isCardKind` filter) --
   // computed here, once, rather than inside collectServices, which several existing tests call
   // bare (see that function's own comment on `services.workers`).
   const services = applyRetryChannelStats(
-    applyWorkerStats(collectServices({ journalRoot, queueDir, benchRoot, now }), journalRoot, journalTasks, now),
+    applyWorkerStats(collectServices({ journalRoot, queueDir, benchRoot, now }), journalRoot, journalTasks, now, daemonEvents),
     journalTasks,
     now
   );
@@ -1271,7 +1388,7 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
     trend: collectTrend(journalRoot),
     services,
     daemonStats: collectDaemonStats(journalTasks, queue.depth),
-    reports: collectReportPipeline(journalRoot, reportsDir),
+    reports: collectReportPipeline(journalRoot, reportsDir, { now, events: daemonEvents }),
     system: null,
     prod: null,
     tokens: null,

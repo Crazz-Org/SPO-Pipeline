@@ -3096,10 +3096,11 @@ test('buildReparkArgv: a null exitCode/signal (a hand-run repark, or a signal-le
 // drives is EDGE-triggered. A restart destroys that memory, so if the pool goes idle, the daemon
 // restarts (this project's post-merge hook SIGTERMs it on every merge), and the pool then
 // recovers, the `returned` edge is never written -- leaving a bare idle edge as daemon.jsonl's
-// newest dispatcher event forever. bin/spo's computeDispatcherStatus (renamed by card #164; was
-// computeDispatcherIdleStatus) answers "is the dispatcher idle right now" by walking back to the
-// newest edge, so without a startup boundary it reported a permanent false alarm (measured: "IDLE
-// since 191h06m ago" on a busy fixture).
+// newest dispatcher event forever. console/dispatcher-status.js's computeDispatcherStatus (renamed
+// by card #164; was computeDispatcherIdleStatus; moved out of bin/spo by card #186 so `spo status`
+// and the dashboard deck share one derivation) answers "is the dispatcher idle right now" by
+// walking back to the newest edge, so without a startup boundary it reported a permanent false
+// alarm (measured: "IDLE since 191h06m ago" on a busy fixture).
 test('the dispatcher writes a dispatcher-start event at startup -- the boundary `spo status` stops its idle walk at', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-start-q-');
   const journalDir = mkTmp('spo-disp-start-j-');

@@ -29,13 +29,16 @@ require('./no-real-spawn');
 // violation of the invariant above and would otherwise be invisible to a sweep that only ever
 // opened bin/spo. CARD #189 CORRECTION: this sentence used to say "one module deeper", and
 // SCAN_FILES was a hand list built to match -- bin/spo:210-211's eager `require('../console/
-// collect')`/`require('../console/render')`, and bin/spo:1174-1177's `--serve`-only
+// collect')`/`require('../console/render')`, and bin/spo:1127-1130's `--serve`-only
 // `require('../console/serve')`/`.../system`/`.../prod-version`/`.../usage-scan`. That list missed
-// bin/spo:1199-1215's static-mode generateOnce() -- run once unconditionally, and again every 30s
-// under `spo dashboard --watch` (bin/spo:1217-1220); NOT gated behind `--serve`, which returns
-// earlier at :1190 -- and its own lazy `require('../console/par-times')` at :1204-1205, whose
+// bin/spo:1152-1168's static-mode generateOnce() -- run once unconditionally, and again every 30s
+// under `spo dashboard --watch` (bin/spo:1170-1173); NOT gated behind `--serve`, which returns
+// earlier at :1143 -- and its own lazy `require('../console/par-times')` at :1157-1158, whose
 // byte-identical plant went undetected there while the same plant in console/collect.js was
-// caught. SCAN_FILES below is still a literal list, readable at a glance without running
+// caught. CARD #186 ADDITION: bin/spo now also eagerly requires `console/dispatcher-status.js`
+// (its own `computeDispatcherStatus`, moved out of bin/spo so `spo status` and console/collect.js's
+// dashboard deck can share one derivation) right alongside collect/render, so SCAN_FILES gained
+// that module too. SCAN_FILES below is still a literal list, readable at a glance without running
 // deriveConsoleModules() to see what it scans, but deriveConsoleModules() further down walks
 // bin/spo's own require('../console/X') call sites and, from there, every console module's own
 // require('./X') (or, equivalently, require('../console/X')) call sites on other console modules --
@@ -48,7 +51,7 @@ require('./no-real-spawn');
 // never grows a subdirectory, a symlink, or a .cjs/.mjs file in the first place. So a future
 // require this list forgets to list, a require spelling the walk's own regex cannot parse, or a
 // file shape none of this machinery was built to see, fails one of those
-// tests instead of silently going unscanned. Measured today, that walk's closure is all 11 files in
+// tests instead of silently going unscanned. Measured today, that walk's closure is all 12 files in
 // console/, including three reached only two or three requires deep (console/live-step.js via
 // serve.js, console/render-deck.js via render.js, and console/plain-language.js via render.js ->
 // render-deck.js). console/usage-rollups.js and console/par-times.js are the two console modules in
@@ -84,7 +87,7 @@ require('./no-real-spawn');
 //      thread) and called it, however it was imported: bare (destructured) or
 //      through a namespace object (`journal.writeState(...)`) -- bin/spo's OWN dominant import
 //      style is namespace objects (`accounts.`, `intake.`, `autoTriage.`, `reportIntake.`,
-//      `remoteReportPull.`, `recette.` -- bin/spo:212-223), so a namespaced `journal.writeState`
+//      `remoteReportPull.`, `recette.` -- bin/spo:213-224), so a namespaced `journal.writeState`
 //      is if anything the MORE likely future spelling, not an edge case to special-case away.
 //      `accounts.writeState(...)` is the one deliberate exclusion: it writes the claude-accounts
 //      POOL's own state.json (cooldowns/disabled markers), a completely different file under a
@@ -115,6 +118,7 @@ const REPO_ROOT = path.join(__dirname, '..');
 const SCAN_FILES = [
   'bin/spo',
   'console/collect.js',
+  'console/dispatcher-status.js',
   'console/render.js',
   'console/serve.js',
   'console/system.js',
@@ -368,13 +372,13 @@ test('bin/spo and the console modules it delegates to never write a taskDir stat
   // Sanity floors, same reasoning as both reference sweeps' own siteCount/checked floors: if any
   // of these drop, the sweep has stopped finding real content (a file moved, shrank drastically,
   // or the scanner's own regexes broke) and a green offenders list would mean nothing.
-  //   - totalBytes: measured 414,689 characters (source.length -- the code sums character count,
-  //     not on-disk byte count, which is 414,811 for these files once multibyte characters are
-  //     counted) across these 12 files; 200,000 tolerates ordinary growth/shrink but still catches
+  //   - totalBytes: measured 429,469 characters (source.length -- the code sums character count,
+  //     not on-disk byte count, which is 429,599 for these files once multibyte characters are
+  //     counted) across these 13 files; 200,000 tolerates ordinary growth/shrink but still catches
   //     something close to gh-api-argv's own "a refactor renamed the convention" failure mode.
   //   - totalWriteCallSites: measured 6 today (bin/spo's own 3 writeFileSync calls -- both of
-  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1210 and its health-view
-  //     sibling at bin/spo:1212, plus the account-disable marker -- usage-rollups.js's
+  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1163 and its health-view
+  //     sibling at bin/spo:1165, plus the account-disable marker -- usage-rollups.js's
   //     writeFileSync+renameSync pair, and par-times.js's own writeFileSync in saveParTimes). A
   //     drop to 0 would mean the write-callee regex stopped matching, not that every write
   //     vanished.
@@ -518,7 +522,7 @@ test('deriveConsoleModules() reaches exactly the top-level console/*.js files th
   // This is the real floor on deriveConsoleModules()'s completeness -- the test above (derived
   // subset of SCAN_FILES) cannot catch an UNDER-reaching BFS on its own: a shallower walk or a
   // narrower regex still returns a set that is (vacuously) a subset of SCAN_FILES, however small. A
-  // numeric floor would be too weak too: measured, a one-hop-only walk already finds 7 of these 11,
+  // numeric floor would be too weak too: measured, a one-hop-only walk already finds 8 of these 12,
   // so a floor would have to sit within a few files of today's count to catch even that, and would
   // need re-tuning as the module graph changes. Comparing against fs.readdirSync('console/') --
   // ground truth, not a number chosen to tolerate drift -- is what actually catches an under-reaching
