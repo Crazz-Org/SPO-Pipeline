@@ -506,10 +506,27 @@ body[data-stale="1"] #offline-banner { display: block; }
 .tile-locked .tile-face { fill: none; stroke: var(--border); stroke-dasharray: 5 4; }
 .tile-detour .tile-face { fill: var(--orange-bg); stroke: var(--orange); stroke-width: 1.8; }
 .tile-detour .tile-icon { color: var(--orange); }
-.tile-detour .tile-label { fill: var(--orange); }
 .detour-arc { fill: none; stroke: var(--orange); stroke-width: 1.8; stroke-dasharray: 6 4; }
 .tile-attempts circle { fill: var(--orange); }
 .tile-attempts text { font-family: var(--font-mono); font-size: 10px; font-weight: 700; text-anchor: middle; fill: var(--bg); }
+.arrow-head-red { fill: var(--red); }
+.tile-failed .tile-face { fill: var(--red-bg); stroke: var(--red); stroke-width: 1.8; }
+.tile-failed .tile-icon { color: var(--red); }
+.tile-failed .tile-label { fill: var(--red); font-weight: 700; }
+.fail-badge circle { fill: var(--red); }
+.fail-badge path { fill: none; stroke: var(--bg); stroke-width: 2; stroke-linecap: round; }
+.fail-caption { font-family: var(--font-mono); font-size: 9px; text-anchor: middle; fill: var(--red); }
+.fail-arc { fill: none; stroke: var(--red); stroke-width: 1.8; }
+.detour-box-label { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; fill: var(--orange); }
+.detour-box-sub { font-family: var(--font-mono); font-size: 9px; fill: var(--muted); }
+.detour-live .tile-face { stroke: var(--teal); }
+.detour-live .tile-icon { color: var(--teal); }
+.detour-live .detour-box-label { fill: var(--teal); }
+.split-failed { background: var(--red-bg); box-shadow: inset 3px 0 0 var(--red); }
+.split-failed .split-icon, .split-failed .split-name { color: var(--red); }
+.split-failed .split-name small { color: var(--muted); }
+.split-failed .split-name small b { color: var(--red); font-weight: 700; }
+.split-detour .split-icon { color: var(--orange); }
 .runner-body { fill: var(--teal); }
 .runner-tip { fill: var(--teal); }
 .runner-label { font-family: var(--font-mono); font-size: 13px; font-weight: 700; text-anchor: middle; fill: var(--bg); }
