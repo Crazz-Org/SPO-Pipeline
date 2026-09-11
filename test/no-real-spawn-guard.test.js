@@ -232,14 +232,21 @@ function runProbedDaemonOnce(env) {
 // `./state-machine`, which unconditionally requires `./steps/scripted` and `./command-timeout` at
 // ITS OWN top -- run at MODULE LOAD, before `main()` ever inspects `process.argv` to decide which
 // subcommand (if any) was asked for. Verified directly, not assumed:
-//   $ grep -n "require(" bin/spo | grep -c orchestrator   # 15 orchestrator requires, all above main()
+//   $ grep -n "require(" bin/spo | grep -c orchestrator   # 16 (15 top-level, plus the lazy
+//                                                         # project-board one at :1470)
 //   $ grep -n "^const recette = require" bin/spo          # unconditional, not inside any `if`
 // So "no subcommand" reaches the exact same require graph -- and therefore the exact same
 // command-timeout.js spawnSync capture -- as any real subcommand would, without this test needing
 // to fabricate a safe-to-run one. Verified, not assumed, that today's requires are the ONLY ones
-// gating this: 19 top-level requires sit at bin/spo:204-222 (unconditional, above `main()`), and
+// gating this: 21 top-level requires sit at bin/spo:206-226 (unconditional, above `main()`), and
 // the only LAZY requires anywhere in the file are `console/serve|system|prod-version|usage-scan|
-// par-times` around :1124-1155, none of which touches a spawn function.
+// par-times` around :1127-1158, none of which touches a spawn function, and
+// `orchestrator/project-board` at :1470 (`cmdAsk`'s own `deps.projectBoard ||` fallback) -- that
+// one DOES require `./command-timeout` (project-board.js:42), but only ever as a cache hit:
+// bin/spo's top-level requires already load command-timeout.js before main() runs (measured via
+// require.cache: first through the direct `intake` require, intake.js -> steps/llm.js ->
+// steps/scripted.js -> board.js; the `recette` chain reaches it again as a cache hit), so its lazy
+// require here can never be the FIRST thing to destructure the real spawnSync.
 //
 // THIS IS ALSO THE TEST'S OWN BLIND SPOT, worth flagging for whoever touches bin/spo next: if a
 // future change makes any of TODAY's unconditional requires LAZY (e.g. moving

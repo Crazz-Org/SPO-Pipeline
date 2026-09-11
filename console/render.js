@@ -134,10 +134,18 @@ function fmtDateTime(iso) {
   return String(iso).replace('T', ' ').slice(0, 16);
 }
 
+// `stopped` (card #186, workers.status only) is unambiguous across every tile that feeds this
+// function -- no other status vocabulary in this module uses that word -- so it is safe to add
+// here directly. `idle` is NOT: retryChannel's own status already uses 'idle' for a different,
+// neutral meaning (nothing parked, so the scan has nothing to be healthy about -- renderServicesInner's
+// own comment on RETRY_WORD) and renders `tile-gray` today; the Workers tile's 'idle' (the
+// dispatcher is up but has no healthy accounts) needs its OWN orange, so it is colored locally in
+// renderServicesInner rather than folded into this shared function, which would repaint the retry
+// tile too.
 function tileClass(status) {
   if (status === 'up' || status === 'ok' || status === 'pass') return 'tile-green';
   if (status === 'busy' || status === 'stale' || status === 'warn') return 'tile-orange';
-  if (status === 'down' || status === 'fail') return 'tile-red';
+  if (status === 'down' || status === 'fail' || status === 'stopped') return 'tile-red';
   return 'tile-gray';
 }
 
@@ -644,7 +652,10 @@ body[data-stale="1"] #offline-banner { display: block; }
 
 // ---- 1. services --------------------------------------------------------------------------
 
-const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'BACKED UP', stale: 'STALE', down: 'DOWN', unknown: 'UNKNOWN' };
+// `stopped`/`idle` (card #186) are workers.status values ONLY -- console/collect.js's
+// applyWorkerStats sets them from console/dispatcher-status.js's computeDispatcherStatus, the same
+// derivation `spo status`'s STOPPED/IDLE lines read, so this word choice matches the CLI exactly.
+const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'BACKED UP', stale: 'STALE', down: 'DOWN', unknown: 'UNKNOWN', stopped: 'STOPPED', idle: 'IDLE' };
 
 function svcTile({ name, status, cls, big, bigUnit, caption, timestamp }) {
   const pulse = cls === 'tile-green' ? ' pulse' : '';
@@ -739,6 +750,51 @@ function renderServicesInner(services, accounts, prod) {
           ? `of ${retry.parkedCards} parked confirmed reaching GitHub${retry.unprovenCards ? `, ${retry.unprovenCards} unproven` : ''}`
           : `${retry.parkedCards} parked, no scan outcome recorded yet`;
 
+  // Card #186: services.workers.status (console/collect.js's applyWorkerStats) folds in
+  // console/dispatcher-status.js's computeDispatcherStatus -- 'stopped'/'idle' outrank the
+  // present/absent rule this tile used to be the whole story. 'stopped' must not read like a
+  // reassuring live count -- a stopped dispatcher can still have live-workers.json on disk, count
+  // 0, present:true, which is exactly the discriminator this card exists to fix -- so its big
+  // number is always the empty dash and its caption mirrors bin/spo's own `cmdStatus` STOPPED
+  // wording (reason, plus drained/survivors when the stop event carried them). 'idle' keeps
+  // showing the live count honestly (a dispatcher that is up and idle can still show 0) but says
+  // why. Colored locally rather than through the shared tileClass() -- see that function's own
+  // comment on why 'idle' cannot be folded in there without repainting the retry-channel tile,
+  // which already uses that word for an unrelated, neutral meaning.
+  const workersDispatcher = workers.dispatcher || {};
+  // A stop/idle event with no parseable `ts` has no age to report; the since/ago clause is dropped
+  // entirely rather than rendering a dangling age suffix with no age in front of it.
+  const ageMs = workersDispatcher.sinceAgeMs;
+  const ageKnown = typeof ageMs === 'number' && Number.isFinite(ageMs);
+  let workersCls;
+  let workersBig;
+  let workersCaption;
+  if (workers.status === 'stopped') {
+    const reason = workersDispatcher.reason || 'unknown';
+    const extraParts = [];
+    if (typeof workersDispatcher.drained === 'boolean') {
+      extraParts.push(
+        workersDispatcher.drained ? 'drained clean' : `drained incomplete (${workersDispatcher.survivors || 0} survivor(s))`
+      );
+    }
+    const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+    // 'stopped' -> tile-red, via the shared tileClass() (not hardcoded here) so that branch stays
+    // live code, not a comment-only claim -- see tileClass's own header.
+    workersCls = tileClass('stopped');
+    workersBig = '—';
+    workersCaption = `stopped${ageKnown ? ` ${fmtAgeMs(ageMs)} ago` : ''} — reason: ${reason}${extraNote}`;
+  } else if (workers.status === 'idle') {
+    workersCls = 'tile-orange';
+    workersBig = workers.present ? fmtInt(workers.count) : '—';
+    workersCaption = `no healthy accounts${ageKnown ? ` — since ${fmtAgeMs(ageMs)} ago` : ''}`;
+  } else {
+    workersCls = tileClass(workers.status);
+    workersBig = workers.present ? fmtInt(workers.count) : '—';
+    workersCaption = workers.present
+      ? `live${workers.staleCount ? `, ${workers.staleCount} stale` : ''}${workers.trailingCount ? `, ${workers.trailingCount} exiting` : ''} — published ${fmtAgeMs(workers.ageMs)} ago`
+      : 'no live-workers.json published';
+  }
+
   const tiles = [
     svcTile({
       name: 'Daemon',
@@ -761,15 +817,15 @@ function renderServicesInner(services, accounts, prod) {
     // orchestrator/worker-status.js's header for the double-count hazard this avoids. `present:
     // false` (no live-workers.json at all -- no dispatcher has ever published here, or none is
     // running) renders UNKNOWN, never a reassuring "0" that would be indistinguishable from a
-    // dispatcher that is up and genuinely idle.
+    // dispatcher that is up and genuinely idle. Card #186: STOPPED and IDLE (computed above, from
+    // console/dispatcher-status.js) outrank all of that -- a stopped dispatcher that left
+    // live-workers.json behind at count 0 must not render the same as a live, idle one either.
     svcTile({
       name: 'Workers',
       status: STATUS_WORD[workers.status] || 'UNKNOWN',
-      cls: tileClass(workers.status),
-      big: workers.present ? fmtInt(workers.count) : '—',
-      caption: workers.present
-        ? `live${workers.staleCount ? `, ${workers.staleCount} stale` : ''}${workers.trailingCount ? `, ${workers.trailingCount} exiting` : ''} — published ${fmtAgeMs(workers.ageMs)} ago`
-        : 'no live-workers.json published',
+      cls: workersCls,
+      big: workersBig,
+      caption: workersCaption,
     }),
     svcTile({
       name: 'Retry channel',
@@ -958,6 +1014,7 @@ function renderReportsInner(reports) {
   const cycle = r.lastIntakeCycle;
   const w = r.last24h || {};
   const pull = r.pull || {};
+  const dispatcherHistory = r.dispatcher || {};
 
   const cycleLine = cycle
     ? `<p class="meta">last intake cycle (${escapeHtml(cycle.ts || '?')}): ${escapeHtml(cycle.processed)} processed, ${escapeHtml(cycle.filed)} filed, ${escapeHtml(cycle.duplicates)} duplicates${cycle.errors ? `, <strong>${escapeHtml(cycle.errors)} errors</strong>` : ''}</p>`
@@ -966,6 +1023,61 @@ function renderReportsInner(reports) {
   const pullLine = pull.configured
     ? `<p class="meta">remote pull: last pull ${escapeHtml(pull.lastPulledAt || '?')} &middot; 24h: ${escapeHtml(pull.pulled24h)} pulled / ${escapeHtml(pull.acked24h)} acked${pull.ackFailed24h ? ` / <strong>${escapeHtml(pull.ackFailed24h)} ack failures</strong>` : ''}${pull.rejected24h ? ` / ${escapeHtml(pull.rejected24h)} rejected${pull.lastRejectReason ? ` (${escapeHtml(pull.lastRejectReason)})` : ''}` : ''}</p>`
     : `<p class="empty">remote pull not configured</p>`;
+
+  // Card #186: `report-held-mechanical`/`report-held-unclaimable` (auto-triage.js's own two
+  // distinct terminal-hold outcomes) rendered as their own counts, never folded into `held` --
+  // console/collect.js's own header on why. Shown alongside the generic `held` line since that is
+  // where this pipeline's other 24h counters already live.
+  const heldLine =
+    w.heldMechanical || w.heldUnclaimable
+      ? `<p class="meta">24h holds: ${escapeHtml(w.heldMechanical || 0)} mechanical &middot; ${escapeHtml(w.heldUnclaimable || 0)} unclaimable</p>`
+      : '';
+
+  // A minimal drain summary, shown only when this pipeline has ever seen one -- the dispatcher's
+  // CURRENT liveness is the Workers tile's job (console/dispatcher-status.js), never re-derived
+  // here; this is history only (console/collect.js's own header on `result.dispatcher`).
+  //
+  // `lastDrainStart`/`lastDrainEnd` are each the most recent occurrence of THEIR OWN event kind,
+  // independently -- collect.js's switch never pairs them. Rendering them side by side
+  // unconditionally would pair the CURRENT start with a STALE end from an earlier drain whenever a
+  // new drain began after the previous one had already finished and ended (e.g. drain 1 finishes
+  // cleanly two days ago, the dispatcher restarts, drain 2 starts 1 minute ago with survivors still
+  // in flight -- pairing them unconditionally would read "started <1 min ago>, ended <2 days ago>
+  // (drained clean)", describing an in-progress drain as long since finished). An end only
+  // describes the latest start when it is not older than it (`Date.parse` is deterministic on its
+  // own input, not a clock read, so this stays a pure function of `reports` -- no `Date.now()`
+  // here).
+  //
+  // When the end does not match the start, the drain is not necessarily still running:
+  // dispatcher.js writes `dispatcher-stopped` BEFORE the post-stop reap (so a SIGKILL there cannot
+  // lose it) and `dispatcher-drain-end` only AFTER it (so it records real outcomes); a
+  // TimeoutStopSec SIGKILL, a crash or power loss during that reap therefore loses the drain-end
+  // write. So a later `lastStopped` or `lastStart` at or after this drain's own start proves the
+  // process that opened it is gone, and the honest text is "no drain-end recorded", not "in
+  // progress" -- which is shown ONLY when neither of those exists yet, using
+  // `lastDrainStart.inFlight`, already collected for exactly this.
+  const drainStart = dispatcherHistory.lastDrainStart;
+  const drainEnd = dispatcherHistory.lastDrainEnd;
+  const lastStopped = dispatcherHistory.lastStopped;
+  const lastStart = dispatcherHistory.lastStart;
+  const endMatchesStart =
+    drainStart && drainEnd && drainStart.ts && drainEnd.ts && Date.parse(drainEnd.ts) >= Date.parse(drainStart.ts);
+  let drainLine = '';
+  if (drainStart || drainEnd) {
+    const startPart = drainStart ? `started ${escapeHtml(drainStart.ts || '?')}` : 'no start recorded';
+    let endPart;
+    if (drainStart && !endMatchesStart) {
+      const stoppedSince = lastStopped && lastStopped.ts && drainStart.ts && Date.parse(lastStopped.ts) >= Date.parse(drainStart.ts);
+      const startedSince = lastStart && lastStart.ts && drainStart.ts && Date.parse(lastStart.ts) >= Date.parse(drainStart.ts);
+      endPart =
+        stoppedSince || startedSince ? ', no drain-end recorded' : `, in progress (${escapeHtml(drainStart.inFlight || 0)} in flight)`;
+    } else if (drainEnd) {
+      endPart = `, ended ${escapeHtml(drainEnd.ts || '?')} (${drainEnd.drained ? 'drained clean' : `${escapeHtml(drainEnd.survivors || 0)} survivor(s)`})`;
+    } else {
+      endPart = '';
+    }
+    drainLine = `<p class="meta">dispatcher drain: ${startPart}${endPart}</p>`;
+  }
 
   return `<h2>Bug reports</h2>
     <div class="kpi-grid">
@@ -976,7 +1088,9 @@ function renderReportsInner(reports) {
     <div class="card">
       ${cycleLine}
       <p class="meta">24h: ${escapeHtml(w.triagedFiled || 0)} filed &middot; ${escapeHtml(w.held || 0)} held &middot; ${escapeHtml(w.triagedDuplicate || 0)} duplicates &middot; ${escapeHtml(w.discarded || 0)} discarded</p>
+      ${heldLine}
       ${pullLine}
+      ${drainLine}
     </div>`;
 }
 

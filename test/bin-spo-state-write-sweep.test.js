@@ -24,17 +24,47 @@ require('./no-real-spawn');
 // framework enforces that; it is true only because nobody has written the code that would break
 // it. This test is that enforcement.
 //
-// SCOPE: bin/spo itself, plus every console/*.js module it actually delegates dashboard rendering
-// to (bin/spo:210-211's `require('../console/collect')`/`require('../console/render')`, and
-// bin/spo:1174-1177's `--serve`-only `require('../console/serve')`/`.../system`/`.../prod-version`/
-// `.../usage-scan`) -- a write one module deeper than bin/spo itself is just as real a violation of
-// the invariant above and would otherwise be invisible to a sweep that only ever opened bin/spo.
-// console/usage-rollups.js is included one level deeper still, for a different reason: it is
-// required by several of the files above (collect/render/serve/usage-scan) and is the ONE place in
-// this whole dependency graph that already does real filesystem writes (its own tmp-then-rename
-// idiom, saving usage rollups) -- including it is what proves this sweep can walk right past a
-// real write to an UNRELATED file without false-flagging it, rather than the "clean" result being
-// an artifact of never looking at a file with any writes in it at all.
+// SCOPE: bin/spo itself, plus every console/*.js module it reaches through require(), directly or
+// transitively -- a write any number of requires deeper than bin/spo itself is just as real a
+// violation of the invariant above and would otherwise be invisible to a sweep that only ever
+// opened bin/spo. CARD #189 CORRECTION: this sentence used to say "one module deeper", and
+// SCAN_FILES was a hand list built to match -- bin/spo:210-211's eager `require('../console/
+// collect')`/`require('../console/render')`, and bin/spo:1127-1130's `--serve`-only
+// `require('../console/serve')`/`.../system`/`.../prod-version`/`.../usage-scan`. That list missed
+// bin/spo:1152-1168's static-mode generateOnce() -- run once unconditionally, and again every 30s
+// under `spo dashboard --watch` (bin/spo:1170-1173); NOT gated behind `--serve`, which returns
+// earlier at :1143 -- and its own lazy `require('../console/par-times')` at :1157-1158, whose
+// byte-identical plant went undetected there while the same plant in console/collect.js was
+// caught. CARD #186 ADDITION: bin/spo now also eagerly requires `console/dispatcher-status.js`
+// (its own `computeDispatcherStatus`, moved out of bin/spo so `spo status` and console/collect.js's
+// dashboard deck can share one derivation) right alongside collect/render, so SCAN_FILES gained
+// that module too. SCAN_FILES below is still a literal list, readable at a glance without running
+// deriveConsoleModules() to see what it scans, but deriveConsoleModules() further down walks
+// bin/spo's own require('../console/X') call sites and, from there, every console module's own
+// require('./X') (or, equivalently, require('../console/X')) call sites on other console modules --
+// covering TOP-LEVEL console/*.js files only (a require into a SUBDIRECTORY of console/,
+// a SYMLINKED DIRECTORY there, or one naming a .cjs/.mjs file, would evade both this walk and the
+// on-disk listing the tests below compare it against; a THIRD test guards that specific gap by
+// asserting console/ contains none of those shapes). Three tests check this machinery's output:
+// one that SCAN_FILES scans everything the walk reaches, one that the walk reaches exactly the
+// top-level console/*.js files that exist on disk (neither more nor fewer), and one that console/
+// never grows a subdirectory, a symlink, or a .cjs/.mjs file in the first place. So a future
+// require this list forgets to list, a require spelling the walk's own regex cannot parse, or a
+// file shape none of this machinery was built to see, fails one of those
+// tests instead of silently going unscanned. Measured today, that walk's closure is all 12 files in
+// console/, including three reached only two or three requires deep (console/live-step.js via
+// serve.js, console/render-deck.js via render.js, and console/plain-language.js via render.js ->
+// render-deck.js). console/usage-rollups.js and console/par-times.js are the two console modules in
+// this graph that already make DIRECT fs write calls to paths unrelated to state.json today
+// (usage-rollups.js's own tmp-then-rename idiom, saving usage rollups; par-times.js:87's
+// writeFileSync in saveParTimes, saving par-times.json) -- "direct" because console/serve.js also
+// TRIGGERS real writes (refreshParTimes at :207, saveRollups at :238, appendDaemonEvent at :249)
+// without any fs.* WRITE call of its own (serve.js does call fs.readdirSync and fs.existsSync in
+// its own source, at :55/:61/:65 -- reads, not writes), which is a different thing from what this
+// sweep's write-callee regex looks for. Keeping usage-rollups.js and par-times.js in the scanned set
+// is what proves this sweep can walk right past a real write to an UNRELATED file without
+// false-flagging it, rather than the "clean" result being an artifact of never looking at a file
+// with any writes in it at all.
 //
 // Modelled directly on test/gh-api-argv.test.js and test/no-real-spawn-sweep.test.js: read the
 // SOURCE rather than mock anything, for the same reason both of those give -- a future subcommand
@@ -57,7 +87,7 @@ require('./no-real-spawn');
 //      thread) and called it, however it was imported: bare (destructured) or
 //      through a namespace object (`journal.writeState(...)`) -- bin/spo's OWN dominant import
 //      style is namespace objects (`accounts.`, `intake.`, `autoTriage.`, `reportIntake.`,
-//      `remoteReportPull.`, `recette.` -- bin/spo:212-223), so a namespaced `journal.writeState`
+//      `remoteReportPull.`, `recette.` -- bin/spo:213-224), so a namespaced `journal.writeState`
 //      is if anything the MORE likely future spelling, not an edge case to special-case away.
 //      `accounts.writeState(...)` is the one deliberate exclusion: it writes the claude-accounts
 //      POOL's own state.json (cooldowns/disabled markers), a completely different file under a
@@ -88,12 +118,17 @@ const REPO_ROOT = path.join(__dirname, '..');
 const SCAN_FILES = [
   'bin/spo',
   'console/collect.js',
+  'console/dispatcher-status.js',
   'console/render.js',
   'console/serve.js',
   'console/system.js',
   'console/prod-version.js',
   'console/usage-scan.js',
   'console/usage-rollups.js',
+  'console/par-times.js',
+  'console/live-step.js',
+  'console/render-deck.js',
+  'console/plain-language.js',
 ];
 
 // blankComments: blank out comments before searching, so this file's OWN header above (which
@@ -228,6 +263,102 @@ function checkSource(source) {
   return checkFile(source).offenders.map((o) => `${o.line}: ${o.text}`);
 }
 
+// scanFiles(files, {overrides}) -> {offenders, totalBytes, totalWriteCallSites,
+// totalStateJsonMentions}. Runs checkFile() -- the exact scanner both the real-file test and the
+// fixture tests above already trust -- over each path in `files`, reading its source from disk
+// under REPO_ROOT UNLESS `overrides` supplies an in-memory replacement keyed by that same relative
+// path. The override path is what lets the regression tests below plant a tainted write inside a
+// console module's source, or add a fake require to bin/spo's, and drive the real scanner (and the
+// real deriveConsoleModules() walk) over the planted text without ever writing into the tree.
+function scanFiles(files, { overrides = {} } = {}) {
+  const offenders = [];
+  let totalBytes = 0;
+  let totalWriteCallSites = 0;
+  let totalStateJsonMentions = 0;
+  for (const rel of files) {
+    const source = Object.prototype.hasOwnProperty.call(overrides, rel)
+      ? overrides[rel]
+      : fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+    totalBytes += source.length;
+    const { offenders: fileOffenders, writeCallSitesScanned, stateJsonMentions } = checkFile(source);
+    totalWriteCallSites += writeCallSitesScanned;
+    totalStateJsonMentions += stateJsonMentions;
+    for (const o of fileOffenders) offenders.push(`${rel}:${o.line}: ${o.text}`);
+  }
+  return { offenders, totalBytes, totalWriteCallSites, totalStateJsonMentions };
+}
+
+// readForDerive(rel, overrides) -- same override-or-disk read scanFiles uses, factored out so
+// deriveConsoleModules can share it without scanFiles and deriveConsoleModules needing to agree on
+// anything beyond this one helper's signature.
+function readForDerive(rel, overrides) {
+  return Object.prototype.hasOwnProperty.call(overrides, rel)
+    ? overrides[rel]
+    : fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+}
+
+// consoleRequireRe(): matches require('./<name>'), require('../console/<name>'), and both spelled
+// with an explicit trailing .js. Only the './name' form (no .js suffix) is actually used inside
+// console/*.js today, in all four files that require a sibling console module -- measured counts:
+// serve.js 7, collect.js 4, render-deck.js 3, render.js 1 -- but the regex also accepts the longer
+// '../console/name' spelling and an explicit '.js' on either, since nothing in the language stops a
+// future require from using them and this BFS should not need editing the day one does.
+// Deliberately does NOT match a computed require, a template-literal path, or a require built via
+// path.join()/require.resolve() -- those spellings, when they name a TOP-LEVEL console/*.js file,
+// are caught by a DIFFERENT test below (the on-disk equality check): a module reached only through
+// one of those spellings still exists on disk, so it shows up there as "on disk but not derived"
+// instead of silently passing. A require into a SUBDIRECTORY of console/, into a SYMLINKED
+// DIRECTORY there, or one naming a .cjs/.mjs file, is a separate blind spot this regex shares with
+// the disk-equality check's own listing -- guarded instead by the structural assertion further
+// down that console/ contains none of those shapes. Comments
+// are NOT blanked before this regex runs (unlike checkFile's own scan) -- a require merely
+// mentioned in a comment would be a false positive here, which is harmless: it only ever ADDS an
+// extra module to the derived set, which a completeness assertion treats as "cover it", never as
+// "skip it".
+function consoleRequireRe() {
+  return /require\(\s*['"](?:\.\/|\.\.\/console\/)([\w-]+)(?:\.js)?['"]\s*\)/g;
+}
+
+// deriveConsoleModules(overrides) -> Set<string> of 'console/<name>.js' relative paths that
+// bin/spo reaches through require(), directly or transitively. A BFS over plain string regexes,
+// same posture as this file's own checkFile: a require('../console/<name>') match against bin/spo's
+// own source seeds the queue (bin/spo lives in bin/, a SIBLING of console/ under the repo root, not
+// inside console/ itself -- a same-directory './' require there would resolve within bin/ and could
+// never name a console file, which is why bin/spo's OWN scan uses only the '../console/' form, not
+// the combined consoleRequireRe() defined above -- see the seed loop). From each console module
+// reached that way, consoleRequireRe() against THAT module's own source (a require('./<name>') OR
+// the equivalent require('../console/<name>')) queues the modules it delegates to in turn.
+// `overrides` (rel path -> source string) lets a caller feed in-memory source for bin/spo or any
+// console module without touching the tree -- the fake-require test below uses it to prove this BFS
+// picks up a require that does not exist on disk yet. A module name queued this way is recorded in
+// `visited` (and therefore in the returned set) even if reading its own source later fails -- the
+// require site is what proves bin/spo reaches it; a missing file at the far end is a different
+// problem for a different test to catch.
+function deriveConsoleModules(overrides = {}) {
+  const spoSource = readForDerive('bin/spo', overrides);
+  const rootRe = /require\(\s*['"]\.\.\/console\/([\w-]+)(?:\.js)?['"]\s*\)/g;
+  const queue = [];
+  let m;
+  while ((m = rootRe.exec(spoSource))) queue.push(m[1]);
+
+  const visited = new Set();
+  while (queue.length) {
+    const name = queue.shift();
+    if (visited.has(name)) continue;
+    visited.add(name);
+    let source;
+    try {
+      source = readForDerive(`console/${name}.js`, overrides);
+    } catch {
+      continue; // named by a require site, but unreadable -- not this BFS's problem to solve
+    }
+    const siblingRe = consoleRequireRe();
+    let mm;
+    while ((mm = siblingRe.exec(source))) queue.push(mm[1]);
+  }
+  return new Set([...visited].map((name) => `console/${name}.js`));
+}
+
 // Named, reasoned exceptions only -- see this file's own header for why the list starts empty.
 // Add an entry here only for a call site that genuinely, on inspection, does not write a taskDir's
 // state.json under a journal root (the same bar test/no-real-spawn-sweep.test.js's own ALLOWLIST
@@ -235,37 +366,27 @@ function checkSource(source) {
 const ALLOWLIST = {};
 
 test('bin/spo and the console modules it delegates to never write a taskDir state.json under a journal root', () => {
-  const offenders = [];
-  let totalBytes = 0;
-  let totalWriteCallSites = 0;
-  let totalStateJsonMentions = 0;
-
-  for (const rel of SCAN_FILES) {
-    if (Object.prototype.hasOwnProperty.call(ALLOWLIST, rel)) continue;
-    const abs = path.join(REPO_ROOT, rel);
-    const source = fs.readFileSync(abs, 'utf8');
-    totalBytes += source.length;
-    const { offenders: fileOffenders, writeCallSitesScanned, stateJsonMentions } = checkFile(source);
-    totalWriteCallSites += writeCallSitesScanned;
-    totalStateJsonMentions += stateJsonMentions;
-    for (const o of fileOffenders) offenders.push(`${rel}:${o.line}: ${o.text}`);
-  }
+  const scannedFiles = SCAN_FILES.filter((rel) => !Object.prototype.hasOwnProperty.call(ALLOWLIST, rel));
+  const { offenders, totalBytes, totalWriteCallSites, totalStateJsonMentions } = scanFiles(scannedFiles);
 
   // Sanity floors, same reasoning as both reference sweeps' own siteCount/checked floors: if any
   // of these drop, the sweep has stopped finding real content (a file moved, shrank drastically,
   // or the scanner's own regexes broke) and a green offenders list would mean nothing.
-  //   - totalBytes: measured 228,847 bytes across these 8 files; 200,000 tolerates ordinary
-  //     growth/shrink but still catches something close to gh-api-argv's own "a refactor renamed
-  //     the convention" failure mode.
-  //   - totalWriteCallSites: measured 4 today (bin/spo's own 2 writeFileSync calls -- the
-  //     dashboard HTML export and the account-disable marker -- plus usage-rollups.js's
-  //     writeFileSync+renameSync pair). A drop to 0 would mean the write-callee regex stopped
-  //     matching, not that every write vanished.
+  //   - totalBytes: measured 429,469 characters (source.length -- the code sums character count,
+  //     not on-disk byte count, which is 429,599 for these files once multibyte characters are
+  //     counted) across these 13 files; 200,000 tolerates ordinary growth/shrink but still catches
+  //     something close to gh-api-argv's own "a refactor renamed the convention" failure mode.
+  //   - totalWriteCallSites: measured 6 today (bin/spo's own 3 writeFileSync calls -- both of
+  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1163 and its health-view
+  //     sibling at bin/spo:1165, plus the account-disable marker -- usage-rollups.js's
+  //     writeFileSync+renameSync pair, and par-times.js's own writeFileSync in saveParTimes). A
+  //     drop to 0 would mean the write-callee regex stopped matching, not that every write
+  //     vanished.
   //   - totalStateJsonMentions: measured 4 today, all of them READS (bin/spo's two
   //     readJsonSafe(..., 'state.json', ...) call sites, collect.js's own two). A drop to 0 would
   //     mean the literal-detection regex itself stopped matching, which is exactly the failure
   //     mode that would let a real write slip through silently.
-  assert.ok(totalBytes > 200000, `expected the swept files to total a substantial size, got ${totalBytes} bytes -- has the file list shrunk or a file gone missing?`);
+  assert.ok(totalBytes > 200000, `expected the swept files to total a substantial size, got ${totalBytes} characters -- has the file list shrunk or a file gone missing?`);
   assert.ok(totalWriteCallSites >= 4, `expected several real write-shaped call sites across ${SCAN_FILES.join(', ')}, found ${totalWriteCallSites} -- has the write-callee regex stopped matching?`);
   assert.ok(totalStateJsonMentions >= 4, `expected several 'state.json' mentions (bin/spo's and collect.js's own read call sites), found ${totalStateJsonMentions} -- is the literal-detection regex broken?`);
 
@@ -362,4 +483,202 @@ test('sweep does NOT flag an fs write with no state.json anywhere nearby -- e.g.
   ].join('\n');
   const offenders = checkSource(src);
   assert.deepEqual(offenders, [], 'a tmp+rename write with no state.json in scope must never be flagged -- proves the sweep is not just "any rename is suspect"');
+});
+
+// ---- card #189 regression: coverage, not just the scanner's own pattern-matching -------------
+//
+// The fixture tests above prove checkFile() catches every write shape it claims to. None of them
+// prove SCAN_FILES actually hands checkFile() every file it needs to see -- and card #189's own
+// bug was exactly that gap: the same tainted write, planted temporarily (never a real write either
+// file carries) in console/par-times.js, went undetected while the byte-identical plant in
+// console/collect.js was caught -- because par-times.js itself was never in SCAN_FILES. The tests
+// below turn that probe into a permanent check, run against every console module bin/spo actually
+// reaches -- not just par-times.js -- and against deriveConsoleModules()'s own completeness claim.
+
+test('deriveConsoleModules finds every console module bin/spo reaches, directly or transitively, and SCAN_FILES scans all of them', () => {
+  const derived = [...deriveConsoleModules()].sort();
+
+  const missing = derived.filter((rel) => !SCAN_FILES.includes(rel));
+  assert.deepEqual(
+    missing,
+    [],
+    `bin/spo reaches these console modules through require(), directly or transitively, but SCAN_FILES does not scan them -- this is exactly card #189's bug shape: ${missing.join(', ')}`
+  );
+});
+
+// CONSOLE_MODULE_EXCLUSIONS: reasoned exceptions to the on-disk-vs-derived equality test below -- a
+// console/*.js file that genuinely is NOT reached by bin/spo's own require graph (e.g. a standalone
+// script nothing delegates dashboard rendering to). Starts empty: every file physically in console/
+// today IS reached by deriveConsoleModules() -- see that test's own failure message for what a
+// future addition to this list needs to say. An entry's WRITTEN REASON is the only guard against
+// excluding a module that actually IS reached, just through a require() spelling this BFS's regex
+// cannot parse (a computed require, a template literal): the validation test further down can check
+// that an entry names a real file the BFS does not currently reach, but it has no way to check
+// WHETHER that's because the module is genuinely unreached or because the regex merely missed it --
+// a reason a human reader would reject on sight is the only thing standing in the way of that.
+const CONSOLE_MODULE_EXCLUSIONS = {};
+
+test('deriveConsoleModules() reaches exactly the top-level console/*.js files that exist on disk -- neither more nor fewer', () => {
+  // This is the real floor on deriveConsoleModules()'s completeness -- the test above (derived
+  // subset of SCAN_FILES) cannot catch an UNDER-reaching BFS on its own: a shallower walk or a
+  // narrower regex still returns a set that is (vacuously) a subset of SCAN_FILES, however small. A
+  // numeric floor would be too weak too: measured, a one-hop-only walk already finds 8 of these 12,
+  // so a floor would have to sit within a few files of today's count to catch even that, and would
+  // need re-tuning as the module graph changes. Comparing against fs.readdirSync('console/') --
+  // ground truth, not a number chosen to tolerate drift -- is what actually catches an under-reaching
+  // BFS at any depth.
+  const onDisk = fs
+    .readdirSync(path.join(REPO_ROOT, 'console'))
+    .filter((name) => name.endsWith('.js'))
+    .map((name) => `console/${name}`)
+    .sort();
+  const onDiskSet = new Set(onDisk);
+
+  const derived = deriveConsoleModules();
+
+  // Direction 1: every file physically on disk is reached (or explicitly, reasonedly excluded).
+  const unreached = onDisk.filter(
+    (rel) => !derived.has(rel) && !Object.prototype.hasOwnProperty.call(CONSOLE_MODULE_EXCLUSIONS, rel)
+  );
+  assert.deepEqual(
+    unreached,
+    [],
+    'these console/*.js files exist on disk but deriveConsoleModules() -- a require()-following BFS ' +
+      "rooted at bin/spo -- does not reach them. Either bin/spo's dashboard code genuinely never " +
+      'delegates to them (add a reasoned entry to CONSOLE_MODULE_EXCLUSIONS instead of ignoring ' +
+      'this), or they are reached only through a require() spelling consoleRequireRe() does not ' +
+      `parse (a computed require, a template literal, a path.join()-built path) -- in which case the regex needs to widen: ${unreached.join(', ')}`
+  );
+
+  // Direction 2: every module the BFS claims to have reached actually exists on disk. Without this,
+  // a stale or mistyped require -- naming a console module that was renamed or deleted -- would sit
+  // silently inside `derived` forever: deriveConsoleModules() records a name in `visited` (and
+  // therefore in its returned set) from the require SITE alone, before it ever tries to read that
+  // module's own source (see that function's own comment on why).
+  const phantom = [...derived].filter((rel) => !onDiskSet.has(rel));
+  assert.deepEqual(
+    phantom,
+    [],
+    'deriveConsoleModules() reached these names through a require() call site somewhere in the ' +
+      `graph, but no such file exists on disk under console/ -- a stale or mistyped require: ${phantom.join(', ')}`
+  );
+});
+
+test('console/ holds no subdirectory, symlink, or .cjs/.mjs file -- regular files only', () => {
+  // consoleRequireRe()'s own [\w-]+ cannot match a "/", so a require reaching into a SUBDIRECTORY of
+  // console/ is invisible to deriveConsoleModules() entirely -- not merely unparsed the way a
+  // computed require or a template literal is (those still land on a real console/*.js file, which
+  // is what lets the on-disk equality test above catch them; a subdirectory file evades THAT test
+  // too, since the disk listing is top-level only, so a file inside a subdirectory is never listed).
+  // Separately, the on-disk side of that same test only keeps names ending in ".js"
+  // (`.filter((name) => name.endsWith('.js'))`), so a .cjs or .mjs file sitting right next to the
+  // others would not even appear in the comparison as something to reach.
+  //
+  // A SYMLINKED DIRECTORY evades both the walk and the listing exactly as a real subdirectory does,
+  // and an `e.isDirectory()`-only check would not catch it: fs.Dirent's isDirectory()/isFile()
+  // describe the entry ITSELF, not what a symlink points at, so a symlink -- to a directory, to a
+  // file, or dangling -- is neither isDirectory() NOR isFile(), regardless of its target. Likewise
+  // an extension check gated on isFile() would miss a symlink whose own name ends in .cjs. NOTE: a
+  // symlink to an ordinary .js FILE does NOT actually evade deriveConsoleModules() or the on-disk
+  // listing -- deriveConsoleModules()'s regex still matches its require() call site by name, the
+  // on-disk listing still lists its name (readdirSync returns the link's own name like any other
+  // entry), and fs.readFileSync follows the link when the real sweep later reads its content. The
+  // fix below rejects it anyway, along with every other symlink, as a DELIBERATE CONSERVATIVE
+  // choice: flagging every entry that is not a regular file at all (`!e.isFile()`) is simpler and
+  // safer than special-casing "a symlink to a regular .js file is fine, every other symlink is
+  // not". The .cjs/.mjs extension is checked on the name alone, with no isFile() precondition, so a
+  // symlink whose OWN name ends in .cjs is flagged by both rules rather than slipping through a
+  // gate the other rule already tripped.
+  //
+  // Both this sweep and deriveConsoleModules() would need extending -- not just this test loosening
+  // -- before a subdirectory (real or symlinked) or a .cjs/.mjs file could be added under console/
+  // safely.
+  const entries = fs.readdirSync(path.join(REPO_ROOT, 'console'), { withFileTypes: true });
+  const badNonFile = entries.filter((e) => !e.isFile()).map((e) => `console/${e.name}`);
+  const badExt = entries
+    .filter((e) => e.name.endsWith('.cjs') || e.name.endsWith('.mjs'))
+    .map((e) => `console/${e.name}`);
+  const offenders = [...new Set([...badNonFile, ...badExt])].sort();
+  assert.deepEqual(
+    offenders,
+    [],
+    'deriveConsoleModules() and the on-disk equality test above only cover TOP-LEVEL ' +
+      "console/*.js files -- a subdirectory (real or symlinked) or a .cjs/.mjs file physically " +
+      "exists here but neither the require-following BFS nor the disk listing it's checked against " +
+      'would ever notice it (every OTHER symlink is rejected here too, conservatively, even though ' +
+      `a symlink to an ordinary .js file would not actually evade either check): ${offenders.join(', ')}`
+  );
+});
+
+test('every CONSOLE_MODULE_EXCLUSIONS entry names a real console/*.js file that deriveConsoleModules() genuinely does not reach -- never a stale or redundant one', () => {
+  const onDisk = new Set(
+    fs
+      .readdirSync(path.join(REPO_ROOT, 'console'))
+      .filter((name) => name.endsWith('.js'))
+      .map((name) => `console/${name}`)
+  );
+  const derived = deriveConsoleModules();
+
+  for (const rel of Object.keys(CONSOLE_MODULE_EXCLUSIONS)) {
+    assert.ok(
+      onDisk.has(rel),
+      `CONSOLE_MODULE_EXCLUSIONS names ${rel}, which does not exist on disk under console/ -- a stale entry left behind after the file itself was removed or renamed`
+    );
+    assert.ok(
+      !derived.has(rel),
+      `CONSOLE_MODULE_EXCLUSIONS names ${rel}, but deriveConsoleModules() DOES reach it -- a redundant exclusion that hides nothing today, and would silently hide a real gap if the BFS ever stopped reaching it for a genuine reason`
+    );
+  }
+});
+
+test('deriveConsoleModules picks up a brand-new require(\'../console/X\') added to bin/spo, even one naming a module that does not exist on disk', () => {
+  const realSpo = fs.readFileSync(path.join(REPO_ROOT, 'bin/spo'), 'utf8');
+  const fakeSpo = `${realSpo}\nfunction __probeNewDelegate() {\n  require('../console/__card-189-fake-module').go();\n}\n`;
+  const derived = deriveConsoleModules({ 'bin/spo': fakeSpo });
+  assert.ok(
+    derived.has('console/__card-189-fake-module.js'),
+    "expected a new require('../console/...') shape added to bin/spo to be picked up immediately, even for a module that does not exist on disk yet -- the require SITE is what proves bin/spo reaches it"
+  );
+});
+
+test('a planted tainted state.json write is caught in every console module bin/spo delegates to, and goes undetected the moment that module is dropped from the scanned set', () => {
+  const modules = [...deriveConsoleModules()].sort();
+  assert.ok(modules.includes('console/collect.js'), 'expected collect.js -- the positive control -- among the derived modules');
+  assert.ok(modules.includes('console/par-times.js'), 'expected par-times.js -- card #189\'s own finding -- among the derived modules');
+
+  // Byte-identical across every module probed: a direct fs.writeFileSync onto a variable whose own
+  // initializer names state.json literally -- no tmp file, no rename, the simplest shape checkFile's
+  // own taint-tracking (Shape 1, findStateJsonTaintedVars) is built to catch. The two statements
+  // here are the same ones card #189's own investigation planted by hand in collect.js and
+  // par-times.js (only the wrapping function's name and layout differ). Appended to the module's own
+  // real source so the rest of that module's real content (including its own real writes, if any) is
+  // still exercised alongside the plant.
+  const PLANT = "\nfunction __card189ProbeStateWrite(d) {\n  const target = path.join(d, 'state.json');\n  fs.writeFileSync(target, JSON.stringify({ probe: true }));\n}\n";
+
+  for (const rel of modules) {
+    const realSource = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+    const taintedSource = realSource + PLANT;
+
+    const withModuleScanned = scanFiles(SCAN_FILES, { overrides: { [rel]: taintedSource } });
+    assert.ok(
+      withModuleScanned.offenders.some((o) => o.startsWith(`${rel}:`)),
+      `planting a tainted state.json write in ${rel} was not caught while ${rel} is in SCAN_FILES -- the scanner regressed`
+    );
+
+    // The assertion above is what proves SCAN_FILES membership matters: the plant IS caught while
+    // the module is actually in the scanned set. This second half checks a narrower thing --
+    // that scanFiles(files, {overrides}) only ever scans the paths named in `files`, and never
+    // leaks in an `overrides` entry for a path that was not asked for. Without that property,
+    // dropping a module from `files` (as this half does, without touching SCAN_FILES itself) would
+    // not actually be equivalent to dropping it from SCAN_FILES, and this whole test would prove
+    // nothing regardless of what `files` contains.
+    const withModuleDropped = scanFiles(
+      SCAN_FILES.filter((f) => f !== rel),
+      { overrides: { [rel]: taintedSource } }
+    );
+    assert.ok(
+      !withModuleDropped.offenders.some((o) => o.startsWith(`${rel}:`)),
+      `expected dropping ${rel} from the scanned set to hide its planted write (proving this regression test bites), but it was still caught`
+    );
+  }
 });

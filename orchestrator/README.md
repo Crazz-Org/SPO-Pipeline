@@ -137,7 +137,28 @@ per-task retry budgets this section is about, both journaled and both visible in
   `diagnosisSummary` reads back whichever of a DIAGNOSE finding and a VALIDATE reject was
   journaled most recently as the primary line, and still shows the other (if any) for context,
   clearly attributed to its own state so IMPLEMENT can tell "a check/gate/CI failed" apart from
-  "the change was built and the validator rejected it".
+  "the change was built and the validator rejected it". Card #174: validate-change.md requires a
+  REJECT to carry "exactly one" `reasons` entry; a REJECT that reaches handleValidate's REJECT
+  branch with zero usable reasons (the key absent, `null`, `[]`, `"[]"`, or an array of non-string
+  entries) or more than one journals a `reject-reasons-contract-violation` event (`{attempt,
+  reasonsKeyPresent, reasonsShape, usableCount}`) — never a park. `key in parsedPayload`
+  (`step-contracts.js`'s VALIDATE `outputContract`, checked in `llm.js`) is a PRESENCE check, not a
+  shape check: only a reply that omits `reasons` entirely parks `llm-transport-failed:VALIDATE`
+  before a verdict is ever read, so `reasonsKeyPresent: false` reaches the REJECT branch only via a
+  shadow-mode fixture — the legacy `ctx.task.llm.<step>` override returns `invokeClaudeReal`'s raw
+  shape with no top-level `verdict` at all (parks `validate-unrecognized-verdict` instead), and
+  `--dry-run`'s canned VALIDATE payload is always a `PASS` (a REJECT can never happen under
+  `--dry-run`). A real, live reply sending `reasons: null`/`[]`/`"[]"`/a bare non-JSON string/an
+  array of non-string entries, however, satisfies the presence check and reaches the REJECT branch
+  the same as a shadow fixture would. A bare non-JSON-encoded string is
+  salvaged as the one reason instead of being discarded (the card #640 class of bug, one shape
+  further); exactly one usable reason journals nothing new. Zero usable reasons still writes
+  `(no reason given; reasons shape: <shape>)` on the ledger line, so a reader can tell "the
+  validator sent none" from "the pipeline lost it". Every usable reason has internal whitespace —
+  including an embedded newline — collapsed to single spaces (`state-machine.js`'s
+  `collapseToOneLine`, also used by `handleDiagnose`'s nested-`root_cause` unwrap) before it
+  reaches the ledger or the `result` event, so a multi-line reason still lands on `ledger.md` as
+  one line.
 
 **The bounds this pipeline actually enforces**, beyond the two retry budgets above, are three
 wall-clock ceilings and (outside the daemon) a supervised harness's own caps:

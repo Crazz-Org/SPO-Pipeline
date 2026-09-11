@@ -178,7 +178,10 @@ function diagnosisSummary(taskDir) {
   // meant a rejection carrying only `findings` threaded nothing, and if an older DIAGNOSE
   // existed, its stale cause was presented to IMPLEMENT as the current one, with no hint that a
   // rejection had just happened -- the precise failure 1.6 exists to prevent. handleValidate
-  // already writes '(no reason given)' on the ledger side for this case; match it here.
+  // writes '(no reason given...)' (card #174: with the raw `reasons` shape appended) on the
+  // ledger side for this case; match the fixed '(no reason given)' text here, not the ledger's
+  // exact string -- IMPLEMENT's `{{diagnosis}}` placeholder has no reader that needs the shape,
+  // only DIAGNOSE reading ledger.md directly does.
   let valText = null;
   if (val) {
     const hasReasons = Array.isArray(val.reasons) && val.reasons.length > 0;
