@@ -18,7 +18,7 @@ const path = require('path');
 require('./no-real-spawn');
 
 const { spawn: realSpawn } = require('child_process');
-const { mkTmp, runSpo } = require('./helpers');
+const { mkTmp, runSpo, isolatedEnv } = require('./helpers');
 const { collectAll, collectReportPipeline } = require('../console/collect');
 const { renderDashboard, renderServicesInner, renderReportsInner } = require('../console/render');
 const { computeDispatcherStatus } = require('../console/dispatcher-status');
@@ -30,7 +30,7 @@ const { processAlive, pidExists } = require('../orchestrator/lock');
 // module's own "scope: spawnSync only" header), awaited to exit, its pid then provably free.
 function deadPid() {
   return new Promise((resolve, reject) => {
-    const child = realSpawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    const child = realSpawn(process.execPath, ['-e', ''], { stdio: 'ignore', env: isolatedEnv() });
     child.on('exit', () => resolve(child.pid));
     child.on('error', reject);
   });
