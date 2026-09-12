@@ -755,6 +755,15 @@ test('every real-spawn call site in test/ carries an `env:` option', () => {
     'park-alert.test.js': 1,
     'tokens.test.js': 9,
     'worker-mode.test.js': 1,
+    // Card SPO-Pipeline#205's sibling, #204 (2026-09-12): these two were in `auditedRealCorpusFiles`
+    // but pinned nowhere, and the sweep's own comment admitted "no record says why they were not
+    // also pinned here". Membership in the audited set is per file and the global floor only
+    // COUNTS, so a new launch in either file changed nothing the sweep checks by name -- the
+    // card's probe appended a well-formed launch to each and got 11 pass / 0 fail, while the same
+    // launch in a pinned file (`park-alert.test.js`) went red at once. Counts below are the
+    // sweep's own, not transcribed from the card: they were entered and the assertion re-run.
+    'daemon-repark-mode.test.js': 2,
+    'usage-report.test.js': 1,
   };
   const actualSitesPerFile = {};
   for (const s of sites) {
@@ -800,6 +809,72 @@ test('every real-spawn call site in test/ derives its env from isolatedEnv(), no
       'SPO_PRODUCT_REPO/SPO_WORKTREES_DIR/SPO_ACCOUNTS_DIR/SPO_BENCH_DIR/SPO_REPORTS_DIR/' +
       "SPO_STATE_DIR pointed at the maintainer's real, shared machine state. Spread isolatedEnv() " +
       `instead (\`{ ...isolatedEnv(), FOO: 1 }\`):\n  ${offenders.join('\n  ')}`
+  );
+});
+
+// spreadOrderOffence(optsText) -- card SPO-Pipeline#203 (2026-09-12). The test above asks whether
+// `isolatedEnv()` is PRESENT in the call's env; that tests whether the text occurs, not where it
+// sits. `env: { ...isolatedEnv(), ...process.env }` contains the text and passes -- and then the
+// later spread overwrites every key isolatedEnv() set, for every key the parent environment
+// happens to define. The card measured it: with that one shape planted, `SPO_STATE_DIR` resolved
+// to the maintainer's real `~/.spo-state`, `SPO_PRODUCT_REPO` to the real `~/SPO-WebClient`, and
+// `SPO_NO_REAL_SPAWN` to `''` -- the child guard DISARMED -- while the sweep stayed 11 pass /
+// 0 fail.
+//
+// Order is the whole story, and a presence regex cannot see order: `isolatedEnv()` itself returns
+// `{ ...process.env, <overrides> }`, so whichever spread comes LAST wins. Hence the rule below:
+// the last `...process.env` must not sit after the last `isolatedEnv()`.
+//
+// Returns null when the text is fine, or a reason string. Pure, so the planted-fixture test right
+// after it can prove the check bites without touching a real call site.
+function spreadOrderOffence(optsText) {
+  const text = String(optsText || '');
+  const lastIsolated = text.lastIndexOf('isolatedEnv()');
+  if (lastIsolated === -1) return null; // "no isolatedEnv() at all" is the PREVIOUS test's offence
+  let lastBareSpread = -1;
+  const re = /\.\.\.\s*process\.env\b/g;
+  let m;
+  while ((m = re.exec(text)) !== null) lastBareSpread = m.index;
+  if (lastBareSpread === -1) return null;
+  if (lastBareSpread > lastIsolated) {
+    return '`...process.env` is spread AFTER isolatedEnv(), so it overwrites every isolated key ' +
+      'the parent environment defines';
+  }
+  return null;
+}
+
+test('spread ORDER is checked, not just the presence of isolatedEnv() -- planted fixture', () => {
+  // The exact bypass shape from the card. A presence-only check (`/isolatedEnv\(\)/.test`) calls
+  // this clean; that regex is asserted below to show the two disagree, which is the whole point.
+  const bypass = 'env: { ...isolatedEnv(), ...process.env }';
+  assert.ok(/isolatedEnv\(\)/.test(bypass), 'the bypass shape DOES satisfy a presence-only check');
+  assert.ok(spreadOrderOffence(bypass), 'the order check must catch what the presence check waves through');
+
+  // Same two spreads, correct order -- isolatedEnv() last, so it wins.
+  assert.equal(spreadOrderOffence('env: { ...process.env, ...isolatedEnv() }'), null);
+  // The ordinary shapes stay clean.
+  assert.equal(spreadOrderOffence('env: isolatedEnv()'), null);
+  assert.equal(spreadOrderOffence('env: { ...isolatedEnv(), SPO_FOO: 1 }'), null);
+  // Whitespace between the dots and the identifier must not be an escape hatch.
+  assert.ok(spreadOrderOffence('env: { ...isolatedEnv(), ...  process.env }'));
+  // A site with no isolatedEnv() at all is NOT this test's offence -- the previous test owns it,
+  // and reporting it twice would make one fix look like two.
+  assert.equal(spreadOrderOffence('env: { ...process.env, FOO: 1 }'), null);
+});
+
+test('no real-spawn call site in test/ spreads process.env AFTER isolatedEnv()', () => {
+  const offenders = collectSites()
+    .filter((s) => !s.unparseable && !s.allowlisted)
+    .map((s) => ({ s, why: spreadOrderOffence(s.optsText) }))
+    .filter((x) => x.why)
+    .map((x) => `${x.s.file}:${x.s.lineNo} -- ${x.why}`);
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'real spawn(s) in test/ whose env is isolatedEnv()-derived ON PAPER ONLY: a later ' +
+      '`...process.env` spread puts SPO_STATE_DIR / SPO_PRODUCT_REPO / SPO_NO_REAL_SPAWN back to ' +
+      `the maintainer's real values. Put isolatedEnv() LAST:\n  ${offenders.join('\n  ')}`
   );
 });
 

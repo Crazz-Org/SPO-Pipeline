@@ -98,6 +98,12 @@ const ALLOWLIST = new Map([
         `require("../orchestrator/',`,
         `require('../bin/",`,
         `require("../bin/',`,
+        // The two spellings added for card #205, anchored to their own array-literal punctuation
+        // exactly as the four above are -- never the bare prefix.
+        `require('../console/",`,
+        `require("../console/',`,
+        `require('../scripts/",`,
+        `require("../scripts/',`,
         // The main sweep test's own assertion-failure message below, which spells the rule out
         // with a literal "..." placeholder instead of a real module name.
         "require('../orchestrator/...')",
@@ -196,11 +202,29 @@ function blankComments(source) {
 // among them -- so it destructures the real spawnSync at require time exactly like a direct
 // orchestrator require does, and a sweep that only knew the `../orchestrator/` spelling waved
 // `test/spo-triage.test.js` straight through.
+//
+// `../console/` and `../scripts/` joined them for card SPO-Pipeline#205 (2026-09-12). Same
+// argument, one indirection further out: this sweep reads each test file's own TEXT and never
+// follows a require, so a file that reaches an orchestrator module only THROUGH a console module
+// was never asked for the killswitch. Measured at the time: `console/serve` alone already loads
+// 11 orchestrator modules, and six test files requiring `../console/` carried no killswitch at
+// all (`dashboard-system`, `dashboard-usage-rollups`, `dashboard-serve`, `dashboard-prod-version`,
+// `dashboard-usage-scan`, `usage-report`). The card's own probe planted a top-level spawn in
+// `console/usage-scan.js` and watched it RUN, in the parent test process, with this sweep green
+// at 16 pass / 0 fail. `../scripts/` is included on the same reasoning before it can bite:
+// `scripts/usage-report.js` is required by tests the same way.
+//
+// Widening the patterns is only half of it -- the six files above were given the killswitch in
+// the same change, because a pattern nothing satisfies fails the suite instead of guarding it.
 const ORCHESTRATOR_REQUIRE_PATTERNS = [
   "require('../orchestrator/",
   'require("../orchestrator/',
   "require('../bin/",
   'require("../bin/',
+  "require('../console/",
+  'require("../console/',
+  "require('../scripts/",
+  'require("../scripts/',
 ];
 
 // Anchored to a line start -- checked by `findOccurrences` below via "index 0, or the previous
