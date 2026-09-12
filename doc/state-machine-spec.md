@@ -603,7 +603,7 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1190`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1202`)
   writes static HTML (the flight deck, plus `health.html` beside it) from the same local surfaces
   or, with `--serve`, runs a live HTTP server (`console/serve.js`) over those surfaces plus host
   CPU/memory and an outbound production-version probe (`--no-prod` turns it off); either way it

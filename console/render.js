@@ -800,9 +800,18 @@ function renderServicesInner(services, accounts, prod) {
   let workersCaption;
   if (workers.status === 'stopped' && workersDispatcher.diedDraining) {
     const inFlightNote = typeof workersDispatcher.inFlight === 'number' ? ` (${workersDispatcher.inFlight} in flight at drain start)` : '';
+    // Card #208 (F8): `workersDispatcher.rebooted` (console/collect.js's own whitelisted copy of
+    // computeDispatcherStatus's result field) is the one diedDraining case where death is MEASURED
+    // rather than inferred -- see bin/spo's own cmdStatus caption comment for the reasoning this
+    // mirrors. An operator reading "process gone or past its drain bound" for every other
+    // diedDraining case has to weigh "or"; a reboot removes the ambiguity entirely, so it earns its
+    // own wording rather than being folded into the hedge.
+    const deathNote = workersDispatcher.rebooted
+      ? 'host rebooted since drain start — process is certainly gone'
+      : 'process gone or past its drain bound';
     workersCls = tileClass('stopped');
     workersBig = '—';
-    workersCaption = `stopped — drain never concluded (drain started ${ageKnown ? fmtAgeMs(ageMs) : '?'} ago), no dispatcher-stopped recorded; process gone or past its drain bound${inFlightNote}`;
+    workersCaption = `stopped — drain never concluded (drain started ${ageKnown ? fmtAgeMs(ageMs) : '?'} ago), no dispatcher-stopped recorded; ${deathNote}${inFlightNote}`;
   } else if (workers.status === 'stopped') {
     const reason = workersDispatcher.reason || 'unknown';
     const extraParts = [];
@@ -1124,11 +1133,17 @@ function renderReportsInner(reports, workersDispatcher) {
       // already gone (the journal observation this card starts from). `wd.diedDraining` is the
       // Workers tile's own verdict on THIS SAME open drain (both read off the same daemonEvents).
       const diedDraining = wd.diedDraining === true;
+      // Card #208 (F8): `wd.rebooted` -- same verdict field, same reasoning as the Workers tile's
+      // own caption just above -- turns the hedged "gone or past its bound" into a certain "host
+      // rebooted", the one diedDraining case where this history line can say more than it inferred.
+      const deathNote = wd.rebooted
+        ? 'host rebooted since drain start -- process is certainly gone'
+        : 'process gone or past its drain bound';
       endPart =
         stoppedSince || startedSince
           ? ', no drain-end recorded'
           : diedDraining
-            ? ', drain never concluded -- process gone or past its drain bound (no dispatcher-stopped recorded)'
+            ? `, drain never concluded -- ${deathNote} (no dispatcher-stopped recorded)`
             : `, in progress (${escapeHtml(drainStart.inFlight || 0)} in flight)`;
     } else if (drainEnd) {
       endPart = `, ended ${escapeHtml(drainEnd.ts || '?')} (${drainEnd.drained ? 'drained clean' : `${escapeHtml(drainEnd.survivors || 0)} survivor(s)`})`;

@@ -26,6 +26,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn: realSpawn } = require('child_process');
 
@@ -141,6 +142,23 @@ test('drain: an in-flight card runs to completion instead of being killed', { ti
   // the only thing that ever set `stopReason` (no prior `stop()` call), so it must read exactly
   // what `requestDrain` itself set it to.
   assert.equal(start.reason, 'drain-requested', 'dispatcher-drain-start must carry the real in-memory stopReason at drain time');
+  // UPTIME (card #208): `os.uptime() * 1000` -- boot-relative, monotonic, and (unlike
+  // `monotonicNowMsFn()`) comparable across processes -- carried alongside `ts` so a DIFFERENT
+  // reader (`spo status`, the dashboard) can bound this drain's age without trusting the wall
+  // clock. `run()` above executes in THIS process, so a fresh `os.uptime() * 1000` read here,
+  // right after the event was written, must be very close to (and never far below) the event's
+  // own reading -- a wide tolerance (10s) absorbs normal test scheduling jitter without weakening
+  // the check the drop-mutation proof below actually depends on (that the field exists and is a
+  // real, current number, not that it is exact to the millisecond).
+  assert.ok(
+    Number.isFinite(start.hostUptimeAtMs),
+    'dispatcher-drain-start must carry a numeric hostUptimeAtMs (os.uptime() * 1000 at write time)'
+  );
+  const nowHostUptimeMs = os.uptime() * 1000;
+  assert.ok(
+    Math.abs(nowHostUptimeMs - start.hostUptimeAtMs) < 10000,
+    `dispatcher-drain-start's hostUptimeAtMs must be a real, current os.uptime() reading, not a stale or fabricated one: wrote ${start.hostUptimeAtMs}, now ${nowHostUptimeMs}`
+  );
   assert.ok(end, 'no dispatcher-drain-end');
   assert.equal(end.drained, true, 'the drain did not wait for the card');
   assert.deepEqual(end.survivors, []);

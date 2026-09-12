@@ -803,16 +803,22 @@ function cmdStatus(opts) {
   // under a different Unix user than this shell, e.g. a system unit with `User=`), and
   // `process.kill(pid, 0)` throws EPERM for a pid that is alive but not signalable --
   // `processAlive` reads that the same as ESRCH ("gone"), which would misreport a live-but-foreign
-  // dispatcher as dead. `pidExists` reads EPERM as "still there". `now`/`killGraceMs` (card #188
-  // follow-up) are ALSO injected here, never read inside computeDispatcherStatus itself: `now` is
-  // this same `Date.now()` snapshot (declared once, above, and reused for every age computation in
-  // this function) rather than a fresh clock read, and `killGraceMs` is this process's own
+  // dispatcher as dead. `pidExists` reads EPERM as "still there". `now`/`hostUptimeNowMs`/`killGraceMs`
+  // (card #188 follow-up, card #208) are ALSO injected here, never read inside
+  // computeDispatcherStatus itself: `now` is this same `Date.now()` snapshot (declared once, above,
+  // and reused for every age computation in this function) rather than a fresh clock read;
+  // `hostUptimeNowMs` is `os.uptime() * 1000`, the PREFERRED (boot-relative, monotonic, cross-process-
+  // comparable) age reading a `dispatcher-drain-start` written by card #208's dispatcher.js now
+  // carries alongside its wall-clock `ts` -- see console/dispatcher-status.js's own header for why
+  // that beats both `ts` and `monotonicNowMs()`; and `killGraceMs` is this process's own
   // `defaultConfig.drainKillGraceMs` -- together they let a reader bound an UNCONCLUDED drain-start
   // past its own `timeoutMs` plus that grace as STOPPED even when a reused pid would otherwise read
-  // it alive forever (a dead-but-pid-reused daemon does not print DRAINING indefinitely any more).
+  // it alive forever (a dead-but-pid-reused daemon does not print DRAINING indefinitely any more),
+  // and does so on a clock that cannot be fooled by this box's own measured wall-clock steps.
   const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot), {
     isAlive: pidExists,
     now,
+    hostUptimeNowMs: os.uptime() * 1000,
     killGraceMs: defaultConfig.drainKillGraceMs,
   });
   if (dispatcherStatus && dispatcherStatus.status === 'idle') {
@@ -856,7 +862,10 @@ function cmdStatus(opts) {
       // recorded, `diedDraining` does not distinguish the two, so this caption states only what both
       // prove. In the bound case death is inferred, not measured: under the installed unit,
       // TimeoutStopSec SIGKILLs the process at most 60s past the bound; outside it, a SIGSTOPped or
-      // suspended process may still be alive).
+      // suspended process may still be alive) -- EXCEPT for `dispatcherStatus.rebooted` (card #208
+      // F8): a host reboot between the write and this read is a MEASURED death, not an inferred one
+      // (uptime resetting to near zero can only mean a reboot happened, and nothing -- the drain,
+      // the whole process -- survives one), so that one case gets its own, non-hedged wording below.
       // Never worded "STOPPED since <age> ago": nobody recorded a stop time, only a DRAIN start time --
       // `stoppedAge` above is the age of the drain-start event, not of the (unknown) moment the
       // process actually died, and captioning it as a stop time would state a fact nobody measured.
@@ -872,8 +881,11 @@ function cmdStatus(opts) {
       if (stoppedEvent.signal) extraParts.push(`signal ${stoppedEvent.signal}`);
       if (Array.isArray(stoppedEvent.inFlight)) extraParts.push(`${stoppedEvent.inFlight.length} in flight at drain start`);
       const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+      const deathNote = dispatcherStatus.rebooted
+        ? 'host rebooted since drain start -- process is certainly gone'
+        : 'process gone or past its drain bound';
       console.log(
-        `dispatcher: STOPPED -- drain never concluded (drain started ${stoppedAge} ago; no dispatcher-stopped recorded; process gone or past its drain bound; reason: ${reason})${extraNote}`
+        `dispatcher: STOPPED -- drain never concluded (drain started ${stoppedAge} ago; no dispatcher-stopped recorded; ${deathNote}; reason: ${reason})${extraNote}`
       );
     } else {
       const reason = stoppedEvent.reason || 'unknown';

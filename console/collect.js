@@ -852,7 +852,7 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
   return services;
 }
 
-// applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents) -- action 6.7,
+// applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs) -- action 6.7,
 // extended by card #186. Mutates `services.workers` in place with the SAME classification bin/spo's
 // cmdStatus renders per row (orchestrator/worker-status.js's describeLiveWorkers), filtered to
 // `isCardKind` tasks only -- the same filter collectDaemonStats already applies to its own `active`
@@ -872,7 +872,11 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
 // state the dispatcher is in. 'stopped' and 'idle' outrank the present/absent rule below; when
 // neither applies, that rule is unchanged. `daemonEvents` defaults to a fresh read here so this
 // function stays usable standalone -- every existing status-6.7 test calls it with no fifth
-// argument at all.
+// argument at all. `hostUptimeNowMs` (card #208), the sixth argument, defaults the same way -- to a
+// fresh `os.uptime() * 1000` read -- so every existing caller that predates this card (including
+// the fifth-argument-only ones above) still gets the real, current boot-relative reading rather
+// than `undefined` (which would silently skip computeDispatcherStatus's PREFERRED bound path for
+// every caller that has not been updated to inject it explicitly).
 // collectDeck(journalRoot, journalTasks, now) -> the cards the flight deck renders, newest
 // activity first. One entry per `onDeck` card kind:'card' (a report/triage task is not a run
 // along the track and has no splits to draw), each carrying the run built in collectJournalTasks
@@ -930,7 +934,7 @@ function collectDeck(journalRoot, journalTasks, now = Date.now()) {
     .sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
 }
 
-function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents) {
+function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs) {
   if (!journalRoot) return services;
   const kindById = new Map((journalTasks || []).map((t) => [t.id, t]));
   const worker = describeLiveWorkers(journalRoot, null, now);
@@ -960,23 +964,34 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
   // `processAlive` reads that identically to ESRCH ("gone"), which would misreport a live-but-
   // foreign dispatcher as dead (`pidExists`'s own header in orchestrator/lock.js).
   //
-  // `now`/`killGraceMs` (card #188 follow-up) are ALSO injected here, never read inside
-  // computeDispatcherStatus itself -- `now` is collectAll's own `now` snapshot, the one it also
-  // hands collectServices, applyRetryChannelStats and collectReportPipeline, threaded through as
-  // this function's `now` parameter, never a fresh clock read here, and `killGraceMs` is this process's own
-  // `orchestrator/config.js`'s `drainKillGraceMs`, required lazily here (same pattern as this
-  // file's other config reads -- see collectAll's own `spoReportsDir` fallback and
-  // `collectReportPipeline`'s `result.pull.configured`, both below) so a test context with no
-  // config module reachable degrades to "no bound" rather than throwing. Together they let a
-  // reader bound an UNCONCLUDED drain-start past its own `timeoutMs` plus that grace as STOPPED
-  // even when a reused pid would otherwise read it alive forever.
+  // `now`/`hostUptimeNowMs`/`killGraceMs` (card #188 follow-up, card #208) are ALSO injected here,
+  // never read inside computeDispatcherStatus itself -- `now` is collectAll's own `now` snapshot,
+  // the one it also hands collectServices, applyRetryChannelStats and collectReportPipeline,
+  // threaded through as this function's `now` parameter, never a fresh clock read here;
+  // `hostUptimeNowMs` is this function's own sixth parameter (see this function's header for why it
+  // defaults to a fresh `os.uptime() * 1000` rather than being required) -- the PREFERRED,
+  // boot-relative, cross-process-comparable age reading a card #208 `dispatcher-drain-start`
+  // carries alongside its wall-clock `ts` (console/dispatcher-status.js's own header has the full
+  // reasoning); and `killGraceMs` is this process's own `orchestrator/config.js`'s
+  // `drainKillGraceMs`, required lazily here (same pattern as this file's other config reads --
+  // see collectAll's own `spoReportsDir` fallback and `collectReportPipeline`'s
+  // `result.pull.configured`, both below) so a test context with no config module reachable
+  // degrades to "no bound" rather than throwing. Together they let a reader bound an UNCONCLUDED
+  // drain-start past its own `timeoutMs` plus that grace as STOPPED even when a reused pid would
+  // otherwise read it alive forever, on a clock that cannot be fooled by this box's own measured
+  // wall-clock steps.
   let killGraceMs;
   try {
     killGraceMs = require('../orchestrator/config').drainKillGraceMs;
   } catch {
     /* config module unavailable in this test context -- no bound applies, same as a missing `now` */
   }
-  const dispatcher = computeDispatcherStatus(events, { isAlive: pidExists, now, killGraceMs });
+  const dispatcher = computeDispatcherStatus(events, {
+    isAlive: pidExists,
+    now,
+    hostUptimeNowMs: Number.isFinite(hostUptimeNowMs) ? hostUptimeNowMs : os.uptime() * 1000,
+    killGraceMs,
+  });
   if (dispatcher && dispatcher.status === 'stopped') {
     services.workers.status = 'stopped';
   } else if (dispatcher && dispatcher.status === 'draining') {
@@ -1010,6 +1025,12 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
       inFlight: Array.isArray(ev.inFlight) ? ev.inFlight.length : null,
       timeoutMs: typeof ev.timeoutMs === 'number' ? ev.timeoutMs : null,
       diedDraining: dispatcher.diedDraining === true,
+      // Card #208 (F8): `dispatcher.rebooted` (computeDispatcherStatus's own result field, not
+      // `ev`'s -- it is derived by comparing `hostUptimeNowMs` against `ev.hostUptimeAtMs`, never
+      // read off the event alone) is the ONE case where a diedDraining 'stopped' is a MEASURED
+      // death rather than an inferred one -- see render.js's caption for why that distinction is
+      // worth threading through rather than leaving this true whitelist filter to silently drop it.
+      rebooted: dispatcher.rebooted === true,
     };
   } else {
     services.workers.dispatcher = null;
@@ -1425,6 +1446,10 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
   })();
   const usageSnapshot = collectUsageSnapshot(journalRoot);
   const now = Date.now();
+  // Card #208: read once here, same reasoning as `now`/`daemonEvents` immediately below -- one
+  // `os.uptime()` snapshot for the whole collectAll call rather than a fresh read inside
+  // applyWorkerStats, so a single dashboard render is internally consistent.
+  const hostUptimeNowMs = os.uptime() * 1000;
   // Card #186: the daemon-events tail is read ONCE here and handed to both consumers below --
   // applyWorkerStats (dispatcher liveness) and collectReportPipeline (24h counters plus dispatcher
   // history) -- rather than each calling readDaemonEventsTail(journalRoot) on its own, which would
@@ -1434,7 +1459,14 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
   // computed here, once, rather than inside collectServices, which several existing tests call
   // bare (see that function's own comment on `services.workers`).
   const services = applyRetryChannelStats(
-    applyWorkerStats(collectServices({ journalRoot, queueDir, benchRoot, now }), journalRoot, journalTasks, now, daemonEvents),
+    applyWorkerStats(
+      collectServices({ journalRoot, queueDir, benchRoot, now }),
+      journalRoot,
+      journalTasks,
+      now,
+      daemonEvents,
+      hostUptimeNowMs
+    ),
     journalTasks,
     now
   );

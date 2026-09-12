@@ -1366,7 +1366,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1231",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1243",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1397,7 +1397,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1231",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1243",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:157",
@@ -1412,7 +1412,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:900", // re-pinned from :893 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above reportIntakeColumn, a true pure shift; content byte-identical at :900
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1190",
+  "doc/state-machine-spec.md :: bin/spo:1202",
   "doc/state-machine-spec.md :: dispatcher.js:634-648",
   "doc/state-machine-spec.md :: intake.js:936-938", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -2535,7 +2535,7 @@ test('MUTATION PROOF: reverting run.ts:63 back to run.ts:64 (the historical bug)
   assert.equal(found63, true, 'the real, fixed :63 citation must anchor cleanly');
 });
 
-test('MUTATION PROOF: reverting bin/spo:1231 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
+test('MUTATION PROOF: reverting bin/spo:1243 back to bin/spo:1129 (the drift this check caught again) makes it red, on the real files', () => {
   const raw = read('doc/bench-plan-derived-2026-09-02.md');
   const withoutFences = stripFences(raw);
   const normalized = normalizeWrap(withoutFences);
@@ -2609,7 +2609,10 @@ test('MUTATION PROOF: reverting bin/spo:1231 back to bin/spo:1129 (the drift thi
   // "collect"-shaped candidate nearby, so it still fails for the right reason. Paid eleven times.
   //
   // TWELFTH catch, 2026-09-11, same card (the drain-that-reads-DRAINING-forever follow-up): the
-  // dispatcher-drain-start age bound (`now`/`killGraceMs` injected into computeDispatcherStatus,
+  // dispatcher-drain-start age bound (`now`/`killGraceMs` injected into computeDispatcherStatus --
+  // card #208 (2026-09-12) later added a third injected option, `hostUptimeNowMs`, to this same
+  // bound; not present yet at the time of THIS catch, named here only so this description does not
+  // go on describing a two-option bound after a third option exists --
   // plus the matching rewording of `spo status`'s own top-of-file subcommand inventory, the
   // DRAINING-branch comment, and the diedDraining-branch comment) added 21 net lines above
   // `cmdDashboard` (measured at the time: `git diff --stat -- bin/spo` read 35 insertions, 14 deletions),
@@ -2634,7 +2637,20 @@ test('MUTATION PROOF: reverting bin/spo:1231 back to bin/spo:1129 (the drift thi
   // -- 2 lines above the TWELFTH catch's own construct, which this round's +2 pushed from :1129 to
   // :1131 (`    }`, the same reconciled-row branch's closing brace) -- still no "collect"-shaped
   // candidate nearby, so it still fails for the right reason. Paid thirteen times.
-  const reverted = normalized.replace('reached from `bin/spo:1231`', 'reached from `bin/spo:1129`');
+  //
+  // FOURTEENTH catch, 2026-09-12 (card #208, the dispatcher-status drain-bound clock fix pass):
+  // threading `hostUptimeAtMs`/`hostUptimeNowMs` through `bin/spo`'s `cmdStatus` (the injected-
+  // options comment above `computeDispatcherStatus`'s call, the call itself, and -- a second,
+  // later edit in this same fix pass, F8 -- widening the `diedDraining` caption's own comment and
+  // adding its `rebooted`-branching `deathNote`) is net +12 lines (19 added, 7 removed -- `git
+  // diff --numstat -- bin/spo`), pushing `collectAll(sources)` down again, from :1231 to :1243.
+  // The canary stays `:1129` -- re-checked empirically against the new file: line 1129 is now a
+  // comment inside `cmdParked` (`// printed under its own heading instead. Measured 2026-09-01: 3
+  // of 3 parked-or-abandoned`), pushed there from the THIRTEENTH catch's own `if ((state.state ===
+  // 'PARKED' ...` line by this card's own insertions landing above it (inside `cmdStatus`), still
+  // no "collect"-shaped candidate nearby, so it still fails for the right reason. Paid fourteen
+  // times.
+  const reverted = normalized.replace('reached from `bin/spo:1243`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
