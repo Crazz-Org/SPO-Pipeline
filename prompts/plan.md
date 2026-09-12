@@ -160,7 +160,7 @@ you are drafting the file content, not a description of it.
   and never backgrounded with a trailing `&` — both destroy the code the driver needs to read.
   If a command's output must be trimmed, redirect to a file and let the reader filter the file,
   not the live stream.
-- Effort is chosen by the caller from `{{task_size}}` (S/M/L → low/medium/high) — you do not
+- Effort is chosen by the caller from `{{task_size}}` (S/M/L → medium/high/high) — you do not
   reason about it, but a plan for an `L` task is expected to carry proportionally more
   invariants and checks than an `S` one.
 - Your reply is read by a script, not a human. Output **only** the JSON object described in the

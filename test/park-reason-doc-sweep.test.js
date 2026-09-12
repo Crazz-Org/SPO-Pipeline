@@ -1008,13 +1008,13 @@ test('parkSignalSpans + blankComments: a reason only named in a comment is never
 });
 
 // Real-corpus guard for the same mutation: FINDING 2 also measured that blankComments matters on
-// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1031 has one genuine
+// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1089 has one genuine
 // commented-out `throw new ParkSignal('validate-unrecognized-verdict', ...)` inside a prose
 // comment (its own header, describing action 1.4's history), and blanking it away is what keeps
 // the reported call-site count from over-counting it as a live site. Pinned to the exact numbers
 // measured 2026-09-02 so a future change to state-machine.js's comment (or a regression in
 // blankComments) is caught by name, not just by a shrinking/growing floor.
-test('blankComments on the real corpus removes exactly the one known commented-out ParkSignal site (state-machine.js:1031)', () => {
+test('blankComments on the real corpus removes exactly the one known commented-out ParkSignal site (state-machine.js:1089)', () => {
   const rawSource = readSource(path.join('orchestrator', 'state-machine.js'));
   const blanked = blankComments(rawSource);
   const blankedCount = parkSignalSpans(blanked).length;

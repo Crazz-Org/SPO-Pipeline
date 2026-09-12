@@ -109,9 +109,11 @@ test('dry-run demo: dryrun-PLAN.md shows the argv (--model/--effort/--json-schem
 
   assert.match(content, /## argv/);
   assert.match(content, /--model/);
-  assert.match(content, /fable/); // no escalation flags set -> base model
+  // EXP-PLAN-OPUS (doc/model-experiments.md): no planInvalidRetry -> PLAN's base model, Opus. Matched
+  // as the exact argv pair, since a bare /opus/ or /high/ could match the filled prompt below it.
+  assert.match(content, /"--model","opus"/);
   assert.match(content, /--effort/);
-  assert.match(content, /medium/); // size "M" -> effort "medium"
+  assert.match(content, /"--effort","high"/); // size "M" -> effort "high" (PLAN_EFFORT_BY_SIZE)
   assert.match(content, /--json-schema/);
   assert.match(content, /plan_markdown/); // PLAN's output contract, inside the json-schema
 

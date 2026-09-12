@@ -549,7 +549,7 @@ test('handleValidate: rdoDiffTouched as a non-boolean ("false" string or 0) is n
     // The journal disagrees with the in-memory non-boolean value: if the resolver ever coerced
     // rdoDiffTouched instead of requiring typeof === 'boolean', it would use this falsy value and
     // skip, hiding the real journal signal (touched: true) underneath -- the same `=== true`
-    // strict-equality class of bug measured at step-contracts.js:326's shouldEscalate.
+    // strict-equality class of bug measured at step-contracts.js:354's shouldEscalate.
     appendEvent(taskDir, 'PUSH_PR', 'rdo-diff-derived', { touched: true, path: 'src/shared/rdo-members.ts' });
 
     const task = {

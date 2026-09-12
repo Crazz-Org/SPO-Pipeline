@@ -28,9 +28,12 @@ const path = require('path');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 
-// spec: "per task size S/M/L -> low/medium/high" (PLAN, IMPLEMENT only -- DIAGNOSE and both
-// VALIDATE steps are pinned "high" regardless of size; validate-change.md's own text: "Effort
-// is high regardless of task size -- the mission is not proportional to diff size").
+// spec: "per task size S/M/L -> low/medium/high" -- the shared default for an `effort: 'bySize'`
+// step with no `effortBySize` of its own. Today no step falls back to it: PLAN and IMPLEMENT each
+// carry their own map (PLAN_EFFORT_BY_SIZE, IMPLEMENT_EFFORT_BY_SIZE, both below), and DIAGNOSE
+// and both VALIDATE steps are pinned "high" regardless of size (validate-change.md's own text:
+// "Effort is high regardless of task size -- the mission is not proportional to diff size").
+// Kept as the historical baseline both experiments are measured against, and as the revert target.
 const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 
 // IMPLEMENT_EFFORT_BY_SIZE -- IMPLEMENT no longer shares PLAN's map: its S row is 'medium'.
@@ -66,11 +69,36 @@ const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 // per merged card do not fall below ~2.0, revert this map to { S: 'low', M: 'medium', L: 'high' };
 // the experiment will have answered no, which is a result worth having either way.
 //
-// PLAN deliberately keeps the shared map. Its cost is essentially all per-turn (fit over 9 real
-// calls: fixed ~= 0, 4,531/turn, R^2 = 0.89), and its `L -> high` row was the one configuration
-// that had never completed, until #516 completed it twice post-raise (864.152s, 1123.965s, both
-// `ok: true`) -- see LLM_STEP_DEADLINE_MS_BY_STEP.
+// PLAN kept the shared map until 2026-09-13 and now carries its own (PLAN_EFFORT_BY_SIZE, below).
+// Its cost is essentially all per-turn (fit over 9 real calls: fixed ~= 0, 4,531/turn,
+// R^2 = 0.89), and its `L -> high` row was the one configuration that had never completed, until
+// #516 completed it twice post-raise (864.152s, 1123.965s, both `ok: true`) -- see
+// LLM_STEP_DEADLINE_MS_BY_STEP.
 const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
+
+// PLAN_EFFORT_BY_SIZE -- PLAN's own map since 2026-09-13, the day PLAN moved from Fable-only to
+// Opus-first with Fable as its fallback (maintainer decision, for cost -- see the PLAN entry in
+// STEP_CONTRACTS for the fallback trigger). THIS IS AN EXPERIMENT, NOT A MEASURED RESULT. It is
+// registered as EXP-PLAN-OPUS in doc/model-experiments.md, together with its baseline, the metrics
+// that settle it, and the revert criterion. Read that entry before changing the model or this map,
+// and update it when you do.
+//
+// Why one rung above the shared map: the trade the maintainer chose is a cheaper model at more
+// effort, not a cheaper model at the same effort. L stays 'high' rather than 'xhigh' because of the
+// deadline: Fable's L/high cell ran a 825s median against PLAN's 1,800,000ms, and the in-run Fable
+// fallback can spend a second full call after the first one.
+//
+// Fable baseline: every PLAN llm-call journaled in ~/.spo-state/journal up to 2026-09-13, medians
+// over all calls, failed ones included (`node scripts/model-report.js --step=PLAN
+// --until=2026-09-13` re-derives these):
+//   fable/low     n=103  ok=98   217s    83,596 billable   26 turns
+//   fable/medium  n=66   ok=57   473s   164,428 billable   49 turns
+//   fable/high    n=8    ok=3    825s   311,387 billable   64 turns  (includes the pre-raise
+//                                                                     deadline kills of #486)
+// The IMPLEMENT caveat above applies here too: effort is a pure function of size, so a cell compares
+// card populations as much as settings. One map serves both models, so a Fable fallback call also
+// runs at the raised effort.
+const PLAN_EFFORT_BY_SIZE = { S: 'medium', M: 'high', L: 'high' };
 
 const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 
@@ -349,17 +377,28 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_
 //                            ctx.counters.validateRejects > 0` immediately before the call -- a
 //                            retry after a DIAGNOSE or a VALIDATE reject escalates on OBSERVED
 //                            difficulty, independent of the wire/plan signals above.
+//   - 'planInvalidRetry'  -- PLAN only (EXP-PLAN-OPUS, 2026-09-13). task.planInvalidRetry === true,
+//                            strictly boolean, assigned by handlePlan (state-machine.js) right
+//                            before each PLAN call. It is true in two cases: the card's most recent
+//                            park was plan-invalid, or it is the ONE in-run retry that follows a
+//                            real-mode Opus reply which would have parked plan-invalid. This is
+//                            the model-layer fallback the removal note above called "a separate
+//                            design decision", and it was taken for plan QUALITY, not for quota. A
+//                            Fable quota exhaustion is still handled by account rotation + cooldown.
 const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
-    baseModel: 'fable',
-    // No escalation. Both docs described one -- the spec's "Opus 5 fallback", README's matching
-    // row -- and neither was reachable: the only trigger PLAN carried was 'escalateFlag', which
-    // nothing sets (see the removal note above). Removed rather than left as decoration, so the
-    // table says what the code does.
-    escalatedModel: null,
-    escalatesOn: [],
+    baseModel: 'opus',
+    // EXP-PLAN-OPUS (2026-09-13, maintainer decision, for cost): Opus first, Fable as the fallback.
+    // Until then PLAN was Fable with no escalation. The "Opus 5 fallback" promised before 2026-09-04
+    // hung on 'escalateFlag', which nothing set -- see the removal note above. This trigger is
+    // reachable by construction, because handlePlan assigns task.planInvalidRetry itself.
+    // doc/model-experiments.md registers the experiment with its baseline and revert criterion;
+    // keep that entry in step with this one.
+    escalatedModel: 'fable',
+    escalatesOn: ['planInvalidRetry'],
     effort: 'bySize',
+    effortBySize: PLAN_EFFORT_BY_SIZE, // one rung above the shared map -- see that map's comment
     // Spec + README table both say "Read, Grep, Glob, Bash(ro)" -- the "(ro)" is enforced by
     // the prompt's own text ("you hold no edit tool there") and by permissionMode below, not
     // by a distinct --allowedTools value (the CLI has no read-only Bash sub-permission to pass
@@ -552,6 +591,11 @@ function shouldEscalate(stepDef, task) {
   if (task && task.diagnoseOrValidateRetry === true && stepDef.escalatesOn.includes('diagnoseOrValidateRetry')) {
     return true;
   }
+  // PLAN's Fable fallback (EXP-PLAN-OPUS). Independent of every other signal, so it sits above
+  // the RDO block for the same reason trigger 4 does.
+  if (task && task.planInvalidRetry === true && stepDef.escalatesOn.includes('planInvalidRetry')) {
+    return true;
+  }
   if (task && stepDef.escalatesOn.includes('planDeclaresRdoMembers')) {
     if (task.rdoDiffTouched === true) return true; // source 1: the real diff
     if (task.planDeclaresRdoMembers === true) return true; // source 2: the plan declared it
@@ -644,6 +688,7 @@ module.exports = {
   STEP_CONTRACTS,
   EFFORT_BY_SIZE,
   IMPLEMENT_EFFORT_BY_SIZE,
+  PLAN_EFFORT_BY_SIZE,
   LLM_STEP_DEADLINE_MS,
   LLM_STEP_DEADLINE_MS_BY_STEP,
   MAX_LLM_STEP_DEADLINE_MS,
