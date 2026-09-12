@@ -9,6 +9,12 @@ const fs = require('fs');
 const path = require('path');
 
 const { mkTmp } = require('./helpers');
+// Killswitch first, textually, before this file's own `require('../console/...')` /
+// `require('../scripts/...')` below -- card SPO-Pipeline#205: the sweep used to know only the
+// `../orchestrator/` and `../bin/` spellings, so a console module that started spawning would
+// have run its child in this very process with live credentials, unguarded. The sweep now
+// enforces this line's presence; see test/no-real-spawn.js's header.
+require('./no-real-spawn');
 const { createDashboardServer } = require('../console/serve');
 const { loadRollups } = require('../console/usage-rollups');
 
