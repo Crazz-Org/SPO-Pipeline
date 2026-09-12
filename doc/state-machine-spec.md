@@ -209,10 +209,10 @@ low.
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
 | PLAN | Fable 5 — no escalation (the promised "Opus 5 fallback" was unreachable and was removed 2026-09-04) | per task size S/M/L → low/medium/high | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
-| IMPLEMENT | Sonnet 5 — **Opus 5 on `task.touchesRdoMembers`**, set once at intake from the issue's own Area field or a literal `rdo-members.ts` mention in its body[^rdo-wire], or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
+| IMPLEMENT | Sonnet 5 — **Opus 5** on any of four triggers (`step-contracts.js`'s `shouldEscalate`, card #213 action 2 + its 2026-09-12 amendment): (1) `task.rdoDiffTouched === true`, the real diff once PUSH_PR has run; (2) `task.planDeclaresRdoMembers`, the PLAN's own `files_to_change` declaration naming `rdo-members.ts` (resolved by `state-machine.js`'s `resolvePlanDeclaresRdoMembers` before the call — an EMPTY declared list still counts and resolves `false`, with no fallback to (3)); (3) `task.touchesRdoMembers === true`[^rdo-wire], the intake guess, read only when (2) is undefined (PLAN never declared a list at all); or (4) `task.diagnoseOrValidateRetry === true` — a retry after a DIAGNOSE or a VALIDATE reject, independent of the RDO signals, escalating on observed difficulty; or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
 | DIAGNOSE | Opus 5 (was Fable 5 until 2026-09-04) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
-| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when `task.touchesRdoMembers` is true (`step-contracts.js`'s `escalatesEffortOn`) — an intake guess that the real diff can only raise false→true, and only in memory for the rest of that run (a re-enqueue or resume rebuilds the task from `task.json`'s intake value), so an intake-true call gets xhigh even if the diff never touches the RDO wire | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when `task.rdoDiffTouched` is true (`step-contracts.js`'s `escalatesEffortOn`) — **action 1 of card #213 (2026-09-12)** moved this off `task.touchesRdoMembers` (an intake guess): on the 36-card window measured that day, the guess fired on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` calls under the old trigger judged a diff with no RDO in it. `rdoDiffTouched` is written onto `ctx.task` by `handleValidate` (`state-machine.js`, from `resolveRdoDiffTouched`) before this call, so a `--worker` resume that rebuilt `ctx.task` from `task.json` still escalates correctly, the same restart-durability `resolveRdoDiffTouched` already gave CITATION_VERIFIER's own trigger (#105) | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
 
 The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LLM_STEP_DEADLINE_MS_BY_STEP`
 overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
@@ -229,19 +229,28 @@ decision and the bounds that actually are enforced.
 [^rdo-wire]: `task.touchesRdoMembers` (`intake.js`'s `makeTask`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
     stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
     `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session-phase code — but only
-    detects a slice of it, and is set once at intake, before a plan exists. No step ever
-    re-derives it against the *plan*; PUSH_PR (`steps/scripted.js`) does re-derive it from the
-    real diff, but only for the literal file `src/shared/rdo-members.ts` and only one way
-    (false→true). **On IMPLEMENT's first pass that correction arrives too late — PUSH_PR runs
-    after it — so the first IMPLEMENT sees the intake value alone. It is NOT too late for the
-    retries.** `runTask` carries one `ctx` across every hop and `steps/llm.js` re-reads
-    `ctx.task` at each call, so any IMPLEMENT re-entered afterwards — from `handleDiagnose`, from
-    `handleValidate` on a REJECT under budget, or from a Lint / Coverage-of-changed-lines CI
-    retry via `ci-cause-table.js`'s `classifyCiFailure` — runs with the corrected flag, and was
-    measured spawning `--model opus` on exactly that path. The promotion is one-way for this
-    reason: lowering it at
-    PUSH_PR would silently demote those retries to sonnet. The diff-derived truth for VALIDATE's
-    citation-verifier lives in the separate `rdoDiffTouched` field instead.
+    detects a slice of it, and is set once at intake, before a plan exists. Card #213 action 2
+    (2026-09-12) gave IMPLEMENT's own escalation two steps that DO re-derive against better
+    evidence, checked before this field: PLAN's own declared `files_to_change`
+    (`task.planDeclaresRdoMembers`, resolved fresh at each IMPLEMENT call — see the row above), and
+    the real diff once PUSH_PR has run (`task.rdoDiffTouched`, re-derived from the literal file
+    `src/shared/rdo-members.ts` and journaled both ways — see `rdo-symmetry` above). This field is
+    read only when PLAN never declared a `files_to_change` list at all, i.e. as the last of the
+    three; it is still promoted `false→true` by PUSH_PR (`steps/scripted.js`) and never the other
+    way, for the same reason as before: **on IMPLEMENT's first pass, if neither of the two better
+    sources has an answer yet, the correction from PUSH_PR arrives too late** — PUSH_PR runs after
+    it, so the first IMPLEMENT sees the intake value alone. It is NOT too late for the retries.
+    `runTask` carries one `ctx` across every hop and `steps/llm.js` re-reads `ctx.task` at each
+    call, so any IMPLEMENT re-entered afterwards — from `handleDiagnose`, from `handleValidate` on
+    a REJECT under budget, or from a Lint / Coverage-of-changed-lines CI retry via
+    `ci-cause-table.js`'s `classifyCiFailure` — runs with the corrected flag (or, by then, with
+    `rdoDiffTouched` itself already resolved and taking priority over it), and was measured
+    spawning `--model opus` on exactly that path before #213. The promotion is one-way for this
+    reason: lowering it at PUSH_PR would silently demote those retries to sonnet — the exact hole a
+    naive "plan declaration always wins" order would have reopened from the other side, which is
+    why `rdoDiffTouched` outranks the plan declaration rather than the reverse. The diff-derived
+    truth for VALIDATE's citation-verifier lives in the separate `rdoDiffTouched` field, shared with
+    IMPLEMENT's own source 1 above rather than duplicated.
 
 Before any of the five calls above ever spawns, `steps/llm.js`'s real path fills the step's own
 `prompts/<file>.md` template against the values `task-values.js` derives for it

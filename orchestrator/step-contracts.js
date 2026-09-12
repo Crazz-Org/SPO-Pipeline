@@ -213,6 +213,46 @@ const LLM_STEP_DEADLINE_MS_BY_STEP = {
   IMPLEMENT: 1800000, // 30 min -- see the comment immediately above for the measurement and the bet
 };
 
+// ACTION 3 (card #213), measured 2026-09-12: THE LADDER IS SPENT. Per-call figures across the four
+// LLM steps, split at 2026-09-10 (before -> since) -- the raises above are 98fc04b (2026-09-04,
+// PLAN) and 6287cd2 (2026-09-08, card #158, IMPLEMENT): IMPLEMENT 26 -> 53 requests, $0.86 ->
+// $3.38, 226s -> 741s. PLAN 11 -> 16, $2.68 -> $4.46, 208s -> 434s. VALIDATE 7 -> 8, $1.24 ->
+// $2.01, 82s -> 233s. DIAGNOSE (deadline unchanged) 9 -> 13, $0.83 -> $0.92, 59s -> 142s.
+//
+// WINDOW AND DERIVATION, so a future reader can tell a DRIFTED figure from a WRONG one: the since
+// side is the cards whose first llm-call is >= 2026-09-10 -- 36 cards, 139 calls, $492.54 at the
+// time of measuring, on a LIVE daemon, so the window grows after this was written (re-measured the
+// same day at 150 calls it reads 98.0% / 3.85, against the 98.4% / 4.00 recorded below: drift, not
+// error). Dollars are tier-weighted relative effort on a Max subscription, not a bill. The
+// "requests" column is the ONE figure here NOT derivable from the journal: llm-call carries no
+// such field, and numTurns is not it (it reproduces IMPLEMENT's before-side 26 and then diverges,
+// 43 vs 53; PLAN's is not close either way). It comes from the card's transcript rejoin, which
+// walks the subagents/ subtree -- cited here rather than silently, because every other figure in
+// this block can be re-derived from ~/.spo-state/journal and that one cannot.
+//
+// THE ATTRIBUTION IS CONFOUNDED, stated plainly because the figures above invite the opposite
+// reading: 98fc04b, which raised PLAN's deadline, ALSO retuned models and effort on that same
+// 2026-09-04 change (IMPLEMENT's own size -> effort map among them) -- so no figure above isolates
+// the deadline's own effect from the rest of what that commit did. What the corpus DOES support is
+// the co-movement, not the deadline alone: DIAGNOSE is the one step whose deadline never moved (it
+// still takes LLM_STEP_DEADLINE_MS's 900000ms default above), and its cost per call is the one that
+// barely moved too -- $0.83 -> $0.92, +11%, against IMPLEMENT's +293% -- "barely moved", not "did
+// not move": the figure above is still an increase.
+//
+// Reliability rose over the same window -- 98.4% of calls now return ok:true, against 88.4% before,
+// at 4.00 calls/card against 5.60 -- under the identical confound: evidence the 2026-09-04 change
+// worked, not evidence of which part of it did.
+//
+// THE NEW CEILING IS ALREADY BINDING. Two IMPLEMENT calls were killed AT the 1,800,000ms deadline
+// on 2026-09-12 -- issue-542 (1,800.519s) and issue-544 (1,800.66s) -- the same failure shape this
+// override was raised to fix at 900,000ms, recurring now at 1,800,000ms.
+//
+// THE LADDER IS SPENT: reliability already sits at 98.4% and two calls hit the new ceiling anyway,
+// so a further raise is not aimed at what is actually failing them, and buys nothing the ladder was
+// meant to buy. The untried direction is DOWN: PLAN's own `L -> medium` (recommended above,
+// :145-146, still never run -- PLAN's effort is bySize, so no L-sized card has ever called PLAN
+// below `high`) is cheaper than another deadline increase and has not been measured either way.
+
 // The longest any single LLM call may legitimately run, across every step. MAX_LEASE_AGE_MS below
 // is derived from THIS, not from LLM_STEP_DEADLINE_MS: the moment one step got a longer deadline,
 // deriving the lease bound from the default would have understated the worst legitimate hold and
@@ -276,12 +316,39 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_
 //                            intake.js's makeTask only detects a slice of that
 //                            (`area === 'rdo' || /rdo-members\.ts/.test(body)`), once at
 //                            intake, before a plan exists.
-//                            As a MODEL signal this applies to IMPLEMENT only; VALIDATE's
-//                            change-validator reads the same flag through `escalatesEffortOn`
-//                            (effort high -> xhigh, model unchanged -- see its entry and
-//                            shouldEscalateEffort). Neither applies to PLAN. See the note
+//                            VALIDATE's change-validator reads this flag through
+//                            `escalatesEffortOn` (effort high -> xhigh, model unchanged -- see its
+//                            entry and shouldEscalateEffort). Does not apply to PLAN. See the note
 //                            on the PLAN entry below.
+//                            IMPLEMENT no longer lists this string in its own `escalatesOn` (card
+//                            #213, action 2) -- it reads task.touchesRdoMembers directly, as the
+//                            LAST of three sources, from inside its 'planDeclaresRdoMembers'
+//                            branch below. See that entry and shouldEscalate's own header.
 //   - 'lSize'             -- task.size === 'L', IMPLEMENT only ("... or L-sized task").
+//   - 'planDeclaresRdoMembers' -- IMPLEMENT only (card #213, action 2). NOT a single field read:
+//                            shouldEscalate resolves this trigger from THREE sources, most-
+//                            trustworthy first -- (1) task.rdoDiffTouched === true, strictly
+//                            boolean (the real diff, once PUSH_PR has run), (2)
+//                            task.planDeclaresRdoMembers (the plan's own declaration, resolved by
+//                            state-machine.js's resolvePlanDeclaresRdoMembers before the call --
+//                            true/false when PLAN declared a files_to_change list, even an EMPTY
+//                            one; undefined when it never declared at all), (3)
+//                            task.touchesRdoMembers === true, the fallback, reached only when (2)
+//                            was undefined. Escalating on a PLAN declaration rather than the
+//                            intake guess narrows the trigger to evidence the plan actually
+//                            produced; the fallback to touchesRdoMembers exists so a card that has
+//                            reached neither of the first two sources yet keeps today's pre-#213
+//                            behaviour, and in particular so scripted.js's touchesRdoMembers
+//                            false->true promotion after PUSH_PR (its own comment forbids the
+//                            reverse) still keeps a later IMPLEMENT retry on Opus. See
+//                            shouldEscalate's own header for the full order and why it is not
+//                            "plan first".
+//   - 'diagnoseOrValidateRetry' -- IMPLEMENT only (card #213's 2026-09-12 amendment, trigger 4).
+//                            task.diagnoseOrValidateRetry === true, set by handleImplement
+//                            (state-machine.js) from `ctx.counters.diagnoseAttempts > 0 ||
+//                            ctx.counters.validateRejects > 0` immediately before the call -- a
+//                            retry after a DIAGNOSE or a VALIDATE reject escalates on OBSERVED
+//                            difficulty, independent of the wire/plan signals above.
 const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
@@ -323,7 +390,13 @@ const STEP_CONTRACTS = {
     promptFile: path.join(PROMPTS_DIR, 'implement.md'),
     baseModel: 'sonnet',
     escalatedModel: 'opus',
-    escalatesOn: ['touchesRdoMembers', 'lSize'],
+    // Card #213, action 2 (+ 2026-09-12 amendment): 'touchesRdoMembers' (the intake guess) is
+    // gone from this list -- see this table's own preamble comment on 'touchesRdoMembers' and
+    // 'planDeclaresRdoMembers' for the three-source resolution the latter now drives, and
+    // shouldEscalate's header for why the intake guess is still read, just no longer named here.
+    // 'lSize' is untouched -- an L-sized card still escalates on size alone, independent of the
+    // other two.
+    escalatesOn: ['planDeclaresRdoMembers', 'lSize', 'diagnoseOrValidateRetry'],
     effort: 'bySize',
     effortBySize: IMPLEMENT_EFFORT_BY_SIZE, // floor raised to 'medium' -- see that map's comment
     // Neither doc enumerates the literal tool names behind "full edit tools in the worktree"
@@ -402,7 +475,7 @@ const STEP_CONTRACTS = {
     // change-validator judging the same diff.
     //
     // Fixed by escalating the lever that actually points up: EFFORT. The model stays Fable on
-    // every path, and the RDO wire buys `xhigh` instead of `high`.
+    // every path; `xhigh` now comes from the diff-derived `rdoDiffTouched`, not intake's guess.
     //
     // Why xhigh is safe here: the escalation has already run -- 5 `xhigh` VALIDATE calls (#385,
     // #489, #507, #640 x2), all `ok: true`, mean 245.84s, mean 98.6k billable, max 336.852s
@@ -414,7 +487,7 @@ const STEP_CONTRACTS = {
     escalatedModel: null,
     escalatesOn: [],
     escalatedEffort: 'xhigh',
-    escalatesEffortOn: ['touchesRdoMembers'],
+    escalatesEffortOn: ['rdoDiffTouched'],
     neverModel: 'sonnet', // documentation only -- 'sonnet' never appears as base or escalated
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
@@ -424,26 +497,100 @@ const STEP_CONTRACTS = {
   },
 };
 
-// task.touchesRdoMembers / task.size decide whether a step's model is escalated this call -- NOT
+// task.touchesRdoMembers / task.size / task.rdoDiffTouched / task.planDeclaresRdoMembers /
+// task.diagnoseOrValidateRetry decide whether a step's model is escalated this call -- NOT
 // task.escalate, which nothing reads on any step (removed 2026-09-04). Never true for a step
 // whose contract carries no escalatedModel at all (DIAGNOSE, CITATION_VERIFIER).
+//
+// Card #213, action 2 (+ its 2026-09-12 amendment): IMPLEMENT's 'planDeclaresRdoMembers' trigger
+// is NOT a single field read -- it is a THREE-SOURCE resolution, most-trustworthy first, and
+// deliberately in THIS order rather than "plan declaration first":
+//   1. task.rdoDiffTouched === true, strictly boolean -- the real diff, once PUSH_PR has run.
+//      Checked first because it is ground truth, when it exists.
+//   2. task.planDeclaresRdoMembers -- the plan's own declaration (resolved by state-machine.js's
+//      resolvePlanDeclaresRdoMembers, before the call): true/false when PLAN declared a
+//      files_to_change list, even an EMPTY one (guardDeclaredFiles's own header: "an empty list
+//      IS a declaration"); undefined when it never declared at all. A `false` here escalates
+//      false and does NOT fall through to source 3 -- the plan spoke and said no.
+//   3. task.touchesRdoMembers === true -- STILL NEEDED, as the fallback for a card that has
+//      reached neither of the above (no plan declaration at all, PUSH_PR hasn't run yet). This is
+//      IMPLEMENT's pre-#213 behaviour, kept so scripted.js's touchesRdoMembers false->true
+//      promotion after PUSH_PR (its own comment forbids the reverse) still keeps a later
+//      IMPLEMENT retry on Opus: a naive "plan declaration, then intake guess" order with no
+//      fallback would re-open that hole from the other side (a plan that omitted rdo-members.ts
+//      on a card whose diff later turned out to touch it would otherwise demote every following
+//      retry to Sonnet). Reached only when source 2 resolved to undefined.
+// All three reads live inside the ONE 'planDeclaresRdoMembers' branch below, gated by that one
+// escalatesOn entry -- IMPLEMENT's own contract no longer lists the literal string
+// 'touchesRdoMembers' (see the STEP_CONTRACTS preamble comment on both names), but the field
+// itself is still read, right here, as the documented step 3.
+//
+// Trigger 4 (2026-09-12 amendment): task.diagnoseOrValidateRetry === true, independent of the
+// three sources above -- a retry after a DIAGNOSE or a VALIDATE reject escalates on OBSERVED
+// difficulty (set by handleImplement, state-machine.js, from ctx.counters at call time). Being
+// INDEPENDENT is the whole point of it, so it is evaluated BEFORE the three-source block, which
+// returns out of the entire function on a `planDeclaresRdoMembers === false` card -- see the
+// comment at its call site for the 19-of-26 measurement that placement cost when it sat below.
 function shouldEscalate(stepDef, task) {
   if (!stepDef.escalatedModel) return false;
-  if (task && task.touchesRdoMembers === true && stepDef.escalatesOn.includes('touchesRdoMembers')) return true;
   if (task && task.size === 'L' && stepDef.escalatesOn.includes('lSize')) return true;
+  // Trigger 4 is evaluated HERE, ahead of the RDO block, and the placement is load-bearing rather
+  // than stylistic. The block below ends a `planDeclaresRdoMembers === false` card by returning
+  // out of the WHOLE function, so with trigger 4 underneath it the amendment's own "independent"
+  // trigger was unreachable for every card whose plan declared a list not naming the catalogue.
+  // Measured on ~/.spo-state/journal before this fix: 81 of 100 cards with a PLAN result declared
+  // a list, 5 name rdo-members.ts, so 76 resolve `false`; of the 26 cards that ever ran DIAGNOSE
+  // or took a VALIDATE reject -- trigger 4's entire population -- 19 (73%) never reached it. It
+  // fired on 7. Order among independent OR-triggers cannot change a result, which is why hoisting
+  // is safe and why `lSize` already sits above the block for the same reason. The tempting
+  // alternative -- guarding the block with `&& task.planDeclaresRdoMembers !== false` -- was
+  // measured and REJECTED: it skips source 1, so a card with a no-catalogue declaration whose diff
+  // DID touch the catalogue demotes to Sonnet on every retry, reopening exactly the hole that
+  // realPushPr's one-way touchesRdoMembers promotion (steps/scripted.js) exists to prevent.
+  // Referred to by name, not by file:line, deliberately: this card moved that block's line numbers
+  // three times in one lot, and a name does not drift.
+  if (task && task.diagnoseOrValidateRetry === true && stepDef.escalatesOn.includes('diagnoseOrValidateRetry')) {
+    return true;
+  }
+  if (task && stepDef.escalatesOn.includes('planDeclaresRdoMembers')) {
+    if (task.rdoDiffTouched === true) return true; // source 1: the real diff
+    if (task.planDeclaresRdoMembers === true) return true; // source 2: the plan declared it
+    if (task.planDeclaresRdoMembers === false) return false; // declared, and said no -- blocks SOURCE 3 only; trigger 4 already ran above
+    if (task.touchesRdoMembers === true) return true; // source 3: intake's guess, undeclared plan
+  }
   return false;
 }
 
 // The effort-side twin of shouldEscalate, reading `escalatedEffort`/`escalatesEffortOn` instead of
 // `escalatedModel`/`escalatesOn`. Deliberately a SEPARATE function and a separate pair of fields:
 // a step may escalate on one axis, the other, or neither, and VALIDATE is the case that forced the
-// split -- it escalates effort and must never escalate model (see its entry). Same signal
-// vocabulary as shouldEscalate so a reader learns one set of names, and false for any step with no
-// escalatedEffort at all, which is every step except VALIDATE.
+// split -- it escalates effort and must never escalate model (see its entry). False for any step
+// with no escalatedEffort at all, which is every step except VALIDATE.
+//
+// ACTION 1 (card #213), measured 2026-09-12: 'rdoDiffTouched' replaces 'touchesRdoMembers' in
+// THIS function's own vocabulary -- the two functions no longer share one signal set for the RDO
+// wire ('lSize' is still shared). VALIDATE's escalatesEffortOn now names task.rdoDiffTouched
+// (resolveRdoDiffTouched, state-machine.js's handleValidate) instead of the intake guess: on the
+// 36-card window from 2026-09-10, intake's touchesRdoMembers fired on 23 of 36 cards while the
+// merged diff actually touched rdo-members.ts on only 2, so 17 of 19 xhigh VALIDATE calls judged a
+// diff with no RDO in it at all ($2.35 vs $1.60 for `high`, ~$10.07 of the window -- the window's
+// one VALIDATE rejection, issue-536, came from a `high` call). Precedent: #105 (2026-09-06) made
+// the same correction for CITATION_VERIFIER's own trigger.
+//
+// The touchesRdoMembers branch this function used to carry is DROPPED, not kept as unreachable
+// decoration: VALIDATE was the only step with an escalatedEffort at all, so once its
+// escalatesEffortOn stopped naming 'touchesRdoMembers' nothing in STEP_CONTRACTS names it here any
+// more -- the same "a signal nothing sets" situation 'escalateFlag' was in above shouldEscalate's
+// own vocabulary comment, and removed for the same reason (see that comment). shouldEscalate (the
+// model-side twin) still reads task.touchesRdoMembers -- action 2 (card #213, landed after this
+// comment was first written) folded it into IMPLEMENT's 'planDeclaresRdoMembers' branch as that
+// resolution's step-3 fallback, rather than dropping it the way this function did; see
+// shouldEscalate's own header for why MODEL escalation still needs it and EFFORT escalation here
+// does not.
 function shouldEscalateEffort(stepDef, task) {
   if (!stepDef.escalatedEffort) return false;
   const on = stepDef.escalatesEffortOn || [];
-  if (task && task.touchesRdoMembers === true && on.includes('touchesRdoMembers')) return true;
+  if (task && task.rdoDiffTouched === true && on.includes('rdoDiffTouched')) return true;
   if (task && task.size === 'L' && on.includes('lSize')) return true;
   return false;
 }
