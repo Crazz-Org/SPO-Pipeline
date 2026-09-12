@@ -63,7 +63,10 @@
 //         outputContract-satisfying object marked {dryRun: true}. Otherwise invokeClaudeReal
 //         runs for real, and a successful reply's `result` string is JSON.parsed and checked
 //         against outputContract.required -- a missing key returns the same {kind: 'error'}
-//         shape invokeClaudeReal itself uses for a spawn/parse failure.
+//         shape invokeClaudeReal itself uses for a spawn/parse failure. Card #207: a required key
+//         that IS present but fails its outputContract.types entry (step-contracts.js's
+//         checkOutputTypes) returns that identical {kind: 'error'} shape too -- a key with no
+//         declared type is untouched, presence-checked only, exactly as before this card.
 //     Every sub-path resolves cwd via config.cwdForStep, takes the account from ctx.account (set
 //     by the caller's account-rotation retry loop -- see state-machine.js's callLlmStep), and
 //     journals one event per call (an 'llm-call' for a real attempt, a 'dry-run' for a dry one).
@@ -104,7 +107,7 @@ const { sleep } = require('./scripted');
 const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
-const { resolveStepContract, deadlineMsForStep } = require('../step-contracts');
+const { resolveStepContract, deadlineMsForStep, checkOutputTypes } = require('../step-contracts');
 const { isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
@@ -1095,6 +1098,29 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       ok: false,
       kind: 'error',
       error: `llm.js: ${stepName} reply missing required key(s): ${missingKeys.join(', ')}`,
+      sessionId: raw.sessionId,
+      ...tokenFieldsFrom(raw),
+      numTurns: raw.numTurns,
+      raw: raw.raw,
+    };
+  }
+
+  // Card #207: every required key is now confirmed present -- check the ones step-contracts.js
+  // also declares a type for. checkOutputTypes mutates parsedPayload in place for any array-typed
+  // key whose value arrived as a JSON-encoded string that parses to the right shape (the same
+  // leniency park-loop.js's normalizeFindingsPayload already applies for its own callers), so a
+  // downstream reader of the returned payload sees the real array either way. A key that is
+  // present but genuinely wrongly typed is reported through the exact same failure shape as a
+  // missing key above -- same {ok:false, kind:'error', ...} fields, never a new failure channel --
+  // naming the key, its declared type, and what actually arrived, so a park report says something
+  // more useful than "reply missing required key(s)" for a key that was never missing at all.
+  const { failures: typeFailures } = checkOutputTypes(parsedPayload, contract.outputContract);
+  if (typeFailures.length > 0) {
+    const describe = (f) => `${f.key} (expected ${f.type}, got ${JSON.stringify(f.received)})`;
+    return {
+      ok: false,
+      kind: 'error',
+      error: `llm.js: ${stepName} reply has wrongly-typed key(s): ${typeFailures.map(describe).join(', ')}`,
       sessionId: raw.sessionId,
       ...tokenFieldsFrom(raw),
       numTurns: raw.numTurns,

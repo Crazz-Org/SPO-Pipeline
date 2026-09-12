@@ -226,6 +226,39 @@ end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-u
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
 
+**`outputContract` types (card #207, 2026-09-12; fix pass same day).** Every `required` list above
+now has an optional sibling, `types` — a plain per-key label (`string`/`number`/`boolean`/`object`/
+`array`/`<elementType>[]`, e.g. `string[]`). `steps/llm.js`'s reply check runs `checkOutputTypes`
+(`step-contracts.js`) right after the existing presence filter: a required key with a declared type
+that arrives wrongly typed fails the same way a missing key does, naming the key, its declared
+type, and what actually arrived. A present `null` never fails (it already satisfied the presence
+check before this card, and stays a wildcard against every declared type); an array-typed key also
+accepts a JSON-encoded STRING that parses to an array of the right element type, normalizing it in
+place — the same leniency `park-loop.js`'s `normalizeFindingsPayload` already applies for its own
+callers.
+
+The FIRST build of this card declared a type for a key whenever its shape looked settled from
+reading the key's own prompt file, without replaying the live corpus against it first — an Opus
+verifier's corpus replay found two of those declarations (IMPLEMENT's `tests_run`/`invariants`)
+wrong: both arrive as a JSON-encoded string 100% of the time, and roughly a third of real replies
+parse to a shape (an array of `{cmd|command, exit_code}` objects; a prose sentence) the declared
+type would have rejected, parking real, already-working replies. This same-day fix pass corrected
+that: the actually-enforced set today is `verdict` (VALIDATE, CITATION_VERIFIER), `root_cause`
+(DIAGNOSE), `plan_markdown`/`invariants_markdown` (PLAN), and `summary` (IMPLEMENT) — five keys,
+each corpus-replayed against every real reply in `~/.spo-state/journal/` with zero failures found —
+except `root_cause`, which has no literal wire record to replay at all (`handleDiagnose` renames it
+to `rootCause` before journalling, unlike every other key here) and was instead replayed via that
+renamed field as a faithful proxy for the model's actual value.
+Every other required key across the five steps — VALIDATE's `reasons`/`findings`, CITATION_VERIFIER's
+`entries`, IMPLEMENT's `all_green`/`files_changed`/`invariants`/`tests_run`, PLAN's
+`invariant_ids`/`check_commands` (and PLAN's optional `files_to_change`) — carries real, measured
+type drift and stays undeclared by necessity, not by oversight: `step-contracts.js`'s own header
+comment records the corpus/test evidence for each one. `resolveStepContract`'s `--json-schema`
+envelope now also carries a `properties` object built from the same `types` map (omitted entirely
+for a step that declares none), so the schema sent to the model matches the shape the pipeline
+enforces — whether the harness actually enforces `--json-schema` at all remains unmeasured, same as
+before this card.
+
 [^rdo-wire]: `task.touchesRdoMembers` (`intake.js`'s `makeTask`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
     stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
     `src/shared/rdo-*`, `src/server/rdo.ts`, `rdo-members.ts`, session-phase code — but only

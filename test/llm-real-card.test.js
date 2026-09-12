@@ -14,6 +14,7 @@ const path = require('path');
 require('./no-real-spawn');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { ParkSignal } = require('../orchestrator/park-signal');
+const { appendEvent } = require('../orchestrator/journal');
 const { mkTmp } = require('./helpers');
 
 
@@ -104,6 +105,46 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   // journals do not have.
   assert.equal(typeof call.duration_s, 'number', 'the llm-call event carries duration_s');
   assert.equal(call.durationS, undefined, 'spelled duration_s, not camelCase -- the spec documents duration_s');
+});
+
+// Second fix pass (2026-09-13): the F3 test in test/step-contracts.test.js asserts on
+// `checkOutputTypes`' own return value, not on what actually reaches `runLlm`'s caller -- an Opus
+// verifier made `llm.js` normalize `check_commands` in place AFTER calling `checkOutputTypes`
+// (re-parsing and re-attaching the array itself) and that mutation survived, because nothing
+// exercised the real `runLlm` path with a comma-bearing command. This closes that gap: the
+// consumer-facing assertion, through `runLlm` itself, not through the type-checker in isolation.
+test('PLAN real card path: check_commands as a JSON-encoded string containing a comma INSIDE one command reaches runLlm\'s caller BYTE-IDENTICAL (card #153\'s comma-corruption guard, exercised end to end)', async () => {
+  const taskDir = mkTmp('spo-card-plan-comma-');
+  const task = {
+    kind: 'card',
+    issue: 153,
+    title: 'RDO citation check',
+    criterion: 'the citation check passes',
+    worktreePath: '/tmp/worktree-153',
+    size: 'S',
+  };
+
+  // The comma sits INSIDE one command -- exactly the shape stringifyValue's `', '.join` would
+  // corrupt if this ever became a real array instead of the JSON string the model actually sent.
+  const checkCommandsRaw = JSON.stringify(['grep -Eq "kind, arity, and citation" src/foo.ts']);
+  const invariantIdsRaw = JSON.stringify(['INV-1, the comma-bearing id']);
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({
+        plan_markdown: '# Plan\n\nAdd the RDO citation check.\n',
+        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+        invariant_ids: invariantIdsRaw,
+        check_commands: checkCommandsRaw,
+      });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.check_commands, checkCommandsRaw, 'must be the exact same JSON-encoded STRING reference/value -- not re-parsed into a real array by anything downstream of checkOutputTypes');
+  assert.equal(result.invariant_ids, invariantIdsRaw, 'same guard, same reason, for invariant_ids');
 });
 
 // Card #158, 2026-09-08: pins the fix (orchestrator/steps/llm.js now reads
@@ -347,4 +388,293 @@ test('DIAGNOSE reply root_cause is also exposed as rootCause (handleDiagnose rea
   assert.equal(result.ok, true);
   assert.equal(result.root_cause, 'coverage regression in foo.ts');
   assert.equal(result.rootCause, 'coverage regression in foo.ts');
+});
+
+// Second fix pass (2026-09-13): `root_cause` IS declared (`'string'` in DIAGNOSE's `types`), and
+// `root_cause: null` is not an edge case -- diagnose.md's own documented "no new cause" shape
+// (handleDiagnose's `diagnose-no-new-cause` park reads it directly). No real-`runLlm` test
+// exercised this before: an Opus verifier mutated `scalarTypeOk`'s 'string' case to reject `null`
+// for `root_cause` specifically (leaving every other declared key's null-wildcard behaviour
+// intact) and every test in this repo still passed, because nothing on the real path ever sent
+// DIAGNOSE a null `root_cause`. This pins it.
+test('DIAGNOSE reply with root_cause: null succeeds -- the documented "no new cause" shape, and the null-wildcard rule\'s only real-path exercise of a DECLARED key', async () => {
+  const taskDir = mkTmp('spo-card-diagnose-rootcause-null-');
+  const task = { kind: 'card', issue: 207, worktreePath: '/tmp/worktree-207' };
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({ root_cause: null, reason: 'the plan was already fully implemented' });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'DIAGNOSE', 'llm.DIAGNOSE', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.root_cause, null);
+  assert.equal(result.rootCause, null);
+});
+
+// ---- outputContract types (card #207) -- checkOutputTypes wired into the real reply check ----
+
+function validateTask({ taskDir, issue }) {
+  // VALIDATE's own prompt values (task-values.js's buildPromptValues, 'VALIDATE' branch) read
+  // invariants_path/invariant_ids off the last journaled PLAN 'result' event -- write one first,
+  // exactly as the "IMPLEMENT real card path escalates to opus" test above does for IMPLEMENT.
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/plan.md',
+      invariants_path: '/tmp/invariants.md',
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    },
+  });
+  return { kind: 'card', issue, criterion: 'the widget renders', worktreePath: `/tmp/worktree-${issue}`, size: 'S' };
+}
+
+test('VALIDATE reply with reasons as a JSON-encoded string succeeds -- and the returned value stays the RAW STRING, untouched (item 4\'s resolution for this key: reasons carries no declared type, see step-contracts.js\'s own header comment for why -- state-machine.js\'s handleValidate journals this exact value verbatim as "the ONLY record of what the validator actually sent", card #640)', async () => {
+  const taskDir = mkTmp('spo-card-validate-reasons-jsonstring-');
+  const task = validateTask({ taskDir, issue: 200 });
+  const raw = JSON.stringify(['the criterion is not met: the widget never renders']);
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({ verdict: 'REJECT', reasons: raw, findings: [] });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.reasons, raw, 'left untouched -- handleValidate does its own normalizeFindingsPayload downstream, on purpose');
+});
+
+test('VALIDATE reply with verdict: 42 (a genuinely wrongly-typed required key) fails, naming the key in the error -- {ok:false, kind:"error"}, same shape as a missing key', async () => {
+  const taskDir = mkTmp('spo-card-validate-badverdict-');
+  const task = validateTask({ taskDir, issue: 201 });
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({ verdict: 42, reasons: [], findings: [] });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.match(result.error, /verdict/);
+  assert.match(result.error, /string/);
+});
+
+// Retitled 2026-09-13 (second fix pass): this test's original title claimed to pin the null-
+// wildcard rule, but `reasons` carries NO declared type at all -- so this only shows that an
+// UNDECLARED key with a `null` value still succeeds (true, but unrelated to the wildcard rule,
+// which only ever runs for a DECLARED key). The real wildcard-rule pin on the real `runLlm` path
+// is the new DIAGNOSE `root_cause: null` test further down.
+test('VALIDATE reply with reasons: null still succeeds -- reasons carries no declared type at all, so a null value is simply never checked (same real-mode shape test/validate-reject-reasons-contract.test.js\'s (c-1-real) pins)', async () => {
+  const taskDir = mkTmp('spo-card-validate-reasons-null-');
+  const task = validateTask({ taskDir, issue: 202 });
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({ verdict: 'REJECT', reasons: null, findings: [] });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.reasons, null);
+});
+
+test('VALIDATE reply with findings as a bare, unparsable, non-JSON string still succeeds -- findings carries no declared type, so it behaves exactly as before this card (matches test/validate-findings.test.js\'s real-mode malformed-findings coverage)', async () => {
+  const taskDir = mkTmp('spo-card-validate-findings-malformed-');
+  const task = validateTask({ taskDir, issue: 203 });
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: 'not json at all {{{' });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.findings, 'not json at all {{{', 'left completely untouched -- no declared type means no check and no normalization');
+});
+
+test('IMPLEMENT reply with all_green as the STRING "false" (the real issue-247 corpus shape) still succeeds -- all_green carries no declared type', async () => {
+  const taskDir = mkTmp('spo-card-implement-allgreen-string-');
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/plan.md',
+      invariants_path: '/tmp/invariants.md',
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    },
+  });
+  const task = { kind: 'card', issue: 204, criterion: 'c', worktreePath: '/tmp/worktree-204', size: 'S' };
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({
+        summary: 'Cannot proceed: the required plan file does not exist',
+        files_changed: '[]',
+        invariants: [],
+        tests_run: [],
+        all_green: 'false',
+      });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.all_green, 'false', 'left untouched -- a declared boolean type would park this real, already-observed shape');
+  assert.equal(result.files_changed, '[]', 'files_changed carries no declared type either -- left untouched for state-machine.js\'s own parseFilesChanged to read');
+});
+
+test('IMPLEMENT reply with files_changed as a bare, unparsable, non-JSON string still succeeds -- files_changed carries no declared type (matches test/implement-empty-result.test.js\'s real-mode coverage)', async () => {
+  const taskDir = mkTmp('spo-card-implement-fileschanged-unparsable-');
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/plan.md',
+      invariants_path: '/tmp/invariants.md',
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    },
+  });
+  const task = { kind: 'card', issue: 206, criterion: 'c', worktreePath: '/tmp/worktree-206', size: 'S' };
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({
+        summary: 'x',
+        files_changed: 'not json',
+        invariants: [],
+        tests_run: [],
+        all_green: false,
+      });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.files_changed, 'not json', 'left completely untouched, for state-machine.js\'s own parseFilesChanged to route to DIAGNOSE');
+});
+
+// ---- card #207 fix pass (2026-09-12) -- the regression the first build's `tests_run`/
+// `invariants` declarations would have caused. Both fixtures below are byte-exact excerpts of
+// real IMPLEMENT `result` payloads for issue-385 (~/.spo-state/journal/issue-385/journal.jsonl,
+// read-only, nothing under ~/.spo-state was modified to produce them) -- the "cmd"-keyed
+// tests_run and the prose invariants string come from two different real attempts on that card
+// (no single attempt happened to combine both shapes), the "command"-keyed tests_run and its
+// invariants array come from a single real attempt, verbatim. Both must succeed: `tests_run` and
+// `invariants` carry no declared type (see step-contracts.js's own header and per-entry comments
+// for why), so neither shape is enforced or normalized -- exactly the "behaves as before this
+// card" guarantee item 4 of the original spec requires, and exactly what the first build's now-
+// reverted `types: { invariants: 'object[]', tests_run: 'string[]' }` would have violated for
+// both of these.
+
+test('IMPLEMENT reply with tests_run as an array of {cmd, exit_code} objects and invariants as a prose string succeeds (real issue-385 shapes)', async () => {
+  const taskDir = mkTmp('spo-card-implement-issue385-cmd-prose-');
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/plan.md',
+      invariants_path: '/tmp/invariants.md',
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    },
+  });
+  const task = { kind: 'card', issue: 385, criterion: 'favorites folder operations', worktreePath: '/tmp/worktree-385', size: 'L' };
+
+  // Verbatim tests_run (as the JSON-encoded string on the wire) from issue-385's final IMPLEMENT
+  // attempt's real reply.
+  const testsRunRaw =
+    '[{"cmd":"node -e precondition-check.js","exit_code":0},{"cmd":"npm run verdict -- typecheck","exit_code":0},{"cmd":"npm run verdict -- lint","exit_code":0},{"cmd":"npm run verdict -- coverage:changed","exit_code":0},{"cmd":"git grep sweep 1 (skips/links-only/procedure claims)","exit_code":0},{"cmd":"git grep sweep 2 (flow/message identifier names)","exit_code":0}]';
+  // Verbatim invariants (prose, not an array) from a DIFFERENT real issue-385 IMPLEMENT attempt.
+  const invariantsRaw =
+    'All 16 invariants (INV-1 through INV-16) checked against the worktree as it now stands: all HELD (exact substring match for every quote).';
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({
+        summary: 'Verified the favorites folder implementation against plan-385.md; all checks green.',
+        files_changed: '[]',
+        invariants: invariantsRaw,
+        tests_run: testsRunRaw,
+        all_green: 'true',
+      });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.tests_run, testsRunRaw, 'left as the raw JSON-encoded string -- tests_run carries no declared type');
+  assert.equal(result.invariants, invariantsRaw, 'left as the raw prose string -- invariants carries no declared type');
+});
+
+test('IMPLEMENT reply with tests_run as an array of {command, exit_code} objects (the "command" spelling variant) also succeeds (real issue-385 shape)', async () => {
+  const taskDir = mkTmp('spo-card-implement-issue385-command-');
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/plan.md',
+      invariants_path: '/tmp/invariants.md',
+      invariant_ids: ['INV-1'],
+      check_commands: ['npm run typecheck'],
+    },
+  });
+  const task = { kind: 'card', issue: 385, criterion: 'favorites folder operations', worktreePath: '/tmp/worktree-385', size: 'L' };
+
+  // Verbatim tests_run AND invariants from a single real issue-385 IMPLEMENT attempt (the
+  // "command", not "cmd", spelling).
+  const testsRunRaw =
+    '[{"command": "node -e \\"<precondition check: InterfaceServer.pas:202 declaration, Favorites.pas:247 guard, requestPrompt/requestConfirm, rdoCall>\\"", "exit_code": 0}, {"command": "npm run verdict -- typecheck", "exit_code": 0}, {"command": "npm run verdict -- lint", "exit_code": 0}, {"command": "npm run verdict -- coverage:changed", "exit_code": 0}, {"command": "node -e \\"<git grep sweep: no doc claims folders are skipped / a Favorites member is a procedure>\\"", "exit_code": 0}, {"command": "node -e \\"<git grep sweep: no doc enumerates the flow/message names this change adds>\\"", "exit_code": 0}]';
+  const invariantsRaw =
+    '[{"id": "INV-1", "status": "HELD"}, {"id": "INV-2", "status": "HELD"}, {"id": "INV-3", "status": "HELD"}, {"id": "INV-4", "status": "HELD"}, {"id": "INV-5", "status": "HELD"}, {"id": "INV-6", "status": "HELD"}, {"id": "INV-7", "status": "HELD"}, {"id": "INV-8", "status": "HELD"}, {"id": "INV-9", "status": "HELD"}, {"id": "INV-10", "status": "HELD"}, {"id": "INV-11", "status": "HELD"}, {"id": "INV-12", "status": "HELD"}, {"id": "INV-13", "status": "HELD"}, {"id": "INV-14", "status": "HELD"}, {"id": "INV-15", "status": "HELD"}, {"id": "INV-16", "status": "HELD"}]';
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({
+        summary: 'Verified the favorites folder implementation against plan-385.md; all checks green.',
+        files_changed: '[]',
+        invariants: invariantsRaw,
+        tests_run: testsRunRaw,
+        all_green: 'true',
+      });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.tests_run, testsRunRaw, 'left as the raw JSON-encoded string -- tests_run carries no declared type');
+  assert.equal(result.invariants, invariantsRaw, 'left as the raw JSON-encoded string -- invariants carries no declared type either, so a valid array is left as-is same as a prose string would be');
+});
+
+// Retitled 2026-09-13 (second fix pass): CITATION_VERIFIER's outputContract DOES declare a type
+// (`verdict: 'string'`) -- the original title's "declares no types at all" was simply wrong. What
+// this test actually pins is that its one UNDECLARED key, `entries`, behaves exactly as before
+// this card regardless of shape.
+test('CITATION_VERIFIER\'s undeclared key (`entries`) behaves exactly as before this card, even though `verdict` -- the step\'s other required key -- IS declared and enforced', async () => {
+  const taskDir = mkTmp('spo-card-citation-verifier-entries-');
+  const task = { kind: 'card', issue: 205, worktreePath: '/tmp/worktree-205', citations: ['AdmMembersRDO.pas:512'] };
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply({ verdict: 'PASS', entries: 'not an array, not JSON, not anything checkable' });
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.entries, 'not an array, not JSON, not anything checkable');
 });
