@@ -1654,7 +1654,13 @@ async function cmdAsk(opts, deps = {}) {
   }
 
   if (wouldPlaceOnBoard) {
-    const placed = projectBoardImpl.placeOnBoard(filed.issueNumber, effectiveGhRepo, deps);
+    // `filed.priority` is the one review-card's corrections landed on, not the drafter's first
+    // guess -- see fileCard's return. A board that has no Priority field yet takes the card
+    // anyway (placeOnBoard fails open and reports `prioritySkipped`); only the Status half is
+    // load-bearing for visibility.
+    const placed = projectBoardImpl.placeOnBoard(filed.issueNumber, effectiveGhRepo, deps, {
+      priority: filed.priority,
+    });
     if (!placed.ok) {
       // The issue itself was filed successfully -- still tell the maintainer where it landed --
       // but board placement failing is exactly the invisible-card defect this action exists to

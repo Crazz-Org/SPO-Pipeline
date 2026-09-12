@@ -9,6 +9,7 @@
   Adapted from SPO-WebClient/.claude/agents/card-reviewer.md — same neutrality rules and four
   checks, JSON output instead of a prose block.
   Placeholders: {{card_title}} {{card_body}} {{card_category}} {{card_size}} {{card_area}}
+  {{card_priority}}
                 {{repo}}  (defaults to "Crazz-Org/SPO-WebClient" for this pipeline)
                 {{human_confirmed}}  "yes" | "no" -- see § 0
   Output — stdout, JSON only, nothing else:
@@ -39,11 +40,13 @@ body:             {{card_body}}
 category:         {{card_category}}
 size:              {{card_size}}
 area:              {{card_area}}
+priority:          {{card_priority}}
 repo:              {{repo}}
 human_confirmed:  {{human_confirmed}}    "yes" | "no" -- see § 0
 ```
 
-This is the **draft card, verbatim, as it would be filed** — title, body, category, size, area.
+This is the **draft card, verbatim, as it would be filed** — title, body, category, size, area,
+priority.
 Nothing else — no rationale, no chat history. If the title or body is not in English, say so in
 the verdict: the board is written in English, and translation is the finder's job, not the
 claimer's.
@@ -118,9 +121,30 @@ The claimer must be able to start without redoing the investigation. Require:
 ### 4 · Is the weight right, and the ground named?
 
 `category` (`defect` 🔴 · `latent-trap` 🟠 · `feature` 🟡 · `observation` ⚪ · `doc-infra` 📚)
-and `size` (`S` · `M` · `L`) feed the priority order the human maintains by hand, so an `L`
-filed as `S` distorts that order for every session that reads the board afterwards. Say which
-value you would use and why; do not haggle over one notch when the card is otherwise sound.
+and `size` (`S` · `M` · `L`) are the *weight* half of the board's ranking — what a card costs and
+what kind of thing it is — so an `L` filed as `S` distorts the order for every session that reads
+the board afterwards. Say which value you would use and why; do not haggle over one notch when
+the card is otherwise sound.
+
+`priority` (`Urgent` · `High` · `Medium` · `Low` — GitHub's own built-in Priority options, spelled
+exactly so) is the criticity itself, and since 2026-09-12 it is a **board field** — it is what the
+Todo column is ordered on, so a wrong value here does not just read badly, it puts the card in the
+wrong place in the queue. Judge it on **how often the trigger fires × what one firing costs**, not
+on how alarming the write-up sounds:
+
+- `Urgent` is for work being lost *now* on a trigger that needs nothing rare. A finding that is
+  merely severe *if* it ever fires is not `Urgent` — that is what `Low` and a stated reopen
+  condition are for.
+- A card whose evidence does not separate two rungs belongs on the **lower** one, with the
+  measurement that would raise it named in the body. Correct an inflated priority down as readily
+  as a thin one up; a drafter has every incentive to round its own finding upward.
+- Criticity written as **prose** — a `Severity:` line in the body, or a `HIGH — ` title prefix —
+  is a correction even when the value is right: it is unsortable, and a body that says one thing
+  while the field says another is worse than either alone. Name it in `corrections` and say the
+  prose should come out.
+- `DECISION` is **not** a priority. "A human must arbitrate before code is written" is an
+  orthogonal axis — a DECISION card can be `Urgent` or `Low`. It stays a title prefix; never
+  accept it as a `priority` value.
 
 `area` is not weight — it is the **ground reservation**, the one field another session's claim
 depends on: a Todo card whose area a live card already holds is skipped by the intake path, and
@@ -156,10 +180,10 @@ recommendation for whoever reads the board next, never a gate that keeps the car
 | `verdict` | Meaning | What happens next |
 |---|---|---|
 | `FILE` | The card holds as written. | Filed unchanged. |
-| `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:` correction is applied to the draft before filing; whether it also ships as a `cat:`/`size:` label depends on the target repo's label inventory — the exact label name ships when the inventory confirms it present, is dropped and announced on stdout when the inventory confirms it absent, and ships unverified when the inventory cannot be read (see `intake.js`'s `fileCard` header for the exact three-way split); a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
+| `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:`/`priority:` correction is applied to the draft before filing (`priority:` is case-folded to GitHub's own spelling, so `priority: urgent` lands as `Urgent`, and reaches the board field itself on a project-2 target — `orchestrator/project-board.js`); whether it also ships as a `cat:`/`size:` label depends on the target repo's label inventory — the exact label name ships when the inventory confirms it present, is dropped and announced on stdout when the inventory confirms it absent, and ships unverified when the inventory cannot be read (see `intake.js`'s `fileCard` header for the exact three-way split); a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
 | `DO_NOT_FILE` | There is no card here — not a defect, duplicate of #N, or already fixed at `<sha>`. | Nothing is filed. |
 
-`FILE_AMENDED` must name **exactly** what to change in `corrections` — the corrected `category`,
+`FILE_AMENDED` must name **exactly** what to change in `corrections` — the corrected `priority`, `category`,
 the missing `file:line`, the sentence that states what done looks like. "Needs more detail" is
 not a correction.
 
@@ -182,7 +206,7 @@ human's, and a real, low-value finding is still filed.
 - **Holds against the code** — <what you opened, and what it showed>
 - **Not already covered** — <what you searched, and what you found>
 - **Actionable** — <the missing piece, or "yes">
-- **Weight and ground** — <category / size / area, kept or corrected, with the reason>
+- **Weight and ground** — <priority / category / size / area, kept or corrected, with the reason>
 
 <For FILE AMENDED: the corrections, one per line — same content as `corrections` above. For
 DO NOT FILE: the reference that makes the finding moot.>

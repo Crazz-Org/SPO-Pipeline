@@ -277,7 +277,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:869-871`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:906-908`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -2204,6 +2204,74 @@ step contracts already use (never a second spawn path), and every account comes 
 pool (`accounts.pick`); every `gh`/`npm` call is injected the same way `steps/scripted.js`'s
 `spawnStep` already is (`deps.spawnSync`) -- production code never passes it, so a real run
 always spawns the real binaries on `PATH`.
+
+### Priority
+
+Every draft carries a `priority`, one of **`Urgent` / `High` / `Medium` / `Low`**. It is a
+required key of the draft contract (`intake.js`'s `DRAFT_REQUIRED` / `validateDraftContract`,
+`VALID_PRIORITIES`), it is rendered into `review-card`'s prompt as `{{card_priority}}`, and on a
+project-2 target it is written to the board's own `Priority` single-select by
+`orchestrator/project-board.js`.
+
+**The vocabulary is GitHub's, not ours.** `Urgent` / `High` / `Medium` / `Low` are the options of
+GitHub Projects' own built-in Priority field, spelled and ordered exactly as the platform ships
+them. Do not re-spell them. A first cut of this action shipped `CRITICAL` / `HIGH` / `MEDIUM` /
+`LOW`, justified as "the words the issue titles already used" — a real observation attached to the
+wrong conclusion: the platform already provides this field, so a parallel spelling buys a board
+that no GitHub default view, saved layout or roadmap grouping recognises, and that disagrees with
+every other project in the org, in exchange for nothing. `CRITICAL` in an old title (#161) maps
+onto `Urgent`; those titles are historical prose, not a schema to preserve.
+
+**Why it is a field and not a sentence.** Until 2026-09-12 criticity reached the board only as
+prose — `**Severity: MEDIUM**` in the body, or a `HIGH — ` title prefix. No board view, no sort
+and no `gh` query can read a sentence, so ranking a column meant opening every card: the
+maintainer's 2026-09-11 criticity review did exactly that, by hand, for 18 issues.
+
+**The rubric** — *how often the trigger fires × what one firing costs*, never how alarming the
+write-up reads:
+
+| | |
+|---|---|
+| `Urgent` | Losing work, money or availability **now**, on a trigger needing nothing rare. |
+| `High` | Routine trigger, costly outcome. Next to schedule once `Urgent` is clear. |
+| `Medium` | Routine trigger, bounded and recoverable cost. |
+| `Low` | Slow-burning, cosmetic, or gated on a precondition that does not exist yet. |
+
+Evidence that does not separate two rungs takes the **lower** rung, with the measurement that
+would raise it named in the body. `review-card` re-ranks as a *mechanical* correction
+(`priority: urgent` is case-folded to `Urgent` by `canonicalPriority`), and `fileCard` returns the
+**applied** value — so what lands on the board is the judge's verdict, not the drafter's first
+guess. The draft contract itself stays case-EXACT: a drafter is handed the spelling verbatim in
+its prompt, and a wrong-cased reply there is worth failing loudly on.
+
+**`DECISION` is not a priority.** "A human must arbitrate before any code is written" is an
+orthogonal axis: a DECISION card can be `Urgent` (#166) or `Low` (#79). It stays a title prefix,
+and `VALID_PRIORITIES` rejects it as a value on purpose.
+
+**Two failure shapes, deliberately different** (`placeOnBoard`):
+
+- The **board** has no `Priority` field — project 1 today, and project 2 before 2026-09-12 — the
+  card is filed and columned anyway, and the return carries `prioritySkipped: true`. Same
+  fail-open shape as a `cat:`/`size:` label the target repo lacks (#196/#199), same reason:
+  refusing to file over missing taxonomy loses the card, which is strictly worse.
+- The **value** is not one the field offers — a typo, or a vocabulary that drifted — fails loudly
+  *before* any board mutation. Silently filing an `Urgent` card as untriaged is the failure this
+  field exists to prevent.
+
+Both the Status and the Priority write are **read back from the API** before the call reports
+success; an accepted mutation is not proof of a stored value.
+
+**Filing by hand** (`gh issue create`, which is how most factory cards are actually filed): set
+the field in the same breath, then read it back. Project 2's `Priority` field is
+`PVTSSF_lADOEyAVD84BiHMrzhiG-_Q`; options Urgent `c38699dc`, High `fc35ba09`, Medium `4fe07203`,
+Low `283ea466` — re-read them with `gh project field-list 2 --owner Crazz-Org --format json`
+rather than trusting these if a call 404s. The mutation is the same
+`updateProjectV2ItemFieldValue` a column move uses (CLAUDE.md § *`gh` conventions*).
+
+**Ordering.** Project 2's Todo column is ordered top-first by priority, and that order is *set*,
+not derived: `gh project item-list` and a plain `items(first:100)` GraphQL query both return
+board-add order, so the column order cannot be read back from either. After changing a card's
+priority, move it too (`updateProjectV2ItemPosition`) or the field and the column will disagree.
 
 ## Single-instance lock
 
