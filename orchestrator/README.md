@@ -277,7 +277,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:906-908`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:936-938`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -2107,8 +2107,8 @@ target repo's own label inventory (`gh label list`, read just before `gh issue c
 confirmed present ships, a label confirmed absent is dropped and announced on stdout by name and
 repo, and if the inventory itself can't be read (a failed or unparseable `gh label list`) both
 labels ship anyway, unverified, with a stdout announcement that `gh issue create` may fail if the
-target repo turns out to lack them -- see `intake.js`'s own `fileCard` header comment for the
-exact three-way split.
+target repo turns out to lack them -- see `intake.js`'s own `resolveLabelArgs` header comment for
+the exact three-way split.
 
 **The maintainer flow, end to end:**
 

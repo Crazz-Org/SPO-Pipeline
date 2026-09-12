@@ -378,7 +378,7 @@ separate repos with no shared runtime.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:906-908`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:936-938`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -713,7 +713,7 @@ Four other modules spawn real `git`/`gh`/`npm` through their own private `runSyn
 | `board.js` | `npm run board:move` (`moveCard`) | mid-step, called from inside `realWorktree` / `realCheck` / `realGate` / `realMerge` / `postParkComment` |
 | `park-loop.js` | `gh issue comment` (park comment, abandon ack), `gh api .../comments` (unpark scan) | after the task is already terminal, or the daemon-loop unpark scan (no task in scope) |
 | `report-intake.js` | `npm run report:card`, `gh issue list` (dedup), `gh issue create`, `gh api .../comments` (confirm scan), `gh issue close` | the daemon-loop `autoIntakeMs` / `reportConfirmScanMs` timers (no task in scope) |
-| `intake.js` | `gh api issues/<n>`, `gh issue comment`, `gh issue create`, `gh issue edit`, `gh label list` (fileCard's pre-create inventory read, issue #196), `npm run board:claim` | the maintainer-facing `spo ask` / `spo pull` path and auto-triage.js's driver (its three LLM steps already carry their own `deadlineMs`) |
+| `intake.js` | `gh api issues/<n>`, `gh issue comment`, `gh issue create`, `gh issue edit`, `gh label list` (fileCard's pre-create / amendCard's pre-edit inventory read via `resolveLabelArgs`, issues #196/#198), `npm run board:claim` | the maintainer-facing `spo ask` / `spo pull` path and auto-triage.js's driver (its three LLM steps already carry their own `deadlineMs`) |
 
 All four now arm the identical class default from the same table above, via
 `orchestrator/command-timeout.js`'s `armTimeout` (`classifyCommand` + `classTimeoutMs`, factored
