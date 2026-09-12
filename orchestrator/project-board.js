@@ -64,7 +64,27 @@ const PROJECT_OWNER = 'Crazz-Org';
 // The Status this module always sets a newly-added item to. `spo ask --repo` only ever *files* a
 // card -- there is no verdict here that could justify landing anywhere but the front of the
 // queue, the same place project 1's own auto-add workflow is meant to land a SPO-WebClient card.
+const STATUS_FIELD_NAME = 'Status';
 const TARGET_STATUS_NAME = 'Todo';
+
+// Priority -- the card's criticity as a FIELD. Added to project 2 ("SPO Factory") on 2026-09-12;
+// project 1 does not have it yet, which is exactly why placeOnBoard fails OPEN on a board that
+// lacks the field rather than refusing to file.
+//
+// This is GitHub Projects' OWN built-in Priority field, not a bespoke one: name `Priority`,
+// options `Urgent` / `High` / `Medium` / `Low`, in that order. Nothing here invents a vocabulary.
+// A first cut of this action did -- CRITICAL/HIGH/MEDIUM/LOW, justified as "the words the issue
+// TITLES already used" (#161 "CRITICAL -- auto-triage loops forever", #162 "HIGH -- ...") -- and
+// that justification was beside the point: the platform already ships this exact field, so a
+// parallel spelling buys a board that no GitHub default view, saved layout or roadmap grouping
+// recognises, and that every other project in the org disagrees with. `CRITICAL` from an old title
+// maps onto `Urgent`; the old titles are historical prose, not a schema to preserve.
+//
+// What is NOT in this vocabulary, on purpose: **DECISION**. "A human must arbitrate before any
+// code is written" (#166, #79) is an orthogonal axis, not a rung on this ladder -- a DECISION card
+// can be Urgent or Low. It stays a title prefix; see CLAUDE.md's "Filling a card" section.
+const PRIORITY_FIELD_NAME = 'Priority';
+const VALID_PRIORITIES = new Set(['Urgent', 'High', 'Medium', 'Low']);
 
 // projectNumberForRepo(ghRepo) -- null for a repo with no board entry (SPO-WebClient, or any
 // repo nobody has mapped yet). The caller (bin/spo's cmdAsk) uses this to decide whether
@@ -142,31 +162,47 @@ function resolveProjectId(deps, projectNumber) {
   return { ok: true, projectId: id };
 }
 
-// resolveStatusField(deps, projectNumber, statusName) -- reads `gh project field-list <n>
-// --owner Crazz-Org --format json`, finds the `Status` field, and finds `statusName` among its
-// options. Never hardcodes a field id or an option id (CLAUDE.md's "gh conventions" section) --
-// both come back out of this JSON, every call.
-function resolveStatusField(deps, projectNumber, statusName) {
+// listFields(deps, projectNumber) -- ONE `gh project field-list <n> --owner Crazz-Org --format
+// json` per placeOnBoard call, whose payload every single-select this module writes is then
+// resolved out of. Deliberately one read, not one per field: Status and Priority are set in the
+// same breath and a second identical `gh` call would only add latency and a second way for the
+// two resolutions to disagree about what the board looks like.
+function listFields(deps, projectNumber) {
   const listed = runGhJson(
     deps,
     ['project', 'field-list', String(projectNumber), '--owner', PROJECT_OWNER, '--format', 'json'],
-    'resolveStatusField'
+    'listFields'
   );
   if (!listed.ok) return listed;
-  const fields = (listed.data && listed.data.fields) || [];
-  const statusField = fields.find((f) => f.name === 'Status');
-  if (!statusField || !statusField.id) {
-    return { ok: false, error: `resolveStatusField: project ${projectNumber} has no "Status" field` };
+  return { ok: true, fields: (listed.data && listed.data.fields) || [] };
+}
+
+// pickSingleSelect(fields, projectNumber, fieldName, optionName) -- pure: finds `fieldName` among
+// an already-read field-list payload and `optionName` among its options. Never hardcodes a field
+// id or an option id (CLAUDE.md's "gh conventions" section) -- both come back out of that JSON,
+// every call. The two failure shapes are distinguished ON PURPOSE and the caller acts on them
+// differently: `missingField` means this board has never been given the field at all (an older
+// board, or project 2 before Priority was added on 2026-09-12), which placeOnBoard tolerates for
+// an OPTIONAL field; a missing OPTION means the field exists and the value asked for is not one
+// of its values, which is a caller bug and always fails loudly.
+function pickSingleSelect(fields, projectNumber, fieldName, optionName) {
+  const field = (fields || []).find((f) => f.name === fieldName);
+  if (!field || !field.id) {
+    return {
+      ok: false,
+      missingField: true,
+      error: `pickSingleSelect: project ${projectNumber} has no "${fieldName}" field`,
+    };
   }
-  const options = statusField.options || [];
-  const option = options.find((o) => o.name === statusName);
+  const option = (field.options || []).find((o) => o.name === optionName);
   if (!option || !option.id) {
     return {
       ok: false,
-      error: `resolveStatusField: project ${projectNumber}'s "Status" field has no "${statusName}" option`,
+      missingField: false,
+      error: `pickSingleSelect: project ${projectNumber}'s "${fieldName}" field has no "${optionName}" option`,
     };
   }
-  return { ok: true, fieldId: statusField.id, optionId: option.id };
+  return { ok: true, fieldId: field.id, optionId: option.id };
 }
 
 // resolveIssueNodeId(deps, ghRepo, issueNumber) -- `gh issue view` (not `gh api`: no -f, nothing
@@ -208,9 +244,11 @@ function addItem(deps, projectId, contentId) {
   return { ok: true, itemId };
 }
 
-// setStatus(deps, projectId, itemId, fieldId, optionId) -- `updateProjectV2ItemFieldValue`, the
-// same mutation board.js's own header names as the CLI-less way to move a card.
-function setStatus(deps, projectId, itemId, fieldId, optionId) {
+// setSingleSelect(deps, projectId, itemId, fieldId, optionId) -- `updateProjectV2ItemFieldValue`,
+// the same mutation board.js's own header names as the CLI-less way to move a card. Field-agnostic
+// by construction: the ids it writes are whatever pickSingleSelect resolved, so Status and
+// Priority go through this one call site rather than two near-identical ones.
+function setSingleSelect(deps, projectId, itemId, fieldId, optionId) {
   const updated = runGhJson(
     deps,
     [
@@ -227,45 +265,69 @@ function setStatus(deps, projectId, itemId, fieldId, optionId) {
       '-f',
       `option=${optionId}`,
     ],
-    'setStatus'
+    'setSingleSelect'
   );
   if (!updated.ok) return updated;
   return { ok: true };
 }
 
-// readBackStatus(deps, itemId) -- the verification step this whole module exists for: a fresh
-// `gh api graphql` READ of the item's own `Status` field, not a re-derivation of what we just
-// wrote and not a read of the list view (`gh project item-list`, which is what the maintainer
-// would eyeball and the exact surface the empty-Status defect was invisible on). Returns the
-// option NAME currently stored server-side, or null if the field genuinely carries no value.
-function readBackStatus(deps, itemId) {
+// readBackSingleSelect(deps, itemId, fieldName) -- the verification step this whole module exists
+// for: a fresh `gh api graphql` READ of the item's own `fieldName` field, not a re-derivation of
+// what we just wrote and not a read of the list view (`gh project item-list`, which is what the
+// maintainer would eyeball and the exact surface the empty-Status defect was invisible on).
+// Returns the option NAME currently stored server-side, or null if the field genuinely carries no
+// value. `fieldName` is a GraphQL VARIABLE, not interpolated into the query text -- the field name
+// reaches this function from PRIORITY_FIELD_NAME/STATUS_FIELD_NAME below, but a query built by
+// string concatenation is one refactor away from taking an attacker-shaped name.
+function readBackSingleSelect(deps, itemId, fieldName) {
   const read = runGhJson(
     deps,
     [
       'api',
       'graphql',
       '-f',
-      'query=query($item:ID!){node(id:$item){... on ProjectV2Item{fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}',
+      'query=query($item:ID!,$field:String!){node(id:$item){... on ProjectV2Item{fieldValueByName(name:$field){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}',
       '-f',
       `item=${itemId}`,
+      '-f',
+      `field=${fieldName}`,
     ],
-    'readBackStatus'
+    'readBackSingleSelect'
   );
   if (!read.ok) return read;
   const node = read.data && read.data.data && read.data.data.node;
   const name = node && node.fieldValueByName && node.fieldValueByName.name;
-  return { ok: true, statusName: name || null };
+  return { ok: true, optionName: name || null };
 }
 
-// placeOnBoard(issueNumber, ghRepo, deps) -- the whole sequence: resolve the project id, resolve
-// the Status field/option ids, resolve the issue's node id, add the item, set Status, then READ
-// STATUS BACK FROM THE API and gate success on that read matching TARGET_STATUS_NAME. Any single
-// step failing -- including a read-back that comes back empty or wrong -- is the whole call
-// failing: {ok: false, error}. This function never throws and never partially succeeds silently;
-// the caller (bin/spo's cmdAsk) is expected to print `error` to stderr and exit non-zero, because
-// a card that fileCard filed but this function could not place is exactly the invisible-card
+// placeOnBoard(issueNumber, ghRepo, deps, opts) -- the whole sequence: resolve the project id,
+// read the board's fields ONCE, resolve the issue's node id, add the item, set Status, set
+// Priority, then READ EACH BACK FROM THE API and gate success on those reads. Any single step
+// failing -- including a read-back that comes back empty or wrong -- is the whole call failing:
+// {ok: false, error}. This function never throws and never partially succeeds silently; the
+// caller (bin/spo's cmdAsk) is expected to print `error` to stderr and exit non-zero, because a
+// card that fileCard filed but this function could not place is exactly the invisible-card
 // failure this module exists to kill (see this file's header).
-function placeOnBoard(issueNumber, ghRepo, deps = {}) {
+//
+// `opts.priority` (one of VALID_PRIORITIES) is the card's criticity as a BOARD FIELD -- the whole
+// point of action "Priority is a field, not a sentence" (2026-09-12). Before it, criticity was
+// written as prose into the issue body ("**Severity: MEDIUM**", "**Criticity: HIGH**"), which no
+// board view, no sort and no `gh` query can read: the maintainer's own 2026-09-11 criticity review
+// had to open 18 issue bodies by hand to rank a column. Two failure modes, deliberately different:
+//
+//   - `opts.priority` omitted -> Priority is simply not written. Lets an older caller keep working
+//     and keeps this an additive change.
+//   - the BOARD has no `Priority` field -> skipped, reported in the return value as
+//     `priorityName: null` + `prioritySkipped: true`, NOT a failure. Status is what makes a card
+//     visible; a board that predates the field still gets a correctly-columned card rather than no
+//     card at all. This is the same fail-open shape `fileCard` uses for a `cat:`/`size:` label the
+//     target repo lacks (#196/#199) -- and the same reason: refusing to file over a missing piece
+//     of taxonomy loses the card, which is strictly worse than filing it untagged.
+//
+// A priority the caller asked for that the field does not OFFER is not fail-open: it is a caller
+// bug (a typo, or a vocabulary that drifted from the board's) and fails loudly, because silently
+// filing an Urgent card as untriaged is the failure this field exists to prevent.
+function placeOnBoard(issueNumber, ghRepo, deps = {}, opts = {}) {
   const projectNumber = projectNumberForRepo(ghRepo);
   if (!projectNumber) {
     return { ok: false, error: `placeOnBoard: no project mapped for repo "${ghRepo}"` };
@@ -274,8 +336,26 @@ function placeOnBoard(issueNumber, ghRepo, deps = {}) {
   const project = resolveProjectId(deps, projectNumber);
   if (!project.ok) return project;
 
-  const field = resolveStatusField(deps, projectNumber, TARGET_STATUS_NAME);
-  if (!field.ok) return field;
+  const listed = listFields(deps, projectNumber);
+  if (!listed.ok) return listed;
+
+  const statusField = pickSingleSelect(listed.fields, projectNumber, STATUS_FIELD_NAME, TARGET_STATUS_NAME);
+  if (!statusField.ok) return { ok: false, error: statusField.error };
+
+  // Resolved BEFORE anything is written, so a bad `opts.priority` costs no board mutation at all.
+  let priorityField = null;
+  const wantPriority = opts.priority !== undefined && opts.priority !== null && opts.priority !== '';
+  if (wantPriority) {
+    if (!VALID_PRIORITIES.has(opts.priority)) {
+      return {
+        ok: false,
+        error: `placeOnBoard: unrecognized priority "${opts.priority}" -- expected one of ${[...VALID_PRIORITIES].join(', ')}`,
+      };
+    }
+    const picked = pickSingleSelect(listed.fields, projectNumber, PRIORITY_FIELD_NAME, opts.priority);
+    if (!picked.ok && !picked.missingField) return { ok: false, error: picked.error };
+    priorityField = picked.ok ? picked : null; // null == the board has no Priority field: fail open
+  }
 
   const issue = resolveIssueNodeId(deps, ghRepo, issueNumber);
   if (!issue.ok) return issue;
@@ -283,27 +363,56 @@ function placeOnBoard(issueNumber, ghRepo, deps = {}) {
   const added = addItem(deps, project.projectId, issue.contentId);
   if (!added.ok) return added;
 
-  const set = setStatus(deps, project.projectId, added.itemId, field.fieldId, field.optionId);
+  const set = setSingleSelect(deps, project.projectId, added.itemId, statusField.fieldId, statusField.optionId);
   if (!set.ok) return set;
 
-  const readBack = readBackStatus(deps, added.itemId);
+  const readBack = readBackSingleSelect(deps, added.itemId, STATUS_FIELD_NAME);
   if (!readBack.ok) return readBack;
 
-  if (readBack.statusName !== TARGET_STATUS_NAME) {
+  if (readBack.optionName !== TARGET_STATUS_NAME) {
     return {
       ok: false,
-      error: `placeOnBoard: read back Status="${readBack.statusName || '(empty)'}" for item ${added.itemId}, expected "${TARGET_STATUS_NAME}" -- the card is on the board with no/wrong column and is effectively invisible`,
+      error: `placeOnBoard: read back Status="${readBack.optionName || '(empty)'}" for item ${added.itemId}, expected "${TARGET_STATUS_NAME}" -- the card is on the board with no/wrong column and is effectively invisible`,
       itemId: added.itemId,
     };
   }
 
-  return { ok: true, itemId: added.itemId, projectNumber, statusName: readBack.statusName };
+  let priorityName = null;
+  if (priorityField) {
+    const setPrio = setSingleSelect(deps, project.projectId, added.itemId, priorityField.fieldId, priorityField.optionId);
+    if (!setPrio.ok) return { ...setPrio, itemId: added.itemId };
+
+    // Read back for the same reason Status is: `updateProjectV2ItemFieldValue` returning the item
+    // id proves the call was accepted, not that the value is what a maintainer will see.
+    const readPrio = readBackSingleSelect(deps, added.itemId, PRIORITY_FIELD_NAME);
+    if (!readPrio.ok) return { ...readPrio, itemId: added.itemId };
+    if (readPrio.optionName !== opts.priority) {
+      return {
+        ok: false,
+        error: `placeOnBoard: read back Priority="${readPrio.optionName || '(empty)'}" for item ${added.itemId}, expected "${opts.priority}"`,
+        itemId: added.itemId,
+      };
+    }
+    priorityName = readPrio.optionName;
+  }
+
+  return {
+    ok: true,
+    itemId: added.itemId,
+    projectNumber,
+    statusName: readBack.optionName,
+    priorityName,
+    prioritySkipped: wantPriority && !priorityField,
+  };
 }
 
 module.exports = {
   PROJECT_NUMBER_BY_REPO,
   PROJECT_OWNER,
+  STATUS_FIELD_NAME,
   TARGET_STATUS_NAME,
+  PRIORITY_FIELD_NAME,
+  VALID_PRIORITIES,
   projectNumberForRepo,
   placeOnBoard,
 };
