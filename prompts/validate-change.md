@@ -34,10 +34,13 @@ time you run, PUSH_PR has measured the real diff against `src/shared/rdo-members
 fuller wire-rule set of `src/shared/rdo-*`/`src/server/rdo.ts`/session-phase code, which intake's
 own narrower check at card intake may also have caught from the issue text — and recorded that
 measurement, both directions, as `task.rdoDiffTouched` (`rdo-diff-derived` in the journal). That
-diff-derived field is what gates the citation-verifier ahead of you. `task.touchesRdoMembers`
-remains a separate, one-way (false→true) intake guess, because it also drives IMPLEMENT's Opus
-escalation across retries. On that flag the caller raises your **effort** to `xhigh` — it never
-changes your model (`step-contracts.js`: VALIDATE's `escalatedModel` is `null`). You run as
+diff-derived field is what gates the citation-verifier ahead of you, and (card #213, 2026-09-12)
+is also what raises your own **effort** to `xhigh` when it is `true` — it never changes your model
+(`step-contracts.js`: VALIDATE's `escalatedModel` is `null`). `task.touchesRdoMembers` remains a
+separate, one-way (false→true) intake guess that still drives IMPLEMENT's Opus escalation across
+retries; it no longer moves anything of yours — on the 36-card window measured 2026-09-12, it fired
+on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so most of what used to
+buy you `xhigh` was never really RDO work. You run as
 Fable 5 on every path a real card can take — never Sonnet 5: Sonnet is the executor, and a same-model judge tends to ratify precisely
 the misunderstandings its author had. There is no per-attempt fallback to another model either: a
 retry after an account limit (`state-machine.js`'s `callLlmStep`) rotates only the account leased

@@ -31,7 +31,13 @@ const {
   readLiveWorkerIds,
   clearReparkClaim,
 } = require('./journal');
-const { scratchDir, lastResultPayload, lastJournaledCitations, lastJournaledRdoDiffTouched } = require('./task-values');
+const {
+  scratchDir,
+  lastResultPayload,
+  lastJournaledCitations,
+  lastJournaledRdoDiffTouched,
+  lastJournaledPlanFiles,
+} = require('./task-values');
 const { buildBaseline } = require('./invariants');
 const { detectSpanConflicts } = require('./plan-span-guard');
 const { makeFixtureReader } = require('./fixture');
@@ -445,6 +451,15 @@ function guardDeclaredFiles(ctx, rawFilesToChange, provenance) {
     });
     return;
   }
+  // Action 2 (card #213): propagate the normalized declaration onto ctx.task -- until now it was
+  // used for protectedMatches/the park detail below and then dropped, so nothing downstream
+  // (IMPLEMENT's Opus escalation, in particular) could ever see what PLAN actually declared.
+  // Set for BOTH the array and json-string shapes, including an EMPTY list (this line runs
+  // before the length check below) -- an empty declaration is real information ("this plan
+  // changes nothing already on record", see this function's own header) and callers reading
+  // ctx.task.planFilesToChange must be able to tell it apart from "never declared" (where this
+  // field is left unset entirely, by the `!isList || !allStrings` branch above returning early).
+  ctx.task.planFilesToChange = filesToChange;
   if (filesToChange.length === 0) return;
   // D1: detectProtectedFiles already caps matches PER CALL (PROTECTED_MATCH_CAP), but this site
   // flatMaps it across every declared file, so the total is unbounded (N x PROTECTED_MATCH_CAP).
@@ -779,11 +794,74 @@ function parseFilesChanged(raw) {
   return null;
 }
 
+// Card #213, action 2: the RDO catalogue's basename, matched the same substring way
+// detectProtectedFiles/guardDeclaredFiles already match declared paths (which arrive ABSOLUTE,
+// per guardDeclaredFiles's own header) -- not imported from steps/scripted.js's own
+// RDO_CATALOGUE_PATH ('src/shared/rdo-members.ts'), which that module does not export; this is
+// the same file, named locally rather than reaching into another module's internals for one
+// literal.
+const RDO_CATALOGUE_BASENAME = 'rdo-members.ts';
+
+// Card #213, action 2: resolves the tri-state "did the PLAN declare the RDO catalogue" signal
+// step-contracts.js's shouldEscalate reads as source 2 of IMPLEMENT's Opus-escalation order (see
+// that function's own header for the full three-source resolution and why it is not "plan
+// first"). Returns:
+//   - true / false  -- the plan DID declare a files_to_change list (even an EMPTY one -- see
+//     guardDeclaredFiles's header, "an empty list IS a declaration") and that list does/doesn't
+//     name rdo-members.ts. shouldEscalate must NOT fall through to touchesRdoMembers on `false`:
+//     the plan spoke and said no.
+//   - undefined     -- PLAN never declared a files_to_change list at all this task (absent,
+//     malformed, or PLAN hasn't run yet) -- shouldEscalate's step 3 (touchesRdoMembers) is the
+//     fallback for this case.
+//
+// Source order: ctx.task.planFilesToChange (this same process -- guardDeclaredFiles, above, just
+// set it) first, task-values.js's lastJournaledPlanFiles(ctx.taskDir) second -- the restart-
+// durable fallback, reading the same PLAN/result event guardDeclaredFiles itself was fed from,
+// mirroring lastJournaledRdoDiffTouched's role for ctx.task.rdoDiffTouched (resolveRdoDiffTouched,
+// above). Called fresh at the IMPLEMENT call site on every attempt, never cached -- see
+// handleImplement's own comment on why that is what makes trigger 4 (below) restart-durable, and
+// the same reasoning applies here: whatever ctx.task/the journal holds AT THIS CALL is what the
+// model resolves from.
+function resolvePlanDeclaresRdoMembers(ctx) {
+  const declared = Array.isArray(ctx.task.planFilesToChange)
+    ? ctx.task.planFilesToChange
+    : lastJournaledPlanFiles(ctx.taskDir);
+  if (!Array.isArray(declared)) return undefined;
+  return declared.some((f) => typeof f === 'string' && f.includes(RDO_CATALOGUE_BASENAME));
+}
+
 async function handleImplement(ctx) {
   // Kanban piloting: move to "Implementing" before the LLM call -- IMPLEMENT is an LLM step, not
   // a scripted one, so there is no realX(ctx, deps) function for board.js's moveCard to live
   // inside; it runs here instead, gated the same way every real-mode call in this file is.
   if (isRealMode(ctx)) moveCard(ctx, ctx.deps, 'IMPLEMENT');
+
+  // Card #213, action 2 (+ its 2026-09-12 amendment): the two derived signals IMPLEMENT's Opus
+  // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
+  // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
+  // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
+  // (orchestrator/steps/llm.js:975 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // ctx.counters or ctx.taskDir directly.
+  //
+  // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact
+  // call, rather than from anything set earlier in the run. ctx.counters.diagnoseAttempts/
+  // validateRejects are restored from state.json wherever ctx.counters itself is rebuilt after a
+  // crash (reparkCrashedTask, below, and orphan-scan.js's own identical restore) -- because this
+  // reads ctx.counters at call time rather than trusting a value stamped once earlier and carried
+  // forward, a ctx whose counters were rebuilt from state.json resolves the SAME escalation a
+  // ctx that lived through the DIAGNOSE/VALIDATE-REJECT loop in one continuous process would.
+  // (Today, both of those restore call sites use the restored counters only to write an accurate
+  // park report via finalizePark, never to re-enter this handler on the same ctx -- runTask's own
+  // cameFrom comment records that a retry always restarts a task at INTAKE, with fresh counters.
+  // The property above holds regardless: it describes what THIS function does with whatever
+  // ctx.counters it is handed, not a claim that a live mid-pipeline resume exists today.)
+  ctx.task.planDeclaresRdoMembers = resolvePlanDeclaresRdoMembers(ctx);
+  // Amendment trigger 4: a retry after a DIAGNOSE or a VALIDATE reject escalates IMPLEMENT to
+  // Opus on OBSERVED difficulty ("Sonnet needs strong direction"), independent of the wire/plan
+  // signals above -- it fires precisely when the first pass did not hold, whatever the card's own
+  // text guessed or the plan declared.
+  ctx.task.diagnoseOrValidateRetry = ctx.counters.diagnoseAttempts > 0 || ctx.counters.validateRejects > 0;
+
   const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
   const payload = result === null ? { ok: true } : result;
   appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload });
@@ -1282,7 +1360,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:432's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:559's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
@@ -1410,6 +1488,27 @@ async function handleValidate(ctx) {
       throw new ParkSignal('citation-verifier-unrecognized-verdict', { verdict: cv.verdict });
     }
   }
+
+  // Action 1 of card #213: step-contracts.js's shouldEscalateEffort resolves VALIDATE's own
+  // xhigh trigger from task.rdoDiffTouched, but llm.js's resolveStepContract(stepName, ctx.task)
+  // reads it off ctx.task, not off the local rdoDiffTouchedResolved above -- on the normal path
+  // ctx.task.rdoDiffTouched is already set in-process by realPushPr (steps/scripted.js), so this
+  // assignment only earns its keep on a --worker resume that rebuilt ctx.task from task.json and
+  // lost that in-memory field. Written back here, unconditionally, before the call that reads it,
+  // so the resume path escalates exactly like the same-process path does. Precedent: #105
+  // (2026-09-06) did the same thing for CITATION_VERIFIER's own trigger, above.
+  //
+  // LATENT TRAP, recorded rather than guarded because it is unreachable today: this write-back
+  // persists resolveRdoDiffTouched's answer, whose THIRD source is Boolean(touchesRdoMembers) --
+  // intake's keyword guess, the very thing card #213 removes from the escalations. The field it
+  // writes is ALSO shouldEscalate's source 1, which treats it as diff-derived ground truth. So if
+  // VALIDATE could ever run before PUSH_PR had set the field, this line would launder the guess
+  // into ground truth and a later IMPLEMENT retry would escalate on it. It cannot today: PUSH_PR
+  // always precedes VALIDATE in the state graph, and realPushPr assigns rdoDiffTouched
+  // unconditionally and in BOTH directions (steps/scripted.js), so source 1 of
+  // resolveRdoDiffTouched always answers first on every live path. One reordering, or one early
+  // return added above that assignment in realPushPr, makes this live.
+  ctx.task.rdoDiffTouched = rdoDiffTouchedResolved;
 
   const result = await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', ctx.deps);
   const verdict = result && result.verdict;

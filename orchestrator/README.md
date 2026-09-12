@@ -98,7 +98,7 @@ Recognized keys:
 | `prWait` | `pr:wait` exit code: 0 merged · 1 closed unmerged · 4 still open (bounded re-wait) | number |
 | `llm.PLAN`, `llm.IMPLEMENT` | step payload; any object with `ok !== false` succeeds | object |
 | `llm.DIAGNOSE` | `{ "rootCause": "…" }` | object |
-| `llm.CITATION_VERIFIER` | `{ "verdict": "PASS" \| "REJECT" \| "DIVERGES" }` (only consulted when `task.touchesRdoMembers` is true) | object |
+| `llm.CITATION_VERIFIER` | `{ "verdict": "PASS" \| "REJECT" \| "DIVERGES" }` (only consulted when the REAL diff touched the RDO catalogue -- `task.rdoDiffTouched`, resolved by `resolveRdoDiffTouched`; moved off intake's `task.touchesRdoMembers` guess by #105, and this row was never updated) | object |
 | `llm.VALIDATE` | `{ "verdict": "PASS" \| "PASS_WITH_FINDINGS" \| "REJECT" }` | object |
 | `delays.<STATE>` | artificial ms delay before an LLM step returns (`delays.PLAN`, `delays.IMPLEMENT`, `delays.DIAGNOSE`, `delays.CITATION_VERIFIER`, `delays.VALIDATE`), for the deadline test | number |
 | `delays.<fixtureKey>` | same mechanism for a **scripted** step, but keyed on its fixture key, not its state name: `delays.worktree`, `delays.check`, `delays.pushPr`, `delays.gate`, `delays.prMergeEnqueue`, `delays.prWait`, `delays.finish` — `delays.WORKTREE`/`delays.CHECK`/`delays.PUSH_PR`/etc. are silently ignored (`steps/scripted.js` reads `delays.${fixtureKey}`, never the state name) | number |
@@ -381,11 +381,27 @@ A card task's own fields:
 `size` drives effort for PLAN and IMPLEMENT — PLAN through `step-contracts.js`'s shared
 `EFFORT_BY_SIZE` (low/medium/high), IMPLEMENT through its own `IMPLEMENT_EFFORT_BY_SIZE`
 (medium/medium/high: a labelled experiment whose revert criterion sits in that map's comment);
-there is no per-size budget table — see § Budgets. `touchesRdoMembers` is the RDO wire-rule
-escalation flag for IMPLEMENT and VALIDATE (never PLAN — see the comment on `step-contracts.js`'s
-PLAN entry). The sample above no longer carries `escalate`: the field is **dead — nothing reads
-it on any step**. `shouldEscalate` (`step-contracts.js`) tests only `touchesRdoMembers === true`
-and `size === 'L'`; measured, a task carrying `escalate: true` (or `escalateFlag: true`) still
+there is no per-size budget table — see § Budgets. `touchesRdoMembers` used to be IMPLEMENT's
+whole MODEL escalation story; action 2 of card #213 (2026-09-12, + its own 2026-09-12 amendment)
+narrowed it to the LAST of three sources `shouldEscalate` (`step-contracts.js`) resolves, most
+trustworthy first: (1) `task.rdoDiffTouched === true` (the real diff, once PUSH_PR has run), (2)
+`task.planDeclaresRdoMembers` (the plan's own `files_to_change` declaration, resolved by
+`state-machine.js`'s `resolvePlanDeclaresRdoMembers` before the call — true/false when PLAN
+declared a list, even an empty one; undefined when it never declared at all, in which case source
+3 is the fallback), (3) `task.touchesRdoMembers === true` — this field, the intake guess, still
+read but only for a card that has reached neither of the first two. IMPLEMENT also escalates on a
+FOURTH, independent trigger: `task.diagnoseOrValidateRetry === true`, set from
+`ctx.counters.diagnoseAttempts > 0 || ctx.counters.validateRejects > 0` immediately before the
+call — a retry after a DIAGNOSE or a VALIDATE reject escalates on observed difficulty, whatever
+the wire/plan signals say. None of this applies to PLAN — see the comment on
+`step-contracts.js`'s PLAN entry. VALIDATE no longer reads `touchesRdoMembers` at all: action 1 of
+card #213 (2026-09-12) moved VALIDATE's own `escalatesEffortOn` to the diff-derived
+`rdoDiffTouched` instead (see `shouldEscalateEffort`'s own comment, `step-contracts.js`) — on the
+36-card window measured 2026-09-12, the `touchesRdoMembers` guess fired on 23 of 36 cards while
+the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` VALIDATE calls under the
+old trigger judged a diff with no RDO in it at all.
+The sample above no longer carries `escalate`: the field is **dead — nothing reads
+it on any step**. Measured, a task carrying `escalate: true` (or `escalateFlag: true`) still
 resolves IMPLEMENT to sonnet. The "Opus 5 fallback" it used to name was only ever reachable
 through this flag and was removed 2026-09-04. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and only when the
 diff-derived `rdoDiffTouched` says the real diff touched the catalogue. `citations` in the JSON above is shown as a hand-set task

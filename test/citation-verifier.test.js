@@ -582,3 +582,41 @@ test('handleValidate: rdoDiffTouched as a non-boolean ("false" string or 0) is n
     );
   }
 });
+
+// ---- card #213 action 1: the SAME resolved value now also drives VALIDATE's own effort escalation
+// (step-contracts.js's shouldEscalateEffort), via ctx.task.rdoDiffTouched -- but llm.js's
+// resolveStepContract(stepName, ctx.task) reads that field off ctx.task, not off a local variable,
+// so handleValidate must write resolveRdoDiffTouched's result back onto ctx.task before the
+// VALIDATE call, exactly as it already does (implicitly, via realPushPr) on the same-process path.
+// This is what makes a --worker resume -- ctx.task rebuilt from task.json, in-memory field gone --
+// still escalate on the journal-durable value instead of silently staying at 'high'.
+test('handleValidate: writes resolveRdoDiffTouched\'s result back onto ctx.task before the VALIDATE call, both true and false, so a --worker resume still escalates on it', async () => {
+  for (const touched of [true, false]) {
+    const taskDir = mkTmp('spo-validate-rdo-writeback-');
+    // Same restart simulation as the durability test above: only the journal remembers PUSH_PR's
+    // finding, ctx.task does not.
+    appendEvent(taskDir, 'PUSH_PR', 'rdo-diff-derived', { touched, path: 'src/shared/rdo-members.ts' });
+
+    const task = {
+      id: 'validate-rdo-writeback',
+      kind: 'synthetic',
+      touchesRdoMembers: false,
+      citations: [], // no citations -> CITATION_VERIFIER is skipped either way; isolates the write-back
+      shadow: {
+        llm: { VALIDATE: { verdict: 'PASS' } },
+      },
+    };
+    const ctx = validateShadowCtx('validate-rdo-writeback', task, taskDir);
+    assert.equal(ctx.task.rdoDiffTouched, undefined, 'the rebuilt task must not carry the in-memory field yet');
+
+    await HANDLERS.VALIDATE(ctx);
+
+    assert.equal(
+      ctx.task.rdoDiffTouched,
+      touched,
+      'handleValidate must write the resolved value back onto ctx.task before calling VALIDATE, so ' +
+        "llm.js's resolveStepContract(stepName, ctx.task) -- and a --worker resume that rebuilds " +
+        'ctx.task from task.json -- read the journal-durable value, not undefined'
+    );
+  }
+});

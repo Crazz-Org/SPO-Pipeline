@@ -1702,6 +1702,15 @@ async function realPushPr(ctx, deps = {}) {
   // back to false here would silently demote every later retry's IMPLEMENT from opus to sonnet.
   // The diff-derived truth for the OTHER consumer (whether CITATION_VERIFIER should run) lives in
   // ctx.task.rdoDiffTouched below instead, which is genuinely symmetric (set both directions).
+  //
+  // Card #213, action 2 (2026-09-12): shouldEscalate no longer reads this field FIRST -- it is now
+  // the LAST of three sources (real diff, then PLAN's own declaration, then this guess), consulted
+  // only when neither of the first two has an answer. The guarantee above still holds for exactly
+  // that case (a card whose plan never declared a files_to_change list at all): this line sets
+  // `ctx.task.rdoDiffTouched = touchesCatalogue` right below too, which is now shouldEscalate's
+  // SOURCE 1 and normally already resolves any retry from here on -- this promotion mainly still
+  // matters for a card that reaches CITATION_VERIFIER/VALIDATE without ever having had a plan
+  // declaration recorded, or for the narrow window before this line runs on the FIRST PUSH_PR.
   if (touchesCatalogue && !ctx.task.touchesRdoMembers) {
     ctx.task.touchesRdoMembers = true;
     appendEvent(ctx.taskDir, 'PUSH_PR', 'touches-rdo-members-rederived', { from: false, to: true });

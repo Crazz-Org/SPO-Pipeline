@@ -33,6 +33,11 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// Action 2 (card #213): lastJournaledPlanFiles below reuses the SAME shape-tolerant parser
+// guardDeclaredFiles (state-machine.js) already normalizes `files_to_change` through at write
+// time -- one definition of "an array, or a JSON string holding one, or neither", never a second.
+// park-loop.js does not require this module, so this require introduces no cycle.
+const { normalizeFindingsPayload } = require('./park-loop');
 
 const DEFAULT_SPO_ORIGINAL_PATH = path.join(os.homedir(), 'SPO-Original');
 
@@ -139,6 +144,34 @@ function lastJournaledRdoDiffTouched(taskDir) {
 // reason to fail CHECK.
 function lastInvariantsBaseline(taskDir) {
   return lastMatchingEvent(taskDir, (e) => e.state === 'PLAN' && e.event === 'invariants-baseline');
+}
+
+// Action 2 (card #213): the restart-durable fallback for ctx.task.planFilesToChange, mirroring
+// lastJournaledRdoDiffTouched's role for ctx.task.rdoDiffTouched above. Decision recorded on the
+// card itself: rather than add a SECOND journal event for the normalized declaration, this reads
+// `files_to_change` straight off the most recent PLAN 'result' event's payload -- handlePlan
+// (state-machine.js) already journals that field verbatim, raw JSON-string-or-array shape and
+// all, on every PLAN 'result' it writes (the fresh-reply path and the plan-reuse path both do,
+// and BOTH re-journal 'result' a second time with plan_path/invariants_path added, so the LAST
+// 'result' event for this state always carries it when PLAN ever declared one at all). One event
+// is enough; a second was not needed.
+//
+// Returns the NORMALIZED array (same array/json-string tolerance, and the same "empty list IS a
+// declaration" posture as guardDeclaredFiles) when the last PLAN 'result' payload declared a
+// files_to_change list, or `undefined` when it never declared at all -- absent, null, an object,
+// a bare unparsable string, or a list with a non-string entry all collapse to `undefined` here,
+// exactly as guardDeclaredFiles treats them as "undeclared" (journalling 'plan-files-undeclared'
+// rather than proceeding). A caller distinguishing "declared empty" from "never declared" gets to
+// do so via Array.isArray on the return value, same as it would on ctx.task.planFilesToChange
+// itself (guardDeclaredFiles only ever sets that field for the declared shapes).
+function lastJournaledPlanFiles(taskDir) {
+  const payload = lastResultPayload(taskDir, 'PLAN');
+  if (!payload) return undefined;
+  const declared = normalizeFindingsPayload(payload.files_to_change);
+  const isList = declared.shape === 'array' || declared.shape === 'json-string';
+  if (!isList) return undefined;
+  const allStrings = declared.items.every((f) => typeof f === 'string');
+  return allStrings ? declared.items : undefined;
 }
 
 // The most recent DIAGNOSE finding and/or VALIDATE REJECT, as an IMPLEMENT-facing summary, or a
@@ -288,6 +321,7 @@ module.exports = {
   lastResultEvent,
   lastJournaledCitations,
   lastJournaledRdoDiffTouched,
+  lastJournaledPlanFiles,
   lastInvariantsBaseline,
   scratchDir,
   diffPath,
