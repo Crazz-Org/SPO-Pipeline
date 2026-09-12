@@ -37,6 +37,21 @@ Don't rediscover them. `gh` is the project's native GitHub tool (account `Crazz-
   permission layer. A permission block therefore never concerns the daemon, only a Claude
   session.
 
+## Filling a card
+
+**Criticity is a board FIELD, never a sentence.** Project 2 carries a `Priority` single-select —
+`CRITICAL` / `HIGH` / `MEDIUM` / `LOW` (added 2026-09-12). Set it when the card is filed; never
+*also* write `**Severity: HIGH**` in the body or a `HIGH — ` title prefix. Prose criticity is
+unsortable: the 2026-09-11 review had to open 18 issue bodies by hand to rank one column.
+
+- Rank on **trigger frequency × cost of one firing**, not on how alarming the write-up reads.
+  Evidence that does not separate two rungs takes the **lower** one.
+- **`DECISION` is not a priority** — orthogonal axis, stays a title prefix (§ *Working a chantier*:
+  the driver never delegates one).
+- Rubric, the field/option ids, the hand-filing mutation and the `spo ask` contract:
+  `orchestrator/README.md` § *Priority*. Todo is ordered top-first by priority and that order is
+  **set, not readable back** — after changing a priority, move the card too.
+
 ## Permissions
 
 Policy, measures, and trade-offs: `doc/permissions.md`. Two things to know before planning a

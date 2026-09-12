@@ -21,6 +21,7 @@
                "category": "defect" | "latent-trap" | "feature" | "observation" | "doc-infra",
                "size": "S" | "M" | "L",
                "area": "docs" | "rdo" | "bench" | "renderer" | "gateway" | "client" | "e2e" | "shared" | "ci",
+               "priority": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
                "is_bug_report": true, "confirmed": true } }
   `draft` is a LITERAL NESTED JSON OBJECT, exactly as shown above — a second JSON object inside
   the first, never a JSON-encoded STRING. WRONG: "draft": "{\"title\": \"...\"}" (a string that
@@ -160,7 +161,7 @@ greppable marker, exactly:
 
 — this is what makes the next run's dedup search find it.
 
-## 4 · Draft: `category`, `size`, `area`
+## 4 · Draft: `category`, `size`, `area`, `priority`
 
 `kind` pre-orients `category`, it does not decide it: `wrong-data`/`broken-action` → 🔴 `defect`;
 `visual` → your judgement between `feature` (a real gap) and `observation`. `size` is the usual
@@ -175,6 +176,14 @@ earlier wins).
 - a `## Done means` section — the acceptance criterion;
 - the `<!-- anchorKey: ... --> ` marker from step 3;
 - a final line: `Source: /triage-report queue, {{today}}`.
+
+`priority` — the card's criticity as a **board field**, one of `CRITICAL` / `HIGH` / `MEDIUM` /
+`LOW`. Rank it on **how often the trigger fires × what one firing costs**, not on how strongly the
+reporter phrased it: a single user hitting a cosmetic glitch is `LOW` however annoyed the report
+sounds. `CRITICAL` is for something losing work or availability now, on a trigger needing nothing
+rare. Where the evidence does not separate two rungs, take the lower one. Never *also* write the
+criticity into `title` or `body_markdown` — the field is the only place it lives, and a `HIGH — `
+prefix or a `**Severity:**` line is a correction `review-card` will call out.
 
 Set `is_bug_report: true` and `confirmed: true` — you only reach this branch once step 1 has
 already reproduced the claim; a report that did not reproduce never reaches a draft.

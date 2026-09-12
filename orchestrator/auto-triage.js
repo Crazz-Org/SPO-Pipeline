@@ -700,6 +700,7 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
 // draft already relies on for a wrong guess. 'client' is the most common ground for a UI/UX
 // improvement idea, which "could be better" mostly is.
 const DEFAULT_SUGGESTION_AREA = 'client';
+const DEFAULT_SUGGESTION_PRIORITY = 'LOW';
 
 // buildSuggestionDraft(entry, deps) -- the mechanical path for a `kind: 'suggestion'` report:
 // NO reproduction, no drafting LLM call at all (a maintainer's own confirm is the only judgement
@@ -717,6 +718,12 @@ function buildSuggestionDraft(entry, deps) {
     category: 'feature',
     size: 'S',
     area: DEFAULT_SUGGESTION_AREA,
+    // A maintainer suggestion arrives with no evidence attached and no measured cost, so it enters
+    // at the bottom of the ladder rather than guessing. review-card is the step that may raise it
+    // (a `priority: HIGH` correction is mechanical -- intake.js's applyMechanicalCorrections), and
+    // a human re-ranks it on the board afterwards. Starting anywhere above LOW would let an
+    // unreviewed suggestion outrank a measured defect.
+    priority: DEFAULT_SUGGESTION_PRIORITY,
     is_bug_report: false,
     confirmed: true,
   };

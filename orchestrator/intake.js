@@ -50,7 +50,7 @@ const DRAFT_CARD_PROMPT = path.join(PROMPTS_DIR, 'draft-card.md');
 const REVIEW_CARD_PROMPT = path.join(PROMPTS_DIR, 'review-card.md');
 const TRIAGE_BUG_REPORT_PROMPT = path.join(PROMPTS_DIR, 'triage-bug-report.md');
 
-const DRAFT_REQUIRED = ['title', 'body_markdown', 'category', 'size', 'area', 'is_bug_report', 'confirmed'];
+const DRAFT_REQUIRED = ['title', 'body_markdown', 'category', 'size', 'area', 'priority', 'is_bug_report', 'confirmed'];
 const REVIEW_REQUIRED = ['verdict', 'corrections', 'first_comment_markdown'];
 const REVIEW_VERDICTS = new Set(['FILE', 'FILE_AMENDED', 'DO_NOT_FILE']);
 
@@ -59,6 +59,13 @@ const TRIAGE_OUTCOMES = new Set(['schema-version', 'not-reproduced', 'insufficie
 const VALID_CATEGORIES = new Set(['defect', 'latent-trap', 'feature', 'observation', 'doc-infra']);
 const VALID_SIZES = new Set(['S', 'M', 'L']);
 const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'client', 'e2e', 'shared', 'ci']);
+// Criticity, as a VALUE a board field can hold -- not a sentence in the body. Before 2026-09-12
+// every card carried its criticity as prose ("**Severity: MEDIUM**", or a "HIGH -- " title
+// prefix), so no board view could sort on it and the maintainer's 2026-09-11 criticity review had
+// to open 18 issue bodies by hand. The four words are the ones the existing corpus already used,
+// so the board backfill was lossless. Single source of truth, re-exported and re-asserted by
+// orchestrator/project-board.js's own VALID_PRIORITIES (test/project-board.test.js pins the pair).
+const VALID_PRIORITIES = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
 
 // config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted/LLM steps and must stay
 // that way -- it is not a fit for either intake step. draftCard and reviewCard are the
@@ -417,6 +424,9 @@ function validateDraftContract(parsed) {
   if (!VALID_AREAS.has(parsed.area)) {
     return { ok: false, error: `unrecognized area "${parsed.area}"` };
   }
+  if (!VALID_PRIORITIES.has(parsed.priority)) {
+    return { ok: false, error: `unrecognized priority "${parsed.priority}"` };
+  }
   return { ok: true };
 }
 
@@ -469,6 +479,7 @@ async function reviewCard(draft, deps = {}) {
     card_body: draft.body_markdown,
     card_category: draft.category,
     card_size: draft.size,
+    card_priority: draft.priority,
     card_area: draft.area,
     repo: ghRepo,
     // 'yes' only when auto-triage.js passes deps.humanConfirmed for a report a maintainer has
@@ -533,7 +544,7 @@ async function reviewCard(draft, deps = {}) {
 // prose: left untouched here, and never silently dropped, since first_comment_markdown (posted
 // verbatim as the issue's first comment) always carries the full corrections text for a human to
 // read.
-const MECHANICAL_CORRECTION_RE = /^\s*(category|size|area)\s*:\s*([^\s].*?)\s*$/i;
+const MECHANICAL_CORRECTION_RE = /^\s*(category|size|area|priority)\s*:\s*([^\s].*?)\s*$/i;
 
 function applyMechanicalCorrections(draft, corrections) {
   const applied = { ...draft };
@@ -554,6 +565,11 @@ function applyMechanicalCorrections(draft, corrections) {
       applied.size = rawValue.toUpperCase();
     } else if (field === 'area' && VALID_AREAS.has(rawValue)) {
       applied.area = rawValue;
+    } else if (field === 'priority' && VALID_PRIORITIES.has(rawValue.toUpperCase())) {
+      // Upper-cased like `size`, and for the same reason: the vocabulary is stored upper-case, and
+      // a judge that wrote `priority: high` meant HIGH -- that is a casing slip, not an unknown
+      // value to hand back to a human as an unmechanical correction.
+      applied.priority = rawValue.toUpperCase();
     } else {
       unmechanical.push(correction); // named the right field but not a value this build knows
     }
@@ -764,7 +780,11 @@ function fileCard(draft, review, deps = {}) {
   }
 
   const url = parseIssueUrl(createResult.stdout) || `https://github.com/${ghRepo}/issues/${issueNumber}`;
-  return { ok: true, issueNumber, url, bodyFile, commentFile: commented.commentFile };
+  // `priority` is the APPLIED one, not `draft.priority`: review-card's `priority: HIGH` correction
+  // is mechanical (applyMechanicalCorrections above), and bin/spo hands this value straight to
+  // project-board.js. Returning the drafter's original here would put the judge's verdict in the
+  // issue body and the drafter's guess on the board -- the two disagreeing silently.
+  return { ok: true, issueNumber, url, bodyFile, commentFile: commented.commentFile, priority: applied.priority };
 }
 
 // amendCard(issueNumber, draft, review, deps) -- fileCard's sibling for the human-first intake
@@ -1353,6 +1373,7 @@ module.exports = {
   VALID_CATEGORIES,
   VALID_SIZES,
   VALID_AREAS,
+  VALID_PRIORITIES,
   TRIAGE_OUTCOMES,
   // Exported so config.js's accountLeaseWaitMs bound can be ASSERTED against the scanner's own
   // worst legitimate lease hold (2 x this, one lease spanning the primary call and its

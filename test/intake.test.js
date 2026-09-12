@@ -96,6 +96,7 @@ const VALID_DRAFT = {
   category: 'feature',
   size: 'S',
   area: 'client',
+  priority: 'MEDIUM',
   is_bug_report: false,
   confirmed: false,
 };
@@ -3691,4 +3692,114 @@ test('the daemon: a real daemon-side call site (park-loop.js\'s postParkComment)
   assert.ok(commentCall, 'gh issue comment was never called');
   assert.equal(commentCall.argv[commentCall.argv.indexOf('--repo') + 1], 'Crazz-Org/SPO-WebClient');
   assert.equal(commentCall.argv[commentCall.argv.indexOf('--repo') + 1], orchestratorConfig.ghRepo);
+});
+
+// --- priority is a contract FIELD, not prose in the body (2026-09-12) ------------------------
+// Before this, criticity reached the board only as text a reader had to parse out of
+// `body_markdown` ("**Severity: MEDIUM**"). These pin that it is now a first-class draft key with
+// a closed vocabulary, corrected like any other taxonomy field, and carried out of fileCard so
+// bin/spo can write it to the board.
+
+test('validateDraftContract: a draft with no `priority` key is rejected -- it is required, not optional', () => {
+  const dir = mkTmp('spo-draft-noprio-');
+  const file = path.join(dir, 'draft.json');
+  const { priority, ...withoutPriority } = VALID_DRAFT;
+  fs.writeFileSync(file, JSON.stringify(withoutPriority, null, 2));
+
+  const result = intake.loadDraftFile(file);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /missing required key\(s\): priority/);
+});
+
+test('validateDraftContract: a priority outside the vocabulary is rejected by name', () => {
+  const dir = mkTmp('spo-draft-badprio-');
+  const file = path.join(dir, 'draft.json');
+  fs.writeFileSync(file, JSON.stringify({ ...VALID_DRAFT, priority: 'P0' }, null, 2));
+
+  const result = intake.loadDraftFile(file);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /unrecognized priority "P0"/);
+});
+
+test('validateDraftContract: every word of the vocabulary is accepted, and only those words', () => {
+  const dir = mkTmp('spo-draft-prio-vocab-');
+  for (const word of ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']) {
+    const file = path.join(dir, `draft-${word}.json`);
+    fs.writeFileSync(file, JSON.stringify({ ...VALID_DRAFT, priority: word }, null, 2));
+    const result = intake.loadDraftFile(file);
+    assert.equal(result.ok, true, `${word} should be accepted: ${result.error}`);
+    assert.equal(result.draft.priority, word);
+  }
+  // Lower case is NOT accepted at the contract boundary -- the drafter's contract says upper. A
+  // casing slip is repairable later, as a review-card correction (next test), not here.
+  const lower = path.join(dir, 'draft-lower.json');
+  fs.writeFileSync(lower, JSON.stringify({ ...VALID_DRAFT, priority: 'high' }, null, 2));
+  assert.equal(intake.loadDraftFile(lower).ok, false);
+  // DECISION is an orthogonal axis (a human must arbitrate), never a rung on this ladder.
+  const decision = path.join(dir, 'draft-decision.json');
+  fs.writeFileSync(decision, JSON.stringify({ ...VALID_DRAFT, priority: 'DECISION' }, null, 2));
+  assert.equal(intake.loadDraftFile(decision).ok, false);
+});
+
+test('applyMechanicalCorrections: review-card can re-rank a draft, and a casing slip is applied not rejected', () => {
+  const raised = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: CRITICAL']);
+  assert.equal(raised.applied.priority, 'CRITICAL');
+  assert.deepEqual(raised.unmechanical, []);
+  assert.equal(VALID_DRAFT.priority, 'MEDIUM', 'the input draft must not be mutated');
+
+  const lowercased = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: low']);
+  assert.equal(lowercased.applied.priority, 'LOW');
+  assert.deepEqual(lowercased.unmechanical, []);
+
+  // A word outside the vocabulary stays prose for a human, exactly like an unknown category.
+  const unknown = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: URGENT-ISH']);
+  assert.equal(unknown.applied.priority, 'MEDIUM', 'an unknown value must not overwrite the draft');
+  assert.deepEqual(unknown.unmechanical, ['priority: URGENT-ISH']);
+});
+
+test('VALID_PRIORITIES is exported and agrees, word for word, with project-board.js', () => {
+  const projectBoard = require('../orchestrator/project-board');
+  assert.deepEqual([...intake.VALID_PRIORITIES], ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
+  assert.deepEqual([...intake.VALID_PRIORITIES], [...projectBoard.VALID_PRIORITIES]);
+  assert.ok(intake.DRAFT_REQUIRED.includes('priority'));
+});
+
+test('fileCard: returns the APPLIED priority, not the drafter\'s original -- bin/spo writes this to the board', () => {
+  const deps = {
+    spawnSync: fakeSpawnSync((command, argv) => {
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return { status: 0, stdout: JSON.stringify([]), stderr: '', signal: null };
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return {
+          status: 0,
+          stdout: 'https://github.com/Crazz-Org/SPO-Pipeline/issues/999\n',
+          stderr: '',
+          signal: null,
+        };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+
+  // The judge raised it. If fileCard handed back `draft.priority` the board would read MEDIUM
+  // while the issue's own review comment said CRITICAL -- the two disagreeing silently, which is
+  // the exact failure the read-back in project-board.js cannot catch (it verifies the write
+  // landed, not that the right value was chosen).
+  const raised = intake.fileCard(
+    VALID_DRAFT,
+    { verdict: 'FILE_AMENDED', corrections: ['priority: CRITICAL'], first_comment_markdown: 'raised' },
+    deps
+  );
+  assert.equal(raised.ok, true);
+  assert.equal(raised.priority, 'CRITICAL');
+  assert.notEqual(raised.priority, VALID_DRAFT.priority);
+
+  // With no correction it is the draft's own value, unchanged.
+  const untouched = intake.fileCard(
+    VALID_DRAFT,
+    { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' },
+    deps
+  );
+  assert.equal(untouched.priority, VALID_DRAFT.priority);
 });

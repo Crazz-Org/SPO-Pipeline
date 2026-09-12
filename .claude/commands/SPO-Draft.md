@@ -27,6 +27,7 @@ produces (see that file for the fuller rules on tone and citation quality):
   "category": "defect" | "latent-trap" | "feature" | "observation" | "doc-infra",
   "size": "S" | "M" | "L",
   "area": "docs" | "rdo" | "bench" | "renderer" | "gateway" | "client" | "e2e" | "shared" | "ci",
+  "priority": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
   "is_bug_report": true | false,
   "confirmed": true | false
 }
@@ -34,6 +35,14 @@ produces (see that file for the fuller rules on tone and citation quality):
 
 - `title` / `body_markdown` are English regardless of what language the conversation was in —
   translate the substance, never transcribe the words.
+- `priority` is the card's criticity **as a board field**, ranked on how often the trigger fires
+  times what one firing costs — never on how interesting the finding is. `CRITICAL` only for work
+  being lost now on a trigger that needs nothing rare; `LOW` when the trigger needs a precondition
+  that does not exist yet. Where the evidence does not separate two rungs, take the lower one and
+  say in the body what would raise it. **Do not also write the criticity into the title or body**
+  (no `HIGH — ` prefix, no `**Severity: HIGH**` line): the field is the single place it lives, and
+  a duplicate in prose is what the field replaced. `DECISION` is not a priority — it is an
+  orthogonal axis and stays a title prefix.
 - `is_bug_report: true` only for something genuinely broken; `confirmed: true` only when the
   conversation supplied a reproduction precise enough to replay, or you verified the behaviour
   yourself against the code. Do not mark a thin report `confirmed: true` to make it look
