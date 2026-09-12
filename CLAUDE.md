@@ -39,11 +39,14 @@ Don't rediscover them. `gh` is the project's native GitHub tool (account `Crazz-
 
 ## Filling a card
 
-**Criticity is a board FIELD, never a sentence.** Project 2 carries a `Priority` single-select —
-`CRITICAL` / `HIGH` / `MEDIUM` / `LOW` (added 2026-09-12). Set it when the card is filed; never
-*also* write `**Severity: HIGH**` in the body or a `HIGH — ` title prefix. Prose criticity is
-unsortable: the 2026-09-11 review had to open 18 issue bodies by hand to rank one column.
+**Criticity is a board FIELD, never a sentence.** Project 2 carries GitHub's built-in `Priority`
+single-select — `Urgent` / `High` / `Medium` / `Low`, spelled exactly so (added 2026-09-12). Set it
+when the card is filed; never *also* write `**Severity: High**` in the body or a `HIGH — ` title
+prefix. Prose criticity is unsortable: the 2026-09-11 review had to open 18 issue bodies by hand to
+rank one column.
 
+- **Use the platform's field, never a house variant.** A bespoke vocabulary (`CRITICAL`, `P0`)
+  costs every GitHub default view, saved layout and roadmap grouping, for nothing.
 - Rank on **trigger frequency × cost of one firing**, not on how alarming the write-up reads.
   Evidence that does not separate two rungs takes the **lower** one.
 - **`DECISION` is not a priority** — orthogonal axis, stays a title prefix (§ *Working a chantier*:

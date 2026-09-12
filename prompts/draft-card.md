@@ -13,7 +13,7 @@
     "category": "defect" | "latent-trap" | "feature" | "observation" | "doc-infra",
     "size": "S" | "M" | "L",
     "area": "docs" | "rdo" | "bench" | "renderer" | "gateway" | "client" | "e2e" | "shared" | "ci",
-    "priority": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+    "priority": "Urgent" | "High" | "Medium" | "Low",
     "is_bug_report": true | false,
     "confirmed": true | false
   }
@@ -54,8 +54,11 @@ today:        {{today}}
    `renderer` / `gateway` / `client` / `e2e` / `shared` / `ci` — `docs` first, `ci` last and the
    catch-all; where two rows could match, the earlier row wins. A request that genuinely spans two
    blocking areas is not this step's problem to solve — pick the row the larger half lands in.
-6. **`priority`** — the card's criticity, as one of exactly `CRITICAL` / `HIGH` / `MEDIUM` / `LOW`.
-   This is a **board field**, not a sentence: never also write "Severity: HIGH" or a `HIGH — `
+6. **`priority`** — the card's criticity, as one of exactly `Urgent` / `High` / `Medium` / `Low`.
+   These are GitHub Projects' own built-in Priority options; spell them **exactly** as written
+   here, capital first letter and nothing else — not `URGENT`, not `P0`.
+
+   This is a **board field**, not a sentence: never also write "Severity: High" or a `HIGH — `
    title prefix into `title`/`body_markdown`. Prose criticity is what this field replaced — no
    board view, no sort and no `gh` query can read a sentence, so a column ranked that way has to
    be re-derived by opening every card.
@@ -63,14 +66,14 @@ today:        {{today}}
    Rank on **how often the trigger fires × what one firing costs**, never on how interesting the
    finding is:
 
-   - `CRITICAL` — it is losing work, money or availability *now*, on a trigger that needs nothing
-     rare. Reserved for that; a card that merely sounds alarming is not CRITICAL.
-   - `HIGH` — routine trigger, costly outcome. The next thing to schedule once CRITICAL is clear.
-   - `MEDIUM` — a real defect on a routine trigger whose cost is bounded and recoverable.
-   - `LOW` — real, but slow-burning, cosmetic, or needing a precondition that does not exist yet.
+   - `Urgent` — it is losing work, money or availability *now*, on a trigger that needs nothing
+     rare. Reserved for that; a card that merely sounds alarming is not `Urgent`.
+   - `High` — routine trigger, costly outcome. The next thing to schedule once `Urgent` is clear.
+   - `Medium` — a real defect on a routine trigger whose cost is bounded and recoverable.
+   - `Low` — real, but slow-burning, cosmetic, or needing a precondition that does not exist yet.
 
    When the evidence does not separate two rungs, take the **lower** one and say in the body what
-   measurement would raise it. `review-card` reads this field and may correct it (`priority: HIGH`
+   measurement would raise it. `review-card` reads this field and may correct it (`priority: High`
    is a mechanical correction), so an honest low guess costs nothing and an inflated one is
    re-ranked against you.
 

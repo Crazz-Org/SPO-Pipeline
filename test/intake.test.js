@@ -96,7 +96,7 @@ const VALID_DRAFT = {
   category: 'feature',
   size: 'S',
   area: 'client',
-  priority: 'MEDIUM',
+  priority: 'Medium',
   is_bug_report: false,
   confirmed: false,
 };
@@ -3723,18 +3723,21 @@ test('validateDraftContract: a priority outside the vocabulary is rejected by na
 
 test('validateDraftContract: every word of the vocabulary is accepted, and only those words', () => {
   const dir = mkTmp('spo-draft-prio-vocab-');
-  for (const word of ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']) {
+  for (const word of ['Urgent', 'High', 'Medium', 'Low']) {
     const file = path.join(dir, `draft-${word}.json`);
     fs.writeFileSync(file, JSON.stringify({ ...VALID_DRAFT, priority: word }, null, 2));
     const result = intake.loadDraftFile(file);
     assert.equal(result.ok, true, `${word} should be accepted: ${result.error}`);
     assert.equal(result.draft.priority, word);
   }
-  // Lower case is NOT accepted at the contract boundary -- the drafter's contract says upper. A
-  // casing slip is repairable later, as a review-card correction (next test), not here.
-  const lower = path.join(dir, 'draft-lower.json');
-  fs.writeFileSync(lower, JSON.stringify({ ...VALID_DRAFT, priority: 'high' }, null, 2));
-  assert.equal(intake.loadDraftFile(lower).ok, false);
+  // The spelling is case-EXACT at the contract boundary: the drafter is handed `Urgent`/`High`/
+  // `Medium`/`Low` verbatim in its prompt. A casing slip is repairable later, as a review-card
+  // correction (next test), not here. The old house vocabulary is refused outright.
+  for (const wrong of ['high', 'HIGH', 'URGENT', 'CRITICAL', 'P0']) {
+    const f = path.join(dir, `draft-wrong-${wrong}.json`);
+    fs.writeFileSync(f, JSON.stringify({ ...VALID_DRAFT, priority: wrong }, null, 2));
+    assert.equal(intake.loadDraftFile(f).ok, false, `"${wrong}" must not be accepted`);
+  }
   // DECISION is an orthogonal axis (a human must arbitrate), never a rung on this ladder.
   const decision = path.join(dir, 'draft-decision.json');
   fs.writeFileSync(decision, JSON.stringify({ ...VALID_DRAFT, priority: 'DECISION' }, null, 2));
@@ -3742,24 +3745,27 @@ test('validateDraftContract: every word of the vocabulary is accepted, and only 
 });
 
 test('applyMechanicalCorrections: review-card can re-rank a draft, and a casing slip is applied not rejected', () => {
-  const raised = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: CRITICAL']);
-  assert.equal(raised.applied.priority, 'CRITICAL');
+  const raised = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: Urgent']);
+  assert.equal(raised.applied.priority, 'Urgent');
   assert.deepEqual(raised.unmechanical, []);
-  assert.equal(VALID_DRAFT.priority, 'MEDIUM', 'the input draft must not be mutated');
+  assert.equal(VALID_DRAFT.priority, 'Medium', 'the input draft must not be mutated');
 
-  const lowercased = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: low']);
-  assert.equal(lowercased.applied.priority, 'LOW');
-  assert.deepEqual(lowercased.unmechanical, []);
+  // Case-folded to GitHub's own spelling, in BOTH directions of the slip.
+  for (const [written, canonical] of [['low', 'Low'], ['URGENT', 'Urgent'], ['hIgH', 'High']]) {
+    const folded = intake.applyMechanicalCorrections(VALID_DRAFT, [`priority: ${written}`]);
+    assert.equal(folded.applied.priority, canonical, `"${written}" should fold to "${canonical}"`);
+    assert.deepEqual(folded.unmechanical, []);
+  }
 
   // A word outside the vocabulary stays prose for a human, exactly like an unknown category.
   const unknown = intake.applyMechanicalCorrections(VALID_DRAFT, ['priority: URGENT-ISH']);
-  assert.equal(unknown.applied.priority, 'MEDIUM', 'an unknown value must not overwrite the draft');
+  assert.equal(unknown.applied.priority, 'Medium', 'an unknown value must not overwrite the draft');
   assert.deepEqual(unknown.unmechanical, ['priority: URGENT-ISH']);
 });
 
 test('VALID_PRIORITIES is exported and agrees, word for word, with project-board.js', () => {
   const projectBoard = require('../orchestrator/project-board');
-  assert.deepEqual([...intake.VALID_PRIORITIES], ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
+  assert.deepEqual([...intake.VALID_PRIORITIES], ['Urgent', 'High', 'Medium', 'Low']);
   assert.deepEqual([...intake.VALID_PRIORITIES], [...projectBoard.VALID_PRIORITIES]);
   assert.ok(intake.DRAFT_REQUIRED.includes('priority'));
 });
@@ -3782,17 +3788,17 @@ test('fileCard: returns the APPLIED priority, not the drafter\'s original -- bin
     }),
   };
 
-  // The judge raised it. If fileCard handed back `draft.priority` the board would read MEDIUM
-  // while the issue's own review comment said CRITICAL -- the two disagreeing silently, which is
+  // The judge raised it. If fileCard handed back `draft.priority` the board would read Medium
+  // while the issue's own review comment said Urgent -- the two disagreeing silently, which is
   // the exact failure the read-back in project-board.js cannot catch (it verifies the write
   // landed, not that the right value was chosen).
   const raised = intake.fileCard(
     VALID_DRAFT,
-    { verdict: 'FILE_AMENDED', corrections: ['priority: CRITICAL'], first_comment_markdown: 'raised' },
+    { verdict: 'FILE_AMENDED', corrections: ['priority: Urgent'], first_comment_markdown: 'raised' },
     deps
   );
   assert.equal(raised.ok, true);
-  assert.equal(raised.priority, 'CRITICAL');
+  assert.equal(raised.priority, 'Urgent');
   assert.notEqual(raised.priority, VALID_DRAFT.priority);
 
   // With no correction it is the draft's own value, unchanged.

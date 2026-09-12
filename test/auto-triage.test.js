@@ -92,7 +92,7 @@ const VALID_DRAFT = {
   category: 'defect',
   size: 'S',
   area: 'rdo',
-  priority: 'HIGH',
+  priority: 'High',
   is_bug_report: true,
   confirmed: true,
 };

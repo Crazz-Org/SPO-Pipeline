@@ -126,13 +126,14 @@ what kind of thing it is — so an `L` filed as `S` distorts the order for every
 the board afterwards. Say which value you would use and why; do not haggle over one notch when
 the card is otherwise sound.
 
-`priority` (`CRITICAL` · `HIGH` · `MEDIUM` · `LOW`) is the criticity itself, and since 2026-09-12
-it is a **board field** — it is what the Todo column is ordered on, so a wrong value here does not
-just read badly, it puts the card in the wrong place in the queue. Judge it on **how often the
-trigger fires × what one firing costs**, not on how alarming the write-up sounds:
+`priority` (`Urgent` · `High` · `Medium` · `Low` — GitHub's own built-in Priority options, spelled
+exactly so) is the criticity itself, and since 2026-09-12 it is a **board field** — it is what the
+Todo column is ordered on, so a wrong value here does not just read badly, it puts the card in the
+wrong place in the queue. Judge it on **how often the trigger fires × what one firing costs**, not
+on how alarming the write-up sounds:
 
-- `CRITICAL` is for work being lost *now* on a trigger that needs nothing rare. A finding that is
-  merely severe *if* it ever fires is not CRITICAL — that is what `LOW` and a stated reopen
+- `Urgent` is for work being lost *now* on a trigger that needs nothing rare. A finding that is
+  merely severe *if* it ever fires is not `Urgent` — that is what `Low` and a stated reopen
   condition are for.
 - A card whose evidence does not separate two rungs belongs on the **lower** one, with the
   measurement that would raise it named in the body. Correct an inflated priority down as readily
@@ -142,8 +143,8 @@ trigger fires × what one firing costs**, not on how alarming the write-up sound
   while the field says another is worse than either alone. Name it in `corrections` and say the
   prose should come out.
 - `DECISION` is **not** a priority. "A human must arbitrate before code is written" is an
-  orthogonal axis — a DECISION card can be CRITICAL or LOW. It stays a title prefix; never accept
-  it as a `priority` value.
+  orthogonal axis — a DECISION card can be `Urgent` or `Low`. It stays a title prefix; never
+  accept it as a `priority` value.
 
 `area` is not weight — it is the **ground reservation**, the one field another session's claim
 depends on: a Todo card whose area a live card already holds is skipped by the intake path, and
@@ -179,7 +180,7 @@ recommendation for whoever reads the board next, never a gate that keeps the car
 | `verdict` | Meaning | What happens next |
 |---|---|---|
 | `FILE` | The card holds as written. | Filed unchanged. |
-| `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:`/`priority:` correction is applied to the draft before filing (`priority:` is upper-cased, so `priority: high` lands as `HIGH`, and reaches the board field itself on a project-2 target — `orchestrator/project-board.js`); whether it also ships as a `cat:`/`size:` label depends on the target repo's label inventory — the exact label name ships when the inventory confirms it present, is dropped and announced on stdout when the inventory confirms it absent, and ships unverified when the inventory cannot be read (see `intake.js`'s `fileCard` header for the exact three-way split); a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
+| `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:`/`priority:` correction is applied to the draft before filing (`priority:` is case-folded to GitHub's own spelling, so `priority: urgent` lands as `Urgent`, and reaches the board field itself on a project-2 target — `orchestrator/project-board.js`); whether it also ships as a `cat:`/`size:` label depends on the target repo's label inventory — the exact label name ships when the inventory confirms it present, is dropped and announced on stdout when the inventory confirms it absent, and ships unverified when the inventory cannot be read (see `intake.js`'s `fileCard` header for the exact three-way split); a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
 | `DO_NOT_FILE` | There is no card here — not a defect, duplicate of #N, or already fixed at `<sha>`. | Nothing is filed. |
 
 `FILE_AMENDED` must name **exactly** what to change in `corrections` — the corrected `priority`, `category`,

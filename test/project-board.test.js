@@ -31,10 +31,10 @@ const FAKE_ISSUE_NODE_ID = 'I_ZZZ_issue_node_c001';
 const FAKE_ITEM_ID = 'PVTI_ZZZ_item_dead22';
 const FAKE_PRIORITY_FIELD_ID = 'PVTSSF_ZZZ_priority_field_4d70';
 const FAKE_PRIORITY_OPTION_IDS = {
-  CRITICAL: 'opt_ZZZ_crit_8a11',
-  HIGH: 'opt_ZZZ_high_5c42',
-  MEDIUM: 'opt_ZZZ_med_2f93',
-  LOW: 'opt_ZZZ_low_0e64',
+  Urgent: 'opt_ZZZ_urgent_8a11',
+  High: 'opt_ZZZ_high_5c42',
+  Medium: 'opt_ZZZ_med_2f93',
+  Low: 'opt_ZZZ_low_0e64',
 };
 
 function graphqlVar(args, name) {
@@ -280,11 +280,11 @@ test('placeOnBoard: malformed JSON from gh is a clean failure, not a thrown exce
 
 test('placeOnBoard: writes Priority to the board field with ids resolved from field-list, and reads it back', () => {
   const { spawnSync, calls } = buildHappyPathSpawn({ withPriorityField: true });
-  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'HIGH' });
+  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'High' });
 
   assert.equal(result.ok, true, result.error);
   assert.equal(result.statusName, 'Todo');
-  assert.equal(result.priorityName, 'HIGH');
+  assert.equal(result.priorityName, 'High');
   assert.equal(result.prioritySkipped, false);
 
   // The option id actually written is the one the fixture's field-list carries for HIGH -- so a
@@ -297,7 +297,7 @@ test('placeOnBoard: writes Priority to the board field with ids resolved from fi
       graphqlVar(c.args, 'field') === FAKE_PRIORITY_FIELD_ID
   );
   assert.ok(priorityMutation, 'no updateProjectV2ItemFieldValue call targeted the Priority field');
-  assert.equal(graphqlVar(priorityMutation.args, 'option'), FAKE_PRIORITY_OPTION_IDS.HIGH);
+  assert.equal(graphqlVar(priorityMutation.args, 'option'), FAKE_PRIORITY_OPTION_IDS.High);
 
   // One field-list read for BOTH fields -- not one per field.
   const fieldLists = calls.filter((c) => c.args[0] === 'project' && c.args[1] === 'field-list');
@@ -305,7 +305,7 @@ test('placeOnBoard: writes Priority to the board field with ids resolved from fi
 });
 
 test('placeOnBoard: each priority word resolves to its OWN option id -- the fixture cannot pass by echoing one constant', () => {
-  for (const word of ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']) {
+  for (const word of ['Urgent', 'High', 'Medium', 'Low']) {
     const { spawnSync, calls } = buildHappyPathSpawn({ withPriorityField: true });
     const result = projectBoard.placeOnBoard(1, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: word });
     assert.equal(result.ok, true, `${word}: ${result.error}`);
@@ -323,7 +323,7 @@ test('placeOnBoard: each priority word resolves to its OWN option id -- the fixt
 
 test('placeOnBoard: a board with no Priority field still files the card -- skipped, reported, not a failure', () => {
   const { spawnSync, calls } = buildHappyPathSpawn({ withPriorityField: false });
-  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'CRITICAL' });
+  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'Urgent' });
 
   assert.equal(result.ok, true, result.error);
   assert.equal(result.statusName, 'Todo', 'the card must still land in a column');
@@ -351,17 +351,17 @@ test('placeOnBoard: a priority word the vocabulary does not know fails loudly BE
 });
 
 test('placeOnBoard: a Priority read-back that disagrees with what was written is a failure, not a silent success', () => {
-  const { spawnSync } = buildHappyPathSpawn({ withPriorityField: true, readBackPriority: 'LOW' });
-  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'CRITICAL' });
+  const { spawnSync } = buildHappyPathSpawn({ withPriorityField: true, readBackPriority: 'Low' });
+  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'Urgent' });
 
   assert.equal(result.ok, false);
-  assert.match(result.error, /read back Priority="LOW".*expected "CRITICAL"/);
+  assert.match(result.error, /read back Priority="Low".*expected "Urgent"/);
   assert.equal(result.itemId, FAKE_ITEM_ID, 'the caller needs the item id to repair the half-placed card');
 });
 
 test('placeOnBoard: an EMPTY Priority read-back is a failure -- the same invisible-field defect Status guards against', () => {
   const { spawnSync } = buildHappyPathSpawn({ withPriorityField: true, readBackPriority: null });
-  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'MEDIUM' });
+  const result = projectBoard.placeOnBoard(207, 'Crazz-Org/SPO-Pipeline', { spawnSync }, { priority: 'Medium' });
 
   assert.equal(result.ok, false);
   assert.match(result.error, /read back Priority="\(empty\)"/);
@@ -381,8 +381,12 @@ test('placeOnBoard: no priority asked for -- the older 3-arg call is unchanged a
   assert.equal(graphqlVar(mutations[0].args, 'field'), FAKE_STATUS_FIELD_ID);
 });
 
-test('VALID_PRIORITIES is the four-word corpus vocabulary, and DECISION is deliberately not in it', () => {
-  assert.deepEqual([...projectBoard.VALID_PRIORITIES], ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
+test("VALID_PRIORITIES is GitHub's own built-in Priority vocabulary, and DECISION is deliberately not in it", () => {
+  // GitHub Projects' own built-in Priority options, spelled and ORDERED exactly as the platform
+  // ships them. A house re-spelling (`CRITICAL`, `P0`) is what this assertion exists to refuse.
+  assert.deepEqual([...projectBoard.VALID_PRIORITIES], ['Urgent', 'High', 'Medium', 'Low']);
   assert.equal(projectBoard.VALID_PRIORITIES.has('DECISION'), false);
+  assert.equal(projectBoard.VALID_PRIORITIES.has('CRITICAL'), false, 'the pre-correction house vocabulary must not creep back');
+  assert.equal(projectBoard.VALID_PRIORITIES.has('URGENT'), false, 'the spelling is case-exact at the contract boundary');
   assert.equal(projectBoard.PRIORITY_FIELD_NAME, 'Priority');
 });

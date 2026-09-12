@@ -62,10 +62,27 @@ const VALID_AREAS = new Set(['docs', 'rdo', 'bench', 'renderer', 'gateway', 'cli
 // Criticity, as a VALUE a board field can hold -- not a sentence in the body. Before 2026-09-12
 // every card carried its criticity as prose ("**Severity: MEDIUM**", or a "HIGH -- " title
 // prefix), so no board view could sort on it and the maintainer's 2026-09-11 criticity review had
-// to open 18 issue bodies by hand. The four words are the ones the existing corpus already used,
-// so the board backfill was lossless. Single source of truth, re-exported and re-asserted by
+// to open 18 issue bodies by hand.
+//
+// The four words are GitHub Projects' OWN built-in Priority options, spelled and ordered exactly
+// as the platform ships them -- `Urgent` / `High` / `Medium` / `Low`. Not a house vocabulary: a
+// bespoke spelling would make this board disagree with every GitHub default view and with every
+// other project in the org. Single source of truth, re-exported and re-asserted by
 // orchestrator/project-board.js's own VALID_PRIORITIES (test/project-board.test.js pins the pair).
-const VALID_PRIORITIES = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
+const VALID_PRIORITIES = new Set(['Urgent', 'High', 'Medium', 'Low']);
+
+// canonicalPriority(raw) -- the one case-insensitive lookup, so `urgent`/`URGENT`/`Urgent` all
+// resolve to the single spelling the board stores. Used ONLY by applyMechanicalCorrections: the
+// draft contract itself stays exact (like `category` and `area`), because a drafter is handed the
+// spelling verbatim in its prompt and a wrong-cased reply there is worth failing loudly on.
+function canonicalPriority(raw) {
+  if (typeof raw !== 'string') return null;
+  const lowered = raw.trim().toLowerCase();
+  for (const word of VALID_PRIORITIES) {
+    if (word.toLowerCase() === lowered) return word;
+  }
+  return null;
+}
 
 // config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted/LLM steps and must stay
 // that way -- it is not a fit for either intake step. draftCard and reviewCard are the
@@ -565,11 +582,11 @@ function applyMechanicalCorrections(draft, corrections) {
       applied.size = rawValue.toUpperCase();
     } else if (field === 'area' && VALID_AREAS.has(rawValue)) {
       applied.area = rawValue;
-    } else if (field === 'priority' && VALID_PRIORITIES.has(rawValue.toUpperCase())) {
-      // Upper-cased like `size`, and for the same reason: the vocabulary is stored upper-case, and
-      // a judge that wrote `priority: high` meant HIGH -- that is a casing slip, not an unknown
-      // value to hand back to a human as an unmechanical correction.
-      applied.priority = rawValue.toUpperCase();
+    } else if (field === 'priority' && canonicalPriority(rawValue)) {
+      // Case-folded like `size` is upper-cased, and for the same reason: a judge that wrote
+      // `priority: urgent` meant `Urgent` -- that is a casing slip, not an unknown value to hand
+      // back to a human as an unmechanical correction.
+      applied.priority = canonicalPriority(rawValue);
     } else {
       unmechanical.push(correction); // named the right field but not a value this build knows
     }

@@ -67,22 +67,24 @@ const PROJECT_OWNER = 'Crazz-Org';
 const STATUS_FIELD_NAME = 'Status';
 const TARGET_STATUS_NAME = 'Todo';
 
-// Priority -- the card's criticity as a FIELD. Created on project 2 ("SPO Factory") on
-// 2026-09-12; project 1 does not have it yet, which is exactly why placeOnBoard fails OPEN on a
-// board that lacks the field rather than refusing to file.
+// Priority -- the card's criticity as a FIELD. Added to project 2 ("SPO Factory") on 2026-09-12;
+// project 1 does not have it yet, which is exactly why placeOnBoard fails OPEN on a board that
+// lacks the field rather than refusing to file.
 //
-// The vocabulary is not invented here: CRITICAL / HIGH / MEDIUM / LOW are the four words the
-// backlog corpus already used in issue TITLES and bodies ("CRITICAL -- auto-triage loops forever"
-// #161, "HIGH -- dispatcher-stopped is emitted after killAllChildren" #162, "MEDIUM -- ..." #165,
-// "LOW -- amendCard passes cat:/size:" #198), so the backfill of the existing board was lossless.
-// Deliberately NOT GitHub's own P0/P1/P2 template: renaming the corpus would have made every
-// historical card's own prose disagree with its field.
+// This is GitHub Projects' OWN built-in Priority field, not a bespoke one: name `Priority`,
+// options `Urgent` / `High` / `Medium` / `Low`, in that order. Nothing here invents a vocabulary.
+// A first cut of this action did -- CRITICAL/HIGH/MEDIUM/LOW, justified as "the words the issue
+// TITLES already used" (#161 "CRITICAL -- auto-triage loops forever", #162 "HIGH -- ...") -- and
+// that justification was beside the point: the platform already ships this exact field, so a
+// parallel spelling buys a board that no GitHub default view, saved layout or roadmap grouping
+// recognises, and that every other project in the org disagrees with. `CRITICAL` from an old title
+// maps onto `Urgent`; the old titles are historical prose, not a schema to preserve.
 //
 // What is NOT in this vocabulary, on purpose: **DECISION**. "A human must arbitrate before any
 // code is written" (#166, #79) is an orthogonal axis, not a rung on this ladder -- a DECISION card
-// can be CRITICAL or LOW. It stays a title prefix; see CLAUDE.md's "Filling a card" section.
+// can be Urgent or Low. It stays a title prefix; see CLAUDE.md's "Filling a card" section.
 const PRIORITY_FIELD_NAME = 'Priority';
-const VALID_PRIORITIES = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
+const VALID_PRIORITIES = new Set(['Urgent', 'High', 'Medium', 'Low']);
 
 // projectNumberForRepo(ghRepo) -- null for a repo with no board entry (SPO-WebClient, or any
 // repo nobody has mapped yet). The caller (bin/spo's cmdAsk) uses this to decide whether
@@ -324,7 +326,7 @@ function readBackSingleSelect(deps, itemId, fieldName) {
 //
 // A priority the caller asked for that the field does not OFFER is not fail-open: it is a caller
 // bug (a typo, or a vocabulary that drifted from the board's) and fails loudly, because silently
-// filing a CRITICAL card as untriaged is the failure this field exists to prevent.
+// filing an Urgent card as untriaged is the failure this field exists to prevent.
 function placeOnBoard(issueNumber, ghRepo, deps = {}, opts = {}) {
   const projectNumber = projectNumberForRepo(ghRepo);
   if (!projectNumber) {

@@ -21,7 +21,7 @@
                "category": "defect" | "latent-trap" | "feature" | "observation" | "doc-infra",
                "size": "S" | "M" | "L",
                "area": "docs" | "rdo" | "bench" | "renderer" | "gateway" | "client" | "e2e" | "shared" | "ci",
-               "priority": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+               "priority": "Urgent" | "High" | "Medium" | "Low",
                "is_bug_report": true, "confirmed": true } }
   `draft` is a LITERAL NESTED JSON OBJECT, exactly as shown above — a second JSON object inside
   the first, never a JSON-encoded STRING. WRONG: "draft": "{\"title\": \"...\"}" (a string that
@@ -177,13 +177,14 @@ earlier wins).
 - the `<!-- anchorKey: ... --> ` marker from step 3;
 - a final line: `Source: /triage-report queue, {{today}}`.
 
-`priority` — the card's criticity as a **board field**, one of `CRITICAL` / `HIGH` / `MEDIUM` /
-`LOW`. Rank it on **how often the trigger fires × what one firing costs**, not on how strongly the
-reporter phrased it: a single user hitting a cosmetic glitch is `LOW` however annoyed the report
-sounds. `CRITICAL` is for something losing work or availability now, on a trigger needing nothing
-rare. Where the evidence does not separate two rungs, take the lower one. Never *also* write the
-criticity into `title` or `body_markdown` — the field is the only place it lives, and a `HIGH — `
-prefix or a `**Severity:**` line is a correction `review-card` will call out.
+`priority` — the card's criticity as a **board field**, one of `Urgent` / `High` / `Medium` /
+`Low` (GitHub's own built-in Priority options; spell them exactly so). Rank it on **how often the
+trigger fires × what one firing costs**, not on how strongly the reporter phrased it: a single user
+hitting a cosmetic glitch is `Low` however annoyed the report sounds. `Urgent` is for something
+losing work or availability now, on a trigger needing nothing rare. Where the evidence does not
+separate two rungs, take the lower one. Never *also* write the criticity into `title` or
+`body_markdown` — the field is the only place it lives, and a `HIGH — ` prefix or a
+`**Severity:**` line is a correction `review-card` will call out.
 
 Set `is_bug_report: true` and `confirmed: true` — you only reach this branch once step 1 has
 already reproduced the claim; a report that did not reproduce never reaches a draft.
