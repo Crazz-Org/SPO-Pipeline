@@ -852,6 +852,22 @@ function amendCard(issueNumber, draft, review, deps = {}) {
   fs.writeFileSync(bodyFile, body);
 
   const reportIntakeLabel = deps.reportIntakeLabel || config.reportIntakeLabel;
+  // UNCONDITIONAL on purpose, and it is a trap for whoever widens this function's reach.
+  //
+  // `gh issue edit --add-label` exits non-zero on a label the target repo does not have -- the
+  // same failure #196 fixed in fileCard, which now reads the repo's label inventory first and
+  // drops what it cannot confirm. amendCard does NOT do that, and deliberately: it cannot reach a
+  // repo without these labels today. Its only caller is auto-triage.js's routeConfirmedReport,
+  // `ghRepo` resolves to `deps.ghRepo || config.ghRepo`, and `config.ghRepo` is hardcoded to
+  // Crazz-Org/SPO-WebClient (config.js), which carries every `cat:*` and `size:*` label. The only
+  // two places that set `ghRepo:` outside config.js are recette.js (it passes `config.ghRepo`
+  // itself) and bin/spo's `spo ask --repo`, which goes to fileCard, never here.
+  //
+  // SO: the day you give amendCard a second caller, or a `deps.ghRepo` that is not
+  // `config.ghRepo`, this breaks -- silently for the maintainer, as a non-zero exit for the
+  // daemon. Reuse fileCard's inventory read above rather than copying these two lines.
+  // Card SPO-Pipeline#198 measured this and was dropped in favour of this comment, because a card
+  // parked on a condition nobody watches is worth less than a warning where the change happens.
   const editArgs = [
     'issue',
     'edit',
