@@ -2,6 +2,21 @@
 
 > **Status: a dated record.** Every figure is true as of 2026-09-02 and nowhere re-verified
 > since. Where a number is quoted elsewhere in `doc/`, this file is the source.
+>
+> **Citations are pinned, not live.** Every `file:line` citation in this document with a real
+> target to pin -- all but the dangling `sanctuarize.test.ts` reference below (file deleted before
+> this record was written) and the second, comma-joined half of the `config.ts` rate-limiter
+> citation below (a continuation this ratchet's citation scanner does not parse as a second
+> citation) -- is checked against the text it named when this record was written: SPO-Pipeline
+> paths at
+> `7902164309c1766d7b785daab9ba94ff6472bc1d`, SPO-WebClient paths at
+> `935283890fa0593c5c5d0b41cceeaec2c1972c6f` (`test/citation-pins-data.js`'s `BENCH_PINS`) -- the
+> commit `~/SPO-WebClient` was actually on when this audit was measured (this document's own
+> "A trap that governs the fix", below: `feat/suggestion-report-kind` @ `9352838`, 35 commits
+> behind `origin/main`; also recorded in `doc/bench-plan-derived-2026-09-02.md`'s row 1.2),
+> not merely a commit that happens to agree with it -- except the `bin/spo` `collectAll` call site
+> and `doc/state-machine-spec.md`'s FINISH row, which are maintained as true today and re-pinned by
+> hand as those files grow.
 
 Action 8.1 of `remediation-plan-2026-08.md`. The bench is the e2e gate that stands between a
 change and `main`: a session or the pipeline runs `npm run gate`, a worker drives the change
@@ -276,7 +291,7 @@ merged-base PASS and a clean PASS also render identically.
 ### D6 — the evidence and the attestation are filed under different names
 
 `verify-gate.js` names the artifact after the checkout's HEAD **after** `prepareRef` merged
-`origin/main`; `worker.ts:301` keys the verdict on the **deposited** sha. When the gate merged,
+`origin/main`; `worker.ts:302` keys the verdict on the **deposited** sha. When the gate merged,
 the two differ, and every join by sha silently fails.
 
 The separation is perfect: of 393 verdicts written from `ref/checkout`, **248 have an artifact
@@ -402,7 +417,7 @@ supervision model* — and demanding a **single-repo counterexample** for each c
 | **D1** attestation opacity — the schema *is* the wire | D5, D6, D8, D9, D10, D11 — bench-internal |
 | **D3** the merge-safety chain | D2 — the intrinsic worker↔job-body boundary, which no relocation removes |
 | **D7** exit-code collapse — the exit code *is* the wire | stale docs — a single-repo instance was found in this very audit (`doc/state-machine-spec.md:166` promises FINISH fast-forwards the main checkout; `realFinish` does not) |
-| **process-tree ownership across `exec`** — the pipeline's timeout kills `npm`, the `cli.js` grandchild survives | synthetic tests — a deliberate strategy choice: `test/helpers.js:65-80` points every daemon subprocess at a fresh empty `SPO_BENCH_DIR` |
+| **process-tree ownership across `exec`** — the pipeline's timeout kills `npm`, the `cli.js` grandchild survives | synthetic tests — a deliberate strategy choice: `test/helpers.js:65-94` points every daemon subprocess at a fresh empty `SPO_BENCH_DIR` |
 
 **Four of ten, and the four are contract defects, not location defects.**
 
@@ -427,7 +442,7 @@ Three measurements defeat it:
 **Verdict: keep 8.5 superseded, and correct the plan's number in the same edit.** The decisive
 evidence is not architectural. It is that **`scripts/finish.sh:245-247` already contains the
 three-line rule that would have prevented the entire incident** — reinstall the worker when a
-merge touches `src/e2e/bench/` or `scripts/bench-` — and `realFinish` (`scripted.js:1944-1994`)
+merge touches `src/e2e/bench/` or `scripts/bench-` — and `realFinish` (`scripted.js:1944-1996`)
 simply never runs it. When the fix for the damaging class is three lines on one side of the
 boundary, moving 7.5 k lines across it is not the proportionate answer.
 
