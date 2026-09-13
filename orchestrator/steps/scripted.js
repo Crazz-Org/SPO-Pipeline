@@ -463,11 +463,18 @@ function classifyNightly(nightly, targetSha) {
 // B3.2 changes is that 'unknown' is no longer silently indistinguishable from 'green' the way it
 // used to be (a stale FAIL used to fall through this function's old FAIL-and-sha-match check
 // exactly like a genuine PASS did) -- it is now classified, and journalled, as what it is.
-function guardNightlyRed(ctx, stepName, config, originMainSha) {
+// `extraDetail` (card #212 item 3): merged into the `main-red-no-merge` ParkSignal's own detail,
+// verbatim -- empty for the two call sites unaffected by this action (CI_CHECKS below, and
+// MERGE's own regate), and `{testsRan: false}` for GATE's own main-moved/refusal call site alone,
+// since that is the only one of the three where the structural fact is true (CI_CHECKS only
+// reaches this guard after checks-green; MERGE's regate only reaches it after a GATE PASS earlier
+// in the same attempt). Adding a parameter here, rather than a fourth copy of this function, keeps
+// the "one shared definition of red" property this function's own header states.
+function guardNightlyRed(ctx, stepName, config, originMainSha, extraDetail = {}) {
   const nightly = readJsonSafe(path.join(config.spoBenchDir, 'nightly', 'latest.json'));
   const { status, reason } = classifyNightly(nightly, originMainSha);
   if (status === 'red') {
-    throw new ParkSignal('main-red-no-merge', {});
+    throw new ParkSignal('main-red-no-merge', { ...extraDetail });
   }
   if (status === 'unknown') {
     appendEvent(ctx.taskDir, stepName, 'nightly-unknown', { sha: originMainSha, reason });
@@ -1845,7 +1852,7 @@ async function realPushPr(ctx, deps = {}) {
 // helper and, on the exit-0 path above (which spawns no other git command and has nothing else to
 // catch it), parks a gate that PASSED, permanently (`git-timed-out` is not on
 // TRANSIENT_RETRY_REASONS), because a purely diagnostic `git rev-parse HEAD` happened to hang.
-// Same shape, same fix, as preserveWorktreeWip's own guard and the main-moved-conflict merge
+// Same shape, same fix, as preserveWorktreeWip's own guard and the gate-merge-refused merge
 // --abort guard just below in this file: catch ONLY ParkSignal (a genuine programming error must
 // still escape, never get swallowed into a plausible-looking journal event), journal it as just
 // another unreadable-HEAD outcome, and return null so callers fall back exactly as they already
@@ -2074,6 +2081,27 @@ function acceptPassedGate(ctx, config, headSha, verdict, exitFrom) {
   return 'CI_CHECKS';
 }
 
+// ---- card #212: confirm (never route on) a bench merge refusal's own NAME ---------------------
+//
+// worker.ts:751's own literal, read from `done/<jobId>.json`'s `.detail` -- e.g. "<ref> does not
+// merge cleanly with origin/main (base <sha>)". Measured over the real corpus: 15/15
+// FAIL-without-baseMain verdicts whose done report still survives match this literal (the 5
+// oldest predate the corpus this action measured and have no report left, so they are
+// unverifiable, not counterexamples). This exists ONLY to confirm the reason's name for a
+// maintainer reading the park comment -- `routeGateVerdict`'s caller already decided to take this
+// branch from the exit-1 + `verdict.verdict === 'FAIL'` + `!baseMain` facts alone, before this
+// function is ever called, and that route must never change based on free text from a different
+// repo. A missing `jobId`, an unreadable/malformed/wrong-shaped `done/<jobId>.json`, or a
+// `.detail` that does not match all read as `false` -- "the structural route fired, the literal
+// that names it could not be confirmed" -- never as "maybe this was not a refusal".
+const GATE_MERGE_REFUSAL_DETAIL_RE = /does not merge cleanly with origin\/main/;
+
+function isGateMergeRefusalConfirmed(config, jobId) {
+  if (!jobId) return false;
+  const { report } = readGateDoneReport(config, jobId);
+  return !!(report && typeof report.detail === 'string' && GATE_MERGE_REFUSAL_DETAIL_RE.test(report.detail));
+}
+
 // ---- action B2.3(b)/4.2/B3.4, extracted for card #211: routing a KNOWN, well-shaped, non-PASS-
 // contradicting verdict for HEAD (BLOCKED / FAIL-without-baseMain / STALE / a real FAIL / anything
 // else) -- everything a real exit 1 does once `verdicts/<sha>.json` has already been read and
@@ -2106,7 +2134,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
   // `return 'DIAGNOSE'` at the bottom of this function and asks a judge to diagnose a code defect
   // that was never observed -- verify-gate.js's own BLOCKED comment says as much: "This is not a
   // verdict on the change: the flows could not be driven, none failed." Same shape as
-  // `main-moved-conflict` just below (a real park for a "not the code's fault" situation, not a
+  // `gate-merge-refused` just below (a real park for a "not the code's fault" situation, not a
   // DIAGNOSE call spent on an unanswerable question).
   //
   // Adversarial verification of B2.3 (finding T4) found `BLOCKED` is not one fact, it is at
@@ -2189,7 +2217,15 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // this default rests on) rather than a hardcoded "once".
     const gateBudget = resolveMainMovedRegateBudget(config);
     if (ctx.counters.mainMoveUsed >= gateBudget) {
-      throw new ParkSignal('main-moved-twice', { mainMoveUsed: ctx.counters.mainMoveUsed, mainMovedRegateBudget: gateBudget });
+      // Card #212 item 3: reached only through THIS branch (a bench refusal -- see the header
+      // comment above), so `testsRan: false` is the same structural fact `gate-merge-refused`
+      // itself carries below -- CI_CHECKS' own `main-moved-twice` throw (a separate call site,
+      // reached only after checks-green) does NOT get this field, because there testsRan is true.
+      throw new ParkSignal('main-moved-twice', {
+        mainMoveUsed: ctx.counters.mainMoveUsed,
+        mainMovedRegateBudget: gateBudget,
+        testsRan: false,
+      });
     }
     ctx.counters.mainMoveUsed += 1;
 
@@ -2204,7 +2240,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // because the merge two lines below resolves the SAME ref. If `git rev-parse origin/main`
     // genuinely cannot resolve it, neither can `git merge origin/main` -- measured in a scratch
     // repo with no remote: rev-parse exits 128 ("unknown revision"), merge exits 1 ("merge:
-    // origin/main - not something we can merge") -- so the card parks `main-moved-conflict`
+    // origin/main - not something we can merge") -- so the card parks `gate-merge-refused`
     // rather than merging anything. The one residual window is a rev-parse that fails for a
     // reason unrelated to the ref while the ref itself is fine (an operator's `kill -9` with no
     // deadline armed, which spawnOnce maps to exit 1): the guard is skipped and a red `main`
@@ -2213,7 +2249,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // costs one CHECK/GATE cycle, where a false park costs a maintainer.
     const originMainRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
     if (originMainRes.exit === 0) {
-      guardNightlyRed(ctx, 'GATE', config, originMainRes.stdout.trim());
+      guardNightlyRed(ctx, 'GATE', config, originMainRes.stdout.trim(), { testsRan: false });
     } else {
       appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-rev-parse-failed', { exit: originMainRes.exit });
     }
@@ -2237,7 +2273,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // 4.3's verification finding in a different costume (a lookup documented as "never parks"
     // parking the card before its own event was written), and this is one of the two call sites
     // in this function where a spawnStep throw destroys information the rest of the system depends
-    // on: `main-moved-conflict` is the whole output of this action, the reason a maintainer
+    // on: `gate-merge-refused` is the whole output of this action, the reason a maintainer
     // reads, and the reason action 4.4 keys its transient-retry decision off. Journal the
     // timeout, then park for the real reason regardless. (The other spawnStep calls here --
     // rev-parse, fetch, merge -- are deliberately NOT wrapped: a hung git there parks
@@ -2261,7 +2297,41 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // Parking here is deliberate, not a gap: #439 proves DIAGNOSE cannot fix a conflict
     // IMPLEMENT never even saw, and a maintainer's `retry` restarts at INTAKE from a fresh
     // worktree off the new main -- which is what actually resolved it, in 19 minutes.
-    throw new ParkSignal('main-moved-conflict', { headSha, mergeExit: merge.exit });
+    //
+    // Card #212: renamed from `main-moved-conflict`. Measured over the real corpus: this throw
+    // is the ONLY producer of that name (11/11 real parks), and every one of them is a bench
+    // REFUSAL, not a conflict between two sets of tested code -- `worker.ts`'s `prepareRef`
+    // returned FAIL before `baseMain` was ever assigned (that is exactly the branch condition
+    // above), so NO flow was ever driven and the bench never ran a single test. The old name
+    // said "your branch conflicts with what landed on main"; the true fact is "the bench never
+    // got far enough to test anything, and the pipeline's own local merge-forward hit the
+    // identical conflict the bench already refused". `jobId` (from `parseGateJobId(stdout)`, the
+    // same anchor `readGateDoneReport` elsewhere in this file relies on) and `refusalConfirmed`
+    // (whether `done/<jobId>.json`'s own `.detail` matches the bench's literal -- see
+    // `isGateMergeRefusalConfirmed` below) are read ONLY to confirm the reason's NAME for a
+    // maintainer; the ROUTE is already fixed by the exit-1 + FAIL + no-baseMain facts this branch
+    // is gated on, never by that text. `testsRan: false` and `gatePassedOnSha: false` are
+    // structural at this throw site -- the verdict just read for `headSha` IS the refusal, so
+    // there is nothing else to look up. Terminal, unchanged from `main-moved-conflict`: a retry
+    // restarts at INTAKE and re-burns PLAN+IMPLEMENT+VALIDATE (~322k tokens p50) replacing the
+    // PR, and under spine contention the fresh attempt can conflict again -- see
+    // doc/state-machine-spec.md and orchestrator/README.md for the full cost argument this driver
+    // decision rests on. `main-moved-conflict` itself no longer has any producer and is NOT
+    // registered in TERMINAL_PARK_REASONS any more (test/park-reason-partition.test.js's own "NO
+    // DEAD ENTRIES" check forbids a member with none) -- it survives only in
+    // `console/plain-language.js`'s PARK_REASONS text, so a dashboard can still render the cards
+    // still parked under that name (two were on 2026-09-13, when it was renamed) and
+    // the historical journals that carried it before this rename.
+    const jobId = parseGateJobId(stdout);
+    const refusalConfirmed = isGateMergeRefusalConfirmed(config, jobId);
+    throw new ParkSignal('gate-merge-refused', {
+      headSha,
+      mergeExit: merge.exit,
+      jobId,
+      refusalConfirmed,
+      testsRan: false,
+      gatePassedOnSha: false,
+    });
   }
 
   // Action B3.4: STALE ("the tree changed between deposit and the end of the run") is not a
@@ -2995,6 +3065,57 @@ async function probeMergeability(ctx, deps, prNumber) {
   return { ...classification, prState, mergeable, mergeStateStatus };
 }
 
+// ---- card #212 item 3: "did the gate already pass on this sha" for a merge-conflict park ------
+//
+// `headSha` is not carried in `ctx` at realMerge's own throw site -- only WORKTREE/GATE narrow a
+// sha into local variables, never onto `ctx.task`. `regateAfterNonLandingUnguarded` (below) does
+// its own `git rev-parse HEAD`, but has many early `return null` branches that never carry it
+// back to the caller, and threading a return-shape change through every one of them (plus
+// `regateAfterNonLanding`'s own wrapping try/catch) is out of scope for enriching ONE park's
+// detail -- so this does one guarded rev-parse of its own instead, at the park, exactly the
+// pattern the spec calls out as the fallback. Structurally safe to trust as "the sha GATE ran
+// against": MERGE is only reachable after a GATE run that ended in acceptance on the CURRENT HEAD
+// earlier in this same attempt -- either a real exit-0 PASS, or card #211's exit-3 recovery
+// reaching the identical `acceptPassedGate` acceptance path with a fresh PASS -- and any HEAD
+// change after that (a main-moved merge at GATE/CI_CHECKS/MERGE's own regate) loops back through
+// CHECK -> PUSH_PR -> GATE before MERGE is ever reached again.
+//
+// Wrapped, and deliberately catches ANY error, not only `ParkSignal`: this function is a pure
+// DIAGNOSTIC enrichment on top of a park the caller has already decided to make (GitHub's own
+// attested cause, read before this function is ever called) -- unlike the merge --abort cleanup
+// catch just above in this file, which sits on the DECISION path and must let a genuine
+// programming error escape, nothing here decides anything. `spawnStep` retries once and then
+// THROWS `ParkSignal('git-timed-out'/'command-killed-by-signal')` on a double timeout/kill
+// (action 2.1), and a bug in this lookup itself (a TypeError, say) is exactly as capable of
+// unwinding past the `merge-conflict` park as a ParkSignal is -- either way the caller's real,
+// GitHub-attested park must not be replaced by this enrichment's own plumbing failing, so BOTH
+// classes are swallowed here, on purpose. A failed or swallowed-throw rev-parse answers
+// `headSha: null, gatePassedOnSha: null, liveStatus: null` -- unknown, never `false`, which would
+// misreport "the gate did not pass" for a sha nobody could even name.
+function readMergeConflictGateFacts(ctx, deps, worktreePath, config) {
+  let headRes;
+  try {
+    headRes = spawnStep(ctx, deps, 'MERGE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+  } catch (err) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-conflict-head-rev-parse-failed', {
+      reason: err instanceof ParkSignal ? err.reason : 'unexpected-error',
+      message: err instanceof ParkSignal ? undefined : String((err && err.message) || err),
+    });
+    return { headSha: null, gatePassedOnSha: null, liveStatus: null };
+  }
+  if (headRes.exit !== 0) {
+    appendEvent(ctx.taskDir, 'MERGE', 'merge-conflict-head-rev-parse-failed', { exit: headRes.exit });
+    return { headSha: null, gatePassedOnSha: null, liveStatus: null };
+  }
+  const headSha = headRes.stdout.trim();
+  const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
+  return {
+    headSha,
+    gatePassedOnSha: !!(verdict && verdict.verdict === 'PASS'),
+    liveStatus: (verdict && verdict.live && verdict.live.status) || null,
+  };
+}
+
 // parkFromMergeCause(cause, detail) -- turns a `{kind: 'cause', reason}` from `classifyMergeCause`
 // into a park, as a literal `new ParkSignal('<reason>', ...)` per reason rather than
 // `new ParkSignal(cause.reason, ...)`. Deliberate: test/park-reason-doc-sweep.test.js's
@@ -3262,11 +3383,17 @@ async function realMerge(ctx, deps = {}) {
       // believing it -- see regateAfterNonLanding's own header for the full rationale.
       const routed = await regateAfterNonLanding(ctx, deps, cause);
       if (routed === 'CHECK') return 'CHECK';
+      // Card #212 item 3: only `merge-conflict` gets the extra "did the gate already pass"
+      // facts -- the other four MERGE_CAUSE_REASONS are not in scope (see
+      // readMergeConflictGateFacts's own header).
+      const gateFacts =
+        cause.reason === MERGE_CAUSE_REASONS.CONFLICT ? readMergeConflictGateFacts(ctx, deps, worktreePath, config) : {};
       parkFromMergeCause(cause, {
         exit: w1.exit,
         prState: cause.prState,
         mergeable: cause.mergeable,
         mergeStateStatus: cause.mergeStateStatus,
+        ...gateFacts,
       });
     }
     // GitHub had no usable answer either -- keep the pre-existing literal, unenriched.
@@ -3294,11 +3421,15 @@ async function realMerge(ctx, deps = {}) {
       // helper rather than duplicating the intersection-test body.
       const routed = await regateAfterNonLanding(ctx, deps, cause);
       if (routed === 'CHECK') return 'CHECK';
+      // Card #212 item 3: same enrichment as the w1.exit === 1 leg above, same scope limit.
+      const gateFacts =
+        cause.reason === MERGE_CAUSE_REASONS.CONFLICT ? readMergeConflictGateFacts(ctx, deps, worktreePath, config) : {};
       parkFromMergeCause(cause, {
         lastExit: w2.exit,
         prState: cause.prState,
         mergeable: cause.mergeable,
         mergeStateStatus: cause.mergeStateStatus,
+        ...gateFacts,
       });
     }
     // GitHub had no usable answer either -- the fallback this whole action exists to keep honest:

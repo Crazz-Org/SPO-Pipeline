@@ -2177,7 +2177,15 @@ const TERMINAL_PARK_REASONS = new Set([
   'ci-retry-budget-exhausted',
   'pr-rules-needs-approval', // ci-cause-table.js's classifyCiFailure, via `outcome.reason`
   'main-red-no-merge',
-  'main-moved-conflict',
+  // card #212: renamed from `main-moved-conflict` -- steps/scripted.js's FAIL-without-
+  // baseMain branch was its only producer, and that throw now names `gate-merge-refused`. Not
+  // kept as a `main-moved-conflict` entry here: test/park-reason-partition.test.js's own "NO DEAD
+  // ENTRIES" check forbids a TERMINAL_PARK_REASONS member with no live producer (deliberately --
+  // that check's whole point is to keep this set from silently accumulating names nothing throws
+  // any more). `console/plain-language.js`'s PARK_REASONS text for `main-moved-conflict` stays
+  // registered, unproducing, so the dashboard can still render the 11 real historical parks that
+  // carried that name -- that dict has no analogous producer requirement.
+  'gate-merge-refused',
   'main-moved-merge-failed',
   'main-moved-twice',
   'nightly-main-red',
@@ -2973,7 +2981,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1283 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1341 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal

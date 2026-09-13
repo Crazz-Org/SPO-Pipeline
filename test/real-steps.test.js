@@ -2915,7 +2915,7 @@ test('realGate (card #211 fix-pass): recovered fresh STALE verdict -> the same g
   assert.ok(journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'fail'));
 });
 
-test('realGate (card #211 fix-pass): recovered fresh FAIL without baseMain reaches the SAME main-moved branch a real exit 1 reaches -- a conflicting local merge parks main-moved-conflict', async () => {
+test('realGate (card #211 fix-pass): recovered fresh FAIL without baseMain reaches the SAME main-moved branch a real exit 1 reaches -- a conflicting local merge parks gate-merge-refused (card #212: renamed from main-moved-conflict; this test proves reachability through the SHARED routeGateVerdict helper, not a second copy)', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-gate-211fp-mainmoved-wt-');
   const headSha = '3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c';
@@ -2938,7 +2938,17 @@ test('realGate (card #211 fix-pass): recovered fresh FAIL without baseMain reach
 
   await assert.rejects(
     () => realGate(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-moved-conflict' && err.detail.headSha === headSha && err.detail.mergeExit === 1
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-merge-refused' &&
+      err.detail.headSha === headSha &&
+      err.detail.mergeExit === 1 &&
+      err.detail.jobId === jobId &&
+      // done/<jobId>.json above carries no `.detail` field, so the literal cannot be confirmed --
+      // false, not the route (the route already fired from the exit-code/verdict facts alone).
+      err.detail.refusalConfirmed === false &&
+      err.detail.testsRan === false &&
+      err.detail.gatePassedOnSha === false
   );
 });
 
@@ -3524,7 +3534,11 @@ test('realCiChecks: main already moved once this task -> PARKED (main-moved-twic
 
   await assert.rejects(
     () => realCiChecks(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
+    // Card #212 item 6a: GATE's own main-moved-twice throw (a separate call site) adds
+    // `testsRan: false` because it is reached only through a bench refusal; CI_CHECKS reaches
+    // this throw only after checks-green, so testsRan is NOT a fact this call site should ever
+    // assert one way or the other -- it must carry no `testsRan` key at all.
+    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice' && !('testsRan' in err.detail)
   );
   assert.ok(!calls.some((a) => a.includes('merge')));
 });

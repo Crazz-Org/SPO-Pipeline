@@ -184,11 +184,15 @@ test('realGate: exit 1, no verdict file for HEAD -> PARKED gate-non-attesting, n
 
 // ---- shared fake for the FAIL-without-baseMain family (tests 3-6) ----------------------------
 
-function failNoBaseMainDeps({ headSha, calls, mergeExit = 0, nightly = null }) {
+// `gateStdout` (card #212): the exit-1 `npm run gate` result's own stdout, defaulting to '' (no
+// job id printed) same as before this action -- `routeGateVerdict`'s `parseGateJobId(stdout)` for
+// the `gate-merge-refused` park reads THIS, so a test that wants a jobId in the park detail must
+// pass a `job <id> queued` line here, same shape `real-steps.test.js`'s own `gateJobStdout` uses.
+function failNoBaseMainDeps({ headSha, calls, mergeExit = 0, nightly = null, gateStdout = '' }) {
   return {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return { status: 1, stdout: gateStdout, stderr: '', signal: null };
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
@@ -226,23 +230,41 @@ test('realGate: exit 1, FAIL without baseMain, merge clean -> CHECK, main-moved-
   assert.equal(merged.from, 'GATE');
 });
 
-// ---- 4. FAIL without baseMain, merge conflicts -> abort + PARKED main-moved-conflict ----------
+// ---- 4. FAIL without baseMain, merge conflicts -> abort + PARKED gate-merge-refused -----------
+//        (card #212: renamed from main-moved-conflict -- see steps/scripted.js's own header on
+//        this throw for why: 11/11 real parks under the old name were bench REFUSALS, not a real
+//        conflict between two sets of tested code -- no flow was ever driven.)
 
-test('realGate: exit 1, FAIL without baseMain, merge conflicts -> merge --abort issued, PARKED main-moved-conflict', async () => {
+test('realGate: exit 1, FAIL without baseMain, merge conflicts, done report confirms the refusal literal -> merge --abort issued, PARKED gate-merge-refused, refusalConfirmed true', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('mainmovedconflicthead');
+  const jobId = 'job-gmm-refused-confirmed';
   writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'FAIL',
+    detail: `${headSha} does not merge cleanly with origin/main (base freshoriginmainsha)`,
+  });
 
   const calls = [];
-  const deps = failNoBaseMainDeps({ headSha, calls, mergeExit: 1 });
+  const deps = failNoBaseMainDeps({
+    headSha,
+    calls,
+    mergeExit: 1,
+    gateStdout: `job ${jobId} queued (ref, position 1)\n`,
+  });
 
   await assert.rejects(
     () => realGate(ctx, deps),
     (err) =>
       err instanceof ParkSignal &&
-      err.reason === 'main-moved-conflict' &&
+      err.reason === 'gate-merge-refused' &&
       err.detail.headSha === headSha &&
-      err.detail.mergeExit === 1
+      err.detail.mergeExit === 1 &&
+      err.detail.jobId === jobId &&
+      err.detail.refusalConfirmed === true &&
+      err.detail.testsRan === false &&
+      err.detail.gatePassedOnSha === false
   );
 
   assert.ok(
@@ -252,6 +274,128 @@ test('realGate: exit 1, FAIL without baseMain, merge conflicts -> merge --abort 
 
   const journal = readJournal(ctx.taskDir);
   assert.ok(!journal.some((e) => e.event === 'main-moved-merge'), 'a conflicted merge must never journal success');
+});
+
+// Distinct jobId (`job-gmm-refused-missing`, no `done/<jobId>.json` written at all) from the test
+// above (`job-gmm-refused-confirmed`) -- proves `refusalConfirmed` is keyed on the done report's
+// own content, not on the jobId string being merely present or merely different.
+test('realGate: exit 1, FAIL without baseMain, merge conflicts, done report missing -> PARKED gate-merge-refused, refusalConfirmed false', async () => {
+  const ctx = gateCtx();
+  const headSha = fakeSha('mainmovedconflicthead2');
+  const jobId = 'job-gmm-refused-missing';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  // Deliberately no done/<jobId>.json written -- the "report never landed / unreadable" case.
+
+  const calls = [];
+  const deps = failNoBaseMainDeps({
+    headSha,
+    calls,
+    mergeExit: 1,
+    gateStdout: `job ${jobId} queued (ref, position 1)\n`,
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-merge-refused' &&
+      err.detail.headSha === headSha &&
+      err.detail.mergeExit === 1 &&
+      err.detail.jobId === jobId &&
+      err.detail.refusalConfirmed === false &&
+      err.detail.testsRan === false &&
+      err.detail.gatePassedOnSha === false
+  );
+});
+
+// Distinct jobId again (`job-gmm-refused-wrongdetail`) and a done report that DOES exist and DOES
+// carry a string `.detail` -- but one that names a real test failure ("flow X failed"), never the
+// bench's own "does not merge cleanly with origin/main" refusal literal. Mutation this kills: a
+// regex that always matches (or a `refusalConfirmed` that only checks `typeof detail === 'string'`
+// without actually testing it against GATE_MERGE_REFUSAL_DETAIL_RE) would report `true` here --
+// wrongly confirming a refusal off unrelated bench prose.
+test('realGate: exit 1, FAIL without baseMain, merge conflicts, done report present but its detail names a real failure, not the refusal literal -> PARKED gate-merge-refused, refusalConfirmed false', async () => {
+  const ctx = gateCtx();
+  const headSha = fakeSha('mainmovedconflicthead3');
+  const jobId = 'job-gmm-refused-wrongdetail';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'FAIL',
+    detail: 'flow X failed: assertion mismatch at step 3',
+  });
+
+  const calls = [];
+  const deps = failNoBaseMainDeps({
+    headSha,
+    calls,
+    mergeExit: 1,
+    gateStdout: `job ${jobId} queued (ref, position 1)\n`,
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-merge-refused' &&
+      err.detail.headSha === headSha &&
+      err.detail.mergeExit === 1 &&
+      err.detail.jobId === jobId &&
+      err.detail.refusalConfirmed === false &&
+      err.detail.testsRan === false &&
+      err.detail.gatePassedOnSha === false
+  );
+});
+
+// Card #212 item 6f: countRepeatedParks fingerprints on JSON.stringify(detail) -- proven here
+// against a detail the REAL throw site produced, not a hand-built object that merely happens to
+// look right (a hand-built fixture could pass even if the real throw emits keys in a different
+// order, an extra field, or a different value shape). Two independent realGate calls that reach
+// the SAME sha and job deposit (a plausible repeat: the SAME conflict refused twice in a row)
+// must produce byte-identical details, and countRepeatedParks must recognise the streak.
+test('realGate: two real gate-merge-refused parks on the SAME sha/jobId produce identical details -- countRepeatedParks counts the streak', async () => {
+  const { countRepeatedParks } = require('../orchestrator/park-loop');
+
+  const headSha = fakeSha('gmmrepeathead');
+  const jobId = 'job-gmm-repeat-same';
+  const gateStdout = `job ${jobId} queued (ref, position 1)\n`;
+
+  async function parkOnce(worktreePath) {
+    const config = testConfig();
+    writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+    writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+      id: jobId,
+      verdict: 'FAIL',
+      detail: `${headSha} does not merge cleanly with origin/main (base freshoriginmainsha)`,
+    });
+    const ctx = gateCtx({ config, worktreePath });
+    const calls = [];
+    const deps = failNoBaseMainDeps({ headSha, calls, mergeExit: 1, gateStdout });
+
+    let caught = null;
+    try {
+      await realGate(ctx, deps);
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof ParkSignal && caught.reason === 'gate-merge-refused');
+    return caught.detail;
+  }
+
+  const detail1 = await parkOnce(mkTmp('spo-gmm-repeat-wt1-'));
+  const detail2 = await parkOnce(mkTmp('spo-gmm-repeat-wt2-'));
+
+  assert.deepEqual(detail1, detail2, 'the same sha/jobId/mergeExit must produce byte-identical details across two independent real throws');
+
+  const lines = [
+    { event: 'parked', reason: 'gate-merge-refused', detail: detail1 },
+    { event: 'parked', reason: 'gate-merge-refused', detail: detail2 },
+  ];
+  assert.equal(
+    countRepeatedParks(lines, 'gate-merge-refused', detail2),
+    2,
+    'countRepeatedParks must count the second real park as a repeat of the first'
+  );
 });
 
 // ---- 5. main already moved once this task -> main-moved-twice, no merge argv ------------------
@@ -267,7 +411,10 @@ test('realGate: exit 1, FAIL without baseMain, mainMoveUsed already true -> PARK
 
   await assert.rejects(
     () => realGate(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
+    // Card #212 item 3: reached through the refusal branch, so testsRan is structurally false --
+    // see steps/scripted.js's own comment on this throw for why CI_CHECKS' own main-moved-twice
+    // (a separate call site) does not carry this field.
+    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice' && err.detail.testsRan === false
   );
 
   assert.ok(!calls.some((c) => c.args.includes('merge')), 'a second move must never even attempt a merge');
@@ -367,7 +514,10 @@ test('realGate: exit 1, FAIL without baseMain, nightly red at the fetched origin
 
   await assert.rejects(
     () => realGate(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-red-no-merge'
+    // Card #212 item 3: reached through GATE's own refusal branch, so testsRan is structurally
+    // false here -- guardNightlyRed's OTHER two call sites (CI_CHECKS, MERGE's regate) pass no
+    // extraDetail and so carry no testsRan field at all, since tests DID run to reach either.
+    (err) => err instanceof ParkSignal && err.reason === 'main-red-no-merge' && err.detail.testsRan === false
   );
 
   assert.ok(!calls.some((c) => c.args.includes('merge')), 'a known-red main must never be merged');
@@ -396,7 +546,9 @@ test('realCiChecks: nightly-red guard (extracted into the shared helper) still p
 
   await assert.rejects(
     () => realCiChecks(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-red-no-merge'
+    // Card #212 item 6a: CI_CHECKS' own call to guardNightlyRed passes no extraDetail (tests DID
+    // run to reach this branch), so the shared main-red-no-merge throw must carry no testsRan key.
+    (err) => err instanceof ParkSignal && err.reason === 'main-red-no-merge' && !('testsRan' in err.detail)
   );
 });
 
@@ -806,10 +958,11 @@ for (const [label, populate, expected] of [
 
 // Adversarial review finding (c): `merge --abort` is best-effort cleanup, but it goes through
 // spawnStep -- and since action 2.1 a twice-timed-out spawnStep THROWS ParkSignal('git-timed-out')
-// rather than returning. Unguarded, that throw unwinds past the main-moved-conflict park, so the
-// card parks under a reason naming the cleanup instead of the cause and loses {headSha, mergeExit}
-// with it. Same shape as action 4.3's own verification finding.
-test('realGate: a merge --abort that TIMES OUT still parks main-moved-conflict, not git-timed-out', async () => {
+// rather than returning. Unguarded, that throw unwinds past the gate-merge-refused park (card
+// #212: renamed from main-moved-conflict), so the card parks under a reason naming the cleanup
+// instead of the cause and loses {headSha, mergeExit} with it. Same shape as action 4.3's own
+// verification finding.
+test('realGate: a merge --abort that TIMES OUT still parks gate-merge-refused, not git-timed-out', async () => {
   const config = testConfig({ commandTimeoutsMs: { git: 5000 } });
   const ctx = gateCtx({ config });
   const headSha = fakeSha('abortTimeoutHead');
@@ -835,7 +988,7 @@ test('realGate: a merge --abort that TIMES OUT still parks main-moved-conflict, 
     () => realGate(ctx, deps),
     (err) =>
       err instanceof ParkSignal &&
-      err.reason === 'main-moved-conflict' &&
+      err.reason === 'gate-merge-refused' &&
       err.detail.headSha === headSha &&
       err.detail.mergeExit === 1
   );
@@ -849,7 +1002,7 @@ test('realGate: a merge --abort that TIMES OUT still parks main-moved-conflict, 
 // rather than a bare catch (the same line preserveWorktreeWip uses, for the same reason): the
 // catch exists to swallow ONE specific control-flow throw. A genuine programming error thrown
 // from inside spawnStep must still escape -- a catch that eats everything would turn a TypeError
-// into a silent main-moved-conflict park and hide the bug behind a plausible reason.
+// into a silent gate-merge-refused park and hide the bug behind a plausible reason.
 test('realGate: a NON-ParkSignal error from merge --abort still escapes -- the catch swallows control flow, not bugs', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('abortThrowsHead');

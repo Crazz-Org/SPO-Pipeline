@@ -123,6 +123,17 @@ const PINS = [
     file: 'SPO-WebClient/src/e2e/bench/cli.ts',
     contains: 'queued (',
   },
+  {
+    // Card #212: gate-merge-refused's `refusalConfirmed` reads done/<jobId>.json's own `.detail`
+    // against this literal (scripted.js's isGateMergeRefusalConfirmed:
+    // /does not merge cleanly with origin\/main/), ONLY to confirm the reason's NAME -- never the
+    // route, which is already fixed by the exit-1 + FAIL + no-baseMain facts. Same cross-repo
+    // hazard as every other pin above: a maintainer rewording this message over there silently
+    // makes refusalConfirmed always false, with every test in this repo staying green.
+    name: 'gate-merge-refused: refusalConfirmed literal (scripted.js: /does not merge cleanly with origin\\/main/)',
+    file: 'SPO-WebClient/src/e2e/bench/worker.ts',
+    contains: 'does not merge cleanly with origin/main',
+  },
 ];
 
 test('every stderr/stdout literal realGate matches for GATE exit 2/3/1-job-id routing still exists in the real SPO-WebClient tree', () => {
@@ -156,7 +167,7 @@ test('every stderr/stdout literal realGate matches for GATE exit 2/3/1-job-id ro
 // floor does: a mutation that deletes rows from PINS must not leave this file green while
 // checking fewer facts than it claims to.
 test('PINS covers every literal this sweep exists to pin -- not silently shrunk', () => {
-  assert.equal(PINS.length, 8, `expected exactly 8 pinned literals, found ${PINS.length}`);
+  assert.equal(PINS.length, 9, `expected exactly 9 pinned literals, found ${PINS.length}`);
   assert.deepEqual(
     PINS.map((p) => p.name).sort(),
     [
@@ -168,6 +179,7 @@ test('PINS covers every literal this sweep exists to pin -- not silently shrunk'
       'exit 3, WORKER DIED -> gate-worker-died-midjob (scripted.js: /WORKER DIED/)',
       'exit 3, WORKER DOWN fallback -> gate-worker-down, unchanged (scripted.js comment)',
       'exit 3, bench client not built -> gate-worker-not-built (scripted.js: /bench client not built/)',
+      'gate-merge-refused: refusalConfirmed literal (scripted.js: /does not merge cleanly with origin\\/main/)',
     ].sort(),
     'PINS lost or gained a row -- update this pin in the same change as any deliberate addition/removal.'
   );

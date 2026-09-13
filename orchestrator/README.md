@@ -1073,8 +1073,17 @@ Exit 1: no verdict file at all → PARKED `gate-non-attesting` (a `NON_ATTESTING
 never written to `verdicts/`, so nothing was learned about the code and a DIAGNOSE call would be
 spent on nothing); a `FAIL` with no `baseMain` → the branch no longer merges with `origin/main`
 (the bench merges it itself, before assigning `baseMain`), so fetch + merge `origin/main` →
-`'CHECK'`, or `merge --abort` and PARKED `main-moved-conflict`; a `FAIL` that DOES carry
-`baseMain` → `'DIAGNOSE'`, unchanged.
+`'CHECK'`, or `merge --abort` and PARKED `gate-merge-refused` (**card #212**, renamed from
+`main-moved-conflict`: this is a bench REFUSAL, not a real conflict between two sets of tested
+code — the bench never got past checking mergeability, so no flow was ever driven. Terminal,
+unchanged — a retry re-burns PLAN+IMPLEMENT+VALIDATE (~322k tokens p50) replacing the PR, and
+under spine contention the fresh attempt can conflict again, which is why the driver keeps this a
+human decision rather than an auto-retry. `detail`: `headSha`, `mergeExit`, `jobId`,
+`refusalConfirmed`, `testsRan: false`, `gatePassedOnSha: false`. `main-moved-conflict` is dropped
+from `TERMINAL_PARK_REASONS` entirely (test/park-reason-partition.test.js's "NO DEAD ENTRIES"
+check forbids a member with no live producer) but stays in `console/plain-language.js`'s
+`PARK_REASONS` text, unproducing, so the dashboard can still render old journals that carried it);
+a `FAIL` that DOES carry `baseMain` → `'DIAGNOSE'`, unchanged.
 
 Exit 0 (action B2.3): no longer read as proof on its own. `verdicts/<sha>.json` now carries
 `live` (`LiveAttestation` — `{status:'ran', flows}` · `{status:'skipped', why, required}` ·
@@ -1159,6 +1168,15 @@ fetch or merge failure, the shared `mainMovedRegateBudget` already spent), falls
 to the original park, unchanged — the re-gate never masks or worsens a park, and never adds a
 second `gh pr view` call (it reuses the probe's own answer). See `merge-regate` above and
 `doc/state-machine-spec.md`'s MERGE row for the full detail.
+
+**card #212:** a `merge-conflict` park's `detail` also carries `headSha`, `gatePassedOnSha`
+and `liveStatus` — `readMergeConflictGateFacts` does one guarded `git rev-parse HEAD` at the park
+(MERGE is only reachable after a GATE run that ACCEPTED the current HEAD earlier in the same
+attempt — a real exit-0 PASS, or card #211's exit-3 recovery reaching a fresh PASS through the
+identical `acceptPassedGate` acceptance path — so this is the sha the gate ran against) and reads
+`verdicts/<headSha>.json`; a failed or swallowed-
+throw rev-parse reads `headSha: null, gatePassedOnSha: null, liveStatus: null` — unknown, never
+`false`. Only `merge-conflict` gets this; the other four `MERGE_CAUSE_REASONS` are out of scope.
 
 **FINISH** (action B1.4 gave it a new preamble, ahead of the pre-existing board-sync/teardown
 below) first fast-forwards `config.productRepo`'s own checkout to `origin/main` and, only when
@@ -2954,6 +2972,7 @@ task/daemon split itself).
 | `leftover-pr-lookup-failed` | task | the leftover sweep's `gh pr list` for the stale branch failed or returned unparsable JSON — the delete is refused rather than risk closing an invisible PR (`steps/scripted.js`). |
 | `leftover-remote-preserved` | task | the leftover sweep pushed the stale remote branch's unmerged tip to a `wip/` ref before deleting it (`steps/scripted.js`). |
 | `leftover-worktree-removed` | task | the leftover sweep removed (or pruned the registration of) a stale worktree directory (`steps/scripted.js`). |
+| `merge-conflict-head-rev-parse-failed` | task | card #212: `readMergeConflictGateFacts`'s own guarded `git rev-parse HEAD` (enriching a `merge-conflict` park with "did the gate already pass on this sha") either exited non-zero or THREW (a double-timeout `git-timed-out`, or `command-killed-by-signal` from a deploy restart) — the throw is swallowed so it can never replace the caller's own `merge-conflict` park, and the `merge-conflict` detail then carries `headSha: null, gatePassedOnSha: null, liveStatus: null` (unknown, never `false`) (`steps/scripted.js`). |
 | `merge-regate` | task | SPO-Pipeline#84: `realMerge`'s own re-gate attempt on a non-landing `pr:wait`, run only when `probeMergeability`'s cause is `merge-conflict`/`merge-behind-base` — one event per outcome, `decision` naming which: `rev-parse-failed` (HEAD), `no-base-main` (no bench verdict for HEAD, or it carries no `baseMain`), `fetch-failed`, `diff-failed`, `no-intersection` (the branch and `origin/main`'s own moved files don't overlap — the original park stands), `budget-exhausted` (`config.mainMovedRegateBudget` already spent, shared with GATE/CI_CHECKS), `origin-main-rev-parse-failed` (the nightly-red guard is skipped, not fatal), `merge-failed` (the regate's own `git merge origin/main` conflicted — aborted and left clean), `spawn-park-suppressed` (one of the re-gate's own `spawnStep` calls THREW rather than returning — `git-timed-out` after its retry, or `command-killed-by-signal` from a deploy restart — and the throw was swallowed, `suppressedReason` naming it, so the caller's original GitHub-attested park still fires; `main-red-no-merge` is the one throw deliberately NOT suppressed), or `routed` (merged cleanly; `realMerge` returns `'CHECK'` and the caller's own park never fires). Every non-`routed` decision falls through to the pre-existing `parkFromMergeCause`/fallback park unchanged — this event never itself parks the card (`steps/scripted.js`). |
 | `merge-regate-abort-failed` | task | the re-gate's own `git merge --abort` (cleaning up a failed regate merge) itself exited non-zero or hit a spawn timeout — mirrors `gate-main-moved-abort-failed` above for the same cleanup step, one state over (`steps/scripted.js`). |
 | `no-worktree-change` | task | IMPLEMENT's `files_changed` claim was non-empty but `git status --porcelain` on the worktree came back clean — routes to DIAGNOSE (card #385's cross-check, `state-machine.js`). |

@@ -66,6 +66,58 @@ function parseCommentId(stdout) {
 const RETRY_ABANDON_LINE =
   'pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to close this attempt.';
 
+function shortSha(sha) {
+  return sha ? String(sha).slice(0, 10) : 'unknown';
+}
+
+// Card #212 item 3: a park comment used to say nothing about whether the gate had already proven
+// THIS code green, or whether it ran any test at all. The issue's own headline ("five of the seven
+// ... already-PASSED") does NOT hold up against the corpus and this file must not repeat it: 0 of
+// the 11 real `main-moved-conflict` parks had a PASS -- every one was a bench REFUSAL (the bench
+// never got past checking whether the branch merges with `origin/main`, so no flow was ever
+// driven; see steps/scripted.js's own `gate-merge-refused` header for the full measurement) -- and
+// 7 of the 7 real `merge-conflict` parks WERE on a gate-PASSED, live-attested sha. The two reasons
+// carry opposite facts, which is exactly why this line is keyed on the detail's own
+// `gatePassedOnSha`/`testsRan` fields rather than on the reason string. This adds ONE line above
+// the existing `<details>` JSON dump (never replacing it) -- set structurally by the two throw
+// sites that carry them (`gate-merge-refused` always sets both to `false`; `merge-conflict`'s own
+// `readMergeConflictGateFacts`, steps/scripted.js, sets them from a fresh read). A detail carrying
+// neither field (every other park reason today) renders nothing here, so every existing park
+// comment stays byte-identical -- verified in test/park-loop.test.js by comparing against a
+// snapshot of the pre-this-action output.
+//
+// What `retry` actually does to the PR, verified before writing this (not assumed from the old
+// reason's name): `reEnqueueTask` (this file, below) re-enqueues the card's ORIGINAL task.json,
+// stripped of `worktreePath`/`branch`/`baseMainSha`, which always starts the next run at INTAKE.
+// `realWorktree` (steps/scripted.js) then rebuilds the same-named `claude-pipe/<id>` branch from
+// the CURRENT `origin/main` via its leftover sweep (`sweepWorktreeLeftovers`) -- and that sweep's
+// own rule 3 (card #455) does not let the remote branch delete close this card's open PR as an
+// invisible side effect: it explicitly runs `gh pr close <number>` on it FIRST (steps/scripted.js,
+// the "-- 3b. Close any open PR deliberately" block), then deletes the branch and lets PUSH_PR
+// open a brand-new PR (a new number) on the next pass. So a `retry` genuinely closes this exact
+// pull request, on purpose -- but it does NOT throw the commits away first: rule 3a (the block
+// right before 3b) pushes the branch's tip to a durable `wip/<id>-<ts>` ref whenever that tip is
+// not already an ancestor of `origin/main`, before anything is deleted. What a `retry` actually
+// costs is the PR object and its green gate status, not the code.
+function buildGateFactLine(detail) {
+  if (!detail) return null;
+  if (detail.gatePassedOnSha === true) {
+    return (
+      `**The gate had already PASSED on \`${shortSha(detail.headSha)}\` -- this pull request is green.** ` +
+      'A `retry` closes this pull request (its commits are kept on a `wip/` ref) and restarts the ' +
+      'card at INTAKE, opening a brand-new PR on the next pass -- the PR and its green gate status ' +
+      'do not survive, even though the code does.'
+    );
+  }
+  if (detail.testsRan === false) {
+    return (
+      `No test ran on \`${shortSha(detail.headSha)}\`: the bench refused the branch because it does not ` +
+      'merge cleanly with `origin/main` -- this is not a test failure.'
+    );
+  }
+  return null;
+}
+
 // countRepeatedParks(lines, reason, detail) -- how many parks in a row, most recent first, share
 // this exact reason + JSON.stringify(detail) fingerprint. Card #385's loop: branch-unmerged-
 // leftover parked four times running, byte-identical detail every time, because each attempt's
@@ -148,6 +200,11 @@ function buildParkComment({
   if (attemptLines.length > 0) {
     lines.push('Attempts:');
     lines.push(...attemptLines, '');
+  }
+
+  const gateFactLine = buildGateFactLine(detail);
+  if (gateFactLine) {
+    lines.push(gateFactLine, '');
   }
 
   if (detail && Object.keys(detail).length > 0) {

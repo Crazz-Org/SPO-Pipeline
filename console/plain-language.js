@@ -210,6 +210,9 @@ const PARK_REASONS = {
   'pr-closed-unmerged': 'The pull request was closed without being merged.',
   'pr-merge-enqueue-failed': 'The merge could not be queued.',
   'pr-wait-unrecognized-exit': 'Waiting for the merge exited in an unrecognised way.',
+  'gate-merge-refused': 'The branch does not merge cleanly with the base branch, so nothing was tested.',
+  // historical: renamed to `gate-merge-refused` on 2026-09-13 (card #212) -- kept so the
+  // dashboard can still render older journals that carried this name.
   'main-moved-conflict': 'Someone else merged first and the changes conflict.',
   'main-moved-merge-failed': 'Someone else merged first and rebasing onto it failed.',
   'finish-failed': 'The card could not be marked done on the board.',

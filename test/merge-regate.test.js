@@ -367,7 +367,9 @@ test('regate: origin/main is nightly-red at its new tip -> PARKED main-red-no-me
 
   await assert.rejects(
     () => realMerge(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-red-no-merge'
+    // Card #212 item 6a: MERGE's own regate call to guardNightlyRed passes no extraDetail either
+    // (only reachable after a GATE PASS earlier in this attempt), so no testsRan key here.
+    (err) => err instanceof ParkSignal && err.reason === 'main-red-no-merge' && !('testsRan' in err.detail)
   );
 
   const mergeCalls = calls.filter((c) => c.command === 'git' && c.args.includes('merge') && c.args.includes('origin/main'));

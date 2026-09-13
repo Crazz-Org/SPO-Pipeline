@@ -1233,3 +1233,11 @@ test('the box rises to wherever the journal says DIAGNOSE sent the card, not to 
   assert.equal(detourGeometry(html).riseX, labelX(html, 'Plan'));
   assert.equal(tileClass(html, 'Test'), 'tile-failed');
 });
+
+// card #212 renamed the GATE refusal park `main-moved-conflict` -> `gate-merge-refused` and dropped the
+// old name from TERMINAL_PARK_REASONS (no producer left). Cards parked before the rename still carry
+// the old reason in state.json, so the dashboard must keep rendering it in plain language.
+test('renamed park reason main-moved-conflict still has dashboard text for cards parked before card #212', () => {
+  assert.equal(reasonText('main-moved-conflict').known, true);
+  assert.equal(reasonText('gate-merge-refused').known, true);
+});
