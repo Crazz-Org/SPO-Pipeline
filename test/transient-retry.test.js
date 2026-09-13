@@ -1201,6 +1201,46 @@ test('finalizePark: gate-worker-dirty-checkout is NOT on the allowlist -> ordina
   assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'));
 });
 
+// ---- card #212 item 2: gate-merge-refused stays TERMINAL, the status quo continuing -----------
+//
+// Driver decision (see steps/scripted.js's own header on this throw, and doc/state-machine-
+// spec.md's GATE row): a retry restarts at INTAKE and re-burns PLAN+IMPLEMENT+VALIDATE (~322k
+// tokens p50) replacing the PR, and under spine contention the fresh attempt can conflict again --
+// manual retries after a refusal DID reach DONE 3/3 times tried (#439, #510, #522), which is the
+// argument FOR transient, but the driver's call is that the maintainer keeps this choice rather
+// than the daemon spending real LLM cost on an automatic retry loop. Same class as today
+// (`main-moved-conflict` was already terminal) -- this rename does not change auto-retry
+// behaviour, and this pin is what proves that: a renamed reason keys TRANSIENT_RETRY_REASONS on
+// the exact string (state-machine.js's own header), so a rename with no matching classification
+// decision would silently flip the retry policy, exactly the trap this whole test file exists to
+// catch.
+test('finalizePark: gate-merge-refused is NOT on the allowlist -> ordinary park (terminal, same disposition as the main-moved-conflict name it replaces)', () => {
+  const config = testConfig();
+  const ctx = buildParkCtx({ config });
+
+  finalizePark(ctx, 'GATE', 'gate-merge-refused', {
+    headSha: 'abc1234',
+    mergeExit: 1,
+    jobId: 'job-1',
+    refusalConfirmed: true,
+    testsRan: false,
+    gatePassedOnSha: false,
+  });
+
+  const state = readState(ctx.taskDir);
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'gate-merge-refused');
+  assert.equal(queuedFiles(config.queueDir).length, 0);
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'transient-retry'));
+});
+
+test('classifyParkReason/isTransientRetryReason: gate-merge-refused classifies terminal, never transient', () => {
+  const { classifyParkReason, isTransientRetryReason, TRANSIENT_RETRY_REASONS } = require('../orchestrator/state-machine');
+  assert.equal(classifyParkReason('gate-merge-refused'), 'terminal');
+  assert.equal(isTransientRetryReason('gate-merge-refused'), false);
+  assert.equal(TRANSIENT_RETRY_REASONS.has('gate-merge-refused'), false);
+});
+
 // The exit-2/3 four: neither gate-dirty-tree nor gate-worker-down (the reasons they refine) was
 // ever on TRANSIENT_RETRY_REASONS, so all four staying off it is the status quo continuing, not a
 // new decision -- pinned here anyway so a future accidental addition is caught the same way a

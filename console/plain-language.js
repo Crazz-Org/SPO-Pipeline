@@ -171,7 +171,7 @@ const PARK_REASONS = {
   // --- the gate (full test run) -----------------------------------------------------------
   'gate-dirty-tree': 'The working copy had uncommitted changes when the test run started.',
   'gate-worker-down': 'The machine that runs the full test suite was not answering.',
-  'gate-worker-died-midjob': 'The test machine died in the middle of the run.',
+  'gate-worker-died-midjob': 'The test machine looked dead, and the pipeline could not confirm what happened to the run.',
   'gate-worker-not-built': 'The test machine has not been built yet.',
   'gate-worker-dirty-checkout': "The test machine's own checkout was not clean.",
   'gate-timeout': 'The full test run took too long and was cut off.',
@@ -210,6 +210,9 @@ const PARK_REASONS = {
   'pr-closed-unmerged': 'The pull request was closed without being merged.',
   'pr-merge-enqueue-failed': 'The merge could not be queued.',
   'pr-wait-unrecognized-exit': 'Waiting for the merge exited in an unrecognised way.',
+  'gate-merge-refused': 'The branch does not merge cleanly with the base branch, so nothing was tested.',
+  // historical: renamed to `gate-merge-refused` on 2026-09-13 (card #212) -- kept so the
+  // dashboard can still render older journals that carried this name.
   'main-moved-conflict': 'Someone else merged first and the changes conflict.',
   'main-moved-merge-failed': 'Someone else merged first and rebasing onto it failed.',
   'finish-failed': 'The card could not be marked done on the board.',

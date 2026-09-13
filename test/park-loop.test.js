@@ -108,6 +108,84 @@ test('buildParkComment: repeat omitted (or 1) carries no loop-warning block -- u
   assert.ok(!body.includes('Ce park est identique'));
 });
 
+// ---- buildParkComment: card #212 item 3 -- the "did the gate already pass" plain-language line -
+
+test('buildParkComment: a detail without gatePassedOnSha/testsRan renders byte-identical to before card #212 -- no line spliced in', () => {
+  const body = buildParkComment({ reason: 'worktree-npm-ci-failed', detail: { exit: 1 }, lastState: 'WORKTREE' });
+  assert.ok(!body.includes('PASSED on'));
+  assert.ok(!body.includes('No test ran on'));
+  // Exact structural proof, not just absence of the marker text: RETRY_ABANDON_LINE is followed
+  // by a blank line and then directly the "This card so far" line, nothing spliced between them.
+  const idx = body.indexOf(RETRY_ABANDON_LINE);
+  const after = body.slice(idx + RETRY_ABANDON_LINE.length);
+  assert.match(after, /^\n\n\*\*This card so far:\*\*/);
+});
+
+test('buildParkComment: gatePassedOnSha true renders the bold PASSED line with the short sha, above the detail block', () => {
+  const detail = {
+    headSha: 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',
+    gatePassedOnSha: true,
+    liveStatus: 'ran',
+    mergeStateStatus: 'DIRTY',
+  };
+  const body = buildParkComment({ reason: 'merge-conflict', detail, lastState: 'MERGE' });
+  assert.match(body, /\*\*The gate had already PASSED on `a1a1a1a1a1`.*is green\.\*\*/);
+  assert.match(body, /retry/);
+  assert.ok(!body.includes('No test ran on'), 'gatePassedOnSha true must never also render the no-test line');
+  assert.ok(body.indexOf('PASSED on') < body.indexOf('<details>'), 'the plain-language line must sit above the JSON dump');
+});
+
+test('buildParkComment: testsRan false renders the "no test ran" line, never the PASSED line', () => {
+  const detail = {
+    headSha: 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2',
+    mergeExit: 1,
+    jobId: 'job-buildcomment-x',
+    refusalConfirmed: true,
+    testsRan: false,
+    gatePassedOnSha: false,
+  };
+  const body = buildParkComment({ reason: 'gate-merge-refused', detail, lastState: 'GATE' });
+  assert.match(body, /No test ran on `b2b2b2b2b2`: the bench refused the branch/);
+  assert.ok(!body.includes('PASSED on'));
+  assert.ok(body.indexOf('No test ran on') < body.indexOf('<details>'));
+});
+
+test('buildParkComment: absent gatePassedOnSha/testsRan fields render neither line', () => {
+  const body = buildParkComment({ reason: 'merge-behind-base', detail: { mergeStateStatus: 'BEHIND' }, lastState: 'MERGE' });
+  assert.ok(!body.includes('PASSED on'));
+  assert.ok(!body.includes('No test ran on'));
+});
+
+test('buildParkComment: gatePassedOnSha/testsRan gate on `=== true`/`=== false` exactly -- a truthy-but-not-true (or falsy-but-not-false) value renders neither line', () => {
+  // Mutation this kills: a loose `if (detail.gatePassedOnSha)`/`if (!detail.testsRan)` check would
+  // render the PASSED/no-test line for ANY truthy/falsy value, not just the real booleans the two
+  // producers (gate-merge-refused, merge-conflict's readMergeConflictGateFacts) actually write.
+  for (const gatePassedOnSha of ['true', 1, {}]) {
+    const body = buildParkComment({ reason: 'merge-conflict', detail: { headSha: 'deadbeef00', gatePassedOnSha }, lastState: 'MERGE' });
+    assert.ok(!body.includes('PASSED on'), `gatePassedOnSha=${JSON.stringify(gatePassedOnSha)} must not render the PASSED line`);
+  }
+  for (const testsRan of ['false', 0, null]) {
+    const body = buildParkComment({ reason: 'gate-merge-refused', detail: { headSha: 'deadbeef00', testsRan }, lastState: 'GATE' });
+    assert.ok(!body.includes('No test ran on'), `testsRan=${JSON.stringify(testsRan)} must not render the no-test line`);
+  }
+});
+
+test('countRepeatedParks: two identical gate-merge-refused parks (card #212 rename) still count as a repeat', () => {
+  const detail = {
+    headSha: 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3',
+    mergeExit: 1,
+    jobId: 'job-repeat-x',
+    refusalConfirmed: true,
+    testsRan: false,
+    gatePassedOnSha: false,
+  };
+  const lines = [
+    { event: 'parked', reason: 'gate-merge-refused', detail },
+    { event: 'parked', reason: 'gate-merge-refused', detail },
+  ];
+  assert.equal(countRepeatedParks(lines, 'gate-merge-refused', detail), 2);
+});
+
 // ---- buildParkComment: action 5.2 -- cumulative tokens + attempt history, still pure ----------
 
 test('buildParkComment: stays pure -- no filesystem access at all, callable with only in-memory numbers', () => {

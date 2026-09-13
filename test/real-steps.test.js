@@ -103,6 +103,13 @@ function testConfig(overrides = {}) {
     // bound matters).
     benchIdleWaitMaxPolls: 3,
     benchIdleWaitPollIntervalMs: 10,
+    // Card #211: realGate's exit-3/WORKER-DIED recovery poll -- same reasoning as
+    // benchIdleWaitMaxPolls/benchIdleWaitPollIntervalMs above: small numbers here so a test that
+    // does not deliberately exercise the bound (every existing exit-3 test, whose spoBenchDir has
+    // no done/<jobId>.json at all) never actually sleeps to it. The dedicated recovery tests below
+    // override both further where a specific bound matters.
+    gateDiedRecoveryMaxPolls: 3,
+    gateDiedRecoveryPollIntervalMs: 10,
     ...overrides,
   };
 }
@@ -2414,7 +2421,11 @@ for (const [verdict, expectedReason, headSha, jobId] of B34_VERDICT_CASES) {
 
     await assert.rejects(
       () => realGate(ctx, deps),
-      (err) => err instanceof ParkSignal && err.reason === expectedReason
+      // Fix-pass round 2, defect 3: a REAL exit 1 must carry exitFrom: 1, pinned by value so the
+      // mutation that changes this real path's value 1 -> 3 (confusable with the exit-3 recovery
+      // path's own exitFrom: 3) goes red -- see routeGateNonAttestingReport's own header for why
+      // this field is shared with card #211's recovered exit-3 path at all.
+      (err) => err instanceof ParkSignal && err.reason === expectedReason && err.detail.exitFrom === 1
     );
 
     const journal = readJournal(ctx.taskDir);
@@ -2427,6 +2438,9 @@ for (const [verdict, expectedReason, headSha, jobId] of B34_VERDICT_CASES) {
       !journal.some((e) => e.event === 'gate-non-attesting'),
       'the split reason must fire INSTEAD of gate-non-attesting, not alongside it'
     );
+    const reasonEvent = journal.find((e) => e.event === expectedReason);
+    assert.ok(reasonEvent, `expected a ${expectedReason} journal event`);
+    assert.equal(reasonEvent.exitFrom, 1, 'the journal event must carry exitFrom: 1 too, not just the ParkSignal detail');
   });
 }
 
@@ -2570,6 +2584,765 @@ for (const [exit, stderrText, expectedReason] of [
     );
   });
 }
+
+// ---- GATE, card #211: bounded recovery for exit 3 / WORKER DIED with a known job id -----------
+//
+// The corpus proved 7 of 7 real `gate-worker-died-midjob` parks were a LIVE worker that went on
+// to PASS that exact job -- see doc/state-machine-spec.md's GATE row and config.js's
+// GATE_DIED_RECOVERY_MAX_POLLS comment for the measurement. These tests exercise the recovery
+// wait `recoverFromGateWorkerDied` adds before parking under this name, gated on a job id being
+// present in stdout (`parseGateJobId`) -- the loop above already pins the no-job-id shape as
+// unaffected; this file only adds a dedicated regression guard for it (below) so the "never
+// sleeps" property is asserted explicitly, not merely implied by the absence of a `sleep` dep.
+function workerDiedStderr(jobId, reason = 'heartbeat stale') {
+  return `WORKER DIED while job ${jobId} was pending: ${reason}\n`;
+}
+
+function workerDiedGateResult(jobId, reason) {
+  return { status: 3, stdout: gateJobStdout(jobId), stderr: workerDiedStderr(jobId, reason), signal: null };
+}
+
+test('realGate (card #211): report already on disk (poll 0) with a fresh PASS verdict -> CI_CHECKS, no park, sleep never called', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211-pass-wt-');
+  const headSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+  const jobId = 'job-00000000000211-aaaaaa';
+  const task = { id: 'card-211-pass', kind: 'card', issue: 940, worktreePath };
+  const ctx = testCtx({ id: 'card-211-pass', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'PASS' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'PASS',
+    jobId,
+    live: { status: 'ran', flows: ['login-spine'] },
+  });
+
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  }, sleeps);
+
+  const next = await realGate(ctx, deps);
+
+  assert.equal(next, 'CI_CHECKS');
+  assert.deepEqual(sleeps, [], 'the report was already there on the FIRST check -- no sleep should ever fire');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'gate-died-recovery-start' && e.jobId === jobId));
+  assert.ok(
+    journal.some((e) => e.event === 'gate-died-recovery' && e.jobId === jobId && e.polls === 0 && e.outcome === 'pass'),
+    'expected the recovery-end event with outcome pass and zero polls'
+  );
+  assert.ok(!journal.some((e) => e.reason === 'gate-worker-died-midjob'));
+});
+
+test('realGate (card #211): the report lands only on poll 3 of a possible 5 -- sleep called exactly 3 times, then CI_CHECKS', async () => {
+  const config = testConfig({ gateDiedRecoveryMaxPolls: 5, gateDiedRecoveryPollIntervalMs: 1000 });
+  const worktreePath = mkTmp('spo-real-gate-211-pollk-wt-');
+  const headSha = 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2';
+  const jobId = 'job-00000000000211-bbbbbb';
+  const task = { id: 'card-211-pollk', kind: 'card', issue: 941, worktreePath };
+  const ctx = testCtx({ id: 'card-211-pollk', task, config });
+
+  const K = 3;
+  const sleeps = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('gate')) return workerDiedGateResult(jobId);
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      return ok('');
+    },
+    // The report and its verdict land as a side effect of the Kth sleep call, exactly like
+    // realCiChecks' own in-flight tests model "the next poll finds it done" above.
+    sleep: (ms) => {
+      sleeps.push(ms);
+      if (sleeps.length === K) {
+        writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'PASS' });
+        writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+          verdict: 'PASS',
+          jobId,
+          live: { status: 'ran', flows: [] },
+        });
+      }
+      return Promise.resolve();
+    },
+  };
+
+  const next = await realGate(ctx, deps);
+
+  assert.equal(next, 'CI_CHECKS');
+  assert.equal(sleeps.length, K, 'expected sleep called EXACTLY K times, not more (asserting the count, not >=)');
+  assert.deepEqual(sleeps, [1000, 1000, 1000]);
+});
+
+test('realGate (card #211): recovered fresh PASS whose live is routed-but-not-driven -> parks gate-live-not-driven with exitFrom: 3 (proves the exit-0 acceptance checks are shared, not bypassed)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211-notdriven-wt-');
+  const headSha = 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3';
+  const jobId = 'job-00000000000211-cccccc';
+  const task = { id: 'card-211-notdriven', kind: 'card', issue: 942, worktreePath };
+  const ctx = testCtx({ id: 'card-211-notdriven', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'PASS' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'PASS',
+    jobId,
+    live: { status: 'skipped', why: 'routing named a flow the live stage never drove', required: ['politics-write'] },
+  });
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-live-not-driven' &&
+      err.detail.exitFrom === 3 &&
+      err.detail.headSha === headSha &&
+      err.detail.required.length === 1
+  );
+});
+
+test('realGate (card #211): recovered fresh FAIL verdict carrying baseMain -> DIAGNOSE, same as a genuine exit 1', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211-fail-wt-');
+  const headSha = 'd4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4';
+  const jobId = 'job-00000000000211-dddddd';
+  const task = { id: 'card-211-fail', kind: 'card', issue: 943, worktreePath };
+  const ctx = testCtx({ id: 'card-211-fail', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'FAIL' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'FAIL',
+    jobId,
+    baseMain: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+  });
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  });
+
+  const next = await realGate(ctx, deps);
+  assert.equal(next, 'DIAGNOSE');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'gate-verdict' && e.headSha === headSha));
+});
+
+test('realGate (card #211): a PASS verdict left by a DIFFERENT, earlier job on the same sha (stale) -> parks gate-worker-died-midjob, never accepted', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211-stale-wt-');
+  const headSha = 'e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5';
+  const jobId = 'job-00000000000211-eeeeee'; // the job THIS gate deposited
+  const earlierJobId = 'job-00000000000211-000000'; // the job the stale verdicts/ file actually belongs to
+  const task = { id: 'card-211-stale', kind: 'card', issue: 944, worktreePath };
+  const ctx = testCtx({ id: 'card-211-stale', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'PASS' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'PASS',
+    jobId: earlierJobId, // proves WHICH jobId is keyed: mismatches the printed one, so must not be accepted
+    live: { status: 'ran', flows: [] },
+  });
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-worker-died-midjob' &&
+      err.detail.exit === 3 &&
+      !('jobId' in err.detail) && // fix-pass defect 4: the raw jobId lives on the journal event only
+      err.detail.recoveryPolls === config.gateDiedRecoveryMaxPolls // the bound ran out waiting for a fresh verdict (fix-pass defect 3: NOT parked on the first stale poll)
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(
+    journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'stale-verdict' && e.jobId === jobId),
+    'the RAW jobId belongs on the journal event, so a maintainer reading journal.jsonl can still find it'
+  );
+});
+
+test('realGate (card #211): done/<jobId>.json never lands -> parks gate-worker-died-midjob after exactly maxPolls sleeps, detail enriched with recoveryPolls/workerDiedReason but never the raw jobId', async () => {
+  const config = testConfig({ gateDiedRecoveryMaxPolls: 4, gateDiedRecoveryPollIntervalMs: 1000 });
+  const worktreePath = mkTmp('spo-real-gate-211-noreport-wt-');
+  const jobId = 'job-00000000000211-ffffff';
+  const task = { id: 'card-211-noreport', kind: 'card', issue: 945, worktreePath };
+  const ctx = testCtx({ id: 'card-211-noreport', task, config });
+
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId, 'bench heartbeat truncated on read');
+    return ok('');
+  }, sleeps);
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-worker-died-midjob' &&
+      err.detail.exit === 3 &&
+      !('jobId' in err.detail) &&
+      err.detail.recoveryPolls === 4 &&
+      err.detail.workerDiedReason === 'bench heartbeat truncated on read'
+  );
+
+  assert.equal(sleeps.length, 4, 'expected sleep called EXACTLY maxPolls times, not more');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(
+    journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'no-report' && e.jobId === jobId && e.workerDiedReason === 'bench heartbeat truncated on read'),
+    'the RAW jobId and RAW workerDiedReason belong on the journal event'
+  );
+  assert.ok(journal.some((e) => e.event === 'gate-died-recovery-start' && e.jobId === jobId && e.maxPolls === 4));
+  assert.ok(journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'no-report' && e.polls === 4));
+});
+
+test('realGate (card #211 regression guard): exit 3 WORKER DIED with NO job id in stdout never invokes the recovery wait -- deps.sleep is never called, detail stays the pre-#211 {exit} shape', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211-nojobid-wt-');
+  const task = { id: 'card-211-nojobid', kind: 'card', issue: 946, worktreePath };
+  const ctx = testCtx({ id: 'card-211-nojobid', task, config });
+
+  const sleeps = [];
+  const deps = noSleepDeps(
+    (command, args) => (args.includes('gate') ? fail(3, 'WORKER DIED while job job-1-abc was pending: heartbeat stale\n') : ok('')),
+    sleeps
+  );
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-worker-died-midjob' &&
+      err.detail.exit === 3 &&
+      !('jobId' in err.detail) &&
+      !('recoveryPolls' in err.detail) &&
+      !('workerDiedReason' in err.detail)
+  );
+
+  assert.deepEqual(sleeps, [], 'no job id in stdout -> no recovery wait -> deps.sleep must never be called');
+});
+
+// ---- GATE (card #211), fix-pass: recovered non-PASS shapes other than a plain FAIL-with-baseMain
+//
+// The Opus verifier's own defects 1/3/6 for this action: mutation coverage (M10/M18/M20) for the
+// BLOCKED/STALE/FAIL-without-baseMain routes through recovery, and the "attesting report arrived
+// before its verdicts/ file" ordering worker.ts actually has (done/<id>.json first, verdicts/<sha>
+// ~7ms later -- so a report found before a fresh verdict must keep polling, not park).
+
+test('realGate (card #211 fix-pass): recovered fresh BLOCKED whose live is routed-but-not-driven -> parks gate-live-not-driven with exitFrom: 3, journalled gate-died-recovery outcome fail', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211fp-blocked-wt-');
+  const headSha = '1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a';
+  const jobId = 'job-00000000000211-1a1a1a';
+  const task = { id: 'card-211fp-blocked', kind: 'card', issue: 950, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp-blocked', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'BLOCKED' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'BLOCKED',
+    jobId,
+    live: { status: 'skipped', why: 'routing named a flow the live stage never drove', required: ['politics-write'] },
+  });
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    // M10: exitFrom mutated 3 -> 1 fails this. M18: bypassing routeGateVerdict (e.g. always
+    // returning DIAGNOSE, or always parking gate-worker-died-midjob) also fails this -- only
+    // routeGateVerdict's own BLOCKED/liveRoutedButNotDriven branch produces this exact reason.
+    (err) => err instanceof ParkSignal && err.reason === 'gate-live-not-driven' && err.detail.exitFrom === 3 && err.detail.headSha === headSha
+  );
+
+  // M20: dropping the outcome:'fail' gate-died-recovery event fails this.
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(
+    journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'fail' && e.jobId === jobId),
+    'expected a gate-died-recovery event with outcome "fail" for a recovered non-PASS verdict'
+  );
+});
+
+test('realGate (card #211 fix-pass): recovered fresh STALE verdict -> the same gate-stale park a real exit 1 gives, enriched with the done report detail', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211fp-stale-wt-');
+  const headSha = '2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b';
+  const jobId = 'job-00000000000211-2b2b2b';
+  const task = { id: 'card-211fp-stale', kind: 'card', issue: 951, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp-stale', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'STALE',
+    detail: 'the tree changed between deposit and the end of the run -- resubmit',
+  });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'STALE', jobId });
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-stale' &&
+      err.detail.headSha === headSha &&
+      err.detail.jobDetail === 'the tree changed between deposit and the end of the run -- resubmit'
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'fail'));
+});
+
+test('realGate (card #211 fix-pass): recovered fresh FAIL without baseMain reaches the SAME main-moved branch a real exit 1 reaches -- a conflicting local merge parks gate-merge-refused (card #212: renamed from main-moved-conflict; this test proves reachability through the SHARED routeGateVerdict helper, not a second copy)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211fp-mainmoved-wt-');
+  const headSha = '3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c';
+  const jobId = 'job-00000000000211-3c3c3c';
+  const task = { id: 'card-211fp-mainmoved', kind: 'card', issue: 952, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp-mainmoved', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'FAIL' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL', jobId }); // no baseMain
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    if (args.includes('rev-parse') && args.includes('origin/main')) return ok('deadbeefcafedeadbeefcafedeadbeefcafedead\n');
+    if (args.includes('fetch')) return ok('');
+    if (args.includes('merge') && args.includes('--abort')) return ok('');
+    if (args.includes('merge')) return fail(1, 'CONFLICT (content): Merge conflict\n'); // the local merge conflicts
+    return ok('');
+  });
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-merge-refused' &&
+      err.detail.headSha === headSha &&
+      err.detail.mergeExit === 1 &&
+      err.detail.jobId === jobId &&
+      // done/<jobId>.json above carries no `.detail` field, so the literal cannot be confirmed --
+      // false, not the route (the route already fired from the exit-code/verdict facts alone).
+      err.detail.refusalConfirmed === false &&
+      err.detail.testsRan === false &&
+      err.detail.gatePassedOnSha === false
+  );
+});
+
+test('realGate (card #211 fix-pass, defect 3): the done report lands on poll k, the verdicts/ file only on poll k+2 (worker.ts writes them ~7ms apart) -> keeps polling within the SAME bound, then CI_CHECKS', async () => {
+  const config = testConfig({ gateDiedRecoveryMaxPolls: 6, gateDiedRecoveryPollIntervalMs: 1000 });
+  const worktreePath = mkTmp('spo-real-gate-211fp-ordering-wt-');
+  const headSha = '4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d';
+  const jobId = 'job-00000000000211-4d4d4d';
+  const task = { id: 'card-211fp-ordering', kind: 'card', issue: 953, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp-ordering', task, config });
+
+  const REPORT_AT = 2; // done/<jobId>.json appears after the 2nd sleep
+  const VERDICT_AT = 4; // verdicts/<headSha>.json appears after the 4th sleep
+  const sleeps = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      if (args.includes('gate')) return workerDiedGateResult(jobId);
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      return ok('');
+    },
+    sleep: (ms) => {
+      sleeps.push(ms);
+      if (sleeps.length === REPORT_AT) {
+        writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'PASS' });
+      }
+      if (sleeps.length === VERDICT_AT) {
+        writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+          verdict: 'PASS',
+          jobId,
+          live: { status: 'ran', flows: [] },
+        });
+      }
+      return Promise.resolve();
+    },
+  };
+
+  const next = await realGate(ctx, deps);
+
+  assert.equal(next, 'CI_CHECKS');
+  assert.equal(sleeps.length, VERDICT_AT, 'the SAME poll budget covers both waits -- no separate counter reset when the report arrives');
+
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'gate-died-recovery' && e.outcome === 'pass'));
+});
+
+test('realGate (card #211 fix-pass, defect 3): an INTERRUPTED done report -> the SAME reason a real exit 1 gives (gate-interrupted), never a terminal gate-worker-died-midjob, at exitFrom: 3', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211fp-interrupted-wt-');
+  const headSha = '5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e';
+  const jobId = 'job-00000000000211-5e5e5e';
+  const task = { id: 'card-211fp-interrupted', kind: 'card', issue: 954, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp-interrupted', task, config });
+
+  // recoverInterrupted never writes verdicts/<sha>.json for INTERRUPTED -- only done/<id>.json.
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'INTERRUPTED',
+    detail: 'the worker restarted while this job was running',
+  });
+
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  }, sleeps);
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-interrupted' &&
+      err.detail.exitFrom === 3 &&
+      err.detail.headSha === headSha &&
+      err.detail.jobId === jobId &&
+      err.detail.jobDetail === 'the worker restarted while this job was running'
+  );
+
+  // Never waits for a verdicts/ file that recoverInterrupted will never write.
+  assert.deepEqual(sleeps, [], 'a NON-attesting report routes immediately -- it must never burn a poll waiting for verdicts/');
+
+  // routeGateNonAttestingReport journals its OWN specific reason event (gate-interrupted here) --
+  // there is no separate generic gate-died-recovery bookkeeping event for the four known
+  // non-attesting shapes, only for the terminal pass/fail/no-report/stale-verdict outcomes.
+  const journal = readJournal(ctx.taskDir);
+  assert.ok(journal.some((e) => e.event === 'gate-interrupted' && e.exitFrom === 3 && e.jobId === jobId));
+});
+
+test('realGate (card #211 fix-pass round 2, defect 2): a done report naming an unrecognised verdict (LEASED) logs and parks EXACTLY ONCE -- never loops back to re-poll the same unresolvable report', async () => {
+  const config = testConfig({ gateDiedRecoveryMaxPolls: 5, gateDiedRecoveryPollIntervalMs: 1000 });
+  const worktreePath = mkTmp('spo-real-gate-211fp2-leased-wt-');
+  const headSha = '7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a';
+  const jobId = 'job-00000000000211-7a7a7a';
+  const task = { id: 'card-211fp2-leased', kind: 'card', issue: 970, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp2-leased', task, config });
+
+  // LEASED flatly contradicts exit 3 (cli.ts's own wait() maps PASS/LEASED to exit 0) -- the
+  // concrete example of a done-report verdict that is neither attesting (PASS/FAIL/BLOCKED/STALE)
+  // nor one of the four routeGateNonAttestingReport recognises (ENVIRONMENT/DIRTY/ABANDONED/
+  // INTERRUPTED). Before this fix, reaching this shape re-entered the poll loop and re-read/
+  // re-logged/re-rev-parsed the SAME immutable report on every remaining poll.
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'LEASED',
+    detail: 'this job is currently leased by a worker',
+  });
+
+  let revParseCalls = 0;
+  const sleeps = [];
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) {
+      revParseCalls += 1;
+      return ok(`${headSha}\n`);
+    }
+    return ok('');
+  }, sleeps);
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'gate-worker-died-midjob' &&
+      err.detail.exit === 3 &&
+      err.detail.recoveryPolls === 0
+  );
+
+  assert.deepEqual(sleeps, [], 'an unrecognised verdict must park on the FIRST check, never loop back to poll again');
+  assert.equal(
+    revParseCalls,
+    1,
+    'must resolve HEAD exactly once, never once per remaining poll (measured before this fix: 182 rev-parse spawns at the default 90-poll bound)'
+  );
+
+  const journal = readJournal(ctx.taskDir);
+  const recoveryEvents = journal.filter((e) => e.event === 'gate-died-recovery');
+  assert.equal(recoveryEvents.length, 1, 'exactly one gate-died-recovery event, not one per poll');
+  assert.equal(recoveryEvents[0].outcome, 'stale-verdict');
+
+  const gateLog = fs.readFileSync(gateLogPath(ctx.taskDir), 'utf8');
+  const blocks = gateLog.split('----- card #211 recovery:').length - 1;
+  assert.equal(blocks, 1, 'exactly one recovery block appended to gate.log, not one per poll');
+  assert.match(gateLog, /verdict: LEASED/);
+});
+
+// Fix-pass round 2, defect 4: all four non-attesting shapes on the RECOVERED path, not just
+// INTERRUPTED (already covered above) -- the same table B34_VERDICT_CASES uses for the real exit-1
+// path, run instead through exit 3 / WORKER DIED recovery. Each must route immediately (no sleep,
+// no waiting for a verdicts/ entry that worker.ts never writes for these) to the identical reason
+// the real exit-1 path gives, at exitFrom: 3. The mutation that adds ENVIRONMENT (or any of the
+// other three) to GATE_ATTESTING_DONE_VERDICTS makes recovery poll for a verdicts/ file that never
+// arrives instead of routing immediately -- both the reason and the zero-sleep assertion catch it.
+const B211_NON_ATTESTING_RECOVERY_CASES = [
+  ['ENVIRONMENT', 'gate-environment', '8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a'],
+  ['DIRTY', 'gate-worker-dirty-checkout', '9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b'],
+  ['ABANDONED', 'gate-abandoned', 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1'],
+  ['INTERRUPTED', 'gate-interrupted', 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2'],
+];
+
+for (const [verdict, expectedReason, headSha] of B211_NON_ATTESTING_RECOVERY_CASES) {
+  test(`realGate (card #211 fix-pass round 2, defect 4): recovered ${verdict} done report -> the SAME reason a real exit 1 gives (${expectedReason}), exitFrom: 3, never sleeps`, async () => {
+    const config = testConfig();
+    const worktreePath = mkTmp(`spo-real-gate-211fp2-${verdict.toLowerCase()}-wt-`);
+    const jobId = `job-00000000000211-${verdict.toLowerCase()}`;
+    const task = { id: `card-211fp2-${verdict}`, kind: 'card', issue: 971, worktreePath };
+    const ctx = testCtx({ id: `card-211fp2-${verdict}`, task, config });
+
+    writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+      id: jobId,
+      verdict,
+      detail: `synthetic ${verdict} detail for the recovered path`,
+    });
+
+    const sleeps = [];
+    const deps = noSleepDeps((command, args) => {
+      if (args.includes('gate')) return workerDiedGateResult(jobId);
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      return ok('');
+    }, sleeps);
+
+    await assert.rejects(
+      () => realGate(ctx, deps),
+      (err) =>
+        err instanceof ParkSignal &&
+        err.reason === expectedReason &&
+        err.detail.exitFrom === 3 &&
+        err.detail.jobId === jobId &&
+        err.detail.jobDetail === `synthetic ${verdict} detail for the recovered path`
+    );
+
+    assert.deepEqual(sleeps, [], `a NON-attesting ${verdict} report must route immediately -- never sleep waiting for verdicts/`);
+  });
+}
+
+test('realGate (card #211 fix-pass, defect 5): recovery routing onward appends the done report\'s verdict/detail to gate.log, so a DIAGNOSE reached through a recovered FAIL can see why', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-gate-211fp-gatelog-wt-');
+  const headSha = '6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f';
+  const jobId = 'job-00000000000211-6f6f6f';
+  const task = { id: 'card-211fp-gatelog', kind: 'card', issue: 955, worktreePath };
+  const ctx = testCtx({ id: 'card-211fp-gatelog', task, config });
+
+  writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
+    id: jobId,
+    verdict: 'FAIL',
+    detail: 'typecheck failed: 3 errors in src/index.ts',
+  });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+    verdict: 'FAIL',
+    jobId,
+    baseMain: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', // a REAL failure -> DIAGNOSE
+  });
+
+  const deps = noSleepDeps((command, args) => {
+    if (args.includes('gate')) return workerDiedGateResult(jobId);
+    if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+    return ok('');
+  });
+
+  const next = await realGate(ctx, deps);
+  assert.equal(next, 'DIAGNOSE');
+
+  const gateLog = fs.readFileSync(gateLogPath(ctx.taskDir), 'utf8');
+  assert.match(gateLog, /verdict: FAIL/);
+  assert.match(gateLog, /typecheck failed: 3 errors in src\/index\.ts/);
+});
+
+test('realGate (card #211 fix-pass, defect 4): two parks whose raw workerDiedReason/jobId differ only in digits produce IDENTICAL details -- countRepeatedParks recognises the second as a repeat', async () => {
+  const { countRepeatedParks } = require('../orchestrator/park-loop');
+
+  const config = testConfig({ gateDiedRecoveryMaxPolls: 1, gateDiedRecoveryPollIntervalMs: 1 });
+  const worktreePath1 = mkTmp('spo-real-gate-211fp-fingerprint-wt1-');
+  const worktreePath2 = mkTmp('spo-real-gate-211fp-fingerprint-wt2-');
+
+  async function parkOnce(jobId, reason, worktreePath, issue) {
+    const task = { id: `card-211fp-fp-${issue}`, kind: 'card', issue, worktreePath };
+    const ctx = testCtx({ id: `card-211fp-fp-${issue}`, task, config });
+    const deps = noSleepDeps((command, args) =>
+      args.includes('gate') ? { status: 3, stdout: gateJobStdout(jobId), stderr: workerDiedStderr(jobId, reason), signal: null } : ok('')
+    );
+    let caught = null;
+    try {
+      await realGate(ctx, deps);
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof ParkSignal && caught.reason === 'gate-worker-died-midjob');
+    return caught.detail;
+  }
+
+  // Two entirely different job deposits (different job ids) whose worker-side reason text differs
+  // ONLY in the live numbers it embeds -- exactly `paths.ts`'s "heartbeat is N s old" shape.
+  const detail1 = await parkOnce('job-00000000000211-first0', 'heartbeat is 23.5 s old', worktreePath1, 960);
+  const detail2 = await parkOnce('job-00000000000211-second1', 'heartbeat is 41 s old', worktreePath2, 961);
+
+  assert.deepEqual(detail1, detail2, 'normalized details must be byte-identical across two different job deposits');
+  assert.equal(detail1.workerDiedReason, 'heartbeat is N s old');
+
+  // Same shape as park-loop.test.js's own "counts consecutive identical parks" test: `lines` is
+  // the journal history INCLUDING the just-journalled current park (state-machine.js's
+  // finalizePark appends the 'parked' event, THEN calls countRepeatedParks against the same
+  // journal) -- so two real, independently-produced parks under this reason must fingerprint
+  // identically for the SECOND call to see a streak of 2, not 1.
+  const lines = [
+    { event: 'parked', reason: 'gate-worker-died-midjob', detail: detail1 },
+    { event: 'parked', reason: 'gate-worker-died-midjob', detail: detail2 },
+  ];
+  assert.equal(
+    countRepeatedParks(lines, 'gate-worker-died-midjob', detail2),
+    2,
+    'countRepeatedParks must count the second occurrence as a repeat of the first -- unfixed, differing raw jobId/reason would break the streak at 1'
+  );
+});
+
+// ---- GATE (card #211), reachability: the deadline hazard only a real dispatch can show --------
+//
+// Every test above calls `realGate` directly, which proves only the function -- it cannot see
+// deadline.js's `callWithDeadline` at all. `config.stepDeadlineMsByState` had no GATE entry before
+// this action, and that was only ever safe because every command in `realGate` ran through the
+// BLOCKING `spawnSync` -- no `await` ever yielded the event loop, so `withTimeout`'s own JS timer
+// could never fire while the "step" was still doing real work (see the GATE deadline comment in
+// config.js and doc/state-machine-spec.md's GATE row for the account, and card #587's MERGE
+// precedent for the shape this recreates when it fires: an abandoned first invocation kept
+// running while `callWithDeadline` re-ran a SECOND `npm run gate` from scratch).
+//
+// `await pollSleep(...)` inside `recoverFromGateWorkerDied` is realGate's FIRST genuine yield.
+// This test proves the derived GATE entry covers it: a busy-wait spawnSync blocks well past a
+// deliberately tiny GENERIC `stepDeadlineMs` (which is what GATE would fall back to if its own
+// entry were ever removed), then one REAL `setTimeout`-based sleep (not a mocked `Promise.resolve()`
+// -- a microtask-only "await" never lets a `setTimeout`-based deadline fire, so a mock would not
+// exercise this hazard at all) actually yields the event loop while the done report lands. With
+// the derived GATE entry in place the already-armed deadline has not yet expired at that point, so
+// `npm run gate` is spawned exactly once end to end.
+//
+// Fix-pass (mutation M7): this must use config.js's OWN `stepDeadlineMsByState.GATE` derivation,
+// not a copy of its formula re-typed here -- a re-typed copy stays green even if config.js's own
+// arithmetic silently drifts, or its GATE entry is deleted outright. Since `config.js` has no
+// exported function for this one-line formula (unlike WORKTREE/FINISH's `product-repo-hold.js`
+// helpers), the way to use the REAL derivation with small, fast numbers is to override the SAME
+// env vars config.js itself reads (`SPO_TIMEOUT_NPM_GATE_MS`, `SPO_GATE_DIED_RECOVERY_MAX_POLLS`,
+// `SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS`) and re-require the real module -- the identical
+// `loadConfigWith` idiom test/env-timer-guards.test.js already uses. `SPO_BENCH_DIR` is overridden
+// too so the real module never touches the maintainer's actual `~/.spo-bench`. The generic
+// `stepDeadlineMs` margin is config.js's own real (un-overridable) 120000ms constant -- large
+// enough that it costs the PASSING test nothing (the busy-wait is 50ms), while still proving the
+// derived entry, not the margin alone, is what covers the busy-wait + recovery sum.
+test('GATE (card #211 reachability): a real recovery yield does not retroactively re-run npm run gate -- config.js\'s OWN derived GATE deadline (never a re-typed copy) covers busy-wait + recovery', async () => {
+  const CONFIG_PATH = require.resolve('../orchestrator/config.js');
+  const benchDir = mkTmp('spo-gate-211-deadline-bench-');
+  const worktreePath = mkTmp('spo-gate-211-deadline-wt-');
+  const headSha = 'f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6';
+  const jobId = 'job-00000000000211-gggggg';
+  const npmGateBusyWaitMs = 50; // how long the fake spawnSync blocks the event loop
+
+  const envOverrides = {
+    SPO_BENCH_DIR: benchDir,
+    SPO_TIMEOUT_NPM_GATE_MS: String(npmGateBusyWaitMs),
+    SPO_GATE_DIED_RECOVERY_MAX_POLLS: '2',
+    SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS: '10',
+  };
+  const previous = {};
+  for (const key of Object.keys(envOverrides)) {
+    previous[key] = process.env[key];
+    process.env[key] = envOverrides[key];
+  }
+  delete require.cache[CONFIG_PATH];
+  let config;
+  try {
+    config = require(CONFIG_PATH); // the REAL module, real derivation -- only the env inputs shrink
+  } finally {
+    for (const key of Object.keys(envOverrides)) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    delete require.cache[CONFIG_PATH];
+  }
+
+  // Sanity: this really is config.js's own derivation with the overridden (small) inputs, not a
+  // hand-built substitute -- and deleting stepDeadlineMsByState.GATE in config.js turns THIS
+  // assertion, and the reachability assertion below, red (verified by hand).
+  assert.equal(config.commandTimeoutsMs['npm-gate'], npmGateBusyWaitMs);
+  assert.equal(config.gateDiedRecoveryMaxPolls, 2);
+  assert.equal(config.gateDiedRecoveryPollIntervalMs, 10);
+  assert.equal(
+    config.stepDeadlineMsByState.GATE,
+    config.commandTimeoutsMs['npm-gate'] + config.gateDiedRecoveryMaxMs + config.stepDeadlineMs
+  );
+
+  const task = { id: 'card-211-deadline', kind: 'card', issue: 947, worktreePath };
+  const ctx = testCtx({ id: 'card-211-deadline', task, config });
+
+  let gateRuns = 0;
+  let sleepCalls = 0;
+  ctx.deps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args[0] === 'run' && args[1] === 'gate') {
+        gateRuns += 1;
+        const until = Date.now() + npmGateBusyWaitMs;
+        while (Date.now() < until) {
+          /* busy-wait: exactly what a real spawnSync does to the event loop */
+        }
+        return workerDiedGateResult(jobId);
+      }
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
+      return ok('');
+    },
+    // A REAL short timer -- see this block's own header for why a mocked Promise.resolve() would
+    // not exercise the hazard. The report lands as a side effect of the first genuine yield, so
+    // the recovery wait needs exactly one real sleep to complete.
+    sleep: (ms) =>
+      new Promise((resolve) => {
+        sleepCalls += 1;
+        if (sleepCalls === 1) {
+          writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), { id: jobId, verdict: 'PASS' });
+          writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), {
+            verdict: 'PASS',
+            jobId,
+            live: { status: 'ran', flows: [] },
+          });
+        }
+        setTimeout(resolve, ms);
+      }),
+  };
+
+  const next = await HANDLERS.GATE(ctx);
+
+  assert.equal(next, 'CI_CHECKS');
+  assert.equal(gateRuns, 1, 'npm run gate ran ONCE -- a retroactively-fired deadline would spawn a SECOND real gate while the first kept running');
+  assert.equal(
+    readJournal(ctx.taskDir).filter((e) => e.event === 'deadline-exceeded').length,
+    0,
+    'no deadline-exceeded event: config.js\'s own derived GATE entry must cover the busy-wait plus the recovery wait, not just the generic ceiling'
+  );
+});
 
 // ---- CI_CHECKS ------------------------------------------------------------------------------
 
@@ -2761,7 +3534,11 @@ test('realCiChecks: main already moved once this task -> PARKED (main-moved-twic
 
   await assert.rejects(
     () => realCiChecks(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice'
+    // Card #212 item 6a: GATE's own main-moved-twice throw (a separate call site) adds
+    // `testsRan: false` because it is reached only through a bench refusal; CI_CHECKS reaches
+    // this throw only after checks-green, so testsRan is NOT a fact this call site should ever
+    // assert one way or the other -- it must carry no `testsRan` key at all.
+    (err) => err instanceof ParkSignal && err.reason === 'main-moved-twice' && !('testsRan' in err.detail)
   );
   assert.ok(!calls.some((a) => a.includes('merge')));
 });
@@ -5882,6 +6659,215 @@ test('config.benchIdleWaitMaxMs is the PRODUCT of benchIdleWaitMaxPolls and benc
   assert.equal(config.benchIdleWaitMaxMs, 900000, 'the documented 180 x 5s = 15 minutes default');
 });
 
+// ---- Card #211: gateDiedRecoveryMaxPolls/PollIntervalMs/MaxMs and the derived GATE deadline ----
+//
+// Same "pinned BY VALUE, not just by shape" reasoning as benchIdleWaitMaxMs above -- a `*` silently
+// mutated to `+` (or a GATE deadline that stopped covering the recovery wait) would leave a
+// shape-only test green while re-opening the exact retroactive-deadline hazard the dedicated
+// reachability test above proves closed for one specific set of small numbers. Env-var
+// unset/valid/malformed/empty/negative/Infinity/zero coverage for `gateDiedRecoveryPollIntervalMs`
+// lives in test/env-timer-guards.test.js's TIMERS table (positiveMsFromEnv, zero not a sentinel --
+// the same posture as benchIdleWaitPollIntervalMs/ciChecksPollIntervalMs); `gateDiedRecoveryMaxPolls`
+// is a bare-ternary count (SPO_GATE_DIED_RECOVERY_MAX_POLLS), the same unguarded shape
+// BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS already have and neither is malformed-env-tested
+// anywhere in this suite -- mirrored here, not "fixed", per this action's own brief.
+test('config.gateDiedRecoveryMaxPolls/PollIntervalMs/MaxMs: documented defaults (90, 5000ms, 450000ms), and MaxMs is the PRODUCT of the other two', () => {
+  const config = require('../orchestrator/config.js');
+  assert.equal(config.gateDiedRecoveryMaxPolls, 90, 'the documented default poll count (7.5 min bound)');
+  assert.equal(config.gateDiedRecoveryPollIntervalMs, 5000, 'the documented default poll interval');
+  assert.equal(
+    config.gateDiedRecoveryMaxMs,
+    config.gateDiedRecoveryMaxPolls * config.gateDiedRecoveryPollIntervalMs,
+    'gateDiedRecoveryMaxMs must be the PRODUCT of the two, not their sum'
+  );
+  assert.equal(config.gateDiedRecoveryMaxMs, 450000, 'the documented 90 x 5s = 450s (7.5 min) default, saving 7/7 of the measured corpus gaps');
+});
+
+test('config.gateDiedRecoveryMaxPolls (SPO_GATE_DIED_RECOVERY_MAX_POLLS): unset -> default 90, valid override -> parsed', () => {
+  const CONFIG_PATH = require.resolve('../orchestrator/config.js');
+  function loadConfigWith(name, value) {
+    const had = Object.prototype.hasOwnProperty.call(process.env, name);
+    const previous = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    delete require.cache[CONFIG_PATH];
+    try {
+      return require(CONFIG_PATH);
+    } finally {
+      if (had) process.env[name] = previous;
+      else delete process.env[name];
+      delete require.cache[CONFIG_PATH];
+    }
+  }
+
+  assert.equal(loadConfigWith('SPO_GATE_DIED_RECOVERY_MAX_POLLS', undefined).gateDiedRecoveryMaxPolls, 90);
+  assert.equal(loadConfigWith('SPO_GATE_DIED_RECOVERY_MAX_POLLS', '60').gateDiedRecoveryMaxPolls, 60);
+});
+
+// Fix-pass, defect 2 (adversarial verification): unlike BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS
+// (a bare ternary, left alone here -- the driver is filing their identical gap as a separate card),
+// gateDiedRecoveryMaxPolls goes through `boundedPositiveIntFromEnv`, because this count is folded
+// straight into `stepDeadlineMsByState.GATE`, a value `deadline.js` hands to a real
+// `setTimeout`/`setInterval`. `positiveIntFromEnv`'s own guard is not enough: `1e10` IS a positive
+// integer, so it would sail through unchanged and push the derived GATE deadline past Node's own
+// hard `2^31 - 1` ms ceiling on a single timer delay -- which Node does not reject, it SILENTLY
+// CLAMPS to 1ms, re-arming `callWithDeadline`'s timer to fire almost instantly and reproducing the
+// exact retroactive-deadline hazard (`npm run gate` spawned twice) the GATE entry exists to close.
+// Every one of these five malformed shapes must fall back to the documented default (90), and the
+// resulting GATE deadline must stay finite and at or under that ceiling.
+test('config.gateDiedRecoveryMaxPolls: a non-finite, non-positive-integer, or oversized override falls back to 90, and the derived GATE deadline always stays finite and <= 2^31-1', () => {
+  const CONFIG_PATH = require.resolve('../orchestrator/config.js');
+  function loadConfigWith(name, value) {
+    const had = Object.prototype.hasOwnProperty.call(process.env, name);
+    const previous = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    delete require.cache[CONFIG_PATH];
+    try {
+      return require(CONFIG_PATH);
+    } finally {
+      if (had) process.env[name] = previous;
+      else delete process.env[name];
+      delete require.cache[CONFIG_PATH];
+    }
+  }
+
+  const MAX_TIMER_DELAY_MS = 2147483647; // 2^31 - 1, Node's own signed-32-bit timer ceiling
+
+  for (const malformed of ['abc', 'Infinity', '1e10', '0', '-5']) {
+    const config = loadConfigWith('SPO_GATE_DIED_RECOVERY_MAX_POLLS', malformed);
+    assert.equal(config.gateDiedRecoveryMaxPolls, 90, `SPO_GATE_DIED_RECOVERY_MAX_POLLS=${malformed} must fall back to 90`);
+    assert.ok(
+      Number.isFinite(config.stepDeadlineMsByState.GATE),
+      `SPO_GATE_DIED_RECOVERY_MAX_POLLS=${malformed} must still produce a FINITE GATE deadline`
+    );
+    assert.ok(
+      config.stepDeadlineMsByState.GATE <= MAX_TIMER_DELAY_MS,
+      `SPO_GATE_DIED_RECOVERY_MAX_POLLS=${malformed} must keep the GATE deadline (${config.stepDeadlineMsByState.GATE}ms) at or under Node's 2^31-1 timer ceiling`
+    );
+  }
+
+  // A valid override well under the (default-config) ceiling still passes through -- the guard
+  // rejects OVERSIZED values, not merely LARGE ones.
+  const near = loadConfigWith('SPO_GATE_DIED_RECOVERY_MAX_POLLS', '100000');
+  assert.equal(near.gateDiedRecoveryMaxPolls, 100000);
+  assert.ok(near.stepDeadlineMsByState.GATE <= MAX_TIMER_DELAY_MS);
+});
+
+// Fix-pass round 2, defect 5: the test above only proves malformed/very-large values fall back --
+// it says nothing about where the boundary actually sits, so a mutated ceiling formula (e.g. one
+// that drops the npm-gate timeout or the margin term, or a `>=` swapped in for `>`) could still
+// leave every assertion above green. This test derives the ceiling from config.js's OWN real
+// values -- commandTimeoutsMs['npm-gate'], stepDeadlineMs, gateDiedRecoveryPollIntervalMs -- via
+// the SAME formula GATE_DIED_RECOVERY_MAX_POLLS_CEILING uses (2^31-1 minus npm-gate minus margin,
+// divided by the interval), never `floor(2^31-1 / 5000)` in isolation, and checks the EXACT
+// boundary: the ceiling value itself must be ACCEPTED (catches `>=` where `>` belongs), and
+// ceiling+1 must fall back to 90 (catches a ceiling formula that ignores npm-gate/margin and so
+// computes a ceiling far larger than the real ones, under which ceiling+1 would still be accepted).
+test('config.gateDiedRecoveryMaxPolls: the EXACT computed ceiling is accepted, ceiling + 1 falls back to 90', () => {
+  const CONFIG_PATH = require.resolve('../orchestrator/config.js');
+  function loadConfigWith(name, value) {
+    const had = Object.prototype.hasOwnProperty.call(process.env, name);
+    const previous = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    delete require.cache[CONFIG_PATH];
+    try {
+      return require(CONFIG_PATH);
+    } finally {
+      if (had) process.env[name] = previous;
+      else delete process.env[name];
+      delete require.cache[CONFIG_PATH];
+    }
+  }
+
+  const MAX_TIMER_DELAY_MS = 2147483647;
+  const defaultConfig = require('../orchestrator/config.js');
+  const npmGateTimeoutMs = defaultConfig.commandTimeoutsMs['npm-gate'];
+  const marginMs = defaultConfig.stepDeadlineMs;
+  const pollIntervalMs = defaultConfig.gateDiedRecoveryPollIntervalMs;
+  const ceiling = Math.floor((MAX_TIMER_DELAY_MS - npmGateTimeoutMs - marginMs) / pollIntervalMs);
+
+  const atCeiling = loadConfigWith('SPO_GATE_DIED_RECOVERY_MAX_POLLS', String(ceiling));
+  assert.equal(atCeiling.gateDiedRecoveryMaxPolls, ceiling, 'the ceiling value itself must be ACCEPTED, not rejected');
+  assert.ok(
+    atCeiling.stepDeadlineMsByState.GATE <= MAX_TIMER_DELAY_MS,
+    'the GATE deadline at the exact ceiling must still be <= 2^31-1'
+  );
+
+  const pastCeiling = loadConfigWith('SPO_GATE_DIED_RECOVERY_MAX_POLLS', String(ceiling + 1));
+  assert.equal(pastCeiling.gateDiedRecoveryMaxPolls, 90, 'ceiling + 1 must fall back to the default, not be accepted');
+});
+
+// Fix-pass round 2, defect 6 (residual overflow): the guard above only fires when
+// SPO_GATE_DIED_RECOVERY_MAX_POLLS is ITSELF overridden -- an absent override returns the literal
+// default (90) without ever consulting the ceiling. Two OTHER env vars can still overflow the
+// derived GATE deadline past 2^31-1 without touching MAX_POLLS at all: an oversized poll INTERVAL
+// (90 default polls x a huge interval), or an oversized npm-gate TIMEOUT (leaving less headroom
+// than the default recovery bound needs). Both must now be caught by re-clamping the resolved poll
+// count to the ceiling unconditionally (config.js's outer Math.min), not only on an explicit
+// MAX_POLLS override.
+test('config.stepDeadlineMsByState.GATE stays finite and <= 2^31-1 even when SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS or SPO_TIMEOUT_NPM_GATE_MS alone are oversized (residual overflow, never MAX_POLLS itself)', () => {
+  const CONFIG_PATH = require.resolve('../orchestrator/config.js');
+  function loadConfigWithMany(envMap) {
+    const previous = {};
+    for (const key of Object.keys(envMap)) {
+      previous[key] = process.env[key];
+      process.env[key] = envMap[key];
+    }
+    delete require.cache[CONFIG_PATH];
+    try {
+      return require(CONFIG_PATH);
+    } finally {
+      for (const key of Object.keys(envMap)) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      delete require.cache[CONFIG_PATH];
+    }
+  }
+
+  const MAX_TIMER_DELAY_MS = 2147483647;
+
+  const hugeInterval = loadConfigWithMany({ SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS: '1e8' });
+  assert.ok(Number.isFinite(hugeInterval.stepDeadlineMsByState.GATE), 'a 1e8ms poll interval must still produce a finite GATE deadline');
+  assert.ok(
+    hugeInterval.stepDeadlineMsByState.GATE <= MAX_TIMER_DELAY_MS,
+    `SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS=1e8 must keep the GATE deadline (${hugeInterval.stepDeadlineMsByState.GATE}ms) <= 2^31-1`
+  );
+  // The poll COUNT is what absorbed it -- MAX_POLLS itself was never touched.
+  assert.ok(hugeInterval.gateDiedRecoveryMaxPolls < 90, 'the resolved poll count must be reduced below the untouched default to make room');
+
+  const hugeNpmGate = loadConfigWithMany({ SPO_TIMEOUT_NPM_GATE_MS: '2147000000' });
+  assert.ok(Number.isFinite(hugeNpmGate.stepDeadlineMsByState.GATE), 'a near-ceiling npm-gate timeout must still produce a finite GATE deadline');
+  assert.ok(
+    hugeNpmGate.stepDeadlineMsByState.GATE <= MAX_TIMER_DELAY_MS,
+    `SPO_TIMEOUT_NPM_GATE_MS=2147000000 must keep the GATE deadline (${hugeNpmGate.stepDeadlineMsByState.GATE}ms) <= 2^31-1`
+  );
+  assert.ok(hugeNpmGate.gateDiedRecoveryMaxPolls < 90, 'the resolved poll count must be reduced below the untouched default to make room');
+
+  // Pathological remainder: npm-gate's timeout ALONE leaves no room even at 0 polls -- the final
+  // unconditional clamp on the GATE entry itself must still hold.
+  const noRoomAtAll = loadConfigWithMany({ SPO_TIMEOUT_NPM_GATE_MS: '3000000000' });
+  assert.equal(noRoomAtAll.gateDiedRecoveryMaxPolls, 0, 'zero polls, not negative, when nothing fits');
+  assert.ok(Number.isFinite(noRoomAtAll.stepDeadlineMsByState.GATE));
+  assert.equal(noRoomAtAll.stepDeadlineMsByState.GATE, MAX_TIMER_DELAY_MS, 'clamped to exactly the Node ceiling as the last resort');
+});
+
+test('config.stepDeadlineMsByState.GATE >= commandTimeoutsMs["npm-gate"] + gateDiedRecoveryMaxMs (the recovery wait can never legitimately outlast its own deadline)', () => {
+  const config = require('../orchestrator/config.js');
+  assert.equal(
+    config.stepDeadlineMsByState.GATE,
+    config.commandTimeoutsMs['npm-gate'] + config.gateDiedRecoveryMaxMs + config.stepDeadlineMs,
+    'GATE deadline must be npm-gate timeout + recovery bound + one ordinary step deadline of margin, the same shape CI_CHECKS uses'
+  );
+  assert.ok(
+    config.stepDeadlineMsByState.GATE >= config.commandTimeoutsMs['npm-gate'] + config.gateDiedRecoveryMaxMs,
+    'GATE deadline must cover at least a full npm-gate spawn plus the whole recovery wait, with no margin left over is still a bug -- there IS margin (one stepDeadlineMs) by construction above'
+  );
+  assert.equal(config.stepDeadlineMsByState.GATE, 8370000, 'documented value: 7800000 (npm-gate) + 450000 (recovery) + 120000 (margin)');
+});
+
 // ---- V20 (post-verification, third pass): the bench-idle wait must run ONLY when a reinstall is
 // actually needed (fast-forward succeeded AND benchTouched) -- not on every card. The pre-existing
 // bench-reinstall-skipped test only asserted "no `bash` call", which cannot tell "the wait ran and
@@ -6321,14 +7307,19 @@ test('finalizePark stays total when preserveWorktreeWip times out: PARKED state.
 });
 
 // (b) The relation this action leaves implicit, pinned so it cannot break silently.
-//     config.stepDeadlineMsByState has no GATE entry, so GATE keeps the generic 120s ceiling
-//     even though npm-gate's spawnSync timeout is 900s. That is only safe because realGate never
-//     yields the event loop: spawnSync BLOCKS, so callWithDeadline's timer cannot fire during the
-//     spawn, and when the (long-expired) timer finally becomes runnable the handler's own
-//     resolution -- a microtask -- has already won the race. Adding a single `await` to realGate
-//     that yields to the macrotask queue breaks it: measured, the deadline then fires
-//     RETROACTIVELY, callWithDeadline re-runs the whole step (a SECOND real bench gate) and parks
-//     step-deadline-exceeded-twice. This test fails the moment that happens.
+//     This test's own testConfig() deliberately carries no `stepDeadlineMsByState` override, so
+//     GATE keeps the generic `stepDeadlineMs` (15ms here) even though npm-gate's spawnSync timeout
+//     is 900s -- unlike production's real config.js, which (card #211) now DOES carry a derived
+//     `stepDeadlineMsByState.GATE`. That asymmetry is the point: this test's own spawnSync never
+//     returns exit 3 (it returns a plain PASS-shaped exit 0), so `realGate` never reaches the
+//     recovery wait and never yields the event loop -- spawnSync BLOCKS, so callWithDeadline's
+//     timer cannot fire during the spawn, and when the (long-expired) timer finally becomes
+//     runnable the handler's own resolution -- a microtask -- has already won the race. It proves
+//     the ORIGINAL hazard this action's own header comment describes (a single `await` added to
+//     realGate breaks it: measured, the deadline then fires RETROACTIVELY, callWithDeadline re-runs
+//     the whole step -- a SECOND real bench gate -- and parks step-deadline-exceeded-twice). See
+//     the dedicated "GATE (card #211 reachability)" test above for the recovery wait's OWN
+//     `await`, and why THAT path needs a real derived GATE entry rather than the generic ceiling.
 test('GATE: a spawn that blocks far past the state deadline still returns its real result -- the deadline never fires retroactively', async () => {
   const worktreePath = mkTmp('spo-gate-block-wt-');
   const config = testConfig({ stepDeadlineMs: 15, commandTimeoutsMs: TIMEOUT_TABLE });

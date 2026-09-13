@@ -184,7 +184,11 @@ test('classifyMergeCause: lowercase input is classified exactly like uppercase (
 // recording no-op here so every existing call site keeps working unchanged, and any test that
 // cares about the wait itself can read `sleeps` (an array of every `ms` argument, in call order)
 // off the returned object.
-function makeDeps({ enqueueExit = 0, waitExits, probe, sleep }) {
+// `git` (card #212 item 3): overrides `git rev-parse HEAD` alone -- `readMergeConflictGateFacts`
+// (steps/scripted.js) is the only new caller of it in this flow, and every existing test below
+// that does not pass `git` keeps the exact pre-this-action fallthrough (`ok('')`, i.e. an empty
+// headSha whose verdict lookup finds nothing -- harmless, since none of them assert on it).
+function makeDeps({ enqueueExit = 0, waitExits, probe, sleep, git = {} }) {
   let waitCalls = 0;
   const calls = [];
   const sleeps = [];
@@ -199,6 +203,9 @@ function makeDeps({ enqueueExit = 0, waitExits, probe, sleep }) {
       const exit = waitExits[Math.min(waitCalls, waitExits.length - 1)];
       waitCalls += 1;
       return exit === 0 ? ok('') : fail(exit);
+    }
+    if (command === 'git' && args.includes('rev-parse') && args.includes('HEAD')) {
+      return git.headRevParse !== undefined ? git.headRevParse : ok('');
     }
     return ok('');
   };
@@ -233,6 +240,196 @@ test('realMerge: [4,4] + probe reports CONFLICTING -> PARKED merge-conflict, det
     (err) => err instanceof ParkSignal && err.reason === 'merge-conflict' && err.detail.mergeStateStatus === 'DIRTY'
   );
   assert.equal(waitCallsRef(), 2);
+});
+
+// ---- card #212 item 3: merge-conflict's own "did the gate already pass on this sha" facts ------
+//
+// readMergeConflictGateFacts (steps/scripted.js) does one guarded `git rev-parse HEAD` at the
+// park and reads `verdicts/<headSha>.json` -- distinct shas per case below (never the same fixed
+// HEAD_SHA reused, the trap the spec calls out: a repeating fixture hides which value is keyed).
+
+const CONFLICT_PROBE = ok(JSON.stringify({ state: 'OPEN', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }));
+
+function writeVerdict(spoBenchDir, sha, verdict) {
+  const dir = path.join(spoBenchDir, 'verdicts');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sha}.json`), JSON.stringify(verdict));
+}
+
+test('realMerge: merge-conflict, verdict PASS for HEAD -> detail carries gatePassedOnSha: true, headSha, liveStatus', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-mergecause-gatefacts-pass-');
+  const headSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
+  const task = { id: 'card-mc-gf-pass', kind: 'card', issue: 701, worktreePath };
+  const ctx = testCtx({ id: 'card-mc-gf-pass', task, config });
+  ctx.prNumber = 701;
+  writeVerdict(config.spoBenchDir, headSha, { verdict: 'PASS', live: { status: 'ran' } });
+
+  const { deps } = makeDeps({
+    waitExits: [1],
+    probe: CONFLICT_PROBE,
+    git: { headRevParse: ok(`${headSha}\n`) },
+  });
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-conflict' &&
+      err.detail.headSha === headSha &&
+      err.detail.gatePassedOnSha === true &&
+      err.detail.liveStatus === 'ran'
+  );
+});
+
+test('realMerge: merge-conflict, verdict FAIL for HEAD -> detail carries gatePassedOnSha: false', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-mergecause-gatefacts-fail-');
+  const headSha = 'b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2';
+  const task = { id: 'card-mc-gf-fail', kind: 'card', issue: 702, worktreePath };
+  const ctx = testCtx({ id: 'card-mc-gf-fail', task, config });
+  ctx.prNumber = 702;
+  writeVerdict(config.spoBenchDir, headSha, { verdict: 'FAIL', baseMain: 'somebasesha' });
+
+  const { deps } = makeDeps({
+    waitExits: [1],
+    probe: CONFLICT_PROBE,
+    git: { headRevParse: ok(`${headSha}\n`) },
+  });
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-conflict' &&
+      err.detail.headSha === headSha &&
+      err.detail.gatePassedOnSha === false
+  );
+});
+
+test('realMerge: merge-conflict, no verdict file at all for HEAD -> detail carries gatePassedOnSha: false, never null', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-mergecause-gatefacts-none-');
+  const headSha = 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3';
+  const task = { id: 'card-mc-gf-none', kind: 'card', issue: 703, worktreePath };
+  const ctx = testCtx({ id: 'card-mc-gf-none', task, config });
+  ctx.prNumber = 703;
+  // deliberately no writeVerdict call
+
+  const { deps } = makeDeps({
+    waitExits: [1],
+    probe: CONFLICT_PROBE,
+    git: { headRevParse: ok(`${headSha}\n`) },
+  });
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-conflict' &&
+      err.detail.headSha === headSha &&
+      err.detail.gatePassedOnSha === false
+  );
+});
+
+test('realMerge: merge-conflict, HEAD rev-parse itself fails -> detail carries headSha: null, gatePassedOnSha: null (unknown, never false)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-mergecause-gatefacts-unreadable-');
+  const task = { id: 'card-mc-gf-unreadable', kind: 'card', issue: 704, worktreePath };
+  const ctx = testCtx({ id: 'card-mc-gf-unreadable', task, config });
+  ctx.prNumber = 704;
+
+  const { deps } = makeDeps({
+    waitExits: [1],
+    probe: CONFLICT_PROBE,
+    git: { headRevParse: fail(128, 'fatal: ambiguous argument \'HEAD\'') },
+  });
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-conflict' &&
+      err.detail.headSha === null &&
+      err.detail.gatePassedOnSha === null &&
+      err.detail.liveStatus === null
+  );
+});
+
+// Card #212 item 6e: readMergeConflictGateFacts is a pure DIAGNOSTIC enrichment on top of a park
+// realMerge has already decided to make (GitHub's own attested cause) -- unlike the merge --abort
+// cleanup catch elsewhere in this file, nothing here is on the decision path, so a bug in the
+// lookup itself (not just a ParkSignal) must not replace the real, GitHub-attested park either.
+// Pinned: a non-ParkSignal throw from the rev-parse spawn still yields the real `merge-conflict`
+// park, with headSha/gatePassedOnSha/liveStatus all `null` (unknown, exactly like a plain rev-
+// parse failure) -- proves the catch swallows more than just ParkSignal, on purpose.
+test('realMerge: merge-conflict, HEAD rev-parse THROWS a non-ParkSignal error -- the real merge-conflict park still fires, headSha/gatePassedOnSha/liveStatus all null', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-mergecause-gatefacts-throws-');
+  const task = { id: 'card-mc-gf-throws', kind: 'card', issue: 706, worktreePath };
+  const ctx = testCtx({ id: 'card-mc-gf-throws', task, config });
+  ctx.prNumber = 706;
+  const boom = new TypeError('spawnSync blew up for a reason that is not a park');
+
+  const { deps } = makeDeps({ waitExits: [1], probe: CONFLICT_PROBE });
+  // makeDeps' own `git` option only ever returns a value, never throws -- wrap spawnSync directly
+  // so the rev-parse HEAD call raises a real, synchronous, non-ParkSignal exception. `cause.reason`
+  // is CONFLICT, so `regateAfterNonLanding` runs FIRST and does its own `git rev-parse HEAD` --
+  // that one must succeed (regate falls through on "no-base-main" for the returned sha, since no
+  // verdict is written for it) so only the SECOND rev-parse call, `readMergeConflictGateFacts`'s
+  // own at the park site, is the one under test.
+  let revParseHeadCalls = 0;
+  const realSpawnSync = deps.spawnSync;
+  deps.spawnSync = (command, args) => {
+    if (command === 'git' && args.includes('rev-parse') && args.includes('HEAD')) {
+      revParseHeadCalls += 1;
+      if (revParseHeadCalls === 1) return ok('regatesha00000000000000000000000000000000\n');
+      throw boom;
+    }
+    return realSpawnSync(command, args);
+  };
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-conflict' &&
+      err.detail.headSha === null &&
+      err.detail.gatePassedOnSha === null &&
+      err.detail.liveStatus === null
+  );
+});
+
+// Card #212 item 6c: the four gate-facts tests above all go through the w1.exit === 1 leg
+// (waitExits: [1]). The exit-4 leg (`pr:wait` twice, both "still open", THEN the probe) is a
+// second, separate call site in realMerge with its own `parkFromMergeCause` call and its own
+// `readMergeConflictGateFacts` enrichment -- proven here so a mutation that enriches only the w1
+// leg (or wires the wrong `lastExit` through) cannot hide behind the w1 tests alone.
+test('realMerge: merge-conflict via the exit-4 (w2) leg -> detail ALSO carries gatePassedOnSha/headSha/liveStatus', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-mergecause-gatefacts-w2-');
+  const headSha = 'd4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4';
+  const task = { id: 'card-mc-gf-w2', kind: 'card', issue: 705, worktreePath };
+  const ctx = testCtx({ id: 'card-mc-gf-w2', task, config });
+  ctx.prNumber = 705;
+  writeVerdict(config.spoBenchDir, headSha, { verdict: 'PASS', live: { status: 'ran' } });
+
+  const { deps } = makeDeps({
+    waitExits: [4, 4],
+    probe: CONFLICT_PROBE,
+    git: { headRevParse: ok(`${headSha}\n`) },
+  });
+
+  await assert.rejects(
+    () => realMerge(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-conflict' &&
+      err.detail.lastExit === 4 &&
+      err.detail.headSha === headSha &&
+      err.detail.gatePassedOnSha === true &&
+      err.detail.liveStatus === 'ran'
+  );
 });
 
 test('realMerge: [4,4] + probe reports state MERGED -> returns FINISH, no park', async () => {
@@ -406,7 +603,17 @@ test('realMerge: probe reports mergeStateStatus BLOCKED -> PARKED merge-blocked 
 
   await assert.rejects(
     () => realMerge(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'merge-blocked' && err.detail.mergeStateStatus === 'BLOCKED'
+    // Card #212 item 6b: only `merge-conflict` gets the extra gate-facts enrichment
+    // (readMergeConflictGateFacts, steps/scripted.js) -- the other four MERGE_CAUSE_REASONS'
+    // details must stay byte-identical to before that action, no headSha/gatePassedOnSha/
+    // liveStatus leaking in.
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-blocked' &&
+      err.detail.mergeStateStatus === 'BLOCKED' &&
+      !('headSha' in err.detail) &&
+      !('gatePassedOnSha' in err.detail) &&
+      !('liveStatus' in err.detail)
   );
 });
 
@@ -424,7 +631,13 @@ test('realMerge: probe reports mergeStateStatus BEHIND -> PARKED merge-behind-ba
 
   await assert.rejects(
     () => realMerge(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'merge-behind-base' && err.detail.mergeStateStatus === 'BEHIND'
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-behind-base' &&
+      err.detail.mergeStateStatus === 'BEHIND' &&
+      !('headSha' in err.detail) &&
+      !('gatePassedOnSha' in err.detail) &&
+      !('liveStatus' in err.detail)
   );
 });
 
@@ -442,7 +655,13 @@ test('realMerge: probe reports mergeStateStatus DRAFT -> PARKED merge-pr-draft -
 
   await assert.rejects(
     () => realMerge(ctx, deps),
-    (err) => err instanceof ParkSignal && err.reason === 'merge-pr-draft' && err.detail.mergeStateStatus === 'DRAFT'
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'merge-pr-draft' &&
+      err.detail.mergeStateStatus === 'DRAFT' &&
+      !('headSha' in err.detail) &&
+      !('gatePassedOnSha' in err.detail) &&
+      !('liveStatus' in err.detail)
   );
 });
 
@@ -461,7 +680,12 @@ test('realMerge: probe reports mergeStateStatus UNSTABLE -> PARKED merge-checks-
   await assert.rejects(
     () => realMerge(ctx, deps),
     (err) =>
-      err instanceof ParkSignal && err.reason === 'merge-checks-failing' && err.detail.mergeStateStatus === 'UNSTABLE'
+      err instanceof ParkSignal &&
+      err.reason === 'merge-checks-failing' &&
+      err.detail.mergeStateStatus === 'UNSTABLE' &&
+      !('headSha' in err.detail) &&
+      !('gatePassedOnSha' in err.detail) &&
+      !('liveStatus' in err.detail)
   );
 });
 

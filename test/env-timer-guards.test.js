@@ -86,6 +86,15 @@ const TIMERS = [
   },
   { env: 'SPO_LOCK_WATCH_MS', field: 'lockWatchMs', defaultMs: 15 * 1000, zeroIsSentinel: false },
   { env: 'SPO_CACHE_TTL_MS', field: 'cacheTtlMs', defaultMs: 60 * 60 * 1000, zeroIsSentinel: false },
+  // Card #211: the exit-3/WORKER-DIED recovery poll interval -- same shape as
+  // benchIdleWaitPollIntervalMs above (0 has never meant anything but "misconfigured" for a poll
+  // interval, and would busy-loop `readGateDoneReport` if it fell through unguarded).
+  {
+    env: 'SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS',
+    field: 'gateDiedRecoveryPollIntervalMs',
+    defaultMs: 5000,
+    zeroIsSentinel: false,
+  },
 ];
 
 for (const { env, field, defaultMs, zeroIsSentinel } of TIMERS) {
@@ -128,10 +137,10 @@ for (const { env, field, defaultMs, zeroIsSentinel } of TIMERS) {
   });
 }
 
-test('every TIMERS row is exercised (15 vars: 11 zero-sentinel + 4 strictly-positive)', () => {
-  assert.equal(TIMERS.length, 15);
+test('every TIMERS row is exercised (16 vars: 11 zero-sentinel + 5 strictly-positive)', () => {
+  assert.equal(TIMERS.length, 16);
   assert.equal(TIMERS.filter((t) => t.zeroIsSentinel).length, 11);
-  assert.equal(TIMERS.filter((t) => !t.zeroIsSentinel).length, 4);
+  assert.equal(TIMERS.filter((t) => !t.zeroIsSentinel).length, 5);
 });
 
 // Regression guard (CLAUDE.md-adjacent, but purely mechanical): a future *_MS env var read
