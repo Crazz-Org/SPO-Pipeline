@@ -82,9 +82,9 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   assert.equal(result.sessionId, 'sess-card-1');
 
   assert.ok(seenArgv.includes('--model'));
-  assert.ok(seenArgv.includes('fable')); // no escalation flags on this task
+  assert.equal(seenArgv[seenArgv.indexOf('--model') + 1], 'opus'); // Opus-first; no planInvalidRetry on this task
   assert.ok(seenArgv.includes('--effort'));
-  assert.ok(seenArgv.includes('low')); // S -> low
+  assert.equal(seenArgv[seenArgv.indexOf('--effort') + 1], 'medium'); // S -> medium (PLAN_EFFORT_BY_SIZE)
   assert.ok(seenArgv.includes('--json-schema'));
   const promptArg = seenInput;
   assert.ok(promptArg.includes('/tmp/worktree-99'));
@@ -97,7 +97,7 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
     .map((l) => JSON.parse(l));
   const call = journalLines.find((e) => e.event === 'llm-call');
   assert.ok(call);
-  assert.equal(call.model, 'fable');
+  assert.equal(call.model, 'opus');
   // Action 5.4 item E: the field doc/state-machine-spec.md has documented all along. Spelled
   // `duration_s`, in seconds -- renaming the journalled key to `durationS` passed all 1157 tests
   // when nothing asserted the spelling, and the spec would have gone on claiming a field the
