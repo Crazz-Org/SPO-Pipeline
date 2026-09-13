@@ -17,7 +17,17 @@
 //     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
 //     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
 //     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
-//     numTurns, durationS, raw}. `sessionId` is set on every branch representing a spawn that was
+//     modelUsage, numTurns, durationS, raw}. Card #214: `modelUsage` is the same four
+//     billable-accounting fields plus `billableTokens`, broken out PER MODEL (keyed by the
+//     model name modelUsage's own reply used) instead of summed across every model the call
+//     touched -- present only when extractTokens() found at least one recognized field
+//     (mirroring `tokensSource: 'modelUsage'`'s own presence rule), absent on a call that
+//     reported nothing. Without it, a step whose call delegates to a subagent running a
+//     DIFFERENT model than the contract resolved -- PLAN is measured to do this, see
+//     step-contracts.js's own comment on its `allowedTools` -- has the subagent's tokens
+//     summed into the same flat totals as the resolved model's own, with no way for a reader
+//     to pull them back apart; the journalled `model` field then names only the step's
+//     CONTRACT model, never the subagent's. `sessionId` is set on every branch representing a spawn that was
 //     at least attempted (success, deadline kill, external signal, unparsable stdout) and null
 //     only when `claude` never started at all (an unreadable `oauthTokenFile`, or a spawn failure
 //     such as ENOENT/EACCES/E2BIG) -- see invokeClaudeReal's own inline comment for why each
@@ -63,7 +73,10 @@
 //         outputContract-satisfying object marked {dryRun: true}. Otherwise invokeClaudeReal
 //         runs for real, and a successful reply's `result` string is JSON.parsed and checked
 //         against outputContract.required -- a missing key returns the same {kind: 'error'}
-//         shape invokeClaudeReal itself uses for a spawn/parse failure.
+//         shape invokeClaudeReal itself uses for a spawn/parse failure. Card #207: a required key
+//         that IS present but fails its outputContract.types entry (step-contracts.js's
+//         checkOutputTypes) returns that identical {kind: 'error'} shape too -- a key with no
+//         declared type is untouched, presence-checked only, exactly as before this card.
 //     Every sub-path resolves cwd via config.cwdForStep, takes the account from ctx.account (set
 //     by the caller's account-rotation retry loop -- see state-machine.js's callLlmStep), and
 //     journals one event per call (an 'llm-call' for a real attempt, a 'dry-run' for a dry one).
@@ -104,7 +117,7 @@ const { sleep } = require('./scripted');
 const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
-const { resolveStepContract, deadlineMsForStep } = require('../step-contracts');
+const { resolveStepContract, deadlineMsForStep, checkOutputTypes } = require('../step-contracts');
 const { isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
@@ -238,6 +251,22 @@ function pickNumber(obj, ...keys) {
 // by sessionId (console/usage-scan.js already streams that file for other reasons; see
 // orchestrator/tokens.js's own header for why the join, not this call site, is where that
 // actually matters).
+//
+// Card #214: the SAME loop below also builds `perModel`, a per-model breakdown of the four
+// billable-accounting fields (plus each model's own `billableTokens`) -- surfaced on the
+// return value as `modelUsage`, present under the same `found` gate as `tokensSource` so a
+// call that reported nothing recognizable carries no breakdown either (never an empty object).
+// This is not a second walk: `Object.entries(modelUsage)` replaces the flat totals'
+// `Object.values(modelUsage)` so the model name is available in the same iteration, rather
+// than re-deriving the breakdown elsewhere. Measured motivation: 6 of 42 PLAN calls, measured
+// 2026-09-10..12 while PLAN was Fable-only (PR #222 changes PLAN to Opus-first with a Fable
+// fallback), spawned Opus subagents while the PLAN call itself resolved to `fable` -- see
+// step-contracts.js's own comment on PLAN's `allowedTools` for the corrected, fuller-corpus
+// measurement -- but this function already summed those subagents' tokens into the flat totals (the whole-tree
+// accounting `modelUsage` itself provides), but the single `model` field on the journalled
+// event named only `fable`, so every by-model view built off that field alone was wrong by the
+// subagents' share. `modelUsage` is the fix: a reader that wants "how much did each model
+// actually cost on this call" no longer has to guess from the resolved-model label.
 function extractTokens(modelUsage) {
   if (!modelUsage || typeof modelUsage !== 'object') return { ...ZERO_TOKENS };
 
@@ -248,8 +277,9 @@ function extractTokens(modelUsage) {
   let outputTokens = 0;
   let cacheCreationEphemeral1h = 0;
   let cacheCreationEphemeral5m = 0;
+  const perModel = {};
 
-  for (const usage of Object.values(modelUsage)) {
+  for (const [model, usage] of Object.entries(modelUsage)) {
     if (!usage || typeof usage !== 'object') continue;
     const fi = pickNumber(usage, 'input_tokens', 'inputTokens');
     const cc = pickNumber(usage, 'cache_creation_input_tokens', 'cacheCreationInputTokens');
@@ -260,6 +290,16 @@ function extractTokens(modelUsage) {
     cacheCreationTokens += cc;
     cacheReadTokens += cr;
     outputTokens += out;
+    // Same billable formula as the flat total below (fresh input + cache-creation + output,
+    // cache-read excluded -- see the flat `billableTokens` comment above for why), applied per
+    // model instead of across the sum.
+    perModel[model] = {
+      freshInputTokens: fi,
+      cacheCreationTokens: cc,
+      cacheReadTokens: cr,
+      outputTokens: out,
+      billableTokens: fi + cc + out,
+    };
 
     const nested = usage.cache_creation || usage.cacheCreation;
     if (nested && typeof nested === 'object') {
@@ -280,12 +320,17 @@ function extractTokens(modelUsage) {
     billableTokens: freshInputTokens + cacheCreationTokens + outputTokens,
     cacheCreationEphemeral1h,
     cacheCreationEphemeral5m,
+    ...(found ? { modelUsage: perModel } : {}),
   };
 }
 
 // The token fields alone, lifted off an invokeClaudeReal result (or anything with the same
 // shape) -- used every place below that needs to pass them along (a journal event, an error
-// return) without repeating all eight names at every call site.
+// return) without repeating all nine names at every call site. Card #214 added the ninth,
+// `modelUsage` (extractTokens's per-model breakdown) -- `raw.modelUsage` reads back `undefined`
+// on any result extractTokens/ZERO_TOKENS never set it on, which JSON.stringify drops from the
+// journalled line the same way it already drops an unset `duration_s` (see invokeClaudeReal's
+// own comment), so a historical/not-found call journals no breakdown rather than a false one.
 function tokenFieldsFrom(raw) {
   return {
     tokensSource: raw.tokensSource,
@@ -296,6 +341,7 @@ function tokenFieldsFrom(raw) {
     billableTokens: raw.billableTokens,
     cacheCreationEphemeral1h: raw.cacheCreationEphemeral1h,
     cacheCreationEphemeral5m: raw.cacheCreationEphemeral5m,
+    modelUsage: raw.modelUsage,
   };
 }
 
@@ -383,7 +429,7 @@ async function maybeRecoverTokens(result, opts, deps) {
 // has actually observed plus the API's documented error type names", which overstated the
 // evidence for more than one entry below):
 //   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
-//     intake.js:906-908's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     intake.js:938-940's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
 //     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
 //   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
 //     observed as a real reply in this repo; included because it is structured (not free text)
@@ -759,6 +805,30 @@ async function invokeClaudeReal(opts, deps = {}) {
   // reply carries neither `session_id` nor `uuid` (a call that ran without ever being asked to
   // report one in its own reply's expected shape).
   const reportedSessionId = parsed.session_id || parsed.uuid || sessionId;
+  // Card #214: `num_turns` counts AGENTIC LOOP TURNS, not API requests -- the Agent SDK's own
+  // agent-loop docs: "A turn is one round trip inside the loop: Claude produces output that
+  // includes tool calls, the SDK executes those tools, and the results feed back." The CLI's
+  // own `--output-format json` schema is not formally published and never defines the field
+  // either. No field in the reply reports a request count at all: `usage` covers only the main
+  // loop, `modelUsage` (extractTokens above) is whole-tree TOKEN and cost accounting, not a
+  // count of anything. Deduplicating the session transcript by `message.id` is the only
+  // reliable request count this repo has (console/usage-scan.js's `scanFile`), and it disagrees
+  // with `num_turns` badly: differs from it by more than 1.5x on 199 of 442 rejoinable calls
+  // (45%, typical ratio ~2.0), worst case `num_turns: 3` against 382 real requests on a call
+  // with NO subagents (so not even the subagent-folding shape this file's `modelUsage` comment
+  // describes explains it) -- which contradicts the documented definition too, since every tool
+  // round-trip should be a turn. The docs offer no explanation for that worst case and this
+  // build does not investigate further (see step-contracts.js's own prose on the same finding).
+  // Kept on `result`/the return shapes below (runLlm's ~12 return sites, `orchestrator/
+  // intake.js`'s internal use, and 24 test files construct/assert it) because stripping the
+  // INTERNAL field would churn all of them for no behavioural gain -- but deliberately NOT
+  // written into the journalled `llm-call` event (see both appendEvent call sites below): there
+  // is no correct source for a request count on the journalling path without walking the
+  // transcript, and journalling a number that is not reliably even what its own name says would
+  // be worse than journalling nothing. console/usage-scan.js's `requestCount`
+  // (computeStepDeltas/sessionRequestCount, fix pass) is the real, deduplicated per-step
+  // request count instead -- a transcript-derived figure, not a journalled one, subagent
+  // requests included, printed via `spo tokens --usage-delta` (card #214, action 4).
   const numTurns = parsed.num_turns;
 
   if (parsed.is_error || exit !== 0) {
@@ -955,7 +1025,11 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       // fields instead of folded into tokenFieldsFrom.
       transcriptFilesRead: result.transcriptFilesRead,
       transcriptFilesSkipped: result.transcriptFilesSkipped,
-      numTurns: result.numTurns,
+      // Card #214: `numTurns` is deliberately NOT journalled here -- see the comment at
+      // `parsed.num_turns`'s own read site in invokeClaudeReal for why (it is dropped from the
+      // event, not from `result` -- `result.numTurns` is still a real field on the object above,
+      // just never written into this journal line). `runLlm`'s override branch below returns
+      // `result` (and therefore `result.numTurns`) to its caller unchanged.
       // duration_s: spelled with the underscore doc/state-machine-spec.md's Observability
       // section already used to describe this event, not tokenFieldsFrom's camelCase convention
       // -- see invokeClaudeReal's own comment for why it's measured around the spawn and present
@@ -1048,7 +1122,9 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     // inside it.
     transcriptFilesRead: raw.transcriptFilesRead,
     transcriptFilesSkipped: raw.transcriptFilesSkipped,
-    numTurns: raw.numTurns,
+    // Card #214: `numTurns` deliberately not journalled -- same reasoning as the override
+    // branch above (see its comment) and invokeClaudeReal's own comment at `parsed.num_turns`.
+    // `raw.numTurns` is still a real field on `raw`, read back below into every returned shape.
     duration_s: raw.durationS, // see the override branch above for why this is snake_case
     ok: raw.ok,
   });
@@ -1095,6 +1171,29 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       ok: false,
       kind: 'error',
       error: `llm.js: ${stepName} reply missing required key(s): ${missingKeys.join(', ')}`,
+      sessionId: raw.sessionId,
+      ...tokenFieldsFrom(raw),
+      numTurns: raw.numTurns,
+      raw: raw.raw,
+    };
+  }
+
+  // Card #207: every required key is now confirmed present -- check the ones step-contracts.js
+  // also declares a type for. checkOutputTypes mutates parsedPayload in place for any array-typed
+  // key whose value arrived as a JSON-encoded string that parses to the right shape (the same
+  // leniency park-loop.js's normalizeFindingsPayload already applies for its own callers), so a
+  // downstream reader of the returned payload sees the real array either way. A key that is
+  // present but genuinely wrongly typed is reported through the exact same failure shape as a
+  // missing key above -- same {ok:false, kind:'error', ...} fields, never a new failure channel --
+  // naming the key, its declared type, and what actually arrived, so a park report says something
+  // more useful than "reply missing required key(s)" for a key that was never missing at all.
+  const { failures: typeFailures } = checkOutputTypes(parsedPayload, contract.outputContract);
+  if (typeFailures.length > 0) {
+    const describe = (f) => `${f.key} (expected ${f.type}, got ${JSON.stringify(f.received)})`;
+    return {
+      ok: false,
+      kind: 'error',
+      error: `llm.js: ${stepName} reply has wrongly-typed key(s): ${typeFailures.map(describe).join(', ')}`,
       sessionId: raw.sessionId,
       ...tokenFieldsFrom(raw),
       numTurns: raw.numTurns,

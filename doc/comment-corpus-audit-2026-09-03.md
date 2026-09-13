@@ -96,7 +96,7 @@ until you know whether zero came from a check or from a blind spot. §3 separate
   recorded only in the maintainer's own memory file. `README.md:37` and
   `doc/jewels-inventory.md:14` both promise a `bench/` directory that does not exist
   (`ls -d bench` — no such directory).
-- **E6** — `README.md:34`'s subcommand list omits `bin/spo:1838`: `if (cmd === 'tokens') return
+- **E6** — `README.md:34`'s subcommand list omits `bin/spo:2220`: `if (cmd === 'tokens') return
   cmdTokens(opts);` (and five siblings).
 - **E15** — `orchestrator/park-loop.js:179`: `// machine.js's buildCtx resets it to 0 …` is the
   wrapped continuation of `state-` on the line above — and the same pattern at
@@ -123,7 +123,7 @@ until you know whether zero came from a check or from a blind spot. §3 separate
 - **E1** — `doc/board-audit.md:20`: `currently holds all 12 options`; `gh project field-list 1
   --owner Crazz-Org` returns 10 today (`Todo | Planning | Implementing | Checks & PR | Gate |
   Validation | Merging | Done | Parked | Intake`).
-- **E9** — `scripts/daemon-install.sh:103`: `cost: bin/spo cost`; `bin/spo:993` names the
+- **E9** — `scripts/daemon-install.sh:103`: `cost: bin/spo cost`; `bin/spo:1139` names the
   handler `cmdCostDeprecated`, and every other of the six sites naming `spo cost` says so.
 
 ---

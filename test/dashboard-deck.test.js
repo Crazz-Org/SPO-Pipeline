@@ -126,9 +126,13 @@ test('buildRun attaches each event to the leg that was open, never to a neighbou
   assert.equal(by('VALIDATE', 1).verdict, 'REJECT');
   assert.equal(by('DIAGNOSE', 1).rootCause, 'The retry budget was never wired to the fetch.');
   assert.deepEqual(
-    { model: by('IMPLEMENT', 2).model, turns: by('IMPLEMENT', 2).numTurns, tokens: by('IMPLEMENT', 2).billableTokens },
-    { model: 'sonnet', turns: 40, tokens: 115043 }
+    { model: by('IMPLEMENT', 2).model, tokens: by('IMPLEMENT', 2).billableTokens },
+    { model: 'sonnet', tokens: 115043 }
   );
+  // Card #214: numTurns is no longer collected onto the split's detail at all (the fixture
+  // above still carries it on the raw event, matching a real journal that predates this card --
+  // buildRun must ignore it, not merely leave it unsummed).
+  assert.equal(by('IMPLEMENT', 2).numTurns, undefined);
 });
 
 test('buildRun keeps only the CURRENT run: a retried card starts over rather than accumulating every past attempt', () => {
@@ -233,24 +237,42 @@ test('a split that never carried a numeric billableTokens stays exactly null, di
   assert.equal(impl.detail.measuredCalls, 1);
 });
 
-// Fix 12 (this lot's own remediation): billableTokens sums across calls in a split; numTurns and
-// durationS must sum the same way, or the two figures on one split row silently mean different
-// spans (one call's turns next to two calls' tokens). No consumer (par-times.js, render.js,
+// Fix 12 (this lot's own remediation): billableTokens sums across calls in a split; durationS
+// must sum the same way, or the two figures on one split row silently mean different spans (one
+// call's seconds next to two calls' tokens). No consumer (par-times.js, render.js,
 // render-deck.js) depends on last-wins semantics for either field -- both are read only by
 // splitNote's own display line, which now reports the same total the tokens figure does.
-test('buildRun sums numTurns and durationS across every call in a split, exactly like billableTokens', () => {
+//
+// Card #214 removed `numTurns` from this test (it used to assert the same sum for that field
+// too): the field is no longer collected onto the split's detail at all -- see the test below,
+// and collect.js's own comment at the removal site, for why a per-call figure that does not
+// reliably count anything should not be summed across calls even when it is present on old
+// events.
+test('buildRun sums durationS across every call in a split, exactly like billableTokens', () => {
   const run = buildRun([
     { ts: T(0), state: 'INTAKE', event: 'taken' },
     { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
     { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'IMPLEMENT' },
-    { ts: T(2), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 1000, numTurns: 12, duration_s: 90, ok: true },
-    { ts: T(3), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 2000, numTurns: 11, duration_s: 89, ok: true },
+    { ts: T(2), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 1000, duration_s: 90, ok: true },
+    { ts: T(3), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 2000, duration_s: 89, ok: true },
     { ts: T(4), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
   ]);
   const impl = run.splits.find((s) => s.state === 'IMPLEMENT');
   assert.equal(impl.detail.billableTokens, 3000);
-  assert.equal(impl.detail.numTurns, 23, 'summed, not the last call\'s 11');
   assert.equal(impl.detail.durationS, 179, 'summed, not the last call\'s 89');
+});
+
+test('buildRun (card #214): a split whose calls carry numTurns (a historical event shape) never surfaces it on the detail -- the field is dropped entirely, not summed', () => {
+  const run = buildRun([
+    { ts: T(0), state: 'INTAKE', event: 'taken' },
+    { ts: T(0), state: 'INTAKE', event: 'transition', to: 'WORKTREE' },
+    { ts: T(1), state: 'WORKTREE', event: 'transition', to: 'IMPLEMENT' },
+    { ts: T(2), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 1000, numTurns: 12, ok: true },
+    { ts: T(3), state: 'IMPLEMENT', event: 'llm-call', tokensSource: 'modelUsage', billableTokens: 2000, numTurns: 11, ok: true },
+    { ts: T(4), state: 'IMPLEMENT', event: 'transition', to: 'CHECK' },
+  ]);
+  const impl = run.splits.find((s) => s.state === 'IMPLEMENT');
+  assert.equal(impl.detail.numTurns, undefined);
 });
 
 test('normalizeRootCause keeps a sentence, drops "null", and unwraps the JSON-object shape the model sometimes answers with', () => {

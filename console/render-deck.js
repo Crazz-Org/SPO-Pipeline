@@ -604,7 +604,14 @@ function splitNote(s, isLive) {
   if (typeof d.checksGreen === 'number') bits.push(`${d.checksGreen} checks green`);
   if (d.prNumber) bits.push(`PR #${esc(d.prNumber)}`);
   if (d.rootCause) bits.push(`&ldquo;${esc(trimNarration(d.rootCause, 90))}&rdquo;`);
-  if (typeof d.numTurns === 'number') bits.push(`${d.numTurns} turns`);
+  // Card #214: a "N turns" line used to render here off `d.numTurns` -- removed along with the
+  // field itself (collect.js no longer sums it; `numTurns` counts agentic loop turns, not API
+  // requests, and disagreed with the real request count by more than 1.5x on 45% of a measured
+  // corpus -- see steps/llm.js's own comment). console/usage-scan.js's `requestCount`
+  // (computeStepDeltas/sessionRequestCount, fix pass) is the real per-step deduplicated request
+  // count, subagent requests included -- printed via `spo tokens --usage-delta`, not rendered
+  // per-split here: it is a session-level, transcript-derived figure with no journalled
+  // per-event value to attach to one split the way `d.billableTokens` has.
   // Same A4 discipline as the chip (renderSpendChip below): a split whose ledger is incomplete
   // (a not-measured or recovered call sits in it) never shows a bare figure here either -- the
   // reader who follows the chip's "spend only partly recorded" down to the split that is short

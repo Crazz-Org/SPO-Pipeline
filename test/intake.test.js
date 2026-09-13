@@ -1813,6 +1813,317 @@ test('amendCard: a timed-out gh issue edit never throws -- reported as an error 
   assert.equal(spawnCalls.filter((a) => a[0] === 'issue' && a[1] === 'comment').length, 0);
 });
 
+// ---- issue #198: amendCard's label inventory filter (same defect #196 fixed in fileCard, one
+// function down) --------------------------------------------------------------------------------
+//
+// `gh issue edit --add-label` exits non-zero on a label the target repo doesn't have, exactly
+// like `gh issue create --label` does -- amendCard used to pass `cat:<category>`/`size:<size>`
+// unconditionally. amendCard now reuses fileCard's filter via the shared `resolveLabelArgs`
+// helper (intake.js -- the shared label-inventory helper used by fileCard and amendCard): same
+// three-way split, same exact case-sensitive match, same `deps.log` announcements -- only the gh
+// flag (`--add-label` instead of `--label`) and the log lines' caller prefix (`amendCard:`) and
+// gh-command mention (`gh issue edit` instead of `gh issue create`) differ. Every test below
+// stubs `gh api issues/<n>` (fetchIssue)
+// and `gh issue comment` the same trivial way the pre-#198 amendCard tests above do, and asserts
+// on the argv actually handed to the fake `gh issue edit` (never just the return value) and/or on
+// the skip-/unknown-inventory text amendCard writes via the injected `deps.log`.
+
+function fakeFetchIssueAnd(labelListAndEditResponder) {
+  return fakeSpawnSync((command, argv) => {
+    if (argv[0] === 'api') return { status: 0, stdout: JSON.stringify({ body: 'RAW REPORT BODY' }), stderr: '', signal: null };
+    return labelListAndEditResponder(argv);
+  });
+}
+
+test('amendCard: target repo has BOTH cat:/size: labels -- both survive in the edit argv, nothing announced', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse(['cat:feature', 'size:S', 'bug']);
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(editCall.includes('--add-label'));
+  assert.ok(editCall.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(editCall.includes(`size:${VALID_DRAFT.size}`));
+  assert.deepEqual(logs, []);
+});
+
+test('amendCard: target repo has NEITHER label family -- both skipped, no --add-label reaches argv, each skip named on stdout', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse(['bug', 'enhancement']);
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(!editCall.includes('--add-label'));
+  assert.ok(!editCall.includes(`cat:${VALID_DRAFT.category}`));
+  assert.ok(!editCall.includes(`size:${VALID_DRAFT.size}`));
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'no log named the skipped cat: label');
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'no log named the skipped size: label');
+  assert.ok(logs.some((l) => l.includes('x/y')), 'no log named the repo');
+});
+
+test('amendCard: target repo has ONLY cat: -- cat: survives, size: is skipped and named', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse([`cat:${VALID_DRAFT.category}`, 'bug']);
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(editCall.includes(`cat:${VALID_DRAFT.category}`), 'the present cat: label should survive');
+  assert.ok(!editCall.includes(`size:${VALID_DRAFT.size}`), 'the absent size: label should not reach argv');
+  assert.ok(logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'no log named the skipped size: label');
+  assert.ok(!logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'the present cat: label was announced as skipped');
+});
+
+test('amendCard: target repo has ONLY size: (the reverse direction) -- size: survives, cat: is skipped and named', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse([`size:${VALID_DRAFT.size}`, 'bug']);
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(editCall.includes(`size:${VALID_DRAFT.size}`), 'the present size: label should survive');
+  assert.ok(!editCall.includes(`cat:${VALID_DRAFT.category}`), 'the absent cat: label should not reach argv');
+  assert.ok(logs.some((l) => l.includes(`cat:${VALID_DRAFT.category}`)), 'no log named the skipped cat: label');
+  assert.ok(!logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'the present size: label was announced as skipped');
+});
+
+test('amendCard: label inventory read fails (non-zero exit) -- UNKNOWN inventory, BOTH labels ship unverified, announced with the amendCard/gh-issue-edit wording', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return { status: 1, stdout: '', stderr: 'gh: boom', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(editCall.includes(`cat:${VALID_DRAFT.category}`), 'UNKNOWN inventory must still pass the requested cat: label');
+  assert.ok(editCall.includes(`size:${VALID_DRAFT.size}`), 'UNKNOWN inventory must still pass the requested size: label');
+  assert.deepEqual(logs, [
+    'amendCard: label inventory for x/y could not be read -- amending with ' +
+      `cat:${VALID_DRAFT.category} and size:${VALID_DRAFT.size} unverified; \`gh issue edit\` may fail if x/y lacks them`,
+  ]);
+});
+
+test('amendCard: label inventory read exits 0 but stdout is not valid JSON -- treated the same as an unknown inventory, both labels ship unverified', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return { status: 0, stdout: 'not json', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  assert.ok(editCall.includes(`cat:${VALID_DRAFT.category}`), 'UNKNOWN inventory must still pass the requested cat: label');
+  assert.ok(editCall.includes(`size:${VALID_DRAFT.size}`), 'UNKNOWN inventory must still pass the requested size: label');
+  assert.ok(logs.some((l) => l.includes('could not be read')));
+});
+
+test('amendCard: label args land before --remove-label in the edit argv, same ordering as before the #198 extraction', () => {
+  const spawnCalls = [];
+  const deps = {
+    ghRepo: 'x/y',
+    reportIntakeLabel: 'report:raw',
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse([`cat:${VALID_DRAFT.category}`, `size:${VALID_DRAFT.size}`]);
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  const catIdx = editCall.indexOf(`cat:${VALID_DRAFT.category}`);
+  const sizeIdx = editCall.indexOf(`size:${VALID_DRAFT.size}`);
+  const removeLabelIdx = editCall.indexOf('--remove-label');
+  assert.ok(catIdx >= 0 && sizeIdx >= 0 && removeLabelIdx >= 0);
+  assert.ok(catIdx < removeLabelIdx && sizeIdx < removeLabelIdx, '--remove-label must come after the label args');
+  assert.equal(editCall[removeLabelIdx + 1], 'report:raw');
+});
+
+test('amendCard: full gh issue edit argv is unchanged by the #198 extraction (exact order, both labels present)', () => {
+  const spawnCalls = [];
+  const deps = {
+    ghRepo: 'x/y',
+    reportIntakeLabel: 'report:raw',
+    spawnSync: fakeFetchIssueAnd((argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse([`cat:${VALID_DRAFT.category}`, `size:${VALID_DRAFT.size}`]);
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
+  const bodyFileArg = editCall[editCall.indexOf('--body-file') + 1];
+  assert.deepEqual(editCall, [
+    'issue',
+    'edit',
+    '501',
+    '--repo',
+    'x/y',
+    '--title',
+    VALID_DRAFT.title,
+    '--body-file',
+    bodyFileArg,
+    '--add-label',
+    `cat:${VALID_DRAFT.category}`,
+    '--add-label',
+    `size:${VALID_DRAFT.size}`,
+    '--remove-label',
+    'report:raw',
+  ]);
+});
+
+// ---- regression: the #198 extraction must not move fileCard's own argv or log wording ----------
+
+test('fileCard: label inventory unreadable -- log wording is BYTE-IDENTICAL to before the resolveLabelArgs extraction', () => {
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      if (argv[0] === 'label' && argv[1] === 'list') return { status: 1, stdout: '', stderr: 'gh: boom', signal: null };
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/x/y/issues/9\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+  assert.deepEqual(logs, [
+    'fileCard: label inventory for x/y could not be read -- filing with ' +
+      `cat:${VALID_DRAFT.category} and size:${VALID_DRAFT.size} unverified; \`gh issue create\` may fail if x/y lacks them`,
+  ]);
+});
+
+test('fileCard: full gh issue create argv is unchanged by the #198 extraction (exact order, both labels present)', () => {
+  const spawnCalls = [];
+  const deps = {
+    ghRepo: 'x/y',
+    tmpDir: os.tmpdir(),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      if (argv[0] === 'label' && argv[1] === 'list') {
+        return labelListResponse([`cat:${VALID_DRAFT.category}`, `size:${VALID_DRAFT.size}`]);
+      }
+      if (argv[0] === 'issue' && argv[1] === 'create') {
+        return { status: 0, stdout: 'https://github.com/x/y/issues/9\n', stderr: '', signal: null };
+      }
+      return { status: 0, stdout: '', stderr: '', signal: null };
+    }),
+  };
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
+
+  const result = intake.fileCard(VALID_DRAFT, review, deps);
+  assert.equal(result.ok, true);
+
+  const create = spawnCalls.find((argv) => argv[0] === 'issue' && argv[1] === 'create');
+  const bodyFileArg = create[create.indexOf('--body-file') + 1];
+  assert.deepEqual(create, [
+    'issue',
+    'create',
+    '--repo',
+    'x/y',
+    '--title',
+    VALID_DRAFT.title,
+    '--body-file',
+    bodyFileArg,
+    '--label',
+    `cat:${VALID_DRAFT.category}`,
+    '--label',
+    `size:${VALID_DRAFT.size}`,
+  ]);
+});
+
 // ---- pullBoard: board:claim output parsing -----------------------------------------------------
 
 test('pullBoard: parses candidate lines in order, skips known header/tail noise, warns on garbage', () => {
@@ -2816,6 +3127,10 @@ test('draftCard: journals an `llm-call` into daemon.jsonl with the same fields a
   assert.equal(ev.cacheCreationTokens, 8000);
   assert.equal(ev.cacheReadTokens, 21000);
   assert.equal(ev.outputTokens, 50);
+  // Fix pass, card #214, F3(b): journalIntakeLlmCall must not journal `numTurns` either --
+  // realShapedReply sets `num_turns: 1` by default, so this fails if that field is ever put
+  // back into this daemon.jsonl `llm-call` event.
+  assert.equal('numTurns' in ev, false, 'journalIntakeLlmCall must not journal numTurns');
   assert.equal(ev.billableTokens, 8950); // cache-READ excluded, same rule as tokens.js
   assert.equal(typeof ev.ts, 'string');
 });
@@ -2981,8 +3296,8 @@ test(
 
 // ---- spo ask --repo <owner/name> + board placement (action 184/185) --------------------------
 //
-// `--repo` is NOT a parseArgs flag (bin/spo:228-290 is above test/doc-constant-sweep.test.js's
-// line-pinned `bin/spo:1112`/`:1153` citations, and that test forbids inserting or deleting a
+// `--repo` is NOT a parseArgs flag (bin/spo:239-305 is above test/doc-constant-sweep.test.js's
+// line-pinned `bin/spo:1142`/`:1183` citations, and that test forbids inserting or deleting a
 // line there) -- cmdAsk pulls it back out of opts._ itself (bin/spo's own extractRepoFlag, right
 // above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
 // cmdAsk test in this file, never reimplementing the extraction here.

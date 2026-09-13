@@ -260,6 +260,9 @@ function parseArgs(argv) {
     recetteDir: null,
     capMs: null,
     capLlmSteps: null,
+    // Card #214, `spo tokens` only: opt-in, not the default -- see cmdTokens's own comment for
+    // why (a real transcript-corpus scan, not bounded the way this command's other rows are).
+    usageDelta: false,
     // action 7.2, post-verification correction: `--help` was NOT recognized here at all before
     // this -- it fell straight into `opts._` (unused) and `spo recette --help` (or, worse,
     // `spo recette --scenario parallel-doc-log --help`) fell through to cmdRecette's own real-run
@@ -294,6 +297,7 @@ function parseArgs(argv) {
     else if (a === '--recette-dir') opts.recetteDir = argv[++i];
     else if (a === '--cap-ms') opts.capMs = Number(argv[++i]);
     else if (a === '--cap-llm-steps') opts.capLlmSteps = Number(argv[++i]);
+    else if (a === '--usage-delta') opts.usageDelta = true;
     else if (a === '--help' || a === '-h') opts.help = true;
     else opts._.push(a);
   }
@@ -803,16 +807,22 @@ function cmdStatus(opts) {
   // under a different Unix user than this shell, e.g. a system unit with `User=`), and
   // `process.kill(pid, 0)` throws EPERM for a pid that is alive but not signalable --
   // `processAlive` reads that the same as ESRCH ("gone"), which would misreport a live-but-foreign
-  // dispatcher as dead. `pidExists` reads EPERM as "still there". `now`/`killGraceMs` (card #188
-  // follow-up) are ALSO injected here, never read inside computeDispatcherStatus itself: `now` is
-  // this same `Date.now()` snapshot (declared once, above, and reused for every age computation in
-  // this function) rather than a fresh clock read, and `killGraceMs` is this process's own
+  // dispatcher as dead. `pidExists` reads EPERM as "still there". `now`/`hostUptimeNowMs`/`killGraceMs`
+  // (card #188 follow-up, card #208) are ALSO injected here, never read inside
+  // computeDispatcherStatus itself: `now` is this same `Date.now()` snapshot (declared once, above,
+  // and reused for every age computation in this function) rather than a fresh clock read;
+  // `hostUptimeNowMs` is `os.uptime() * 1000`, the PREFERRED (boot-relative, monotonic, cross-process-
+  // comparable) age reading a `dispatcher-drain-start` written by card #208's dispatcher.js now
+  // carries alongside its wall-clock `ts` -- see console/dispatcher-status.js's own header for why
+  // that beats both `ts` and `monotonicNowMs()`; and `killGraceMs` is this process's own
   // `defaultConfig.drainKillGraceMs` -- together they let a reader bound an UNCONCLUDED drain-start
   // past its own `timeoutMs` plus that grace as STOPPED even when a reused pid would otherwise read
-  // it alive forever (a dead-but-pid-reused daemon does not print DRAINING indefinitely any more).
+  // it alive forever (a dead-but-pid-reused daemon does not print DRAINING indefinitely any more),
+  // and does so on a clock that cannot be fooled by this box's own measured wall-clock steps.
   const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot), {
     isAlive: pidExists,
     now,
+    hostUptimeNowMs: os.uptime() * 1000,
     killGraceMs: defaultConfig.drainKillGraceMs,
   });
   if (dispatcherStatus && dispatcherStatus.status === 'idle') {
@@ -856,7 +866,10 @@ function cmdStatus(opts) {
       // recorded, `diedDraining` does not distinguish the two, so this caption states only what both
       // prove. In the bound case death is inferred, not measured: under the installed unit,
       // TimeoutStopSec SIGKILLs the process at most 60s past the bound; outside it, a SIGSTOPped or
-      // suspended process may still be alive).
+      // suspended process may still be alive) -- EXCEPT for `dispatcherStatus.rebooted` (card #208
+      // F8): a host reboot between the write and this read is a MEASURED death, not an inferred one
+      // (uptime resetting to near zero can only mean a reboot happened, and nothing -- the drain,
+      // the whole process -- survives one), so that one case gets its own, non-hedged wording below.
       // Never worded "STOPPED since <age> ago": nobody recorded a stop time, only a DRAIN start time --
       // `stoppedAge` above is the age of the drain-start event, not of the (unknown) moment the
       // process actually died, and captioning it as a stop time would state a fact nobody measured.
@@ -872,8 +885,11 @@ function cmdStatus(opts) {
       if (stoppedEvent.signal) extraParts.push(`signal ${stoppedEvent.signal}`);
       if (Array.isArray(stoppedEvent.inFlight)) extraParts.push(`${stoppedEvent.inFlight.length} in flight at drain start`);
       const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
+      const deathNote = dispatcherStatus.rebooted
+        ? 'host rebooted since drain start -- process is certainly gone'
+        : 'process gone or past its drain bound';
       console.log(
-        `dispatcher: STOPPED -- drain never concluded (drain started ${stoppedAge} ago; no dispatcher-stopped recorded; process gone or past its drain bound; reason: ${reason})${extraNote}`
+        `dispatcher: STOPPED -- drain never concluded (drain started ${stoppedAge} ago; no dispatcher-stopped recorded; ${deathNote}; reason: ${reason})${extraNote}`
       );
     } else {
       const reason = stoppedEvent.reason || 'unknown';
@@ -983,7 +999,7 @@ function cmdTask(id, opts) {
 // task's previous llm-call exceeded the platform's observed cache TTL, and the call's own
 // cache-creation tokens dominated its cache-read tokens), never proof, and never something this
 // command or the daemon acts on -- reporting only.
-function cmdTokens(opts) {
+async function cmdTokens(opts) {
   const { journalRoot } = resolveDirs(opts);
   const report = tokenReport(journalRoot);
 
@@ -1086,6 +1102,32 @@ function cmdTokens(opts) {
         'only the now-retired dollar figure; a call claude never started (E2BIG etc.) never gets a ' +
         'token block, and a killed/signalled/unparsable call only lands here if recovery found nothing.'
     );
+  }
+
+  // Card #214, action 4, opt-in (`--usage-delta`): the per-step journal-vs-transcript delta,
+  // reusing console/usage-scan.js's scanFile dedup + subagent walk (see that module's own header
+  // for the measured motivation -- PLAN spawning Opus subagents its `model` field never named).
+  // NOT printed by default, unlike everything above: this walks the real transcript corpus under
+  // every pool account's CLAUDE_CONFIG_DIR/projects plus ~/.claude/projects, real disk I/O with
+  // no bound the rest of this command shares (which reads only the one journal it was pointed
+  // at). Never lets a scan failure take down the report above it -- this section is diagnostic,
+  // appended after everything the report already promised has been printed.
+  if (opts.usageDelta) {
+    try {
+      const { discoverUsageRoots, buildStepDeltaReport, formatStepDeltaReport } = require('../console/usage-scan');
+      const roots = discoverUsageRoots(resolveAccountsDir(opts));
+      const deltaReport = await buildStepDeltaReport({ journalRoot, roots });
+      const lines = formatStepDeltaReport(deltaReport);
+      if (lines.length) {
+        for (const line of lines) console.log(line);
+      } else {
+        console.log('');
+        console.log('per-step journal-vs-transcript delta: no joinable llm-call events found (nothing to compare)');
+      }
+    } catch (err) {
+      console.log('');
+      console.log(`note: --usage-delta could not complete (${err && err.message ? err.message : err})`);
+    }
   }
 }
 
@@ -2151,6 +2193,7 @@ function printUsage() {
     [
       'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
+      '            tokens: [--usage-delta] (per-step journal-vs-transcript delta, real transcript-corpus scan, opt-in)',
       '            ask: [--repo <owner/name>|--repo=<owner/name>, LEADING only] [--dry] [--draft-file <path>]   pull: [--limit <n>] [--force]',
       '            intake: [--limit <n>] [--reports-dir <dir>] [--force]   reports: [--reports-dir <dir>]',
       '            triage: [--limit <n>] [--file]   (defaults to --dry)   OR   triage --retry <issue> [--file]',

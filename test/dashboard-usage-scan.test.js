@@ -14,7 +14,18 @@ const { mkTmp } = require('./helpers');
 // have run its child in this very process with live credentials, unguarded. The sweep now
 // enforces this line's presence; see test/no-real-spawn.js's header.
 require('./no-real-spawn');
-const { createUsageScanner, buildTokenViews, buildTrendViews, localDateKey } = require('../console/usage-scan');
+const {
+  createUsageScanner,
+  buildTokenViews,
+  buildTrendViews,
+  localDateKey,
+  computeStepDeltas,
+  sessionBillableTokens,
+  sessionRequestCount,
+  collectJournalCallsForStepDelta,
+  buildStepDeltaReport,
+  formatStepDeltaReport,
+} = require('../console/usage-scan');
 
 function usageLine(id, model, usage) {
   return JSON.stringify({ message: { id, model, usage } });
@@ -520,4 +531,278 @@ test('buildTrendViews({}) returns an empty, non-throwing shape', () => {
   assert.deepEqual(trend.series, []);
   assert.equal(trend.lastRecordedDate, null);
   assert.equal(trend.kpis.todayAvgWeightPerSession, null);
+});
+
+// ---- per-step journal-vs-transcript delta (card #214, action 4) ---------------------------
+
+test('sessionBillableTokens sums fresh input + cache-creation + output across every model, excluding cache-read', () => {
+  const entry = {
+    models: {
+      'claude-fable-5': { msgs: 1, inp: 1000, cc: 200, cr: 999999, out: 100 },
+      'claude-opus-5': { msgs: 1, inp: 300, cc: 0, cr: 0, out: 400 },
+    },
+  };
+  assert.equal(sessionBillableTokens(entry), 1000 + 200 + 100 + 300 + 400);
+});
+
+test('sessionBillableTokens is 0, never throws, for a missing/empty session entry', () => {
+  assert.equal(sessionBillableTokens(null), 0);
+  assert.equal(sessionBillableTokens(undefined), 0);
+  assert.equal(sessionBillableTokens({}), 0);
+  assert.equal(sessionBillableTokens({ models: {} }), 0);
+});
+
+// ---- sessionRequestCount (fix pass, card #214: the numTurns-replacement request count) ------
+
+test('sessionRequestCount sums each model\'s own (already-deduplicated) msgs counter', () => {
+  const entry = {
+    models: {
+      'claude-fable-5': { msgs: 3, inp: 0, cc: 0, cr: 0, out: 0 },
+      'claude-opus-5': { msgs: 2, inp: 0, cc: 0, cr: 0, out: 0 },
+    },
+  };
+  assert.equal(sessionRequestCount(entry), 5);
+});
+
+test('sessionRequestCount is 0, never throws, for a missing/empty session entry', () => {
+  assert.equal(sessionRequestCount(null), 0);
+  assert.equal(sessionRequestCount(undefined), 0);
+  assert.equal(sessionRequestCount({}), 0);
+  assert.equal(sessionRequestCount({ models: {} }), 0);
+});
+
+test('computeStepDeltas: a matched call sums into its step, journal vs transcript compared correctly', () => {
+  const usageIndex = {
+    bySession: {
+      'sess-plan-1': { models: { 'claude-fable-5': { msgs: 1, inp: 900, cc: 100, cr: 0, out: 100 } } }, // billable 1100
+    },
+  };
+  const journalCalls = [{ step: 'PLAN', sessionId: 'sess-plan-1', billableTokens: 1000 }];
+  const steps = computeStepDeltas(usageIndex, journalCalls);
+  assert.equal(steps.PLAN.journalBillableTokens, 1000);
+  assert.equal(steps.PLAN.transcriptBillableTokens, 1100);
+  assert.equal(steps.PLAN.delta, -100, 'journal under-reports relative to the transcript');
+  assert.equal(steps.PLAN.deltaPct, (-100 / 1100) * 100);
+  assert.equal(steps.PLAN.callsMatched, 1);
+  assert.equal(steps.PLAN.callsUnmatched, 0);
+  assert.equal(steps.PLAN.requestCount, 1, 'the session\'s one deduplicated message');
+});
+
+test('computeStepDeltas: a call whose sessionId is absent from bySession counts as unmatched, and its billableTokens is NOT added to the journal total', () => {
+  const usageIndex = { bySession: {} };
+  const journalCalls = [{ step: 'IMPLEMENT', sessionId: 'sess-gone', billableTokens: 5000 }];
+  const steps = computeStepDeltas(usageIndex, journalCalls);
+  assert.equal(steps.IMPLEMENT.callsMatched, 0);
+  assert.equal(steps.IMPLEMENT.callsUnmatched, 1);
+  assert.equal(steps.IMPLEMENT.journalBillableTokens, 0, 'an unmatched call must not look like a real 0 transcript');
+  assert.equal(steps.IMPLEMENT.transcriptBillableTokens, 0);
+  assert.equal(steps.IMPLEMENT.requestCount, 0, 'an unmatched call must not look like a real 0-request step');
+});
+
+test('computeStepDeltas: a call with no sessionId at all is silently skipped -- not matched, not unmatched', () => {
+  const steps = computeStepDeltas({ bySession: {} }, [{ step: 'DIAGNOSE', sessionId: null, billableTokens: 10 }]);
+  assert.equal(steps.DIAGNOSE, undefined, 'a step with only an unjoinable call should not even appear');
+});
+
+test('computeStepDeltas: two calls on the same step accumulate; a step with a genuinely zero delta reports deltaPct 0, not null', () => {
+  const usageIndex = {
+    bySession: {
+      's1': { models: { m: { msgs: 1, inp: 100, cc: 0, cr: 0, out: 0 } } },
+      's2': { models: { m: { msgs: 1, inp: 200, cc: 0, cr: 0, out: 0 } } },
+    },
+  };
+  const journalCalls = [
+    { step: 'VALIDATE', sessionId: 's1', billableTokens: 100 },
+    { step: 'VALIDATE', sessionId: 's2', billableTokens: 200 },
+  ];
+  const steps = computeStepDeltas(usageIndex, journalCalls);
+  assert.equal(steps.VALIDATE.journalBillableTokens, 300);
+  assert.equal(steps.VALIDATE.transcriptBillableTokens, 300);
+  assert.equal(steps.VALIDATE.delta, 0);
+  assert.equal(steps.VALIDATE.deltaPct, 0);
+  assert.equal(steps.VALIDATE.callsMatched, 2);
+});
+
+test('computeStepDeltas: deltaPct is null when the transcript side found nothing at all (never a divide-by-zero NaN)', () => {
+  const usageIndex = { bySession: { s1: { models: { m: { msgs: 1, inp: 0, cc: 0, cr: 0, out: 0 } } } } };
+  const steps = computeStepDeltas(usageIndex, [{ step: 'PLAN', sessionId: 's1', billableTokens: 500 }]);
+  assert.equal(steps.PLAN.transcriptBillableTokens, 0);
+  assert.equal(steps.PLAN.deltaPct, null);
+});
+
+test('collectJournalCallsForStepDelta reads every task journal AND daemon.jsonl (intake calls), skipping non-llm-call events', () => {
+  const journalRoot = mkTmp('spo-usage-delta-journal-');
+  fs.mkdirSync(path.join(journalRoot, 'issue-1'), { recursive: true });
+  fs.writeFileSync(
+    path.join(journalRoot, 'issue-1', 'journal.jsonl'),
+    [
+      JSON.stringify({ event: 'transition', to: 'PLAN' }),
+      JSON.stringify({ event: 'llm-call', step: 'PLAN', sessionId: 'sess-a', billableTokens: 1000 }),
+      JSON.stringify({ event: 'llm-call', step: 'IMPLEMENT', sessionId: 'sess-b', billableTokens: 2000 }),
+    ].join('\n') + '\n'
+  );
+  fs.writeFileSync(
+    path.join(journalRoot, 'daemon.jsonl'),
+    JSON.stringify({ event: 'llm-call', step: 'DRAFT_CARD', sessionId: 'sess-c', billableTokens: 300 }) + '\n'
+  );
+
+  const calls = collectJournalCallsForStepDelta(journalRoot);
+  assert.deepEqual(
+    calls.sort((a, b) => a.step.localeCompare(b.step)),
+    [
+      { step: 'DRAFT_CARD', sessionId: 'sess-c', billableTokens: 300 },
+      { step: 'IMPLEMENT', sessionId: 'sess-b', billableTokens: 2000 },
+      { step: 'PLAN', sessionId: 'sess-a', billableTokens: 1000 },
+    ]
+  );
+});
+
+test('collectJournalCallsForStepDelta never throws on a missing journalRoot, an unreadable daemon.jsonl, or a torn line', () => {
+  assert.deepEqual(collectJournalCallsForStepDelta(null), []);
+  assert.deepEqual(collectJournalCallsForStepDelta(path.join(mkTmp('spo-usage-delta-missing-'), 'does-not-exist')), []);
+
+  const journalRoot = mkTmp('spo-usage-delta-torn-');
+  fs.mkdirSync(path.join(journalRoot, 'issue-1'), { recursive: true });
+  fs.writeFileSync(
+    path.join(journalRoot, 'issue-1', 'journal.jsonl'),
+    JSON.stringify({ event: 'llm-call', step: 'PLAN', sessionId: 'sess-a', billableTokens: 1 }) + '\n{"event": "llm-call", "step": "IMPL' // torn final line
+  );
+  const calls = collectJournalCallsForStepDelta(journalRoot);
+  assert.deepEqual(calls, [{ step: 'PLAN', sessionId: 'sess-a', billableTokens: 1 }]);
+});
+
+// Card #214, acceptance criterion 4's own fixture requirement: "A fixture test covers a session
+// with a subagents/ subtree." PLAN's own measured shape -- a journalled call whose reply's
+// modelUsage undercounted because the CLI reply itself only carried the resolved model's own
+// tokens, while the real transcript (main file + subagents/) also holds an Opus subagent's.
+test('buildStepDeltaReport: a session with a subagents/ subtree joins correctly, and the delta reflects the tokens the journal never saw', async () => {
+  const journalRoot = mkTmp('spo-usage-delta-subagent-journal-');
+  fs.mkdirSync(path.join(journalRoot, 'issue-526'), { recursive: true });
+  // The journalled PLAN call: 1100 billable tokens is what the CLI's own reply reported for the
+  // FABLE call alone -- it never saw the subagent's own spend (the shape card #214's fact 1
+  // measures: a subagent's tokens are real, whole-tree accounting, but this fixture deliberately
+  // gives the journalled figure a value LOWER than the full transcript to model a call whose
+  // own modelUsage was incomplete, e.g. reported before token-ledger lot's `modelUsage` fix).
+  fs.writeFileSync(
+    path.join(journalRoot, 'issue-526', 'journal.jsonl'),
+    JSON.stringify({ event: 'llm-call', step: 'PLAN', sessionId: 'sess-526-plan', billableTokens: 1100 }) + '\n'
+  );
+
+  const transcriptRoot = mkTmp('spo-usage-delta-subagent-transcript-');
+  const projDir = path.join(transcriptRoot, 'projet-A');
+  const parentId = 'sess-526-plan';
+  // Main session file: the fable call's own reply, 1000 input + 100 output = 1100 billable.
+  fs.mkdirSync(projDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(projDir, `${parentId}.jsonl`),
+    JSON.stringify({ message: { id: 'm1', model: 'claude-fable-5', usage: { input_tokens: 1000, output_tokens: 100 } } }) + '\n'
+  );
+  // The subagents/ subtree: an Opus subagent this journal's own `model` field never named --
+  // exactly finding 1's measured shape (6 of 42 PLAN calls, claude-opus-5 under a fable call).
+  fs.mkdirSync(path.join(projDir, parentId, 'subagents'), { recursive: true });
+  fs.writeFileSync(
+    path.join(projDir, parentId, 'subagents', 'agent-opus1.jsonl'),
+    JSON.stringify({ sessionId: parentId, message: { id: 'sub-1', model: 'claude-opus-5', usage: { input_tokens: 2000, output_tokens: 400 } } }) + '\n'
+  );
+
+  const report = await buildStepDeltaReport({ journalRoot, roots: [{ path: transcriptRoot, account: 'local' }] });
+
+  assert.equal(report.scannedSessions, 1);
+  const plan = report.steps.PLAN;
+  assert.ok(plan, 'PLAN must appear in the report');
+  assert.equal(plan.callsMatched, 1);
+  assert.equal(plan.callsUnmatched, 0);
+  assert.equal(plan.journalBillableTokens, 1100);
+  // Transcript total: main file (1000 + 100) + subagent (2000 + 400) = 3500 -- the subagent's
+  // spend the journalled figure above never included.
+  assert.equal(plan.transcriptBillableTokens, 3500);
+  assert.equal(plan.delta, 1100 - 3500);
+  assert.ok(plan.deltaPct < 0, 'the journal under-reports once the subagent is counted');
+  // The numTurns-replacement request count (fix pass, card #214): one main-file message + one
+  // subagent message = 2 deduplicated requests -- the subagent's own request counted, not
+  // silently dropped, exactly the property numTurns never had.
+  assert.equal(plan.requestCount, 2);
+
+  const lines = formatStepDeltaReport(report);
+  assert.ok(lines.some((l) => l.includes('PLAN')), JSON.stringify(lines));
+  assert.ok(lines.some((l) => l.includes('1 matched')), JSON.stringify(lines));
+  assert.ok(lines.some((l) => l.includes('requests') && l.includes('2')), JSON.stringify(lines));
+});
+
+// Fix pass, card #214, F1: mutation-proof coverage for the numTurns-replacement request count,
+// isolated from the billable-token assertions above so each property is pinned on its own --
+// per the verifier's own instruction ("remove the dedup and a test fails; skip the subagent walk
+// and a test fails").
+test('buildStepDeltaReport (dedup mutation proof): a message id repeated across two lines in the main transcript counts as ONE request, not two', async () => {
+  const journalRoot = mkTmp('spo-usage-delta-dedup-journal-');
+  fs.mkdirSync(path.join(journalRoot, 'issue-1'), { recursive: true });
+  fs.writeFileSync(
+    path.join(journalRoot, 'issue-1', 'journal.jsonl'),
+    JSON.stringify({ event: 'llm-call', step: 'IMPLEMENT', sessionId: 'sess-dup', billableTokens: 100 }) + '\n'
+  );
+
+  const transcriptRoot = mkTmp('spo-usage-delta-dedup-transcript-');
+  const projDir = path.join(transcriptRoot, 'projet-A');
+  // The SAME message.id appears TWICE, output_tokens growing as the CLI streams a rewrite --
+  // scanFile keeps only the LAST occurrence (see its own header on why last, not first, wins).
+  // If this report summed raw lines instead of scanFile's already-deduplicated `msgs`, this
+  // would read 2, not 1 -- the exact class of over-count `numTurns` never protected against.
+  fs.mkdirSync(projDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(projDir, 'sess-dup.jsonl'),
+    [
+      usageLine('m1', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 10 }),
+      usageLine('m1', 'claude-sonnet-5', { input_tokens: 100, output_tokens: 50 }),
+    ].join('\n') + '\n'
+  );
+
+  const report = await buildStepDeltaReport({ journalRoot, roots: [{ path: transcriptRoot, account: 'local' }] });
+  assert.equal(report.steps.IMPLEMENT.requestCount, 1, 'the repeated message.id must be counted once, not twice');
+});
+
+test('buildStepDeltaReport (subagent-walk mutation proof): a subagent transcript\'s own request is counted, never silently dropped', async () => {
+  const journalRoot = mkTmp('spo-usage-delta-subreq-journal-');
+  fs.mkdirSync(path.join(journalRoot, 'issue-1'), { recursive: true });
+  fs.writeFileSync(
+    path.join(journalRoot, 'issue-1', 'journal.jsonl'),
+    JSON.stringify({ event: 'llm-call', step: 'PLAN', sessionId: 'sess-sub', billableTokens: 100 }) + '\n'
+  );
+
+  const transcriptRoot = mkTmp('spo-usage-delta-subreq-transcript-');
+  const projDir = path.join(transcriptRoot, 'projet-A');
+  const parentId = 'sess-sub';
+  fs.mkdirSync(projDir, { recursive: true });
+  fs.writeFileSync(path.join(projDir, `${parentId}.jsonl`), usageLine('m1', 'claude-fable-5', { input_tokens: 100, output_tokens: 10 }) + '\n');
+  fs.mkdirSync(path.join(projDir, parentId, 'subagents'), { recursive: true });
+  fs.writeFileSync(
+    path.join(projDir, parentId, 'subagents', 'agent-1.jsonl'),
+    JSON.stringify({ sessionId: parentId, message: { id: 'sub-1', model: 'claude-opus-5', usage: { input_tokens: 50, output_tokens: 5 } } }) + '\n'
+  );
+
+  const report = await buildStepDeltaReport({ journalRoot, roots: [{ path: transcriptRoot, account: 'local' }] });
+  // 1 main-file request + 1 subagent request = 2. If the subagent walk were skipped (only the
+  // session's own top-level jsonl scanned, as scripts/usage-report.js's pre-#170 bug did), this
+  // would read 1, silently dropping the subagent's own spend from the count.
+  assert.equal(report.steps.PLAN.requestCount, 2, 'the subagent\'s own request must be counted, not dropped');
+});
+
+test('buildStepDeltaReport: a step whose call has no matching transcript at all still appears, marked unmatched', async () => {
+  const journalRoot = mkTmp('spo-usage-delta-unmatched-journal-');
+  fs.mkdirSync(path.join(journalRoot, 'issue-1'), { recursive: true });
+  fs.writeFileSync(
+    path.join(journalRoot, 'issue-1', 'journal.jsonl'),
+    JSON.stringify({ event: 'llm-call', step: 'DIAGNOSE', sessionId: 'sess-nowhere', billableTokens: 500 }) + '\n'
+  );
+  const transcriptRoot = mkTmp('spo-usage-delta-unmatched-transcript-');
+  fs.mkdirSync(transcriptRoot, { recursive: true }); // no matching project/session at all
+
+  const report = await buildStepDeltaReport({ journalRoot, roots: [{ path: transcriptRoot, account: 'local' }] });
+  assert.equal(report.scannedSessions, 0);
+  assert.equal(report.steps.DIAGNOSE.callsMatched, 0);
+  assert.equal(report.steps.DIAGNOSE.callsUnmatched, 1);
+});
+
+test('formatStepDeltaReport returns [] (nothing to print) when no step has a joinable call', () => {
+  assert.deepEqual(formatStepDeltaReport({ steps: {} }), []);
+  assert.deepEqual(formatStepDeltaReport(null), []);
 });

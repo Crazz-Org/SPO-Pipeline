@@ -21,6 +21,9 @@ const {
   LLM_STEP_DEADLINE_MS,
   LLM_STEP_DEADLINE_MS_BY_STEP,
   MAX_LLM_STEP_DEADLINE_MS,
+  checkOutputTypes,
+  valueSatisfiesType,
+  jsonSchemaPropertiesFor,
 } = require('../orchestrator/step-contracts');
 const { WORKTREE_SIDE_STEPS } = require('../orchestrator/config');
 
@@ -455,4 +458,236 @@ test('resolveStepContract: jsonSchema.required mirrors the step outputContract',
 
 test('resolveStepContract: unknown step throws', () => {
   assert.throws(() => resolveStepContract('NOT_A_STEP', {}), /no contract for step/);
+});
+
+// =================================================================================================
+// Card #207 -- outputContract `types` + checkOutputTypes/valueSatisfiesType/jsonSchemaPropertiesFor.
+// =================================================================================================
+
+// ---- valueSatisfiesType: one table-driven pass over every supported type spelling, a correct
+// value, a wrongly-typed value, and (for the array spellings) the JSON-string-of-an-array case.
+// checkOutputTypes' own JSON-string leniency is layered ON TOP of valueSatisfiesType (it re-tries
+// JSON.parse(value) and re-checks the PARSED result against the same function) -- so
+// valueSatisfiesType itself never accepts a string as satisfying an array type; that leniency is
+// exercised separately, through checkOutputTypes, further down.
+test('valueSatisfiesType: table-driven, one correct + one wrong value per supported type', () => {
+  const cases = [
+    ['string', 'a sentence', true],
+    ['string', 42, false],
+    ['number', 3.14, true],
+    ['number', '3.14', false],
+    ['number', NaN, false], // Number.isFinite(NaN) is false -- NaN is not a usable number
+    ['boolean', true, true],
+    ['boolean', 'true', false],
+    ['object', { a: 1 }, true],
+    ['object', [1, 2], false], // an array is NOT the 'object' type -- Array.isArray excluded explicitly
+    ['array', [1, 2, 3], true],
+    ['array', 'not an array', false],
+    ['string[]', ['a', 'b'], true],
+    ['string[]', [1, 2], false], // an array, but the wrong ELEMENT type
+    ['string[]', 'a', false], // a bare string is not a string[] without the JSON-string leniency
+    ['object[]', [{ a: 1 }, { b: 2 }], true],
+    ['object[]', [{ a: 1 }, 'not an object'], false],
+    ['object[]', [null], false], // null elements fail the 'object' element check (validate-findings.test.js's array-of-nulls case)
+  ];
+  for (const [type, value, expected] of cases) {
+    assert.equal(
+      valueSatisfiesType(value, type),
+      expected,
+      `valueSatisfiesType(${JSON.stringify(value)}, ${JSON.stringify(type)}) should be ${expected}`
+    );
+  }
+});
+
+// ---- checkOutputTypes: the JSON-string-of-an-array leniency, one case per array spelling.
+test('checkOutputTypes: a JSON-encoded string that parses to an array of the right element type is accepted AND normalized in place', () => {
+  const outputContract = { required: ['tags', 'notes'], types: { tags: 'string[]', notes: 'object[]' } };
+  const payload = { tags: JSON.stringify(['a', 'b']), notes: JSON.stringify([{ x: 1 }]) };
+  const { payload: normalized, failures } = checkOutputTypes(payload, outputContract);
+  assert.deepEqual(failures, []);
+  assert.deepEqual(normalized.tags, ['a', 'b'], 'the string was replaced with the parsed array');
+  assert.deepEqual(normalized.notes, [{ x: 1 }]);
+  assert.equal(normalized, payload, 'checkOutputTypes mutates and returns the SAME object, not a copy');
+});
+
+test('checkOutputTypes: a JSON-encoded string that parses to the WRONG element type is a genuine failure, not silently accepted', () => {
+  const outputContract = { required: ['tags'], types: { tags: 'string[]' } };
+  const { failures } = checkOutputTypes({ tags: JSON.stringify([1, 2, 3]) }, outputContract);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].key, 'tags');
+});
+
+test('checkOutputTypes: a present, non-null, wrongly-typed REQUIRED key fails and names the key/type/received value (verdict: 42)', () => {
+  const { failures } = checkOutputTypes({ verdict: 42, reasons: [], findings: [] }, STEP_CONTRACTS.VALIDATE.outputContract);
+  assert.equal(failures.length, 1);
+  assert.deepEqual(failures[0], { key: 'verdict', type: 'string', received: 42 });
+});
+
+// Second fix pass (2026-09-13): the test above pins VALIDATE's `verdict` individually, but nothing
+// pinned the other four enforced keys the same way -- an Opus verifier removed PLAN's
+// `plan_markdown` type entirely and every existing test still passed (the only test that would
+// have noticed, "at least one enforced key per step", is satisfied by `invariants_markdown`
+// alone); removing `root_cause`'s type was caught only by that same generic test, never by a
+// direct pin. This is table-driven and runs against the REAL `STEP_CONTRACTS`, one row per key
+// this card actually enforces, so a future removal of any one of them fails HERE, by name, not by
+// a generic "at least one" count going from 1 to 0.
+test('checkOutputTypes: each of the five keys this card actually enforces fails INDIVIDUALLY when wrongly typed (table-driven, real STEP_CONTRACTS)', () => {
+  const cases = [
+    { step: 'VALIDATE', key: 'verdict', payload: { verdict: 42, reasons: [], findings: [] } },
+    { step: 'CITATION_VERIFIER', key: 'verdict', payload: { verdict: 42, entries: [] } },
+    { step: 'DIAGNOSE', key: 'root_cause', payload: { root_cause: 42 } },
+    {
+      step: 'PLAN',
+      key: 'plan_markdown',
+      payload: { plan_markdown: 42, invariants_markdown: '# Invariants\n', invariant_ids: '[]', check_commands: '[]' },
+    },
+    {
+      step: 'PLAN',
+      key: 'invariants_markdown',
+      payload: { plan_markdown: '# Plan\n', invariants_markdown: 42, invariant_ids: '[]', check_commands: '[]' },
+    },
+    {
+      step: 'IMPLEMENT',
+      key: 'summary',
+      payload: { summary: 42, files_changed: '[]', invariants: '[]', tests_run: '[]', all_green: 'true' },
+    },
+  ];
+  for (const { step, key, payload } of cases) {
+    const outputContract = STEP_CONTRACTS[step].outputContract;
+    const { failures } = checkOutputTypes({ ...payload }, outputContract);
+    assert.ok(
+      failures.some((f) => f.key === key),
+      `${step}.${key} wrongly typed (42) should fail -- got failures: ${JSON.stringify(failures)}`
+    );
+  }
+});
+
+test('checkOutputTypes: null is a wildcard against every declared type -- never a failure, never normalized', () => {
+  const outputContract = { required: ['a', 'b', 'c'], types: { a: 'string', b: 'string[]', c: 'object' } };
+  const payload = { a: null, b: null, c: null };
+  const { payload: out, failures } = checkOutputTypes(payload, outputContract);
+  assert.deepEqual(failures, []);
+  assert.equal(out.a, null);
+  assert.equal(out.b, null);
+  assert.equal(out.c, null);
+});
+
+test('checkOutputTypes: a step whose outputContract declares no `types` at all is untouched -- behaves exactly as before this card', () => {
+  const outputContract = { required: ['root_cause'] }; // no `types` key
+  const { payload, failures } = checkOutputTypes({ root_cause: 42 }, outputContract);
+  assert.deepEqual(failures, [], 'no types map means nothing is ever checked, however wrong the value');
+  assert.equal(payload.root_cause, 42, 'and nothing is ever normalized either');
+});
+
+test('checkOutputTypes: a declared type on an OPTIONAL (non-required) key is schema-only -- never enforced, never normalized', () => {
+  // Card #207 fix pass (2026-09-12): PLAN's `files_to_change` was this test's real-world example
+  // until this same fix pass removed it from `types` entirely (see step-contracts.js's own header
+  // comment -- 241/241 corpus occurrences are a JSON-encoded string, never measured before that
+  // declaration was made). No key in the current table is BOTH optional and typed any more, so
+  // this test now exercises the mechanism directly with a synthetic outputContract, the same way
+  // the null-wildcard and no-`types`-at-all tests above already do -- it is testing
+  // checkOutputTypes' own optional-is-schema-only rule, not any one step's current declarations.
+  const outputContract = { required: ['a'], optional: ['b'], types: { a: 'string', b: 'string[]' } };
+  const payload = { a: 'fine', b: 'not an array, not JSON, not anything sane' };
+  const { payload: out, failures } = checkOutputTypes(payload, outputContract);
+  assert.deepEqual(failures, [], 'a malformed OPTIONAL field must never fail the gate');
+  assert.equal(out.b, payload.b, 'and must never be normalized either');
+});
+
+test('checkOutputTypes: VALIDATE reasons has no declared type -- a JSON-encoded string is left completely untouched, not normalized (state-machine.js journals it verbatim, card #640)', () => {
+  const outputContract = STEP_CONTRACTS.VALIDATE.outputContract;
+  assert.ok(!('reasons' in outputContract.types), 'sanity: reasons is deliberately undeclared');
+  const raw = JSON.stringify(['the criterion is not met']);
+  const payload = { verdict: 'REJECT', reasons: raw, findings: [] };
+  const { payload: out, failures } = checkOutputTypes(payload, outputContract);
+  assert.deepEqual(failures, []);
+  assert.equal(out.reasons, raw, 'must stay the raw string -- normalizing here would corrupt the verbatim journal record');
+});
+
+test('checkOutputTypes: VALIDATE findings has no declared type -- a malformed value never fails here, matching test/validate-findings.test.js', () => {
+  const outputContract = STEP_CONTRACTS.VALIDATE.outputContract;
+  assert.ok(!('findings' in outputContract.types), 'sanity: findings is deliberately undeclared');
+  for (const malformed of ['not json {{{', null, [null, null], { oops: true }]) {
+    const { failures } = checkOutputTypes({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: malformed }, outputContract);
+    assert.deepEqual(failures, [], `findings: ${JSON.stringify(malformed)} must never be a type failure`);
+  }
+});
+
+// ---- F3 (card #207 fix pass, 2026-09-12): PLAN's `invariant_ids`/`check_commands` are the two
+// exclusions NOTHING today would fail if they were reinstated (unlike `tests_run`/`invariants`,
+// which the corpus replay above pins) -- reinstating either as `'string[]'` makes every existing
+// test in this suite pass, because nothing else in the hermetic suite constructs a value with a
+// comma INSIDE one array element (the shape that actually breaks prompt-template.js's
+// `stringifyValue` re-join, per card #153: 14.5% of real `check_commands` contain one). This test
+// exists so that a future "tidy-up" reinstating either declaration goes red here, even though it
+// would go green everywhere else.
+test('checkOutputTypes: PLAN check_commands/invariant_ids have no declared type -- a JSON-encoded array containing a comma inside one element reaches the consumer BYTE-IDENTICAL, never normalized in place (card #153\'s comma-corruption guard)', () => {
+  const outputContract = STEP_CONTRACTS.PLAN.outputContract;
+  assert.ok(!('check_commands' in outputContract.types), 'sanity: check_commands is deliberately undeclared');
+  assert.ok(!('invariant_ids' in outputContract.types), 'sanity: invariant_ids is deliberately undeclared');
+
+  // The comma sits INSIDE one command -- exactly the shape stringifyValue's `', '.join` would
+  // corrupt if this were a real array instead of a JSON string re-read verbatim by
+  // task-values.js/prompt-template.js.
+  const checkCommandsRaw = JSON.stringify(['grep -Eq "kind, arity, and citation" src/foo.ts']);
+  const invariantIdsRaw = JSON.stringify(['INV-1, the comma-bearing id']);
+  const payload = {
+    plan_markdown: '# Plan\n',
+    invariants_markdown: '# Invariants\n',
+    check_commands: checkCommandsRaw,
+    invariant_ids: invariantIdsRaw,
+  };
+  const { payload: out, failures } = checkOutputTypes(payload, outputContract);
+  assert.deepEqual(failures, []);
+  assert.equal(out.check_commands, checkCommandsRaw, 'must stay the exact same JSON-encoded STRING -- normalizing to a real array here would silently reintroduce #153\'s comma-corruption once prompt-template.js\'s stringifyValue re-joins it with ", " for the next prompt');
+  assert.equal(out.invariant_ids, invariantIdsRaw, 'same guard, same reason, for invariant_ids');
+});
+
+// ---- jsonSchemaPropertiesFor / the --json-schema envelope.
+test('jsonSchemaPropertiesFor: undefined (not {}) for a step with no `types` at all -- omits `properties` entirely, byte-for-byte the pre-card-#207 envelope', () => {
+  assert.equal(jsonSchemaPropertiesFor(undefined), undefined);
+});
+
+test('jsonSchemaPropertiesFor: translates every declared spelling to its JSON-Schema fragment', () => {
+  const properties = jsonSchemaPropertiesFor({
+    a: 'string',
+    b: 'number',
+    c: 'boolean',
+    d: 'object',
+    e: 'array',
+    f: 'string[]',
+    g: 'object[]',
+  });
+  assert.deepEqual(properties, {
+    a: { type: 'string' },
+    b: { type: 'number' },
+    c: { type: 'boolean' },
+    d: { type: 'object' },
+    e: { type: 'array' },
+    f: { type: 'array', items: { type: 'string' } },
+    g: { type: 'array', items: { type: 'object' } },
+  });
+});
+
+test('resolveStepContract: the generated --json-schema envelope carries `properties` for every declared key, on every step that declares any', () => {
+  for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
+    const { jsonSchema, outputContract } = resolveStepContract(step, {});
+    if (!outputContract.types) {
+      assert.ok(!('properties' in jsonSchema), `${step}: no types declared, so no properties key expected`);
+      continue;
+    }
+    assert.ok('properties' in jsonSchema, `${step}: types declared, so properties must be present`);
+    assert.deepEqual(Object.keys(jsonSchema.properties).sort(), Object.keys(outputContract.types).sort());
+  }
+});
+
+test('resolveStepContract: DIAGNOSE/CITATION_VERIFIER/VALIDATE/IMPLEMENT all declare at least one required-key type today', () => {
+  // Not PLAN's invariant_ids/check_commands (deliberately undeclared, see step-contracts.js's own
+  // header comment) -- but every step's outputContract should have SOME enforced type, so this
+  // guards against a future edit silently emptying one out.
+  for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
+    const { outputContract } = resolveStepContract(step, {});
+    const enforcedKeys = Object.keys(outputContract.types || {}).filter((k) => outputContract.required.includes(k));
+    assert.ok(enforcedKeys.length > 0, `${step}: expected at least one required key with a declared, enforced type`);
+  }
 });

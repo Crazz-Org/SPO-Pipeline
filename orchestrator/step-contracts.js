@@ -28,6 +28,316 @@ const path = require('path');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 
+// ---- outputContract types (card #207) --------------------------------------------------------
+//
+// Every outputContract below was `{ required: [...] }` (PLAN also carries `optional`) with no
+// type information at all -- llm.js's reply check only ever asked "is the key present"
+// (`key in parsedPayload`), and the --json-schema envelope built by resolveStepContract() only
+// ever sent `{ type: 'object', required }`, no `properties`. Measured 2026-09-11: all 3 raw
+// VALIDATE `reasons` values in the live journal are the JSON-encoded TEXT of an array, not an
+// array -- a string satisfies a presence-only check exactly as well as the real shape does. This
+// section adds a `types` sibling map to `required`/`optional`, kept minimal and boring on
+// purpose (a plain string label per key, not a schema library): `required`/`optional` stay the
+// authority on PRESENCE, `types` is consulted only for a key that is both present and named
+// here. A key with no entry in `types` -- because its step carries no `types` map at all, or
+// because this build could not pin its real shape confidently enough to enforce it (see the
+// per-entry comments below) -- behaves exactly as before this card: presence-checked, never
+// type-checked.
+//
+// THE HONEST SUMMARY, stated plainly rather than left to be inferred from the per-entry comments
+// below: with the exclusions this section documents, the keys this card actually enforces are
+// `verdict` (on both VALIDATE and CITATION_VERIFIER), `root_cause` (DIAGNOSE), `plan_markdown` and
+// `invariants_markdown` (PLAN), and `summary` (IMPLEMENT) -- and the live corpus shows NONE of
+// those five was ever sent wrongly typed. Every other required key across the five steps --
+// `reasons`/`findings` (VALIDATE), `entries` (CITATION_VERIFIER), `all_green`/`files_changed`/
+// `invariants`/`tests_run` (IMPLEMENT), `invariant_ids`/`check_commands` (PLAN) -- has REAL,
+// measured type drift in the corpus and stays undeclared BY NECESSITY, not by oversight: each
+// one's actual normalization already lives downstream, in state-machine.js, while this file only
+// ever gets to see the reply before that normalization runs. So this card adds the mechanism and
+// closes it around the five keys the corpus shows are actually stable; it does NOT remove the
+// drift on the other nine -- that drift is real, it is measured, and it is exactly as wide after
+// this card as before it.
+//
+// SPELLING: 'string' | 'number' | 'boolean' | 'object' | 'array' (an array of unchecked element
+// type) | '<elementType>[]' (an array whose every element must itself satisfy <elementType> --
+// NONE of the array spellings are actually used below any more, as of this same card's fix pass
+// (2026-09-12): every key that was ever declared with one (`tests_run`, `invariants`,
+// `files_to_change`) was removed for a measured reason, see the "NINE MORE KEYS" section further
+// down. `checkOutputTypes()`'s own element check stays generic over any of the four scalar labels
+// regardless -- this is a statement about today's table, not a constraint the mechanism imposes).
+// Chosen over a JSON-Schema-shaped object
+// per key (`{type: 'array', items: {type: 'string'}}`) because every real key here is either a
+// bare scalar or a flat array of one element type -- nothing in prompts/ or the five outputContract
+// tables below ever asks a model for a nested array-of-arrays or a keyed object shape precise
+// enough to be worth validating field-by-field, so the extra generality would document a shape
+// this build never checks. Plain strings also read the same in this table as in a
+// `console.log(stepDef.outputContract)` dump, which a JSON-Schema fragment would not.
+//
+// checkOutputTypes(payload, outputContract) -- run by llm.js's reply check, AFTER the existing
+// presence filter (`required.filter(key => !(key in payload))`) has already returned no missing
+// keys, so every key this function inspects is confirmed present. Two things it deliberately does
+// NOT do, both load-bearing:
+//
+//   1. It skips `null`. A present-but-null value already satisfies llm.js's presence check today
+//      (the `in` operator, not truthiness -- see DIAGNOSE's own `root_cause` comment below, the
+//      one field this build already documents as "possibly null"), and a stricter reading here
+//      would silently re-introduce the exact class of regression item 4 of this card's spec
+//      forbids: a reply that reaches its consumer today would start failing at this gate instead.
+//      No declared type is "nullable" as a result -- null is a wildcard against every type, not a
+//      value `checkOutputTypes` was ever asked to validate the CONTENTS of.
+//
+//   2. For an array-typed key (`array`, `string[]`, `object[]`), a value that arrives as a STRING
+//      is given one chance: `JSON.parse` it, and if the parsed result is an array whose elements
+//      all satisfy the declared element type, accept it -- and NORMALIZE it in place (the caller
+//      replaces the string with the parsed array before returning `ok: true`), exactly what
+//      `park-loop.js`'s `normalizeFindingsPayload` already does for every consumer that calls it
+//      directly. Nothing in the five `outputContract`s below actually exercises this path today
+//      (see the `reasons`/`findings` writeup right below for why the one obvious candidate,
+//      VALIDATE's `reasons`, does NOT use it) -- it is exercised directly by
+//      test/step-contracts.test.js's own table-driven `checkOutputTypes` tests, and stays here for
+//      the array-typed key a future step's contract does want this leniency for. A value that is
+//      neither the declared array type nor a string that parses into one is a genuine type
+//      failure, same as any other key.
+//
+// WHY VALIDATE's `reasons` IS **NOT** DECLARED, even though it looks like the textbook case this
+// card was written for (validate-change.md documents it as an array; the live corpus sends it
+// JSON-encoded 100% of the time, 65/65 raw records measured 2026-09-13 against the live journal --
+// up from the 3/3 the criticity review first saw, the corpus having simply grown since) --
+// normalizing it here would be WRONG, not just
+// unnecessary, for a reason distinct from (and stronger than) the array-shape arguments below for
+// `findings`/`all_green`/`invariant_ids`/`check_commands`: state-machine.js's `handleValidate`
+// journals `result.reasons` **VERBATIM, PRE-NORMALIZATION**, on purpose (its own comment: "this is
+// the ONLY record of what the validator actually sent ... Raw here, normalized there; the pair is
+// what makes the claim falsifiable") into the `change-validator` event, specifically because card
+// #640's bug was three DIAGNOSE attempts unable to tell "the validator sent nothing" from "the
+// validator sent it and our OWN reader dropped it" -- and test/validate-findings.test.js pins the
+// raw event byte-for-byte equal to the JSON-encoded string the model sent
+// ("change-validator journals reasons verbatim, pre-normalization"). If `checkOutputTypes`
+// normalized `reasons` in place, `result` (this function's own return value) would already carry
+// the parsed ARRAY by the time `handleValidate` journals it as "raw", silently re-introducing
+// exactly the ambiguity #640's fix exists to prevent, just one layer earlier. The actual
+// normalization VALIDATE needs already happens, correctly, downstream in `handleValidate` itself
+// (`normalizeFindingsPayload(result.reasons)`, unrelated to this function) -- this card's job is
+// to ADD enforcement, not to move a normalization step that is already in the right place for a
+// reason. Left undeclared, the same as `findings` right below, though for a different, and in this
+// case decisive, reason.
+//
+// NINE MORE KEYS ARE DELIBERATELY LEFT OUT OF `types` ENTIRELY (`reasons`, just discussed, makes
+// ten in total), not given a lenient type -- their real shape is wider than any type this
+// checker could enforce, or their wire shape must reach a downstream consumer untouched, without
+// reintroducing a measured regression, through this exact real-mode `runLlm` path (not a
+// shadow-mode fixture, which never reaches this code). Six of the nine (`findings`, `all_green`,
+// `files_changed`, `invariant_ids`, `check_commands`, `entries`) were left out of this card's
+// FIRST build, on a REASONED basis -- a real corpus shape or a pinned test already on record. The
+// remaining three (`tests_run`, `invariants`, `files_to_change`) were NOT -- the first build
+// declared and enforced two of them (`tests_run`, `invariants`) from implement.md's documented
+// shape alone, never having replayed the live corpus against them, and an Opus verifier's replay
+// found that reasoning wrong (see their own bullets below for the measured numbers). This is why
+// the module header above states the enforced set as a closed, corpus-checked list rather than
+// claiming this section's absence of a consumer proves a wider shape is safe: absence-of-evidence
+// was exactly the mistake the first build made:
+//
+//   - VALIDATE's `findings` -- test/validate-findings.test.js's real-mode "malformed findings ...
+//     never throw and never block the merge" case sends `findings` as an unparsable string
+//     ('this is not JSON {{{'), `null`, an array of NULLS (`[null, null]` -- `null` elements fail
+//     the `object[]` element check even though the outer value is a real array), and a bare object
+//     (`{oops: true}`), and asserts `HANDLERS.VALIDATE` still returns `MERGE` for every one of
+//     them, never a park. `normalizeFindingsPayload` (park-loop.js) is the actual, already-correct
+//     contract for this field downstream, and it is strictly more permissive than "array,
+//     JSON-string-of-array, or null" -- declaring `object[]` here would park all four cases that
+//     test pins as non-fatal. Left undeclared.
+//   - IMPLEMENT's `all_green` -- state-machine.js's own comment on `handleImplement` (search
+//     "issue-247") records a REAL production reply: `{ok: true, filesChanged: "[]", allGreen:
+//     "false", ...}` -- `allGreen`/`all_green` sent as the STRING `"false"`, not the boolean.
+//     Declaring `boolean` here would turn that exact, already-observed shape into a park
+//     (`llm-transport-failed:IMPLEMENT`) where today it reaches CHECK/DIAGNOSE exactly as
+//     intended. This card's own criticity note independently confirms the field is read NOWHERE
+//     in orchestrator/, console/, bin/ or scripts/ (only journaled), so there is no consumer this
+//     enforcement would protect, only a park it would newly cause. Left undeclared.
+//   - IMPLEMENT's `files_changed` -- test/implement-empty-result.test.js's real-mode
+//     "an unparsable filesChanged string" and "filesChanged that parses as valid JSON but is NOT
+//     an array (an object)" cases both pin `HANDLERS.IMPLEMENT` routing to DIAGNOSE (journalling
+//     `empty-implement`), never a park -- state-machine.js's own `parseFilesChanged` is the
+//     already-correct contract (`Array.isArray(raw) ? raw : (JSON.parse succeeds AND is an array
+//     ? that : null)`, collapsing every OTHER shape to `null`, treated as "no files changed").
+//     Declaring `string[]` here (even with the JSON-string leniency above, which only accepts a
+//     string that PARSES to the right array -- a bare `'not json'` or a JSON object satisfies
+//     neither) would park both of those pinned cases instead of routing them to DIAGNOSE. Left
+//     undeclared.
+//   - IMPLEMENT's `tests_run` -- the first build's `string[]` declaration was corpus-checked
+//     AFTER the fact, not before, by an Opus verifier replaying every real IMPLEMENT reply in
+//     ~/.spo-state/journal (186 replies, 2026-08-29 -> 2026-09-12). The field is a JSON-ENCODED
+//     STRING on the wire 100% of the time (never a real array -- same wire convention as PLAN's
+//     `invariant_ids`/`check_commands` below, and just as deliberate on implement.md's side),
+//     which `checkOutputTypes`'s JSON-string leniency parses fine -- but 69 of those 186 parse to
+//     an array of `{cmd|command, exit_code}` OBJECTS, not the plain command strings implement.md's
+//     own worked example shows, and the leniency's element check then fails on the parsed
+//     objects, same as it would on the raw string. Declaring `string[]` would have parked those
+//     69 replies (37% of the corpus) at `llm-transport-failed:IMPLEMENT` -- and since IMPLEMENT is
+//     in TRANSIENT_RETRY_LLM_STEPS, the retry loop would have re-sent the identical reply into the
+//     identical park every cycle. No consumer reads `tests_run` for anything but journalling
+//     today, so there is nothing this enforcement would have protected. Left undeclared.
+//   - IMPLEMENT's `invariants` -- same corpus replay, same verdict: a JSON-ENCODED STRING 100% of
+//     the time, and 22 of 186 (12%) do not parse to an array of objects at all -- a prose
+//     sentence, an unparsable fragment, or a JSON array of something other than an object.
+//     Declaring `object[]` would have parked those 22 as `llm-transport-failed:IMPLEMENT`, into
+//     the same auto-retry loop as `tests_run` above. Left undeclared.
+//   - PLAN's `invariant_ids` and `check_commands` -- NOT because their shape is uncertain (it is
+//     the most confidently measured shape in this whole table): prompt-template.js's own
+//     `stringifyValue` comment records that 158 of 158 successful PLAN `result` payloads send BOTH
+//     fields as a JSON-ENCODED STRING, never a real array, and that this is deliberate, not a
+//     defect -- card #153 measured and closed "won't-fix" a proposal to normalize them, because
+//     14.5% of declared `check_commands` contain a comma, and re-joining a real array with ", "
+//     for the IMPLEMENT/VALIDATE prompt that reads them back (task-values.js: "PLAN's plan_path/
+//     invariants_path/invariant_ids/check_commands feed IMPLEMENT and VALIDATE") is NOT losslessly
+//     reversible. `checkOutputTypes`'s own JSON-string leniency would NORMALIZE this field in
+//     place -- turning the on-the-wire JSON string into a real array BEFORE task-values.js reads
+//     it back -- which would make `stringifyValue`'s `Array.isArray` branch fire on the very next
+//     prompt fill and silently reintroduce the exact comma-corruption #153 was closed to prevent,
+//     on 100% of cards, not an edge case. `plan_markdown`/`invariants_markdown` carry no such
+//     downstream re-render and are declared `string` below without incident.
+//   - PLAN's `files_to_change` -- OPTIONAL (see `optional` below), so a declared type here was
+//     always schema-only: `checkOutputTypes` never enforces or normalizes a key that is not also
+//     in `required` (see its own header comment further down). The first build declared it
+//     `string[]` anyway, reasoning that a schema-only declaration could not cause harm -- true for
+//     enforcement, but still a confidence claim doc/state-machine-spec.md and this header made
+//     about the corpus without having measured it. Measured now (2026-09-12, corrected 2026-09-13
+//     for a counting trap -- `handlePlan` journals `result` TWICE per real reply, once markdown-
+//     only and again with paths added, so a raw record count is not a reply count; 315 raw records
+//     collapse to 156 distinct replies by `sessionId`): 130 of 130 DISTINCT replies that declare
+//     `files_to_change` send it as a JSON-encoded string, 0 a real array (the other 26 of the 156
+//     omit the key entirely) --
+//     the same wire convention as `invariant_ids`/`check_commands` above, for the same reason
+//     (`normalizeFindingsPayload`/`guardDeclaredFiles` are its actual, already-correct downstream
+//     contract). Left undeclared, for honesty about what was actually checked, even though nothing
+//     here currently enforces it either way.
+//
+// CITATION_VERIFIER's `entries` is ALSO left undeclared, for the same structural reason as
+// `findings` rather than a distinct one: it is produced by the same "LLM replies with a JSON
+// array of judge-authored objects" shape, is read through the identical
+// `normalizeFindingsPayload` tolerant path when VALIDATE later renders a DIVERGES verdict
+// (state-machine.js's `divergesEntriesNorm`, ~:1577), and this card's own "Not measured" section
+// names it, alongside `findings`, as a field whose real-corpus shape this action did not audit --
+// declaring a type from the key's name and one prompt reading alone is exactly what item 2 of
+// this card's spec says not to do. `verdict` (CITATION_VERIFIER's other required key) is declared
+// below; only `entries` is left out.
+function scalarTypeOk(value, type) {
+  switch (type) {
+    case 'string':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'object':
+      return typeof value === 'object' && value !== null && !Array.isArray(value);
+    default:
+      return false;
+  }
+}
+
+// arrayElementTypeOk(items, elementType) -- every element of `items` (already confirmed an
+// array by the caller) satisfies `elementType`, one of the four scalarTypeOk labels above.
+function arrayElementTypeOk(items, elementType) {
+  return items.every((item) => scalarTypeOk(item, elementType));
+}
+
+// valueSatisfiesType(value, type) -- the non-array-leniency half of the check: does `value`,
+// AS GIVEN (no JSON.parse attempt), satisfy `type`. Exported separately from checkOutputTypes so
+// the table-driven test can exercise every (type, value) pair directly, without constructing a
+// full payload/outputContract per case.
+function valueSatisfiesType(value, type) {
+  if (type === 'array') return Array.isArray(value);
+  if (type.endsWith('[]')) {
+    const elementType = type.slice(0, -2);
+    return Array.isArray(value) && arrayElementTypeOk(value, elementType);
+  }
+  return scalarTypeOk(value, type);
+}
+
+// checkOutputTypes(payload, outputContract) -- returns { payload, failures }. `payload` is the
+// SAME object the caller passed in, mutated in place for any array-typed key whose value was
+// accepted via the JSON-string leniency (so every downstream reader, not just this function, sees
+// the real array) -- callers that must not mutate their input should pass a shallow copy.
+// `failures` is an array of `{ key, type, received }`, one entry per present, non-null,
+// declared-type key whose value did not satisfy its type (after the JSON-string leniency above);
+// empty when every checked key was fine.
+//
+// ENFORCEMENT IS REQUIRED-KEYS-ONLY, DELIBERATELY -- a key named in `types` but not in
+// `outputContract.required` is skipped here entirely: no type check, no JSON-string
+// normalization, nothing. That is not an oversight; it is what keeps `types` usable for
+// `properties` on an OPTIONAL key without also making that key's shape load-bearing. No key in
+// today's table is actually both optional and typed -- PLAN's `files_to_change` was the one real
+// example until this same card's fix pass (2026-09-12) removed it from `types` entirely (its own
+// declared type had never been corpus-checked either, see the "NINE MORE KEYS" section) -- so this
+// rule exists for a future optional-and-typed key, proven directly by
+// test/step-contracts.test.js's synthetic-outputContract test rather than by any real one. Before
+// that removal, `files_to_change`'s own downstream reader (state-machine.js's guardDeclaredFiles,
+// task-values.js's lastJournaledPlanFiles) already tolerated absent/null/an object/an unparsable
+// string by falling back to "not declared", journalled and unparked -- had this function enforced
+// a type on it too, a malformed OPTIONAL field would have newly PARKED the whole PLAN step, the
+// exact class of regression this card exists to avoid, just for a different key than the one the
+// card names.
+//
+// A key present in `payload` AND in `outputContract.required` AND named in `outputContract.types`
+// is inspected; everything else -- absent, optional, or with no declared type at all -- is
+// untouched, "behaves exactly as today" per this card's own requirement.
+function checkOutputTypes(payload, outputContract) {
+  const types = (outputContract && outputContract.types) || {};
+  const required = (outputContract && outputContract.required) || [];
+  const failures = [];
+  for (const [key, type] of Object.entries(types)) {
+    if (!required.includes(key)) continue; // optional keys: schema-only, never enforced -- see above
+    if (!(key in payload)) continue; // absence is the presence filter's job, not this one's
+    const value = payload[key];
+    if (value === null) continue; // null is a wildcard against every declared type -- see header
+
+    if (valueSatisfiesType(value, type)) continue;
+
+    // The JSON-string leniency: an array-shaped type accepts a STRING that parses to an array of
+    // the right element type, normalising it in place -- see the header comment's item 2 and the
+    // VALIDATE `reasons` example it walks through.
+    const isArrayType = type === 'array' || type.endsWith('[]');
+    if (isArrayType && typeof value === 'string') {
+      let parsed;
+      try {
+        parsed = JSON.parse(value);
+      } catch {
+        parsed = undefined;
+      }
+      if (parsed !== undefined && valueSatisfiesType(parsed, type)) {
+        payload[key] = parsed;
+        continue;
+      }
+    }
+
+    failures.push({ key, type, received: value });
+  }
+  return { payload, failures };
+}
+
+// jsonSchemaPropertyFor(type) -- one declared `types` entry, translated to the JSON-Schema
+// fragment `--json-schema`'s `properties` object wants for it. Comment on the envelope build
+// site (resolveStepContract, below) for what this is -- and is not -- known to do once sent.
+function jsonSchemaPropertyFor(type) {
+  if (type === 'array') return { type: 'array' };
+  if (type.endsWith('[]')) return { type: 'array', items: { type: type.slice(0, -2) } };
+  return { type };
+}
+
+// jsonSchemaPropertiesFor(types) -- undefined (never an empty object) when the step declares no
+// `types` at all, so an entry with nothing declared omits `properties` from its envelope exactly
+// as every step did before this card -- "behaves exactly as today" applies to the schema sent to
+// the model, not just to llm.js's own check.
+function jsonSchemaPropertiesFor(types) {
+  if (!types) return undefined;
+  const properties = {};
+  for (const [key, type] of Object.entries(types)) {
+    properties[key] = jsonSchemaPropertyFor(type);
+  }
+  return properties;
+}
+
 // spec: "per task size S/M/L -> low/medium/high" -- the shared default for an `effort: 'bySize'`
 // step with no `effortBySize` of its own. Today no step falls back to it: PLAN and IMPLEMENT each
 // carry their own map (PLAN_EFFORT_BY_SIZE, IMPLEMENT_EFFORT_BY_SIZE, both below), and DIAGNOSE
@@ -70,9 +380,15 @@ const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 // the experiment will have answered no, which is a result worth having either way.
 //
 // PLAN kept the shared map until 2026-09-13 and now carries its own (PLAN_EFFORT_BY_SIZE, below).
-// Its cost is essentially all per-turn (fit over 9 real calls: fixed ~= 0, 4,531/turn,
-// R^2 = 0.89), and its `L -> high` row was the one configuration that had never completed, until
-// #516 completed it twice post-raise (864.152s, 1123.965s, both `ok: true`) -- see
+// An earlier version of this comment fit PLAN's cost against `num_turns` (9 real calls: fixed ~= 0,
+// 4,531/turn, R^2 = 0.89); card #214 measured that `num_turns` counts agentic loop turns, not API
+// requests, is not formally defined by the CLI's own JSON schema, and differs from the deduplicated
+// real request count by more than 1.5x on 45% of a measured corpus (worst case 3 against 382 real
+// requests, with no subagents to explain the gap) -- an independent variable unfit to support a
+// per-turn cost claim, so that fit is RETRACTED here, not replaced with a new one this build has not
+// measured. What survives independently of it: PLAN's `L -> high` row was the one configuration
+// that had never completed, until #516 completed it twice post-raise (864.152s, 1123.965s, both
+// `ok: true`) -- see
 // LLM_STEP_DEADLINE_MS_BY_STEP.
 const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
 
@@ -90,7 +406,7 @@ const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
 //
 // Fable baseline: every PLAN llm-call journaled in ~/.spo-state/journal up to 2026-09-13, medians
 // over all calls, failed ones included (`node scripts/model-report.js --step=PLAN
-// --until=2026-09-13` re-derives these):
+// --until=2026-09-13` re-derives these; `turns` is num_turns, not a request count -- card #214):
 //   fable/low     n=103  ok=98   217s    83,596 billable   26 turns
 //   fable/medium  n=66   ok=57   473s   164,428 billable   49 turns
 //   fable/high    n=8    ok=3    825s   311,387 billable   64 turns  (includes the pre-raise
@@ -403,6 +719,28 @@ const STEP_CONTRACTS = {
     // the prompt's own text ("you hold no edit tool there") and by permissionMode below, not
     // by a distinct --allowedTools value (the CLI has no read-only Bash sub-permission to pass
     // here).
+    //
+    // Card #214, MEASURED, stated plainly because this table's own shape implies otherwise:
+    // `allowedTools` is NOT the authority on what a call can spawn. `Task` is not declared here,
+    // yet 6 of the 42 PLAN calls, measured 2026-09-10..12 while PLAN was Fable-only, spawned
+    // subagents running `claude-opus-5` while the PLAN call itself resolved to `fable` (PR #222
+    // changes PLAN to Opus-first with a Fable fallback, so "the PLAN call itself resolved to
+    // fable" describes that measured window, not a standing property of the step). This card's
+    // own fix pass
+    // (2026-09-13) re-measured against the fuller corpus available by then: 11 PLAN(fable)
+    // sessions carried an Opus subagent -- and, CORRECTING the original "0 IMPLEMENT" claim,
+    // one IMPLEMENT session did too (issue-584, a Sonnet subagent). So "no step but PLAN
+    // delegates" is NOT established; only that PLAN did it far more often in every window
+    // measured so far. The original window's subtrees hold 230 deduplicated API requests
+    // (console/usage-scan.js's own dedup+subagent walk), and their tokens land in this call's
+    // own `modelUsage` (whole-tree accounting -- see steps/llm.js's `extractTokens`), just under
+    // a `model` field that still reads `fable`. This build does NOT add `Task` here: the
+    // measurement is that subagents ran while it was undeclared, so adding it would assert an
+    // intent nobody has established and would change nothing about the observed behaviour.
+    // WHETHER PLAN (or IMPLEMENT) SHOULD delegate at all -- and whether `allowedTools` ought to
+    // be made binding, or some other steps could delegate and simply have not yet -- is
+    // an open question this card raises but does not decide; it is the maintainer's call, not
+    // this table's.
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only planning mode; matches the state's own name
     cwdKind: 'worktree', // reads {{worktree}}; config.cwdForStep already encodes this split
@@ -413,6 +751,20 @@ const STEP_CONTRACTS = {
       // canonical scratch_dir/plan-<issue>.md convention, then journals plan_path/invariants_path
       // itself for task-values.js's IMPLEMENT/VALIDATE placeholder derivation to keep reading.
       required: ['plan_markdown', 'invariants_markdown', 'invariant_ids', 'check_commands'],
+      // Card #207: `plan_markdown`/`invariants_markdown` are plan.md/invariants.md's full text
+      // (prose) -- 'string'. `invariant_ids`/`check_commands` are REQUIRED but deliberately left
+      // OUT of `types` -- see this file's own "outputContract types" header comment for why (158
+      // of 158 measured PLAN replies send them as a JSON-encoded STRING on purpose, per card #153,
+      // and this checker's own JSON-string leniency would normalize that string into a real array
+      // before task-values.js/prompt-template.js read it back for IMPLEMENT's/VALIDATE's own
+      // prompt, silently reintroducing #153's comma-corruption regression). `files_to_change` is
+      // ALSO left out of `types` entirely, as of this same card's fix pass (2026-09-12) -- see the
+      // header comment for the measured reason (130 of 130 DISTINCT replies that declare it send a
+      // JSON-encoded string, 0 a real array; it stays `optional` below regardless).
+      types: {
+        plan_markdown: 'string',
+        invariants_markdown: 'string',
+      },
       // Action 3.2: files_to_change is declared but deliberately NOT required. `required` above
       // drives BOTH llm.js's missing-key validation (~line 680) and the `--json-schema` envelope
       // built below -- promoting files_to_change into it would park every card whose PLAN reply
@@ -447,6 +799,31 @@ const STEP_CONTRACTS = {
     cwdKind: 'worktree',
     outputContract: {
       required: ['summary', 'files_changed', 'invariants', 'tests_run', 'all_green'],
+      // Card #207: `summary` is implement.md's few sentences of prose -- 'string', declared and
+      // enforced. `invariants` and `tests_run` are REQUIRED but, as of this same card's fix pass
+      // (2026-09-12), deliberately left OUT of `types` -- the first build declared them
+      // (`invariants: 'object[]'`, `tests_run: 'string[]'`) reasoning from implement.md's own
+      // documented shape (`[{"id": "INV-1", "status": "HELD"}, ...]` / `["...", ...]`) rather than
+      // from the corpus, and a corpus replay found that wrong: measured against
+      // ~/.spo-state/journal (186 real IMPLEMENT replies, 2026-09-12), `tests_run` is a
+      // JSON-encoded string 100% of the time, and 69 of those 186 parse to an array of
+      // `{cmd|command, exit_code}` OBJECTS, not strings -- `checkOutputTypes`'s own JSON-string
+      // leniency parses the wire string fine, but the parsed array then fails its OWN
+      // `string[]` element check. `invariants` is also a JSON-encoded string 100% of the time, and
+      // 22 of those 186 do not parse to an array of objects (a prose sentence, an unparsable
+      // fragment, or a JSON array of something other than objects). Declaring either type here
+      // would have parked roughly a third of real IMPLEMENT replies as `llm-transport-failed:
+      // IMPLEMENT` -- and since IMPLEMENT is in TRANSIENT_RETRY_LLM_STEPS, the park would have
+      // auto-retried into the identical failure and re-spent tokens every cycle. `all_green` and
+      // `files_changed` are undeclared for a separate, earlier-measured reason -- see this file's
+      // own "outputContract types" header comment for the full evidence (issue-247's real
+      // `allGreen: "false"`, and test/implement-empty-result.test.js's real-mode "unparsable
+      // filesChanged string" / "valid JSON but not an array" cases, both of which must still reach
+      // `state-machine.js`'s own `parseFilesChanged`-based routing to DIAGNOSE, never a park at
+      // this gate).
+      types: {
+        summary: 'string',
+      },
     },
   },
 
@@ -470,8 +847,14 @@ const STEP_CONTRACTS = {
     // loop (#487, #488, #492) reached DONE. The plan's own conditional ("if diagnose-* parks stay
     // > 10% after C1, escalate attempt 3 to Opus") is measurably NOT met; the pre-C1 17% was the
     // blind-judge artifact action 1.3 fixed. So this is a lateral move made for price and quota,
-    // and the 8/8 baseline (~52k mean billable, ~90s, ~20 turns) is what a future reader should
-    // compare against to tell whether it cost anything.
+    // and the 8/8 baseline (~52k mean billable, ~90s) is what a future reader should compare
+    // against to tell whether it cost anything. (This baseline used to also cite "~20 turns" --
+    // dropped, card #214: `num_turns` counts agentic loop turns, not API requests, and disagreed
+    // with the real deduplicated request count by more than 1.5x on 45% of a measured corpus, so
+    // it is not a figure worth carrying forward as a baseline. `numTurns` is no longer journalled
+    // at all; console/usage-scan.js's `requestCount` (computeStepDeltas/sessionRequestCount, fix
+    // pass) is the real per-step deduplicated request count for a reader who wants a comparable
+    // number here -- subagent requests included, printed via `spo tokens --usage-delta`.)
     baseModel: 'opus',
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
@@ -483,7 +866,18 @@ const STEP_CONTRACTS = {
     // null) is the one key common to both, so it is the only one whose *presence* is a hard
     // requirement -- see llm.js's `in` check, which treats a present-but-null root_cause as
     // satisfied, never as "missing".
-    outputContract: { required: ['root_cause'] },
+    outputContract: {
+      required: ['root_cause'],
+      // Card #207: 'string' -- diagnose.md documents root_cause as "one line" prose or `null`;
+      // the `null` half needs no entry here at all, since checkOutputTypes() treats a present
+      // `null` as a wildcard against every declared type (same "possibly null" idiom the comment
+      // two lines above this one already documents for the presence check, kept consistent
+      // rather than re-litigated per consumer). test/diagnose-nested-contract.test.js's own
+      // "nested contract" shape (a model that wraps its whole reply JSON-encoded INSIDE
+      // root_cause) is still a plain string at this top level either way -- the nesting is
+      // unwrapped downstream, in state-machine.js's unwrapNestedDiagnoseContract, never here.
+      types: { root_cause: 'string' },
+    },
   },
 
   CITATION_VERIFIER: {
@@ -500,7 +894,16 @@ const STEP_CONTRACTS = {
     allowedTools: ['Read', 'Grep'],
     permissionMode: 'default',
     cwdKind: 'pipeline',
-    outputContract: { required: ['verdict', 'entries'] },
+    outputContract: {
+      required: ['verdict', 'entries'],
+      // Card #207: `verdict` is one of three enum strings (verify-citations.md: PASS / REJECT /
+      // DIVERGES) -- 'string' catches a genuinely wrong-shaped reply (a number, an object)
+      // without re-encoding the enum itself, which state-machine.js's own verdict-dispatch
+      // already owns. `entries` is DELIBERATELY left out of `types` -- see this file's own
+      // "outputContract types" header comment for why (same structural pattern as VALIDATE's
+      // `findings`, and this card's own "Not measured" section names it unaudited).
+      types: { verdict: 'string' },
+    },
   },
 
   VALIDATE: {
@@ -532,7 +935,30 @@ const STEP_CONTRACTS = {
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'default',
     cwdKind: 'pipeline',
-    outputContract: { required: ['verdict', 'reasons', 'findings'] },
+    outputContract: {
+      required: ['verdict', 'reasons', 'findings'],
+      // Card #207 -- the action's central judgement call, see this file's own "outputContract
+      // types" header comment for the full evidence trail. Short version:
+      //   - `verdict` is one of three enum strings (validate-change.md: PASS / PASS_WITH_FINDINGS
+      //     / REJECT) -- 'string' only, same reasoning as CITATION_VERIFIER's above.
+      //   - `reasons` is DELIBERATELY left out of `types`, even though it looks like the textbook
+      //     case (validate-change.md documents it as an array; the corpus sends it JSON-encoded
+      //     100% of the time, 65/65 raw records measured 2026-09-13, up from 3/3 at the original
+      //     criticity review -- the corpus has simply grown): state-machine.js's `handleValidate` journals
+      //     `result.reasons` -- this function's OWN return value -- VERBATIM into the
+      //     `change-validator` event, on purpose, as "the ONLY record of what the validator
+      //     actually sent" (card #640's fix). Normalizing it here would corrupt that raw record
+      //     one layer earlier than #640's fix was written to guard against --
+      //     test/validate-findings.test.js's "(card #640)" test pins the raw event byte-for-byte
+      //     equal to the JSON-encoded string. The normalization VALIDATE actually needs already
+      //     happens, correctly, downstream in `handleValidate` itself.
+      //   - `findings` is ALSO left out of `types` -- test/validate-findings.test.js's real-mode
+      //     "malformed findings ... never block the merge" case (unparsable string, null, an array
+      //     of nulls, a bare object) pins that this pipeline already handles those shapes correctly
+      //     through this exact `runLlm` path, and a declared `object[]` would park every one of
+      //     them instead.
+      types: { verdict: 'string' },
+    },
   },
 };
 
@@ -663,6 +1089,8 @@ function resolveStepContract(stepName, task = {}) {
   const effortEscalated = shouldEscalateEffort(stepDef, task);
   const effort = effortEscalated ? stepDef.escalatedEffort : baseEffort;
 
+  const schemaProperties = jsonSchemaPropertiesFor(stepDef.outputContract.types);
+
   return {
     step: stepName,
     promptFile: stepDef.promptFile,
@@ -678,7 +1106,21 @@ function resolveStepContract(stepName, task = {}) {
     permissionMode: stepDef.permissionMode,
     // No $ cap: steps/llm.js's buildArgv only passes --max-budget-usd when this is a number.
     maxBudgetUsd: undefined,
-    jsonSchema: { type: 'object', required: stepDef.outputContract.required },
+    // Card #207: `properties`, built from the step's declared `types` (jsonSchemaPropertiesFor,
+    // above) so the schema the model receives matches the shape checkOutputTypes() enforces on
+    // the reply -- `undefined` (never `{}`) for a step whose outputContract carries no `types` at
+    // all, so `--json-schema` for such a step is byte-for-byte what it was before this card
+    // (`resolveStepContract: jsonSchema.required mirrors the step outputContract`,
+    // test/step-contracts.test.js, is unaffected). UNMEASURED, same as the `required`-only
+    // envelope this replaces: whether adding `properties` changes what the model actually sends,
+    // or whether `claude -p --json-schema` enforces this schema at all -- see this card's own
+    // "What the card measured, and what it did NOT" section. The schema is a declaration; the
+    // enforcement is checkOutputTypes() in llm.js's reply check.
+    jsonSchema: {
+      type: 'object',
+      required: stepDef.outputContract.required,
+      ...(schemaProperties !== undefined ? { properties: schemaProperties } : {}),
+    },
     cwdKind: stepDef.cwdKind,
     outputContract: stepDef.outputContract,
   };
@@ -697,4 +1139,9 @@ module.exports = {
   MAX_LEASE_AGE_MS,
   shouldEscalate,
   resolveStepContract,
+  // Card #207: exported for llm.js's reply check (checkOutputTypes) and for the table-driven
+  // type-checker tests in test/step-contracts.test.js (valueSatisfiesType, jsonSchemaPropertiesFor).
+  checkOutputTypes,
+  valueSatisfiesType,
+  jsonSchemaPropertiesFor,
 };
