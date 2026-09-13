@@ -277,15 +277,26 @@ function buildRun(lines) {
         // SUMMED across every successful call in the split, same rule as billableTokens just
         // above (action 4.4 remediation): a state visited more than once within one split (a step
         // that retries its own CLI invocation internally, no transition in between) must report
-        // the total turns/seconds across every call, not just the last one's figure. Before this,
-        // billableTokens summed while these two stayed last-wins, so a split's own row could show
-        // a turn/duration count that covered only ONE of the calls whose tokens it was reporting
-        // the total for -- two numbers on the same row, silently meaning different spans. Absence,
-        // never 0, is preserved exactly as billableTokens preserves it.
-        d.numTurns =
-          typeof e.numTurns === 'number'
-            ? (typeof d.numTurns === 'number' ? d.numTurns : 0) + e.numTurns
-            : d.numTurns ?? null;
+        // the total seconds across every call, not just the last one's figure. Before this,
+        // billableTokens summed while this stayed last-wins, so a split's own row could show a
+        // duration that covered only ONE of the calls whose tokens it was reporting the total
+        // for -- two numbers on the same row, silently meaning different spans. Absence, never 0,
+        // is preserved exactly as billableTokens preserves it.
+        //
+        // Card #214: `d.numTurns` (the same sum, over `e.numTurns`) is REMOVED, not merely left
+        // unsummed -- `numTurns` is no longer journalled on a new `llm-call` event at all (see
+        // steps/llm.js's comment at its `parsed.num_turns` read site: it counts agentic loop
+        // turns, not API requests, and disagreed with the real request count by more than 1.5x
+        // on 45% of a measured corpus). A sum of an unreliable per-call figure was already worse
+        // than nothing; summing it across a mix of historical events that carry the field and new
+        // ones that do not would have made it silently partial too. render-deck.js's splitNote no
+        // longer reads `d.numTurns` either (see its own comment). The deduplicated per-step
+        // request count this figure was standing in for now lives in console/usage-scan.js's
+        // `requestCount` (computeStepDeltas/sessionRequestCount, fix pass): it sums each
+        // matched call's session's already-deduplicated `message.id` count, INCLUDING every
+        // subagent's own requests (the same `subagents/` walk this module already does for
+        // tokens) -- printed via `spo tokens --usage-delta`, not summed here, because unlike
+        // billableTokens it has no per-event journalled figure to sum in the first place.
         d.durationS =
           typeof e.duration_s === 'number'
             ? (typeof d.durationS === 'number' ? d.durationS : 0) + e.duration_s
@@ -383,7 +394,9 @@ function buildRun(lines) {
 // field), and journal.jsonl (last event, and every recorded `llm-call` event -- see
 // orchestrator/steps/llm.js's appendEvent call for the exact shape: {step, model, effort,
 // account, sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
-// outputTokens, billableTokens, numTurns, ok}). No dollar figure is ever collected here -- see
+// outputTokens, billableTokens, modelUsage, ok} -- card #214 added `modelUsage` (the per-model
+// breakdown, present when tokensSource is 'modelUsage') and removed `numTurns` (never a
+// reliable request count -- see steps/llm.js's own comment). No dollar figure is ever collected here -- see
 // console/render.js's header ("NEVER a dollar figure"); `orchestrator/tokens.js` / `spo tokens`
 // own the token-accounting view instead.
 function collectJournalTasks(journalRoot, { now = Date.now() } = {}) {

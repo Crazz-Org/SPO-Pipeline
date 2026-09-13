@@ -411,7 +411,7 @@ separate repos with no shared runtime.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:936-938`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:938-940`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -498,10 +498,29 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
 
 - `journal/<task-id>/journal.jsonl` — every event: state transitions, step spawns and results
   (`{step, model, effort, account, sessionId, tokensSource, freshInputTokens,
-  cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, transcriptFilesRead,
-  transcriptFilesSkipped, duration_s, exit, verdict}` — no dollar figure anywhere;
-  `orchestrator/tokens.js`'s "billable-weighted" = fresh input + cache-creation + output,
-  cache-read reported separately, never summed in). `tokensSource` is one of three states:
+  cacheCreationTokens, cacheReadTokens, outputTokens, billableTokens, modelUsage,
+  transcriptFilesRead, transcriptFilesSkipped, duration_s, exit, verdict}` — no dollar figure
+  anywhere; `orchestrator/tokens.js`'s "billable-weighted" = fresh input + cache-creation +
+  output, cache-read reported separately, never summed in). Card #214: `modelUsage` is the same
+  four billable-accounting fields plus each model's own `billableTokens`, broken out PER MODEL
+  and keyed by model name, present under the same condition as `tokensSource: 'modelUsage'`
+  (absent, never an empty object, on a call that reported nothing recognizable, and absent on
+  every event journalled before this card). It exists because `model` above names only the
+  step's CONTRACT model, and a call can spend real tokens under a DIFFERENT model when it
+  delegates — measured on PLAN: 6 of 42 calls, measured 2026-09-10..12 while PLAN was
+  Fable-only (PR #222 changes PLAN to Opus-first with a Fable fallback), spawned
+  Opus subagents while the PLAN call itself resolved to Fable (`orchestrator/step-contracts.js`'s
+  own comment on PLAN's `allowedTools`, which also carries the corrected, fuller-corpus
+  measurement — IMPLEMENT can delegate too, not only PLAN), and the subagents' tokens were
+  already counted in the flat totals
+  (`modelUsage` is whole-tree accounting) but invisible to any by-model view keyed on `model`
+  alone. The same card removed `numTurns` from this event (it used to appear here too): measured
+  to count agentic loop turns, not API requests, and to disagree with the real deduplicated
+  request count by more than 1.5x on 45% of a rejoined corpus, with no CLI-documented schema
+  defining it either way — `console/usage-scan.js`'s `requestCount` (computeStepDeltas/
+  sessionRequestCount, fix pass) is the real per-step deduplicated request count, reusing its
+  existing `message.id` dedup and `subagents/` walk (so a subagent's own requests are included,
+  not dropped) — printed via `spo tokens --usage-delta`. `tokensSource` is one of three states:
   `'modelUsage'` (measured directly from the CLI's own reply), `'transcript'` (token-ledger lot
   action 4.3 — recovered from the call's own session transcript on disk when the CLI reply
   carried no `modelUsage`; a lower bound, a distinct source, never merged with a `modelUsage`
@@ -636,7 +655,7 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1202`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1232`)
   writes static HTML (the flight deck, plus `health.html` beside it) from the same local surfaces
   or, with `--serve`, runs a live HTTP server (`console/serve.js`) over those surfaces plus host
   CPU/memory and an outbound production-version probe (`--no-prod` turns it off); either way it

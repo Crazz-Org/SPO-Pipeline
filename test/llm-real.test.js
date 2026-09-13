@@ -328,6 +328,59 @@ test('extractTokens: no nested cache_creation/cacheCreation object -- ephemeral 
   assert.equal(tokens.cacheCreationEphemeral5m, 0);
 });
 
+// ---- extractTokens: modelUsage per-model breakdown (card #214) ----------------------------
+
+test('extractTokens: a two-model modelUsage payload carries a per-model breakdown alongside the flat totals, keyed by model name (card #214 acceptance criterion 1)', () => {
+  // Exactly the shape a PLAN call that delegated to an Opus subagent would report: the CLI's
+  // own reply's `modelUsage` has one entry per model the call actually touched.
+  const tokens = extractTokens({
+    'claude-fable-5': { inputTokens: 1000, cacheCreationInputTokens: 200, cacheReadInputTokens: 50, outputTokens: 100 },
+    'claude-opus-5': { inputTokens: 300, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 400 },
+  });
+
+  // Flat totals are unaffected -- still the sum across every model, exactly as before this card.
+  assert.equal(tokens.tokensSource, 'modelUsage');
+  assert.equal(tokens.freshInputTokens, 1300);
+  assert.equal(tokens.cacheCreationTokens, 200);
+  assert.equal(tokens.cacheReadTokens, 50);
+  assert.equal(tokens.outputTokens, 500);
+  assert.equal(tokens.billableTokens, 1300 + 200 + 500);
+
+  // The new per-model breakdown: one entry per model, each with its own four fields plus its
+  // own billableTokens (same fresh+cache-creation+output formula, never cache-read).
+  assert.deepEqual(tokens.modelUsage, {
+    'claude-fable-5': {
+      freshInputTokens: 1000,
+      cacheCreationTokens: 200,
+      cacheReadTokens: 50,
+      outputTokens: 100,
+      billableTokens: 1300,
+    },
+    'claude-opus-5': {
+      freshInputTokens: 300,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      outputTokens: 400,
+      billableTokens: 700,
+    },
+  });
+});
+
+test('extractTokens: a single-model modelUsage payload still gets a one-entry modelUsage breakdown', () => {
+  const tokens = extractTokens({
+    'claude-sonnet-5': { input_tokens: 10, output_tokens: 5 },
+  });
+  assert.deepEqual(tokens.modelUsage, {
+    'claude-sonnet-5': { freshInputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 5, billableTokens: 15 },
+  });
+});
+
+test('extractTokens: modelUsage breakdown is ABSENT (not an empty object) when nothing recognizable was found, matching tokensSource: null', () => {
+  assert.equal(extractTokens(undefined).modelUsage, undefined);
+  assert.equal(extractTokens({}).modelUsage, undefined);
+  assert.equal(extractTokens({ 'model-a': {}, 'model-b': { someUnrelatedField: 1 } }).modelUsage, undefined);
+});
+
 test('classifyFailure: api_error_status 429 -> limit', () => {
   assert.equal(classifyFailure({ api_error_status: 429, result: 'nope' }), 'limit');
 });
@@ -1261,6 +1314,10 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
   assert.equal(llmCallEvent.account, 'acct-x');
   assert.equal(llmCallEvent.ok, true);
   assert.equal(llmCallEvent.sessionId, 'sess-123');
+  // Fix pass, card #214, F3(a): the legacy ctx.task.llm.<step> OVERRIDE branch's own appendEvent
+  // call must not journal `numTurns` either -- realShapedPayload sets `num_turns: 1` above, so
+  // this fails if that field is ever put back into this branch's journalled event.
+  assert.equal('numTurns' in llmCallEvent, false, 'the override branch must not journal numTurns');
 });
 
 // The success-path test above proves the legacy override path's journal write carries an id when

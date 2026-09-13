@@ -3127,6 +3127,10 @@ test('draftCard: journals an `llm-call` into daemon.jsonl with the same fields a
   assert.equal(ev.cacheCreationTokens, 8000);
   assert.equal(ev.cacheReadTokens, 21000);
   assert.equal(ev.outputTokens, 50);
+  // Fix pass, card #214, F3(b): journalIntakeLlmCall must not journal `numTurns` either --
+  // realShapedReply sets `num_turns: 1` by default, so this fails if that field is ever put
+  // back into this daemon.jsonl `llm-call` event.
+  assert.equal('numTurns' in ev, false, 'journalIntakeLlmCall must not journal numTurns');
   assert.equal(ev.billableTokens, 8950); // cache-READ excluded, same rule as tokens.js
   assert.equal(typeof ev.ts, 'string');
 });
@@ -3292,8 +3296,8 @@ test(
 
 // ---- spo ask --repo <owner/name> + board placement (action 184/185) --------------------------
 //
-// `--repo` is NOT a parseArgs flag (bin/spo:228-290 is above test/doc-constant-sweep.test.js's
-// line-pinned `bin/spo:1112`/`:1153` citations, and that test forbids inserting or deleting a
+// `--repo` is NOT a parseArgs flag (bin/spo:239-305 is above test/doc-constant-sweep.test.js's
+// line-pinned `bin/spo:1142`/`:1183` citations, and that test forbids inserting or deleting a
 // line there) -- cmdAsk pulls it back out of opts._ itself (bin/spo's own extractRepoFlag, right
 // above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
 // cmdAsk test in this file, never reimplementing the extraction here.

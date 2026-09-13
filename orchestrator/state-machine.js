@@ -840,7 +840,7 @@ async function handleImplement(ctx) {
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
   // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
-  // (orchestrator/steps/llm.js:978 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // (orchestrator/steps/llm.js:1049 calls `resolveStepContract(stepName, ctx.task || {})`), never
   // ctx.counters or ctx.taskDir directly.
   //
   // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact
@@ -1360,7 +1360,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:951's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:986's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;

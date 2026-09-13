@@ -239,7 +239,9 @@ function journalIntakeLlmCall(deps, opts, raw) {
     account: opts.account && opts.account.name,
     sessionId: raw.sessionId,
     ...tokenFieldsFrom(raw),
-    numTurns: raw.numTurns,
+    // Card #214: `numTurns` deliberately not journalled -- this writes the SAME `llm-call`
+    // event steps/llm.js does (this function's own header comment), so it drops the field for
+    // the same reason: see steps/llm.js's comment at its `parsed.num_turns` read site.
     // duration_s: snake_case, matching steps/llm.js's own event verbatim -- see its comment for
     // why the one field on this record breaks the camelCase convention.
     duration_s: raw.durationS,

@@ -107,6 +107,70 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   assert.equal(call.durationS, undefined, 'spelled duration_s, not camelCase -- the spec documents duration_s');
 });
 
+// Card #214, acceptance criterion 1: a real card-path call whose CLI reply's `modelUsage` names
+// TWO models (the shape PLAN's undeclared subagent delegation produces -- see step-contracts.js's
+// own comment on PLAN's `allowedTools`) journals a per-model breakdown on the `llm-call` event,
+// alongside the pre-existing single `model` field naming only the CONTRACT's resolved model.
+// Acceptance criterion 3 is exercised in the same test: the journalled event carries no
+// `numTurns` at all, even though `runLlm`'s own return value (the internal shape, kept on
+// purpose) still does.
+test('PLAN real card path: a two-model modelUsage payload journals a per-model breakdown on the llm-call event, and the event carries no numTurns', async () => {
+  const taskDir = mkTmp('spo-card-plan-modelusage-');
+  const task = {
+    kind: 'card',
+    issue: 526,
+    title: 'Add a widget',
+    criterion: 'the widget renders',
+    worktreePath: '/tmp/worktree-526',
+    size: 'S',
+  };
+
+  const deps = {
+    spawnSync: fakeSpawnSync(() => {
+      const reply = realShapedReply(
+        {
+          plan_markdown: '# Plan\n\nAdd a widget to the header.\n',
+          invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+          invariant_ids: [],
+          check_commands: ['npm run typecheck'],
+        },
+        {
+          // The measured shape: the PLAN call itself resolves to fable, but its reply's own
+          // modelUsage names an Opus subagent too -- whole-tree accounting, already summed into
+          // the flat totals before this card, now also broken out per model.
+          modelUsage: {
+            'claude-fable-5': { inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 200, outputTokens: 800 },
+            'claude-opus-5': { inputTokens: 2000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 3000 },
+          },
+          num_turns: 4,
+        }
+      );
+      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+    }),
+  };
+
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  assert.equal(result.ok, true);
+  // The internal return shape keeps numTurns -- this card only removes it from the JOURNALLED
+  // event, not from runLlm's own return value (24 test files and ~12 return sites depend on it).
+  assert.equal(result.numTurns, 4);
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const call = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(call);
+  assert.equal(call.model, 'fable', 'the CONTRACT-resolved model, unchanged by this card');
+  assert.deepEqual(call.modelUsage, {
+    'claude-fable-5': { freshInputTokens: 5000, cacheCreationTokens: 1000, cacheReadTokens: 200, outputTokens: 800, billableTokens: 6800 },
+    'claude-opus-5': { freshInputTokens: 2000, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 3000, billableTokens: 5000 },
+  });
+  assert.equal(call.billableTokens, 6800 + 5000, 'flat total still sums across both models, unchanged');
+  assert.equal('numTurns' in call, false, 'numTurns must be gone from the journalled llm-call event (acceptance criterion 3)');
+});
+
 // Second fix pass (2026-09-13): the F3 test in test/step-contracts.test.js asserts on
 // `checkOutputTypes`' own return value, not on what actually reaches `runLlm`'s caller -- an Opus
 // verifier made `llm.js` normalize `check_commands` in place AFTER calling `checkOutputTypes`

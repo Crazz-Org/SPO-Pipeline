@@ -376,10 +376,17 @@ const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 // per merged card do not fall below ~2.0, revert this map to { S: 'low', M: 'medium', L: 'high' };
 // the experiment will have answered no, which is a result worth having either way.
 //
-// PLAN deliberately keeps the shared map. Its cost is essentially all per-turn (fit over 9 real
-// calls: fixed ~= 0, 4,531/turn, R^2 = 0.89), and its `L -> high` row was the one configuration
-// that had never completed, until #516 completed it twice post-raise (864.152s, 1123.965s, both
-// `ok: true`) -- see LLM_STEP_DEADLINE_MS_BY_STEP.
+// PLAN deliberately keeps the shared map -- there is no live per-turn cost model to justify a
+// custom one. An earlier version of this comment fit PLAN's cost against `num_turns` (9 real
+// calls: fixed ~= 0, 4,531/turn, R^2 = 0.89); card #214 measured that `num_turns` counts agentic
+// loop turns, not API requests, is not formally defined by the CLI's own JSON schema, and
+// differs from the deduplicated real request count by more than 1.5x on 45% of a measured
+// corpus (worst case 3 against 382 real requests, with no subagents to explain the gap) -- an
+// independent variable unfit to support a per-turn cost claim, so that fit is RETRACTED here,
+// not replaced with a new one this build has not measured. What survives independently of it:
+// PLAN's `L -> high` row was the one configuration that had never completed, until #516
+// completed it twice post-raise (864.152s, 1123.965s, both `ok: true`) -- see
+// LLM_STEP_DEADLINE_MS_BY_STEP.
 const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
 
 const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
@@ -674,6 +681,28 @@ const STEP_CONTRACTS = {
     // the prompt's own text ("you hold no edit tool there") and by permissionMode below, not
     // by a distinct --allowedTools value (the CLI has no read-only Bash sub-permission to pass
     // here).
+    //
+    // Card #214, MEASURED, stated plainly because this table's own shape implies otherwise:
+    // `allowedTools` is NOT the authority on what a call can spawn. `Task` is not declared here,
+    // yet 6 of the 42 PLAN calls, measured 2026-09-10..12 while PLAN was Fable-only, spawned
+    // subagents running `claude-opus-5` while the PLAN call itself resolved to `fable` (PR #222
+    // changes PLAN to Opus-first with a Fable fallback, so "the PLAN call itself resolved to
+    // fable" describes that measured window, not a standing property of the step). This card's
+    // own fix pass
+    // (2026-09-13) re-measured against the fuller corpus available by then: 11 PLAN(fable)
+    // sessions carried an Opus subagent -- and, CORRECTING the original "0 IMPLEMENT" claim,
+    // one IMPLEMENT session did too (issue-584, a Sonnet subagent). So "no step but PLAN
+    // delegates" is NOT established; only that PLAN did it far more often in every window
+    // measured so far. The original window's subtrees hold 230 deduplicated API requests
+    // (console/usage-scan.js's own dedup+subagent walk), and their tokens land in this call's
+    // own `modelUsage` (whole-tree accounting -- see steps/llm.js's `extractTokens`), just under
+    // a `model` field that still reads `fable`. This build does NOT add `Task` here: the
+    // measurement is that subagents ran while it was undeclared, so adding it would assert an
+    // intent nobody has established and would change nothing about the observed behaviour.
+    // WHETHER PLAN (or IMPLEMENT) SHOULD delegate at all -- and whether `allowedTools` ought to
+    // be made binding, or some other steps could delegate and simply have not yet -- is
+    // an open question this card raises but does not decide; it is the maintainer's call, not
+    // this table's.
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     permissionMode: 'plan', // read-only planning mode; matches the state's own name
     cwdKind: 'worktree', // reads {{worktree}}; config.cwdForStep already encodes this split
@@ -780,8 +809,14 @@ const STEP_CONTRACTS = {
     // loop (#487, #488, #492) reached DONE. The plan's own conditional ("if diagnose-* parks stay
     // > 10% after C1, escalate attempt 3 to Opus") is measurably NOT met; the pre-C1 17% was the
     // blind-judge artifact action 1.3 fixed. So this is a lateral move made for price and quota,
-    // and the 8/8 baseline (~52k mean billable, ~90s, ~20 turns) is what a future reader should
-    // compare against to tell whether it cost anything.
+    // and the 8/8 baseline (~52k mean billable, ~90s) is what a future reader should compare
+    // against to tell whether it cost anything. (This baseline used to also cite "~20 turns" --
+    // dropped, card #214: `num_turns` counts agentic loop turns, not API requests, and disagreed
+    // with the real deduplicated request count by more than 1.5x on 45% of a measured corpus, so
+    // it is not a figure worth carrying forward as a baseline. `numTurns` is no longer journalled
+    // at all; console/usage-scan.js's `requestCount` (computeStepDeltas/sessionRequestCount, fix
+    // pass) is the real per-step deduplicated request count for a reader who wants a comparable
+    // number here -- subagent requests included, printed via `spo tokens --usage-delta`.)
     baseModel: 'opus',
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],

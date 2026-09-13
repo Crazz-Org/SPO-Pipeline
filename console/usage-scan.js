@@ -640,12 +640,273 @@ function discoverUsageRoots(accountsDir) {
   return roots;
 }
 
+// ---- per-step journal-vs-transcript delta (card #214, action 4) -------------------------------
+//
+// Measured motivation: PLAN's contract resolved to `fable`, but 6 of 42 PLAN calls, measured
+// 2026-09-10..12 while PLAN was Fable-only (PR #222 changes PLAN to Opus-first with a Fable
+// fallback), spawned Opus subagents this table's own `model` field never named -- see
+// step-contracts.js's own comment on PLAN's `allowedTools` for the corrected, fuller-corpus
+// measurement, which also found IMPLEMENT can delegate, not only PLAN. A journal-only reader
+// had no way to notice, and the only way this was actually caught in the first place was a
+// hand-rolled, one-off join of 139 journalled calls against their transcripts (walking the
+// `subagents/` subtree that scanFile above already walks for every OTHER caller). This is that
+// join, promoted from a one-off script into a standing feature of this reader, so the next
+// divergence shows up without a hand-rolled measurement: rejoining the same 139 calls this way,
+// every step landed within 3.5% of the journal once the subagent walk was included (PLAN: $225.70
+// journalled vs $217.83 reconstructed) -- so a healthy corpus prints a SMALL delta, not zero; a
+// large one is the signal worth investigating, the same way finding 1 (the undeclared PLAN
+// subagents) was found in the first place.
+//
+// This DOES replace `numTurns` (removed from the journalled event by this same card, see
+// steps/llm.js's own comment) with a real request-count figure: `requestCount` below, the
+// deduplicated API request count `numTurns` never reliably was. It is NOT `callsMatched`/
+// `callsUnmatched` (those count CALLS -- one `llm-call` event -- not requests; a single call can
+// itself spend many requests, deduplicated across its own transcript and every subagent's own).
+// `requestCount`
+// sums `sessionRequestCount` (below) over every matched call's session: scanFile's own per-model
+// `msgs` counter, already deduplicated by `message.id` (last-occurrence-wins -- see scanFile's own
+// header) and already folded across a session's main transcript AND its `subagents/` subtree by
+// this module's own walk (listCandidateFiles). So a message rewritten several times in one
+// streamed line counts once, and a subagent's own requests are counted, never silently dropped --
+// exactly the two properties `numTurns` never had (see the fix pass that added this: fixture
+// coverage in test/dashboard-usage-scan.test.js proves both through the real scanFile/
+// listCandidateFiles pipeline, not just by summing pre-built numbers).
+
+// emptyStepDelta() -- the zero-value shape computeStepDeltas accumulates into, one per step name
+// encountered in the journal side of the join.
+function emptyStepDelta() {
+  return { journalBillableTokens: 0, transcriptBillableTokens: 0, requestCount: 0, callsMatched: 0, callsUnmatched: 0 };
+}
+
+// sessionBillableTokens(sessionEntry) -- sessionEntry: one value out of a `bySession` map (this
+// file's own `{models: {model: {inp, cc, cr, out, msgs}}}` shape, already deduplicated by
+// message.id and already folded across a session's main file AND its `subagents/` subtree by
+// scanFile/listCandidateFiles -- see this file's own header for why walking that subtree is the
+// whole fix for a session that delegates). Same billable formula as everywhere else in this repo
+// (fresh input + cache-creation + output, cache-read excluded -- see orchestrator/tokens.js's own
+// header for why), summed across every model the session touched.
+function sessionBillableTokens(sessionEntry) {
+  if (!sessionEntry || !sessionEntry.models) return 0;
+  let total = 0;
+  for (const m of Object.values(sessionEntry.models)) {
+    total += (m.inp || 0) + (m.cc || 0) + (m.out || 0);
+  }
+  return total;
+}
+
+// sessionRequestCount(sessionEntry) -- the deduplicated API request count for a session: sum of
+// each model's own `msgs` counter. `msgs` is scanFile's per-model count of messages that survived
+// its message.id dedup (last occurrence wins -- see scanFile's own header on why: a subagent
+// transcript rewrites the same assistant message across several consecutive lines as it streams,
+// growing output_tokens, and only the last one is counted), and by the time a model's `msgs`
+// reaches `bySession` it has already been folded (via mergeAgg) across every file scanFile found
+// for this session -- the main transcript AND every file under its `subagents/` subtree
+// (listCandidateFiles' own walk, reused here rather than re-derived). So this total already
+// reflects both properties `numTurns` never had: a message rewritten several times in one
+// streamed line counts once, and a subagent's own requests are counted, never silently dropped.
+// This is the deduplicated per-step request count `numTurns` used to stand in for badly (card
+// #214, item 3) -- it replaces that removed field; it is NOT `callsMatched`/`callsUnmatched`
+// above (a count of llm-call EVENTS, not of the requests each one can spend many of).
+//
+// LATENT CROSS-FILE OVER-COUNT (recorded, not fixed): `scanFile`'s `message.id` dedup is
+// PER FILE (its `lastById` map is scoped to one call) -- a `message.id` that repeats ACROSS two
+// files folded into the same `bySession` entry (main transcript + a `subagents/` file, or two
+// files that independently name the same session) would be counted once per file, not once
+// overall, over-counting this total. Measured 2026-09-13: 4 of 1,799 sessions carried 980
+// cross-file id repeats out of 109,874 total ids -- all four in resumed or interactive sessions
+// (a `claude --resume` re-opening a transcript the CLI itself re-wrote lines into), and NONE
+// joined to a pipeline `llm-call` event, so `requestCount` and the journal-vs-transcript delta
+// are unaffected by this today. Not fixed here: fixing it would mean deduplicating by
+// `message.id` GLOBALLY across every file in a session rather than per file, a real change to
+// `scanFile` itself (shared with every other caller of this module), not a one-line addition,
+// and nothing measured yet needs it.
+function sessionRequestCount(sessionEntry) {
+  if (!sessionEntry || !sessionEntry.models) return 0;
+  let total = 0;
+  for (const m of Object.values(sessionEntry.models)) {
+    total += m.msgs || 0;
+  }
+  return total;
+}
+
+// computeStepDeltas(usageIndex, journalCalls) -- usageIndex: an object carrying `bySession`
+// (either a real scan()/buildStepDeltaReport result, or a hand-built fixture in a test).
+// journalCalls: [{step, sessionId, billableTokens}], one entry per journalled `llm-call` event
+// that names a step. A call with no `sessionId` at all (an event that predates sessionId
+// journalling, or a spawn that never started -- see steps/llm.js's own header on when sessionId
+// is null) cannot be joined to anything and is silently skipped, not counted as unmatched: there
+// is nothing on the transcript side for either total to disagree with. A call whose sessionId
+// IS present but absent from `bySession` (the transcript was rotated/deleted, or ran on an
+// account/root this scan never covered) counts toward that step's `callsUnmatched` instead --
+// its journalled billableTokens is deliberately NOT added to the step's journal total either,
+// so an unmatched call can never masquerade as a transcript that measured exactly 0. Same rule
+// for `requestCount` (sessionRequestCount's own deduplicated-request total, see that function's
+// header): an unmatched call contributes 0 requests, never a false "this step made no requests".
+function computeStepDeltas(usageIndex, journalCalls) {
+  const bySession = (usageIndex && usageIndex.bySession) || {};
+  const steps = {};
+  for (const call of journalCalls || []) {
+    if (!call || typeof call.step !== 'string' || !call.step) continue;
+    if (typeof call.sessionId !== 'string' || !call.sessionId) continue;
+    const entry = (steps[call.step] = steps[call.step] || emptyStepDelta());
+    const sessionEntry = bySession[call.sessionId];
+    if (!sessionEntry) {
+      entry.callsUnmatched += 1;
+      continue;
+    }
+    entry.callsMatched += 1;
+    entry.journalBillableTokens += typeof call.billableTokens === 'number' ? call.billableTokens : 0;
+    entry.transcriptBillableTokens += sessionBillableTokens(sessionEntry);
+    entry.requestCount += sessionRequestCount(sessionEntry);
+  }
+  for (const entry of Object.values(steps)) {
+    entry.delta = entry.journalBillableTokens - entry.transcriptBillableTokens;
+    entry.deltaPct = entry.transcriptBillableTokens > 0 ? (entry.delta / entry.transcriptBillableTokens) * 100 : null;
+  }
+  return steps;
+}
+
+// collectJournalCallsForStepDelta(journalRoot) -- the journal side of the join: every task
+// directory's own `journal.jsonl` PLUS the daemon-scoped `journal/daemon.jsonl` (intake's
+// DRAFT_CARD/REVIEW_CARD/TRIAGE_BUG_REPORT calls -- orchestrator/intake.js's
+// journalIntakeLlmCall writes the exact same `llm-call` event shape there, see that function's
+// own header), collecting {step, sessionId, billableTokens} for every `llm-call` event found.
+// Never throws: an unreadable directory, an unreadable file, or a torn/corrupt journal line (the
+// daemon may be appending to either file while this reads it) is skipped, the same convention
+// every other reader in this repo already uses.
+function collectJournalCallsForStepDelta(journalRoot) {
+  const calls = [];
+  if (!journalRoot) return calls;
+
+  function collectFromFile(filePath) {
+    let raw;
+    try {
+      raw = fs.readFileSync(filePath, 'utf8');
+    } catch {
+      return;
+    }
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (event.event !== 'llm-call') continue;
+      calls.push({
+        step: event.step,
+        sessionId: event.sessionId,
+        billableTokens: typeof event.billableTokens === 'number' ? event.billableTokens : 0,
+      });
+    }
+  }
+
+  let taskDirs = [];
+  try {
+    taskDirs = fs
+      .readdirSync(journalRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    taskDirs = [];
+  }
+  for (const id of taskDirs) {
+    collectFromFile(path.join(journalRoot, id, 'journal.jsonl'));
+  }
+  collectFromFile(path.join(journalRoot, 'daemon.jsonl'));
+
+  return calls;
+}
+
+// buildStepDeltaReport({journalRoot, roots, filter, maxFileBytes}) -- ties the two halves
+// together: collectJournalCallsForStepDelta above for the journal side, a ONE-SHOT transcript
+// scan for the other -- reusing listCandidateFiles' subagent walk and scanFile's message.id
+// dedup exactly as createUsageScanner's own scan() does (this is deliberately NOT a second
+// implementation of that walk, per this card's own instruction not to build a new reconciliation
+// reader), just without createUsageScanner's mtime/size cache: a one-off report has no repeat
+// caller to amortize a cache for. Returns {steps: computeStepDeltas' own return shape,
+// scannedSessions: how many distinct sessions the transcript side found at all, regardless of
+// whether the journal side ever names them -- a sanity figure for "did this scan see anything"}.
+async function buildStepDeltaReport({ journalRoot, roots = [], filter = null, maxFileBytes = DEFAULT_MAX_FILE_BYTES } = {}) {
+  const journalCalls = collectJournalCallsForStepDelta(journalRoot);
+  const files = listCandidateFiles({ roots, filter });
+  const bySession = {};
+  for (const f of files) {
+    let st;
+    try {
+      st = fs.statSync(f.absPath);
+    } catch {
+      continue;
+    }
+    if (st.size > maxFileBytes) continue;
+    const agg = await scanFile(f.absPath, f.account);
+    if (!agg.sessionId) continue;
+    const sEntry = (bySession[agg.sessionId] = bySession[agg.sessionId] || { models: {} });
+    for (const [model, m] of Object.entries(agg.models)) {
+      const sModel = (sEntry.models[model] = sEntry.models[model] || emptyModelAgg());
+      mergeAgg(sModel, m);
+    }
+  }
+  return { steps: computeStepDeltas({ bySession }, journalCalls), scannedSessions: Object.keys(bySession).length };
+}
+
+// formatStepDeltaReport(report) -- pure string formatting (no I/O), so any caller (bin/spo's
+// `cmdTokens`, a future dashboard panel) can print the result of buildStepDeltaReport/
+// computeStepDeltas directly. Returns [] (nothing to print) when no step carries a joinable
+// call -- a caller should skip the section entirely rather than print an empty header.
+function formatStepDeltaReport(report) {
+  const steps = (report && report.steps) || {};
+  const names = Object.keys(steps).sort();
+  if (names.length === 0) return [];
+  const lines = [
+    '',
+    'per-step journal-vs-transcript delta (card #214, billable-weighted tokens) and deduplicated request count (the numTurns replacement, card #214 fix pass):',
+  ];
+  for (const step of names) {
+    const s = steps[step];
+    const pct = s.deltaPct === null ? 'n/a' : `${s.deltaPct >= 0 ? '+' : ''}${s.deltaPct.toFixed(1)}%`;
+    const unmatched = s.callsUnmatched ? `, ${s.callsUnmatched} unmatched` : '';
+    lines.push(
+      `  ${step.padEnd(18)}journal ${formatTokenCountForDelta(s.journalBillableTokens).padStart(8)}  ` +
+        `transcript ${formatTokenCountForDelta(s.transcriptBillableTokens).padStart(8)}  ` +
+        `delta ${pct.padStart(7)}  requests ${String(s.requestCount).padStart(6)}  (${s.callsMatched} matched${unmatched})`
+    );
+  }
+  return lines;
+}
+
+// A local copy of orchestrator/tokens.js's formatTokenCount -- not imported from there on
+// purpose: orchestrator/ is this pipeline's state-machine layer and console/ its read-only
+// dashboard/reporting layer, and this file already keeps no dependency the other direction (see
+// its own header: it is imported BY orchestrator/token-recovery.js, never the reverse). Kept
+// byte-identical to tokens.js's version; if the two drift, extend the sibling-grep the next time
+// either changes.
+function formatTokenCountForDelta(n) {
+  const v = typeof n === 'number' ? n : 0;
+  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return String(Math.round(v));
+}
+
 module.exports = {
   createUsageScanner,
   buildTokenViews,
   buildTrendViews,
   discoverUsageRoots,
   localDateKey,
+  // Card #214, action 4: the per-step journal-vs-transcript delta, and (fix pass, same card) the
+  // deduplicated request count replacing `numTurns` -- computeStepDeltas/sessionBillableTokens/
+  // sessionRequestCount are pure (test fixtures build `usageIndex`/`journalCalls` by hand, never
+  // touching disk); collectJournalCallsForStepDelta and buildStepDeltaReport are the real I/O,
+  // exported so bin/spo's `cmdTokens` (or a future dashboard panel) can call them without a
+  // second implementation.
+  computeStepDeltas,
+  sessionBillableTokens,
+  sessionRequestCount,
+  collectJournalCallsForStepDelta,
+  buildStepDeltaReport,
+  formatStepDeltaReport,
   DEFAULT_MAX_FILE_BYTES,
   // listJsonlFilesRecursive / listCandidateFiles are exported for scripts/usage-report.js
   // (SPO-Pipeline#170): the offline CLI's own discovery used to be a second, undeclared copy of
