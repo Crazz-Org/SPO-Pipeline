@@ -123,6 +123,9 @@ test('PLAN real card path: a two-model modelUsage payload journals a per-model b
     criterion: 'the widget renders',
     worktreePath: '/tmp/worktree-526',
     size: 'S',
+    // PR #222 made PLAN Opus-first. The shape below was measured while PLAN was Fable-only, so
+    // this task takes #222's Fable fallback to keep that shape: a Fable call with an Opus subagent.
+    planInvalidRetry: true,
   };
 
   const deps = {
