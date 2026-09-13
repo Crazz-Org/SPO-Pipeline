@@ -1046,7 +1046,14 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // costs six throwaway (exit-swept) temp directories per call (test/helpers.js:106-142, the same
   // cost the temp-dir-registry ALLOWLIST entry above cites for skipping it elsewhere), and this
   // keeps the file with no allowlist entry of its own.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  // doc/manual-nightly-proof.md (2026-09-13): nightly-proof.test.js spawns bin/spo three times, each
+  // audited against the four properties: `env` is `isolatedEnv()` or `{ ...isolatedEnv(), CLAUDECODE }`
+  // with isolatedEnv() spread first and nothing after it but that one key, no `--real`. Two are
+  // `spo nightly reprove`, which refuses before spawning anything -- that refusal is what those
+  // tests assert. The third, `spo nightly`, gets --journal/--queue/--bench-dir as fresh mkTmp dirs,
+  // and its only spawn (`git ls-remote` in the isolated SPO_PRODUCT_REPO) meets the child's own
+  // SPO_NO_REAL_SPAWN guard, which is why that test expects UNKNOWN.
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });

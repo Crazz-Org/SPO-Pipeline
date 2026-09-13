@@ -738,7 +738,7 @@ function renderServicesInner(services, accounts, prod) {
   const nightlyStatus = NIGHTLY_WORD[nightly.status] || 'UNKNOWN';
   const nightlyCls = tileClass(nightly.status);
   const nightlyCaption = nightly.finishedAt
-    ? `verdict ${nightly.verdict || '?'}, ${fmtAgeMs(nightly.ageMs)} ago${nightly.status === 'stale' ? ' — STALE (>36h)' : ''}`
+    ? `verdict ${nightly.verdict || '?'}, ${fmtAgeMs(nightly.ageMs)} ago${nightly.manualBy ? ` — manual, by ${nightly.manualBy}` : ''}${nightly.status === 'stale' ? ' — STALE (>36h)' : ''}`
     : 'no data yet';
   const passRate = verdicts.recentTotal ? Math.round((verdicts.recentPass / verdicts.recentTotal) * 100) : null;
   const VERDICTS_WORD = { pass: 'STABLE', fail: 'UNSTABLE', stale: 'STALE', unknown: 'UNKNOWN' };

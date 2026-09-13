@@ -472,7 +472,7 @@ test('every bin/spo top-level subcommand is named in README.md', () => {
   // posture as this file's other siteCount/checked floors.
   assert.deepEqual(
     commands.slice().sort(),
-    ['account', 'accounts', 'ask', 'cost', 'dashboard', 'intake', 'parked', 'pull', 'pull-reports', 'recette', 'reports', 'resume', 'status', 'task', 'tokens', 'triage'],
+    ['account', 'accounts', 'ask', 'cost', 'dashboard', 'intake', 'nightly', 'parked', 'pull', 'pull-reports', 'recette', 'reports', 'resume', 'status', 'task', 'tokens', 'triage'],
     'bin/spo\'s top-level dispatch table changed -- a subcommand was added, removed, or renamed. ' +
       'Update this pin AND README.md\'s bin/spo row in the same change.'
   );
