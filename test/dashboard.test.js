@@ -435,6 +435,28 @@ test('collectServices: a nightly that FAILED stays RED however old it is -- stal
   assert.match(html, /svc-tile tile-red[\s\S]{0,400}?Nightly[\s\S]{0,400}?>RED</, 'a stale FAIL renders red, not orange');
 });
 
+test('collectServices: a manual nightly names who asked on the tile, and the trigger changes nothing about its status', () => {
+  // doc/manual-nightly-proof.md: `trigger`/`requestedBy` are legibility, never classification.
+  const benchRoot = mkTmp('spo-dash-nightly-manual-');
+  const now = Date.parse('2026-09-13T15:00:00.000Z');
+  const finishedAt = new Date(now - 60 * 60 * 1000).toISOString();
+  const record = { verdict: 'PASS', sha: 'abc123', finishedAt, trigger: 'manual', requestedBy: { user: 'crazz' } };
+  writeJson(path.join(benchRoot, 'nightly', 'latest.json'), record);
+
+  const services = collectServices({ benchRoot, now });
+  assert.equal(services.nightly.status, 'pass');
+  assert.equal(services.nightly.manualBy, 'crazz');
+  const html = renderDashboard({ services, accounts: { rows: [] } }, { view: 'health' });
+  assert.match(html, /Nightly[\s\S]{0,600}?verdict PASS, [^<]* — manual, by crazz/);
+
+  const scheduledRoot = mkTmp('spo-dash-nightly-scheduled-');
+  writeJson(path.join(scheduledRoot, 'nightly', 'latest.json'), { ...record, trigger: 'scheduled' });
+  const scheduled = collectServices({ benchRoot: scheduledRoot, now });
+  assert.equal(scheduled.nightly.status, 'pass');
+  assert.equal(scheduled.nightly.manualBy, null);
+  assert.doesNotMatch(renderDashboard({ services: scheduled, accounts: { rows: [] } }, { view: 'health' }), /manual, by/);
+});
+
 test('collectServices does NOT mark fresh bench verdicts stale', () => {
   const benchRoot = mkTmp('spo-dash-verdicts-fresh-');
   const now = Date.parse('2026-09-01T12:00:00.000Z');

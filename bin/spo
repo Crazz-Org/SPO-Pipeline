@@ -2188,10 +2188,71 @@ async function cmdRecette(opts, deps = {}) {
   process.exitCode = result.ok ? 0 : 1;
 }
 
+// `spo nightly` -- the nightly proof of SPO-WebClient's main, read-only: MAIN GREEN/RED/UNKNOWN from
+// steps/scripted.js's own classifyNightly against `git ls-remote` origin/main, the record's trigger
+// (scheduled/manual, who asked), a pending manual request, and the cards parked nightly-main-red.
+// Exit 0 green, 1 red, 2 unknown -- SPO-WebClient scripts/nightly-check.sh's codes.
+//
+// `spo nightly reprove --reason <text>` -- asks the bench worker for a fresh nightly-equivalent
+// proof of origin/main's tip. HUMAN ONLY: refused inside a Claude Code session and without a
+// terminal. Runs SPO-WebClient's `request-nightly`, which confirms the sha and leaves a request the
+// worker serves from its idle queue. See orchestrator/nightly-proof.js, doc/manual-nightly-proof.md.
+//
+// All the logic is in orchestrator/nightly-proof.js; this is CLI glue. It sits after cmdRecette, and
+// `--reason` is read from opts._ rather than parseArgs, so that no line above moves: doc/ cites
+// bin/spo by line (test/doc-constant-sweep.test.js). classifyNightly is required lazily --
+// steps/scripted.js is heavy and no other command here needs it. Never write under the bench dir
+// from here: see nightly-proof.js's header.
+function reasonFrom(args) {
+  const i = args.indexOf('--reason');
+  if (i !== -1) return args[i + 1];
+  const eq = args.find((a) => a.startsWith('--reason='));
+  return eq ? eq.slice('--reason='.length) : null;
+}
+
+function cmdNightly(opts) {
+  const nightlyProof = require('../orchestrator/nightly-proof');
+  const productRepo = defaultConfig.productRepo;
+  if (opts._[0] === 'reprove') {
+    process.exitCode = nightlyProof.reprove(
+      {
+        reason: reasonFrom(opts._),
+        productRepo,
+        env: process.env,
+        stdinIsTTY: Boolean(process.stdin.isTTY),
+        stdoutIsTTY: Boolean(process.stdout.isTTY),
+        err: (line) => console.error(line),
+      },
+      { spawnSync: (...args) => require('child_process').spawnSync(...args) }
+    );
+    return;
+  }
+  if (opts._[0] !== undefined) {
+    console.error('usage: spo nightly [reprove --reason "<text>"]');
+    process.exitCode = 1;
+    return;
+  }
+  const { journalRoot } = resolveDirs(opts);
+  const { classifyNightly } = require('../orchestrator/steps/scripted');
+  const state = nightlyProof.readNightlyState(resolveBenchDir(opts));
+  const tip = nightlyProof.resolveOriginMainTip(productRepo, (...args) => require('child_process').execFileSync(...args));
+  const classification = tip.sha
+    ? classifyNightly(state.latest, tip.sha)
+    : { status: 'unknown', reason: 'could not resolve origin/main' };
+  const lines = nightlyProof.formatNightlyStatus({
+    ...state,
+    tip,
+    classification,
+    parks: nightlyProof.listNightlyRedParks(journalRoot),
+  });
+  for (const line of lines) console.log(line);
+  process.exitCode = nightlyProof.STATUS_EXIT[classification.status];
+}
+
 function printUsage() {
   console.error(
     [
-      'usage: spo <status|task <id>|parked|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
+      'usage: spo <status|task <id>|parked|nightly [reprove --reason <text>]|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            tokens: [--usage-delta] (per-step journal-vs-transcript delta, real transcript-corpus scan, opt-in)',
       '            ask: [--repo <owner/name>|--repo=<owner/name>, LEADING only] [--dry] [--draft-file <path>]   pull: [--limit <n>] [--force]',
@@ -2217,6 +2278,7 @@ function main() {
     return cmdTask(id, opts);
   }
   if (cmd === 'parked') return cmdParked(opts);
+  if (cmd === 'nightly') return cmdNightly(opts);
   if (cmd === 'tokens') return cmdTokens(opts);
   if (cmd === 'cost') return cmdCostDeprecated(opts);
   if (cmd === 'resume') {
