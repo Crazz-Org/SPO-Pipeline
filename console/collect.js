@@ -732,7 +732,7 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
     daemon: { status: 'unknown', pid: null, host: null, mode: null, startedAt: null, uptimeMs: null },
     queue: { status: 'ok', depth: 0 },
     benchWorker: { status: 'unknown', pid: null, port: null, startedAt: null, heartbeatAt: null, heartbeatAgeMs: null },
-    nightly: { status: 'unknown', verdict: null, sha: null, finishedAt: null, ageMs: null },
+    nightly: { status: 'unknown', verdict: null, sha: null, finishedAt: null, ageMs: null, manualBy: null },
     verdicts: { status: 'unknown', lastVerdict: null, lastAt: null, ageMs: null, recentPass: 0, recentTotal: 0 },
     // action 6.7: C6's dispatcher.js/live-workers.json, an AGGREGATE COUNT ONLY -- see this
     // module's own header ("per-task detail duplicates the GitHub Projects board") for why this
@@ -813,6 +813,11 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
       services.nightly.verdict = nightly.verdict || null;
       services.nightly.sha = nightly.sha || null;
       services.nightly.finishedAt = nightly.finishedAt || null;
+      // doc/manual-nightly-proof.md: a record a human asked for says so on the tile. Display only --
+      // status below is unchanged by the trigger, exactly as classifyNightly is.
+      if (nightly.trigger === 'manual') {
+        services.nightly.manualBy = (nightly.requestedBy && nightly.requestedBy.user) || '?';
+      }
       const finishedMs = nightly.finishedAt ? Date.parse(nightly.finishedAt) : NaN;
       const ageMs = Number.isFinite(finishedMs) ? now - finishedMs : null;
       services.nightly.ageMs = ageMs;
