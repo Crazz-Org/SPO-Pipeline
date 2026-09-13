@@ -97,6 +97,8 @@ The method is not optional and not re-invented per session — it is the plan's 
   `README.md`, and reports what it found; the Opus verifier checks it did.
 - Audits use the other pairing: read-only **Fable 5.1** sweep, then **every** finding re-verified by
   Opus running a real probe — Fable's line refs hold, its derived conclusions have been inverted.
+- **Model/effort audits start from `doc/model-experiments.md`.** Re-measure every open entry
+  (`node scripts/model-report.js`), give it a verdict against its revert criterion, and record that verdict there.
 
 ## Git
 

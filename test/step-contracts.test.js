@@ -17,6 +17,7 @@ const {
   shouldEscalate,
   EFFORT_BY_SIZE,
   IMPLEMENT_EFFORT_BY_SIZE,
+  PLAN_EFFORT_BY_SIZE,
   LLM_STEP_DEADLINE_MS,
   LLM_STEP_DEADLINE_MS_BY_STEP,
   MAX_LLM_STEP_DEADLINE_MS,
@@ -77,23 +78,55 @@ test('cwdKind matches config.js WORKTREE_SIDE_STEPS exactly (one policy, not dup
 
 test('resolveStepContract: PLAN never escalates on touchesRdoMembers (spec wins over prompts/README.md)', () => {
   const c = resolveStepContract('PLAN', { size: 'S', touchesRdoMembers: true });
-  assert.equal(c.model, 'fable');
+  assert.equal(c.model, 'opus');
   assert.equal(c.escalated, false);
 });
 
-// Replaces 'PLAN escalates on the generic task.escalate fallback flag' (2026-09-04). That flag was
-// removed: `task.escalate` is assigned nowhere in orchestrator/, bin/ or console/, so the escalation
-// both docs promised could never fire. The regression this guards is someone re-adding a PLAN
-// escalation without a trigger that actually exists -- note it asserts on a task carrying EVERY
-// signal the other steps escalate on, not just the deleted one.
-test('resolveStepContract: PLAN never escalates -- no reachable trigger exists, and `escalate` is gone', () => {
-  for (const task of [{ size: 'S' }, { size: 'S', escalate: true }, { size: 'L', touchesRdoMembers: true, escalate: true }]) {
+// 2026-09-13 (EXP-PLAN-OPUS, doc/model-experiments.md): PLAN is Opus-first with Fable as its
+// fallback. This replaces 'PLAN never escalates' (2026-09-04), which guarded against re-adding a
+// PLAN escalation with no trigger that could fire -- the `task.escalate` flag nothing ever set.
+// The new trigger IS reachable: handlePlan (state-machine.js) assigns task.planInvalidRetry right
+// before each PLAN call -- test/plan-writes.test.js drives both paths end to end. What this test
+// still guards is the old failure's other half: every signal the OTHER steps escalate on is carried
+// below, and none of them may move PLAN off Opus.
+test('resolveStepContract: PLAN is Opus-first and falls back to Fable ONLY on planInvalidRetry', () => {
+  const everyOtherSignal = {
+    size: 'L',
+    touchesRdoMembers: true,
+    rdoDiffTouched: true,
+    planDeclaresRdoMembers: true,
+    diagnoseOrValidateRetry: true,
+    escalate: true,
+  };
+  for (const task of [{ size: 'S' }, { size: 'S', escalate: true }, everyOtherSignal]) {
     const c = resolveStepContract('PLAN', task);
-    assert.equal(c.model, 'fable', `PLAN must stay Fable for ${JSON.stringify(task)}`);
+    assert.equal(c.model, 'opus', `PLAN must stay Opus for ${JSON.stringify(task)}`);
     assert.equal(c.escalated, false);
   }
-  assert.equal(STEP_CONTRACTS.PLAN.escalatedModel, null, 'the table must not advertise an unreachable escalation');
-  assert.deepEqual(STEP_CONTRACTS.PLAN.escalatesOn, []);
+  const fallback = resolveStepContract('PLAN', { size: 'M', planInvalidRetry: true });
+  assert.equal(fallback.model, 'fable');
+  assert.equal(fallback.escalated, true);
+  assert.equal(STEP_CONTRACTS.PLAN.baseModel, 'opus');
+  assert.equal(STEP_CONTRACTS.PLAN.escalatedModel, 'fable');
+  assert.deepEqual(STEP_CONTRACTS.PLAN.escalatesOn, ['planInvalidRetry']);
+});
+
+// Same strictness convention as IMPLEMENT's signals below: only a boolean `true` buys the fallback.
+for (const bogus of ['false', 'true', 0, 1, {}, []]) {
+  test(`resolveStepContract: PLAN planInvalidRetry ${JSON.stringify(bogus)} is not boolean true -- stays Opus`, () => {
+    assert.equal(resolveStepContract('PLAN', { size: 'S', planInvalidRetry: bogus }).model, 'opus');
+  });
+}
+
+// planInvalidRetry is PLAN's own vocabulary: a card re-planned after a plan-invalid park must not
+// also drag any other step's model with it.
+test('resolveStepContract: no step other than PLAN escalates on planInvalidRetry', () => {
+  for (const [name, def] of Object.entries(STEP_CONTRACTS)) {
+    if (name === 'PLAN') continue;
+    assert.ok(!def.escalatesOn.includes('planInvalidRetry'), `${name} must not list planInvalidRetry`);
+    const task = { size: 'S', planInvalidRetry: true };
+    assert.equal(resolveStepContract(name, task).model, def.baseModel, `${name} moved on planInvalidRetry`);
+  }
 });
 
 // The flag is gone everywhere, not just from PLAN -- a sweep, so re-adding it to any one step is
@@ -330,10 +363,19 @@ test('resolveStepContract: DIAGNOSE and CITATION_VERIFIER never escalate, whatev
   assert.equal(shouldEscalate(STEP_CONTRACTS.CITATION_VERIFIER, task), false);
 });
 
-test('resolveStepContract: PLAN effort follows task.size (S/M/L -> low/medium/high)', () => {
-  assert.equal(resolveStepContract('PLAN', { size: 'S' }).effort, 'low');
-  assert.equal(resolveStepContract('PLAN', { size: 'M' }).effort, 'medium');
+// EXP-PLAN-OPUS (2026-09-13): PLAN runs one rung above the old low/medium/high. The ceiling matters as
+// much as the floor: `xhigh` on L would push an Opus call plus its in-run Fable fallback toward
+// PLAN's deadline. See PLAN_EFFORT_BY_SIZE's comment and doc/model-experiments.md.
+test('resolveStepContract: PLAN effort follows task.size through PLAN_EFFORT_BY_SIZE (S/M/L -> medium/high/high)', () => {
+  assert.equal(resolveStepContract('PLAN', { size: 'S' }).effort, 'medium');
+  assert.equal(resolveStepContract('PLAN', { size: 'M' }).effort, 'high');
   assert.equal(resolveStepContract('PLAN', { size: 'L' }).effort, 'high');
+  // The map belongs to the step, not the model: the Fable fallback call runs at the same effort.
+  assert.equal(resolveStepContract('PLAN', { size: 'S', planInvalidRetry: true }).effort, 'medium');
+  for (const size of ['S', 'M', 'L', undefined, 'nonsense']) {
+    const { effort } = resolveStepContract('PLAN', { size });
+    assert.ok(effort === 'medium' || effort === 'high', `size ${size} resolved PLAN effort ${effort}`);
+  }
 });
 
 // IMPLEMENT stopped sharing PLAN's map on 2026-09-04: its S row is 'medium'. That change is a
@@ -351,11 +393,13 @@ test('resolveStepContract: IMPLEMENT has its own size map with a `medium` floor,
   }
 });
 
-// The two maps must stay independent objects: sharing one again would silently re-couple the steps,
-// and the next edit to PLAN's floor would move IMPLEMENT's with it.
-test('resolveStepContract: PLAN and IMPLEMENT do not share one size->effort map', () => {
+// The maps must stay independent objects. Sharing one again would silently re-couple the two
+// experiments, so reverting one of them would move the other.
+test('resolveStepContract: PLAN and IMPLEMENT each carry their own size->effort map', () => {
   assert.notEqual(EFFORT_BY_SIZE.S, IMPLEMENT_EFFORT_BY_SIZE.S);
-  assert.equal(STEP_CONTRACTS.PLAN.effortBySize, undefined, 'PLAN uses the shared default');
+  assert.notEqual(EFFORT_BY_SIZE.S, PLAN_EFFORT_BY_SIZE.S);
+  assert.notEqual(PLAN_EFFORT_BY_SIZE, IMPLEMENT_EFFORT_BY_SIZE);
+  assert.equal(STEP_CONTRACTS.PLAN.effortBySize, PLAN_EFFORT_BY_SIZE);
   assert.equal(STEP_CONTRACTS.IMPLEMENT.effortBySize, IMPLEMENT_EFFORT_BY_SIZE);
 });
 

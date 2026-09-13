@@ -583,6 +583,60 @@ function normalizeDeclaredInvariantIds(rawInvariantIds) {
   return { declaredIds: isList ? declared.items : [], shape: declared.shape };
 }
 
+// EXP-PLAN-OPUS (2026-09-13, doc/model-experiments.md): PLAN is Opus-first, with Fable as its
+// fallback, and task.planInvalidRetry is the one signal step-contracts.js's shouldEscalate moves
+// it on. This is the cross-run half of that signal: true when the card's MOST RECENT park was
+// plan-invalid. It is read from the journal fresh at each PLAN call, following the same
+// "whatever the journal holds AT THIS CALL" rule as resolvePlanDeclaresRdoMembers, because a
+// `retry` restarts the card at INTAKE with a fresh ctx.task. "Most recent", not "ever":
+// decidePlanReuse's condition 6 reads the same event the same way, and a card whose Fable re-plan
+// later parked on something orthogonal (gate-failed, say) has no reason to stay off Opus.
+function lastParkWasPlanInvalid(ctx) {
+  const lastParked = [...readJournalLines(ctx.taskDir)].reverse().find((e) => e && e.event === 'parked');
+  return Boolean(lastParked && lastParked.reason === 'plan-invalid');
+}
+
+// The plan-invalid detail handlePlan parks with, or null when the reply satisfies the contract.
+// Factored out so that the in-run Fable fallback judges the Opus reply and the Fable reply by one
+// rule. `noFixture` is callLlmStep's `result === null` (shadow mode with no llm.PLAN fixture),
+// which has always meant "trivially ok, nothing to validate".
+function planInvalidDetail(payload, noFixture) {
+  if (!payload || payload.ok === false) return { payload };
+  if (noFixture) return null;
+  const missing = [];
+  if (typeof payload.plan_markdown !== 'string' || payload.plan_markdown.trim() === '') missing.push('plan_markdown');
+  if (typeof payload.invariants_markdown !== 'string' || payload.invariants_markdown.trim() === '') {
+    missing.push('invariants_markdown');
+  }
+  return missing.length > 0 ? { payload, missing } : null;
+}
+
+// One PLAN LLM call: journals its result and parks a transport failure itself, so a transport
+// failure never reaches the plan-invalid judgement or the Fable fallback. It says nothing about
+// the plan, and re-running the identical call on another model would only spend a second call.
+async function callPlanOnce(ctx) {
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
+  const payload = result === null ? { ok: true } : result;
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
+
+  // Action 1.4: a transport failure (spawn error, non-JSON output, missing required key, a
+  // deadline kill -- classifyFailure's 'error' kind, or timedOut on its own) means PLAN never
+  // produced a verdict at all. Route it to its own park, distinct from 'plan-invalid', which is
+  // reserved for a real reply the model DID produce that fails the plan_markdown/
+  // invariants_markdown contract (planInvalidDetail). `kind: 'limit'` is deliberately excluded
+  // here -- that is the account-rotation path callLlmStep already retries across accounts; a
+  // 'limit' result reaching this line at all would mean rotation gave up, and is left to
+  // plan-invalid/the generic ok:false branch exactly as before.
+  if (payload && payload.ok === false && (payload.kind === 'error' || payload.timedOut)) {
+    throw new ParkSignal('llm-transport-failed:PLAN', {
+      kind: payload.kind,
+      timedOut: payload.timedOut,
+      error: payload.error,
+    });
+  }
+  return { result, payload };
+}
+
 async function handlePlan(ctx) {
   // Action 3.1: a still-valid plan from an earlier run short-circuits everything below, including
   // the LLM call itself -- that IS the point, not an optimization bolted onto a call that still
@@ -660,38 +714,42 @@ async function handlePlan(ctx) {
     return 'IMPLEMENT';
   }
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', ctx.deps);
-  const payload = result === null ? { ok: true } : result;
-  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload });
-
-  // Action 1.4: a transport failure (spawn error, non-JSON output, missing required key, a
-  // deadline kill -- classifyFailure's 'error' kind, or timedOut on its own) means PLAN never
-  // produced a verdict at all. Route it to its own park, distinct from 'plan-invalid', which is
-  // reserved for a real reply the model DID produce that fails the plan_markdown/
-  // invariants_markdown contract below. `kind: 'limit'` is deliberately excluded here -- that is
-  // the account-rotation path callLlmStep already retries across accounts; a 'limit' result
-  // reaching this line at all would mean rotation gave up, and is left to plan-invalid/the
-  // generic ok:false branch exactly as before.
-  if (payload && payload.ok === false && (payload.kind === 'error' || payload.timedOut)) {
-    throw new ParkSignal('llm-transport-failed:PLAN', {
-      kind: payload.kind,
-      timedOut: payload.timedOut,
-      error: payload.error,
-    });
+  // EXP-PLAN-OPUS (doc/model-experiments.md): PLAN is Opus-first with a Fable fallback, driven by
+  // task.planInvalidRetry. It is assigned immediately before the call because resolveStepContract
+  // sees ONLY ctx.task -- the same placement handleImplement uses for its own derived signals.
+  // Real mode only: shadow fixtures and --dry-run never choose a model, so a second call there
+  // would just replay the same fixture. Every switch to Fable journals `plan-model-fallback`
+  // with its cause, and the `llm-call` that follows names the model actually used. Audits count
+  // both through scripts/model-report.js.
+  const realMode = isRealMode(ctx);
+  ctx.task.planInvalidRetry = realMode && lastParkWasPlanInvalid(ctx);
+  if (ctx.task.planInvalidRetry) {
+    appendEvent(ctx.taskDir, 'PLAN', 'plan-model-fallback', { cause: 'prior-plan-invalid-park' });
   }
-  if (!payload || payload.ok === false) {
-    throw new ParkSignal('plan-invalid', { payload });
+
+  let { result, payload } = await callPlanOnce(ctx);
+  let invalid = planInvalidDetail(payload, result === null);
+
+  // The in-run half: an Opus reply that would park plan-invalid gets ONE more call, on Fable.
+  // Once per run by construction -- planInvalidRetry is already true for that second call, and
+  // for a card that started on Fable, so a Fable reply that is still invalid parks exactly as
+  // every PLAN reply did before this experiment.
+  if (invalid && realMode && ctx.task.planInvalidRetry !== true) {
+    appendEvent(ctx.taskDir, 'PLAN', 'plan-model-fallback', {
+      cause: 'plan-invalid-reply',
+      missing: invalid.missing || null,
+    });
+    ctx.task.planInvalidRetry = true;
+    ({ result, payload } = await callPlanOnce(ctx));
+    invalid = planInvalidDetail(payload, result === null);
+  }
+  if (invalid) {
+    throw new ParkSignal('plan-invalid', invalid);
   }
   if (result === null) return 'IMPLEMENT';
 
   const planMarkdown = payload.plan_markdown;
   const invariantsMarkdown = payload.invariants_markdown;
-  const missing = [];
-  if (typeof planMarkdown !== 'string' || planMarkdown.trim() === '') missing.push('plan_markdown');
-  if (typeof invariantsMarkdown !== 'string' || invariantsMarkdown.trim() === '') missing.push('invariants_markdown');
-  if (missing.length > 0) {
-    throw new ParkSignal('plan-invalid', { payload, missing });
-  }
 
   const dir = scratchDir(ctx.taskDir);
   fs.mkdirSync(dir, { recursive: true });
@@ -1360,7 +1418,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:986's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1029's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
