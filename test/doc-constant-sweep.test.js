@@ -30,7 +30,7 @@ const { gitEnv, mkTmp } = require('./helpers');
 // trackedFiles/PRODUCT_REPO/DEPLOY_REPO) lives in citation-pins.js -- action 11.1 (#206) moved
 // it there so this file and action 11.3's test/-comment-citation sweep call the same function
 // instead of each carrying a copy that could drift. resolvePins (the pinned-anchor check) and
-// its data (BENCH_PINS/LIVE_RANGE_PINS/BLUNT_PINS) live there too.
+// its data (BENCH_PINS/LIVE_RANGE_PINS/BLUNT_PINS/CCA_PINS) live there too.
 const {
   PRODUCT_REPO,
   DEPLOY_REPO,
@@ -42,7 +42,7 @@ const {
   shiftedCitation,
   resolvePins,
 } = require('./citation-pins');
-const { BENCH_PINS, LIVE_RANGE_PINS, BLUNT_PINS } = require('./citation-pins-data');
+const { BENCH_PINS, LIVE_RANGE_PINS, BLUNT_PINS, CCA_PINS } = require('./citation-pins-data');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -2651,6 +2651,192 @@ test('LIVE_RANGE_PINS/BLUNT_PINS cite exactly what the live corpus text says tod
   assert.deepEqual(offenders, [], `pinned live citation(s) no longer match the corpus's current text -- a citing file's number moved without LIVE_RANGE_PINS/BLUNT_PINS following, or vice versa:\n  ${offenders.join('\n  ')}`);
 });
 
+// ---- part 2.8: pinned literal-text citation check for doc/comment-corpus-audit-2026-09-03.md
+// (action 11.2, #206) ------------------------------------------------------------------------
+//
+// This doc is a THIRD dated record, same posture as the two bench docs part 2.7 pins: it is
+// deliberately excluded from CORPUS_FILES ("written AFTER the corpus it measured -- not part of
+// what it measured", CORPUS_FILES's own comment above), so none of its 37 file-tied citations
+// were ever checked by anything -- part 2's ratchet does not scan it, and the identifier-anchor
+// layer (part 2.5/2.6) never gets the chance to either. #206's own comments measured this being
+// exploited in practice: two `bin/spo` citations were hand re-pinned to today's tree by card
+// #208/#214 (`:2220`/`:1139`) with nothing failing, and three more had already drifted silently
+// before that. CCA_PINS (test/citation-pins-data.js) closes the same gap part 2.7 closed for the
+// bench docs, for this doc instead: every file-tied citation gets a literal-text pin, frozen at
+// the SPO-Pipeline commit this doc's own header names (`7902164309c1766d7b785daab9ba94ff6472bc1d`)
+// -- never `d03ea8b7` (the commit the header names for `~/SPO-WebClient`), since nothing in this
+// doc cites a product file by line. This doc is NOT added to CORPUS_FILES itself -- its 67-file
+// scope and every count pinned on it (EXPECTED_CITATIONS, `checked`, etc.) stay exactly as they
+// are; CCA_PINS is a parallel, dedicated walk, the same relationship BENCH_PINS has to the corpus
+// walk for the two bench docs.
+
+// CCA_PINS carries all 37 file-tied citations (fix pass 11.2, D1) -- `README.md:34`/`:35`/`:37`
+// are pinned below with a `path` field (test/citation-pins.js's resolvePins), not allowlisted:
+// see test/citation-pins-data.js's CCA_PINS header comment for why an allowlist could not catch a consistent wrong
+// re-pin of an ambiguous citation (probed, shipped green 74/74).
+
+const EXPECTED_CCA_PIN_KEYS = [
+  "doc/comment-corpus-audit-2026-09-03.md :: CLAUDE.md:29 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: README.md:34 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: README.md:35 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: README.md:37 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:1654 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:1838 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:407-408 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:715 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:993 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: console/prod-version.js:13 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/board-audit.md:20 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/board-audit.md:20 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/environments.md:32 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/jewels-inventory.md:14 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/permissions.md:114-169 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/setup.md:15 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:117 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:121 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:445 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:9 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:98 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:1062 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:1062 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:1180 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:2056 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:2371 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:790 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/config.js:489 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/config.js:704 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:179 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:219 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:755 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:825 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:925 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/state-machine.js:1564 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: scripts/daemon-install.sh:103 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: test/doc-constant-sweep.test.js:352 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+];
+
+test('CCA_PINS holds exactly the 37 file-tied citations in doc/comment-corpus-audit-2026-09-03.md -- no more, no fewer', () => {
+  assert.equal(CCA_PINS.length, 37, `CCA_PINS has ${CCA_PINS.length} entries, expected 37 (every file-tied citation the doc carries -- no allowlist left) -- update EXPECTED_CCA_PIN_KEYS in the same change.`);
+  assert.deepEqual(
+    CCA_PINS.map((p) => `${p.file} :: ${p.citation} @ ${p.at}`).sort(),
+    EXPECTED_CCA_PIN_KEYS.slice().sort(),
+    'CCA_PINS (test/citation-pins-data.js) changed membership -- a pin was added, removed, or ' +
+      're-keyed. Update EXPECTED_CCA_PIN_KEYS here in the same change, by name.'
+  );
+});
+
+test('every CCA_PINS entry resolves: its pinned commit (7902164) names, at the pinned line(s), exactly the text this action read by hand', () => {
+  const results = resolvePins(CCA_PINS);
+  const offenders = results.filter((r) => !r.ok).map((r) => r.why);
+  assert.deepEqual(offenders, [], `pinned doc/comment-corpus-audit-2026-09-03.md citation(s) whose target no longer reads what the pin says:\n  ${offenders.join('\n  ')}`);
+});
+
+// D6 (fix pass 11.2, driver decision): switching a CCA pin's `at` to `HEAD` while also editing
+// EXPECTED_CCA_PIN_KEYS to match ships green -- the membership test above only checks the KEYS
+// agree with each other, never that the commit named is the RIGHT one. This doc is a dated
+// record; every one of its pins must stay frozen at the SPO-Pipeline commit the doc's OWN header
+// names, read from the doc's live text at test time (never hardcoded here, so an edit to the
+// doc's header without a matching edit to every pin's `at` is caught too, and vice versa).
+test('every CCA_PINS entry is frozen at the SPO-Pipeline commit doc/comment-corpus-audit-2026-09-03.md\'s own header names -- never HEAD, never a different sha', () => {
+  const headerText = read('doc/comment-corpus-audit-2026-09-03.md').slice(0, 600);
+  const shaMatch = /Measured 2026-09-03 against this worktree at\s*\n?>?\s*`([0-9a-f]{40})`/.exec(headerText);
+  assert.ok(shaMatch, "could not find the doc's own \"Measured ... against this worktree at `<sha>`\" header sentence -- has it been reworded?");
+  const namedSha = shaMatch[1];
+  assert.equal(namedSha, '7902164309c1766d7b785daab9ba94ff6472bc1d', "the doc's own header now names a different commit than this suite assumes -- re-verify every CCA_PINS entry against the new commit before updating this pin.");
+  const wrongAt = CCA_PINS.filter((p) => p.at !== namedSha).map((p) => `${p.file} :: ${p.citation} @ ${p.at}`);
+  assert.deepEqual(wrongAt, [], `CCA_PINS entry(ies) not frozen at the doc's own header commit (${namedSha}):\n  ${wrongAt.join('\n  ')}`);
+});
+
+// Same missing-link BENCH_PINS's own cross-check test closes (this file's part 2.7 header): a
+// STATIC pin array never re-reads the doc, so on its own it would happily keep checking a
+// citation the doc no longer makes if the doc's own number moved and CCA_PINS did not follow.
+// Array equality (`.sort()`), not set equality, on purpose: doc/board-audit.md:20 and
+// orchestrator/README.md:1062 are each cited twice in the doc's own prose, so CCA_PINS carries
+// each of those twice too, and this comparison must see that multiplicity, not collapse it.
+test('CCA_PINS covers exactly the citations doc/comment-corpus-audit-2026-09-03.md actually carries today -- a re-pin of the doc without a matching pin change is caught, by name', () => {
+  const CCA_DOC = 'doc/comment-corpus-audit-2026-09-03.md';
+  const raw = read(CCA_DOC);
+  const normalized = normalizeWrap(stripFences(raw));
+  const liveKeys = extractCitations(normalized).map((c) => `${CCA_DOC} :: ${c.raw}`);
+  const pinnedKeys = CCA_PINS.map((p) => `${p.file} :: ${p.citation}`);
+
+  assert.deepEqual(
+    liveKeys.slice().sort(),
+    pinnedKeys.slice().sort(),
+    'doc/comment-corpus-audit-2026-09-03.md\'s live citations no longer match CCA_PINS -- either a ' +
+      'doc citation moved without its pin following, a pin is now DEAD (no longer cited by the ' +
+      'doc), or a new citation appeared unpinned. Update CCA_PINS in the same change as any edit ' +
+      'to the doc.'
+  );
+});
+
+// ---- fixture tests: the `path` field (fix pass 11.2, D1) ---------------------------------------
+//
+// Direct, hermetic tests of resolvePins's `path` handling against a small committed fixture repo
+// (same rationale as makeCommittedFixtureRepo's other callers below: a mutation to any of these
+// three guard clauses must go red HERE, on a small fixture, rather than being inferred from the
+// real corpus staying green -- the real corpus only exercises the ACCEPT path for `README.md`,
+// never the two REFUSE paths).
+test('resolvePins: `path` is accepted when the bare name is genuinely ambiguous, its basename matches, and it contains a "/"', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+  });
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: './dup.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, true, result.why);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: `path` on an already-UNAMBIGUOUS citation is refused', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'solo.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'solo.txt:2', at: sha, path: './solo.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false);
+  assert.match(result.why, /not ambiguous under the resolver/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: `path` whose basename does not match the cited name is refused', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+    'other.txt': 'xxx\n',
+  });
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: './other.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false);
+  assert.match(result.why, /basename does not match/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a bare `path` with no "/" is refused -- the exact trap a bare "README.md" would fall back into', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+  });
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: 'dup.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false);
+  assert.match(result.why, /has no "\/"/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a +/-1 drift on a `path` pin is caught, same as any other pin', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\nfour\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+  });
+  const repoRoots = { repo: root, product: root, deploy: root };
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: './dup.txt', first: 'two' };
+  const base = resolvePins([pin], { repoRoots });
+  assert.equal(base[0].ok, true, 'fixture precondition: the base path pin must itself be correct');
+  const drifted = { ...pin, citation: shiftedCitation(pin.citation, 1) }; // :2 -> :3 ("three", not "two")
+  const driftedResult = resolvePins([drifted], { repoRoots });
+  assert.equal(driftedResult[0].ok, false, 'a +1 drift on a `path` pin must be caught, exactly like a plain pin');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 // ---- fixture tests: resolvePins error paths (fix pass 11.1, D5) --------------------------------
 //
 // Direct, hermetic tests of resolvePins itself against a real (but throwaway, git-backed) repo --
@@ -2785,10 +2971,11 @@ function classifySurvivors(survivors, allowlist) {
 // "cannot verify must never silently grow" posture as ANCHOR_BLUNT_CITATIONS/`unanchorable` above.
 // Measured empirically (this action's own mutation-proof test, immediately below): planting every
 // start-1/start+1/stop-1/stop+1/shift-1/shift+1 drift for every range pin, and every +/-1 drift for
-// every single-line pin -- 258 planted drifts across all 57 pins (41 BENCH_PINS + 13
-// LIVE_RANGE_PINS + 3 BLUNT_PINS, fix pass D2/D6/D7 grew both totals) -- ALL 258 are caught. Empty is
-// the honest, measured result, not an unproven default; if a future pin lands on an edge like this,
-// it is added here BY NAME, with a reason, exactly like every other allowlist in this file.
+// every single-line pin -- 346 planted drifts across all 95 pins (41 BENCH_PINS + 14
+// LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS, action 11.2/#206 added the fourth registry) -- ALL
+// 346 are caught. Empty is the honest, measured result, not an unproven default; if a future pin
+// lands on an edge like this, it is added here BY NAME, with a reason, exactly like every other
+// allowlist in this file.
 //
 // D8d (fix pass 11.1): the mutation-proof test's own final assertion used to be
 // `assert.equal(killed, variants.length)` -- a genuine, correctly-allowlisted survivor would still
@@ -2844,7 +3031,7 @@ test('classifySurvivors: an allowlisted survivor is credited as accounted-for; t
 });
 
 test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shift drift (or a +/-1 drift for a single line) is caught by resolvePins, for EVERY pin -- not a sample', () => {
-  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS];
+  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
   const base = resolvePins(allPins);
   const offenders = base.filter((r) => !r.ok).map((r) => r.why);
   assert.deepEqual(offenders, [], `a pin used as this mutation proof's own baseline is not itself green -- fix the pin, not the proof:\n  ${offenders.join('\n  ')}`);
@@ -2881,7 +3068,13 @@ test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shi
     }
   });
 
-  assert.ok(variants.length > 200, `expected well over 200 planted drifts across ${allPins.length} pins, found ${variants.length} -- a pin lost its line-count headroom or the corpus shrank; re-measure.`);
+  // D3 (fix pass 11.2, driver decision): a bare `> 200` floor stays green even if `...CCA_PINS`
+  // were dropped from `allPins` entirely (41+14+3 BENCH/LIVE_RANGE/BLUNT pins alone already plant
+  // 264 variants, comfortably over 200) -- the floor cannot tell "the fourth registry is wired in"
+  // from "it silently is not". Assert the exact, measured totals instead: 95 pins (41 BENCH_PINS +
+  // 14 LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS) plant exactly 346 variants.
+  assert.equal(allPins.length, 95, `expected 95 pins (41 BENCH_PINS + 14 LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS), found ${allPins.length} -- a registry was added, removed, or resized; re-measure and update this pin.`);
+  assert.equal(variants.length, 346, `expected exactly 346 planted drifts across 95 pins, found ${variants.length} -- a pin lost or gained line-count headroom, a registry changed size, or the corpus shrank; re-measure.`);
 
   const results = resolvePins(variants.map((v) => v.shifted));
   const survivors = [];

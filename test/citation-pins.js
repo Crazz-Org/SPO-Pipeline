@@ -239,7 +239,42 @@ function resolvePins(pins, opts = {}) {
       meta[i] = { why: `${pin.file} :: ${pin.citation} -- this citation is a SINGLE LINE but the pin carries a \`last\` -- a single-line pin must not have one` };
       return;
     }
-    const resolved = resolveCitationTarget(parsed.file, repoRoots);
+    // D1 (fix pass 11.2, driver decision, #206): an optional `path` field disambiguates a
+    // citation whose bare filename is ambiguous under resolveCitationTarget -- e.g. `README.md:34`
+    // naming the repo ROOT README when `orchestrator/README.md`, `prompts/README.md` and a test
+    // fixture also share that bare basename. Probed: a consistent wrong re-pin of an allowlisted
+    // ambiguous citation (`README.md:37` -> `:38`, doc text and CITATION_ALLOWLIST/CCA_ALLOWLIST-
+    // style entry moved together) shipped green 74/74 under the old "allowlist it" posture, since
+    // an allowlisted citation is never content-checked at all. `path` closes that: it is accepted
+    // ONLY when all three hold, checked in this order so a refusal names which one failed:
+    //   1. the cited bare name IS ambiguous under the resolver (a `path` on an already-unambiguous
+    //      citation is refused -- allowing it would let `path` silently mask a real "this citation
+    //      now names a different file" drift instead of failing on it);
+    //   2. `path.basename(pin.path)` equals the citation's own bare cited name (a mismatched
+    //      basename would let `path` silently repoint a citation at an unrelated file);
+    //   3. `pin.path` contains a "/" -- so resolveCitationTarget's own slash branch resolves it
+    //      directly against `fs.existsSync`, never re-entering the ambiguous-basename search a
+    //      bare `path: 'README.md'` would fall straight back into (the exact trap this field
+    //      exists to route around; the fix is `path: './README.md'` or any real relative path).
+    let resolved;
+    if (pin.path !== undefined) {
+      const bareResolved = resolveCitationTarget(parsed.file, repoRoots);
+      if (!bareResolved.ambiguous) {
+        meta[i] = { why: `${pin.file} :: ${pin.citation} -- has a \`path\` ("${pin.path}") but its bare name "${parsed.file}" is not ambiguous under the resolver; \`path\` may only disambiguate an ambiguous basename` };
+        return;
+      }
+      if (path.basename(pin.path) !== parsed.file) {
+        meta[i] = { why: `${pin.file} :: ${pin.citation} -- \`path\` ("${pin.path}") basename does not match the cited name "${parsed.file}"` };
+        return;
+      }
+      if (!pin.path.includes('/')) {
+        meta[i] = { why: `${pin.file} :: ${pin.citation} -- \`path\` ("${pin.path}") has no "/" -- a bare basename resolves ambiguously again; use "./${pin.path}" or a real relative path` };
+        return;
+      }
+      resolved = resolveCitationTarget(pin.path, repoRoots);
+    } else {
+      resolved = resolveCitationTarget(parsed.file, repoRoots);
+    }
     if (resolved.root === 'product-absent') {
       meta[i] = { why: `${pin.file} :: ${pin.citation} -- cannot verify, ${repoRoots.product} is not on disk (E1: never a silent pass)` };
       return;
