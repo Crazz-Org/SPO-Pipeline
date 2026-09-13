@@ -669,16 +669,29 @@ test('jsonSchemaPropertiesFor: translates every declared spelling to its JSON-Sc
   });
 });
 
-test('resolveStepContract: the generated --json-schema envelope carries `properties` for every declared key, on every step that declares any', () => {
+test('resolveStepContract: --json-schema `properties` declares EVERY required and optional key, typed ones with their type and the rest as {} (a key left out is a StructuredOutput parameter the model never sends)', () => {
   for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
     const { jsonSchema, outputContract } = resolveStepContract(step, {});
     if (!outputContract.types) {
       assert.ok(!('properties' in jsonSchema), `${step}: no types declared, so no properties key expected`);
       continue;
     }
-    assert.ok('properties' in jsonSchema, `${step}: types declared, so properties must be present`);
-    assert.deepEqual(Object.keys(jsonSchema.properties).sort(), Object.keys(outputContract.types).sort());
+    const expectedKeys = [...outputContract.required, ...(outputContract.optional || [])];
+    assert.deepEqual(Object.keys(jsonSchema.properties).sort(), [...expectedKeys].sort(), `${step}: every contract key declared`);
+    for (const key of expectedKeys) {
+      const expected = outputContract.types[key] ? jsonSchemaPropertiesFor({ [key]: outputContract.types[key] })[key] : {};
+      assert.deepEqual(jsonSchema.properties[key], expected, `${step}.${key}`);
+    }
   }
+});
+
+test('resolveStepContract: IMPLEMENT schema names all five reply keys and types only summary (2026-09-13 regression: summary-only properties exhausted structured-output retries)', () => {
+  const { jsonSchema } = resolveStepContract('IMPLEMENT', { size: 'S' });
+  assert.deepEqual(jsonSchema, {
+    type: 'object',
+    required: ['summary', 'files_changed', 'invariants', 'tests_run', 'all_green'],
+    properties: { summary: { type: 'string' }, files_changed: {}, invariants: {}, tests_run: {}, all_green: {} },
+  });
 });
 
 test('resolveStepContract: DIAGNOSE/CITATION_VERIFIER/VALIDATE/IMPLEMENT all declare at least one required-key type today', () => {
