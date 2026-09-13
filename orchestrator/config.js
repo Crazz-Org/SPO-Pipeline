@@ -111,6 +111,76 @@ const COMMAND_TIMEOUTS_MS = {
 };
 const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
+// Card #211: `npm run gate` exit 3, stderr `WORKER DIED while job <id> was pending: ...`, is the
+// gate CLI's OWN liveness read (cli.ts's `workerStatus`) disagreeing with the worker's actual
+// state -- not proof the worker died. Measured over the real corpus (7 real `gate-worker-died-
+// midjob` parks, 2026-09-11/12): 7 of 7 were a LIVE worker that went on to PASS that exact job
+// (`verdict.jobId === the job id printed on stdout`), 4.3-414.1s after the park. The park comment
+// is what a maintainer acts on, and the documented response to a park (`retry`) restarts the card
+// at INTAKE, destroying an already-green, already-merged-worthy PR -- see this action's own issue
+// (#211) for two cards that cost exactly that.
+//
+// steps/scripted.js's realGate polls `<spoBenchDir>/done/<jobId>.json` (`readGateDoneReport`,
+// already used elsewhere in this same function, reused unchanged) before parking under this name
+// -- but ONLY when a job id was actually printed (`parseGateJobId(r.stdout)`); the no-job-id exit-3
+// sub-causes (`gate-worker-not-built`, `gate-worker-down`) never had a job to poll for and are
+// unaffected. Same maxPolls/pollIntervalMs shape as BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS
+// above -- hoisted here, AFTER COMMAND_TIMEOUTS_MS (unlike those two), because this block's own
+// MAX_POLLS ceiling (see GATE_DIED_RECOVERY_MAX_POLLS_CEILING below) needs
+// COMMAND_TIMEOUTS_MS['npm-gate'] already resolved -- for the identical reason
+// stepDeadlineMsByState's GATE entry below has to derive from the SAME bound, or a legitimate
+// recovery wait can outlast the very deadline meant to cover it.
+//
+// DEFAULT: 90 polls x 5s = 450000ms (7.5 min). Measured against the corpus's own gaps between the
+// park and the job's own PASS verdict landing -- 4.3, 15.2, 56.8, 68.3, 145.5, 203.4, 414.1s -- 450s
+// is the smallest round bound that saves all 7 of 7; 300s (60 polls) would have saved only 6 of 7,
+// missing the 414.1s case. Costs at most 7.5 minutes on a GENUINE worker death, which has 0
+// occurrences in the corpus (0 `gate-worker-down`/`gate-interrupted` parks either). SPO_GATE_DIED_
+// RECOVERY_MAX_POLLS / SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS override.
+const GATE_DIED_RECOVERY_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS', 5000);
+// Node's own hard ceiling on a single setTimeout/setInterval delay: signed 32-bit ms
+// (2^31 - 1, ~24.8 days). Past it, Node does not throw -- it clamps the delay to 1ms (a stderr TimeoutOverflowWarning only)
+// (measured) -- which is what makes an oversized GATE deadline dangerous rather than merely slow:
+// a 1ms-clamped `deadline.js` timer re-arms `callWithDeadline` almost instantly, and because
+// `withTimeout` abandons the loser rather than cancelling it, `npm run gate` gets spawned a SECOND
+// time while the first is still running.
+const MAX_TIMER_DELAY_MS = 2147483647;
+// Fix-pass finding (adversarial verification of this action, defect 2): the largest poll count
+// that keeps the WHOLE derived GATE deadline (npm-gate's own spawnSync timeout + this bound + one
+// ordinary step deadline of margin -- the exact `stepDeadlineMsByState.GATE` formula below) at or
+// under MAX_TIMER_DELAY_MS. See `boundedPositiveIntFromEnv`'s own header (above the
+// module.exports this file ends with) for why `positiveIntFromEnv` alone cannot catch an oversized
+// override (`1e10` IS a positive integer). `Math.max(0, ...)`: if `commandTimeoutsMs['npm-gate']`
+// and `stepDeadlineMs` alone already exceed the ceiling (an extreme override of
+// SPO_TIMEOUT_NPM_GATE_MS), there is no room left for even a single poll -- 0, not a negative
+// count, is the honest answer ("this bound cannot be honoured at all", never "poll a negative
+// number of times").
+const GATE_DIED_RECOVERY_MAX_POLLS_CEILING = Math.max(
+  0,
+  Math.floor((MAX_TIMER_DELAY_MS - COMMAND_TIMEOUTS_MS['npm-gate'] - STEP_DEADLINE_MS) / GATE_DIED_RECOVERY_POLL_INTERVAL_MS)
+);
+// Fix-pass round 2, defect 6 (residual overflow): `boundedPositiveIntFromEnv`'s own ceiling check
+// only fires when SPO_GATE_DIED_RECOVERY_MAX_POLLS is ITSELF overridden -- an absent override
+// returns the literal default (90) without ever consulting the ceiling. That left two paths to the
+// exact hazard this whole guard exists to close, neither touching SPO_GATE_DIED_RECOVERY_MAX_POLLS
+// at all: SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS=1e8 (90 polls x 100,000,000ms alone is
+// ~9 billion ms) or SPO_TIMEOUT_NPM_GATE_MS=2147000000 (leaves only ~364,000ms of headroom, well
+// under the default 90 x 5000ms recovery bound). Chosen rule: the resolved poll count -- default
+// or explicit override alike -- is ALWAYS re-clamped to the ceiling via this outer `Math.min`, so
+// which of the three env vars caused the overflow never matters; the poll count is what absorbs
+// it (reducing HOW LONG recovery waits, never disabling the deadline's own safety margin). The
+// pathological remainder -- npm-gate's timeout plus margin alone already at or past the ceiling,
+// so even 0 polls cannot fit -- is not reachable through this value alone; see the GATE
+// stepDeadlineMsByState entry below for the final, unconditional clamp that closes it.
+const GATE_DIED_RECOVERY_MAX_POLLS = Math.min(
+  boundedPositiveIntFromEnv('SPO_GATE_DIED_RECOVERY_MAX_POLLS', 90, GATE_DIED_RECOVERY_MAX_POLLS_CEILING),
+  GATE_DIED_RECOVERY_MAX_POLLS_CEILING
+);
+// The product of the two above, same reason BENCH_IDLE_WAIT_MAX_MS is: config.js's own GATE
+// deadline derivation and steps/scripted.js's actual poll loop must never restate (and drift from)
+// the same number twice.
+const GATE_DIED_RECOVERY_MAX_MS = GATE_DIED_RECOVERY_MAX_POLLS * GATE_DIED_RECOVERY_POLL_INTERVAL_MS;
+
 // Hoisted out of the `orphanScanMs`/`unparkScanMs` fields below (action 7's scanner-crash-breaker
 // fix) so scannerHealthyUptimeMs's own default can be DERIVED from these two instead of a third,
 // independently-typed literal that could silently drift from them -- see that field's own comment
@@ -224,6 +294,29 @@ function positiveIntFromEnv(name, defaultN) {
   if (raw === undefined) return defaultN;
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed <= 0) return defaultN;
+  return parsed;
+}
+
+// Card #211 fix-pass (adversarial verification): same fallback idiom as positiveIntFromEnv above,
+// PLUS an upper bound -- for the narrow class of positive-integer COUNTS that get multiplied by a
+// duration and folded into a `stepDeadlineMsByState` entry (today: gateDiedRecoveryMaxPolls alone;
+// `ciChecksMaxPolls`/`benchIdleWaitMaxPolls` have the identical unguarded-magnitude gap, filed
+// separately). `positiveIntFromEnv` alone is not enough here: `1e10` IS a positive integer, so it
+// sails through that guard unchanged, and `maxPolls * pollIntervalMs` can then push the derived
+// deadline past Node's own hard ceiling on a single `setTimeout`/`setInterval` delay -- a signed
+// 32-bit ms count, `2^31 - 1` (`2147483647`, ~24.8 days). Node does not throw past that ceiling,
+// it clamps the delay to 1ms with only a stderr warning (measured) -- so an oversized override does not
+// fail loudly: it re-arms `deadline.js`'s own timer to fire almost instantly, reproducing the exact
+// retroactive-deadline hazard (`npm run gate` spawned a SECOND time while the first still ran) the
+// derived GATE entry exists to close, through the very tunable meant to size it. `maxN` is the
+// caller's own pre-computed ceiling (see GATE_DIED_RECOVERY_MAX_POLLS_CEILING below for how GATE's
+// is derived); non-finite, non-integer, non-positive, or over that ceiling all fall back to
+// `defaultN`, never to something silently larger.
+function boundedPositiveIntFromEnv(name, defaultN, maxN) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultN;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > maxN) return defaultN;
   return parsed;
 }
 
@@ -459,6 +552,39 @@ module.exports = {
     // this deadline for the identical reason the bench-install timeout itself already is. See
     // product-repo-hold.js's finishStepDeadlineMs for the full derivation.
     FINISH: productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),
+
+    // Card #211: GATE never had an entry here, and that was only ever safe because realGate's
+    // exit-3/WORKER-DIED recovery wait is the FIRST `await` this function ever places inside its
+    // own invocation -- every real command before it runs through the BLOCKING `spawnSync`, which
+    // never yields the event loop, so deadline.js's setTimeout could not fire while a real
+    // `npm run gate` (116-344s in the corpus) was still running. Adding a recovery poll that DOES
+    // yield (`await pollSleep`) arms a timer that was previously always a no-op -- and once armed,
+    // the generic 120s `stepDeadlineMs` ceiling expires long before either the gate itself or the
+    // recovery wait can finish. deadline.js's callWithDeadline does not cancel the loser on expiry
+    // (withTimeout abandons it), so a retroactively-fired deadline re-runs realGate from scratch --
+    // a SECOND real `npm run gate` spawned while the first is still running. This already happened
+    // in production on MERGE (card #587, same shape: probeMergeability's 750ms pollSleep after two
+    // 9-minute pr:wait spawns) -- that MERGE defect is separate and is not fixed here.
+    //
+    // Derived, never a literal, same "poll budget plus one step deadline of margin" shape
+    // CI_CHECKS' own entry above uses: the npm-gate command's own spawnSync timeout
+    // (commandTimeoutsMs['npm-gate'], the real ceiling on how long one gate run can block) plus the
+    // recovery wait's own bound (gateDiedRecoveryMaxMs, GATE_DIED_RECOVERY_MAX_MS above) plus one
+    // ordinary step deadline of margin for the handful of git/gh calls the recovery and main-moved
+    // paths still make. Does NOT depend on `workers` (K) -- unlike WORKTREE/FINISH above, nothing
+    // here waits on the product-repo mutex -- so daemon.js's --workers recompute (see its own
+    // comment) does not need a GATE entry: this one is safe to inherit via the spread it already
+    // does off defaultConfig.stepDeadlineMsByState, the same as CI_CHECKS.
+    //
+    // Fix-pass round 2, defect 6 (residual overflow): GATE_DIED_RECOVERY_MAX_POLLS_CEILING's own
+    // `Math.max(0, ...)` (above) covers the recovery term -- but when `commandTimeoutsMs['npm-gate']`
+    // ALONE (an extreme `SPO_TIMEOUT_NPM_GATE_MS` override) already leaves no room even at 0 polls,
+    // the sum below can still exceed MAX_TIMER_DELAY_MS with nothing left upstream to reduce.
+    // Chosen rule for this remainder: clamp the FINAL sum, unconditionally. This is the honest
+    // last resort, not a silent one -- Node would otherwise clamp the very same oversized value to
+    // 1ms on its own (measured, undocumented as a throw), which is worse than an explicit ceiling:
+    // 2147483647ms of margin before the timer could ever misfire beats 1ms of none.
+    GATE: Math.min(COMMAND_TIMEOUTS_MS['npm-gate'] + GATE_DIED_RECOVERY_MAX_MS + STEP_DEADLINE_MS, MAX_TIMER_DELAY_MS),
   },
 
   // ---- action 2.1: real spawnSync per-command-class timeouts -----------------------------
@@ -830,6 +956,15 @@ module.exports = {
   benchIdleWaitMaxPolls: BENCH_IDLE_WAIT_MAX_POLLS,
   benchIdleWaitPollIntervalMs: BENCH_IDLE_WAIT_POLL_INTERVAL_MS,
   benchIdleWaitMaxMs: BENCH_IDLE_WAIT_MAX_MS,
+
+  // Card #211: steps/scripted.js's realGate reads these three before parking `gate-worker-died-
+  // midjob` on an exit-3 WORKER DIED with a known job id -- see GATE_DIED_RECOVERY_MAX_POLLS's own
+  // comment above for the full rationale and the default's derivation. gateDiedRecoveryMaxMs is
+  // the pre-multiplied bound (maxPolls x pollIntervalMs), exported so this file's own GATE
+  // stepDeadlineMsByState entry above can read the total directly rather than re-deriving it.
+  gateDiedRecoveryMaxPolls: GATE_DIED_RECOVERY_MAX_POLLS,
+  gateDiedRecoveryPollIntervalMs: GATE_DIED_RECOVERY_POLL_INTERVAL_MS,
+  gateDiedRecoveryMaxMs: GATE_DIED_RECOVERY_MAX_MS,
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //

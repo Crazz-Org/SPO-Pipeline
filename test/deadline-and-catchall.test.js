@@ -77,10 +77,24 @@ test('CI_CHECKS deadline covers its own bounded in-flight poll budget, so 1.7 pa
       'else the in-flight wait parks step-deadline-exceeded-twice and leaks a ghost invocation'
   );
 
-  // Every other state keeps the generic ceiling -- the override is deliberately narrow.
-  for (const state of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE', 'GATE', 'CHECK', 'PUSH_PR', 'MERGE']) {
+  // Every other state keeps the generic ceiling -- the override is deliberately narrow. GATE is
+  // no longer in this list (card #211): it now carries its own derived entry, asserted separately
+  // below, for the identical reason CI_CHECKS has one -- its exit-3/WORKER-DIED recovery wait
+  // (`recoverFromGateWorkerDied`) sleeps ON PURPOSE inside its own invocation, the first genuine
+  // `await` realGate ever places there. See doc/state-machine-spec.md's GATE row for the account.
+  for (const state of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE', 'CHECK', 'PUSH_PR', 'MERGE']) {
     assert.equal(deadlineMsFor(config, state), config.stepDeadlineMs, `${state} must keep stepDeadlineMs`);
   }
+
+  // GATE's own bound must exceed a full npm-gate spawn PLUS the whole recovery wait, the same
+  // "poll budget plus margin" shape CI_CHECKS' own assertion above checks.
+  const gateBoundMs = config.commandTimeoutsMs['npm-gate'] + config.gateDiedRecoveryMaxMs;
+  const gateDeadline = deadlineMsFor(config, 'GATE');
+  assert.ok(
+    gateDeadline > gateBoundMs,
+    `GATE deadline (${gateDeadline}ms) must exceed npm-gate's own timeout plus the recovery wait (${gateBoundMs}ms), ` +
+      'else a real recovery yield parks step-deadline-exceeded-twice and re-runs npm run gate from scratch'
+  );
 
   // A config with no per-state map at all (every hand-built test ctx in this suite) still works.
   assert.equal(deadlineMsFor({ stepDeadlineMs: 30000 }, 'CI_CHECKS'), 30000);

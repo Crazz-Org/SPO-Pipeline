@@ -1968,6 +1968,470 @@ function readGateJobReportForRouting(ctx, config, state, stdout) {
   return report;
 }
 
+// ---- action B3.4, extracted in card #211's fix-pass: park reasons known ONLY from
+// done/<jobId>.json's own verdict field -- ENVIRONMENT/DIRTY/ABANDONED (worker.ts's own
+// NON_ATTESTING set) plus INTERRUPTED (recoverInterrupted also never writes verdicts/ for it) --
+// SPO-WebClient never writes a verdicts/<sha>.json entry for any of these four, so this file is
+// the ONLY place their real cause survives at all; waiting for a verdicts/ file that will never
+// land would just burn a caller's whole poll budget on nothing.
+//
+// Shared by two callers: a real exit-1 gate whose verdicts/<sha>.json read came back empty
+// (exitFrom: 1, the pre-existing behaviour -- byte-identical to before this extraction, same
+// events, same detail shape apart from the `exitFrom` key this extraction adds to all four,
+// harmless since nothing tests these details by strict equality), and card #211's exit-3 recovery
+// once done/<jobId>.json itself already names one of these four (exitFrom: 3 -- see
+// recoverFromGateWorkerDied below). A genuine worker death leaves an INTERRUPTED report via
+// recoverInterrupted, and a real exit 1 already treats `gate-interrupted` as auto-retryable
+// (TRANSIENT_RETRY_REASONS) -- so recovery must reach the exact same reason, never a terminal
+// `gate-worker-died-midjob`, or a real death would retry MORE slowly than before this action.
+//
+// Returns false (never throws) when `jobReport.verdict` is none of the four, so the caller falls
+// through to its own next step exactly as if this function did not exist -- a real exit 1 falls to
+// `gate-non-attesting`; recovery falls to its own not-yet-fresh handling.
+function routeGateNonAttestingReport(ctx, config, headSha, jobReport, exitFrom) {
+  const detail = { headSha, jobId: jobReport.id, jobDetail: jobReport.detail || null, exitFrom };
+  if (jobReport.verdict === 'ENVIRONMENT') {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-environment', detail);
+    throw new ParkSignal('gate-environment', detail);
+  }
+  if (jobReport.verdict === 'DIRTY') {
+    // NOT the session's own tree (bench-gate.sh already refused a dirty session tree at exit 2,
+    // before a job was ever deposited) -- this is the bench worker's OWN shared ref checkout
+    // (`paths.refCheckout`) found dirty by the worker itself, after `prepareRef`. Deliberately
+    // named "the bench worker" and NOT by filename: part 1.8 of test/doc-constant-sweep.test.js
+    // reads a possessive filename followed by a code-shaped word as a symbol citation, and the
+    // emphatic OWN here is prose, not a symbol the worker's source defines.
+    // A worker-side environment fact, never named `gate-dirty-tree` (that name is reserved for
+    // the session's own tree, exit 2).
+    appendEvent(ctx.taskDir, 'GATE', 'gate-worker-dirty-checkout', detail);
+    throw new ParkSignal('gate-worker-dirty-checkout', detail);
+  }
+  if (jobReport.verdict === 'ABANDONED') {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-abandoned', detail);
+    throw new ParkSignal('gate-abandoned', detail);
+  }
+  if (jobReport.verdict === 'INTERRUPTED') {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-interrupted', detail);
+    throw new ParkSignal('gate-interrupted', detail);
+  }
+  return false;
+}
+
+// ---- action B2.3(a)/(c), extracted for card #211: the acceptance checks a PASS verdict for HEAD
+// must pass before GATE is allowed to proceed to CI_CHECKS -----------------------------------
+//
+// Shared by two callers: a real exit-0 gate (exitFrom: 0, headSha/verdict freshly read off HEAD),
+// and card #211's exit-3 WORKER DIED recovery once a same-job verdict is found (exitFrom: 3,
+// headSha/verdict already resolved by the recovery poll -- see recoverFromGateWorkerDied below).
+// Behaviour for the exit-0 caller is byte-identical to before this extraction: same events, same
+// `exitFrom: 0` on both the journal event and the ParkSignal detail.
+//
+// The bench-side fix (verify-gate.js) now fails a routed-but-not-driven diff closed -- BLOCKED,
+// never PASS -- so this combination should be unreachable from a CURRENT worker. This check is the
+// pipeline's OWN read of the same fact, defence in depth: it also covers a verdict written by an
+// older worker binary, and a REUSED verdict (merge-queue.ts's `mayReuseVerdict`) copied forward
+// from one. Reaching it at all means something is wrong that a human should see, not something a
+// retry can fix -- WORKTREE->PLAN->IMPLEMENT->GATE would just ask the exact same worker the exact
+// same question at real LLM cost, so this reason is never added to state-machine.js's
+// TRANSIENT_RETRY_REASONS.
+//
+// Absence must be safe (action B2.3(c)): no verdict file at all (515 of 517 files on this very
+// machine as of that action had none), a verdict present but with no `live` key (every verdict
+// written before this field existed -- see verdict.ts's own field comment), an unparsable file, or
+// `live.status === 'unknown'` are ALL the identical fact -- "nothing on file proves the live stage
+// ran" -- and none of them may be read as proof either way. Parking on any of them would stall the
+// whole backlog on old data; routing exactly as before (CI_CHECKS) is the defensible middle that
+// action calls for. Journalled so the gap stays visible without being actionable per card.
+function acceptPassedGate(ctx, config, headSha, verdict, exitFrom) {
+  const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
+  const live = verdict && verdict.live;
+  if (!live || live.status === 'unknown') {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-live-unknown', {
+      headSha,
+      verdictPath,
+      verdictExists: fs.existsSync(verdictPath),
+    });
+    return 'CI_CHECKS';
+  }
+
+  if (liveRoutedButNotDriven(live)) {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-live-not-driven', {
+      headSha,
+      exitFrom,
+      why: live.why,
+      required: live.required,
+    });
+    // exitFrom on the ParkSignal detail too (adversarial verification T4), not only the
+    // journal event above -- the park comment and state.json are built from `detail`
+    // (park-loop.js's buildParkComment), and before this fix neither one said whether this
+    // park arrived honestly off exit 1 or via the pipeline's own defence-in-depth read of a
+    // PASS/exit-0 verdict; a maintainer had to open journal.jsonl to tell the two apart.
+    throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom, why: live.why, required: live.required });
+  }
+
+  // live.status === 'ran', or 'skipped' with nothing required (the common, legitimate case) --
+  // proceed exactly as before.
+  return 'CI_CHECKS';
+}
+
+// ---- action B2.3(b)/4.2/B3.4, extracted for card #211: routing a KNOWN, well-shaped, non-PASS-
+// contradicting verdict for HEAD (BLOCKED / FAIL-without-baseMain / STALE / a real FAIL / anything
+// else) -- everything a real exit 1 does once `verdicts/<sha>.json` has already been read and
+// found present -----------------------------------------------------------------------------
+//
+// Shared by two callers: a real exit-1 gate (exitFrom: 1, called right after the `if (!verdict)`
+// NON_ATTESTING branch above has already ruled out a missing/unreadable verdict file), and card
+// #211's exit-3 WORKER DIED recovery once a same-job verdict is found and it is NOT a PASS
+// (exitFrom: 3 -- see recoverFromGateWorkerDied below). `stdout` is threaded through rather than
+// read off `ctx`/`deps` because the STALE branch's `readGateJobReportForRouting` needs the same
+// `job <id> queued` line the caller already has (real exit 1's own `r.stdout`, or exit 3's --
+// `parseGateJobId` finds the identical job id in both, since it is the SAME deposit). Behaviour
+// for the exit-1 caller is byte-identical to before this extraction: same events, same
+// `exitFrom: 1` on both the journal events and the ParkSignal details.
+function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, stdout, exitFrom) {
+  const baseMain = verdict.baseMain;
+  appendEvent(ctx.taskDir, 'GATE', 'gate-verdict', {
+    headSha,
+    verdict,
+    baseMain: baseMain || null,
+    merged: verdict.merged === true,
+  });
+
+  // ---- action B2.3(b): BLOCKED stops being routed to DIAGNOSE -----------------------------
+  //
+  // `cli.ts`'s wait() collapses every non-PASS/LEASED report.verdict to the same exit 1
+  // (`report.verdict === 'PASS' || 'LEASED' ? 0 : 1`) -- BLOCKED included, and BLOCKED is not in
+  // worker.ts's `NON_ATTESTING` set, so the verdict IS on disk here, distinguishable from a real
+  // FAIL by `verdict.verdict` alone. Without this check a BLOCKED gate falls straight through to
+  // `return 'DIAGNOSE'` at the bottom of this function and asks a judge to diagnose a code defect
+  // that was never observed -- verify-gate.js's own BLOCKED comment says as much: "This is not a
+  // verdict on the change: the flows could not be driven, none failed." Same shape as
+  // `main-moved-conflict` just below (a real park for a "not the code's fault" situation, not a
+  // DIAGNOSE call spent on an unanswerable question).
+  //
+  // Adversarial verification of B2.3 (finding T4) found `BLOCKED` is not one fact, it is at
+  // least four, from four different producers in SPO-WebClient, and a bare
+  // `verdict.verdict === 'BLOCKED'` check collapsed all of them into `gate-live-not-driven` --
+  // a name that asserts "routing required a live drive that never happened". That is true for
+  // the headline case (a routed-but-undriven diff, `verify-gate.js:342`, and `verify-gate.js:
+  // 308`'s capability-question variant) but false for the fourth: `run.ts:63`'s `runLive`
+  // returning BLOCKED because the world lock refused the run (dirty, or another live run
+  // already in flight). There used to be a second producer here -- a live-run rate limiter
+  // that could never fire -- but action B3.5 (SPO-WebClient PR #646) deleted it outright
+  // rather than tune it, so the world lock is now the whole of this case.
+  // `liveAttestationFrom` (worker.ts) maps that fourth
+  // case to `live.status === 'unknown'` -- the IDENTICAL value the exit-0/`acceptPassedGate` path
+  // reads as "nothing proven either way" and explicitly refuses to park on. Parking it here,
+  // under a name that claims routing was proven undriven, was the collapse: the same fact
+  // treated two opposite ways depending on which exit code carried it.
+  //
+  // So the split keys on the `live` FACT (`liveRoutedButNotDriven`, shared with `acceptPassedGate`
+  // above), not the bare verdict string. Only a genuinely routed-but-undriven BLOCKED
+  // gets `gate-live-not-driven` -- unchanged reason, unchanged non-transient treatment (a
+  // property of the worker binary or a reused verdict, not of the moment; a retry just asks
+  // the same worker the same question at real WORKTREE->PLAN->IMPLEMENT->GATE cost). Every
+  // other BLOCKED -- the world lock, or `verify-gate.js:308`'s capability-question
+  // variant, where `required` can be empty and nothing was actually routed -- gets its own
+  // reason, `gate-live-blocked`, deliberately not reusing a name that would misdescribe it.
+  //
+  // `gate-live-blocked`'s own disposition: unlike `gate-live-not-driven`, this one IS added to
+  // `TRANSIENT_RETRY_REASONS` below. The operational case that motivates it -- a maintainer
+  // running `gate:local --live` takes the single-flight lock (`world-lock.ts`'s own error:
+  // "A live run is already in flight ... Live runs are single-flight") -- clears itself in
+  // minutes, and parking the daemon's card on it permanently for that reason alone would be
+  // wrong. A genuinely DIRTY world lock ("Only a human clears this", world-lock.ts) does NOT
+  // self-heal, and the rate-limit arm is dead either way -- but `why` is free text from a
+  // different repo, not a contract this file should parse to split those apart, and
+  // TRANSIENT_RETRY_REASONS' own bounded budget (`config.transientRetryBudget`, default 2)
+  // already caps the cost of getting that wrong: a persistently-dirty lock burns at most 2
+  // extra WORKTREE->PLAN->IMPLEMENT->GATE cycles before falling through to an ordinary,
+  // human-visible park, exactly like `gate-non-attesting`'s own transient-but-bounded
+  // treatment above. Self-healing the common case beats a permanent park on a condition that
+  // was never the card's fault to begin with.
+  if (verdict.verdict === 'BLOCKED') {
+    const live = verdict.live;
+    if (liveRoutedButNotDriven(live)) {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-live-not-driven', {
+        headSha,
+        exitFrom,
+        why: live.why,
+        required: live.required,
+      });
+      throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom, why: live.why, required: live.required });
+    }
+
+    appendEvent(ctx.taskDir, 'GATE', 'gate-live-blocked', {
+      headSha,
+      exitFrom,
+      liveStatus: live && live.status,
+      why: live && live.why,
+    });
+    throw new ParkSignal('gate-live-blocked', {
+      headSha,
+      exitFrom,
+      liveStatus: live && live.status,
+      why: live && live.why,
+    });
+  }
+
+  if (verdict.verdict === 'FAIL' && !baseMain) {
+    // The bench never got past `prepareRef` -- this branch does not merge with origin/main.
+    // Fetch the real remote tip first: the intersection/merge decision below must be made
+    // against it, not a lagging local `origin/main`. A non-zero exit here is not fatal --
+    // continue with what is already local rather than parking on a flaky fetch.
+    const fetch = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'fetch', 'origin', 'main']);
+    if (fetch.exit !== 0) {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-fetch-failed', { exit: fetch.exit });
+    }
+
+    // Action 6.5: compare against the configurable budget (default 1, no behaviour change --
+    // see config.js's mainMovedRegateBudget comment for the settled decision and the corpus
+    // this default rests on) rather than a hardcoded "once".
+    const gateBudget = resolveMainMovedRegateBudget(config);
+    if (ctx.counters.mainMoveUsed >= gateBudget) {
+      throw new ParkSignal('main-moved-twice', { mainMoveUsed: ctx.counters.mainMoveUsed, mainMovedRegateBudget: gateBudget });
+    }
+    ctx.counters.mainMoveUsed += 1;
+
+    // Same nightly-red refusal CI_CHECKS applies to its own main-moved merge (guardNightlyRed,
+    // above) -- a rev-parse failure here is likewise non-fatal: without a sha to compare, the
+    // guard cannot fire, so this degrades to "not known to be red" rather than parking on what
+    // is, same as the fetch above, an enrichment lookup rather than the merge decision itself.
+    //
+    // That asymmetry with CI_CHECKS (whose gitRevParse throws ParkSignal('ci-checks-rev-parse-
+    // failed') on the very same failure) is deliberate and it is safe, for a reason worth
+    // writing down rather than trusting: skipping the guard cannot let a red `main` be merged,
+    // because the merge two lines below resolves the SAME ref. If `git rev-parse origin/main`
+    // genuinely cannot resolve it, neither can `git merge origin/main` -- measured in a scratch
+    // repo with no remote: rev-parse exits 128 ("unknown revision"), merge exits 1 ("merge:
+    // origin/main - not something we can merge") -- so the card parks `main-moved-conflict`
+    // rather than merging anything. The one residual window is a rev-parse that fails for a
+    // reason unrelated to the ref while the ref itself is fine (an operator's `kill -9` with no
+    // deadline armed, which spawnOnce maps to exit 1): the guard is skipped and a red `main`
+    // could be merged. Accepted rather than closed, on the same principle as the fetch above --
+    // a diagnostic lookup must not become the thing that parks the card -- and a merged red main
+    // costs one CHECK/GATE cycle, where a false park costs a maintainer.
+    const originMainRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
+    if (originMainRes.exit === 0) {
+      guardNightlyRed(ctx, 'GATE', config, originMainRes.stdout.trim());
+    } else {
+      appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-rev-parse-failed', { exit: originMainRes.exit });
+    }
+
+    const merge = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
+    if (merge.exit === 0) {
+      appendEvent(ctx.taskDir, 'GATE', 'main-moved-merge', { from: 'GATE' });
+      return 'CHECK';
+    }
+
+    // Non-zero: abort the failed merge so the worktree is left clean, then park. `merge
+    // --abort` goes through spawnStep like everything else here, so its own exit is already
+    // journalled by the generic 'spawn' event -- a NON-ZERO exit is deliberately not inspected,
+    // because a failed abort must not be allowed to mask the park below.
+    //
+    // "Not inspected" is not the same as "cannot escape", and the try/catch is what makes the
+    // sentence above actually true: since action 2.1, a spawnStep whose command is killed by
+    // its own timeout TWICE does not return at all -- it throws ParkSignal('git-timed-out'),
+    // which would unwind straight past the throw below and park the card under a reason naming
+    // the CLEANUP instead of the cause, taking {headSha, mergeExit} with it. That is action
+    // 4.3's verification finding in a different costume (a lookup documented as "never parks"
+    // parking the card before its own event was written), and this is one of the two call sites
+    // in this function where a spawnStep throw destroys information the rest of the system depends
+    // on: `main-moved-conflict` is the whole output of this action, the reason a maintainer
+    // reads, and the reason action 4.4 keys its transient-retry decision off. Journal the
+    // timeout, then park for the real reason regardless. (The other spawnStep calls here --
+    // rev-parse, fetch, merge -- are deliberately NOT wrapped: a hung git there parks
+    // `git-timed-out` before any routing decision has been made, which is honest and is exactly
+    // what spawnStep's own header prescribes.)
+    //
+    // What a failed abort leaves behind, traced rather than assumed: an unresolved index with
+    // conflict markers. finalizePark then calls preserveWorktreeWip, which does `git status
+    // --porcelain` (non-empty -> proceeds), then `git checkout --detach` -- and git REFUSES
+    // that on an unmerged index ("error: you need to resolve your current index first", exit 1,
+    // measured). preserveWorktreeWip journals `wip-preserve-failed {step:'detach'}` and returns
+    // null, so a conflicted tree is never committed to a `wip/` ref and no branch pointer moves.
+    // Nothing is lost either: the only content in that tree that is not already on the branch is
+    // origin/main's own, and `retry` rebuilds the worktree from scratch anyway.
+    try {
+      spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', '--abort']);
+    } catch (err) {
+      if (!(err instanceof ParkSignal)) throw err;
+      appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-abort-failed', { reason: err.reason });
+    }
+    // Parking here is deliberate, not a gap: #439 proves DIAGNOSE cannot fix a conflict
+    // IMPLEMENT never even saw, and a maintainer's `retry` restarts at INTAKE from a fresh
+    // worktree off the new main -- which is what actually resolved it, in 19 minutes.
+    throw new ParkSignal('main-moved-conflict', { headSha, mergeExit: merge.exit });
+  }
+
+  // Action B3.4: STALE ("the tree changed between deposit and the end of the run") is not a
+  // code defect either -- verify-gate.js's own PASS/FAIL body verdict, whatever it was, applies
+  // to a tree that no longer exists, and the bench's own advice is "resubmit", never "diagnose
+  // this". Unlike DIRTY/ENVIRONMENT/ABANDONED/INTERRUPTED above, `verdicts/<sha>.json` IS
+  // written for STALE (it is not in `NON_ATTESTING`), so `verdict.verdict === 'STALE'` is
+  // already known here without needing `done/<id>.json` -- but that file's own `detail` still
+  // gives a maintainer the human-readable "what changed and when" the compact verdicts/ entry
+  // does not carry, so it is read best-effort for that alone; its absence never blocks the park.
+  if (verdict.verdict === 'STALE') {
+    const jobReport = readGateJobReportForRouting(ctx, config, 'GATE', stdout);
+    const jobDetail = jobReport && jobReport.verdict === 'STALE' ? jobReport.detail || null : null;
+    const detail = { headSha, jobDetail };
+    appendEvent(ctx.taskDir, 'GATE', 'gate-stale', detail);
+    throw new ParkSignal('gate-stale', detail);
+  }
+
+  // FAIL carrying baseMain (a real failure -- see the header comment above), or any other
+  // shape (e.g. a PASS verdict recorded against an exit-1 gate; BLOCKED/STALE are carved out
+  // above) -> DIAGNOSE, unchanged.
+  return 'DIAGNOSE';
+}
+
+// worker.ts's own NON_ATTESTING set is {DIRTY, ENVIRONMENT, ABANDONED}; INTERRUPTED joins them here
+// (recoverInterrupted also never writes verdicts/<sha>.json). PASS/FAIL/BLOCKED/STALE are the
+// "attesting" verdicts -- worker.ts DOES write verdicts/<sha>.json for all four (STALE and BLOCKED
+// included -- see routeGateVerdict's own header), just ~7ms AFTER done/<jobId>.json (worker.ts
+// writes the done report first, then the verdicts file -- fix-pass defect 3). A done report naming
+// one of THESE four is a promise that a verdicts/ entry is coming, not proof it has arrived yet.
+const GATE_ATTESTING_DONE_VERDICTS = new Set(['PASS', 'FAIL', 'BLOCKED', 'STALE']);
+
+// Card #211 fix-pass, defect 4: `park-loop.js`'s `countRepeatedParks` fingerprints on
+// `JSON.stringify(detail)`, so two consecutive `gate-worker-died-midjob` parks must produce
+// IDENTICAL details to be recognised as a repeat. A job id is unique to its own deposit by
+// construction, and the worker's own free-text reason embeds live numbers (`paths.ts`'s "heartbeat
+// is 23.5 s old", "heartbeat is 41 s old", ...) -- so, unfixed, no two real parks under this reason
+// ever fingerprint equal and the whole repeat-park warning is dead for it. Collapsing every run of
+// digits (a decimal point included) to a literal `N` makes the SHAPE of the reason the fingerprint,
+// not its instant-specific values -- "heartbeat is N s old" repeats; "worker has never heartbeat"
+// (no digits at all) is untouched, exactly as it should be.
+function normalizeWorkerDiedReason(reason) {
+  return reason == null ? reason : reason.replace(/\d+(?:\.\d+)?/g, 'N');
+}
+
+// ---- card #211: bounded recovery for exit 3, WORKER DIED, with a known job id ------------------
+//
+// Polls `<spoBenchDir>/done/<jobId>.json` (`readGateDoneReport`, reused unchanged -- unique per
+// job, so it can never be stale the way `verdicts/<sha>.json` can) every
+// `config.gateDiedRecoveryPollIntervalMs` up to `config.gateDiedRecoveryMaxPolls` times, checking
+// once BEFORE the first sleep (a report may already be sitting there). Bound and defaults: see
+// GATE_DIED_RECOVERY_MAX_POLLS's own comment in config.js for the corpus measurement this rests
+// on -- 90 polls x 5s = 450s saves 7 of 7 real occurrences; 300s would have saved 6 of 7.
+//
+// Finding the done report is not the end of the story (fix-pass defect 3): a report naming an
+// ATTESTING verdict (PASS/FAIL/BLOCKED/STALE) means a `verdicts/<sha>.json` entry is coming but may
+// not have landed on THIS poll -- worker.ts writes the two files ~7ms apart -- so that case does
+// NOT park; it keeps polling, within the SAME remaining bound (the counter is never reset), until
+// either a fresh verdict lands or the bound itself runs out. A report naming a NON-attesting
+// verdict (ENVIRONMENT/DIRTY/ABANDONED/INTERRUPTED) is the opposite case: worker.ts NEVER writes a
+// verdicts/ entry for these, so waiting for one would just burn the whole bound on a file that can
+// never arrive -- these route immediately through `routeGateNonAttestingReport`, THE SAME per-verdict
+// logic a real exit 1 uses off this same file, at `exitFrom: 3`. A genuine worker death leaves an
+// INTERRUPTED report via `recoverInterrupted`, and a real exit 1 already treats `gate-interrupted`
+// as auto-retryable -- routing it here the same way, rather than to a terminal
+// `gate-worker-died-midjob`, is the whole point: a real death must never retry SLOWER than before
+// this action. A report naming NEITHER shape (`LEASED` contradicts exit 3 outright; a future
+// verdict this file does not recognise yet is the general case) is unresolvable by waiting --
+// `done/<jobId>.json` is immutable once written -- so it falls back to the terminal park
+// immediately (fix-pass round 2, defect 2): before this fix, it fell through silently and
+// re-polled the SAME unresolvable report on every remaining poll, re-logging and re-spawning
+// `git rev-parse` each time (measured: 182 spawns at the default 90-poll bound).
+//
+// Once a verdicts/ entry IS found for an attesting report, freshness still gates whether it is
+// trusted: `verdicts/<headSha>.json` can carry an EARLIER job's verdict for the same sha (26 of 271
+// shas in the corpus had more than one job, and the verdicts file did not track the latest job in
+// 23 of those 26) -- so `verdict.jobId === jobId` is required before the verdict is read as an
+// answer to THIS job. A mismatch, a missing `verdict.jobId`, no verdicts file, or an unreadable
+// HEAD are all the identical fact -- "nothing on file proves what THIS job decided, yet" -- and
+// keep polling exactly like "no report at all", not a park.
+//
+// A fresh PASS is routed through `acceptPassedGate` -- THE SAME acceptance checks a real exit-0
+// gate uses (`gate-live-unknown`/`gate-live-not-driven`/CI_CHECKS) -- and a fresh non-PASS through
+// `routeGateVerdict` -- THE SAME BLOCKED/FAIL-without-baseMain/STALE/DIAGNOSE logic a real exit-1
+// gate uses -- both with `exitFrom: 3` so a maintainer reading the park comment or `journal.jsonl`
+// can always tell a recovered exit-3 apart from a genuine exit 0/1. Either route (fix-pass defect
+// 5) appends the done report's own `verdict`/`detail` to `journal/<id>/gate.log`, which otherwise
+// holds only the exit-3 stdout -- a DIAGNOSE reached through a recovered FAIL must see WHY, not
+// just that `npm run gate` once printed "WORKER DIED".
+//
+// No report within the bound, or an attesting report whose verdict never became fresh, parks
+// `gate-worker-died-midjob` exactly as before this action -- still terminal, no new park reason.
+// Fix-pass defect 4: the park `detail` deliberately does NOT carry the raw `jobId` or the raw
+// `workerDiedReason` (both go on the `gate-died-recovery` journal event instead, for a maintainer
+// reading `journal.jsonl`) -- only `exit: 3`, `recoveryPolls`, and `workerDiedReason` NORMALIZED
+// through `normalizeWorkerDiedReason`, so `countRepeatedParks`' `JSON.stringify(detail)`
+// fingerprint can actually recognise a repeat of this reason across two different job deposits.
+async function recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId, workerDiedReason, r) {
+  const maxPolls = config.gateDiedRecoveryMaxPolls;
+  const pollIntervalMs = config.gateDiedRecoveryPollIntervalMs;
+  appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery-start', { jobId, maxPolls, pollIntervalMs });
+
+  // Fix-pass defect 5: appended (never overwritten -- fs.writeFileSync already captured the
+  // exit-3 stdout/stderr above, at the top of realGate) exactly once, right before recovery routes
+  // onward (PASS or non-PASS) -- never on a park, and never on an intermediate not-yet-fresh poll.
+  const logRecoveredReport = (report) => {
+    fs.appendFileSync(
+      gateLogPath(ctx.taskDir),
+      `\n----- card #211 recovery: done/${jobId}.json -----\nverdict: ${report.verdict}\ndetail: ${report.detail || '(none)'}\n`
+    );
+  };
+
+  let polls = 0;
+  for (;;) {
+    const { report } = readGateDoneReport(config, jobId);
+    if (report) {
+      if (!GATE_ATTESTING_DONE_VERDICTS.has(report.verdict)) {
+        const headSha = resolveGateHeadSha(ctx, deps, worktreePath);
+        logRecoveredReport(report);
+        routeGateNonAttestingReport(ctx, config, headSha, report, 3); // throws for one of the four; falls through otherwise
+        // Fix-pass round 2, defect 2: reaching this line means `report.verdict` is neither
+        // ATTESTING nor one of the four NON-attesting shapes `routeGateNonAttestingReport`
+        // recognises (its own appendEvent/throw already handled those four -- nothing above this
+        // line ran for them). `LEASED` is the concrete example -- it flatly contradicts exit 3 at
+        // all -- but any FUTURE verdict this file does not know about yet lands here the same way.
+        // Before this fix, falling through silently re-entered the loop: the SAME report was
+        // re-read, re-logged to gate.log, and re-spawned `git rev-parse` on every remaining poll
+        // (measured: 182 spawns at the default 90-poll bound) because nothing here ever advanced
+        // past the unresolvable report. An unknown verdict can never become resolvable by waiting
+        // -- the file is already written and done/<id>.json is immutable once landed -- so this
+        // parks immediately, logged and journalled EXACTLY ONCE, the same terminal reason a
+        // missing or never-fresh verdict gets.
+        appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery', { jobId, workerDiedReason, polls, outcome: 'stale-verdict' });
+        throw new ParkSignal('gate-worker-died-midjob', {
+          exit: 3,
+          recoveryPolls: polls,
+          workerDiedReason: normalizeWorkerDiedReason(workerDiedReason),
+        });
+      }
+
+      const headSha = resolveGateHeadSha(ctx, deps, worktreePath);
+      const verdict = headSha ? readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`)) : null;
+      const fresh = !!(verdict && verdict.jobId === jobId);
+      if (fresh) {
+        logRecoveredReport(report);
+        if (verdict.verdict === 'PASS') {
+          appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery', { jobId, workerDiedReason, polls, outcome: 'pass' });
+          return acceptPassedGate(ctx, config, headSha, verdict, 3);
+        }
+        appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery', { jobId, workerDiedReason, polls, outcome: 'fail' });
+        return routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, r.stdout, 3);
+      }
+      // Attesting verdict, but no fresh verdicts/ entry for THIS job yet -- keep polling within
+      // the SAME remaining bound (fix-pass defect 3), not a park.
+    }
+
+    if (polls >= maxPolls) {
+      const outcome = report ? 'stale-verdict' : 'no-report';
+      appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery', { jobId, workerDiedReason, polls, outcome });
+      throw new ParkSignal('gate-worker-died-midjob', {
+        exit: 3,
+        recoveryPolls: polls,
+        workerDiedReason: normalizeWorkerDiedReason(workerDiedReason),
+      });
+    }
+    polls += 1;
+    await pollSleep(deps, pollIntervalMs);
+  }
+}
+
 async function realGate(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
@@ -1999,42 +2463,7 @@ async function realGate(ctx, deps = {}) {
     const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
     const verdict = readJsonSafe(verdictPath); // same accessor the exit-1 path below and realCiChecks already use
 
-    // Absence must be safe (action B2.3(c)): no verdict file at all (515 of 517 files on this
-    // very machine today have none), a verdict present but with no `live` key (every verdict
-    // written before this field existed -- see verdict.ts's own field comment), an unparsable
-    // file, or `live.status === 'unknown'` are ALL the identical fact -- "nothing on file proves
-    // the live stage ran" -- and none of them may be read as proof either way. Parking on any of
-    // them would stall the whole backlog on old data; routing exactly as before (CI_CHECKS) is
-    // the defensible middle this action calls for. Journalled so the gap stays visible without
-    // being actionable per card.
-    const live = verdict && verdict.live;
-    if (!live || live.status === 'unknown') {
-      appendEvent(ctx.taskDir, 'GATE', 'gate-live-unknown', {
-        headSha,
-        verdictPath,
-        verdictExists: fs.existsSync(verdictPath),
-      });
-      return 'CI_CHECKS';
-    }
-
-    if (liveRoutedButNotDriven(live)) {
-      appendEvent(ctx.taskDir, 'GATE', 'gate-live-not-driven', {
-        headSha,
-        exitFrom: 0,
-        why: live.why,
-        required: live.required,
-      });
-      // exitFrom on the ParkSignal detail too (adversarial verification T4), not only the
-      // journal event above -- the park comment and state.json are built from `detail`
-      // (park-loop.js's buildParkComment), and before this fix neither one said whether this
-      // park arrived honestly off exit 1 or via the pipeline's own defence-in-depth read of a
-      // PASS/exit-0 verdict; a maintainer had to open journal.jsonl to tell the two apart.
-      throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom: 0, why: live.why, required: live.required });
-    }
-
-    // live.status === 'ran', or 'skipped' with nothing required (the common, legitimate case) --
-    // proceed exactly as before.
-    return 'CI_CHECKS';
+    return acceptPassedGate(ctx, config, headSha, verdict, 0);
   }
 
   if (r.exit === 1) {
@@ -2127,35 +2556,12 @@ async function realGate(ctx, deps = {}) {
       // STALE (those DO get written to verdicts/<sha>.json, so reaching this branch at all with
       // one of THOSE verdicts means the two files disagree) is an inconsistency this function
       // does not try to explain -- it falls through to the pre-existing gate-non-attesting park
-      // exactly as if the richer read had failed.
+      // exactly as if the richer read had failed. (Card #211 fix-pass: the four-verdict routing
+      // itself now lives in routeGateNonAttestingReport, shared with the exit-3 recovery path --
+      // see that function's own header.)
       const jobReport = readGateJobReportForRouting(ctx, config, 'GATE', r.stdout);
       if (jobReport) {
-        const detail = { headSha, jobId: jobReport.id, jobDetail: jobReport.detail || null };
-        if (jobReport.verdict === 'ENVIRONMENT') {
-          appendEvent(ctx.taskDir, 'GATE', 'gate-environment', detail);
-          throw new ParkSignal('gate-environment', detail);
-        }
-        if (jobReport.verdict === 'DIRTY') {
-          // NOT the session's own tree (bench-gate.sh already refused a dirty session tree at
-          // exit 2, before a job was ever deposited) -- this is the bench worker's OWN shared
-          // ref checkout (`paths.refCheckout`) found dirty by the worker itself, after
-          // `prepareRef`. Deliberately named "the bench worker" and NOT by filename: part 1.8
-          // of test/doc-constant-sweep.test.js reads a possessive filename followed by a code-
-          // shaped word as a symbol citation, and the emphatic OWN here is prose, not a symbol
-          // the worker's source defines.
-          // A worker-side environment fact, never named `gate-dirty-tree` (that name is reserved
-          // for the session's own tree, exit 2, below).
-          appendEvent(ctx.taskDir, 'GATE', 'gate-worker-dirty-checkout', detail);
-          throw new ParkSignal('gate-worker-dirty-checkout', detail);
-        }
-        if (jobReport.verdict === 'ABANDONED') {
-          appendEvent(ctx.taskDir, 'GATE', 'gate-abandoned', detail);
-          throw new ParkSignal('gate-abandoned', detail);
-        }
-        if (jobReport.verdict === 'INTERRUPTED') {
-          appendEvent(ctx.taskDir, 'GATE', 'gate-interrupted', detail);
-          throw new ParkSignal('gate-interrupted', detail);
-        }
+        routeGateNonAttestingReport(ctx, config, headSha, jobReport, 1); // throws on a match; falls through otherwise
       }
 
       // `verdictDirExists` is on the event AND on the park detail deliberately: a misconfigured
@@ -2169,224 +2575,33 @@ async function realGate(ctx, deps = {}) {
       throw new ParkSignal('gate-non-attesting', { headSha, verdictDirExists });
     }
 
-    const baseMain = verdict.baseMain;
-    appendEvent(ctx.taskDir, 'GATE', 'gate-verdict', {
-      headSha,
-      verdict,
-      baseMain: baseMain || null,
-      merged: verdict.merged === true,
-    });
-
-    // ---- action B2.3(b): BLOCKED stops being routed to DIAGNOSE -----------------------------
-    //
-    // `cli.ts`'s wait() collapses every non-PASS/LEASED report.verdict to the same exit 1
-    // (`report.verdict === 'PASS' || 'LEASED' ? 0 : 1`) -- BLOCKED included, and BLOCKED is not in
-    // worker.ts's `NON_ATTESTING` set, so the verdict IS on disk here, distinguishable from a real
-    // FAIL by `verdict.verdict` alone. Without this check a BLOCKED gate falls straight through to
-    // `return 'DIAGNOSE'` at the bottom of this block and asks a judge to diagnose a code defect
-    // that was never observed -- verify-gate.js's own BLOCKED comment says as much: "This is not a
-    // verdict on the change: the flows could not be driven, none failed." Same shape as
-    // `main-moved-conflict` just below (a real park for a "not the code's fault" situation, not a
-    // DIAGNOSE call spent on an unanswerable question).
-    //
-    // Adversarial verification of B2.3 (finding T4) found `BLOCKED` is not one fact, it is at
-    // least four, from four different producers in SPO-WebClient, and a bare
-    // `verdict.verdict === 'BLOCKED'` check collapsed all of them into `gate-live-not-driven` --
-    // a name that asserts "routing required a live drive that never happened". That is true for
-    // the headline case (a routed-but-undriven diff, `verify-gate.js:342`, and `verify-gate.js:
-    // 308`'s capability-question variant) but false for the fourth: `run.ts:63`'s `runLive`
-    // returning BLOCKED because the world lock refused the run (dirty, or another live run
-    // already in flight). There used to be a second producer here -- a live-run rate limiter
-    // that could never fire -- but action B3.5 (SPO-WebClient PR #646) deleted it outright
-    // rather than tune it, so the world lock is now the whole of this case.
-    // `liveAttestationFrom` (worker.ts) maps that fourth
-    // case to `live.status === 'unknown'` -- the IDENTICAL value the exit-0 path just above
-    // reads as "nothing proven either way" and explicitly refuses to park on. Parking it here,
-    // under a name that claims routing was proven undriven, was the collapse: the same fact
-    // treated two opposite ways depending on which exit code carried it.
-    //
-    // So the split keys on the `live` FACT (`liveRoutedButNotDriven`, shared with the exit-0
-    // path above), not the bare verdict string. Only a genuinely routed-but-undriven BLOCKED
-    // gets `gate-live-not-driven` -- unchanged reason, unchanged non-transient treatment (a
-    // property of the worker binary or a reused verdict, not of the moment; a retry just asks
-    // the same worker the same question at real WORKTREE->PLAN->IMPLEMENT->GATE cost). Every
-    // other BLOCKED -- the world lock, or `verify-gate.js:308`'s capability-question
-    // variant, where `required` can be empty and nothing was actually routed -- gets its own
-    // reason, `gate-live-blocked`, deliberately not reusing a name that would misdescribe it.
-    //
-    // `gate-live-blocked`'s own disposition: unlike `gate-live-not-driven`, this one IS added to
-    // `TRANSIENT_RETRY_REASONS` below. The operational case that motivates it -- a maintainer
-    // running `gate:local --live` takes the single-flight lock (`world-lock.ts`'s own error:
-    // "A live run is already in flight ... Live runs are single-flight") -- clears itself in
-    // minutes, and parking the daemon's card on it permanently for that reason alone would be
-    // wrong. A genuinely DIRTY world lock ("Only a human clears this", world-lock.ts) does NOT
-    // self-heal, and the rate-limit arm is dead either way -- but `why` is free text from a
-    // different repo, not a contract this file should parse to split those apart, and
-    // TRANSIENT_RETRY_REASONS' own bounded budget (`config.transientRetryBudget`, default 2)
-    // already caps the cost of getting that wrong: a persistently-dirty lock burns at most 2
-    // extra WORKTREE->PLAN->IMPLEMENT->GATE cycles before falling through to an ordinary,
-    // human-visible park, exactly like `gate-non-attesting`'s own transient-but-bounded
-    // treatment above. Self-healing the common case beats a permanent park on a condition that
-    // was never the card's fault to begin with.
-    if (verdict.verdict === 'BLOCKED') {
-      const live = verdict.live;
-      if (liveRoutedButNotDriven(live)) {
-        appendEvent(ctx.taskDir, 'GATE', 'gate-live-not-driven', {
-          headSha,
-          exitFrom: 1,
-          why: live.why,
-          required: live.required,
-        });
-        throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom: 1, why: live.why, required: live.required });
-      }
-
-      appendEvent(ctx.taskDir, 'GATE', 'gate-live-blocked', {
-        headSha,
-        exitFrom: 1,
-        liveStatus: live && live.status,
-        why: live && live.why,
-      });
-      throw new ParkSignal('gate-live-blocked', {
-        headSha,
-        exitFrom: 1,
-        liveStatus: live && live.status,
-        why: live && live.why,
-      });
-    }
-
-    if (verdict.verdict === 'FAIL' && !baseMain) {
-      // The bench never got past `prepareRef` -- this branch does not merge with origin/main.
-      // Fetch the real remote tip first: the intersection/merge decision below must be made
-      // against it, not a lagging local `origin/main`. A non-zero exit here is not fatal --
-      // continue with what is already local rather than parking on a flaky fetch.
-      const fetch = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'fetch', 'origin', 'main']);
-      if (fetch.exit !== 0) {
-        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-fetch-failed', { exit: fetch.exit });
-      }
-
-      // Action 6.5: compare against the configurable budget (default 1, no behaviour change --
-      // see config.js's mainMovedRegateBudget comment for the settled decision and the corpus
-      // this default rests on) rather than a hardcoded "once".
-      const gateBudget = resolveMainMovedRegateBudget(config);
-      if (ctx.counters.mainMoveUsed >= gateBudget) {
-        throw new ParkSignal('main-moved-twice', { mainMoveUsed: ctx.counters.mainMoveUsed, mainMovedRegateBudget: gateBudget });
-      }
-      ctx.counters.mainMoveUsed += 1;
-
-      // Same nightly-red refusal CI_CHECKS applies to its own main-moved merge (guardNightlyRed,
-      // above) -- a rev-parse failure here is likewise non-fatal: without a sha to compare, the
-      // guard cannot fire, so this degrades to "not known to be red" rather than parking on what
-      // is, same as the fetch above, an enrichment lookup rather than the merge decision itself.
-      //
-      // That asymmetry with CI_CHECKS (whose gitRevParse throws ParkSignal('ci-checks-rev-parse-
-      // failed') on the very same failure) is deliberate and it is safe, for a reason worth
-      // writing down rather than trusting: skipping the guard cannot let a red `main` be merged,
-      // because the merge two lines below resolves the SAME ref. If `git rev-parse origin/main`
-      // genuinely cannot resolve it, neither can `git merge origin/main` -- measured in a scratch
-      // repo with no remote: rev-parse exits 128 ("unknown revision"), merge exits 1 ("merge:
-      // origin/main - not something we can merge") -- so the card parks `main-moved-conflict`
-      // rather than merging anything. The one residual window is a rev-parse that fails for a
-      // reason unrelated to the ref while the ref itself is fine (an operator's `kill -9` with no
-      // deadline armed, which spawnOnce maps to exit 1): the guard is skipped and a red `main`
-      // could be merged. Accepted rather than closed, on the same principle as the fetch above --
-      // a diagnostic lookup must not become the thing that parks the card -- and a merged red main
-      // costs one CHECK/GATE cycle, where a false park costs a maintainer.
-      const originMainRes = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'origin/main']);
-      if (originMainRes.exit === 0) {
-        guardNightlyRed(ctx, 'GATE', config, originMainRes.stdout.trim());
-      } else {
-        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-rev-parse-failed', { exit: originMainRes.exit });
-      }
-
-      const merge = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
-      if (merge.exit === 0) {
-        appendEvent(ctx.taskDir, 'GATE', 'main-moved-merge', { from: 'GATE' });
-        return 'CHECK';
-      }
-
-      // Non-zero: abort the failed merge so the worktree is left clean, then park. `merge
-      // --abort` goes through spawnStep like everything else here, so its own exit is already
-      // journalled by the generic 'spawn' event -- a NON-ZERO exit is deliberately not inspected,
-      // because a failed abort must not be allowed to mask the park below.
-      //
-      // "Not inspected" is not the same as "cannot escape", and the try/catch is what makes the
-      // sentence above actually true: since action 2.1, a spawnStep whose command is killed by
-      // its own timeout TWICE does not return at all -- it throws ParkSignal('git-timed-out'),
-      // which would unwind straight past the throw below and park the card under a reason naming
-      // the CLEANUP instead of the cause, taking {headSha, mergeExit} with it. That is action
-      // 4.3's verification finding in a different costume (a lookup documented as "never parks"
-      // parking the card before its own event was written), and this is one of the two call sites
-      // in this block where a spawnStep throw destroys information the rest of the system depends
-      // on: `main-moved-conflict` is the whole output of this action, the reason a maintainer
-      // reads, and the reason action 4.4 keys its transient-retry decision off. Journal the
-      // timeout, then park for the real reason regardless. (The other spawnStep calls here --
-      // rev-parse, fetch, merge -- are deliberately NOT wrapped: a hung git there parks
-      // `git-timed-out` before any routing decision has been made, which is honest and is exactly
-      // what spawnStep's own header prescribes.)
-      //
-      // What a failed abort leaves behind, traced rather than assumed: an unresolved index with
-      // conflict markers. finalizePark then calls preserveWorktreeWip, which does `git status
-      // --porcelain` (non-empty -> proceeds), then `git checkout --detach` -- and git REFUSES
-      // that on an unmerged index ("error: you need to resolve your current index first", exit 1,
-      // measured). preserveWorktreeWip journals `wip-preserve-failed {step:'detach'}` and returns
-      // null, so a conflicted tree is never committed to a `wip/` ref and no branch pointer moves.
-      // Nothing is lost either: the only content in that tree that is not already on the branch is
-      // origin/main's own, and `retry` rebuilds the worktree from scratch anyway.
-      try {
-        spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', '--abort']);
-      } catch (err) {
-        if (!(err instanceof ParkSignal)) throw err;
-        appendEvent(ctx.taskDir, 'GATE', 'gate-main-moved-abort-failed', { reason: err.reason });
-      }
-      // Parking here is deliberate, not a gap: #439 proves DIAGNOSE cannot fix a conflict
-      // IMPLEMENT never even saw, and a maintainer's `retry` restarts at INTAKE from a fresh
-      // worktree off the new main -- which is what actually resolved it, in 19 minutes.
-      throw new ParkSignal('main-moved-conflict', { headSha, mergeExit: merge.exit });
-    }
-
-    // Action B3.4: STALE ("the tree changed between deposit and the end of the run") is not a
-    // code defect either -- verify-gate.js's own PASS/FAIL body verdict, whatever it was, applies
-    // to a tree that no longer exists, and the bench's own advice is "resubmit", never "diagnose
-    // this". Unlike DIRTY/ENVIRONMENT/ABANDONED/INTERRUPTED above, `verdicts/<sha>.json` IS
-    // written for STALE (it is not in `NON_ATTESTING`), so `verdict.verdict === 'STALE'` is
-    // already known here without needing `done/<id>.json` -- but that file's own `detail` still
-    // gives a maintainer the human-readable "what changed and when" the compact verdicts/ entry
-    // does not carry, so it is read best-effort for that alone; its absence never blocks the park.
-    if (verdict.verdict === 'STALE') {
-      const jobReport = readGateJobReportForRouting(ctx, config, 'GATE', r.stdout);
-      const jobDetail = jobReport && jobReport.verdict === 'STALE' ? jobReport.detail || null : null;
-      const detail = { headSha, jobDetail };
-      appendEvent(ctx.taskDir, 'GATE', 'gate-stale', detail);
-      throw new ParkSignal('gate-stale', detail);
-    }
-
-    // FAIL carrying baseMain (a real failure -- see the header comment above), or any other
-    // shape (e.g. a PASS verdict recorded against an exit-1 gate; BLOCKED/STALE are carved out
-    // above) -> DIAGNOSE, unchanged.
-    return 'DIAGNOSE';
+    return routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, r.stdout, 1);
   }
 
   // ---- action B3.4: exit 2/3 sub-causes, named from the CLI's own printed diagnostic --------
   //
   // Principle 1 above ("exit codes are the contract... never printed text") still decides the
-  // ROUTE for exit 2 and exit 3 -- both remain a park, unconditionally, exactly as before this
-  // action. What changes is only the NAME attached to that already-decided park: `done/<id>.json`
-  // cannot help here (SPO-WebClient/scripts/bench-gate.sh's own two pre-flight refusals, and
-  // cli.ts submit()'s WORKER DOWN / DuplicateJobError checks, all run BEFORE any job is deposited
-  // -- there is no job id to parse yet; the one exit-3 case where a job WAS deposited, "WORKER
-  // DIED while job was pending", returns the instant `!worker.alive`, before the worker's own
-  // restart-time `recoverInterrupted` has had any chance to write that job's `done/<id>.json`) --
-  // so the only place the distinguishing fact still exists is the literal diagnostic text each
-  // script already prints to stderr, captured unchanged in `r.stderr` (and journalled to
-  // gate.log above regardless). Three sub-causes per exit code
-  // (SPO-WebClient/scripts/bench-gate.sh's "DIRTY TREE"/"NOT PUSHED", cli.ts submit()'s
-  // DuplicateJobError message, for exit 2; SPO-WebClient/scripts/bench-submit.sh's "bench client
-  // not built", cli.ts submit()'s "WORKER DOWN", cli.ts wait()'s "WORKER DIED", for exit 3) --
-  // matched by substring against known, stable literals this pipeline does not control but does
-  // cite exactly (see each regex's own comment). Anything unrecognized falls back to the
-  // pre-existing, most-common-case name (`gate-dirty-tree` / `gate-worker-down`) exactly as
-  // before this action -- never a new failure mode, only a more specific one when the text is
-  // there to support it.
+  // ROUTE for exit 2, and for every exit-3 sub-cause except one: `done/<id>.json` genuinely
+  // cannot help for exit 2 (SPO-WebClient/scripts/bench-gate.sh's own two pre-flight refusals) or
+  // for exit 3's other two sub-causes -- bench client not built, and cli.ts submit()'s own
+  // WORKER-DOWN check -- because all of them run BEFORE any job is ever deposited; there is no job
+  // id to parse yet. Those three stay an unconditional park, exactly as before this action, with
+  // only the NAME attached to that already-decided park changing (matched by substring against
+  // known, stable literals this pipeline does not control but does cite exactly -- see each
+  // regex's own comment).
+  //
+  // Card #211's fix-pass corrects a claim this comment used to make about the fourth sub-cause,
+  // "WORKER DIED while job was pending": it does NOT return before a job id exists (a job WAS
+  // deposited, printed on stdout, and `parseGateJobId` reads it there) -- what actually happens is
+  // `!worker.alive` firing before `done/<jobId>.json` has necessarily LANDED yet, which is a race,
+  // not an ordering guarantee. So `done/<id>.json` is NOT unusable here; it is merely maybe-not-
+  // there-yet, and `recoverFromGateWorkerDied` (below) polls for it -- see that function's own
+  // header for the full account. When a job id is present, exit 3 is NO LONGER an unconditional
+  // park: recovery can resolve to `CI_CHECKS`, `DIAGNOSE`, `CHECK` (a clean main-moved merge), or
+  // any other reason `acceptPassedGate`/`routeGateVerdict`/`routeGateNonAttestingReport` produce,
+  // at `exitFrom: 3`. Only when no job id was ever printed (the three sub-causes above, or an
+  // unrecognised WORKER-DIED shape) does exit 3 stay the unconditional, exit-code-only park this
+  // section's own header still correctly describes for everything else.
   if (r.exit === 2) {
     const text = (r.stderr || '') + '\n' + (r.stdout || '');
     // scripts/bench-gate.sh: `echo "NOT PUSHED: ..." >&2`
@@ -2402,7 +2617,29 @@ async function realGate(ctx, deps = {}) {
     // scripts/bench-submit.sh: `echo "bench client not built at $CLI ..." >&2`
     if (/bench client not built/.test(text)) throw new ParkSignal('gate-worker-not-built', { exit: r.exit });
     // cli.ts wait(): `deps.err(\`WORKER DIED while job ${id} was pending: ...\`)`
-    if (/WORKER DIED/.test(text)) throw new ParkSignal('gate-worker-died-midjob', { exit: r.exit });
+    if (/WORKER DIED/.test(text)) {
+      // Card #211: this text alone is the gate CLI's OWN liveness read (cli.ts's workerStatus)
+      // disagreeing with the worker's actual state, not proof the worker died -- measured over
+      // the real corpus, 7 of 7 `gate-worker-died-midjob` parks were a LIVE worker that went on
+      // to PASS this exact job 4.3-414.1s later (see GATE_DIED_RECOVERY_MAX_POLLS's own comment
+      // in config.js for the full measurement). Recovery only applies when a job id was actually
+      // deposited (`parseGateJobId(r.stdout)`, gated on stdout alone -- the same anchor
+      // `readGateDoneReport` elsewhere in this file already relies on): that is the "queue is
+      // preserved" case cli.ts's own wait() describes, and the ONLY case a `done/<jobId>.json`
+      // can ever land for later. No job id (bench-gate.sh's own two pre-flight refusals and
+      // cli.ts submit()'s WORKER-DOWN/duplicate checks run before any deposit, so this should not
+      // happen for THIS text, but stays defensive for an unrecognised WORKER DIED shape) falls
+      // straight through to the unconditional park below, unchanged from before this action --
+      // never a sleep, never a poll. This is also why the pre-existing exit-3/WORKER-DIED test
+      // (no job id in its stdout) stays green with `deps.sleep` never called.
+      const jobId = parseGateJobId(r.stdout);
+      if (jobId) {
+        const reasonMatch = /WORKER DIED while job \S+ was pending: (.*)/.exec(text);
+        const workerDiedReason = reasonMatch ? reasonMatch[1].trim() : null;
+        return recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId, workerDiedReason, r);
+      }
+      throw new ParkSignal('gate-worker-died-midjob', { exit: r.exit });
+    }
     // cli.ts submit(): `deps.err(\`WORKER DOWN: ...\`)` -- also the fallback for anything
     // unrecognized, matching this reason's own pre-existing, most-common meaning.
     throw new ParkSignal('gate-worker-down', { exit: r.exit });

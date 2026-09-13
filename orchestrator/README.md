@@ -862,7 +862,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:773`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:899`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -916,7 +916,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:150` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:159` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1094,6 +1094,31 @@ world-lock refusal or a dead-today rate limit, `run.ts`'s `runLive` in SPO-WebCl
 `ctx.counters.mainMoveUsed` and the `guardNightlyRed` helper with CI_CHECKS. The shadow-fixture
 path keeps the old flat table. See `doc/state-machine-spec.md`'s GATE row and realGate's own
 header comment for the measurement.
+
+**Card #211: exit 3, `WORKER DIED`, no longer parks on that text alone** when a job id was also
+printed (`parseGateJobId(r.stdout)`) — the corpus showed 7 of 7 real `gate-worker-died-midjob`
+parks were a LIVE worker that went on to PASS that exact job. `recoverFromGateWorkerDied` polls
+`<spoBenchDir>/done/<jobId>.json` every `config.gateDiedRecoveryPollIntervalMs`
+(`SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS`, default 5000ms) up to
+`config.gateDiedRecoveryMaxPolls` (`SPO_GATE_DIED_RECOVERY_MAX_POLLS`, default 90, 450s total —
+saves 7/7 of the measured corpus; guarded against a non-finite/non-positive/oversized override via
+`boundedPositiveIntFromEnv`, since this count is folded into the GATE deadline below and an
+oversized value would silently clamp Node's own timer). A done report naming a NON-attesting
+verdict (ENVIRONMENT/DIRTY/ABANDONED/INTERRUPTED — worker.ts never writes `verdicts/` for these)
+routes immediately through `routeGateNonAttestingReport`, the SAME per-verdict logic a real exit 1
+uses off that same file; a report naming an ATTESTING verdict (PASS/FAIL/BLOCKED/STALE) keeps
+polling within the SAME bound until a fresh same-job entry in `verdicts/<headSha>.json`
+(`verdict.jobId === jobId`) lands, since worker.ts writes the two files ~7ms apart. A fresh verdict
+routes through the exact same acceptance/failure logic a real exit 0/1 uses (`acceptPassedGate` /
+`routeGateVerdict`), tagged `exitFrom: 3`, and appends the done report's own verdict/detail to
+`gate.log`. No report within the bound, or an attesting report whose verdict never became fresh,
+still parks `gate-worker-died-midjob` — unchanged, still terminal — with `detail` limited to
+`{exit: 3, recoveryPolls, workerDiedReason}` (the raw job id and raw reason text live on the
+`gate-died-recovery` journal event only; the park detail's own `workerDiedReason` has every run of
+digits collapsed to `N` so `countRepeatedParks` can still recognise a repeat across two different
+job deposits). See `doc/state-machine-spec.md`'s GATE row for the full account, including why this
+recovery wait forced GATE to finally get its own derived
+`stepDeadlineMsByState` entry (the first real `await` inside `realGate`).
 
 **CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
 <worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to

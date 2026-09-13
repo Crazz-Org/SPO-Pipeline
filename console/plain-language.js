@@ -171,7 +171,7 @@ const PARK_REASONS = {
   // --- the gate (full test run) -----------------------------------------------------------
   'gate-dirty-tree': 'The working copy had uncommitted changes when the test run started.',
   'gate-worker-down': 'The machine that runs the full test suite was not answering.',
-  'gate-worker-died-midjob': 'The test machine died in the middle of the run.',
+  'gate-worker-died-midjob': 'The test machine looked dead, and the pipeline could not confirm what happened to the run.',
   'gate-worker-not-built': 'The test machine has not been built yet.',
   'gate-worker-dirty-checkout': "The test machine's own checkout was not clean.",
   'gate-timeout': 'The full test run took too long and was cut off.',

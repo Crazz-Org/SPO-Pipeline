@@ -1370,7 +1370,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:157",
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:166", // re-pinned from :157 -- card #211's fix-pass Principle-1 growth pushed the whole step table down 9 lines, so :157 (which used to be the FINISH row) is now PLAN; FINISH itself is at :166. A true pure shift; content byte-identical at :166 (verified: the FINISH row's own "Action B1.4: FINISH now actually keeps the promise this row always made -- fast-forward the main product checkout" opens it).
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
@@ -1400,7 +1400,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1273", // same re-pin, same day, card #214 -- see the sibling doc's own EXPECTED_CITATIONS comment above.
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
-  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:157",
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:166", // re-pinned from :157, same shift/reason as doc/bench-audit-2026-09-02.md's own entry above
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293",
   "doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156",
@@ -1409,7 +1409,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
-  "doc/board-audit.md :: config.js:900", // re-pinned from :893 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above reportIntakeColumn, a true pure shift; content byte-identical at :900
+  "doc/board-audit.md :: config.js:1035", // re-pinned from :900, then :965, then :1003, then :1035 (card #211's fix-pass ROUND 2: MAX_TIMER_DELAY_MS const + the residual-overflow Math.max/Math.min guards on GATE_DIED_RECOVERY_MAX_POLLS_CEILING/MAX_POLLS added 32 more net lines above reportIntakeColumn) -- a true pure shift each time; content byte-identical at :1035
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1382",
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1232", // re-pinned in card #214 (Lot 9, 2026-09-13): :1202 -> :1232, a pure +30-line shift when that action's `cmdTokens` gained the opt-in `--usage-delta` section (see this file's own EXPECTED_CITATIONS entry for `bin/spo:1273`, the `collectAll` pin shifted by the same edit) landed above `cmdDashboard` in the same file; content byte-identical (`function cmdDashboard(opts) {`) at :1232, verified by re-reading the target line.
@@ -1418,9 +1418,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: .claude/settings.json:109-127",
   "orchestrator/README.md :: account-lease.js:156",
-  "orchestrator/README.md :: config.js:773", // re-pinned from :766 -- action 2.2 of card #158 added 7 lines to config.js's accountLeaseWaitMs comment above productRepo, a true pure shift; content byte-identical at :773
+  "orchestrator/README.md :: config.js:899", // re-pinned from :773, then :829, then :867, then :899 (card #211's fix-pass ROUND 2: MAX_TIMER_DELAY_MS const + the residual-overflow Math.max/Math.min guards on GATE_DIED_RECOVERY_MAX_POLLS_CEILING/MAX_POLLS added 32 more net lines above productRepo) -- a true pure shift each time; content byte-identical at :899
   "orchestrator/README.md :: dispatcher.js:634-648",
-  "orchestrator/README.md :: doc/state-machine-spec.md:150",
+  "orchestrator/README.md :: doc/state-machine-spec.md:159", // re-pinned from :150 -- card #211's fix-pass Principle-1 edit (naming the WORKER-DIED exception truthfully) added 9 net lines above the step table, a true pure shift; content byte-identical at :159 (the CHECK row)
   "orchestrator/README.md :: intake.js:938-940", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines.
   "orchestrator/README.md :: lock.js:276",
   "orchestrator/README.md :: lock.js:278-309",
@@ -1432,7 +1432,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/dispatcher.js :: daemon.js:607",
   "orchestrator/dispatcher.js :: daemon.js:626-627",
-  "orchestrator/invariants.js :: doc/state-machine-spec.md:150",
+  "orchestrator/invariants.js :: doc/state-machine-spec.md:159", // re-pinned from :150, same shift/reason as orchestrator/README.md's own entry above
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/journal.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
@@ -2210,23 +2210,25 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
 //     leaves a 32-line window still containing the same identifier; a range citation is
 //     bounds-checked and content-anchored, never line-discriminated. Counted, not hidden.
 const ANCHOR_BLUNT_CITATIONS = {
-  // README.md: "`doc/state-machine-spec.md:150` has always promised CHECK runs an invariant
+  // README.md: "`doc/state-machine-spec.md:159` has always promised CHECK runs an invariant
   // substring check". The target is the spec's own step TABLE, where `CHECK` is both a step name
-  // and the "next state" cell of the rows above it -- lines 148, 149, 150 and 152 all contain the
-  // bare word. The citation is correct (150 IS the CHECK row); no identifier-level rule can
-  // separate row 149 from row 150 when the discriminating token is the table's own column value.
+  // and the "next state" cell of the rows above it -- lines 157, 158, 159 and 161 all contain the
+  // bare word. The citation is correct (159 IS the CHECK row); no identifier-level rule can
+  // separate row 158 from row 159 when the discriminating token is the table's own column value.
   // Re-measured for card #78, then RE-re-measured by the verifier: this action's Principle-2 edits
   // (above the table) shifted every row down by EIGHT lines, not ten -- the "was 138/139/140/142"
   // the first cut recorded was copied from the previous comment, not measured; `main` really had
   // the bare word on 140/141/142/144 and the CHECK ROW on 142, so the old pin :140 named the PLAN
-  // row. Measured on the file as it stands, `\bCHECK\b` occurs on 148, 149, 150, 152, 153, 154 and
-  // 156 -- more lines than the four this entry names, which does not change the verdict (the
-  // anchor word is the table's own column value, so no identifier-level rule can pick 150 out of
-  // its neighbours) and :150 IS the CHECK row.
-  'orchestrator/README.md :: doc/state-machine-spec.md:150':
-    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (148-150, 152) " +
-    '-- the anchor word is the column value itself, so :149 anchors as well as :150. Citation ' +
-    'confirmed correct by hand: 150 is the CHECK row.',
+  // row. Re-pinned again in card #211's fix-pass: that action's own Principle-1 edit (naming the
+  // WORKER-DIED exception truthfully) added 9 net lines above this table, a true pure shift --
+  // :150 -> :159, same target, same shape. Measured on the file as it stands, `\bCHECK\b` occurs
+  // on 157, 158, 159, 161, 162, 163 and 165 -- more lines than the four this entry names, which
+  // does not change the verdict (the anchor word is the table's own column value, so no
+  // identifier-level rule can pick 159 out of its neighbours) and :159 IS the CHECK row.
+  'orchestrator/README.md :: doc/state-machine-spec.md:159':
+    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (157-159, 161) " +
+    '-- the anchor word is the column value itself, so :158 anchors as well as :159. Citation ' +
+    'confirmed correct by hand: 159 is the CHECK row.',
   // park-loop.js: "doc/remediation-progress.md:664 confirms the same referent under 'DIAGNOSE
   // surfacing'" (re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines above this bullet in
   // remediation-progress.md, a true pure shift). Line 664 is the bullet's own heading line and 665
@@ -2255,7 +2257,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
   assert.deepEqual(
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
-      'orchestrator/README.md :: doc/state-machine-spec.md:150',
+      'orchestrator/README.md :: doc/state-machine-spec.md:159',
       'orchestrator/park-loop.js :: doc/remediation-progress.md:664',
       'orchestrator/state-machine.js :: park-loop.js:1283',
     ],

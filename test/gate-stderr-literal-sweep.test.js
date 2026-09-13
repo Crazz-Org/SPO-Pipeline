@@ -109,6 +109,11 @@ const PINS = [
     contains: 'WORKER DIED',
   },
   {
+    name: "card #211: exit 3, WORKER DIED reason capture shape (scripted.js: /WORKER DIED while job \\S+ was pending: (.*)/)",
+    file: 'SPO-WebClient/src/e2e/bench/cli.ts',
+    contains: 'was pending:',
+  },
+  {
     name: 'exit 3, WORKER DOWN fallback -> gate-worker-down, unchanged (scripted.js comment)',
     file: 'SPO-WebClient/src/e2e/bench/cli.ts',
     contains: 'WORKER DOWN',
@@ -151,10 +156,11 @@ test('every stderr/stdout literal realGate matches for GATE exit 2/3/1-job-id ro
 // floor does: a mutation that deletes rows from PINS must not leave this file green while
 // checking fewer facts than it claims to.
 test('PINS covers every literal this sweep exists to pin -- not silently shrunk', () => {
-  assert.equal(PINS.length, 7, `expected exactly 7 pinned literals, found ${PINS.length}`);
+  assert.equal(PINS.length, 8, `expected exactly 8 pinned literals, found ${PINS.length}`);
   assert.deepEqual(
     PINS.map((p) => p.name).sort(),
     [
+      "card #211: exit 3, WORKER DIED reason capture shape (scripted.js: /WORKER DIED while job \\S+ was pending: (.*)/)",
       "exit 1, job-deposited stdout marker -- parseGateJobId's own anchor (/(?:^|\\n)job (\\S+) queued/)",
       'exit 2, DIRTY TREE fallback -> gate-dirty-tree, unchanged (scripted.js comment)',
       'exit 2, NOT PUSHED -> gate-not-pushed (scripted.js: /NOT PUSHED/)',
