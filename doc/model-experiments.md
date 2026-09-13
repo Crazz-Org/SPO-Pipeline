@@ -68,8 +68,9 @@ Caveats that apply to every entry:
   | fable/high (L) | 8 | 3 | 825s | 311,387 | 64 |
 
   The fable/high `ok` count includes #486's pre-raise deadline kills. `turns` is the CLI's
-  `num_turns` (agentic-loop turns, not API requests). Card #214 stopped journalling it, so Opus-era
-  calls have no `turns` to compare against this column.
+  `num_turns` (agentic-loop turns, not API requests). Card #214 stops journalling it: once that is
+  deployed, `medianTurns` covers only the calls that still carry the field, a subset of the cell's
+  `n`, and is null for a cell made entirely after the deploy. Do not compare this column across it.
 
   | Cards planned on Fable | cards | done | parked at PLAN | IMPLEMENT calls / done | DIAGNOSE calls / done | median billable / done |
   |---|---|---|---|---|---|---|
@@ -92,9 +93,9 @@ Caveats that apply to every entry:
 
   Otherwise **adopt**, and move this entry to *Settled decisions*.
 - **Watch for:** Opus planning M cards at `high` costing more than Fable did at `medium`. The cell
-  comparison in `calls` shows it in billable tokens and duration (not turns, see the baseline note),
-  and `spo tokens --usage-delta` gives the per-step request count. It is a reason to try M → medium
-  before reverting the model.
+  comparison in `calls` shows it in billable tokens and duration (not turns, see the baseline note).
+  `spo tokens --usage-delta` counts requests per step, but over all models and all dates, so it
+  cannot split Opus from Fable. It is a reason to try M → medium before reverting the model.
 - **Verdict log:** *(none yet)*
 
 ### EXP-IMPLEMENT-S-MEDIUM — IMPLEMENT's S cards at `medium` instead of `low`

@@ -406,7 +406,7 @@ const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
 //
 // Fable baseline: every PLAN llm-call journaled in ~/.spo-state/journal up to 2026-09-13, medians
 // over all calls, failed ones included (`node scripts/model-report.js --step=PLAN
-// --until=2026-09-13` re-derives these):
+// --until=2026-09-13` re-derives these; `turns` is num_turns, not a request count -- card #214):
 //   fable/low     n=103  ok=98   217s    83,596 billable   26 turns
 //   fable/medium  n=66   ok=57   473s   164,428 billable   49 turns
 //   fable/high    n=8    ok=3    825s   311,387 billable   64 turns  (includes the pre-raise
