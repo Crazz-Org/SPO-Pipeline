@@ -244,6 +244,14 @@ const PARK_REASONS = {
 
   // --- maintainer verdicts ------------------------------------------------------------------------
   'abandoned-by-maintainer': 'You told it to stop working on this card.',
+
+  // --- resume (card #212 C) -----------------------------------------------------------------------
+  // C2 widened this park's real causes past "the branch/worktree" alone: a closed or merged pull
+  // request, a merge left mid-conflict, a rewritten branch -- see doc/state-machine-spec.md's
+  // "Resume at CHECK" section for the full step list. PARK_REASONS is keyed by reason string only
+  // (no detail-based variants), so one sentence has to fit every one of those shapes.
+  'resume-precondition-failed':
+    'The card was asked to continue from where it left off, but its branch, worktree, or pull request was not in a state it could continue from.',
 };
 
 // The reasons the daemon retries on its own, mirrored from state-machine.js's

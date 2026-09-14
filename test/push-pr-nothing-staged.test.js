@@ -447,3 +447,150 @@ test('realPushPr: commit exit 0 (ordinary path) -> no status/rev-parse diagnosti
   assert.ok(findPush(calls), 'the ordinary push must still happen');
   assert.equal(findEvent(ctx.taskDir, 'commit-skipped-nothing-staged'), undefined);
 });
+
+// ================================================================================================
+// ---- card #212 C2: the PUSH_PR one-shot exemption for a resumed branch -----------------------
+// ================================================================================================
+//
+// `ctx.resumePushPending` is set by runTask's resume path (state-machine.js) and consumed here,
+// at the very top of realPushPr, read once and cleared immediately -- see that assignment's own
+// comment for why. These tests set it by hand on a ctx built the same way every other test in
+// this file does (buildCtx never sets it to anything but `false`), the same shortcut
+// test/resume-at-check.test.js takes for `task.resume` fields runTask would otherwise rehydrate.
+
+test("realPushPr: resume pass, HEAD === remote tip -> commit-skipped-resume, push issued, no park; a SECOND call on the same ctx parks nothing-new-to-push (one-shot)", async () => {
+  const worktreePath = mkTmp('spo-pps-resume1-wt-');
+  const branch = 'claude-pipe/card-pps-resume1';
+  const task = { id: 'card-pps-resume1', kind: 'card', issue: 701, title: 't', worktreePath, branch };
+  const ctx = testCtx({ id: 'card-pps-resume1', task, config: testConfig() });
+  ctx.resumePushPending = true;
+
+  const calls = [];
+  const deps = {
+    spawnSync: pushPrSpawnSync(calls, {
+      commitExit: 1,
+      statusOut: '',
+      head: 'resumehead1111111111111111111111111111111',
+      remoteBranchSha: 'resumehead1111111111111111111111111111111', // == head: the resumed branch's own shape
+      mainSha: 'originmainR1111111111111111111111111111111',
+    }),
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.resumePushPending, false, 'the flag must be cleared after this call');
+
+  const skipped = findEvent(ctx.taskDir, 'commit-skipped-resume');
+  assert.ok(skipped, 'expected commit-skipped-resume to be journalled');
+  assert.equal(skipped.head, 'resumehead1111111111111111111111111111111');
+  assert.equal(skipped.remoteBranchSha, 'resumehead1111111111111111111111111111111');
+  assert.equal(skipped.branch, branch);
+  assert.equal(
+    findEvent(ctx.taskDir, 'commit-skipped-nothing-staged'),
+    undefined,
+    'the resume-specific event must fire instead of the generic one'
+  );
+
+  assert.ok(findPush(calls), 'push must be attempted');
+
+  // Second call, same ctx: resumePushPending is now false, so the IDENTICAL shape parks exactly
+  // as it would have without the exemption ever existing -- proving the exemption is one-shot.
+  await assert.rejects(
+    () => realPushPr(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'push-pr-failed' &&
+      err.detail.step === 'commit' &&
+      err.detail.reason === 'nothing-new-to-push'
+  );
+});
+
+test('realPushPr: resume pass, HEAD === origin/main -> still parks nothing-implemented (the exemption never covers this shape)', async () => {
+  const worktreePath = mkTmp('spo-pps-resume-ni-wt-');
+  const task = { id: 'card-pps-resume-ni', kind: 'card', issue: 703, title: 't', worktreePath };
+  const ctx = testCtx({ id: 'card-pps-resume-ni', task, config: testConfig() });
+  ctx.resumePushPending = true;
+
+  const calls = [];
+  const deps = {
+    spawnSync: pushPrSpawnSync(calls, {
+      commitExit: 1,
+      statusOut: '',
+      head: 'samesha9999999999999999999999999999999999',
+      mainSha: 'samesha9999999999999999999999999999999999', // HEAD === origin/main
+      remoteBranchSha: null,
+    }),
+  };
+
+  await assert.rejects(
+    () => realPushPr(ctx, deps),
+    (err) =>
+      err instanceof ParkSignal &&
+      err.reason === 'push-pr-failed' &&
+      err.detail.step === 'commit' &&
+      err.detail.reason === 'nothing-implemented'
+  );
+  assert.equal(ctx.resumePushPending, false, 'the flag is cleared even on the park this exemption never covers');
+  assert.equal(findPush(calls), undefined, 'no push may be attempted when nothing was ever implemented');
+});
+
+test('realPushPr: without resumePushPending, the #213 shape parks exactly as before -- the exemption changes nothing for an ordinary retry', async () => {
+  const worktreePath = mkTmp('spo-pps-noresume-wt-');
+  const task = { id: 'card-pps-noresume', kind: 'card', issue: 704, title: 't', worktreePath };
+  const ctx = testCtx({ id: 'card-pps-noresume', task, config: testConfig() });
+  assert.equal(ctx.resumePushPending, false, 'buildCtx must default this to false');
+
+  const calls = [];
+  const deps = {
+    spawnSync: pushPrSpawnSync(calls, {
+      commitExit: 1,
+      statusOut: '',
+      head: 'ordinaryhead44444444444444444444444444444',
+      remoteBranchSha: 'ordinaryhead44444444444444444444444444444',
+      mainSha: 'originmainR4444444444444444444444444444444',
+    }),
+  };
+
+  await assert.rejects(
+    () => realPushPr(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'push-pr-failed' && err.detail.reason === 'nothing-new-to-push'
+  );
+});
+
+test('realPushPr: resumePushPending is cleared even when this call parks on an EARLIER step (`git add` failing) -- proven by a second call', async () => {
+  const worktreePath = mkTmp('spo-pps-resume-addfail-wt-');
+  const task = { id: 'card-pps-resume-addfail', kind: 'card', issue: 702, title: 't', worktreePath };
+  const ctx = testCtx({ id: 'card-pps-resume-addfail', task, config: testConfig() });
+  ctx.resumePushPending = true;
+
+  const failAddDeps = {
+    spawnSync: (command, args) => (command === 'git' && args.includes('add') ? fail(1) : ok('')),
+  };
+
+  await assert.rejects(
+    () => realPushPr(ctx, failAddDeps),
+    (err) => err instanceof ParkSignal && err.reason === 'push-pr-failed' && err.detail.step === 'add'
+  );
+  assert.equal(
+    ctx.resumePushPending,
+    false,
+    'the flag must already be cleared -- it is read and cleared at the top of the function, before `add` ever runs'
+  );
+
+  // Second call, same ctx, a shape the exemption WOULD have covered had the flag still been set:
+  // it must park normally, proving the first call's early park did not leave the flag armed.
+  const calls2 = [];
+  const deps2 = {
+    spawnSync: pushPrSpawnSync(calls2, {
+      commitExit: 1,
+      statusOut: '',
+      head: 'addfixedhead2222222222222222222222222222222',
+      remoteBranchSha: 'addfixedhead2222222222222222222222222222222',
+      mainSha: 'originmainR2222222222222222222222222222222',
+    }),
+  };
+  await assert.rejects(
+    () => realPushPr(ctx, deps2),
+    (err) => err instanceof ParkSignal && err.reason === 'push-pr-failed' && err.detail.reason === 'nothing-new-to-push'
+  );
+});

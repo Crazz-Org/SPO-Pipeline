@@ -120,7 +120,7 @@
     },
     {
       "citingFile": "test/blank-comments-sync.test.js",
-      "citation": "orchestrator/state-machine.js:216",
+      "citation": "orchestrator/state-machine.js:225",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
@@ -477,7 +477,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "park-loop.js:1341",
+      "citation": "park-loop.js:1457",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    if (state.state !== 'PARKED') continue;",
@@ -543,7 +543,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "orchestrator/README.md:2134",
+      "citation": "orchestrator/README.md:2169",
       "occurrence": 0,
       "at": "HEAD",
       "first": "SPO-Deploy's `DEPLOY.md` § 5.5 and SPO-WebClient's `src/server/report-pull-endpoint.ts`.",
@@ -567,7 +567,7 @@
     },
     {
       "citingFile": "test/gate-legs-reachability.test.js",
-      "citation": "state-machine.js:246",
+      "citation": "state-machine.js:255",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));",
@@ -575,7 +575,7 @@
     },
     {
       "citingFile": "test/gate-legs-reachability.test.js",
-      "citation": "state-machine.js:242",
+      "citation": "state-machine.js:251",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  if (ctx.fixture('nightlyMainRed', false)) {",
@@ -583,7 +583,7 @@
     },
     {
       "citingFile": "test/gate-legs-reachability.test.js",
-      "citation": "test/real-steps.test.js:3901",
+      "citation": "test/real-steps.test.js:3977",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  assert.equal(waitCalls, 2);",
@@ -599,7 +599,7 @@
     },
     {
       "citingFile": "test/gate-legs-reachability.test.js",
-      "citation": "state-machine.js:246",
+      "citation": "state-machine.js:255",
       "occurrence": 1,
       "at": "HEAD",
       "first": "    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));",
@@ -607,7 +607,7 @@
     },
     {
       "citingFile": "test/gate-legs-reachability.test.js",
-      "citation": "state-machine.js:246",
+      "citation": "state-machine.js:255",
       "occurrence": 2,
       "at": "HEAD",
       "first": "    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));",
@@ -640,7 +640,7 @@
     },
     {
       "citingFile": "test/merge-cause.test.js",
-      "citation": "test/real-steps.test.js:2646-2699",
+      "citation": "test/real-steps.test.js:2722-2775",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  const task = { id: 'card-211-pollk', kind: 'card', issue: 941, worktreePath };",
@@ -708,7 +708,7 @@
     },
     {
       "citingFile": "test/park-loop.test.js",
-      "citation": "park-loop.js:1451",
+      "citation": "park-loop.js:1567",
       "occurrence": 0,
       "at": "HEAD",
       "first": "        requeuedFile = reEnqueueTask(queueDir, taskDir, id, {}, match.id, 'h');",
@@ -716,7 +716,7 @@
     },
     {
       "citingFile": "test/park-reason-doc-sweep.test.js",
-      "citation": "state-machine.js:1587",
+      "citation": "state-machine.js:1598",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  // generic `throw new ParkSignal('validate-unrecognized-verdict', ...)` at the bottom of this",
@@ -757,7 +757,7 @@
     },
     {
       "citingFile": "test/step-contracts.test.js",
-      "citation": "scripted.js:1705-1708",
+      "citation": "scripted.js:1924-1927",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  //",
@@ -815,7 +815,7 @@
     },
     {
       "citingFile": "test/phantom-park.test.js",
-      "citation": "state-machine.js:2601-2604",
+      "citation": "state-machine.js:2643-2646",
       "occurrence": 0,
       "at": "HEAD",
       "first": "if (isRealMode(ctx) && isAccountPoolParkReason(reason)) {",
@@ -824,7 +824,7 @@
     },
     {
       "citingFile": "test/real-steps.test.js",
-      "citation": "test/real-steps.test.js:6460",
+      "citation": "test/real-steps.test.js:6536",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    config: testConfig({ commandTimeoutsMs: TIMEOUT_TABLE, ...overrides }),",
@@ -1011,7 +1011,7 @@
     },
     {
       "citingFile": "test/invariants.test.js",
-      "citation": "doc/state-machine-spec.md:159",
+      "citation": "doc/state-machine-spec.md:380",
       "occurrence": 0,
       "at": "HEAD",
       "first": "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |",
@@ -1059,7 +1059,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "doc/state-machine-spec.md:159",
+      "citation": "doc/state-machine-spec.md:380",
       "occurrence": 0,
       "at": "HEAD",
       "first": "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |",
@@ -1221,7 +1221,7 @@
     },
     {
       "citingFile": "test/blank-comments-sync.test.js",
-      "citation": "orchestrator/state-machine.js:216",
+      "citation": "orchestrator/state-machine.js:225",
       "occurrence": 1,
       "at": "HEAD",
       "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
@@ -1231,7 +1231,7 @@
     },
     {
       "citingFile": "test/blank-comments-sync.test.js",
-      "citation": "orchestrator/steps/scripted.js:1905",
+      "citation": "orchestrator/steps/scripted.js:2132",
       "occurrence": 0,
       "at": "HEAD",
       "first": "// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are",
@@ -1261,7 +1261,7 @@
     },
     {
       "citingFile": "test/gh-api-argv.test.js",
-      "citation": "orchestrator/steps/scripted.js:1905",
+      "citation": "orchestrator/steps/scripted.js:2132",
       "occurrence": 0,
       "at": "HEAD",
       "first": "// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are",
@@ -1271,7 +1271,7 @@
     },
     {
       "citingFile": "test/park-reason-doc-sweep.test.js",
-      "citation": "orchestrator/steps/scripted.js:1905",
+      "citation": "orchestrator/steps/scripted.js:2132",
       "occurrence": 0,
       "at": "HEAD",
       "first": "// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are",
@@ -1334,7 +1334,7 @@
     },
     {
       "citingFile": "test/gh-api-argv.test.js",
-      "citation": "orchestrator/state-machine.js:216",
+      "citation": "orchestrator/state-machine.js:225",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
@@ -1344,7 +1344,7 @@
     },
     {
       "citingFile": "test/gh-api-argv.test.js",
-      "citation": "orchestrator/state-machine.js:216",
+      "citation": "orchestrator/state-machine.js:225",
       "occurrence": 1,
       "at": "HEAD",
       "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
@@ -1354,7 +1354,7 @@
     },
     {
       "citingFile": "test/park-reason-doc-sweep.test.js",
-      "citation": "orchestrator/state-machine.js:216",
+      "citation": "orchestrator/state-machine.js:225",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
@@ -1823,7 +1823,7 @@
     },
     {
       "citingFile": "test/park-reason-doc-sweep.test.js",
-      "citation": "orchestrator/state-machine.js:216",
+      "citation": "orchestrator/state-machine.js:225",
       "occurrence": 1,
       "at": "HEAD",
       "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",

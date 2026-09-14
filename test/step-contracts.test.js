@@ -196,7 +196,7 @@ test('resolveStepContract: IMPLEMENT source 2 -- a plan declaring rdo-members.ts
   assert.equal(c.model, 'opus');
 });
 
-// REGRESSION (card #213's own acceptance criterion 3): the hole scripted.js:1705-1708's
+// REGRESSION (card #213's own acceptance criterion 3): the hole scripted.js:1924-1927's
 // touchesRdoMembers false->true promotion (after PUSH_PR) exists to close, from the other side --
 // a plan that did NOT declare rdo-members.ts on a card whose real diff DID touch it must still
 // escalate. Source 1 must win over source 2 here.

@@ -1,6 +1,6 @@
 'use strict';
 // Unit tests for orchestrator/invariants.js -- action 1.8's "invariant substring check"
-// (doc/state-machine-spec.md:159), the module both handlePlan (PLAN-time baseline) and realCheck
+// (doc/state-machine-spec.md:380), the module both handlePlan (PLAN-time baseline) and realCheck
 // (CHECK-time verification) import rather than re-implement. Pure fs -- every test here uses
 // fs.mkdtempSync(os.tmpdir()) as its "worktree", never a real git checkout.
 
