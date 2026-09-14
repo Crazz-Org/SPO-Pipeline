@@ -68,6 +68,63 @@ function legacyStateEvidence(repoRoot) {
   return found;
 }
 
+// 2026-09-13 incident: a bare `daemon.js --dry-run` (no --queue/--journal, no SPO_STATE_DIR) on
+// the production box resolved the SAME live queue/journal the real daemon owns, took the lock,
+// and drained all 30 real queue entries into a fake DONE in ~150ms -- overwriting 30 state.json,
+// appending fake journal runs, and clobbering real scratch/plan-*.md, all recovered by hand
+// afterwards. `--shadow` reads the identical queue/journal roots (only the STEP execution is
+// faked -- see daemon.js's own header on `--shadow`/`--dry-run`), so it carries the same
+// exposure. isLiveStateRoot is the one place that answers "would THIS queueDir/journalRoot
+// actually touch the live default", so daemon.js can refuse before doing anything else.
+//
+// Deliberately NOT "was --queue/--journal/SPO_STATE_DIR given" (assertStateMigrated's own
+// question, right above) -- that would let `--queue ~/.spo-state/queue` right past the guard it
+// exists to be. Instead it compares the RESOLVED paths the caller ended up with against the
+// live default, however they got there. `fs.realpathSync` when the candidate exists, so a
+// symlink or a `~/.spo-state/` trailing-slash spelling cannot slip past a plain string compare;
+// a path that does not exist yet falls back to `path.resolve` -- callers create queue/journal
+// AFTER this check runs (daemon.js's own mkdirSync), so "not there yet" must not read as "safe".
+// `home` is injectable so this stays pure under test, matching resolveStateRoot's own `env` param.
+function realOrResolvedPath(candidate) {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+function isSameResolvedPath(a, b) {
+  return realOrResolvedPath(a) === realOrResolvedPath(b);
+}
+
+// True iff `candidate` resolves to `ancestor` itself, or to something nested under it. Used for
+// `taskDir` below: `--worker <taskDir>`/`--repark-task <taskDir>` name a single task directory,
+// not the queue/journal root -- a live one is shaped `<liveJournalRoot>/<id>`, never equal to the
+// root itself, so an equality check (isSameResolvedPath) would never catch it.
+function isInsideOrSame(candidate, ancestor) {
+  const resolvedCandidate = realOrResolvedPath(candidate);
+  const resolvedAncestor = realOrResolvedPath(ancestor);
+  return resolvedCandidate === resolvedAncestor || resolvedCandidate.startsWith(resolvedAncestor + path.sep);
+}
+
+// `taskDir` (optional): verification finding -- `--worker <taskDir>`/`--repark-task <taskDir>`
+// bypassed the guard entirely, because it only ever checked queueDir/journalRoot. Both modes are
+// commonly invoked with an explicit --queue/--journal (a dispatcher-spawned child always is --
+// dispatcher.js's buildWorkerArgv/buildReparkArgv), which made queueDir/journalRoot look safe
+// while `--worker $HOME/.spo-state/journal/issue-5 --queue /tmp/q --journal /tmp/j` still walked
+// a real, live-shaped task to a fake terminal state and rewrote its real state.json. A live
+// taskDir is a directory NESTED under the live queue or journal root (`<liveRoot>/journal/<id>`
+// for a worker/repark target -- queue is checked too since nothing stops a caller from pointing
+// `--worker`/`--repark-task` at a queue-rooted path), so this checks containment, not equality.
+function isLiveStateRoot({ queueDir, journalRoot, taskDir, home = os.homedir() } = {}) {
+  const liveRoot = path.join(home, '.spo-state');
+  const liveQueue = stateQueueDir(liveRoot);
+  const liveJournal = stateJournalRoot(liveRoot);
+  if (isSameResolvedPath(queueDir, liveQueue) || isSameResolvedPath(journalRoot, liveJournal)) return true;
+  if (taskDir && (isInsideOrSame(taskDir, liveQueue) || isInsideOrSame(taskDir, liveJournal))) return true;
+  return false;
+}
+
 class UnmigratedStateError extends Error {
   constructor(message, detail) {
     super(message);
@@ -111,5 +168,6 @@ module.exports = {
   stateJournalRoot,
   legacyStateEvidence,
   assertStateMigrated,
+  isLiveStateRoot,
   UnmigratedStateError,
 };

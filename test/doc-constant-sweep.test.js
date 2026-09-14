@@ -1323,14 +1323,14 @@ const EXPECTED_CITATIONS = [
   "orchestrator/auto-triage.js :: state-machine.js:3171", // re-pinned from :3006 -- card #213 net +88 (90 added, 2 removed by diff --numstat against origin/main) across state-machine.js's guardDeclaredFiles (planFilesToChange propagation), the new resolvePlanDeclaresRdoMembers, handleImplement's escalation stamping and handleValidate's rdoDiffTouched write-back -- all above this appendDaemonEvent precedent, a true pure shift; then :3094 -> :3105 when D6 added its latent-trap note to handleValidate; content byte-identical at :3105 (verified by diffing the two lines). Previously re-pinned from :2923 by card #174, same pure-shift reason. Re-pinned again in card #212 (Lot 10, 2026-09-13): :3163 -> :3171, a pure +8-line shift when the new `gate-merge-refused` TERMINAL_PARK_REASONS entry and its header comment (explaining why `main-moved-conflict` is NOT kept alongside it) landed above this appendDaemonEvent precedent in the same file; content byte-identical at :3171, verified by re-reading the target line.
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
-  "orchestrator/dispatcher.js :: daemon.js:607",
-  "orchestrator/dispatcher.js :: daemon.js:626-627",
+  "orchestrator/dispatcher.js :: daemon.js:646", // re-pinned from :607, then :637 -- the 2026-09-13 incident fix (state-root.js's isLiveStateRoot dry-run/shadow live-root refusal, plus its taskDir-containment verifier fix) added net lines to daemon.js's main() above this point in the same file, a true pure shift; content byte-identical at :646, verified by re-reading the target line.
+  "orchestrator/dispatcher.js :: daemon.js:665-666", // re-pinned from :626-627, then :656-657 -- same shift history as the :607 -> :646 re-pin above (isLiveStateRoot guard and its taskDir-containment fix, both added to daemon.js's main()); content byte-identical at :665-666, verified by re-reading the target lines.
   "orchestrator/invariants.js :: doc/state-machine-spec.md:159", // re-pinned from :150, same shift/reason as orchestrator/README.md's own entry above
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/journal.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
-  "orchestrator/orphan-scan.js :: daemon.js:912",
-  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202",
+  "orchestrator/orphan-scan.js :: daemon.js:951", // re-pinned from :912, then :942 -- same shift history as dispatcher.js's :607 -> :646 re-pin above (isLiveStateRoot guard and its taskDir-containment fix, both added to daemon.js's main()); content byte-identical at :951, verified by re-reading the target line.
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:203", // re-pinned from :202 -- this action's isLiveStateRoot dry-run/shadow guard fix added 1 net line to the "Chantier gate" bullet above the row table in the same file, a true pure shift; content byte-identical at :203, verified by re-reading the target line.
   "orchestrator/park-loop.js :: doc/remediation-progress.md:664", // re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines to remediation-progress.md's C5-findings section above this bullet, a true pure shift; content byte-identical at :664
   "orchestrator/park-loop.js :: intake.js:953-955", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines. Re-pinned again in card #218 (Lot 12, 2026-09-14): :938-940 -> :953-955, a net +15-line shift when that action's resolveLabelArgs fix (issue #218: replacing the binary `flag === '--label' ? ... : ...` ternaries with the frozen, throwing LABEL_ARGS_BY_FLAG lookup, plus the corrected header-comment sentence) landed above this point in the same file; content byte-identical at :953-955, verified by re-reading the target lines.
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
@@ -2235,10 +2235,10 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'orchestrator/auto-triage.js :: state-machine.js:3171',
   'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325',
   'orchestrator/config.js :: worker.ts:1542',
-  'orchestrator/dispatcher.js :: daemon.js:607',
+  'orchestrator/dispatcher.js :: daemon.js:646',
   'orchestrator/invariants.js :: doc/state-machine-spec.md:159',
-  'orchestrator/orphan-scan.js :: daemon.js:912',
-  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202',
+  'orchestrator/orphan-scan.js :: daemon.js:951',
+  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:203',
   'orchestrator/state-machine.js :: orchestrator/steps/llm.js:1049',
   'orchestrator/state-machine.js :: run.ts:63',
   'orchestrator/state-machine.js :: step-contracts.js:1029',
@@ -2490,7 +2490,7 @@ const EXPECTED_LIVE_PIN_KEYS = [
   "orchestrator/README.md :: doc/state-machine-spec.md:159 @ HEAD",
   "orchestrator/README.md :: intake.js:953-955 @ HEAD",
   "orchestrator/README.md :: lock.js:354-385 @ HEAD",
-  "orchestrator/dispatcher.js :: daemon.js:626-627 @ HEAD",
+  "orchestrator/dispatcher.js :: daemon.js:665-666 @ HEAD",
   "orchestrator/journal.js :: auto-pull.js:58-66 @ HEAD",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66 @ HEAD",
   "orchestrator/park-loop.js :: doc/remediation-progress.md:664 @ HEAD",
@@ -3564,7 +3564,7 @@ test('every bare "doc/<name>.md" reference in the 67-file corpus resolves here, 
 // checking nothing.
 //
 // This closes the specific, checkable subset: the three real SPO-Deploy artifacts this corpus
-// actually names by filename (re-measured: `DEPLOY.md` -- orchestrator/README.md:2124;
+// actually names by filename (re-measured: `DEPLOY.md` -- orchestrator/README.md:2134;
 // `deploy.sh` and `setup.conf.example` -- doc/setup.md:11,15), each verified to exist in
 // DEPLOY_REPO, or reported as a setup problem (E1 posture, never a silent pass) if DEPLOY_REPO
 // itself is absent from disk.

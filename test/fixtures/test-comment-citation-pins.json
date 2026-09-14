@@ -446,7 +446,7 @@
       "citingFile": "test/doc-constant-sweep.test.js",
       "citation": "daemon.js:626-627",
       "occurrence": 0,
-      "at": "HEAD",
+      "at": "85669aa13f15b8c7c88b9a3a02f193b1ae664a3e",
       "first": "  process.once('exit', () => {",
       "last": "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');",
       "claim": "killAllChildren('SIGTERM')"
@@ -503,7 +503,7 @@
       "citingFile": "test/doc-constant-sweep.test.js",
       "citation": "daemon.js:626-627",
       "occurrence": 1,
-      "at": "HEAD",
+      "at": "85669aa13f15b8c7c88b9a3a02f193b1ae664a3e",
       "first": "  process.once('exit', () => {",
       "last": "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');",
       "claim": "killAllChildren"
@@ -520,7 +520,7 @@
       "citingFile": "test/doc-constant-sweep.test.js",
       "citation": "daemon.js:626-627",
       "occurrence": 2,
-      "at": "HEAD",
+      "at": "85669aa13f15b8c7c88b9a3a02f193b1ae664a3e",
       "first": "  process.once('exit', () => {",
       "last": "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');",
       "claim": "killAllChildren"
@@ -543,7 +543,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "orchestrator/README.md:2124",
+      "citation": "orchestrator/README.md:2134",
       "occurrence": 0,
       "at": "HEAD",
       "first": "SPO-Deploy's `DEPLOY.md` § 5.5 and SPO-WebClient's `src/server/report-pull-endpoint.ts`.",
@@ -1315,7 +1315,7 @@
       "citingFile": "test/doc-constant-sweep.test.js",
       "citation": "daemon.js:626",
       "occurrence": 0,
-      "at": "HEAD",
+      "at": "85669aa13f15b8c7c88b9a3a02f193b1ae664a3e",
       "first": "  process.once('exit', () => {",
       "claimless": true,
       "category": "no-claim-in-prose",

@@ -34,7 +34,10 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
 - Defaults: `--queue` = `~/.spo-state/queue`, `--journal` = `~/.spo-state/journal` (both created
   if missing; `state-root.js`'s `DEFAULT_STATE_ROOT`, overridable with `SPO_STATE_DIR`, resolved
   the same way by `daemon.js` and `bin/spo`). Point both at a temp dir to run an isolated batch —
-  this is how the test suite works.
+  this is how the test suite works. **`--shadow`/`--dry-run` REFUSE to start** if that resolves
+  to the live default (`state-root.js`'s `isLiveStateRoot`, 2026-09-13 incident) — always pass an
+  explicit `--queue`/`--journal` or `SPO_STATE_DIR` pointed at a throwaway directory, never the
+  bare command above, outside a test.
 
 ## Task-file format
 
@@ -639,7 +642,14 @@ still written), instead of the old behaviour of silently fabricating a unique
 `node orchestrator/daemon.js --dry-run --once [--queue <dir>] [--journal <dir>]` runs real-mode
 semantics — step-contracts.js resolution, prompt-template.js fill, account rotation — **without
 spawning anything**. `runLlm` (steps/llm.js) and `runScripted` (steps/scripted.js) both check
-`ctx.dryRun` immediately before their own spawn point:
+`ctx.dryRun` immediately before their own spawn point.
+
+**Refuses to start against the live state root** — state-root.js's `isLiveStateRoot` — when
+neither `--queue`/`--journal` nor `SPO_STATE_DIR` names somewhere else (2026-09-13 incident: a
+bare `--dry-run` run took the real daemon's own 30 queued cards and drained them to a fake `DONE`
+in ~150ms). Point it at a throwaway root instead:
+`SPO_STATE_DIR="$(mktemp -d)" node orchestrator/daemon.js --dry-run --once`. `--shadow` carries
+the identical exposure and is refused the same way — see "Running shadow mode" above.
 
 - an **LLM step** builds the real prompt and the real argv (via the same `buildArgv` real mode
   uses), writes both to `journal/<id>/dryrun-<STATE>.md` (the argv — just the flag line, since

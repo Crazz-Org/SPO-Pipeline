@@ -1263,12 +1263,12 @@ function createDispatcher(queueDir, journalRoot, config) {
         //
         // WORSE since card #162's hoist than when this guard was first written: `killAllChildren`
         // and `reapSignalledChildren` both run AFTER this emit now, so an escaping throw here
-        // would skip both. daemon.js's own `process.once('exit')` hook (daemon.js:626-627) still fires
+        // would skip both. daemon.js's own `process.once('exit')` hook (daemon.js:665-666) still fires
         // an ordinary `killAllChildren('SIGTERM')`, so live workers and the scanner are at least
         // signalled on the way out -- but nothing REAPS them: no bounded wait, no SIGKILL
         // escalation, so a straggler that ignores SIGTERM is handed straight back to systemd's
         // cgroup kill, the exact outcome `reapSignalledChildren` exists to prevent. A reparking
-        // child is signalled by neither (that hook passes no `includeReparking`, daemon.js:607).
+        // child is signalled by neither (that hook passes no `includeReparking`, daemon.js:646).
         // Measured in-process, where no such exit hook exists: with this guard deleted the test
         // fails its assertion and then never exits. One process survives -- the scanner stand-in,
         // un-signalled because `killAllChildren` was skipped; it never exits on its own and its
