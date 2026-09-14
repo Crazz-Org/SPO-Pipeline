@@ -1949,6 +1949,16 @@ function snapshot(ctx, state) {
   };
 }
 
+// Card #212 C4: reEnqueueTask strips `resume` for every caller, so a machine re-enqueue of a run
+// that was itself resumed (`continue`) has to carry it forward explicitly -- otherwise the retry
+// restarts at INTAKE and WORKTREE closes the PR the maintainer just fixed. prNumber is refreshed
+// from ctx (PUSH_PR may have journalled pr-number-changed); prepareResume re-checks everything.
+function carriedResume(ctx) {
+  const resume = ctx.task && ctx.task.resume;
+  if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return {};
+  return { resume: { ...resume, prNumber: ctx.prNumber || resume.prNumber } };
+}
+
 // action 4.4: the closed, named allowlist of park reasons finalizePark auto-retries instead of
 // parking for real -- see that function's own header comment for the eligibility rule and
 // doc/state-machine-spec.md Principle 2 for why this is a narrow exception, not a policy change.
@@ -2593,7 +2603,7 @@ function finalizePark(ctx, lastState, reason, detail) {
         const carriedPoolWait = {};
         if (ctx.task && Number.isFinite(ctx.task.poolWaitMs)) carriedPoolWait.poolWaitMs = ctx.task.poolWaitMs;
         if (ctx.task && Number.isFinite(ctx.task.poolWaitAttempts)) carriedPoolWait.poolWaitAttempts = ctx.task.poolWaitAttempts;
-        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore, ...carriedPoolWait }, attempt, 't');
+        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore, ...carriedPoolWait, ...carriedResume(ctx) }, attempt, 't');
       } catch (err) {
         appendEvent(ctx.taskDir, lastState, 'transient-retry-failed', {
           reason,
@@ -2702,7 +2712,7 @@ function finalizePark(ctx, lastState, reason, detail) {
             poolQueueDir,
             ctx.taskDir,
             ctx.id,
-            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore, ...carriedTransient },
+            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore, ...carriedTransient, ...carriedResume(ctx) },
             attempt,
             't'
           );
@@ -3202,7 +3212,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1341 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1457 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal

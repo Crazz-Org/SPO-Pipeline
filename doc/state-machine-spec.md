@@ -291,6 +291,75 @@ open PR now existing for this branch leaves a record of it (reopening a PR keeps
 that alone never fires it). `ctx.prNumber` is still reassigned to GitHub's answer either way; only the journalling
 is new.
 
+**The `continue` verb (card #212 C4/C5).** Everything above this point is `runTask`'s own side of
+a resume, entered from a `task.resume` descriptor that has to come from somewhere. This is where
+it comes from: `park-loop.js`'s `unparkScan`, reading a maintainer's `continue` reply the same way
+it already reads `retry`/`abandon` (`CONTINUE_RE = /^continue\b/i`, added to `UNPARK_PATTERNS`
+alongside them — `report-intake.js`'s own `CONFIRM_RE`/`DISCARD_RE` vocabulary is disjoint, no
+collision).
+
+`continue` is available for exactly the six park reasons a resume can restart from
+(`RESUMABLE_PARK_REASONS`, `park-loop.js`, exported for `test/unpark-continue.test.js`'s own
+membership sweep): `merge-conflict`, `gate-merge-refused`, `main-moved-merge-failed`,
+`main-moved-twice`, `merge-behind-base`, `resume-precondition-failed` — every member also a
+`TERMINAL_PARK_REASONS` entry in `state-machine.js`, since `continue` never resumes a reason the
+code does not already treat as terminal. Eligibility (`continueEligibility`, read straight off
+`state.json` — no extra `gh` call) additionally requires `state.state === 'PARKED'`, a verified
+positive-integer `state.prNumber`, no `state.externallyResolved`, and a configured
+`config.pipelineWorktreesDir`.
+
+**Eligible:** re-enqueues exactly like a maintainer `retry` — same `reEnqueueTask`, same
+`0000-retry-h-<key>-<id>.json` naming keyed on the comment id, same priority class `h`, same
+effect-before-marker ordering and the same guarded `reEnqueueTask` catch (a failed write withholds
+the marker; the next scan redoes the effect) — but with one extra field in the queue entry:
+`resume: {startState: 'CHECK', prNumber: state.prNumber, worktreePath:
+<pipelineWorktreesDir>/<id>, commentId, fromReason: state.reason}`. `worktreePath` is always the
+PIPELINE's own path for this id, computed fresh from `config.pipelineWorktreesDir`, never
+`state.json`'s own `worktreePath` — that field can be stale or (defence in depth) foreign, and
+`prepareResume` (C2) refuses anything else anyway. The marker is `unparked-by-maintainer` with an
+added `verb: 'continue'` field, the same event `retry` writes.
+
+**Ineligible:** NEVER falls back to `retry` — reinterpreting a maintainer's explicit word as a
+different one they did not type is exactly the silent-misbehaviour class this pipeline's `gh
+api -f` incident (CLAUDE.md) already paid for once. Instead, one acknowledgement comment is
+posted on the issue (`gh issue comment`, the same mechanism the `abandon` ack uses), its first
+line starting `pipeline:` — so it can never itself match `UNPARK_PATTERNS` on a later scan — naming
+why (`continueEligibility`'s own `why`: `not-resumable`, `no-pr`, `externally-resolved`,
+`no-worktrees-dir`) and that `retry`/`abandon` remain available. `unpark-verb-refused`
+(`{commentId, verb: 'continue', reason, why, ackExit}`) is then journalled whether or not the ack
+itself succeeded — `ackExit` carries the ack's own `gh` exit code, and a non-zero one also
+journals `continue-ack-failed` first, the same shape `abandon-ack-failed` already has. No queue
+entry, no `unparked-by-maintainer`.
+
+The refused comment must never be matched again on a later scan: `findParkAnchor` treats an
+`unpark-verb-refused` event carrying a numeric `commentId` as a new anchor, exactly like
+`park-comment` — the last of either kind wins, by journal position, same rule the anchor already
+follows. A `retry`, `abandon`, or a later eligible `continue` posted AFTER the refusal is still
+scanned normally, since it sits after this new boundary. `unpark-verb-refused` is deliberately NOT
+in `retry-channel.js`'s `PARK_CYCLE_ENDING_EVENTS`: a refusal does not end the park cycle, so the
+retry-channel health walk (`summarizeUnparkScanTail`) still reads through it correctly.
+
+**`resume` must never leak into a run that did not ask for it.** `takeNextTask` renames the queue
+entry straight over `journal/<id>/task.json`, so after a resumed run that file still carries
+`resume` — and `reEnqueueTask` reads its "original" fields from exactly that file. `reEnqueueTask`
+therefore strips `resume` from its stripped-field destructure, alongside
+`worktreePath`/`branch`/`baseMainSha`/`transientRetries`/`notBefore`/`poolWaitMs`/
+`poolWaitAttempts` — for EVERY caller: a maintainer `retry`, and both of `finalizePark`'s own
+machine re-enqueues (the bounded transient auto-retry, the pool-exhaustion wait). `resume` comes
+back only through `reEnqueueTask`'s `extra` parameter: from the `continue` branch, and from those
+two machine re-enqueues when the run being retried was itself resumed (`carriedResume`, with
+`prNumber` refreshed from the run). A transient park during a resumed run therefore retries at
+CHECK, through `prepareResume` again, instead of restarting at INTAKE and closing the PR the
+maintainer just fixed. A maintainer `retry` always drops it.
+
+**The park comment (card #212 C5).** `RETRY_ABANDON_LINE` stays byte-identical — pinned by
+`test/park-loop.test.js`. For a park whose reason is on `RESUMABLE_PARK_REASONS`,
+`buildParkComment` (`park-loop.js`) adds ONE extra line right after it, naming
+`` `claude-pipe/<id>` `` and the `continue` reply; `resume-precondition-failed` gets its own
+phrasing (fix what the reason above already names, then reply `continue` again — there may be no
+conflict to push a merge commit onto). Every other park's comment renders byte-identical to
+before this action.
+
 ## Task lifecycle
 
 ```

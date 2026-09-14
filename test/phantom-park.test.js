@@ -306,7 +306,7 @@ test('T-C: the pool-wait re-enqueue path journals no `parked` line', () => {
 //
 // poolCooldownDeadlineMs returns null for 'all-accounts-cooling-wait-cap-exceeded' by NAME, before
 // either detail key is read (its own header comment), and the pool branch is gated on that at
-// state-machine.js:2633-2636 (`if (isRealMode(ctx) && isAccountPoolParkReason(reason))`, the
+// state-machine.js:2643-2646 (`if (isRealMode(ctx) && isAccountPoolParkReason(reason))`, the
 // `poolCooldownDeadlineMs(reason, detail)` call, and `if (deadlineMs !== null && ...)` -- the
 // three checks this sentence names. Re-pinned from :2333-2335, which cited the block's own
 // header COMMENT above the gate, not the gate itself -- card #174 added lines to handleValidate's

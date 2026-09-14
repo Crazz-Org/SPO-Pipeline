@@ -3,8 +3,9 @@
 // the unpark (retry/abandon) comment scan working?"
 //
 // The retry channel is the maintainer's only way back into a parked card: park-loop.js's
-// unparkScan reads a `retry` / `abandon` reply on the issue and re-enqueues (or terminates) the
-// task. Project-2 card #476 measured what that channel's journal could and could not answer. It
+// unparkScan reads a `retry` / `abandon` / (card #212 C4) `continue` reply on the issue and
+// re-enqueues (or terminates, or -- `continue` only -- acks a refusal) the task. Project-2 card
+// #476 measured what that channel's journal could and could not answer. It
 // went down for 33 hours -- 238 consecutive `unpark-scan-failed` events on issue-213 alone,
 // first 2026-08-30T10:11:23Z, last 2026-08-31T19:52:07Z -- and during those 33 hours a `retry`
 // reply on any parked issue did nothing at all, silently.
@@ -55,7 +56,10 @@
 // A park cycle ENDING or RESTARTING: `parked` is a fresh park, so the previous cycle's failures
 // belong to a park that no longer exists (this is why issue-385 correctly reports 8 failures
 // where issue-213 reports 238, on the same outage); `unparked-by-maintainer` and
-// `abandoned-by-maintainer` are the two ways a human ends one.
+// `abandoned-by-maintainer` are the two ways a human ends one. Card #212 C4's `unpark-verb-
+// refused` (an ineligible `continue`) is deliberately NOT a third: the park cycle is still open
+// after a refusal -- a maintainer's next `retry`/`abandon`/eligible `continue` must still be
+// readable through the same walk, so a refusal must not read as the cycle having ended.
 const PARK_CYCLE_ENDING_EVENTS = new Set(['parked', 'unparked-by-maintainer', 'abandoned-by-maintainer']);
 
 // POSITIVE EVIDENCE that the scan itself succeeded, i.e. that `gh` answered:

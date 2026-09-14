@@ -926,7 +926,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:311` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:380` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1472,6 +1472,11 @@ maintainer, and this literal line:
 pipeline: reply "retry" (optionally after fixing) to requeue, or "abandon" to close this attempt.
 ```
 
+Card #212 C5: for a park whose reason is on `RESUMABLE_PARK_REASONS` (see the `continue` bullet
+below), ONE extra line follows this one, naming `claude-pipe/<id>` and the `continue` reply --
+never replacing the line above, so `retry`/`abandon` stay available on every park. Every other
+park's comment renders byte-identical to before this action (`test/park-loop.test.js`).
+
 `gh issue comment`'s own stdout carries the created comment's URL
 (`.../issues/<n>#issuecomment-<id>`); the numeric id is journaled (`park-comment`, `commentId`)
 as the anchor for what comes next -- GitHub comment ids are monotonically increasing site-wide,
@@ -1491,9 +1496,10 @@ matched"), filtered to an AUTHORIZED author (a repo collaborator, per `gh api ..
 cached and re-checked hourly; a non-collaborator's `retry`/`abandon` is ignored and journalled
 `unpark-scan-ignored-author`, never silently dropped), with per-issue backoff on consecutive `gh`
 failures. The first authorized comment whose **first line** is `retry` (optionally followed by
-more text) or `abandon`, case-insensitive, decides the outcome; anything else on the issue -- a
-`retry` posted *before* the park comment, one from a non-collaborator, or a comment matching
-neither word -- is left alone, since a human conversation on the issue is allowed:
+more text), `abandon`, or (card #212 C4) `continue`, case-insensitive, decides the outcome;
+anything else on the issue -- a `retry` posted *before* the park comment, one from a
+non-collaborator, or a comment matching none of the three words -- is left alone, since a human
+conversation on the issue is allowed:
 
 - **`retry`** -- re-enqueues the task (`reEnqueueTask`: a fresh
   `queue/0000-retry-<h|t>-<key>-<id>.json`, `<key>` the (zero-padded) retry comment id -- or, for
@@ -1534,6 +1540,35 @@ neither word -- is left alone, since a human conversation on the issue is allowe
   comment ("Understood -- closing this attempt.") is posted on the issue. The card's *column* is
   deliberately left alone here -- where it lands next is the maintainer's own board gesture, not
   this build's to make.
+- **`continue`** (card #212 C4) -- the non-destructive alternative to `retry`, ONLY for a park on
+  `park-loop.js`'s `RESUMABLE_PARK_REASONS` (`merge-conflict`, `gate-merge-refused`,
+  `main-moved-merge-failed`, `main-moved-twice`, `merge-behind-base`, `resume-precondition-failed`
+  -- every member also a `TERMINAL_PARK_REASONS` entry, checked by
+  `test/park-reason-partition.test.js`) whose `state.json` still carries a verified positive
+  integer `prNumber` and no `externallyResolved`, with `config.pipelineWorktreesDir` configured.
+  Eligible: re-enqueues exactly like `retry` (same `0000-retry-h-<key>-<id>.json` naming, same
+  effect-before-marker ordering, same guarded `reEnqueueTask` catch) but with one extra field,
+  `resume: {startState: 'CHECK', prNumber: state.prNumber, worktreePath:
+  <pipelineWorktreesDir>/<id>, commentId, fromReason: state.reason}` -- always the PIPELINE's own
+  worktree path for this id, never `state.worktreePath` (which could be stale or foreign;
+  `prepareResume`, C2, refuses anything else) -- so `runTask` (C1) enters the next run at CHECK
+  instead of INTAKE, on the same worktree/branch/PR the park left behind. The marker is
+  `unparked-by-maintainer` with an added `verb: 'continue'` field, same event as `retry`.
+  Ineligible: NEVER falls back to `retry` -- instead posts one acknowledgement comment on the
+  issue (first line `pipeline:`, so it can never itself match a verb on a later scan) naming why
+  (`continueEligibility`'s own `why`: `not-resumable`, `no-pr`, `externally-resolved`,
+  `no-worktrees-dir`) and that `retry`/`abandon` remain, then journals `unpark-verb-refused`
+  (`commentId`, `verb: 'continue'`, `reason`, `why`, `ackExit`) whether or not the ack itself
+  succeeded (`continue-ack-failed` on a non-zero ack exit, same shape as `abandon-ack-failed`).
+  `findParkAnchor` treats `unpark-verb-refused` as a new anchor exactly like `park-comment`, so the
+  refused comment is never matched again, while a later `retry`/`abandon`/eligible `continue`
+  posted after it still is; the event is deliberately NOT in `retry-channel.js`'s
+  `PARK_CYCLE_ENDING_EVENTS` -- a refusal does not end the park cycle. `reEnqueueTask` strips a
+  stale `resume` off `task.json` for every caller (a `retry`, and finalizePark's own two machine
+  re-enqueues) exactly like `worktreePath`/`branch`/`transientRetries`/... above; only the
+  `continue` branch adds one back through `extra`, and so do finalizePark's two machine
+  re-enqueues when the run being retried was itself resumed (`carriedResume`), so a transient park
+  during a resumed run retries at CHECK instead of closing the PR at WORKTREE.
 
 Idempotent across scans: a task already acted on for its current park cycle (an
 `unparked-by-maintainer`/`abandoned-by-maintainer` event already follows the anchor
@@ -3011,6 +3046,8 @@ task/daemon split itself).
 | `unpark-scan-ok` | task | the unpark (retry/abandon) comment scan reached GitHub, journalled ONLY when that is a change of outcome: the first proven-live scan of this park cycle, or a recovery from a standing `unpark-scan-failed` streak (`afterFailures` says which, and `firstFailedAt` dates the streak it ends). Never per-cycle — a healthy scan that has already said so writes nothing. Project-2 card #476: before it a successful scan journalled nothing at all, so an old failure streak in a journal's tail could not be told apart from a channel that had recovered silently, and "the retry channel is alive" was only ever inferrable from an ABSENCE of failures (`park-loop.js`; the rule deciding when it is an outcome change is `retry-channel.js`'s `shouldJournalScanOk`). |
 | `unpark-scan-backoff-skip` | task | `park-loop.js`'s own name for `comment-scan.js`'s shared `backoffSkip` event, reached when the unpark (retry/abandon) comment scan is still backed off from a recent `gh` failure (`park-loop.js`, via `comment-scan.js`). |
 | `unpark-requeue-failed` | daemon | card #137: `unparkScan` found a maintainer's `retry` comment but `reEnqueueTask` threw writing the queue entry — the same environment class as `queue-claim-failed` above (reEnqueueTask's own per-writer tmp-name discriminator already closed its ENOENT trigger). The `unparked-by-maintainer` marker is deliberately WITHHELD on this path: writing it anyway would satisfy the effect-before-marker ordering's own reasoning in reverse (a marker with no effect reads as handled but is never redone). `findParkAnchor`'s `alreadyHandled` therefore still sees no marker, so the next `unparkScan` cycle re-scans and retries the same re-enqueue from scratch once the failure clears (`park-loop.js`). |
+| `continue-ack-failed` | task | card #212 C4: an INELIGIBLE `continue`'s own `gh issue comment` refusal ack exited non-zero (same shape as `abandon-ack-failed`) — the refusal is still journalled below regardless (`ackExit` carries this event's own `exit`), so the next cycle never re-attempts the ack (`park-loop.js`). |
+| `unpark-verb-refused` | task | card #212 C4: a `continue` reply on a park `continueEligibility` refused — not resumable (`why: 'not-resumable'`), no verified `prNumber` (`'no-pr'`), the card already `externallyResolved` (`'externally-resolved'`), or no `config.pipelineWorktreesDir` (`'no-worktrees-dir'`). Carries `commentId`, `verb: 'continue'`, `reason` (the park reason refused), `why`, and `ackExit` (the refusal ack's own `gh` exit code, whether or not it succeeded). Never re-enqueues and never falls back to `retry`. `findParkAnchor` treats this event as a new anchor exactly like `park-comment` — the refused comment itself is never matched again, but a later `retry`/`abandon`/eligible `continue` posted after it still is — and it is deliberately NOT in `retry-channel.js`'s `PARK_CYCLE_ENDING_EVENTS`: the park cycle is still open after a refusal (`park-loop.js`). |
 | `usage-rollups-scan-failed` | daemon | card #137 (Lot 3, 3.2b): the live dashboard's usage-scan timer's own chain — `usageScanner.scan()`, then `mergeRollups`/`saveRollups` — threw or rejected; the tokens trend's durable `usage-rollups.json` silently stopped advancing until now, with nothing anywhere saying so (`console/serve.js`). |
 | `validate-findings-post-skipped` | task | VALIDATE's findings comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `wip-preserve-failed` | task | `preserveWorktreeWip` could not commit/push a dirty worktree's diff to a `wip/` ref before a park (a spawn timeout, or a failed `git status`/`checkout --detach`/etc. step) — the park still proceeds without a wip ref (`steps/scripted.js`). |
