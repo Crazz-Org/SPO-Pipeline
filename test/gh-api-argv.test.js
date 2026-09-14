@@ -168,7 +168,7 @@ test('blankComments: an opener inside a `//` comment does not swallow the gh api
   //   - `.trimStart()` in the whole-line test: without it the INDENTED comment on line 3 is left
   //     alone, its opener reaches the block's closer on line 9, and call site 1 disappears.
   //     Indented comments carrying an opener are the repo's real shape, not a contrivance --
-  //     orchestrator/state-machine.js:210 and orchestrator/config.js:764 are two of them.
+  //     orchestrator/state-machine.js:216 and orchestrator/config.js:916 are two of them.
   //   - blanking to spaces rather than '': every line keeps its width, so the offsets this file
   //     turns into `file:line` still address the real source.
   //   - the block regex staying LAZY: greedy runs from line 7's opener to line 15's closer and
@@ -220,7 +220,7 @@ test('blankComments: an opener inside a `//` comment does not swallow the gh api
   assert.equal(lineOf(blanked, spans[1].index), 12, 'call site 2 must still be reported on its real line');
 });
 
-test('the -f/--method sweep still catches a genuine violation even in the presence of a /* inside a // comment', () => {
+test('the -f/--method sweep still catches a genuine violation even in the presence of a slash-star inside a // comment', () => {
   // Same fixture shape as above, but the real call site actually violates the -f-without-method
   // rule -- proving the sweep still goes red on a genuine violation rather than the fix merely
   // making everything look clean.
@@ -247,8 +247,8 @@ test('the -f/--method sweep still catches a genuine violation even in the presen
 
 test('blankComments: an UNCLOSED opener in a `//` comment, closed only by a later `//` comment -- the shape the repo carries today', () => {
   // The closed case above is the easy one. The occurrences actually present at HEAD are
-  // UNCLOSED openers sitting in prose -- orchestrator/state-machine.js:210 and :397 and
-  // orchestrator/steps/scripted.js:1889 -- dormant purely because those files contain no
+  // UNCLOSED openers sitting in prose -- orchestrator/state-machine.js:216 and :403 and
+  // orchestrator/steps/scripted.js:1905 -- dormant purely because those files contain no
   // closer below them. The danger is one future `*/` away, and this fixture is that future:
   // the second comment's `journal/*/` supplies a closer, and `journal/*/` is the family's
   // worst case, being an opener and a closer in the same four characters. The old

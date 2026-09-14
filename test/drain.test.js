@@ -1021,7 +1021,7 @@ test('drain: dispatcher-stopped precedes dispatcher-kill-escalated and dispatche
   //
   // READY FILE, written immediately AFTER the handler is installed -- removes the last timing
   // dependency from this test, which had migrated from the discriminating ASSERTION (fixed
-  // already) into its PRECONDITION. `worker-spawn` (dispatcher.js:817-818's own event) fires
+  // already) into its PRECONDITION. `worker-spawn` (dispatcher.js:819's own event) fires
   // SYNCHRONOUSLY inside `spawnOne`, the instant the child's handle is created -- which says
   // nothing about whether the freshly spawned OS process has actually finished booting node and
   // reached this script's own `process.on('SIGTERM', ...)` line yet. Waiting on `worker-spawn`

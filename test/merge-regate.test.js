@@ -491,7 +491,7 @@ test('regate: pins the exact git argv the re-gate spawns, in order, and the jour
 // Everything above calls `realMerge` directly. That proves the helper, not the ROUTE: nothing
 // there shows a real card walking the real state graph from a MERGE re-gate back through
 // CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> VALIDATE -> MERGE. That gap mattered already
-// (`realPushPr`'s PR reuse is proven only by a direct unit call, test/real-steps.test.js:1827,
+// (`realPushPr`'s PR reuse is proven only by a direct unit call, test/real-steps.test.js:2315,
 // and every real-mode `gh pr list` stub in this suite returns `[]`); this action adds a SECOND
 // producer of that lap, so it is proven here instead of assumed.
 //

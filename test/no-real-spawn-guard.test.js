@@ -262,7 +262,7 @@ function runProbedDaemonOnce(env) {
 // `orchestrator/auto-triage`, `orchestrator/report-intake`, `orchestrator/remote-report-pull` AND
 // `orchestrator/recette` each independently load command-timeout.js on their own -- every one of
 // the five ultimately requires `./intake` and/or `./board`, and both of THOSE require
-// `./command-timeout` directly, unconditionally, at their own top (intake.js:46, board.js:44). So
+// `./command-timeout` directly, unconditionally, at their own top (intake.js:47, board.js:44). So
 // making any ONE of the five lazy (e.g. moving `require('../orchestrator/recette')` inside
 // `if (cmd === 'recette')`) would NOT silently defeat this probe -- the other four still load
 // command-timeout.js unconditionally before `main()` runs. Only moving ALL FIVE lazy in the same

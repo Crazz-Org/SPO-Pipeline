@@ -938,7 +938,7 @@ test('unparkScan: idempotent -- a second scan (state.json still PARKED) never re
   assert.equal(queued.length, 1, 'only the first scan re-enqueues');
 });
 
-// card #137 (Lot 3, 3.2a): the `retry` branch's own `reEnqueueTask` call at park-loop.js:1372 used
+// card #137 (Lot 3, 3.2a): the `retry` branch's own `reEnqueueTask` call at park-loop.js:1451 used
 // to sit outside every try/catch on the path back to runScanCycle -- a throw there killed the
 // scanner process. reEnqueueTask's own ENOENT trigger is already closed (its per-writer tmp-name
 // discriminator); what survives is a solitary environment failure writing into `queueDir`

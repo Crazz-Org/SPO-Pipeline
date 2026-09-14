@@ -2158,7 +2158,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
   // gets `gate-live-not-driven` -- unchanged reason, unchanged non-transient treatment (a
   // property of the worker binary or a reused verdict, not of the moment; a retry just asks
   // the same worker the same question at real WORKTREE->PLAN->IMPLEMENT->GATE cost). Every
-  // other BLOCKED -- the world lock, or `verify-gate.js:308`'s capability-question
+  // other BLOCKED -- the world lock, or `verify-gate.js:336`'s capability-question
   // variant, where `required` can be empty and nothing was actually routed -- gets its own
   // reason, `gate-live-blocked`, deliberately not reusing a name that would misdescribe it.
   //

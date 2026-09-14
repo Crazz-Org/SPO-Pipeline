@@ -1,7 +1,7 @@
 'use strict';
 // What scripts/gate.sh runs, pinned.
 //
-// The gate excludes three test files because they assert agreement with the SIBLING repos --
+// The gate excludes four test files because they assert agreement with the SIBLING repos --
 // SPO-WebClient (the product repo this pipeline drives) and SPO-Deploy -- rather than testing this
 // repo's own code. That exclusion is the one place this gate could rot into uselessness: widen it
 // by a file and the gate silently stops checking something, with a green tick either way. So it is
@@ -31,6 +31,8 @@ const EXPECTED_CROSS_REPO = {
     "realGate's stderr/stdout literals must still exist in SPO-WebClient's own source",
   'heartbeat-contract-pin.test.js':
     "HEARTBEAT_STALE_MS is pinned to SPO-WebClient/src/e2e/bench/paths.ts's literal",
+  'test-comment-citation-sweep.test.js':
+    "resolves test/ comment citations (including SPO-WebClient/SPO-Deploy-rooted ones) through citation-pins.js's resolvePins, same as doc-constant-sweep.test.js (#190, action 11.3)",
 };
 
 // A test file may MENTION the sibling-repo env vars and still be gate-safe, because it tolerates
@@ -73,7 +75,7 @@ test('gate.sh exists, is executable, and its exclusion list parses', () => {
   assert.ok(parsed, 'CROSS_REPO_FILES=( ... ) no longer parses out of scripts/gate.sh -- this guard has gone blind, fix the parser or the script');
 });
 
-test('the gate excludes EXACTLY the three sibling-repo files -- no more (a silent hole), no fewer (a permanently red gate)', () => {
+test('the gate excludes EXACTLY the four sibling-repo files -- no more (a silent hole), no fewer (a permanently red gate)', () => {
   const parsed = parseCrossRepoFiles(readGateSh());
   assert.deepEqual(
     parsed.slice().sort(),
@@ -95,13 +97,18 @@ test('every excluded file actually exists -- a stale name would exclude nothing 
 
 test('no OTHER test file reaches for a sibling repo without being classified', () => {
   // The ratchet that makes this guard survive new tests: any file naming the sibling-repo env vars
-  // must be either excluded from the gate or explicitly recorded as tolerating their absence.
-  // A new cross-repo test that is neither fails here -- loudly, at authoring time -- instead of
-  // quietly turning the gate red for everyone later.
+  // -- OR reaching them indirectly through citation-pins.js's resolveCitationTarget/resolvePins,
+  // action 11.3 (#190): a file that only `require('./citation-pins')` and never spells
+  // SPO_PRODUCT_REPO/SPO_DEPLOY_REPO itself (test-comment-citation-sweep.test.js is exactly this
+  // shape) still resolves citations against ~/SPO-WebClient and ~/SPO-Deploy, and escaped this
+  // scan entirely before this widening -- must be either excluded from the gate or explicitly
+  // recorded as tolerating their absence. A new cross-repo test that is neither fails here --
+  // loudly, at authoring time -- instead of quietly turning the gate red for everyone later.
   const offenders = [];
   for (const base of fs.readdirSync(path.join(REPO_ROOT, 'test')).filter((f) => f.endsWith('.test.js'))) {
     const src = fs.readFileSync(path.join(REPO_ROOT, 'test', base), 'utf8');
-    if (!/SPO_PRODUCT_REPO|SPO_DEPLOY_REPO/.test(src)) continue;
+    const reachesSibling = /SPO_PRODUCT_REPO|SPO_DEPLOY_REPO/.test(src) || /require\(.\.\/citation-pins.\)/.test(src);
+    if (!reachesSibling) continue;
     if (Object.prototype.hasOwnProperty.call(EXPECTED_CROSS_REPO, base)) continue;
     if (Object.prototype.hasOwnProperty.call(MENTIONS_BUT_TOLERATES_ABSENCE, base)) continue;
     offenders.push(base);

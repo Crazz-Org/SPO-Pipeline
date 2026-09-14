@@ -41,6 +41,18 @@ const {
   resolveCitationTarget,
   shiftedCitation,
   resolvePins,
+  // stripFences/normalizeWrap/CITATION_RE/POSSESSIVE_LINE_RE/CHAIN_RE/PROXIMITY_CHARS/
+  // extractCitations/isCitationAllowlisted -- moved to citation-pins.js verbatim, action 11.3
+  // (#190), so this file and test/test-comment-citation-sweep.test.js call the SAME extractor
+  // instead of each carrying a copy that could drift.
+  stripFences,
+  normalizeWrap,
+  CITATION_RE,
+  POSSESSIVE_LINE_RE,
+  CHAIN_RE,
+  PROXIMITY_CHARS,
+  extractCitations,
+  isCitationAllowlisted,
 } = require('./citation-pins');
 const { BENCH_PINS, LIVE_RANGE_PINS, BLUNT_PINS, CCA_PINS } = require('./citation-pins-data');
 
@@ -580,7 +592,7 @@ test('extractTopLevelSubcommands: reads a synthetic dispatch table, proving the 
 // in three places (`lock.js`'s `SECOND` idiom -- ordinal "a second, simpler idiom", not a
 // constant; `config.js`'s `OWN` -- emphasis on "own", not an identifier; `intake.js`'s `LLM` --
 // "the intake LLM steps", not a symbol). Reworded at the source (product-repo-lock.js:28,
-// recette.js:125, bin/spo:1875) rather than allowlisted: these were never real symbol citations
+// recette.js:125, bin/spo:1891) rather than allowlisted: these were never real symbol citations
 // to begin with, so an allowlist entry would misrepresent them as reviewed-and-accepted phantoms
 // instead of what they are, three sentences that happened to fall into a regex's blind spot.
 function isCodeShapedIdentifier(ident) {
@@ -862,14 +874,14 @@ test('symbolDefinedIn (M15b): a name that exists ONLY inside the cited file\'s o
 // doc/comment-corpus-audit-2026-09-03.md's E12: a comment marks itself "---- action N.Na ----"
 // (a section banner naming which plan action the code below implements) and that id does not
 // appear in either plan document. 1 id / 3 sites, found 2026-09-03: `action 5.1d`
-// (orchestrator/park-loop.js:219, orchestrator/state-machine.js:893,1249).
+// (orchestrator/park-loop.js:219, orchestrator/state-machine.js:835,1249).
 //
 // Fix round (2026-09-03, adversarial pass), S3: the first cut of this allowlist entry claimed
 // the referent was "a judgement call about the plan's own history." Re-resolved directly against
-// both docs -- it was not. doc/remediation-plan-2026-08.md:186 lists row 5.1's three sub-items in
+// both docs -- it was not. doc/remediation-plan-2026-08.md:188 lists row 5.1's three sub-items in
 // one cell, unlettered: pre-worktree board moves, "DIAGNOSE activity surfaced (a 'diagnosing,
 // attempt N/3' comment or a dedicated column -- driver decision)" (this one), and dropping the
-// redundant IMPLEMENT-retry move. doc/remediation-progress.md:647 names the same referent again,
+// redundant IMPLEMENT-retry move. doc/remediation-progress.md:649 names the same referent again,
 // under "DIAGNOSE surfacing" ("6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a
 // park"). The referent was never ambiguous -- only the letter `d` was invented (the plan does not
 // letter row 5.1's sub-items at all; a scatter of OTHER letters -- 5.1a/5.1b/5.1c/5.1e -- exists
@@ -926,7 +938,7 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
     while ((m = re.exec(src))) { ids.add(m[1]); checked += 1; }
   }
 
-  assert.ok(checked >= 5, `expected at least 5 "action N.Na" mentions across orchestrator/**+bin/spo, found ${checked} -- has the banner convention changed?`);
+  assert.ok(checked >= 5, `expected at least 5 "action N.Na" mentions across orchestrator (recursively) and bin/spo, found ${checked} -- has the banner convention changed?`);
 
   const offenders = [];
   for (const id of ids) {
@@ -1083,15 +1095,10 @@ const CORPUS_FILES = [
 // `config.deployRepo` exists (confirmed by doc/comment-corpus-audit-2026-09-03.md §5), which is
 // why DEPLOY_REPO is a scanner-local constant rather than something read off `orchestrator/config.js`.
 
-// `bin/spo` is an explicit alternative, not a generalized "extensionless path" allowance: it is
-// the one extensionless executable this corpus cites by line (action 9.3 found real citations to
-// it -- doc/state-machine-spec.md:448, and two dated-record sites -- invisible to the plain
-// `\.ext` shape below, meaning `bin/spo:1090-1093`'s drift to :1137 (see part 2.5) could not even
-// be SEEN, let alone bounds- or anchor-checked, before this widening).
-const CITATION_RE = /((?:bin\/spo)|(?:[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))):(\d+)(?:-(\d+))?/g;
-const POSSESSIVE_LINE_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))'s(?:[^()\n]{0,60})?\(line (\d+)\)/g;
-const CHAIN_RE = /`:(\d+)(?:-(\d+))?`|(?<=\bat ):(\d+)(?:-(\d+))?\b/g;
-const PROXIMITY_CHARS = 150;
+// CITATION_RE/POSSESSIVE_LINE_RE/CHAIN_RE/PROXIMITY_CHARS -- moved to citation-pins.js verbatim,
+// action 11.3 (#190), and imported at the top of this file (see that module's own header: `bin/spo`
+// is an explicit alternative there, not a generalized "extensionless path" allowance -- it is the
+// one extensionless executable this corpus cites by line).
 
 // Per-fact allowlist, exactly the ALLOWLIST/KNOWN_FICTIONAL idiom this suite and
 // park-reason-doc-sweep.test.js already use -- keyed `${file} :: ${citation}`, never per-file
@@ -1170,9 +1177,8 @@ const CITATION_ALLOWLIST = {
 // only that CITATION_ALLOWLIST's OWN keys look right. This function is that comparison, called by
 // the main test below instead of inlining it, so the fixture test right after it is exercising
 // the exact same logic the real ratchet runs, not a parallel reimplementation that could drift.
-function isCitationAllowlisted(allowlist, rel, raw) {
-  return Object.prototype.hasOwnProperty.call(allowlist, `${rel} :: ${raw}`);
-}
+// isCitationAllowlisted -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported
+// at the top of this file.
 
 test('isCitationAllowlisted: matches per FACT (file + citation), never by file alone (M13)', () => {
   const allowlist = { 'orchestrator/README.md :: known-absent.ts:1': 'a real, dated absence' };
@@ -1205,22 +1211,8 @@ test('CITATION_ALLOWLIST holds exactly the entries this action explicitly justif
   );
 });
 
-function stripFences(src) {
-  // Fenced code blocks hold format TEMPLATES (e.g. "File: relative/path/to/file.ts:123" in the
-  // invariant-block example), never a real citation -- blanked the same way blankComments strips
-  // // and /* */ elsewhere in this suite's sweeps, so line numbers of anything real are unaffected.
-  let inFence = false;
-  return src
-    .split('\n')
-    .map((line) => {
-      if (line.trim().startsWith('```')) {
-        inFence = !inFence;
-        return '';
-      }
-      return inFence ? '' : line;
-    })
-    .join('\n');
-}
+// stripFences -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported at the top
+// of this file.
 
 // normalizeWrap(src) -- E18/E15: joins an identifier or citation the source happened to wrap
 // across a line break, so CITATION_RE (which never spans a space, deliberately -- spanning one
@@ -1230,11 +1222,8 @@ function stripFences(src) {
 // character, after stripping any `//`/`*`/`#` comment leader the continuation line starts with;
 // (2) every other line break, collapsed to a single space (safe: a citation never legitimately
 // contains a literal space, so this can only ever help a match, never manufacture a false one).
-function normalizeWrap(src) {
-  let text = src.replace(/([-/])\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, '$1');
-  text = text.replace(/[ \t]*\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, ' ');
-  return text;
-}
+// normalizeWrap -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported at the
+// top of this file.
 
 // trackedFiles/findByBasename/resolveIn/resolveCitationTarget -- moved to citation-pins.js
 // verbatim, action 11.1 (#206), and imported at the top of this file. See that module's own
@@ -1248,52 +1237,8 @@ function normalizeWrap(src) {
 // against the nearest preceding real citation within PROXIMITY_CHARS. `text` is expected to
 // already be fence-stripped (if markdown) and normalizeWrap'd. Exported shape:
 // [{ raw, file, start, stop, unanchored }], `file: null` iff `unanchored` is true.
-function extractCitations(text) {
-  const matches = [];
-  let m;
-  CITATION_RE.lastIndex = 0;
-  while ((m = CITATION_RE.exec(text))) {
-    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[3] || m[2]) });
-  }
-  POSSESSIVE_LINE_RE.lastIndex = 0;
-  while ((m = POSSESSIVE_LINE_RE.exec(text))) {
-    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[2]) });
-  }
-  CHAIN_RE.lastIndex = 0;
-  while ((m = CHAIN_RE.exec(text))) {
-    const start = Number(m[1] || m[3]);
-    const stop = Number(m[2] || m[4] || start);
-    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'chain', start, stop });
-  }
-  matches.sort((a, b) => a.idx - b.idx);
-
-  // A chain match landing inside a full/possessive match's own span is the ":N" already captured
-  // by that match (e.g. the ":49" inside "spec.md:49") -- drop it, it is not a second citation.
-  const filtered = matches.filter(
-    (mm) => mm.kind !== 'chain' || !matches.some((o) => o.kind !== 'chain' && mm.idx >= o.idx && mm.idx < o.end)
-  );
-
-  const out = [];
-  let lastFile = null;
-  let lastFileEnd = -1;
-  for (const mm of filtered) {
-    // idx/end (the match's own character span) are carried through for part 2.5's anchor check
-    // below, which needs to know WHERE in the citing text a citation sits in order to scan its
-    // surrounding prose -- part 2 itself never reads these two fields.
-    if (mm.kind === 'chain') {
-      if (!lastFile || mm.idx - lastFileEnd > PROXIMITY_CHARS) {
-        out.push({ raw: `(unanchored) :${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: null, start: mm.start, stop: mm.stop, unanchored: true, idx: mm.idx, end: mm.end });
-      } else {
-        out.push({ raw: `${lastFile}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: lastFile, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
-      }
-    } else {
-      lastFile = mm.file;
-      lastFileEnd = mm.end;
-      out.push({ raw: `${mm.file}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: mm.file, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
-    }
-  }
-  return out;
-}
+// extractCitations -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported at
+// the top of this file.
 
 // M17 (2026-09-03) removed 4 entries -- `orchestrator/bench-queue-wait.js :: worker.ts:129` and
 // `:997`, `orchestrator/journal.js :: worker.ts:131`, `orchestrator/steps/scripted.js ::
@@ -1396,7 +1341,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/state-machine.js :: step-contracts.js:1029", // re-pinned FIVE TIMES within card #213 (2026-09-12), each a pure relocation of the same `touchesRdoMembers === true` line, content unchanged: :432 -> :527 when action 2 rewrote shouldEscalate into the three-source order, then :527 -> :546 when the D1 fix hoisted trigger 4 above that block, then :546 -> :559 as D6/D7 and the name-only rewording added record comments above it, then :559 -> :880 when card #207 (Lot 9)'s FIRST build landed its own ~273-line addition (the outputContract `types` mechanism, its header comment, checkOutputTypes/valueSatisfiesType/jsonSchemaPropertiesFor, and per-step `types` maps) entirely ABOVE shouldEscalate in the file. Re-pinned again, same day, in that same card's first Opus-verifier fix pass (removing the two `types` declarations the corpus replay found unsafe and adding ~55 net lines of measured-evidence comment to the header instead): :880 -> :935. Re-pinned a THIRD time within card #207 itself, in the SECOND Opus-verifier fix pass (2026-09-13, honesty fixes F/G: stale wording corrections and a corrected corpus count added ~16 more net lines above this point): :935 -> :951. Re-pinned a SIXTH time in card #214 (Lot 9, 2026-09-13): :951 -> :978, a pure shift when that action added a measured comment above PLAN's `allowedTools` (allowedTools does not bind subagent spawning) and rewrote the IMPLEMENT_EFFORT_BY_SIZE per-turn-fit prose, both entirely above this point in the file; content byte-identical at :978, verified by re-reading the target line. Re-pinned a SEVENTH time in card #214's own fix pass (2026-09-13, F1): :978 -> :979, a pure +1-line shift when that pass widened the DIAGNOSE baseline comment's parenthetical (naming the new `requestCount`/`sessionRequestCount` replacement by name), above this point in the file; content byte-identical at :979, verified by re-reading the target line. Re-pinned an EIGHTH time in the SAME fix pass (F4): :979 -> :987, a pure +8-line shift when F4 dated/corrected PLAN's allowedTools comment itself (PR #222, and the corrected "IMPLEMENT can delegate too" finding, both above shouldEscalate in the file); content byte-identical at :987, verified by re-reading the target line. Re-pinned a NINTH time in a follow-up fix pass on the same card (2026-09-13, tense-neutral PR #222 wording): :987 -> :986, a pure -1-line shift when that pass tightened PLAN's allowedTools comment (cutting a "likely to merge" forecast clause), above shouldEscalate in the file; content byte-identical at :986, verified by re-reading the target line. Re-pinned a TENTH time when Lot 9's branch merged origin/main after PR #222 (2026-09-13): :986 -> :1029, a pure relocation -- #222 rewrote the shared EFFORT_BY_SIZE comment and added PLAN_EFFORT_BY_SIZE with its Fable baseline, all above shouldEscalate in the file (main alone had it at :603); content byte-identical at :1029, verified by re-reading the target line. It is still source 3 (intake's guess, reached only when the plan declared nothing at all). Every move was verified by re-reading the target line, not inferred from a diff offset.
   "orchestrator/steps/llm.js :: intake.js:938-940", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines.
   "orchestrator/steps/scripted.js :: run.ts:63",
-  "orchestrator/steps/scripted.js :: verify-gate.js:308",
+  "orchestrator/steps/scripted.js :: verify-gate.js:336",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
   "orchestrator/steps/scripted.js :: worker.ts:1542",
   "orchestrator/steps/scripted.js :: worker.ts:751", // card #212: isGateMergeRefusalConfirmed's own comment cites worker.ts:751's refusal-detail literal ("<ref> does not merge cleanly with origin/main (base <sha>)"), confirmed against the real product repo (SPO-WebClient `0b5b5687`+).
@@ -1647,7 +1592,7 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // `SIGTERM` handler -- cited twice), `worker.ts:108`/`:110`/`:109-110` (each one line short of
 // the real `DONE_RETENTION_MS`/`MAX_LEASE_MINUTES`/`DEFAULT_LEASE_MINUTES` declarations),
 // `doc/remediation-plan-2026-08.md:186` and `doc/remediation-progress.md:647` (both two lines
-// short of the real "DIAGNOSE" row/paragraph they cite), `step-contracts.js:136` (should be
+// short of the real "DIAGNOSE" row/paragraph they cite), `step-contracts.js:108` (should be
 // `:99`, the comment block that actually states the IMPLEMENT/VALIDATE-not-PLAN escalation rule),
 // and `doc/board-audit.md`'s own two: `orchestrator/steps/scripted.js:937` (should be `:1295`,
 // the real `npm run board:take` spawn site) and `config.js:711` (should be `:764`, the real
@@ -1696,7 +1641,7 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // Measured twice, on two different corpora, because the corpus moved underneath this change while
 // it sat unmerged: 22 anchored / 3 unanchorable / 0 offenders at every N on 2026-09-03, and
 // 22 anchored / 2 unanchorable / 0 offenders at every N on 2026-09-04, after #109 deleted the
-// unfireable `escalateFlag` and with it prompts/README.md's `step-contracts.js:127` citation. The
+// unfireable `escalateFlag` and with it prompts/README.md's `step-contracts.js:99` citation. The
 // `unanchorable` move is #109's, not this change's -- removing a citation cannot alter what a
 // tolerance band accepts -- and the sweep's own result is unchanged by it: the band is still
 // buying zero anchors. The second measurement is a re-run, not the first one with a digit edited.
@@ -1744,7 +1689,7 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //      closes the worst version of this (a citation's own candidates leaking from an ADJACENT
 //      citation's sentence), but two candidates for the SAME citation can still be mis-ordered
 //      within one un-clipped span -- `account-lease.js:156`, `dispatcher.js:635-648`, and
-//      `verify-gate.js:308` on CITATION_ANCHOR_ALLOWLIST below are exactly this: a real, nearby
+//      `verify-gate.js:336` on CITATION_ANCHOR_ALLOWLIST below are exactly this: a real, nearby
 //      identifier that turned out to belong to a different clause than the one being cited, not a
 //      wrong citation. Every one was read by hand and reasoned about below, not assumed.
 //   4. Excludes `doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` from
@@ -1923,21 +1868,23 @@ const CITATION_ANCHOR_ALLOWLIST = {
     "nearest candidate ('handleExit') is the SUBJECT OF THE NEXT CLAUSE in the same sentence (a " +
     "daemon that never runs handleExit at all), not of this citation -- confirmed correct by " +
     'hand: lines 635-648 are the worker-exit-during-shutdown handling this prose actually names.',
-  // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:308`'s capability-question
+  // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:336`'s capability-question
   // variant, where `required` can be empty...": the true subject is a PROSE PHRASE
   // ("capability-question variant"), not a code-shaped identifier -- `BLOCKED`/`GATE` are
-  // incidental nearby words, not this citation's own content. Confirmed correct: line 308 sits at
-  // the Stage 2 (capabilities) / Stage 3 (routing) boundary this "capability-question" prose
+  // incidental nearby words, not this citation's own content. Confirmed correct (fix pass 11.3
+  // round 3, #190 verifier finding 4 -- the earlier "Stage 2/Stage 3 boundary" reading described
+  // the STALE :308, not today's :336): line 336 is `artifact.verdict = 'BLOCKED';` itself, four
+  // lines below the "capability question... BLOCKED" comment this "capability-question" prose
   // describes.
-  'orchestrator/steps/scripted.js :: verify-gate.js:308':
+  'orchestrator/steps/scripted.js :: verify-gate.js:336':
     "no code-shaped candidate names this citation's true subject (a prose phrase, " +
     "'capability-question variant', not an identifier) -- 'BLOCKED'/'GATE' are incidental nearby " +
-    'words. Confirmed correct by hand: line 308 sits at the Stage 2/Stage 3 boundary this prose describes.',
+    "words. Confirmed correct by hand: line 336 is `artifact.verdict = 'BLOCKED';`, the capability-question outcome this prose describes.",
   // card #212: isGateMergeRefusalConfirmed's own comment cites worker.ts:751 for the
   // refusal-detail LITERAL TEXT itself (a template-string interpolation, not a code-shaped
   // identifier) -- the nearby candidates the heuristic finds ('NAME'/const from an unrelated
   // nearby capitalised word, 'jobId'/camel from this file's own surrounding prose) are incidental,
-  // same shape as the verify-gate.js:308 entry just above. Confirmed correct by hand: worker.ts:751
+  // same shape as the verify-gate.js:336 entry just above. Confirmed correct by hand: worker.ts:751
   // is the exact `${request.ref} does not merge cleanly with origin/main (base ...)` string
   // isGateMergeRefusalConfirmed's own regex matches against.
   'orchestrator/steps/scripted.js :: worker.ts:751':
@@ -1950,7 +1897,7 @@ const CITATION_ANCHOR_ALLOWLIST = {
   // content -- the `"hooks": {` block through the third PreToolUse hook's `"timeout": 10` line --
   // never contains. A JSON config value has no code-shaped identifier or cross-file mention to
   // anchor on; this is the same "no code-shaped candidate names this citation's true subject"
-  // shape as verify-gate.js:308 above, not a wrong citation. Confirmed correct by hand: lines
+  // shape as verify-gate.js:336 above, not a wrong citation. Confirmed correct by hand: lines
   // 109-127 at 935283890fa0593c5c5d0b41cceeaec2c1972c6f are exactly that hooks block.
   'orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127':
     "the only nearby candidate is a 'file' substring match on \"settings\" (the citation's own " +
@@ -1970,7 +1917,7 @@ test('CITATION_ANCHOR_ALLOWLIST holds exactly the entries this action explicitly
       'orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127',
       'orchestrator/README.md :: account-lease.js:156',
       'orchestrator/README.md :: dispatcher.js:635-648',
-      'orchestrator/steps/scripted.js :: verify-gate.js:308',
+      'orchestrator/steps/scripted.js :: verify-gate.js:336',
       'orchestrator/steps/scripted.js :: worker.ts:751',
     ],
     'CITATION_ANCHOR_ALLOWLIST changed size or membership -- read the new/changed citation by ' +
@@ -2048,8 +1995,8 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
-  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:797-799`, `orchestrator/steps/
-  // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:127` (deleted
+  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:796-798`, `orchestrator/steps/
+  // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:99` (deleted
   // by #109, leaving the two still listed here) -- each citing a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
   // mention -- correctly unverifiable, not wrong -- 3 on CITATION_ANCHOR_ALLOWLIST (already
@@ -2079,10 +2026,10 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // alone is enough to anchor it, and `reconcileExternalClosure` alone is what still anchors it
   // one line up, at park-loop.js:1261 ("...only reconcileExternalClosure runs for it.") -- see
   // ANCHOR_BLUNT_CITATIONS below for why that also makes it blunt, not merely anchored.
-  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:354`
+  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
   // (resolveRdoDiffTouched's strict-boolean rationale). Re-measured: 29 verified (was 28), 2
   // unanchorable (unchanged), 0 offenders. It anchors on `touchesRdoMembers` (camelCase), present
-  // verbatim on step-contracts.js:354 itself (`touchesRdoMembers === true`).
+  // verbatim on step-contracts.js:326 itself (`touchesRdoMembers === true`).
   // card #78 (2026-09-07): no citation added or removed, but this action's own doc/comment fixes
   // (correcting the now-false "crash repark runs in-process" claim across the tree) moved SEVEN
   // already-pinned targets. VERIFIER CORRECTION (same card): the first cut of this note said FIVE
@@ -2114,7 +2061,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // Every current pin above was opened at its cited line and read by hand. `anchored` is unchanged
   // at 29 (the two re-pinned bench-doc citations are anchor-excluded and count in neither number).
   // card #161 (2026-09-09): +3 anchored citations, `orchestrator/auto-triage.js :: park-loop.js:1396`,
-  // `:: remote-report-pull.js:193` and `:: state-machine.js:2981`, all three to the identical
+  // `:: remote-report-pull.js:193` and `:: state-machine.js:2923`, all three to the identical
   // best-effort appendDaemonEvent-try/catch precedent. `appendDaemonEvent` sits inside every one of
   // the three citations' own same-sentence anchor windows, so all three anchor on it directly --
   // no CITATION_ANCHOR_ALLOWLIST entry and no unanchorable bump needed. 29 -> 32.
@@ -2138,12 +2085,12 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // "exactly one reader" argument that range makes). It anchors: `scanFile` (line 12) and
   // `reader` (lines 12, 15, 16) appear verbatim within lines 10-18 (the paragraph the citation
   // targets), so the heuristic finds a candidate in range. 34 -> 35.
-  // card #213 action 2 (2026-09-12): `orchestrator/state-machine.js :: step-contracts.js:500`
+  // card #213 action 2 (2026-09-12): `orchestrator/state-machine.js :: step-contracts.js:461`
   // stopped anchoring mid-lot, when action 2's own rewrite of shouldEscalate (STEP_CONTRACTS'
   // IMPLEMENT entry, the vocabulary preamble, and shouldEscalate itself, all ahead of :461 in the
   // file) pushed `touchesRdoMembers === true` down to :527. Re-pinned in both state-machine.js's
-  // citing comment and EXPECTED_CITATIONS to :527, where it anchors again -- `touchesRdoMembers
-  // === true` sits verbatim on that exact line today, inside shouldEscalate's rewritten body
+  // citing comment and EXPECTED_CITATIONS to :1029 (as of this writing -- see EXPECTED_CITATIONS's own re-pin history above), where it anchors again -- `touchesRdoMembers
+  // === true` sat verbatim on that exact line at the time, inside shouldEscalate's rewritten body
   // (`if (task.touchesRdoMembers === true) return true; // source 3: intake's guess, undeclared
   // plan`). That re-pin is COUNT-NEUTRAL, and the note that used to stand here said otherwise:
   // the citation was already counted as `anchored` at :432 on origin/main and is `anchored` again
@@ -2156,7 +2103,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // mechanism exists to prevent -- the next reader who moves shouldEscalate would otherwise
   // "correct" the count in the wrong direction.
   assert.equal(anchored, 36, `expected 36 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
-  // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:127` to explain an
+  // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
   // citation. The population SHRANK -- which is the direction this pin is happy to move in; it
@@ -2165,7 +2112,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // other pin in this file.
   // card #161 (2026-09-09): +2 citations, `orchestrator/auto-triage.js :: park-loop.js:1396` and
   // `:: remote-report-pull.js:193`, both to the identical best-effort appendDaemonEvent-try/catch
-  // precedent (a third, state-machine.js:2981, cites the same precedent). The prose was written so
+  // precedent (a third, state-machine.js:2923, cites the same precedent). The prose was written so
   // `appendDaemonEvent` itself falls inside each citation's same-sentence anchor window rather than
   // being clipped off by an adjacent citation. Re-measured: 32 anchored (was 29 -- see the pin
   // above), 2 unanchorable (unchanged), 0 offenders -- all three new citations anchor on
@@ -2345,12 +2292,12 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // park-loop.js's reEnqueueTask header comment shifted the ABOVE citation's target from :1262 to
   // :1273 (a true pure shift -- see ANCHOR_BLUNT_CITATIONS's own updated entry). Still BLUNT, same
   // shape, same reasoning; blunt/discriminating/ranges counts are unchanged by this.
-  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:354`
+  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
   // -- single-line, anchored on `touchesRdoMembers`, which appears on line 326 only (neither 325
   // nor 327 mentions it), so it discriminates a one-line drift -- discriminating is 16 -> 17.
   // blunt and ranges are unchanged.
   // card #161 (2026-09-09): +3 citations, `orchestrator/auto-triage.js :: park-loop.js:1396`,
-  // `:: remote-report-pull.js:193` and `:: state-machine.js:2981`, each single-line and anchored on
+  // `:: remote-report-pull.js:193` and `:: state-machine.js:2923`, each single-line and anchored on
   // `appendDaemonEvent` (see the main anchor test's own note above). `appendDaemonEvent` does not
   // appear on any neighbouring line of any of the three targets, so all three discriminate a
   // one-line drift -- discriminating is 17 -> 20. blunt and ranges are unchanged.
@@ -2368,7 +2315,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // (`c.start !== c.stop`), blunt by construction like every other range in this corpus. ranges is
   // 10 -> 11. discriminating and blunt are unchanged.
   // card #213 action 2 (2026-09-12): the SAME re-pin as the main anchor test's own note above
-  // (`orchestrator/state-machine.js :: step-contracts.js:500` -> `:527`, after shouldEscalate's
+  // (`orchestrator/state-machine.js :: step-contracts.js:461` -> `:527`, after shouldEscalate's
   // rewrite). Still single-line and still discriminating -- its neighbours do not mention
   // `touchesRdoMembers`, so a one-line shift in either direction still misses it. But as the main
   // anchor test's own note now records, that re-pin is COUNT-NEUTRAL: the citation was already
@@ -2390,7 +2337,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // (11) by design -- it also pins two citations CITATION_ANCHOR_ALLOWLIST skips before this walk
   // ever pushes to `ranges` (`orchestrator/README.md :: dispatcher.js:635-648`, and
   // `orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127` -- a JSON config value
-  // with no code-shaped candidate, same shape as verify-gate.js:308 above) and one this walk
+  // with no code-shaped candidate, same shape as verify-gate.js:336 above) and one this walk
   // classifies UNANCHORABLE instead (`orchestrator/park-loop.js :: intake.js:938-940` -- this
   // specific occurrence has no code-shaped candidate nearby, unlike its three sibling citations of
   // the same fact, so it never passes the `top.length === 0` guard above to be classified as a
@@ -3600,7 +3547,7 @@ test('every bare "doc/<name>.md" reference in the 67-file corpus resolves here, 
 // checking nothing.
 //
 // This closes the specific, checkable subset: the three real SPO-Deploy artifacts this corpus
-// actually names by filename (measured 2026-09-03: `DEPLOY.md` -- orchestrator/README.md:1667;
+// actually names by filename (re-measured: `DEPLOY.md` -- orchestrator/README.md:2124;
 // `deploy.sh` and `setup.conf.example` -- doc/setup.md:11,15), each verified to exist in
 // DEPLOY_REPO, or reported as a setup problem (E1 posture, never a silent pass) if DEPLOY_REPO
 // itself is absent from disk.

@@ -18,7 +18,7 @@
 # The command lives in scripts/gate.sh, NOT here -- one definition, so CI, the pre-push hook and a
 # human typing it cannot drift apart. test/gate-scope.test.js fails if this file grows its own
 # `node --test` invocation. See that script's header for what it deliberately does not run (the
-# three sibling-repo drift checks, which depend on SPO-WebClient's and SPO-Deploy's current state
+# four sibling-repo drift checks, which depend on SPO-WebClient's and SPO-Deploy's current state
 # rather than on this repo's diff).
 
 name: gate

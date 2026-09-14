@@ -286,7 +286,7 @@ test("daemon.js re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K -
   );
   // Action B1.4: FINISH now acquires the lock TWICE (finish-sync, then finish), so it needs
   // product-repo-hold.js's own finishStepDeadlineMs -- the SAME formula config.js itself calls
-  // (config.js:352) -- not lockedStepDeadlineMs, which only accounts for one acquisition.
+  // (config.js:554) -- not lockedStepDeadlineMs, which only accounts for one acquisition.
   assert.match(
     configLiteral,
     /FINISH: productRepoHold\.finishStepDeadlineMs\(/,

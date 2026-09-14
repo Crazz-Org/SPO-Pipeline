@@ -358,7 +358,34 @@ function resolvePins(pins, opts = {}) {
       ok = ok && stop >= 1 && stop <= lineCount && actualLast === wantLast;
     }
 
+    // pin.claim (fix pass 11.3, #190 verifier finding D2/D3): first/last alone let a pin certify
+    // whatever text happens to sit at the cited number, never checking it is the FACT the citing
+    // comment actually states -- exactly how a stale citation got pinned as if correct, and how a
+    // dated note got frozen at a commit where the SAME wrong claim already read as true. When a
+    // pin carries `claim`, the FULL cited span (every line start..stop, in bounds, joined) must
+    // contain it as a literal substring -- not just first/last, since the claim's own text can sit
+    // on an interior line of a range. Optional at the citation-pins.js level (11.1/11.2's own
+    // registries never set it); test-comment-citation-sweep.test.js requires it on every pin.
+    let actualSpanForClaim;
+    if (ok && pin.claim !== undefined) {
+      const spanStart = Math.max(1, start);
+      const spanStop = pin.last !== undefined ? stop : start;
+      actualSpanForClaim = lines.slice(spanStart - 1, spanStop).join('\n');
+      ok = ok && actualSpanForClaim.includes(pin.claim);
+    }
+
     if (ok) return { pin, ok: true, actualFirst, actualLast, lineCount };
+
+    if (pin.claim !== undefined && actualSpanForClaim !== undefined && !actualSpanForClaim.includes(pin.claim)) {
+      return {
+        pin,
+        ok: false,
+        actualFirst,
+        actualLast,
+        lineCount,
+        why: `${pin.file} :: ${pin.citation} @ ${pin.at} -- claim not found in span: expected to find "${truncateForMessage(pin.claim)}" somewhere in lines ${start}-${pin.last !== undefined ? stop : start}`,
+      };
+    }
 
     const movedTo = computeMovedTo(lines, pin);
     const parts = [`${pin.file} :: ${pin.citation} @ ${pin.at}`];
@@ -371,6 +398,195 @@ function resolvePins(pins, opts = {}) {
     if (movedTo) parts.push(`moved to :${movedTo}`);
     return { pin, ok: false, actualFirst, actualLast, why: parts.join(' -- '), movedTo, lineCount };
   });
+}
+
+// ---- vacuous-claim rejection (fix pass 11.3 round 2, #190 verifier finding A1) ----------------
+//
+// A `claim` that is trivially true of almost any span is not a claim: it does not tie the pin to
+// the SPECIFIC fact the citing comment states, it just happens to occur wherever you look --
+// "own", "README", or a bare "}" all sit inside huge swaths of this corpus's cited spans. Three
+// mechanical rules, checked in this order so a rejection names exactly which one fired:
+//   (a) the claim must not consist only of a stopword/generic word (case-insensitive) or a bare
+//       brace -- CLAIM_STOPWORDS below is the named, closed list;
+//   (b) the claim must not be a substring of its OWN citation text (rejects "README" on a
+//       README.md citation, "lock.js" on an orchestrator lock.js citation, etc. -- a token that
+//       just repeats the filename proves nothing about the LINE);
+//   (c) the claim must be at least 4 characters, UNLESS it contains a non-word character (a short
+//       but distinctive token like `'--base',` is fine; a bare `}` is not -- and is caught by (a)
+//       anyway, since a lone brace is explicitly on the stopword list).
+const CLAIM_STOPWORDS = new Set([
+  'own', 'out', 'const', 'ref', 'run', 'ever', 'one', 'repo', 'already', 'live', 'thing', 'below',
+  'header', 'new', 'step', 'call', 'doc', 'wrong', 'function', 'state', 'board', 'reads', 'journal',
+  'bullet', 'bench', 'relative', 'cross', '{', '}',
+]);
+
+// isVacuousClaim(claim, citationText) -> { vacuous: false } | { vacuous: true, reason }
+function isVacuousClaim(claim, citationText) {
+  const trimmed = claim.trim();
+  const lower = trimmed.toLowerCase();
+  if (CLAIM_STOPWORDS.has(lower)) {
+    return { vacuous: true, reason: `claim "${trimmed}" is a stopword/generic word (or a bare brace) -- it does not tie the pin to a specific fact` };
+  }
+  if (citationText.toLowerCase().includes(lower)) {
+    return { vacuous: true, reason: `claim "${trimmed}" is a substring of its own citation text "${citationText}" -- it proves nothing about the cited LINE` };
+  }
+  const hasNonWordChar = /[^A-Za-z0-9_]/.test(trimmed);
+  if (trimmed.length < 4 && !hasNonWordChar) {
+    return { vacuous: true, reason: `claim "${trimmed}" is shorter than 4 characters and contains no non-word character` };
+  }
+  return { vacuous: false };
+}
+
+// ---- shared extraction (action 11.3, #190) --------------------------------------------------
+//
+// Moved verbatim from test/doc-constant-sweep.test.js so that file and this action's own
+// test/test-comment-citation-sweep.test.js call the SAME extractor instead of each carrying a
+// copy that could drift -- the same "one resolver" rule this module's own header states for
+// resolveCitationTarget. Nothing about the logic changes here, only its address; see
+// doc-constant-sweep.test.js's part 2 header for the full rationale of each shape/regex below.
+
+function stripFences(src) {
+  // Fenced code blocks hold format TEMPLATES (e.g. "File: relative/path/to/file.ts:123" in the
+  // invariant-block example), never a real citation -- blanked the same way blankComments strips
+  // // and /* */ elsewhere in this suite's sweeps, so line numbers of anything real are unaffected.
+  let inFence = false;
+  return src
+    .split('\n')
+    .map((line) => {
+      if (line.trim().startsWith('```')) {
+        inFence = !inFence;
+        return '';
+      }
+      return inFence ? '' : line;
+    })
+    .join('\n');
+}
+
+// normalizeWrap(src) -- E18/E15: joins an identifier or citation the source happened to wrap
+// across a line break, so CITATION_RE (which never spans a space, deliberately -- spanning one
+// would turn ordinary prose into false-positive matches) still reads it as one contiguous string.
+// Two cases, in order: (1) the line up to the break ends in `-` or `/` -- a path or hyphenated
+// identifier continuation (`doc/state-machine-` + `spec.md:49`) -- joined with NO inserted
+// character, after stripping any `//`/`*`/`#` comment leader the continuation line starts with;
+// (2) every other line break, collapsed to a single space (safe: a citation never legitimately
+// contains a literal space, so this can only ever help a match, never manufacture a false one).
+// replaceWithMap(text, map, regex, replacer) -- runs ONE global-regex replace while threading an
+// offset map alongside: for every character of the OUTPUT, which character of the ORIGINAL (the
+// text `map` itself was built against) it came from. A collapsed/inserted span (the join point
+// itself) maps to the original index of whatever preceded it -- close enough for line-number
+// purposes, since the join point is always inside the SAME comment as the text right before it.
+// Fix pass 11.3 round 3 (#190 verifier finding 7, driver decision): moved here from
+// test-comment-citation-sweep.test.js, which had its own copy plus a self-check asserting it never
+// drifted from this file's normalizeWrap -- now there is only one implementation to drift from.
+function replaceWithMap(text, map, regex, replacer) {
+  let newText = '';
+  const newMap = [];
+  let last = 0;
+  regex.lastIndex = 0;
+  let m;
+  while ((m = regex.exec(text))) {
+    newText += text.slice(last, m.index);
+    for (let i = last; i < m.index; i++) newMap.push(map[i]);
+    const rep = replacer(m);
+    newText += rep;
+    const anchor = newMap.length ? newMap[newMap.length - 1] : map[0] || 0;
+    for (let i = 0; i < rep.length; i++) newMap.push(anchor);
+    last = m.index + m[0].length;
+    if (m[0].length === 0) regex.lastIndex += 1; // never happens with this module's own patterns, guarded anyway
+  }
+  newText += text.slice(last);
+  for (let i = last; i < text.length; i++) newMap.push(map[i]);
+  return { text: newText, map: newMap };
+}
+
+// normalizeWrapWithMap(text) -> { text, map } -- same two-pass join normalizeWrap always did, plus
+// a `map` from each character of the OUTPUT back to its index in `text` (the UN-normalized input)
+// -- normalizeWrap collapses newlines, so a citation split across a wrapped line would otherwise
+// report the wrong line number to anything computing one from an offset into the normalized text.
+// `normalizeWrap` itself is now a one-line wrapper over this, so there is exactly one join
+// implementation for both callers that need only the text and the one (this sweep's own citing-
+// line computation) that also needs to know where each character came from.
+function normalizeWrapWithMap(text) {
+  const identity = Array.from({ length: text.length }, (_, i) => i);
+  const pass1 = replaceWithMap(text, identity, /([-/])\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, (m) => m[1]);
+  const pass2 = replaceWithMap(pass1.text, pass1.map, /[ \t]*\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, () => ' ');
+  return pass2;
+}
+
+function normalizeWrap(src) {
+  return normalizeWrapWithMap(src).text;
+}
+
+// `bin/spo` is an explicit alternative, not a generalized "extensionless path" allowance: it is
+// the one extensionless executable this corpus cites by line (action 9.3 found real citations to
+// it, invisible to the plain `\.ext` shape below).
+const CITATION_RE = /((?:bin\/spo)|(?:[A-Za-z0-9_./][A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))|(?:[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))):(\d+)(?:-(\d+))?/g;
+const POSSESSIVE_LINE_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))'s(?:[^()\n]{0,60})?\(line (\d+)\)/g;
+const CHAIN_RE = /`:(\d+)(?:-(\d+))?`|(?<=\bat ):(\d+)(?:-(\d+))?\b/g;
+const PROXIMITY_CHARS = 150;
+
+// extractCitations(text) -- the three shapes, merged in document order, chain matches resolved
+// against the nearest preceding real citation within PROXIMITY_CHARS. `text` is expected to
+// already be fence-stripped (if markdown) and normalizeWrap'd. Exported shape:
+// [{ raw, file, start, stop, unanchored }], `file: null` iff `unanchored` is true.
+function extractCitations(text) {
+  const matches = [];
+  let m;
+  CITATION_RE.lastIndex = 0;
+  while ((m = CITATION_RE.exec(text))) {
+    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[3] || m[2]) });
+  }
+  POSSESSIVE_LINE_RE.lastIndex = 0;
+  while ((m = POSSESSIVE_LINE_RE.exec(text))) {
+    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[2]) });
+  }
+  CHAIN_RE.lastIndex = 0;
+  while ((m = CHAIN_RE.exec(text))) {
+    const start = Number(m[1] || m[3]);
+    const stop = Number(m[2] || m[4] || start);
+    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'chain', start, stop });
+  }
+  matches.sort((a, b) => a.idx - b.idx);
+
+  // A chain match landing inside a full/possessive match's own span is the ":N" already captured
+  // by that match (e.g. the ":49" inside "spec.md:49") -- drop it, it is not a second citation.
+  const filtered = matches.filter(
+    (mm) => mm.kind !== 'chain' || !matches.some((o) => o.kind !== 'chain' && mm.idx >= o.idx && mm.idx < o.end)
+  );
+
+  const out = [];
+  let lastFile = null;
+  let lastFileEnd = -1;
+  for (const mm of filtered) {
+    // idx/end (the match's own character span) are carried through for doc-constant-sweep's
+    // anchor check, which needs to know WHERE in the citing text a citation sits in order to scan
+    // its surrounding prose -- callers that only need part 2's citations never read these two.
+    if (mm.kind === 'chain') {
+      if (!lastFile || mm.idx - lastFileEnd > PROXIMITY_CHARS) {
+        out.push({ raw: `(unanchored) :${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: null, start: mm.start, stop: mm.stop, unanchored: true, idx: mm.idx, end: mm.end });
+      } else {
+        out.push({ raw: `${lastFile}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: lastFile, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
+      }
+    } else {
+      lastFile = mm.file;
+      lastFileEnd = mm.end;
+      out.push({ raw: `${mm.file}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: mm.file, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
+    }
+  }
+  return out;
+}
+
+// isCitationAllowlisted -- extracted so the per-FACT (never per-file) matching discipline any
+// CITATION_ALLOWLIST-shaped object depends on is itself under test, not merely asserted by a
+// membership pin. Generic over `allowlist` for any caller keyed `${rel} :: ${raw}` --
+// doc-constant-sweep.test.js's own CITATION_ALLOWLIST is exactly that shape.
+// test-comment-citation-sweep.test.js's registry keys carry an extra ` #<occurrence>` suffix (a
+// citation repeated in the same file needs one entry per mention, not one per fact) and so does
+// its OWN matching, inline, rather than through this function -- correction, fix pass 11.3
+// (#190 verifier finding D8): an earlier draft of this comment claimed it called this function
+// too, which was never true.
+function isCitationAllowlisted(allowlist, rel, raw) {
+  return Object.prototype.hasOwnProperty.call(allowlist, `${rel} :: ${raw}`);
 }
 
 module.exports = {
@@ -386,4 +602,16 @@ module.exports = {
   shiftedCitation,
   batchCatFile,
   resolvePins,
+  stripFences,
+  normalizeWrap,
+  normalizeWrapWithMap,
+  replaceWithMap,
+  CITATION_RE,
+  POSSESSIVE_LINE_RE,
+  CHAIN_RE,
+  PROXIMITY_CHARS,
+  extractCitations,
+  isCitationAllowlisted,
+  CLAIM_STOPWORDS,
+  isVacuousClaim,
 };

@@ -631,3 +631,54 @@ which pulls a large surface into a pin set sized for `doc/` prose — or teachin
 resolve test-file targets, which is the same "parse what the citation claims" mechanism §8.1
 already registered as too large to attempt. The cheap mitigation is the one taken: the citations
 name a file, not a `file:line`, so only a rename or a move breaks them, not an ordinary edit.
+
+## 10 · Known limits of the `test/` comment-citation sweep (card #190, action 11.3, 2026-09-13)
+
+`test/test-comment-citation-sweep.test.js` guards `file:line` citations inside `test/*.js` and
+`test/fixtures/**/*.js` comments the same way `doc-constant-sweep.test.js` guards the `doc/`
+corpus: a pinned-anchor check (`test/citation-pins.js`'s `resolvePins`) that stores the exact cited
+text, not merely the line count. Three limits are accepted rather than fixed, matching this
+document's own posture of naming a gap honestly instead of quietly shipping a narrower check as if
+it were complete:
+
+1. **Trailing inline comments are not scanned.** Extraction reuses `blankComments`, whose own
+   contract (`test/blank-comments-sync.test.js`) blanks whole-line `//` comments only — a `code();
+   // file.js:10` trailing comment is left as code and never reaches the extractor. Measured: 4 such
+   citations existed in the corpus before this action, one of which DID carry a real, uncorrected
+   drift (`test/gate-legs-reachability.test.js`'s `real: true, // handleIntake's own
+   real-flag-required gate (state-machine.js:194)` — stale by nine lines, fixed in this action's own
+   pass but only because a human happened to read it; the sweep itself cannot see a trailing
+   comment, live or stale). They remain invisible to this sweep exactly as they are invisible to
+   `doc-constant-sweep`'s own part 2.
+2. **A `/*` inside a string can blank a region.** `blankComments` finds `/* ... */` on the RAW
+   source after line-comments are stripped, with no notion of "inside a string literal" — the same
+   trap `doc-constant-sweep.test.js`'s own `blankComments` copy carries. This action found and fixed
+   FOUR live instances, not two:
+   - an `` `...orchestrator/**+bin/spo...` `` assertion message in `test/doc-constant-sweep.test.js`
+     (phantom-blanked lines 929–1234, 305 lines, measured against the pre-fix commit);
+   - a `.claude/hooks/*.sh` criterion string in `test/protected-files-guard.test.js`
+     (phantom-blanked lines 221–733, 512 lines) — first rephrased to a different filename (which
+     sidestepped the trap but silently changed what the regression fixture said), then corrected to
+     keep the ORIGINAL bytes via string concatenation (`'.claude/hooks/' + '*.sh'`), which carries
+     the same text with no literal `/*` adjacency;
+   - two TEST TITLES (not fixture strings quoting another file) that named this very trap in prose
+     — `` `the -f/--method sweep still catches a genuine violation even in the presence of a /*
+     inside a // comment` `` in `test/gh-api-argv.test.js` and its twin in
+     `test/park-reason-doc-sweep.test.js` — each blanking 7 lines of the test's OWN following body,
+     rephrased to "a slash-star inside a // comment" so nothing is blanked.
+   Re-measured after all four fixes: no span longer than 6 lines remains anywhere in `test/*.js`,
+   and the short ones left are deliberate FIXTURE STRINGS (not titles) in
+   `test/gh-api-argv.test.js`/`test/park-reason-doc-sweep.test.js` that exist specifically to test
+   this exact trap on a DIFFERENT target file, not on their own source.
+3. **Chains (`` `:N` `` with no path) are not guarded.** `extractCitations`'s chain resolution
+   (`CHAIN_RE`) still runs, but an `unanchored` chain — one that could not attach to a preceding
+   real citation within `PROXIMITY_CHARS` — is filtered out before the registry check, the same
+   posture `doc-constant-sweep.test.js` already takes for its own unanchored chains. Measured: 63
+   such chain occurrences in the `test/*.js` corpus at HEAD (re-measured 2026-09-14, fix pass 11.3
+   round 3 — the normalizeWrap integration this sweep gained in round 2 joins a few wrapped
+   citations that used to read as separate unanchored fragments), none independently checkable
+   without a citing file to resolve against.
+
+None of the three widen a check to look complete while checking less — they are named exclusions
+of shapes the sweep structurally cannot see, the same discipline this document already applies to
+`doc-constant-sweep.test.js` itself.

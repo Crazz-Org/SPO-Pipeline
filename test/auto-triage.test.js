@@ -1136,7 +1136,7 @@ test('runAutoTriage: a report-confirmed event with pendingPath: null is held-unc
 // return routeConfirmedReport(...)`), so a `report-confirmed` event with `pendingPath: null`
 // reaches it unmodified under `spo triage --dry`. Without the guard, `entry.pendingPath` (null)
 // flows into `intake.triageBugReport` -> `fillPromptTemplate`'s placeholder check
-// (prompt-template.js:99, `values[name] === null` counts as missing) -> a thrown
+// (prompt-template.js:113, `values[name] === null` counts as missing) -> a thrown
 // MissingPlaceholderError, uncaught here. Direct check first, same shape as claimReport's own
 // pair above: processConfirmedReport(..., {dry:true}) returns the mechanical-failure shape,
 // never throws.
@@ -1238,7 +1238,7 @@ function daemonEvents(journalRoot) {
 // so it is not an error. Action 3.1 (Lot 3): this used to return `dest` (a path that is NOT
 // there) as if the move had succeeded, indistinguishable from success to every caller. It now
 // returns `null` and journals a distinct `report-move-source-missing` event via the new 4th
-// `journalRoot` parameter, so a caller that binds the return value (report-intake.js:300) records
+// `journalRoot` parameter, so a caller that binds the return value (report-intake.js:313) records
 // "could not vouch for this" instead of a fabricated path. Any other rename error (EXDEV across
 // filesystems, EPERM, ...) still propagates: there is no "someone else already handled it" story
 // for those, and swallowing them would hide a real filesystem problem, and no event is journaled
@@ -1303,7 +1303,7 @@ test('moveReportTo: a non-ENOENT rename failure (e.g. EXDEV) still propagates un
   assert.deepEqual(daemonEvents(journalRoot), [], 'a genuine rename error must never journal report-move-source-missing');
 });
 
-// Reachability for report-intake.js:300's own binding lives in test/report-intake.test.js
+// Reachability for report-intake.js:313's own binding lives in test/report-intake.test.js
 // (runReportIntake drives the real call site) -- this file only unit-tests moveReportTo directly.
 
 test('moveReportTo: a journalling failure (appendDaemonEvent throws) must not make moveReportTo itself throw', () => {

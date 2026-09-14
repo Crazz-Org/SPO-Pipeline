@@ -1043,7 +1043,7 @@ test('realWorktree (B1.4 R4, fifth pass F1): a TIMED-OUT bench-install.sh while 
   // commandTimeoutsMs must actually name 'bench-install' -- spawnOnce only treats an ETIMEDOUT
   // fake result as a real timeout when a numeric deadline was armed (`deadlineArmed`); testConfig's
   // own default has no commandTimeoutsMs at all, which would silently make this ETIMEDOUT result
-  // read as a plain exit failure instead, same shape test/real-steps.test.js:4671 already learned.
+  // read as a plain exit failure instead, same shape test/real-steps.test.js:6460 already learned.
   const config = testConfig({ commandTimeoutsMs: { 'bench-install': 900000 } });
   const task = { id: 'card-debt-installtimeout', kind: 'card', issue: 907 };
   const ctx = testCtx({ id: 'card-debt-installtimeout', task, config });
@@ -7004,7 +7004,7 @@ test('npm-gate timeout also covers K workers\' worst-case bench queue wait, incl
 // shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
 //
 // A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
-// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 217) deletes
+// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 325) deletes
 // every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
 // worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
 // all-time records, and re-measuring on a different day legitimately yields a different sample
