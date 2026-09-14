@@ -512,11 +512,14 @@ function resolvePins(pins, opts = {}) {
 }
 
 // resolveAnchor(lines, anchorText, hintLine) -> { line, unique, absent } -- action 1 of the
-// line-number-as-truth-key migration (this action lands it DARK: nothing calls it yet, see this
-// module's own header note and the chantier spec). Where computeMovedTo (above) only fires once a
-// pin has already failed its exact-position check, this is the primitive the LATER inverted model
-// needs as its primary lookup: given the anchor TEXT alone, find where it lives now. Same match
-// discipline as computeMovedTo: `line.trim() === anchorText.trim()`, exact, no fuzzy/substring.
+// line-number-as-truth-key migration. Landed dark in that action (nothing called it yet); action 3
+// wired it in as resolvePins' own primary lookup for every `at: 'HEAD'` pin, below -- it is no
+// longer unused (corrected here, external audit, 2026-09-14 second pass: this comment kept
+// claiming "nothing calls it yet" after that wiring landed). Where computeMovedTo (above) only
+// fires once a pin has already failed its exact-position check, this is the primitive the inverted
+// HEAD-pin model uses as its primary lookup: given the anchor TEXT alone, find where it lives now.
+// Same match discipline as computeMovedTo: `line.trim() === anchorText.trim()`, exact, no
+// fuzzy/substring.
 //
 // `hintLine` is informational passthrough ONLY -- a future caller's own "moved from N to M"
 // reporting -- and must never affect `line`/`unique`/`absent`. Deliberately not read here beyond

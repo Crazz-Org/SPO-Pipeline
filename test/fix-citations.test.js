@@ -19,7 +19,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const { mkTmp, isolatedEnv } = require('./helpers');
+const { execFileSync } = require('child_process');
+const { mkTmp, isolatedEnv, gitEnv } = require('./helpers');
 
 const FIX_CITATIONS = path.join(__dirname, '..', 'scripts', 'fix-citations.js');
 
@@ -256,6 +257,112 @@ test('a whole-token occurrence is still fixed even when a longer citation sharin
     `Real citation: ${NEW_CITATION}. Unrelated, longer: ${LONGER_CITATION}.\n`,
     'only the whole-token occurrence changes; the longer citation beside it is left exactly as it was'
   );
+});
+
+// Reproduces the real corruption the external audit found (2026-09-14, second pass), against the
+// REAL bug first (proving it existed), then against the fixed script (proving it's closed).
+// citation-pins.js's `correction.citation` is built from `m.relPath` -- the repo-root-RESOLVED
+// path -- never from the citation's own original path spelling. A bare citation naming only the
+// fixture's target basename, resolved via git-tracked-basename lookup to that same file nested
+// one directory down, makes `correction.citation` carry the fuller, DIFFERENT path text -- not
+// the citation's own original spelling. If the citing prose spells the fact with that fuller
+// path already (naming the containing directory too), the bare original citation matches as a
+// SUFFIX of that longer text (findCitationOccurrences' own deliberately loose leading side), and
+// a naive splice-in of the corrected citation at that match point duplicates the directory
+// segment instead of fixing the line number. (Deliberately not spelling either citation as a
+// literal `path.ext:N` token in this comment -- see OLD_CITATION's own header note above for why:
+// this repo's test-comment-citation-sweep existence-checks exactly that shape out of every
+// comment in test/, and a scratch fixture path/line pair the sweep would try to resolve was never
+// the point here.)
+// gitScratch -- the path-spelling fixtures below need a real git repo: their registry citation is
+// BARE (no "/"), so resolveCitationTarget resolves it through findByBasename/`git ls-files`, which
+// is the only resolution route whose `m.relPath` can differ from the citation's own text.
+function gitScratch(prefix, { targetRel, citingContent, citation }) {
+  const dir = mkTmp(prefix);
+  fs.mkdirSync(path.join(dir, path.dirname(targetRel)), { recursive: true });
+  fs.writeFileSync(path.join(dir, targetRel), TARGET_LINES.join('\n') + '\n', 'utf8');
+  fs.writeFileSync(path.join(dir, 'citing.md'), citingContent, 'utf8');
+  const dataFilePath = path.join(dir, 'pins-data.js');
+  fs.writeFileSync(
+    dataFilePath,
+    pinsDataSource({ benchPinLine: `{ file: "citing.md", citation: "${citation}", at: "HEAD", first: "TARGET TEXT" },` })
+  );
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['config', 'user.email', 't@t.t'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['add', '-A'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['commit', '-q', '-m', 'scratch'], { cwd: dir, env: gitEnv() });
+  return { dir, dataFilePath, citingPath: path.join(dir, 'citing.md') };
+}
+
+// The OTHER half of the same guard, and the reason it is a LEADING-BOUNDARY check rather than a
+// flat path-equality refusal (verification of the audit fix, 2026-09-14): when the corrected path
+// disagrees with the cited one but the prose spelled the citation BARE -- exactly as the registry
+// pin does -- the rewrite is correct, and merely re-spells the citation in the resolved form.
+// That is not a corner case. Three of this repo's own four real collateral re-pins have exactly
+// this shape (bare in both the registry and the prose, resolving under orchestrator/), so a flat
+// refusal would refuse three of the four real drift shapes this script exists to automate -- and,
+// since the data-file half succeeds independently, would leave the registry re-spelled while the
+// prose still said the old text, a divergence this repo's own live-corpus citation sweep goes RED
+// on. Measured, both halves, before this test was written.
+test('a corrected citation whose path differs but whose prose occurrence STARTS a path token is still rewritten', () => {
+  const { dir, dataFilePath, citingPath } = gitScratch('fix-citations-path-respell-', {
+    targetRel: path.join('nested', 'thing.js'),
+    // Prose spells the fact bare, exactly as the registry pin does -- nothing precedes it but a space.
+    citingContent: 'Prose cites thing.js:2 for the detail.\n',
+    citation: 'thing.js:2',
+  });
+
+  const res = run(dataFilePath, dir, ['--apply']);
+
+  assert.equal(res.status, 0, `a bare prose occurrence is safe to re-spell, not a refusal: ${res.stdout}\n${res.stderr}`);
+  assert.match(res.stdout, /citing file .*: rewrote 1 occurrence/);
+  assert.equal(
+    readAll(citingPath),
+    'Prose cites nested/thing.js:4 for the detail.\n',
+    'the citation is re-spelled in the resolved form with the corrected line number, and nothing else changes'
+  );
+  // The registry and the prose must still agree afterwards -- the invariant this repo's own
+  // live-corpus citation sweep enforces, and the whole reason a flat refusal was the wrong shape.
+  assert.match(readAll(dataFilePath), /citation: "nested\/thing\.js:4"/);
+});
+
+// The refusal is keyed on BOTH conditions together -- the paths disagreeing AND the prose
+// occurrence being the tail of a longer path. See the sibling test above for the disagreeing-but-
+// bare case, which is safe and must still be rewritten.
+test('a corrected citation whose path differs AND whose prose occurrence is the tail of a longer path is refused, never spliced in', () => {
+  const dir = mkTmp('fix-citations-path-mismatch-');
+  fs.mkdirSync(path.join(dir, 'nested'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'nested', 'thing.js'), TARGET_LINES.join('\n') + '\n', 'utf8');
+  const citingContent = 'Prose cites nested/thing.js:2 for the detail.\n';
+  fs.writeFileSync(path.join(dir, 'citing.md'), citingContent, 'utf8');
+  const dataFilePath = path.join(dir, 'pins-data.js');
+  // Bare citation (no "/"), no `path` field -- resolved via git-tracked-basename lookup, which
+  // is exactly the resolution path whose `m.relPath` differs from the citation's own bare text.
+  fs.writeFileSync(
+    dataFilePath,
+    pinsDataSource({ benchPinLine: `{ file: "citing.md", citation: "thing.js:2", at: "HEAD", first: "TARGET TEXT" },` })
+  );
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['config', 'user.email', 't@t.t'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['add', '-A'], { cwd: dir, env: gitEnv() });
+  execFileSync('git', ['commit', '-q', '-m', 'scratch'], { cwd: dir, env: gitEnv() });
+
+  const beforeCiting = readAll(path.join(dir, 'citing.md'));
+
+  const res = run(dataFilePath, dir, ['--apply']);
+  assert.notEqual(res.status, 0, `a path-spelling mismatch must be refused, not guessed at: ${res.stdout}\n${res.stderr}`);
+  assert.match(res.stdout, /citing file: REFUSED/);
+  assert.match(res.stdout, /path.*differently|differently.*path/i);
+
+  assert.equal(
+    readAll(path.join(dir, 'citing.md')),
+    beforeCiting,
+    'the citing file must be byte-identical -- a path-spelling mismatch must never be spliced in, which would ' +
+      'have produced "nested/nested/thing.js:4" from "nested/thing.js:2"'
+  );
+  assert.doesNotMatch(readAll(path.join(dir, 'citing.md')), /nested\/nested/, 'the specific corruption shape must not appear');
 });
 
 test('an at:<sha> pin in the same run is completely ignored, regardless of what its own citing file contains', () => {
