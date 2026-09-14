@@ -2745,8 +2745,8 @@ const DATED_DOCUMENT_PATTERN = /-\d{4}-\d{2}-\d{2}\.md$/;
 const DATED_DOC_HEAD_EXCEPTIONS = new Set([
   "doc/bench-audit-2026-09-02.md :: bin/spo:1283", // re-pinned 15+ times as bin/spo grows -- hand-maintained as true today, not dated record (BENCH_PINS header)
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1283", // same fact, same reason, cited from the sibling doc
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:166", // the FINISH row -- hand-maintained as true today, not dated record (BENCH_PINS header)
-  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:166", // same fact, same reason, cited from the sibling doc
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:387", // the FINISH row -- hand-maintained as true today, not dated record (BENCH_PINS header); re-pinned from :166 by main's own card #212 merge, a true pure shift
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:387", // same fact, same reason, cited from the sibling doc
 ]);
 
 // Pure, reusable check: given a flat pin array, return the `file :: citation` keys of every pin
