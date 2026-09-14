@@ -31,7 +31,7 @@ require('./no-real-spawn');
 
 const { mkTmp, runSpo } = require('./helpers');
 const { computeDispatcherStatus } = require('../console/dispatcher-status');
-const { collectAll, collectServices, applyWorkerStats } = require('../console/collect');
+const { collectAll, collectServices, applyWorkerStats, readDaemonEventsTail } = require('../console/collect');
 const { renderServicesInner, renderReportsInner } = require('../console/render');
 
 // Fixed clock for every unit test below -- never Date.now(), so every assertion is an exact,
@@ -63,7 +63,7 @@ test('bound: drain-start OLDER than timeoutMs+killGraceMs reads stopped/diedDrai
     },
     now: NOW,
   });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
   assert.equal(isAliveCalls, 0, 'the bound must decide before isAlive is ever consulted');
 });
 
@@ -109,7 +109,7 @@ test('bound: no resolvable pid at all, older than the bound, reads stopped/diedD
   // TRUE, to prove the bound alone decides -- pid-unresolvable used to mean 'draining' by
   // default; past the bound it must not any more.
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
 });
 
 test('bound: exact boundary -- age === timeoutMs + killGraceMs reads draining (the bound has not been EXCEEDED yet)', () => {
@@ -137,7 +137,7 @@ test('bound: one millisecond past the boundary reads stopped/diedDraining', () =
     inFlight: ['a'],
   };
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
 });
 
 test("bound: the event's OWN killGraceMs wins over the injected one", () => {
@@ -154,7 +154,7 @@ test("bound: the event's OWN killGraceMs wins over the injected one", () => {
   // 1000 + 100000 = 101000ms and 1500ms would read comfortably inside it (draining). Reading
   // stopped here proves the event's own `killGraceMs` is the one actually used.
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW, killGraceMs: 100000 });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
 });
 
 test('bound: a LEGACY record with no killGraceMs of its own uses the injected (caller config) grace', () => {
@@ -171,7 +171,7 @@ test('bound: a LEGACY record with no killGraceMs of its own uses the injected (c
   // all, and this would fall through to liveness and read 'draining'. Reading stopped proves the
   // caller's injected killGraceMs reached the bound.
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW, killGraceMs: 1000 });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
 });
 
 test('bound: missing `ts` -- no bound applies, falls through to liveness (isAlive TRUE -> draining)', () => {
@@ -388,15 +388,17 @@ test('production LEGACY: a pid-less, killGraceMs-less drain-start (2h old) reads
 // `Date.parse(ev.ts)`), but the wait it bounds (dispatcher.js's awaitInFlight) runs on the
 // MONOTONIC clock. A forward wall-clock step during a live drain pushes the wall age past the
 // bound before the monotonic wait has actually expired -- a false STOPPED for a drain that is
-// still running. (A host suspend is the card's other named trigger, and it is NOT closed by this
-// change: `/proc/uptime` is `ktime_get_boottime`, which counts suspended time, while the wait's
+// still running. (A host suspend is the card's other named trigger; card #208 itself did NOT
+// close it: `/proc/uptime` is `ktime_get_boottime`, which counts suspended time, while the wait's
 // `hrtime` is CLOCK_MONOTONIC, which does not. Measured on this box: CLOCK_BOOTTIME minus
 // CLOCK_MONOTONIC is -1.7 us after 63 h of uptime, which cannot distinguish "this host never
-// suspended" from "WSL2 collapses the two" -- so suspend stays a named residual, neither closed
-// nor demonstrated.) dispatcher.js now stamps `dispatcher-drain-start` with `hostUptimeAtMs`
-// (`os.uptime() * 1000`, seconds-since-boot converted to ms) alongside `ts`: unlike
-// `monotonicNowMs()` (meaningless outside the writing process, orchestrator/monotonic-clock.js's
-// own header), boot-relative uptime is comparable ACROSS PROCESSES on the same boot, and unlike
+// suspended" from "WSL2 collapses the two" -- so suspend stayed a named residual after card #208,
+// neither closed nor demonstrated. Card #219, below, closes it where the clock allows -- see its
+// own section further down.) dispatcher.js now stamps `dispatcher-drain-start` with
+// `hostUptimeAtMs` (`os.uptime() * 1000`, seconds-since-boot converted to ms) alongside `ts`:
+// boot-relative uptime is comparable ACROSS PROCESSES on the same boot on every platform (unlike
+// `monotonicNowMs()`, whose cross-process comparability is a measured Linux implementation detail,
+// not a documented Node guarantee -- orchestrator/monotonic-clock.js's own header), and unlike
 // `ts` it never steps. computeDispatcherStatus now prefers this reading whenever the event carries
 // it, falling back to the wall-clock comparison only for a record with no `hostUptimeAtMs` at all.
 
@@ -439,7 +441,7 @@ test('card #208: an UPTIME age genuinely past the bound reads stopped/diedDraini
     inFlight: ['a'],
   };
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW, hostUptimeNowMs: UPTIME_NOW });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'uptime' });
 });
 
 // F3 (2026-09-12 fix pass): the LEGACY wall-clock path has an exact-boundary pin (card #188,
@@ -475,7 +477,7 @@ test('card #208: PREFERRED-path one millisecond past the boundary reads stopped/
     inFlight: ['a'],
   };
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW, hostUptimeNowMs: UPTIME_NOW });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'uptime' });
 });
 
 test("card #208: hostUptimeNowMs LESS than the event's own hostUptimeAtMs means a reboot happened since the write -- reads stopped/diedDraining/rebooted, isAlive never consulted", () => {
@@ -545,7 +547,7 @@ test('card #208: a LEGACY event with no hostUptimeAtMs at all still uses the wal
   // hostUptimeNowMs IS injected (as every real caller now does) but must be ignored for a record with
   // no hostUptimeAtMs of its own -- the legacy wall-clock path is the only one it can use.
   const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW, hostUptimeNowMs: UPTIME_NOW });
-  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
 });
 
 test('card #208: an event carrying hostUptimeAtMs but no hostUptimeNowMs injected skips the bound entirely (falls through to liveness) rather than silently using the wall-clock fallback', () => {
@@ -571,14 +573,21 @@ test('production: real os.uptime() reaches both callers -- an ANCIENT wall ts wi
   const queueDir = mkTmp('spo-208-uptime-q-');
   const hostUptimeNowMs = os.uptime() * 1000;
   writeDaemonEvents(journalRoot, [
-    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
+    // pid 1 (init/systemd), not `process.pid` -- card #219's pid-reuse check reads this
+    // pid's REAL `/proc/<pid>/stat` starttime in production and would otherwise misfire: this
+    // TEST process's own actual starttime is "whenever this suite began", which can postdate a
+    // `hostUptimeAtMs` of only a few seconds ago in a fast run, reading as a false reuse. pid 1 has
+    // been alive since boot (`pidExists(1)` reads the EPERM-as-alive path -- see
+    // dispatcher-status-deck.test.js's own use of the same trick), so its real starttime is always
+    // safely before any `hostUptimeAtMs` this test constructs.
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: 1, workers: 1 },
     {
       // Ancient WALL ts -- past even this generous bound. If the reader fell back to wall clock
       // here (instead of preferring `hostUptimeAtMs`) it would misread this as STOPPED -- exactly the
       // false-STOPPED bug this card fixes.
       ts: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
       event: 'dispatcher-drain-start',
-      pid: process.pid,
+      pid: 1,
       signal: 'SIGTERM',
       inFlight: ['a'],
       reason: 'drain-requested',
@@ -761,3 +770,574 @@ test('F8: the Bug Reports drain-history line prints the certain-death reboot wor
   assert.ok(html.includes('host rebooted since drain start'), 'Bug Reports drain-history line must print the certain-death wording when rebooted is true');
   assert.ok(!html.includes('process gone or past its drain bound'), 'Bug Reports drain-history line must not ALSO print the hedged wording when rebooted is true');
 });
+
+// ---- card #219: residual 2, "in-boot pid reuse" ---------------------------------------
+//
+// A drain still genuinely inside its own bound (uptime path: `hostUptimeNowMs - hostUptimeAtMs`
+// well under `timeoutMs + grace`) whose pid `isAlive` reports TRUE can still be a DIFFERENT
+// process than the one that wrote the drain-start, if that pid was reused by something else
+// started after the drain began. `processStartUptimeMs(pid)` (orchestrator/lock.js, `/proc/<pid>
+// /stat` field 22) resolves that: a starttime measurably AFTER `ev.hostUptimeAtMs` cannot be the
+// drainer, since a real drainer's own pid necessarily existed BEFORE it wrote the event.
+
+test('#219 residual 2: pid reuse -- starttime past hostUptimeAtMs + slack reads stopped/diedDraining/pidReused', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 500, // well inside the bound
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    // Reused pid: started 2000ms AFTER the drain-start's own hostUptimeAtMs -- comfortably past
+    // any tick-granularity slack.
+    processStartUptimeMs: () => ev.hostUptimeAtMs + 2000,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, pidReused: true });
+});
+
+test('#219 residual 2: starttime BEFORE hostUptimeAtMs (the real drainer, not a reuse) reads draining', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 500,
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    // Started well BEFORE the drain-start write -- exactly what a real drainer's own pid must do.
+    processStartUptimeMs: () => ev.hostUptimeAtMs - 10000,
+  });
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 residual 2: processStartUptimeMs returning null (non-Linux, pid gone, unparseable) leaves the verdict unchanged -- draining', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 500,
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    processStartUptimeMs: () => null,
+  });
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 residual 2: exact boundary -- starttime === hostUptimeAtMs + PID_REUSE_SLACK_MS (1000) reads draining, not yet EXCEEDED', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 500,
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    processStartUptimeMs: () => ev.hostUptimeAtMs + 1000, // exactly at the slack boundary
+  });
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 residual 2: one millisecond past the slack boundary reads stopped/diedDraining/pidReused', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 500,
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    processStartUptimeMs: () => ev.hostUptimeAtMs + 1001,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, pidReused: true });
+});
+
+test('#219 residual 2: no ev.hostUptimeAtMs (LEGACY record) never consults processStartUptimeMs -- still draining off liveness alone', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    // no hostUptimeAtMs at all.
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  let calls = 0;
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    processStartUptimeMs: () => {
+      calls++;
+      return 999999999;
+    },
+  });
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+  assert.equal(calls, 0, 'a LEGACY record has no boot-relative hostUptimeAtMs to compare against -- the probe must never be consulted');
+});
+
+test('#219 residual 2: isAlive FALSE already returns stopped without ever consulting processStartUptimeMs', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 500,
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  let calls = 0;
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => false,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    processStartUptimeMs: () => {
+      calls++;
+      return ev.hostUptimeAtMs + 999999;
+    },
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true });
+  assert.equal(calls, 0, 'isAlive already decided this -- the reuse probe is only for the TRUE case');
+});
+
+// ---- card #219: residual 1, "a host suspend during a drain" ---------------------------
+//
+// A synthetic monotonic baseline, unrelated to this box's real process.hrtime.bigint(), exactly
+// like UPTIME_NOW is unrelated to this box's real os.uptime() -- every assertion below is an
+// exact, reproducible number.
+const MONOTONIC_NOW = 500_000; // ms
+
+test('#219 residual 1: simulated suspend -- uptime elapsed far exceeds monotonic elapsed, monotonic within bound -- reads draining where the uptime path alone would have said stopped', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    // Uptime age: 10 minutes -- past a 2000ms bound (the "suspend" -- boottime kept advancing).
+    hostUptimeAtMs: UPTIME_NOW - 10 * 60 * 1000,
+    // Monotonic age: 500ms -- comfortably inside the same bound (the wait itself did not advance).
+    monotonicAtMs: MONOTONIC_NOW - 500,
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 residual 1: monotonic elapsed past its own bound reads stopped/diedDraining/boundClock:monotonic', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 5000, // also past the uptime bound -- both paths agree here
+    monotonicAtMs: MONOTONIC_NOW - 5000,
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'monotonic' });
+});
+
+test('#219 residual 1: implausible monotonic (monotonicNowMs < monotonicAtMs) falls back to the uptime path', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 5000, // past the uptime bound -- must decide this, since monotonic is implausible
+    monotonicAtMs: MONOTONIC_NOW + 999999, // AHEAD of "now"'s own monotonic reading -- impossible for the same clock
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'uptime' });
+});
+
+test('#219 residual 1: implausible monotonic (monotonic elapsed exceeds uptime elapsed + tolerance) falls back to the uptime path', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 100, // uptime elapsed 100ms -- inside the bound
+    // monotonic elapsed 100000ms -- far more than uptime elapsed could ever legitimately allow,
+    // well past the 1000ms tolerance -- not the same system-wide clock this path assumes.
+    monotonicAtMs: MONOTONIC_NOW - 100000,
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  // Uptime path: 100ms elapsed, well under the 2000ms bound -- draining, decided by the FALLBACK
+  // path (proves the implausible monotonic reading was actually skipped, not merely coincidentally
+  // agreeing).
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 residual 1: reboot check fires regardless of monotonic values -- rebooted verdict wins', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW + 5000, // ahead of "now" -- a reboot happened
+    monotonicAtMs: MONOTONIC_NOW - 100, // would otherwise read comfortably inside the bound
+    timeoutMs: 3600000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  let isAliveCalls = 0;
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => {
+      isAliveCalls++;
+      return true;
+    },
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, rebooted: true });
+  assert.equal(isAliveCalls, 0);
+});
+
+test('#219 residual 1: no monotonicAtMs on the event -- monotonic path skipped, uptime path decides, boundClock:uptime', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 5000, // past the bound
+    // no monotonicAtMs field at all -- exactly a record written before this action.
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'uptime' });
+});
+
+test('#219 residual 1: no monotonicNowMs injected -- monotonic path skipped even though the event carries monotonicAtMs', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 100, // inside the uptime bound
+    monotonicAtMs: MONOTONIC_NOW - 5000, // would fire the monotonic bound if it were consulted
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    // no monotonicNowMs.
+  });
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 residual 1: uptime bound (boundClock: uptime) still fires exactly as card #208 shipped when neither monotonic field is present', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: UPTIME_NOW - 2001,
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW, hostUptimeNowMs: UPTIME_NOW });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'uptime' });
+});
+
+test('#219 residual 1: LEGACY bound (no hostUptimeAtMs at all) carries boundClock: wallclock when it fires', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 5000).toISOString(),
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], { isAlive: () => true, now: NOW });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' });
+});
+
+// ---- PRODUCTION REACH (card #219): both real callers wire processStartUptimeMs and -----
+// monotonicNowMs, not merely computeDispatcherStatus in isolation.
+
+test('#219 F-production: a LIVE pid (this test process) whose real processStartUptimeMs is measurably AFTER a drain-start\'s hostUptimeAtMs reads STOPPED via spo status and collectAll (pid-reuse, real /proc)', () => {
+  const journalRoot = mkTmp('spo-219-pidreuse-j-');
+  const queueDir = mkTmp('spo-219-pidreuse-q-');
+  const hostUptimeNowMs = os.uptime() * 1000;
+  writeDaemonEvents(journalRoot, [
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
+    {
+      ts: new Date(Date.now() - 100).toISOString(),
+      event: 'dispatcher-drain-start',
+      pid: process.pid, // this test process -- REAL, alive, and its REAL starttime is being read
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'drain-requested',
+      timeoutMs: 3600000, // generous -- neither the uptime nor the monotonic bound fires first
+      killGraceMs: 60000,
+      // Recorded as having started an hour BEFORE this test process actually did -- so THIS
+      // process's own real starttime necessarily reads well past hostUptimeAtMs + slack, exactly
+      // the pid-reuse shape (a real drainer's pid could never legitimately postdate its own event).
+      hostUptimeAtMs: hostUptimeNowMs - 60 * 60 * 1000,
+    },
+  ]);
+
+  const out = runSpo(['status', '--journal', journalRoot, '--queue', queueDir]);
+  assert.match(out, /dispatcher: STOPPED/, `expected STOPPED -- real processStartUptimeMs must catch the pid-reuse shape: ${out}`);
+  assert.doesNotMatch(out, /dispatcher: DRAINING/, `bin/spo's cmdStatus must inject a real processStartUptimeMs: ${out}`);
+
+  const data = collectAll({ journalRoot, queueDir, spoReportsDir: mkTmp('spo-219-pidreuse-reports-') });
+  assert.equal(data.services.workers.status, 'stopped');
+  assert.equal(data.services.workers.dispatcher.diedDraining, true);
+});
+
+test('#219 F-production: real monotonicNowMs reaches both callers -- an hostUptimeAtMs PAST its bound but a FRESH monotonicAtMs reads DRAINING (the suspend case), never the false STOPPED the uptime reading alone would produce', () => {
+  const journalRoot = mkTmp('spo-219-monotonic-j-');
+  const queueDir = mkTmp('spo-219-monotonic-q-');
+  const hostUptimeNowMs = os.uptime() * 1000;
+  const monotonicNow = Number(process.hrtime.bigint() / 1000000n);
+  writeDaemonEvents(journalRoot, [
+    // pid 1, not `process.pid` -- same reason as the "production: real os.uptime()" test above:
+    // `hostUptimeAtMs` here is deliberately 60s in the past (simulating a suspend), and this TEST
+    // process has not necessarily been alive that long, which would make card #219's real
+    // pid-reuse probe misfire before the monotonic path even gets evaluated. pid 1 has been alive
+    // since boot.
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: 1, workers: 1 },
+    {
+      ts: new Date(Date.now() - 100).toISOString(),
+      event: 'dispatcher-drain-start',
+      pid: 1,
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'drain-requested',
+      // Fix pass (flake risk): a 2000ms bound left almost no margin between "monotonic age must
+      // read comfortably inside the bound" and the real wall-clock cost of THIS test's own
+      // `runSpo` subprocess spawn plus `collectAll` -- both real, both variable under load
+      // (CLAUDE.md's own "the machine is loaded" note). 30000ms gives that real work ample
+      // headroom while staying well short of the 60s uptime age below, so the "uptime path alone
+      // would have misread this as stopped" framing still holds.
+      timeoutMs: 30000,
+      killGraceMs: 0, // bound = 30000ms
+      // Uptime age: 60s -- PAST the bound (simulating a suspend: boottime kept advancing).
+      hostUptimeAtMs: hostUptimeNowMs - 60000,
+      // Monotonic age: ~0 -- fresh, well INSIDE the bound (the wait itself did not advance).
+      monotonicAtMs: monotonicNow,
+    },
+  ]);
+
+  const out = runSpo(['status', '--journal', journalRoot, '--queue', queueDir]);
+  assert.match(out, /dispatcher: DRAINING/, `expected DRAINING -- the real monotonic reading must win over the stale uptime one: ${out}`);
+  assert.doesNotMatch(out, /dispatcher: STOPPED/, `bin/spo's cmdStatus must inject a real monotonicNowMs: ${out}`);
+
+  const data = collectAll({ journalRoot, queueDir, spoReportsDir: mkTmp('spo-219-monotonic-reports-') });
+  assert.equal(data.services.workers.status, 'draining');
+});
+
+test("#219 F-production: console/collect.js's applyWorkerStats DEFAULT fallbacks (no processStartUptimeMs/monotonicNowMs arguments at all) still reach the real production probes", () => {
+  const journalRoot = mkTmp('spo-219-collect-defaults-j-');
+  const hostUptimeNowMs = os.uptime() * 1000;
+  writeDaemonEvents(journalRoot, [
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
+    {
+      ts: new Date(Date.now() - 100).toISOString(),
+      event: 'dispatcher-drain-start',
+      pid: process.pid,
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'drain-requested',
+      timeoutMs: 3600000,
+      killGraceMs: 60000,
+      hostUptimeAtMs: hostUptimeNowMs - 60 * 60 * 1000, // pid-reuse shape, as above
+    },
+  ]);
+
+  // Called with only 4 arguments -- no daemonEvents, hostUptimeNowMs, or monotonicNowMsAtRead --
+  // exactly the shape every pre-card-#219 call site has. Both applyWorkerStats's own default
+  // (a fresh os.uptime()*1000) AND its default processStartUptimeMs/monotonicNowMs must reach the
+  // real production probes for this to read stopped rather than skipping the reuse check.
+  const services = applyWorkerStats(collectServices({ journalRoot }), journalRoot, [], Date.now());
+  assert.equal(
+    services.workers.status,
+    'stopped',
+    'applyWorkerStats must reach the real processStartUptimeMs even when called with no seventh argument'
+  );
+});
+
+// ---- fix pass, card #219 verification round: pinning tests ------------------------------------
+
+test('#219 pin (a): tolerance kills a mutant that zeroes MONOTONIC_PLAUSIBILITY_TOLERANCE_MS -- monotonic elapsed 501ms beyond uptime elapsed is still plausible, and the bound fires via monotonic', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    // Uptime elapsed: 119500ms -- just SHORT of the 120000ms bound on its own.
+    hostUptimeAtMs: UPTIME_NOW - 119500,
+    // Monotonic elapsed: 120001ms -- 501ms MORE than uptime elapsed. With tolerance=0 this would
+    // fail the plausibility check's own elapsed-vs-elapsed clause (120001 > 119500 + 0) and fall
+    // back to the uptime path (119500, NOT past the 120000ms bound -> draining). With the real
+    // 1000ms tolerance, 120001 <= 119500 + 1000 holds -- plausible -- and the monotonic path's OWN
+    // bound (120001 > 120000) fires instead. A mutant that zeroes the tolerance constant reads
+    // 'draining' here; the real code reads 'stopped'/boundClock:'monotonic'.
+    monotonicAtMs: MONOTONIC_NOW - 120001,
+    timeoutMs: 120000,
+    killGraceMs: 0,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'monotonic' });
+});
+
+test('#219 pin (b): the reboot check fires BEFORE the monotonic path is even considered -- kills a mutant that only checks reboot when monotonic is implausible', () => {
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    // A sub-second regression: hostUptimeAtMs is 100ms AHEAD of hostUptimeNowMs -- the reboot
+    // signal (uptime resets on boot, so "now" reading LESS than the event's own recorded uptime
+    // can only mean a reboot happened between them).
+    hostUptimeAtMs: UPTIME_NOW + 100,
+    // Monotonic elapsed: 500ms -- by the bare arithmetic this READS plausible (500 <= -100 + 1000
+    // tolerance = 900) and comfortably inside any real bound, so a mutant that only consults the
+    // reboot check inside an "else" branch (i.e. only when the monotonic path did NOT already
+    // apply) would read this as a live, fresh 'draining' drain instead. The real code checks
+    // reboot FIRST, unconditionally, so it must read rebooted regardless.
+    monotonicAtMs: MONOTONIC_NOW - 500,
+    timeoutMs: 3600000,
+    killGraceMs: 0,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  let isAliveCalls = 0;
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => {
+      isAliveCalls++;
+      return true;
+    },
+    now: NOW,
+    hostUptimeNowMs: UPTIME_NOW,
+    monotonicNowMs: MONOTONIC_NOW,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, rebooted: true });
+  assert.equal(isAliveCalls, 0, 'a pre-reboot pid cannot answer whether the CURRENT process is alive');
+});
+
+test("#219 pin (c): applyWorkerStats' own monotonicNowMsAtRead DEFAULT (argument omitted entirely) still reaches the PREFERRED-MONOTONIC path, not just the hostUptimeNowMs default", () => {
+  const journalRoot = mkTmp('spo-219-pin-c-j-');
+  const hostUptimeNowMs = os.uptime() * 1000;
+  const monotonicNow = Number(process.hrtime.bigint() / 1000000n);
+  writeDaemonEvents(journalRoot, [
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: 1, workers: 1 },
+    {
+      ts: new Date(Date.now() - 100).toISOString(),
+      event: 'dispatcher-drain-start',
+      pid: 1, // long-lived (since boot) -- see the pid-1 note on the "production: real os.uptime()" test above
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'drain-requested',
+      timeoutMs: 1000,
+      killGraceMs: 1000, // bound = 2000ms
+      // Uptime age: 60s -- PAST the bound (what the uptime-only path alone would read as stopped).
+      hostUptimeAtMs: hostUptimeNowMs - 60000,
+      // Monotonic age: ~0 -- fresh, well INSIDE the bound. If applyWorkerStats's own default for
+      // its 7th parameter (monotonicNowMsAtRead) is anything other than a live monotonicNowMs()
+      // reading -- undefined, stale, or simply never reaching computeDispatcherStatus -- this
+      // reads 'stopped' off the uptime path instead of 'draining' off the monotonic one.
+      monotonicAtMs: monotonicNow,
+    },
+  ]);
+
+  const events = readDaemonEventsTail(journalRoot);
+  // Six arguments -- daemonEvents (5th) and hostUptimeNowMs (6th) both supplied, but the 7th
+  // (monotonicNowMsAtRead) is OMITTED entirely, isolating this test to that one default.
+  const services = applyWorkerStats(collectServices({ journalRoot }), journalRoot, [], Date.now(), events, hostUptimeNowMs);
+  assert.equal(
+    services.workers.status,
+    'draining',
+    "applyWorkerStats's default monotonicNowMsAtRead must be a live monotonicNowMs() reading reaching the PREFERRED-MONOTONIC path, not undefined"
+  );
+});
+
+// #219 pin (d), noted rather than tested: computeDispatcherStatus's residual-2 branch requires
+// `isAlive(pid) === true` (strict equality), not merely "not false" -- but every real production
+// caller injects `pidExists` (orchestrator/lock.js), which only ever returns the boolean `true` or
+// `false` (never `undefined`/a truthy non-boolean), so `=== true` and `!== false` are equivalent
+// for every actual call site; the distinction only matters for a synthetic test `isAlive` that
+// returns some other truthy value, which is why the unit tests above use `() => true` throughout
+// rather than pinning this specific operator.

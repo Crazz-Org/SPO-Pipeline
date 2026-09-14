@@ -104,12 +104,22 @@ function slowWorkerSpawn(ms) {
 
 // ---- 1. an in-flight card finishes, and the drain says so -------------------------------------
 
+// A distinctive, unrelated-to-any-real-clock value -- if `monotonicAtMs` ever silently reads
+// `Date.now()` instead of the injected monotonic clock, or the field is simply dropped from the
+// write, this exact number will not appear on the event and the assertion below catches either
+// mutation.
+const FAKE_MONOTONIC_MS = 987654321;
+
 test('drain: an in-flight card runs to completion instead of being killed', { timeout: 30000 }, async () => {
   const queueDir = mkTmp('spo-drain-q-');
   const journalDir = mkTmp('spo-drain-j-');
   writeTask(queueDir, '0001-a.json', { id: 'drain-a', kind: 'synthetic' });
 
-  const dispatcher = createDispatcher(queueDir, journalDir, baseConfig({ deps: { spawn: slowWorkerSpawn(1500), spawnScanner: neverExitsSpawn } }));
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({ deps: { spawn: slowWorkerSpawn(1500), spawnScanner: neverExitsSpawn, monotonicNowMs: () => FAKE_MONOTONIC_MS } })
+  );
   const runPromise = dispatcher.run();
   await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn'), 10000, 'worker-spawn');
 
@@ -142,10 +152,13 @@ test('drain: an in-flight card runs to completion instead of being killed', { ti
   // the only thing that ever set `stopReason` (no prior `stop()` call), so it must read exactly
   // what `requestDrain` itself set it to.
   assert.equal(start.reason, 'drain-requested', 'dispatcher-drain-start must carry the real in-memory stopReason at drain time');
-  // UPTIME (card #208): `os.uptime() * 1000` -- boot-relative, monotonic, and (unlike
-  // `monotonicNowMsFn()`) comparable across processes -- carried alongside `ts` so a DIFFERENT
-  // reader (`spo status`, the dashboard) can bound this drain's age without trusting the wall
-  // clock. `run()` above executes in THIS process, so a fresh `os.uptime() * 1000` read here,
+  // UPTIME (card #208): `os.uptime() * 1000` -- boot-relative, monotonic, and comparable across
+  // processes on EVERY platform, unlike `monotonicNowMsFn()` (comparable across processes only
+  // where hrtime happens to be the system-wide CLOCK_MONOTONIC -- a measured Linux implementation
+  // detail, not a cross-platform guarantee; see orchestrator/monotonic-clock.js's own header, card
+  // #219) -- carried alongside `ts` so a DIFFERENT reader (`spo status`, the dashboard) can bound
+  // this drain's age without trusting the wall clock. `run()` above executes in THIS process, so a
+  // fresh `os.uptime() * 1000` read here,
   // right after the event was written, must be very close to (and never far below) the event's
   // own reading -- a wide tolerance (10s) absorbs normal test scheduling jitter without weakening
   // the check the drop-mutation proof below actually depends on (that the field exists and is a
@@ -158,6 +171,16 @@ test('drain: an in-flight card runs to completion instead of being killed', { ti
   assert.ok(
     Math.abs(nowHostUptimeMs - start.hostUptimeAtMs) < 10000,
     `dispatcher-drain-start's hostUptimeAtMs must be a real, current os.uptime() reading, not a stale or fabricated one: wrote ${start.hostUptimeAtMs}, now ${nowHostUptimeMs}`
+  );
+  // MONOTONIC (card #219): `monotonicAtMs`, the SAME elapsed-clock reading `awaitInFlight` itself
+  // waits on -- captured here via the injected `deps.monotonicNowMs` above, so this assertion is
+  // exact (not a tolerance window like `hostUptimeAtMs`'s real-clock check above). Untested before
+  // this fix pass: `Date.now()` written in its place, or the field dropped entirely (silently
+  // disabling console/dispatcher-status.js's PREFERRED-MONOTONIC bound), both left this file green.
+  assert.equal(
+    start.monotonicAtMs,
+    FAKE_MONOTONIC_MS,
+    'dispatcher-drain-start must carry monotonicAtMs from the SAME monotonicNowMsFn awaitInFlight waits on, not Date.now() or nothing'
   );
   assert.ok(end, 'no dispatcher-drain-end');
   assert.equal(end.drained, true, 'the drain did not wait for the card');

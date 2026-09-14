@@ -3335,10 +3335,12 @@ test(
 
 // ---- spo ask --repo <owner/name> + board placement (action 184/185) --------------------------
 //
-// `--repo` is NOT a parseArgs flag (bin/spo:239-305 is above test/doc-constant-sweep.test.js's
-// line-pinned `bin/spo:1142`/`:1183` citations, and that test forbids inserting or deleting a
-// line there) -- cmdAsk pulls it back out of opts._ itself (bin/spo's own extractRepoFlag, right
-// above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
+// `--repo` is NOT a parseArgs flag (bin/spo:240-306 is above test/doc-constant-sweep.test.js's
+// line-pinned `bin/spo:1152`/`:1193` citations (re-pinned from :239-305/:1142/:1183 -- card #219,
+// a pure +1-line shift, then re-pinned again by that same card's own fix pass -- a further +7-line
+// shift when the injected-deps comment above `cmdStatus`'s `computeDispatcherStatus` call was
+// expanded), and that test forbids inserting or deleting a line there) -- cmdAsk pulls it back out
+// of opts._ itself (bin/spo's own extractRepoFlag, right above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
 // cmdAsk test in this file, never reimplementing the extraction here.
 //
 // Board placement goes through `deps.projectBoard` -- the same injection convention as

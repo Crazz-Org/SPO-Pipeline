@@ -1163,30 +1163,53 @@ function createDispatcher(queueDir, journalRoot, config) {
           // (console/dispatcher-status.js's computeDispatcherStatus) can bound an unconcluded
           // drain's own age without having to assume the READER's config matches the WRITER's.
           killGraceMs: resolveDrainKillGraceMs(config),
-          // Card #208: `os.uptime()` (seconds since boot) converted to ms -- deliberately NOT
-          // `monotonicNowMsFn()`/`monotonicNowMs()` (orchestrator/monotonic-clock.js). That
-          // module's own header says plainly that an `hrtime.bigint()` reading is "meaningless
-          // outside the ONE process that read it": it resets to an arbitrary origin on every
-          // process start and cannot be compared to another process's own monotonic clock, let
-          // alone written to a file and read back by a different one. This event IS read by a
-          // different process -- `spo status` (bin/spo's cmdStatus) and the dashboard
-          // (console/collect.js's applyWorkerStats) -- so the bound this field feeds needs a clock
-          // that is both monotonic (unlike `ts`/`Date.now()`, which this box's own clock has been
-          // measured stepping, see dispatcher-status.js's module header) AND comparable across
-          // processes on the same boot, which `os.uptime()` is and `monotonicNowMs()` is not.
-          // `ts` stays alongside it unchanged: it is still the human-readable record, and other
-          // readers (the drain-start summaries elsewhere in this file/console/collect.js) use it.
-          // Named `hostUptimeAtMs`, NOT `uptimeMs` (card #208 fix pass, F6): `daemon.jsonl` already
-          // carries `uptimeMs` on `scanner-crashed` (this file, the appendDaemonEvent above -- a
-          // DURATION, "how long that scanner ran", from `monotonicNowMsFn()`, judged against
-          // `scannerHealthyUptimeMs` next to it) and `services.daemon.uptimeMs` means "how long
-          // the daemon has been up". (Those two are the only collisions: no worker event carries
-          // `uptimeMs` at all -- the `worker-crash-repark-*` family does not. An earlier draft of
-          // this comment named `scanner-crash`/`worker-crash`; neither event exists.) This field is
-          // neither -- it is host seconds-since-boot AT WRITE TIME, an ABSOLUTE reading, not a
-          // duration -- so it gets its own name rather than silently colliding with a same-named
-          // field of opposite semantics elsewhere in the same journal.
+          // Card #208: `os.uptime()` (seconds since boot) converted to ms -- PREFERRED over
+          // `monotonicNowMsFn()`/`monotonicNowMs()` (orchestrator/monotonic-clock.js) as the
+          // primary cross-process reading because it is comparable across processes on EVERY
+          // platform, not merely where a Linux-specific implementation detail happens to hold (see
+          // `monotonicAtMs` just below, and orchestrator/monotonic-clock.js's own header, for what
+          // changed on that front in card #219). This event IS read by a different process --
+          // `spo status` (bin/spo's cmdStatus) and the dashboard (console/collect.js's
+          // applyWorkerStats) -- so the bound this field feeds needs a clock that is both monotonic
+          // (unlike `ts`/`Date.now()`, which this box's own clock has been measured stepping, see
+          // dispatcher-status.js's module header) AND comparable across processes on the same boot
+          // on every platform, which `os.uptime()` is and a bare `hrtime.bigint()` reading is not
+          // guaranteed to be. `ts` stays alongside it unchanged: it is still the human-readable
+          // record, and other readers (the drain-start summaries elsewhere in this
+          // file/console/collect.js) use it. Named `hostUptimeAtMs`, NOT `uptimeMs` (card #208 fix
+          // pass, F6): `daemon.jsonl` already carries `uptimeMs` on `scanner-crashed` (this file,
+          // the appendDaemonEvent above -- a DURATION, "how long that scanner ran", from
+          // `monotonicNowMsFn()`, judged against `scannerHealthyUptimeMs` next to it) and
+          // `services.daemon.uptimeMs` means "how long the daemon has been up". (Those two are the
+          // only collisions: no worker event carries `uptimeMs` at all -- the
+          // `worker-crash-repark-*` family does not. An earlier draft of this comment named
+          // `scanner-crash`/`worker-crash`; neither event exists.) This field is neither -- it is
+          // host seconds-since-boot AT WRITE TIME, an ABSOLUTE reading, not a duration -- so it
+          // gets its own name rather than silently colliding with a same-named field of opposite
+          // semantics elsewhere in the same journal.
           hostUptimeAtMs: os.uptime() * 1000,
+          // Card #219 (#219 residual 1, "a host suspend during a drain"): `monotonicNowMsFn()` --
+          // the SAME elapsed-clock reading `awaitInFlight`'s own `startedAt`/`elapsed()` (below)
+          // use to measure the wait this event precedes -- captured here, alongside `hostUptimeAtMs`,
+          // as an ABSOLUTE reading at write time (never a duration). `hostUptimeAtMs` (`os.uptime()`,
+          // `CLOCK_BOOTTIME`) COUNTS suspended time; the wait it approximates does not, since
+          // `awaitInFlight` runs on `CLOCK_MONOTONIC`. A host suspend mid-drain therefore advances
+          // `hostUptimeAtMs`'s own reading without advancing the wait -- the residual
+          // console/dispatcher-status.js's header used to call unclosed on either path.
+          // `monotonicAtMs` lets a reader close it WHERE the clock allows: measured, card #219
+          // (#219), this host (Linux/WSL2, Node v22) -- two separate node processes reading
+          // `process.hrtime.bigint()` 56ms apart differed by 56.4ms, both tracking `/proc/uptime` --
+          // i.e. on Linux, libuv's `uv_hrtime()` IS the system-wide `CLOCK_MONOTONIC`, comparable
+          // across processes on the same boot, contrary to what orchestrator/monotonic-clock.js's
+          // header claimed before this action (now corrected there). That is a measured Linux
+          // implementation detail, not a documented Node guarantee, so the reader
+          // (console/dispatcher-status.js's computeDispatcherStatus) gates its use behind a
+          // plausibility check and falls back to `hostUptimeAtMs` alone wherever that check fails --
+          // see that module's own header for the full reasoning. `monotonicNowMsFn()` is the exact
+          // same function reference `deps.monotonicNowMs || monotonicNowMs` resolves to at the top
+          // of run() (see that assignment's own comment), so a test that injects a fake monotonic
+          // clock for `awaitInFlight` gets the identical fake reading recorded here.
+          monotonicAtMs: monotonicNowMsFn(),
         });
       } catch {
         // Best-effort, same posture as the other journal writes on this shutdown path.

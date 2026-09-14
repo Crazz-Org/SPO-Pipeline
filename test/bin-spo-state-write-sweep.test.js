@@ -29,13 +29,18 @@ require('./no-real-spawn');
 // violation of the invariant above and would otherwise be invisible to a sweep that only ever
 // opened bin/spo. CARD #189 CORRECTION: this sentence used to say "one module deeper", and
 // SCAN_FILES was a hand list built to match -- bin/spo:221-222's eager `require('../console/
-// collect')`/`require('../console/render')`, and bin/spo:1247-1250's `--serve`-only
+// collect')`/`require('../console/render')`, and bin/spo:1257-1260's `--serve`-only
 // `require('../console/serve')`/`.../system`/`.../prod-version`/`.../usage-scan`. That list missed
-// bin/spo:1272-1288's static-mode generateOnce() -- run once unconditionally, and again every 30s
-// under `spo dashboard --watch` (bin/spo:1290-1292); NOT gated behind `--serve`, which returns
-// earlier at :1263 -- and its own lazy `require('../console/par-times')` at :1277-1278, whose
+// bin/spo:1282-1298's static-mode generateOnce() -- run once unconditionally, and again every 30s
+// under `spo dashboard --watch` (bin/spo:1300-1302); NOT gated behind `--serve`, which returns
+// earlier at :1273 -- and its own lazy `require('../console/par-times')` at :1287-1288, whose
 // byte-identical plant went undetected there while the same plant in console/collect.js was
-// caught. CARD #186 ADDITION: bin/spo now also eagerly requires `console/dispatcher-status.js`
+// caught. (Re-pinned from :1247-1250/:1272-1288/:1290-1292/:1263/:1277-1278 -- card #219 added a
+// `monotonicNowMs` require line plus two option lines to `cmdStatus`'s `computeDispatcherStatus`
+// call, above all of these, a true pure +3-line shift, then re-pinned AGAIN by that same card's
+// own fix pass -- the injected-deps comment above that call was expanded by 4 more net lines,
+// a true pure +7-line shift overall from the original numbers; content byte-identical at each
+// new location, verified by re-reading.) CARD #186 ADDITION: bin/spo now also eagerly requires `console/dispatcher-status.js`
 // (its own `computeDispatcherStatus`, moved out of bin/spo so `spo status` and console/collect.js's
 // dashboard deck can share one derivation) right alongside collect/render, so SCAN_FILES gained
 // that module too. SCAN_FILES below is still a literal list, readable at a glance without running
@@ -378,8 +383,9 @@ test('bin/spo and the console modules it delegates to never write a taskDir stat
   //     counted) across these 13 files; 200,000 tolerates ordinary growth/shrink but still catches
   //     something close to gh-api-argv's own "a refactor renamed the convention" failure mode.
   //   - totalWriteCallSites: measured 6 today (bin/spo's own 3 writeFileSync calls -- both of
-  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1283 and its health-view
-  //     sibling at bin/spo:1285, plus the account-disable marker -- usage-rollups.js's
+  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1293 and its health-view
+  //     sibling at bin/spo:1295 (re-pinned from :1283/:1285, then :1286/:1288 -- card #219, same
+  //     +7-line shift overall as above), plus the account-disable marker -- usage-rollups.js's
   //     writeFileSync+renameSync pair, and par-times.js's own writeFileSync in saveParTimes). A
   //     drop to 0 would mean the write-callee regex stopped matching, not that every write
   //     vanished.

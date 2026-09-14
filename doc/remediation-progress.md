@@ -1345,6 +1345,14 @@ Consequences worth carrying forward:
   Timestamps written to disk or compared across processes — lease `startedAt`, `cooldownUntil`,
   `notBefore`, the orphan grace window — must stay wall-clock, because a monotonic clock is
   meaningless across processes and reboots.
+  > **Correction, 2026-09-14 (card #219).** "Meaningless across processes" is not quite right and
+  > this file is a dated record, so it stays as written above; the measured truth: on Linux,
+  > `process.hrtime.bigint()` IS the system-wide `CLOCK_MONOTONIC`, comparable across processes on
+  > the same boot (not a documented Node guarantee, but true on this host) — it resets across a
+  > reboot, same as this entry says. `orchestrator/monotonic-clock.js`'s own header carries the
+  > current, measured account; card #219 (`console/dispatcher-status.js`'s PREFERRED-MONOTONIC
+  > bound) is the one place this repo now relies on that cross-process comparability, gated behind
+  > a runtime plausibility check rather than assumed.
 
 ### What verification cost and bought, per action
 

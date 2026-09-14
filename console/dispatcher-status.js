@@ -1,6 +1,7 @@
 'use strict';
 
-// computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, killGraceMs }) -- dispatcher.js's own `dispatcher-idle-no-
+// computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, killGraceMs, monotonicNowMs, processStartUptimeMs }) --
+// dispatcher.js's own `dispatcher-idle-no-
 // healthy-accounts` / `dispatcher-healthy-accounts-returned` pair (fillSlots's poolIdleDetail) is
 // EDGE-TRIGGERED: one line when the pool first has zero healthy accounts, one line when it
 // recovers, nothing in between (no matter how many fillSlots passes happen while still idle). So
@@ -48,29 +49,83 @@
 // its own bound with no conclusion recorded', not a measured death. It applies ONLY when every
 // input it needs is actually known: a usable age reading (see below), `ev.timeoutMs` and a grace
 // must each be a finite number (field-by-field detail below); missing any one of them falls
-// through to the liveness read exactly as before. Residual gaps the bound does not close, stated
-// rather than left implicit: a drain that is genuinely still within its own bound and whose pid
-// has already been reused still reads 'draining' (this is the SAME "no isAlive/no pid -> draining"
-// default as before, now merely narrower).
+// through to the liveness read exactly as before. Residual gap the bound does not close, stated
+// rather than left implicit at the time of this follow-up: a drain that is genuinely still within
+// its own bound and whose pid has already been reused still read 'draining' (the SAME "no
+// isAlive/no pid -> draining" default as before, now merely narrower). Card #219 (2026-09-14)
+// later closed this specific gap ON LINUX ONLY -- see that card's own section further down for the
+// pid-reuse check that reads such a case as 'stopped'/`pidReused: true` instead; on any other
+// platform (`orchestrator/lock.js`'s `processStartUptimeMs` returns `null` there) it is still
+// exactly this residual, unchanged.
 //
-// Card #208: the age reading itself has TWO paths, preferred and legacy. `ev.hostUptimeAtMs`
-// (dispatcher.js's write, `os.uptime() * 1000` -- seconds since boot converted to ms) is the
-// PREFERRED one whenever the event carries it: `os.uptime()` is monotonic (never steps backward or
-// forward the way `Date.now()` has been measured doing on this box -- see the WALL-clock paragraph
-// below) AND, unlike `process.hrtime.bigint()`/`monotonicNowMs()` (orchestrator/monotonic-clock.js,
-// whose own header says an hrtime reading is "meaningless outside the ONE process that read it"),
-// comparable across processes on the same boot -- exactly what this comparison needs, since the
-// event is written by the daemon and read by a DIFFERENT process (`spo status`, the dashboard's
-// collectAll). The bound then reads `hostUptimeNowMs - ev.hostUptimeAtMs > ev.timeoutMs + grace`, where
-// `hostUptimeNowMs` is injected exactly like `now` (see below) -- a caller that does not inject it
-// skips the uptime bound entirely (falls through to the liveness read) rather than silently
-// re-deriving an age from wall time, which would defeat the point for exactly the events this path
-// exists to fix. `hostUptimeNowMs` LESS than `ev.hostUptimeAtMs` means a reboot happened between the write
-// and this read -- uptime resets on boot, so that ordering can only occur across a reboot, and
-// nothing survives a reboot: the drain, and the whole process that was running it, is certainly
-// over, so this reads 'stopped'/diedDraining unconditionally, without ever falling into the
-// pid/isAlive logic below (a pid from a previous boot is not the same process as whatever now holds
-// that pid number, so `isAlive(pid)` could not answer this question even if it were asked).
+// Card #208: the age reading itself has (as of card #219) THREE paths, tried in precedence order
+// PREFERRED-MONOTONIC, then PREFERRED (uptime), then LEGACY (wall clock).
+//
+// PREFERRED-MONOTONIC (card #219's residual 1 -- "a host suspend during a drain"): `ev.monotonicAtMs`
+// (dispatcher.js's write -- the SAME `monotonicNowMsFn()`/`monotonicNowMs()` reading `awaitInFlight`
+// itself waits on) compared against the caller's injected `monotonicNowMs`. Node's own docs promise
+// only that `hrtime` reads "an arbitrary time in the past" -- cross-PROCESS comparability is not a
+// documented guarantee, and orchestrator/monotonic-clock.js's own header used to overclaim the
+// opposite ("meaningless outside the ONE process that read it", "cannot be compared to another
+// process's own monotonic clock"). Measured, card #219, this host (2026-09-14, Linux/WSL2,
+// Node v22): two SEPARATE node processes reading `process.hrtime.bigint()` 56ms apart returned
+// readings 56.4ms apart, and both tracked `/proc/uptime` -- i.e. on Linux, libuv's `uv_hrtime()` IS
+// `clock_gettime(CLOCK_MONOTONIC)`, the SAME system-wide clock for every process on the box, not a
+// per-process origin. That is a measured LINUX IMPLEMENTATION DETAIL, not a cross-platform Node
+// guarantee, so this path is trusted only behind the plausibility check below, and it never counts
+// suspended time the way `hostUptimeAtMs` does (below) -- unlike boottime, `CLOCK_MONOTONIC` is
+// defined to exclude system suspend, which is exactly what lets it close the suspend residual where
+// it applies.
+//
+// The plausibility check exists because this path is USED precisely where it disagrees with the
+// uptime reading (that disagreement is what a suspend produces, and what this path exists to
+// catch), so it cannot validate itself against uptime the way the pid-reuse check below does. It
+// checks internal consistency instead, and ALL of the following must hold or this path is skipped
+// (falls through to PREFERRED-uptime with no other effect -- beyond the plausibility tolerance it
+// can only suppress a bound firing early, never invent one):
+//   - `ev.monotonicAtMs` and the injected `monotonicNowMs` are both finite;
+//   - no reboot -- the existing `hostUptimeNowMs >= ev.hostUptimeAtMs` test below, since a reboot
+//     resets BOTH clocks and invalidates any comparison between two readings taken across it;
+//   - `monotonicNowMs >= ev.monotonicAtMs` -- a process-relative origin (the shape this check
+//     guards against on a platform or runtime where the Linux finding above does not hold) would
+//     typically violate this on the read side, since it restarts near zero on every process start;
+//   - `(monotonicNowMs - ev.monotonicAtMs) <= (hostUptimeNowMs - ev.hostUptimeAtMs) + tolerance` --
+//     monotonic elapsed time can never legitimately exceed boottime elapsed time (boottime is a
+//     strict superset: it counts everything monotonic does, plus suspend), so a monotonic reading
+//     claiming to have advanced FURTHER than boottime did is not the same system-wide clock this
+//     path assumes, and the comparison is abandoned rather than trusted. The tolerance
+//     (`MONOTONIC_PLAUSIBILITY_TOLERANCE_MS`, defined below) exists only to absorb the two
+//     measurements' own granularity (`os.uptime()` was measured at 10ms resolution on this host,
+//     and the hrtime cross-process reads above at ~10ms wall-clock jitter under load) -- it must
+//     stay small relative to any real drain (minutes) or suspend (the failure mode it exists to
+//     catch) it is meant to distinguish from measurement noise.
+// When every clause holds, the bound reads `monotonicNowMs - ev.monotonicAtMs > ev.timeoutMs +
+// grace`, and a firing bound carries `boundClock: 'monotonic'` on the returned status. This is the
+// step that actually closes the suspend residual: during a suspend, `hostUptimeAtMs`'s reading
+// keeps advancing (boottime counts the suspend) while `monotonicAtMs`'s does not, so a genuinely
+// live, still-waiting drain reads well inside ITS bound even though the uptime-only reading would
+// have called it stopped.
+//
+// PREFERRED (uptime): `ev.hostUptimeAtMs` (dispatcher.js's write, `os.uptime() * 1000` -- seconds
+// since boot converted to ms) is used whenever the event carries it and the monotonic path above
+// did not apply: `os.uptime()` is monotonic (never steps backward or forward the way `Date.now()`
+// has been measured doing on this box -- see the WALL-clock paragraph below) and comparable across
+// processes on the same boot on every platform, unlike the monotonic path's Linux-only guarantee --
+// exactly what this comparison needs, since the event is written by the daemon and read by a
+// DIFFERENT process (`spo status`, the dashboard's collectAll). The bound then reads
+// `hostUptimeNowMs - ev.hostUptimeAtMs > ev.timeoutMs + grace`, where `hostUptimeNowMs` is injected
+// exactly like `now` (see below) -- a caller that does not inject it skips the uptime bound
+// entirely (falls through to the liveness read) rather than silently re-deriving an age from wall
+// time, which would defeat the point for exactly the events this path exists to fix. A firing bound
+// here carries `boundClock: 'uptime'`. `hostUptimeNowMs` LESS than `ev.hostUptimeAtMs` means a
+// reboot happened between the write and this read -- uptime resets on boot, so that ordering can
+// only occur across a reboot, and nothing survives a reboot: the drain, and the whole process that
+// was running it, is certainly over, so this reads 'stopped'/diedDraining unconditionally
+// (`rebooted: true` alongside it), without ever falling into the pid/isAlive logic below (a pid
+// from a previous boot is not the same process as whatever now holds that pid number, so
+// `isAlive(pid)` could not answer this question even if it were asked) -- and this check runs
+// BEFORE the monotonic path is even considered, since a reboot invalidates a monotonic comparison
+// too (see the plausibility check above).
 //
 // LEGACY events -- written before card #208, so carrying no `ev.hostUptimeAtMs` at all -- fall back to
 // EXACTLY today's wall-clock comparison (`now - Date.parse(ev.ts) > ev.timeoutMs + grace`,
@@ -80,29 +135,31 @@
 // FORWARD WALL-CLOCK STEP during a live LEGACY drain can put it past this fallback bound before
 // the monotonic wait has actually expired, reading a still-running drain as 'stopped'. A record
 // with no parseable `ts` has no age to bound at all here either, and falls through to liveness
-// exactly as before.
+// exactly as before. A firing bound here carries `boundClock: 'wallclock'`.
 //
-// Scope of what card #208 actually closes (2026-09-12 fix pass, F7): the forward-WALL-CLOCK-STEP
-// half of this gap is closed for the PREFERRED path -- `os.uptime()` never gets the NTP-style step
-// corrections this box's own `Date.now()` has been measured taking (see the PREFERRED paragraph
-// above), so a record carrying `ev.hostUptimeAtMs` cannot be pushed past its bound by one. A HOST
-// SUSPEND is NOT closed by either path, PREFERRED included, and this header must not claim it is:
-// on a standard Linux kernel `/proc/uptime` (what `os.uptime()` reads) is `CLOCK_BOOTTIME`, which
-// INCLUDES suspended time, while the monotonic wait this bound approximates is `CLOCK_MONOTONIC`
-// (hrtime), which does not -- so a host suspending mid-drain would advance `ev.hostUptimeAtMs`'s
-// reading but not the wait it is meant to track, on the PREFERRED path too. Measured (not
-// reasoned): `CLOCK_BOOTTIME - CLOCK_MONOTONIC` held at -1.7 microseconds after 63 hours of uptime
-// on this box -- consistent with either "this host has never suspended" or "WSL2 collapses the two
-// clocks", and the measurement cannot tell those apart. Unverified, not refuted: treat a suspend
-// during a live drain as a remaining residual on BOTH paths, not a closed gap on either.
+// Scope of what is actually closed (2026-09-12 fix pass F7, extended by card #219 2026-09-14): the
+// forward-WALL-CLOCK-STEP half of the original gap is closed for the PREFERRED (uptime) path --
+// `os.uptime()` never gets the NTP-style step corrections this box's own `Date.now()` has been
+// measured taking (see the PREFERRED paragraph above), so a record carrying `ev.hostUptimeAtMs`
+// cannot be pushed past its bound by one. HOST SUSPEND (residual 1) is now closed BY the
+// PREFERRED-MONOTONIC path above, but ONLY where the plausibility check finds hrtime trustworthy --
+// measured true on Linux (this host, WSL2, see above), assumed FALSE (path skipped, falls back to
+// PREFERRED-uptime, suspend residual remains) on every other platform, since nothing here re-derives
+// the libuv/kernel guarantee at runtime beyond the plausibility check's own internal-consistency
+// test. A live suspend was NOT reproduced on this host for this action either (same reason card
+// #208 could not: WSL2's own `CLOCK_BOOTTIME - CLOCK_MONOTONIC` measured at -1.7 microseconds after
+// 63 hours of uptime, consistent with either "never suspended" or "WSL2 collapses the two clocks"),
+// so this remains "closed by construction where the clock allows", not "demonstrated live" -- see
+// doc/accepted-gaps.md for the platforms and shapes still open.
 //
-// `now`/`hostUptimeNowMs`/`killGraceMs` are INJECTED, exactly like `isAlive`, for the same
-// dependency-free reason: this module must never read a clock itself (a caller that cached
-// `daemonEvents` and evaluated them later would get a silently different verdict from one call to
-// the next) and must never import config.js directly (the callers already have it, and requiring
-// it here would make a pure event-array function depend on this process's SPO_* environment, which
-// config.js reads at require time). A caller that omits `now` and/or `hostUptimeNowMs`
-// gets the pre-bound behaviour exactly -- see the missing-input list below.
+// `now`/`hostUptimeNowMs`/`killGraceMs`/`monotonicNowMs` are INJECTED, exactly like `isAlive` and
+// `processStartUptimeMs` (card #219), for the same dependency-free reason: this module must never
+// read a clock itself (a caller that cached `daemonEvents` and evaluated them later would get a
+// silently different verdict from one call to the next) and must never import config.js directly
+// (the callers already have it, and requiring it here would make a pure event-array function
+// depend on this process's SPO_* environment, which config.js reads at require time). A caller
+// that omits `now` and/or `hostUptimeNowMs` and/or `monotonicNowMs` gets the pre-bound behaviour
+// exactly -- see the missing-input list below.
 //
 // PRECEDENCE, walking backwards from the tail, first match wins -- renamed from
 // computeDispatcherIdleStatus because it now reports a status, not just an idle flag:
@@ -114,26 +171,46 @@
 //                                            free, since the start is then the newest of the two
 //                                            and this walk never reaches the marker beneath it)
 //   dispatcher-drain-start                -> THE BOUND (checked first, before any pid/isAlive
-//                                              logic). Card #208: two paths, PREFERRED then
-//                                              LEGACY, either of which can short-circuit straight
-//                                              to {status: 'stopped', event: ev, diedDraining:
-//                                              true} (or, reboot only, that plus `rebooted: true`)
+//                                              logic). Card #208, extended by card #219: THREE
+//                                              paths, PREFERRED-MONOTONIC then PREFERRED then
+//                                              LEGACY, any of which can short-circuit straight to
+//                                              {status: 'stopped', event: ev, diedDraining: true}
+//                                              (or, reboot only, that plus `rebooted: true`)
 //                                              regardless of isAlive.
-//                                              PREFERRED, when `ev.hostUptimeAtMs` is a finite number:
-//                                              needs `hostUptimeNowMs` (injected) also finite, plus a
-//                                              resolvable `ev.timeoutMs` (finite, >= 0) and grace
-//                                              (`ev.killGraceMs` if finite >= 0, else the injected
-//                                              `killGraceMs` if finite >= 0). `hostUptimeNowMs <
-//                                              ev.hostUptimeAtMs` -> a reboot happened since the write ->
+//                                              Reboot check FIRST, whenever `ev.hostUptimeAtMs` is
+//                                              a finite number and `hostUptimeNowMs` (injected) is
+//                                              too: `hostUptimeNowMs < ev.hostUptimeAtMs` -> a
+//                                              reboot happened since the write ->
 //                                              stopped/diedDraining/rebooted unconditionally, pid/
 //                                              isAlive never consulted (see the header for why a
-//                                              pre-reboot pid cannot answer this). Otherwise, when
+//                                              pre-reboot pid cannot answer this) -- checked before
+//                                              either bound below, since a reboot invalidates a
+//                                              monotonic comparison across it too.
+//                                              PREFERRED-MONOTONIC, when `ev.monotonicAtMs` and the
+//                                              injected `monotonicNowMs` are both finite AND the
+//                                              plausibility check holds (no reboot per above,
+//                                              `monotonicNowMs >= ev.monotonicAtMs`, and monotonic
+//                                              elapsed no more than boottime elapsed plus a small
+//                                              tolerance -- see the header for the full reasoning):
+//                                              `monotonicNowMs - ev.monotonicAtMs > ev.timeoutMs +
+//                                              grace` -> stopped/diedDraining, `boundClock:
+//                                              'monotonic'`. Implausible, or either field missing,
+//                                              skips straight to PREFERRED (uptime) with no other
+//                                              effect -- except within the plausibility tolerance
+//                                              it can only suppress an early bound, never invent one.
+//                                              PREFERRED (uptime), when `ev.hostUptimeAtMs` is a
+//                                              finite number and the monotonic path above did not
+//                                              apply: needs `hostUptimeNowMs` (injected) also
+//                                              finite, plus a resolvable `ev.timeoutMs` (finite, >=
+//                                              0) and grace (`ev.killGraceMs` if finite >= 0, else
+//                                              the injected `killGraceMs` if finite >= 0). When
 //                                              `ev.timeoutMs`/grace resolve and `hostUptimeNowMs -
 //                                              ev.hostUptimeAtMs > ev.timeoutMs + grace` ->
-//                                              stopped/diedDraining. `hostUptimeNowMs` not injected, or
-//                                              `ev.timeoutMs`/grace not resolvable, skips this path
-//                                              (does NOT fall back to the legacy wall-clock path --
-//                                              see the header) and falls through to liveness.
+//                                              stopped/diedDraining, `boundClock: 'uptime'`.
+//                                              `hostUptimeNowMs` not injected, or `ev.timeoutMs`/
+//                                              grace not resolvable, skips this path (does NOT fall
+//                                              back to the legacy wall-clock path -- see the
+//                                              header) and falls through to liveness.
 //                                              LEGACY, only when `ev.hostUptimeAtMs` is NOT a finite
 //                                              number (a record from before card #208): applies
 //                                              only when `now` (injected), the event's own
@@ -141,34 +218,50 @@
 //                                              finite numbers (`ev.timeoutMs` also >= 0), AND a
 //                                              grace is resolvable exactly as above. When those
 //                                              resolve and `now - Date.parse(ev.ts) > ev.timeoutMs
-//                                              + grace` -> stopped/diedDraining -- past its own
-//                                              wait bound plus the reap's own kill grace, a drain
-//                                              that ran as designed has already written its
-//                                              conclusion (run() writes `dispatcher-stopped` the
-//                                              moment the wait ends, before any kill or reap even
-//                                              starts), so an unconcluded one is read as stopped;
-//                                              residual gaps in the header. Any missing input (no
-//                                              `now` injected, no parseable `ts`, a non-finite/
-//                                              absent `timeoutMs`, or no resolvable grace) skips
-//                                              this path too and falls through to liveness -- a
-//                                              future `ts` (negative age) is always INSIDE this
-//                                              bound, never past it, so it never short-circuits.
-//                                            Otherwise (neither path fired, or neither could be
-//                                              applied), liveness decides exactly as before card
-//                                              #188's follow-up: pid known and isAlive(pid) ===
-//                                              false ->
+//                                              + grace` -> stopped/diedDraining, `boundClock:
+//                                              'wallclock'` -- past its own wait bound plus the
+//                                              reap's own kill grace, a drain that ran as designed
+//                                              has already written its conclusion (run() writes
+//                                              `dispatcher-stopped` the moment the wait ends,
+//                                              before any kill or reap even starts), so an
+//                                              unconcluded one is read as stopped; residual gaps in
+//                                              the header. Any missing input (no `now` injected, no
+//                                              parseable `ts`, a non-finite/absent `timeoutMs`, or
+//                                              no resolvable grace) skips this path too and falls
+//                                              through to liveness -- a future `ts` (negative age)
+//                                              is always INSIDE this bound, never past it, so it
+//                                              never short-circuits.
+//                                            Otherwise (no path fired, or none could be applied),
+//                                              liveness decides exactly as before card #188's
+//                                              follow-up: pid known and isAlive(pid) === false ->
 //                                              {status: 'stopped', event: ev, diedDraining: true}
 //                                              -- a drain-start is written only after requestDrain
 //                                              accepted a drain (dispatcher.js's run(), gated on
 //                                              `drainRequest`), and this process is provably gone
 //                                              with no dispatcher-stopped recorded.
+//                                            Otherwise, RESIDUAL 2 (card #219, "in-boot pid
+//                                              reuse"): when `isAlive(pid)` says TRUE (not merely
+//                                              "not false"), `ev.hostUptimeAtMs` is finite, and
+//                                              `processStartUptimeMs` is injected: reading that
+//                                              pid's real `/proc/<pid>/stat` starttime and finding
+//                                              it measurably (`PID_REUSE_SLACK_MS`) AFTER
+//                                              `ev.hostUptimeAtMs` means this pid cannot be the
+//                                              process that wrote the event (a real drainer's own
+//                                              pid necessarily existed before its own write) ->
+//                                              {status: 'stopped', event: ev, diedDraining: true,
+//                                              pidReused: true}. `processStartUptimeMs` returning
+//                                              `null` (non-Linux, pid gone, unparseable) or not
+//                                              being injected leaves the verdict unchanged.
 //                                            otherwise: {status: 'draining', event: ev} -- a live
 //                                              wait, one whose liveness cannot be checked (no
 //                                              isAlive injected, or no pid resolvable), or one
-//                                              whose bound cannot be evaluated -- the residual gap
-//                                              named above: a drain still inside its own bound
-//                                              whose pid has been reused reads 'draining' here,
-//                                              same as it always has.
+//                                              whose bound cannot be evaluated and whose pid, if
+//                                              reused, cannot be proven so (non-Linux, or no
+//                                              `processStartUptimeMs` injected) -- the residual gap
+//                                              named in the header: a drain still inside its own
+//                                              bound whose pid has been reused reads 'draining' here
+//                                              wherever the reuse cannot be proven, same as it
+//                                              always has for that case.
 //                                            pid resolution: `ev.pid` if it is a positive integer
 //                                              (card #188 added the field); else the pid of the
 //                                              nearest EARLIER `dispatcher-start` in the array (a
@@ -198,7 +291,30 @@ function resolveDrainGrace(ev, killGraceMs) {
     : null;
 }
 
-function computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, killGraceMs } = {}) {
+// MONOTONIC_PLAUSIBILITY_TOLERANCE_MS (card #219) -- slack for the PREFERRED-MONOTONIC
+// plausibility check's "monotonic elapsed <= boottime elapsed" clause (module header). Sized off
+// this action's own measurements: `os.uptime()` was found to have 10ms granularity on this host,
+// and two separate node processes' `hrtime.bigint()` reads showed ~10ms of wall-clock jitter
+// across an intentional 56ms gap. 1000ms is a generous multiple of both, chosen (as the spec asks)
+// to stay far below any real drain (minutes) or suspend (the failure mode this path exists to
+// detect), so it cannot mask either.
+const MONOTONIC_PLAUSIBILITY_TOLERANCE_MS = 1000;
+
+// PID_REUSE_SLACK_MS (card #219, residual 2) -- slack for comparing a live pid's own
+// `/proc/<pid>/stat` starttime against the drain-start event's `hostUptimeAtMs`. Both readings are
+// boot-relative but come from different sources at different granularities: `os.uptime()` was
+// measured at 10ms resolution, `/proc/<pid>/stat`'s starttime at the kernel's own USER_HZ (100
+// ticks/sec = 10ms/tick, orchestrator/lock.js's `LINUX_CLK_TCK`). 1000ms covers both with margin
+// for scheduling jitter under load (this box runs multiple concurrent agents -- CLAUDE.md's own
+// "the machine is loaded" note) without coming close to masking an actual reuse, which by
+// definition happens only after the ORIGINAL process has exited and a NEW one was later assigned
+// the same pid -- a gap that is never sub-second on a live system.
+const PID_REUSE_SLACK_MS = 1000;
+
+function computeDispatcherStatus(
+  daemonEvents,
+  { isAlive, now, hostUptimeNowMs, killGraceMs, monotonicNowMs, processStartUptimeMs } = {}
+) {
   for (let i = daemonEvents.length - 1; i >= 0; i--) {
     const ev = daemonEvents[i];
     if (!ev) continue;
@@ -223,12 +339,13 @@ function computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, 
       // information never partially applies a bound, it just skips it.
       //
       // PREFERRED path (card #208): `ev.hostUptimeAtMs`, when present, is boot-relative and comparable
-      // ACROSS PROCESSES on the same boot -- see the module header for why that beats both `ts`
-      // (wall clock; steps on this box) and `monotonicNowMs()` (meaningless outside the writing
-      // process). Only a record written before this card has no `ev.hostUptimeAtMs` at all; that is the
-      // ONLY case that falls to the LEGACY wall-clock path below -- a record that has `ev.hostUptimeAtMs`
-      // but for which the caller did not inject `hostUptimeNowMs` skips straight past both paths to the
-      // liveness read, rather than silently re-deriving an age from `ts`.
+      // ACROSS PROCESSES on the same boot -- see the module header for why that beats `ts` (wall
+      // clock; steps on this box), and why the PREFERRED-MONOTONIC path (card #219, checked first
+      // below, when it applies) beats this one on a suspend. Only a record written before this card
+      // has no `ev.hostUptimeAtMs` at all; that is the ONLY case that falls to the LEGACY wall-clock
+      // path below -- a record that has `ev.hostUptimeAtMs` but for which the caller did not inject
+      // `hostUptimeNowMs` skips straight past both paths to the liveness read, rather than silently
+      // re-deriving an age from `ts`.
       if (Number.isFinite(ev.hostUptimeAtMs)) {
         if (Number.isFinite(hostUptimeNowMs)) {
           if (hostUptimeNowMs < ev.hostUptimeAtMs) {
@@ -239,13 +356,35 @@ function computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, 
             // the pid/isAlive logic below -- a pid from a previous boot is not the same process as
             // whatever now holds that pid number (pids are reused across a reboot too), so
             // `isAlive(pid)` could not answer this question even if it were asked, and asking it
-            // risks a false "still alive" off a coincidentally-live, unrelated process.
+            // risks a false "still alive" off a coincidentally-live, unrelated process. Checked
+            // BEFORE the monotonic path below for the same reason: a reboot invalidates a
+            // monotonic comparison across it too.
             return { status: 'stopped', event: ev, diedDraining: true, rebooted: true };
           }
           const grace = resolveDrainGrace(ev, killGraceMs);
-          if (Number.isFinite(ev.timeoutMs) && ev.timeoutMs >= 0 && grace !== null) {
+          const hasTimeoutAndGrace = Number.isFinite(ev.timeoutMs) && ev.timeoutMs >= 0 && grace !== null;
+
+          // PREFERRED-MONOTONIC (card #219) -- see the module header for the full reasoning. Every
+          // clause of the plausibility check must hold or this path is skipped in favour of the
+          // PREFERRED (uptime) bound just below; it can fire before the uptime path would only by at
+          // most MONOTONIC_PLAUSIBILITY_TOLERANCE_MS.
+          const monotonicPlausible =
+            Number.isFinite(ev.monotonicAtMs) &&
+            Number.isFinite(monotonicNowMs) &&
+            monotonicNowMs >= ev.monotonicAtMs &&
+            monotonicNowMs - ev.monotonicAtMs <= hostUptimeNowMs - ev.hostUptimeAtMs + MONOTONIC_PLAUSIBILITY_TOLERANCE_MS;
+
+          if (monotonicPlausible) {
+            if (hasTimeoutAndGrace && monotonicNowMs - ev.monotonicAtMs > ev.timeoutMs + grace) {
+              return { status: 'stopped', event: ev, diedDraining: true, boundClock: 'monotonic' };
+            }
+            // Within the monotonic bound (or no timeout/grace to check it against) -- trust THIS
+            // reading over the uptime one, which is exactly the suspend case this path exists to
+            // fix, and fall through to liveness/pid-reuse below rather than also consulting the
+            // uptime bound.
+          } else if (hasTimeoutAndGrace) {
             if (hostUptimeNowMs - ev.hostUptimeAtMs > ev.timeoutMs + grace) {
-              return { status: 'stopped', event: ev, diedDraining: true };
+              return { status: 'stopped', event: ev, diedDraining: true, boundClock: 'uptime' };
             }
           }
         }
@@ -258,7 +397,7 @@ function computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, 
         const grace = resolveDrainGrace(ev, killGraceMs);
         if (Number.isFinite(now) && Number.isFinite(tsMs) && Number.isFinite(ev.timeoutMs) && ev.timeoutMs >= 0 && grace !== null) {
           if (now - tsMs > ev.timeoutMs + grace) {
-            return { status: 'stopped', event: ev, diedDraining: true };
+            return { status: 'stopped', event: ev, diedDraining: true, boundClock: 'wallclock' };
           }
         }
       }
@@ -274,6 +413,31 @@ function computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, 
       }
       if (pid !== null && typeof isAlive === 'function' && isAlive(pid) === false) {
         return { status: 'stopped', event: ev, diedDraining: true };
+      }
+      // Residual 2 (card #219, "in-boot pid reuse"): a drain still short of its own bound whose
+      // pid has since been reused by an unrelated process, started AFTER the drain began, used to
+      // read 'draining' forever -- the same "no positive evidence of death" default the liveness
+      // read alone always used. Applies only when `isAlive` explicitly says TRUE (not merely
+      // "not false" -- an unresolvable liveness read must stay exactly as unresolved as before) AND
+      // `ev.hostUptimeAtMs` is present (both readings must be on the same boot-relative clock) AND
+      // a `processStartUptimeMs` probe is injected. `null` from that probe (non-Linux, pid already
+      // gone, or unparseable) leaves the verdict unchanged, still 'draining' -- this check can only
+      // ever ADD a 'stopped' verdict, never remove the existing liveness-based one.
+      if (
+        pid !== null &&
+        Number.isFinite(ev.hostUptimeAtMs) &&
+        typeof isAlive === 'function' &&
+        isAlive(pid) === true &&
+        typeof processStartUptimeMs === 'function'
+      ) {
+        const starttimeMs = processStartUptimeMs(pid);
+        if (Number.isFinite(starttimeMs) && starttimeMs > ev.hostUptimeAtMs + PID_REUSE_SLACK_MS) {
+          // This pid started (in boot-relative terms) measurably AFTER the drain-start event was
+          // written -- it cannot be the same process that wrote it. A real drainer is always the
+          // daemon process that wrote the drain-start event, so it necessarily started BEFORE that
+          // write (dispatcher.js's run() only reaches the write after `process.pid` already exists).
+          return { status: 'stopped', event: ev, diedDraining: true, pidReused: true };
+        }
       }
       return { status: 'draining', event: ev };
     }
