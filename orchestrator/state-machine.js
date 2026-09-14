@@ -185,6 +185,19 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
 
 // ---- per-state handlers ----------------------------------------------------------------
 
+// A kind: "card" task reaching real execution (neither --shadow nor --dry-run) needs the driver
+// to have explicitly opted in with daemon.js's --real flag -- real scripted steps spawn actual
+// git/npm/gh commands against the product repo. Checked here, not just at the CLI, so any caller
+// that builds ctx.config by hand (a future scheduler, a test) gets the same refusal rather than a
+// card silently running for real.
+//
+// Card #212 C1: factored out of handleIntake so runTask's `task.resume` path (which enters at
+// CHECK and never runs INTAKE at all) can apply the identical rule rather than reimplementing it
+// -- a resumed real-mode card still needs --real, for the same reason a fresh one does.
+function cardRequiresRealFlag(ctx) {
+  return ctx.task.kind === 'card' && isRealMode(ctx) && !(ctx.config && ctx.config.real);
+}
+
 async function handleIntake(ctx) {
   if (!ctx.task || ctx.task.__invalid) {
     throw new ParkSignal('invalid-task-json', { rawPreview: ctx.task && ctx.task.rawPreview });
@@ -194,12 +207,7 @@ async function handleIntake(ctx) {
     appendEvent(ctx.taskDir, 'INTAKE', 'force-state', { to });
     return to;
   }
-  // A kind: "card" task reaching real execution (neither --shadow nor --dry-run) needs the
-  // driver to have explicitly opted in with daemon.js's --real flag -- real scripted steps spawn
-  // actual git/npm/gh commands against the product repo. Checked here, not just at the CLI, so
-  // any caller that builds ctx.config by hand (a future scheduler, a test) gets the same refusal
-  // rather than a card silently running for real.
-  if (ctx.task.kind === 'card' && isRealMode(ctx) && !(ctx.config && ctx.config.real)) {
+  if (cardRequiresRealFlag(ctx)) {
     throw new ParkSignal('real-flag-required', { kind: ctx.task.kind });
   }
   // Action 3.2, site 1 -- REMOVED 2026-09-05 (#118), and this comment is the record of why.
@@ -910,9 +918,11 @@ async function handleImplement(ctx) {
   // ctx that lived through the DIAGNOSE/VALIDATE-REJECT loop in one continuous process would.
   // (Today, both of those restore call sites use the restored counters only to write an accurate
   // park report via finalizePark, never to re-enter this handler on the same ctx -- runTask's own
-  // cameFrom comment records that a retry always restarts a task at INTAKE, with fresh counters.
-  // The property above holds regardless: it describes what THIS function does with whatever
-  // ctx.counters it is handed, not a claim that a live mid-pipeline resume exists today.)
+  // cameFrom comment records that a retry always restarts a task at INTAKE, with fresh counters,
+  // and a card #212 resume enters at CHECK with equally fresh counters, so this handler is never
+  // reached with anything but ctx.counters' own zeros unless a genuine DIAGNOSE/VALIDATE-REJECT
+  // loop incremented them earlier in THIS SAME run. The property above holds regardless: it
+  // describes what THIS function does with whatever ctx.counters it is handed.)
   ctx.task.planDeclaresRdoMembers = resolvePlanDeclaresRdoMembers(ctx);
   // Amendment trigger 4: a retry after a DIAGNOSE or a VALIDATE reject escalates IMPLEMENT to
   // Opus on OBSERVED difficulty ("Sonnet needs strong direction"), independent of the wire/plan
@@ -1870,14 +1880,18 @@ function buildCtx(id, task, taskDir, config) {
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
     // The state runTask's transition loop just came FROM, set fresh by that loop before every
-    // handler call (null for the very first, INTAKE) -- action 1.3's prepareJudgeInputs reads it
-    // to tell "DIAGNOSE entered from GATE" (gate.log required) from every other DIAGNOSE entry
-    // point (gate.log optional). Deliberately NOT part of snapshot()/state.json: a retry always
-    // restarts a task at INTAKE (card #424 -- see steps/scripted.js's sweepWorktreeLeftovers
-    // header), and orphan-scan.js reparks an orphaned task directly through finalizePark without
-    // ever re-entering this loop, so nothing ever resumes runTask mid-state from a persisted
-    // snapshot -- cameFrom has no restart to be durable across in the first place. A direct-unit-
-    // test caller of HANDLERS.DIAGNOSE/VALIDATE that bypasses runTask must set it explicitly.
+    // handler call (null for the very first handler call of a run -- INTAKE ordinarily, CHECK on
+    // a card #212 resume) -- action 1.3's prepareJudgeInputs reads it to tell "DIAGNOSE entered
+    // from GATE" (gate.log required) from every other DIAGNOSE entry point (gate.log optional).
+    // Deliberately NOT part of snapshot()/state.json: a retry always restarts a task at INTAKE
+    // (card #424 -- see steps/scripted.js's sweepWorktreeLeftovers header), a card #212 resume
+    // (task.resume) restarts one at CHECK instead, and orphan-scan.js reparks an orphaned task
+    // directly through finalizePark without ever re-entering this loop -- every one of those
+    // three paths hands this loop a FRESH ctx (this buildCtx call) rather than reviving a
+    // persisted one, so cameFrom has no restart to be durable across in the first place, resume
+    // included: it is set to null right here, then overwritten by the loop itself on the very
+    // first hop, exactly as it always has been. A direct-unit-test caller of
+    // HANDLERS.DIAGNOSE/VALIDATE that bypasses runTask must set it explicitly.
     cameFrom: null,
     counters: {
       diagnoseAttempts: 0,
@@ -1898,9 +1912,10 @@ function buildCtx(id, task, taskDir, config) {
       // Action 5.1 (DIAGNOSE-surfacing sub-item, see park-loop.js's own "action 5.1" comment):
       // whether this task has already posted its one-time "pipeline diagnosing"
       // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
-      // persisted lifetime as board.js's own 5.1c dedupe memo, and for the same reason: a retry
-      // always restarts a task at INTAKE with a fresh ctx (see this file's own cameFrom comment),
-      // so "first DIAGNOSE entry" is naturally scoped to one run, never carried across a restart.
+      // persisted lifetime as board.js's own 5.1c dedupe memo, and for the same reason: every
+      // restart -- a retry at INTAKE, or a card #212 resume at CHECK -- hands this loop a fresh
+      // ctx (see this file's own cameFrom comment), so "first DIAGNOSE entry" is naturally scoped
+      // to one run, never carried across a restart, whichever state that run started from.
       diagnoseSurfaced: false,
     },
   };
@@ -2237,6 +2252,12 @@ const TERMINAL_PARK_REASONS = new Set([
   'state-machine-runaway', // state-machine.js's own dispatch-loop guard
   'unrecognized-state', // state-machine.js's own dispatch-loop guard
   'abandoned-by-maintainer', // park-loop.js's abandon-reply reconciler, written straight to state.json
+
+  // ---- resume (card #212 C)
+  'resume-precondition-failed', // runTask's own task.resume guard -- a malformed resume
+  // descriptor, parked BEFORE INTAKE or CHECK ever run (a resume on a real-mode kind:"card" task
+  // with no --real parks INTAKE's own `real-flag-required` instead, not this). Never auto-retried: retrying without a human fixing the resume descriptor
+  // (C4's unpark-scan writes it) would just fail the identical check again.
 ]);
 
 // TERMINAL_PARK_REASON_PREFIXES -- the family whose values can never be enumerated as exact
@@ -2890,16 +2911,28 @@ function reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCod
   }
 }
 
-// Runs one task through the state machine to completion (DONE or PARKED). Never throws for a
-// recognized outcome -- a ParkSignal anywhere in the handler chain is caught here and turned
-// into the PARKED terminal state. An unrecognized state name (HANDLERS[state] undefined,
-// including one injected by a shadow fixture for testing) is itself routed through ParkSignal,
-// which is the catch-all the spec calls for.
-async function runTask(id, task, taskDir, config) {
-  const ctx = buildCtx(id, task, taskDir, config);
-  let state = 'INTAKE';
-  ctx.cameFrom = null; // no previous state yet -- see the field's own doc comment on buildCtx/snapshot
-  writeState(taskDir, snapshot(ctx, state));
+// Card #212 C1: validates a queue entry's `task.resume` descriptor before runTask does anything
+// else with it -- an invalid resume must never fall back to INTAKE (that is exactly the
+// destructive path this feature exists to avoid: WORKTREE would destroy the existing branch and
+// close the existing PR). Returns null when `resume` is well-formed, or a short field name
+// (used verbatim as the park detail's `field`) naming the first thing wrong with it otherwise.
+// Deliberately conservative -- `startState` accepts only the one value this action wires up
+// (`'CHECK'`); a future action widening resume to another state extends this function, not the
+// caller.
+function resumeValidationError(resume) {
+  if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return 'resume';
+  if (resume.startState !== 'CHECK') return 'startState';
+  if (!Number.isInteger(resume.prNumber) || resume.prNumber <= 0) return 'prNumber';
+  if (typeof resume.worktreePath !== 'string' || resume.worktreePath === '') return 'worktreePath';
+  return null;
+}
+
+// The dispatch loop every run of runTask actually executes, factored out so the ordinary INTAKE
+// start and the card #212 resume-at-CHECK start below share one implementation instead of two
+// copies that could silently drift -- hops/lock-check/handler-dispatch/DONE-write are identical
+// either way; only which state (and which ctx) the loop is handed differs.
+async function runStateMachineLoop(ctx, taskDir, config, startState) {
+  let state = startState;
 
   // Runaway guard: a real handler bug that returns a valid-looking but cyclic path (e.g. an
   // infinite DIAGNOSE<->IMPLEMENT loop from a logic error) still terminates the run instead of
@@ -2950,6 +2983,78 @@ async function runTask(id, task, taskDir, config) {
     writeState(taskDir, snapshot(ctx, 'DONE'));
   }
   return state;
+}
+
+// Runs one task through the state machine to completion (DONE or PARKED). Never throws for a
+// recognized outcome -- a ParkSignal anywhere in the handler chain is caught here and turned
+// into the PARKED terminal state. An unrecognized state name (HANDLERS[state] undefined,
+// including one injected by a shadow fixture for testing) is itself routed through ParkSignal,
+// which is the catch-all the spec calls for.
+//
+// Card #212 C1: `task.resume` (absent on every task before this action; written by C4's
+// unpark-scan, once it exists) is the one thing checked before the ordinary INTAKE start below --
+// a `continue` verb resumes a parked card at CHECK on its existing worktree/branch/PR instead of
+// a `retry`'s destructive INTAKE restart (WORKTREE would destroy the branch and close the PR a
+// resume is meant to keep). `resume: null` is treated identically to it being absent -- only a
+// real object reaches resumeValidationError. Everything below this check, and the ordinary-start
+// branch that follows it, is byte-identical to the pre-#212 function: a task with no `resume`
+// takes neither new branch and behaves exactly as it always has.
+async function runTask(id, task, taskDir, config) {
+  const ctx = buildCtx(id, task, taskDir, config);
+
+  if (task && task.resume !== undefined && task.resume !== null) {
+    const resume = task.resume;
+    const badField = resumeValidationError(resume);
+    if (badField) {
+      // Parked BEFORE any writeState/handler runs -- an invalid resume must never fall back to
+      // INTAKE (see this function's own header). finalizePark itself needs no pre-existing
+      // state.json: writeState (journal.js) always writes a fresh temp file and renames it over
+      // whatever is or is not already there. That rename is also why the previous park's
+      // prNumber/worktreePath are carried forward first: a descriptor that failed validation
+      // cannot be trusted for them, and a null written over them would make a later `abandon`
+      // (which closes the PR named in state.json) leak the PR.
+      const prior = readJsonSafe(path.join(taskDir, 'state.json'));
+      ctx.task.worktreePath = (prior && prior.worktreePath) || null;
+      ctx.prNumber = (prior && prior.prNumber) || null;
+      finalizePark(ctx, 'CHECK', 'resume-precondition-failed', { step: 'invalid-resume', field: badField });
+      return 'PARKED';
+    }
+    // Rehydrate exactly the fields a real CHECK/PUSH_PR/GATE/... run needs -- the same three
+    // runtime-only fields orphan-scan.js and reparkCrashedTask already restore from a persisted
+    // state.json (worktreePath, prNumber; `branch` is CHECK-onward's own derived convention, see
+    // steps/scripted.js's realWorktree/realPushPr). ctx.counters stays at buildCtx's fresh
+    // zeros: a human resuming a card is the same "only a human resets an allowance" act a `retry`
+    // already is, and a resumed run's counters must be exactly as fresh as a retried one's.
+    ctx.task.worktreePath = resume.worktreePath;
+    ctx.task.branch = `claude-pipe/${id}`;
+    ctx.prNumber = resume.prNumber;
+    ctx.cameFrom = null; // no previous state yet -- see buildCtx's own cameFrom comment
+
+    // The same guard INTAKE applies to every kind:"card" task in real mode, replicated here
+    // because a resume skips INTAKE entirely -- see cardRequiresRealFlag's own header. After the
+    // rehydration above, so this park's state.json keeps the PR and worktree a later `abandon`
+    // or `continue` needs.
+    if (cardRequiresRealFlag(ctx)) {
+      finalizePark(ctx, 'CHECK', 'real-flag-required', { kind: ctx.task.kind });
+      return 'PARKED';
+    }
+
+    appendEvent(taskDir, 'CHECK', 'resumed-at-check', {
+      prNumber: resume.prNumber,
+      worktreePath: resume.worktreePath,
+      commentId: resume.commentId,
+      fromReason: resume.fromReason,
+    });
+
+    const state = 'CHECK';
+    writeState(taskDir, snapshot(ctx, state));
+    return runStateMachineLoop(ctx, taskDir, config, state);
+  }
+
+  const state = 'INTAKE';
+  ctx.cameFrom = null; // no previous state yet -- see the field's own doc comment on buildCtx/snapshot
+  writeState(taskDir, snapshot(ctx, state));
+  return runStateMachineLoop(ctx, taskDir, config, state);
 }
 
 // ---- queue draining -----------------------------------------------------------------------

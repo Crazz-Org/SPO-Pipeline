@@ -12,7 +12,7 @@
 // REACH that branch at all. A direct call to the function bypasses everything upstream of it,
 // including the one thing that actually routes a real task there: state-machine.js's dispatch
 // from state to handler. The verifier proved this the cheap way: sever `handleWorktree`'s real-
-// mode dispatch (state-machine.js:246, `return callWithDeadline(...)` -> `return 'PLAN'`) and run
+// mode dispatch (state-machine.js:254, `return callWithDeadline(...)` -> `return 'PLAN'`) and run
 // the suite. Eight tests failed. None of them were round 1's seven new ones -- they cannot see
 // that cut, because none of them ever go through `handleWorktree` (or any handler) in the first
 // place. The eight that DID fail (`runTask (real mode, card)` x1 in test/park-loop.test.js, four
@@ -31,7 +31,7 @@
 // ---- the one leg that cannot be driven this way, and why that is correct, not a gap -----------
 //
 // `main-red-refuse-worktree` is checked by `ctx.fixture('nightlyMainRed', false)`
-// (state-machine.js:242, `handleWorktree`) BEFORE `isRealMode(ctx)` is even read. The naive
+// (state-machine.js:250, `handleWorktree`) BEFORE `isRealMode(ctx)` is even read. The naive
 // reading -- "shadow mode gates the read" -- is WRONG, and worth stating precisely because round
 // 1's own file came close to that same wrong shape: `orchestrator/fixture.js`'s
 // `makeFixtureReader` reads `task.shadow.<key>` UNCONDITIONALLY, off the TASK OBJECT, not off
@@ -97,7 +97,7 @@
 //
 // ---- acceptance test (do this yourself before trusting this file) -----------------------------
 //
-// Sever state-machine.js:246 the same way the verifier did (`return callWithDeadline(ctx,
+// Sever state-machine.js:254 the same way the verifier did (`return callWithDeadline(ctx,
 // 'WORKTREE', () => realWorktree(ctx, ctx.deps));` -> `return 'PLAN';`) and run
 // `node --test --test-timeout=30000 test/gate-legs-reachability.test.js`. Every `runTask`-driven
 // test below must fail (ctx.task.worktreePath is never set, so nothing downstream of WORKTREE
@@ -153,7 +153,7 @@ function realConfig(overrides = {}) {
   return {
     shadowMode: false,
     dryRun: false,
-    real: true, // handleIntake's own real-flag-required gate (state-machine.js:203) -- a
+    real: true, // handleIntake's own real-flag-required gate (state-machine.js:211) -- a
     // kind:"card" task in real mode with no explicit opt-in parks immediately, before WORKTREE
     // is ever reached; every test below is driving PAST INTAKE on purpose.
     productRepo: '/fake/home/SPO-WebClient',
@@ -428,7 +428,7 @@ test('runTask (real mode, card): GATE/CI_CHECKS/VALIDATE all pass, pr:wait exits
 // This is the leg `main-red-refuse-worktree` (next section) defers to in real mode: the exact
 // same "is main red, refuse to start" condition, wired to the exact real spawn realWorktree reads
 // (<spoBenchDir>/nightly/latest.json), reached the moment `runTask` enters WORKTREE at all --
-// which is also why severing state-machine.js:246's real-mode dispatch (this file's own
+// which is also why severing state-machine.js:254's real-mode dispatch (this file's own
 // acceptance mutation, see header) makes THIS test fail: nothing downstream of that line runs.
 
 test('runTask (real mode, card): WORKTREE finds nightly FAIL at the exact fetched origin/main sha -> PARKED nightly-main-red, before any worktree add (corpus fire count 0)', async () => {

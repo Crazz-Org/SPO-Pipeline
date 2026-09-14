@@ -926,7 +926,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:159` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:200` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`

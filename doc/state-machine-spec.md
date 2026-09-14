@@ -139,6 +139,47 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    is durably on disk; a re-enqueue that fails journals `transient-retry-failed` instead and the
    task parks normally, so the journal never records a retry the queue does not hold.
 
+### Resume at CHECK (card #212)
+
+A maintainer `retry` re-enqueues a parked card and `runTask` always restarts it at INTAKE, with
+fresh counters — the right behaviour for most parks, but destructive for one narrow class: a
+card parked because its branch conflicts with `origin/main` (`merge-conflict`,
+`gate-merge-refused`, …) still has a perfectly good worktree, branch and open PR sitting on disk
+and on GitHub, and INTAKE's own WORKTREE step would destroy that branch and close that PR before
+trying again from scratch. `continue` is the non-destructive alternative: a queue entry carrying
+`task.resume = {startState: 'CHECK', prNumber, worktreePath, commentId, fromReason}` (written by
+a later action's unpark-scan, never by a maintainer's own `retry`) makes `runTask` skip INTAKE,
+WORKTREE, PLAN and IMPLEMENT entirely and enter the loop directly at CHECK, on the SAME
+`worktreePath`/branch (`` `claude-pipe/<id>` ``, the same convention `realWorktree`/`realPushPr`
+already use) and the same `prNumber` the resume descriptor names.
+
+What is rehydrated is exactly `worktreePath` and `prNumber` — the same two runtime-only fields
+orphan-scan.js and a worker-crash repark already restore from a persisted `state.json`, because
+neither one is ever written to `task.json`. Everything else starts as fresh as an ordinary
+INTAKE run: `ctx.counters` (diagnoseAttempts, validateRejects, ciImplementRetries, mainMoveUsed)
+are `buildCtx`'s own zeros, never carried forward from whatever the queue entry or an old
+`task.json` happens to hold — the same "only a human resets an allowance" rule a `retry` already
+follows, and the human who queued a `continue` just did. `ctx.cameFrom` is `null`, exactly as it
+is for the very first handler call of any run.
+
+Before any of that is written, `task.resume` is validated: it must be a plain object, its
+`startState` must be exactly `'CHECK'` (the only value this action wires up), `prNumber` must be
+a positive integer, and `worktreePath` must be a non-empty string. A `task.resume` that fails any
+of those checks — including one that is present but not an object at all — is parked
+`resume-precondition-failed` (`{step: 'invalid-resume', field}`, naming the first field found
+wrong) **before INTAKE or CHECK ever run**: an invalid resume must never silently fall back to
+the destructive INTAKE restart it exists to avoid. A `task.resume` that is absent, or explicitly
+`null`, behaves exactly as today — an ordinary INTAKE start, byte-identical to a task that has
+never heard of this feature. A resumed `kind: "card"` task in real mode still needs `--real`,
+exactly as INTAKE itself requires: an invalid or missing flag there parks `real-flag-required`
+(replicating INTAKE's own guard, since a resume skips INTAKE and so never reaches it directly).
+
+A valid resume journals exactly one event before entering the loop, `resumed-at-check`
+(`{prNumber, worktreePath, commentId, fromReason}`, fields the resume descriptor did not carry
+simply absent), and the very first `state.json` this run writes already has `state: 'CHECK'`
+alongside `prNumber`/`worktreePath` — never an intermediate INTAKE/WORKTREE snapshot a `continue`
+never runs.
+
 ## Task lifecycle
 
 ```

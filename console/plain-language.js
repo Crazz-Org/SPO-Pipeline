@@ -244,6 +244,10 @@ const PARK_REASONS = {
 
   // --- maintainer verdicts ------------------------------------------------------------------------
   'abandoned-by-maintainer': 'You told it to stop working on this card.',
+
+  // --- resume (card #212 C) -----------------------------------------------------------------------
+  'resume-precondition-failed':
+    'The card was asked to continue on its existing branch, but that branch or its worktree was not in a state it could continue from.',
 };
 
 // The reasons the daemon retries on its own, mirrored from state-machine.js's
