@@ -114,7 +114,7 @@ const { appendDaemonEvent, appendEvent } = require('./journal');
 const { orphanScan } = require('./orphan-scan');
 const { createDispatcher } = require('./dispatcher');
 const { readPipelineVersion } = require('./pipeline-version');
-const { resolveStateRoot, stateQueueDir, stateJournalRoot, assertStateMigrated } = require('./state-root');
+const { resolveStateRoot, stateQueueDir, stateJournalRoot, assertStateMigrated, isLiveStateRoot } = require('./state-root');
 
 // Resolved once at require time, in EVERY mode (dispatcher, worker, scanner) -- see
 // pipeline-version.js's header. A worker resolves it from its own __dirname, which is the point:
@@ -193,6 +193,10 @@ function printUsage() {
       '  --dry-run         real-mode semantics without spawning: real prompt fill + account',
       '                    rotation, but no `claude` CLI call and no scripted command run --',
       '                    see steps/llm.js / steps/scripted.js. Ignored if --shadow is given.',
+      '                    Both --shadow and --dry-run REFUSE to start if the resolved queue/',
+      '                    journal is the live default (~/.spo-state) -- point at a throwaway',
+      '                    root instead: SPO_STATE_DIR="$(mktemp -d)" node orchestrator/daemon.js',
+      '                    --dry-run --once (see state-root.js\'s isLiveStateRoot).',
       '  --real            actually spawns git/npm/gh commands and the `claude` CLI. Required',
       '                    for any kind: "card" task (refused otherwise -- see handleIntake\'s',
       '                    "real-flag-required" park). Mutually exclusive with --shadow; if',
@@ -549,6 +553,41 @@ async function main() {
   if (!opts.queue || !opts.journal) assertStateMigrated(repoRoot, stateRoot);
   const queueDir = opts.queue || stateQueueDir(stateRoot);
   const journalRoot = opts.journal || stateJournalRoot(stateRoot);
+
+  // 2026-09-13 incident: a bare `--dry-run` run on this box resolved the SAME live queue/journal
+  // the real daemon owns (no override given), took the lock, and drained all 30 real cards into
+  // a fake DONE in ~150ms -- overwriting state.json, journal history and queue entries a human
+  // then had to reconstruct by hand. Neither mode avoids the filesystem -- only the STEP
+  // execution is faked (this file's own header on `--shadow`/`--dry-run`) -- so both are exactly
+  // as dangerous as `--real` here. Refuse before touching anything: no mkdirSync below, no lock
+  // (acquireLock is further down still). state-root.js's isLiveStateRoot compares the RESOLVED
+  // queueDir/journalRoot against the live default (symlink/trailing-slash safe), not whether a
+  // flag was passed -- an explicit `--queue ~/.spo-state/queue` is refused exactly like the bare
+  // invocation that caused the incident. A child a dispatcher spawns (`--worker`/`--scanner`/
+  // `--repark-task`) always inherits an EXPLICIT --queue/--journal from its already-guarded
+  // parent (dispatcher.js's buildWorkerArgv/buildScannerArgv/buildReparkArgv), so this only ever
+  // fires for a hand-run invocation that never had one.
+  //
+  // Verification finding: `--worker <taskDir>`/`--repark-task <taskDir>` bypassed the guard
+  // above -- queueDir/journalRoot can be a perfectly safe explicit temp root while `taskDir`
+  // itself is still `$HOME/.spo-state/journal/<id>`, a real, live-shaped task. Reproduced: that
+  // combination walked a real task to a fake terminal state and rewrote its real state.json.
+  // `taskDir` is passed whenever this process IS one of those two modes (never for the dispatcher
+  // or `--scanner`, which have none); isLiveStateRoot checks it for containment under the live
+  // root, not equality (a task directory is nested one level under the root, never equal to it).
+  const liveGuardTaskDir = workerMode ? opts.worker : reparkMode ? opts.reparkTask : null;
+  if ((opts.shadow || opts.dryRun) && isLiveStateRoot({ queueDir, journalRoot, taskDir: liveGuardTaskDir })) {
+    const mode = opts.shadow ? '--shadow' : '--dry-run';
+    console.error(
+      `orchestrator/daemon.js: refusing to run ${mode} against the live state root (${stateRoot}) -- ` +
+        'it would take real queue entries and overwrite real journal/state.json with fake ' +
+        'results (see CLAUDE.md, 2026-09-13 incident). Point it at a throwaway root instead, e.g.:\n' +
+        `  SPO_STATE_DIR="$(mktemp -d)" node orchestrator/daemon.js ${mode} --once`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   fs.mkdirSync(queueDir, { recursive: true });
   fs.mkdirSync(journalRoot, { recursive: true });
 

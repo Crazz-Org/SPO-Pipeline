@@ -1053,7 +1053,13 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // tests assert. The third, `spo nightly`, gets --journal/--queue/--bench-dir as fresh mkTmp dirs,
   // and its only spawn (`git ls-remote` in the isolated SPO_PRODUCT_REPO) meets the child's own
   // SPO_NO_REAL_SPAWN guard, which is why that test expects UNKNOWN.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  // 2026-09-13 incident fix: daemon-live-state-root-guard.test.js's runDaemonRawIn spawns
+  // daemon.js directly -- audited: `env: { ...isolatedEnv(), HOME: home }` (isolatedEnv() spread
+  // first, HOME overridden after -- the one deliberate departure, needed to exercise the "no
+  // override at all, falls back to HOME" path this guard exists for; SPO_STATE_DIR is then
+  // deleted or re-set from the isolatedEnv()-derived object, never left as isolatedEnv()'s own
+  // throwaway value when the test wants the DEFAULT resolution), no `--real`.
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });

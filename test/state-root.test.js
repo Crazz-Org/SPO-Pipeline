@@ -24,6 +24,7 @@ const {
   stateJournalRoot,
   legacyStateEvidence,
   assertStateMigrated,
+  isLiveStateRoot,
   UnmigratedStateError,
 } = require('../orchestrator/state-root');
 
@@ -127,5 +128,104 @@ test('assertStateMigrated: a nonexistent state root is still "has none", not a c
   assert.throws(
     () => assertStateMigrated(repo, path.join(os.tmpdir(), 'spo-sr-does-not-exist-' + Date.now())),
     UnmigratedStateError
+  );
+});
+
+// ---- isLiveStateRoot ---------------------------------------------------------------------------
+//
+// 2026-09-13 incident: a bare `daemon.js --dry-run` (no --queue/--journal, no SPO_STATE_DIR) on
+// the production box resolved the SAME live queue/journal the real daemon owns, took the lock,
+// and drained all 30 real queue entries into a fake DONE in ~150ms. isLiveStateRoot is the pure
+// predicate daemon.js now checks before touching anything -- these tests pin it directly, with an
+// injected `home` so none of them can accidentally read this machine's own real ~/.spo-state.
+
+test('isLiveStateRoot: the DEFAULT resolution (no override at all) is live', () => {
+  const home = mk('spo-sr-home-default-');
+  const stateRoot = path.join(home, '.spo-state');
+  assert.equal(
+    isLiveStateRoot({ queueDir: stateQueueDir(stateRoot), journalRoot: stateJournalRoot(stateRoot), home }),
+    true
+  );
+});
+
+test('isLiveStateRoot: SPO_STATE_DIR pointed elsewhere is safe', () => {
+  const home = mk('spo-sr-home-safe-');
+  const elsewhere = mk('spo-sr-elsewhere-');
+  assert.equal(
+    isLiveStateRoot({
+      queueDir: stateQueueDir(elsewhere),
+      journalRoot: stateJournalRoot(elsewhere),
+      home,
+    }),
+    false
+  );
+});
+
+test('isLiveStateRoot: an explicit --queue/--journal that just RESPELLS the live default is still live -- presence of a flag is not the question', () => {
+  const home = mk('spo-sr-home-respell-');
+  const stateRoot = path.join(home, '.spo-state');
+  const elsewhere = mk('spo-sr-respell-elsewhere-');
+  // Same QUEUE path, spelled with a trailing slash -- a plain string compare would miss this.
+  // journalRoot is deliberately NOT the live path (an unrelated safe dir) -- otherwise this case
+  // passes even for a mutant `realOrResolvedPath` that never normalises at all (e.g. returns the
+  // raw candidate unchanged): journalRoot alone, compared by plain equality, would already make
+  // the whole call true, and the trailing-slash queueDir spelling would never actually be
+  // exercised. Isolating it here is what makes THIS test the one that catches that mutant.
+  assert.equal(
+    isLiveStateRoot({
+      queueDir: stateQueueDir(stateRoot) + path.sep,
+      journalRoot: elsewhere,
+      home,
+    }),
+    true
+  );
+});
+
+test('isLiveStateRoot: only ONE of queueDir/journalRoot matching the live default is enough to refuse', () => {
+  const home = mk('spo-sr-home-onematch-');
+  const stateRoot = path.join(home, '.spo-state');
+  const elsewhere = mk('spo-sr-elsewhere2-');
+  assert.equal(
+    isLiveStateRoot({ queueDir: stateQueueDir(elsewhere), journalRoot: stateJournalRoot(stateRoot), home }),
+    true,
+    'journalRoot alone matching the live default must still refuse'
+  );
+  assert.equal(
+    isLiveStateRoot({ queueDir: stateQueueDir(stateRoot), journalRoot: stateJournalRoot(elsewhere), home }),
+    true,
+    'queueDir alone matching the live default must still refuse'
+  );
+});
+
+test('isLiveStateRoot: a SYMLINK to the live default is caught (fs.realpathSync, not a plain string compare)', () => {
+  const home = mk('spo-sr-home-symlink-');
+  const liveStateRoot = path.join(home, '.spo-state');
+  fs.mkdirSync(stateQueueDir(liveStateRoot), { recursive: true });
+  fs.mkdirSync(stateJournalRoot(liveStateRoot), { recursive: true });
+
+  const alias = mk('spo-sr-alias-');
+  fs.rmdirSync(alias); // symlinkSync refuses to create the link if the target path already exists
+  fs.symlinkSync(liveStateRoot, alias, 'dir');
+
+  assert.equal(
+    isLiveStateRoot({ queueDir: stateQueueDir(alias), journalRoot: stateJournalRoot(alias), home }),
+    true
+  );
+});
+
+test('isLiveStateRoot: a queue/journal dir that does not exist YET still resolves correctly (mkdirSync runs AFTER this check, not before)', () => {
+  const home = mk('spo-sr-home-notyet-');
+  const stateRoot = path.join(home, '.spo-state');
+  // Neither stateQueueDir(stateRoot) nor stateJournalRoot(stateRoot) has been created -- confirm
+  // realOrResolvedPath's fs.realpathSync-fails-so-fall-back-to-path.resolve branch still lands on
+  // the live verdict, not a false "safe" from an ENOENT.
+  assert.equal(
+    fs.existsSync(stateQueueDir(stateRoot)),
+    false,
+    'test setup: the directory must not exist yet for this case to mean anything'
+  );
+  assert.equal(
+    isLiveStateRoot({ queueDir: stateQueueDir(stateRoot), journalRoot: stateJournalRoot(stateRoot), home }),
+    true
   );
 });
