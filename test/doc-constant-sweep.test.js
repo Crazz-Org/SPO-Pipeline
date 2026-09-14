@@ -2916,13 +2916,25 @@ function classifySurvivors(survivors, allowlist) {
 // EDGE_TEXT_NOT_DISCRIMINATING -- pins whose adjacent line has identical trimmed text (a lone `}`,
 // a blank line next to another blank line) cannot be discriminated by a literal-text pin, the same
 // "cannot verify must never silently grow" posture as ANCHOR_BLUNT_CITATIONS/`unanchorable` above.
-// Measured empirically (this action's own mutation-proof test, immediately below): planting every
-// start-1/start+1/stop-1/stop+1/shift-1/shift+1 drift for every range pin, and every +/-1 drift for
-// every single-line pin -- 346 planted drifts across all 95 pins (41 BENCH_PINS + 14
-// LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS, action 11.2/#206 added the fourth registry) -- ALL
-// 346 are caught. Empty is the honest, measured result, not an unproven default; if a future pin
-// lands on an edge like this, it is added here BY NAME, with a reason, exactly like every other
-// allowlist in this file.
+//
+// SCOPED TO SHA-FROZEN PINS ONLY (action 3 of the line-number-as-truth-key migration, #206
+// follow-up, 2026-09-14): a frozen commit's blob cannot drift, so "any planted drift is rejected"
+// is still the right, unconditional guarantee there -- resolvePins' `at: '<sha>'` branch is
+// byte-for-byte untouched by that action. `at: 'HEAD'` pins are the other half of this corpus-wide
+// proof now, in the HEAD_CORRECTION_EXCEPTIONS allowlist and its own mutation-proof test right
+// after this one's: a HEAD pin's text is truth and its line number is DERIVED (resolveAnchor), so a
+// pure shift no longer "survives" undetected -- it resolves `ok: true` with a `correction` naming
+// the real, current position instead of being silently missed. The single unified population this
+// comment used to describe (95 pins, 346 variants, all rejected) split the day that became true.
+//
+// Measured (SHA half only, 2026-09-14): planting every start-1/start+1/stop-1/stop+1/shift-1/
+// shift+1 drift for every SHA-frozen range pin, and every +/-1 drift for every SHA-frozen
+// single-line pin -- 254 planted drifts across 75 SHA-frozen pins (37 of BENCH_PINS' 41 are
+// SHA-frozen, the other 4 are HEAD; 1 of LIVE_RANGE_PINS' 14 is SHA-frozen, the other 13 are HEAD;
+// 0 of BLUNT_PINS' 3 (all 3 are HEAD); all 37 of CCA_PINS are SHA-frozen) -- ALL 254 are caught.
+// Empty is the honest, measured result, not an unproven default; if a future SHA pin lands on an
+// edge like this, it is added here BY NAME, with a reason, exactly like every other allowlist in
+// this file.
 //
 // D8d (fix pass 11.1): the mutation-proof test's own final assertion used to be
 // `assert.equal(killed, variants.length)` -- a genuine, correctly-allowlisted survivor would still
@@ -2931,7 +2943,7 @@ function classifySurvivors(survivors, allowlist) {
 // count now credits an ALLOWED survivor as accounted-for, not merely "not reported as unexpected".
 const EDGE_TEXT_NOT_DISCRIMINATING = {};
 
-test('EDGE_TEXT_NOT_DISCRIMINATING holds exactly the pins this action measured unable to discriminate a neighbouring line -- no more, no fewer', () => {
+test('EDGE_TEXT_NOT_DISCRIMINATING holds exactly the SHA-frozen pins this action measured unable to discriminate a neighbouring line -- no more, no fewer', () => {
   assert.deepEqual(
     Object.keys(EDGE_TEXT_NOT_DISCRIMINATING).sort(),
     [],
@@ -2977,19 +2989,17 @@ test('classifySurvivors: an allowlisted survivor is credited as accounted-for; t
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shift drift (or a +/-1 drift for a single line) is caught by resolvePins, for EVERY pin -- not a sample', () => {
-  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
-  const base = resolvePins(allPins);
-  const offenders = base.filter((r) => !r.ok).map((r) => r.why);
-  assert.deepEqual(offenders, [], `a pin used as this mutation proof's own baseline is not itself green -- fix the pin, not the proof:\n  ${offenders.join('\n  ')}`);
-
-  // Plant every drift shape this action's spec calls for, varied per pin (never a repeating
-  // fixture value -- test/park-reason-doc-sweep.test.js's own "repeating fixture hides which
-  // value is keyed" trap) by deriving each shifted citation from the PIN's own real citation
-  // string and skipping only a shift that would run off either end of the real file (no
-  // neighbouring line exists there to be confused with).
-  const variants = []; // { pinIndex, kind, shifted }
-  allPins.forEach((pin, i) => {
+// plantDriftVariants(pins, base) -- shared by both halves of the corpus-wide mutation proof below
+// (action 3 follow-up split this into SHA-half/HEAD-half tests; the planting logic itself is
+// unchanged from the single test it replaces). Plants every drift shape this action's spec calls
+// for, varied per pin (never a repeating fixture value -- test/park-reason-doc-sweep.test.js's own
+// "repeating fixture hides which value is keyed" trap) by deriving each shifted citation from the
+// PIN's own real citation string and skipping only a shift that would run off either end of the
+// real file (no neighbouring line exists there to be confused with). Returns
+// [{ pinIndex, kind, shifted }].
+function plantDriftVariants(pins, base) {
+  const variants = [];
+  pins.forEach((pin, i) => {
     const lineCount = base[i].lineCount;
     const isRange = pin.last !== undefined;
     const plant = (kind, startDelta, stopDelta) => {
@@ -3014,19 +3024,34 @@ test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shi
       plant('line+1', 1, 1);
     }
   });
+  return variants;
+}
 
-  // D3 (fix pass 11.2, driver decision): a bare `> 200` floor stays green even if `...CCA_PINS`
-  // were dropped from `allPins` entirely (41+14+3 BENCH/LIVE_RANGE/BLUNT pins alone already plant
-  // 264 variants, comfortably over 200) -- the floor cannot tell "the fourth registry is wired in"
-  // from "it silently is not". Assert the exact, measured totals instead: 95 pins (41 BENCH_PINS +
-  // 14 LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS) plant exactly 346 variants.
-  assert.equal(allPins.length, 95, `expected 95 pins (41 BENCH_PINS + 14 LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS), found ${allPins.length} -- a registry was added, removed, or resized; re-measure and update this pin.`);
-  assert.equal(variants.length, 346, `expected exactly 346 planted drifts across 95 pins, found ${variants.length} -- a pin lost or gained line-count headroom, a registry changed size, or the corpus shrank; re-measure.`);
+test('MUTATION PROOF, every SHA-frozen pin: a start-1/start+1/stop-1/stop+1/whole-range-shift drift (or a +/-1 drift for a single line) is caught by resolvePins, for EVERY SHA-frozen pin -- not a sample', () => {
+  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
+  // Scoped to `at: '<sha>'` pins (action 3 of the line-number-as-truth-key migration, #206
+  // follow-up): a frozen blob cannot drift, so "any planted drift must be rejected" is still the
+  // unconditional guarantee here -- see EDGE_TEXT_NOT_DISCRIMINATING's own header, above, for why
+  // `at: 'HEAD'` pins are no longer part of THIS test (they get their own, right below).
+  const shaPins = allPins.filter((p) => p.at !== 'HEAD');
+  const base = resolvePins(shaPins);
+  const offenders = base.filter((r) => !r.ok).map((r) => r.why);
+  assert.deepEqual(offenders, [], `a pin used as this mutation proof's own baseline is not itself green -- fix the pin, not the proof:\n  ${offenders.join('\n  ')}`);
+
+  const variants = plantDriftVariants(shaPins, base);
+
+  // D3 (fix pass 11.2, driver decision), re-measured after the SHA/HEAD split (action 3 follow-up,
+  // 2026-09-14): a bare `> 200` floor stays green even if a whole registry silently stopped being
+  // wired in -- the floor cannot tell "the fourth registry is wired in" from "it silently is not".
+  // Assert the exact, measured totals instead: 75 SHA-frozen pins (37 of BENCH_PINS' 41 + 1 of
+  // LIVE_RANGE_PINS' 14 + 0 of BLUNT_PINS' 3 + all 37 of CCA_PINS) plant exactly 254 variants.
+  assert.equal(shaPins.length, 75, `expected 75 SHA-frozen pins (37 of BENCH_PINS' 41 + 1 of LIVE_RANGE_PINS' 14 + 0 of BLUNT_PINS' 3 + 37 of CCA_PINS' 37), found ${shaPins.length} -- a registry was added, removed, resized, or a pin moved between \`at: 'HEAD'\` and \`at: '<sha>'\`; re-measure and update this pin.`);
+  assert.equal(variants.length, 254, `expected exactly 254 planted drifts across 75 SHA-frozen pins, found ${variants.length} -- a pin lost or gained line-count headroom, a registry changed size, or the corpus shrank; re-measure.`);
 
   const results = resolvePins(variants.map((v) => v.shifted));
   const survivors = [];
   results.forEach((r, idx) => {
-    if (r.ok) survivors.push(`${variants[idx].shifted.file} :: ${allPins[variants[idx].pinIndex].citation} -- ${variants[idx].kind} drift (now "${variants[idx].shifted.citation}") still reads as correct`);
+    if (r.ok) survivors.push(`${variants[idx].shifted.file} :: ${shaPins[variants[idx].pinIndex].citation} -- ${variants[idx].kind} drift (now "${variants[idx].shifted.citation}") still reads as correct`);
   });
   const killed = results.length - survivors.length;
 
@@ -3054,6 +3079,125 @@ test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shi
   const survivorKeysSeen = new Set(survivors.map((s) => s.split(' -- ')[0]));
   const staleAllowlistEntries = Object.keys(EDGE_TEXT_NOT_DISCRIMINATING).filter((k) => !survivorKeysSeen.has(k));
   assert.deepEqual(staleAllowlistEntries, [], `EDGE_TEXT_NOT_DISCRIMINATING entry(ies) that no longer correspond to any actual planted-drift survivor -- remove them:\n  ${staleAllowlistEntries.join('\n  ')}`);
+});
+
+// HEAD_CORRECTION_EXCEPTIONS -- the complementary allowlist to EDGE_TEXT_NOT_DISCRIMINATING, for
+// the HEAD half of the same corpus-wide proof (action 3 of the line-number-as-truth-key migration,
+// #206 follow-up, 2026-09-14): a planted drift on an `at: 'HEAD'` pin is now EXPECTED to resolve
+// `ok: true` with a `correction` pointing back at the pin's own true, unshifted position -- that is
+// the whole point of the inversion, not a survivor to be caught. But two genuinely different real
+// edges keep a handful of variants from reaching that clean "corrected" state, both measured by
+// hand against the real corpus, neither a defect in resolvePins:
+//   - the `last` anchor is itself ambiguous in its target file (matches 2+ lines there). resolvePins'
+//     own safety net for this (test/citation-pins.js: the ambiguous-fallback path) either (a)
+//     succeeds because the ORIGINAL cited line still holds the text -- resolving `ok: true` but
+//     WITHOUT a `correction`, since a fallback resolution never knows whether the number really
+//     moved -- or (b) fails outright when the fallback's own stale-position check also misses,
+//     exactly the same "likely stale" hard-fail an ambiguous SHA-style mismatch would produce. Both
+//     are the correct, safety-first behavior the spec calls for, not a hole.
+//   - a 2-line range pin (daemon.js:665-666) where a start+1 or stop-1 shift makes the two cited
+//     numbers COINCIDE -- shiftedCitation then formats the drifted citation as a SINGLE-LINE
+//     string, while the pin still carries `last`. The pre-existing RANGE/`last`-shape guard (D4,
+//     unchanged by this action, runs before the HEAD/SHA fork) rejects that combination outright --
+//     a plant()-mechanism artifact of this specific citation's own 2-line length, not a property of
+//     the correction logic.
+// Named by pin (not by variant-kind, same granularity EDGE_TEXT_NOT_DISCRIMINATING already uses),
+// since either edge affects some or all of a pin's own planted variants together, never a single
+// isolated one. Measured 2026-09-14: 3 pins, 14 of the 92 HEAD-half variants land here.
+const HEAD_CORRECTION_EXCEPTIONS = {
+  'doc/state-machine-spec.md :: dispatcher.js:635-648':
+    "the `last` anchor (\"      return;\") occurs 3 times in orchestrator/dispatcher.js -- ambiguous. " +
+    'A start-only shift (start-1/start+1) resolves ok via the ambiguous-fallback path (the original ' +
+    'stop, 648, still reads "return;") but reports no correction; a stop-touching shift (stop-1/' +
+    'stop+1/shift-1/shift+1) moves off 648 and the fallback\'s own stale-position check also misses, ' +
+    'so it hard-fails. All 6 range-variant kinds land here.',
+  'orchestrator/README.md :: dispatcher.js:635-648':
+    'the same fact, cited a second time from a different file -- identical reasoning and outcome as ' +
+    'the doc/state-machine-spec.md entry above (same target, same ambiguous `last` anchor).',
+  'orchestrator/dispatcher.js :: daemon.js:665-666':
+    'a 2-line range: the start+1 and stop-1 shifts make the two cited numbers coincide (666 and 665 ' +
+    'respectively), so the drifted citation string collapses to SINGLE-LINE form while the pin still ' +
+    'carries `last` -- rejected by the pre-existing, unchanged RANGE-shape guard before HEAD ' +
+    'resolution ever runs. start-1/stop+1/shift-1/shift+1 all correct cleanly.',
+};
+
+test('HEAD_CORRECTION_EXCEPTIONS holds exactly the HEAD pins this action measured unable to reach a clean corrected state -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(HEAD_CORRECTION_EXCEPTIONS).sort(),
+    [
+      'doc/state-machine-spec.md :: dispatcher.js:635-648',
+      'orchestrator/README.md :: dispatcher.js:635-648',
+      'orchestrator/dispatcher.js :: daemon.js:665-666',
+    ].sort(),
+    'HEAD_CORRECTION_EXCEPTIONS changed -- read the new entry by hand and justify it here before pinning it.'
+  );
+});
+
+test('MUTATION PROOF, every HEAD pin: the same planted drift resolves ok: true with a `correction` pointing back at the real, unchanged position -- HEAD pins report drift instead of rejecting it (action 3 of the line-number-as-truth-key migration)', () => {
+  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
+  const headPins = allPins.filter((p) => p.at === 'HEAD');
+  const base = resolvePins(headPins);
+  const offenders = base.filter((r) => !r.ok || r.correction).map((r) => r.why || `${r.pin.file} :: ${r.pin.citation} -- unexpectedly reported a correction: ${JSON.stringify(r.correction)}`);
+  assert.deepEqual(offenders, [], `a pin used as this mutation proof's own baseline is not itself green (ok: true, no correction) -- fix the pin, not the proof:\n  ${offenders.join('\n  ')}`);
+
+  const variants = plantDriftVariants(headPins, base);
+
+  // Measured 2026-09-14 (mirrors the SHA-half's own D3 discipline, above): 20 HEAD pins (4 of
+  // BENCH_PINS' 41 + 13 of LIVE_RANGE_PINS' 14 + all 3 of BLUNT_PINS + 0 of CCA_PINS' 37, CCA_PINS
+  // being entirely SHA-frozen) plant exactly 92 variants.
+  assert.equal(headPins.length, 20, `expected 20 HEAD pins (4 of BENCH_PINS' 41 + 13 of LIVE_RANGE_PINS' 14 + 3 of BLUNT_PINS' 3 + 0 of CCA_PINS' 37), found ${headPins.length} -- a registry was added, removed, resized, or a pin moved between \`at: 'HEAD'\` and \`at: '<sha>'\`; re-measure and update this pin.`);
+  assert.equal(variants.length, 92, `expected exactly 92 planted drifts across 20 HEAD pins, found ${variants.length} -- a pin lost or gained line-count headroom, a registry changed size, or the corpus shrank; re-measure.`);
+
+  const results = resolvePins(variants.map((v) => v.shifted));
+  const notCorrected = [];
+  let corrected = 0;
+  results.forEach((r, idx) => {
+    const v = variants[idx];
+    const originalPin = headPins[v.pinIndex];
+    const key = `${originalPin.file} :: ${originalPin.citation}`;
+    const label = `${key} -- ${v.kind} drift (now "${v.shifted.citation}")`;
+    if (!r.ok) {
+      notCorrected.push(`${label} was rejected instead of corrected: ${r.why}`);
+      return;
+    }
+    if (!r.correction) {
+      notCorrected.push(`${label} resolved ok but reported no correction`);
+      return;
+    }
+    // The correction must point back at the pin's own ORIGINAL (pre-drift) start/stop -- the real
+    // text never moved, only this planted guess about where to look did, so every variant of the
+    // same pin must agree on the identical real position.
+    const orig = /^(.+):(\d+)(?:-(\d+))?$/.exec(originalPin.citation);
+    const origStart = Number(orig[2]);
+    const origStop = Number(orig[3] || orig[2]);
+    const got = /^(.+):(\d+)(?:-(\d+))?$/.exec(r.correction.citation);
+    const gotStart = Number(got[2]);
+    const gotStop = Number(got[3] || got[2]);
+    if (gotStart !== origStart || gotStop !== origStop) {
+      notCorrected.push(`${label} reported a correction pointing at "${r.correction.citation}", expected it to point back at start ${origStart}/stop ${origStop}`);
+      return;
+    }
+    corrected += 1;
+  });
+
+  const { allowed: allowedExceptions, unexpected: unexpectedNotCorrected } = classifySurvivors(notCorrected, HEAD_CORRECTION_EXCEPTIONS);
+
+  assert.deepEqual(
+    unexpectedNotCorrected,
+    [],
+    `planted drift(s) on a HEAD pin did NOT resolve to a clean correction and are not on ` +
+      `HEAD_CORRECTION_EXCEPTIONS -- either the resolver regressed, or this pin genuinely cannot reach ` +
+      `a corrected state and belongs on that allowlist with a reason:\n  ${unexpectedNotCorrected.join('\n  ')}`
+  );
+  assert.equal(
+    corrected + allowedExceptions.length,
+    variants.length,
+    `expected every planted HEAD drift to be either cleanly corrected (${corrected}) or explicitly ` +
+      `allowlisted (${allowedExceptions.length}) -- ${variants.length} planted; see the list above for which and why.`
+  );
+  const notCorrectedKeysSeen = new Set(notCorrected.map((s) => s.split(' -- ')[0]));
+  const staleAllowlistEntries = Object.keys(HEAD_CORRECTION_EXCEPTIONS).filter((k) => !notCorrectedKeysSeen.has(k));
+  assert.deepEqual(staleAllowlistEntries, [], `HEAD_CORRECTION_EXCEPTIONS entry(ies) that no longer correspond to any actual not-corrected variant -- remove them:\n  ${staleAllowlistEntries.join('\n  ')}`);
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check

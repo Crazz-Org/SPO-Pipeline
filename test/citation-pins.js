@@ -347,6 +347,117 @@ function resolvePins(pins, opts = {}) {
     const lines = rawLines;
     const lineCount = lines.length;
     const { start, stop } = m.parsed;
+
+    // ---- inverted model, `at: 'HEAD'` pins only (this action, line-number-as-truth-key migration)
+    // ------------------------------------------------------------------------------------------
+    // The `at: '<sha>'` branch below (the fallthrough past this `if`) is untouched: a frozen blob
+    // cannot drift, so there is nothing to invert there. For a HEAD pin, the anchor TEXT is truth
+    // and the line number is derived by looking the text up with resolveAnchor -- not asserted at
+    // the originally-cited position the way the sha branch (and the old HEAD behaviour) does.
+    if (pin.at === 'HEAD') {
+      const firstResult = resolveAnchor(lines, pin.first, start);
+      let firstLine;
+      let firstAmbiguousFallback = false;
+      if (firstResult.absent) {
+        return {
+          pin,
+          ok: false,
+          why: `${pin.file} :: ${pin.citation} @ HEAD -- anchor text for the first line was not found anywhere in ${m.relPath} (the cited text appears to have been deleted or rewritten): "${truncateForMessage(pin.first.trim())}"`,
+        };
+      }
+      if (firstResult.unique) {
+        firstLine = firstResult.line;
+      } else if (start >= 1 && start <= lineCount && (lines[start - 1] ?? '').trim() === pin.first.trim()) {
+        // Ambiguous match (2+ lines carry the same text): fall back to the same exact-position
+        // check the old code always did, as a safety net -- content-search alone can't safely pick
+        // a line when the anchor isn't unique. A pin resolved this way never reports a `correction`
+        // (below): we don't actually know if the number moved when the anchor isn't unique.
+        // The `start >= 1 && start <= lineCount` bounds test is the sha branch's own, carried over
+        // deliberately (verifier finding, action 3): without it an out-of-bounds citation reads
+        // `lines[start - 1]` as `undefined` -> `''`, which COMPARES EQUAL to a blank/whitespace-only
+        // anchor -- so a pin whose `first` is a blank line, cited at `:9999` of a 100-line file (or
+        // at `:0`, since a JS array has no negative index either), resolved ok: true at a line that
+        // does not exist. No pin in the registries carries a blank anchor today, but the blank-line
+        // pin is an anticipated shape here (EDGE_TEXT_NOT_DISCRIMINATING's own header names it),
+        // and "cannot verify" must never read as a silent pass (E1).
+        firstLine = start;
+        firstAmbiguousFallback = true;
+      } else {
+        return {
+          pin,
+          ok: false,
+          why: `${pin.file} :: ${pin.citation} @ HEAD -- anchor text for the first line is ambiguous (matches more than one line in ${m.relPath}) AND the originally-cited line ${start} does not hold it either -- likely stale`,
+        };
+      }
+
+      let lastLine;
+      let lastAmbiguousFallback = false;
+      if (pin.last !== undefined) {
+        const lastResult = resolveAnchor(lines, pin.last, stop);
+        if (lastResult.absent) {
+          return {
+            pin,
+            ok: false,
+            why: `${pin.file} :: ${pin.citation} @ HEAD -- anchor text for the last line was not found anywhere in ${m.relPath} (the cited text appears to have been deleted or rewritten): "${truncateForMessage(pin.last.trim())}"`,
+          };
+        }
+        if (lastResult.unique) {
+          lastLine = lastResult.line;
+        } else if (stop >= 1 && stop <= lineCount && (lines[stop - 1] ?? '').trim() === pin.last.trim()) {
+          // Same bounds test, same reason, as the `first` fallback above.
+          lastLine = stop;
+          lastAmbiguousFallback = true;
+        } else {
+          return {
+            pin,
+            ok: false,
+            why: `${pin.file} :: ${pin.citation} @ HEAD -- anchor text for the last line is ambiguous (matches more than one line in ${m.relPath}) AND the originally-cited line ${stop} does not hold it either -- likely stale`,
+          };
+        }
+      }
+
+      // Ordering guard (range pins only): can only fire when at least one side went through the
+      // ambiguous-fallback path with a stale start/stop, or in some pathological case -- rare to
+      // never in practice, but must be checked: two anchors resolving out of order means one of
+      // them is no longer a real match for what the citation is trying to say.
+      if (pin.last !== undefined && firstLine > lastLine) {
+        return {
+          pin,
+          ok: false,
+          why: `${pin.file} :: ${pin.citation} @ HEAD -- resolved out of order (first line ${firstLine} is after last line ${lastLine} in ${m.relPath}) -- the two anchors resolved out of order, which almost certainly means one of the two anchor texts is no longer a real match for what the citation is trying to say`,
+        };
+      }
+
+      const headActualFirst = (lines[firstLine - 1] ?? '').trim();
+      const headActualLast = pin.last !== undefined ? (lines[lastLine - 1] ?? '').trim() : undefined;
+      const headSpanStop = pin.last !== undefined ? lastLine : firstLine;
+
+      if (pin.claim !== undefined) {
+        const headSpanForClaim = lines.slice(firstLine - 1, headSpanStop).join('\n');
+        if (!headSpanForClaim.includes(pin.claim)) {
+          return {
+            pin,
+            ok: false,
+            actualFirst: headActualFirst,
+            actualLast: headActualLast,
+            lineCount,
+            why: `${pin.file} :: ${pin.citation} @ ${pin.at} -- claim not found in span: expected to find "${truncateForMessage(pin.claim)}" somewhere in lines ${firstLine}-${headSpanStop}`,
+          };
+        }
+      }
+
+      const headResult = { pin, ok: true, actualFirst: headActualFirst, actualLast: headActualLast, lineCount };
+      const positionDiffers = firstLine !== start || (pin.last !== undefined && lastLine !== stop);
+      if (positionDiffers && !firstAmbiguousFallback && !lastAmbiguousFallback) {
+        // Match shiftedCitation's own single-vs-range formatting convention exactly: single-line
+        // form iff the two resolved numbers are numerically equal, never keyed on whether the
+        // ORIGINAL citation was a range.
+        const citation = firstLine === headSpanStop ? `${m.relPath}:${firstLine}` : `${m.relPath}:${firstLine}-${headSpanStop}`;
+        headResult.correction = { file: m.relPath, start: firstLine, stop: headSpanStop, citation };
+      }
+      return headResult;
+    }
+
     const actualFirst = (lines[start - 1] !== undefined ? lines[start - 1] : '').trim();
     const wantFirst = pin.first.trim();
     let ok = start >= 1 && start <= lineCount && actualFirst === wantFirst;

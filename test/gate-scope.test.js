@@ -57,6 +57,13 @@ const MENTIONS_BUT_TOLERATES_ABSENCE = {
     'arrays -- never calls resolveCitationTarget/resolvePins, never resolves a real repo on disk (measured ' +
     '2026-09-14: `SPO_PRODUCT_REPO=/nonexistent/no-such-repo SPO_DEPLOY_REPO=/nonexistent/no-such-repo ' +
     'node --test test/citation-pins-resolve-anchor.test.js` -- 10 pass, 0 fail)',
+  'citation-pins-resolve-head.test.js':
+    'requires citation-pins.js for resolvePins, but every pin used (hermetic fixtures with a repoRoots override, ' +
+    'plus the real corpus/historical-drift pins, all of which cite SPO-Pipeline-local paths -- bin/spo, ' +
+    'orchestrator/daemon.js, orchestrator/intake.js, orchestrator/lock.js, and the real at: HEAD registry entries) ' +
+    'resolves inside this repo before resolveCitationTarget ever reaches the product/deploy branches (measured ' +
+    '2026-09-14: `SPO_PRODUCT_REPO=/nonexistent/no-such-repo SPO_DEPLOY_REPO=/nonexistent/no-such-repo ' +
+    'node --test test/citation-pins-resolve-head.test.js` -- 20 pass, 0 fail)',
 };
 
 function readGateSh() {
