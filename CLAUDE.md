@@ -89,8 +89,9 @@ The method is not optional and not re-invented per session — it is the plan's 
   `git status`: subagents don't commit, so the worktree is equally dirty at the builder's first
   write and its last.
 - **One chantier at a time**, next starts only on a green gate: `node --test test/*.test.js`
-  (never bare) + `daemon.js --dry-run` + the chantier's listed checks. *(live recette)* gates stop
-  and ask the maintainer.
+  (never bare) + `SPO_STATE_DIR=$(mktemp -d) daemon.js --dry-run --once` (bare refuses: it would
+  drain the live queue) + the chantier's listed checks. *(live recette)* gates stop and ask the
+  maintainer.
 - Items marked **DECISION** are never delegated; the driver frames, the maintainer decides.
 - **Sibling grep** (rule 6): any action correcting a factual claim greps the old *and* new phrasing
   across `doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`,

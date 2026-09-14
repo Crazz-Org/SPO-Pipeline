@@ -51,8 +51,9 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    architect: it decomposes, reviews the verifications, and settles edge cases. Items marked
    **DECISION** are never delegated: the driver frames them and has the maintainer decide
    before dispatching the mechanical half.
-3. **Chantier gate**: full replay suite green (`node --test test/*.test.js` — never bare, which also runs the non-test helper/fixture `.js` files under `test/` as tests: false passes and false failures) + `daemon.js --dry-run` on a
-   synthetic card + the listed specific checks. Gates marked *(live recette)* require a real,
+3. **Chantier gate**: full replay suite green (`node --test test/*.test.js` — never bare, which also runs the non-test helper/fixture `.js` files under `test/` as tests: false passes and false failures) + `SPO_STATE_DIR=$(mktemp -d) daemon.js --dry-run` on a
+   synthetic card (bare refuses against the live state root — state-root.js's isLiveStateRoot,
+   2026-09-13 incident) + the listed specific checks. Gates marked *(live recette)* require a real,
    maintainer-supervised card — the driver stops and explicitly asks for it. From chantier 3
    on, the live recette goes through the `spo recette` harness (action 2.9).
 4. **Every behavior change** is reflected in `doc/state-machine-spec.md` /
