@@ -897,6 +897,15 @@ function resolvePlanDeclaresRdoMembers(ctx) {
   return declared.some((f) => typeof f === 'string' && f.includes(RDO_CATALOGUE_BASENAME));
 }
 
+// The product worktree's HEAD sha, or null when it cannot be read. Exit AND shape are both
+// checked: a failing `git rev-parse HEAD` prints the literal `HEAD` on stdout (see realPushPr's
+// own comment in steps/scripted.js), which must never compare as a sha.
+function readWorktreeHead(ctx) {
+  const res = spawnStep(ctx, ctx.deps, 'IMPLEMENT', 'git', ['-C', ctx.task.worktreePath, 'rev-parse', 'HEAD']);
+  const sha = (res.stdout || '').trim();
+  return res.exit === 0 && /^[0-9a-f]{7,64}$/.test(sha) ? sha : null;
+}
+
 async function handleImplement(ctx) {
   // Kanban piloting: move to "Implementing" before the LLM call -- IMPLEMENT is an LLM step, not
   // a scripted one, so there is no realX(ctx, deps) function for board.js's moveCard to live
@@ -930,6 +939,14 @@ async function handleImplement(ctx) {
   // signals above -- it fires precisely when the first pass did not hold, whatever the card's own
   // text guessed or the plan declared.
   ctx.task.diagnoseOrValidateRetry = ctx.counters.diagnoseAttempts > 0 || ctx.counters.validateRejects > 0;
+
+  // HEAD before THIS attempt, read for the card #385 cross-check below: an IMPLEMENT that commits
+  // its own fix leaves a clean tree, and porcelain alone cannot tell that from one that did
+  // nothing. Measured here rather than taken from ctx.task.baseMainSha: both measured misroutes
+  // (issue-598, issue-593) were IMPLEMENTs reached from GATE -> DIAGNOSE, after PUSH_PR had
+  // already committed the first pass -- HEAD was past the base sha before the call even started,
+  // so a base-sha comparison would wave through every post-gate IMPLEMENT that changed nothing.
+  const headBeforeImplement = isRealMode(ctx) && ctx.task.worktreePath ? readWorktreeHead(ctx) : null;
 
   const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
   const payload = result === null ? { ok: true } : result;
@@ -991,11 +1008,28 @@ async function handleImplement(ctx) {
       // legacy ctx.task.llm.IMPLEMENT override shape (test/board-move.test.js) carries no
       // files_changed claim at all, so there is nothing here to cross-check against -- this
       // exempts it exactly as the guard above already does.
+      //
+      // "Moved" is a dirty tree OR a HEAD that differs from the one read before this attempt:
+      // issue-598 and issue-593 both parked after IMPLEMENT committed a correct fix, the clean
+      // tree read as "nothing changed", and DIAGNOSE had nothing left to diagnose. An unreadable
+      // HEAD on either side leaves porcelain as the only evidence -- the pre-fix behaviour.
       if (ctx.task.worktreePath) {
         const status = spawnStep(ctx, ctx.deps, 'IMPLEMENT', 'git', ['-C', ctx.task.worktreePath, 'status', '--porcelain']);
         if (status.exit === 0 && status.stdout.trim() === '') {
-          appendEvent(ctx.taskDir, 'IMPLEMENT', 'no-worktree-change', { claimedFilesChanged: filesChanged.length });
-          return 'DIAGNOSE';
+          const headAfterImplement = headBeforeImplement ? readWorktreeHead(ctx) : null;
+          if (headAfterImplement && headAfterImplement !== headBeforeImplement) {
+            appendEvent(ctx.taskDir, 'IMPLEMENT', 'worktree-moved-by-commit', {
+              headBefore: headBeforeImplement,
+              headAfter: headAfterImplement,
+            });
+          } else {
+            appendEvent(ctx.taskDir, 'IMPLEMENT', 'no-worktree-change', {
+              claimedFilesChanged: filesChanged.length,
+              headBefore: headBeforeImplement,
+              headAfter: headAfterImplement,
+            });
+            return 'DIAGNOSE';
+          }
         }
       }
     }
