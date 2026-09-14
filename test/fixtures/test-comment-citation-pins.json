@@ -52,7 +52,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1247-1250",
+      "citation": "bin/spo:1257-1260",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    const { createDashboardServer, discoverUsageRoots } = require('../console/serve');",
@@ -61,7 +61,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1272-1288",
+      "citation": "bin/spo:1282-1298",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  function generateOnce() {",
@@ -70,7 +70,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1263",
+      "citation": "bin/spo:1273",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    return;",
@@ -78,7 +78,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1277-1278",
+      "citation": "bin/spo:1287-1288",
       "occurrence": 0,
       "at": "HEAD",
       "first": "      require('../console/par-times').refreshParTimes(journalRoot, path.join(journalRoot, 'par-times.json'));",
@@ -104,7 +104,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1283",
+      "citation": "bin/spo:1293",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    fs.writeFileSync(outPath, renderDashboard(data));",
@@ -112,7 +112,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1285",
+      "citation": "bin/spo:1295",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    fs.writeFileSync(healthPath, renderDashboard(data, { view: 'health' }));",
@@ -189,7 +189,7 @@
     },
     {
       "citingFile": "test/citation-pins-data.js",
-      "citation": "intake.js:938-940",
+      "citation": "intake.js:953-955",
       "occurrence": 0,
       "at": "HEAD",
       "first": "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on",
@@ -254,7 +254,7 @@
     },
     {
       "citingFile": "test/dispatcher.test.js",
-      "citation": "dispatcher.js:1286",
+      "citation": "dispatcher.js:1309",
       "occurrence": 0,
       "at": "HEAD",
       "first": "        appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {",
@@ -262,7 +262,7 @@
     },
     {
       "citingFile": "test/dispatcher.test.js",
-      "citation": "dispatcher.js:1232",
+      "citation": "dispatcher.js:1255",
       "occurrence": 0,
       "at": "HEAD",
       "first": "        appendDaemonEvent(journalRoot, 'dispatcher-stopped', stopReason);",
@@ -361,7 +361,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "bin/spo:1273",
+      "citation": "bin/spo:1283",
       "occurrence": 0,
       "at": "HEAD",
       "first": "    const data = collectAll(sources);",
@@ -527,7 +527,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "bin/spo:1273",
+      "citation": "bin/spo:1283",
       "occurrence": 1,
       "at": "HEAD",
       "first": "    const data = collectAll(sources);",
@@ -535,7 +535,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "bin/spo:1273",
+      "citation": "bin/spo:1283",
       "occurrence": 2,
       "at": "HEAD",
       "first": "    const data = collectAll(sources);",
@@ -631,7 +631,7 @@
     },
     {
       "citingFile": "test/intake.test.js",
-      "citation": "bin/spo:239-305",
+      "citation": "bin/spo:240-306",
       "occurrence": 0,
       "at": "HEAD",
       "first": "function parseArgs(argv) {",
@@ -661,7 +661,7 @@
       "occurrence": 0,
       "at": "HEAD",
       "first": "require('../orchestrator/no-real-spawn-guard').installGuard();",
-      "last": "const { lockPath, pidExists } = require('../orchestrator/lock');",
+      "last": "const { lockPath, pidExists, processStartUptimeMs } = require('../orchestrator/lock');",
       "claim": "installGuard"
     },
     {
@@ -1115,7 +1115,7 @@
     },
     {
       "citingFile": "test/bin-spo-state-write-sweep.test.js",
-      "citation": "bin/spo:1290-1292",
+      "citation": "bin/spo:1300-1302",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  generateOnce();",
@@ -1124,7 +1124,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "lock.js:310",
+      "citation": "lock.js:386",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  const tryWrite = () => tryCreate(filePath, payload);",
@@ -1132,7 +1132,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "lock.js:310",
+      "citation": "lock.js:386",
       "occurrence": 1,
       "at": "HEAD",
       "first": "  const tryWrite = () => tryCreate(filePath, payload);",
@@ -1140,7 +1140,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "lock.js:276",
+      "citation": "lock.js:352",
       "occurrence": 1,
       "at": "HEAD",
       "first": "function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {",
@@ -1611,7 +1611,7 @@
     },
     {
       "citingFile": "test/intake.test.js",
-      "citation": "bin/spo:1142",
+      "citation": "bin/spo:1152",
       "occurrence": 0,
       "at": "HEAD",
       "first": "  return cmdTokens(opts);",
@@ -1621,7 +1621,7 @@
     },
     {
       "citingFile": "test/intake.test.js",
-      "citation": "bin/spo:1183",
+      "citation": "bin/spo:1193",
       "occurrence": 0,
       "at": "HEAD",
       "first": "      // than folded into the PARKED rows above: the two ask different questions of a maintainer",
@@ -1684,7 +1684,7 @@
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "intake.js:938-940",
+      "citation": "intake.js:953-955",
       "occurrence": 0,
       "at": "HEAD",
       "first": "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on",
@@ -1941,17 +1941,17 @@
       "first": "  return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });",
       "claimless": true,
       "category": "no-claim-in-prose",
-      "reason": "part of the CHAIN_RE chain-shape example (\"`account-lease.js:156` -> `lock.js:276` ... -> `:310`\", quoting orchestrator/README.md), not a historical-record/phantom-SYMBOL location; edge line is `return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });`"
+      "reason": "part of the CHAIN_RE chain-shape example (\"`account-lease.js:156` -> `lock.js:352` ... -> `:386`\", quoting orchestrator/README.md), not a historical-record/phantom-SYMBOL location; edge line is `return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });`"
     },
     {
       "citingFile": "test/doc-constant-sweep.test.js",
-      "citation": "lock.js:276",
+      "citation": "lock.js:352",
       "occurrence": 0,
       "at": "HEAD",
       "first": "function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {",
       "claimless": true,
       "category": "no-claim-in-prose",
-      "reason": "part of the SAME CHAIN_RE chain-shape example as account-lease.js:156 #0 above (quoting orchestrator/README.md's `account-lease.js:156` -> `lock.js:276` ... -> `:310` chain), not a historical-record/phantom-SYMBOL location; edge line is `function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {`"
+      "reason": "part of the SAME CHAIN_RE chain-shape example as account-lease.js:156 #0 above (quoting orchestrator/README.md's `account-lease.js:156` -> `lock.js:352` ... -> `:386` chain), not a historical-record/phantom-SYMBOL location; edge line is `function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {`"
     }
   ],
   "allowlist": {

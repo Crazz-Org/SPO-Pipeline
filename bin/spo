@@ -234,7 +234,8 @@ const remoteReportPull = require('../orchestrator/remote-report-pull');
 const { tokenReport, todaySpend, formatTokenCount } = require('../orchestrator/tokens');
 const recette = require('../orchestrator/recette');
 const retryChannel = require('../orchestrator/retry-channel');
-const { lockPath, pidExists } = require('../orchestrator/lock');
+const { lockPath, pidExists, processStartUptimeMs } = require('../orchestrator/lock');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 
 function parseArgs(argv) {
   const opts = {
@@ -812,18 +813,27 @@ function cmdStatus(opts) {
   // computeDispatcherStatus itself: `now` is this same `Date.now()` snapshot (declared once, above,
   // and reused for every age computation in this function) rather than a fresh clock read;
   // `hostUptimeNowMs` is `os.uptime() * 1000`, the PREFERRED (boot-relative, monotonic, cross-process-
-  // comparable) age reading a `dispatcher-drain-start` written by card #208's dispatcher.js now
-  // carries alongside its wall-clock `ts` -- see console/dispatcher-status.js's own header for why
-  // that beats both `ts` and `monotonicNowMs()`; and `killGraceMs` is this process's own
+  // comparable on EVERY platform) age reading a `dispatcher-drain-start` written by card #208's
+  // dispatcher.js now carries alongside its wall-clock `ts` -- see console/dispatcher-status.js's
+  // own header for why that beats `ts`, and why it is itself beaten, where the PREFERRED-MONOTONIC
+  // path applies, by `monotonicNowMs()` (below); and `killGraceMs` is this process's own
   // `defaultConfig.drainKillGraceMs` -- together they let a reader bound an UNCONCLUDED drain-start
   // past its own `timeoutMs` plus that grace as STOPPED even when a reused pid would otherwise read
   // it alive forever (a dead-but-pid-reused daemon does not print DRAINING indefinitely any more),
   // and does so on a clock that cannot be fooled by this box's own measured wall-clock steps.
+  // `processStartUptimeMs`/`monotonicNowMs()` (card #219) are ALSO injected here, below: the
+  // former is `orchestrator/lock.js`'s real `/proc/<pid>/stat` probe (residual 2, in-boot pid
+  // reuse); the latter is a fresh `orchestrator/monotonic-clock.js` reading feeding
+  // computeDispatcherStatus's PREFERRED-MONOTONIC bound (residual 1, a host suspend during a
+  // drain) -- see that module's own header for the full reasoning and the platforms where each
+  // applies.
   const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot), {
     isAlive: pidExists,
     now,
     hostUptimeNowMs: os.uptime() * 1000,
     killGraceMs: defaultConfig.drainKillGraceMs,
+    processStartUptimeMs, // card #219 (residual 2): pid-reuse probe, orchestrator/lock.js
+    monotonicNowMs: monotonicNowMs(), // card #219 (residual 1): PREFERRED-MONOTONIC bound
   });
   if (dispatcherStatus && dispatcherStatus.status === 'idle') {
     const idleEvent = dispatcherStatus.event;

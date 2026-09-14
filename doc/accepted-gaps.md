@@ -682,3 +682,92 @@ it were complete:
 None of the three widen a check to look complete while checking less — they are named exclusions
 of shapes the sweep structurally cannot see, the same discipline this document already applies to
 `doc-constant-sweep.test.js` itself.
+
+## 11 · Card #219 residual gaps (dispatcher-status drain bound), 2026-09-14
+
+Card #219 closed #208's two named residuals (`console/dispatcher-status.js`'s own header,
+`orchestrator/README.md`'s `dispatcher-drain-start` row) *where the platform and the record allow*.
+What is left open, named rather than silently shipped as if closed:
+
+1. **Non-Linux pid-reuse detection.** `orchestrator/lock.js`'s `processStartUptimeMs(pid)` reads
+   `/proc/<pid>/stat` — Linux only. On any other platform it returns `null`, and
+   `computeDispatcherStatus` leaves the verdict exactly as it was before this card: a drain still
+   inside its own bound whose pid has been reused by an unrelated process reads `'draining'`
+   forever. Not measurable here (this action's host is Linux/WSL2); not attempted.
+2. **Suspend detection off the measured-Linux case.** The PREFERRED-MONOTONIC path
+   (`console/dispatcher-status.js`) trusts `monotonicAtMs`/`monotonicNowMs` only when its
+   plausibility check holds — internal consistency only (finite, no reboot, `monotonicNowMs >=
+   monotonicAtMs`, monotonic elapsed within `hostUptimeNowMs` elapsed plus a small tolerance), not
+   an actual platform check. On a platform where `hrtime` is NOT the system-wide `CLOCK_MONOTONIC`
+   (measured true here for Linux/WSL2/Node v22; not measured for macOS, other BSDs, or a container
+   runtime with its own clock namespace — though in practice macOS's `mach_absolute_time` and
+   Windows' `QueryPerformanceCounter`, libuv's macOS and Windows `uv_hrtime` backends, are ALSO system-wide
+   monotonic clocks, not per-process ones, so a genuinely process-relative hrtime origin is closer
+   to a hypothetical exotic-runtime case than a common one), the plausibility check catches a
+   process-relative hrtime origin ONLY for a SHORT-LIVED reader: a freshly-spawned `spo status`
+   process's own `monotonicNowMs` starts near zero, so it violates `monotonicNowMs >=
+   monotonicAtMs` against a writer that has been up for any real length of time, and the check
+   correctly falls back to the PREFERRED (uptime) path. A LONG-LIVED reader (a dashboard service
+   process running continuously, `console/collect.js`'s `collectAll`) does NOT get this same
+   protection for free: given enough of its OWN uptime, its `monotonicNowMs` can coincidentally
+   grow past an unrelated writer's `monotonicAtMs` even though the two values come from different,
+   incomparable per-process origins — the plausibility check cannot distinguish that coincidence
+   from a genuine same-clock reading. This is reasoned, not measured on any non-Linux platform or
+   against a real long-lived reader — a suspend during a live drain on a platform where hrtime is
+   genuinely process-relative remains exactly as open as before this card, for a long-lived reader
+   in particular.
+3. **Legacy (pre-#208) records.** A `dispatcher-drain-start` with no `hostUptimeAtMs` at all
+   (written before card #208) has no `monotonicAtMs` either, so it gets neither the suspend fix nor
+   the pid-reuse fix — only the pre-#208 wall-clock bound, unchanged. The 38 real records on disk
+   noted in the `dispatcher-drain-start` row all predate #208 and age out as new drains are written
+   (same note as before this card); the count was not re-measured for this action.
+4. **The reboot check's own blind spot, checked and confirmed real -- corrected 2026-09-14
+   (fix pass), see below.** `hostUptimeNowMs < ev.hostUptimeAtMs` is the reboot signal (uptime
+   resets to near zero on boot, so "now" reading LESS than the event's own recorded uptime can only
+   mean a reboot happened between them). It does NOT fire the other way: if the host reboots and
+   then stays up long enough that the NEW boot's own uptime climbs back up to or past the OLD
+   `hostUptimeAtMs` value before anyone reads the record, the check reads `hostUptimeNowMs >=
+   ev.hostUptimeAtMs` and never learns a reboot happened at all.
+
+   **What actually happens next is NOT the doubly-wrong monotonic read this entry first claimed.**
+   Simulated directly: at the exact instant `hostUptimeNowMs` first reaches the old
+   `ev.hostUptimeAtMs`, the NEW boot's own `monotonicNowMs` (assuming no suspend in the new boot,
+   so its own uptime and monotonic clock track together from a shared near-zero start) has ALSO
+   grown to roughly that same value — and if the OLD boot likewise had no suspend before it wrote
+   the event, `ev.monotonicAtMs` roughly equals `ev.hostUptimeAtMs` too. So `monotonicNowMs >=
+   ev.monotonicAtMs` is satisfied (by definition of the blind spot, NOT violated the way this
+   entry's first draft assumed), and the elapsed-vs-elapsed tolerance clause passes trivially (both
+   differences are near zero right at the crossing) — the PREFERRED-MONOTONIC path is judged
+   plausible and IS taken. Its own bound reads `monotonicNowMs - ev.monotonicAtMs`, which is also
+   near zero at that instant, so it reads `'draining'` -- the SAME verdict the (blind) uptime path
+   would have produced on its own difference, also near zero. The two paths agree, for the wrong
+   reason, at the boundary.
+
+   **The blind spot is therefore temporary, not permanent**, and its own duration is boundable: it
+   lasts only while `(hostUptimeNowMs - ev.hostUptimeAtMs) <= ev.timeoutMs + grace` -- once the new
+   boot's own uptime has grown PAST the old `hostUptimeAtMs` by more than the bound itself, the
+   monotonic elapsed reading (tracking the same growth, absent a new-boot suspend) exceeds
+   `timeoutMs + grace` too, and the bound fires `'stopped'`/`diedDraining: true` -- correct in
+   OUTCOME (the pre-reboot process is certainly gone) but not labelled `rebooted: true` the way an
+   actual reboot detection would, since the reboot check itself never fired. Residual 2's pid-reuse
+   probe does not rescue the transient window either: a pid alive during it necessarily started
+   AFTER the new boot (a small `processStartUptimeMs` reading), which typically reads as BEFORE
+   the old, large `ev.hostUptimeAtMs` -- i.e. NOT flagged as reused, the opposite of what pid-reuse
+   detection is for. Reasoned and hand-simulated against the actual comparison logic, not measured
+   against a real reboot mid-suite (out of scope, same as residual 1's own suspend). This blind spot
+   existed unchanged since card #208 and is not new to card #219; it is recorded here because this
+   card's own spec asked to check for it, and corrected here because the first draft of this entry
+   misdescribed which path fires and what it reads.
+
+5. **A non-100 clock tick rate.** `orchestrator/lock.js` hardcodes `LINUX_CLK_TCK = 100`, measured
+   with `getconf CLK_TCK` on this host; it is 100 on every architecture Node supports. Where
+   USER_HZ is larger, starttime reads too high, and `processStartUptimeMs`'s future-guard catches that
+   only once the inflated value passes the current uptime. While it still falls between the drain's
+   `hostUptimeAtMs` and now (at most `timeoutMs` + grace), a live drainer can read `pidReused`.
+   Unreachable at 100; recorded, not closed (verifier simulation, 2026-09-14).
+
+None of these five are faked shut. Where the code cannot tell (`processStartUptimeMs` returning
+`null`, the plausibility check failing, no `hostUptimeAtMs`/`monotonicAtMs` on the record, or the
+reboot check's own blind spot), the verdict is exactly what it would have been without card #219 --
+`'draining'` off liveness alone, or the pre-#208 wall-clock bound -- never a guess dressed up as a
+measurement.

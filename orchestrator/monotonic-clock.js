@@ -21,13 +21,26 @@
 // (steps/llm.js's duration_s) -- with this monotonic clock. Never use it for a
 // WALL-CLOCK TIMESTAMP: anything written to disk or compared ACROSS PROCESSES (a lease's
 // `startedAt`, an account's `cooldownUntil`, a queue entry's `notBefore`, orphan-scan.js's grace
-// window against `state.json`'s `updatedAt`) must stay Date.now()-based, because
-// process.hrtime.bigint() is meaningless outside the ONE process that read it -- it resets to an
-// arbitrary origin on every process start and cannot be compared to another process's own
-// monotonic clock, let alone written to a file and read back after a reboot. A future edit that
-// "finishes the job" by routing one of those wall-clock values through this function would silently
-// break every cooldown/lease/retry comparison in the pool -- this file exists partly so that
-// temptation has a named, documented place to stop at.
+// window against `state.json`'s `updatedAt`) must stay Date.now()-based. Node's own docs promise
+// only that `hrtime` returns "an arbitrary time in the past" -- cross-PROCESS comparability is
+// NOT a documented guarantee, and this file used to overclaim the opposite here ("meaningless
+// outside the ONE process that read it... cannot be compared to another process's own monotonic
+// clock"). Measured instead, card #219, 2026-09-14, this host (Linux/WSL2, Node v22): two
+// SEPARATE node processes reading `process.hrtime.bigint()` 56ms apart returned readings 56.4ms
+// apart, and both tracked `/proc/uptime` -- on Linux, libuv's `uv_hrtime()` IS the system-wide
+// `CLOCK_MONOTONIC`, comparable across every process on the box. That is a measured LINUX
+// IMPLEMENTATION DETAIL, not a cross-platform Node guarantee, and it still resets on every reboot
+// (unlike a wall-clock timestamp, which survives one) -- so this function's OWN cross-process use
+// (the PREFERRED-MONOTONIC bound in console/dispatcher-status.js, dispatcher.js's `monotonicAtMs`
+// drain-start field) gates it behind a runtime plausibility check and a same-platform fallback,
+// never assumes it unconditionally. Everything below this line is still correct on its own terms:
+// a value written to disk and read back by a DIFFERENT process, or across a reboot, must stay
+// Date.now()-based UNLESS the reader has independently verified (as that one call site does) that
+// comparability actually holds here. A future edit that "finishes the job" by routing a
+// lease/cooldown/queue-notBefore wall-clock value through this function WITHOUT that verification
+// would silently break every such comparison in the pool on any platform, or after a reboot, where
+// the Linux finding above does not hold -- this file exists partly so that temptation has a named,
+// documented place to stop at.
 function monotonicNowMs() {
   return Number(process.hrtime.bigint() / 1000000n);
 }

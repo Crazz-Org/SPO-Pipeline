@@ -15,7 +15,7 @@ const path = require('path');
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
-const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('../orchestrator/lock');
+const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock, processStartUptimeMs } = require('../orchestrator/lock');
 const shortLock = require('../orchestrator/lock'); // acquireShortLock/releaseShortLock -- see the verifier tests at the end of this file
 const { runTask } = require('../orchestrator/state-machine');
 const { DAEMON, mkTmp, writeTask, runDaemonOnce, runDaemonWorker, readState, isolatedEnv } = require('./helpers');
@@ -610,4 +610,116 @@ test('acquireShortLock: a DEAD holder is still swept -- the fix above must not c
   const held = shortLock.acquireShortLock(file, { isAlive: () => false });
   assert.ok(held, 'a lock held by a dead pid must still be swept and taken');
   assert.strictEqual(held.pid, process.pid);
+});
+
+// ---- processStartUptimeMs (card #219 residual 2: in-boot pid reuse) --------------------
+//
+// Reads /proc/<pid>/stat field 22 (starttime, clock ticks since boot) and converts it to ms on
+// the same boot-relative clock os.uptime()*1000 uses. This module reads the REAL /proc/<pid>/stat
+// path, not an injectable one -- deliberately, since it is Linux-specific plumbing, not a seam
+// production ever swaps -- so these tests drive it against REAL processes (this one, and a
+// deliberately weird-named spawned one below) rather than a synthetic fixture file.
+
+test('processStartUptimeMs: a live read of process.pid lands within a sane range of os.uptime()*1000 (Linux only)', { skip: process.platform !== 'linux' }, () => {
+  const before = os.uptime() * 1000;
+  const starttimeMs = processStartUptimeMs(process.pid);
+  const after = os.uptime() * 1000;
+  assert.strictEqual(typeof starttimeMs, 'number');
+  assert.ok(Number.isFinite(starttimeMs), 'starttimeMs must be a finite number for a live pid');
+  // This process started at some point in the past -- its starttime must be LESS than "now"'s own
+  // uptime reading (with generous margin for the two clocks' own tick granularity), and certainly
+  // not negative.
+  assert.ok(starttimeMs >= 0, `starttimeMs must not be negative: ${starttimeMs}`);
+  assert.ok(starttimeMs <= after + 1000, `starttimeMs (${starttimeMs}) must not be far ahead of current uptime (${after})`);
+  assert.ok(before >= 0);
+});
+
+test('processStartUptimeMs: a pid that does not exist returns null, never throws', () => {
+  // A pid astronomically unlikely to exist -- Linux pid_max is well under 4194304 by default, and
+  // even a custom-raised pid_max does not reach this.
+  assert.strictEqual(processStartUptimeMs(999999999), null);
+});
+
+// FUTURE-GUARD (fix pass, card #219): a computed starttime after "now" is impossible and must be
+// refused, not trusted -- this is what actually keeps a wrong LINUX_CLK_TCK safe (see that
+// constant's own comment: the unsafe failure direction is a starttime read TOO HIGH, which would
+// otherwise misread a live drainer's own pid as started-after-the-event and answer
+// 'stopped'/`pidReused: true` for a process that is still running). Exercised here by monkey-
+// patching the shared `os` module's own `uptime()` -- `orchestrator/lock.js`'s `const os =
+// require('os')` is the SAME cached module object, so overriding it here reaches that call too --
+// rather than by faking a wrong CLK_TCK (a module-private `const`, not an injectable seam): the
+// guard's OWN behaviour is what this test proves, independent of what makes a starttime read too
+// high.
+test('processStartUptimeMs: a computed starttime AFTER "now" (os.uptime()) returns null -- the future-guard, not the raw computation', { skip: process.platform !== 'linux' }, () => {
+  const os = require('os');
+  const realUptime = os.uptime;
+  try {
+    // This process's real starttime is some positive number of ms; forcing os.uptime() to read 0
+    // makes ANY real process's starttime read as "in the future" relative to it, without needing a
+    // fake /proc/<pid>/stat file or a wrong CLK_TCK.
+    os.uptime = () => 0;
+    assert.strictEqual(processStartUptimeMs(process.pid), null, 'a starttime past "now" must be refused, not trusted');
+  } finally {
+    os.uptime = realUptime;
+  }
+});
+
+test('processStartUptimeMs: non-Linux platforms return null unconditionally, without touching /proc', () => {
+  const realPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+  try {
+    assert.strictEqual(processStartUptimeMs(process.pid), null);
+  } finally {
+    Object.defineProperty(process, 'platform', realPlatform);
+  }
+});
+
+// The `/proc/<pid>/stat` parser locates field 22 AFTER the LAST `)` specifically because `comm`
+// (field 2) can itself contain spaces and parentheses -- a plain whitespace split from the start
+// of the line would misalign every field after it. Proven against a REAL kernel-written stat line
+// for a process whose comm genuinely contains both: a symlink to this node binary itself, named
+// with an embedded `(...)` and a space, spawned and read while still alive.
+test('processStartUptimeMs: a comm containing spaces and parentheses does not misalign field 22 (real /proc/<pid>/stat)', { skip: process.platform !== 'linux' }, async () => {
+  const dir = mkTmp('spo-proc-comm-parens-');
+  const weirdName = 'weird (name) proc'; // truncated by the kernel to TASK_COMM_LEN (16 bytes,
+  // 15 visible chars) -- "weird (name) pr" still carries a balanced "(...)" plus a leading and a
+  // trailing space-adjacent segment, which is exactly the shape this parser must not misparse.
+  const link = path.join(dir, weirdName);
+  fs.symlinkSync(process.execPath, link);
+  const { spawn } = require('child_process');
+  const child = spawn(link, ['-e', 'setTimeout(() => {}, 5000)']);
+  try {
+    // BOUNDED POLL, not a fixed sleep (fix pass, flake risk): a fixed 200ms wait for the kernel to
+    // have populated /proc/<pid>/comm is itself a flake under load (CLAUDE.md's own "the machine
+    // is loaded" note) -- too short and the read races the kernel, too long just wastes time on a
+    // quiet box. Poll until the real comm actually carries the shape this test needs (or a
+    // generous 5000ms deadline elapses, which fails loudly below rather than reading a garbled
+    // half-written comm as a real mismatch).
+    const commDeadline = Date.now() + 5000;
+    let comm = '';
+    while (Date.now() < commDeadline) {
+      try {
+        comm = fs.readFileSync(`/proc/${child.pid}/comm`, 'utf8').trim();
+      } catch {
+        comm = ''; // not written yet, or the process already gone -- keep polling either way
+      }
+      if (comm.includes('(') && comm.includes(')') && comm.includes(' ')) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(comm.includes('('), `expected the spawned process's comm to carry a "(": ${comm}`);
+    assert.ok(comm.includes(')'), `expected the spawned process's comm to carry a ")": ${comm}`);
+    assert.ok(comm.includes(' '), `expected the spawned process's comm to carry a space: ${comm}`);
+
+    const before = os.uptime() * 1000;
+    const starttimeMs = processStartUptimeMs(child.pid);
+    const after = os.uptime() * 1000;
+    assert.ok(Number.isFinite(starttimeMs), `expected a finite starttimeMs, got ${starttimeMs}`);
+    // A process spawned just now must have a starttime very close to (never far from) "now"'s own
+    // uptime reading -- a misaligned field would instead read some UNRELATED /proc/stat column
+    // (e.g. a flag or a fault count), producing a wildly wrong number far outside this window.
+    assert.ok(starttimeMs <= after + 1000, `starttimeMs (${starttimeMs}) must not be ahead of current uptime (${after})`);
+    assert.ok(starttimeMs >= before - 5000, `starttimeMs (${starttimeMs}) must be close to spawn time (${before}), not a misaligned field`);
+  } finally {
+    child.kill();
+  }
 });

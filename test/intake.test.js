@@ -1941,6 +1941,14 @@ test('amendCard: target repo has ONLY size: (the reverse direction) -- size: sur
   assert.ok(!logs.some((l) => l.includes(`size:${VALID_DRAFT.size}`)), 'the present size: label was announced as skipped');
 });
 
+// issue #218: AMEND_UNKNOWN_DRAFT differs from VALID_DRAFT (fileCard's own UNKNOWN-inventory test
+// below) in both fields, so the two exact log-line pins can never be satisfied by one shared
+// string. LABEL_ARGS_BY_FLAG carries only `command`/`verb`, so a swapped map entry is caught by
+// that wording, not by these label values (measured: with the shared draft, a swap still goes
+// red on the wording alone) -- the distinct draft is belt-and-braces, not what catches a swap.
+// Kept because it costs nothing and makes each pin's line unambiguous to a reader.
+const AMEND_UNKNOWN_DRAFT = { ...VALID_DRAFT, category: 'defect', size: 'L' };
+
 test('amendCard: label inventory read fails (non-zero exit) -- UNKNOWN inventory, BOTH labels ship unverified, announced with the amendCard/gh-issue-edit wording', () => {
   const spawnCalls = [];
   const logs = [];
@@ -1957,15 +1965,15 @@ test('amendCard: label inventory read fails (non-zero exit) -- UNKNOWN inventory
   };
   const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
 
-  const result = intake.amendCard(501, VALID_DRAFT, review, deps);
+  const result = intake.amendCard(501, AMEND_UNKNOWN_DRAFT, review, deps);
   assert.equal(result.ok, true);
 
   const editCall = spawnCalls.find((a) => a[0] === 'issue' && a[1] === 'edit');
-  assert.ok(editCall.includes(`cat:${VALID_DRAFT.category}`), 'UNKNOWN inventory must still pass the requested cat: label');
-  assert.ok(editCall.includes(`size:${VALID_DRAFT.size}`), 'UNKNOWN inventory must still pass the requested size: label');
+  assert.ok(editCall.includes(`cat:${AMEND_UNKNOWN_DRAFT.category}`), 'UNKNOWN inventory must still pass the requested cat: label');
+  assert.ok(editCall.includes(`size:${AMEND_UNKNOWN_DRAFT.size}`), 'UNKNOWN inventory must still pass the requested size: label');
   assert.deepEqual(logs, [
     'amendCard: label inventory for x/y could not be read -- amending with ' +
-      `cat:${VALID_DRAFT.category} and size:${VALID_DRAFT.size} unverified; \`gh issue edit\` may fail if x/y lacks them`,
+      `cat:${AMEND_UNKNOWN_DRAFT.category} and size:${AMEND_UNKNOWN_DRAFT.size} unverified; \`gh issue edit\` may fail if x/y lacks them`,
   ]);
 });
 
@@ -2122,6 +2130,37 @@ test('fileCard: full gh issue create argv is unchanged by the #198 extraction (e
     '--label',
     `size:${VALID_DRAFT.size}`,
   ]);
+});
+
+// ---- issue #218: resolveLabelArgs throws on an unrecognised flag instead of silently reusing
+// amendCard's `gh issue edit`/"amending" wording (Opus-verifier finding D5 on #198, the ternary
+// `flag === '--label' ? ... : ...` was not a total map over `flag`). resolveLabelArgs is exported
+// solely for this direct test: fileCard and amendCard each pass exactly one hardcoded, always-
+// recognised flag, so the unrecognised-flag branch is unreachable through either public caller.
+
+test('resolveLabelArgs: an unrecognised flag throws naming the flag and the known flags, before any gh spawn or deps.log call', () => {
+  const spawnCalls = [];
+  const logs = [];
+  const deps = {
+    ghRepo: 'x/y',
+    log: (msg) => logs.push(msg),
+    spawnSync: fakeSpawnSync((command, argv) => {
+      spawnCalls.push(argv);
+      return { status: 0, stdout: '[]', stderr: '', signal: null };
+    }),
+  };
+  const applied = { category: 'feature', size: 'S' };
+
+  assert.throws(
+    () => intake.resolveLabelArgs(applied, 'x/y', '--labels', 'someCaller', deps),
+    /resolveLabelArgs: unrecognised flag "--labels" -- known flags: --label, --add-label/
+  );
+  // An inherited Object.prototype key is not a known flag either (own-key lookup only).
+  for (const inherited of ['constructor', 'toString', '__proto__']) {
+    assert.throws(() => intake.resolveLabelArgs(applied, 'x/y', inherited, 'someCaller', deps), /unrecognised flag/);
+  }
+  assert.deepEqual(spawnCalls, [], 'an unrecognised flag must never reach a gh spawn (label list or otherwise)');
+  assert.deepEqual(logs, [], 'an unrecognised flag must never be announced via deps.log');
 });
 
 // ---- pullBoard: board:claim output parsing -----------------------------------------------------
@@ -3296,10 +3335,12 @@ test(
 
 // ---- spo ask --repo <owner/name> + board placement (action 184/185) --------------------------
 //
-// `--repo` is NOT a parseArgs flag (bin/spo:239-305 is above test/doc-constant-sweep.test.js's
-// line-pinned `bin/spo:1142`/`:1183` citations, and that test forbids inserting or deleting a
-// line there) -- cmdAsk pulls it back out of opts._ itself (bin/spo's own extractRepoFlag, right
-// above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
+// `--repo` is NOT a parseArgs flag (bin/spo:240-306 is above test/doc-constant-sweep.test.js's
+// line-pinned `bin/spo:1152`/`:1193` citations (re-pinned from :239-305/:1142/:1183 -- card #219,
+// a pure +1-line shift, then re-pinned again by that same card's own fix pass -- a further +7-line
+// shift when the injected-deps comment above `cmdStatus`'s `computeDispatcherStatus` call was
+// expanded), and that test forbids inserting or deleting a line there) -- cmdAsk pulls it back out
+// of opts._ itself (bin/spo's own extractRepoFlag, right above cmdAsk). These tests drive that through parseArgs + cmdAsk exactly like every other
 // cmdAsk test in this file, never reimplementing the extraction here.
 //
 // Board placement goes through `deps.projectBoard` -- the same injection convention as

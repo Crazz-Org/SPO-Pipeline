@@ -18,11 +18,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const accountsModule = require('../orchestrator/accounts');
-const { processAlive, pidExists } = require('../orchestrator/lock');
+const { processAlive, pidExists, processStartUptimeMs } = require('../orchestrator/lock');
 const { describeLiveWorkers } = require('../orchestrator/worker-status');
 const { HEARTBEAT_STALE_MS, heartbeatAgeMs: benchHeartbeatAgeMs } = require('../orchestrator/bench-heartbeat');
 const { summarizeUnparkScanTail } = require('../orchestrator/retry-channel');
 const { computeDispatcherStatus } = require('./dispatcher-status');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 
 const QUEUE_PREVIEW_LIMIT = 25;
 const VERDICTS_LIMIT = 5;
@@ -870,7 +871,7 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
   return services;
 }
 
-// applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs) -- action 6.7,
+// applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs, monotonicNowMsAtRead) -- action 6.7,
 // extended by card #186. Mutates `services.workers` in place with the SAME classification bin/spo's
 // cmdStatus renders per row (orchestrator/worker-status.js's describeLiveWorkers), filtered to
 // `isCardKind` tasks only -- the same filter collectDaemonStats already applies to its own `active`
@@ -894,7 +895,10 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
 // fresh `os.uptime() * 1000` read -- so every existing caller that predates this card (including
 // the fifth-argument-only ones above) still gets the real, current boot-relative reading rather
 // than `undefined` (which would silently skip computeDispatcherStatus's PREFERRED bound path for
-// every caller that has not been updated to inject it explicitly).
+// every caller that has not been updated to inject it explicitly). `monotonicNowMsAtRead` (action
+// 12.2, #219), the seventh argument, is the same story one card later: defaults to a fresh
+// `monotonicNowMs()` (orchestrator/monotonic-clock.js) so a caller that predates card #219 still
+// reaches the PREFERRED-MONOTONIC bound with a live reading.
 // collectDeck(journalRoot, journalTasks, now) -> the cards the flight deck renders, newest
 // activity first. One entry per `onDeck` card kind:'card' (a report/triage task is not a run
 // along the track and has no splits to draw), each carrying the run built in collectJournalTasks
@@ -952,7 +956,7 @@ function collectDeck(journalRoot, journalTasks, now = Date.now()) {
     .sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
 }
 
-function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs) {
+function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs, monotonicNowMsAtRead) {
   if (!journalRoot) return services;
   const kindById = new Map((journalTasks || []).map((t) => [t.id, t]));
   const worker = describeLiveWorkers(journalRoot, null, now);
@@ -1004,11 +1008,22 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
   } catch {
     /* config module unavailable in this test context -- no bound applies, same as a missing `now` */
   }
+  // `processStartUptimeMs`/`monotonicNowMsAtRead` (card #219) -- same injection posture as
+  // every other computeDispatcherStatus dependency here: `processStartUptimeMs`
+  // (orchestrator/lock.js, imported above alongside `pidExists`) is the production probe for
+  // residual 2 (in-boot pid reuse -- `pidExists` itself only answers plain liveness, not whether
+  // THIS pid is the one that wrote the event), and `monotonicNowMsAtRead` defaults to a fresh
+  // `monotonicNowMs()` read (orchestrator/monotonic-clock.js) exactly the way `hostUptimeNowMs`
+  // defaults to a fresh `os.uptime() * 1000` above -- so every existing caller that predates card
+  // #219 (every status-6.7 test with no seventh argument) still reaches the PREFERRED-MONOTONIC
+  // path with a live reading rather than `undefined`, which would silently skip it forever.
   const dispatcher = computeDispatcherStatus(events, {
     isAlive: pidExists,
     now,
     hostUptimeNowMs: Number.isFinite(hostUptimeNowMs) ? hostUptimeNowMs : os.uptime() * 1000,
     killGraceMs,
+    processStartUptimeMs,
+    monotonicNowMs: Number.isFinite(monotonicNowMsAtRead) ? monotonicNowMsAtRead : monotonicNowMs(),
   });
   if (dispatcher && dispatcher.status === 'stopped') {
     services.workers.status = 'stopped';
@@ -1468,6 +1483,9 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
   // `os.uptime()` snapshot for the whole collectAll call rather than a fresh read inside
   // applyWorkerStats, so a single dashboard render is internally consistent.
   const hostUptimeNowMs = os.uptime() * 1000;
+  // Card #219: same one-snapshot-per-call reasoning as `hostUptimeNowMs` immediately
+  // above, for the PREFERRED-MONOTONIC bound's own `monotonicNowMs` reading.
+  const monotonicNowMsAtRead = monotonicNowMs();
   // Card #186: the daemon-events tail is read ONCE here and handed to both consumers below --
   // applyWorkerStats (dispatcher liveness) and collectReportPipeline (24h counters plus dispatcher
   // history) -- rather than each calling readDaemonEventsTail(journalRoot) on its own, which would
@@ -1483,7 +1501,8 @@ function collectAll({ journalRoot, queueDir, accountsDir, benchRoot, spoReportsD
       journalTasks,
       now,
       daemonEvents,
-      hostUptimeNowMs
+      hostUptimeNowMs,
+      monotonicNowMsAtRead
     ),
     journalTasks,
     now

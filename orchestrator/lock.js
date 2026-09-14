@@ -97,6 +97,82 @@ function pidExists(pid) {
   }
 }
 
+// LINUX_CLK_TCK -- clock ticks per second for /proc/<pid>/stat's `starttime` field (below). Fixed
+// at 100 on every mainline Linux kernel since the 2.6 switch to a configuration-independent
+// USER_HZ for process-accounting fields specifically (unlike the scheduler's own internal HZ,
+// which does vary) -- measured on this host via `getconf CLK_TCK` = 100, card #219.
+// Hardcoded rather than shelling out to `getconf` on every call: a spawnSync per liveness probe
+// would be its own liveness-probe-shaped cost. Fix pass, card #219: a kernel where this assumption
+// is false is NOT merely "wrong but bounded" -- verification found the failure direction is unsafe.
+// A HIGHER real tick rate (e.g. some `alpha` kernels ran USER_HZ 1024) makes `starttimeTicks /
+// LINUX_CLK_TCK` read TOO HIGH (dividing by a smaller-than-real divisor), which reads as a pid that
+// started LATER than it really did -- for a genuinely live drainer, that can push its own computed
+// starttime PAST the drain-start event's `hostUptimeAtMs`, misreading a live process as reused and
+// answering 'stopped'/`pidReused: true` for a drain that is still running: exactly the
+// false-STOPPED-while-alive inversion card #164/#188 exist to prevent. `processStartUptimeMs`'s own
+// future-guard below (a computed starttime after "now" is impossible and is refused rather than
+// trusted) narrows this failure mode but does not close it (see accepted-gaps §11): unreachable at 100.
+const LINUX_CLK_TCK = 100;
+
+// FUTURE_START_SLACK_MS -- the future-guard's own tolerance (below): `os.uptime()` was measured at
+// 10ms granularity on this host, and `/proc/<pid>/stat`'s starttime ticks at 10ms resolution
+// (LINUX_CLK_TCK above) -- 1000ms is a generous multiple of both, the same margin
+// console/dispatcher-status.js's own `PID_REUSE_SLACK_MS`/`MONOTONIC_PLAUSIBILITY_TOLERANCE_MS`
+// use for the same reason, kept as its own constant here rather than imported: this module must
+// stay usable standalone, and the guard exists independently of anything that module does with the
+// result.
+const FUTURE_START_SLACK_MS = 1000;
+
+// processStartUptimeMs(pid) -- card #219 (residual 2, "in-boot pid reuse"): reads
+// `/proc/<pid>/stat` field 22 (`starttime`, clock ticks since boot) and converts it to
+// milliseconds on the SAME boot-relative clock `os.uptime() * 1000` (this repo's `hostUptimeAtMs`,
+// dispatcher.js's drain-start write) already uses -- the two are comparable for exactly the reason
+// console/dispatcher-status.js's own header gives for preferring `hostUptimeAtMs` over `ts` or
+// `monotonicNowMs()`: both are boot-relative and, unlike a monotonic-clock reading, meant to be
+// read by a DIFFERENT process than the one that started the pid in question.
+//
+// Linux-only by construction (`/proc` does not exist elsewhere) -- returns null on any other
+// platform, when the pid is already gone (ESRCH: the file never existed, or vanished between the
+// liveness check and this read), or when the line cannot be parsed, rather than throwing: a caller
+// bounding a drain must treat "cannot tell" the same whether the reason is "not Linux" or "pid
+// raced away underneath us".
+//
+// Field 22 is located by parsing AFTER the stat line's LAST `)`, never by a plain whitespace
+// split from the start of the line: field 2, `comm` (the executable's basename in parentheses,
+// truncated to 15 bytes by the kernel but not otherwise restricted), can itself contain spaces
+// and parentheses -- a process renamed via prctl(PR_SET_NAME) or a re-exec that rewrites argv[0]
+// can produce e.g. `(node (worker))` -- so splitting on whitespace before locating the closing
+// paren would silently misalign every fixed-position field that follows it, starttime included.
+// The kernel guarantees `)` cannot appear in any field AFTER comm, so the LAST `)` in the line is
+// always the true end of the comm field, however many parens comm itself contains.
+function processStartUptimeMs(pid) {
+  if (process.platform !== 'linux') return null;
+  let raw;
+  try {
+    raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch {
+    return null; // ENOENT (pid gone), EACCES, or any other read failure -- "cannot tell", not a throw
+  }
+  const closeParen = raw.lastIndexOf(')');
+  if (closeParen === -1) return null; // not the shape this parser understands -- refuse to guess
+  // Fields from `state` (the real field 3) onward, in order, split on the run of whitespace right
+  // after comm's closing paren. `state` is index 0 of this array, so field N (1-indexed) is at
+  // index (N - 3); field 22 (starttime) is therefore index 19.
+  const rest = raw.slice(closeParen + 1).trim().split(/\s+/);
+  const STARTTIME_INDEX = 19;
+  const starttimeTicks = Number(rest[STARTTIME_INDEX]);
+  if (!Number.isFinite(starttimeTicks)) return null;
+  const starttimeMs = (starttimeTicks / LINUX_CLK_TCK) * 1000;
+  // FUTURE-GUARD (fix pass, card #219): a process cannot legitimately start in the future. A wrong
+  // `LINUX_CLK_TCK` (this host's real USER_HZ differing from the hardcoded 100) is the one failure
+  // mode that would otherwise turn a LIVE pid into a false 'stopped'/`pidReused: true` verdict
+  // (see LINUX_CLK_TCK's own comment above) -- catching that here, once, means every caller's own
+  // slack-comparison logic never has to distrust this function's return value; it can trust `null`
+  // to mean "cannot tell"; a non-null number is at least not in the future (not proof of a sane tick rate).
+  if (starttimeMs > os.uptime() * 1000 + FUTURE_START_SLACK_MS) return null;
+  return starttimeMs;
+}
+
 // One exclusive-create attempt. Returns true when this process created the file.
 //
 // Was a bare `open(..., 'wx')`: atomic, but it creates an EMPTY file and the content lands in a
@@ -381,6 +457,7 @@ module.exports = {
   LockLostError,
   processAlive,
   pidExists,
+  processStartUptimeMs,
   watchLock,
   acquireShortLock,
   releaseShortLock,

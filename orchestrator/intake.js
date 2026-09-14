@@ -643,10 +643,13 @@ function parseIssueUrl(stdout) {
 // --add-label` exits non-zero on a label the target repo doesn't have exactly like `gh issue
 // create --label` does). `flag` and `callerName` are the only two axes this needs to vary on:
 // every other detail (a `gh issue create`-vs-`gh issue edit` mention, "filing"-vs-"amending" in
-// the unknown-inventory log line) is derived from `flag` alone, because `--label` and
-// `--add-label` are each used by exactly one gh subcommand in this file -- see the two call sites
-// below. Each requested label is checked against the inventory by an exact, case-sensitive match
-// on the literal name. Three outcomes, decided per label list read:
+// the unknown-inventory log line) is looked up from `flag` in the frozen LABEL_ARGS_BY_FLAG map
+// below -- looked up by OWN key only (`Object.hasOwn`), not the `flag === '--label' ? ... : ...` binary
+// else issue #218 found here (Opus-verifier finding D5 on #198): an unrecognised flag THROWS,
+// naming the flag and the known keys, before any gh spawn or inventory read, instead of silently
+// logging amendCard's wording (an inherited key such as `constructor` throws too). Each requested
+// label is checked against the inventory by an exact, case-sensitive match on the literal name.
+// Three outcomes, decided per label list read:
 //   - inventory read OK, label PRESENT -> ships, as `<flag> <label>`.
 //   - inventory read OK, label ABSENT  -> skipped; one `deps.log` line names the label and repo.
 //   - inventory UNKNOWN (a non-zero exit, unparseable stdout, or a non-array parse) -> BOTH
@@ -670,13 +673,25 @@ function parseIssueUrl(stdout) {
 // exactly like a non-zero exit, not thrown. Returns a flat argv array to splice into the caller's
 // own args, e.g. `['--label', 'cat:bug']`, `['--add-label', 'cat:bug', '--add-label', 'size:S']`,
 // or `[]`.
+const LABEL_ARGS_BY_FLAG = Object.freeze({
+  '--label': { command: 'gh issue create', verb: 'filing' },
+  '--add-label': { command: 'gh issue edit', verb: 'amending' },
+});
+
 function resolveLabelArgs(applied, ghRepo, flag, callerName, deps = {}) {
+  const flagInfo = Object.hasOwn(LABEL_ARGS_BY_FLAG, flag) ? LABEL_ARGS_BY_FLAG[flag] : null;
+  if (!flagInfo) {
+    throw new Error(
+      `resolveLabelArgs: unrecognised flag ${JSON.stringify(flag)} -- known flags: ` +
+        `${Object.keys(LABEL_ARGS_BY_FLAG).join(', ')}`
+    );
+  }
   const log = deps.log || console.log;
   const catLabel = `cat:${applied.category}`;
   const sizeLabel = `size:${applied.size}`;
   const requestedLabels = [catLabel, sizeLabel];
-  const ghCommandLabel = flag === '--label' ? 'gh issue create' : 'gh issue edit';
-  const actionVerb = flag === '--label' ? 'filing' : 'amending';
+  const ghCommandLabel = flagInfo.command;
+  const actionVerb = flagInfo.verb;
 
   const labelListResult = runSync(deps, 'gh', [
     'label',
@@ -1403,6 +1418,9 @@ module.exports = {
   fileCard,
   amendCard,
   fetchIssue,
+  // exported for issue #218's direct unit test of the unrecognised-flag throw (fileCard/amendCard
+  // only ever pass a known flag, so that path is unreachable through either public caller)
+  resolveLabelArgs,
   postIssueComment,
   triageBugReport,
   pullBoard,
