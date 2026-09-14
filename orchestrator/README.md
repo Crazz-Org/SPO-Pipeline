@@ -3325,3 +3325,19 @@ the `--real` daemon was running against it. The residual is the environment itse
 that builds its own `env:` object from scratch rather than from `isolatedEnv()` would still spawn
 an unguarded child — `test/spawn-isolation-sweep.test.js`, the isolation sweep over spawned-child
 call sites, is what now keeps that from happening unnoticed.
+
+**Dated documents pin `at: '<sha>'`, never `at: 'HEAD'`.** `test/doc-constant-sweep.test.js`'s
+pinned-citation checks (`BENCH_PINS`/`LIVE_RANGE_PINS`/`BLUNT_PINS`/`CCA_PINS`, in
+`test/citation-pins-data.js`, resolved by `test/citation-pins.js`'s `resolvePins`) freeze a
+citation's literal text either at a specific commit or at `HEAD`. A dated document — a file whose
+own basename embeds a `YYYY-MM-DD` date and whose prose is a point-in-time measurement narrative,
+not a living description of current code; today exactly `doc/bench-audit-2026-09-02.md`,
+`doc/bench-plan-derived-2026-09-02.md` and `doc/comment-corpus-audit-2026-09-03.md` — must pin
+every citation `at: '<sha>'`, frozen at the commit its own header names, never `at: 'HEAD'`: a sha
+pin is zero-maintenance forever (a git blob at a fixed commit cannot drift) and preserves exactly
+what the doc measured, where `HEAD` would silently start tracking whatever the code says today
+instead. Two citations are the deliberate, named exception, kept `at: 'HEAD'` because they are
+hand-maintained as true TODAY rather than dated record even though they are cited from inside a
+dated file: the `bin/spo` `collectAll` call site and `doc/state-machine-spec.md`'s FINISH row, each
+cited from both bench docs. Enforced by name, never by count, in
+`test/doc-constant-sweep.test.js`'s `DATED_DOC_HEAD_EXCEPTIONS`.

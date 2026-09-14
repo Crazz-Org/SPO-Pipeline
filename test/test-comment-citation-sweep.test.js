@@ -1,30 +1,60 @@
 'use strict';
-// test-comment-citation-sweep.test.js -- action 11.3, #190: `file:line` citations inside `test/`
-// comments decay silently as the cited files grow, and nothing catches it (measured on #187, then
-// on #190's own evidence: doc-constant-sweep.test.js's own header once cited a `doc/state-machine-
-// spec.md` row by line number to justify CITATION_RE's `bin/spo` alternative -- that citation has
-// since been DELETED from the file entirely, not re-pinned to a successor line (verified: no
-// citation to that spec row exists in doc-constant-sweep.test.js or doc/state-machine-spec.md
-// today) -- and two more `bin/spo` citations in test/intake.test.js, all found by a HUMAN
-// re-reading the comment, never by a test).
-// This is the guard #190 asks for: the SAME pinned-anchor mechanism 11.1 built for corpus-doc
-// citations (test/citation-pins.js's resolvePins), pointed at every `test/<name>.js` file's own
-// comments instead of at doc/orchestrator/bin/spo prose.
+// test-comment-citation-sweep.test.js -- registry-free rewrite (chantier "citation-pins
+// migration", action 2). Card #190 originally built this as a hand-maintained registry (219
+// exact-text pins + 67 allowlist entries, three separately hand-bumped counts) mirroring
+// test/citation-pins.js's resolvePins. An Opus research review (2026-09-14, maintainer-approved)
+// found that machinery disproportionate for the lowest-stakes citation class in the repo -- a
+// stale `file:line` in a `test/` comment costs a reader about a minute of confusion, nothing like
+// the safety-critical citations elsewhere -- and asked for a REGISTRY-FREE replacement: no stored
+// pin text, no `claim`, no hand-bumped counts.
+//
+// What ships is ONE check:
+//
+//   EXISTENCE -- does the cited file resolve (this repo, SPO-WebClient, or SPO-Deploy), and are
+//   the line numbers in bounds? Mirrors doc-constant-sweep.test.js's part 2 bounds check
+//   (`c.stop > lineCount`), simplified: no EXPECTED_CITATIONS ratchet, no cross-repo pin set, just
+//   "does this line exist".
 //
 // Extraction is shared with test/doc-constant-sweep.test.js, not reimplemented: CITATION_RE /
-// extractCitations / stripFences / normalizeWrap all live in test/citation-pins.js, action 11.3
-// moved them there for exactly this reuse -- fix pass 11.3 round 2 (#190 verifier finding B5) also
-// wired normalizeWrap into THIS file's own extraction (stripFences is still a no-op here, since
-// A test/<name>.js file is never markdown, but is applied anyway so "the SAME extraction functions" is
-// literally true, not merely extractCitations alone). The resolver (resolvePins) is the same one
-// 11.1/11.2 built and proved with a corpus-wide mutation plant.
+// extractCitations / stripFences / normalizeWrapWithMap / resolveCitationTarget all live in
+// test/citation-pins.js.
 //
-// blankComments below is an EIGHTH copy of the helper tracked by test/blank-comments-sync.test.js
-// (KEEP IN SYNC -- see that file's own header for why the duplication is deliberate and the drift
-// is not). This file's OWN source must never write a bare node-test glob in a comment, and must
-// never open an unterminated block-comment marker in a comment or string -- see
-// doc/accepted-gaps.md and this action's own report for the two real instances of that second
-// trap this action found and fixed elsewhere in the corpus.
+// ---- why there is no ANCHOR check: the measurement that removed it ----------------------------
+// The chantier's brief also asked for a second, looser check -- an "anchor": take the last
+// identifier-shaped token in the PROXIMITY_CHARS window of prose before a citation and require it
+// to appear somewhere in the cited range. That check WAS built, measured against the real corpus,
+// and then deliberately deleted rather than shipped. The measurement (2026-09-14, this action's
+// own report has the full table) is the reason, and it is recorded here so the idea is not
+// re-proposed from scratch by the next reader:
+//
+//   - Taking the brief literally (candidate filtered only by CLAIM_STOPWORDS + isVacuousClaim)
+//     produced 224 offenders out of 286 citations. `test/*.js` comments are free-form narrative
+//     prose, so "the nearest word before the citation" is overwhelmingly an ordinary English or
+//     capitalised-emphasis word (`HEAD`, `SAME`, `README`), not an identifier.
+//   - Adding a code-shape filter (candidate must contain `_`, a camelCase transition, or a
+//     letter/digit adjacency) cut that to 69 offenders -- but pushed `unanchorable` (no candidate
+//     at all, so no verification performed) from 48 to 161 of the 247 citations that reached the
+//     check. 65% of the corpus would have been waved through unchecked either way.
+//   - Of the 86 citations the check actually fired on, 69 FAILED and 17 passed. All 69 were then
+//     read by hand against the real target file: every single one was a correct citation whose
+//     nearest code-shaped token names the ENCLOSING function/declaration (mentioned once in the
+//     surrounding sentence) rather than text repeated on the cited line. ZERO genuine drifts.
+//     A gate with a 69-to-0 false-positive-to-true-positive ratio does not find drift; it trains
+//     its readers to allowlist, which is precisely how a real drift would get waved through.
+//   - The cost of shipping it was 60 hand-written allowlist entries (on top of the 30 EXISTENCE
+//     genuinely needs), each a prose paragraph to be maintained forever -- larger than the 67-entry
+//     allowlist of the registry this migration exists to retire, i.e. the same tax relocated.
+//   - The one principled narrowing available (fire only when the candidate appears ELSEWHERE in
+//     the cited file, so it is a plausible anchor rather than prose noise) was also measured: it
+//     cuts 69 firings to 32, and all 32 are still false positives, for the same structural reason.
+//     Fixing it properly needs a "declaration nearby" concept -- which is exactly
+//     doc-constant-sweep.test.js part 2.5's tuned candidate-ranking machinery, deliberately out of
+//     scope for this corpus and the very thing the migration was created to stop paying for.
+//
+// So: EXISTENCE is the whole check. It is cheap, it has no tuning knobs, its 30 allowlist entries
+// are all structural and stable (fabricated fixture paths, a deleted product file, genuinely
+// ambiguous bare basenames), and what it does NOT catch is stated plainly in
+// doc/accepted-gaps.md §10 rather than papered over with a heuristic that looks like coverage.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -32,10 +62,11 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { gitEnv } = require('./helpers');
-const { extractCitations, resolvePins, shiftedCitation, parseCitation, stripFences, normalizeWrap, normalizeWrapWithMap, isVacuousClaim } = require('./citation-pins');
+const {
+  extractCitations, resolveCitationTarget, stripFences, normalizeWrapWithMap,
+} = require('./citation-pins');
 
 const REPO_ROOT = path.join(__dirname, '..');
-const REGISTRY_PATH = path.join(__dirname, 'fixtures', 'test-comment-citation-pins.json');
 
 // KEEP IN SYNC -- see test/blank-comments-sync.test.js's own header. Byte-identical to the other
 // seven copies; this file is the eighth, registered in that file's EXPECTED_COPIES.
@@ -67,13 +98,9 @@ function commentsOnly(source) {
 // helper modules that sit directly in test/, e.g. helpers.js, citation-pins.js,
 // citation-pins-data.js) plus every `test/fixtures/<dir>/<name>.js` file, via `git ls-files` so this never
 // depends on directory-walk ordering or misses a file `.gitignore` would hide from a naive scan.
-// corpusFiles() -- D1 (fix pass 11.3, #190 verifier finding): a bare \`git ls-files\` lists only
-// TRACKED files, so this sweep's own new files (untracked until the driver commits them) were
-// invisible to their own completeness check -- the sweep would go GREEN before a commit and RED
-// the moment \`git add\` tracked them, since the corpus it walked silently grew. \`--others
-// --exclude-standard\` adds every untracked-but-not-gitignored file to the walk, so a fresh
-// \`test/<new-sweep>.test.js\` is covered from the moment it is written, not from the moment it is
-// committed.
+// `--others --exclude-standard` adds every untracked-but-not-gitignored file too, so a fresh
+// `test/<new-sweep>.test.js` is covered from the moment it is written, not from the moment it is
+// committed (D1, fix pass 11.3, #190 verifier finding).
 function corpusFiles() {
   return execFileSync('git', ['-C', REPO_ROOT, 'ls-files', '--cached', '--others', '--exclude-standard', 'test'], { encoding: 'utf8', env: gitEnv() })
     .split('\n')
@@ -81,94 +108,15 @@ function corpusFiles() {
     .filter((f) => f.endsWith('.js'));
 }
 
-// extractFileCitations(rel) -- every citation this sweep cares about in one file's own comments,
-// in document order, WITH an occurrence index per distinct `${rel} :: ${raw}` pair (several real
-// comments cite the identical fact more than once in the same file -- test/doc-constant-sweep.test.js
-// has several such repeats -- and each occurrence needs its own registry entry, keyed by
-// citing file + citation text + occurrence index, so a repeating fixture value can never hide
-// which specific mention is being checked; test/park-reason-doc-sweep.test.js's own "a repeating
-// fixture hides which value is keyed" trap).
-function extractFileCitations(rel) {
-  const source = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
-  const cText = commentsOnly(source);
-  const fenceStripped = stripFences(cText); // no-op for a test source file (never markdown), applied anyway
-  // so "the SAME extraction functions doc-constant-sweep uses" is literally true, not merely
-  // extractCitations alone (fix pass 11.3 round 2, #190 verifier finding B5).
-  const { text: normalized, map } = normalizeWrapWithMap(fenceStripped);
-  const cites = extractCitations(normalized).filter((c) => !c.unanchored);
-  const seen = new Map();
-  return cites.map((c) => {
-    const key = `${rel} :: ${c.raw}`;
-    const occurrence = seen.get(key) || 0;
-    seen.set(key, occurrence + 1);
-    const origIdx = map[c.idx] !== undefined ? map[c.idx] : c.idx;
-    const citingLine = fenceStripped.slice(0, origIdx).split('\n').length;
-    return { citingFile: rel, citation: c.raw, occurrence, citingLine };
-  });
-}
-
-// commentLinesOf(rel) -- the SAME commentsOnly text, split into lines, cached -- used by the
-// claim-proximity check below to look at the ±3 lines around a citation without re-reading and
-// re-blanking the file for every pin.
-const _commentLineCache = new Map();
-function commentLinesOf(rel) {
-  if (!_commentLineCache.has(rel)) {
-    _commentLineCache.set(rel, commentsOnly(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')).split('\n'));
-  }
-  return _commentLineCache.get(rel);
-}
-
-function allCorpusCitations() {
-  const out = [];
-  for (const rel of corpusFiles()) out.push(...extractFileCitations(rel));
-  return out;
-}
-
-function regKey(c) {
-  return `${c.citingFile} :: ${c.citation} #${c.occurrence}`;
-}
-
-// ---- the registry ------------------------------------------------------------------------------
-const registry = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
-const REGISTRY_PINS = registry.pins; // [{ citingFile, citation, occurrence, at, first, last?, path? }]
-const REGISTRY_ALLOWLIST = registry.allowlist; // { "<file> :: <citation> #<n>": "<reason>" }
-
-function pinRegKey(p) {
-  return `${p.citingFile} :: ${p.citation} #${p.occurrence}`;
-}
-
-// ALLOWLIST_CATEGORIES -- fix pass 11.3 (#190 verifier finding D4): a closed set, so a new
-// allowlist entry cannot invent its own excuse. Every entry in the registry's `allowlist` map is
-// now `{ category, reason }`, never a bare reason string.
-const ALLOWLIST_CATEGORIES = new Set([
-  'illustrative',
-  'quoted-as-wrong',
-  'hypothetical-example',
-  'wrong-when-written',
-  'deleted-file',
-  'extraction-gap',
-  'no-claim-in-prose',
-  'ambiguous-bare-path',
-]);
-
-// D6 (fix pass 11.3, #190 verifier finding): a stray slash-star inside a STRING or a code line
-// (never inside a whole-line // comment, which blankComments already blanks first) opens a
-// phantom block-comment span that runs to the next unrelated '*/' anywhere later in the file --
-// this action found and fixed two live instances (an assert message in doc-constant-sweep.test.js,
-// a criterion fixture string in protected-files-guard.test.js) that each blanked hundreds of real
-// lines from this sweep's own extraction. Re-measured corpus-wide so a THIRD instance cannot land
-// silently: no scanned file may open a block span longer than a small, named tolerance (a real
-// '/** ... */' JSDoc comment, or the short fixture strings gh-api-argv.test.js/
-// park-reason-doc-sweep.test.js deliberately carry to test this exact trap on ANOTHER file, are
-// the only shapes that legitimately exist here today). Fix pass 11.3 round 3 (#190 verifier
-// finding 5): the corpus's largest real span today is 6 lines, so a per-file KNOWN_SHORT_PHANTOM_SPANS
-// exception list (an earlier draft carried 20 entries here) is never actually consulted at
-// tolerance 8 -- removed rather than kept as dead weight; if a future short, legitimate block span
-// ever needs an exception, raise PHANTOM_SPAN_TOLERANCE_LINES with a comment naming which file, not
-// a silently-unreachable allowlist.
+// D6 (fix pass 11.3, #190 verifier finding), unchanged from the registry-based version: a stray
+// slash-star inside a STRING or a code line (never inside a whole-line // comment, which
+// blankComments already blanks first) opens a phantom block-comment span that runs to the next
+// unrelated '*/' anywhere later in the file. Corpus-wide, no scanned file may open a block span
+// longer than a small, named tolerance -- see doc/accepted-gaps.md §10 for the live instances
+// this action's predecessor found and fixed.
 const PHANTOM_SPAN_TOLERANCE_LINES = 8;
 
-test('no scanned test source file opens a phantom block-comment span longer than the known, named tolerance -- the slash-star-in-a-string trap this action found twice', () => {
+test('no scanned test source file opens a phantom block-comment span longer than the known, named tolerance -- the slash-star-in-a-string trap this corpus has hit before', () => {
   const BLOCK_RE = /\/\*[\s\S]*?\*\//g;
   const offenders = [];
   for (const rel of corpusFiles()) {
@@ -187,569 +135,226 @@ test('no scanned test source file opens a phantom block-comment span longer than
   assert.deepEqual(offenders, [], `phantom block-comment span(s) found:\n  ${offenders.join('\n  ')}`);
 });
 
-// ---- checking functions (fix pass 11.3 round 2, #190 verifier finding A2) --------------------
-// Extracted to module scope, named, and exported so the hermetic mutation tests further below can
-// call the REAL production checks against a synthetic bad fixture -- proving each check actually
-// fires, not merely that today's real registry happens to have zero violations (Set-semantics
-// reimplemented in a fixture test would prove nothing about whether the SWEEP's own code path is
-// wired up).
+// ---- extraction --------------------------------------------------------------------------------
 
-// A pin is either a CLAIM pin (`claim` a non-empty string, no `claimless`) or a CLAIMLESS pin
-// (`claimless: true`, no `claim`, `category: 'no-claim-in-prose'`, and a `reason` -- fix pass
-// 11.3 round 3, #190 verifier finding 1, driver decision). Exactly one of the two shapes, never
-// both, never neither.
-function checkDuplicatesClaimsAndCategories(pins, allowlist, allowlistCategories) {
+// extractFileCitations(rel) -- every citation this sweep cares about in one file's own comments,
+// in document order.
+function extractFileCitations(rel) {
+  const source = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+  const cText = commentsOnly(source);
+  const fenceStripped = stripFences(cText); // no-op for a test source file (never markdown), applied anyway
+  // so "the SAME extraction functions doc-constant-sweep uses" is literally true, not merely
+  // extractCitations alone (fix pass 11.3 round 2, #190 verifier finding B5).
+  const { text: normalized } = normalizeWrapWithMap(fenceStripped);
+  const all = extractCitations(normalized);
+  const live = all.filter((c) => !c.unanchored);
+  return { rel, live };
+}
+
+function citationKey(rel, raw) {
+  return `${rel} :: ${raw}`;
+}
+
+// describeResolutionFailure(resolved) -- resolveCitationTarget's own four dangling shapes, turned
+// into a human-facing reason. Never a silent pass (E1 posture, same as doc-constant-sweep.test.js's
+// own use of this resolver): an absent sibling repo is reported distinctly from a genuinely
+// dangling citation, so the two are never confused with each other.
+function describeResolutionFailure(resolved) {
+  if (resolved.ambiguous) return `ambiguous basename in the ${resolved.root} repo: ${resolved.ambiguous.join(', ')}`;
+  if (resolved.root === 'product-absent') return 'cannot verify -- the product repo (SPO-WebClient) is not on disk';
+  if (resolved.root === 'deploy-absent') return 'cannot verify -- the deploy repo (SPO-Deploy) is not on disk';
+  return 'does not resolve in any known repo (this one, SPO-WebClient, or SPO-Deploy)';
+}
+
+// readLines(target) -- text.split('\n') with exactly one trailing-empty-element pop, matching
+// citation-pins.js's resolvePins byte-for-byte (D8a, fix pass 11.1): a file ending in a real
+// newline (almost every one) produces one phantom empty element after the last line, which would
+// otherwise inflate lineCount by one and let a citation one line past EOF read as in-bounds.
+function readLines(target) {
+  const text = fs.readFileSync(target, 'utf8');
+  const lines = text.split('\n');
+  if (text.endsWith('\n') && lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+// ---- the check, run once over the whole corpus -------------------------------------------------
+//
+// checkCorpus(allowlist) -> { total, offenders, allowlisted } -- every offender/allowlisted entry
+// is `{ key, detail }`.
+function checkCorpus(allowlist) {
+  let total = 0;
   const offenders = [];
-  const seen = new Set();
-  for (const p of pins) {
-    const k = pinRegKey(p);
-    if (seen.has(k)) offenders.push(`duplicate registry pin entry: ${k}`);
-    seen.add(k);
-    if (p.claimless) {
-      if (p.claim !== undefined) {
-        offenders.push(`pin ${k} is claimless but also carries a \`claim\` -- a pin is either a claim pin or a claimless pin, never both.`);
+  const allowlisted = [];
+
+  for (const rel of corpusFiles()) {
+    const { live } = extractFileCitations(rel);
+    for (const c of live) {
+      total += 1;
+      const key = citationKey(rel, c.raw);
+
+      const resolved = resolveCitationTarget(c.file);
+      const dangling = resolved.root === null || resolved.root === 'product-absent' || resolved.root === 'deploy-absent' || Boolean(resolved.ambiguous);
+      let detail = null;
+      if (dangling) {
+        detail = describeResolutionFailure(resolved);
+      } else {
+        const lineCount = readLines(resolved.target).length;
+        if (c.start < 1 || c.start > lineCount || c.stop < 1 || c.stop > lineCount) {
+          detail = `out of bounds -- ${c.file} has ${lineCount} line(s), citation targets ${c.start}${c.stop !== c.start ? `-${c.stop}` : ''}`;
+        }
       }
-      if (p.category !== 'no-claim-in-prose') {
-        offenders.push(`claimless pin ${k} has category "${p.category}" -- a claimless pin's category must be "no-claim-in-prose" (that IS what claimless means).`);
-      }
-      if (!(typeof p.reason === 'string' && p.reason.trim().length > 0)) {
-        offenders.push(`claimless pin ${k} carries no \`reason\``);
-      }
-    } else if (!(typeof p.claim === 'string' && p.claim.length > 0)) {
-      offenders.push(`pin ${k} carries no \`claim\` and is not marked \`claimless\` -- every pin in THIS registry must be one shape or the other (fix pass 11.3, #190 verifier finding D2/D3): the pin must tie back to what the citing comment actually says, not merely to whatever text sits at the cited number.`);
+      if (!detail) continue;
+
+      const bucket = Object.prototype.hasOwnProperty.call(allowlist, key) ? allowlisted : offenders;
+      bucket.push({ key, detail: `${key} -- ${detail}` });
     }
   }
-  for (const [k, entry] of Object.entries(allowlist)) {
-    if (seen.has(k)) offenders.push(`registry key ${k} is both a pin and an allowlist entry`);
-    seen.add(k);
-    if (!(entry && typeof entry === 'object')) {
-      offenders.push(`allowlist entry ${k} is not a { category, reason } object`);
-      continue;
-    }
-    if (!allowlistCategories.has(entry.category)) {
-      offenders.push(`allowlist entry ${k} has unknown category "${entry.category}" -- must be one of: ${[...allowlistCategories].join(', ')}`);
-    }
-    if (!(typeof entry.reason === 'string' && entry.reason.trim().length > 0)) {
-      offenders.push(`allowlist entry ${k} has no reason`);
-    }
-  }
-  return offenders;
+
+  return { total, offenders, allowlisted };
 }
 
-// checkClaimlessReasonsQuoteFirst(pins) -- fix pass 11.3 round 3 (#190 verifier finding 1): a
-// claimless pin's `reason` must quote its OWN `first` line's exact (trimmed) text in backticks --
-// this forces the text to have actually been read (not just copy-pasted from elsewhere), the same
-// spirit as the claim-proximity tie for claim pins, applied to a pin that has no claim to tie.
-function checkClaimlessReasonsQuoteFirst(pins) {
+// ---- the allowlist -----------------------------------------------------------------------------
+//
+// Keyed `${citingFile} :: ${raw citation text}` -- no `#<occurrence>` suffix: every citation text
+// that repeats within one file in this corpus needed the SAME treatment both times it was checked
+// by hand, so the extra disambiguation the old registry carried was never load-bearing here.
+//
+// Exactly 30 entries, every one a STRUCTURAL non-resolution rather than a judgement call: a
+// fabricated path planted as a fixture, a product file that was deleted, a bare basename this repo
+// now has several of, or a dated quote of a value that was already out of bounds when it was
+// written. None of them can be "fixed" by editing the citing comment, and none of them needs
+// periodic re-reading -- which is what distinguishes this list from the 60 further entries the
+// (deleted) anchor heuristic would have demanded. Categories are doc-constant-sweep.test.js's own
+// vocabulary, restricted to the five an existence-only check can actually produce.
+const ALLOWLIST_CATEGORIES = new Set([
+  'illustrative',
+  'quoted-as-wrong',
+  'hypothetical-example',
+  'deleted-file',
+  'ambiguous-bare-path',
+]);
+
+const CITATION_ALLOWLIST = {
+  // ---- deleted-file: the cited product file no longer exists (frozen historical citation) ------
+  'test/citation-pins-data.js :: sanctuarize.test.ts:151-156': { category: 'deleted-file', reason: 'sanctuarize.test.ts was deleted from SPO-WebClient; this frozen citation is CITATION_ALLOWLIST-only in doc-constant-sweep.test.js itself for the identical reason' },
+  'test/doc-constant-sweep.test.js :: sanctuarize.test.ts:151-156': { category: 'deleted-file', reason: 'same deleted product file as citation-pins-data.js\'s identical mention -- sanctuarize.test.ts no longer exists in SPO-WebClient' },
+
+  // ---- ambiguous-bare-path: this repo now has FOUR README.md files (root, orchestrator/,
+  // prompts/, and test/fixtures/plan-span-corpus/ -- the last one did not exist when the old
+  // registry's `path` field disambiguated these citations), and the product repo has two paths.ts.
+  // resolveCitationTarget correctly reports the bare basename as ambiguous; the registry-free
+  // design has no `path`-style disambiguator, so these stay allowlisted rather than silently
+  // picking one candidate.
+  'test/citation-pins-data.js :: README.md:34': { category: 'ambiguous-bare-path', reason: 'JSDoc prose illustrating the `path` disambiguation feature using this exact bare citation as its own worked example; root README.md:34 is the real target but the bare basename is ambiguous among 4 README.md files today' },
+  'test/citation-pins-data.js :: README.md:35': { category: 'ambiguous-bare-path', reason: 'same worked example as :34, one line further into the same illustrative block' },
+  'test/citation-pins-data.js :: README.md:37': { category: 'ambiguous-bare-path', reason: 'same worked example as :34/:35, completing the illustrative block' },
+  'test/citation-pins.js :: README.md:34': { category: 'ambiguous-bare-path', reason: 'JSDoc prose illustrating why `path` exists ("e.g. `README.md:34`"), using the same real-but-ambiguous bare citation as the worked example' },
+  'test/citation-pins.js :: README.md:37': { category: 'ambiguous-bare-path', reason: 'JSDoc prose illustrating a re-pin scenario ("`README.md:37` -> `:38`"), same ambiguous bare basename' },
+  'test/citation-pins.js :: README.md:38': { category: 'ambiguous-bare-path', reason: 'the re-pin target named in the same sentence as :37 above, same ambiguous bare basename' },
+  'test/doc-constant-sweep.test.js :: README.md:34': { category: 'ambiguous-bare-path', reason: 'header prose describing a real, dated fix to root README.md:34\'s own content; the bare citation is ambiguous among this repo\'s 4 README.md files, same as citation-pins.js/citation-pins-data.js\'s identical mentions' },
+  'test/doc-constant-sweep.test.js :: README.md:35': { category: 'ambiguous-bare-path', reason: 'header prose listing CCA_PINS\'s own coverage ("README.md:34/:35/:37"); same ambiguous bare basename as the :34/:37 entries beside it' },
+  'test/doc-constant-sweep.test.js :: README.md:37': { category: 'ambiguous-bare-path', reason: 'the third citation in the same CCA_PINS coverage list as :34/:35 beside it, same ambiguous bare basename' },
+  'test/doc-constant-sweep.test.js :: paths.ts:52': { category: 'ambiguous-bare-path', reason: 'header prose narrating a historical drift ("paths.ts:52 drifted to a real line 77 unnoticed"); the product repo has two paths.ts files (src/e2e/bench/paths.ts and src/server/paths.ts), so the bare basename is genuinely ambiguous today, independent of the dated drift itself' },
+
+  // ---- illustrative: JSDoc/comment prose quoting a citation-shaped example to describe a
+  // mechanism (a format template, a wrap-join example, a regression-test shape), never asserting a
+  // live fact about the named file. None of these paths resolves anywhere, by construction.
+  'test/citation-pins.js :: relative/path/to/file.ts:123': { category: 'illustrative', reason: 'JSDoc example of a fenced-code-block format TEMPLATE ("File: relative/path/to/file.ts:123"), the same illustrative text doc-constant-sweep.test.js\'s own CITATION_ALLOWLIST already excuses; no such path exists' },
+  'test/doc-constant-sweep.test.js :: relative/path/to/file.ts:123': { category: 'illustrative', reason: 'same fenced-code-block format-template illustrative example as citation-pins.js\'s identical mention; no such path exists' },
+  'test/citation-pins.js :: foo.js:10': { category: 'illustrative', reason: 'JSDoc example illustrating a degenerate range shape ("a degenerate foo.js:10-10 range"); no foo.js exists in any known repo' },
+  'test/citation-pins.js :: spec.md:49': { category: 'illustrative', reason: 'JSDoc example illustrating the hyphen-wrap join ("doc/state-machine- + spec.md:49") and the chain-match-inside-a-full-match exclusion rule; no bare "spec.md" exists' },
+  'test/doc-constant-sweep.test.js :: spec.md:49': { category: 'illustrative', reason: 'same wrap-join illustrative example as citation-pins.js\'s identical mention, reused in a hermetic fixture string and its own describing comment; no bare "spec.md" exists' },
+  'test/protected-files-guard.test.js :: .claude/settings.json:109-127': { category: 'illustrative', reason: 'test title/comment explicitly says this is "the real shapes from journal/issue-418 and journal/issue-429" reproduced for a regression test -- a frozen shape example, not an assertion about the current settings.json, which is 120 lines long and so genuinely does not have a line 127' },
+
+  // ---- hypothetical-example: fabricated citations planted for a hermetic mutation/fixture test;
+  // the named file/range is never meant to exist or resolve.
+  'test/doc-constant-sweep.test.js :: foo.js:10': { category: 'hypothetical-example', reason: 'chain-continuation shape example in prose ("foo.js:10, `:20`") describing CHAIN_RE, not a real citation' },
+  'test/doc-constant-sweep.test.js :: foo.js:20': { category: 'hypothetical-example', reason: 'the chain-continuation target in the same illustrative example as foo.js:10 beside it' },
+  'test/doc-constant-sweep.test.js :: orchestrator/journal.js:999999': { category: 'hypothetical-example', reason: 'a deliberately-planted fabricated OUT-OF-BOUNDS citation (journal.js is 462 lines) used by a hermetic isCitationAllowlisted mutation test, never a real citation' },
+  'test/doc-constant-sweep.test.js :: alpha.js:1': { category: 'hypothetical-example', reason: 'fabricated fixture text (`\'alpha.js:1 nearIdentOne beta.js:2 farIdentTwo\'`) for a hermetic candidate-window clip test, not a real citation' },
+  'test/doc-constant-sweep.test.js :: beta.js:2': { category: 'hypothetical-example', reason: 'the clip-boundary fixture citation in the same hermetic test as alpha.js:1 beside it' },
+  'test/doc-constant-sweep.test.js :: gamma.js:2': { category: 'hypothetical-example', reason: 'fabricated fixture text for the companion "same file, no clip" hermetic test beside the alpha/beta one' },
+  'test/plan-writes.test.js :: foo.js:2-6': { category: 'hypothetical-example', reason: 'comment describing this file\'s own fabricated `foo.js` invariant-span fixtures (foo.js does not exist); used to test PLAN\'s invariant-overlap detection, never a real citation' },
+  'test/plan-writes.test.js :: foo.js:1-3': { category: 'hypothetical-example', reason: 'same fabricated foo.js fixture family as foo.js:2-6 beside it, the INV-1 baseline span these comments describe' },
+  'test/real-steps.test.js :: foo.js:2-6': { category: 'hypothetical-example', reason: 'same fabricated foo.js fixture family as test/plan-writes.test.js\'s identical mentions, reused in this file\'s own real-agent variant of the same scenario' },
+  'test/real-steps.test.js :: foo.js:1-3': { category: 'hypothetical-example', reason: 'same fabricated foo.js fixture family as test/plan-writes.test.js\'s identical mentions' },
+
+  // ---- quoted-as-wrong: dated historical narration quoting a bare form that was ALREADY out of
+  // bounds when it was written -- never meant to resolve today.
+  'test/citation-pins-data.js :: .claude/settings.json:109-127': { category: 'quoted-as-wrong', reason: 'header prose narrating fix pass D2/R1\'s own dated diagnosis history of this exact bare form ("fix pass D2 first found this UNPINNABLE... that was the wrong diagnosis"); THIS repo\'s .claude/settings.json is 120 lines, so the bare form is out of bounds here -- the live, correct citation is the SPO-WebClient/-prefixed form pinned in this file\'s own registry' },
+  'test/doc-constant-sweep.test.js :: .claude/settings.json:109-127': { category: 'quoted-as-wrong', reason: 'header prose narrating the identical dated diagnosis history as citation-pins-data.js\'s own mention ("the first completeness check (D2) could not pin ... wrongly diagnosed as unpinnable"); same out-of-bounds bare form against this repo\'s 120-line settings.json' },
+};
+
+for (const [key, entry] of Object.entries(CITATION_ALLOWLIST)) {
+  if (!ALLOWLIST_CATEGORIES.has(entry.category)) {
+    throw new Error(`test-comment-citation-sweep.test.js: CITATION_ALLOWLIST entry ${key} has unknown category "${entry.category}"`);
+  }
+  if (!(typeof entry.reason === 'string' && entry.reason.trim().length > 0)) {
+    throw new Error(`test-comment-citation-sweep.test.js: CITATION_ALLOWLIST entry ${key} has no reason`);
+  }
+}
+
+// ---- the sweep itself --------------------------------------------------------------------------
+
+test('CITATION_ALLOWLIST holds only known categories and non-empty reasons (mechanical, re-asserted so a fixture mutation is caught by node --test, not merely by the module-load throw above)', () => {
   const offenders = [];
-  for (const p of pins) {
-    if (!p.claimless) continue;
-    const quoted = '`' + p.first.trim() + '`';
-    if (!p.reason.includes(quoted)) {
-      offenders.push(`${pinRegKey(p)} -- reason does not quote the edge line's exact text ${quoted}`);
-    }
+  for (const [key, entry] of Object.entries(CITATION_ALLOWLIST)) {
+    if (!ALLOWLIST_CATEGORIES.has(entry.category)) offenders.push(`${key} -- unknown category "${entry.category}"`);
+    if (!(typeof entry.reason === 'string' && entry.reason.trim().length > 0)) offenders.push(`${key} -- no reason`);
   }
-  return offenders;
-}
-
-function checkNoDuplicateReasons(allowlist) {
-  const byReason = new Map(); // reason -> Set(citation text)
-  for (const k of Object.keys(allowlist)) {
-    const reason = allowlist[k].reason;
-    const citation = k.split(' :: ')[1].replace(/ #\d+$/, '');
-    if (!byReason.has(reason)) byReason.set(reason, new Set());
-    byReason.get(reason).add(citation);
-  }
-  return [...byReason.entries()]
-    .filter(([, citations]) => citations.size > 1)
-    .map(([reason, citations]) => `"${reason.slice(0, 60)}..." shared by: ${[...citations].join(', ')}`);
-}
-
-// checkClaimProximity(pins, deps) -- `deps.getCommentLines`/`deps.getFileCitations` default to the
-// real corpus readers (commentLinesOf/extractFileCitations) but are injectable so a hermetic
-// fixture test can feed synthetic file content without touching disk (A2(ii)).
-function checkClaimProximity(pins, deps = {}) {
-  const getCommentLines = deps.getCommentLines || commentLinesOf;
-  const getFileCitations = deps.getFileCitations || extractFileCitations;
-  const offenders = [];
-  for (const p of pins) {
-    if (p.claimless) continue; // no claim to tie to the prose -- checkClaimlessReasonsQuoteFirst covers it instead
-    const lines = getCommentLines(p.citingFile);
-    // p.citingLine is not stored in the registry itself (it is re-derived, the same way the
-    // COMPLETENESS check re-derives it) -- look the pin up by its own (citingFile, citation,
-    // occurrence) key against a fresh extraction, so this can never drift from what
-    // COMPLETENESS itself considers the citing line to be.
-    const liveHere = getFileCitations(p.citingFile).find((c) => c.citation === p.citation && c.occurrence === p.occurrence);
-    if (!liveHere) continue; // COMPLETENESS already reports a dead entry for this case
-    const winFrom = Math.max(0, liveHere.citingLine - 4);
-    const winTo = Math.min(lines.length, liveHere.citingLine + 3);
-    const window = lines.slice(winFrom, winTo).join('\n');
-    if (!window.includes(p.claim)) {
-      offenders.push(`${pinRegKey(p)} -- claim "${p.claim}" not found within +/-3 lines of citing line ${liveHere.citingLine} in ${p.citingFile}`);
-    }
-  }
-  return offenders;
-}
-
-test('the registry (test/fixtures/test-comment-citation-pins.json) has no duplicate entries, every pin carries a claim, and every allowlist entry has a known category and a non-empty reason', () => {
-  const offenders = checkDuplicatesClaimsAndCategories(REGISTRY_PINS, REGISTRY_ALLOWLIST, ALLOWLIST_CATEGORIES);
-  assert.deepEqual(offenders, [], `registry shape violation(s):\n  ${offenders.join('\n  ')}`);
+  assert.deepEqual(offenders, [], `CITATION_ALLOWLIST shape violation(s):\n  ${offenders.join('\n  ')}`);
 });
 
-test('no two allowlist entries share an identical reason string unless their citation text is identical', () => {
-  const offenders = checkNoDuplicateReasons(REGISTRY_ALLOWLIST);
+// A JS object literal silently keeps only the LAST of two entries sharing a key, so a duplicated
+// allowlist key is a silently-dropped exemption, not a syntax error. The registry-free rewrite
+// shipped with exactly that defect on its first draft (91 entries written, 90 effective -- one
+// `dispatcher.js:635-648` key written twice), which is why this is asserted against the SOURCE
+// text rather than against Object.keys, whose duplicates are already gone by the time it runs.
+test('CITATION_ALLOWLIST has no duplicate keys -- a repeated key is silently swallowed by the object literal', () => {
+  const src = fs.readFileSync(__filename, 'utf8');
+  const body = src.slice(src.indexOf('const CITATION_ALLOWLIST = {'));
+  const seen = new Map();
+  const dupes = [];
+  const KEY_RE = /^ {2}'((?:[^'\\]|\\.)*)':\s*\{ category:/gm;
+  let m;
+  while ((m = KEY_RE.exec(body))) {
+    const key = m[1].replace(/\\'/g, "'");
+    if (seen.has(key)) dupes.push(key);
+    seen.set(key, true);
+  }
+  assert.ok(seen.size > 0, 'the duplicate-key scan matched no entries at all -- its KEY_RE no longer matches this file\'s own formatting');
+  assert.deepEqual(dupes, [], `duplicate CITATION_ALLOWLIST key(s) -- the later entry silently shadows the earlier one:\n  ${dupes.join('\n  ')}`);
+  assert.equal(seen.size, Object.keys(CITATION_ALLOWLIST).length, 'source-text key count and object key count disagree');
+});
+
+test('EXISTENCE: every file:line citation in the test/ corpus resolves to a real file (this repo, SPO-WebClient, or SPO-Deploy) with in-bounds line numbers, or is on CITATION_ALLOWLIST', () => {
+  const { offenders } = checkCorpus(CITATION_ALLOWLIST);
+  const messages = offenders.map((o) => o.detail);
   assert.deepEqual(
-    offenders,
+    messages,
     [],
-    'two allowlist entries with DIFFERENT citation text share the identical reason string -- a copy-pasted reason that does not actually name what is specific about each fact is a bulk allowlist in disguise.'
+    `citation(s) that do not exist -- the cited file is unresolvable/absent, or the line number is out of bounds. Fix the ` +
+      `citation if it drifted, or add a CITATION_ALLOWLIST entry with a genuine reason if it is structurally ` +
+      `unresolvable:\n  ${messages.join('\n  ')}`
   );
 });
 
-test('every pin\'s claim occurs verbatim in its OWN citing comment text within +/-3 lines of the citation -- that is what ties the pin to the prose, not merely to the cited file', () => {
-  const offenders = checkClaimProximity(REGISTRY_PINS);
-  assert.deepEqual(offenders, [], `pin(s) whose claim is not actually near the citation it is supposed to justify:\n  ${offenders.join('\n  ')}`);
-});
-
-test('every claimless pin\'s reason quotes its own edge line\'s exact text in backticks', () => {
-  const offenders = checkClaimlessReasonsQuoteFirst(REGISTRY_PINS);
-  assert.deepEqual(offenders, [], `claimless pin(s) whose reason does not quote the edge text:\n  ${offenders.join('\n  ')}`);
-});
-
-test('COMPLETENESS: every file-tied comment citation in the test/ corpus (flat test-file modules plus every fixtures subdirectory file) has exactly one registry entry (a pin or a named allowlist reason) -- no more, no fewer, none dead', () => {
-  const live = allCorpusCitations();
-  const liveKeys = new Set(live.map(regKey));
-
-  const registryKeys = new Set([...REGISTRY_PINS.map(pinRegKey), ...Object.keys(REGISTRY_ALLOWLIST)]);
-
-  const lineByKey = new Map(live.map((c) => [regKey(c), c.citingLine]));
-  const missing = live.map(regKey).filter((k) => !registryKeys.has(k));
-  const missingWithLines = missing.map((k) => `${k} (line ${lineByKey.get(k)})`);
+test('CITATION_ALLOWLIST has no stale entries -- every entry corresponds to a real EXISTENCE offender this run, or is not needed any more', () => {
+  const { allowlisted } = checkCorpus(CITATION_ALLOWLIST);
+  const stillFiring = new Set(allowlisted.map((o) => o.key));
+  const stale = Object.keys(CITATION_ALLOWLIST).filter((k) => !stillFiring.has(k));
   assert.deepEqual(
-    missingWithLines,
+    stale,
     [],
-    `citation(s) found in a test/ comment with NO registry entry -- a new file:line citation was written into a ` +
-      `test comment without recording the cited text; add a pin (the exact text) or an allowlist entry (a reason) ` +
-      `to test/fixtures/test-comment-citation-pins.json for each:\n  ${missingWithLines.join('\n  ')}`
-  );
-
-  const dead = [...registryKeys].filter((k) => !liveKeys.has(k));
-  assert.deepEqual(
-    dead,
-    [],
-    `registry entry(ies) with no corresponding citation left in the corpus (the comment was edited, moved, or ` +
-      `removed without updating the registry) -- remove them:\n  ${dead.join('\n  ')}`
+    `CITATION_ALLOWLIST entry(ies) that no longer correspond to any EXISTENCE offender -- the citation was fixed, ` +
+      `moved, or removed; delete the entry:\n  ${stale.join('\n  ')}`
   );
 });
 
-// ---- resolution ----------------------------------------------------------------------------
-function toResolvePin(p) {
-  return { file: p.citingFile, citation: p.citation, at: p.at, first: p.first, last: p.last, path: p.path, claim: p.claim };
-}
-
-test('RESOLUTION: every pinned citation in the registry resolves -- the exact text at the pinned line(s), at HEAD or the frozen commit', () => {
-  const results = resolvePins(REGISTRY_PINS.map(toResolvePin));
-  const offenders = results.filter((r) => !r.ok).map((r) => r.why);
-  assert.deepEqual(
-    offenders,
-    [],
-    `pinned citation(s) failed to resolve -- either the cited file drifted (fix the citing comment AND re-pin the ` +
-      `registry entry together) or the registry text itself is stale:\n  ${offenders.join('\n  ')}`
-  );
-});
-
-// ---- mutation proof: every pin, every drift shape ----------------------------------------------
-// Same method as test/doc-constant-sweep.test.js's own corpus-wide mutation proof (11.1): plant a
-// start-1/start+1/stop-1/stop+1/whole-range-shift drift for every RANGE pin, and a +/-1 drift for
-// every SINGLE-LINE pin, skipping only a shift that would run off either end of the real file (no
-// neighbouring line exists there to be confused with). Killed count must equal planted count,
-// survivors credited only via EDGE_TEXT_NOT_DISCRIMINATING, by name, with a reason -- reused
-// verbatim from doc-constant-sweep.test.js's own classifySurvivors idiom (kept as a small local
-// copy here since that function lives inline in a *.test.js file that must not be required, per
-// this action's own report on why blankComments is duplicated rather than shared that way).
-function classifySurvivors(survivors, allowlist) {
-  const allowedKeys = new Set(Object.keys(allowlist));
-  const allowed = survivors.filter((s) => allowedKeys.has(s.split(' -- ')[0]));
-  const unexpected = survivors.filter((s) => !allowedKeys.has(s.split(' -- ')[0]));
-  return { allowed, unexpected };
-}
-
-// Measured empirically by this action's own mutation-proof run below: EMPTY is the honest result
-// -- every planted drift across this registry's pins is caught. Fix pass 11.3 round 2 (#190
-// verifier finding A4) corrected two things that used to make this non-empty: (1) the
-// bin-spo-state-write-sweep.test.js range used to end on bin/spo's OWN closing brace (a lone `}`,
-// indistinguishable from the NEXT function's closing brace one line below) -- re-pinned to end one
-// line earlier, on `setInterval(generateOnce, 30000);` itself, distinctive text a stop+1 drift
-// cannot land on and still match; (2) this file's own header used to PIN two adjacent lone braces
-// by line number for no reason other than illustrating the shape -- dropped the line numbers
-// entirely (named by symbol -- generateOnce's own closing brace, and the enclosing command's,
-// right below it -- instead), since a pin on text that cannot discriminate a neighbour proves
-// nothing and only invites exactly the "genuine edge" entries this constant exists to avoid
-// accumulating. A future pin landing on a real, unavoidable edge is added here BY NAME, with a
-// reason, exactly like doc-constant-sweep.test.js's own EDGE_TEXT_NOT_DISCRIMINATING.
-const EDGE_TEXT_NOT_DISCRIMINATING = {};
-
-test('EDGE_TEXT_NOT_DISCRIMINATING holds exactly the pins this action measured unable to discriminate a neighbouring line -- no more, no fewer', () => {
-  assert.deepEqual(
-    Object.keys(EDGE_TEXT_NOT_DISCRIMINATING).sort(),
-    [].sort(),
-    'EDGE_TEXT_NOT_DISCRIMINATING changed -- read the new entry by hand and justify it here before pinning it.'
-  );
-});
-
-// Pinned population -- this action's own report has the full breakdown (live-HEAD / frozen-
-// history / reused-from-an-existing-pin, and why). 219 pins measured 2026-09-14 (fix pass 11.3 round 3, final -- 148 claim pins + 71 claimless pins) against this
-// registry; a resize is caught by NAME here, not merely by the mutation-proof test's own count.
-const REGISTRY_PIN_COUNT = 219;
-// 637 planted drifts across 219 pins (each RANGE pin plants 6 variants -- start-1/start+1/stop-1/
-// stop+1/shift-1/shift+1 -- each SINGLE-LINE pin plants 2 -- line-1/line+1 -- minus the handful
-// that would run off either end of their file and are skipped). Measured, not assumed; the test
-// below recomputes this from the registry's own pins and fails by NAME if it no longer matches.
-const REGISTRY_VARIANT_COUNT = 637;
-
-test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shift drift (or a +/-1 drift for a single line) is caught by resolvePins, for EVERY pin in this registry -- not a sample', () => {
-  const pins = REGISTRY_PINS.map(toResolvePin);
-  const base = resolvePins(pins);
-  const offenders = base.filter((r) => !r.ok).map((r) => r.why);
-  assert.deepEqual(offenders, [], `a pin used as this mutation proof's own baseline is not itself green -- fix the pin, not the proof:\n  ${offenders.join('\n  ')}`);
-
-  const variants = []; // { pinIndex, kind, shifted }
-  pins.forEach((pin, i) => {
-    const lineCount = base[i].lineCount;
-    const isRange = pin.last !== undefined;
-    const { start, stop } = parseCitation(pin.citation);
-    const plant = (kind, startDelta, stopDelta) => {
-      const newStart = start + startDelta;
-      const newStop = stop + stopDelta;
-      if (newStart < 1 || newStart > lineCount || newStop < 1 || newStop > lineCount) return;
-      variants.push({ pinIndex: i, kind, shifted: { ...pin, citation: shiftedCitation(pin.citation, startDelta, stopDelta) } });
-    };
-    if (isRange) {
-      plant('start-1', -1, 0);
-      plant('start+1', 1, 0);
-      plant('stop-1', 0, -1);
-      plant('stop+1', 0, 1);
-      plant('shift-1', -1, -1);
-      plant('shift+1', 1, 1);
-    } else {
-      plant('line-1', -1, -1);
-      plant('line+1', 1, 1);
-    }
-  });
-
-  // Exact, measured totals -- a bare floor stays green even if the registry silently shrank; see
-  // this action's own report for how these numbers were produced.
-  assert.equal(pins.length, REGISTRY_PIN_COUNT, `expected ${REGISTRY_PIN_COUNT} pins, found ${pins.length} -- the registry changed size; re-measure and update this pin.`);
-  assert.equal(variants.length, REGISTRY_VARIANT_COUNT, `expected exactly ${REGISTRY_VARIANT_COUNT} planted drifts across ${REGISTRY_PIN_COUNT} pins, found ${variants.length} -- a pin lost or gained line-count headroom, or the registry changed size; re-measure.`);
-
-  const results = resolvePins(variants.map((v) => v.shifted));
-  const survivors = [];
-  results.forEach((r, idx) => {
-    if (r.ok) survivors.push(`${variants[idx].shifted.file} :: ${pins[variants[idx].pinIndex].citation} -- ${variants[idx].kind} drift (now "${variants[idx].shifted.citation}") still reads as correct`);
-  });
-  const killed = results.length - survivors.length;
-
-  const { allowed: allowedSurvivors, unexpected: unexpectedSurvivors } = classifySurvivors(survivors, EDGE_TEXT_NOT_DISCRIMINATING);
-
-  assert.deepEqual(
-    unexpectedSurvivors,
-    [],
-    `planted drift(s) NOT caught by resolvePins and not on EDGE_TEXT_NOT_DISCRIMINATING -- either the resolver ` +
-      `loosened, or this pin genuinely cannot discriminate a neighbouring line and belongs on that allowlist with ` +
-      `a reason:\n  ${unexpectedSurvivors.join('\n  ')}`
-  );
-  assert.equal(
-    killed + allowedSurvivors.length,
-    variants.length,
-    `expected every planted drift to be either caught (${killed}) or explicitly allowlisted (${allowedSurvivors.length}) -- ${variants.length} planted; see the survivor list above for which and why.`
-  );
-  const survivorKeysSeen = new Set(survivors.map((s) => s.split(' -- ')[0]));
-  const staleAllowlistEntries = Object.keys(EDGE_TEXT_NOT_DISCRIMINATING).filter((k) => !survivorKeysSeen.has(k));
-  assert.deepEqual(staleAllowlistEntries, [], `EDGE_TEXT_NOT_DISCRIMINATING entry(ies) that no longer correspond to any actual planted-drift survivor -- remove them:\n  ${staleAllowlistEntries.join('\n  ')}`);
-});
-
-// D9 (fix pass 11.3, #190 verifier finding): hermetic proofs that the two primitives
-// COMPLETENESS itself depends on are correct, independent of the real corpus currently having no
-// gaps to exercise them against -- the same "prove the mechanism, not just today's zero result"
-// posture doc-constant-sweep.test.js's own classifySurvivors fixture test already takes.
-
-// M2: a citation present in a synthetic "live" extraction but ABSENT from a synthetic registry
-// must be reported missing -- proves the missing-detection arithmetic (Set membership over
-// regKey-shaped strings) independent of whatever the real corpus and real registry currently hold.
-test('M2 -- COMPLETENESS\'s own missing-citation check: a live citation with no registry entry is reported, one that has an entry is not', () => {
-  const fakeLive = [
-    { citingFile: 'test/fake-a.test.js', citation: 'real.js:10', occurrence: 0, citingLine: 5 },
-    { citingFile: 'test/fake-a.test.js', citation: 'real.js:20', occurrence: 0, citingLine: 9 },
-  ];
-  const fakeRegistryKeys = new Set(['test/fake-a.test.js :: real.js:10 #0']); // only the FIRST is registered
-  const liveKeys = fakeLive.map(regKey);
-  const missing = liveKeys.filter((k) => !fakeRegistryKeys.has(k));
-  assert.deepEqual(missing, ['test/fake-a.test.js :: real.js:20 #0'], 'the unregistered citation must be the one reported missing');
-  assert.ok(!missing.includes('test/fake-a.test.js :: real.js:10 #0'), 'the registered citation must NOT be reported missing');
-});
-
-// M3: an allowlist (or pin registry) lookup matches an EXACT key only -- a key that is merely a
-// PREFIX or SUBSTRING of a real entry must not be treated as covered. This is the per-fact (never
-// per-file, never per-prefix) discipline test/doc-constant-sweep.test.js's own isCitationAllowlisted
-// fixture test (M13) already proves for CITATION_ALLOWLIST; this is the same proof for THIS
-// registry's own occurrence-suffixed key shape.
-test('M3 -- registry key matching is EXACT: a key that is a prefix or substring of a real entry is not treated as present', () => {
-  const registryKeys = new Set(['test/fake-a.test.js :: real.js:10 #0']);
-  assert.equal(registryKeys.has('test/fake-a.test.js :: real.js:10 #0'), true, 'the exact key must match');
-  assert.equal(registryKeys.has('test/fake-a.test.js :: real.js:10'), false, 'a key missing the occurrence suffix must NOT match');
-  assert.equal(registryKeys.has('test/fake-a.test.js :: real.js:1'), false, 'a citation-text PREFIX must NOT match');
-  assert.equal(registryKeys.has('fake-a.test.js :: real.js:10 #0'), false, 'a citingFile SUBSTRING (missing the test/ prefix) must NOT match');
-});
-
-test('registry population is exactly what this action measured: 219 pins (148 claim + 71 claimless) + 67 allowlist entries = 286 registry entries', () => {
-  assert.equal(REGISTRY_PINS.length, 219, `expected 219 pins, found ${REGISTRY_PINS.length}`);
-  assert.equal(REGISTRY_PINS.filter((p) => p.claimless).length, 71, `expected 71 claimless pins, found ${REGISTRY_PINS.filter((p) => p.claimless).length}`);
-  assert.equal(REGISTRY_PINS.filter((p) => !p.claimless).length, 148, `expected 148 claim pins, found ${REGISTRY_PINS.filter((p) => !p.claimless).length}`);
-  assert.equal(Object.keys(REGISTRY_ALLOWLIST).length, 67, `expected 67 allowlist entries, found ${Object.keys(REGISTRY_ALLOWLIST).length}`);
-});
-
-test('allowlist per-category counts are exactly what this action measured (fix pass 11.3, D4)', () => {
-  const EXPECTED_CATEGORY_COUNTS = {
-    illustrative: 28,
-    'quoted-as-wrong': 30,
-    'hypothetical-example': 4,
-    'wrong-when-written': 0,
-    'deleted-file': 1,
-    'extraction-gap': 0,
-    'no-claim-in-prose': 4,
-    'ambiguous-bare-path': 0,
-  };
-  const actual = {};
-  for (const cat of Object.keys(EXPECTED_CATEGORY_COUNTS)) actual[cat] = 0;
-  for (const entry of Object.values(REGISTRY_ALLOWLIST)) actual[entry.category] = (actual[entry.category] || 0) + 1;
-  assert.deepEqual(actual, EXPECTED_CATEGORY_COUNTS, 'allowlist category counts changed -- a category grew or shrank; re-measure and update this pin by name.');
-});
-
-// ---- A1: vacuous-claim rejection is mechanical (fix pass 11.3 round 2, #190 verifier finding A1) --
-// isVacuousClaim lives in citation-pins.js (exported for reuse); these are hermetic fixture tests
-// of the REAL function, one per rule, plus a corpus-wide sweep that no CURRENT pin's claim violates
-// any of the three rules.
-
-test('isVacuousClaim rule (a): a claim that is only a stopword/generic word, or a bare brace, is rejected', () => {
-  assert.equal(isVacuousClaim('own', 'lock.js:276').vacuous, true, '"own" is on CLAIM_STOPWORDS');
-  assert.equal(isVacuousClaim('}', 'bin/spo:1294').vacuous, true, 'a bare "}" is on CLAIM_STOPWORDS');
-  assert.equal(isVacuousClaim('{', 'bin/spo:10').vacuous, true, 'a bare "{" is on CLAIM_STOPWORDS');
-  assert.equal(isVacuousClaim('OWN', 'lock.js:276').vacuous, true, 'the stopword check is case-insensitive');
-  assert.equal(isVacuousClaim('purgeDone', 'worker.ts:922').vacuous, false, 'a real identifier is not a stopword');
-});
-
-test('isVacuousClaim rule (b): a claim that is a substring of its own citation text is rejected', () => {
-  assert.equal(isVacuousClaim('lock.js', 'orchestrator/lock.js:276').vacuous, true, '"lock.js" repeats the cited filename');
-  assert.equal(isVacuousClaim('README', 'README.md:34').vacuous, true, '"README" repeats the cited filename');
-  assert.equal(isVacuousClaim('lease', 'account-lease.js:156').vacuous, true, '"lease" is contained in the cited filename');
-  assert.equal(isVacuousClaim('LEASE', 'account-lease.js:156').vacuous, true, 'the substring check is case-insensitive');
-  assert.equal(isVacuousClaim('acquireShortLock', 'account-lease.js:156').vacuous, false, 'a real identifier is not a filename substring');
-});
-
-test('isVacuousClaim rule (c): a claim shorter than 4 characters is rejected UNLESS it has a non-word character', () => {
-  assert.equal(isVacuousClaim('ref', 'worker.ts:751').vacuous, true, '"ref" is 3 chars with no non-word character');
-  assert.equal(isVacuousClaim('LLM', 'bin/spo:1891').vacuous, true, '"LLM" is 3 chars with no non-word character');
-  assert.equal(isVacuousClaim("'--base',", 'real-steps.test.js:1827').vacuous, false, 'short but has non-word characters -- allowed');
-  assert.equal(isVacuousClaim('board:take', 'scripted.js:1295').vacuous, false, 'has a non-word character (":") -- allowed regardless of length');
-  assert.equal(isVacuousClaim('CHECK', 'doc/state-machine-spec.md:159').vacuous, false, '5 plain characters clears the length floor on its own');
-});
-
-test('no pin currently in the registry has a vacuous claim under any of the three rules', () => {
-  const offenders = [];
-  for (const p of REGISTRY_PINS) {
-    if (p.claimless) continue; // no claim to check -- claimless pins are exempt by design (item 1)
-    const v = isVacuousClaim(p.claim, p.citation);
-    if (v.vacuous) offenders.push(`${pinRegKey(p)} -- claim "${p.claim}" -- ${v.reason}`);
-  }
-  assert.deepEqual(offenders, [], `pin(s) with a vacuous claim -- use a better token from the citing prose, or allowlist no-claim-in-prose:\n  ${offenders.join('\n  ')}`);
-});
-
-// ---- A2: hermetic mutation tests on the REAL sweep code (fix pass 11.3 round 2, #190 verifier
-// finding A2) -- each fixture plants exactly the bad shape the corresponding check exists to
-// catch, and asserts the REAL function (not a reimplementation) reports it.
-
-// ---- shared normalizeWrap (fix pass 11.3 round 3, #190 verifier finding 7) --------------------
-// normalizeWrapWithMap now lives in citation-pins.js (this file's own former mirror, plus its
-// self-check against citation-pins.js's normalizeWrap, is deleted -- there is exactly one join
-// implementation, not two kept in sync by an assertion). One hermetic proof that the offset MAP
-// itself is correct, independent of the real corpus: a citation split across a wrapped line must
-// report the line the WRAP STARTED on (where the citation's own text begins), not a line invented
-// by the collapse.
-test('normalizeWrap(s) === normalizeWrapWithMap(s).text for every wrap shape (-, /, //, *, #) -- one implementation, no divergence possible', () => {
-  const fixtures = [
-    'doc/state-machine-\nspec.md:49 (hyphen wrap)',
-    'orchestrator/\nstate-machine.js:216 (slash wrap)',
-    '// a line comment continuation\n// on the next line, no citation shape',
-    '/* a block comment\n * continued with a star leader */',
-    '# a shell-style comment\n# continued with a hash leader',
-    'plain prose that wraps\nwith no leader at all',
-  ];
-  for (const s of fixtures) {
-    assert.equal(normalizeWrap(s), normalizeWrapWithMap(s).text, `normalizeWrap and normalizeWrapWithMap.text must agree on: ${JSON.stringify(s)}`);
-  }
-
-  // Mutation proof: a DIVERGENT standalone normalizeWrap (here, one that forgets to join on "/")
-  // must disagree with normalizeWrapWithMap's text -- proving this consistency check is actually
-  // sensitive to the two implementations drifting apart, not vacuously true by construction.
-  function divergentNormalizeWrap(src) {
-    // Only joins on "-", never on "/" -- the bug this proof must catch.
-    let text = src.replace(/(-)\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, '$1');
-    text = text.replace(/[ \t]*\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, ' ');
-    return text;
-  }
-  const slashFixture = 'orchestrator/\nstate-machine.js:216 (slash wrap)';
-  assert.notEqual(divergentNormalizeWrap(slashFixture), normalizeWrapWithMap(slashFixture).text, 'a normalizeWrap that does not join on "/" must be caught disagreeing with normalizeWrapWithMap');
-});
-
-test('normalizeWrapWithMap: a citation wrapped across a line break maps to its correct ORIGINAL line', () => {
-  const src = [
-    'line one',
-    '// see orchestrator/state-',
-    '// machine.js:216 for detail',
-    'line four',
-  ].join('\n');
-  const { text, map } = normalizeWrapWithMap(src);
-  assert.match(text, /orchestrator\/state-machine\.js:216/, 'the wrap must still join into one contiguous citation');
-  const idx = text.indexOf('orchestrator/state-machine.js:216');
-  const origIdx = map[idx];
-  const citingLine = src.slice(0, origIdx).split('\n').length;
-  assert.equal(citingLine, 2, 'the citation must map back to line 2 (where "orchestrator/state-" itself starts), not line 3 or some other collapsed position');
-
-  // Mutation proof: a map entry pointing at the WRONG original position (here, deliberately
-  // corrupted to point at "line four" instead of the citation's own real line 2) must report a
-  // DIFFERENT line -- proving the assertion above is actually reading `map`, not returning a
-  // constant that happens to equal 2.
-  const corruptedMap = map.slice();
-  corruptedMap[idx] = src.indexOf('line four');
-  const corruptedLine = src.slice(0, corruptedMap[idx]).split('\n').length;
-  assert.notEqual(corruptedLine, citingLine, 'a corrupted map entry must disagree with the correct map -- if this ever passes, the test above is not actually sensitive to the map');
-});
-
-test('A2(i): resolvePins\' own claim check -- a claim present in the comment but absent from the cited span is reported', () => {
-  // Exercise resolvePins (citation-pins.js's real production function, not a reimplementation)
-  // against a REAL file/line whose text is known (this file's own first line), with a claim that
-  // does not occur there -- proves the claim check itself, independent of file resolution.
-  const results = resolvePins([{ file: 'test/citation-pins.js', citation: 'test/citation-pins.js:1', at: 'HEAD', first: "'use strict';", claim: 'THIS_TOKEN_DOES_NOT_APPEAR_ANYWHERE_NEAR_LINE_1' }]);
-  assert.equal(results[0].ok, false, 'a claim absent from the cited span must fail resolvePins');
-  assert.match(results[0].why, /claim not found in span/, 'the failure reason must name the claim check specifically');
-});
-
-test('A2(ii): the +/-3-line proximity tie -- a claim present in the target span but NOT near the citing comment is reported', () => {
-  const fakePin = { citingFile: 'test/fake-b.test.js', citation: 'real.js:50', occurrence: 0, claim: 'FAR_AWAY_TOKEN' };
-  // Synthetic corpus: the claim text sits on line 1 of the "comment lines", but the citation
-  // itself is reported at line 40 -- 39 lines away, far outside the +/-3 window.
-  const fakeLines = ['FAR_AWAY_TOKEN', ...Array(60).fill('')];
-  const offenders = checkClaimProximity([fakePin], {
-    getCommentLines: () => fakeLines,
-    getFileCitations: () => [{ citingFile: 'test/fake-b.test.js', citation: 'real.js:50', occurrence: 0, citingLine: 40 }],
-  });
-  assert.equal(offenders.length, 1, 'a claim far from its own citing line must be reported');
-  assert.match(offenders[0], /not found within \+\/-3 lines/);
-});
-
-test('A2(iii): the allowlist reason-uniqueness check -- two entries with DIFFERENT citation text sharing an identical reason are reported', () => {
-  const fakeAllowlist = {
-    'test/fake-c.test.js :: real.js:1 #0': { category: 'illustrative', reason: 'the exact same copy-pasted reason' },
-    'test/fake-c.test.js :: real.js:2 #0': { category: 'illustrative', reason: 'the exact same copy-pasted reason' },
-  };
-  const offenders = checkNoDuplicateReasons(fakeAllowlist);
-  assert.equal(offenders.length, 1, 'two different citations sharing one reason string must be reported');
-});
-
-test('A2(iv): category validation -- an allowlist entry with an unknown category is reported', () => {
-  const fakePins = [];
-  const fakeAllowlist = { 'test/fake-d.test.js :: real.js:1 #0': { category: 'not-a-real-category', reason: 'a real, specific reason' } };
-  const offenders = checkDuplicatesClaimsAndCategories(fakePins, fakeAllowlist, ALLOWLIST_CATEGORIES);
-  assert.equal(offenders.some((o) => /unknown category/.test(o)), true, 'an unknown category must be reported');
-});
-// ---- claimless pins (fix pass 11.3 round 3, #190 verifier finding 1, driver decision) ---------
-// An allowlist entry catches nothing (a future drift at that citation is invisible). A claimless
-// pin -- verified edge text, no claim, `claimless: true` -- still goes red on future drift, the
-// same as any other pin; it just has no fact from the prose to additionally tie to.
-
-test('a claimless pin whose reason does not quote its own `first` text is reported', () => {
-  const fakePins = [{ citingFile: 'test/fake-e.test.js', citation: 'real.js:1', occurrence: 0, at: 'HEAD', first: 'const x = 1;', claimless: true, category: 'no-claim-in-prose', reason: 'this reason never quotes the edge text at all' }];
-  const offenders = checkClaimlessReasonsQuoteFirst(fakePins);
-  assert.equal(offenders.length, 1, 'a claimless pin whose reason omits the backtick-quoted edge text must be reported');
-});
-
-test('a claimless pin whose reason DOES quote its own `first` text passes', () => {
-  const fakePins = [{ citingFile: 'test/fake-e.test.js', citation: 'real.js:1', occurrence: 0, at: 'HEAD', first: 'const x = 1;', claimless: true, category: 'no-claim-in-prose', reason: 'bare cross-reference; edge line is `const x = 1;`' }];
-  const offenders = checkClaimlessReasonsQuoteFirst(fakePins);
-  assert.deepEqual(offenders, [], 'a claimless pin whose reason quotes the exact trimmed edge text must not be reported');
-});
-
-test('a claimless pin is still drift-checked by resolvePins -- a planted +/-1 on it goes red', () => {
-  // Exercise the REAL resolvePins against a real file/line, claimless (no `claim` key at all),
-  // then shift it by one line -- proving claimless pins are not silently exempted from the
-  // mutation-proof mechanism the way an allowlist entry always is.
-  const basePin = { file: 'test/citation-pins.js', citation: 'test/citation-pins.js:1', at: 'HEAD', first: "'use strict';" };
-  const base = resolvePins([basePin]);
-  assert.equal(base[0].ok, true, 'the baseline claimless-shaped pin must itself resolve correctly');
-  const shifted = resolvePins([{ ...basePin, citation: shiftedCitation(basePin.citation, 1) }]);
-  assert.equal(shifted[0].ok, false, 'a +1 drift on a claimless pin must still be caught by resolvePins');
-});
-
-test('a claimless pin carrying a `claim` is rejected -- a pin is either shape, never both', () => {
-  const fakePins = [{ citingFile: 'test/fake-f.test.js', citation: 'real.js:1', occurrence: 0, at: 'HEAD', first: 'const x = 1;', claim: 'x', claimless: true, category: 'no-claim-in-prose', reason: 'edge line is `const x = 1;`' }];
-  const offenders = checkDuplicatesClaimsAndCategories(fakePins, {}, ALLOWLIST_CATEGORIES);
-  assert.equal(offenders.some((o) => /claimless but also carries a `claim`/.test(o)), true, 'a claimless pin that also carries a claim must be rejected');
-});
-
-
-
-// A2(v): two allowlist entries swapping categories with the aggregate counts unchanged -- a pure
-// count-based test (like the one above) cannot catch this by construction (the totals are
-// identical before and after the swap). Fix pass 11.3 round 3 (#190 verifier finding 6): a
-// per-key snapshot, kept READABLE (a sorted key->category fixture file, diffable in an ordinary
-// review) rather than a SHA-256 digest -- a hash changing tells you SOMETHING moved; this tells
-// you what.
-const CATEGORY_SNAPSHOT_PATH = path.join(__dirname, 'fixtures', 'test-comment-citation-category-snapshot.json');
-
-function categorySnapshotOf(allowlist) {
-  const out = {};
-  for (const k of Object.keys(allowlist).sort()) out[k] = allowlist[k].category;
-  return out;
-}
-
-// diffCategorySnapshots(expected, actual) -- returns { added, removed, recategorized }: keys only
-// in `actual` (added), keys only in `expected` (removed), and keys in both whose category differs
-// (recategorized, "key: from -> to"). A pure equality assert would just say "these two objects
-// differ"; this names EXACTLY what changed, the same discipline COMPLETENESS's own missing/dead
-// split already uses.
-function diffCategorySnapshots(expected, actual) {
-  const added = Object.keys(actual).filter((k) => !(k in expected));
-  const removed = Object.keys(expected).filter((k) => !(k in actual));
-  const recategorized = Object.keys(expected)
-    .filter((k) => k in actual && expected[k] !== actual[k])
-    .map((k) => `${k}: ${expected[k]} -> ${actual[k]}`);
-  return { added, removed, recategorized };
-}
-
-const EXPECTED_CATEGORY_SNAPSHOT = JSON.parse(fs.readFileSync(CATEGORY_SNAPSHOT_PATH, 'utf8'));
-
-test('A2(v): the per-key allowlist category snapshot is exactly what this action measured -- a swap between two entries is reported as a RECATEGORIZATION even though the aggregate counts would not change', () => {
-  // Hermetic proof the diff itself is swap-sensitive, independent of the real registry's current
-  // contents: two synthetic entries, then the same two with their categories swapped, must be
-  // reported as two recategorizations even though a per-category COUNT over the two sets is
-  // identical either way.
-  const before = { a: { category: 'illustrative', reason: 'x' }, b: { category: 'quoted-as-wrong', reason: 'y' } };
-  const swapped = { a: { category: 'quoted-as-wrong', reason: 'x' }, b: { category: 'illustrative', reason: 'y' } };
-  const swapDiff = diffCategorySnapshots(categorySnapshotOf(before), categorySnapshotOf(swapped));
-  assert.deepEqual(swapDiff.added, [], 'a swap adds no keys');
-  assert.deepEqual(swapDiff.removed, [], 'a swap removes no keys');
-  assert.deepEqual(swapDiff.recategorized.sort(), ['a: illustrative -> quoted-as-wrong', 'b: quoted-as-wrong -> illustrative'].sort(), 'a swap between two keys must be reported as two recategorizations');
-
-  // The real registry's own snapshot, checked against the fixture file by NAME -- a future edit
-  // that swaps two entries' categories (leaving the aggregate counts test further up green, since
-  // the swap does not change any category's total) is reported HERE, by exactly which keys moved.
-  const actual = categorySnapshotOf(REGISTRY_ALLOWLIST);
-  const diff = diffCategorySnapshots(EXPECTED_CATEGORY_SNAPSHOT, actual);
-  assert.deepEqual(
-    diff,
-    { added: [], removed: [], recategorized: [] },
-    `allowlist category snapshot changed -- update ${CATEGORY_SNAPSHOT_PATH} to match, having first confirmed by eye that each change below is correct, not just copied to make this pass:\n` +
-      `  added: ${diff.added.join(', ') || '(none)'}\n` +
-      `  removed: ${diff.removed.join(', ') || '(none)'}\n` +
-      `  recategorized: ${diff.recategorized.join('; ') || '(none)'}`
-  );
+// A sanity floor, not a magic-number ratchet (this design has no exact-count pin -- there is no
+// stored registry to keep in sync): the corpus walk and extraction must still be finding citations
+// at all. If this ever reports 0, the walk or the extractor broke, not that the corpus emptied out.
+test('sanity: the corpus walk finds a non-trivial number of file-tied citations', () => {
+  const { total } = checkCorpus(CITATION_ALLOWLIST);
+  assert.ok(total > 100, `expected well over 100 file-tied citations across test/**/*.js, found ${total} -- has corpusFiles() or extractCitations() broken?`);
 });
