@@ -15,20 +15,21 @@
 #
 # ---- what it deliberately does NOT run, and why that is not a loophole -----------------------
 #
-# Three test files assert agreement with the SIBLING repos -- SPO-WebClient (the product repo this
+# Four test files assert agreement with the SIBLING repos -- SPO-WebClient (the product repo this
 # pipeline drives) and SPO-Deploy. They are excluded here, and the exclusion is pinned by name in
 # test/gate-scope.test.js so it cannot quietly grow:
 #
 #   test/doc-constant-sweep.test.js        -- citations/constants resolved against the real trees
 #   test/gate-stderr-literal-sweep.test.js -- realGate's stderr literals vs SPO-WebClient's source
 #   test/heartbeat-contract-pin.test.js    -- HEARTBEAT_STALE_MS pinned to paths.ts's own literal
+#   test/test-comment-citation-sweep.test.js -- test/ comment citations resolved the same way (#190)
 #
-# Measured 2026-09-04 with neither sibling on disk: those three files produce 10 failures, and
+# Measured 2026-09-04 with neither sibling on disk (three files at the time; #190 added the fourth): those three files produce 10 failures, and
 # every other test file passes -- 1729 of 1729. They fail LOUDLY on an absent repo by design
 # ("an ABSENT product or deploy repo is never a silent pass" -- doc-constant-sweep's own header),
 # which is correct for a drift check and wrong for a merge gate.
 #
-# The distinction is not convenience, it is scope. Those three do not test this repo's code; they
+# The distinction is not convenience, it is scope. These four do not test this repo's code; they
 # test whether ANOTHER repo has moved out from under this one's citations. Their verdict changes
 # when SPO-WebClient changes and this repo does not, so folding them in would make this gate red
 # for work that is not the author's -- and an advisory gate that reds for someone else's reasons
@@ -57,6 +58,7 @@ CROSS_REPO_FILES=(
   doc-constant-sweep.test.js
   gate-stderr-literal-sweep.test.js
   heartbeat-contract-pin.test.js
+  test-comment-citation-sweep.test.js
 )
 
 files=()

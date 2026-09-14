@@ -3,6 +3,17 @@
 > **Derived from `doc/bench-audit-2026-09-02.md`, 2026-09-02.** Every row traces to a
 > defect class D1–D11 in that document, and every claim it rests on was measured and then
 > re-verified by an adversarial pass. Rows that do not trace to a measured defect are not here.
+>
+> **Citations are pinned, not live.** Same posture as `doc/bench-audit-2026-09-02.md`: every
+> `file:line` citation here with a real target to pin -- all but the dangling `sanctuarize.test.ts`
+> reference below and the second, comma-joined half of the `config.ts` rate-limiter citation below
+> (see that document's own pin notice for why) -- is checked against the text it named when this
+> record was written: SPO-Pipeline paths at `7902164309c1766d7b785daab9ba94ff6472bc1d`, SPO-WebClient
+> paths at `935283890fa0593c5c5d0b41cceeaec2c1972c6f` (the commit `~/SPO-WebClient` was actually on
+> when this plan's own audit was measured -- see this plan's own row 1.2, and
+> `doc/bench-audit-2026-09-02.md`'s "A trap that governs the fix") -- except the `bin/spo`
+> `collectAll` call site and
+> `doc/state-machine-spec.md`'s FINISH row, kept live.
 
 **This replaces plan rows 8.2–8.7 wholesale**, as `remediation-plan-2026-08.md`'s row 8.1
 provided for. The mapping is in §5.
@@ -118,7 +129,7 @@ seven legs fires in a test · full suite green.
 
 | # | action | files |
 |---|---|---|
-| 4.1 | **The artifact and the attestation stop being filed under different names.** `verify-gate.js` names the artifact after the post-merge HEAD; `worker.ts:301` keys the verdict on the deposited sha. Record **both** shas in both files, so a join never depends on which one a reader guessed. | `scripts/verify-gate.js`, `src/e2e/bench/worker.ts`, `verdict.ts` |
+| 4.1 | **The artifact and the attestation stop being filed under different names.** `verify-gate.js` names the artifact after the post-merge HEAD; `worker.ts:302` keys the verdict on the deposited sha. Record **both** shas in both files, so a join never depends on which one a reader guessed. | `scripts/verify-gate.js`, `src/e2e/bench/worker.ts`, `verdict.ts` |
 | 4.2 | **One durable append-only line per job.** `done/` is purged after 24 h, which is why the whole non-attesting vocabulary — DIRTY, ENVIRONMENT, ABANDONED, INTERRUPTED — is invisible in a 509-record corpus. Append to `~/.spo-bench/jobs.jsonl` and purge only the `.log`. | `src/e2e/bench/job.ts`, `worker.ts`, `paths.ts` |
 | 4.3 | **Re-gates become visible.** `attempt: 1` in 314 of 314 artifacts, though at least one sha was demonstrably gated twice. | `scripts/verify-gate.js`, `src/e2e/bench/worker.ts` |
 | 4.4 | **A nightly drive can be attached to the commit it drove.** All 51 nightly live artifacts are `branch: "local"` and none contains a sha. | `src/e2e/bench/nightly.ts`, `src/e2e/run.ts` |
@@ -140,7 +151,7 @@ that fails if the suffix filter is dropped · full suite green.
 | 5.1 | **A deadline per stage.** `realRunCommand` spawns `git fetch`, `npm ci`, `npm run build:*`, `verify-gate.js` and `run.js` with no timeout and no kill. One wedged job parks every later card `gate-timeout` at two hours each. | `src/e2e/bench/worker.ts`, `worker.test.ts` |
 | 5.2 | **The heartbeat reports progress, not existence.** It rides its own `setInterval` and says nothing about the loop; carry `{currentJob, startedAt}` so a client can tell ALIVE from PROGRESSING. | `src/e2e/bench/worker.ts`, `paths.ts` |
 | 5.3 | **One staleness contract for the heartbeat.** The bench reads it by **mtime with a 20 s bound**; `console/collect.js`, reached from `bin/spo:1273`, reads it by **content with a 120 s bound**. Two readers, two contracts, one file. | `console/collect.js`, `src/e2e/bench/paths.ts`, `test/` |
-| 5.4 | **The SPO-WebClient suite stops writing into the live bench.** 6938 of 7172 `gate-*` logs and 2249 of 2336 `.alive` files are test output in the production corpus. Point every test at a temporary `SPO_BENCH_DIR` — the pipeline already does exactly this (`test/helpers.js:65-80`) and is the model. Add a sweep test that fails if any test path can resolve to `~/.spo-bench`. **Corrected 2026-09-03 by 9.1's verification**: the original wording here cited
+| 5.4 | **The SPO-WebClient suite stops writing into the live bench.** 6938 of 7172 `gate-*` logs and 2249 of 2336 `.alive` files are test output in the production corpus. Point every test at a temporary `SPO_BENCH_DIR` — the pipeline already does exactly this (`test/helpers.js:65-94`) and is the model. Add a sweep test that fails if any test path can resolve to `~/.spo-bench`. **Corrected 2026-09-03 by 9.1's verification**: the original wording here cited
 `sanctuarize.test.ts:151-156` as the deliberate writer. That file was deleted on 2026-08-29 in
 `9a03ac49`, four days before this plan was written — a dangling citation in a remediation row, in
 the plan produced by an audit about dangling citations. The live picture, measured: **15 test

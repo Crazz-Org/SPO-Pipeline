@@ -5,7 +5,16 @@
 > `~/SPO-WebClient` at `d03ea8b7` and the live Crazz-Org project 1. Two passes: a sweep
 > (`sweep-c9-docs.md`) and an adversarial verification (`verify-c9.md`) that re-ran every
 > scanner independently. **Where they disagree, this document uses the verification's
-> numbers** — both reports are kept in the scratchpad, not in this repo.
+> numbers** — both reports are kept in the scratchpad, not in this repo. Every `file:line`
+> citation below that the citation sweep actually extracts is pinned (action 11.2, #206) to the
+> SPO-Pipeline commit named above and must never be re-pinned to today's tree — a re-pin that
+> moves the citation without re-verifying it against the frozen commit is exactly the failure
+> this pin exists to catch. Not everything below is in that extracted form: the E2 example's own
+> comma-joined line list in §2 (three lines on one filename; only its first number is an
+> extractable citation), "line 263's `CITATION_DOCS`" (§2's E18 example), and "(line 812)" in
+> §5's SPO-Deploy paragraph are prose line references, not `file:line` citations, so the sweep
+> does not see or pin them — verified by hand against 7902164 when this pinning pass was done,
+> but unguarded against a future drift.
 
 Empirical input to action 9.2 (build the sweeps) and 9.3 (fix the sites). The corpus is
 `doc/accepted-gaps.md` §3d's accepted gap — 65 files, 14,368 comment/doc lines, the
@@ -96,7 +105,7 @@ until you know whether zero came from a check or from a blind spot. §3 separate
   recorded only in the maintainer's own memory file. `README.md:37` and
   `doc/jewels-inventory.md:14` both promise a `bench/` directory that does not exist
   (`ls -d bench` — no such directory).
-- **E6** — `README.md:34`'s subcommand list omits `bin/spo:2220`: `if (cmd === 'tokens') return
+- **E6** — `README.md:34`'s subcommand list omits `bin/spo:1838`: `if (cmd === 'tokens') return
   cmdTokens(opts);` (and five siblings).
 - **E15** — `orchestrator/park-loop.js:179`: `// machine.js's buildCtx resets it to 0 …` is the
   wrapped continuation of `state-` on the line above — and the same pattern at
@@ -118,12 +127,12 @@ until you know whether zero came from a check or from a blind spot. §3 separate
 - **E10** — `README.md:35`: `` `node --test test/*.test.js` suite `` vs.
   `orchestrator/README.md:2371`: `node --test --test-timeout=30000 test/*.test.js`.
 - **E11** — `bin/spo:1654` and `orchestrator/README.md:2056` both quote `CLAUDE.md` as
-  "Verdict by exit code, never by reading text output"; `CLAUDE.md:35` reads "**Verdict by exit
+  "Verdict by exit code, never by reading text output"; `CLAUDE.md:29` reads "**Verdict by exit
   code**, never by reading `gh`'s text output" — close, but not verbatim in either repo.
 - **E1** — `doc/board-audit.md:20`: `currently holds all 12 options`; `gh project field-list 1
   --owner Crazz-Org` returns 10 today (`Todo | Planning | Implementing | Checks & PR | Gate |
   Validation | Merging | Done | Parked | Intake`).
-- **E9** — `scripts/daemon-install.sh:103`: `cost: bin/spo cost`; `bin/spo:1139` names the
+- **E9** — `scripts/daemon-install.sh:103`: `cost: bin/spo cost`; `bin/spo:993` names the
   handler `cmdCostDeprecated`, and every other of the six sites naming `spo cost` says so.
 
 ---
@@ -179,7 +188,7 @@ This project's documents are expected to state their own errors — `doc/accepte
 the precedent: a plan claim that its own quoted grep command, if actually run, would have
 contradicted. The same class of slip happened twice while producing this one.
 
-**A manufactured finding, retracted.** The sweep read `orchestrator/config.js:839`'s comment —
+**A manufactured finding, retracted.** The sweep read `orchestrator/config.js:704`'s comment —
 "`board-move.sh` is 125 lines of `gh api graphql`" — reported the line count as **drifted**
 (`wc -l` → 147), and added a supporting sentence: "grew 22 lines since 2026-09-01." Both halves
 are wrong. `grep -c . scripts/board-move.sh` (non-blank lines) is **exactly 125** — the comment

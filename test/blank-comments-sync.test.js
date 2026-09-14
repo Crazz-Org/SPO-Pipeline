@@ -73,6 +73,7 @@ const EXPECTED_COPIES = [
   'park-reason-doc-sweep.test.js',
   'park-reason-partition.test.js',
   'prompt-contract-sweep.test.js',
+  'test-comment-citation-sweep.test.js',
 ];
 
 // Anchored at line start. A definition indented inside another function would not be found --
@@ -315,7 +316,7 @@ test('blankComments matches block comments lazily: two blocks do not swallow the
 
 test('blankComments blanks INDENTED whole-line comments, so a block opener inside one cannot open a phantom span (kills the trimStart mutant)', () => {
   // The repo carries indented line comments containing a block opener today -- among them
-  // orchestrator/state-machine.js:210 and orchestrator/config.js:764, both of which mention
+  // orchestrator/state-machine.js:216 and orchestrator/config.js:916, both of which mention
   // `.claude/hooks/` with a glob in indented prose. Dropping `.trimStart()` leaves those lines
   // unblanked, and the opener inside them then reaches the next closer anywhere below.
   const raw = [
@@ -343,8 +344,8 @@ test('blankComments blanks INDENTED whole-line comments, so a block opener insid
 });
 
 test('blankComments survives the shape the repo actually carries: an UNCLOSED opener in a line comment, closed only by a later line comment', () => {
-  // This is the live shape at HEAD, not a hypothetical: orchestrator/state-machine.js:210 and
-  // :397 and orchestrator/steps/scripted.js:1889 each hold an unclosed block opener inside a
+  // This is the live shape at HEAD, not a hypothetical: orchestrator/state-machine.js:216 and
+  // :403 and orchestrator/steps/scripted.js:1905 each hold an unclosed block opener inside a
   // line comment, dormant today only because those files happen to contain no closer below.
   // `journal/` with a glob segment is the worst case of the family, being opener and closer at
   // once. The old block-first order read the first line comment as opening a real block that

@@ -1615,7 +1615,7 @@ test('card #78 (fix): a graceful drain WAITS for an in-flight repark to finish i
   // ORDER, NOT DURATION -- but not the first pairing tried. An order fact built from
   // 'worker-crash-repark-exit' vs 'dispatcher-drain-end' does NOT discriminate: run()'s drain block
   // always runs `killAllChildren` + `await reapSignalledChildren` between `awaitInFlight` returning
-  // and 'dispatcher-drain-end' being journalled (dispatcher.js:1206-1207, 1229), and
+  // and 'dispatcher-drain-end' being journalled (dispatcher.js:1286, 1229), and
   // reapSignalledChildren itself blocks on the repark child's exit (naturally or via its own SIGKILL
   // escalation) before returning -- so repark-exit precedes drain-end in BOTH the correct world and a
   // mutant that drops `reparking.size > 0` from awaitInFlight's own wait condition. Measured before
@@ -1623,7 +1623,7 @@ test('card #78 (fix): a graceful drain WAITS for an in-flight repark to finish i
   // `drainEnd.drained` (false, `waitedMs` ~0) -- never on a repark-exit/drain-end order check, which
   // is why that pairing was rejected. It now fails here, on the order assertion itself.
   //
-  // 'dispatcher-stopped' (dispatcher.js:1175) is the anchor that DOES discriminate: it is journalled
+  // 'dispatcher-stopped' (dispatcher.js:1232) is the anchor that DOES discriminate: it is journalled
   // the instant `awaitInFlight` returns, strictly BEFORE `killAllChildren`/the reap (dispatcher.js
   // :1206-1207) ever run -- so in the buggy mutant above, 'dispatcher-stopped' is written before the
   // repark child has any chance to exit, while in the correct world `awaitInFlight` cannot return

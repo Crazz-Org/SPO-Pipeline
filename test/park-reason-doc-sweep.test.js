@@ -106,7 +106,7 @@
 // checked by test/blank-comments-sync.test.js. Comments are blanked, not deleted, before
 // scanning, so byte offsets (and therefore reported line numbers) still match the real file.
 // Load-bearing both ways here: (1) a reason merely NAMED in a comment -- and this codebase's own
-// comments quote plenty of them, e.g. steps/scripted.js:756's "now throws ParkSignal('git-timed-
+// comments quote plenty of them, e.g. orchestrator/steps/scripted.js:973's "now throws ParkSignal('git-timed-
 // out')" -- must never be extracted as if it were a real call site (this file's own header above,
 // which quotes several reasons in prose, would otherwise flag itself); (2) doc/state-machine-
 // spec.md is Markdown, not JS, so this direction is a non-issue for the SPEC side, but the same
@@ -862,7 +862,7 @@ test('blankComments: an opener inside a `//` comment does not swallow the ParkSi
   //   - `.trimStart()` in the whole-line test: without it the INDENTED comment on line 3 is left
   //     alone, its opener reaches the block's closer on line 9, and call site 1 disappears.
   //     Indented comments carrying an opener are the repo's real shape -- orchestrator/
-  //     state-machine.js:210 and orchestrator/config.js:764 are two of them.
+  //     state-machine.js:216 and orchestrator/config.js:916 are two of them.
   //   - blanking to spaces rather than '': every line keeps its width, so the offsets this file
   //     turns into `file:line` still address the real source.
   //   - the block regex staying LAZY: greedy runs from line 7's opener to line 15's closer and
@@ -916,8 +916,8 @@ test('blankComments: an opener inside a `//` comment does not swallow the ParkSi
 
 test('blankComments: an UNCLOSED opener in a `//` comment, closed only by a later `//` comment -- the shape the repo carries today', () => {
   // The closed case above is the easy one. The occurrences actually present at HEAD are
-  // UNCLOSED openers sitting in prose -- orchestrator/state-machine.js:210 and :397 and
-  // orchestrator/steps/scripted.js:1889 -- dormant purely because those files contain no closer
+  // UNCLOSED openers sitting in prose -- orchestrator/state-machine.js:216 and :403 and
+  // orchestrator/steps/scripted.js:1905 -- dormant purely because those files contain no closer
   // below them. The danger is one future `*/` away, and this fixture is that future: the second
   // comment's `journal/*/` supplies a closer, and `journal/*/` is the family's worst case, being
   // an opener and a closer in the same four characters. The old block-first order joined the two
@@ -943,7 +943,7 @@ test('blankComments: an UNCLOSED opener in a `//` comment, closed only by a late
   assert.equal(blanked.split('\n')[5].trim(), '', 'the closer-bearing comment must itself be blanked');
 });
 
-test('the doc sweep still catches a genuine undocumented reason even in the presence of a /* inside a // comment', () => {
+test('the doc sweep still catches a genuine undocumented reason even in the presence of a slash-star inside a // comment', () => {
   // Same fixture shape as above, but the real call site's reason is one a stand-in spec does NOT
   // mention -- proving the sweep still goes red on a genuine violation rather than the fix merely
   // making everything look clean.
@@ -1008,7 +1008,7 @@ test('parkSignalSpans + blankComments: a reason only named in a comment is never
 });
 
 // Real-corpus guard for the same mutation: FINDING 2 also measured that blankComments matters on
-// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1089 has one genuine
+// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1587 has one genuine
 // commented-out `throw new ParkSignal('validate-unrecognized-verdict', ...)` inside a prose
 // comment (its own header, describing action 1.4's history), and blanking it away is what keeps
 // the reported call-site count from over-counting it as a live site. Pinned to the exact numbers

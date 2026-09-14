@@ -535,7 +535,7 @@ model's free-prose `plan_markdown` at this same site. Measured against all 17 re
 positives, both already-`DONE` cards: issue-418's plan text *asserts* a hook is **absent**
 (`` `.claude/hooks/context-router.sh:117`. That file does not exist ``, with a check command
 `! test -e .../.claude/hooks/context-router.sh`), and issue-429's *cites*
-`` `.claude/settings.json:109-127` `` as evidence, never proposing to touch it. 33% precision, and
+`` `SPO-WebClient/.claude/settings.json:109-127` `` as evidence, never proposing to touch it. 33% precision, and
 not bad luck — structural: `prompts/plan.md` instructs PLAN to emit "a falsification sweep: one
 search command per claim in `doc/`, `.claude/`, or `CLAUDE.md`", and SPO-WebClient's `CLAUDE.md` —
 fed to every PLAN call as domain context — itself contains matches, including the heading
@@ -2380,7 +2380,7 @@ child instead and returns immediately, with `finalizePark` itself running inside
 scan. The scanner-based mechanism below exists for what the dispatcher itself cannot cover: a
 worker killed during the dispatcher's OWN shutdown (deliberately never reparked in that window —
 spawning a repark child mid-shutdown would only move the same risk into it, since a park half-
-written by a process about to be SIGKILLed can never be recovered later — `dispatcher.js:634-648`)
+written by a process about to be SIGKILLed can never be recovered later — `dispatcher.js:635-648`)
 and any owning daemon process that simply never comes back to run `handleExit` at all (a hard kill
 of the whole process tree).
 A deploy produces that shutdown case only for a card that outlives the drain: the pull's

@@ -160,7 +160,7 @@ test('runReportIntake: happy path -- files a raw card, moves the column, comment
   assert.match(daemonLog, /"issue":501/);
 });
 
-// Action 3.1 (Lot 3): report-intake.js:300 binds moveReportTo's return value into the
+// Action 3.1 (Lot 3): report-intake.js:313 binds moveReportTo's return value into the
 // report-intake event's own `pendingPath` field. Before this action that value was ALWAYS a
 // string (even on the swallowed-ENOENT race, moveReportTo used to return a fabricated `dest` that
 // was never actually there) -- now it can be `null`, and this is the one place in the whole

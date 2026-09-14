@@ -26,6 +26,35 @@ const { execFileSync } = require('child_process');
 // Strips the inherited GIT_* env from every real `git` spawn below -- see helpers.js's gitEnv
 // for the incident that makes this load-bearing rather than tidy.
 const { gitEnv, mkTmp } = require('./helpers');
+// The ONE citation-target resolver (resolveCitationTarget/resolveIn/findByBasename/
+// trackedFiles/PRODUCT_REPO/DEPLOY_REPO) lives in citation-pins.js -- action 11.1 (#206) moved
+// it there so this file and action 11.3's test/-comment-citation sweep call the same function
+// instead of each carrying a copy that could drift. resolvePins (the pinned-anchor check) and
+// its data (BENCH_PINS/LIVE_RANGE_PINS/BLUNT_PINS/CCA_PINS) live there too.
+const {
+  PRODUCT_REPO,
+  DEPLOY_REPO,
+  _trackedCache,
+  trackedFiles,
+  findByBasename,
+  resolveIn,
+  resolveCitationTarget,
+  shiftedCitation,
+  resolvePins,
+  // stripFences/normalizeWrap/CITATION_RE/POSSESSIVE_LINE_RE/CHAIN_RE/PROXIMITY_CHARS/
+  // extractCitations/isCitationAllowlisted -- moved to citation-pins.js verbatim, action 11.3
+  // (#190), so this file and test/test-comment-citation-sweep.test.js call the SAME extractor
+  // instead of each carrying a copy that could drift.
+  stripFences,
+  normalizeWrap,
+  CITATION_RE,
+  POSSESSIVE_LINE_RE,
+  CHAIN_RE,
+  PROXIMITY_CHARS,
+  extractCitations,
+  isCitationAllowlisted,
+} = require('./citation-pins');
+const { BENCH_PINS, LIVE_RANGE_PINS, BLUNT_PINS, CCA_PINS } = require('./citation-pins-data');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const abs = (rel) => path.join(REPO_ROOT, rel);
@@ -563,7 +592,7 @@ test('extractTopLevelSubcommands: reads a synthetic dispatch table, proving the 
 // in three places (`lock.js`'s `SECOND` idiom -- ordinal "a second, simpler idiom", not a
 // constant; `config.js`'s `OWN` -- emphasis on "own", not an identifier; `intake.js`'s `LLM` --
 // "the intake LLM steps", not a symbol). Reworded at the source (product-repo-lock.js:28,
-// recette.js:125, bin/spo:1875) rather than allowlisted: these were never real symbol citations
+// recette.js:125, bin/spo:1891) rather than allowlisted: these were never real symbol citations
 // to begin with, so an allowlist entry would misrepresent them as reviewed-and-accepted phantoms
 // instead of what they are, three sentences that happened to fall into a regex's blind spot.
 function isCodeShapedIdentifier(ident) {
@@ -845,14 +874,14 @@ test('symbolDefinedIn (M15b): a name that exists ONLY inside the cited file\'s o
 // doc/comment-corpus-audit-2026-09-03.md's E12: a comment marks itself "---- action N.Na ----"
 // (a section banner naming which plan action the code below implements) and that id does not
 // appear in either plan document. 1 id / 3 sites, found 2026-09-03: `action 5.1d`
-// (orchestrator/park-loop.js:219, orchestrator/state-machine.js:893,1249).
+// (orchestrator/park-loop.js:219, orchestrator/state-machine.js:835,1249).
 //
 // Fix round (2026-09-03, adversarial pass), S3: the first cut of this allowlist entry claimed
 // the referent was "a judgement call about the plan's own history." Re-resolved directly against
-// both docs -- it was not. doc/remediation-plan-2026-08.md:186 lists row 5.1's three sub-items in
+// both docs -- it was not. doc/remediation-plan-2026-08.md:188 lists row 5.1's three sub-items in
 // one cell, unlettered: pre-worktree board moves, "DIAGNOSE activity surfaced (a 'diagnosing,
 // attempt N/3' comment or a dedicated column -- driver decision)" (this one), and dropping the
-// redundant IMPLEMENT-retry move. doc/remediation-progress.md:647 names the same referent again,
+// redundant IMPLEMENT-retry move. doc/remediation-progress.md:649 names the same referent again,
 // under "DIAGNOSE surfacing" ("6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a
 // park"). The referent was never ambiguous -- only the letter `d` was invented (the plan does not
 // letter row 5.1's sub-items at all; a scatter of OTHER letters -- 5.1a/5.1b/5.1c/5.1e -- exists
@@ -909,7 +938,7 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
     while ((m = re.exec(src))) { ids.add(m[1]); checked += 1; }
   }
 
-  assert.ok(checked >= 5, `expected at least 5 "action N.Na" mentions across orchestrator/**+bin/spo, found ${checked} -- has the banner convention changed?`);
+  assert.ok(checked >= 5, `expected at least 5 "action N.Na" mentions across orchestrator (recursively) and bin/spo, found ${checked} -- has the banner convention changed?`);
 
   const offenders = [];
   for (const id of ids) {
@@ -1062,20 +1091,14 @@ const CORPUS_FILES = [
   'scripts/usage-report.js',
 ];
 
-const PRODUCT_REPO = process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient');
-// No `config.deployRepo` exists (confirmed by doc/comment-corpus-audit-2026-09-03.md §5) -- this
-// constant is scanner-local on purpose; see the header above.
-const DEPLOY_REPO = process.env.SPO_DEPLOY_REPO || path.join(os.homedir(), 'SPO-Deploy');
+// PRODUCT_REPO/DEPLOY_REPO -- imported from citation-pins.js above (action 11.1, #206). No
+// `config.deployRepo` exists (confirmed by doc/comment-corpus-audit-2026-09-03.md §5), which is
+// why DEPLOY_REPO is a scanner-local constant rather than something read off `orchestrator/config.js`.
 
-// `bin/spo` is an explicit alternative, not a generalized "extensionless path" allowance: it is
-// the one extensionless executable this corpus cites by line (action 9.3 found real citations to
-// it -- doc/state-machine-spec.md:448, and two dated-record sites -- invisible to the plain
-// `\.ext` shape below, meaning `bin/spo:1090-1093`'s drift to :1137 (see part 2.5) could not even
-// be SEEN, let alone bounds- or anchor-checked, before this widening).
-const CITATION_RE = /((?:bin\/spo)|(?:[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))):(\d+)(?:-(\d+))?/g;
-const POSSESSIVE_LINE_RE = /([A-Za-z0-9_./-]*[A-Za-z0-9_-]\.(?:js|md|sh|ts|json))'s(?:[^()\n]{0,60})?\(line (\d+)\)/g;
-const CHAIN_RE = /`:(\d+)(?:-(\d+))?`|(?<=\bat ):(\d+)(?:-(\d+))?\b/g;
-const PROXIMITY_CHARS = 150;
+// CITATION_RE/POSSESSIVE_LINE_RE/CHAIN_RE/PROXIMITY_CHARS -- moved to citation-pins.js verbatim,
+// action 11.3 (#190), and imported at the top of this file (see that module's own header: `bin/spo`
+// is an explicit alternative there, not a generalized "extensionless path" allowance -- it is the
+// one extensionless executable this corpus cites by line).
 
 // Per-fact allowlist, exactly the ALLOWLIST/KNOWN_FICTIONAL idiom this suite and
 // park-reason-doc-sweep.test.js already use -- keyed `${file} :: ${citation}`, never per-file
@@ -1102,7 +1125,13 @@ const CITATION_ALLOWLIST = {
   // records (measured against a pinned SPO-WebClient commit); 9.1's own re-verification
   // (doc/comment-corpus-audit-2026-09-03.md §1) confirmed sanctuarize.test.ts has since been
   // deleted from the product repo. The citation was true when the record was written -- editing
-  // it now would misrepresent what the audit actually found at measurement time.
+  // it now would misrepresent what the audit actually found at measurement time. This is the ONE
+  // shape action 11.1 (#206) leaves on this allowlist for these two docs: a deleted file has no
+  // line left to pin against. Every OTHER file-tied citation in both docs (41 of them) now has a
+  // real content check of its own -- BENCH_PINS, in test/citation-pins-data.js, resolved by
+  // test/citation-pins.js's resolvePins (see the tests below part 2.5) -- so "dated 8.1 audit
+  // records" here describes only why THESE TWO entries are permanently unfixable, not why the
+  // two docs as a whole go unchecked; they no longer do.
   'doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156':
     'product file deleted after this dated record was written (confirmed by 9.1, ' +
     'doc/comment-corpus-audit-2026-09-03.md §1) -- historical citation, not a live one.',
@@ -1118,12 +1147,6 @@ const CITATION_ALLOWLIST = {
   'doc/bench-audit-2026-09-02.md :: worker.ts:779-780':
     "product file has shrunk since this dated record's measurement commit (759 lines today) -- " +
     'historical citation, not a live one.',
-  // This repo's own .claude/settings.json has been edited since 2026-09-02 (120 lines today,
-  // down from the 109-127 range cited as evidence of a 33%-precision worked example) -- same
-  // dated-record posture, this time about THIS repo rather than the product.
-  'orchestrator/README.md :: .claude/settings.json:109-127':
-    "this repo's .claude/settings.json has been edited since this dated record's measurement " +
-    'date -- historical citation (worked-example evidence), not a live one.',
   // doc/bench-audit-2026-09-02.md's own "One sweep's broken references are all in `.ts` files
   // (`cli.ts` is 310 lines and was cited to `:458`; `fingerprint.ts` is 80 and cited to `:277`);
   // the other's are all in shell scripts (`bench-submit.sh` is 15 lines, cited to `:65-69`)"
@@ -1154,9 +1177,8 @@ const CITATION_ALLOWLIST = {
 // only that CITATION_ALLOWLIST's OWN keys look right. This function is that comparison, called by
 // the main test below instead of inlining it, so the fixture test right after it is exercising
 // the exact same logic the real ratchet runs, not a parallel reimplementation that could drift.
-function isCitationAllowlisted(allowlist, rel, raw) {
-  return Object.prototype.hasOwnProperty.call(allowlist, `${rel} :: ${raw}`);
-}
+// isCitationAllowlisted -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported
+// at the top of this file.
 
 test('isCitationAllowlisted: matches per FACT (file + citation), never by file alone (M13)', () => {
   const allowlist = { 'orchestrator/README.md :: known-absent.ts:1': 'a real, dated absence' };
@@ -1181,7 +1203,6 @@ test('CITATION_ALLOWLIST holds exactly the entries this action explicitly justif
       'doc/bench-audit-2026-09-02.md :: worker.ts:779-780',
       'doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156',
       'orchestrator/README.md :: .claude/hooks/context-router.sh:117',
-      'orchestrator/README.md :: .claude/settings.json:109-127',
       'orchestrator/invariants.js :: relative/path/to/file.ts:123',
     ],
     'CITATION_ALLOWLIST changed size or membership. Adding an entry here exempts a citation from ' +
@@ -1190,22 +1211,8 @@ test('CITATION_ALLOWLIST holds exactly the entries this action explicitly justif
   );
 });
 
-function stripFences(src) {
-  // Fenced code blocks hold format TEMPLATES (e.g. "File: relative/path/to/file.ts:123" in the
-  // invariant-block example), never a real citation -- blanked the same way blankComments strips
-  // // and /* */ elsewhere in this suite's sweeps, so line numbers of anything real are unaffected.
-  let inFence = false;
-  return src
-    .split('\n')
-    .map((line) => {
-      if (line.trim().startsWith('```')) {
-        inFence = !inFence;
-        return '';
-      }
-      return inFence ? '' : line;
-    })
-    .join('\n');
-}
+// stripFences -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported at the top
+// of this file.
 
 // normalizeWrap(src) -- E18/E15: joins an identifier or citation the source happened to wrap
 // across a line break, so CITATION_RE (which never spans a space, deliberately -- spanning one
@@ -1215,144 +1222,23 @@ function stripFences(src) {
 // character, after stripping any `//`/`*`/`#` comment leader the continuation line starts with;
 // (2) every other line break, collapsed to a single space (safe: a citation never legitimately
 // contains a literal space, so this can only ever help a match, never manufacture a false one).
-function normalizeWrap(src) {
-  let text = src.replace(/([-/])\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, '$1');
-  text = text.replace(/[ \t]*\r?\n[ \t]*(?:\/\/|\*(?!\/)|#)?[ \t]*/g, ' ');
-  return text;
-}
+// normalizeWrap -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported at the
+// top of this file.
 
-// trackedFiles(root) -- the repo's OWN tree, from git, cached per root.
-//
-// This replaced a recursive readdir walk that skipped only `.git` and `node_modules`, and it is
-// not a tidy-up: the walk descended into NESTED GIT WORKTREES. `/home/crazz/SPO-WebClient` holds
-// abandoned agent worktrees under `.claude/worktrees/<slug>/`, each a full copy of the product
-// tree, and `.claude` sorts before `src`, so a bare-basename citation like `worker.ts:892`
-// resolved to a MONTHS-OLD copy and was line-checked against it. That is how four dangling
-// cross-repo citations passed 9.1's verification and this ratchet's own green run: the file the
-// checker read was not the file the citation meant. Measured 2026-09-03, when `worker.ts:892`
-// (a real line in the product's `src/e2e/bench/worker.ts`) was reported dangling because the
-// worktree copy it resolved to has only 759 lines.
-//
-// `git ls-files` is the fix and not merely a filter: a nested worktree is not tracked by the
-// parent repo, and neither are `node_modules`, `dist` or any other ignored build output, so the
-// exclusion is the repo's own definition of what belongs to it rather than a denylist this file
-// would have to keep in step with whatever a future tool drops on disk.
-const _trackedCache = new Map();
-function trackedFiles(root) {
-  if (_trackedCache.has(root)) return _trackedCache.get(root);
-  let list = [];
-  try {
-    list = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: gitEnv() })
-      .split('\n')
-      .filter(Boolean);
-  } catch {
-    list = [];
-  }
-  _trackedCache.set(root, list);
-  return list;
-}
-
-// findByBasename -- every tracked file whose basename matches, never just the first. An
-// AMBIGUOUS basename is a defect in the citation (it does not say which file it means) and the
-// caller reports it by name; silently taking the first match is what let the stale-worktree copy
-// win above, and "pick one and say nothing" is the shape this whole sweep exists to remove.
-function findByBasename(name, root) {
-  return trackedFiles(root)
-    .filter((rel) => path.basename(rel) === name)
-    .map((rel) => path.join(root, rel));
-}
-
-// resolveIn(root, filePath) -> { target } | { ambiguous: [paths] } | null
-function resolveIn(root, filePath) {
-  if (filePath.includes('/')) {
-    const target = path.join(root, filePath);
-    return fs.existsSync(target) ? { target } : null;
-  }
-  const hits = findByBasename(filePath, root);
-  if (hits.length === 0) return null;
-  if (hits.length > 1) return { ambiguous: hits };
-  return { target: hits[0] };
-}
-
-// resolveCitationTarget(filePath) -- E1, minimally: this repo first, then the product repo (with
-// a leading "SPO-WebClient/" stripped, since prose sometimes spells the citation out with the
-// repo name attached), then SPO-Deploy the same way. Returns one of:
-//   { target, root: 'repo' | 'product' | 'deploy' }            -- resolved
-//   { target: null, root: 'product-absent' | 'deploy-absent' } -- the repo that would be needed
-//                                                                  to tell isn't on disk: this is
-//                                                                  NEVER treated as a pass (see
-//                                                                  the header's E1 section)
-//   { target: null, root: null }                               -- resolved nowhere; dangling
-function resolveCitationTarget(filePath) {
-  // `ambiguous` is carried out to the caller rather than resolved here: only the caller knows the
-  // citation's own text, and the offender line has to name the candidates for the maintainer to
-  // pick between them. Never collapse it to a target.
-  const local = resolveIn(REPO_ROOT, filePath);
-  if (local && local.ambiguous) return { target: null, root: 'repo', ambiguous: local.ambiguous };
-  if (local) return { target: local.target, root: 'repo' };
-  const productPath = filePath.replace(/^SPO-WebClient\//, '');
-  if (!fs.existsSync(PRODUCT_REPO)) return { target: null, root: 'product-absent' };
-  const product = resolveIn(PRODUCT_REPO, productPath);
-  if (product && product.ambiguous) return { target: null, root: 'product', ambiguous: product.ambiguous };
-  if (product) return { target: product.target, root: 'product' };
-  const deployPath = filePath.replace(/^SPO-Deploy\//, '');
-  if (!fs.existsSync(DEPLOY_REPO)) return { target: null, root: 'deploy-absent' };
-  const deploy = resolveIn(DEPLOY_REPO, deployPath);
-  if (deploy && deploy.ambiguous) return { target: null, root: 'deploy', ambiguous: deploy.ambiguous };
-  if (deploy) return { target: deploy.target, root: 'deploy' };
-  return { target: null, root: null };
-}
+// trackedFiles/findByBasename/resolveIn/resolveCitationTarget -- moved to citation-pins.js
+// verbatim, action 11.1 (#206), and imported at the top of this file. See that module's own
+// header for the incident this resolver fixes (a nested abandoned worktree under
+// `~/SPO-WebClient/.claude/worktrees/<slug>/` shadowing the real product file, `.claude` sorting
+// before `src` in a plain readdir walk) -- nothing about the logic changed, only its address, so
+// this file and action 11.3's test/-comment-citation sweep call the same function rather than
+// each carrying a copy that could drift.
 
 // extractCitations(text) -- the three shapes, merged in document order, chain matches resolved
 // against the nearest preceding real citation within PROXIMITY_CHARS. `text` is expected to
 // already be fence-stripped (if markdown) and normalizeWrap'd. Exported shape:
 // [{ raw, file, start, stop, unanchored }], `file: null` iff `unanchored` is true.
-function extractCitations(text) {
-  const matches = [];
-  let m;
-  CITATION_RE.lastIndex = 0;
-  while ((m = CITATION_RE.exec(text))) {
-    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[3] || m[2]) });
-  }
-  POSSESSIVE_LINE_RE.lastIndex = 0;
-  while ((m = POSSESSIVE_LINE_RE.exec(text))) {
-    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'full', file: m[1], start: Number(m[2]), stop: Number(m[2]) });
-  }
-  CHAIN_RE.lastIndex = 0;
-  while ((m = CHAIN_RE.exec(text))) {
-    const start = Number(m[1] || m[3]);
-    const stop = Number(m[2] || m[4] || start);
-    matches.push({ idx: m.index, end: m.index + m[0].length, kind: 'chain', start, stop });
-  }
-  matches.sort((a, b) => a.idx - b.idx);
-
-  // A chain match landing inside a full/possessive match's own span is the ":N" already captured
-  // by that match (e.g. the ":49" inside "spec.md:49") -- drop it, it is not a second citation.
-  const filtered = matches.filter(
-    (mm) => mm.kind !== 'chain' || !matches.some((o) => o.kind !== 'chain' && mm.idx >= o.idx && mm.idx < o.end)
-  );
-
-  const out = [];
-  let lastFile = null;
-  let lastFileEnd = -1;
-  for (const mm of filtered) {
-    // idx/end (the match's own character span) are carried through for part 2.5's anchor check
-    // below, which needs to know WHERE in the citing text a citation sits in order to scan its
-    // surrounding prose -- part 2 itself never reads these two fields.
-    if (mm.kind === 'chain') {
-      if (!lastFile || mm.idx - lastFileEnd > PROXIMITY_CHARS) {
-        out.push({ raw: `(unanchored) :${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: null, start: mm.start, stop: mm.stop, unanchored: true, idx: mm.idx, end: mm.end });
-      } else {
-        out.push({ raw: `${lastFile}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: lastFile, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
-      }
-    } else {
-      lastFile = mm.file;
-      lastFileEnd = mm.end;
-      out.push({ raw: `${mm.file}:${mm.start}${mm.stop !== mm.start ? `-${mm.stop}` : ''}`, file: mm.file, start: mm.start, stop: mm.stop, unanchored: false, idx: mm.idx, end: mm.end });
-    }
-  }
-  return out;
-}
+// extractCitations -- moved to citation-pins.js verbatim, action 11.3 (#190), and imported at
+// the top of this file.
 
 // M17 (2026-09-03) removed 4 entries -- `orchestrator/bench-queue-wait.js :: worker.ts:129` and
 // `:997`, `orchestrator/journal.js :: worker.ts:131`, `orchestrator/steps/scripted.js ::
@@ -1374,7 +1260,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
   "doc/bench-audit-2026-09-02.md :: bin/spo:1273", // re-pinned FIFTEENTH TIME in card #214 (Lot 9, 2026-09-13): :1243 -> :1273, when that action's `cmdTokens` gained an opt-in `--usage-delta` per-step journal-vs-transcript section (console/usage-scan.js's own new join, plus the `usageDelta` flag/parseArgs branch above it) -- net +30 lines above `collectAll(sources)`. See the mutation-proof test's own FIFTEENTH-catch paragraph for the empirical re-check.
-  "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110",
+  "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110", // KEPT as originally written -- action 11.1 (#206) first pass wrongly "corrected" this to :111-112 against d03ea8b7; fix pass D6 found the audit was actually measured against `93528389` (remediation-plan row 1.2, confirmed an ancestor of origin/main), where :109-110 IS the finished_marker/if-guard pair that reads `.finished` -- the :111-112 figure only held two lines later, at the wrong base commit.
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
   "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:166", // re-pinned from :157 -- card #211's fix-pass Principle-1 growth pushed the whole step table down 9 lines, so :157 (which used to be the FINISH row) is now PLAN; FINISH itself is at :166. A true pure shift; content byte-identical at :166 (verified: the FINISH row's own "Action B1.4: FINISH now actually keeps the promise this row always made -- fast-forward the main product checkout" opens it).
@@ -1383,18 +1269,18 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
   "doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156",
   "doc/bench-audit-2026-09-02.md :: scripted.js:1347",
-  "doc/bench-audit-2026-09-02.md :: scripted.js:1944-1994",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:1944-1996", // re-pinned from :1944-1994 -- fix pass D7: realFinish genuinely ends at :1996 (the function's own closing brace); :1994 is a blank line two short of that, verified by reading orchestrator/steps/scripted.js at 7902164.
   "doc/bench-audit-2026-09-02.md :: scripted.js:292-293",
   "doc/bench-audit-2026-09-02.md :: scripts/finish.sh:245-247",
   "doc/bench-audit-2026-09-02.md :: scripts/nightly-check.sh:70-73",
   "doc/bench-audit-2026-09-02.md :: src/e2e/bench/paths.ts:143-163",
   "doc/bench-audit-2026-09-02.md :: src/e2e/bench/worker.ts:482",
   "doc/bench-audit-2026-09-02.md :: src/e2e/config.ts:93",
-  "doc/bench-audit-2026-09-02.md :: test/helpers.js:65-80",
+  "doc/bench-audit-2026-09-02.md :: test/helpers.js:65-94", // re-pinned from :65-80 -- fix pass D7: isolatedEnv spans :65-94, and the fact this citation claims (the SPO_BENCH_DIR temp-dir assignment) is at :92, seven lines past where the old range stopped; verified by reading test/helpers.js at 7902164.
   "doc/bench-audit-2026-09-02.md :: verdict.ts:162-183",
   "doc/bench-audit-2026-09-02.md :: verdict.ts:23-67",
   "doc/bench-audit-2026-09-02.md :: worker.ts:106",
-  "doc/bench-audit-2026-09-02.md :: worker.ts:301",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:302", // re-pinned from :301 -- action 11.1 (#206) corrected the citation to request.fingerprint.head's own `const head =` line, not the comment line above it; verified by reading src/e2e/bench/worker.ts at d03ea8b7.
   "doc/bench-audit-2026-09-02.md :: worker.ts:307-319",
   "doc/bench-audit-2026-09-02.md :: worker.ts:482",
   "doc/bench-audit-2026-09-02.md :: worker.ts:482-486",
@@ -1405,7 +1291,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1273", // same re-pin, same day, card #214 -- see the sibling doc's own EXPECTED_CITATIONS comment above.
-  "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110",
+  "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110", // same revert, same reason as bench-audit's own entry above (fix pass D6).
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:166", // re-pinned from :157, same shift/reason as doc/bench-audit-2026-09-02.md's own entry above
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
@@ -1414,19 +1300,19 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: scripts/finish.sh:245-247",
   "doc/bench-plan-derived-2026-09-02.md :: scripts/nightly-check.sh:70-73",
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
-  "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-80",
-  "doc/bench-plan-derived-2026-09-02.md :: worker.ts:301",
+  "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-94", // same re-pin, same reason as bench-audit's own entry above (fix pass D7).
+  "doc/bench-plan-derived-2026-09-02.md :: worker.ts:302", // same re-pin, same reason as bench-audit's own entry above.
   "doc/board-audit.md :: config.js:1035", // re-pinned from :900, then :965, then :1003, then :1035 (card #211's fix-pass ROUND 2: MAX_TIMER_DELAY_MS const + the residual-overflow Math.max/Math.min guards on GATE_DIED_RECOVERY_MAX_POLLS_CEILING/MAX_POLLS added 32 more net lines above reportIntakeColumn) -- a true pure shift each time; content byte-identical at :1035
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1389", // re-pinned from :1382 -- card #212 added a `guardNightlyRed` extraDetail parameter and header comment (~7 net lines) above realWorktree in the same file, a true pure shift; content byte-identical at :1389
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1232", // re-pinned in card #214 (Lot 9, 2026-09-13): :1202 -> :1232, a pure +30-line shift when that action's `cmdTokens` gained the opt-in `--usage-delta` section (see this file's own EXPECTED_CITATIONS entry for `bin/spo:1273`, the `collectAll` pin shifted by the same edit) landed above `cmdDashboard` in the same file; content byte-identical (`function cmdDashboard(opts) {`) at :1232, verified by re-reading the target line.
-  "doc/state-machine-spec.md :: dispatcher.js:634-648",
+  "doc/state-machine-spec.md :: dispatcher.js:635-648", // re-pinned from :634-648 -- action 11.1 (#206) found :634 is a blank line (unable to discriminate any drift against it, and blank text pins do not narrow `movedTo` either); :635 is the "if (childrenSignalled && outcome === 'crashed') {" line this citation actually names, verified by reading.
   "doc/state-machine-spec.md :: intake.js:938-940", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
-  "orchestrator/README.md :: .claude/settings.json:109-127",
+  "orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127", // fix pass R1 (#206): the citation was true all along, it just cites the OTHER repo -- issue-429's PLAN ran with cwd in an SPO-WebClient worktree (base de2039e9), and `.claude/settings.json:109-127` there is the `"hooks": {` block through the third PreToolUse hook's `"timeout": 10` line, byte-identical at de2039e9/93528389/HEAD. Re-spelled with the `SPO-WebClient/` prefix so resolveCitationTarget routes it to the product repo instead of this one's own (109-line-shorter) settings.json.
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:899", // re-pinned from :773, then :829, then :867, then :899 (card #211's fix-pass ROUND 2: MAX_TIMER_DELAY_MS const + the residual-overflow Math.max/Math.min guards on GATE_DIED_RECOVERY_MAX_POLLS_CEILING/MAX_POLLS added 32 more net lines above productRepo) -- a true pure shift each time; content byte-identical at :899
-  "orchestrator/README.md :: dispatcher.js:634-648",
+  "orchestrator/README.md :: dispatcher.js:635-648", // re-pinned from :634-648 -- action 11.1 fix pass (D3): the same sibling fact as doc/state-machine-spec.md's own entry above, missed in the first pass; :634 is a blank line, :635 is "if (childrenSignalled && outcome === 'crashed') {".
   "orchestrator/README.md :: doc/state-machine-spec.md:159", // re-pinned from :150 -- card #211's fix-pass Principle-1 edit (naming the WORKER-DIED exception truthfully) added 9 net lines above the step table, a true pure shift; content byte-identical at :159 (the CHECK row)
   "orchestrator/README.md :: intake.js:938-940", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines.
   "orchestrator/README.md :: lock.js:276",
@@ -1455,7 +1341,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/state-machine.js :: step-contracts.js:1029", // re-pinned FIVE TIMES within card #213 (2026-09-12), each a pure relocation of the same `touchesRdoMembers === true` line, content unchanged: :432 -> :527 when action 2 rewrote shouldEscalate into the three-source order, then :527 -> :546 when the D1 fix hoisted trigger 4 above that block, then :546 -> :559 as D6/D7 and the name-only rewording added record comments above it, then :559 -> :880 when card #207 (Lot 9)'s FIRST build landed its own ~273-line addition (the outputContract `types` mechanism, its header comment, checkOutputTypes/valueSatisfiesType/jsonSchemaPropertiesFor, and per-step `types` maps) entirely ABOVE shouldEscalate in the file. Re-pinned again, same day, in that same card's first Opus-verifier fix pass (removing the two `types` declarations the corpus replay found unsafe and adding ~55 net lines of measured-evidence comment to the header instead): :880 -> :935. Re-pinned a THIRD time within card #207 itself, in the SECOND Opus-verifier fix pass (2026-09-13, honesty fixes F/G: stale wording corrections and a corrected corpus count added ~16 more net lines above this point): :935 -> :951. Re-pinned a SIXTH time in card #214 (Lot 9, 2026-09-13): :951 -> :978, a pure shift when that action added a measured comment above PLAN's `allowedTools` (allowedTools does not bind subagent spawning) and rewrote the IMPLEMENT_EFFORT_BY_SIZE per-turn-fit prose, both entirely above this point in the file; content byte-identical at :978, verified by re-reading the target line. Re-pinned a SEVENTH time in card #214's own fix pass (2026-09-13, F1): :978 -> :979, a pure +1-line shift when that pass widened the DIAGNOSE baseline comment's parenthetical (naming the new `requestCount`/`sessionRequestCount` replacement by name), above this point in the file; content byte-identical at :979, verified by re-reading the target line. Re-pinned an EIGHTH time in the SAME fix pass (F4): :979 -> :987, a pure +8-line shift when F4 dated/corrected PLAN's allowedTools comment itself (PR #222, and the corrected "IMPLEMENT can delegate too" finding, both above shouldEscalate in the file); content byte-identical at :987, verified by re-reading the target line. Re-pinned a NINTH time in a follow-up fix pass on the same card (2026-09-13, tense-neutral PR #222 wording): :987 -> :986, a pure -1-line shift when that pass tightened PLAN's allowedTools comment (cutting a "likely to merge" forecast clause), above shouldEscalate in the file; content byte-identical at :986, verified by re-reading the target line. Re-pinned a TENTH time when Lot 9's branch merged origin/main after PR #222 (2026-09-13): :986 -> :1029, a pure relocation -- #222 rewrote the shared EFFORT_BY_SIZE comment and added PLAN_EFFORT_BY_SIZE with its Fable baseline, all above shouldEscalate in the file (main alone had it at :603); content byte-identical at :1029, verified by re-reading the target line. It is still source 3 (intake's guess, reached only when the plan declared nothing at all). Every move was verified by re-reading the target line, not inferred from a diff offset.
   "orchestrator/steps/llm.js :: intake.js:938-940", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines.
   "orchestrator/steps/scripted.js :: run.ts:63",
-  "orchestrator/steps/scripted.js :: verify-gate.js:308",
+  "orchestrator/steps/scripted.js :: verify-gate.js:336",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
   "orchestrator/steps/scripted.js :: worker.ts:1542",
   "orchestrator/steps/scripted.js :: worker.ts:751", // card #212: isGateMergeRefusalConfirmed's own comment cites worker.ts:751's refusal-detail literal ("<ref> does not merge cleanly with origin/main (base <sha>)"), confirmed against the real product repo (SPO-WebClient `0b5b5687`+).
@@ -1706,7 +1592,7 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // `SIGTERM` handler -- cited twice), `worker.ts:108`/`:110`/`:109-110` (each one line short of
 // the real `DONE_RETENTION_MS`/`MAX_LEASE_MINUTES`/`DEFAULT_LEASE_MINUTES` declarations),
 // `doc/remediation-plan-2026-08.md:186` and `doc/remediation-progress.md:647` (both two lines
-// short of the real "DIAGNOSE" row/paragraph they cite), `step-contracts.js:136` (should be
+// short of the real "DIAGNOSE" row/paragraph they cite), `step-contracts.js:108` (should be
 // `:99`, the comment block that actually states the IMPLEMENT/VALIDATE-not-PLAN escalation rule),
 // and `doc/board-audit.md`'s own two: `orchestrator/steps/scripted.js:937` (should be `:1295`,
 // the real `npm run board:take` spawn site) and `config.js:711` (should be `:764`, the real
@@ -1755,7 +1641,7 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 // Measured twice, on two different corpora, because the corpus moved underneath this change while
 // it sat unmerged: 22 anchored / 3 unanchorable / 0 offenders at every N on 2026-09-03, and
 // 22 anchored / 2 unanchorable / 0 offenders at every N on 2026-09-04, after #109 deleted the
-// unfireable `escalateFlag` and with it prompts/README.md's `step-contracts.js:127` citation. The
+// unfireable `escalateFlag` and with it prompts/README.md's `step-contracts.js:99` citation. The
 // `unanchorable` move is #109's, not this change's -- removing a citation cannot alter what a
 // tolerance band accepts -- and the sweep's own result is unchanged by it: the band is still
 // buying zero anchors. The second measurement is a re-run, not the first one with a digit edited.
@@ -1802,36 +1688,44 @@ test('resolveCitationTarget: an absent product repo is reported as product-absen
 //      files close together can rank the wrong one first. The clip-at-neighbouring-citation rule
 //      closes the worst version of this (a citation's own candidates leaking from an ADJACENT
 //      citation's sentence), but two candidates for the SAME citation can still be mis-ordered
-//      within one un-clipped span -- `account-lease.js:156`, `dispatcher.js:634-648`, and
-//      `verify-gate.js:308` on CITATION_ANCHOR_ALLOWLIST below are exactly this: a real, nearby
+//      within one un-clipped span -- `account-lease.js:156`, `dispatcher.js:635-648`, and
+//      `verify-gate.js:336` on CITATION_ANCHOR_ALLOWLIST below are exactly this: a real, nearby
 //      identifier that turned out to belong to a different clause than the one being cited, not a
 //      wrong citation. Every one was read by hand and reasoned about below, not assumed.
-//   4. Excludes `doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` (see
-//      ANCHOR_EXCLUDED_FILES below) -- their own citations are still bounds/dangling-checked by
-//      part 2, unchanged, just not content-anchored.
+//   4. Excludes `doc/bench-audit-2026-09-02.md` and `doc/bench-plan-derived-2026-09-02.md` from
+//      THIS (identifier-based) anchor layer only (see ANCHOR_PIN_CHECKED_FILES below) -- as of
+//      action 11.1 (#206) their own citations get a STRONGER check instead, a literal-text pin
+//      (BENCH_PINS, test/citation-pins-data.js), not merely the bounds/dangling check part 2
+//      still also runs on them unchanged. "Excluded" describes which CHECK runs, not whether one does.
 
-// Excluded from the ANCHOR layer only (part 2's bounds/dangling check above still covers them in
-// full, unchanged): these two are DATED, point-in-time audit records, already treated specially
-// by CITATION_ALLOWLIST's own historical entries above ("product file has shrunk/deleted since
-// this dated record's measurement commit"). Measured directly while building this check: the
-// product tree is not a fixed target even across this ONE action's own working session --
-// `verdict.ts` was 167 lines when this file's CITATION_ALLOWLIST entries were written (hours
-// before this section) and 422 lines when this section's own measurement ran, because other work
-// landed in SPO-WebClient in between. Anchor-checking these two files' citations against
-// "whatever the product tree happens to contain today" measured 22 failures, nearly all of them
-// paragraphs of quoted code from a snapshot the product has since been substantially rewritten
-// past -- not a wrong citation, a snapshot no longer matching a moving target, which is exactly
-// the class of fact this suite's own CITATION_ALLOWLIST entries already recognize and exempt for
-// these same two files. Per-fact allowlisting all 22 was rejected as disproportionate noise for a
-// property these two files' own header already establishes (dated, not live); a file-level scope
-// limit for the ANCHOR layer specifically -- stated here, not silent, and still fully
-// bounds/dangling-checked -- was judged the honest choice. The one exception, `bin/spo:1090-1093`
-// -> `:1137`, was NOT left on this exemption: it was fixed in passing (see the header above)
-// because the underlying fact ("console/collect.js is reached from bin/spo") is still true today,
-// just at a different line -- a stale pointer, not a stale snapshot -- and its catch is proven
-// directly against the real files by the mutation-proof canary below, independent of this
-// exclusion.
-const ANCHOR_EXCLUDED_FILES = new Set(['doc/bench-audit-2026-09-02.md', 'doc/bench-plan-derived-2026-09-02.md']);
+// PINNED, not merely excluded (action 11.1, #206). These two are DATED, point-in-time audit
+// records; the reasoning that first kept them out of THIS identifier-based layer still holds --
+// re-measured for this action: anchoring today's product tree against their CURRENT citation
+// finds only 6/26 (bench-audit) and 3/9 (bench-plan-derived) of their anchor-checkable
+// citations, and anchoring their OWN commit's tree (the honest target for a dated record, and
+// what a maintainer would actually want checked) still finds only 14/26 and 4/9 -- most misses
+// are the nearest-candidate picker choosing a markdown-table label (`T02`, `W36`, `D11`) over
+// the real citation, not a wrong citation. Per-fact allowlisting the gap (~20-26 entries) was
+// rejected as disproportionate noise when this section first measured it (22 failures against a
+// product tree that kept moving underneath the measurement itself -- `verdict.ts` alone went
+// from 167 to 422 lines within one action's working session) and is rejected again here for the
+// same reason: allowlisting a heuristic's blind spot one citation at a time does not make the
+// heuristic right for this doc's vocabulary, it just hides that it isn't.
+//
+// So this action does not force these two docs through the identifier heuristic. It gives them
+// something the heuristic cannot do at all: a PIN of the literal, trimmed text of the cited
+// line(s), read once by hand and compared exactly against the file at the commit the record
+// actually describes -- `test/citation-pins-data.js`'s BENCH_PINS, resolved by
+// `test/citation-pins.js`'s resolvePins (tests below this exclusion, and below part 2.5's own
+// tests). Every one of the 41 file-tied citations these two docs carry, other than the 2
+// dangling `sanctuarize.test.ts:151-156` citations (CITATION_ALLOWLIST-only -- a deleted file has
+// no line to pin against), now has a real content check for the first time; the `bin/spo`
+// `collectAll` call site and `doc/state-machine-spec.md`'s FINISH row -- the two facts hand-
+// maintained as true today rather than dated -- are pinned at HEAD instead of frozen. The one
+// pre-existing exception this section already fixed in passing, `bin/spo:1090-1093` -> `:1137`
+// (now `:1273`), is exactly that live fact; its catch is additionally proven by the mutation-proof
+// canary further below, independent of this constant.
+const ANCHOR_PIN_CHECKED_FILES = new Set(['doc/bench-audit-2026-09-02.md', 'doc/bench-plan-derived-2026-09-02.md']);
 
 const ANCHOR_WIN = 150; // chars of citing prose scanned on each side, same order of magnitude as CHAIN_RE's own PROXIMITY_CHARS
 const ANCHOR_TOPK = 2; // nearest-ranked candidates checked; see the run.ts:64 discussion above for why 1 is too strict and 3 adds nothing over 2 in this corpus
@@ -1960,39 +1854,56 @@ const CITATION_ANCHOR_ALLOWLIST = {
     "nearest candidate ('tryCreate'/'linkSync') belongs to an earlier analogy about lock.js's " +
     "daemon.lock idiom, not to this citation's own content -- confirmed correct by hand: line " +
     '156 is where tryAcquireLease calls lock.acquireShortLock and closes.',
-  // "...a worker killed during the dispatcher's OWN shutdown (... `dispatcher.js:634-648`) and any
+  // "...a worker killed during the dispatcher's OWN shutdown (... `dispatcher.js:635-648`) and any
   // owning daemon process that simply never comes back to run `handleExit` at all...": `handleExit`
   // is the SECOND clause's subject (the daemon-never-returns case, uncited), not the first
-  // (dispatcher.js:634-648, the worker-killed-during-shutdown case this citation actually names).
-  // Confirmed correct: lines 634-648 are exactly the `worker-exit-during-shutdown` handling this
+  // (dispatcher.js:635-648, the worker-killed-during-shutdown case this citation actually names).
+  // Confirmed correct: lines 635-648 are exactly the `worker-exit-during-shutdown` handling this
   // prose describes (re-measured for card #78; VERIFIER CORRECTION: this is a REPAIR, not a shift
   // -- `main`:485-499 was `killScanner`, never the worker-exit-during-shutdown block, so the old
-  // pin was wrong before this lot moved the block at all).
-  'orchestrator/README.md :: dispatcher.js:634-648':
+  // pin was wrong before this lot moved the block at all). Re-pinned again in action 11.1's fix
+  // pass (D3, #206): :634-648 -> :635-648, the same one-line correction as doc/state-machine-
+  // spec.md's own sibling citation -- :634 is a blank line, :635 is the block's own `if` line.
+  'orchestrator/README.md :: dispatcher.js:635-648':
     "nearest candidate ('handleExit') is the SUBJECT OF THE NEXT CLAUSE in the same sentence (a " +
     "daemon that never runs handleExit at all), not of this citation -- confirmed correct by " +
-    'hand: lines 634-648 are the worker-exit-during-shutdown handling this prose actually names.',
-  // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:308`'s capability-question
+    'hand: lines 635-648 are the worker-exit-during-shutdown handling this prose actually names.',
+  // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:336`'s capability-question
   // variant, where `required` can be empty...": the true subject is a PROSE PHRASE
   // ("capability-question variant"), not a code-shaped identifier -- `BLOCKED`/`GATE` are
-  // incidental nearby words, not this citation's own content. Confirmed correct: line 308 sits at
-  // the Stage 2 (capabilities) / Stage 3 (routing) boundary this "capability-question" prose
+  // incidental nearby words, not this citation's own content. Confirmed correct (fix pass 11.3
+  // round 3, #190 verifier finding 4 -- the earlier "Stage 2/Stage 3 boundary" reading described
+  // the STALE :308, not today's :336): line 336 is `artifact.verdict = 'BLOCKED';` itself, four
+  // lines below the "capability question... BLOCKED" comment this "capability-question" prose
   // describes.
-  'orchestrator/steps/scripted.js :: verify-gate.js:308':
+  'orchestrator/steps/scripted.js :: verify-gate.js:336':
     "no code-shaped candidate names this citation's true subject (a prose phrase, " +
     "'capability-question variant', not an identifier) -- 'BLOCKED'/'GATE' are incidental nearby " +
-    'words. Confirmed correct by hand: line 308 sits at the Stage 2/Stage 3 boundary this prose describes.',
+    "words. Confirmed correct by hand: line 336 is `artifact.verdict = 'BLOCKED';`, the capability-question outcome this prose describes.",
   // card #212: isGateMergeRefusalConfirmed's own comment cites worker.ts:751 for the
   // refusal-detail LITERAL TEXT itself (a template-string interpolation, not a code-shaped
   // identifier) -- the nearby candidates the heuristic finds ('NAME'/const from an unrelated
   // nearby capitalised word, 'jobId'/camel from this file's own surrounding prose) are incidental,
-  // same shape as the verify-gate.js:308 entry just above. Confirmed correct by hand: worker.ts:751
+  // same shape as the verify-gate.js:336 entry just above. Confirmed correct by hand: worker.ts:751
   // is the exact `${request.ref} does not merge cleanly with origin/main (base ...)` string
   // isGateMergeRefusalConfirmed's own regex matches against.
   'orchestrator/steps/scripted.js :: worker.ts:751':
     "the citation's true subject is a template-literal STRING, not a code-shaped identifier -- " +
     "'jobId' (from this file's own nearby prose) and 'NAME' are incidental. Confirmed correct by " +
     "hand: line 751 is the exact \"does not merge cleanly with origin/main\" template literal.",
+  // Fix pass R1 (#206): "...issue-429's *cites* `SPO-WebClient/.claude/settings.json:109-127` as
+  // evidence, never proposing to touch it...": the only candidate this window finds is a 'file'
+  // substring match on "settings" itself (the citation's own filename), which the target JSON
+  // content -- the `"hooks": {` block through the third PreToolUse hook's `"timeout": 10` line --
+  // never contains. A JSON config value has no code-shaped identifier or cross-file mention to
+  // anchor on; this is the same "no code-shaped candidate names this citation's true subject"
+  // shape as verify-gate.js:336 above, not a wrong citation. Confirmed correct by hand: lines
+  // 109-127 at 935283890fa0593c5c5d0b41cceeaec2c1972c6f are exactly that hooks block.
+  'orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127':
+    "the only nearby candidate is a 'file' substring match on \"settings\" (the citation's own " +
+    "filename), which the cited JSON content never contains -- a config value has no code-shaped " +
+    'identifier to anchor on. Confirmed correct by hand: lines 109-127 (at 93528389) are the ' +
+    '`"hooks": {` block through the third PreToolUse hook\'s `"timeout": 10` line.',
 };
 
 function isAnchorAllowlisted(rel, raw) {
@@ -2003,9 +1914,10 @@ test('CITATION_ANCHOR_ALLOWLIST holds exactly the entries this action explicitly
   assert.deepEqual(
     Object.keys(CITATION_ANCHOR_ALLOWLIST).sort(),
     [
+      'orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127',
       'orchestrator/README.md :: account-lease.js:156',
-      'orchestrator/README.md :: dispatcher.js:634-648',
-      'orchestrator/steps/scripted.js :: verify-gate.js:308',
+      'orchestrator/README.md :: dispatcher.js:635-648',
+      'orchestrator/steps/scripted.js :: verify-gate.js:336',
       'orchestrator/steps/scripted.js :: worker.ts:751',
     ],
     'CITATION_ANCHOR_ALLOWLIST changed size or membership -- read the new/changed citation by ' +
@@ -2051,11 +1963,11 @@ function forEachAnchorCheckedCitation(anchorCorpus, fn) {
 }
 
 test('every anchorable file:line citation in the anchor-checked corpus points at a line whose own prose names something actually there', () => {
-  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_EXCLUDED_FILES.has(rel));
+  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_PIN_CHECKED_FILES.has(rel));
   // Named floor, not a silent "no exclusions happened": if a future edit to CORPUS_FILES or
-  // ANCHOR_EXCLUDED_FILES drops this to 2 or fewer, that is exactly the two dated docs swallowing
+  // ANCHOR_PIN_CHECKED_FILES drops this to 2 or fewer, that is exactly the two dated docs swallowing
   // the whole corpus (or a mis-typed exclusion) and this fails loudly instead of quietly checking nothing.
-  assert.equal(anchorCorpus.length, CORPUS_FILES.length - ANCHOR_EXCLUDED_FILES.size, 'ANCHOR_EXCLUDED_FILES no longer matches exactly two CORPUS_FILES entries by name.');
+  assert.equal(anchorCorpus.length, CORPUS_FILES.length - ANCHOR_PIN_CHECKED_FILES.size, 'ANCHOR_PIN_CHECKED_FILES no longer matches exactly two CORPUS_FILES entries by name.');
 
   const offenders = [];
   let anchored = 0;
@@ -2069,6 +1981,13 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
     );
   });
 
+  // Named-first (comment 4 on #206: "a failure does not say which citation broke"): every count
+  // assertion below this point (`anchored`, `unanchorable`) is preceded by naming any offender, so
+  // a drift is reported BY CITATION before either count assertion gets a chance to just say a
+  // number changed -- D1 of the 11.1 fix pass: this used to sit AFTER `assert.equal(anchored, 36,
+  // ...)`, so a drift still failed with only "found 35", the exact complaint it was meant to fix.
+  assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
+
   // Re-measured 2026-09-03 after M17's symbol-citation conversion: 22 verified (was 26), 3
   // unanchorable (unchanged then; 2 since 2026-09-04 -- see the note on the pin itself below). The 4 that left the anchored set are the 4 line-number citations
   // converted to symbol citations in the same change -- `worker.ts:129`/`:997`/`:131`/`:130-131`
@@ -2076,8 +1995,8 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // already named. They did not stop being checked; they stopped being checked BY LINE NUMBER.
   //
   // Original measurement, for the shape of the unanchorable set: 26 verified,
-  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:797-799`, `orchestrator/steps/
-  // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:127` (deleted
+  // 3 unanchorable -- `orchestrator/park-loop.js :: intake.js:796-798`, `orchestrator/steps/
+  // scripted.js :: verify-gate.js:342`, and `prompts/README.md :: step-contracts.js:99` (deleted
   // by #109, leaving the two still listed here) -- each citing a
   // fact its own surrounding prose never names with a code-shaped identifier or a cross-file
   // mention -- correctly unverifiable, not wrong -- 3 on CITATION_ANCHOR_ALLOWLIST (already
@@ -2107,10 +2026,10 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // alone is enough to anchor it, and `reconcileExternalClosure` alone is what still anchors it
   // one line up, at park-loop.js:1261 ("...only reconcileExternalClosure runs for it.") -- see
   // ANCHOR_BLUNT_CITATIONS below for why that also makes it blunt, not merely anchored.
-  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:354`
+  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
   // (resolveRdoDiffTouched's strict-boolean rationale). Re-measured: 29 verified (was 28), 2
   // unanchorable (unchanged), 0 offenders. It anchors on `touchesRdoMembers` (camelCase), present
-  // verbatim on step-contracts.js:354 itself (`touchesRdoMembers === true`).
+  // verbatim on step-contracts.js:326 itself (`touchesRdoMembers === true`).
   // card #78 (2026-09-07): no citation added or removed, but this action's own doc/comment fixes
   // (correcting the now-false "crash repark runs in-process" claim across the tree) moved SEVEN
   // already-pinned targets. VERIFIER CORRECTION (same card): the first cut of this note said FIVE
@@ -2142,7 +2061,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // Every current pin above was opened at its cited line and read by hand. `anchored` is unchanged
   // at 29 (the two re-pinned bench-doc citations are anchor-excluded and count in neither number).
   // card #161 (2026-09-09): +3 anchored citations, `orchestrator/auto-triage.js :: park-loop.js:1396`,
-  // `:: remote-report-pull.js:193` and `:: state-machine.js:2981`, all three to the identical
+  // `:: remote-report-pull.js:193` and `:: state-machine.js:2923`, all three to the identical
   // best-effort appendDaemonEvent-try/catch precedent. `appendDaemonEvent` sits inside every one of
   // the three citations' own same-sentence anchor windows, so all three anchor on it directly --
   // no CITATION_ANCHOR_ALLOWLIST entry and no unanchorable bump needed. 29 -> 32.
@@ -2166,12 +2085,12 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // "exactly one reader" argument that range makes). It anchors: `scanFile` (line 12) and
   // `reader` (lines 12, 15, 16) appear verbatim within lines 10-18 (the paragraph the citation
   // targets), so the heuristic finds a candidate in range. 34 -> 35.
-  // card #213 action 2 (2026-09-12): `orchestrator/state-machine.js :: step-contracts.js:500`
+  // card #213 action 2 (2026-09-12): `orchestrator/state-machine.js :: step-contracts.js:461`
   // stopped anchoring mid-lot, when action 2's own rewrite of shouldEscalate (STEP_CONTRACTS'
   // IMPLEMENT entry, the vocabulary preamble, and shouldEscalate itself, all ahead of :461 in the
   // file) pushed `touchesRdoMembers === true` down to :527. Re-pinned in both state-machine.js's
-  // citing comment and EXPECTED_CITATIONS to :527, where it anchors again -- `touchesRdoMembers
-  // === true` sits verbatim on that exact line today, inside shouldEscalate's rewritten body
+  // citing comment and EXPECTED_CITATIONS to :1029 (as of this writing -- see EXPECTED_CITATIONS's own re-pin history above), where it anchors again -- `touchesRdoMembers
+  // === true` sat verbatim on that exact line at the time, inside shouldEscalate's rewritten body
   // (`if (task.touchesRdoMembers === true) return true; // source 3: intake's guess, undeclared
   // plan`). That re-pin is COUNT-NEUTRAL, and the note that used to stand here said otherwise:
   // the citation was already counted as `anchored` at :432 on origin/main and is `anchored` again
@@ -2184,7 +2103,7 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // mechanism exists to prevent -- the next reader who moves shouldEscalate would otherwise
   // "correct" the count in the wrong direction.
   assert.equal(anchored, 36, `expected 36 verified anchor matches, found ${anchored} -- a citation moved between verified/unanchorable/offending; re-measure and update this pin by name.`);
-  // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:127` to explain an
+  // 3 -> 2 on 2026-09-04: prompts/README.md's PLAN row cited `step-contracts.js:99` to explain an
   // "Opus 5 fallback" that could never fire (its only trigger, `task.escalate`, was set nowhere).
   // The escalation was deleted, so the row no longer makes the claim and no longer needs the
   // citation. The population SHRANK -- which is the direction this pin is happy to move in; it
@@ -2193,13 +2112,12 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
   // other pin in this file.
   // card #161 (2026-09-09): +2 citations, `orchestrator/auto-triage.js :: park-loop.js:1396` and
   // `:: remote-report-pull.js:193`, both to the identical best-effort appendDaemonEvent-try/catch
-  // precedent (a third, state-machine.js:2981, cites the same precedent). The prose was written so
+  // precedent (a third, state-machine.js:2923, cites the same precedent). The prose was written so
   // `appendDaemonEvent` itself falls inside each citation's same-sentence anchor window rather than
   // being clipped off by an adjacent citation. Re-measured: 32 anchored (was 29 -- see the pin
   // above), 2 unanchorable (unchanged), 0 offenders -- all three new citations anchor on
   // `appendDaemonEvent` itself, not on an allowlist entry.
   assert.equal(unanchorable, 2, `expected exactly 2 unanchorable citations (no code-shaped candidate named nearby) -- found ${unanchorable}. This count is pinned so "cannot verify" cannot silently grow into a way to dodge this check.`);
-  assert.deepEqual(offenders, [], `citation(s) whose own prose names something NOT found near the cited line -- a drift this check exists to catch:\n  ${offenders.join('\n  ')}`);
 });
 
 // ---- part 2.6: corpus-wide +/-1 mutation proof (this action) ------------------------------------
@@ -2274,6 +2192,14 @@ const ANCHOR_BLUNT_CITATIONS = {
     'line 1341, not on 1340). Citation confirmed correct by hand: 1341 is the ' +
     '`if (state.state !== \'PARKED\') continue;` line.',
 };
+// NOT retired by action 11.1 (#206), even though these same 3 citations also carry a literal-text
+// HEAD pin now (BLUNT_PINS, test/citation-pins-data.js) that DOES discriminate a +/-1 drift on all
+// three (see this action's own corpus-wide pin mutation-proof test, further below) -- because the
+// property this constant/test pins is narrower and still literally true: the IDENTIFIER heuristic
+// on its own cannot discriminate these three, regardless of what else now also checks them. The
+// corpus-level blind spot these three names is CLOSED (BLUNT_PINS would catch a drift on any of
+// them), but the identifier-only property this section measures is unchanged, so the pin is kept
+// rather than retired.
 
 test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to discriminate one line -- no more, no fewer', () => {
   assert.deepEqual(
@@ -2288,8 +2214,41 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
   );
 });
 
+// EXPECTED_DISCRIMINATING_CITATIONS -- action 11.1 (#206), comment 4's own finding ("a failure
+// does not say which citation broke"): named by key, same idiom as EXPECTED_CITATIONS/
+// CITATION_ALLOWLIST above, so a citation entering or leaving the DISCRIMINATING population
+// (below) fails by NAME (assert.deepEqual's own diff) instead of only moving a count. The
+// RANGES population is named the same way without a second list: it is, by construction, the
+// exact set of citations pinned in LIVE_RANGE_PINS (test/citation-pins-data.js) -- both walks
+// enumerate the identical corpus-wide range citations, so re-deriving a second name list here
+// would only ever be able to drift from that one, never usefully disagree with it.
+const EXPECTED_DISCRIMINATING_CITATIONS = [
+  'doc/board-audit.md :: config.js:1035',
+  'doc/board-audit.md :: orchestrator/steps/scripted.js:1389',
+  'doc/board-audit.md :: report-intake.js:29',
+  'doc/state-machine-spec.md :: bin/spo:1232',
+  'orchestrator/README.md :: config.js:899',
+  'orchestrator/README.md :: lock.js:276',
+  'orchestrator/README.md :: lock.js:310',
+  'orchestrator/auto-triage.js :: park-loop.js:1453',
+  'orchestrator/auto-triage.js :: remote-report-pull.js:193',
+  'orchestrator/auto-triage.js :: state-machine.js:3171',
+  'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325',
+  'orchestrator/config.js :: worker.ts:1542',
+  'orchestrator/dispatcher.js :: daemon.js:607',
+  'orchestrator/invariants.js :: doc/state-machine-spec.md:159',
+  'orchestrator/orphan-scan.js :: daemon.js:912',
+  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:202',
+  'orchestrator/state-machine.js :: orchestrator/steps/llm.js:1049',
+  'orchestrator/state-machine.js :: run.ts:63',
+  'orchestrator/state-machine.js :: step-contracts.js:1029',
+  'orchestrator/steps/scripted.js :: run.ts:63',
+  'orchestrator/steps/scripted.js :: worker.ts:1542',
+  'prompts/README.md :: plan.md:103',
+];
+
 test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check accepts stops anchoring when its line is shifted by one', () => {
-  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_EXCLUDED_FILES.has(rel));
+  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_PIN_CHECKED_FILES.has(rel));
   const discriminating = [];
   const blunt = [];
   const ranges = [];
@@ -2333,12 +2292,12 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // park-loop.js's reEnqueueTask header comment shifted the ABOVE citation's target from :1262 to
   // :1273 (a true pure shift -- see ANCHOR_BLUNT_CITATIONS's own updated entry). Still BLUNT, same
   // shape, same reasoning; blunt/discriminating/ranges counts are unchanged by this.
-  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:354`
+  // rdo-symmetry (2026-09-06): +1 citation, `orchestrator/state-machine.js :: step-contracts.js:326`
   // -- single-line, anchored on `touchesRdoMembers`, which appears on line 326 only (neither 325
   // nor 327 mentions it), so it discriminates a one-line drift -- discriminating is 16 -> 17.
   // blunt and ranges are unchanged.
   // card #161 (2026-09-09): +3 citations, `orchestrator/auto-triage.js :: park-loop.js:1396`,
-  // `:: remote-report-pull.js:193` and `:: state-machine.js:2981`, each single-line and anchored on
+  // `:: remote-report-pull.js:193` and `:: state-machine.js:2923`, each single-line and anchored on
   // `appendDaemonEvent` (see the main anchor test's own note above). `appendDaemonEvent` does not
   // appear on any neighbouring line of any of the three targets, so all three discriminate a
   // one-line drift -- discriminating is 17 -> 20. blunt and ranges are unchanged.
@@ -2356,7 +2315,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // (`c.start !== c.stop`), blunt by construction like every other range in this corpus. ranges is
   // 10 -> 11. discriminating and blunt are unchanged.
   // card #213 action 2 (2026-09-12): the SAME re-pin as the main anchor test's own note above
-  // (`orchestrator/state-machine.js :: step-contracts.js:500` -> `:527`, after shouldEscalate's
+  // (`orchestrator/state-machine.js :: step-contracts.js:461` -> `:527`, after shouldEscalate's
   // rewrite). Still single-line and still discriminating -- its neighbours do not mention
   // `touchesRdoMembers`, so a one-line shift in either direction still misses it. But as the main
   // anchor test's own note now records, that re-pin is COUNT-NEUTRAL: the citation was already
@@ -2368,11 +2327,733 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     `the set of citations that CANNOT discriminate a one-line drift changed. Every entry must be read\n  by hand and justified in ANCHOR_BLUNT_CITATIONS before being pinned -- this population is capped\n  for the same reason "unanchorable" is:\n  ${blunt.join('\n  ')}`
   );
-  assert.equal(discriminating.length, 22, `expected 22 single-line citations proven to discriminate a one-line drift, found ${discriminating.length} -- re-measure and update this pin by name.`);
-  assert.equal(ranges.length, 11, `expected 11 range citations (blunt by construction, see this section's header), found ${ranges.length}.`);
+  assert.deepEqual(
+    discriminating.slice().sort(),
+    EXPECTED_DISCRIMINATING_CITATIONS.slice().sort(),
+    `the set of citations proven to discriminate a one-line drift changed -- re-measure and update EXPECTED_DISCRIMINATING_CITATIONS by name:\n  ${discriminating.join('\n  ')}`
+  );
+  assert.equal(ranges.length, 11, `expected 11 range citations in the ANCHORED population (blunt by construction, see this section's header), found ${ranges.length}.`);
+  // fix pass D2/R1: LIVE_RANGE_PINS (14) is a SUPERSET of this ANCHORED-only `ranges` population
+  // (11) by design -- it also pins two citations CITATION_ANCHOR_ALLOWLIST skips before this walk
+  // ever pushes to `ranges` (`orchestrator/README.md :: dispatcher.js:635-648`, and
+  // `orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127` -- a JSON config value
+  // with no code-shaped candidate, same shape as verify-gate.js:336 above) and one this walk
+  // classifies UNANCHORABLE instead (`orchestrator/park-loop.js :: intake.js:938-940` -- this
+  // specific occurrence has no code-shaped candidate nearby, unlike its three sibling citations of
+  // the same fact, so it never passes the `top.length === 0` guard above to be classified as a
+  // range either). Exact equality would be false; every ANCHORED range having a pin is still
+  // required, and the completeness test below (part 2.7) separately proves the FULL set --
+  // anchored, unanchorable, and allowlisted alike -- is pinned.
+  const liveRangePinKeys = new Set(LIVE_RANGE_PINS.map((p) => `${p.file} :: ${p.citation}`));
+  const unpinnedRanges = ranges.filter((k) => !liveRangePinKeys.has(k));
+  assert.deepEqual(unpinnedRanges, [], `range citation(s) in the ANCHORED population with no LIVE_RANGE_PINS entry -- add one:\n  ${unpinnedRanges.join('\n  ')}`);
   // Ties this measurement to the main test's own pin: the three populations must together be
   // exactly the citations that test counted as `anchored`, or one of the two walks has drifted.
   assert.equal(discriminating.length + blunt.length + ranges.length, 36, 'the three populations must sum to the main anchor test\'s pinned `anchored` count (36).');
+});
+
+
+// ---- part 2.7: pinned literal-text citation check (action 11.1, #206) --------------------------
+//
+// Everything above (part 2.5/2.6) verifies a citation by asking whether SOME code-shaped
+// identifier named nearby also appears somewhere in the cited line range -- useful, but blind by
+// construction to a range citation drifting by one line (a wide window still contains the same
+// identifier after a +/-1 shift; see part 2.6's own header), and entirely unusable on the two
+// dated bench docs, whose prose is a measurement narrative rather than code (ANCHOR_PIN_CHECKED_FILES
+// above). A PIN is the opposite kind of check: the literal, trimmed text of the cited line(s),
+// read once by hand, compared EXACTLY (no fuzzy match, no "anywhere in the span") against either
+// the real working tree (`at: 'HEAD'`) or a frozen commit (`at: '<sha>'`) -- resolvePins, in
+// test/citation-pins.js; the pins themselves, in test/citation-pins-data.js.
+//
+// Two registries: BENCH_PINS (the 41 file-tied citations in the two dated bench docs, other than
+// the 2 dangling `sanctuarize.test.ts:151-156` ones, which stay CITATION_ALLOWLIST-only) and
+// LIVE_RANGE_PINS + BLUNT_PINS (13 range citations -- every range in the live corpus, anchored,
+// unanchorable, or on CITATION_ANCHOR_ALLOWLIST alike, per fix pass D2 -- and 3
+// ANCHOR_BLUNT_CITATIONS entries), given a pin IN ADDITION to (or, for the 2 that the identifier
+// layer cannot see at all, INSTEAD of) the existing identifier-based anchor check, since a pin can
+// discriminate the +/-1 drift the identifier heuristic structurally cannot on a range.
+
+// EXPECTED_BENCH_PIN_KEYS / EXPECTED_LIVE_PIN_KEYS -- named membership, same idiom as
+// EXPECTED_CITATIONS above: typed independently of citation-pins-data.js's own content (these are
+// the citation SHAPES this action found and decided to pin, not a re-export of the data file), so
+// a pin silently added, removed, or re-keyed there fails this test by name.
+const EXPECTED_BENCH_PIN_KEYS = [
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1273 @ HEAD",
+  "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: cli.ts:179 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: cli.ts:221-227 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:166 @ HEAD",
+  "doc/bench-audit-2026-09-02.md :: finish.sh:275-276 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: run.ts:109 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:1347 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:1944-1996 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/bench-audit-2026-09-02.md :: scripted.js:292-293 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/bench-audit-2026-09-02.md :: scripts/finish.sh:245-247 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: scripts/nightly-check.sh:70-73 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/bench/paths.ts:143-163 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/bench/worker.ts:482 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: src/e2e/config.ts:93 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: test/helpers.js:65-94 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/bench-audit-2026-09-02.md :: verdict.ts:162-183 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: verdict.ts:23-67 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:106 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:302 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:307-319 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:482 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:482-486 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:487 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:495-502 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:543-546 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:576 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:750 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-audit-2026-09-02.md :: worker.ts:779-780 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1273 @ HEAD",
+  "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:166 @ HEAD",
+  "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/bench-plan-derived-2026-09-02.md :: scripts/finish.sh:245-247 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: scripts/nightly-check.sh:70-73 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-94 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/bench-plan-derived-2026-09-02.md :: worker.ts:302 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+];
+
+test('BENCH_PINS holds exactly the 41 file-tied citations this action pinned in the two dated bench docs -- no more, no fewer', () => {
+  assert.equal(BENCH_PINS.length, 41, `BENCH_PINS has ${BENCH_PINS.length} entries, expected 41 -- update EXPECTED_BENCH_PIN_KEYS in the same change.`);
+  assert.deepEqual(
+    BENCH_PINS.map((p) => `${p.file} :: ${p.citation} @ ${p.at}`).sort(),
+    EXPECTED_BENCH_PIN_KEYS.slice().sort(),
+    'BENCH_PINS (test/citation-pins-data.js) changed membership -- a pin was added, removed, or ' +
+      're-keyed. Update EXPECTED_BENCH_PIN_KEYS here in the same change, by name.'
+  );
+});
+
+test('every BENCH_PINS entry resolves: its pinned commit (or HEAD) names, at the pinned line(s), exactly the text this action read by hand', () => {
+  const results = resolvePins(BENCH_PINS);
+  const offenders = results.filter((r) => !r.ok).map((r) => r.why);
+  assert.deepEqual(offenders, [], `pinned bench-doc citation(s) whose target no longer reads what the pin says (file, citation, expected/actual text, and where it moved to, if unique):\n  ${offenders.join('\n  ')}`);
+});
+
+// This is the test that actually closes #206's probe 1 ("a consistent wrong re-pin -- doc text
+// and EXPECTED_CITATIONS moved together -- ships green"): BENCH_PINS is a STATIC array, typed
+// once and never re-derived from the doc (deliberately -- see this file's own header on why a
+// re-derived expectation pins nothing), so on its own it would happily keep checking a citation
+// the doc no longer makes if the doc's number moved and BENCH_PINS's did not follow. This test is
+// the missing link: the set of citations BENCH_PINS actually pins must equal the set the two
+// dated bench docs actually carry TODAY (via the same extractCitations pipeline the corpus-wide
+// tests use, filtered to CITATION_ALLOWLIST's two dangling/three-unanchored-chain exemptions,
+// which have no line to pin against) -- so a re-pin that moves the doc's own citation without
+// moving BENCH_PINS to match now fails HERE, by name, even though EXPECTED_CITATIONS (which only
+// ever re-derives from the SAME doc text) would happily follow the doc anywhere.
+test('BENCH_PINS pins exactly the citations the two dated bench docs actually carry today -- a re-pin of the doc without a matching re-pin here is caught, by name', () => {
+  const BENCH_DOCS = ['doc/bench-audit-2026-09-02.md', 'doc/bench-plan-derived-2026-09-02.md'];
+  // ONLY the genuinely unpinnable citations: a deleted file (sanctuarize.test.ts) has no line to
+  // pin against, and an unanchored chain has no `file` at all. The two CITATION_ALLOWLIST entries
+  // for `verdict.ts:162-183`/`worker.ts:779-780` are NOT in this set -- those files exist and are
+  // pinned anyway (frozen at 935283890fa0593c5c5d0b41cceeaec2c1972c6f, where the citation was true); CITATION_ALLOWLIST exempts
+  // them only from part 2's HEAD-bounds check, not from being pinnable.
+  const BENCH_DANGLING_KEYS = new Set([
+    'doc/bench-audit-2026-09-02.md :: sanctuarize.test.ts:151-156',
+    'doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156',
+    'doc/bench-audit-2026-09-02.md :: (unanchored) :277',
+    'doc/bench-audit-2026-09-02.md :: (unanchored) :458',
+    'doc/bench-audit-2026-09-02.md :: (unanchored) :65-69',
+  ]);
+  const liveBenchKeys = [];
+  for (const rel of BENCH_DOCS) {
+    const raw = read(rel);
+    const normalized = normalizeWrap(stripFences(raw));
+    for (const c of extractCitations(normalized)) {
+      const key = `${rel} :: ${c.raw}`;
+      if (BENCH_DANGLING_KEYS.has(key)) continue;
+      liveBenchKeys.push(key);
+    }
+  }
+  assert.deepEqual(
+    liveBenchKeys.slice().sort(),
+    BENCH_PINS.map((p) => `${p.file} :: ${p.citation}`).sort(),
+    'BENCH_PINS (test/citation-pins-data.js) no longer matches the citations the two dated bench ' +
+      'docs actually carry -- either a doc citation moved without its pin following, or a pin was ' +
+      'added/removed without the doc changing. Update BENCH_PINS in the same change as any edit to ' +
+      'either doc.'
+  );
+});
+
+const EXPECTED_LIVE_PIN_KEYS = [
+  "doc/state-machine-spec.md :: dispatcher.js:635-648 @ HEAD",
+  "doc/state-machine-spec.md :: intake.js:938-940 @ HEAD",
+  "orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+  "orchestrator/README.md :: dispatcher.js:635-648 @ HEAD",
+  "orchestrator/README.md :: doc/state-machine-spec.md:159 @ HEAD",
+  "orchestrator/README.md :: intake.js:938-940 @ HEAD",
+  "orchestrator/README.md :: lock.js:278-309 @ HEAD",
+  "orchestrator/dispatcher.js :: daemon.js:626-627 @ HEAD",
+  "orchestrator/journal.js :: auto-pull.js:58-66 @ HEAD",
+  "orchestrator/orphan-scan.js :: auto-pull.js:58-66 @ HEAD",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:664 @ HEAD",
+  "orchestrator/park-loop.js :: intake.js:938-940 @ HEAD",
+  "orchestrator/state-machine.js :: auto-pull.js:58-66 @ HEAD",
+  "orchestrator/state-machine.js :: auto-pull.js:58-66 @ HEAD",
+  "orchestrator/state-machine.js :: park-loop.js:1341 @ HEAD",
+  "orchestrator/steps/llm.js :: intake.js:938-940 @ HEAD",
+  "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18 @ HEAD",
+];
+
+test('LIVE_RANGE_PINS + BLUNT_PINS hold exactly the 14 live ranges and 3 ANCHOR_BLUNT_CITATIONS this action pinned -- no more, no fewer', () => {
+  assert.equal(LIVE_RANGE_PINS.length, 14, `LIVE_RANGE_PINS has ${LIVE_RANGE_PINS.length} entries, expected 14 (must equal the completeness check's own range population below).`);
+  assert.equal(BLUNT_PINS.length, 3, `BLUNT_PINS has ${BLUNT_PINS.length} entries, expected 3 (must equal ANCHOR_BLUNT_CITATIONS's own membership).`);
+  assert.deepEqual(
+    [...LIVE_RANGE_PINS, ...BLUNT_PINS].map((p) => `${p.file} :: ${p.citation} @ ${p.at}`).sort(),
+    EXPECTED_LIVE_PIN_KEYS.slice().sort(),
+    'LIVE_RANGE_PINS/BLUNT_PINS (test/citation-pins-data.js) changed membership, commit, or HEAD-vs-frozen split -- update ' +
+      'EXPECTED_LIVE_PIN_KEYS here in the same change, by name.'
+  );
+});
+
+// The completeness check D2 asked for: every RANGE citation ANYWHERE in the live anchor corpus --
+// whether the identifier-based walk counts it as anchored, unanchorable, or skips it entirely via
+// CITATION_ALLOWLIST/CITATION_ANCHOR_ALLOWLIST -- must have a LIVE_RANGE_PINS entry. Unlike
+// forEachAnchorCheckedCitation (which exists to walk the corpus the identifier heuristic can
+// usefully judge), this walk deliberately does NOT skip allowlisted citations -- that is exactly
+// the gap the first pass's `orchestrator/README.md :: dispatcher.js:634-648` omission fell into: a
+// real range fact, invisible to this completeness check only because something ELSE had already
+// excused it from a DIFFERENT, narrower check. Fix pass R1 retired the one citation the first
+// completeness check (D2) could not pin (`.claude/settings.json:109-127`, wrongly diagnosed as
+// unpinnable): it names the PRODUCT repo, not this one, and is pinned like every other product
+// citation now that it is spelled that way -- so this walk requires a pin for EVERY range found,
+// with no exceptions left to name.
+test('every RANGE citation in the live (non-bench) anchor corpus has a pin -- a new unpinned range fails here, by name', () => {
+  const anchorCorpus = CORPUS_FILES.filter((rel) => !ANCHOR_PIN_CHECKED_FILES.has(rel));
+  const pinnedKeys = new Map(); // key -> count
+  for (const p of [...LIVE_RANGE_PINS, ...BLUNT_PINS]) {
+    if (p.last === undefined) continue; // BLUNT_PINS are single-line; this check is ranges only
+    const key = `${p.file} :: ${p.citation}`;
+    pinnedKeys.set(key, (pinnedKeys.get(key) || 0) + 1);
+  }
+  const foundCounts = new Map();
+  for (const rel of anchorCorpus) {
+    const raw = read(rel);
+    const withoutFences = rel.endsWith('.md') ? stripFences(raw) : raw;
+    const normalized = normalizeWrap(withoutFences);
+    for (const c of extractCitations(normalized).filter((c) => !c.unanchored && c.start !== c.stop)) {
+      const key = `${rel} :: ${c.raw}`;
+      foundCounts.set(key, (foundCounts.get(key) || 0) + 1);
+    }
+  }
+  const offenders = [];
+  for (const [key, count] of foundCounts) {
+    const pinnedCount = pinnedKeys.get(key) || 0;
+    if (pinnedCount !== count) {
+      offenders.push(`${key} -- ${count} occurrence(s) in the live corpus, ${pinnedCount} pinned`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `range citation(s) in the live anchor corpus with no matching LIVE_RANGE_PINS entry (or a mismatched count):\n  ${offenders.join('\n  ')}`
+  );
+});
+
+test('every LIVE_RANGE_PINS/BLUNT_PINS entry resolves (HEAD, or the one product citation frozen at 93528389), exactly as read by hand', () => {
+  const results = resolvePins([...LIVE_RANGE_PINS, ...BLUNT_PINS]);
+  const offenders = results.filter((r) => !r.ok).map((r) => r.why);
+  assert.deepEqual(offenders, [], `pinned live citation(s) whose target no longer reads what the pin says:\n  ${offenders.join('\n  ')}`);
+});
+
+// The above proves LIVE_RANGE_PINS/BLUNT_PINS's OWN citation text is still true; it does NOT prove
+// the CITING file still says the same thing -- a pin, like BENCH_PINS, is a static array that never
+// re-reads the doc. This is the #206 comment-4 scenario, generalized: `intake.js:906-908` was
+// re-pinned to `:936-938` in FOUR files, and shifting all four to `:935-938`/`:936-939`/`:937-939`
+// (a genuine drift, not a consistent-and-correct re-pin) left the corpus-wide identifier check
+// 51/51 green, because a RANGE citation is blunt by construction (part 2.6's own header) -- the
+// old drifted range still happened to contain the same identifier. So this test closes the same
+// loophole BENCH_PINS's own cross-check does, for the live corpus instead of the two dated docs:
+// the exact citation TEXT each pin claims must occur, with the same multiplicity, somewhere in the
+// live corpus scan every other test in this file already runs -- a citing file's number moving
+// without its pin following (or vice versa) is now a NAMED failure here, not a silent pass.
+test('LIVE_RANGE_PINS/BLUNT_PINS cite exactly what the live corpus text says today -- a citing file\'s citation drifting without its pin following is caught, by name', () => {
+  const liveCounts = new Map();
+  for (const rel of CORPUS_FILES) {
+    const raw = read(rel);
+    const withoutFences = rel.endsWith('.md') ? stripFences(raw) : raw;
+    const normalized = normalizeWrap(withoutFences);
+    for (const c of extractCitations(normalized)) {
+      const key = `${rel} :: ${c.raw}`;
+      liveCounts.set(key, (liveCounts.get(key) || 0) + 1);
+    }
+  }
+  const pinnedCounts = new Map();
+  for (const p of [...LIVE_RANGE_PINS, ...BLUNT_PINS]) {
+    const key = `${p.file} :: ${p.citation}`;
+    pinnedCounts.set(key, (pinnedCounts.get(key) || 0) + 1);
+  }
+  const offenders = [];
+  for (const [key, count] of pinnedCounts) {
+    const live = liveCounts.get(key) || 0;
+    if (live !== count) offenders.push(`${key} -- pinned ${count} time(s), the live corpus scan has ${live} occurrence(s) of this exact citation text`);
+  }
+  assert.deepEqual(offenders, [], `pinned live citation(s) no longer match the corpus's current text -- a citing file's number moved without LIVE_RANGE_PINS/BLUNT_PINS following, or vice versa:\n  ${offenders.join('\n  ')}`);
+});
+
+// ---- part 2.8: pinned literal-text citation check for doc/comment-corpus-audit-2026-09-03.md
+// (action 11.2, #206) ------------------------------------------------------------------------
+//
+// This doc is a THIRD dated record, same posture as the two bench docs part 2.7 pins: it is
+// deliberately excluded from CORPUS_FILES ("written AFTER the corpus it measured -- not part of
+// what it measured", CORPUS_FILES's own comment above), so none of its 37 file-tied citations
+// were ever checked by anything -- part 2's ratchet does not scan it, and the identifier-anchor
+// layer (part 2.5/2.6) never gets the chance to either. #206's own comments measured this being
+// exploited in practice: two `bin/spo` citations were hand re-pinned to today's tree by card
+// #208/#214 (`:2220`/`:1139`) with nothing failing, and three more had already drifted silently
+// before that. CCA_PINS (test/citation-pins-data.js) closes the same gap part 2.7 closed for the
+// bench docs, for this doc instead: every file-tied citation gets a literal-text pin, frozen at
+// the SPO-Pipeline commit this doc's own header names (`7902164309c1766d7b785daab9ba94ff6472bc1d`)
+// -- never `d03ea8b7` (the commit the header names for `~/SPO-WebClient`), since nothing in this
+// doc cites a product file by line. This doc is NOT added to CORPUS_FILES itself -- its 67-file
+// scope and every count pinned on it (EXPECTED_CITATIONS, `checked`, etc.) stay exactly as they
+// are; CCA_PINS is a parallel, dedicated walk, the same relationship BENCH_PINS has to the corpus
+// walk for the two bench docs.
+
+// CCA_PINS carries all 37 file-tied citations (fix pass 11.2, D1) -- `README.md:34`/`:35`/`:37`
+// are pinned below with a `path` field (test/citation-pins.js's resolvePins), not allowlisted:
+// see test/citation-pins-data.js's CCA_PINS header comment for why an allowlist could not catch a consistent wrong
+// re-pin of an ambiguous citation (probed, shipped green 74/74).
+
+const EXPECTED_CCA_PIN_KEYS = [
+  "doc/comment-corpus-audit-2026-09-03.md :: CLAUDE.md:29 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: README.md:34 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: README.md:35 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: README.md:37 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:1654 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:1838 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:407-408 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:715 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: bin/spo:993 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: console/prod-version.js:13 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/board-audit.md:20 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/board-audit.md:20 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/environments.md:32 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/jewels-inventory.md:14 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/permissions.md:114-169 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/setup.md:15 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:117 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:121 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:445 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:9 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: doc/state-machine-spec.md:98 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:1062 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:1062 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:1180 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:2056 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:2371 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/README.md:790 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/config.js:489 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/config.js:704 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:179 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:219 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:755 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:825 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/park-loop.js:925 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: orchestrator/state-machine.js:1564 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: scripts/daemon-install.sh:103 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+  "doc/comment-corpus-audit-2026-09-03.md :: test/doc-constant-sweep.test.js:352 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
+];
+
+test('CCA_PINS holds exactly the 37 file-tied citations in doc/comment-corpus-audit-2026-09-03.md -- no more, no fewer', () => {
+  assert.equal(CCA_PINS.length, 37, `CCA_PINS has ${CCA_PINS.length} entries, expected 37 (every file-tied citation the doc carries -- no allowlist left) -- update EXPECTED_CCA_PIN_KEYS in the same change.`);
+  assert.deepEqual(
+    CCA_PINS.map((p) => `${p.file} :: ${p.citation} @ ${p.at}`).sort(),
+    EXPECTED_CCA_PIN_KEYS.slice().sort(),
+    'CCA_PINS (test/citation-pins-data.js) changed membership -- a pin was added, removed, or ' +
+      're-keyed. Update EXPECTED_CCA_PIN_KEYS here in the same change, by name.'
+  );
+});
+
+test('every CCA_PINS entry resolves: its pinned commit (7902164) names, at the pinned line(s), exactly the text this action read by hand', () => {
+  const results = resolvePins(CCA_PINS);
+  const offenders = results.filter((r) => !r.ok).map((r) => r.why);
+  assert.deepEqual(offenders, [], `pinned doc/comment-corpus-audit-2026-09-03.md citation(s) whose target no longer reads what the pin says:\n  ${offenders.join('\n  ')}`);
+});
+
+// D6 (fix pass 11.2, driver decision): switching a CCA pin's `at` to `HEAD` while also editing
+// EXPECTED_CCA_PIN_KEYS to match ships green -- the membership test above only checks the KEYS
+// agree with each other, never that the commit named is the RIGHT one. This doc is a dated
+// record; every one of its pins must stay frozen at the SPO-Pipeline commit the doc's OWN header
+// names, read from the doc's live text at test time (never hardcoded here, so an edit to the
+// doc's header without a matching edit to every pin's `at` is caught too, and vice versa).
+test('every CCA_PINS entry is frozen at the SPO-Pipeline commit doc/comment-corpus-audit-2026-09-03.md\'s own header names -- never HEAD, never a different sha', () => {
+  const headerText = read('doc/comment-corpus-audit-2026-09-03.md').slice(0, 600);
+  const shaMatch = /Measured 2026-09-03 against this worktree at\s*\n?>?\s*`([0-9a-f]{40})`/.exec(headerText);
+  assert.ok(shaMatch, "could not find the doc's own \"Measured ... against this worktree at `<sha>`\" header sentence -- has it been reworded?");
+  const namedSha = shaMatch[1];
+  assert.equal(namedSha, '7902164309c1766d7b785daab9ba94ff6472bc1d', "the doc's own header now names a different commit than this suite assumes -- re-verify every CCA_PINS entry against the new commit before updating this pin.");
+  const wrongAt = CCA_PINS.filter((p) => p.at !== namedSha).map((p) => `${p.file} :: ${p.citation} @ ${p.at}`);
+  assert.deepEqual(wrongAt, [], `CCA_PINS entry(ies) not frozen at the doc's own header commit (${namedSha}):\n  ${wrongAt.join('\n  ')}`);
+});
+
+// Same missing-link BENCH_PINS's own cross-check test closes (this file's part 2.7 header): a
+// STATIC pin array never re-reads the doc, so on its own it would happily keep checking a
+// citation the doc no longer makes if the doc's own number moved and CCA_PINS did not follow.
+// Array equality (`.sort()`), not set equality, on purpose: doc/board-audit.md:20 and
+// orchestrator/README.md:1062 are each cited twice in the doc's own prose, so CCA_PINS carries
+// each of those twice too, and this comparison must see that multiplicity, not collapse it.
+test('CCA_PINS covers exactly the citations doc/comment-corpus-audit-2026-09-03.md actually carries today -- a re-pin of the doc without a matching pin change is caught, by name', () => {
+  const CCA_DOC = 'doc/comment-corpus-audit-2026-09-03.md';
+  const raw = read(CCA_DOC);
+  const normalized = normalizeWrap(stripFences(raw));
+  const liveKeys = extractCitations(normalized).map((c) => `${CCA_DOC} :: ${c.raw}`);
+  const pinnedKeys = CCA_PINS.map((p) => `${p.file} :: ${p.citation}`);
+
+  assert.deepEqual(
+    liveKeys.slice().sort(),
+    pinnedKeys.slice().sort(),
+    'doc/comment-corpus-audit-2026-09-03.md\'s live citations no longer match CCA_PINS -- either a ' +
+      'doc citation moved without its pin following, a pin is now DEAD (no longer cited by the ' +
+      'doc), or a new citation appeared unpinned. Update CCA_PINS in the same change as any edit ' +
+      'to the doc.'
+  );
+});
+
+// ---- fixture tests: the `path` field (fix pass 11.2, D1) ---------------------------------------
+//
+// Direct, hermetic tests of resolvePins's `path` handling against a small committed fixture repo
+// (same rationale as makeCommittedFixtureRepo's other callers below: a mutation to any of these
+// three guard clauses must go red HERE, on a small fixture, rather than being inferred from the
+// real corpus staying green -- the real corpus only exercises the ACCEPT path for `README.md`,
+// never the two REFUSE paths).
+test('resolvePins: `path` is accepted when the bare name is genuinely ambiguous, its basename matches, and it contains a "/"', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+  });
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: './dup.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, true, result.why);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: `path` on an already-UNAMBIGUOUS citation is refused', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'solo.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'solo.txt:2', at: sha, path: './solo.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false);
+  assert.match(result.why, /not ambiguous under the resolver/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: `path` whose basename does not match the cited name is refused', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+    'other.txt': 'xxx\n',
+  });
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: './other.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false);
+  assert.match(result.why, /basename does not match/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a bare `path` with no "/" is refused -- the exact trap a bare "README.md" would fall back into', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+  });
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: 'dup.txt', first: 'two' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false);
+  assert.match(result.why, /has no "\/"/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a +/-1 drift on a `path` pin is caught, same as any other pin', () => {
+  const { root, sha } = makeCommittedFixtureRepo({
+    'dup.txt': 'one\ntwo\nthree\nfour\n',
+    'sub/dup.txt': 'aaa\nbbb\nccc\n',
+  });
+  const repoRoots = { repo: root, product: root, deploy: root };
+  const pin = { file: 'x.md', citation: 'dup.txt:2', at: sha, path: './dup.txt', first: 'two' };
+  const base = resolvePins([pin], { repoRoots });
+  assert.equal(base[0].ok, true, 'fixture precondition: the base path pin must itself be correct');
+  const drifted = { ...pin, citation: shiftedCitation(pin.citation, 1) }; // :2 -> :3 ("three", not "two")
+  const driftedResult = resolvePins([drifted], { repoRoots });
+  assert.equal(driftedResult[0].ok, false, 'a +1 drift on a `path` pin must be caught, exactly like a plain pin');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// ---- fixture tests: resolvePins error paths (fix pass 11.1, D5) --------------------------------
+//
+// Direct, hermetic tests of resolvePins itself against a real (but throwaway, git-backed) repo --
+// same rationale as makeFixtureRepo's own tests above: a mutation to any of these error paths
+// must go red HERE, on a small fixture, rather than being inferred from the real corpus staying
+// green (which it would, since none of these shapes exist in the real corpus today).
+function makeCommittedFixtureRepo(layout) {
+  const root = mkTmp('spo-resolvepins-fixture-');
+  for (const [rel, body] of Object.entries(layout)) {
+    const full = path.join(root, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, body);
+  }
+  execFileSync('git', ['-C', root, 'init', '-q'], { env: gitEnv() });
+  execFileSync('git', ['-C', root, 'add', '-A'], { env: gitEnv() });
+  execFileSync('git', ['-C', root, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'fixture'], { env: gitEnv() });
+  const sha = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: gitEnv() }).trim();
+  return { root, sha };
+}
+
+test('resolvePins: a missing sha (frozen pin, commit does not exist) fails, never a silent pass', () => {
+  const { root } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'a.txt:1', at: '0000000000000000000000000000000000000000', first: 'one' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'a pin frozen at a nonexistent commit must fail');
+  assert.ok(/missing/.test(result.why), `expected the failure to name the object as missing, got: ${result.why}`);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a missing path at a VALID sha fails, never a silent pass', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'nonexistent.txt:1', at: sha, first: 'one' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'a pin whose path does not exist at an otherwise-real commit must fail');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: an unresolvable bare basename fails, never a silent pass', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'nowhere.txt:1', at: sha, first: 'one' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'a bare filename that matches nothing tracked anywhere must fail');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: repoRoots.product pointed at a missing directory makes a HEAD product pin fail, never silently read the real product repo (D5/D8b)', () => {
+  const { root } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const bogusProduct = path.join(os.tmpdir(), `spo-resolvepins-absent-${process.pid}-${Date.now()}`);
+  assert.equal(fs.existsSync(bogusProduct), false, 'fixture precondition: bogusProduct must not exist');
+  // "src/e2e/config.ts" is a REAL path in the REAL product repo -- if repoRoots.product were
+  // ignored (the exact bug this proof exists for), this citation would resolve to and read the
+  // real ~/SPO-WebClient file, unrelated to anything this fixture set up, and likely pass.
+  const pin = { file: 'x.md', citation: 'src/e2e/config.ts:93', at: 'HEAD', first: 'this text cannot appear in the real file' };
+  const result = resolvePins([pin], { repoRoots: { repo: root, product: bogusProduct, deploy: root } });
+  assert.equal(result[0].ok, false, 'a HEAD pin under an overridden, absent product root must fail, not fall through to this repo or the real product repo');
+  assert.match(result[0].why, /product-absent|not on disk/, `expected a product-absent style failure, got: ${result[0].why}`);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a HEAD pin reads the WORKING TREE, not the committed blob -- an uncommitted edit is seen', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  // Edit the working tree WITHOUT committing -- gitEnv()'d git status confirms the repo now has
+  // an uncommitted change, so a HEAD pin reading the committed blob (git show HEAD:a.txt) would
+  // still see "two", while the real working tree already says "TWO-EDITED".
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\nTWO-EDITED\nthree\n');
+  const status = execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8', env: gitEnv() });
+  assert.ok(status.includes('a.txt'), 'fixture precondition: the edit must be uncommitted (visible in git status)');
+
+  const committedPin = { file: 'x.md', citation: 'a.txt:2', at: sha, first: 'two' };
+  const headPin = { file: 'x.md', citation: 'a.txt:2', at: 'HEAD', first: 'TWO-EDITED' };
+  const results = resolvePins([committedPin, headPin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(results[0].ok, true, 'the FROZEN pin (at the real commit sha) must still see the committed text ("two"), unaffected by the later edit');
+  assert.equal(results[1].ok, true, 'the HEAD pin must see the UNCOMMITTED working-tree text ("TWO-EDITED"), not the stale committed blob');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a duplicate line means movedTo is null, never a guess', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'same\nsame\nsame\n' });
+  // pin.first names text that occurs on THREE lines -- a drifted pin's real failure message must
+  // not claim a specific "moved to :N", since there is no way to tell which of the three is meant.
+  const pin = { file: 'x.md', citation: 'a.txt:5', at: sha, first: 'same' }; // :5 is out of range (file has 3 lines)
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'fixture precondition: citing a line past EOF must fail');
+  assert.equal(result.movedTo, null, `a text that occurs on more than one line must never produce a guessed movedTo, got: ${JSON.stringify(result.movedTo)}`);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a RANGE citation (start !== stop) with no `last` fails -- D4 (fix pass R2)', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'a.txt:1-2', at: sha, first: 'one' }; // no `last`
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'a range pin with no `last` must fail, never pass on `first` alone');
+  assert.match(result.why, /RANGE.*no `last`|no `last`.*RANGE/i, `expected the failure to name the missing \`last\`, got: ${result.why}`);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a SINGLE-LINE citation (no "-stop") with a `last` fails -- D4 (fix pass R2)', () => {
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'a.txt:1', at: sha, first: 'one', last: 'two' }; // single line, but carries `last`
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'a single-line pin carrying a `last` must fail, never silently ignore it');
+  assert.match(result.why, /SINGLE LINE.*last|last.*SINGLE LINE/i, `expected the failure to name the unexpected \`last\`, got: ${result.why}`);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('resolvePins: a citation one line PAST EOF with `first: ""` fails -- D8a phantom-trailing-newline fix (fix pass R3)', () => {
+  // A 3-line file with a trailing newline: text.split('\n') produces a 4th, PHANTOM empty
+  // element ('one\ntwo\nthree\n'.split('\n') is ['one','two','three',''], not 3 real lines).
+  // Before D8a, lineCount was 4 here, so a pin citing line 4 with first:"" passed bounds AND
+  // matched the phantom empty string -- a citation past the real end of the file "verified".
+  const { root, sha } = makeCommittedFixtureRepo({ 'a.txt': 'one\ntwo\nthree\n' });
+  const pin = { file: 'x.md', citation: 'a.txt:4', at: sha, first: '' };
+  const [result] = resolvePins([pin], { repoRoots: { repo: root, product: root, deploy: root } });
+  assert.equal(result.ok, false, 'a citation one line past the real EOF must fail, even when `first` is blank');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// classifySurvivors(survivors, allowlist) -- splits a mutation proof's own survivor list (each
+// entry "<key> -- <detail>") into { allowed, unexpected } by the leading key, same per-fact
+// keying idiom as isCitationAllowlisted above. Extracted so the real, corpus-wide mutation-proof
+// test below and a small hermetic fixture test (proving this SPLIT itself is correct, since the
+// real corpus currently has zero survivors to exercise it against) call the exact same function.
+function classifySurvivors(survivors, allowlist) {
+  const allowedKeys = new Set(Object.keys(allowlist));
+  const allowed = survivors.filter((s) => allowedKeys.has(s.split(' -- ')[0]));
+  const unexpected = survivors.filter((s) => !allowedKeys.has(s.split(' -- ')[0]));
+  return { allowed, unexpected };
+}
+
+// EDGE_TEXT_NOT_DISCRIMINATING -- pins whose adjacent line has identical trimmed text (a lone `}`,
+// a blank line next to another blank line) cannot be discriminated by a literal-text pin, the same
+// "cannot verify must never silently grow" posture as ANCHOR_BLUNT_CITATIONS/`unanchorable` above.
+// Measured empirically (this action's own mutation-proof test, immediately below): planting every
+// start-1/start+1/stop-1/stop+1/shift-1/shift+1 drift for every range pin, and every +/-1 drift for
+// every single-line pin -- 346 planted drifts across all 95 pins (41 BENCH_PINS + 14
+// LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS, action 11.2/#206 added the fourth registry) -- ALL
+// 346 are caught. Empty is the honest, measured result, not an unproven default; if a future pin
+// lands on an edge like this, it is added here BY NAME, with a reason, exactly like every other
+// allowlist in this file.
+//
+// D8d (fix pass 11.1): the mutation-proof test's own final assertion used to be
+// `assert.equal(killed, variants.length)` -- a genuine, correctly-allowlisted survivor would still
+// fail THAT assertion (killed is one short of variants.length), so this allowlist could never
+// actually hold an entry without turning the whole test permanently red. Fixed below: the final
+// count now credits an ALLOWED survivor as accounted-for, not merely "not reported as unexpected".
+const EDGE_TEXT_NOT_DISCRIMINATING = {};
+
+test('EDGE_TEXT_NOT_DISCRIMINATING holds exactly the pins this action measured unable to discriminate a neighbouring line -- no more, no fewer', () => {
+  assert.deepEqual(
+    Object.keys(EDGE_TEXT_NOT_DISCRIMINATING).sort(),
+    [],
+    'EDGE_TEXT_NOT_DISCRIMINATING changed -- read the new entry by hand and justify it here before pinning it.'
+  );
+});
+
+// Hermetic proof that the allowlist mechanism itself works, independent of the real corpus
+// currently having zero survivors to exercise it against (D8d): builds a REAL survivor (two
+// adjacent lines with identical trimmed text, so a +1 drift genuinely still reads as correct),
+// then proves classifySurvivors puts it in `allowed` when the allowlist names it and in
+// `unexpected` when it does not -- the exact fork the real mutation-proof test's final assertion
+// depends on.
+test('classifySurvivors: an allowlisted survivor is credited as accounted-for; the same survivor with no allowlist entry is reported unexpected', () => {
+  const dir = mkTmp('spo-edge-text-fixture-');
+  // A path WITH a "/" so resolveCitationTarget takes the direct path.join+existsSync branch --
+  // the bare-basename branch would shell out to `git -C dir ls-files`, and `dir` is a plain
+  // mkTmp directory, not a git repo, so a bare "target.txt" citation would resolve nowhere here.
+  fs.mkdirSync(path.join(dir, 'sub'));
+  const file = path.join(dir, 'sub', 'target.txt');
+  // Lines 4 and 5 are both `}` -- a genuine, unavoidable edge: a pin on either line cannot be
+  // told apart from its neighbour by literal text alone.
+  fs.writeFileSync(file, ['one', 'two', 'three', '}', '}', 'six'].join(String.fromCharCode(10)));
+  const pin = { file: 'fixture.md', citation: 'sub/target.txt:4', at: 'HEAD', first: '}' };
+  const repoRoots = { repo: dir, product: dir, deploy: dir };
+  const base = resolvePins([pin], { repoRoots });
+  assert.equal(base[0].ok, true, 'fixture precondition: the base pin must itself be correct');
+
+  const drifted = { ...pin, citation: shiftedCitation(pin.citation, 1, 1) }; // :4 -> :5, also `}`
+  const driftedResult = resolvePins([drifted], { repoRoots });
+  assert.equal(driftedResult[0].ok, true, 'fixture precondition: the +1 drift must survive (both lines read `}`), or this proves nothing about the allowlist split');
+
+  const survivors = [`${pin.file} :: ${pin.citation} -- line+1 drift (now "${drifted.citation}") still reads as correct`];
+
+  const withAllowlist = classifySurvivors(survivors, { [`${pin.file} :: ${pin.citation}`]: 'fixture: two adjacent `}` lines, genuinely indistinguishable' });
+  assert.deepEqual(withAllowlist.unexpected, [], 'an allowlisted survivor must not be reported as unexpected');
+  assert.deepEqual(withAllowlist.allowed, survivors, 'an allowlisted survivor must be credited as accounted-for');
+
+  const withoutAllowlist = classifySurvivors(survivors, {});
+  assert.deepEqual(withoutAllowlist.allowed, [], 'the same survivor with no allowlist entry must not be silently credited');
+  assert.deepEqual(withoutAllowlist.unexpected, survivors, 'the same survivor with no allowlist entry must be reported unexpected');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('MUTATION PROOF, every pin: a start-1/start+1/stop-1/stop+1/whole-range-shift drift (or a +/-1 drift for a single line) is caught by resolvePins, for EVERY pin -- not a sample', () => {
+  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
+  const base = resolvePins(allPins);
+  const offenders = base.filter((r) => !r.ok).map((r) => r.why);
+  assert.deepEqual(offenders, [], `a pin used as this mutation proof's own baseline is not itself green -- fix the pin, not the proof:\n  ${offenders.join('\n  ')}`);
+
+  // Plant every drift shape this action's spec calls for, varied per pin (never a repeating
+  // fixture value -- test/park-reason-doc-sweep.test.js's own "repeating fixture hides which
+  // value is keyed" trap) by deriving each shifted citation from the PIN's own real citation
+  // string and skipping only a shift that would run off either end of the real file (no
+  // neighbouring line exists there to be confused with).
+  const variants = []; // { pinIndex, kind, shifted }
+  allPins.forEach((pin, i) => {
+    const lineCount = base[i].lineCount;
+    const isRange = pin.last !== undefined;
+    const plant = (kind, startDelta, stopDelta) => {
+      const { start, stop } = (() => {
+        const m = /^(.+):(\d+)(?:-(\d+))?$/.exec(pin.citation);
+        return { start: Number(m[2]), stop: Number(m[3] || m[2]) };
+      })();
+      const newStart = start + startDelta;
+      const newStop = stop + stopDelta;
+      if (newStart < 1 || newStart > lineCount || newStop < 1 || newStop > lineCount) return;
+      variants.push({ pinIndex: i, kind, shifted: { ...pin, citation: shiftedCitation(pin.citation, startDelta, stopDelta) } });
+    };
+    if (isRange) {
+      plant('start-1', -1, 0);
+      plant('start+1', 1, 0);
+      plant('stop-1', 0, -1);
+      plant('stop+1', 0, 1);
+      plant('shift-1', -1, -1);
+      plant('shift+1', 1, 1);
+    } else {
+      plant('line-1', -1, -1);
+      plant('line+1', 1, 1);
+    }
+  });
+
+  // D3 (fix pass 11.2, driver decision): a bare `> 200` floor stays green even if `...CCA_PINS`
+  // were dropped from `allPins` entirely (41+14+3 BENCH/LIVE_RANGE/BLUNT pins alone already plant
+  // 264 variants, comfortably over 200) -- the floor cannot tell "the fourth registry is wired in"
+  // from "it silently is not". Assert the exact, measured totals instead: 95 pins (41 BENCH_PINS +
+  // 14 LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS) plant exactly 346 variants.
+  assert.equal(allPins.length, 95, `expected 95 pins (41 BENCH_PINS + 14 LIVE_RANGE_PINS + 3 BLUNT_PINS + 37 CCA_PINS), found ${allPins.length} -- a registry was added, removed, or resized; re-measure and update this pin.`);
+  assert.equal(variants.length, 346, `expected exactly 346 planted drifts across 95 pins, found ${variants.length} -- a pin lost or gained line-count headroom, a registry changed size, or the corpus shrank; re-measure.`);
+
+  const results = resolvePins(variants.map((v) => v.shifted));
+  const survivors = [];
+  results.forEach((r, idx) => {
+    if (r.ok) survivors.push(`${variants[idx].shifted.file} :: ${allPins[variants[idx].pinIndex].citation} -- ${variants[idx].kind} drift (now "${variants[idx].shifted.citation}") still reads as correct`);
+  });
+  const killed = results.length - survivors.length;
+
+  const { allowed: allowedSurvivors, unexpected: unexpectedSurvivors } = classifySurvivors(survivors, EDGE_TEXT_NOT_DISCRIMINATING);
+
+  assert.deepEqual(
+    unexpectedSurvivors,
+    [],
+    `planted drift(s) NOT caught by resolvePins and not on EDGE_TEXT_NOT_DISCRIMINATING -- either the ` +
+      `resolver loosened, or this pin genuinely cannot discriminate a neighbouring line and belongs on ` +
+      `that allowlist with a reason:\n  ${unexpectedSurvivors.join('\n  ')}`
+  );
+  // D8d (fix pass 11.1): an ALLOWED survivor counts as accounted-for, not as a failure -- the old
+  // `assert.equal(killed, variants.length)` could never pass while EDGE_TEXT_NOT_DISCRIMINATING
+  // held a real entry, which is exactly why it had to stay empty regardless of what was true.
+  assert.equal(
+    killed + allowedSurvivors.length,
+    variants.length,
+    `expected every planted drift to be either caught (${killed}) or explicitly allowlisted ` +
+      `(${allowedSurvivors.length}) -- ${variants.length} planted; see the survivor list above for which and why.`
+  );
+  // And EDGE_TEXT_NOT_DISCRIMINATING itself must never hold a STALE entry -- one that no longer
+  // corresponds to any actual survivor -- the same "cannot verify must never silently grow, or
+  // silently go unchecked" posture this file applies to every other allowlist.
+  const survivorKeysSeen = new Set(survivors.map((s) => s.split(' -- ')[0]));
+  const staleAllowlistEntries = Object.keys(EDGE_TEXT_NOT_DISCRIMINATING).filter((k) => !survivorKeysSeen.has(k));
+  assert.deepEqual(staleAllowlistEntries, [], `EDGE_TEXT_NOT_DISCRIMINATING entry(ies) that no longer correspond to any actual planted-drift survivor -- remove them:\n  ${staleAllowlistEntries.join('\n  ')}`);
 });
 
 // ---- fixture tests: the anchor primitives, exercised against synthetic strings so this check
@@ -2713,17 +3394,24 @@ test('MUTATION PROOF: reverting bin/spo:1243 back to bin/spo:1129 (the drift thi
   assert.equal(found1208, true, 'the real, fixed :1208 citation must anchor cleanly');
 });
 
-// Card #186 verification: both doc/bench-audit-2026-09-02.md and doc/bench-plan-derived-2026-09-02.md
-// are in ANCHOR_EXCLUDED_FILES, so neither citation's own content is checked by the anchor layer
-// above -- only by the bounds check (part 2) and, for bench-plan-derived alone, the MUTATION PROOF
-// immediately above this one. bench-audit's own `bin/spo:N` citation had NOTHING checking that its
-// number actually names the right line: a CONSISTENT wrong re-pin (the doc's text and
+// Card #186 verification, and now ALSO covered by action 11.1 (#206)'s BENCH_PINS: at the time
+// this test was written, both doc/bench-audit-2026-09-02.md and doc/bench-plan-derived-2026-09-02.md
+// were content-unchecked (ANCHOR_EXCLUDED_FILES kept them off the identifier anchor layer, and
+// nothing else read their citations' targets), so a CONSISTENT wrong re-pin (the doc's text and
 // EXPECTED_CITATIONS moved together to the same wrong number) would satisfy every existing test in
-// this file and still ship green. This test reads the real bin/spo content at the line each doc
-// cites -- not EXPECTED_CITATIONS, which a consistent re-pin would also have changed -- so it
-// cannot be fooled by that move. `binSpoLineNamesCollectAll` is shared with its own mutation proof
-// immediately below, so a change that made the real check vacuous (e.g. always returning true)
-// would be caught there too.
+// this file and still ship green -- exactly #206's own probe 1. This bespoke test and its mutation
+// proof closed that gap for ONE fact (the `bin/spo` `collectAll` call site) before BENCH_PINS
+// existed, and both docs now ALSO carry a generic LIVE pin for the very same citation
+// (`doc/bench-audit-2026-09-02.md :: bin/spo:1273` / `doc/bench-plan-derived-2026-09-02.md ::
+// bin/spo:1273` in BENCH_PINS), checked by resolvePins and covered by this action's own
+// corpus-wide pin mutation-proof test below. NOT folded into the pin and retired, though: the pin
+// mechanism verifies EACH doc's own citation independently and does not, by itself, guarantee the
+// two docs cite the SAME line -- the cross-doc invariant this test's first assertion checks
+// (`auditCite.start === planCite.start`) is not implied by two passing, independent pins. This test
+// reads the real bin/spo content at the line each doc cites -- not EXPECTED_CITATIONS, which a
+// consistent re-pin would also have changed -- so it cannot be fooled by that move.
+// `binSpoLineNamesCollectAll` is shared with its own mutation proof immediately below, so a change
+// that made the real check vacuous (e.g. always returning true) would be caught there too.
 function binSpoLineNamesCollectAll(lineNumber) {
   const resolved = resolveCitationTarget('bin/spo');
   if (!resolved.target) return { resolved: false, named: false, line: '' };
@@ -2859,7 +3547,7 @@ test('every bare "doc/<name>.md" reference in the 67-file corpus resolves here, 
 // checking nothing.
 //
 // This closes the specific, checkable subset: the three real SPO-Deploy artifacts this corpus
-// actually names by filename (measured 2026-09-03: `DEPLOY.md` -- orchestrator/README.md:1667;
+// actually names by filename (re-measured: `DEPLOY.md` -- orchestrator/README.md:2124;
 // `deploy.sh` and `setup.conf.example` -- doc/setup.md:11,15), each verified to exist in
 // DEPLOY_REPO, or reported as a setup problem (E1 posture, never a silent pass) if DEPLOY_REPO
 // itself is absent from disk.

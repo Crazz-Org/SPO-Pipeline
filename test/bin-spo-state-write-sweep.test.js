@@ -28,12 +28,12 @@ require('./no-real-spawn');
 // transitively -- a write any number of requires deeper than bin/spo itself is just as real a
 // violation of the invariant above and would otherwise be invisible to a sweep that only ever
 // opened bin/spo. CARD #189 CORRECTION: this sentence used to say "one module deeper", and
-// SCAN_FILES was a hand list built to match -- bin/spo:210-211's eager `require('../console/
-// collect')`/`require('../console/render')`, and bin/spo:1127-1130's `--serve`-only
+// SCAN_FILES was a hand list built to match -- bin/spo:221-222's eager `require('../console/
+// collect')`/`require('../console/render')`, and bin/spo:1247-1250's `--serve`-only
 // `require('../console/serve')`/`.../system`/`.../prod-version`/`.../usage-scan`. That list missed
-// bin/spo:1152-1168's static-mode generateOnce() -- run once unconditionally, and again every 30s
-// under `spo dashboard --watch` (bin/spo:1170-1173); NOT gated behind `--serve`, which returns
-// earlier at :1143 -- and its own lazy `require('../console/par-times')` at :1157-1158, whose
+// bin/spo:1272-1288's static-mode generateOnce() -- run once unconditionally, and again every 30s
+// under `spo dashboard --watch` (bin/spo:1290-1292); NOT gated behind `--serve`, which returns
+// earlier at :1263 -- and its own lazy `require('../console/par-times')` at :1277-1278, whose
 // byte-identical plant went undetected there while the same plant in console/collect.js was
 // caught. CARD #186 ADDITION: bin/spo now also eagerly requires `console/dispatcher-status.js`
 // (its own `computeDispatcherStatus`, moved out of bin/spo so `spo status` and console/collect.js's
@@ -58,8 +58,9 @@ require('./no-real-spawn');
 // this graph that already make DIRECT fs write calls to paths unrelated to state.json today
 // (usage-rollups.js's own tmp-then-rename idiom, saving usage rollups; par-times.js:87's
 // writeFileSync in saveParTimes, saving par-times.json) -- "direct" because console/serve.js also
-// TRIGGERS real writes (refreshParTimes at :207, saveRollups at :238, appendDaemonEvent at :249)
-// without any fs.* WRITE call of its own (serve.js does call fs.readdirSync and fs.existsSync in
+// TRIGGERS real writes (refreshParTimes at console/serve.js:207, saveRollups at console/serve.js:238,
+// appendDaemonEvent at console/serve.js:249) without any fs.* WRITE call of its own (serve.js does
+// call fs.readdirSync and fs.existsSync in
 // its own source, at :55/:61/:65 -- reads, not writes), which is a different thing from what this
 // sweep's write-callee regex looks for. Keeping usage-rollups.js and par-times.js in the scanned set
 // is what proves this sweep can walk right past a real write to an UNRELATED file without
@@ -87,7 +88,7 @@ require('./no-real-spawn');
 //      thread) and called it, however it was imported: bare (destructured) or
 //      through a namespace object (`journal.writeState(...)`) -- bin/spo's OWN dominant import
 //      style is namespace objects (`accounts.`, `intake.`, `autoTriage.`, `reportIntake.`,
-//      `remoteReportPull.`, `recette.` -- bin/spo:213-224), so a namespaced `journal.writeState`
+//      `remoteReportPull.`, `recette.` -- bin/spo:224-235), so a namespaced `journal.writeState`
 //      is if anything the MORE likely future spelling, not an edge case to special-case away.
 //      `accounts.writeState(...)` is the one deliberate exclusion: it writes the claude-accounts
 //      POOL's own state.json (cooldowns/disabled markers), a completely different file under a
@@ -377,8 +378,8 @@ test('bin/spo and the console modules it delegates to never write a taskDir stat
   //     counted) across these 13 files; 200,000 tolerates ordinary growth/shrink but still catches
   //     something close to gh-api-argv's own "a refactor renamed the convention" failure mode.
   //   - totalWriteCallSites: measured 6 today (bin/spo's own 3 writeFileSync calls -- both of
-  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1163 and its health-view
-  //     sibling at bin/spo:1165, plus the account-disable marker -- usage-rollups.js's
+  //     static-mode generateOnce()'s writes, the flight deck at bin/spo:1283 and its health-view
+  //     sibling at bin/spo:1285, plus the account-disable marker -- usage-rollups.js's
   //     writeFileSync+renameSync pair, and par-times.js's own writeFileSync in saveParTimes). A
   //     drop to 0 would mean the write-callee regex stopped matching, not that every write
   //     vanished.

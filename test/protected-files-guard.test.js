@@ -217,8 +217,14 @@ test('handleIntake: a card whose CRITERION quotes a protected path is NOT parked
     kind: 'card',
     issue: 1001,
     title: 'The protected-files guard has never once run',
+    // The criterion is built by concatenation, not a single literal, so its bytes are byte-for-
+    // byte what SPO-WebClient#482's real acceptance criterion said ('.claude/hooks/*.sh') without
+    // the string ever containing a literal '/*' -- which would open a phantom block-comment span
+    // (fix pass 11.3, #190 verifier finding D5: the earlier fix renamed the file to
+    // 'pre-commit.sh', which sidestepped the trap but silently changed what this regression test's
+    // fixture actually says).
     criterion:
-      'a plan declaring .claude/settings.json or .claude/hooks/*.sh parks with plan-requires-protected-files before IMPLEMENT spends anything',
+      'a plan declaring .claude/settings.json or .claude/hooks/' + '*.sh parks with plan-requires-protected-files before IMPLEMENT spends anything',
   };
   const { ctx, spawnSync } = intakeCtx(task);
 

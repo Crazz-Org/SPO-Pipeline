@@ -1,0 +1,2228 @@
+{
+  "pins": [
+    {
+      "citingFile": "test/account-rotation.test.js",
+      "citation": "accounts.js:470-471",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  if (overloaded) {",
+      "last": "    ms = OVERLOADED_COOLDOWN_MS;",
+      "claim": "overloaded"
+    },
+    {
+      "citingFile": "test/account-rotation.test.js",
+      "citation": "accounts.js:364-365",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const cooldownUntil = entry && entry.cooldownUntil;",
+      "last": "    const healthy = !cooldownUntil || cooldownUntil <= now;",
+      "claim": "cooldownUntil"
+    },
+    {
+      "citingFile": "test/account-rotation.test.js",
+      "citation": "accounts.js:477",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  const cooldownUntil = now + ms;",
+      "claim": "cooldownUntil"
+    },
+    {
+      "citingFile": "test/auto-triage.test.js",
+      "citation": "report-intake.js:313",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const pendingPath = moveReportTo(reportPath, path.join(spoReportsDir, 'pending'), `intake: #${issueNumber} — ${today}`, journalRoot);",
+      "claim": "journalRoot"
+    },
+    {
+      "citingFile": "test/auto-triage.test.js",
+      "citation": "report-intake.js:313",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "    const pendingPath = moveReportTo(reportPath, path.join(spoReportsDir, 'pending'), `intake: #${issueNumber} — ${today}`, journalRoot);",
+      "claim": "moveReportTo"
+    },
+    {
+      "citingFile": "test/backfill-legacy-tokens.test.js",
+      "citation": "task-summary.js:175",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "      if (typeof event.billableTokens === 'number') billableTokens += event.billableTokens;",
+      "claim": "billableTokens"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1247-1250",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const { createDashboardServer, discoverUsageRoots } = require('../console/serve');",
+      "last": "    const { createUsageScanner } = require('../console/usage-scan');",
+      "claim": "require('../console/serve')"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1272-1288",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  function generateOnce() {",
+      "last": "  }",
+      "claim": "require('../console/par-times')"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1263",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    return;",
+      "claim": "return"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1277-1278",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "      require('../console/par-times').refreshParTimes(journalRoot, path.join(journalRoot, 'par-times.json'));",
+      "last": "      data.parTimes = require('../console/par-times').loadParTimes(path.join(journalRoot, 'par-times.json'));",
+      "claim": "require('../console/par-times')"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "par-times.js:87",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));",
+      "claim": "writeFileSync"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:224-235",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "const accounts = require('../orchestrator/accounts');",
+      "last": "const recette = require('../orchestrator/recette');",
+      "claim": "autoTriage"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1283",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    fs.writeFileSync(outPath, renderDashboard(data));",
+      "claim": "writeFileSync"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1285",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    fs.writeFileSync(healthPath, renderDashboard(data, { view: 'health' }));",
+      "claim": "writeFileSync"
+    },
+    {
+      "citingFile": "test/blank-comments-sync.test.js",
+      "citation": "orchestrator/state-machine.js:216",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
+      "claim": ".claude/hooks/"
+    },
+    {
+      "citingFile": "test/blank-comments-sync.test.js",
+      "citation": "orchestrator/config.js:916",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // THIS repo's `.claude/settings.json` and `.claude/hooks/*.sh` -- generalized it to all of",
+      "claim": ".claude/hooks/"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "worker.ts:302",
+      "occurrence": 0,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "    const head = request.fingerprint.head;",
+      "claim": "request.fingerprint.head"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "board-take.sh:109-110",
+      "occurrence": 0,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "  finished_marker=\"$(session_marker finished 2>/dev/null || true)\"",
+      "last": "  if [ -n \"$finished_marker\" ] && [ -f \"$finished_marker\" ]; then",
+      "claim": "finished_marker"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "board-take.sh:109-110",
+      "occurrence": 1,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "  finished_marker=\"$(session_marker finished 2>/dev/null || true)\"",
+      "last": "  if [ -n \"$finished_marker\" ] && [ -f \"$finished_marker\" ]; then",
+      "claim": "finished_marker"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "scripted.js:1944-1996",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "async function realFinish(ctx, deps = {}) {",
+      "last": "}",
+      "claim": "realFinish"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "test/helpers.js:65-94",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "function isolatedEnv() {",
+      "last": "}",
+      "claim": "isolatedEnv"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "test/helpers.js:65-94",
+      "occurrence": 1,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "function isolatedEnv() {",
+      "last": "}",
+      "claim": "isolatedEnv"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "intake.js:938-940",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on",
+      "last": "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time,",
+      "claim": "Fable"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "bin/spo:1838",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "  if (cmd === 'tokens') return cmdTokens(opts);",
+      "claim": "  if (cmd === 'tokens') return cmdTokens(opts);"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "bin/spo:993",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "function cmdCostDeprecated(opts) {",
+      "claim": "function cmdCostDeprecated(opts) {"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "CLAUDE.md:29",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "- **Verdict by exit code**, never by reading `gh`'s text output.",
+      "claim": "'s text output."
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "CLAUDE.md:29",
+      "occurrence": 1,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "- **Verdict by exit code**, never by reading `gh`'s text output.",
+      "claim": "'s text output."
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "CLAUDE.md:29",
+      "occurrence": 2,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "- **Verdict by exit code**, never by reading `gh`'s text output.",
+      "claim": "'s text output."
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "orchestrator/config.js:704",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "  // is 125 lines of `gh api graphql` -- resolve the option id, write, re-read to confirm -- with",
+      "claim": " -- resolve the option id, write, re-read to confirm -- with"
+    },
+    {
+      "citingFile": "test/citation-verifier.test.js",
+      "citation": "step-contracts.js:999",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "function shouldEscalate(stepDef, task) {",
+      "claim": "shouldEscalate"
+    },
+    {
+      "citingFile": "test/dispatcher.test.js",
+      "citation": "dispatcher.js:1286",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "        appendDaemonEvent(journalRoot, 'dispatcher-drain-end', {",
+      "claim": "dispatcher-drain-end"
+    },
+    {
+      "citingFile": "test/dispatcher.test.js",
+      "citation": "dispatcher.js:1232",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "        appendDaemonEvent(journalRoot, 'dispatcher-stopped', stopReason);",
+      "claim": "dispatcher-stopped"
+    },
+    {
+      "citingFile": "test/dispatcher.test.js",
+      "citation": "dispatcher.js:925-932",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const p = watchChild(child)",
+      "last": "          code: result.code === undefined ? null : result.code,",
+      "claim": "worker-crash-repark-exit"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "README.md:34",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |",
+      "path": "./README.md",
+      "claim": "bin/spo"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:407-408",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "// actually governs when the daemon will pick this card back up (state-machine.js's",
+      "last": "// isEligibleNow reads `notBefore` off the task, not off the journal) -- the two carry the same",
+      "claim": "isEligibleNow"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:715",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "      // is simply waiting for the next drain (state-machine.js's isEligibleNow would take it",
+      "claim": "isEligibleNow"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/state-machine.js:202",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "  // intake.js's pullBoard would not: a refusal there would leave the card silently re-scanned every",
+      "claim": "pullBoard"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/README.md:441",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "  `pullBoard` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It",
+      "claim": "pullBoard"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/park-loop.js:219",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "// ---- action 5.1d: surface DIAGNOSE on the card -------------------------------------------------",
+      "claim": "action 5.1d"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "config.js:658",
+      "occurrence": 0,
+      "at": "a194a1bb779c76a53ba7d9c585f85e0b70ef937b",
+      "first": "  productRepo: process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient'),",
+      "claim": "productRepo"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/state-machine-spec.md:150",
+      "occurrence": 0,
+      "at": "653e7f15ae36997a7073f24180f33d9f7dd727a9",
+      "first": "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |",
+      "claim": "CHECK"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "step-contracts.js:99",
+      "occurrence": 0,
+      "at": "a194a1bb779c76a53ba7d9c585f85e0b70ef937b",
+      "first": "//                            contracts table this applies to IMPLEMENT and to VALIDATE's",
+      "claim": "IMPLEMENT"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "config.js:764",
+      "occurrence": 0,
+      "at": "a194a1bb779c76a53ba7d9c585f85e0b70ef937b",
+      "first": "  reportIntakeColumn: process.env.SPO_REPORT_INTAKE_COLUMN || 'Intake',",
+      "claim": "reportIntakeColumn"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:1273",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const data = collectAll(sources);",
+      "claim": "collectAll"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "dispatcher.js:635-648",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "    if (childrenSignalled && outcome === 'crashed') {",
+      "last": "      return;",
+      "claim": "worker-exit-during-shutdown"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "SPO-WebClient/.claude/settings.json:109-127",
+      "occurrence": 0,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "  \"hooks\": {",
+      "last": "            \"timeout\": 10",
+      "claim": "\"hooks\": {"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "auto-pull.js:58-66",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's",
+      "last": "// Reversing the read order is therefore not cosmetic.",
+      "claim": "computeAutoPullBudget"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1262",
+      "occurrence": 0,
+      "at": "4ccd795ecbc347ae3876e35f112369c65956733e",
+      "first": "    if (state.state !== 'PARKED') continue;",
+      "claim": "PARKED"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1261",
+      "occurrence": 0,
+      "at": "4ccd795ecbc347ae3876e35f112369c65956733e",
+      "first": "    // not change that; only reconcileExternalClosure runs for it.",
+      "claim": "reconcileExternalClosure"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1396",
+      "occurrence": 0,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "        // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:607",
+      "occurrence": 0,
+      "at": "be29b3da8af8256ce42857ceafa9b7902a45e404",
+      "first": "  // CARD #78: a call made HERE is an ORDINARY `killAllChildren('SIGTERM')` -- no `{ includeReparking:",
+      "claim": "killAllChildren"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:607",
+      "occurrence": 1,
+      "at": "be29b3da8af8256ce42857ceafa9b7902a45e404",
+      "first": "  // CARD #78: a call made HERE is an ORDINARY `killAllChildren('SIGTERM')` -- no `{ includeReparking:",
+      "claim": "killAllChildren"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:626",
+      "occurrence": 1,
+      "at": "be29b3da8af8256ce42857ceafa9b7902a45e404",
+      "first": "  process.once('exit', () => {",
+      "claim": "process.once('exit', () => {"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:626-627",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  process.once('exit', () => {",
+      "last": "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');",
+      "claim": "killAllChildren('SIGTERM')"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1396",
+      "occurrence": 1,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "        // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "remote-report-pull.js:193",
+      "occurrence": 1,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "        // Verification precedent (card #137, 3.2a): appendDaemonEvent does its own mkdirSync +",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "run.ts:63",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {",
+      "claim": "runLive"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1341",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    if (state.state !== 'PARKED') continue;",
+      "claim": "PARKED"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1396",
+      "occurrence": 2,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "        // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:607",
+      "occurrence": 2,
+      "at": "be29b3da8af8256ce42857ceafa9b7902a45e404",
+      "first": "  // CARD #78: a call made HERE is an ORDINARY `killAllChildren('SIGTERM')` -- no `{ includeReparking:",
+      "claim": "killAllChildren"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:626-627",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "  process.once('exit', () => {",
+      "last": "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');",
+      "claim": "killAllChildren"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:607",
+      "occurrence": 3,
+      "at": "be29b3da8af8256ce42857ceafa9b7902a45e404",
+      "first": "  // CARD #78: a call made HERE is an ORDINARY `killAllChildren('SIGTERM')` -- no `{ includeReparking:",
+      "claim": "killAllChildren"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:626-627",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "  process.once('exit', () => {",
+      "last": "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');",
+      "claim": "killAllChildren"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:1273",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "    const data = collectAll(sources);",
+      "claim": "collectAll"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:1273",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "    const data = collectAll(sources);",
+      "claim": "collectAll"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/README.md:2124",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "SPO-Deploy's `DEPLOY.md` § 5.5 and SPO-WebClient's `src/server/report-pull-endpoint.ts`.",
+      "claim": "DEPLOY.md"
+    },
+    {
+      "citingFile": "test/drain.test.js",
+      "citation": "dispatcher.js:819",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    appendDaemonEvent(journalRoot, 'worker-spawn', { id, pid: child.pid || null, taskDir });",
+      "claim": "worker-spawn"
+    },
+    {
+      "citingFile": "test/drain.test.js",
+      "citation": "orchestrator/steps/scripted.js:65",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const delay = ctx.fixture(`delays.${fixtureKey}`, 0);",
+      "claim": "delays"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "state-machine.js:246",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));",
+      "claim": "callWithDeadline"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "state-machine.js:242",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  if (ctx.fixture('nightlyMainRed', false)) {",
+      "claim": "ctx.fixture('nightlyMainRed', false)"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "test/real-steps.test.js:3901",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  assert.equal(waitCalls, 2);",
+      "claim": "waitCalls"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "test/gate-main-moved.test.js:132",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "for (const [exit, reason] of [",
+      "claim": "exit"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "state-machine.js:246",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));",
+      "claim": "WORKTREE"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "state-machine.js:246",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "    return callWithDeadline(ctx, 'WORKTREE', () => realWorktree(ctx, ctx.deps));",
+      "claim": "realWorktree"
+    },
+    {
+      "citingFile": "test/gate-live-attestation.test.js",
+      "citation": "run.ts:63",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {",
+      "claim": "runLive"
+    },
+    {
+      "citingFile": "test/gate-live-attestation.test.js",
+      "citation": "run.ts:63",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {",
+      "claim": "runLive"
+    },
+    {
+      "citingFile": "test/intake.test.js",
+      "citation": "bin/spo:239-305",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "function parseArgs(argv) {",
+      "last": "}",
+      "claim": "--repo"
+    },
+    {
+      "citingFile": "test/merge-cause.test.js",
+      "citation": "test/real-steps.test.js:2646-2699",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  const task = { id: 'card-211-pollk', kind: 'card', issue: 941, worktreePath };",
+      "last": "  });",
+      "claim": "testConfig"
+    },
+    {
+      "citingFile": "test/merge-regate.test.js",
+      "citation": "test/real-steps.test.js:2315",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "test('realPushPr: reuses an already-open PR for this branch -- gh pr create never runs, patches the body via gh api, never gh pr edit', async () => {",
+      "claim": "realPushPr"
+    },
+    {
+      "citingFile": "test/no-real-spawn-guard.test.js",
+      "citation": "bin/spo:217-237",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "require('../orchestrator/no-real-spawn-guard').installGuard();",
+      "last": "const { lockPath, pidExists } = require('../orchestrator/lock');",
+      "claim": "installGuard"
+    },
+    {
+      "citingFile": "test/no-real-spawn-guard.test.js",
+      "citation": "project-board.js:42",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "const { armTimeout } = require('./command-timeout');",
+      "claim": "./command-timeout"
+    },
+    {
+      "citingFile": "test/no-real-spawn-guard.test.js",
+      "citation": "command-timeout.js:151-160",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;",
+      "last": "  const result = spawnSyncFn(command, args, spawnOpts);",
+      "claim": "deps.spawnSync"
+    },
+    {
+      "citingFile": "test/no-real-spawn-guard.test.js",
+      "citation": "intake.js:47",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "const { armTimeout } = require('./command-timeout');",
+      "claim": "./command-timeout"
+    },
+    {
+      "citingFile": "test/no-real-spawn-guard.test.js",
+      "citation": "board.js:44",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "const { armTimeout } = require('./command-timeout');",
+      "claim": "./command-timeout"
+    },
+    {
+      "citingFile": "test/orphan-scan.test.js",
+      "citation": "auto-pull.js:58-66",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's",
+      "last": "// Reversing the read order is therefore not cosmetic.",
+      "claim": "fillSlots"
+    },
+    {
+      "citingFile": "test/park-loop.test.js",
+      "citation": "park-loop.js:1451",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "        requeuedFile = reEnqueueTask(queueDir, taskDir, id, {}, match.id, 'h');",
+      "claim": "reEnqueueTask"
+    },
+    {
+      "citingFile": "test/park-reason-doc-sweep.test.js",
+      "citation": "state-machine.js:1587",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // generic `throw new ParkSignal('validate-unrecognized-verdict', ...)` at the bottom of this",
+      "claim": "throw new ParkSignal('validate-unrecognized-verdict', ...)"
+    },
+    {
+      "citingFile": "test/real-steps.test.js",
+      "citation": "SPO-WebClient/src/e2e/bench/job.ts:325",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  purgeDone(maxAgeMs: number, nowMs: number = Date.now()): void {",
+      "claim": "purgeDone"
+    },
+    {
+      "citingFile": "test/release-script.test.js",
+      "citation": "scripts/release.sh:118-133",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "prune_releases() {",
+      "last": "}",
+      "claim": "prune_releases"
+    },
+    {
+      "citingFile": "test/release-script.test.js",
+      "citation": "release.sh:170",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    mv -T \"$tmp\" \"$dest\"",
+      "claim": "mv -T \"$tmp\" \"$dest\""
+    },
+    {
+      "citingFile": "test/report-intake.test.js",
+      "citation": "report-intake.js:313",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    const pendingPath = moveReportTo(reportPath, path.join(spoReportsDir, 'pending'), `intake: #${issueNumber} — ${today}`, journalRoot);",
+      "claim": "pendingPath"
+    },
+    {
+      "citingFile": "test/step-contracts.test.js",
+      "citation": "scripted.js:1705-1708",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  //",
+      "last": "  // ctx.task across the DIAGNOSE/VALIDATE-REJECT/CI-retry loops after this point -- lowering it",
+      "claim": "touchesRdoMembers"
+    },
+    {
+      "citingFile": "test/transient-retry.test.js",
+      "citation": "lock.js:4-11",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// WHY: nothing else stops two daemons sharing a queue. takeNextTask's rename is atomic, so a",
+      "last": "// `node orchestrator/daemon.js --real` in a terminal while the unit is up.",
+      "claim": "takeNextTask"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "orchestrator/steps/scripted.js:1357",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "      throw new ParkSignal('nightly-main-red', { sha: originMainSha });",
+      "claim": "nightly-main-red"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "console/serve.js:207",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "          refreshParTimes(sources.journalRoot, parTimesPath);",
+      "claim": "refreshParTimes"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "console/serve.js:238",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "          saveRollups(rollupsPath, rollups);",
+      "claim": "saveRollups"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "console/serve.js:249",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "            appendDaemonEvent(sources.journalRoot, 'usage-rollups-scan-failed', {",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "test/nightly-verdict-semantics.test.js:369",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "test('realCiChecks: nightly FAIL at the exact origin/main sha still parks main-red-no-merge (regression guard: the ONE reachable never-fired leg, fired here)', async () => {",
+      "claim": "regression guard"
+    },
+    {
+      "citingFile": "test/phantom-park.test.js",
+      "citation": "state-machine.js:2601-2604",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "if (isRealMode(ctx) && isAccountPoolParkReason(reason)) {",
+      "last": "    if (deadlineMs !== null && typeof poolQueueDir === 'string' && poolQueueDir !== '') {",
+      "claim": "isAccountPoolParkReason(reason)"
+    },
+    {
+      "citingFile": "test/real-steps.test.js",
+      "citation": "test/real-steps.test.js:6460",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    config: testConfig({ commandTimeoutsMs: TIMEOUT_TABLE, ...overrides }),",
+      "claim": "commandTimeoutsMs"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "step-contracts.js:326",
+      "occurrence": 0,
+      "at": "5257642d161e32b815128e52c4fafec3a55c221f",
+      "first": "  if (task && task.touchesRdoMembers === true && stepDef.escalatesOn.includes('touchesRdoMembers')) return true;",
+      "claim": "touchesRdoMembers"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "step-contracts.js:326",
+      "occurrence": 1,
+      "at": "5257642d161e32b815128e52c4fafec3a55c221f",
+      "first": "  if (task && task.touchesRdoMembers === true && stepDef.escalatesOn.includes('touchesRdoMembers')) return true;",
+      "claim": "touchesRdoMembers"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "step-contracts.js:326",
+      "occurrence": 2,
+      "at": "5257642d161e32b815128e52c4fafec3a55c221f",
+      "first": "  if (task && task.touchesRdoMembers === true && stepDef.escalatesOn.includes('touchesRdoMembers')) return true;",
+      "claim": "touchesRdoMembers"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "state-machine.js:2923",
+      "occurrence": 0,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "      // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "state-machine.js:2923",
+      "occurrence": 1,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "      // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "state-machine.js:2923",
+      "occurrence": 2,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "      // Verification fix: appendDaemonEvent itself does an mkdirSync + appendFileSync -- on the",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "bin/spo:1139",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "function cmdAccounts(opts) {",
+      "claim": "function cmdAccounts(opts) {"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "CLAUDE.md:35",
+      "occurrence": 0,
+      "at": "769eac5da02428584290cf55cd19c8101ff47a5a",
+      "first": "- **Verdict by exit code**, never by reading `gh`'s text output.",
+      "claim": "'s text output."
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "orchestrator/config.js:779",
+      "occurrence": 0,
+      "at": "769eac5da02428584290cf55cd19c8101ff47a5a",
+      "first": "  // is 125 lines of `gh api graphql` -- resolve the option id, write, re-read to confirm -- with",
+      "claim": "resolve the option id, write, re-read to confirm"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "orchestrator/config.js:839",
+      "occurrence": 0,
+      "at": "7932e5d9a6d729a9cf5ab146c6529e7858065682",
+      "first": "  // is 125 lines of `gh api graphql` -- resolve the option id, write, re-read to confirm -- with",
+      "claim": "resolve the option id, write, re-read to confirm"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "product-repo-lock.js:28",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "// SHAPE: reuses lock.js's second idiom (acquireShortLock/releaseShortLock -- write-tmp-then-link,",
+      "claim": "second"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:1137",
+      "occurrence": 0,
+      "at": "a194a1bb779c76a53ba7d9c585f85e0b70ef937b",
+      "first": "    const data = collectAll(sources);",
+      "claim": "collectAll"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/invariants.js:2-3",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "// orchestrator/invariants.js -- action 1.8: the \"invariant substring check\" doc/state-machine-",
+      "last": "// spec.md:49 has always promised (and prompts/plan.md has always told PLAN a downstream check",
+      "claim": "spec.md:49"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/invariants.js:37",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "//   File: relative/path/to/file.ts:123",
+      "claim": "relative/path/to/file.ts:123"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/state-machine-spec.md:140",
+      "occurrence": 0,
+      "at": "a194a1bb779c76a53ba7d9c585f85e0b70ef937b",
+      "first": "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |",
+      "claim": "invariant substring check"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/steps/scripted.js:1295",
+      "occurrence": 0,
+      "at": "a194a1bb779c76a53ba7d9c585f85e0b70ef937b",
+      "first": "  const claim = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['run', 'board:take', '--', String(issue)], {",
+      "claim": "board:take"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "README.md:34",
+      "occurrence": 1,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` / `tokens` / `cost` (deprecated alias for `tokens`) / `accounts` / `reports` read only the journals/registries; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `pull-reports` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |",
+      "path": "./README.md",
+      "claim": "pull-reports"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "account-lease.js:156",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "  return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });",
+      "claim": "acquireShortLock"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "account-lease.js:156",
+      "occurrence": 3,
+      "at": "HEAD",
+      "first": "  return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });",
+      "claim": "acquireShortLock"
+    },
+    {
+      "citingFile": "test/orphan-scan.test.js",
+      "citation": "orphan-scan.js:127",
+      "occurrence": 0,
+      "at": "e38640238bba3ddfba7a1a0886e0c7010c16c9f8",
+      "first": "  const inQueue = queuedIds(queueDir);",
+      "claim": "queuedIds"
+    },
+    {
+      "citingFile": "test/auto-triage.test.js",
+      "citation": "prompt-template.js:113",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  const missing = placeholders.filter((name) => values[name] === undefined || values[name] === null);",
+      "claim": "values[name] === null"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:221-222",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "const { collectAll, readDaemonEventsTail } = require('../console/collect');",
+      "last": "const { renderDashboard } = require('../console/render');",
+      "claim": "require('../console/render')"
+    },
+    {
+      "citingFile": "test/invariants.test.js",
+      "citation": "doc/state-machine-spec.md:159",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |",
+      "claim": "invariant substring check"
+    },
+    {
+      "citingFile": "test/park-reason-doc-sweep.test.js",
+      "citation": "orchestrator/steps/scripted.js:973",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// now throws ParkSignal('git-timed-out') when the same git command is killed by its own",
+      "claim": "ParkSignal('git-timed-"
+    },
+    {
+      "citingFile": "test/worker-mode.test.js",
+      "citation": "config.js:554",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    FINISH: productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),",
+      "claim": "finishStepDeadlineMs"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:922",
+      "occurrence": 0,
+      "at": "4b6a1efef01b2d5bf356ce84c116f2565a2d8a7c",
+      "first": "      deps.spool.purgeDone(DONE_RETENTION_MS, deps.now());",
+      "claim": "purgeDone"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:1169",
+      "occurrence": 0,
+      "at": "4b6a1efef01b2d5bf356ce84c116f2565a2d8a7c",
+      "first": "  process.on('SIGTERM', () => process.exit(0));",
+      "claim": "SIGTERM"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:751",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "        `${request.ref} does not merge cleanly with origin/main (base ${prep.conflictBase.slice(0, 8)}) — see ${logFile}`,",
+      "claim": "does not merge cleanly"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/state-machine-spec.md:159",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |",
+      "claim": "CHECK"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/remediation-progress.md:664",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park.",
+      "claim": "DIAGNOSE"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verify-gate.js:336",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "    artifact.verdict = 'BLOCKED';",
+      "claim": "BLOCKED"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "run.ts:64",
+      "occurrence": 0,
+      "at": "04bd3692f342297460c02675711806406d3bf19e",
+      "first": "      status: 'BLOCKED',",
+      "claim": "status: 'BLOCKED'"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "run.ts:64",
+      "occurrence": 1,
+      "at": "04bd3692f342297460c02675711806406d3bf19e",
+      "first": "      status: 'BLOCKED',",
+      "claim": "BLOCKED"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/remediation-plan-2026-08.md:188",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "| 5.1 | **Missing board moves**: pre-worktree park moved via direct `gh api graphql` (`updateProjectV2ItemFieldValue` mutation, field ids in `doc/board-audit.md` — no product cwd needed); DIAGNOSE activity surfaced (a \"diagnosing, attempt N/3\" comment or a dedicated column — driver decision); drop the redundant move on every IMPLEMENT retry. | `orchestrator/board.js`, `orchestrator/state-machine.js:239` |",
+      "claim": "DIAGNOSE activity surfaced (a"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/remediation-progress.md:649",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park.",
+      "claim": "DIAGNOSE surfacing"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "bin/spo:1290-1292",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  generateOnce();",
+      "last": "    setInterval(generateOnce, 30000);",
+      "claim": "generateOnce"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "lock.js:310",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  const tryWrite = () => tryCreate(filePath, payload);",
+      "claim": "tryCreate"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "lock.js:310",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "  const tryWrite = () => tryCreate(filePath, payload);",
+      "claim": "tryCreate"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "lock.js:276",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {",
+      "claim": "acquireShortLock"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/setup.md:11",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "cd ~/SPO-Deploy && cp setup.conf.example setup.conf",
+      "claim": "setup.conf.example"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/setup.md:73",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "**SPO-Deploy README § Setup**.",
+      "claim": "§ Setup"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "remote-report-pull.js:193",
+      "occurrence": 0,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "        // Verification precedent (card #137, 3.2a): appendDaemonEvent does its own mkdirSync +",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "remote-report-pull.js:193",
+      "occurrence": 2,
+      "at": "41e11fdccb23118ed6605fe56e9c6b116ce108cc",
+      "first": "        // Verification precedent (card #137, 3.2a): appendDaemonEvent does its own mkdirSync +",
+      "claim": "appendDaemonEvent"
+    },
+    {
+      "citingFile": "test/bin-spo-state-write-sweep.test.js",
+      "citation": "console/serve.js:55",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "      entries = fs.readdirSync(accountsDir, { withFileTypes: true }).filter((d) => d.isDirectory());",
+      "claim": "readdirSync"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/state-machine.js:835",
+      "occurrence": 0,
+      "at": "4f5e7531b142a39092a9c5b6cc7eda1742a0f64b",
+      "first": "  // Action 5.1d: surface DIAGNOSE on the card, first entry only -- see park-loop.js's",
+      "claim": "5.1d"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/token-recovery.js:10-18",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// The fix is not a second accounting path: `claude` itself writes every call's usage into the",
+      "last": "// scripts/usage-report.js once did, until SPO-Pipeline#170 made them share one reader.",
+      "claim": "scanFile"
+    },
+    {
+      "citingFile": "test/intake.test.js",
+      "citation": "test/recette.test.js:328",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "test('recette refuses to run while a live daemon holds journal/daemon.lock', async () => {",
+      "claim": "daemon.lock"
+    },
+    {
+      "citingFile": "test/spo-triage.test.js",
+      "citation": "test/recette.test.js:328",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "test('recette refuses to run while a live daemon holds journal/daemon.lock', async () => {",
+      "claim": "daemon.lock"
+    },
+    {
+      "citingFile": "test/blank-comments-sync.test.js",
+      "citation": "orchestrator/state-machine.js:216",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples`"
+    },
+    {
+      "citingFile": "test/blank-comments-sync.test.js",
+      "citation": "orchestrator/steps/scripted.js:1905",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are`"
+    },
+    {
+      "citingFile": "test/gh-api-argv.test.js",
+      "citation": "orchestrator/config.js:916",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // THIS repo's `.claude/settings.json` and `.claude/hooks/*.sh` -- generalized it to all of",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// THIS repo's `.claude/settings.json` and `.claude/hooks/*.sh` -- generalized it to all of`"
+    },
+    {
+      "citingFile": "test/park-reason-doc-sweep.test.js",
+      "citation": "orchestrator/config.js:916",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // THIS repo's `.claude/settings.json` and `.claude/hooks/*.sh` -- generalized it to all of",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// THIS repo's `.claude/settings.json` and `.claude/hooks/*.sh` -- generalized it to all of`"
+    },
+    {
+      "citingFile": "test/gh-api-argv.test.js",
+      "citation": "orchestrator/steps/scripted.js:1905",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are`"
+    },
+    {
+      "citingFile": "test/park-reason-doc-sweep.test.js",
+      "citation": "orchestrator/steps/scripted.js:1905",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// (`~/.spo-bench/done/*.json`, 24h retention, 2026-09-03): 7 of the last 29 completed jobs are`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/README.md:441",
+      "occurrence": 1,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "  `pullBoard` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference to the same fact pinned with a claim at occurrence #0; edge line is ``pullBoard` would not (a card silently re-scanned forever, uncommented, unmoved on the board). It`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:130-131",
+      "occurrence": 0,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "const DEFAULT_LEASE_MINUTES = 30;",
+      "last": "const MAX_LEASE_MINUTES = 120;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation (M17 removal narrative, same as worker.ts:129/131/997 above); edge line is `const DEFAULT_LEASE_MINUTES = 30;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:130-131",
+      "occurrence": 1,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "const DEFAULT_LEASE_MINUTES = 30;",
+      "last": "const MAX_LEASE_MINUTES = 120;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation (M17 removal narrative, same as worker.ts:129/131/997 above); edge line is `const DEFAULT_LEASE_MINUTES = 30;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:626",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  process.once('exit', () => {",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "names the RANGE citation daemon.js:626-627's own start line; edge line is `process.once('exit', () => {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:779-780",
+      "occurrence": 0,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "  process.on('SIGTERM', () => process.exit(0));",
+      "last": "  process.on('SIGINT', () => process.exit(0));",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "held true at 93528389 (BENCH_PINS' own commit) -- does not discriminate at 4b6a1efe; edge line is `process.on('SIGTERM', () => process.exit(0));`"
+    },
+    {
+      "citingFile": "test/gh-api-argv.test.js",
+      "citation": "orchestrator/state-machine.js:216",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples`"
+    },
+    {
+      "citingFile": "test/gh-api-argv.test.js",
+      "citation": "orchestrator/state-machine.js:216",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples`"
+    },
+    {
+      "citingFile": "test/park-reason-doc-sweep.test.js",
+      "citation": "orchestrator/state-machine.js:216",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference; edge line is `// acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verify-gate.js:336",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    artifact.verdict = 'BLOCKED';",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same shape as the verify-gate.js:336 pin above (no BLOCKED-adjacent text within +/-3 lines of THIS mention); edge line is `artifact.verdict = 'BLOCKED';`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verify-gate.js:336",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "    artifact.verdict = 'BLOCKED';",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same shape as the verify-gate.js:336 pin above (no BLOCKED-adjacent text within +/-3 lines of THIS mention); edge line is `artifact.verdict = 'BLOCKED';`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verify-gate.js:336",
+      "occurrence": 3,
+      "at": "HEAD",
+      "first": "    artifact.verdict = 'BLOCKED';",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same shape as the verify-gate.js:336 pin above (no BLOCKED-adjacent text within +/-3 lines of THIS mention); edge line is `artifact.verdict = 'BLOCKED';`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verify-gate.js:336",
+      "occurrence": 4,
+      "at": "HEAD",
+      "first": "    artifact.verdict = 'BLOCKED';",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same shape as the verify-gate.js:336 pin above (no BLOCKED-adjacent text within +/-3 lines of THIS mention); edge line is `artifact.verdict = 'BLOCKED';`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/token-recovery.js:10-18",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "// The fix is not a second accounting path: `claude` itself writes every call's usage into the",
+      "last": "// scripts/usage-report.js once did, until SPO-Pipeline#170 made them share one reader.",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference to the fact pinned with a claim at occurrence #0; edge line is `// The fix is not a second accounting path: `claude` itself writes every call's usage into the`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "README.md:34",
+      "occurrence": 2,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare listing (\"CCA_PINS carries all 37 file-tied citations... README.md:34/:35/:37\") naming three citations together; edge line is `| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "README.md:35",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `test/` | `node --test test/*.test.js` suite for the orchestrator, shadow mode, temp queue/journal dirs (never bare — see `orchestrator/README.md` § Tests) | ✅ |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same bare listing as README.md:34 #2 above; edge line is `| `test/` | `node --test test/*.test.js` suite for the orchestrator, shadow mode, temp queue/journal dirs (never bare — see `orchestrator/README.md` § Tests) | ✅ |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verdict.ts:162-183",
+      "occurrence": 0,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "export function statusDescription(verdict: BenchVerdict): string {",
+      "last": "}",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "fact already pinned in BENCH_PINS; edge line is `export function statusDescription(verdict: BenchVerdict): string {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/README.md:1062",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "  single missing event is why **14 of 18 tasks' journals stop at `Merging` while the board reads",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "names the \"14 of 18 tasks\" board/journal divergence row; edge line is `single missing event is why **14 of 18 tasks' journals stop at `Merging` while the board reads`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "dispatcher.js:635-648",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    if (childrenSignalled && outcome === 'crashed') {",
+      "last": "      return;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference to the fact pinned with a claim at occurrence #2; edge line is `if (childrenSignalled && outcome === 'crashed') {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "dispatcher.js:635-648",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "    if (childrenSignalled && outcome === 'crashed') {",
+      "last": "      return;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference to the fact pinned with a claim at occurrence #2; edge line is `if (childrenSignalled && outcome === 'crashed') {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "dispatcher.js:635-648",
+      "occurrence": 3,
+      "at": "HEAD",
+      "first": "    if (childrenSignalled && outcome === 'crashed') {",
+      "last": "      return;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference to the fact pinned with a claim at occurrence #2; edge line is `if (childrenSignalled && outcome === 'crashed') {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "run.ts:64",
+      "occurrence": 2,
+      "at": "04bd3692f342297460c02675711806406d3bf19e",
+      "first": "      status: 'BLOCKED',",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "discusses the ANCHOR_TOPK/tolerance-band regression the historical run.ts:64 bug motivated; edge line is `status: 'BLOCKED',`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "recette.js:125",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "// own, unmodified parsing (env var name, Number() coercion, fallback-on-undefined) -- cache-busted",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "one of three historical-record locations (action 9.2) where a sentence used to read as a phantom SYMBOL citation; edge line is `// own, unmodified parsing (env var name, Number() coercion, fallback-on-undefined) -- cache-busted`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "account-lease.js:156",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "  return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference restating no content of its own; \"lease\" is a substring of the citation's own filename and proves nothing about the cited LINE; edge line is `return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "park-loop.js:1262",
+      "occurrence": 1,
+      "at": "4ccd795ecbc347ae3876e35f112369c65956733e",
+      "first": "    if (state.state !== 'PARKED') continue;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference to the fact pinned with a claim at occurrence #0, frozen at the same commit; edge line is `if (state.state !== 'PARKED') continue;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:129",
+      "occurrence": 0,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "const DONE_RETENTION_MS = 24 * 60 * 60 * 1000;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation (M17 removal narrative) -- held true at SPO-WebClient 1bb44779; edge line is `const DONE_RETENTION_MS = 24 * 60 * 60 * 1000;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:997",
+      "occurrence": 0,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "      deps.spool.purgeDone(DONE_RETENTION_MS, deps.now());",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation, same M17 removal narrative as worker.ts:129 above -- held true at SPO-WebClient 1bb44779; edge line is `deps.spool.purgeDone(DONE_RETENTION_MS, deps.now());`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:131",
+      "occurrence": 0,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "const MAX_LEASE_MINUTES = 120;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation (the single-line half of the worker.ts:130-131 pair) -- held true at SPO-WebClient 1bb44779; edge line is `const MAX_LEASE_MINUTES = 120;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:129",
+      "occurrence": 1,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "const DONE_RETENTION_MS = 24 * 60 * 60 * 1000;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation (M17 removal narrative) -- held true at SPO-WebClient 1bb44779; edge line is `const DONE_RETENTION_MS = 24 * 60 * 60 * 1000;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:997",
+      "occurrence": 1,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "      deps.spool.purgeDone(DONE_RETENTION_MS, deps.now());",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation, same M17 removal narrative as worker.ts:129 above -- held true at SPO-WebClient 1bb44779; edge line is `deps.spool.purgeDone(DONE_RETENTION_MS, deps.now());`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:131",
+      "occurrence": 1,
+      "at": "1bb447799fdeedb195eff0d7b995d933937a7624",
+      "first": "const MAX_LEASE_MINUTES = 120;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "quoted as a RETIRED citation (the single-line half of the worker.ts:130-131 pair) -- held true at SPO-WebClient 1bb44779; edge line is `const MAX_LEASE_MINUTES = 120;`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "verify-gate.js:342",
+      "occurrence": 0,
+      "at": "0b5b5687703ce25122db4bee6e40eedadb7a938c",
+      "first": "    artifact.verdict = 'BLOCKED';",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "classified UNANCHORABLE by this file's own part 2.5 measurement -- held true at SPO-WebClient 0b5b5687; edge line is `artifact.verdict = 'BLOCKED';`"
+    },
+    {
+      "citingFile": "test/gate-legs-reachability.test.js",
+      "citation": "test/replay-holes.test.js:79",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  // the assertion below (no WORKTREE 'result' event) proves the nightlyMainRed check short-",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "too generic (appears throughout this file's own prose) to tie specifically to this mention; edge line is `// the assertion below (no WORKTREE 'result' event) proves the nightlyMainRed check short-`"
+    },
+    {
+      "citingFile": "test/intake.test.js",
+      "citation": "bin/spo:1142",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  return cmdTokens(opts);",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"opts\" is a generic parameter name appearing on nearly every bin/spo command function; edge line is `return cmdTokens(opts);`"
+    },
+    {
+      "citingFile": "test/intake.test.js",
+      "citation": "bin/spo:1183",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "      // than folded into the PARKED rows above: the two ask different questions of a maintainer",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"ask\" is too generic/short to tie specifically to this mention; edge line is `// than folded into the PARKED rows above: the two ask different questions of a maintainer`"
+    },
+    {
+      "citingFile": "test/spawn-isolation-sweep.test.js",
+      "citation": "test/helpers.js:106-142",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  const accountsDir = mkTmp('spo-isolated-accounts-');",
+      "last": "    SPO_STATE_DIR: mkTmp('spo-isolated-state-'),",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "too generic (appears throughout this file's own prose about env isolation) to tie specifically to this mention; edge line is `const accountsDir = mkTmp('spo-isolated-accounts-');`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "auto-pull.js:58-66",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's",
+      "last": "// Reversing the read order is therefore not cosmetic.",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"read\" is too generic (this whole paragraph is ABOUT read order); the fact is pinned distinctly at occurrence #1; edge line is `// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "auto-pull.js:58-66",
+      "occurrence": 2,
+      "at": "HEAD",
+      "first": "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's",
+      "last": "// Reversing the read order is therefore not cosmetic.",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"own\" is a stopword; the fact is pinned distinctly at occurrence #1; edge line is `// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "run.ts:63",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"run\" is a stopword; the fact is pinned distinctly at occurrence #0; edge line is `export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {`"
+    },
+    {
+      "citingFile": "test/transient-retry.test.js",
+      "citation": "run.ts:63",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"run\" is a stopword; edge line is `export async function runLive(options: LiveRunOptions): Promise<LiveRunResult> {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "intake.js:938-940",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on",
+      "last": "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time,",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"ever\" is a stopword; the fact is pinned distinctly in LIVE_RANGE_PINS (citation-pins-data.js); edge line is `// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "worker.ts:751",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "        `${request.ref} does not merge cleanly with origin/main (base ${prep.conflictBase.slice(0, 8)}) — see ${logFile}`,",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "the quoted literal text itself (\"does not merge cleanly\") sits a few lines further down, outside the +/-3 line proximity window of THIS (the first) mention -- the fact is pinned distinctly at occurrence #1; edge line is ``${request.ref} does not merge cleanly with origin/main (base ${prep.conflictBase.slice(0, 8)}) — see ${logFile}`,`"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "README.md:34",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference naming three ambiguous basenames together (\"README.md:34/:35/:37 name the bare basename...\"); edge line is `| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "README.md:35",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `test/` | `node --test test/*.test.js` suite for the orchestrator, shadow mode, temp queue/journal dirs (never bare — see `orchestrator/README.md` § Tests) | ✅ |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same bare cross-reference as README.md:34 #0 above; edge line is `| `test/` | `node --test test/*.test.js` suite for the orchestrator, shadow mode, temp queue/journal dirs (never bare — see `orchestrator/README.md` § Tests) | ✅ |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "SPO-WebClient/.claude/settings.json:109-127",
+      "occurrence": 1,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "  \"hooks\": {",
+      "last": "            \"timeout\": 10",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"claude\" is a substring of the citation's own path (`.claude/settings.json`) and proves nothing about the cited LINES; edge line is `\"hooks\": {`"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "dispatcher.js:635-648",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "    if (childrenSignalled && outcome === 'crashed') {",
+      "last": "      return;",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "\"already\" is a stopword; the fact is pinned distinctly in LIVE_RANGE_PINS; edge line is `if (childrenSignalled && outcome === 'crashed') {`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "bin/spo:1891",
+      "occurrence": 0,
+      "at": "f1edc256635fb7d1d88845eb3cc0ce6df09ee3ef",
+      "first": "// cmdAsk/cmdPull are async (they await the LLM/spawn calls orchestrator/intake.js makes); every other",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "historical-record location (action 9.2) reworded from a phantom SYMBOL citation on \"LLM\" -- the only nearby token (\"LLM\", within +/-3 lines) is shorter than 4 characters and has no non-word character; edge line is `// cmdAsk/cmdPull are async (they await the LLM/spawn calls orchestrator/intake.js makes); every other`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "README.md:37",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare listing (\"CCA_PINS carries all 37 file-tied citations... README.md:34/:35/:37\") naming three citations together; \"bench\" is a stopword; edge line is `| `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "README.md:34",
+      "occurrence": 1,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "second CCA_PINS mention of the same README.md bin/spo row; edge line is `| `bin/spo` | Console CLI (`status` / `task <id>` / `parked` / `resume <id>` read only the journals; `account add` / `account enable`/`disable` / `account clear-cooldown` / `dashboard` write local state; `ask` / `pull` / `intake` / `triage --file` / `recette` write to real GitHub, see `orchestrator/intake.js` and `orchestrator/README.md` § Intake) | ✅ v0 |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "README.md:37",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "| `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same fact CCA_PINS pins with a `path` field below; edge line is `| `bench/` | Bench worker, L2 live gate, nightly, replay | planned — migrated from `SPO-WebClient` (`scripts/bench-*`, `src/e2e/bench/`) |`",
+      "path": "./README.md"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "doc/board-audit.md:20",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "(`PVTSSF_lADOEyAVD84BhYwkzhgUrL0`) currently holds all 12 options — the 7 old-pipeline names",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "cited twice in the same doc for the same finding; edge line is `(`PVTSSF_lADOEyAVD84BhYwkzhgUrL0`) currently holds all 12 options — the 7 old-pipeline names`"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "SPO-WebClient/.claude/settings.json:109-127",
+      "occurrence": 0,
+      "at": "935283890fa0593c5c5d0b41cceeaec2c1972c6f",
+      "first": "  \"hooks\": {",
+      "last": "            \"timeout\": 10",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "names the JSON hooks block this action re-diagnosed as true (fact pinned in LIVE_RANGE_PINS already); edge line is `\"hooks\": {`"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "orchestrator/README.md:1062",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "  single missing event is why **14 of 18 tasks' journals stop at `Merging` while the board reads",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "names the \"14 of 18 tasks\" board/journal divergence row; edge line is `single missing event is why **14 of 18 tasks' journals stop at `Merging` while the board reads`"
+    },
+    {
+      "citingFile": "test/park-reason-doc-sweep.test.js",
+      "citation": "orchestrator/state-machine.js:216",
+      "occurrence": 1,
+      "at": "HEAD",
+      "first": "  // acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "same fact cited a second time in this file's own prose (\"UNCLOSED openers sitting in prose\"); edge line is `// acceptance criterion quotes '.claude/settings.json' and '.claude/hooks/*.sh' as the examples`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "doc/board-audit.md:20",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "(`PVTSSF_lADOEyAVD84BhYwkzhgUrL0`) currently holds all 12 options — the 7 old-pipeline names",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "CCA_PINS' own array-equality cross-check note; edge line is `(`PVTSSF_lADOEyAVD84BhYwkzhgUrL0`) currently holds all 12 options — the 7 old-pipeline names`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:910",
+      "occurrence": 0,
+      "at": "653e7f15ae36997a7073f24180f33d9f7dd727a9",
+      "first": "  const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference restating no content of its own; edge line is `const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:910",
+      "occurrence": 1,
+      "at": "653e7f15ae36997a7073f24180f33d9f7dd727a9",
+      "first": "  const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference restating no content of its own; edge line is `const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "daemon.js:910",
+      "occurrence": 2,
+      "at": "653e7f15ae36997a7073f24180f33d9f7dd727a9",
+      "first": "  const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference restating no content of its own; edge line is `const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/steps/llm.js:975",
+      "occurrence": 0,
+      "at": "ab3e7d75256e1e1da5390edd71d470f935c85a96",
+      "first": "  const contract = resolveStepContract(stepName, ctx.task || {});",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference restating no content of its own; edge line is `const contract = resolveStepContract(stepName, ctx.task || {});`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "orchestrator/steps/llm.js:975",
+      "occurrence": 1,
+      "at": "ab3e7d75256e1e1da5390edd71d470f935c85a96",
+      "first": "  const contract = resolveStepContract(stepName, ctx.task || {});",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "bare cross-reference restating no content of its own; edge line is `const contract = resolveStepContract(stepName, ctx.task || {});`"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "bin/spo:2220",
+      "occurrence": 0,
+      "at": "b232de549085ca2d0109dbc232e1478c19ff10dc",
+      "first": "  if (cmd === 'tokens') return cmdTokens(opts);",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "names the re-pinned bin/spo:2220 fact by hand; edge line is `if (cmd === 'tokens') return cmdTokens(opts);`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "intake.js:796-798",
+      "occurrence": 0,
+      "at": "06073c4547a60efc69e8838678191ed3cda16c4e",
+      "first": "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on",
+      "last": "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time,",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "the ORIGINAL measurement's own snapshot, frozen at the commit where intake.js:796-798 held this text; edge line is `// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "intake.js:936-938",
+      "occurrence": 0,
+      "at": "55154058e9174b4e04d348247392c21915a14ea3",
+      "first": "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on",
+      "last": "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time,",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "resolvable: card #198's own commit is where intake.js:936-938 held this same Fable paragraph before the next re-pin to :938-940; edge line is `// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on`"
+    },
+    {
+      "citingFile": "test/citation-pins-data.js",
+      "citation": "scripted.js:1996",
+      "occurrence": 0,
+      "at": "7902164309c1766d7b785daab9ba94ff6472bc1d",
+      "first": "}",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "names the corrected bench-audit end line (realFinish's own closing brace); discriminates against its neighbours (`return 'DONE';` above, a blank line below); edge line is `}`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "account-lease.js:156",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "  return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "part of the CHAIN_RE chain-shape example (\"`account-lease.js:156` -> `lock.js:276` ... -> `:310`\", quoting orchestrator/README.md), not a historical-record/phantom-SYMBOL location; edge line is `return lock.acquireShortLock(leaseFilePath(poolDir, name), { isAlive, maxAgeMs: MAX_LEASE_AGE_MS, now });`"
+    },
+    {
+      "citingFile": "test/doc-constant-sweep.test.js",
+      "citation": "lock.js:276",
+      "occurrence": 0,
+      "at": "HEAD",
+      "first": "function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {",
+      "claimless": true,
+      "category": "no-claim-in-prose",
+      "reason": "part of the SAME CHAIN_RE chain-shape example as account-lease.js:156 #0 above (quoting orchestrator/README.md's `account-lease.js:156` -> `lock.js:276` ... -> `:310` chain), not a historical-record/phantom-SYMBOL location; edge line is `function acquireShortLock(filePath, { isAlive = processAlive, maxAgeMs = null, now = Date.now } = {}) {`"
+    }
+  ],
+  "allowlist": {
+    "test/citation-pins-data.js :: sanctuarize.test.ts:151-156 #0": {
+      "category": "deleted-file",
+      "reason": "product file deleted after the dated bench-audit record was written (already CITATION_ALLOWLIST-exempt in doc-constant-sweep.test.js) -- historical citation, not a live one, and a deleted file has no line left to pin against."
+    },
+    "test/citation-pins-data.js :: worker.ts:301 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value in the D6 fix-pass narrative (\"worker.ts:301 -> :302\") -- the corrected value (:302) is BENCH_PINS's own pin; :301 itself was never true and is quoted only to explain the correction."
+    },
+    "test/citation-pins-data.js :: .claude/settings.json:109-127 #0": {
+      "category": "illustrative",
+      "reason": "illustrative of the exact bare-basename-vs-SPO-WebClient/-prefixed distinction this comment explains (the bare form resolves to THIS repo's own, much shorter settings.json) -- the real, prefixed citation is LIVE_RANGE_PINS's own pin."
+    },
+    "test/citation-pins.js :: foo.js:10 #0": {
+      "category": "illustrative",
+      "reason": "format-template / illustrative example in a comment explaining the citation shapes this sweep matches -- never a real citation."
+    },
+    "test/citation-pins.js :: README.md:38 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "hypothetical WRONG re-pin used as the worked example in the D1 probe narrative (\"`README.md:37` -> `:38`\") -- never asserted true, not a live citation."
+    },
+    "test/citation-pins.js :: verdict.ts:217 #0": {
+      "category": "illustrative",
+      "reason": "hypothetical example illustrating the trailing-empty-element off-by-one bug (\"a citation one line PAST the real end of file... on a 216-line file\") -- not a real citation to today's verdict.ts."
+    },
+    "test/citation-pins.js :: relative/path/to/file.ts:123 #0": {
+      "category": "illustrative",
+      "reason": "format-template example documenting the INV block's `File: <path>:<line>` syntax -- never a real citation."
+    },
+    "test/citation-pins.js :: spec.md:49 #0": {
+      "category": "illustrative",
+      "reason": "illustrative fixture text inside a comment demonstrating normalizeWrap, not a real citation."
+    },
+    "test/citation-pins.js :: spec.md:49 #1": {
+      "category": "illustrative",
+      "reason": "illustrative fixture text inside a comment demonstrating normalizeWrap, not a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: foo.js:10 #0": {
+      "category": "illustrative",
+      "reason": "illustrative example in a comment naming the SAME-file chain-continuation shape (\"foo.js:10, `:20`\") -- never a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: foo.js:20 #0": {
+      "category": "illustrative",
+      "reason": "illustrative example, same sentence as foo.js:10 above -- never a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: spec.md:49 #0": {
+      "category": "illustrative",
+      "reason": "illustrative fixture text inside a comment demonstrating normalizeWrap (\"doc/state-machine-\\nspec.md:49\"), not a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: relative/path/to/file.ts:123 #0": {
+      "category": "illustrative",
+      "reason": "format-template example documenting the INV block's `File: <path>:<line>` syntax -- never a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: orchestrator/journal.js:999999 #0": {
+      "category": "illustrative",
+      "reason": "a DELIBERATELY FAKE, planted dangling citation used to describe the M13 adversarial mutation (\"a real dangling `orchestrator/journal.js:999999` planted in an already-allowlisted file\") -- never a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: spec.md:49 #1": {
+      "category": "illustrative",
+      "reason": "illustrative fixture text inside a comment demonstrating normalizeWrap (\"doc/state-machine-\\nspec.md:49\"), not a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: spec.md:49 #2": {
+      "category": "illustrative",
+      "reason": "illustrative fixture text inside a comment demonstrating normalizeWrap (\"doc/state-machine-\\nspec.md:49\"), not a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:892 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"worker.ts:892 (should be `:1169`, the real `SIGTERM` handler -- cited twice)\") -- never a live fact to pin."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:689 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"worker.ts:689's chain continuation (should be `:922`...)\") -- never a live fact to pin."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:892 #1": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"worker.ts:892 (should be `:1169`, the real `SIGTERM` handler -- cited twice)\") -- never a live fact to pin."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:108 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as a WRONG, pre-correction value (\"worker.ts:108/:110/:109-110 (each one line short of the real DONE_RETENTION_MS/MAX_LEASE_MINUTES/DEFAULT_LEASE_MINUTES declarations)\") -- never a live fact to pin."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:110 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as a WRONG, pre-correction value for worker.ts:110 specifically (\"worker.ts:108/:110/:109-110 (each one line short of the real DONE_RETENTION_MS/MAX_LEASE_MINUTES/DEFAULT_LEASE_MINUTES declarations)\") -- never a live fact to pin."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:109-110 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as a WRONG, pre-correction value for the worker.ts:109-110 range specifically (\"worker.ts:108/:110/:109-110 (each one line short of the real DONE_RETENTION_MS/MAX_LEASE_MINUTES/DEFAULT_LEASE_MINUTES declarations)\") -- never a live fact to pin."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:108 #1": {
+      "category": "illustrative",
+      "reason": "format-template example illustrating how a chain continuation reads (\"a chain continuation like \\\"worker.ts:108, called at :922\\\" is one fact about one file, not two\") -- not a real citation to worker.ts, just a worked example of the chain-continuation shape."
+    },
+    "test/doc-constant-sweep.test.js :: sanctuarize.test.ts:151-156 #0": {
+      "category": "illustrative",
+      "reason": "same fact quoted again in this file's own commentary -- see the CITATION_ALLOWLIST entry this sweep already carries for it."
+    },
+    "test/doc-constant-sweep.test.js :: sanctuarize.test.ts:151-156 #1": {
+      "category": "illustrative",
+      "reason": "same fact quoted again in this file's own commentary -- see the CITATION_ALLOWLIST entry this sweep already carries for it."
+    },
+    "test/doc-constant-sweep.test.js :: alpha.js:1 #0": {
+      "category": "illustrative",
+      "reason": "synthetic fixture string alpha.js:1 in a hermetic unit test for extractAnchorCandidates (paired with beta.js:2 in the same fixture text) -- never a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: beta.js:2 #0": {
+      "category": "illustrative",
+      "reason": "synthetic fixture string beta.js:2 in a hermetic unit test for extractAnchorCandidates (paired with alpha.js:1 in the same fixture text) -- never a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: gamma.js:2 #0": {
+      "category": "illustrative",
+      "reason": "synthetic fixture string gamma.js:2 in a hermetic unit test for extractAnchorCandidates (a same-file clip-point fixture, distinct from the alpha.js:1/beta.js:2 pair) -- never a real citation."
+    },
+    "test/plan-writes.test.js :: foo.js:2-6 #0": {
+      "category": "illustrative",
+      "reason": "synthetic plan fixture text (files_to_change example naming foo.js:2-6), not a real citation."
+    },
+    "test/plan-writes.test.js :: foo.js:1-3 #0": {
+      "category": "illustrative",
+      "reason": "synthetic plan fixture text (files_to_change example naming foo.js:1-3), not a real citation."
+    },
+    "test/plan-writes.test.js :: foo.js:2-6 #1": {
+      "category": "illustrative",
+      "reason": "synthetic plan fixture text (SECOND files_to_change example naming foo.js:2-6, a different test in the same file), not a real citation."
+    },
+    "test/plan-writes.test.js :: foo.js:1-3 #1": {
+      "category": "illustrative",
+      "reason": "synthetic plan fixture text (SECOND files_to_change example naming foo.js:1-3, a different test in the same file), not a real citation."
+    },
+    "test/protected-files-guard.test.js :: .claude/settings.json:109-127 #0": {
+      "category": "illustrative",
+      "reason": "a plan-fixture criterion string illustrating a protected-file mention, not a real citation to a specific line."
+    },
+    "test/real-steps.test.js :: foo.js:2-6 #0": {
+      "category": "illustrative",
+      "reason": "synthetic plan fixture text (files_to_change example naming foo.js:2-6), not a real citation."
+    },
+    "test/real-steps.test.js :: foo.js:1-3 #0": {
+      "category": "illustrative",
+      "reason": "synthetic plan fixture text (files_to_change example naming foo.js:1-3), not a real citation."
+    },
+    "test/doc-constant-sweep.test.js :: config.js:615 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"config.js:615 (should be `:658`, `productRepo`)\") in the corpus-wide anchor-check fix narrative -- never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: doc/state-machine-spec.md:98 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"doc/state-machine-spec.md:98`/`:49` (two citations, both should be the CHECK row's own promise -- `:140`...\")) in the same fix narrative -- never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: doc/state-machine-spec.md:49 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value in the same fix narrative as :98 above -- never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: doc/state-machine-spec.md:128 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the value MISSED BY THE FIRST CUT and re-pinned by the verifier -- the narrative names the correction, not a live fact at :128 itself."
+    },
+    "test/doc-constant-sweep.test.js :: orchestrator/steps/scripted.js:937 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"orchestrator/steps/scripted.js:937 (should be `:1295`, the real `npm run board:take` spawn site)\") -- never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: config.js:711 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"config.js:711 (should be `:764`, the real `reportIntakeColumn` default)\") -- never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: intake.js:906-908 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value in the #206 comment-4 generalization narrative (\"intake.js:906-908 was re-pinned to :936-938 in FOUR files...\") -- never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: intake.js:935-938 #0": {
+      "category": "hypothetical-example",
+      "reason": "one of four HYPOTHETICAL drift targets named while explaining a generalized re-pin scenario (\"shifting all four to :935-938/:936-939/:937-939 (a genuine drift, not a consistent-and-correct re-pin)\") -- never asserted as a real citation anywhere in the corpus."
+    },
+    "test/doc-constant-sweep.test.js :: intake.js:936-939 #0": {
+      "category": "hypothetical-example",
+      "reason": "same hypothetical-drift-target narrative as intake.js:935-938 above."
+    },
+    "test/doc-constant-sweep.test.js :: intake.js:937-939 #0": {
+      "category": "hypothetical-example",
+      "reason": "same hypothetical-drift-target narrative as intake.js:935-938 above, this time naming the :937-939 shift specifically."
+    },
+    "test/citation-pins-data.js :: scripted.js:1994 #0": {
+      "category": "no-claim-in-prose",
+      "reason": "this mention of scripted.js:1994 in test/citation-pins-data.js is a bare cross-reference (\"see above\"/a repeated list item) that restates no content of its own within +/-3 lines -- the underlying fact is independently established elsewhere in this registry; fix pass 11.3 could not derive a distinct claim for THIS specific mention within its own budget."
+    },
+    "test/citation-pins-data.js :: bin/spo:2220 #1": {
+      "category": "quoted-as-wrong",
+      "reason": "a `:2220` chain reference inside citation-pins-data.js's own header, quoting the historical (since-corrected) `bin/spo:2189`->`:2220` re-pin chain -- never asserted true of today's tree."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:108 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quoted as the WRONG, pre-correction value (\"step-contracts.js:108 (should be `:99`, the comment block that actually states the IMPLEMENT/VALIDATE-not-PLAN escalation rule)\") -- never asserted true; 24e99f0 had blindly renumbered this quoted (wrong) value to `:136`, restored to the originally-quoted `:108` (fix pass 11.3 round 2)."
+    },
+    "test/doc-constant-sweep.test.js :: intake.js:797-799 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "Note (2026-09-10) deliberately leaves this citation naming the number as it read AT THE TIME of the original measurement, explicitly stating it \"has since moved twice on the live file\" -- quoted as a historical snapshot, never asserted true of today's tree."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:99 #1": {
+      "category": "no-claim-in-prose",
+      "reason": "citation removed by #109 (the unfireable escalateFlag deletion); prompts/README.md's own step-contracts.js:99 citation no longer exists to state a live fact about, so no claim from today's code applies to this historical mention."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:99 #2": {
+      "category": "no-claim-in-prose",
+      "reason": "citation removed by #109 (the unfireable escalateFlag deletion); prompts/README.md's own step-contracts.js:99 citation no longer exists to state a live fact about, so no claim from today's code applies to this historical mention."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:99 #3": {
+      "category": "no-claim-in-prose",
+      "reason": "citation removed by #109 (the unfireable escalateFlag deletion); prompts/README.md's own step-contracts.js:99 citation no longer exists to state a live fact about, so no claim from today's code applies to this historical mention."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:461 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "describes step-contracts.js:461 as a citation that STOPPED anchoring mid-lot and was re-pinned onward (to :527, then :1029) -- :461 is named as a superseded historical value, never asserted true of today's tree."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:461 #1": {
+      "category": "quoted-as-wrong",
+      "reason": "same superseded historical re-pin (`:461` -> `:527`) as the note just above -- never asserted true of today's tree."
+    },
+    "test/citation-pins-data.js :: scripted.js:1944-1994 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quotes the WRONG, pre-correction bench-audit citation (\"`scripted.js:1944-1994` -> `:1944-1996`\") -- realFinish genuinely ends at :1996, never asserted true of :1994."
+    },
+    "test/citation-pins-data.js :: test/helpers.js:65-80 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quotes the WRONG, pre-correction bench-doc citation (\"`test/helpers.js:65-80` -> `:65-94`\") -- isolatedEnv genuinely spans :65-94, never asserted true of :65-80 alone."
+    },
+    "test/citation-pins.js :: README.md:34 #0": {
+      "category": "illustrative",
+      "reason": "used as the worked example explaining the ambiguous-basename `path` field (\"e.g. `README.md:34` naming the repo ROOT README when `orchestrator/README.md`, `prompts/README.md` and a test fixture also share that bare basename\") -- illustrating the mechanism, not asserting a fact this module itself depends on."
+    },
+    "test/citation-pins.js :: README.md:37 #0": {
+      "category": "hypothetical-example",
+      "reason": "hypothetical WRONG re-pin used as the worked example in the D1 probe narrative (\"a consistent wrong re-pin of an allowlisted ambiguous citation (`README.md:37` -> `:38`...)\") -- never asserted true, not a live citation."
+    },
+    "test/doc-constant-sweep.test.js :: bin/spo:1090-1093 #1": {
+      "category": "quoted-as-wrong",
+      "reason": "the SECOND of two mentions in this file ALSO narrates :1090-1093 as the drifted value (\"`bin/spo:1090-1093` -> `:1137` (now `:1273`), is exactly that live fact\" -- the LIVE fact is the CURRENT number, :1273, never :1090-1093 itself) -- never asserted true, corrected from a wrongly-pinned state (fix pass 11.3 round 2, #190 verifier finding B1)."
+    },
+    "test/doc-constant-sweep.test.js :: bin/spo:1090-1093 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "the FIRST of two mentions in this file narrates :1090-1093 as the ALREADY-DRIFTED value (\"drifted to :1137 through unrelated edits\") -- both mentions describe the same drifted-and-corrected fact; neither asserts :1090-1093 true (fix pass 11.3 round 2, #190 verifier finding B1)."
+    },
+    "test/doc-constant-sweep.test.js :: worker.ts:922 #1": {
+      "category": "illustrative",
+      "reason": "format-template example illustrating how a chain continuation reads (\"a chain continuation like 'worker.ts:108, called at :922' is one fact about one file, not two\") -- not a real citation to worker.ts, just a worked example of the chain-continuation shape."
+    },
+    "test/doc-constant-sweep.test.js :: paths.ts:52 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "the pre-conversion, since-drifted value quoted in the M17 narrative (\"its `paths.ts:52` drifted to a real line 77 unnoticed\") -- quoted as the WRONG value, never asserted true."
+    },
+    "test/doc-constant-sweep.test.js :: step-contracts.js:527 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "describes the HISTORICAL measurement state (\"sat verbatim on that exact line AT THE TIME, inside shouldEscalate's rewritten body\") -- step-contracts.js has since moved on to :1029; quoted as a since-superseded value, never asserted true of today's tree."
+    },
+    "test/doc-constant-sweep.test.js :: .claude/settings.json:109-127 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "same bare-vs-prefixed illustrative point as citation-pins-data.js's own mention -- the bare form resolves to THIS repo's own settings.json, never the intended SPO-WebClient one; quoted to illustrate the ambiguity, not asserted true of the bare path."
+    },
+    "test/doc-constant-sweep.test.js :: doc/remediation-plan-2026-08.md:186 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "same WRONG, pre-correction value quoted a second time in this file's own history narrative (the first mention was restored to :188)."
+    },
+    "test/doc-constant-sweep.test.js :: doc/remediation-progress.md:647 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "same WRONG, pre-correction value (doc/remediation-progress.md:647) quoted a second time in this file's own history narrative, alongside remediation-plan-2026-08.md:186's own second mention (the first mention was restored to :649)."
+    },
+    "test/doc-constant-sweep.test.js :: dispatcher.js:634-648 #0": {
+      "category": "quoted-as-wrong",
+      "reason": "quotes the WRONG, pre-correction citation (\"the first pass's `orchestrator/README.md :: dispatcher.js:634-648` omission\") -- the real, corrected citation is :635-648 (:634 is a blank line); never asserted true."
+    }
+  },
+  "allowlistCategory": {}
+}

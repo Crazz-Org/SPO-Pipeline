@@ -76,7 +76,7 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    side effects, so both shapes only detect the orphan and journal
    `orphan-scan-would-repark` — neither ever parks. `handleExit` also
    deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
-   dispatcher's own shutdown** (`dispatcher.js:634-648`, `childrenSignalled && outcome === 'crashed'`
+   dispatcher's own shutdown** (`dispatcher.js:635-648`, `childrenSignalled && outcome === 'crashed'`
    — keyed on "did we actually signal this child", not on `stopReason`, since a DRAIN sets
    `stopReason` and then waits minutes having signalled nobody):
    reparking here would spawn a fresh `daemon.js --repark-task` child in the middle of a shutdown

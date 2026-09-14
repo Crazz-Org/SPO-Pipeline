@@ -217,7 +217,7 @@ test('runScanCycle reads live-workers.json fresh and protects a listed id from o
 // misread as belonging to neither. Before this action, runScanCycle's orphan-scan call site read
 // live-workers.json (readLiveWorkerIds, evaluated as an inline argument expression) BEFORE
 // orphanScan was even entered, and orphanScan itself only read queue/ on entry (queuedIds, at
-// orphan-scan.js:127 before this action, :143 now) -- the opposite order from auto-pull.js, for
+// orphan-scan.js:127 before this action, :149 now) -- the opposite order from auto-pull.js, for
 // the identical file pair.
 //
 // This is a read-ORDER test, not a behavioural one: every existing orphanScan/runScanCycle test in
