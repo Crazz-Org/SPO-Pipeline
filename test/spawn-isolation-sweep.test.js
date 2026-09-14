@@ -1059,7 +1059,17 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // override at all, falls back to HOME" path this guard exists for; SPO_STATE_DIR is then
   // deleted or re-set from the isolatedEnv()-derived object, never left as isolatedEnv()'s own
   // throwaway value when the test wants the DEFAULT resolution), no `--real`.
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  // #206 action 4 (2026-09-14): fix-citations.test.js spawns scripts/fix-citations.js via
+  // spawnSync(process.execPath, [...], { encoding: 'utf8', env: isolatedEnv() }) -- audited: env
+  // is isolatedEnv() alone (no bare process.env spread, nothing layered after it), no `--real`.
+  // The script itself never touches any of the sibling-repo or machine-state env vars isolatedEnv()
+  // overrides (its own repo-root/data-file are the test's `--repo-root=`/`--data-file=` overrides,
+  // resolved independently of those dirs), but the call site still carries isolatedEnv() -- the
+  // simpler of "isolate" or "justify an allowlist entry" here, same posture usage-report.test.js's
+  // own audit note above takes. (Those two env vars are deliberately NOT spelled out here:
+  // gate-scope.test.js records this file as naming them ONLY inside an assertion-failure message
+  // string, and a comment that spelled them would quietly make that recorded justification false.)
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });
