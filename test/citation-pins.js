@@ -400,6 +400,26 @@ function resolvePins(pins, opts = {}) {
   });
 }
 
+// resolveAnchor(lines, anchorText, hintLine) -> { line, unique, absent } -- action 1 of the
+// line-number-as-truth-key migration (this action lands it DARK: nothing calls it yet, see this
+// module's own header note and the chantier spec). Where computeMovedTo (above) only fires once a
+// pin has already failed its exact-position check, this is the primitive the LATER inverted model
+// needs as its primary lookup: given the anchor TEXT alone, find where it lives now. Same match
+// discipline as computeMovedTo: `line.trim() === anchorText.trim()`, exact, no fuzzy/substring.
+//
+// `hintLine` is informational passthrough ONLY -- a future caller's own "moved from N to M"
+// reporting -- and must never affect `line`/`unique`/`absent`. Deliberately not read here beyond
+// that: reading it to pick or break a tie would silently reintroduce the very line-number-as-truth
+// assumption this migration exists to remove.
+function resolveAnchor(lines, anchorText, hintLine) {
+  const want = anchorText.trim();
+  const hits = [];
+  lines.forEach((l, idx) => { if (l.trim() === want) hits.push(idx + 1); });
+  if (hits.length === 1) return { line: hits[0], unique: true, absent: false };
+  if (hits.length === 0) return { line: null, unique: false, absent: true };
+  return { line: null, unique: false, absent: false };
+}
+
 // ---- vacuous-claim rejection (fix pass 11.3 round 2, #190 verifier finding A1) ----------------
 //
 // A `claim` that is trivially true of almost any span is not a claim: it does not tie the pin to
@@ -602,6 +622,7 @@ module.exports = {
   shiftedCitation,
   batchCatFile,
   resolvePins,
+  resolveAnchor,
   stripFences,
   normalizeWrap,
   normalizeWrapWithMap,
