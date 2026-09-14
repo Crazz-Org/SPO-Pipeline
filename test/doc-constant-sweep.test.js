@@ -2717,6 +2717,115 @@ test('CCA_PINS covers exactly the citations doc/comment-corpus-audit-2026-09-03.
   );
 });
 
+// ---- part 2.9: dated-document citations must never pin `at: 'HEAD'` (chantier action 5) -------
+//
+// A dated document (a file whose own basename embeds a YYYY-MM-DD date and whose prose is a
+// point-in-time measurement narrative, never a living description of current code -- today,
+// exactly doc/bench-audit-2026-09-02.md, doc/bench-plan-derived-2026-09-02.md and
+// doc/comment-corpus-audit-2026-09-03.md) should NEVER pin a citation `at: 'HEAD'`: `at: '<sha>'`
+// is strictly better here -- zero-maintenance forever (a git blob at a fixed commit cannot drift)
+// and it preserves exactly what the doc's own audit measured, rather than silently tracking
+// whatever the code happens to say today. BENCH_PINS/CCA_PINS already get this right almost
+// everywhere (part 2.7/2.8 above); this makes it a STANDING, enforced rule rather than a
+// convention someone has to remember, with the two deliberate exceptions BENCH_PINS's own header
+// documents ("Two facts are kept LIVE (`at: 'HEAD'`) because they are hand-maintained as true
+// today, not dated record" -- test/citation-pins-data.js, above BENCH_PINS): the `bin/spo`
+// `collectAll` call site and doc/state-machine-spec.md's FINISH row are current-code facts cited
+// FROM inside a dated-named file, not measurements the dated file made of a past state.
+
+// Matches this repo's real dated documents today (proved below against `git ls-files doc`): the
+// three named above, and nothing else -- in particular NOT doc/remediation-plan-2026-08.md, whose
+// name carries a year-month only (no day), so `-\d{4}-\d{2}-\d{2}\.md$` does not match it.
+const DATED_DOCUMENT_PATTERN = /-\d{4}-\d{2}-\d{2}\.md$/;
+
+// The only pins allowed to be BOTH `at: 'HEAD'` AND cited from a dated document, named with the
+// reason each is an exception -- matches BENCH_PINS's own "Two facts are kept LIVE" header exactly
+// (test/citation-pins-data.js). Anything else is reported by findDatedDocHeadOffenders below, by
+// name, never by count.
+const DATED_DOC_HEAD_EXCEPTIONS = new Set([
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1283", // re-pinned 15+ times as bin/spo grows -- hand-maintained as true today, not dated record (BENCH_PINS header)
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1283", // same fact, same reason, cited from the sibling doc
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:166", // the FINISH row -- hand-maintained as true today, not dated record (BENCH_PINS header)
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:166", // same fact, same reason, cited from the sibling doc
+]);
+
+// Pure, reusable check: given a flat pin array, return the `file :: citation` keys of every pin
+// that is BOTH `at: 'HEAD'` and cited from a file matching DATED_DOCUMENT_PATTERN, and is NOT on
+// DATED_DOC_HEAD_EXCEPTIONS. Factored out so the fixture tests below can prove it actually catches
+// something, rather than trusting that today's real registries happen to have nothing to catch.
+function findDatedDocHeadOffenders(pins) {
+  return pins
+    .filter((p) => p.at === 'HEAD' && DATED_DOCUMENT_PATTERN.test(p.file))
+    .map((p) => `${p.file} :: ${p.citation}`)
+    .filter((key) => !DATED_DOC_HEAD_EXCEPTIONS.has(key));
+}
+
+test('doc/ carries exactly the three dated documents this rule assumes -- no other doc/ file matches the dated-document filename pattern', () => {
+  const files = execFileSync('git', ['-C', REPO_ROOT, 'ls-files', 'doc'], { encoding: 'utf8', env: gitEnv() })
+    .split('\n')
+    .filter(Boolean);
+  const dated = files.filter((f) => DATED_DOCUMENT_PATTERN.test(f)).sort();
+  assert.deepEqual(
+    dated,
+    ['doc/bench-audit-2026-09-02.md', 'doc/bench-plan-derived-2026-09-02.md', 'doc/comment-corpus-audit-2026-09-03.md'],
+    'a doc/ file was added, renamed, or removed that changes which files match the dated-document ' +
+      'filename pattern -- check whether it is a genuine dated record (see orchestrator/README.md\'s ' +
+      '"dated document" citation-pinning rule) and, if so, whether any of its HEAD citations need ' +
+      'converting to a frozen sha; then update this list.'
+  );
+});
+
+test('no BENCH_PINS/LIVE_RANGE_PINS/BLUNT_PINS/CCA_PINS entry pins a dated document\'s citation `at: \'HEAD\'` except the two named, deliberate exceptions', () => {
+  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
+  const offenders = findDatedDocHeadOffenders(allPins);
+  assert.deepEqual(
+    offenders,
+    [],
+    'dated-document citation(s) pinned `at: \'HEAD\'` without being on DATED_DOC_HEAD_EXCEPTIONS -- ' +
+      'a dated document\'s citation must be pinned `at: \'<sha>\'` (the commit the doc\'s own header ' +
+      'names), never HEAD, unless it is a deliberately-kept-live fact (see BENCH_PINS\'s own "Two ' +
+      'facts are kept LIVE" header in test/citation-pins-data.js):\n  ' + offenders.join('\n  ')
+  );
+});
+
+// An exception that stops matching anything (the pin was converted to a sha, removed, or its
+// `file`/`citation` changed) should be pruned, not left to rot as a stale, unused entry -- the
+// same "named, not counted" discipline as the offender check above, applied to the allowlist
+// itself.
+test('DATED_DOC_HEAD_EXCEPTIONS names only pins that actually exist as `at: \'HEAD\'` dated-document citations today', () => {
+  const allPins = [...BENCH_PINS, ...LIVE_RANGE_PINS, ...BLUNT_PINS, ...CCA_PINS];
+  const liveHeadDatedKeys = new Set(
+    allPins.filter((p) => p.at === 'HEAD' && DATED_DOCUMENT_PATTERN.test(p.file)).map((p) => `${p.file} :: ${p.citation}`)
+  );
+  const stale = [...DATED_DOC_HEAD_EXCEPTIONS].filter((key) => !liveHeadDatedKeys.has(key));
+  assert.deepEqual(
+    stale,
+    [],
+    `DATED_DOC_HEAD_EXCEPTIONS names key(s) no longer present as an \`at: 'HEAD'\` dated-document pin -- prune:\n  ${stale.join('\n  ')}`
+  );
+});
+
+// Fixture proof that findDatedDocHeadOffenders is actually sensitive, not vacuously green because
+// today's real registries happen to have nothing to catch beyond the two known exceptions (same
+// mutation-style discipline as test/citation-pins-resolve-anchor.test.js and
+// test/fix-citations.test.js): a synthetic `at: 'HEAD'` pin on a synthetic dated-document filename,
+// not on the exception list, must be reported by name.
+test('findDatedDocHeadOffenders is sensitive: a synthetic HEAD pin on a synthetic dated-document filename, not on the exception list, is caught', () => {
+  const offenders = findDatedDocHeadOffenders([
+    { file: 'doc/synthetic-audit-2026-01-01.md', citation: 'made-up.js:1', at: 'HEAD', first: 'x' },
+  ]);
+  assert.deepEqual(offenders, ['doc/synthetic-audit-2026-01-01.md :: made-up.js:1']);
+});
+
+test('findDatedDocHeadOffenders does not flag a sha-frozen pin, a HEAD pin on a non-dated file, or a named exempted dated-document HEAD pin', () => {
+  const offenders = findDatedDocHeadOffenders([
+    { file: 'doc/synthetic-audit-2026-01-01.md', citation: 'made-up.js:1', at: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', first: 'x' },
+    { file: 'orchestrator/README.md', citation: 'made-up.js:1', at: 'HEAD', first: 'x' },
+    { file: 'doc/bench-audit-2026-09-02.md', citation: 'bin/spo:1283', at: 'HEAD', first: 'x' },
+  ]);
+  assert.deepEqual(offenders, []);
+});
+
 // ---- fixture tests: the `path` field (fix pass 11.2, D1) ---------------------------------------
 //
 // Direct, hermetic tests of resolvePins's `path` handling against a small committed fixture repo
