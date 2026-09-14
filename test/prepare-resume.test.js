@@ -1,0 +1,944 @@
+'use strict';
+// prepare-resume.test.js -- card #212, action C2: `prepareResume` (orchestrator/steps/scripted.js)
+// is the real-mode-only safety net `runTask`'s resume path (state-machine.js) runs immediately
+// before CHECK, on the SAME ctx a `continue` rehydrates. See prepareResume's own header for the
+// full contract and doc/state-machine-spec.md's "Resume at CHECK" section for the step list this
+// file pins.
+//
+// Driven through `runTask` -- the actual queue-entry entry point -- in REAL mode, same convention
+// as test/push-pr-nothing-staged.test.js and test/merge-regate.test.js: every git/gh spawn is a
+// fake injected via `deps.spawnSync`, argv recorded IN ORDER, no real command ever runs.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+
+// Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
+// credentials -- must land before the orchestrator require below (test/no-real-spawn.js's own
+// header explains the incident this backstops).
+require('./no-real-spawn');
+const { runTask } = require('../orchestrator/state-machine');
+const { mkTmp } = require('./helpers');
+
+const PR_NUMBER = 777;
+
+function ok(stdout = '') {
+  return { status: 0, stdout, stderr: '', signal: null };
+}
+function fail(status, stderr = '') {
+  return { status, stdout: '', stderr, signal: null };
+}
+
+function readJournal(taskDir) {
+  return fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+function findEvent(taskDir, event) {
+  return readJournal(taskDir).find((e) => e.event === event);
+}
+
+function readState(taskDir) {
+  return JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+}
+
+// F5 (fix pass): the ordered PREFIX of `calls` that belongs to `prepareResume` itself (plus
+// whatever ran before it, which is nothing on this file's own entry point), bounded by the first
+// journal event named `boundaryEvent` -- `resume-prepared` on a happy path, `parked` on a refusal.
+// `finalizePark` journals its OWN `parked` event BEFORE it runs any spawn of its own (the park-time
+// `preserveWorktreeWip` housekeeping, when it runs at all -- see finalizePark's own header comment
+// in state-machine.js: "THE single `parked` line ... placed after both [re-enqueue] branches
+// close" and BEFORE the wip-preserve block that follows it), so counting the journal's own `spawn`
+// events strictly before `boundaryEvent` and slicing `calls` to that count yields exactly
+// `prepareResume`'s own call sequence, never anything finalizePark's bookkeeping added afterward.
+function spawnCallsBeforeEvent(taskDir, calls, boundaryEvent) {
+  const journal = readJournal(taskDir);
+  const idx = journal.findIndex((e) => e.event === boundaryEvent);
+  assert.ok(idx >= 0, `expected a '${boundaryEvent}' event to exist in the journal`);
+  const spawnCount = journal.slice(0, idx).filter((e) => e.event === 'spawn').length;
+  return calls.slice(0, spawnCount).map((c) => ({ command: c.command, args: c.args }));
+}
+
+// Routes every git/gh/npm argv prepareResume + the CHECK/PUSH_PR/GATE spawns that follow it can
+// issue on a happy path, to a scripted result -- `calls` records every one, in order, so a
+// refusal test can assert exactly which commands never ran. Every option defaults to the shape
+// that lets a happy-path run sail all the way past prepareResume into CHECK's own npm spawns.
+function resumeSpawnSync(calls, branch, opts = {}) {
+  const {
+    prState = 'OPEN',
+    prViewExit = 0,
+    prViewUnparsable = false,
+    prHeadRefName = branch, // F6: defaults to the branch the resume descriptor names -- a match
+    mergeHeadExit = 1, // non-zero -- no MERGE_HEAD, no merge in progress
+    // F3: MERGE_HEAD's own default (mergeHeadExit) is "no merge in progress", so this default is
+    // read only by the tests that override mergeHeadExit to 0 -- non-empty (still-unmerged paths)
+    // keeps every PRE-F3 test that expects `merge --abort` to run (e.g. 'card-mergehead' below)
+    // passing unchanged.
+    lsFilesExit = 0,
+    lsFilesOut = 'src/conflicted.js\n',
+    mergeAbortExit = 0,
+    symbolicRefExit = 0,
+    symbolicRefBranch = branch,
+    statusExit = 0,
+    statusOut = '',
+    fetchExit = 0,
+    remoteRevExit = 0,
+    remoteSha = 'remotesha1111111111111111111111111111111',
+    localRevExit = 0,
+    localSha = remoteSha, // default: HEAD already equals the remote tip -- no fast-forward needed
+    ancestorExit = 0,
+    ffExit = 0,
+    checkAliasExit = 0,
+    gateExit = 4, // 'gate-timeout' -- a clean, unconditional ParkSignal, no verdict-file parsing
+    // PUSH_PR's own `commit` step, reached only once prepareResume + CHECK both succeed -- default
+    // 0 (an ordinary commit) so most tests never reach PUSH_PR's own commit-exit-1 diagnostics at
+    // all; F4's own resume test overrides this to 1 to reach realPushPr's resume exemption.
+    commitExit = 0,
+    mainSha = null, // `git rev-parse origin/main` (PUSH_PR's own post-commit-exit-1 diagnostic)
+    prListOut = '[]',
+    prCreateUrl = `https://github.com/Crazz-Org/SPO-WebClient/pull/${PR_NUMBER}\n`,
+  } = opts;
+
+  return (command, args, spawnOpts) => {
+    // `cwd` recorded too (F1's own regression test needs it -- `npm run board:move` runs with an
+    // explicit `cwd` rather than a git `-C` flag) -- every pre-existing assertion in this file
+    // only reads `.command`/`.args`, so adding this field changes nothing for them.
+    calls.push({ command, args: [...args], cwd: (spawnOpts && spawnOpts.cwd) || null });
+
+    if (command === 'gh') {
+      if (args[0] === 'pr' && args[1] === 'view') {
+        if (prViewExit !== 0) return fail(prViewExit);
+        if (prViewUnparsable) return ok('not-json{{{');
+        return ok(JSON.stringify({ state: prState, headRefName: prHeadRefName }));
+      }
+      if (args[0] === 'pr' && args[1] === 'list') return ok(prListOut);
+      if (args[0] === 'pr' && args[1] === 'create') return ok(prCreateUrl);
+      return ok('');
+    }
+
+    if (command === 'git') {
+      if (args.includes('ls-files') && args.includes('-u')) {
+        return lsFilesExit === 0 ? ok(lsFilesOut) : fail(lsFilesExit);
+      }
+      if (args.includes('symbolic-ref')) {
+        return symbolicRefExit === 0 ? ok(`${symbolicRefBranch}\n`) : fail(symbolicRefExit);
+      }
+      if (args.includes('status')) {
+        return statusExit === 0 ? ok(statusOut) : fail(statusExit);
+      }
+      if (args.includes('fetch')) {
+        return fetchExit === 0 ? ok('') : fail(fetchExit);
+      }
+      if (args.includes('merge-base') && args.includes('--is-ancestor')) {
+        return { status: ancestorExit, stdout: '', stderr: '', signal: null };
+      }
+      if (args.includes('merge') && args.includes('--abort')) {
+        return mergeAbortExit === 0 ? ok('') : fail(mergeAbortExit);
+      }
+      if (args.includes('merge') && args.includes('--ff-only')) {
+        return ffExit === 0 ? ok('') : fail(ffExit);
+      }
+      if (args.includes('commit')) {
+        return commitExit === 0 ? ok('') : fail(commitExit);
+      }
+      if (args.includes('rev-parse') && args.includes('MERGE_HEAD')) {
+        return mergeHeadExit === 0 ? ok('mergeheadsha00000000000000000000000000000\n') : fail(mergeHeadExit);
+      }
+      if (args.includes('rev-parse') && args.some((a) => typeof a === 'string' && a.startsWith('refs/remotes/origin/'))) {
+        return remoteRevExit === 0 ? ok(`${remoteSha}\n`) : fail(remoteRevExit);
+      }
+      if (args.includes('rev-parse') && args.includes('HEAD')) {
+        return localRevExit === 0 ? ok(`${localSha}\n`) : fail(localRevExit);
+      }
+      // PUSH_PR's own `git rev-parse origin/main` (post-commit-exit-1 diagnostic only) -- `mainSha`
+      // null (the default) falls through to the generic `ok('')` below, exactly as before this
+      // option existed (an empty string origin/main sha, which differs from every real sha this
+      // file uses).
+      if (args.includes('rev-parse') && args.includes('origin/main') && mainSha !== null) {
+        return ok(`${mainSha}\n`);
+      }
+      return ok(''); // add, commit (exit 0), push, diff --name-only, board:move, etc.
+    }
+
+    if (command === 'npm') {
+      if (args[0] === 'run' && args[1] === 'gate') return { status: gateExit, stdout: '', stderr: '', signal: null };
+      return checkAliasExit === 0 ? ok('') : { status: checkAliasExit, stdout: '', stderr: '', signal: null };
+    }
+
+    return ok('');
+  };
+}
+
+function testConfig(pipelineWorktreesDir, overrides = {}) {
+  return {
+    shadowMode: false,
+    dryRun: false,
+    real: true,
+    productRepo: '/fake/home/SPO-WebClient',
+    pipelineWorktreesDir,
+    ghRepo: 'Crazz-Org/SPO-WebClient',
+    spoBenchDir: mkTmp('spo-pr-bench-'),
+    stepDeadlineMs: 30000,
+    ciChecksMaxPolls: 3,
+    ciChecksPollIntervalMs: 1000,
+    ...overrides,
+  };
+}
+
+// Builds a resumed task + its worktree directory (unless `createWorktree` is false), following
+// the exact `task.resume` shape C1 validates (state-machine.js's `resumeValidationError`) and the
+// `<pipelineWorktreesDir>/<id>` convention `prepareResume`'s own mismatch check enforces.
+function setupTask(id, { createWorktree = true, worktreePathOverride } = {}) {
+  const pipelineWorktreesDir = mkTmp('spo-pr-worktrees-');
+  const worktreePath = worktreePathOverride || path.join(pipelineWorktreesDir, id);
+  if (createWorktree) fs.mkdirSync(worktreePath, { recursive: true });
+  const branch = `claude-pipe/${id}`;
+  const taskDir = mkTmp('spo-pr-taskdir-');
+  const task = {
+    id,
+    kind: 'card',
+    issue: 900,
+    title: 'Resumed card',
+    resume: {
+      startState: 'CHECK',
+      prNumber: PR_NUMBER,
+      worktreePath,
+      commentId: 1,
+      fromReason: 'merge-conflict',
+    },
+  };
+  return { pipelineWorktreesDir, worktreePath, branch, taskDir, task };
+}
+
+async function runResumed(id, spawnOpts, setupOpts) {
+  const { pipelineWorktreesDir, worktreePath, branch, taskDir, task } = setupTask(id, setupOpts);
+  const calls = [];
+  const config = testConfig(pipelineWorktreesDir, { deps: { spawnSync: resumeSpawnSync(calls, branch, spawnOpts) } });
+  const finalState = await runTask(task.id, task, taskDir, config);
+  return { finalState, calls, taskDir, worktreePath, branch, task };
+}
+
+// The `git` subset of a recorded call list -- finalizePark's own bookkeeping (postParkComment's
+// `gh issue comment` + its own `moveCard('PARKED')` -> `npm run board:move`, park-alert.js) runs
+// unconditionally on EVERY real-mode kind:"card" park, whatever the reason, so a bare "no command
+// at all" assertion would fail on every one of them for a reason that has nothing to do with
+// prepareResume itself. Filtering to `git` isolates what prepareResume's own sequence (plus
+// preserveWorktreeWip's `git status --porcelain` housekeeping, also unconditional -- see below)
+// actually issued.
+function gitCalls(calls) {
+  return calls.filter((c) => c.command === 'git');
+}
+
+// Same reasoning, narrowed one step further: when the resumed worktree DOES exist on disk,
+// finalizePark's preserveWorktreeWip issues its own `git status --porcelain` unconditionally
+// (park-time housekeeping, unrelated to which step parked -- see preserveWorktreeWipUnguarded's
+// `!fs.existsSync(worktreePath)` guard). A test whose worktree exists therefore cannot assert
+// "zero git commands"; it asserts prepareResume's OWN sequence never issued anything BEYOND that
+// one incidental status check.
+function gitCallsBeyondWipHousekeeping(calls) {
+  return gitCalls(calls).filter((c) => !(c.args.includes('status') && c.args.includes('--porcelain')));
+}
+
+function assertParked(taskDir, step, extra = {}) {
+  const parked = findEvent(taskDir, 'parked');
+  assert.ok(parked, 'expected a parked event');
+  assert.equal(parked.reason, 'resume-precondition-failed');
+  assert.equal(parked.detail.step, step);
+  for (const [k, v] of Object.entries(extra)) {
+    assert.equal(parked.detail[k], v, `expected parked.detail.${k} === ${JSON.stringify(v)}, got ${JSON.stringify(parked.detail[k])}`);
+  }
+  return parked;
+}
+
+// ================================================================================================
+// ---- happy paths --------------------------------------------------------------------------
+// ================================================================================================
+
+test('prepareResume: HEAD already equals the remote tip -- resume-prepared {fastForwardedFrom: null}, no merge --ff-only, the loop reaches CHECK\'s own spawns', async () => {
+  const sameSha = 'samesha0000000000000000000000000000000000';
+  const { calls, taskDir } = await runResumed('card-happy1', { remoteSha: sameSha, localSha: sameSha });
+
+  const prepared = findEvent(taskDir, 'resume-prepared');
+  assert.ok(prepared, 'expected resume-prepared to be journalled');
+  assert.equal(prepared.head, sameSha);
+  assert.equal(prepared.fastForwardedFrom, null);
+
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('--ff-only')),
+    undefined,
+    'no fast-forward merge may be issued when HEAD already equals the remote tip'
+  );
+
+  const checkSpawn = calls.find((c) => c.command === 'npm' && c.args.includes('typecheck'));
+  assert.ok(checkSpawn, "expected the loop to reach CHECK's own npm run typecheck spawn");
+});
+
+test('prepareResume: remote ahead and HEAD is an ancestor -- fast-forwards, resume-prepared.fastForwardedFrom is the OLD head', async () => {
+  const oldHead = 'oldhead11111111111111111111111111111111111';
+  const newRemote = 'newremote2222222222222222222222222222222222';
+  const { calls, taskDir, branch, worktreePath } = await runResumed('card-happy2', {
+    localSha: oldHead,
+    remoteSha: newRemote,
+    ancestorExit: 0,
+    ffExit: 0,
+  });
+
+  const prepared = findEvent(taskDir, 'resume-prepared');
+  assert.ok(prepared);
+  assert.equal(prepared.head, newRemote);
+  assert.equal(prepared.fastForwardedFrom, oldHead);
+
+  const ff = calls.find((c) => c.command === 'git' && c.args.includes('--ff-only'));
+  assert.ok(ff, 'expected a fast-forward merge to be issued');
+  assert.deepEqual(ff.args, ['-C', worktreePath, 'merge', '--ff-only', `refs/remotes/origin/${branch}`]);
+});
+
+test('prepareResume: MERGE_HEAD present -- merge --abort issued BEFORE symbolic-ref, resume-merge-aborted journalled, the run continues', async () => {
+  const { calls, taskDir } = await runResumed('card-mergehead', { mergeHeadExit: 0, mergeAbortExit: 0 });
+
+  assert.ok(findEvent(taskDir, 'resume-merge-aborted'), 'expected resume-merge-aborted to be journalled');
+  assert.ok(findEvent(taskDir, 'resume-prepared'), 'the run must continue past the abort');
+
+  const abortIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('merge') && c.args.includes('--abort'));
+  const symbolicIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('symbolic-ref'));
+  assert.ok(abortIdx >= 0 && symbolicIdx >= 0, 'both calls must have happened');
+  assert.ok(abortIdx < symbolicIdx, 'merge --abort must be issued BEFORE symbolic-ref');
+
+  // F3: `git ls-files -u` must run BEFORE the abort -- it is what decides whether the abort is
+  // safe at all.
+  const lsFilesIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('ls-files') && c.args.includes('-u'));
+  assert.ok(lsFilesIdx >= 0, 'expected ls-files -u to run');
+  assert.ok(lsFilesIdx < abortIdx, 'ls-files -u must be issued BEFORE merge --abort');
+});
+
+// F3 (fix pass): `git ls-files -u` came back EMPTY -- every conflict is already resolved and
+// staged. `merge --abort` here would discard the maintainer's own resolution; the fix parks
+// `merge-in-progress` instead and (via F2) never touches the worktree at all.
+test('prepareResume: MERGE_HEAD present, ls-files -u EMPTY (resolved-and-staged) -- parks merge-in-progress, no abort, no detach/commit/push', async () => {
+  const { calls, taskDir } = await runResumed('card-merge-resolved', { mergeHeadExit: 0, lsFilesOut: '' });
+
+  assertParked(taskDir, 'merge-in-progress');
+  assert.equal(findEvent(taskDir, 'resume-merge-aborted'), undefined, 'a resolved-and-staged merge must never be journalled as aborted');
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('merge') && c.args.includes('--abort')),
+    undefined,
+    'merge --abort must never run over a resolved-and-staged merge'
+  );
+  assert.equal(calls.find((c) => c.command === 'git' && c.args.includes('--detach')), undefined);
+  assert.equal(calls.find((c) => c.command === 'git' && c.args.includes('commit')), undefined);
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'), 'F2: the worktree must be left exactly as found');
+
+  const lsFilesIdx = calls.findIndex((c) => c.command === 'git' && c.args.includes('ls-files') && c.args.includes('-u'));
+  assert.ok(lsFilesIdx >= 0, 'expected ls-files -u to run');
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('symbolic-ref')),
+    undefined,
+    'no symbolic-ref call may run once merge-in-progress itself parked'
+  );
+});
+
+test('prepareResume: MERGE_HEAD present, ls-files -u itself fails -- parks ls-files-failed, no abort issued', async () => {
+  const { calls, taskDir } = await runResumed('card-lsfiles-fail', { mergeHeadExit: 0, lsFilesExit: 2 });
+
+  assertParked(taskDir, 'ls-files-failed', { exit: 2 });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('merge') && c.args.includes('--abort')),
+    undefined,
+    'merge --abort must never run when ls-files -u itself could not answer'
+  );
+});
+
+// ================================================================================================
+// ---- refusals: each parks its own step and issues NO later command ------------------------
+// ================================================================================================
+
+test('prepareResume: worktree-path-mismatch -- no git command issued at all', async () => {
+  const { pipelineWorktreesDir, taskDir, task } = setupTask('card-mismatch', {
+    // `createWorktree: false` -- setupTask would otherwise `mkdirSync` this override path too,
+    // which defeats the point: preserveWorktreeWip's own `fs.existsSync` guard (finalizePark's
+    // park-time housekeeping, unconditional whenever the worktree exists) must never fire here
+    // either, so the path itself must genuinely not exist on disk.
+    createWorktree: false,
+    worktreePathOverride: path.join(mkTmp('spo-pr-mismatch-elsewhere-'), 'nonexistent-subdir'),
+  });
+  const calls = [];
+  const config = testConfig(pipelineWorktreesDir, { deps: { spawnSync: resumeSpawnSync(calls, 'claude-pipe/card-mismatch') } });
+
+  await runTask(task.id, task, taskDir, config);
+
+  assertParked(taskDir, 'worktree-path-mismatch', {
+    expected: path.join(pipelineWorktreesDir, 'card-mismatch'),
+    actual: task.resume.worktreePath,
+  });
+  assert.equal(gitCalls(calls).length, 0, 'no git command may run once the worktree path itself is wrong');
+});
+
+// F1 (fix pass): the case the test above deliberately avoided -- the FOREIGN directory the
+// resume descriptor names genuinely EXISTS and is dirty. Before F1, `ctx.task.worktreePath` stayed
+// set to that foreign path all the way into `finalizePark`, so its own park-time
+// `preserveWorktreeWip` housekeeping (`git status --porcelain` finds it dirty) went on to
+// `checkout --detach` / `add -A` / `commit` / `push` -- and `postParkComment`'s own `moveCard`
+// -- all run with the FOREIGN path, either as a `-C` argv element or as an explicit spawn `cwd`.
+test('prepareResume: worktree-path-mismatch, F1 -- the foreign directory EXISTS and is dirty; no command runs against it, state.json never records it', async () => {
+  const foreignParent = mkTmp('spo-pr-mismatch-foreign-');
+  const foreignWorktreePath = path.join(foreignParent, 'foreign-worktree');
+  fs.mkdirSync(foreignWorktreePath, { recursive: true });
+
+  const { pipelineWorktreesDir, taskDir, task } = setupTask('card-mismatch-f1', {
+    createWorktree: false, // setupTask must not also create the trusted path -- only the override
+    worktreePathOverride: foreignWorktreePath,
+  });
+  const calls = [];
+  const config = testConfig(pipelineWorktreesDir, {
+    deps: {
+      spawnSync: resumeSpawnSync(calls, 'claude-pipe/card-mismatch-f1', {
+        statusOut: ' M some-file.ts\n', // the foreign directory reads dirty on ANY status call
+      }),
+    },
+  });
+
+  await runTask(task.id, task, taskDir, config);
+
+  assertParked(taskDir, 'worktree-path-mismatch', {
+    expected: path.join(pipelineWorktreesDir, 'card-mismatch-f1'),
+    actual: foreignWorktreePath,
+  });
+
+  for (const call of calls) {
+    assert.ok(
+      !call.args.includes(foreignWorktreePath),
+      `no recorded argv may contain the foreign path -- got ${JSON.stringify(call)}`
+    );
+    assert.notEqual(call.cwd, foreignWorktreePath, `no recorded spawn may use the foreign path as cwd -- got ${JSON.stringify(call)}`);
+  }
+
+  const state = readState(taskDir);
+  assert.notEqual(state.worktreePath, foreignWorktreePath, 'state.json must never record the foreign path');
+  assert.equal(state.worktreePath, null, 'no prior park exists to recover a trusted path from -- null, not a guess');
+});
+
+test('prepareResume: worktree-missing -- no git command issued at all', async () => {
+  const { calls, taskDir } = await runResumed('card-missing', {}, { createWorktree: false });
+
+  assertParked(taskDir, 'worktree-missing');
+  assert.equal(gitCalls(calls).length, 0, 'no git command may run once the worktree does not exist');
+});
+
+test('prepareResume: pr-read-failed (gh pr view exits non-zero) -- no git command issued', async () => {
+  const { calls, taskDir } = await runResumed('card-prexit', { prViewExit: 1 });
+
+  assertParked(taskDir, 'pr-read-failed', { exit: 1 });
+  assert.equal(
+    gitCallsBeyondWipHousekeeping(calls).length,
+    0,
+    'prepareResume must never issue a git command once the PR read itself failed'
+  );
+  assert.equal(calls[0].command, 'gh');
+  assert.equal(calls[0].args[1], 'view');
+});
+
+test('prepareResume: pr-read-failed (unparsable gh pr view stdout) -- no git command issued', async () => {
+  const { calls, taskDir } = await runResumed('card-prunparse', { prViewUnparsable: true });
+
+  assertParked(taskDir, 'pr-read-failed', { unparsable: true });
+  assert.equal(
+    gitCallsBeyondWipHousekeeping(calls).length,
+    0,
+    'prepareResume must never issue a git command once the PR read came back unparsable'
+  );
+  assert.equal(calls[0].command, 'gh');
+  assert.equal(calls[0].args[1], 'view');
+});
+
+for (const prState of ['CLOSED', 'MERGED']) {
+  test(`prepareResume: pr-not-open (${prState}) -- no git command issued`, async () => {
+    const { calls, taskDir } = await runResumed(`card-pr-${prState.toLowerCase()}`, { prState });
+
+    assertParked(taskDir, 'pr-not-open', { prState });
+    assert.equal(
+      gitCallsBeyondWipHousekeeping(calls).length,
+      0,
+      'prepareResume must never issue a git command once the PR itself is not open'
+    );
+    assert.equal(calls[0].command, 'gh');
+    assert.equal(calls[0].args[1], 'view');
+  });
+}
+
+// F6 (fix pass): the PR is OPEN, but built off a different branch entirely -- the resume
+// descriptor's `prNumber` is maintainer-supplied and could, by typo or a stale record, name a
+// real, open PR that has nothing to do with this task.
+test('prepareResume: pr-branch-mismatch -- PR is OPEN but headRefName differs, no git command issued', async () => {
+  const { calls, taskDir } = await runResumed('card-pr-branch-mismatch', { prHeadRefName: 'claude-pipe/some-other-card' });
+
+  assertParked(taskDir, 'pr-branch-mismatch', { headRefName: 'claude-pipe/some-other-card' });
+  assert.equal(
+    gitCallsBeyondWipHousekeeping(calls).length,
+    0,
+    'prepareResume must never issue a git command once the PR belongs to a different branch'
+  );
+  assert.equal(calls[0].command, 'gh');
+  assert.equal(calls[0].args[1], 'view');
+  assert.deepEqual(calls[0].args.slice(-2), ['--json', 'state,headRefName'], 'the PR read must request headRefName too');
+});
+
+test('prepareResume: merge-abort-failed -- no symbolic-ref (or anything else) issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-abortfail', { mergeHeadExit: 0, mergeAbortExit: 2 });
+
+  assertParked(taskDir, 'merge-abort-failed', { exit: 2 });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('symbolic-ref')),
+    undefined,
+    'no symbolic-ref call may run once the abort itself failed'
+  );
+  assert.equal(findEvent(taskDir, 'resume-merge-aborted'), undefined, 'a failed abort must never journal success');
+});
+
+// Checked against `fetch`, not `status`: preserveWorktreeWip's own park-time housekeeping
+// (finalizePark, unconditional whenever the worktree exists) issues its own `git status
+// --porcelain` regardless of which step parked, so `status` cannot distinguish "prepareResume's
+// own dirty-worktree check (step 6) never ran" from "it ran, found a clean tree, and stopped".
+// `fetch` (step 7, one step further) is never issued by any of finalizePark's own bookkeeping, so
+// its absence is unambiguous proof prepareResume itself stopped at step 5.
+test('prepareResume: detached-or-wrong-branch (symbolic-ref itself exits non-zero) -- no fetch issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-detached', { symbolicRefExit: 1 });
+
+  assertParked(taskDir, 'detached-or-wrong-branch', { head: null, exit: 1 });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('fetch')),
+    undefined,
+    'no fetch may run once the branch check itself failed'
+  );
+});
+
+test('prepareResume: detached-or-wrong-branch (wrong branch name, exit 0) -- no fetch issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-wrongbranch', { symbolicRefBranch: 'some-other-branch' });
+
+  assertParked(taskDir, 'detached-or-wrong-branch', { head: 'some-other-branch', exit: 0 });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('fetch')),
+    undefined,
+    'no fetch may run once the branch turned out to be the wrong one'
+  );
+});
+
+test('prepareResume: status-failed -- no fetch issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-statusfail', { statusExit: 2 });
+
+  assertParked(taskDir, 'status-failed', { exit: 2 });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('fetch')),
+    undefined,
+    'no fetch may run once `git status` itself failed'
+  );
+});
+
+test('prepareResume: dirty-worktree -- no fetch issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-dirty', { statusOut: ' M src/some-file.ts\n' });
+
+  assertParked(taskDir, 'dirty-worktree');
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('fetch')),
+    undefined,
+    'no fetch may run over a dirty worktree'
+  );
+
+  // F2 (fix pass): before this fix, finalizePark's OWN park-time preserveWorktreeWip housekeeping
+  // ran unconditionally on any dirty, still-existing worktree -- re-detecting the SAME dirty tree
+  // prepareResume's own step 6 just found, then detaching HEAD and committing over it. That would
+  // strand the maintainer's own edit and leave `claude-pipe/card-dirty` detached, so the NEXT
+  // `continue` parks `detached-or-wrong-branch` forever.
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('--detach')),
+    undefined,
+    'a resume-precondition park must never detach the worktree'
+  );
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('commit')),
+    undefined,
+    'a resume-precondition park must never commit over the worktree'
+  );
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('push') && c.args.some((a) => typeof a === 'string' && a.startsWith('HEAD:refs/heads/wip/'))),
+    undefined,
+    'a resume-precondition park must never push a wip/ ref'
+  );
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'), 'expected wip-preserve-skipped to be journalled');
+  assert.equal(findEvent(taskDir, 'wip-preserve-skipped').reason, 'resume-precondition');
+  assert.equal(findEvent(taskDir, 'wip-preserved'), undefined, 'nothing was preserved -- the worktree was never touched');
+});
+
+// F2: a refusal that has NOTHING to do with the worktree being dirty (here, `pr-not-open`) must
+// still skip preservation even when the worktree HAPPENS to also be dirty -- proving the guard is
+// keyed on "this is a resume-precondition park", not on the specific reason that fired.
+test('prepareResume: pr-not-open, worktree also dirty -- still no detach/commit/push (skipWipPreserve is reason-independent)', async () => {
+  const { calls, taskDir } = await runResumed('card-pr-not-open-dirty', {
+    prState: 'CLOSED',
+    statusOut: ' M src/other-file.ts\n',
+  });
+
+  assertParked(taskDir, 'pr-not-open', { prState: 'CLOSED' });
+  assert.equal(calls.find((c) => c.command === 'git' && c.args.includes('--detach')), undefined);
+  assert.equal(calls.find((c) => c.command === 'git' && c.args.includes('commit')), undefined);
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('push')),
+    undefined,
+    'no push of any kind may run -- prepareResume itself never reaches its own dirty-worktree check either'
+  );
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'));
+});
+
+test('prepareResume: fetch-failed -- no remote-branch rev-parse issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-fetchfail', { fetchExit: 1 });
+
+  assertParked(taskDir, 'fetch-failed', { exit: 1 });
+  assert.equal(
+    calls.find(
+      (c) => c.command === 'git' && c.args.some((a) => typeof a === 'string' && a.startsWith('refs/remotes/origin/'))
+    ),
+    undefined,
+    'no remote-branch lookup may run once fetch itself failed'
+  );
+});
+
+test('prepareResume: remote-branch-missing -- no local HEAD rev-parse issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-noremote', { remoteRevExit: 1 });
+
+  assertParked(taskDir, 'remote-branch-missing');
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.length === 3 && c.args[1] === 'rev-parse' && c.args[2] === 'HEAD'),
+    undefined,
+    'no local HEAD lookup may run once the remote branch itself does not exist'
+  );
+});
+
+test('prepareResume: rev-parse-failed (local HEAD) -- no merge-base issued afterward', async () => {
+  const { calls, taskDir } = await runResumed('card-headfail', { localRevExit: 1 });
+
+  assertParked(taskDir, 'rev-parse-failed', { ref: 'HEAD' });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('merge-base')),
+    undefined,
+    'no merge-base call may run once local HEAD itself failed to resolve'
+  );
+});
+
+test('prepareResume: not-fast-forward -- no merge --ff-only issued', async () => {
+  const localSha = 'divergedlocal333333333333333333333333333333';
+  const remoteSha = 'divergedremote4444444444444444444444444444444';
+  const { calls, taskDir } = await runResumed('card-diverged', { localSha, remoteSha, ancestorExit: 1 });
+
+  assertParked(taskDir, 'not-fast-forward', { head: localSha, remote: remoteSha });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('--ff-only')),
+    undefined,
+    'no fast-forward may be attempted once the tip is confirmed NOT an ancestor'
+  );
+});
+
+test('prepareResume: merge-base-failed -- no merge --ff-only issued', async () => {
+  const { calls, taskDir } = await runResumed('card-mergebasefail', {
+    localSha: 'localhead555555555555555555555555555555555',
+    remoteSha: 'remotehead666666666666666666666666666666666',
+    ancestorExit: 128,
+  });
+
+  assertParked(taskDir, 'merge-base-failed', { exit: 128 });
+  assert.equal(
+    calls.find((c) => c.command === 'git' && c.args.includes('--ff-only')),
+    undefined,
+    'no fast-forward may be attempted when the ancestry check itself failed to answer'
+  );
+});
+
+test('prepareResume: fast-forward-failed', async () => {
+  const { taskDir } = await runResumed('card-fffail', {
+    localSha: 'oldhead777777777777777777777777777777777777',
+    remoteSha: 'newhead8888888888888888888888888888888888888',
+    ancestorExit: 0,
+    ffExit: 1,
+  });
+
+  assertParked(taskDir, 'fast-forward-failed', { exit: 1 });
+  assert.equal(findEvent(taskDir, 'resume-prepared'), undefined, 'a failed fast-forward must never journal success');
+});
+
+// ================================================================================================
+// ---- shadow mode: prepareResume never runs -------------------------------------------------
+// ================================================================================================
+
+test('runTask (shadow mode): a resumed task issues no prepareResume and no resume-prepared event', async () => {
+  const worktreePath = '/tmp/spo-resume-shadow-fixture-worktree';
+  const taskDir = mkTmp('spo-pr-shadow-taskdir-');
+  const task = {
+    id: 'card-shadow-resume',
+    kind: 'card',
+    issue: 901,
+    title: 'Resumed card',
+    resume: { startState: 'CHECK', prNumber: PR_NUMBER, worktreePath, commentId: 1, fromReason: 'merge-conflict' },
+  };
+  const calls = [];
+  const config = { shadowMode: true, dryRun: false, deps: { spawnSync: (command, args) => (calls.push({ command, args: [...args] }), ok('')) } };
+
+  await runTask(task.id, task, taskDir, config);
+
+  assert.equal(findEvent(taskDir, 'resume-prepared'), undefined, 'shadow mode must never journal resume-prepared');
+  assert.equal(findEvent(taskDir, 'resume-merge-aborted'), undefined);
+  assert.equal(calls.length, 0, 'shadow mode never spawns anything -- prepareResume must not have run');
+});
+
+// ================================================================================================
+// ---- a park from prepareResume keeps the resume's prNumber/worktreePath, never null --------
+// ================================================================================================
+
+// A refusal AFTER the PR was verified open on this branch (dirty-worktree). A refusal before that
+// point keeps the previous park's PR instead -- see the "re-verification fixes" tests below.
+test("prepareResume: a ParkSignal leaves state.json PARKED with the resume's prNumber/worktreePath, not null", async () => {
+  const { taskDir, worktreePath } = await runResumed('card-missing-state', { statusOut: ' M x.ts\n' });
+
+  const state = readState(taskDir);
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.prNumber, PR_NUMBER);
+  assert.equal(state.worktreePath, worktreePath);
+});
+
+// ================================================================================================
+// ---- F4 (fix pass): end-to-end proof that runTask's resume path sets ctx.resumePushPending -----
+// ================================================================================================
+//
+// Every existing PUSH_PR-one-shot test (test/push-pr-nothing-staged.test.js) calls `realPushPr`
+// directly and sets `ctx.resumePushPending = true` BY HAND -- none of them go through `runTask`,
+// so none of them can catch a regression in the one line that actually ARMS the flag on a real
+// resume (`state-machine.js`'s `runTask`, in the `task.resume` branch). Deleting that line leaves
+// the whole suite green and every resumed card would park `nothing-new-to-push` on its very first
+// PUSH_PR pass. This test goes through `runTask` end to end: prepareResume succeeds (HEAD already
+// equals the remote tip), CHECK's own npm aliases pass, and PUSH_PR's `commit` exits 1 on a clean
+// tree with HEAD === `refs/remotes/origin/claude-pipe/<id>` and `origin/main` genuinely different.
+test('runTask, resume end-to-end (F4): prepareResume succeeds, CHECK passes, PUSH_PR commit exit 1 -- commit-skipped-resume journalled, a push issued, no nothing-new-to-push park', async () => {
+  const sharedSha = 'sharedtip9999999999999999999999999999999999';
+  const { calls, taskDir } = await runResumed('card-f4-e2e', {
+    localSha: sharedSha,
+    remoteSha: sharedSha, // prepareResume: HEAD already equals the remote tip -- no fast-forward
+    commitExit: 1, // PUSH_PR: "nothing to commit"
+    statusOut: '', // clean tree -- resolves to the resume/#213 diagnostic, not `dirty: true`
+    mainSha: 'differentmain8888888888888888888888888888888', // origin/main genuinely differs
+  });
+
+  assert.ok(findEvent(taskDir, 'resume-prepared'), 'prepareResume must have succeeded');
+
+  const skippedResume = findEvent(taskDir, 'commit-skipped-resume');
+  assert.ok(skippedResume, 'expected commit-skipped-resume to be journalled -- proves the resume exemption fired');
+  assert.equal(skippedResume.head, sharedSha);
+  assert.equal(skippedResume.remoteBranchSha, sharedSha);
+
+  const push = calls.find((c) => c.command === 'git' && c.args.includes('push') && c.args.includes('-u'));
+  assert.ok(push, 'expected the ordinary push -u origin <branch> to be issued');
+
+  const parked = findEvent(taskDir, 'parked');
+  assert.ok(
+    !parked || parked.reason !== 'push-pr-failed' || parked.detail.reason !== 'nothing-new-to-push',
+    'must never park nothing-new-to-push on a resumed task\'s first PUSH_PR pass'
+  );
+  assert.equal(findEvent(taskDir, 'commit-skipped-nothing-staged'), undefined, 'the resume-specific event must fire instead of the generic one');
+});
+
+// ================================================================================================
+// ---- F5 (fix pass): prepareResume's own step ORDER, pinned exactly -----------------------------
+// ================================================================================================
+//
+// `deepStrictEqual` on the full ordered argv list, not a set of `.find()` existence checks --
+// existence survives a reordering, order does not. Two swaps are known to survive existence-only
+// assertions: symbolic-ref <-> status (steps 5/6) and the remote <-> local rev-parse (inside step
+// 9's own resolution). Both are pinned below and proven to die under the swap by hand (see this
+// action's own report).
+
+test('prepareResume step order (F5), happy path 1: HEAD already equals the remote tip', async () => {
+  const sameSha = 'samesha0000000000000000000000000000000000';
+  const { calls, taskDir, worktreePath, branch } = await runResumed('card-order-happy1', {
+    remoteSha: sameSha,
+    localSha: sameSha,
+  });
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'resume-prepared');
+  assert.deepStrictEqual(prefix, [
+    { command: 'gh', args: ['pr', 'view', String(PR_NUMBER), '--repo', 'Crazz-Org/SPO-WebClient', '--json', 'state,headRefName'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'status', '--porcelain'] },
+    { command: 'git', args: ['-C', worktreePath, 'fetch', 'origin'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', 'HEAD'] },
+  ]);
+});
+
+test('prepareResume step order (F5), happy path 2: remote ahead, HEAD is an ancestor -- fast-forwards', async () => {
+  const oldHead = 'oldhead11111111111111111111111111111111111';
+  const newRemote = 'newremote2222222222222222222222222222222222';
+  const { calls, taskDir, worktreePath, branch } = await runResumed('card-order-happy2', {
+    localSha: oldHead,
+    remoteSha: newRemote,
+    ancestorExit: 0,
+    ffExit: 0,
+  });
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'resume-prepared');
+  assert.deepStrictEqual(prefix, [
+    { command: 'gh', args: ['pr', 'view', String(PR_NUMBER), '--repo', 'Crazz-Org/SPO-WebClient', '--json', 'state,headRefName'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'status', '--porcelain'] },
+    { command: 'git', args: ['-C', worktreePath, 'fetch', 'origin'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'merge-base', '--is-ancestor', 'HEAD', `refs/remotes/origin/${branch}`] },
+    { command: 'git', args: ['-C', worktreePath, 'merge', '--ff-only', `refs/remotes/origin/${branch}`] },
+  ]);
+});
+
+test('prepareResume step order (F5), refusal: pr-not-open -- only the PR view runs', async () => {
+  const { calls, taskDir } = await runResumed('card-order-pr-not-open', { prState: 'CLOSED' });
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'parked');
+  assert.deepStrictEqual(prefix, [
+    { command: 'gh', args: ['pr', 'view', String(PR_NUMBER), '--repo', 'Crazz-Org/SPO-WebClient', '--json', 'state,headRefName'] },
+  ]);
+});
+
+test('prepareResume step order (F5), refusal: detached-or-wrong-branch -- PR view, MERGE_HEAD, symbolic-ref, then parks', async () => {
+  const { calls, taskDir, worktreePath } = await runResumed('card-order-detached', { symbolicRefExit: 1 });
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'parked');
+  assert.deepStrictEqual(prefix, [
+    { command: 'gh', args: ['pr', 'view', String(PR_NUMBER), '--repo', 'Crazz-Org/SPO-WebClient', '--json', 'state,headRefName'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD'] },
+  ]);
+});
+
+test('prepareResume step order (F5), refusal: dirty-worktree -- PR view, MERGE_HEAD, symbolic-ref, status, then parks', async () => {
+  const { calls, taskDir, worktreePath } = await runResumed('card-order-dirty', { statusOut: ' M x\n' });
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'parked');
+  assert.deepStrictEqual(prefix, [
+    { command: 'gh', args: ['pr', 'view', String(PR_NUMBER), '--repo', 'Crazz-Org/SPO-WebClient', '--json', 'state,headRefName'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'status', '--porcelain'] },
+  ]);
+});
+
+test('prepareResume step order (F5), refusal: not-fast-forward -- the full sequence through both rev-parses and the ancestor check', async () => {
+  const localSha = 'divergedlocal333333333333333333333333333333';
+  const remoteSha = 'divergedremote4444444444444444444444444444444';
+  const { calls, taskDir, worktreePath, branch } = await runResumed('card-order-diverged', {
+    localSha,
+    remoteSha,
+    ancestorExit: 1,
+  });
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'parked');
+  assert.deepStrictEqual(prefix, [
+    { command: 'gh', args: ['pr', 'view', String(PR_NUMBER), '--repo', 'Crazz-Org/SPO-WebClient', '--json', 'state,headRefName'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'status', '--porcelain'] },
+    { command: 'git', args: ['-C', worktreePath, 'fetch', 'origin'] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`] },
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'merge-base', '--is-ancestor', 'HEAD', `refs/remotes/origin/${branch}`] },
+  ]);
+});
+
+// ================================================================================================
+// ---- re-verification fixes: the park never records an unverified PR number or a foreign path --
+// ================================================================================================
+
+async function runResumedOverPriorPark(id, prior, spawnOpts, setupOpts) {
+  const { pipelineWorktreesDir, worktreePath, branch, taskDir, task } = setupTask(id, setupOpts);
+  const priorState = typeof prior === 'function' ? prior({ pipelineWorktreesDir, worktreePath }) : prior;
+  fs.writeFileSync(path.join(taskDir, 'state.json'), JSON.stringify({ id, state: 'PARKED', reason: 'merge-conflict', ...priorState }));
+  const calls = [];
+  const config = testConfig(pipelineWorktreesDir, { deps: { spawnSync: resumeSpawnSync(calls, branch, spawnOpts) } });
+  await runTask(task.id, task, taskDir, config);
+  return { calls, taskDir, worktreePath, pipelineWorktreesDir };
+}
+
+test('resume park: pr-branch-mismatch keeps the PREVIOUS park\'s prNumber, never the unverified descriptor\'s (a later abandon closes state.prNumber)', async () => {
+  const { taskDir } = await runResumedOverPriorPark('card-prnum-mismatch', { prNumber: 555 }, { prHeadRefName: 'claude-pipe/another-card' });
+  assertParked(taskDir, 'pr-branch-mismatch', { headRefName: 'claude-pipe/another-card' });
+  assert.equal(readState(taskDir).prNumber, 555);
+});
+
+for (const [label, spawnOpts, setupOpts, step] of [
+  ['pr-not-open', { prState: 'CLOSED' }, undefined, 'pr-not-open'],
+  ['pr-read-failed', { prViewExit: 1 }, undefined, 'pr-read-failed'],
+  ['worktree-missing', {}, { createWorktree: false }, 'worktree-missing'],
+]) {
+  test(`resume park: ${label} keeps the previous park's prNumber`, async () => {
+    const { taskDir } = await runResumedOverPriorPark(`card-prnum-${label}`, { prNumber: 555 }, spawnOpts, setupOpts);
+    assert.equal(findEvent(taskDir, 'parked').detail.step, step);
+    assert.equal(readState(taskDir).prNumber, 555);
+  });
+}
+
+test('resume park: a refusal AFTER the PR was verified (dirty-worktree) records the verified descriptor prNumber', async () => {
+  const { taskDir } = await runResumedOverPriorPark('card-prnum-dirty', { prNumber: 555 }, { statusOut: ' M x.ts\n' });
+  assertParked(taskDir, 'dirty-worktree');
+  assert.equal(readState(taskDir).prNumber, PR_NUMBER);
+});
+
+test('resume park: a PR that is CLOSED and on another branch parks pr-not-open (state is checked before the branch)', async () => {
+  const { taskDir } = await runResumedOverPriorPark('card-closed-wrong-branch', {}, { prState: 'CLOSED', prHeadRefName: 'claude-pipe/x' });
+  assert.equal(findEvent(taskDir, 'parked').detail.step, 'pr-not-open');
+});
+
+test('resume park: worktree-path-mismatch over a prior park with the TRUSTED path keeps that path and its PR, and never journals resumed-at-check or writes the foreign path', async () => {
+  const foreign = path.join(mkTmp('spo-pr-foreign-'), 'wt');
+  fs.mkdirSync(foreign, { recursive: true });
+  const id = 'card-mismatch-trusted-prior';
+  const writes = [];
+  const origWrite = fs.writeFileSync;
+  fs.writeFileSync = function patched(file, data, ...rest) {
+    if (typeof file === 'string' && typeof data === 'string' && data.includes(foreign)) writes.push(file);
+    return origWrite.call(fs, file, data, ...rest);
+  };
+  let result;
+  try {
+    result = await runResumedOverPriorPark(
+      id,
+      ({ pipelineWorktreesDir }) => ({ prNumber: 555, worktreePath: path.join(pipelineWorktreesDir, id) }),
+      { statusOut: ' M x.ts\n' },
+      { createWorktree: false, worktreePathOverride: foreign }
+    );
+  } finally {
+    fs.writeFileSync = origWrite;
+  }
+  const { taskDir, pipelineWorktreesDir, calls } = result;
+  assert.equal(findEvent(taskDir, 'parked').detail.step, 'worktree-path-mismatch');
+  const state = readState(taskDir);
+  assert.equal(state.worktreePath, path.join(pipelineWorktreesDir, id));
+  assert.equal(state.prNumber, 555);
+  assert.equal(findEvent(taskDir, 'resumed-at-check'), undefined);
+  assert.equal(gitCalls(calls).length, 0);
+  assert.deepEqual(
+    writes.filter((f) => path.basename(f).startsWith('.state.json')),
+    [],
+    'no state.json write may ever carry the foreign path'
+  );
+});
+
+test('resume park: worktree-path-mismatch over a prior park that itself recorded a foreign path records null', async () => {
+  const foreign = path.join(mkTmp('spo-pr-foreign2-'), 'wt');
+  const { taskDir } = await runResumedOverPriorPark(
+    'card-mismatch-foreign-prior',
+    { prNumber: 555, worktreePath: foreign },
+    {},
+    { createWorktree: false, worktreePathOverride: foreign }
+  );
+  assert.equal(findEvent(taskDir, 'parked').detail.step, 'worktree-path-mismatch');
+  assert.equal(readState(taskDir).worktreePath, null);
+});

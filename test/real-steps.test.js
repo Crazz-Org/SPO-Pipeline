@@ -1043,7 +1043,7 @@ test('realWorktree (B1.4 R4, fifth pass F1): a TIMED-OUT bench-install.sh while 
   // commandTimeoutsMs must actually name 'bench-install' -- spawnOnce only treats an ETIMEDOUT
   // fake result as a real timeout when a numeric deadline was armed (`deadlineArmed`); testConfig's
   // own default has no commandTimeoutsMs at all, which would silently make this ETIMEDOUT result
-  // read as a plain exit failure instead, same shape test/real-steps.test.js:6460 already learned.
+  // read as a plain exit failure instead, same shape test/real-steps.test.js:6536 already learned.
   const config = testConfig({ commandTimeoutsMs: { 'bench-install': 900000 } });
   const task = { id: 'card-debt-installtimeout', kind: 'card', issue: 907 };
   const ctx = testCtx({ id: 'card-debt-installtimeout', task, config });
@@ -2340,6 +2340,82 @@ test('realPushPr: reuses an already-open PR for this branch -- gh pr create neve
 
   const journal = readJournal(ctx.taskDir);
   assert.ok(journal.some((e) => e.event === 'pr-reused' && e.prNumber === 452));
+});
+
+// F6 (fix pass, card #212): `ctx.prNumber` can already be non-null when this reuse path runs -- a
+// resume's own rehydration (`task.resume.prNumber`), or an earlier pass through this same run.
+// GitHub's own `gh pr list` answer is ground truth; when it disagrees, that drift is journalled
+// rather than silently overwritten.
+test('realPushPr: reuse path, ctx.prNumber already set and DIFFERS from gh pr list -- journals pr-number-changed, still reassigns to the fresh number', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-prnum-changed-wt-');
+  const task = { id: 'card-pr-changed', kind: 'card', issue: 453, title: 't', worktreePath, branch: 'claude-pipe/card-pr-changed' };
+  const ctx = testCtx({ id: 'card-pr-changed', task, config });
+  ctx.prNumber = 900; // stale -- e.g. a resume descriptor's own prNumber
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'list') return ok(JSON.stringify([{ number: 901 }]));
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.prNumber, 901, 'ctx.prNumber must still be reassigned to GitHub\'s own answer');
+
+  const journal = readJournal(ctx.taskDir);
+  const changed = journal.find((e) => e.event === 'pr-number-changed');
+  assert.ok(changed, 'expected pr-number-changed to be journalled');
+  assert.equal(changed.from, 900);
+  assert.equal(changed.to, 901);
+});
+
+test('realPushPr: reuse path, ctx.prNumber already set and MATCHES gh pr list -- no pr-number-changed journalled', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-prnum-same-wt-');
+  const task = { id: 'card-pr-same', kind: 'card', issue: 454, title: 't', worktreePath, branch: 'claude-pipe/card-pr-same' };
+  const ctx = testCtx({ id: 'card-pr-same', task, config });
+  ctx.prNumber = 902;
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'list') return ok(JSON.stringify([{ number: 902 }]));
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.prNumber, 902);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.equal(journal.find((e) => e.event === 'pr-number-changed'), undefined, 'no drift -- nothing to journal');
+});
+
+test('realPushPr: reuse path, ctx.prNumber was null (an ordinary first pass) -- no pr-number-changed journalled', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-prnum-null-wt-');
+  const task = { id: 'card-pr-null', kind: 'card', issue: 455, title: 't', worktreePath, branch: 'claude-pipe/card-pr-null' };
+  const ctx = testCtx({ id: 'card-pr-null', task, config });
+  assert.equal(ctx.prNumber, null, 'buildCtx must default this to null');
+
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'list') return ok(JSON.stringify([{ number: 903 }]));
+      return ok('');
+    },
+  };
+
+  const next = await realPushPr(ctx, deps);
+  assert.equal(next, 'GATE');
+  assert.equal(ctx.prNumber, 903);
+
+  const journal = readJournal(ctx.taskDir);
+  assert.equal(journal.find((e) => e.event === 'pr-number-changed'), undefined, 'a null-to-anything transition is not "drift"');
 });
 
 // ---- GATE -----------------------------------------------------------------------------------

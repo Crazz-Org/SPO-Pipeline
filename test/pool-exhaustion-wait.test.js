@@ -813,3 +813,31 @@ test('T3 (card #178, phantom park): ZERO `parked` lines on either re-enqueue-SUC
   finalizePark(ordCtx, 'PLAN', 'plan-invalid', {});
   assert.equal(readJournal(ordCtx.taskDir).filter((e) => e.event === 'parked').length, 1, 'ordinary park path');
 });
+
+// Card #212 C4: the pool wait is the other machine re-enqueue -- same carriedResume rule.
+test('finalizePark: a pool-wait re-enqueue of a resumed run carries resume forward, prNumber from the run', () => {
+  const config = testConfig();
+  const resume = { startState: 'CHECK', prNumber: 1, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
+  const ctx = buildParkCtx({ config, task: { resume } });
+  ctx.prNumber = 43;
+  const deadlineMs = Date.now() + 6 * 60 * 1000;
+  finalizePark(ctx, 'PLAN', `all-accounts-cooling-until-${new Date(deadlineMs).toISOString()}`, { earliestCooldownUntil: deadlineMs });
+
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.deepEqual(requeued.resume, { ...resume, prNumber: 43 });
+});
+
+// Card #212 C5: the park comment's continue line through finalizePark (not buildParkComment
+// directly) -- pins that postParkComment passes ctx.id and ctx.prNumber.
+test('finalizePark: a real-mode merge-conflict park comment names claude-pipe/<id>; with no PR it has no continue line', () => {
+  for (const [prNumber, expectLine] of [[55, true], [null, false]]) {
+    const config = testConfig();
+    const ctx = buildParkCtx({ config, id: 'card-cl' });
+    ctx.prNumber = prNumber;
+    finalizePark(ctx, 'MERGE', 'merge-conflict', { mergeable: 'CONFLICTING' });
+    const body = fs.readFileSync(path.join(ctx.taskDir, 'park-comment.md'), 'utf8');
+    assert.equal(body.includes('`claude-pipe/card-cl`'), expectLine, `prNumber ${prNumber}`);
+  }
+});

@@ -1490,6 +1490,205 @@ async function realCheck(ctx, deps = {}) {
   return 'PUSH_PR';
 }
 
+// ---- card #212 C2: real-mode resume safety net ------------------------------------------------
+//
+// A maintainer's `continue` hands `runTask`'s resume path (state-machine.js) a worktree, branch
+// and PR this daemon has not touched since it parked -- possibly minutes or days ago, possibly
+// hand-edited on GitHub in the meantime (a merge commit pushed onto `claude-pipe/<id>` to resolve
+// the conflict that parked it, or nothing at all if `main` has since moved past the conflict on
+// its own). CHECK's own real spawns (`npm run typecheck`/`lint`/`coverage:changed`) are not
+// equipped to notice any of that -- they just run in `worktreePath` and trust it. This function is
+// the check state-machine.js's resume path runs immediately before CHECK, in real mode only
+// (shadow/dry-run resumes have no real worktree/branch/PR to have drifted, so there is nothing
+// genuine here to check), and it refuses every shape CHECK would otherwise run straight into:
+// a worktree pointed at the wrong id, one that no longer exists, a PR closed or merged out from
+// under the card, a merge CI_CHECKS' own main-moved path left conflicted, a detached HEAD, dirty
+// debris, or a branch the maintainer rewrote instead of fast-forwarding. Every refusal is
+// `ParkSignal('resume-precondition-failed', {step, ...})` -- the one reason card #212 C1 already
+// registered -- so a human decides the next move exactly as an ordinary CHECK/GATE/CI_CHECKS park
+// does. See doc/state-machine-spec.md's "Resume at CHECK" section for the full step list.
+//
+// Deliberately does NOT run `npm ci` and does NOT merge `origin/main` here: GATE's own
+// main-moved path (further down this file, unchanged by this action) already does the
+// merge-forward with a fresh budget on a resume (`ctx.counters.mainMoveUsed` starts at 0, same as
+// any retry), and that existing path does not reinstall dependencies either -- staying consistent
+// with it beats inventing a stricter rule just for this one entry point. Accepted gap, stated
+// once here rather than assumed: a maintainer's merge commit that changes `package-lock.json`
+// runs CHECK (and everything after it) against `node_modules` as they were when the worktree was
+// parked, not as the new lockfile describes.
+async function prepareResume(ctx, deps = {}) {
+  const config = ctx.config;
+  const id = ctx.id;
+  const worktreePath = ctx.task.worktreePath;
+  const prNumber = ctx.prNumber;
+  const branch = `claude-pipe/${id}`;
+
+  // 1. A resume descriptor's worktreePath must point at THIS pipeline's own exclusive namespace
+  // for this task -- anywhere else and no command below may run in it at all.
+  const expected = path.join(config.pipelineWorktreesDir, id);
+  if (worktreePath !== expected) {
+    throw new ParkSignal('resume-precondition-failed', {
+      step: 'worktree-path-mismatch',
+      expected,
+      actual: worktreePath,
+    });
+  }
+
+  // 2. Maintainer decision (card #212): a missing worktree parks rather than being silently
+  // rebuilt -- a resume is supposed to be the NON-destructive path, and recreating the worktree
+  // here would just be WORKTREE's own destructive rebuild wearing a different name.
+  if (!fs.existsSync(worktreePath)) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'worktree-missing' });
+  }
+
+  // 3. The PR the resume descriptor names must still be open -- same `gh pr view --json` shape
+  // probeMergeability (further down this file) already uses, without its retry/poll loop: one
+  // stale answer here is a reason to park and let a human look, not a reason to wait and re-ask.
+  // Fix pass (F6): also requests `headRefName` -- `prNumber` is a maintainer-supplied number and
+  // could, by typo or a stale record, name a real, OPEN pull request built off a completely
+  // different branch.
+  const prView = spawnStep(ctx, deps, 'CHECK', 'gh', [
+    'pr',
+    'view',
+    String(prNumber),
+    '--repo',
+    config.ghRepo,
+    '--json',
+    'state,headRefName',
+  ]);
+  if (prView.exit !== 0) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'pr-read-failed', exit: prView.exit });
+  }
+  let prState;
+  let prHeadRefName;
+  try {
+    const parsed = JSON.parse(prView.stdout);
+    prState = parsed.state;
+    prHeadRefName = parsed.headRefName;
+  } catch {
+    throw new ParkSignal('resume-precondition-failed', { step: 'pr-read-failed', unparsable: true });
+  }
+  if (prState !== 'OPEN') {
+    throw new ParkSignal('resume-precondition-failed', { step: 'pr-not-open', prState });
+  }
+  if (prHeadRefName !== branch) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'pr-branch-mismatch', headRefName: prHeadRefName });
+  }
+
+  // 4. CI_CHECKS' own main-moved path (realCiChecks, below) can leave a merge in progress if the
+  // task parked mid-merge (`main-moved-merge-failed` never runs `merge --abort` on its own
+  // conflict) -- checked and cleaned BEFORE the branch/dirty checks below, since an unresolved
+  // merge is itself the reason those would fail. Fix pass (F3): `merge --abort` throws away
+  // whatever is staged in an in-progress merge, including a maintainer's OWN resolved conflict --
+  // `git ls-files -u` (unmerged paths) tells the two cases apart before anything destructive runs.
+  const mergeHead = spawnStep(ctx, deps, 'CHECK', 'git', [
+    '-C',
+    worktreePath,
+    'rev-parse',
+    '-q',
+    '--verify',
+    'MERGE_HEAD',
+  ]);
+  if (mergeHead.exit === 0) {
+    const lsFiles = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'ls-files', '-u']);
+    if (lsFiles.exit !== 0) {
+      throw new ParkSignal('resume-precondition-failed', { step: 'ls-files-failed', exit: lsFiles.exit });
+    }
+    if (lsFiles.stdout.trim() === '') {
+      // Every conflict is already resolved and staged -- this is the maintainer's OWN fix,
+      // sitting uncommitted in the merge. `merge --abort` here would discard it; parking instead
+      // and leaving the merge exactly as found lets them commit and push it, then `continue`
+      // again.
+      throw new ParkSignal('resume-precondition-failed', { step: 'merge-in-progress' });
+    }
+    // Still genuinely unmerged paths -- this is CI_CHECKS' own abandoned conflicted merge
+    // (`main-moved-merge-failed`), never a maintainer's resolution. Safe to abort exactly as
+    // before this fix.
+    const abort = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'merge', '--abort']);
+    if (abort.exit !== 0) {
+      throw new ParkSignal('resume-precondition-failed', { step: 'merge-abort-failed', exit: abort.exit });
+    }
+    appendEvent(ctx.taskDir, 'CHECK', 'resume-merge-aborted', {});
+  }
+
+  // 5. The worktree must be on this task's own branch, not detached (e.g. left mid-merge-abort
+  // recovery, or a maintainer's manual poking around).
+  const symbolicRef = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD']);
+  const currentBranch = (symbolicRef.stdout || '').trim();
+  if (symbolicRef.exit !== 0 || currentBranch !== branch) {
+    throw new ParkSignal('resume-precondition-failed', {
+      step: 'detached-or-wrong-branch',
+      head: currentBranch || null,
+      exit: symbolicRef.exit,
+    });
+  }
+
+  // 6. Clean tree -- a resume is meant to pick up exactly what was pushed before the park, never
+  // whatever debris happens to be sitting in the worktree today.
+  const status = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'status', '--porcelain']);
+  if (status.exit !== 0) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'status-failed', exit: status.exit });
+  }
+  if (status.stdout.trim() !== '') {
+    throw new ParkSignal('resume-precondition-failed', { step: 'dirty-worktree' });
+  }
+
+  const fetch = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'fetch', 'origin']);
+  if (fetch.exit !== 0) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'fetch-failed', exit: fetch.exit });
+  }
+
+  // 8. A resume's whole premise is a maintainer having pushed something to this branch on
+  // GitHub -- no remote branch at all means the resume descriptor itself is stale (the branch was
+  // deleted, or was never pushed in the first place).
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  const remoteRev = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'rev-parse', '--verify', '--quiet', remoteRef]);
+  if (remoteRev.exit !== 0) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'remote-branch-missing' });
+  }
+  const remoteSha = remoteRev.stdout.trim();
+
+  const localRev = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+  if (localRev.exit !== 0) {
+    throw new ParkSignal('resume-precondition-failed', { step: 'rev-parse-failed', ref: 'HEAD' });
+  }
+  const localSha = localRev.stdout.trim();
+
+  let finalHead = localSha;
+  let fastForwardedFrom = null;
+
+  if (localSha !== remoteSha) {
+    // 9. The remote moved past what this worktree holds -- fast-forward onto it ONLY when this
+    // worktree's own HEAD is an ancestor of the remote tip (the maintainer pushed a merge commit
+    // on top of what was already here, or nothing changed locally at all). A remote tip that is
+    // NOT a descendant of HEAD means the maintainer rewrote the branch instead of merging forward
+    // -- or this worktree carries commits origin has never seen -- and a human decides which,
+    // never a silent reset in either direction.
+    const ancestor = spawnStep(ctx, deps, 'CHECK', 'git', [
+      '-C',
+      worktreePath,
+      'merge-base',
+      '--is-ancestor',
+      'HEAD',
+      remoteRef,
+    ]);
+    if (ancestor.exit === 0) {
+      const ff = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'merge', '--ff-only', remoteRef]);
+      if (ff.exit !== 0) {
+        throw new ParkSignal('resume-precondition-failed', { step: 'fast-forward-failed', exit: ff.exit });
+      }
+      fastForwardedFrom = localSha;
+      finalHead = remoteSha;
+    } else if (ancestor.exit === 1) {
+      throw new ParkSignal('resume-precondition-failed', { step: 'not-fast-forward', head: localSha, remote: remoteSha });
+    } else {
+      throw new ParkSignal('resume-precondition-failed', { step: 'merge-base-failed', exit: ancestor.exit });
+    }
+  }
+
+  appendEvent(ctx.taskDir, 'CHECK', 'resume-prepared', { head: finalHead, fastForwardedFrom });
+}
+
 // ---- PUSH_PR --------------------------------------------------------------------------------
 
 function commitMessage(ctx) {
@@ -1559,6 +1758,14 @@ async function realPushPr(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
   const title = (ctx.task && ctx.task.title) || `Card #${ctx.task && ctx.task.issue}`;
   const branch = (ctx.task && ctx.task.branch) || `claude-pipe/${ctx.id}`;
+
+  // Card #212 C2: read once and cleared IMMEDIATELY, so the exemption below applies AT MOST ONCE
+  // per ctx no matter which branch this call takes -- including a park on an earlier step (`git
+  // add` failing, say). A resumed branch has HEAD === origin/<branch> already (it was pushed
+  // before the park, or prepareResume just fast-forwarded it to the maintainer's own push), which
+  // is otherwise indistinguishable from card #213's "nothing new since a prior push" shape below.
+  const resumePass = ctx.resumePushPending === true;
+  ctx.resumePushPending = false;
 
   const messageFile = path.join(ctx.taskDir, 'commit-message.txt');
   fs.writeFileSync(messageFile, commitMessage(ctx));
@@ -1657,25 +1864,37 @@ async function realPushPr(ctx, deps = {}) {
     if (remoteBranchSha !== null && head === remoteBranchSha) {
       // #213's shape: the remote tip for THIS branch already equals HEAD, so this pass's PR (or
       // prior push) already carries everything at HEAD -- pushing again would push nothing and
-      // re-gate a sha CI has already judged.
-      throw new ParkSignal('push-pr-failed', {
-        step: 'commit',
-        exit: commit.exit,
-        reason: 'nothing-new-to-push',
+      // re-gate a sha CI has already judged. EXCEPT on a resume's first PUSH_PR pass
+      // (`resumePass`, card #212 C2): a resumed branch legitimately has HEAD == origin/<branch>
+      // already (it was pushed before the park, or `prepareResume` just fast-forwarded it to the
+      // maintainer's own push), which is otherwise this exact shape -- skip the commit and fall
+      // through to the push, same as `commit-skipped-nothing-staged` below, but journalled under
+      // its own name so the two causes stay distinguishable in the journal. One-shot: `resumePass`
+      // was already cleared above, so a LATER pass through this same function (a CI-red retry
+      // looping DIAGNOSE -> IMPLEMENT -> CHECK -> PUSH_PR back to here) sees it false and parks
+      // exactly as before this action.
+      if (resumePass) {
+        appendEvent(ctx.taskDir, 'PUSH_PR', 'commit-skipped-resume', { head, remoteBranchSha, branch });
+      } else {
+        throw new ParkSignal('push-pr-failed', {
+          step: 'commit',
+          exit: commit.exit,
+          reason: 'nothing-new-to-push',
+          head,
+        });
+      }
+    } else {
+      // Otherwise there IS unpushed work at HEAD -- the main-moved merge commit (case (1) above)
+      // is the motivating example, but this also covers a branch that has simply never been
+      // pushed yet and whose commit failed for a benign "nothing to commit" reason (unusual, but
+      // not this function's problem to rule out). Skip the commit -- there is nothing to add to
+      // it -- and fall through to the push below exactly as if commit.exit had been 0.
+      appendEvent(ctx.taskDir, 'PUSH_PR', 'commit-skipped-nothing-staged', {
         head,
+        remoteBranchSha,
+        branch,
       });
     }
-
-    // Otherwise there IS unpushed work at HEAD -- the main-moved merge commit (case (1) above)
-    // is the motivating example, but this also covers a branch that has simply never been
-    // pushed yet and whose commit failed for a benign "nothing to commit" reason (unusual, but
-    // not this function's problem to rule out). Skip the commit -- there is nothing to add to it
-    // -- and fall through to the push below exactly as if commit.exit had been 0.
-    appendEvent(ctx.taskDir, 'PUSH_PR', 'commit-skipped-nothing-staged', {
-      head,
-      remoteBranchSha,
-      branch,
-    });
   }
 
   // Order matters: the branch is pushed BEFORE the citation check below, not after. A park
@@ -1783,6 +2002,14 @@ async function realPushPr(ctx, deps = {}) {
     if (Array.isArray(existing) && existing.length > 0) {
       const prNumber = existing[0].number;
       appendEvent(ctx.taskDir, 'PUSH_PR', 'pr-reused', { prNumber });
+      // Fix pass (F6): `ctx.prNumber` can already be set here -- a resume's own rehydration, or
+      // an earlier pass through this same run -- and GitHub's own idea of "the open PR for this
+      // branch" is ground truth, not the resume descriptor. Another open PR now existing for this
+      // branch is a real, silent drift here (reopening keeps the number, so it is not one);
+      // journal it before reassigning rather than let it pass unnoticed.
+      if (ctx.prNumber != null && ctx.prNumber !== prNumber) {
+        appendEvent(ctx.taskDir, 'PUSH_PR', 'pr-number-changed', { from: ctx.prNumber, to: prNumber });
+      }
       // Never `gh pr edit` -- CLAUDE.md: it's in `deny` on this repo (Projects classic board).
       // Editing a PR goes through the REST API directly instead.
       const patch = spawnStep(ctx, deps, 'PUSH_PR', 'gh', ['api', `repos/${config.ghRepo}/pulls/${prNumber}`, '-X', 'PATCH', '-f', `body=${body}`]);
@@ -3932,6 +4159,7 @@ module.exports = {
   realFinish,
   preserveWorktreeWip,
   prepareJudgeInputs,
+  prepareResume,
   finalComment,
   sumJournalBillableTokens,
   // Exported for test/real-steps.test.js's own direct coverage, and so

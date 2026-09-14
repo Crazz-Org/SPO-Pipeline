@@ -7,11 +7,14 @@
 //     retry/abandon hand-off line.
 //   unparkScan -- called once per daemon poll cycle (state-machine.js's runForever, real mode
 //     only): for every journaled task still PARKED with a recorded park-comment anchor, reads
-//     the issue's comments and acts on the first "retry" or "abandon" reply posted after that
-//     anchor. An "abandon" match also runs abandonCleanup (action 4.5) -- a best-effort reclaim
-//     of the leaked product worktree, its local/remote claude-pipe/<id> branch, and the open PR
-//     (issue #443, where all three sat leaked indefinitely because ABANDONED used to do nothing
-//     but write state.json).
+//     the issue's comments and acts on the first "retry", "abandon", or (card #212 C4) "continue"
+//     reply posted after that anchor. An "abandon" match also runs abandonCleanup (action 4.5) --
+//     a best-effort reclaim of the leaked product worktree, its local/remote claude-pipe/<id>
+//     branch, and the open PR (issue #443, where all three sat leaked indefinitely because
+//     ABANDONED used to do nothing but write state.json). A "continue" match re-enqueues with
+//     task.resume (runTask's own C1/C2 machinery) when the park is on RESUMABLE_PARK_REASONS and
+//     carries a verified prNumber, or acks a refusal on the issue otherwise -- see
+//     continueEligibility's own header, below.
 //   reconcileExternalClosure -- action 5.1b, called from inside unparkScan's own per-task loop,
 //     BEFORE the retry/abandon comment scan: for a PARKED or ABANDONED task whose owning issue
 //     has since closed OUTSIDE the pipeline (a human fixed it by hand, or -- issue #443's shape --
@@ -68,6 +71,46 @@ const RETRY_ABANDON_LINE =
 
 function shortSha(sha) {
   return sha ? String(sha).slice(0, 10) : 'unknown';
+}
+
+// Card #212 C4/C5: the park reasons a maintainer's `continue` reply can resume from at CHECK
+// (runTask's task.resume path, C1/C2) instead of restarting the whole card at INTAKE -- a
+// worktree/branch/PR that is still sitting there, unlike a `retry`'s destructive rebuild. Every
+// member here must also be registered in state-machine.js's TERMINAL_PARK_REASONS (checked by
+// test/unpark-continue.test.js's own membership sweep) -- `continue` never resumes a reason the
+// code doesn't already treat as terminal.
+const RESUMABLE_PARK_REASONS = new Set([
+  'merge-conflict',
+  'gate-merge-refused',
+  'main-moved-merge-failed',
+  'main-moved-twice',
+  'merge-behind-base',
+  'resume-precondition-failed',
+]);
+
+// buildContinueLine(reason, id) -- the one extra line a resumable park's comment carries right
+// after RETRY_ABANDON_LINE (never replacing it -- `retry`/`abandon` stay available on every park).
+// `resume-precondition-failed` gets its own phrasing: the maintainer just watched THIS verb fail
+// its own precondition check, so the line points at fixing what the reason above already names,
+// not at "the conflict" (there may not be one -- see prepareResume's own refusal list,
+// doc/state-machine-spec.md's "Resume at CHECK" section). Every other resumable reason is a real
+// merge conflict/refusal against `origin/main`. `null` for a non-resumable reason -- the caller
+// renders nothing, and every existing park comment stays byte-identical.
+function buildContinueLine(reason, id, prNumber) {
+  if (!RESUMABLE_PARK_REASONS.has(reason)) return null;
+  // Same PR condition continueEligibility applies: never advertise a verb that would refuse.
+  if (!(Number.isInteger(prNumber) && prNumber > 0)) return null;
+  const branch = `claude-pipe/${id}`;
+  if (reason === 'resume-precondition-failed') {
+    return (
+      `pipeline: fix what the reason above names, then reply "continue" again to retry at CHECK ` +
+      `on \`${branch}\` and this pull request (no re-plan).`
+    );
+  }
+  return (
+    `pipeline: or push a merge commit resolving the conflict onto \`${branch}\`, then reply ` +
+    '"continue" to resume at CHECK on this branch and PR (no re-plan).'
+  );
 }
 
 // Card #212 item 3: a park comment used to say nothing about whether the gate had already proven
@@ -168,6 +211,8 @@ function buildParkComment({
   diagnoseAttempts,
   validateRejects,
   ciImplementRetries,
+  id,
+  prNumber,
 }) {
   const lines = [
     '### Pipeline parked',
@@ -187,7 +232,13 @@ function buildParkComment({
       ''
     );
   }
-  lines.push(RETRY_ABANDON_LINE, '');
+  lines.push(RETRY_ABANDON_LINE);
+  // Card #212 C5: ONE extra line for a resumable reason, right after RETRY_ABANDON_LINE -- never
+  // replacing it. A non-resumable reason (or a call with no `id`, e.g. an existing test) renders
+  // nothing extra here, so every pre-C5 park comment stays byte-identical.
+  const continueLine = buildContinueLine(reason, id, prNumber);
+  if (continueLine) lines.push(continueLine);
+  lines.push('');
 
   const tokensText = hasTokenData ? formatTokenCount(billableTokens) : 'not recorded';
   const parksText =
@@ -259,6 +310,8 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
     diagnoseAttempts: summary.diagnoseAttempts,
     validateRejects: summary.validateRejects,
     ciImplementRetries: summary.ciImplementRetries,
+    id: ctx.id,
+    prNumber: ctx.prNumber,
   });
   const commentFile = path.join(ctx.taskDir, 'park-comment.md');
   fs.writeFileSync(commentFile, body);
@@ -720,6 +773,17 @@ function findParkAnchor(lines) {
       sinceMs = null;
       continue;
     }
+    // Card #212 C4: a refused `continue` acked on the issue is a new anchor, exactly like a
+    // park-comment -- the refusal itself must never be matched again next cycle (it starts with
+    // `pipeline:` so it never would anyway, but the anchor also stops re-scanning everything
+    // before it). A `retry`/`abandon`/eligible `continue` posted AFTER the refusal is still
+    // scanned normally, since it sits after this new boundary.
+    if (e.event === 'unpark-verb-refused' && typeof e.commentId === 'number') {
+      anchorIndex = i;
+      commentId = e.commentId;
+      sinceMs = null;
+      continue;
+    }
     if (e.event === 'park-anchor') {
       const at = Date.parse(e.at);
       // An unparseable stamp is no anchor at all: falling back to "scan everything" would
@@ -739,15 +803,59 @@ function findParkAnchor(lines) {
   return { commentId, sinceMs, alreadyHandled };
 }
 
-// firstLine matching itself now lives in comment-scan.js's scanForMatch -- RETRY_RE/ABANDON_RE
-// stay here because they are unparkScan's OWN vocabulary (report-intake.js has its own,
-// CONFIRM_RE/DISCARD_RE), threaded into scanForMatch as `patterns` below.
+// firstLine matching itself now lives in comment-scan.js's scanForMatch -- RETRY_RE/ABANDON_RE/
+// CONTINUE_RE stay here because they are unparkScan's OWN vocabulary (report-intake.js has its
+// own, CONFIRM_RE/DISCARD_RE -- no overlap: confirm/discard vs retry/abandon/continue), threaded
+// into scanForMatch as `patterns` below.
 const RETRY_RE = /^retry\b/i;
 const ABANDON_RE = /^abandon\b/i;
+// Card #212 C4: `\b` after the word, same convention as RETRY_RE/ABANDON_RE -- "continue" and
+// "continue please" match, "continued" does not (no word boundary between "continue" and "d").
+const CONTINUE_RE = /^continue\b/i;
 const UNPARK_PATTERNS = [
   { name: 'retry', re: RETRY_RE },
   { name: 'abandon', re: ABANDON_RE },
+  { name: 'continue', re: CONTINUE_RE },
 ];
+
+// Card #212 C4: is THIS park eligible for `continue` right now? Read straight off state.json --
+// unparkScan's caller already has it loaded once per task per cycle. Order matches the spec: park
+// reason first (the two checks a bad reason can never pass anyway), then the two facts that are
+// per-task rather than per-reason. `why` is what the refusal ack and the `unpark-verb-refused`
+// journal event both name.
+function continueEligibility(state, config) {
+  if (!state || state.state !== 'PARKED' || !RESUMABLE_PARK_REASONS.has(state.reason)) {
+    return { eligible: false, why: 'not-resumable' };
+  }
+  if (!(Number.isInteger(state.prNumber) && state.prNumber > 0)) {
+    return { eligible: false, why: 'no-pr' };
+  }
+  if (state.externallyResolved) {
+    return { eligible: false, why: 'externally-resolved' };
+  }
+  if (typeof config.pipelineWorktreesDir !== 'string' || config.pipelineWorktreesDir === '') {
+    return { eligible: false, why: 'no-worktrees-dir' };
+  }
+  return { eligible: true, why: null };
+}
+
+// buildContinueRefusedAck(reason, why) -- the one-line-per-cause ack posted when `continue` is
+// NOT available for this park. First line starts `pipeline:` (like RETRY_ABANDON_LINE) so it can
+// never itself match any UNPARK_PATTERNS verb on a later scan. Never falls back to suggesting
+// `continue` again -- `retry`/`abandon` are the two verbs that always remain.
+function buildContinueRefusedAck(reason, why) {
+  const causes = {
+    'not-resumable': `\`${reason}\` is not a park this pipeline can resume -- there is no worktree/branch/PR to resume onto.`,
+    'no-pr': 'no pull request is recorded for this card, so there is nothing to resume at CHECK.',
+    'externally-resolved': 'this card was already resolved outside the pipeline.',
+    'no-worktrees-dir': 'the pipeline has no worktrees directory configured.',
+  };
+  const cause = causes[why] || causes['not-resumable'];
+  return [
+    `pipeline: "continue" is not available for this park -- ${cause}`,
+    'Reply "retry" (restart from scratch) or "abandon" (close this attempt) instead.',
+  ].join('\n');
+}
 
 // action 2.7: unparkScan's own event names for comment-scan.js's scanForMatch -- see that
 // module's header for what each one means. Task-scoped (appendEvent), not daemon-scoped: a
@@ -938,7 +1046,15 @@ let reEnqueueTmpSeq = 0;
 
 function reEnqueueTask(queueDir, taskDir, id, extra = {}, key = null, priorityClass = 't') {
   const original = readJsonSafe(path.join(taskDir, 'task.json')) || {};
-  const { worktreePath, branch, baseMainSha, transientRetries, notBefore, poolWaitMs, poolWaitAttempts, ...rest } = original;
+  // Card #212 C4: `resume` stripped alongside worktreePath/branch/... for every caller of this
+  // function -- a maintainer `retry` and finalizePark's own two machine re-enqueues (transient-
+  // retry, pool-wait) must never carry a stale task.resume forward into a run that did not ask
+  // to resume (takeNextTask renames the queue entry straight over journal/<id>/task.json, so
+  // after a resumed run that field is still sitting there). Only the `continue` branch below adds
+  // it back through `extra`, and so do finalizePark's two machine re-enqueues for a run that was
+  // itself resumed (carriedResume in state-machine.js): a machine retry restarting at INTAKE would
+  // close the PR the maintainer just fixed.
+  const { worktreePath, branch, baseMainSha, transientRetries, notBefore, poolWaitMs, poolWaitAttempts, resume, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
   // Card #43: fall back to Date.now() for anything that isn't a finite number, `null` default
   // included -- see the header comment for why this must never throw.
@@ -1472,6 +1588,81 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
       continue;
     }
 
+    // Card #212 C4: `continue` -- the non-destructive resume, ONLY for the reasons/state
+    // continueEligibility allows (RESUMABLE_PARK_REASONS, a verified prNumber, no
+    // externallyResolved, a configured pipelineWorktreesDir). Never falls back to a plain
+    // `retry`: an ineligible `continue` is a refusal, acked on the issue, not silently
+    // reinterpreted as a different verb the maintainer did not type.
+    if (scan.match.name === 'continue') {
+      const elig = continueEligibility(state, config);
+      if (elig.eligible) {
+        // Same effect-before-marker ordering, and the same guarded catch, as the `retry` branch
+        // above -- see its own comment for why. The worktreePath is always the PIPELINE's own
+        // path for this id, never `state.worktreePath` (prepareResume, C2, refuses anything
+        // else; state.json's own worktreePath could be stale or foreign).
+        const worktreePath = path.join(config.pipelineWorktreesDir, id);
+        let requeuedFile = null;
+        try {
+          requeuedFile = reEnqueueTask(
+            queueDir,
+            taskDir,
+            id,
+            {
+              resume: {
+                startState: 'CHECK',
+                prNumber: state.prNumber,
+                worktreePath,
+                commentId: match.id,
+                fromReason: state.reason,
+              },
+            },
+            match.id,
+            'h'
+          );
+        } catch (err) {
+          try {
+            appendDaemonEvent(journalRoot, 'unpark-requeue-failed', {
+              id,
+              issue: task.issue,
+              retryCommentId: match.id,
+              error: String((err && err.message) || err),
+            });
+          } catch {
+            // Nothing left to record to -- never let this reach runScanCycle either way.
+          }
+        }
+        if (!requeuedFile) continue; // marker withheld -- next scan redoes the effect.
+        appendEvent(taskDir, 'PARKED', 'unparked-by-maintainer', { retryCommentId: match.id, verb: 'continue' });
+        continue;
+      }
+
+      // Ineligible: one ack comment (first line `pipeline:`, so it can never itself match a
+      // later scan), then `unpark-verb-refused` -- journalled whether or not the ack succeeded
+      // (`ackExit` carries the outcome), and findParkAnchor now anchors on it so this comment is
+      // never re-matched. Never re-enqueues, never falls back to `retry`.
+      const ackFile = path.join(taskDir, 'continue-refused-ack.md');
+      fs.writeFileSync(ackFile, `${buildContinueRefusedAck(state.reason, elig.why)}\n`);
+      const ack = runSync(
+        deps,
+        'gh',
+        ['issue', 'comment', String(task.issue), '--repo', ghRepo, '--body-file', ackFile],
+        {},
+        config
+      );
+      const ackExit = normalizeExit(ack);
+      if (ackExit !== 0) {
+        appendEvent(taskDir, 'PARKED', 'continue-ack-failed', { exit: ackExit, timedOut: ack.timedOut === true });
+      }
+      appendEvent(taskDir, 'PARKED', 'unpark-verb-refused', {
+        commentId: match.id,
+        verb: 'continue',
+        reason: state.reason,
+        why: elig.why,
+        ackExit,
+      });
+      continue;
+    }
+
     // abandon -- terminal, mark it directly on state.json (no HANDLERS involvement: this task
     // never re-enters runTask's loop) and ack on the issue, never re-enqueue. The state write
     // happens BEFORE anything else below, including the cleanup a few lines down: once
@@ -1535,4 +1726,8 @@ module.exports = {
   listTaskIds, // shared with orphan-scan.js -- same journal/<id>/ directory listing, one copy
   readJsonSafe, // shared with orphan-scan.js
   readJournalLines, // shared with state-machine.js's finalizePark -- countRepeatedParks' own input
+  RESUMABLE_PARK_REASONS, // card #212 C4 -- exported for test/unpark-continue.test.js's own membership-against-TERMINAL_PARK_REASONS check
+  continueEligibility,
+  buildContinueLine,
+  buildContinueRefusedAck,
 };

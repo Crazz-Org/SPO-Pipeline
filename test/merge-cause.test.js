@@ -6,7 +6,7 @@
 // Two halves, same convention as test/real-steps.test.js's own MERGE section:
 //   1. a plain unit table over `classifyMergeCause` -- no I/O, no ctx, no spawn.
 //   2. `realMerge` integration tests using the SAME injected-`deps.spawnSync` style
-//      test/real-steps.test.js:2646-2699 already uses -- copied here rather than reinvented, down
+//      test/real-steps.test.js:2722-2775 already uses -- copied here rather than reinvented, down
 //      to the `ok`/`fail`/`testConfig`/`testCtx`/`readJournal` helper bodies.
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live

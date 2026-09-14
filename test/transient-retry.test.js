@@ -610,6 +610,39 @@ test('reEnqueueTask: strips transientRetries and notBefore, restoring the full b
   assert.equal('notBefore' in requeued, false);
 });
 
+// Card #212 C4: reEnqueueTask strips `resume` off task.json for every caller, but a transient
+// auto-retry of a run that was ITSELF resumed must carry it forward (carriedResume): restarting at
+// INTAKE would close the PR the maintainer just fixed. prNumber comes from the run.
+test('finalizePark: a transient-retry re-enqueue of a resumed run carries resume forward, prNumber from the run', () => {
+  const config = testConfig();
+  const resume = { startState: 'CHECK', prNumber: 1, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
+  const ctx = buildParkCtx({ config, task: { resume } });
+  ctx.prNumber = 42;
+  fs.writeFileSync(path.join(ctx.taskDir, 'task.json'), JSON.stringify({ id: ctx.id, kind: 'card', issue: 1, resume }));
+
+  finalizePark(ctx, 'WORKTREE', 'claim-rate-limited', { exit: 4 });
+
+  const queued = queuedFiles(config.queueDir);
+  assert.equal(queued.length, 1);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.deepEqual(requeued.resume, { ...resume, prNumber: 42 });
+});
+
+test('finalizePark: a transient-retry re-enqueue of a run that was NOT resumed drops a stale task.json resume', () => {
+  const config = testConfig();
+  const ctx = buildParkCtx({ config });
+  fs.writeFileSync(
+    path.join(ctx.taskDir, 'task.json'),
+    JSON.stringify({ id: ctx.id, kind: 'card', issue: 1, resume: { startState: 'CHECK', prNumber: 1, worktreePath: '/x' } })
+  );
+
+  finalizePark(ctx, 'WORKTREE', 'claim-rate-limited', { exit: 4 });
+
+  const queued = queuedFiles(config.queueDir);
+  const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
+  assert.equal('resume' in requeued, false);
+});
+
 test('unparkScan: a maintainer "retry" reply on a task previously auto-retried strips transientRetries/notBefore', async () => {
   const journalRoot = mkTmp('spo-transient-unpark-journal-');
   const queueDir = mkTmp('spo-transient-unpark-queue-');

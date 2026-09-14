@@ -14,8 +14,8 @@
 //
 // This module owns what both callers share -- "fetch this issue's comments after this anchor,
 // from an authorized author, with a page bound and a backoff" (`scanForMatch`, below). What
-// still differs between the two -- which words count as a match (retry/abandon vs
-// confirm/discard), what anchor a caller already tracks, what happens on a match, and where a
+// still differs between the two -- which words count as a match (retry/abandon/continue, card
+// #212 C4, vs confirm/discard), what anchor a caller already tracks, what happens on a match, and where a
 // scan-level fact gets journalled (a task's own journal.jsonl for park-loop.js, daemon.jsonl for
 // report-intake.js, which has no task directory for a pending report) -- stays with the caller.
 // `scanForMatch`'s own `journal(event, detail)` callback and `events` map are exactly that seam.
