@@ -265,6 +265,109 @@ test('handleImplement (real mode): non-empty filesChanged but a CLEAN worktree r
   assert.ok(event && event.claimedFilesChanged === 2);
 });
 
+// A fake worktree whose HEAD is `before` until the claude call returns, `after` from then on --
+// the shape of an IMPLEMENT that committed (or did not commit) inside its own session.
+function headMovingSpawn({ before, after, porcelain, beforeExit = 0 }) {
+  let implemented = false;
+  const spawnSync = (command, args) => {
+    if (command === 'claude') {
+      implemented = true;
+      return ok(
+        claudeReply({
+          summary: 'fixed the flaky wall-clock test and committed it',
+          files_changed: ['src/e2e/bench/worker.test.ts'],
+          invariants: [{ id: 'INV-1', status: 'HELD' }],
+          tests_run: ['npm test'],
+          all_green: true,
+        })
+      );
+    }
+    if (args && args.includes('rev-parse') && args.includes('HEAD')) {
+      if (implemented) return ok(`${after}\n`);
+      return { ...ok(`${before}\n`), status: beforeExit };
+    }
+    if (args && args.includes('status') && args.includes('--porcelain')) return ok(porcelain);
+    return ok('');
+  };
+  return spawnSync;
+}
+
+// issue-593 / issue-598: IMPLEMENT committed its fix itself, so the tree was clean and the
+// porcelain-only guard sent a finished IMPLEMENT to DIAGNOSE until the card parked. Both runs were
+// post-gate retries -- HEAD was already past the base sha before IMPLEMENT started.
+test('handleImplement (real mode): a COMMITTED fix on a clean worktree (HEAD moved during the attempt) goes to CHECK', async () => {
+  const task = baseTask(593);
+  const taskDir = mkTmp('spo-implement-committed-');
+  const before = 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1';
+  const after = '9e87f89e00000000000000000000000000000000';
+  const ctx = realCardCtx(task, taskDir, headMovingSpawn({ before, after, porcelain: '' }));
+
+  const next = await HANDLERS.IMPLEMENT(ctx);
+
+  assert.equal(next, 'CHECK');
+  const journal = readJournal(taskDir);
+  assert.equal(journal.find((e) => e.event === 'no-worktree-change'), undefined);
+  const moved = journal.find((e) => e.event === 'worktree-moved-by-commit');
+  assert.ok(moved, 'expected a worktree-moved-by-commit journal event');
+  assert.equal(moved.headBefore, before);
+  assert.equal(moved.headAfter, after);
+});
+
+// Card #385's protection with HEAD readable on both sides: a claim of files_changed, a clean tree,
+// and the same HEAD before and after -- nothing was modified and nothing was committed.
+test('handleImplement (real mode): clean worktree AND an unchanged HEAD still routes to DIAGNOSE', async () => {
+  const task = baseTask(386);
+  const taskDir = mkTmp('spo-implement-headunchanged-');
+  const sha = 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1';
+  const ctx = realCardCtx(task, taskDir, headMovingSpawn({ before: sha, after: sha, porcelain: '' }));
+
+  const next = await HANDLERS.IMPLEMENT(ctx);
+
+  assert.equal(next, 'DIAGNOSE');
+  const journal = readJournal(taskDir);
+  const event = journal.find((e) => e.event === 'no-worktree-change');
+  assert.ok(event, 'expected a no-worktree-change journal event');
+  assert.equal(event.headBefore, sha);
+  assert.equal(event.headAfter, sha);
+  assert.equal(journal.find((e) => e.event === 'worktree-moved-by-commit'), undefined);
+});
+
+// A failing `git rev-parse HEAD` prints the literal `HEAD` on stdout. If that were read as a sha, an
+// unreadable-before / readable-after pair would compare unequal and wave an untouched tree through.
+test('handleImplement (real mode): an unreadable pre-attempt HEAD falls back to porcelain alone -- clean tree routes to DIAGNOSE', async () => {
+  const task = baseTask(387);
+  const taskDir = mkTmp('spo-implement-headunreadable-');
+  const ctx = realCardCtx(
+    task,
+    taskDir,
+    headMovingSpawn({ before: 'HEAD', after: '9e87f89e00000000000000000000000000000000', porcelain: '' })
+  );
+
+  const next = await HANDLERS.IMPLEMENT(ctx);
+
+  assert.equal(next, 'DIAGNOSE');
+  const event = readJournal(taskDir).find((e) => e.event === 'no-worktree-change');
+  assert.ok(event);
+  assert.equal(event.headBefore, null);
+});
+
+test('handleImplement (real mode): a pre-attempt rev-parse that EXITS non-zero is unreadable even when stdout looks like a sha', async () => {
+  const task = baseTask(388);
+  const taskDir = mkTmp('spo-implement-headexit-');
+  const ctx = realCardCtx(
+    task,
+    taskDir,
+    headMovingSpawn({
+      before: 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1',
+      beforeExit: 128,
+      after: '9e87f89e00000000000000000000000000000000',
+      porcelain: '',
+    })
+  );
+
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+});
+
 test('handleImplement (shadow mode): an explicit empty-filesChanged fixture is exempt -- shadow mode is not validated, still reaches CHECK', async () => {
   const taskDir = mkTmp('spo-implement-shadow-empty-');
   const task = {
