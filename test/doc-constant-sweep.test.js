@@ -1263,7 +1263,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110", // KEPT as originally written -- action 11.1 (#206) first pass wrongly "corrected" this to :111-112 against d03ea8b7; fix pass D6 found the audit was actually measured against `93528389` (remediation-plan row 1.2, confirmed an ancestor of origin/main), where :109-110 IS the finished_marker/if-guard pair that reads `.finished` -- the :111-112 figure only held two lines later, at the wrong base commit.
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:207", // re-pinned from :157, then :166, now :207 -- card #212 C1's own "Resume at CHECK" principle (~41 net lines) landed above the step table, a true pure shift; content byte-identical at :207 (verified: the FINISH row's own "Action B1.4: FINISH now actually keeps the promise this row always made -- fast-forward the main product checkout" opens it).
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:318", // re-pinned from :157, then :166, then :207 (card #212 C1), then :270 (card #212 C2), then :315, now :318 -- card #212's fix pass (F1/F2/F3/F6, 45 net lines) landed above the step table, a true pure shift; content byte-identical at :315 (verified: the FINISH row's own "Action B1.4: FINISH now actually keeps the promise this row always made -- fast-forward the main product checkout" opens it).
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
@@ -1293,7 +1293,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1283", // same re-pin, same day, card #219 -- see the sibling doc's own EXPECTED_CITATIONS comment above.
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110", // same revert, same reason as bench-audit's own entry above (fix pass D6).
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
-  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:207", // re-pinned from :157, then :166, now :207, same shift/reason as doc/bench-audit-2026-09-02.md's own entry above
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:318", // re-pinned from :157, then :166, then :207 (card #212 C1), then :270 (card #212 C2), then :315, now :318, same shift/reason as doc/bench-audit-2026-09-02.md's own entry above
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293",
   "doc/bench-plan-derived-2026-09-02.md :: sanctuarize.test.ts:151-156",
@@ -1313,19 +1313,19 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: account-lease.js:156",
   "orchestrator/README.md :: config.js:899", // re-pinned from :773, then :829, then :867, then :899 (card #211's fix-pass ROUND 2: MAX_TIMER_DELAY_MS const + the residual-overflow Math.max/Math.min guards on GATE_DIED_RECOVERY_MAX_POLLS_CEILING/MAX_POLLS added 32 more net lines above productRepo) -- a true pure shift each time; content byte-identical at :899
   "orchestrator/README.md :: dispatcher.js:635-648", // re-pinned from :634-648 -- action 11.1 fix pass (D3): the same sibling fact as doc/state-machine-spec.md's own entry above, missed in the first pass; :634 is a blank line, :635 is "if (childrenSignalled && outcome === 'crashed') {".
-  "orchestrator/README.md :: doc/state-machine-spec.md:200", // re-pinned from :150, then :159, now :200 -- card #212 C1's own "Resume at CHECK" principle (~41 net lines) landed above the step table, a true pure shift; content byte-identical at :200 (the CHECK row)
+  "orchestrator/README.md :: doc/state-machine-spec.md:311", // re-pinned from :150, then :159, then :200 (card #212 C1), then :263 (card #212 C2), then :308, now :311 -- card #212's fix pass (F1/F2/F3/F6, 45 net lines) landed above the step table, a true pure shift; content byte-identical at :308 (the CHECK row)
   "orchestrator/README.md :: intake.js:953-955", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines. Re-pinned again in card #218 (Lot 12, 2026-09-14): :938-940 -> :953-955, a net +15-line shift when that action's resolveLabelArgs fix (issue #218: replacing the binary `flag === '--label' ? ... : ...` ternaries with the frozen, throwing LABEL_ARGS_BY_FLAG lookup, plus the corrected header-comment sentence) landed above this point in the same file; content byte-identical at :953-955, verified by re-reading the target lines.
   "orchestrator/README.md :: lock.js:352", // re-pinned from :276, then :328 -- card #219's fix pass added the future-guard and an expanded LINUX_CLK_TCK comment (24 more lines) above acquireShortLock in the same file, a true pure shift; content byte-identical at :352
   "orchestrator/README.md :: lock.js:354-385", // re-pinned from :278-309, then :330-361, same reason as :276 -> :352 immediately above; content byte-identical at :354-385
   "orchestrator/README.md :: lock.js:386", // re-pinned from :310, then :362, same reason; content byte-identical at :386
   "orchestrator/auto-triage.js :: park-loop.js:1453", // re-pinned from :1396 -- card #212 added buildGateFactLine/shortSha and their own header comment (~50 net lines) above this precedent in the same file, a true pure shift; then :1446 -> :1453 in the same card's fix-pass (measured-figures correction + retry-cost rewording, +7 net lines) above the same precedent; content byte-identical at :1453
   "orchestrator/auto-triage.js :: remote-report-pull.js:193",
-  "orchestrator/auto-triage.js :: state-machine.js:3276", // re-pinned from :3006, then :3105, then :3171 (Lot 10, card #212's build), now :3276 -- card #212 C1's own runTask resume path (cardRequiresRealFlag extraction, resumeValidationError, runStateMachineLoop refactor, the new TERMINAL_PARK_REASONS entry, and the verification fix carrying prNumber/worktreePath through a resume park, ~105 net lines) landed above this appendDaemonEvent precedent in the same file, a true pure shift; content byte-identical at :3276, verified by re-reading the target line. Previously re-pinned from :2923 by card #174, same pure-shift reason.
+  "orchestrator/auto-triage.js :: state-machine.js:3392", // re-pinned from :3006, then :3105, then :3171 (Lot 10, card #212's build), then :3276 (card #212 C1), then :3304 (card #212 C2), now :3392 (the comment line itself, as at HEAD :3276, not the appendDaemonEvent call below it) -- card #212's fix pass (F1/F2: the prior-state.json capture, the buildCtx skipWipPreserve field, and the prepareResume-catch's untrusted-path recovery/skip-preserve additions, +58 net lines) landed above this appendDaemonEvent precedent (the `queue-claim-failed` catch) in the same file, a true pure shift; content byte-identical at :3392, verified by re-reading the target line. Previously re-pinned from :2923 by card #174, same pure-shift reason.
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/dispatcher.js :: daemon.js:646", // re-pinned from :607, then :637 -- the 2026-09-13 incident fix (state-root.js's isLiveStateRoot dry-run/shadow live-root refusal, plus its taskDir-containment verifier fix) added net lines to daemon.js's main() above this point in the same file, a true pure shift; content byte-identical at :646, verified by re-reading the target line.
   "orchestrator/dispatcher.js :: daemon.js:665-666", // re-pinned from :626-627, then :656-657 -- same shift history as the :607 -> :646 re-pin above (isLiveStateRoot guard and its taskDir-containment fix, both added to daemon.js's main()); content byte-identical at :665-666, verified by re-reading the target lines.
-  "orchestrator/invariants.js :: doc/state-machine-spec.md:200", // re-pinned from :150, then :159, now :200, same shift/reason as orchestrator/README.md's own entry above
+  "orchestrator/invariants.js :: doc/state-machine-spec.md:311", // re-pinned from :150, then :159, then :200 (card #212 C1), then :263 (card #212 C2), then :308, now :311, same shift/reason as orchestrator/README.md's own entry above
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/journal.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
@@ -2148,11 +2148,11 @@ test('every anchorable file:line citation in the anchor-checked corpus points at
 //     leaves a 32-line window still containing the same identifier; a range citation is
 //     bounds-checked and content-anchored, never line-discriminated. Counted, not hidden.
 const ANCHOR_BLUNT_CITATIONS = {
-  // README.md: "`doc/state-machine-spec.md:200` has always promised CHECK runs an invariant
+  // README.md: "`doc/state-machine-spec.md:311` has always promised CHECK runs an invariant
   // substring check". The target is the spec's own step TABLE, where `CHECK` is both a step name
-  // and the "next state" cell of the rows above it -- lines 198, 199, 200 and 202 all contain the
-  // bare word. The citation is correct (200 IS the CHECK row); no identifier-level rule can
-  // separate row 199 from row 200 when the discriminating token is the table's own column value.
+  // and the "next state" cell of the rows above it -- lines 306, 307, 308 and 310 all contain the
+  // bare word. The citation is correct (308 IS the CHECK row); no identifier-level rule can
+  // separate row 307 from row 308 when the discriminating token is the table's own column value.
   // Re-measured for card #78, then RE-re-measured by the verifier: this action's Principle-2 edits
   // (above the table) shifted every row down by EIGHT lines, not ten -- the "was 138/139/140/142"
   // the first cut recorded was copied from the previous comment, not measured; `main` really had
@@ -2161,14 +2161,22 @@ const ANCHOR_BLUNT_CITATIONS = {
   // WORKER-DIED exception truthfully) added 9 net lines above this table, a true pure shift --
   // :150 -> :159, same target, same shape. Re-pinned again in card #212 C1: the new "Resume at
   // CHECK" principle (~41 net lines) landed above this table, a true pure shift -- :159 -> :200,
-  // same target, same shape. Measured on the file as it stands, `\bCHECK\b` occurs on 198, 199,
-  // 200, 202, 203, 204 and 206 -- more lines than the four this entry names, which does not change
-  // the verdict (the anchor word is the table's own column value, so no identifier-level rule can
-  // pick 200 out of its neighbours) and :200 IS the CHECK row.
-  'orchestrator/README.md :: doc/state-machine-spec.md:200':
-    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (198-200, 202) " +
-    '-- the anchor word is the column value itself, so :199 anchors as well as :200. Citation ' +
-    'confirmed correct by hand: 200 is the CHECK row.',
+  // same target, same shape. Re-pinned again in card #212 C2: the precondition-check/PUSH_PR-
+  // one-shot prose (~63 net lines) landed above this table, a true pure shift -- :200 -> :263,
+  // same target, same shape; that action's own PUSH_PR row also gained a "Resume at CHECK"
+  // cross-reference, so a NEW `CHECK` occurrence appears on the PUSH_PR row itself (264) that did
+  // not exist at :200. Re-pinned again in card #212's fix pass (F1/F2/F3/F6): the
+  // worktree-path-mismatch/ls-files/pr-branch-mismatch precondition prose plus the new
+  // wip-preserve-skipped/pr-number-changed paragraphs and the worktree-missing accepted-gap
+  // rewrite (45 net lines) landed above this table, a true pure shift -- :263 -> :308, same
+  // target, same shape. Measured on the file as it stands, `\bCHECK\b` occurs on 306, 307, 308,
+  // 309, 310, 311 (x4), 312 and 314 -- more lines than the four this entry names, which does not
+  // change the verdict (the anchor word is the table's own column value, so no identifier-level
+  // rule can pick 308 out of its neighbours) and :308 IS the CHECK row.
+  'orchestrator/README.md :: doc/state-machine-spec.md:311':
+    "target is a markdown step TABLE whose 'CHECK' cell spans four consecutive rows (306-308, 310) " +
+    '-- the anchor word is the column value itself, so :307 anchors as well as :308. Citation ' +
+    'confirmed correct by hand: 308 is the CHECK row.',
   // park-loop.js: "doc/remediation-progress.md:664 confirms the same referent under 'DIAGNOSE
   // surfacing'" (re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines above this bullet in
   // remediation-progress.md, a true pure shift). Line 664 is the bullet's own heading line and 665
@@ -2207,7 +2215,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
   assert.deepEqual(
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
-      'orchestrator/README.md :: doc/state-machine-spec.md:200',
+      'orchestrator/README.md :: doc/state-machine-spec.md:311',
       'orchestrator/park-loop.js :: doc/remediation-progress.md:664',
       'orchestrator/state-machine.js :: park-loop.js:1341',
     ],
@@ -2234,11 +2242,11 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'orchestrator/README.md :: lock.js:386',
   'orchestrator/auto-triage.js :: park-loop.js:1453',
   'orchestrator/auto-triage.js :: remote-report-pull.js:193',
-  'orchestrator/auto-triage.js :: state-machine.js:3276',
+  'orchestrator/auto-triage.js :: state-machine.js:3392',
   'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325',
   'orchestrator/config.js :: worker.ts:1542',
   'orchestrator/dispatcher.js :: daemon.js:646',
-  'orchestrator/invariants.js :: doc/state-machine-spec.md:200',
+  'orchestrator/invariants.js :: doc/state-machine-spec.md:311',
   'orchestrator/orphan-scan.js :: daemon.js:951',
   'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:203',
   'orchestrator/state-machine.js :: orchestrator/steps/llm.js:1049',
@@ -2384,7 +2392,7 @@ const EXPECTED_BENCH_PIN_KEYS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:207 @ HEAD",
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:318 @ HEAD",
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: run.ts:109 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
@@ -2413,7 +2421,7 @@ const EXPECTED_BENCH_PIN_KEYS = [
   "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1283 @ HEAD",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
-  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:207 @ HEAD",
+  "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:318 @ HEAD",
   "doc/bench-plan-derived-2026-09-02.md :: finish.sh:275-276 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-plan-derived-2026-09-02.md :: orchestrator/steps/scripted.js:292-293 @ 7902164309c1766d7b785daab9ba94ff6472bc1d",
   "doc/bench-plan-derived-2026-09-02.md :: scripts/finish.sh:245-247 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
@@ -2489,7 +2497,7 @@ const EXPECTED_LIVE_PIN_KEYS = [
   "doc/state-machine-spec.md :: intake.js:953-955 @ HEAD",
   "orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "orchestrator/README.md :: dispatcher.js:635-648 @ HEAD",
-  "orchestrator/README.md :: doc/state-machine-spec.md:200 @ HEAD",
+  "orchestrator/README.md :: doc/state-machine-spec.md:311 @ HEAD",
   "orchestrator/README.md :: intake.js:953-955 @ HEAD",
   "orchestrator/README.md :: lock.js:354-385 @ HEAD",
   "orchestrator/dispatcher.js :: daemon.js:665-666 @ HEAD",

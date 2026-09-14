@@ -862,7 +862,7 @@ test('blankComments: an opener inside a `//` comment does not swallow the ParkSi
   //   - `.trimStart()` in the whole-line test: without it the INDENTED comment on line 3 is left
   //     alone, its opener reaches the block's closer on line 9, and call site 1 disappears.
   //     Indented comments carrying an opener are the repo's real shape -- orchestrator/
-  //     state-machine.js:224 and orchestrator/config.js:916 are two of them.
+  //     state-machine.js:225 and orchestrator/config.js:916 are two of them.
   //   - blanking to spaces rather than '': every line keeps its width, so the offsets this file
   //     turns into `file:line` still address the real source.
   //   - the block regex staying LAZY: greedy runs from line 7's opener to line 15's closer and
@@ -916,8 +916,8 @@ test('blankComments: an opener inside a `//` comment does not swallow the ParkSi
 
 test('blankComments: an UNCLOSED opener in a `//` comment, closed only by a later `//` comment -- the shape the repo carries today', () => {
   // The closed case above is the easy one. The occurrences actually present at HEAD are
-  // UNCLOSED openers sitting in prose -- orchestrator/state-machine.js:224 and :411 and
-  // orchestrator/steps/scripted.js:1905 -- dormant purely because those files contain no closer
+  // UNCLOSED openers sitting in prose -- orchestrator/state-machine.js:225 and :412 and
+  // orchestrator/steps/scripted.js:2132 -- dormant purely because those files contain no closer
   // below them. The danger is one future `*/` away, and this fixture is that future: the second
   // comment's `journal/*/` supplies a closer, and `journal/*/` is the family's worst case, being
   // an opener and a closer in the same four characters. The old block-first order joined the two
@@ -1008,13 +1008,13 @@ test('parkSignalSpans + blankComments: a reason only named in a comment is never
 });
 
 // Real-corpus guard for the same mutation: FINDING 2 also measured that blankComments matters on
-// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1597 has one genuine
+// the ACTUAL codebase, not merely a synthetic fixture -- state-machine.js:1598 has one genuine
 // commented-out `throw new ParkSignal('validate-unrecognized-verdict', ...)` inside a prose
 // comment (its own header, describing action 1.4's history), and blanking it away is what keeps
 // the reported call-site count from over-counting it as a live site. Pinned to the exact numbers
 // measured 2026-09-02 so a future change to state-machine.js's comment (or a regression in
 // blankComments) is caught by name, not just by a shrinking/growing floor.
-test('blankComments on the real corpus removes exactly the one known commented-out ParkSignal site (state-machine.js:1089)', () => {
+test('blankComments on the real corpus removes exactly the one known commented-out ParkSignal site (state-machine.js:1090)', () => {
   const rawSource = readSource(path.join('orchestrator', 'state-machine.js'));
   const blanked = blankComments(rawSource);
   const blankedCount = parkSignalSpans(blanked).length;

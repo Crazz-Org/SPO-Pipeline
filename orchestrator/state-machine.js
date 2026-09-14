@@ -58,6 +58,7 @@ const {
   realFinish,
   preserveWorktreeWip,
   prepareJudgeInputs,
+  prepareResume,
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
@@ -1879,6 +1880,16 @@ function buildCtx(id, task, taskDir, config) {
     owner: (config && config.owner) || null,
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
+    // Card #212 C2: true for exactly one realPushPr call on a resumed task -- set by runTask's
+    // resume path (below), read once and cleared at the top of realPushPr (steps/scripted.js).
+    // Always false here so an ordinary INTAKE-started task never has it.
+    resumePushPending: false,
+    // Fix pass (card #212, F2): true for exactly the resume-precondition parks `runTask`'s own
+    // `prepareResume` catch sets it for, next to the `finalizePark(ctx, 'CHECK', err.reason, ...)`
+    // call it guards -- read once, by `finalizePark` itself, to skip its own park-time
+    // `preserveWorktreeWip` housekeeping (see that call site's own comment for why). Always false
+    // here, so an ordinary INTAKE-started or crash-reparked task preserves exactly as before.
+    skipWipPreserve: false,
     // The state runTask's transition loop just came FROM, set fresh by that loop before every
     // handler call (null for the very first handler call of a run -- INTAKE ordinarily, CHECK on
     // a card #212 resume) -- action 1.3's prepareJudgeInputs reads it to tell "DIAGNOSE entered
@@ -2785,8 +2796,20 @@ function finalizePark(ctx, lastState, reason, detail) {
   // itself already handles. This is what would have saved card #385's 620 lines of stranded
   // IMPLEMENT work: a task orphaned mid-DIAGNOSE (orphan-scan.js) reparks through this exact
   // function, and its worktree is very likely still sitting there, uncommitted.
+  //
+  // Fix pass (card #212, F2): `ctx.skipWipPreserve` -- set only by `runTask`'s own
+  // `prepareResume` catch, right before it calls this function -- skips this housekeeping
+  // entirely. A resume-precondition park is a maintainer's worktree exactly as they left it, not
+  // a crash mid-edit; detaching and committing over it would strand the very state a
+  // `dirty-worktree`/`merge-in-progress` park exists to let them fix by hand and, for
+  // `dirty-worktree` specifically, leave `claude-pipe/<id>` detached so the NEXT `continue` parks
+  // `detached-or-wrong-branch` forever (see doc/state-machine-spec.md's "Resume at CHECK"
+  // section). Every other park -- including an ORDINARY, non-resume park on a dirty worktree --
+  // takes the branch below exactly as before this fix.
   let mergedDetail = detail;
-  if (isRealMode(ctx)) {
+  if (isRealMode(ctx) && ctx.skipWipPreserve) {
+    appendEvent(ctx.taskDir, lastState, 'wip-preserve-skipped', { reason: 'resume-precondition' });
+  } else if (isRealMode(ctx)) {
     const worktreePath = (ctx.task && ctx.task.worktreePath) || (detail && detail.worktreePath) || null;
     const preserved = preserveWorktreeWip(ctx, ctx.deps, { worktreePath, reason });
     if (preserved) mergedDetail = { ...detail, wip: preserved };
@@ -2927,6 +2950,16 @@ function resumeValidationError(resume) {
   return null;
 }
 
+// prepareResume's refusals that fire before it has confirmed the resume's PR is open on this
+// card's own branch -- see runTask's prepareResume catch.
+const PR_UNVERIFIED_RESUME_STEPS = new Set([
+  'worktree-path-mismatch',
+  'worktree-missing',
+  'pr-read-failed',
+  'pr-not-open',
+  'pr-branch-mismatch',
+]);
+
 // The dispatch loop every run of runTask actually executes, factored out so the ordinary INTAKE
 // start and the card #212 resume-at-CHECK start below share one implementation instead of two
 // copies that could silently drift -- hops/lock-check/handler-dispatch/DONE-write are identical
@@ -3004,6 +3037,12 @@ async function runTask(id, task, taskDir, config) {
 
   if (task && task.resume !== undefined && task.resume !== null) {
     const resume = task.resume;
+    // Fix pass (card #212, F1): read the state.json this resume attempt is ABOUT to overwrite
+    // exactly once, before anything below writes a new one -- both the invalid-resume branch
+    // right below and the untrusted-path recovery further down (in the prepareResume catch) need
+    // the value as it stood BEFORE this run touched it, and a second read after the first
+    // `writeState(taskDir, snapshot(ctx, 'CHECK'))` call would just read this run's own write back.
+    const prior = readJsonSafe(path.join(taskDir, 'state.json'));
     const badField = resumeValidationError(resume);
     if (badField) {
       // Parked BEFORE any writeState/handler runs -- an invalid resume must never fall back to
@@ -3013,7 +3052,6 @@ async function runTask(id, task, taskDir, config) {
       // prNumber/worktreePath are carried forward first: a descriptor that failed validation
       // cannot be trusted for them, and a null written over them would make a later `abandon`
       // (which closes the PR named in state.json) leak the PR.
-      const prior = readJsonSafe(path.join(taskDir, 'state.json'));
       ctx.task.worktreePath = (prior && prior.worktreePath) || null;
       ctx.prNumber = (prior && prior.prNumber) || null;
       finalizePark(ctx, 'CHECK', 'resume-precondition-failed', { step: 'invalid-resume', field: badField });
@@ -3029,13 +3067,37 @@ async function runTask(id, task, taskDir, config) {
     ctx.task.branch = `claude-pipe/${id}`;
     ctx.prNumber = resume.prNumber;
     ctx.cameFrom = null; // no previous state yet -- see buildCtx's own cameFrom comment
+    // Card #212 C2: set in BOTH modes, next to the rehydration above -- realPushPr (the only
+    // reader) never runs outside real mode, so this is inert in shadow/dry-run, but it belongs
+    // with the rest of what a resume rehydrates rather than behind its own real-mode branch.
+    ctx.resumePushPending = true;
 
     // The same guard INTAKE applies to every kind:"card" task in real mode, replicated here
     // because a resume skips INTAKE entirely -- see cardRequiresRealFlag's own header. After the
     // rehydration above, so this park's state.json keeps the PR and worktree a later `abandon`
     // or `continue` needs.
     if (cardRequiresRealFlag(ctx)) {
+      // Nothing about the worktree has been checked yet, so the park touches none of it (see F2
+      // below). Unreachable from daemon.js, which refuses real mode without --real at startup.
+      ctx.skipWipPreserve = true;
       finalizePark(ctx, 'CHECK', 'real-flag-required', { kind: ctx.task.kind });
+      return 'PARKED';
+    }
+
+    // Re-verification fix: the path check runs HERE, before this run's first state.json write and
+    // before `resumed-at-check`, not only inside prepareResume -- otherwise a foreign path would
+    // be recorded in state.json (where orphan-scan and `abandon` read it) for the window between
+    // that write and the refusal. prepareResume keeps its own identical check as defence in depth.
+    if (isRealMode(ctx) && resume.worktreePath !== path.join(config.pipelineWorktreesDir, id)) {
+      const expected = path.join(config.pipelineWorktreesDir, id);
+      ctx.task.worktreePath = prior && prior.worktreePath === expected ? expected : null;
+      ctx.prNumber = (prior && prior.prNumber) || null;
+      ctx.skipWipPreserve = true;
+      finalizePark(ctx, 'CHECK', 'resume-precondition-failed', {
+        step: 'worktree-path-mismatch',
+        expected,
+        actual: resume.worktreePath,
+      });
       return 'PARKED';
     }
 
@@ -3048,6 +3110,60 @@ async function runTask(id, task, taskDir, config) {
 
     const state = 'CHECK';
     writeState(taskDir, snapshot(ctx, state));
+
+    // Card #212 C2: real mode only -- a shadow/dry-run resume has no real worktree/branch/PR to
+    // have drifted since the park, so prepareResume's own git/gh spawns would have nothing
+    // genuine to check and nowhere real to run them. See steps/scripted.js's prepareResume for
+    // the full contract; every refusal there is `ParkSignal('resume-precondition-failed', ...)`,
+    // caught here exactly like every other handler's ParkSignal, so a resumed task that fails
+    // this safety net parks the same way an ordinary CHECK/GATE/CI_CHECKS park does.
+    if (isRealMode(ctx)) {
+      // The one path this run trusts enough to run a real git/gh command against, or to hand to
+      // `moveCard`/`abandon` as a worktree cwd -- this pipeline's own exclusive namespace for this
+      // task, the same expression `prepareResume` itself checks `worktreePath` against. Computed
+      // here, real-mode only: `config.pipelineWorktreesDir` is never set for a shadow/dry-run
+      // config (this branch never runs for one), so resolving it any earlier would throw on the
+      // very configs that have no business reaching this line.
+      const trustedWorktreePath = path.join(config.pipelineWorktreesDir, id);
+      try {
+        await callWithDeadline(ctx, 'CHECK', () => prepareResume(ctx, ctx.deps));
+      } catch (err) {
+        if (err instanceof ParkSignal) {
+          // Fix pass (F1): `ctx.task.worktreePath` at this point is still whatever the resume
+          // descriptor named (rehydrated above) -- trusted for every refusal PAST prepareResume's
+          // own path check (they can only fire once that check has already passed), but NOT for
+          // `worktree-path-mismatch` itself, the one refusal this check exists to catch. Recover
+          // to the LAST trusted path (`prior`, captured before this run's own first `state.json`
+          // write) so `finalizePark` below -- its own `preserveWorktreeWip` housekeeping,
+          // `moveCard`'s `board:move` cwd, and a later `abandon`'s `git worktree remove --force`
+          // -- never runs a single command against the foreign directory this refusal named.
+          if (ctx.task.worktreePath !== trustedWorktreePath) {
+            ctx.task.worktreePath =
+              prior && prior.worktreePath === trustedWorktreePath ? prior.worktreePath : null;
+          }
+          // Fix pass (F2): every refusal in this list is `prepareResume` declining to touch a
+          // worktree it found in a state it did not expect -- a maintainer's own dirty edit, an
+          // in-progress or already-resolved merge, a PR that moved out from under the card. None
+          // of that is the "task crashed mid-edit" shape `finalizePark`'s own park-time
+          // `preserveWorktreeWip` housekeeping exists for, and running it anyway would detach
+          // `claude-pipe/<id>` and commit over exactly the state the maintainer needs to act on
+          // (see doc/state-machine-spec.md's "Resume at CHECK" section for the `dirty-worktree`/
+          // `detached-or-wrong-branch` deadlock this closes).
+          // Re-verification fix: until prepareResume has read the PR and found it OPEN on
+          // `claude-pipe/<id>`, the descriptor's prNumber is unverified -- recording it would let a
+          // later `abandon` (`gh pr close <state.prNumber>`) close another card's PR. Keep the
+          // previous park's number for those refusals.
+          if (PR_UNVERIFIED_RESUME_STEPS.has(err.detail && err.detail.step)) {
+            ctx.prNumber = (prior && prior.prNumber) || null;
+          }
+          ctx.skipWipPreserve = true;
+          finalizePark(ctx, 'CHECK', err.reason, err.detail);
+          return 'PARKED';
+        }
+        throw err; // a real bug -- surface it, do not disguise it as a park
+      }
+    }
+
     return runStateMachineLoop(ctx, taskDir, config, state);
   }
 
