@@ -632,56 +632,95 @@ resolve test-file targets, which is the same "parse what the citation claims" me
 already registered as too large to attempt. The cheap mitigation is the one taken: the citations
 name a file, not a `file:line`, so only a rename or a move breaks them, not an ordinary edit.
 
-## 10 · Known limits of the `test/` comment-citation sweep (card #190, action 11.3, 2026-09-13)
+## 10 · Known limits of the `test/` comment-citation sweep (card #190; rewritten for the
+registry-free redesign, chantier "citation-pins migration" action 2, 2026-09-14)
 
 `test/test-comment-citation-sweep.test.js` guards `file:line` citations inside `test/*.js` and
-`test/fixtures/**/*.js` comments the same way `doc-constant-sweep.test.js` guards the `doc/`
-corpus: a pinned-anchor check (`test/citation-pins.js`'s `resolvePins`) that stores the exact cited
-text, not merely the line count. Three limits are accepted rather than fixed, matching this
-document's own posture of naming a gap honestly instead of quietly shipping a narrower check as if
-it were complete:
+`test/fixtures/**/*.js` comments. Card #190's original design (action 11.3) mirrored
+`doc-constant-sweep.test.js`'s pinned-anchor check exactly: a hand-maintained registry of 219
+exact-text pins plus 67 allowlist entries, each pin storing the literal cited text and a `claim`
+proven to sit within ±3 lines of the citation, with three separately hand-bumped exact counts. An
+Opus research review (2026-09-14, maintainer-approved) judged that machinery disproportionate for
+the lowest-stakes citation class in the repo — a stale `file:line` in a `test/` comment costs a
+reader about a minute of confusion, nothing like the safety-critical citations elsewhere — and
+replaced it with a **registry-free** design: no stored pin text, no `claim`, no hand-bumped counts.
 
-1. **Trailing inline comments are not scanned.** Extraction reuses `blankComments`, whose own
-   contract (`test/blank-comments-sync.test.js`) blanks whole-line `//` comments only — a `code();
-   // file.js:10` trailing comment is left as code and never reaches the extractor. Measured: 4 such
-   citations existed in the corpus before this action, one of which DID carry a real, uncorrected
-   drift (`test/gate-legs-reachability.test.js`'s `real: true, // handleIntake's own
-   real-flag-required gate (state-machine.js:194)` — stale by nine lines, fixed in this action's own
-   pass but only because a human happened to read it; the sweep itself cannot see a trailing
-   comment, live or stale). They remain invisible to this sweep exactly as they are invisible to
-   `doc-constant-sweep`'s own part 2.
-2. **A `/*` inside a string can blank a region.** `blankComments` finds `/* ... */` on the RAW
-   source after line-comments are stripped, with no notion of "inside a string literal" — the same
-   trap `doc-constant-sweep.test.js`'s own `blankComments` copy carries. This action found and fixed
-   FOUR live instances, not two:
-   - an `` `...orchestrator/**+bin/spo...` `` assertion message in `test/doc-constant-sweep.test.js`
-     (phantom-blanked lines 929–1234, 305 lines, measured against the pre-fix commit);
-   - a `.claude/hooks/*.sh` criterion string in `test/protected-files-guard.test.js`
-     (phantom-blanked lines 221–733, 512 lines) — first rephrased to a different filename (which
-     sidestepped the trap but silently changed what the regression fixture said), then corrected to
-     keep the ORIGINAL bytes via string concatenation (`'.claude/hooks/' + '*.sh'`), which carries
-     the same text with no literal `/*` adjacency;
-   - two TEST TITLES (not fixture strings quoting another file) that named this very trap in prose
-     — `` `the -f/--method sweep still catches a genuine violation even in the presence of a /*
-     inside a // comment` `` in `test/gh-api-argv.test.js` and its twin in
-     `test/park-reason-doc-sweep.test.js` — each blanking 7 lines of the test's OWN following body,
-     rephrased to "a slash-star inside a // comment" so nothing is blanked.
-   Re-measured after all four fixes: no span longer than 6 lines remains anywhere in `test/*.js`,
-   and the short ones left are deliberate FIXTURE STRINGS (not titles) in
-   `test/gh-api-argv.test.js`/`test/park-reason-doc-sweep.test.js` that exist specifically to test
-   this exact trap on a DIFFERENT target file, not on their own source.
-3. **Chains (`` `:N` `` with no path) are not guarded.** `extractCitations`'s chain resolution
-   (`CHAIN_RE`) still runs, but an `unanchored` chain — one that could not attach to a preceding
-   real citation within `PROXIMITY_CHARS` — is filtered out before the registry check, the same
-   posture `doc-constant-sweep.test.js` already takes for its own unanchored chains. Measured: 63
-   such chain occurrences in the `test/*.js` corpus at HEAD (re-measured 2026-09-14, fix pass 11.3
-   round 3 — the normalizeWrap integration this sweep gained in round 2 joins a few wrapped
-   citations that used to read as separate unanchored fragments), none independently checkable
-   without a citing file to resolve against.
+What ships is ONE check:
 
-None of the three widen a check to look complete while checking less — they are named exclusions
-of shapes the sweep structurally cannot see, the same discipline this document already applies to
-`doc-constant-sweep.test.js` itself.
+- **EXISTENCE** — does the cited file resolve (this repo, SPO-WebClient, or SPO-Deploy), and are
+  the line numbers in bounds? A bounds/resolution check only, the same shape as
+  `doc-constant-sweep.test.js`'s own part 2.
+
+It falls back to a 30-entry `CITATION_ALLOWLIST` (`{ category, reason }`, no `#<occurrence>`
+suffix) for citations that cannot resolve for a structural reason. This is a strictly WEAKER
+guarantee than the retired registry, and the limits below are the accepted cost of that trade,
+stated plainly rather than left implicit.
+
+1. **No exact-text verification at all, by design.** The retired registry compared the cited
+   line(s)' literal text byte-for-byte; this design never reads the cited text. Concretely: **a
+   citation whose line number drifts to any other in-bounds line is silently accepted.** A stale
+   `foo.js:100` that should now read `foo.js:117` passes, because line 117 exists. Only two shapes
+   of rot are caught: a citation into a file that was deleted, renamed, or moved, and a line number
+   that has run off the end of a file that shrank. The retired registry caught ordinary drift; this
+   design structurally cannot, and was not built to.
+2. **An ANCHOR check was built, measured, and deliberately NOT shipped.** The redesign's brief also
+   asked for a second, looser check: take the nearest identifier-shaped token in the prose before a
+   citation and require it to appear somewhere in the cited range. It was implemented and run
+   against the real corpus before any allowlist entry was written, and the measurement is the
+   reason it was cut rather than tuned:
+   - Taken literally (candidate filtered only by `CLAIM_STOPWORDS`) it produced 224 offenders out
+     of 286 citations. `test/*.js` comments are free-form narrative prose, so "the nearest word
+     before the citation" is overwhelmingly an ordinary English or capitalised-emphasis word
+     (`HEAD`, `SAME`, `README`), not an identifier.
+   - Adding a code-shape filter (candidate must contain an underscore, a camelCase transition, or a
+     letter/digit adjacency) cut that to 69 offenders, but raised `unanchorable` — no candidate at
+     all, so no verification performed — from 48 to 161 of the 247 citations that reached the check.
+     Roughly two thirds of the corpus would have passed on trust either way.
+   - Of the 86 citations it actually fired on, **69 failed and 17 passed**. All 69 were then read
+     by hand against the real target file: every one was a correct citation whose nearest
+     code-shaped token names the ENCLOSING function or declaration, mentioned once in the
+     surrounding sentence rather than repeated on the cited line. **Zero genuine drifts.** A gate
+     with a 69-to-0 false-positive-to-true-positive ratio does not find drift; it trains its readers
+     to allowlist, which is how a real drift would eventually be waved through.
+   - The price of shipping it was 60 hand-written allowlist entries on top of the 30 EXISTENCE
+     needs — 90 in total, larger than the 67-entry allowlist of the very registry this migration
+     exists to retire. That is the same maintenance tax relocated, not removed.
+   - The one principled narrowing available (fire only when the candidate appears elsewhere in the
+     cited file, so it is a plausible anchor rather than prose noise) was measured too: 69 firings
+     fall to 32, and all 32 remain false positives, for the same structural reason. Fixing it
+     properly needs a "declaration nearby" concept — precisely `doc-constant-sweep.test.js` part
+     2.5's tuned candidate-ranking machinery, deliberately out of scope for this corpus.
+
+   This entry is recorded as an accepted gap rather than a closed question: the anchor idea is a
+   reasonable one that this corpus defeats, and the numbers are here so it is not re-proposed from
+   scratch.
+3. **The 30 allowlist entries are structural, not judgement calls.** Each is a fabricated path
+   planted as a test fixture (`foo.js`, `alpha.js`, `beta.js`, `gamma.js`,
+   `relative/path/to/file.ts`), a product file that was deleted (`sanctuarize.test.ts`), a bare
+   basename this repo now has several of (four `README.md`, two `paths.ts` in the product repo), or
+   a dated quote of a value already out of bounds when written (`.claude/settings.json:109-127`
+   against a 120-line file). None can be fixed by editing the citing comment, and none needs
+   periodic re-reading. A duplicate-key test guards the list itself: a JS object literal silently
+   keeps only the last of two entries sharing a key, and the registry-free rewrite's first draft
+   shipped exactly that defect (91 entries written, 90 effective).
+4. **Trailing inline comments are not scanned**, unchanged from the retired design. Extraction
+   reuses `blankComments`, whose own contract (`test/blank-comments-sync.test.js`) blanks whole-line
+   `//` comments only — a `code(); // file.js:10` trailing comment is left as code and never reaches
+   the extractor. Invisible to this sweep exactly as it is invisible to `doc-constant-sweep`'s own
+   part 2.
+5. **A `/*` inside a string can blank a region**, unchanged from the retired design and guarded by
+   this sweep's own `PHANTOM_SPAN_TOLERANCE_LINES` test (action 11.3 found and fixed four live
+   instances of this trap; re-measured 2026-09-14, still none longer than the named tolerance).
+6. **Chains (`` `:N` `` with no path) are not guarded.** `extractCitations`'s chain resolution
+   (`CHAIN_RE`) still runs, but an `unanchored` chain — one that could not attach to a preceding real
+   citation within `PROXIMITY_CHARS` — is filtered out before the check, the same posture
+   `doc-constant-sweep.test.js` already takes for its own unanchored chains.
+
+None of the six widens a check to look complete while checking less — they are named exclusions and
+trade-offs, the same discipline this document already applies to `doc-constant-sweep.test.js`
+itself. The registry-free design is a deliberate, reviewed choice to accept a strictly weaker
+guarantee for this specific, lowest-stakes citation class in exchange for removing an ongoing,
+disproportionate maintenance tax — not an accident of implementation.
 
 ## 11 · Card #219 residual gaps (dispatcher-status drain bound), 2026-09-14
 

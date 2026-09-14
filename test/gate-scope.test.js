@@ -32,7 +32,7 @@ const EXPECTED_CROSS_REPO = {
   'heartbeat-contract-pin.test.js':
     "HEARTBEAT_STALE_MS is pinned to SPO-WebClient/src/e2e/bench/paths.ts's literal",
   'test-comment-citation-sweep.test.js':
-    "resolves test/ comment citations (including SPO-WebClient/SPO-Deploy-rooted ones) through citation-pins.js's resolvePins, same as doc-constant-sweep.test.js (#190, action 11.3)",
+    "resolves test/ comment citations (including SPO-WebClient/SPO-Deploy-rooted ones) through citation-pins.js's resolveCitationTarget, same as doc-constant-sweep.test.js (#190; registry-free redesign, 2026-09-14)",
 };
 
 // A test file may MENTION the sibling-repo env vars and still be gate-safe, because it tolerates
@@ -52,10 +52,26 @@ const MENTIONS_BUT_TOLERATES_ABSENCE = {
     'names both env vars only inside an assertion-failure message string listing what a naive env spread would leak, ' +
     'never resolves either repo (measured 2026-09-06: `SPO_PRODUCT_REPO=/nonexistent/no-such-repo ' +
     'SPO_DEPLOY_REPO=/nonexistent/no-such-repo node --test test/spawn-isolation-sweep.test.js` -- 11 pass, 0 fail)',
+  'citation-pins-resolve-anchor.test.js':
+    "only requires citation-pins.js for resolveAnchor, a pure text-search function over synthetic in-memory `lines` " +
+    'arrays -- never calls resolveCitationTarget/resolvePins, never resolves a real repo on disk (measured ' +
+    '2026-09-14: `SPO_PRODUCT_REPO=/nonexistent/no-such-repo SPO_DEPLOY_REPO=/nonexistent/no-such-repo ' +
+    'node --test test/citation-pins-resolve-anchor.test.js` -- 10 pass, 0 fail)',
 };
 
 function readGateSh() {
   return fs.readFileSync(GATE_SH, 'utf8');
+}
+
+// reachesSibling(src) -- ONE predicate for "does this test file's source reach a sibling repo",
+// shared by both the classification scan below and MENTIONS_BUT_TOLERATES_ABSENCE's own
+// still-needed check, so the two can never quietly disagree about what counts (they did once: the
+// classification scan already covered `require('./citation-pins')` as an indirect reach -- action
+// 11.3's own widening, #190 -- but the still-needed check kept testing only the literal env-var
+// names, so a file classified for the INDIRECT reason could never satisfy it and was stuck
+// permanently red the moment it was added).
+function reachesSibling(src) {
+  return /SPO_PRODUCT_REPO|SPO_DEPLOY_REPO/.test(src) || /require\(.\.\/citation-pins.\)/.test(src);
 }
 
 // Parses gate.sh's CROSS_REPO_FILES=( ... ) array -- the ONE place the exclusion is written.
@@ -107,8 +123,7 @@ test('no OTHER test file reaches for a sibling repo without being classified', (
   const offenders = [];
   for (const base of fs.readdirSync(path.join(REPO_ROOT, 'test')).filter((f) => f.endsWith('.test.js'))) {
     const src = fs.readFileSync(path.join(REPO_ROOT, 'test', base), 'utf8');
-    const reachesSibling = /SPO_PRODUCT_REPO|SPO_DEPLOY_REPO/.test(src) || /require\(.\.\/citation-pins.\)/.test(src);
-    if (!reachesSibling) continue;
+    if (!reachesSibling(src)) continue;
     if (Object.prototype.hasOwnProperty.call(EXPECTED_CROSS_REPO, base)) continue;
     if (Object.prototype.hasOwnProperty.call(MENTIONS_BUT_TOLERATES_ABSENCE, base)) continue;
     offenders.push(base);
@@ -129,10 +144,9 @@ test('MENTIONS_BUT_TOLERATES_ABSENCE holds exactly what was measured -- it canno
   for (const base of Object.keys(MENTIONS_BUT_TOLERATES_ABSENCE)) {
     const p = path.join(REPO_ROOT, 'test', base);
     assert.ok(fs.existsSync(p), `${base} is on MENTIONS_BUT_TOLERATES_ABSENCE but no longer exists -- drop the entry`);
-    assert.match(
-      fs.readFileSync(p, 'utf8'),
-      /SPO_PRODUCT_REPO|SPO_DEPLOY_REPO/,
-      `${base} no longer names a sibling repo -- it needs no exemption, drop the entry`
+    assert.ok(
+      reachesSibling(fs.readFileSync(p, 'utf8')),
+      `${base} no longer reaches a sibling repo (directly or through citation-pins.js) -- it needs no exemption, drop the entry`
     );
   }
 });
