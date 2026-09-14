@@ -1089,7 +1089,22 @@ function resolveStepContract(stepName, task = {}) {
   const effortEscalated = shouldEscalateEffort(stepDef, task);
   const effort = effortEscalated ? stepDef.escalatedEffort : baseEffort;
 
-  const schemaProperties = jsonSchemaPropertiesFor(stepDef.outputContract.types);
+  const typedProperties = jsonSchemaPropertiesFor(stepDef.outputContract.types);
+  // Every required/optional key must be declared, typed or not ({} = any value). The prompt's
+  // header, the only other place the output shape is written, is stripped before sending, so this
+  // schema is the model's sole description of its StructuredOutput tool: a key missing from
+  // `properties` is a parameter the model does not know exists. Measured 2026-09-13: with only
+  // `summary` declared, Sonnet IMPLEMENT sent `{summary}` alone until
+  // structured_output_retry_exhausted on 7 of 10 calls; declaring all five took rejections to 0/3.
+  const schemaProperties =
+    typedProperties === undefined
+      ? undefined
+      : Object.fromEntries(
+          [...stepDef.outputContract.required, ...(stepDef.outputContract.optional || [])].map((key) => [
+            key,
+            typedProperties[key] || {},
+          ])
+        );
 
   return {
     step: stepName,
