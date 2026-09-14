@@ -33,10 +33,20 @@ const { mkTmp, runSpo } = require('./helpers');
 const { computeDispatcherStatus } = require('../console/dispatcher-status');
 const { collectAll, collectServices, applyWorkerStats, readDaemonEventsTail } = require('../console/collect');
 const { renderServicesInner, renderReportsInner } = require('../console/render');
+const { processStartUptimeMs } = require('../orchestrator/lock');
 
 // Fixed clock for every unit test below -- never Date.now(), so every assertion is an exact,
 // reproducible number rather than a moving target.
 const NOW = Date.parse('2026-09-11T00:00:00.000Z');
+
+// waitMsSync(ms) -- a real, synchronous, blocking delay: some production-reach tests below need a
+// GUARANTEED minimum amount of real wall-clock time to have passed on the uptime clock before they
+// check anything, and "however long this test file's own prior tests happened to take" is not a
+// guarantee. Atomics.wait on a throwaway SharedArrayBuffer blocks the calling thread for exactly
+// `ms`, synchronously, with no subprocess and no dependency on the event loop.
+function waitMsSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 function writeDaemonEvents(journalRoot, events) {
   fs.mkdirSync(journalRoot, { recursive: true });
@@ -571,33 +581,30 @@ test('card #208: an event carrying hostUptimeAtMs but no hostUptimeNowMs injecte
 test('production: real os.uptime() reaches both callers -- an ANCIENT wall ts with a RECENT hostUptimeAtMs reads DRAINING, never the false STOPPED the wall clock alone would produce', () => {
   const journalRoot = mkTmp('spo-208-uptime-j-');
   const queueDir = mkTmp('spo-208-uptime-q-');
-  const hostUptimeNowMs = os.uptime() * 1000;
+  // process.pid, with hostUptimeAtMs built from its OWN measured real starttime -- not pid 1 with
+  // an offset from "now" (a fixture bug found investigating CI run 34807448013, PR #233: pid 1's
+  // own real starttime has no relationship to an arbitrary offset, and can read LATER than it on
+  // an ephemeral runner, tripping card #219's pid-reuse check independently of what this test
+  // actually means to exercise -- see the #219 F-production test further below for the full
+  // account). `measuredStart` is always comfortably inside the 3660000ms bound below by the time
+  // the `spo status` subprocess reads its own fresh os.uptime() a moment later.
+  const measuredStart = processStartUptimeMs(process.pid);
+  assert.ok(Number.isFinite(measuredStart), 'processStartUptimeMs(process.pid) must resolve on Linux for this test to mean anything');
   writeDaemonEvents(journalRoot, [
-    // pid 1 (init/systemd), not `process.pid` -- card #219's pid-reuse check reads this
-    // pid's REAL `/proc/<pid>/stat` starttime in production and would otherwise misfire: this
-    // TEST process's own actual starttime is "whenever this suite began", which can postdate a
-    // `hostUptimeAtMs` of only a few seconds ago in a fast run, reading as a false reuse. pid 1 has
-    // been alive since boot (`pidExists(1)` reads the EPERM-as-alive path -- see
-    // dispatcher-status-deck.test.js's own use of the same trick), so its real starttime is always
-    // safely before any `hostUptimeAtMs` this test constructs.
-    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: 1, workers: 1 },
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
     {
       // Ancient WALL ts -- past even this generous bound. If the reader fell back to wall clock
       // here (instead of preferring `hostUptimeAtMs`) it would misread this as STOPPED -- exactly the
       // false-STOPPED bug this card fixes.
       ts: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
       event: 'dispatcher-drain-start',
-      pid: 1,
+      pid: process.pid,
       signal: 'SIGTERM',
       inFlight: ['a'],
       reason: 'drain-requested',
       timeoutMs: 3600000, // 1h
       killGraceMs: 60000, // 1min -- bound = 3660000ms
-      // Recent UPTIME reading -- a few seconds "old" in uptime terms, comfortably inside the bound
-      // above. Read from the real os.uptime() at test-write time; the `spo status` subprocess
-      // below reads its own fresh os.uptime() a moment later, so this margin must survive normal
-      // process-spawn latency.
-      hostUptimeAtMs: hostUptimeNowMs - 5000,
+      hostUptimeAtMs: measuredStart,
     },
   ]);
 
@@ -1165,33 +1172,49 @@ test('#219 F-production: a LIVE pid (this test process) whose real processStartU
 test('#219 F-production: real monotonicNowMs reaches both callers -- an hostUptimeAtMs PAST its bound but a FRESH monotonicAtMs reads DRAINING (the suspend case), never the false STOPPED the uptime reading alone would produce', () => {
   const journalRoot = mkTmp('spo-219-monotonic-j-');
   const queueDir = mkTmp('spo-219-monotonic-q-');
+  // Fixture note (CI run 34807448013, PR #233): this fixture used to pair `pid: 1` with an
+  // arbitrary `hostUptimeAtMs` offset from "now" -- pid 1's own real starttime has no relationship
+  // to that offset, and on an ephemeral CI runner it can read LATER than it, tripping card #219's
+  // pid-reuse check independently of the monotonic-vs-uptime logic this test means to exercise.
+  // Fixed by building `hostUptimeAtMs` from THIS process's own MEASURED real starttime instead.
+  //
+  // Neither the `spo status` subprocess below nor `collectAll` takes an injected uptime, so this
+  // test (unlike pin (c) below) cannot substitute a real wait with an injected `hostUptimeNowMs` --
+  // it has to make the uptime clock actually advance. `waitMsSync` guarantees that advance
+  // deterministically, independent of subprocess-spawn cost or how long this file's prior tests
+  // took; `timeoutMs` below is sized as the MONOTONIC side's own cost budget instead (the real work
+  // this test still has to do afterward -- spawning `spo status`, running `collectAll` -- which
+  // must finish well inside it for the monotonic path to still read draining).
+  const measuredStart = processStartUptimeMs(process.pid);
+  assert.ok(Number.isFinite(measuredStart), 'processStartUptimeMs(process.pid) must resolve on Linux for this test to mean anything');
+  waitMsSync(4000); // guarantees >= 4000ms of real uptime-clock elapsed since measuredStart
   const hostUptimeNowMs = os.uptime() * 1000;
   const monotonicNow = Number(process.hrtime.bigint() / 1000000n);
   writeDaemonEvents(journalRoot, [
-    // pid 1, not `process.pid` -- same reason as the "production: real os.uptime()" test above:
-    // `hostUptimeAtMs` here is deliberately 60s in the past (simulating a suspend), and this TEST
-    // process has not necessarily been alive that long, which would make card #219's real
-    // pid-reuse probe misfire before the monotonic path even gets evaluated. pid 1 has been alive
-    // since boot.
-    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: 1, workers: 1 },
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
     {
       ts: new Date(Date.now() - 100).toISOString(),
       event: 'dispatcher-drain-start',
-      pid: 1,
+      pid: process.pid,
       signal: 'SIGTERM',
       inFlight: ['a'],
       reason: 'drain-requested',
-      // Fix pass (flake risk): a 2000ms bound left almost no margin between "monotonic age must
-      // read comfortably inside the bound" and the real wall-clock cost of THIS test's own
-      // `runSpo` subprocess spawn plus `collectAll` -- both real, both variable under load
-      // (CLAUDE.md's own "the machine is loaded" note). 30000ms gives that real work ample
-      // headroom while staying well short of the 60s uptime age below, so the "uptime path alone
-      // would have misread this as stopped" framing still holds.
-      timeoutMs: 30000,
-      killGraceMs: 0, // bound = 30000ms
-      // Uptime age: 60s -- PAST the bound (simulating a suspend: boottime kept advancing).
-      hostUptimeAtMs: hostUptimeNowMs - 60000,
-      // Monotonic age: ~0 -- fresh, well INSIDE the bound (the wait itself did not advance).
+      // timeoutMs is the MONOTONIC-COST BUDGET: how long ONE real check below (`spo status`, or
+      // `collectAll` after the refresh) may take and still read draining. Verification measured the
+      // monotonic side at 170-440ms under the full loaded local suite; 2000ms leaves headroom for a
+      // slower 2-core CI runner. The uptime side only has to EXCEED this bound: waitMsSync(4000)
+      // above guarantees that, independent of load. The two numbers are separate on purpose --
+      // the wait is the uptime guarantee, this bound is the monotonic budget.
+      timeoutMs: 2000,
+      killGraceMs: 0,
+      // Uptime age: >=4000ms, PAST the bound -- what the uptime-only path alone would read as
+      // stopped. Built from this process's OWN real start, so it can never trip the pid-reuse
+      // check for this pid.
+      hostUptimeAtMs: measuredStart,
+      // Monotonic age: ~0 -- fresh, well INSIDE the bound. `waitMsSync` above blocks real time on
+      // BOTH clocks equally (it is a real pause, not a simulated suspend), so capturing
+      // `monotonicNow` AFTER the wait -- not before it -- is what keeps this side honestly
+      // near-zero-elapsed, matching "the drain-start write happened just now".
       monotonicAtMs: monotonicNow,
     },
   ]);
@@ -1200,8 +1223,33 @@ test('#219 F-production: real monotonicNowMs reaches both callers -- an hostUpti
   assert.match(out, /dispatcher: DRAINING/, `expected DRAINING -- the real monotonic reading must win over the stale uptime one: ${out}`);
   assert.doesNotMatch(out, /dispatcher: STOPPED/, `bin/spo's cmdStatus must inject a real monotonicNowMs: ${out}`);
 
+  // Refresh `monotonicAtMs` before the SECOND real check below: the `runSpo` subprocess above
+  // already spent part of the 2000ms monotonic-cost budget, and re-using the same event unchanged
+  // would make `collectAll`'s own check spend against whatever budget `runSpo` left rather than
+  // its own fresh one. `hostUptimeAtMs` is left as `measuredStart` -- more real time only widens
+  // its own gap past the bound, which never hurts the "uptime path alone would say stopped" side.
+  writeDaemonEvents(journalRoot, [
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
+    {
+      ts: new Date(Date.now() - 100).toISOString(),
+      event: 'dispatcher-drain-start',
+      pid: process.pid,
+      signal: 'SIGTERM',
+      inFlight: ['a'],
+      reason: 'drain-requested',
+      timeoutMs: 2000,
+      killGraceMs: 0,
+      hostUptimeAtMs: measuredStart,
+      monotonicAtMs: Number(process.hrtime.bigint() / 1000000n),
+    },
+  ]);
+
   const data = collectAll({ journalRoot, queueDir, spoReportsDir: mkTmp('spo-219-monotonic-reports-') });
-  assert.equal(data.services.workers.status, 'draining');
+  assert.equal(
+    data.services.workers.status,
+    'draining',
+    `expected draining, full dispatcher status: ${JSON.stringify(data.services.workers.dispatcher)}`
+  );
 });
 
 test("#219 F-production: console/collect.js's applyWorkerStats DEFAULT fallbacks (no processStartUptimeMs/monotonicNowMs arguments at all) still reach the real production probes", () => {
@@ -1300,25 +1348,36 @@ test('#219 pin (b): the reboot check fires BEFORE the monotonic path is even con
 
 test("#219 pin (c): applyWorkerStats' own monotonicNowMsAtRead DEFAULT (argument omitted entirely) still reaches the PREFERRED-MONOTONIC path, not just the hostUptimeNowMs default", () => {
   const journalRoot = mkTmp('spo-219-pin-c-j-');
-  const hostUptimeNowMs = os.uptime() * 1000;
+  // Fixture note: see the F-production test above for the CI-fixture story (a `pid: 1` /
+  // arbitrary-`hostUptimeAtMs` pairing). Unlike that test, `applyWorkerStats` takes
+  // `hostUptimeNowMs` as its own 6th argument -- this test only needs the 7th
+  // (`monotonicNowMsAtRead`) to be omitted, so `hostUptimeNowMs` can be INJECTED directly instead
+  // of waited-for, and no real delay is needed at all.
+  const measuredStart = processStartUptimeMs(process.pid);
+  assert.ok(Number.isFinite(measuredStart), 'processStartUptimeMs(process.pid) must resolve on Linux for this test to mean anything');
+  const hostUptimeNowMs = measuredStart + 60000; // injected "now" -- 60000ms after this pid's own real start
   const monotonicNow = Number(process.hrtime.bigint() / 1000000n);
   writeDaemonEvents(journalRoot, [
-    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: 1, workers: 1 },
+    { ts: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), event: 'dispatcher-start', pid: process.pid, workers: 1 },
     {
       ts: new Date(Date.now() - 100).toISOString(),
       event: 'dispatcher-drain-start',
-      pid: 1, // long-lived (since boot) -- see the pid-1 note on the "production: real os.uptime()" test above
+      pid: process.pid,
       signal: 'SIGTERM',
       inFlight: ['a'],
       reason: 'drain-requested',
-      timeoutMs: 1000,
-      killGraceMs: 1000, // bound = 2000ms
-      // Uptime age: 60s -- PAST the bound (what the uptime-only path alone would read as stopped).
-      hostUptimeAtMs: hostUptimeNowMs - 60000,
-      // Monotonic age: ~0 -- fresh, well INSIDE the bound. If applyWorkerStats's own default for
-      // its 7th parameter (monotonicNowMsAtRead) is anything other than a live monotonicNowMs()
-      // reading -- undefined, stale, or simply never reaching computeDispatcherStatus -- this
-      // reads 'stopped' off the uptime path instead of 'draining' off the monotonic one.
+      // bound = 30000ms: comfortably under the 60000ms uptime-elapsed built into the injected
+      // hostUptimeNowMs above (what the uptime-only path alone would read as stopped),
+      // comfortably over the monotonic side's own real cost (a few synchronous fs calls -- no
+      // subprocess, no wait).
+      timeoutMs: 30000,
+      killGraceMs: 0,
+      // This pid's OWN real start -- can never trip the pid-reuse check for this pid.
+      hostUptimeAtMs: measuredStart,
+      // Monotonic age: ~0 -- fresh. If applyWorkerStats's own default for its 7th parameter
+      // (monotonicNowMsAtRead) is anything other than a live monotonicNowMs() reading --
+      // undefined, stale, or simply never reaching computeDispatcherStatus -- this reads
+      // 'stopped' off the injected uptime path instead of 'draining' off the monotonic one.
       monotonicAtMs: monotonicNow,
     },
   ]);
@@ -1330,7 +1389,7 @@ test("#219 pin (c): applyWorkerStats' own monotonicNowMsAtRead DEFAULT (argument
   assert.equal(
     services.workers.status,
     'draining',
-    "applyWorkerStats's default monotonicNowMsAtRead must be a live monotonicNowMs() reading reaching the PREFERRED-MONOTONIC path, not undefined"
+    `applyWorkerStats's default monotonicNowMsAtRead must be a live monotonicNowMs() reading reaching the PREFERRED-MONOTONIC path, not undefined -- full dispatcher status: ${JSON.stringify(services.workers.dispatcher)}`
   );
 });
 
@@ -1341,3 +1400,107 @@ test("#219 pin (c): applyWorkerStats' own monotonicNowMsAtRead DEFAULT (argument
 // for every actual call site; the distinction only matters for a synthetic test `isAlive` that
 // returns some other truthy value, which is why the unit tests above use `() => true` throughout
 // rather than pinning this specific operator.
+
+// ---- a persistent BOOTTIME-MONOTONIC gap must never leak into an ABSOLUTE comparison -----------
+//
+// computeDispatcherStatus's plausibility check and both its monotonic and uptime bounds compare
+// same-clock DELTAS only (`monotonicNowMs - ev.monotonicAtMs` vs `hostUptimeNowMs -
+// ev.hostUptimeAtMs`), never one clock's absolute reading against the other's. This section pins
+// that invariant directly, with pure unit tests against computeDispatcherStatus: no filesystem
+// I/O, no subprocess, no real clock read, so nothing about the host or its load can ever make
+// these flake. A regression that starts comparing an ABSOLUTE monotonic reading against an
+// ABSOLUTE uptime reading (instead of each against its own prior reading) would fail these on ANY
+// host, deterministically, whether or not that host has ever suspended -- proven here by injecting
+// a huge, arbitrary, FIXED gap between the two clocks' absolute values (as a real host with a
+// historical suspend/checkpoint would have) and checking a normal drain, a genuinely-exceeded
+// bound, and an independent mid-drain suspend all still read correctly despite it.
+//
+// (These were added investigating CI run 34807448013, PR #233 -- the eventual root cause of that
+// failure was unrelated to this invariant: see the F-production/pin (c) tests above for it.)
+
+const HUGE_CONSTANT_GAP_MS = 3 * 24 * 60 * 60 * 1000; // +3 days -- an arbitrary, large, FIXED gap
+
+test('#219 CI-investigation pin: a huge CONSTANT gap between the two clocks\' absolute values does not affect a NORMAL (non-suspended) drain -- only the deltas are ever compared', () => {
+  // Simulates a host whose os.uptime() has read a persistent +3 days ahead of process.hrtime.bigint()
+  // for its entire life (e.g. a VM resumed once, long ago, from a snapshot/checkpoint) -- both
+  // absolute values are enormous relative to any drain's own timeoutMs, but the drain itself
+  // progresses normally: uptime elapsed and monotonic elapsed both real-track together (no NEW
+  // suspend during THIS wait), so they must read equal ELAPSED values despite the absolute gap.
+  const hugeUptimeBase = 10_000_000_000; // an arbitrary, large absolute uptime reading
+  const hugeMonotonicBase = hugeUptimeBase - HUGE_CONSTANT_GAP_MS; // same host, persistent gap
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: hugeUptimeBase - 500, // 500ms uptime-elapsed since write
+    monotonicAtMs: hugeMonotonicBase - 500, // ALSO 500ms monotonic-elapsed -- consistent per-clock
+    timeoutMs: 1000,
+    killGraceMs: 1000, // bound = 2000ms
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: hugeUptimeBase, // "now" on the uptime clock -- also huge, same persistent gap
+    monotonicNowMs: hugeMonotonicBase, // "now" on the monotonic clock -- same persistent gap
+  });
+  // 500ms elapsed on both clocks, well under the 2000ms bound -- draining, decided by the
+  // monotonic path (it is plausible: 500 <= 500 + tolerance), regardless of the 3-day absolute gap.
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
+
+test('#219 CI-investigation pin: a huge CONSTANT gap PLUS a bound genuinely exceeded on BOTH clocks still reads stopped/boundClock:monotonic -- the gap never masks a real timeout', () => {
+  const hugeUptimeBase = 10_000_000_000;
+  const hugeMonotonicBase = hugeUptimeBase - HUGE_CONSTANT_GAP_MS;
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    hostUptimeAtMs: hugeUptimeBase - 5000, // 5000ms elapsed on both clocks -- past the 2000ms bound
+    monotonicAtMs: hugeMonotonicBase - 5000,
+    timeoutMs: 1000,
+    killGraceMs: 1000,
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: hugeUptimeBase,
+    monotonicNowMs: hugeMonotonicBase,
+  });
+  assert.deepStrictEqual(result, { status: 'stopped', event: ev, diedDraining: true, boundClock: 'monotonic' });
+});
+
+test('#219 CI-investigation pin: a huge constant gap PLUS a genuine suspend growing mid-drain (uptime elapsed far exceeds monotonic elapsed) still reads draining via monotonic -- the persistent gap and the NEW suspend are independent', () => {
+  const hugeUptimeBase = 10_000_000_000;
+  const hugeMonotonicBase = hugeUptimeBase - HUGE_CONSTANT_GAP_MS;
+  const ev = {
+    event: 'dispatcher-drain-start',
+    pid: 111,
+    ts: new Date(NOW - 100).toISOString(),
+    // At write time, both clocks were 0ms old (fresh write) relative to their OWN absolute base.
+    hostUptimeAtMs: hugeUptimeBase,
+    monotonicAtMs: hugeMonotonicBase,
+    timeoutMs: 1000,
+    killGraceMs: 1000, // bound = 2000ms
+    signal: 'SIGTERM',
+    inFlight: ['a'],
+  };
+  // NOW: a genuine 10-minute suspend has occurred since the write (uptime/BOOTTIME counts it,
+  // monotonic does not) -- on TOP of the pre-existing 3-day persistent gap between the two clocks'
+  // own absolute origins. The two effects must not interact: the persistent gap is already priced
+  // into both bases above; only the NEW suspend should move the deltas apart.
+  const suspendMs = 10 * 60 * 1000;
+  const result = computeDispatcherStatus([ev], {
+    isAlive: () => true,
+    now: NOW,
+    hostUptimeNowMs: hugeUptimeBase + suspendMs, // boottime advanced through the suspend
+    monotonicNowMs: hugeMonotonicBase + 100, // monotonic barely advanced -- the wait itself, not the suspend
+  });
+  // Uptime path alone would read this as 10 minutes old, past the 2000ms bound -- STOPPED. The
+  // monotonic path, unaffected by either the persistent gap or the suspend it doesn't count,
+  // correctly reads 100ms elapsed -- draining.
+  assert.deepStrictEqual(result, { status: 'draining', event: ev });
+});
