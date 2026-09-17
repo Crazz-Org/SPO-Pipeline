@@ -521,6 +521,60 @@ test('invokeClaudeReal: no `claude` resolved on PATH returns a clean step failur
   assert.equal(calls.length, 0);
 });
 
+// ---- invokeClaudeReal: the no-real-spawn killswitch (this function's OWN check, first thing it
+// does) -----------------------------------------------------------------------------------------
+// F1 (fix pass, this action). sdk-call.js's spawnClaudeCodeProcess carries a SECOND copy of this
+// same isEnabled() check (the "defense-in-depth half" -- see that file's own header on "Both, not
+// either") and IS covered elsewhere. THIS function's own check at its very top -- the "fast, clean
+// shape half", read before anything else touches the account/oauth-token file or resolves `claude`
+// on PATH -- had no test of its own at all: mutating `if (isEnabledFn(process.env))` to `if (false)`
+// left the full suite at 3269/3270, byte-identical to baseline. Proven here by asserting the actual
+// property the code's own comment claims ("an armed run must never even attempt to resolve `claude`
+// on PATH"), not merely that some failure came back -- a resolveClaudeCodeExecutable call counter,
+// not just an assertion on the returned shape, is what makes this test fail red under that mutation.
+// LOAD-BEARING, MEASURED (re-verification pass, in-process re-run of the exact `if (false)`
+// mutation): every OTHER assertion below still passes under it, because `sdk-call.js`'s
+// `spawnClaudeCodeProcess` carries its own copy of this same check (the "defense-in-depth half")
+// and throws its OWN `SPO_NO_REAL_SPAWN is set` error -- caught by this function's `query()`
+// try/catch and re-wrapped as `llm.js: query() failed to start: sdk-call.js: ...`, which still
+// matches /SPO_NO_REAL_SPAWN is set/, still carries `sessionId: null`, `billableTokens: 0`, and
+// -- because that second throw fires from INSIDE `spawnClaudeCodeProcess`, before the injected
+// `spawn` function is ever reached -- `calls.length` stays 0 too. Only `resolveClaudeCodeExecutable`
+// gets called once under the mutation (it does not under the real guard, which returns before
+// `buildQueryOptions` is ever invoked) -- the `resolveCalls` counter below is the ONLY assertion
+// in this test that actually discriminates the two. Do not let a later cleanup pass "simplify" it
+// away as redundant with the assertions around it.
+test('invokeClaudeReal: SPO_NO_REAL_SPAWN armed (the real guard, reading process.env -- not a stubbed deps.isNoRealSpawnEnabled) refuses before ever resolving `claude` on PATH or attempting a spawn', async () => {
+  // Deliberately the one test in this file that does NOT pass fakeExecDeps()'s own
+  // `isNoRealSpawnEnabled: () => false` override -- every other test opts OUT of this check that
+  // way (see that helper's header). Here, invokeClaudeReal's own top-of-function `isEnabledFn`
+  // falls back to the REAL orchestrator/no-real-spawn-guard.js#isEnabled, reading
+  // process.env.SPO_NO_REAL_SPAWN -- which this file's own top-of-file `require('./no-real-spawn')`
+  // already set to '1' for the whole process (see that require's own comment). No env mutation of
+  // this test's own: reusing the same ambient state every OTHER test in this file already has to
+  // explicitly opt out of is the point.
+  let resolveCalls = 0;
+  const { spawn, calls } = fakeSpawnDeps([initMessage(), resultMessage()]);
+  const result = await invokeClaudeReal(baseOpts(), {
+    resolveClaudeCodeExecutable: () => {
+      resolveCalls += 1;
+      return '/fake/bin/claude';
+    },
+    spawn,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.kind, 'error');
+  assert.match(result.error, /SPO_NO_REAL_SPAWN is set/);
+  assert.equal(result.sessionId, null);
+  assert.equal(result.tokensSource, null);
+  assert.equal(result.billableTokens, 0);
+  assert.equal(result.numTurns, undefined);
+  assert.equal(result.raw, undefined);
+  assert.equal(resolveCalls, 0, 'an armed run must never even attempt to resolve `claude` on PATH');
+  assert.equal(calls.length, 0, 'an armed run must never attempt a spawn');
+});
+
 test('invokeClaudeReal: a non-UUID opts.sessionId string throws a TypeError naming the field and value -- never spawns', async () => {
   // buildQueryOptions's own throw (test/sdk-call-options.test.js tests the throw itself in
   // detail); this test proves invokeClaudeReal lets it PROPAGATE uncaught, matching its own
@@ -924,11 +978,56 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
   assert.equal('numTurns' in llmCallEvent, false, 'the override branch must not journal numTurns');
 });
 
-// GAP, STATED RATHER THAN SILENTLY DROPPED (per this chantier's own "do not weaken a test to make
-// it pass" rule): the old file had two tests proving the journal write on a deadline-killed call,
-// through BOTH runLlm paths (this legacy `ctx.task.llm.<step>` override, and the real
-// `kind:"card"` path), including a recovery-injected variant of each. Their SHARED premise no
-// longer holds on this transport.
+// F2 (fix pass, this action). The success-path test directly above proves the override branch's
+// journal write carries an id when invokeClaudeReal returns ok:true -- it says NOTHING about a
+// FAILED call on this same path, because `result.ok` is true in both branches there, so
+// `sessionId: result.ok ? result.sessionId : null` and `sessionId: result.sessionId` are
+// indistinguishable under that test alone. This test drives runLlm's legacy ctx.task.llm.<step>
+// override branch through an EXTERNALLY-killed spawn (no deadline decision involved -- see the GAP
+// comment below for why a real elapsed DEADLINE kill is not reproduced at unit-test speed here) and
+// reads the id back out of the journal file on disk, never off the return value -- pinning that a
+// killed call's real sessionId reaches the ledger, not just invokeClaudeReal's own return value.
+test('runLlm legacy ctx.task.llm.<step> override path: an externally-killed call still journals the non-null sessionId (read back from journal.jsonl, not from the return value), even though ok is false', async () => {
+  const taskDir = mkTmp('spo-llmreal-legacy-killed-taskdir-');
+
+  const child = fakeSpawnedChild([initMessage()], { hang: true }); // init arrives (a real sessionId), then nothing
+  const spawn = () => child;
+
+  const ctx = {
+    shadowMode: false,
+    taskDir,
+    config: { stepDeadlineMs: 30000 },
+    account: { name: 'acct-x', configDir: null },
+    task: { id: 't1', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan this', maxBudgetUsd: 1 } } },
+  };
+
+  const resultPromise = runLlm(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
+  setTimeout(() => child.forceExit(null, 'SIGKILL'), 10); // an operator/OOM kill, not this call's own (real) deadline timer
+  const result = await resultPromise;
+
+  // Confirm this call actually took the killed/failed branch -- not a stand-in for the journal
+  // assertions below, which are the actual deliverable.
+  assert.equal(result.ok, false);
+  assert.equal(result.sessionId, SESSION_ID);
+
+  const journalLines = fs.readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const llmCallEvent = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(llmCallEvent, 'expected an llm-call journal event');
+  assert.equal(llmCallEvent.ok, false);
+  // THE ACTUAL DELIVERABLE: the id `claude` reported (read off the init message that DID arrive
+  // before the kill) is the one that landed in the journal line on disk -- not null, not undefined
+  // -- exactly what token-recovery.js needs to find this call's transcript by.
+  assert.equal(llmCallEvent.sessionId, SESSION_ID, 'a killed call must journal the id that lets token-recovery.js find its transcript');
+});
+
+// GAP, NARROWED BUT NOT FULLY CLOSED (per this chantier's own "do not weaken a test to make it
+// pass" rule): the old file had two tests proving the journal write on a DEADLINE-killed call
+// specifically, through BOTH runLlm paths (this legacy `ctx.task.llm.<step>` override, and the real
+// `kind:"card"` path), including a recovery-injected variant of each. The test above (and its card-
+// path sibling in test/llm-real-card.test.js) restores the underlying property -- a failed call's
+// real sessionId reaches the journal line, not just invokeClaudeReal's return value -- via an
+// EXTERNAL kill instead, which settles in milliseconds. What remains genuinely unreproduced at
+// unit-test speed is the DEADLINE-specific combination, explained below.
 //
 // The override branch's own opts construction (a few lines above this comment, unchanged by
 // action A5b: `deadlineMs: deadlineMsForStep(stepName)`) has ALWAYS ignored a caller-supplied
@@ -938,8 +1037,9 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
 // `spawnOpts.timeout` had actually been armed to -- a "timeout occurred" was simulated data, never
 // a real elapsed wait. This transport's deadline is a REAL `setTimeout` racing a real (if faked)
 // async stream (this file's own header, and llm.js's own "Deadline ownership" section) -- there is
-// no way to fake "the deadline fired" without the armed `deadlineMs` actually elapsing. PLAN's
-// real deadline is 1,800,000ms; every other step's is 900,000ms -- both are real production values
+// no way to fake "the deadline fired" without the armed `deadlineMs` actually elapsing. PLAN and
+// IMPLEMENT's real deadlines are both 1,800,000ms (step-contracts.js's LLM_STEP_DEADLINE_MS_BY_STEP);
+// DIAGNOSE/CITATION_VERIFIER/VALIDATE's is 900,000ms -- all real production values
 // no unit test should pay for, and attempting to (an earlier draft of this file's own test did)
 // hangs the whole suite for the real 30 minutes rather than failing fast.
 //
@@ -948,13 +1048,20 @@ test('runLlm real branch: builds the call from ctx.task.llm.<step>, uses ctx.acc
 // such hardcoding) already prove `timedOut`/`sessionId`/`tokensSource` come back correctly shaped
 // on a deadline kill. runLlm's own `appendEvent` call site (a few lines below the opts
 // construction) is unchanged by this action -- it reads `result.sessionId`/`result.tokensSource`/
-// `result.ok` verbatim off whatever invokeClaudeReal returned, the exact same lines the SUCCESS-path
-// journal test above ("runLlm real branch: builds the call from...") already exercises for the
-// non-deadline case. What is genuinely no longer provable at unit-test speed is the SPECIFIC
-// combination "a real elapsed deadline, driven through runLlm's own deadlineMsForStep resolution,
-// with the journal read back from disk" -- that combination now costs 15-30 real minutes to
-// reach, on either transport, and always did; the old tests only ever avoided that cost by faking
-// data at a layer (spawnSync's own return value) that no longer exists.
+// `result.ok` verbatim off whatever invokeClaudeReal returned, the exact same lines the EXTERNAL-
+// KILL journal test above ("an externally-killed call still journals the non-null sessionId...")
+// now exercises for the ok:false case, and the SUCCESS-path journal test earlier in this file
+// ("runLlm real branch: builds the call from...") already exercised for ok:true. What is genuinely
+// still not provable at unit-test speed is the SPECIFIC combination "a real elapsed DEADLINE, driven
+// through runLlm's own deadlineMsForStep resolution, with the journal read back from disk" -- that
+// combination costs 15-30 real minutes to reach, on either transport, and always did; the old tests
+// only ever avoided that cost by faking data at a layer (spawnSync's own return value) that no
+// longer exists. The property a deadline-specific test would have added on top of the external-kill
+// coverage above is narrow: that `appendEvent` reads the SAME `result.sessionId` field regardless of
+// which failure branch produced it -- true by construction (one call site, no branch on `kind` or
+// `timedOut`), and already implied by combining the external-kill test above with the
+// invokeClaudeReal-level deadline tests' own proof that a deadline kill returns that same field
+// shaped the same way.
 
 // ---- regression: #452's E2BIG lesson, successor property -----------------------------------------
 // E2BIG itself is unreachable on this transport (see this file's own header) -- what survives is

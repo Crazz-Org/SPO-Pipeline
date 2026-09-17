@@ -76,33 +76,55 @@ const LEASE_SUFFIX = '.json';
 // intake.js's callIntakeStepWithRotation runs its same-account timeout retry INSIDE the lease's
 // own try/finally, and instrumenting it showed 2 spawns carrying one identical lease payload.
 // state-machine.js's callLlmStep is bounded the same way by construction (callWithDeadline's two
-// attempts both sit inside the lease's try/finally); it happens to measure 1 today only because a
-// blocking spawnSync's resolution microtask always drains before callWithDeadline's timer can
-// fire, which is an implementation detail no bound should lean on. Each call is capped by
-// spawnSync's own `timeout`, armed with that step's deadlineMsForStep (LLM_STEP_DEADLINE_MS, or
-// its override) at spawnOpts -- TODAY, while invokeClaudeReal still spawns synchronously. Action
+// attempts both sit inside the lease's try/finally); it USED TO measure 1, pre-cutover, only
+// because a blocking spawnSync's resolution microtask always drained before callWithDeadline's
+// timer could fire -- an implementation detail this comment already refused to lean on, correctly:
+// STALE SINCE, NOT RE-MEASURED (card #239 chantier, action A5b, 2026-09-17): `invokeClaudeReal`
+// no longer spawns synchronously at all -- it drives the vendored Agent SDK's `query()`, an
+// awaited async call that yields the event loop, so the "microtask always drains before the timer
+// fires" premise this "measures 1" observation rested on no longer holds by construction, and
+// whether callLlmStep's real-mode span still measures 1 or now sometimes 2 has not been
+// re-measured post-cutover. Each call is capped by
+// the deadline `invokeClaudeReal` arms (LLM_STEP_DEADLINE_MS, or its override,
+// via deadlineMsForStep) -- since action A5b, a real `setTimeout` that calls
+// `options.abortController.abort()` on the SDK's own stream, never a `spawnSync` `timeout` option
+// (see steps/llm.js's own "Deadline handling" header). Action
 // A2 adds a second, OUTER cap around that same attempt (config.js's stepDeadlineMsByState,
-// `deadlineMsForStep(step) + STEP_DEADLINE_MARGIN_MS`), sized so the inner cap always fires first
-// (step-contracts.js's own MAX_LLM_STEP_OUTER_DEADLINE_MS comment states the invariant) -- but
-// which becomes the bound that actually governs one attempt once card #239's transport swap
-// replaces this blocking spawnSync with an awaited stream, the "implementation detail no bound
-// should lean on" two sentences up stops being able to save this file's own arithmetic. This
-// constant is derived from the OUTER bound for exactly that reason: it has to stay correct on
-// BOTH sides of that swap, not just the one true today.
+// `deadlineMsForStep(step) + STEP_DEADLINE_MS` -- config.js's own 120000ms constant, not
+// step-contracts.js's same-valued but separate `STEP_DEADLINE_MARGIN_MS`, duplicated rather than
+// imported for the load-time-cycle reason that constant's own comment states), sized so the inner cap always fires first
+// (step-contracts.js's own MAX_LLM_STEP_OUTER_DEADLINE_MS comment states the invariant) -- and,
+// since card #239's transport swap (action A5b) replaced the blocking spawnSync this outer cap
+// used to be inert against with an awaited stream, this outer cap now genuinely IS the bound that
+// governs one attempt in real mode, not merely insurance against a scenario that never fired. This
+// constant is derived from the OUTER bound for exactly that reason: it had to stay correct on
+// BOTH sides of that swap, and now the swap has happened.
 //
 // The +10% slack covers the non-spawn work the lease also spans -- prompt assembly, the JSON parse
 // of up to 64 MiB of stdout, and the journal writes around it -- and is expressed as a fraction so
 // it scales with the deadline rather than becoming a second number that can drift from it.
 //
-// Residual risk, recorded rather than papered over: spawnSync's `timeout` sends killSignal
-// (SIGTERM) and does NOT escalate to SIGKILL, so "spawnSync always returns by its timeout" is not
+// Residual risk, recorded rather than papered over -- AS MEASURED PRE-CUTOVER, NOT RE-VERIFIED
+// SINCE (card #239 chantier, action A5b, 2026-09-17): spawnSync's `timeout` sent killSignal
+// (SIGTERM) and did NOT escalate to SIGKILL, so "spawnSync always returns by its timeout" was not
 // an unconditional guarantee -- measured, a SIGTERM-ignoring child ran 27.6s against a 400ms
 // timeout. A `claude` that ignored SIGTERM could therefore hold a lease past this bound and have
 // it swept while still running, which is the D1 failure (two `claude` processes on one account)
-// rather than the D3 one this closes. That is why the bound is generous rather than tight: 67.2
+// rather than the D3 one this closes. STALE MECHANISM, LIKELY-NARROWER RISK, NOT CONFIRMED: this
+// transport's own deadline handling is a DIFFERENT, and on its face STRONGER, shape --
+// `invokeClaudeReal` aborts, then escalates SIGTERM then SIGKILL (the vendored SDK's own
+// `ProcessTransport.close()`, ~7s worst case), and does not return -- so does not release this
+// file's lease -- until it has confirmed the real child's exit or exhausted a bounded grace window
+// (`sdk-call.js`'s `ABORT_CONFIRM_GRACE_MS`, ~8.5s; see `steps/llm.js`'s own "Deadline handling"
+// header for the account-lease race this was specifically built to close). Whether that means the
+// D1 scenario this paragraph names is now CLOSED, or merely narrowed to that ~8.5s window, is a
+// claim this fix pass frames but does not resolve -- it would require re-deriving the bound below
+// against the new, bounded-but-nonzero confirm window, which nobody has done. That is why the
+// bound stays generous rather than tight either way: 67.2
 // minutes (raised from 63 by action A2 -- see step-contracts.js's own MAX_LEASE_AGE_MS comment)
 // is roughly 7.6x the longest full two-attempt step the C6 funnel actually measured (90-265s per
-// call, i.e. up to 530s for two attempts).
+// call, i.e. up to 530s for two attempts) -- a margin wide enough that neither the pre-cutover
+// 27.6s overrun nor the post-cutover ~8.5s confirm window threatens it either way.
 // The derivation itself now lives in step-contracts.js, beside LLM_STEP_DEADLINE_MS, because
 // config.js needs this same bound to derive accountLeaseWaitMs and cannot require THIS file
 // (account-lease.js requires config.js -- that direction is a load-time cycle). Re-exported

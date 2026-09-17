@@ -2,8 +2,12 @@
 // console/live-step.js -- what an LLM step is doing WHILE it runs.
 //
 // THE PROBLEM THIS EXISTS FOR. PLAN, IMPLEMENT, DIAGNOSE and VALIDATE all run through
-// `spawnSync` with piped stdio (orchestrator/steps/llm.js), and steps/scripted.js's
-// appendSpawnLog only writes after a call returns. So for the whole of an LLM step -- IMPLEMENT
+// `invokeClaudeReal` (orchestrator/steps/llm.js) -- since card #239's transport cutover (action
+// A5b, 2026-09-17) the vendored Claude Agent SDK's `query()`, an awaited async message stream,
+// never a blocking `spawnSync` with piped stdio any more -- and `steps/llm.js`'s own
+// `consumeQueryStream` (sdk-call.js) reduces that WHOLE stream to one final shape before
+// `invokeClaudeReal` returns, journalling nothing per intermediate message; steps/scripted.js's
+// appendSpawnLog only writes after a call returns too. So for the whole of an LLM step -- IMPLEMENT
 // measures a p50 of 3m33s and a p90 of 10m58s over the corpus -- journal.jsonl gains nothing and
 // journal/<id>/logs/<STATE>.log does not grow by a byte. Every existing surface can say only
 // "IMPLEMENT, started 6 minutes ago". That is a clock, not progress.

@@ -21,10 +21,16 @@
 //          THIS process, never the dispatcher's. Spawned and supervised by the dispatcher exactly
 //          like a worker (detached process group, respawned on crash, its own crash-loop
 //          breaker) -- see dispatcher.js's own header for the measurement that forced this split:
-//          one of these scans (auto-triage, via intake.js's callIntakeStepWithRotation) makes a
+//          one of these scans (auto-triage, via intake.js's callIntakeStepWithRotation) made a
 //          BLOCKING `claude` spawnSync call measured at 3-3.5 minutes on the live daemon's own
 //          journal, which would freeze worker-slot refills, timer service, and SIGTERM handling
-//          for that whole window if it ran inside the dispatcher's own loop. Takes no lock (same
+//          for that whole window if it ran inside the dispatcher's own loop. STALE SINCE, NOT
+//          RE-VERIFIED (card #239 chantier, action A5b, 2026-09-17): that call no longer blocks
+//          via `spawnSync` -- `invokeClaudeReal` now drives the vendored Agent SDK's `query()`,
+//          an AWAITED ASYNC call that yields the event loop rather than freezing it. The 3-3.5
+//          minute wall-clock cost is still real; whether it still justifies a separate process is
+//          not re-examined here -- a maintainer DECISION, not something this fix pass resolves.
+//          Takes no lock (same
 //          posture as --worker, and for the same reason: the dispatcher already holds it for the
 //          whole journal root). Mutually exclusive with --once and --worker.
 // --worker <taskDir>  action 6.1: runs the ONE task already sitting in <taskDir>/task.json
@@ -86,7 +92,9 @@
 //               resolve and fill every LLM step's real prompt, account rotation runs for real,
 //               but steps/llm.js's runLlm and steps/scripted.js's runScripted/real* functions all
 //               stop short of their own spawn point -- an LLM step writes
-//               journal/<id>/dryrun-<STATE>.md (the argv + filled prompt) and returns a canned
+//               journal/<id>/dryrun-<STATE>.md (the `query()` options, JSON-formatted -- no argv
+//               builder exists any more since card #239's transport cutover, action A5b,
+//               2026-09-17 -- plus the filled prompt) and returns a canned
 //               outputContract-satisfying payload; a scripted step returns a fixture-free
 //               "assumed success". Also never calls the `claude` CLI. Ignored if --shadow is
 //               also given (shadow wins).

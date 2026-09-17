@@ -979,10 +979,13 @@ function liveDaemonHolder(productJournalRoot, deps = {}) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Cap: wall-clock ceiling + hard LLM-step-count ceiling, enforced at the one choke point every
-// real spawn (scripted AND `claude -p`, per steps/llm.js's invokeClaudeReal) already passes
-// through: `deps.spawnSync`. No state-machine.js change needed -- this wraps the SAME injection
-// point production code already threads through config.deps.
+// Cap: wall-clock ceiling + hard LLM-step-count ceiling. `deps.spawnSync` is STILL the one choke
+// point every real SCRIPTED spawn passes through, wrapped below the same way it always was -- no
+// state-machine.js change needed for that half, this wraps the SAME injection point production
+// code already threads through config.deps. LLM calls are DIFFERENT since action A5b (card #239,
+// 2026-09-17): `steps/llm.js`'s invokeClaudeReal no longer spawns `claude` via `deps.spawnSync` at
+// all (see the `onLlmCallAttempt` paragraph below, a few lines down, for why counting moved off
+// this hook for that half specifically).
 //
 // Wall clock is checked before every spawn, not preemptively mid-spawn (spawnSync is
 // synchronous and blocking -- nothing here can interrupt an in-flight child). Combined with the
@@ -996,7 +999,7 @@ function liveDaemonHolder(productJournalRoot, deps = {}) {
 // steps/llm.js's invokeClaudeReal calls itself, immediately before every real spawn/call it
 // makes -- NOT by matching (command === 'claude') any more. That match used to be exact (every
 // real LLM call in this codebase went through invokeClaudeReal, which spawned literally 'claude',
-// so wrapping deps.spawnSync saw every one of them) but action A5b replaces that spawn with an
+// so wrapping deps.spawnSync saw every one of them) but action A5b replaced that spawn with an
 // in-process Agent SDK query() call, after which no `claude` spawn exists anywhere -- a counter
 // keyed on the command name would silently stop incrementing, and the hard LLM-step ceiling this
 // cap exists to enforce would degrade to wall-clock-only with nothing failing. Counting inside
@@ -1580,7 +1583,8 @@ async function runInlineScenario(scenario, config, plan, opts, deps) {
   // onLlmCallAttempt (action A5a): threaded alongside the wrapped spawnSync so invokeClaudeReal
   // (steps/llm.js) -- and intake.js's direct callers, which receive this same `deps` object via
   // ctx.deps/config.deps -- can enforce the LLM-step cap at the actual call site rather than at
-  // the spawn this file can no longer assume exists once A5b lands.
+  // the spawn this file can no longer assume exists, now that A5b has landed (card #239,
+  // 2026-09-17: invokeClaudeReal drives the vendored Agent SDK's query() instead of spawnSync).
   const wrappedDeps = { ...deps, spawnSync: cap.wrapSpawnSync(deps.spawnSync), onLlmCallAttempt: cap.onLlmCallAttempt };
 
   let issue = null;

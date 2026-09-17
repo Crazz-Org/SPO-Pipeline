@@ -1,7 +1,8 @@
 'use strict';
 // sdk.js -- action A1 (card #239 chantier, "Drive LLM steps through the Claude Agent SDK instead
 // of spawning `claude -p`"). The single place this repo reaches the vendored Agent SDK. Everything
-// downstream (the real A5 invokeClaudeReal, once it lands) requires THIS file, never
+// downstream (steps/llm.js's real invokeClaudeReal, cut over to this transport by action A5b,
+// 2026-09-17 -- landed, not merely planned) requires THIS file, never
 // `vendor/claude-agent-sdk/sdk.mjs` directly, so there is exactly one resolution path to pin.
 //
 // ---- why vendored, not installed --------------------------------------------------------------

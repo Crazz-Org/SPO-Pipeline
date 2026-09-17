@@ -1,21 +1,24 @@
 'use strict';
 // sdk-call.js -- actions A3 and A4 (card #239 chantier, "Drive LLM steps through the Claude Agent
-// SDK instead of spawning `claude -p`"). This module holds every moving part of the SDK call (A5
-// wires invokeClaudeReal to it). A3 added buildQueryOptions -- the pure opts-to-{prompt,options}
-// mapper -- plus the error classes it can throw. THIS action (A4) adds the other half:
+// SDK instead of spawning `claude -p`"). This module holds every moving part of the SDK call (A5b
+// -- landed the same day, 2026-09-17, not merely planned -- wires invokeClaudeReal to it: see that
+// file's own "Deadline handling" header for the design A5b built around this module). A3 added
+// buildQueryOptions -- the pure opts-to-{prompt,options}
+// mapper -- plus the error classes it can throw. Action A4 added the other half:
 // consumeQueryStream, which takes the async iterable a real `query({prompt, options})` call
 // returns and reduces it down to today's invokeClaudeReal return shape. Like buildQueryOptions, it
 // never spawns anything itself -- it is handed an already-running stream and only reads from it --
-// and it does not own the deadline or the journal (see its own header for exactly what A5 still
-// has to add around it).
+// and it does not own the deadline or the journal (see steps/llm.js's own header for what A5b
+// added around it).
 //
 // buildQueryOptions(opts, deps) -> { prompt, options } takes today's invokeClaudeReal opts shape
 // (see steps/llm.js's own header for the authoritative field list) and produces the
 // `{prompt, options}` argument `sdk.js`'s loadQuery()-resolved `query` function expects. It never
-// calls query() itself and never spawns anything -- buildArgv (llm.js) stays the argv builder for
-// the CURRENT transport until A5 cuts the real spawn over; this function is its SDK-shaped
-// sibling, built and tested against the same five step contracts so the two cannot silently
-// diverge before the cutover.
+// calls query() itself and never spawns anything -- buildArgv (llm.js) was the argv builder for
+// the OLD transport, until action A5b cut the real spawn over and deleted it, not merely
+// superseded it; this function is the SDK-shaped mapper that replaced it, built and tested
+// against the same five step contracts so the two could never silently
+// diverge before the cutover, which has now happened.
 //
 // ---- how the mapping below was measured, not assumed ------------------------------------------
 //
@@ -101,7 +104,7 @@
 //      `require('child_process').spawn` BEFORE this file's first `await import()` of the vendored
 //      module (sdk.js's `loadSdk`) is the patch the SDK's own `K1e` binds to (1 intercepted call);
 //      replacing it AFTER that first import has already run does nothing at all (0 intercepted
-//      calls -- a real child actually spawns). `daemon.js:103`
+//      calls -- a real child actually spawns). `daemon.js:111`
 //      (`require('./no-real-spawn-guard').installGuard()`, first line after the file's own
 //      leading comment block) happens to run before any LLM step ever reaches this module, so
 //      today's real daemon process is accidentally safe -- but that ordering is a property of
@@ -257,7 +260,7 @@ function confirmProcessExit(child, graceMs) {
     // for the full, corrected reasoning (fix pass F3): ref'ing THIS timer is not itself what fixes
     // the hang (MEASURED: unref'ing both this timer and llm.js's deadline timer together, while
     // leaving test/helpers.js's fake child's own ref'd `keepalive` interval untouched, still passes
-    // all 81 llm-real.test.js/llm-real-card.test.js tests). It stays ref'd for a different reason
+    // all 90 llm-real.test.js/llm-real-card.test.js tests). It stays ref'd for a different reason
     // that IS real: the vendored SDK's own kill-escalation timers are themselves unref'd in the
     // vendored source, so something ref'd has to hold the loop open for a SIGKILL to have a chance
     // to land when nothing else in the process is doing so. Cleared as soon as either branch below
@@ -398,10 +401,12 @@ class OauthTokenUnreadableError extends Error {
 // did not vendor (sdk.js's header). So a null resolution here is a REAL failure mode this pipeline
 // will actually hit on any account whose pool image lacks `claude` on PATH, not a defensive
 // assertion against a case that "can't happen" -- hence its own named error class, the same
-// reasoning as OauthTokenUnreadableError above: A5 catches this one too and maps it onto today's
+// reasoning as OauthTokenUnreadableError above: action A5b (landed 2026-09-17, the same day) made
+// invokeClaudeReal catch this one too and map it onto the same
 // `{ok:false, kind:'error', ...}` shape, since it stands in for a spawn that never had a chance to
-// start, the same class of failure invokeClaudeReal's own `spawnResult.error` (ENOENT) branch
-// already reports that way today.
+// start -- the same class of failure the OLD transport's `invokeClaudeReal` reported through its
+// own `spawnResult.error` (ENOENT) branch, deleted along with the rest of that transport, not
+// merely superseded.
 class ClaudeExecutableNotFoundError extends Error {
   constructor() {
     super(
@@ -417,7 +422,7 @@ class ClaudeExecutableNotFoundError extends Error {
 // verifier, fix pass). This branch exists so this file can accept the same "already-JSON-encoded
 // string" shape the old transport's now-deleted buildArgv (llm.js) used to -- and that shape is
 // LIVE, not hypothetical: the legacy override path (runLlm's `ctx.task.llm.<step>` branch,
-// llm.js:962) passes `override.jsonSchema` straight through into opts.jsonSchema with no
+// llm.js:964) passes `override.jsonSchema` straight through into opts.jsonSchema with no
 // validation of its own, the same path orchestrator/README.md's own hand-written example
 // documents. The OLD transport never looked at that string until `claude --json-schema <string>`
 // ran and the CLI itself rejected a malformed one (exit 1, a normal step failure via
@@ -520,9 +525,12 @@ function buildEnv(opts) {
 // same reasoning: no turn/time cap is this action's job to invent).
 //
 // deps.resolveClaudeCodeExecutable overrides sdk.js's real PATH walk -- the one injection point
-// this function needs, following steps/llm.js's existing deps.spawnSync/deps.randomUUID
-// convention (a function reference, not a pre-resolved value, so a test can assert it was CALLED
-// the expected number of times / with the expected argument, not just stub its answer).
+// this function needs, following steps/llm.js's existing deps.randomUUID convention (a function
+// reference, not a pre-resolved value, so a test can assert it was CALLED the expected number of
+// times / with the expected argument, not just stub its answer) -- the OLD transport's
+// deps.spawnSync is gone from this codepath entirely, deleted along with buildArgv, not merely
+// renamed; this file's own equivalent injection point for the real spawn is deps.spawn, read by
+// makeSpawnClaudeCodeProcess above, not by this function.
 //
 // Never throws for a missing model/effort/etc -- those are simply omitted when falsy. It DOES
 // throw for exactly FIVE reasons (F6, Opus verifier, fix pass: an earlier draft of this comment
@@ -540,8 +548,9 @@ function buildEnv(opts) {
 //   4. ClaudeExecutableNotFoundError, when no PATH resolution (real or injected) finds `claude`.
 //   5. JsonSchemaParseError, when opts.jsonSchema is a string that is not valid JSON -- see that
 //      class's own comment (F3, fix pass) for why this is named rather than a bare SyntaxError.
-// Reasons 2, 4 and 5 are named classes specifically so A5 can catch and map ONLY those three onto
-// today's `{ok:false, kind:'error', ...}` step-failure shape, while letting reason 1's Error and
+// Reasons 2, 4 and 5 are named classes specifically so action A5b (landed 2026-09-17, the same
+// day) could make invokeClaudeReal catch and map ONLY those three onto
+// the `{ok:false, kind:'error', ...}` step-failure shape, while letting reason 1's Error and
 // reason 3's TypeError propagate uncaught, matching invokeClaudeReal's existing behaviour for both
 // (a missing prompt and a malformed sessionId are both already bare throws today, never a step
 // failure return).
@@ -621,7 +630,7 @@ function buildQueryOptions(opts, deps = {}) {
     // itself when it emits `--json-schema` (see this file's header measurement); the old
     // transport's now-deleted buildArgv accepted opts.jsonSchema as either an object or an
     // already-JSON-encoded string (used verbatim, never re-parsed) -- LIVE on the legacy override
-    // path, llm.js:962's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
+    // path, llm.js:964's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
     // merely a theoretical shape, the same override path this file's allowedTools normalization
     // already accounts for)
     // -- so a string here is parsed back into an object rather than nested as a

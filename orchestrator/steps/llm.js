@@ -366,7 +366,7 @@ function tokenFieldsFrom(raw) {
 
 // Token-ledger lot, action 4.3: recovers billable tokens for a call that really ran (sessionId
 // set) but reported no modelUsage block (tokensSource: null) -- a deadline kill, an external
-// signal kill, unparsable stdout, an is_error/non-zero-exit reply, or even a SUCCESSFUL call whose
+// signal kill, an unparsable reply, an is_error/non-zero-exit reply, or even a SUCCESSFUL call whose
 // modelUsage happened to be empty/absent all land here identically. The decision to attempt
 // recovery is made STRUCTURALLY -- sessionId is a non-empty string, tokensSource is falsy -- never
 // by reading `error`/`result` text (see orchestrator/token-recovery.js's own header, and
@@ -567,7 +567,9 @@ async function invokeClaudeReal(opts, deps = {}) {
   // can still return sessionId: null for a call that never starts at all): opts.sessionId, when
   // the caller already supplied one (a non-empty string), is used verbatim and nothing is
   // generated -- deps.randomUUID (falling back to node's own crypto.randomUUID, following this
-  // file's existing deps.spawnSync/deps.randomUUID convention) is not even called in that case,
+  // file's existing deps.query/deps.buildQueryOptions/deps.randomUUID injection convention -- the
+  // OLD transport's deps.spawnSync is gone from this file, deleted along with buildArgv, not
+  // merely renamed) is not even called in that case,
   // same as the old transport's own pin. A supplied sessionId that is a non-empty string but not
   // UUID-v4 shaped is left untouched here -- buildQueryOptions below still throws its own bare
   // TypeError for it (reason 3 of the five), exactly the "programming error, not a call failure"
@@ -654,7 +656,7 @@ async function invokeClaudeReal(opts, deps = {}) {
   // CORRECTED (Opus verifier, fix pass F3): that earlier draft attributed the fix to THIS timer
   // being ref'd -- false as shipped. MEASURED (fix pass F3, 2026-09-17): restoring `.unref()` on
   // this timer AND on sdk-call.js's confirmProcessExit timer, while leaving test/helpers.js's own
-  // fake child untouched, still passes all 81 llm-real.test.js/llm-real-card.test.js tests -- so
+  // fake child untouched, still passes all 90 llm-real.test.js/llm-real-card.test.js tests -- so
   // ref'ing these two timers is, by itself, INERT; it fixes nothing on its own. The actual cure is
   // test/helpers.js's `fakeSpawnedChild`'s own `keepalive` interval, which is ref'd on purpose: a
   // fake/in-memory child (no real OS pipe handle) has nothing else to keep the event loop open, and

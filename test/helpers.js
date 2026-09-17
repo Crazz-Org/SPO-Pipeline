@@ -254,10 +254,48 @@ function fakeSpawnDeps(lines, opts = {}) {
 // Was hand-rolled identically in test/llm-real.test.js and test/llm-real-card.test.js (both named
 // `fakeExecDeps`, both resolving to the same literal `/fake/bin/claude`) before this fix pass --
 // exported here once so the 18+ files migrating onto this seam next (A5b-2) do not have to hand-roll
-// it a third, fourth, ... time. `extra` overrides/extends the two defaults (e.g. a test that wants
+// it a third, fourth, ... time. `extra` overrides/extends the three defaults (e.g. a test that wants
 // `isNoRealSpawnEnabled: () => true` to exercise the killswitch itself).
+//
+// F4 (card #239 chantier, fix pass, this action). `isNoRealSpawnEnabled: () => false` above
+// disarms BOTH killswitch layers (llm.js's invokeClaudeReal, and sdk-call.js's
+// spawnClaudeCodeProcess -- see the latter's own "Both, not either" header) for every call site
+// that spreads this helper in. With both disarmed, `makeSpawnClaudeCodeProcess`'s own
+// `deps.spawn || spawn` falls back to the REAL `child_process.spawn` the instant a call site
+// forgets to override `spawn` -- and on this machine (and every pool worker image) a real `claude`
+// really is on PATH, so that is not a theoretical gap: a forgotten override would reach it, with
+// whatever OAuth credential this process happens to carry. Latent today only because every one of
+// this suite's 22+ call sites happens to also supply its own `spawn` (as an `extra.spawn`, or as a
+// sibling key in an object spread AFTER `...fakeExecDeps()`) -- nothing STRUCTURAL enforced that
+// pairing before this fix, so a future call site that disarms and forgets would fail silently
+// (or, worse, "succeed" by actually talking to a real process) rather than failing loud.
+//
+// The fix: this function itself supplies a POISON-PILL `spawn` default, bundled in the same place
+// as the disarm, so the guard can never be disarmed here WITHOUT also getting a fake spawn. A call
+// site that overrides `spawn` (directly, or via a later object-spread key -- `...extra` below, or
+// `{...fakeExecDeps(), spawn: ...}` at the call site, both land the same way: the override wins)
+// gets its own real fake, exactly as before. A call site that does NOT is handed a function that
+// throws loudly and synchronously the moment `makeSpawnClaudeCodeProcess` actually invokes it --
+// never a silent fallthrough to the real OS spawn. test/no-real-spawn-guard-pairing.test.js is the
+// standing proof this actually fires (it disarms via fakeExecDeps() with no spawn override at all,
+// drives a real call, and asserts the poison pill's own error surfaces instead of a hang or a real
+// process).
 function fakeExecDeps(extra = {}) {
-  return { resolveClaudeCodeExecutable: () => '/fake/bin/claude', isNoRealSpawnEnabled: () => false, ...extra };
+  return {
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
+    spawn: () => {
+      throw new Error(
+        'test/helpers.js: fakeExecDeps() disarmed the no-real-spawn killswitch ' +
+          '(isNoRealSpawnEnabled: () => false) but this call site never supplied its own deps.spawn ' +
+          'override -- refusing to fall through to the REAL child_process.spawn, which on this ' +
+          'machine would reach a real `claude` executable (and whatever live account credentials ' +
+          'this process carries) instead of a fake one. Pass fakeExecDeps({ spawn: ... }), or spread ' +
+          '...fakeExecDeps() and add your own `spawn` key alongside it.'
+      );
+    },
+    ...extra,
+  };
 }
 
 function writeTask(queueDir, filename, taskObj) {

@@ -76,7 +76,7 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    side effects, so both shapes only detect the orphan and journal
    `orphan-scan-would-repark` — neither ever parks. `handleExit` also
    deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
-   dispatcher's own shutdown** (`dispatcher.js:635-648`, `childrenSignalled && outcome === 'crashed'`
+   dispatcher's own shutdown** (`dispatcher.js:643-656`, `childrenSignalled && outcome === 'crashed'`
    — keyed on "did we actually signal this child", not on `stopReason`, since a DRAIN sets
    `stopReason` and then waits minutes having signalled nobody):
    reparking here would spawn a fresh `daemon.js --repark-task` child in the middle of a shutdown
@@ -126,7 +126,9 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    `state` value with no entry in `HANDLERS` parks `unrecognized-state` (`{state}`) — defensive
    only, since every `state.json`/task-journal write in this codebase is produced by the state
    names this same file defines.
-3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
+3. **LLM steps are stateless calls.** Each judgement step is one `claude` invocation (since card
+   #239's transport cutover, action A5b, 2026-09-17: the vendored Claude Agent SDK's `query()`,
+   never `claude -p` spawned directly -- see `orchestrator/steps/llm.js`'s own header) with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.
 4. **The jewels are not re-implemented.** The bench, the validators' criteria and the
@@ -447,19 +449,26 @@ low.
 The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LLM_STEP_DEADLINE_MS_BY_STEP`
 overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
 CITATION_VERIFIER, VALIDATE) take `LLM_STEP_DEADLINE_MS`'s own 900000ms default. Whichever figure
-applies is the `spawnSync` timeout `invokeClaudeReal` arms for that call (`orchestrator/steps/llm.js`)
-— the INNER deadline, real mode only. `state-machine.js` also wraps every LLM step in the outer
+applies is the deadline `invokeClaudeReal` arms for that call (`orchestrator/steps/llm.js`)
+— the INNER deadline, real mode only. Since card #239's transport cutover (action A5b, 2026-09-17)
+this is a real `setTimeout` that calls `options.abortController.abort()` on the vendored Claude
+Agent SDK's `query()` stream, never a `spawnSync` `timeout` option — that mechanism, and the
+blocking spawn it bounded, are both deleted, not merely superseded (see `steps/llm.js`'s own
+"Deadline handling" header for the full design and the measured abort/kill-escalation timing).
+`state-machine.js` also wraps every LLM step in the outer
 `callWithDeadline` (`deadline.js`); before action A2 (card #239, 2026-09-17) that outer wrap used the
 generic `stepDeadlineMs` (120000ms; no `stepDeadlineMsByState` entry existed for any LLM state), inert
-in real mode (a JS timer cannot preempt the blocking `spawnSync` the inner deadline already bounds)
+in real mode (a JS timer cannot preempt the blocking `spawnSync` the inner deadline USED TO bound)
 but live in shadow mode, where a fixture delay raced that flat 120s timer regardless of which inner
 figure the row above states. A2 gave each of the five its own `stepDeadlineMsByState` entry
 (`orchestrator/config.js`, generated from `STEP_CONTRACTS`'s own keys) — `deadlineMsForStep(step) +`
 one ordinary `stepDeadlineMs` of margin, so PLAN/IMPLEMENT now carry 1920000ms and the other three
-1020000ms — sized so the inner deadline always fires first, ahead of card #239's own transport swap
-(`steps/llm.js`'s `invokeClaudeReal` moving off blocking `spawnSync` onto an awaited stream), the
-change that will make this outer timer live in real mode for the first time. Shadow mode now races
-each step's own outer figure instead of the flat 120s every LLM step used to share. There is no
+1020000ms — sized so the inner deadline always fires first, in anticipation of card #239's own
+transport swap (`steps/llm.js`'s `invokeClaudeReal` moving off blocking `spawnSync` onto an awaited
+stream, action A5b, landed the same day) — the change that made this outer timer genuinely LIVE in
+real mode, racing the inner deadline for real on every LLM call now, not merely inert insurance.
+Shadow mode still races each step's own outer figure instead of the flat 120s every LLM step used
+to share, unaffected by the transport swap (shadow mode never spawns anything). There is no
 per-step or per-size USD budget: `maxBudgetUsd` is plumbed
 end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
@@ -537,15 +546,26 @@ templates park distinguishably rather than colliding on one generic reason. A ma
 this park fixes the named prompt file's header/body mismatch and retries; nothing about the task
 itself is at fault.
 
-Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
-`--session-id <uuid>` (action 4.1: generated by `invokeClaudeReal` immediately before the spawn,
-or used verbatim when a caller already supplies one, so a killed or unparsable call can still be
-tied back to the `claude` session that actually ran), `--json-schema` for the payload,
-`--allowedTools`, `--model`, `--effort`,
+Every LLM call, since card #239's cutover (action A5b, 2026-09-17): the vendored Claude Agent
+SDK's `query({prompt, options})`, never `claude -p` spawned directly any more (the old transport's
+`spawnSync`/`buildArgv` are deleted, not merely superseded — see `orchestrator/steps/llm.js`'s and
+`orchestrator/steps/sdk-call.js`'s own headers for the full design and what was MEASURED against
+the real vendored SDK). `options` carries `--session-id=<uuid>` (action 4.1: generated by
+`invokeClaudeReal` immediately before the call, or used verbatim when a caller already supplies
+one, so a killed or unparsable call can still be tied back to the `claude` session that actually
+ran; a first-class SDK option, not routed through `extraArgs`), `--json-schema` for the payload,
+`--allowedTools` (comma-joined by the SDK's own argv builder), `--model`, `--effort`,
 `--permission-mode` per step (plus `--max-budget-usd` when a caller supplies a numeric
 `maxBudgetUsd` — no daemon or intake path does; the only caller that does is the hand-run
-`scripts/smoke-llm.js`), run under the account chosen by the scheduler
-(`CLAUDE_CONFIG_DIR=<account dir>`). Domain context comes from whatever `CLAUDE.md` sits in the
+`scripts/smoke-llm.js`), and `--setting-sources=user,project,local`, pinned unconditionally — a
+flag the OLD transport never emitted at all (see `sdk-call.js`'s own `SETTING_SOURCES` comment).
+The result comes back as a `stream-json` message stream — never `--output-format json`'s single
+flat reply — reduced by `sdk-call.js`'s `consumeQueryStream` down to the same `{result, cost,
+**session_id**, ...}`-shaped object the old transport's parsed stdout produced (MEASURED,
+byte-identical field names, same file's own header). Every call runs under the account chosen by
+the scheduler (`CLAUDE_CONFIG_DIR=<account dir>`, now set via the SDK's own `options.env` rather
+than a spawned child's inherited environment — same effect, different plumbing). Domain context
+comes from whatever `CLAUDE.md` sits in the
 step's own `cwd` -- the CLI loads it itself (`steps/llm.js` deliberately passes neither
 `--safe-mode` nor `--bare`), and **nothing trims it**: an earlier "(trimmed)" here described an
 intention nobody implemented. Which file that is depends on the step: `config.js`'s `cwdForStep`
@@ -922,14 +942,31 @@ The analysis's top families are mostly **states not to have** rather than branch
    the deadline, not merely the first attempt — parks `step-deadline-exceeded-twice`, `detail`
    naming the state; a single timeout is retried silently, journalled `deadline-exceeded` but
    never parked). Never two live executors for one
-   task. Two independent mechanisms enforce this, because a JS timer cannot preempt a
-   synchronous child: `claude -p` calls (LLM steps) are killed by `spawnSync`'s own `timeout`
-   option inside `steps/llm.js`'s `invokeClaudeReal`, racing `deadline.js`'s `callWithDeadline`
-   as a belt-and-suspenders around the whole call; every `git`/`gh`/`npm` command a scripted step
-   spawns *through `spawnStep`* is killed the same way, per `orchestrator/config.js`'s
-   `commandTimeoutsMs` table (see below). `callWithDeadline`'s own JS-timer race is a no-op here,
-   since a blocking `spawnSync` never yields the event loop for the timer to fire in. Action 2.1
-   closed this gap for `spawnStep`'s own call sites: before it, a hung `gh`/`git`/`npm` child
+   task. **Two DIFFERENT mechanisms now enforce this, for two DIFFERENT reasons — one story
+   before card #239's transport cutover (action A5b, 2026-09-17), a different one since.**
+   `git`/`gh`/`npm` commands a scripted step spawns *through `spawnStep`* are still a genuinely
+   BLOCKING `child_process.spawnSync` (the JS event loop never yields while one runs): `spawnSync`'s
+   own `timeout` option, per `orchestrator/config.js`'s `commandTimeoutsMs` table (see below), is
+   what actually kills those, and `deadline.js`'s `callWithDeadline` race around them is a no-op,
+   exactly as it always was, for exactly the reason it always was — a blocking `spawnSync` never
+   yields the event loop for a JS timer to fire in. LLM steps (PLAN/IMPLEMENT/DIAGNOSE/
+   CITATION_VERIFIER/VALIDATE) no longer work this way at all: `steps/llm.js`'s `invokeClaudeReal`
+   now drives the vendored Claude Agent SDK's `query()`, an AWAITED ASYNC STREAM that DOES yield
+   the event loop — so `callWithDeadline`'s own JS-timer race for these five steps, genuinely a
+   no-op before this cutover, became LIVE the moment it landed (`orchestrator/config.js`'s own
+   comment on `LLM_STEP_DEADLINE_ENTRIES`, action A2 of the same chantier, says this outright: the
+   outer timer every step already raced "becomes LIVE... for the first time"). Two mechanisms
+   race for real now, not one live and one inert: the INNER deadline (`step-contracts.js`'s
+   `deadlineMsForStep`, armed inside `invokeClaudeReal` itself as a real `setTimeout` that calls
+   `options.abortController.abort()`, then confirms the real child's exit before returning — see
+   `steps/llm.js`'s own "Deadline handling" header for the full design and the measured
+   abort/kill-escalation timing) is the one that actually bounds a single call, designed to always
+   fire FIRST; the OUTER deadline (`deadline.js`'s `callWithDeadline`) is retry-once-then-park
+   bookkeeping, sized by `orchestrator/config.js`'s `LLM_STEP_DEADLINE_ENTRIES` as the inner
+   deadline plus one `STEP_DEADLINE_MS` of margin (clamped to `MAX_TIMER_DELAY_MS`) specifically so
+   it never fires before the inner one on a healthy call. Action 2.1 closed an unrelated, still-
+   valid gap for `spawnStep`'s own call sites (the scripted-step half above, untouched by this
+   cutover): before it, a hung `gh`/`git`/`npm` child
    froze the single-threaded daemon forever, holding the task lock, with nothing to recover it.
    Action 2.1b then found and closed the remaining gap: `board.js`'s `moveCard`, `park-loop.js`'s
    park comment and unpark scan, `report-intake.js`'s report-card/dedup/comment-scan spawns, and

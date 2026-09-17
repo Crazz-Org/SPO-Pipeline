@@ -25,7 +25,7 @@ require('./no-real-spawn');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
-const { mkTmp, fakeSpawnDeps, fakeExecDeps } = require('./helpers');
+const { mkTmp, fakeSpawnDeps, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 const SESSION_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
@@ -191,6 +191,59 @@ test('PLAN real card path: a two-model modelUsage payload journals a per-model b
   });
   assert.equal(call.billableTokens, 6800 + 5000, 'flat total still sums across both models, unchanged');
   assert.equal('numTurns' in call, false, 'numTurns must be gone from the journalled llm-call event (acceptance criterion 3)');
+});
+
+// F2 (fix pass, this action). The 19-file migration (action A5b-2) dropped the "runLlm ... read
+// back from journal.jsonl" failure-path coverage this repo used to carry (test/llm-real.test.js's
+// own journal.jsonl mentions went 7 -> 1 across that migration) -- restored here, on the real
+// `kind: "card"` path. Mutating runLlm's card-branch appendEvent call from `sessionId: raw.sessionId`
+// to `sessionId: raw.ok ? raw.sessionId : null` leaves invokeClaudeReal's own return value (already
+// pinned elsewhere in this file and in test/llm-real.test.js) completely untouched -- the gap is one
+// layer OUT from there, exactly where token-recovery.js needs the id to actually land: the JOURNAL
+// LINE ON DISK, not runLlm's return value. An externally-killed call (no deadline decision involved)
+// is used here rather than a deadline kill -- see test/llm-real.test.js's own "GAP, STATED RATHER
+// THAN SILENTLY DROPPED" comment for why a REAL elapsed deadline driven through runLlm's own
+// deadlineMsForStep resolution costs 15-30 real minutes at unit-test speed and is not worth paying
+// twice; an external kill reaches the identical `sessionId: raw.sessionId` call site with a real,
+// non-null id and `ok: false`, via a path that settles in milliseconds.
+test('PLAN real card path: an externally-killed call still journals the non-null sessionId (read back from journal.jsonl, not from the return value), even though ok is false', async () => {
+  const taskDir = mkTmp('spo-card-plan-killed-');
+  const task = {
+    kind: 'card',
+    issue: 640,
+    title: 'Add a widget',
+    criterion: 'the widget renders',
+    worktreePath: '/tmp/worktree-640',
+    size: 'S',
+  };
+
+  const child = fakeSpawnedChild([initMessage()], { hang: true }); // init arrives (a real sessionId), then nothing
+  const spawn = () => child;
+
+  const resultPromise = runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
+  // An operator/OOM kill -- something OTHER than this call's own (real, ~1.8e6ms) deadline timer,
+  // which never fires here (mirrors test/llm-real.test.js's own "external signal kill even WITH a
+  // deadline armed" pattern).
+  setTimeout(() => child.forceExit(null, 'SIGKILL'), 10);
+  const result = await resultPromise;
+
+  // Confirm this call actually took the killed/failed branch -- not a stand-in for the journal
+  // assertion below, which is the actual deliverable.
+  assert.equal(result.ok, false);
+  assert.equal(result.sessionId, SESSION_ID);
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const call = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(call, 'expected an llm-call journal event');
+  assert.equal(call.ok, false);
+  // THE ACTUAL DELIVERABLE: the id `claude` reported (read off the init message that DID arrive
+  // before the kill) is the one that landed in the journal line on disk -- not null, not undefined
+  // -- exactly what token-recovery.js needs to find this call's transcript by.
+  assert.equal(call.sessionId, SESSION_ID, 'a killed call must journal the id that lets token-recovery.js find its transcript');
 });
 
 // Second fix pass (2026-09-13): the F3 test in test/step-contracts.test.js asserts on

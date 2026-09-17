@@ -29,8 +29,10 @@ exception — the opposite of the intent.
 
 ## Why it also hits the automated steps
 
-`orchestrator/steps/llm.js` launches `claude -p` with `CLAUDE_CONFIG_DIR=~/.claude-accounts/poolN`.
-These directories have **no** `settings.json`: user rules disappear for every LLM step. What
+`orchestrator/steps/llm.js`'s `invokeClaudeReal` drives the vendored Claude Agent SDK's `query()`
+(card #239 chantier, action A5b, 2026-09-17 — no longer a direct `claude -p` spawn) with
+`options.env.CLAUDE_CONFIG_DIR=~/.claude-accounts/poolN` (`sdk-call.js`'s `buildEnv`). These
+directories have **no** `settings.json`: user rules disappear for every LLM step. What
 remains are the *project* rules, resolved from the step's `cwd` (`config.js` → `cwdForStep`):
 
 | Step | `cwd` | Project rules visible |

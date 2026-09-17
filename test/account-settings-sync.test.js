@@ -2,7 +2,9 @@
 // Covers the pool's user-tier permission policy: accounts.syncSettings /
 // accounts.stampManagedSettings, and the `spo account sync-settings` command that drives them.
 //
-// WHY the pool needs a policy at all: steps/llm.js spawns `claude -p` with CLAUDE_CONFIG_DIR set
+// WHY the pool needs a policy at all: steps/llm.js's invokeClaudeReal calls the vendored Agent
+// SDK's query() (card #239 chantier, action A5b, 2026-09-17 -- no longer a direct `claude -p`
+// spawn) with `options.env.CLAUDE_CONFIG_DIR` set
 // to the account's own directory, so the machine's ~/.claude/settings.json is never read by a
 // pipeline step -- an account directory IS its own user-settings tier. See
 // orchestrator/accounts.js's syncSettings header and doc/permissions.md.

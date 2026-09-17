@@ -856,8 +856,9 @@ measurement.
 
 Action A2 gave PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE their own
 `config.stepDeadlineMsByState` entry (`deadlineMsForStep(step) + stepDeadlineMs`, clamped to
-Node's timer ceiling) so the outer `deadline.js` timer cannot retroactively kill a still-healthy
-LLM call once card #239's own transport swap makes that timer live in real mode -- see
+Node's timer ceiling) so the outer `deadline.js` timer would not retroactively kill a still-healthy
+LLM call once card #239's own transport swap (action A5b, landed the same day) made that timer
+live in real mode -- which it now is, not merely anticipated -- see
 `orchestrator/config.js`'s own `LLM_STEP_DEADLINE_ENTRIES` comment for the full hazard. The
 `--deadline-ms` CLI flag (`daemon.js`) only ever overrides the GENERIC `config.stepDeadlineMs`
 default, never a state's own `stepDeadlineMsByState` entry, and that flag is not new to this
@@ -902,9 +903,11 @@ Action A3 (`orchestrator/steps/sdk-call.js`'s `buildQueryOptions`) pins the Agen
 `settingSources` option to `['user', 'project', 'local']` on every call, unconditionally — see
 that file's own `SETTING_SOURCES` comment for the full reasoning (`.claude/settings.json` is this
 pipeline's entire permission policy and must never depend on a CLI default this repo does not
-control). This is a genuinely NEW pin, not a preservation of today's behaviour: today's real-mode
-transport (`orchestrator/steps/llm.js`'s `buildArgv`) never emits `--setting-sources` at all — no
-flag, no opts field, nothing feeds one. No test in this repo's suite can catch a wrong choice
+control). This is a genuinely NEW pin, not a preservation of the OLD transport's behaviour: the
+transport as of action A3 (`orchestrator/steps/llm.js`'s `buildArgv`, deleted by action A5b's
+cutover the same day — this entry predates that deletion and is left in the past tense on
+purpose) never emitted `--setting-sources` at all — no flag, no opts field, nothing fed one. No
+test in this repo's suite can catch a wrong choice
 here, by construction: every assertion that touches `settingSources` (this action's own
 `test/sdk-call-options.test.js`) compares against the SAME pinned constant on both sides of the
 equals sign. A test cannot discover what it does not independently know.
@@ -935,13 +938,14 @@ gap.
 
 **Why this is a live gap, not a cosmetic one.** If the flag-omitted default ever turns out to
 differ from `['user', 'project', 'local']` (for instance, by ALSO reading some source this pin
-excludes, or by reading fewer), every LLM step running under the new transport reads a genuinely
-different permission surface than today's `claude -p` calls do, silently, with no test positioned
-to notice because the test and the code share one constant.
+excludes, or by reading fewer), every LLM step running under this transport (the SDK's `query()`,
+current since action A5b, not merely "new" any more) reads a genuinely different permission
+surface than the OLD, now-deleted `claude -p`/`buildArgv` transport's calls did, silently, with no
+test positioned to notice because the test and the code share one constant.
 
 **Not fixed here, and not fixable by more static reading** — per this register's own posture, a
 named gap rather than a silently-assumed one. **Closes at A10's live recette**: that action already
-runs one real card through the new transport end-to-end at real cost, which is the cheapest point
+runs one real card through this transport end-to-end at real cost, which is the cheapest point
 in this chantier to also diff `claude --setting-sources=user,project,local`'s actual loaded
 settings against a flag-omitted invocation's, on a live account, and confirm or correct this pin
 from that one comparison rather than from another round of static tracing.
@@ -997,3 +1001,71 @@ action or card, named here rather than silently accepted. Closing condition: eit
 SDK ships its own process-group kill for `spawnClaudeCodeProcess`-managed children, or a future
 action measures the real blast radius of detached tool subprocesses against the live corpus and
 decides the custom-spawn approach is worth its own risk.
+
+## 15 · F3 prose-sweep scope: what "`claude -p`" was left alone, and why (A5b-2 fix pass, card #239), 2026-09-17
+
+Action A5b's cutover (`spawnSync`/`buildArgv` deleted, replaced by the vendored Agent SDK's
+`query()`) left a large number of comments across `doc/`, `prompts/`, `orchestrator/`, and `test/`
+describing the OLD transport in the present tense. The A5b-2 fix pass corrected every stale
+MECHANISM claim it found by repeated, widening greps (`spawnSync`, `claude -p`, `buildArgv`,
+`argv`, `blocking`, `synchronously`, `output-format json`, `stdout`, plus targeted
+`invokeClaudeReal`+`spawnSync`/`synchronous`/`blocking` combinations) — three separate sweep
+rounds, the last prompted by a verifier cross-check that found sites the first two missed. This
+entry records the boundary that sweep drew, in the tree, not only in a chat report — so a later
+reader can tell "checked and deliberately kept" from "never looked" (the failure mode that let the
+scope slip twice: **`prompts/README.md`'s "`--model`/`--effort` on the `claude -p` invocation"
+looked like harmless shorthand and was actually a MEASURABLE claim that turned out half-false** —
+the flags are real, MEASURED against the vendored SDK argv probe (`sdk-call.js`'s own header), but
+`-p`/`--print` is never passed on this transport at all. That one correction is the reason the
+categories below are stated as "measured, not assumed" rather than "obviously fine").
+
+**Fixed** (mechanism claims — describing HOW something currently works): every present-tense
+"spawns `claude -p`", "the `claude -p` invocation/call/session", "`deps.spawnSync` is the
+[injection point / choke point] `invokeClaudeReal` uses", "the argv it builds", "parses stdout",
+and "once A5b lands" (or "once card #239's transport swap...", present/future tense for an action
+that has landed) — across `orchestrator/config.js`, `account-lease.js`, `step-contracts.js`,
+`recette.js`, `daemon.js`, `dispatcher.js`, `journal.js`, `state-machine.js`, `accounts.js`,
+`tokens.js`, `steps/llm.js`, `steps/scripted.js`, `steps/sdk-call.js`, `sdk.js`,
+`auto-triage.js`, `console/live-step.js`, `scripts/smoke-llm.js`, `orchestrator/README.md`
+(multiple independent copies of the same claim, in different sections), `README.md` (repo root),
+`doc/state-machine-spec.md`, `doc/permissions.md`, `doc/accepted-gaps.md` §12, `prompts/README.md`,
+and `test/account-settings-sync.test.js`.
+
+**Left alone, deliberately, by category — each MEASURED against this HEAD, not assumed true
+by pattern-matching the word "`claude -p`":**
+
+1. **Historical/dated records that already disclaim themselves.** `doc/deployment.md`'s
+   `killedByDeadline`/`isSpawnTimeout` section ("this section is a record of the finding, not of
+   current code"), `doc/remediation-progress.md`/`doc/remediation-plan-2026-08.md`'s dated action
+   logs, `doc/improvisation-analysis.md`'s "v1's `claude -p` model" (explicitly the RETIRED
+   product driver, not this pipeline), config.js's own "a live measurement (2026-08, this
+   machine) of a `claude -p` call" (the measurement genuinely ran on the pre-A5b transport — the
+   date predates A5b by weeks, so the claim is true AS WRITTEN, about a specific past event).
+2. **Test-file comments describing their OWN migration history**, already correctly framed in
+   past tense at the point A5b's own commit and the A5b-2 fix pass touched them (e.g.
+   `test/llm-real.test.js`'s "this file used to fake the old `claude -p` transport",
+   `test/account-rotation.test.js`, `test/status-5.4.test.js`, `test/llm-real-card.test.js`) — by
+   construction these are already correct, since they were written or corrected describing a
+   transition that had already happened.
+3. **`doc/state-machine-spec.md`'s Step-contracts table** (`| PLAN | `claude -p` | ... |`, four
+   rows): a KIND-label naming which rows are LLM steps vs scripted ones, not a claim about argv or
+   spawn mechanics — parallel to the `| script |` label the WORKTREE row carries. Left as `claude -p`
+   deliberately: renaming it to `query()`/`invokeClaudeReal` would suggest the table is making a
+   mechanism claim it never made, and the prose paragraph immediately below the table (fixed in
+   this pass, see doc/state-machine-spec.md's own "Whichever figure applies..." paragraph) is
+   where the actual mechanism is described.
+4. **Cost/count shorthand describing WHAT an LLM call costs, not HOW it runs** — "`spo ask` makes
+   about two real `claude -p` calls per request", "every real `claude -p` call already records its
+   own token counts", "a real `claude -p` reproduction" (account-pool exhaustion cost), "a wide
+   `claude -p` outage" (auto-triage's incident-class name) — none of these assert the `-p` flag,
+   `spawnSync`, or argv construction; they use "`claude -p`" as this repo's established informal
+   name for "one real LLM invocation," the same way "a claude -p call" and "an LLM call" are used
+   interchangeably throughout this very entry. MEASURED risk of leaving these: low — none of them
+   would mislead a maintainer about the CURRENT transport's mechanics, only about a naming
+   convention that predates this chantier and is unrelated to it.
+
+**Not closed by this entry**: the pre-existing `killedByDeadline` field-name references in
+`orchestrator/README.md:1396` and `steps/scripted.js`'s own comment (both cite a field that does
+not exist in `steps/llm.js` today — the real field is `timedOut` — a naming drift that predates
+card #239 and is not caused by the A5b transport swap). Found during this sweep, out of scope for
+it, named here rather than silently carried forward uncorrected.

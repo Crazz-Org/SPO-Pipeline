@@ -94,8 +94,10 @@ source of truth (same philosophy as `~/.spo-bench/`):
   daemon counters and token trend the root page used to carry, unchanged. The deck reads the
   same journals as everything else plus one extra surface no other reader touches — the running
   step's own `claude` session transcript (`console/live-step.js`), which is the only thing on
-  disk that moves during an LLM call, since those run through `spawnSync` and journal nothing
-  until they return.
+  disk that moves during an LLM call, since those run through an awaited async `query()` call
+  (the vendored Claude Agent SDK, since card #239's transport cutover, action A5b, 2026-09-17 —
+  no longer a blocking `spawnSync`) and journal nothing per intermediate message, only once the
+  call returns.
 
 ## Migration (strangler, not big-bang)
 

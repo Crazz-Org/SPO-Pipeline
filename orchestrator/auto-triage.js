@@ -31,8 +31,9 @@
 //
 // "The one rule": this file never reads report CONTENT -- it only reads daemon.jsonl's own
 // journaled events (issue numbers, file paths, outcomes it already judged) to decide what to
-// process next. All schema and reproduction knowledge stays inside the `claude -p` session
-// triageBugReport spawns, reasoning against the product tree itself.
+// process next. All schema and reproduction knowledge stays inside the real LLM call
+// triageBugReport makes (via `invokeClaudeReal`, the vendored Agent SDK's `query()` since card
+// #239's transport cutover, action A5b, 2026-09-17), reasoning against the product tree itself.
 
 const fs = require('fs');
 const os = require('os');

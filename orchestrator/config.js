@@ -22,7 +22,9 @@ const { MAX_LEASE_AGE_MS } = stepContracts;
 
 const REPO_ROOT = path.join(__dirname, '..');
 
-// cwd policy for real-mode `claude -p` calls (steps/llm.js). Shadow mode never spawns anything,
+// cwd policy for real-mode LLM calls (steps/llm.js's invokeClaudeReal, the vendored Agent SDK's
+// query() since card #239's transport cutover, action A5b, 2026-09-17 -- no longer `claude -p`
+// spawned directly). Shadow mode never spawns anything,
 // so it never calls cwdForStep -- this only matters once real mode is actually reached.
 //
 // Split by where the step's authority lives, not by which model runs it:
@@ -326,11 +328,15 @@ function boundedPositiveIntFromEnv(name, defaultN, maxN) {
 
 // ---- action A2 (card #239, 2026-09-17): per-state OUTER deadlines for the five LLM steps -------
 //
-// Card #239 replaces steps/llm.js's invokeClaudeReal spawnSync (BLOCKING -- the event loop never
-// yields, so deadline.js's setTimeout literally cannot fire while a real `claude` call runs) with
-// an awaited async stream. The moment that lands, the outer timer every step already races
-// (deadline.js's callWithDeadline) becomes LIVE for PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/
-// VALIDATE for the first time -- and until this action, none of the five had an entry below, so
+// Action A2 landed AHEAD of action A5b (card #239, 2026-09-17, same day), which then replaced
+// steps/llm.js's invokeClaudeReal spawnSync (BLOCKING -- the event loop never
+// yielded, so deadline.js's setTimeout could not fire while a real `claude` call ran) with
+// an awaited async stream. STALE UNTIL THIS FIX PASS: this comment used to describe A5b in the
+// future tense ("the moment that lands... becomes LIVE") -- A5b has since landed (invokeClaudeReal
+// now drives the vendored Agent SDK's query(), see steps/llm.js's own header), so the outer timer
+// every step already races (deadline.js's callWithDeadline) genuinely IS LIVE now for PLAN/
+// IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE, not merely about to become so -- and until THIS
+// action (A2), none of the five had an entry below, so
 // every one fell back to the generic STEP_DEADLINE_MS (120000ms). A call that legitimately runs
 // 900000-1800000ms (LLM_STEP_DEADLINE_MS_BY_STEP, step-contracts.js) would be killed by that 120s
 // ceiling on its very first event-loop turn, retried once (a SECOND full LLM call, real spend, per
@@ -890,9 +896,10 @@ module.exports = {
   // 2026-09-17) -- that 60-minute figure was 2 x MAX_LLM_STEP_DEADLINE_MS, the INNER deadline
   // alone, correct only while the OUTER per-state timer (deadline.js's callWithDeadline, armed
   // from this file's own stepDeadlineMsByState) had no entry for any LLM step and so could never
-  // fire against a real call -- a blocking spawnSync never yields the event loop. A2 gives every
+  // fire against a real call -- a blocking spawnSync never yielded the event loop. A2 gave every
   // LLM step an outer entry (deadlineMsForStep(step) + STEP_DEADLINE_MS, this file's own
-  // stepDeadlineMsByState above), so once card #239's transport swap makes that timer live, the
+  // stepDeadlineMsByState above), so that once card #239's transport swap (action A5b, landed the
+  // same day) made that timer live -- which it now is, not merely anticipated -- the
   // worst legitimate per-attempt hold becomes the OUTER bound, not the inner one alone --
   // MAX_LLM_STEP_OUTER_DEADLINE_MS = MAX_LLM_STEP_DEADLINE_MS + STEP_DEADLINE_MARGIN_MS =
   // 1,920,000ms (step-contracts.js). MAX_LEASE_AGE_MS is derived from that running maximum for
