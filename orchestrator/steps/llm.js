@@ -1219,6 +1219,15 @@ module.exports = {
   extractTokens,
   tokenFieldsFrom,
   classifyFailure,
+  // A4 (card #239 chantier, orchestrator/steps/sdk-call.js's consumeQueryStream): the SDK
+  // transport's result message carries `api_error_status`/`terminal_reason` in the exact same
+  // snake_case shape this function already reads (MEASURED against the real vendored SDK, a fake
+  // `claude` emitting stream-json -- see sdk-call.js's own header), so consumeQueryStream calls
+  // this directly on a `result` message instead of re-deriving the usage/overloaded split a second
+  // time. Was already defined here and already shared with classifyFailure (see both functions'
+  // own comments on why one table backs both) -- only the export was missing, since nothing outside
+  // this file needed it before this action.
+  limitKindForFailure,
   withCamelAliases,
   cannedDryRunPayload,
   NONINTERACTIVE_ENV_DEFAULTS,

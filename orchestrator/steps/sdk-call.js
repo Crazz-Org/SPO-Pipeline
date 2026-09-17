@@ -1,8 +1,13 @@
 'use strict';
-// sdk-call.js -- action A3 (card #239 chantier, "Drive LLM steps through the Claude Agent SDK
-// instead of spawning `claude -p`"). This module will hold every moving part of the SDK call
-// (A4 adds stream consumption, A5 wires invokeClaudeReal to it); THIS action adds exactly one
-// exported pure function -- buildQueryOptions -- plus the error classes it can throw.
+// sdk-call.js -- actions A3 and A4 (card #239 chantier, "Drive LLM steps through the Claude Agent
+// SDK instead of spawning `claude -p`"). This module holds every moving part of the SDK call (A5
+// wires invokeClaudeReal to it). A3 added buildQueryOptions -- the pure opts-to-{prompt,options}
+// mapper -- plus the error classes it can throw. THIS action (A4) adds the other half:
+// consumeQueryStream, which takes the async iterable a real `query({prompt, options})` call
+// returns and reduces it down to today's invokeClaudeReal return shape. Like buildQueryOptions, it
+// never spawns anything itself -- it is handed an already-running stream and only reads from it --
+// and it does not own the deadline or the journal (see its own header for exactly what A5 still
+// has to add around it).
 //
 // buildQueryOptions(opts, deps) -> { prompt, options } takes today's invokeClaudeReal opts shape
 // (see steps/llm.js's own header for the authoritative field list) and produces the
@@ -125,7 +130,23 @@
 // wired up."
 const fs = require('fs');
 const { resolveClaudeCodeExecutable } = require('../sdk');
-const { resolvePromptText, NONINTERACTIVE_ENV_DEFAULTS } = require('./llm');
+const {
+  resolvePromptText,
+  NONINTERACTIVE_ENV_DEFAULTS,
+  // Reused, never reimplemented, by consumeQueryStream below -- all three are the SAME functions
+  // today's `claude -p`/`--output-format json` transport already uses on `invokeClaudeReal`'s
+  // parsed stdout. MEASURED (this action, 2026-09-17, against the REAL vendored SDK -- a fake
+  // `claude` executable emitting stream-json lines, consumed through a real `query()` call, see
+  // consumeQueryStream's own header): the SDK's `result` message carries `api_error_status` and
+  // `terminal_reason` in the exact same snake_case shape and spelling `classifyFailure`/
+  // `limitKindForFailure` already read off `--output-format json`'s parsed object -- there is
+  // nothing SDK-specific to translate. `limitKindForFailure` was already defined in llm.js but not
+  // exported (nothing outside that file needed it before this action) -- added to its
+  // module.exports in this same change, its own body untouched.
+  extractTokens,
+  classifyFailure,
+  limitKindForFailure,
+} = require('./llm');
 
 // Same UUID-v4 shape check llm.js's invokeClaudeReal applies to opts.sessionId (see that file's
 // own SESSION_ID_UUID_V4_RE comment for the full reasoning: the real `claude` CLI's `--help` says
@@ -480,8 +501,445 @@ function buildQueryOptions(opts, deps = {}) {
   return { prompt, options };
 }
 
+// consumeQueryStream(stream, ctx = {}) -> Promise<today's invokeClaudeReal return shape>
+//
+// Takes the async iterable a real `query({prompt, options})` call returns (from `sdk.js`'s
+// `loadQuery()`-resolved `query` function, handed `buildQueryOptions`'s own output) and reduces it
+// to EXACTLY the object `invokeClaudeReal` (steps/llm.js) returns today, key for key -- see that
+// function's own header for the authoritative field list this matches. It never spawns (the
+// stream is already running when this function receives it -- A5 owns the `query()` call itself),
+// never arms or checks a deadline (A5's job: an abort signal/timeout race around the iteration
+// this function does, not inside it), and never journals (runLlm's two `appendEvent` call sites
+// stay the only place that happens, unchanged by this action).
+//
+// F6 (Opus verifier, fix pass): the "key for key" claim above is true of this function's OWN
+// return value, but only PRE-RECOVERY -- `invokeClaudeReal` today wraps every branch except the
+// two where `claude` never started (an unreadable oauthTokenFile, a spawn failure) in
+// `maybeRecoverTokens` (llm.js), which can overwrite the six token fields on a result whose
+// `tokensSource` came back falsy. `consumeQueryStream` never calls it -- A7 ("Token ledger from
+// the stream") owns wiring that half in for this transport, not this action.
+//
+// ---- how the message shapes below were measured, not assumed ----------------------------------
+//
+// Same discipline as buildQueryOptions's own header: every claim below was checked against the
+// REAL vendored SDK (vendor/claude-agent-sdk/sdk.mjs), not read off its (unpublished, minified, no
+// .d.ts shipped) source by inspection. Method: a fake `pathToClaudeCodeExecutable` -- a `node`
+// script that writes literal stream-json lines (JSON objects the way `claude --output-format
+// stream-json` would emit them, one per stdout line) read from an env var -- run through a real
+// `query({prompt, options})` call from THIS repo's vendored SDK, iterating the real async
+// generator it returns and logging exactly what came out. test/sdk-call-options.test.js's own
+// "argv-level" test (A3, case 3) already crosses this same process boundary for argv; this action
+// reuses that fixture shape for message content instead. Deleted after use, not committed; this
+// comment records the findings for the shapes the checked-in tests (test/sdk-call-options.test.js
+// additions below) do not themselves re-derive:
+//
+//   1. PASS-THROUGH, NOT TRANSFORMED. A `result` message fed in with `is_error:false,
+//      modelUsage:{...}, num_turns:12, duration_ms:1234, structured_output:{...}` comes back out
+//      of the async iterator with every one of those keys byte-identical, same snake_case spelling
+//      the CLI's own `--output-format json` reply already uses. F3 (Opus verifier, fix pass)
+//      corrected the evidence sentence this claim used to rest on: it named FIVE fields
+//      (`api_error_status`, `num_turns`, `terminal_reason`, `session_id`, `duration_ms`) as "NONE
+//      of them occur in the file at all" -- re-measured in this worktree's own vendored copy
+//      (`grep -oF '<name>' vendor/claude-agent-sdk/sdk.mjs | wc -l`): `api_error_status` 0,
+//      `num_turns` 0, `terminal_reason` 0 -- genuinely absent, so the SDK has no hardcoded
+//      knowledge of these three and cannot rename or drop them -- but `session_id` 29 and
+//      `duration_ms` 3, which DO occur (the SDK reads its own session id and timing internally
+//      for bookkeeping the query() caller never sees, e.g. `this.lastErrorResultText`'s own
+//      construction grepped in the is_error branch's comment below). The CONCLUSION survives
+//      unchanged -- the probe above independently confirms both fields still arrive on the
+//      message object byte-identical to what the fake CLI wrote, so "the SDK reads it too" is not
+//      the same claim as "the SDK transforms or strips it" -- but the ORIGINAL sentence's method
+//      (grep for absence, as a stand-in for pass-through) was only valid for three of the five
+//      names it listed. This is WHY `classifyFailure`/`limitKindForFailure` (llm.js) can be called
+//      on a `result` message with zero adaptation -- the field names they already read are exactly
+//      the ones present.
+//   2. `errors` MUST BE AN ARRAY OF STRINGS, or the SDK itself throws while building the message.
+//      MEASURED: a `result` message with `subtype:'error_during_execution', api_error_status:429`
+//      and NO `errors` key at all threw `Cannot read properties of undefined (reading 'map')`
+//      from INSIDE the SDK's own message construction, before this function ever saw a message --
+//      i.e. an error-subtype `result` message structurally REQUIRES `errors` to be present. Given
+//      `errors:['rate limited']` (an array of strings), it passed through untouched. Given
+//      `errors:[{message:'rate limited', type:'api_error'}]` (an array of objects, the shape a
+//      structured API error type might plausibly take), the SDK threw `n.trim is not a function`
+//      -- so the SDK itself calls something like `.trim()` on each entry, meaning `errors` is
+//      documented-by-behaviour to be `string[]`, never `object[]`. Both throws happen inside the
+//      SDK's own iteration, which is exactly the "throws mid-iteration" case item 4 below covers --
+//      this function's own try/catch around the loop is what stands between a malformed message
+//      from a future CLI build and a crashed worker.
+//   3. `is_error:true` DOES NOT STRUCTURALLY MEAN "NO `result` KEY" -- CORRECTED, F1 (Opus
+//      verifier, fix pass). This action's own probe only ever constructed `is_error:true` on the
+//      four error subtypes (`error_during_execution`, `error_max_turns`, `error_max_budget_usd`,
+//      `error_max_structured_output_retries`), none of which carried a `result` field -- and wrongly
+//      generalised that to "every `is_error:true` message," a claim it never actually tested. The
+//      verifier measured against the real CLI binary's own zod schemas (2.1.274, one file this
+//      probe never reached): `subtype:'success'` declares `is_error` as a REQUIRED BOOLEAN, not the
+//      literal `false` -- the agentic loop can complete normally and still report an error. Only
+//      that schema declares `api_error_status` and `result` (required there); the four error
+//      subtypes' schema declares neither. Consequence that made this a real defect, not a
+//      theoretical gap: the one limit this repo has EVER actually recorded (the Fable 429 incident,
+//      llm.js's own `classifyFailure` comment) arrives as `subtype:'success', is_error:true,
+//      api_error_status:429, result:'<limit text>'`, with NO `errors` field at all -- the exact
+//      opposite of what item 3 used to claim. `invokeClaudeReal`'s own `is_error`/`exit!==0` branch
+//      (llm.js) already sets `result: parsed.result` unconditionally on failure -- so `result`
+//      carrying the diagnostic text here is not a divergence to correct for, it is the SAME shape
+//      today's transport already relies on, and `orchestrator/intake.js`'s `formatLlmFailure`
+//      (`raw.error || raw.result || ''`) already falls back to exactly this field. The `errors`
+//      array (this file's own `error`-field decision, below) is the fallback needed ONLY for the
+//      four error subtypes, which genuinely never carry `result` -- see the is_error branch's own
+//      comment, and grep `sdk.mjs` for `is_error?e.subtype==="success"?e.result:e.errors` for the
+//      SDK's own construction of the identical distinction, mirrored here rather than reinvented.
+//   4. A NONZERO-EXIT CHILD WITH NO RESULT MESSAGE THROWS MID-ITERATION. A fake `claude` that
+//      wrote a `system`/`init` line, an `assistant` line, then `process.exit(1)` with no `result`
+//      line at all made the `for await` loop itself throw `Error: Claude Code process exited with
+//      code 1` on its next iteration -- a generic `Error`, not a named class, and not something the
+//      messages already yielded gave any advance warning of. Two things follow: this function's
+//      loop MUST be wrapped in try/catch (an uncaught throw here would propagate out of
+//      `consumeQueryStream` itself, which its own contract -- "never spawn, but always return
+//      today's shape" -- does not allow), and `sessionId` from an `init` message already seen
+//      BEFORE the throw is still honest and must be kept (the session really was created; only the
+//      LLM step failed to complete it) -- matching invokeClaudeReal's existing convention that
+//      `sessionId` is reported whenever a session really exists, not only on a clean return.
+//   5. A ZERO-EXIT CHILD WITH NO RESULT MESSAGE DOES **NOT** THROW. A fake `claude` that wrote only
+//      a `system`/`init` line and then `process.exit(0)` let the `for await` loop complete
+//      normally -- no error, no result. This is a SEPARATE case from item 4 (a clean exit that
+//      simply never got around to emitting a result, vs. a crash), and both need their own branch
+//      below: this function cannot tell "the model finished with nothing to say" apart from "a
+//      `claude` build stopped emitting `result` lines" any more than the old transport's
+//      `!parsed || typeof parsed !== 'object'` branch could tell "malformed JSON" apart from "the
+//      CLI changed its output shape" -- both are reported the same honest way, `kind:'error'`.
+//
+// ---- the five decisions this action's brief asked for, and what backs each one ------------------
+//
+// 1. `raw`. Today it is the child's exit status (an OS int: 0, a positive failure code, or the
+//    value spawnSync leaves on a signal kill) -- `orchestrator/intake.js`'s `formatLlmFailure`
+//    reads it as `exit=<raw.raw>`, present-fields-only (guarded by `!== undefined && !== null`,
+//    the same convention this whole file's `apiErrorStatus`/`terminalReason` fields already use).
+//    There is no exit status on this transport: `query()` never surfaces the child's process exit
+//    code to its caller at all (confirmed by reading every message shape probed above -- none
+//    carries one; the SDK manages the child process internally and reports success/failure only
+//    through `is_error`/`subtype`). This function sets `raw: undefined` on every branch, always --
+//    never a fabricated 0-or-1 standing in for "no exit code available." That keeps
+//    `formatLlmFailure`'s existing `!== undefined && !== null` guard doing exactly what it already
+//    does for the oauthTokenFile-unreadable branch today (which also carries no `raw` key): the
+//    `exit=` detail is silently omitted, not replaced with a lie. WHAT A READER CAN AND CANNOT
+//    COMPARE: an old journal line's implicit "exit=143" (SIGTERM) or "exit=3" (a real CLI failure
+//    code) meant something concrete about the OS-level process outcome; a reader who sees no
+//    `exit=` detail on a new-transport park must not infer "the process exited 0" or "no crash
+//    happened" from the absence -- it means only "this transport does not report an exit code,"
+//    the same non-inference the oauthTokenFile branch already required before this action existed.
+// 2. `result` vs `structured_output`. MEASURED (item 1 above, and directly): a real `result`
+//    message CAN carry both simultaneously (a fake reply with `result:'{"foo":"bar"}'` AND
+//    `structured_output:{foo:'bar'}` passed through with both fields intact, unmodified, not
+//    merged or deduplicated by the SDK), and CAN carry only `structured_output` with no `result`
+//    key at all (a fake reply with `structured_output:{hello:'world'}` and no `result` field
+//    passed through exactly that way) -- so this function cannot assume either is authoritative by
+//    elimination. Every one of this pipeline's five real step contracts sets a `jsonSchema`
+//    (test/sdk-call-options.test.js's own table-driven test 1, A3), which `buildQueryOptions`
+//    always turns into `options.outputFormat = {type:'json_schema', schema}` -- so `structured_output`
+//    is the field this pipeline's OWN request shape asks the SDK to populate, and it arrives
+//    already parsed (a real JS object, not text needing a second decode). `result`'s free-text
+//    shape is the CLI's own historical field, not something this pipeline's json-schema-driven
+//    calls are designed to depend on. So: prefer `structured_output` (re-stringified with
+//    `JSON.stringify`, since today's contract -- `runLlm`'s `JSON.parse(raw.result)` -- needs a
+//    STRING, never a bare object) when it is a non-null object; fall back to `result` verbatim when
+//    it is already a string (the CLI's own historical shape, kept for a future/legacy call that
+//    sets no `jsonSchema` and therefore gets no `structured_output` back); JSON.stringify a
+//    non-string, non-undefined `result` as a last defensive resort (so `runLlm`'s `JSON.parse`
+//    contract is never handed a non-string no matter which of these three shapes actually arrives).
+//    Neither present leaves `result` genuinely absent (`undefined`) -- exactly the shape
+//    `JSON.parse(undefined)` already fails on in `runLlm` today, which is the SAME "reply was not
+//    valid JSON" step failure the old transport already produces for a `result` missing entirely,
+//    not a new failure mode this action invents.
+//
+//    UPHELD, and named the FOURTH DELIBERATE DEPARTURE (Opus verifier, fix pass) from today's
+//    real-mode transport -- `buildQueryOptions`'s own header already names three (stripping
+//    `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, the `allowedTools` comma-vs-space join, and
+//    pinning `settingSources` unconditionally); preferring `structured_output` over `result` is a
+//    fourth, and belongs in this function's header rather than that one since it is
+//    `consumeQueryStream`'s own decision, not `buildQueryOptions`'s. The reasoning the verifier
+//    added: the CLI's success schema types `result` as any string, and F1 (above) is itself the
+//    proof that a `subtype:'success'` reply can carry ordinary prose there (the Fable limit text).
+//    A second live path in the CLI yields a success with an EMPTY `result` and `structured_output`
+//    stripped entirely. `--json-schema` genuinely reaches the CLI on every real call this pipeline
+//    makes (`buildQueryOptions` always sets `options.outputFormat` -- all five step contracts
+//    declare a `jsonSchema`, test/sdk-call-options.test.js's own table-driven test 1, A3), so every
+//    real call asks for `structured_output` to be populated; a turn that cannot produce a
+//    schema-valid reply fails with its OWN `error_max_structured_output_retries` subtype (this
+//    file's error-subtype handling above) rather than emitting free-text prose into either field.
+//    So `structured_output` present implies schema-valid, a guarantee `result` never carries --
+//    inverting the preference (result-first) would hand `runLlm`'s `JSON.parse(raw.result)` the
+//    turn's CLOSING PROSE instead of the payload, and would do so on the ORDINARY json-schema
+//    call, not an edge case: `structured_output` is populated from the model's own
+//    `StructuredOutput` TOOL CALL (the CLI's result message sets `structured_output:
+//    sr.at(-1)?.data` -- the last such call's parsed `input.text`; `StructuredOutput` is matched
+//    there as `e.type === "tool_use" && e.name === "StructuredOutput"`), while `result` is the
+//    turn's final assistant TEXT. Two different productions, not two renderings of one string --
+//    so the two disagreeing is the expected shape of a json-schema reply, and only
+//    `structured_output` is the schema payload at all. The `tool_deferred` path named above is
+//    NOT itself such a case: there the CLI strips `structured_output` outright
+//    (`{api_error_status:O, api_error_code:L, structured_output:A, ...se} = P; yield {...se,
+//    is_error:!1, stop_reason:"tool_deferred", result:""}`) and sets `result:''`, so both
+//    orderings park identically -- it is evidence that `result` is not a reliable JSON carrier,
+//    not evidence that the preference decides anything there.
+//    `step-contracts.js`'s `checkOutputTypes` array-from-JSON-string
+//    leniency (llm.js's own comment on it) simply stops firing on this transport, since a value
+//    that arrived as a JSON string under the old transport now arrives as a real array already --
+//    not a behaviour change, just a leniency with nothing left to correct. Today's single-source
+//    (`result`-only) contract was FRAGILE, not faithful, to keep as this transport's own default;
+//    `structured_output`-first is the one that cannot be handed non-JSON by construction.
+// 3. The error subtypes. `error_max_turns` and `error_max_budget_usd` have no dedicated vocabulary
+//    entry in today's transport (`classifyFailure`/`limitKindForFailure`, llm.js) -- neither
+//    function looks at `subtype` at all, only at `api_error_status` and `terminal_reason`. Rather
+//    than inventing a subtype-keyed branch (a new failure channel this action's brief explicitly
+//    rules out), this function calls `classifyFailure`/`limitKindForFailure` UNIFORMLY on every
+//    `is_error:true` result message regardless of subtype -- which is correct by construction: if
+//    a future `error_max_turns` reply ever also happens to carry `api_error_status:429` (a rate
+//    limit that ALSO caused the loop to be cut short), it is still classified `kind:'limit'`
+//    exactly like a plain `error_during_execution`/429 reply would be, because the classification
+//    depends only on the two fields it has always depended on. Absent those two fields (the
+//    ordinary case for `error_max_turns`/`error_max_budget_usd`/`error_max_structured_output_retries`
+//    -- none of the three represents an account-wide quota or server-overload condition, they are
+//    all THIS call's own agentic-loop/budget/retry caps being hit), `classifyFailure` falls through
+//    to its existing `'error'` default -- the SAME park reason (`llm-transport-failed:<STEP>`,
+//    state-machine.js's four `kind === 'error' || timedOut` guards) a plain malformed-JSON or
+//    spawn failure already produces today. No production path sets `--max-turns` or
+//    `--max-budget-usd` (this action's brief, and `buildQueryOptions`'s own header on
+//    `deadlineMs`/turn caps), so `error_max_turns`/`error_max_budget_usd` are not reachable from a
+//    real card today regardless of this mapping -- recorded for when A8 (per-step permission
+//    policy) or a future action considers setting either.
+//    F1 (Opus verifier, fix pass) corrected a narrower claim THIS decision used to rest on: the
+//    classification call is uniform across every `is_error:true` message regardless of subtype
+//    (unchanged by the fix), but WHICH FIELD carries the diagnostic text is not -- `subtype:'success'`
+//    (is_error:true) is classified the SAME way (`classifyFailure` never looks at `subtype`) but
+//    reports its text via `result`, while the four error subtypes report theirs via `errors` -- see
+//    the is_error branch's own comment and header item 3 for the corrected shape.
+// 4. A stream that ends with no result message (item 5 above), and a stream that throws
+//    mid-iteration (item 4 above). Both produce `{ok:false, kind:'error', error:<honest string>,
+//    ...}` -- the same shape the old transport's "stdout was not valid JSON" branch uses for its
+//    own "something is structurally wrong with what came back" case. `sessionId` is read from
+//    whatever `system`/`init` message this function has already seen by the time either branch is
+//    reached (`null` if none arrived, e.g. a `pathToClaudeCodeExecutable` that resolves but the
+//    child dies before ever writing its first line) -- consistent with invokeClaudeReal's existing
+//    rule that a session id is reported only when a session really exists, never fabricated ahead
+//    of evidence and never withheld once evidence (the `init` message) exists.
+//
+// ---- the sixth decision: does this function take a per-message callback? -----------------------
+//
+// Yes -- `ctx.onMessage`, called once per message in stream order, BEFORE this function's own
+// classification of that message (so a callback sees `assistant`/`user`/`stream_event` progress
+// messages this function itself has no other use for, and sees the terminal `result` message too,
+// same as everything else). Optional (`typeof ctx.onMessage === 'function'` gates it; `ctx` itself
+// defaults to `{}` so a caller that only wants the return shape -- every test in this action, and
+// A5 until A6 lands -- can call `consumeQueryStream(stream)` with no second argument at all).
+// Wrapped in its own try/catch, separate from the loop's own try/catch: a callback that throws
+// must never be indistinguishable from the STREAM throwing (item 4 above) -- a progress-reporting
+// bug in A6's own code must not get misreported as "query() stream threw" and misroute a card into
+// a transport-failure park for a failure that was never the LLM call's own. This action does not
+// build what A6 does with the messages it forwards (no live-progress plumbing, no journal writes
+// from inside the callback -- out of scope, per the chantier brief) -- only the seam A6 attaches
+// to, so A6 does not have to duplicate this function's own stream-iteration/classification logic
+// to get a look at the same messages.
+async function consumeQueryStream(stream, ctx = {}) {
+  const onMessage = typeof ctx.onMessage === 'function' ? ctx.onMessage : null;
+
+  let sessionId = null;
+  let resultMessage = null;
+
+  try {
+    for await (const message of stream) {
+      if (message && typeof message === 'object') {
+        // The authoritative id: MEASURED, a `system`/`init` message's own `session_id` is the
+        // first evidence a session exists at all, and a terminal `result` message's `session_id`
+        // (set again below, once `resultMessage` is known) is the CLI's own last word on the same
+        // question -- both are CLI-reported, never one we generated ourselves (this transport,
+        // unlike invokeClaudeReal, never mints a sessionId of its own at all: `buildQueryOptions`
+        // passes `opts.sessionId` through when the caller already supplied one, and otherwise lets
+        // the CLI mint its own, which is what the `init` message's `session_id` then reports).
+        // The `subtype === 'init'` guard is UNPINNED (mutation-proof, Opus verifier fix pass:
+        // dropping it leaves every test in this file green) but not a gap worth a test for --
+        // every `system` message the CLI emits on a given run carries the SAME `session_id`, so a
+        // wider `message.type === 'system'` match would read the identical value here regardless.
+        // Left in place as the more PRECISE match (this is the one message the SDK's own
+        // `apiKeySource`/`init` semantics document as authoritative for the id), not because a
+        // looser one has been observed to disagree.
+        if (
+          message.type === 'system' &&
+          message.subtype === 'init' &&
+          typeof message.session_id === 'string' &&
+          message.session_id !== ''
+        ) {
+          sessionId = message.session_id;
+        } else if (message.type === 'result') {
+          resultMessage = message;
+          if (typeof message.session_id === 'string' && message.session_id !== '') {
+            sessionId = message.session_id;
+          }
+        }
+      }
+      if (onMessage) {
+        try {
+          onMessage(message);
+        } catch {
+          // A callback's own bug is never this function's failure to report -- see the header's
+          // "sixth decision" section for why this is a SEPARATE try/catch from the loop's own.
+        }
+      }
+    }
+  } catch (err) {
+    // The stream itself threw mid-iteration (header item 4: MEASURED, a nonzero-exit child with
+    // no result message produces exactly this). `sessionId` above already reflects whatever `init`
+    // message arrived before the throw, honestly null otherwise.
+    return {
+      ok: false,
+      kind: 'error',
+      error: `sdk-call.js: query() stream threw before a result message arrived: ${err && err.message}`,
+      sessionId,
+      ...extractTokens(undefined), // the shared "nothing recognizable was found" zero-token shape
+      numTurns: undefined,
+      durationS: undefined,
+      raw: undefined,
+    };
+  }
+
+  if (!resultMessage) {
+    // The stream ended cleanly with no throw, but also no `result` message (header item 5:
+    // MEASURED, a zero-exit child that never wrote one). Distinct from the throw branch above --
+    // both are real and both need their own branch, per this action's brief -- but land on the
+    // same reported shape, the same way the old transport's "stdout was not valid JSON" and
+    // "spawn failed" branches are different causes that both report `kind: 'error'`.
+    return {
+      ok: false,
+      kind: 'error',
+      error: 'sdk-call.js: query() stream ended with no result message',
+      sessionId,
+      ...extractTokens(undefined),
+      numTurns: undefined,
+      durationS: undefined,
+      raw: undefined,
+    };
+  }
+
+  // F1 (Opus verifier, fix pass): `is_error:true` does NOT structurally mean "no result message
+  // shape" -- it can arrive on EITHER of the two message shapes the SDK's own zod schemas declare
+  // (measured by the verifier against the real CLI binary, 2.1.274, one file this action's own
+  // probe never constructed): `subtype:'success'` declares `is_error` as a required BOOLEAN, not
+  // the literal `false` -- the agentic loop can complete normally and still report an error (a 429
+  // mid-response is exactly this shape, and IS the one limit this repo has ever actually recorded,
+  // the Fable incident). Only the success schema declares `api_error_status` and `result`
+  // (required there); the four error subtypes' schema declares neither. So resultMessage below is
+  // one of THREE shapes, not two: SDKResultSuccess (is_error:false), SDKResultSuccess-with-error
+  // (subtype:'success', is_error:true -- carries `result`, may carry `api_error_status`, never
+  // carries `errors`), or SDKResultError (one of the four error subtypes -- carries `errors`,
+  // never `result` or `api_error_status`). extractTokens is the SAME function invokeClaudeReal
+  // calls on `parsed.modelUsage` (llm.js) -- modelUsage's shape is unchanged by this transport
+  // (header item 1: pass-through, not transformed), so no adaptation is needed here either.
+  const tokens = extractTokens(resultMessage.modelUsage);
+  const numTurns = resultMessage.num_turns;
+  // duration_ms is this transport's own measurement of the call (the CLI/SDK's, not this
+  // function's own wall-clock read -- this function does not spawn and does not own timing, see
+  // this file's header) -- converted to seconds for the same `durationS` field name/unit
+  // invokeClaudeReal already reports. Left `undefined`, never fabricated as 0, when the field is
+  // absent (defensive: every probed message carried it, but nothing guarantees a future CLI build
+  // always will).
+  const durationS = typeof resultMessage.duration_ms === 'number' ? resultMessage.duration_ms / 1000 : undefined;
+
+  if (resultMessage.is_error) {
+    const kind = classifyFailure(resultMessage);
+    // F1 (Opus verifier, fix pass): dispatch on `subtype`, mirroring the vendored SDK's OWN
+    // construction of its internal `lastErrorResultText` (grepped from the real `sdk.mjs`, not
+    // reasoned from the outside):
+    //   e.is_error ? (e.subtype === "success" ? e.result : e.errors.map(n=>n.trim()).filter(Boolean).join("; ")) : void 0
+    // i.e. the SDK itself treats `result` as the diagnostic text on `subtype:'success'` and
+    // `errors` (trimmed, empty entries dropped, joined) as the diagnostic text on every other
+    // subtype -- exactly the two schema shapes this branch's own header comment now documents.
+    // `isSuccessSubtypeError` names which of the two this reply is.
+    const isSuccessSubtypeError = resultMessage.subtype === 'success';
+    // F4 (Opus verifier, fix pass): computed BEFORE the return object, not inline, because the
+    // gate on whether to include `error` at all must be the JOINED, TRIMMED, FILTERED text, never
+    // the raw array's `.length`. The original inline version gated on
+    // `resultMessage.errors.length > 0` and then trimmed/filtered AFTER -- so `errors:['']` (length
+    // 1, passes the gate) produced `error: ''`, and `errors:['', '  boom  ', '']` produced
+    // `'; boom  ; '` instead of the SDK's own `'boom'` (re-measured through the real SDK against
+    // both cases; the SDK's construction -- see this branch's own header comment -- filters BEFORE
+    // joining, this file's original code filtered the same way but gated the KEY's presence on the
+    // wrong, pre-filter length). An empty joined string is exactly the collapse
+    // `orchestrator/intake.js`'s `formatLlmFailure` (`raw.error || raw.result || ''`) warns is "no
+    // signal at all" -- the one case the `error` field exists to prevent -- so gating on the
+    // POST-join, POST-filter string (`joinedErrors` truthy, i.e. non-empty) is the only gate that
+    // cannot silently produce that collapse.
+    const joinedErrors = Array.isArray(resultMessage.errors)
+      ? resultMessage.errors
+          .map((e) => String(e).trim())
+          .filter(Boolean)
+          .join('; ')
+      : '';
+    return {
+      ok: false,
+      kind,
+      // Only present on a 'limit' classification -- same convention as invokeClaudeReal's own
+      // identical branch (llm.js): an absent/unrecognised limitKind is accounts.markLimit's own
+      // fail-safe fallback, so omitting the key on a plain 'error' costs nothing.
+      ...(kind === 'limit' ? { limitKind: limitKindForFailure(resultMessage) } : {}),
+      // `result`: TODAY'S TRANSPORT PARITY, corrected by F1 -- present ONLY on
+      // `subtype:'success'`, since that is the one schema that actually declares the field
+      // (required there). This is the shape the one limit this repo has ever recorded (the Fable
+      // 429 incident) actually arrives as: the loop completed, `is_error:true`,
+      // `api_error_status:429`, and the CLI's own limit-reached text sits in `result` -- the same
+      // field today's `claude -p` transport already carries it in (`invokeClaudeReal`'s
+      // `is_error`/`exit!==0` branch, llm.js, sets `result: parsed.result` unconditionally on
+      // failure). No `error` key is set alongside it -- matching today's transport exactly, which
+      // never sets one on this branch either; `result` alone is the diagnostic text, and
+      // `orchestrator/intake.js`'s `formatLlmFailure` (`raw.error || raw.result || ''`) already
+      // falls back to it.
+      ...(isSuccessSubtypeError ? { result: resultMessage.result } : {}),
+      // `error` populated from `joinedErrors` (header item 2: MEASURED to be required, string[], on
+      // every real error-SUBTYPE message -- narrowed by F1 to exclude `subtype:'success'`, which
+      // never carries `errors` at all per the corrected header) -- this is NOT inventing a new
+      // failure field or a new failure channel (the shape still returns `{ok:false, kind, ...}`
+      // exactly like every other branch in this file and in invokeClaudeReal); it is populating
+      // the EXISTING optional `error` string with the one diagnostic source THIS shape actually
+      // has, since the `result`-text fallback structurally cannot exist for it (no `result` field
+      // on the error-subtype schema at all). Gated on the POST-filter string, not the raw array --
+      // see `joinedErrors`'s own comment above (F4) for why the gate has to be the joined text.
+      ...(!isSuccessSubtypeError && joinedErrors ? { error: joinedErrors } : {}),
+      sessionId,
+      ...tokens,
+      numTurns,
+      durationS,
+      apiErrorStatus: resultMessage.api_error_status,
+      terminalReason: resultMessage.terminal_reason,
+      raw: undefined,
+    };
+  }
+
+  // Success (SDKResultSuccess, is_error:false). See decision 2 above for the structured_output vs
+  // result precedence and why each branch below exists.
+  let result;
+  if (resultMessage.structured_output !== null && typeof resultMessage.structured_output === 'object') {
+    result = JSON.stringify(resultMessage.structured_output);
+  } else if (typeof resultMessage.result === 'string') {
+    result = resultMessage.result;
+  } else if (resultMessage.result !== undefined) {
+    result = JSON.stringify(resultMessage.result);
+  }
+  // Neither present: `result` stays undefined, and runLlm's existing `JSON.parse(raw.result)`
+  // fails exactly the way it already does today for a success reply with no usable payload --
+  // no new failure mode, see decision 2's own closing sentence.
+
+  return {
+    ok: true,
+    result,
+    sessionId,
+    ...tokens,
+    numTurns,
+    durationS,
+    raw: undefined,
+  };
+}
+
 module.exports = {
   buildQueryOptions,
+  consumeQueryStream,
   normalizeAllowedTools,
   buildEnv,
   SETTING_SOURCES,
