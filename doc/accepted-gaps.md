@@ -98,10 +98,43 @@ register exists to prevent.
   see "Corrected into scope, again" above for why that reason stopped holding. The two are no
   longer one bucket: `CLAUDE.md` is prose a reader trusts, `.claude/**` is configuration an agent
   cannot touch.
-- **Vendored or generated files** — this exclusion class is currently **empty**: there is no
-  `node_modules/`, no build output, and no generated file checked into this repo (verified:
-  `ls node_modules` fails, no `dist/`/`build/` directory exists). Named so the exclusion is
-  not silently assumed; if one is ever added, it belongs here.
+- **Vendored or generated files** — no longer empty as of 2026-09-17: card #239's chantier added
+  three third-party files, `vendor/claude-agent-sdk/{sdk.mjs,package.json,LICENSE.md}`, copied in
+  from `npm install @anthropic-ai/claude-agent-sdk`, never installed inside this repo (see
+  `orchestrator/sdk.js`'s header). Excluded here because these three are code this repo did not
+  write and make no claim of their own about this pipeline's behavior. (`sdk.mjs` is minified but
+  not degenerate — measured: 225 lines, 14 comment lines, 150 of the 225 under 200 characters; an
+  earlier draft of this entry mischaracterized it as "one minified line," corrected here. That
+  earlier draft is also the reason this bucket is worded the way it now is: see the next
+  paragraph.) `vendor/claude-agent-sdk/README.md`, by contrast, is **not** in this exclusion — it
+  is prose this repo wrote (byte count, md5, version pair, update ritual) and is in scope for
+  `doc/remediation-plan-2026-08.md`'s execution rule 6, which names `vendor/**/README.md`
+  explicitly as of the same date.
+
+  **Measured, by planting a symptom, that the three excluded files do not enter any sweep's**
+  **corpus** — not merely by re-running the suite unmodified and noting the failure count held,
+  which the first draft of this entry did and which a same-day, same-suite regression could
+  satisfy by accident without proving absence of anything. The actual check: a synthetic offender
+  file — one `action 99.9a` banner id documented nowhere, one possessive symbol citation to a
+  file named `zz-nonexistent-file.js` (which does not exist), and one bare `gh api ... -f` call
+  with no `--method`/`-X` — was planted as `vendor/claude-agent-sdk/zz-probe.js` and the file
+  removed afterward (never committed). Command: `node --test test/gh-api-argv.test.js
+  test/doc-constant-sweep.test.js test/park-reason-doc-sweep.test.js test/gate-scope.test.js
+  test/test-comment-citation-sweep.test.js`. Result with the file under `vendor/`: 129 tests,
+  127 pass, 2 fail — identical to the same command with no probe file present at all (the same
+  two pre-existing citation-anchor failures this register's own header does not track). The
+  IDENTICAL file content, planted instead at `orchestrator/zz-probe.js` (which every scanner
+  here dynamically walks via `fs.readdirSync`, not a fixed list): 129 tests, 124 pass, **5**
+  fail — the same 2 pre-existing plus 3 new, named failures: `doc-constant-sweep.test.js`'s
+  `"<file>.js's <CodeShapedIdent>"` symbol-citation check, its `"action N.Na"` banner check, and
+  `gh-api-argv.test.js`'s `-f`/`--method` check. Same bytes, same filename pattern (`zz-probe.js`),
+  different directory, 0 vs. 3 new failures — that is what "does not enter the corpus" means here,
+  demonstrated rather than inferred from an unmodified tree's failure count.
+
+  Still no `node_modules/`, no build output, and no other generated file checked into this repo
+  (verified: `ls node_modules` fails, no `dist/`/`build/` directory exists) — this bucket's other
+  members remain absent; only the three vendored files above populate it. If a future addition
+  changes that, name it here too.
 - **Blank lines and executable code lines inside `orchestrator/**/*.js`, `bin/spo`,
   `console/**/*.js`, `scripts/**`** — only comment lines in these files carry documentation
   claims; a code line's truthfulness is what the test suite already checks, not what this
@@ -115,19 +148,27 @@ register exists to prevent.
 - **`.gitignore`** (repo root) — a git configuration file; it carries no claim about system
   behaviour for a reader to trust or distrust, so it is not documentation in the sense this
   register partitions.
+- **`.gitattributes`** (repo root) — added 2026-09-17 (card #239 A1's fix pass, F12: `vendor/**
+  -diff linguist-vendored`, so `git diff`/GitHub's language stats don't treat the vendored SDK as
+  this repo's own code). Same reason as `.gitignore` immediately above: a git configuration file,
+  not a claim about system behaviour.
 
 **Top-level directory/file check (every entry in the repo root, verified against this tree):**
 `.claude` (excluded, harness-governed, above), `.github` (in scope since 2026-09-05 —
 `gate.yml`'s comment lines; **it was missing from this check entirely until then**), `accounts`
 (in scope, added 2026-09-02), `bin` (in scope, `bin/spo`), `console` (in scope), `doc` (in scope),
 `orchestrator` (in scope), `prompts` (in scope), `scripts` (in scope, added 2026-09-02), `test`
-(excluded, above), `worktrees` (excluded, untracked, above), `CLAUDE.md` (**in scope since
-2026-09-05**, above), `README.md` (in scope), `.gitignore` (excluded, above), `.recette`
-(excluded, untracked and absent from disk, above). Every top-level entry is now placed in exactly
-one bucket, with a reason — a sentence this section already made once, on 2026-09-02, while
-omitting `.github`, so read it as the current claim and not as a guarantee that it is checked by
-anything. Derived with `git ls-files | awk -F/ '{if(NF==1) print $0; else print $1}' | sort -u`,
-which is the check that was missing.
+(excluded, above), `vendor` (**split, added 2026-09-17** — `vendor/claude-agent-sdk/{sdk.mjs,
+package.json,LICENSE.md}` excluded, the "Vendored or generated files" bucket above, which this
+entry newly populates; `vendor/claude-agent-sdk/README.md` is in scope, same bucket's second
+paragraph), `worktrees` (excluded, untracked, above),
+`CLAUDE.md` (**in scope since 2026-09-05**, above), `README.md` (in scope), `.gitignore`
+(excluded, above), `.gitattributes` (**excluded, added 2026-09-17**, above), `.recette` (excluded,
+untracked and absent from disk, above). Every top-level
+entry is now placed in exactly one bucket, with a reason — a sentence this section already made
+once, on 2026-09-02, while omitting `.github`, so read it as the current claim and not as a
+guarantee that it is checked by anything. Derived with `git ls-files | awk -F/ '{if(NF==1) print
+$0; else print $1}' | sort -u`, which is the check that was missing.
 
 ## 2 · Measurement commands (reproducible)
 

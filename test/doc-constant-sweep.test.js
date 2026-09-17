@@ -1013,14 +1013,16 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
 // text), the three doc/accepted-gaps.md §3b running logs (doc/remediation-progress.md,
 // doc/improvisation-analysis.md, doc/remediation-plan-2026-08.md), and
 // doc/comment-corpus-audit-2026-09-03.md (9.1's own deliverable, written AFTER the corpus it
-// measured -- not part of what it measured). 67 files: the 65 of doc/accepted-gaps.md §3d's own
+// measured -- not part of what it measured). 68 files: the 65 of doc/accepted-gaps.md §3d's own
 // count, plus `orchestrator/retry-channel.js`, added by project-2 card #476 (the unpark scan's
 // health rule, factored out of bin/spo when the card gave it a third reader), plus
 // `console/dispatcher-status.js`, added by card #186 when computeDispatcherStatus was factored
 // out of bin/spo into its own module so bin/spo's `spo status` and console/collect.js's dashboard
-// deck could share one derivation instead of each carrying a copy. A file added to or removed
-// from this scope is a deliberate act -- update this array in the same change, by name, the same
-// way PINS's name list above works.
+// deck could share one derivation instead of each carrying a copy, plus `orchestrator/sdk.js`,
+// added by card #239's chantier action A1 (2026-09-17) when the vendored Agent SDK's loader
+// module picked up its own `gate.yml:9-12` citation -- see this file's own header comment for
+// what it cites. A file added to or removed from this scope is a deliberate act -- update this
+// array in the same change, by name, the same way PINS's name list above works.
 const CORPUS_FILES = [
   'README.md',
   'accounts/spo-test-accounts.yml',
@@ -1074,6 +1076,7 @@ const CORPUS_FILES = [
   'orchestrator/remote-report-pull.js',
   'orchestrator/report-intake.js',
   'orchestrator/retry-channel.js',
+  'orchestrator/sdk.js',
   'orchestrator/state-machine.js',
   'orchestrator/step-contracts.js',
   'orchestrator/steps/llm.js',
@@ -1251,7 +1254,7 @@ test('CITATION_ALLOWLIST holds exactly the entries this action explicitly justif
 // see before, and 13 line-number corrections part 2.5's anchor check below found and fixed in
 // passing -- see that section's header for the full list, including the two real-drift cases
 // that motivated it): the exact sorted set of `${file} :: ${citation}` this corpus holds, widened
-// regex + all 67 files + line-unwrap + chain resolution. Not a floor -- a citation added anywhere
+// regex + all 68 files + line-unwrap + chain resolution. Not a floor -- a citation added anywhere
 // in the corpus (a real one, or a new narrative aside shaped like one) must be added HERE, by
 // name, in the same change, the same way PINS's name list above works. See the test below for
 // what happens when this array and the live corpus disagree.
@@ -1330,7 +1333,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/journal.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: daemon.js:951", // re-pinned from :912, then :942 -- same shift history as dispatcher.js's :607 -> :646 re-pin above (isLiveStateRoot guard and its taskDir-containment fix, both added to daemon.js's main()); content byte-identical at :951, verified by re-reading the target line.
-  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:203", // re-pinned from :202 -- this action's isLiveStateRoot dry-run/shadow guard fix added 1 net line to the "Chantier gate" bullet above the row table in the same file, a true pure shift; content byte-identical at :203, verified by re-reading the target line.
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:219", // re-pinned from :202 -- this action's isLiveStateRoot dry-run/shadow guard fix added 1 net line to the "Chantier gate" bullet above the row table in the same file, a true pure shift; content byte-identical at :203, verified by re-reading the target line. Re-pinned again in card #239's A1 fix pass (2026-09-17, F1): :203 -> :215 -> :219, two pure shifts (+12 then +4 net lines) from execution rule 6's two 2026-09-17 amendments (vendor/ scope, then the F4/F5/F6 correction pass) added above the row table in the same file; content byte-identical at :219, verified by re-reading the target line.
   "orchestrator/park-loop.js :: doc/remediation-progress.md:664", // re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines to remediation-progress.md's C5-findings section above this bullet, a true pure shift; content byte-identical at :664
   "orchestrator/park-loop.js :: intake.js:953-955", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines. Re-pinned again in card #218 (Lot 12, 2026-09-14): :938-940 -> :953-955, a net +15-line shift when that action's resolveLabelArgs fix (issue #218: replacing the binary `flag === '--label' ? ... : ...` ternaries with the frozen, throwing LABEL_ARGS_BY_FLAG lookup, plus the corrected header-comment sentence) landed above this point in the same file; content byte-identical at :953-955, verified by re-reading the target lines.
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
@@ -1349,13 +1352,13 @@ const EXPECTED_CITATIONS = [
   "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18",
 ];
 
-test('every file:line citation in the 67-file corpus resolves, or is on the named allowlist', () => {
+test('every file:line citation in the 68-file corpus resolves, or is on the named allowlist', () => {
   // Immediate, named diagnosis if a file is added to or dropped from CORPUS_FILES without
   // updating this pin -- the EXPECTED_CITATIONS deepEqual below would also catch it (every
   // citation that file held would vanish from `found`), but that failure reads as "which
   // citations changed," not "the corpus scope itself changed." Checked first so the more likely
   // cause is named up front.
-  assert.equal(CORPUS_FILES.length, 67, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
+  assert.equal(CORPUS_FILES.length, 68, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
 
   const found = [];
   for (const rel of CORPUS_FILES) {
@@ -1372,7 +1375,7 @@ test('every file:line citation in the 67-file corpus resolves, or is on the name
   // FINDING (this action): a numeric floor cannot say WHICH citation died, added, or drifted --
   // gate C7's own history and this suite's E18 finding are both about exactly that failure mode.
   // deepEqual against the exact pinned set fails by NAME (assert.deepEqual's own diff) the moment
-  // a single citation is added, removed, or reworded anywhere in the 67-file corpus.
+  // a single citation is added, removed, or reworded anywhere in the 68-file corpus.
   assert.deepEqual(
     foundKeys,
     EXPECTED_CITATIONS,
@@ -2238,7 +2241,7 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'orchestrator/dispatcher.js :: daemon.js:646',
   'orchestrator/invariants.js :: doc/state-machine-spec.md:380',
   'orchestrator/orphan-scan.js :: daemon.js:951',
-  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:203',
+  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:219',
   'orchestrator/state-machine.js :: orchestrator/steps/llm.js:1049',
   'orchestrator/state-machine.js :: run.ts:63',
   'orchestrator/state-machine.js :: step-contracts.js:1029',
@@ -2612,7 +2615,7 @@ test('LIVE_RANGE_PINS/BLUNT_PINS cite exactly what the live corpus text says tod
 // bench docs, for this doc instead: every file-tied citation gets a literal-text pin, frozen at
 // the SPO-Pipeline commit this doc's own header names (`7902164309c1766d7b785daab9ba94ff6472bc1d`)
 // -- never `d03ea8b7` (the commit the header names for `~/SPO-WebClient`), since nothing in this
-// doc cites a product file by line. This doc is NOT added to CORPUS_FILES itself -- its 67-file
+// doc cites a product file by line. This doc is NOT added to CORPUS_FILES itself -- its 68-file
 // scope and every count pinned on it (EXPECTED_CITATIONS, `checked`, etc.) stay exactly as they
 // are; CCA_PINS is a parallel, dedicated walk, the same relationship BENCH_PINS has to the corpus
 // walk for the two bench docs.
@@ -3767,7 +3770,7 @@ test('DANGLING_DOC_REF_ALLOWLIST holds exactly the paths this action found dangl
   );
 });
 
-test('every bare "doc/<name>.md" reference in the 67-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
+test('every bare "doc/<name>.md" reference in the 68-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
   const found = new Map(); // path -> [rel,...]
   for (const rel of CORPUS_FILES) {
     const src = read(rel);
