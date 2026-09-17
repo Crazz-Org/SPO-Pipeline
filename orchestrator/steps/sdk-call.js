@@ -422,7 +422,7 @@ class ClaudeExecutableNotFoundError extends Error {
 // verifier, fix pass). This branch exists so this file can accept the same "already-JSON-encoded
 // string" shape the old transport's now-deleted buildArgv (llm.js) used to -- and that shape is
 // LIVE, not hypothetical: the legacy override path (runLlm's `ctx.task.llm.<step>` branch,
-// llm.js:982) passes `override.jsonSchema` straight through into opts.jsonSchema with no
+// llm.js:1052) passes `override.jsonSchema` straight through into opts.jsonSchema with no
 // validation of its own, the same path orchestrator/README.md's own hand-written example
 // documents. The OLD transport never looked at that string until `claude --json-schema <string>`
 // ran and the CLI itself rejected a malformed one (exit 1, a normal step failure via
@@ -630,7 +630,7 @@ function buildQueryOptions(opts, deps = {}) {
     // itself when it emits `--json-schema` (see this file's header measurement); the old
     // transport's now-deleted buildArgv accepted opts.jsonSchema as either an object or an
     // already-JSON-encoded string (used verbatim, never re-parsed) -- LIVE on the legacy override
-    // path, llm.js:982's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
+    // path, llm.js:1052's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
     // merely a theoretical shape, the same override path this file's allowedTools normalization
     // already accounts for)
     // -- so a string here is parsed back into an object rather than nested as a
@@ -716,8 +716,43 @@ function buildQueryOptions(opts, deps = {}) {
 // return value, but only PRE-RECOVERY -- `invokeClaudeReal` today wraps every branch except the
 // two where `claude` never started (an unreadable oauthTokenFile, a spawn failure) in
 // `maybeRecoverTokens` (llm.js), which can overwrite the six token fields on a result whose
-// `tokensSource` came back falsy. `consumeQueryStream` never calls it -- A7 ("Token ledger from
-// the stream") owns wiring that half in for this transport, not this action.
+// `tokensSource` came back falsy. `consumeQueryStream` never calls it -- that wiring is
+// `invokeClaudeReal`'s own, and lands in the SAME commit as this function (action A5b), not in a
+// later one.
+//
+// STALE CLAIM CORRECTED (action A7, card #239 chantier, "token ledger on the SDK stream"): this
+// paragraph used to end "A7 ... owns wiring that half in for this transport, not this action" --
+// true when it was written, false by the time A7 actually started: A5b's own commit already
+// wired every `invokeClaudeReal` return branch (the deadline-kill shape, the external-signal-kill
+// shape, and the ordinary success/failure shape) through `maybeRecoverTokens` before returning
+// (see llm.js's own three `return maybeRecoverTokens(...)` call sites). A7's actual job turned
+// out to be a different one than its own name implied: the card's brief asked it to verify
+// whether that wiring was still needed at all, on the theory that "usage arrives on the stream
+// with the SDK" makes transcript recovery dead code. MEASURED (A7, real `query()` call, a real
+// spawned `node` fixture standing in for `claude`, never an injected `deps.recoverSessionTokens`
+// -- see test/token-recovery-e2e.test.js): a deadline kill, an external signal kill, and a stream
+// that ends (cleanly or not) with no `result` message ALL still reach this function's own
+// item-4/item-5 branches below with `tokensSource` staying null (`extractTokens(undefined)` --
+// there is no `result` message for those branches to read `modelUsage` off of, on this transport
+// exactly as much as the old one).
+//
+// What that proof does NOT measure (Opus verifier, fix pass F2, named so it is not mistaken for
+// settled): the fixture's transcript file exists because the TEST writes it, not because a real
+// `claude` binary was observed doing so under this wire protocol. No SDK-driven call has run
+// against the real CLI yet (this chantier's worktree is ahead of the live daemon, still on
+// pre-cutover `claude -p` at `41fb081`) -- so "the real binary's own `--resume` bookkeeping
+// persists the transcript independent of the wire protocol" is a structural inference (same
+// binary, same on-disk mechanism either way), not a measurement, until the first real SDK-driven
+// kill confirms it. See llm.js's own `maybeRecoverTokens` comment for the fuller statement of that
+// premise and where it gets settled (A10's live-recette checklist). If it is confirmed, recovery
+// is not dead code on this transport; A7 kept it on that basis, corrected this paragraph and this
+// file's own doc consumers instead of deleting anything, rather than carrying the removal forward
+// on an unverified premise. See llm.js's own `maybeRecoverTokens` comment and token-recovery.js's
+// header for the fuller ruling, and the A7 report for the real corpus counts (810 live-era
+// `llm-call` events, 25 recovered via `'transcript'`, 3.09%, every one `ok: false` -- corrected by
+// the same fix pass after an earlier count wrongly included 92 pre-instrumentation events
+// `scripts/backfill-legacy-tokens.js` wrote retroactively, not live recoveries) that answer "how
+// often" rather than only "can it".
 //
 // ---- how the message shapes below were measured, not assumed ----------------------------------
 //

@@ -396,6 +396,76 @@ function tokenFieldsFrom(raw) {
 // the field entirely (undefined) must be treated the same way -- unmeasured, not skip-recovery --
 // which is the safer of the two readings (a stricter `=== null` check would silently skip recovery
 // for any future caller/shape that leaves the field absent instead of null).
+//
+// RULED ON, NOT CARRIED FORWARD BY DEFAULT (action A7, card #239 chantier, "token ledger on the
+// SDK stream"). This action's own brief asked whether this whole function should be deleted: its
+// premise was that "usage arrives on the stream with the SDK," so a call's `modelUsage` always
+// comes from `consumeQueryStream`'s own `result` message now, making transcript recovery dead
+// code left over from the retired `claude -p` transport. MEASURED, not assumed: that premise is
+// true only of a call that produces a `result` message at all. sdk-call.js's own header (items 4
+// and 5 on `consumeQueryStream`) already documents that a deadline kill, an external signal kill,
+// and a stream that ends (cleanly or with a nonzero exit) with no `result` message are all real,
+// reachable shapes on THIS transport -- every one of them still lands in `extractTokens(undefined)`
+// (sdk-call.js), i.e. `tokensSource: null`, for exactly the same reason the old transport's
+// equivalent branches did: there is no `modelUsage` block to read when the CLI never got to send
+// one. test/token-recovery-e2e.test.js proves the WIRING end to end against a real `query()` call
+// and a real spawned fixture standing in for `claude` -- for all four of those shapes, recovery
+// (with `deps.recoverSessionTokens` NOT injected) finds the fixture's real, pre-written transcript
+// tokens instead of reporting zero, and a fifth case (killed before the fixture ever wrote
+// anything) correctly still returns `tokensSource: null`, never a fabricated zero.
+//
+// ONE PREMISE IN THAT PROOF IS A STRUCTURAL INFERENCE, NOT A MEASUREMENT, AND IS NAMED HERE SO IT
+// DOES NOT QUIETLY BECOME ONE (Opus verifier, fix pass F2): the fixture writes its own transcript
+// file because the TEST tells it to -- that proves "if a transcript exists on disk by the time a
+// kill lands, this chain finds and sums it," not "the real `claude` binary, driven over
+// `--input-format/--output-format stream-json`, actually persists one." Checked directly (this fix
+// pass): every session transcript on this machine's pool was written by the daemon running release
+// `41fb081` -- pre-cutover `claude -p` -- because the live daemon (`~/SPO-Pipeline`, a separate
+// checkout from this chantier's worktree) has not pulled past `41fb081`, before A5b's cutover
+// landed. No SDK-driven call has run against the real CLI binary yet, so no one has directly
+// observed whether it still writes that file under the new wire protocol. The inference this
+// ruling rests on is architectural, not empirical: it is the SAME `claude` binary either way, the
+// transcript is that binary's own `--resume` bookkeeping (used by `console/usage-scan.js`'s live
+// dashboard and `token-recovery.js` today, entirely independent of which flags drove a given
+// call), and A5b's own session-id mint (invokeClaudeReal's `suppliedSessionId`, restored
+// specifically so a killed call still has an id to search a transcript by) rests on this exact
+// same premise -- so the two are settled together, not separately, by whichever lands first. This
+// is A10's live-recette checklist's job, not this chantier's: the first real SDK-driven card that
+// gets killed (a genuine deadline, not this file's own fixtures) is the observation that confirms
+// or falsifies it. If it falsifies it, this ruling flips, and the transcript path really does need
+// deleting then -- but the premise itself is not this action's to observe, since this chantier has
+// not deployed against the real CLI yet.
+//
+// THE CORPUS FIGURE, CORRECTED (Opus verifier, fix pass F1): a first pass here counted 117 of 917
+// `llm-call` events (12.8%) carrying `tokensSource: 'transcript'` and called that "not a rare
+// corner ... the dominant shape recovery earns its keep on" because 92 of the 117 were `ok: true`.
+// FALSE -- those 92 are not live `maybeRecoverTokens` output at all. They are the exact target set
+// `scripts/backfill-legacy-tokens.js` (card #169) wrote retroactively: that script's own header
+// names "exactly 92 events, 17 tasks, timestamps 2026-08-29T13:21:55.504Z ..
+// 2026-08-31T08:39:23.895Z" for events journalled before token instrumentation began at
+// 2026-09-01T06:24:27.014Z -- both boundary timestamps and the count match the corpus's 92
+// `ok:true` transcript-sourced rows exactly, and none of the 92 carry `cacheCreationEphemeral1h`
+// or `duration_s` (fields that did not exist yet when they ran) while all 92 carry the
+// since-removed `costUsd` -- conclusive. Restricting to the LIVE era (`ts >=
+// 2026-09-01T06:24:27.014Z`, the backfill's own instrumentation boundary) gives the real figure:
+// **25 of 810 live `llm-call` events, 3.09%**, and every one of the 25 is `ok: false` -- ZERO live
+// successful-call recoveries in this corpus. Of those 25: 5 recovered substantial, nonzero spend
+// (241k-368k tokens each, `duration_s` ~1800s -- IMPLEMENT's own 30-minute step deadline, i.e.
+// genuine deadline kills), and 20 recovered a real, measured 0 (fast ~2-4s `fable` failures whose
+// transcript held one all-zero usage row -- the "found rows summing to 0" case this file's own
+// header on `recoverSessionTokens` already distinguishes from "found no rows"). So "how often does
+// this matter" is smaller than the first pass claimed, but the shape is exactly the one the
+// end-to-end proof above targets -- kills and fast structural failures, not ordinary successes --
+// which makes the ruling BETTER supported, not worse: recovery is not a rare corner case earning
+// its keep on successes it was never needed for, it is caught doing precisely the job its own
+// header describes, on every live occasion this corpus has given it to do so far.
+//
+// Conclusion: this function, its `deps.recoverSessionTokens` injection point, and
+// `token-recovery.js` all stay. Removing them, as the card's own "Done means" asked for, would be
+// a silent regression the moment the architectural premise above is confirmed: every call this
+// transport's own deadline/signal/no-result paths produce would report `billableTokens: 0` for
+// spend that genuinely happened, with nothing in the journal to tell a reader that from an honest,
+// unmeasured `null`.
 async function maybeRecoverTokens(result, opts, deps) {
   if (result.tokensSource || typeof result.sessionId !== 'string' || result.sessionId === '') {
     return result;

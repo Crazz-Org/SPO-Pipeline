@@ -57,6 +57,24 @@
 // `suppliedSessionId` fallback comment) -- in the ordinary case the two are the same value, exactly
 // as they always were.
 //
+// RULED ON, NOT REMOVED (action A7, same chantier). A7's own brief asked whether this module
+// becomes dead code now that a call's usage is read off the SDK's `result` message rather than
+// parsed from a spawnSync reply -- true of a call that produces one, false of the four real shapes
+// on THIS transport that don't (deadline kill, external signal kill, a clean or nonzero-exit stream
+// end with no `result` message -- sdk-call.js's own header, items 4-5). MEASURED end to end
+// (test/token-recovery-e2e.test.js): a real `query()` call driving a real spawned fixture,
+// `recoverSessionTokens` NOT injected, recovers real pre-written transcript tokens on all four; a
+// fifth (killed before the fixture ever wrote anything) correctly still returns null. That proves
+// the WIRING; it does not prove the real `claude` binary still writes a transcript under this
+// wire protocol at all -- no SDK-driven call has run against the real CLI yet (Opus verifier, fix
+// pass F2), so that half is a structural inference (same binary, `--resume` bookkeeping
+// independent of the wire protocol), settled by the first real SDK-driven kill, not by this
+// action. This module and its production call site (llm.js's `maybeRecoverTokens`) both stay --
+// see that function's own comment for the full ruling, the corrected real corpus counts (25 of
+// 810 live-era events, 3.09%, not the 117-of-917 first-pass figure that wrongly counted a
+// retroactive backfill's own writes as live recoveries), and where the open premise gets settled.
+//
+
 // ---- roots searched, in order -------------------------------------------------------------------
 //
 //   1. accountConfigDir's own `projects` directory -- the account the call actually ran under

@@ -65,6 +65,15 @@ const {
   cannedDryRunPayload,
   maybeRecoverTokens,
 } = require('../orchestrator/steps/llm');
+// Elapsed time in this file is measured on the MONOTONIC clock, never Date.now(). Measured
+// 2026-09-17 while verifying card #239's A7: the grace-window test below failed ~36% of runs in
+// isolation (4 of 11), and instrumenting confirmProcessExit's four resolution sites showed the
+// TIMER branch resolving in 6 of 6 runs with the monotonic clock reading 8501-8503ms EVERY time
+// while `Date.now()` read 5694ms and 5787ms on the failing runs -- this host's CLOCK_REALTIME
+// steps BACKWARD ~2.8s mid-run. The function was always correct; the assertion was reading a
+// stepping clock. orchestrator/steps/llm.js already overrides the SDK's own duration_ms for this
+// same reason, and says so in its own comment ("this host's CLOCK_REALTIME demonstrably steps").
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 
 const FAKE_EXECUTABLE_PATH = '/fake/bin/claude'; // never resolved for real -- always injected
 const SESSION_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -823,9 +832,9 @@ test('invokeClaudeReal: a fake child that never exits (grace window exhausted) i
     child = fakeSpawnedChild([initMessage()], { hang: true, ignoreSignal: true, signal: spawnOpts.signal });
     return child;
   };
-  const t0 = Date.now();
+  const t0 = monotonicNowMs();
   const result = await invokeClaudeReal(baseOpts({ deadlineMs: 50 }), fakeExecDeps({ spawn }));
-  const elapsedMs = Date.now() - t0;
+  const elapsedMs = monotonicNowMs() - t0;
 
   assert.equal(result.timedOut, true);
   // The fake never actually dies on its own (ignoreSignal:true, and nothing ever calls
@@ -886,12 +895,12 @@ test('invokeClaudeReal (REAL PROCESS): a real SIGTERM-ignoring child is truly de
     return capturedChild;
   };
 
-  const t0 = Date.now();
+  const t0 = monotonicNowMs();
   const result = await invokeClaudeReal(
     baseOpts({ deadlineMs: 1000 }),
     fakeExecDeps({ spawn, resolveClaudeCodeExecutable: () => fixturePath })
   );
-  const elapsedMs = Date.now() - t0;
+  const elapsedMs = monotonicNowMs() - t0;
 
   // THE PROOF: read liveness the line right after the await resolves, nothing else awaited in
   // between -- process.kill(pid, 0) sends no signal, it only probes whether the pid still exists
