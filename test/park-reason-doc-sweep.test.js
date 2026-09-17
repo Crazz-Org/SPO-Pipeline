@@ -862,7 +862,9 @@ test('blankComments: an opener inside a `//` comment does not swallow the ParkSi
   //   - `.trimStart()` in the whole-line test: without it the INDENTED comment on line 3 is left
   //     alone, its opener reaches the block's closer on line 9, and call site 1 disappears.
   //     Indented comments carrying an opener are the repo's real shape -- orchestrator/
-  //     state-machine.js:225 and orchestrator/config.js:916 are two of them.
+  //     state-machine.js:225 and orchestrator/config.js:978 are two of them. (Re-pinned from :916
+  //     for action A2, card #239, 2026-09-17: a +62-line shift landed above this point in
+  //     config.js; content byte-identical at :978, verified by re-reading the target line.)
   //   - blanking to spaces rather than '': every line keeps its width, so the offsets this file
   //     turns into `file:line` still address the real source.
   //   - the block regex staying LAZY: greedy runs from line 7's opener to line 15's closer and

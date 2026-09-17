@@ -67,8 +67,9 @@ const LEASE_SUFFIX = '.json';
 // /proc/sys/kernel/pid_max is 4194304, not the historical 32768, so recycling is ~128x rarer than
 // the number most pid-reuse folklore assumes) but unbounded and self-perpetuating when it happens.
 //
-// DERIVED from step-contracts.js's MAX_LLM_STEP_DEADLINE_MS (the running maximum across every
-// per-step override, not the LLM_STEP_DEADLINE_MS default alone), never restated as its own
+// DERIVED from step-contracts.js's MAX_LLM_STEP_OUTER_DEADLINE_MS (the running maximum OUTER
+// bound across every per-step override -- action A2, card #239, 2026-09-17; before A2 this was
+// MAX_LLM_STEP_DEADLINE_MS, the INNER bound alone -- see below), never restated as its own
 // literal, so a future edit to either constant moves this bound with it instead of drifting past it.
 //
 // Why 2x and not 1x: one lease can span TWO `claude` calls, not one. Measured, not assumed --
@@ -78,7 +79,16 @@ const LEASE_SUFFIX = '.json';
 // attempts both sit inside the lease's try/finally); it happens to measure 1 today only because a
 // blocking spawnSync's resolution microtask always drains before callWithDeadline's timer can
 // fire, which is an implementation detail no bound should lean on. Each call is capped by
-// spawnSync's own `timeout`, armed with that step's deadlineMsForStep (LLM_STEP_DEADLINE_MS, or its override) at spawnOpts.
+// spawnSync's own `timeout`, armed with that step's deadlineMsForStep (LLM_STEP_DEADLINE_MS, or
+// its override) at spawnOpts -- TODAY, while invokeClaudeReal still spawns synchronously. Action
+// A2 adds a second, OUTER cap around that same attempt (config.js's stepDeadlineMsByState,
+// `deadlineMsForStep(step) + STEP_DEADLINE_MARGIN_MS`), sized so the inner cap always fires first
+// (step-contracts.js's own MAX_LLM_STEP_OUTER_DEADLINE_MS comment states the invariant) -- but
+// which becomes the bound that actually governs one attempt once card #239's transport swap
+// replaces this blocking spawnSync with an awaited stream, the "implementation detail no bound
+// should lean on" two sentences up stops being able to save this file's own arithmetic. This
+// constant is derived from the OUTER bound for exactly that reason: it has to stay correct on
+// BOTH sides of that swap, not just the one true today.
 //
 // The +10% slack covers the non-spawn work the lease also spans -- prompt assembly, the JSON parse
 // of up to 64 MiB of stdout, and the journal writes around it -- and is expressed as a fraction so
@@ -89,9 +99,10 @@ const LEASE_SUFFIX = '.json';
 // an unconditional guarantee -- measured, a SIGTERM-ignoring child ran 27.6s against a 400ms
 // timeout. A `claude` that ignored SIGTERM could therefore hold a lease past this bound and have
 // it swept while still running, which is the D1 failure (two `claude` processes on one account)
-// rather than the D3 one this closes. That is why the bound is generous rather than tight: 63
-// minutes is roughly 7x the longest full two-attempt step the C6 funnel actually measured
-// (90-265s per call).
+// rather than the D3 one this closes. That is why the bound is generous rather than tight: 67.2
+// minutes (raised from 63 by action A2 -- see step-contracts.js's own MAX_LEASE_AGE_MS comment)
+// is roughly 7.6x the longest full two-attempt step the C6 funnel actually measured (90-265s per
+// call, i.e. up to 530s for two attempts).
 // The derivation itself now lives in step-contracts.js, beside LLM_STEP_DEADLINE_MS, because
 // config.js needs this same bound to derive accountLeaseWaitMs and cannot require THIS file
 // (account-lease.js requires config.js -- that direction is a load-time cycle). Re-exported

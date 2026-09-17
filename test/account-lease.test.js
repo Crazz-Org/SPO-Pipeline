@@ -350,34 +350,46 @@ test('leaseHealthyAccount: two identical all-accounts-leased parks produce a byt
 // at 13:00:00Z -- a wall-clock literal in a test is a scheduled outage.
 
 const { MAX_LEASE_AGE_MS } = accountLease;
-// MAX_LLM_STEP_DEADLINE_MS, not MAX_LLM_STEP_DEADLINE_MS: since 2026-09-04 PLAN carries its own,
+// MAX_LLM_STEP_DEADLINE_MS, not LLM_STEP_DEADLINE_MS: since 2026-09-04 PLAN carries its own,
 // longer deadline (1800000ms), and the lease bound has to follow the LONGEST legitimate hold. This
 // import moving is itself the fix -- deriving from the default again would understate the hold.
-const { MAX_LLM_STEP_DEADLINE_MS } = require('../orchestrator/step-contracts');
+// MAX_LLM_STEP_OUTER_DEADLINE_MS -- action A2 (card #239, 2026-09-17): MAX_LEASE_AGE_MS is now
+// derived from THIS (the inner bound above plus the outer margin), not MAX_LLM_STEP_DEADLINE_MS
+// alone -- see step-contracts.js's own MAX_LEASE_AGE_MS comment for why.
+const { MAX_LLM_STEP_DEADLINE_MS, MAX_LLM_STEP_OUTER_DEADLINE_MS } = require('../orchestrator/step-contracts');
 const AGE_EPSILON_MS = 60 * 1000; // comfortably longer than any test's own runtime
 
 function leaseAged(ageMs, pid = process.pid) {
   return JSON.stringify({ pid, startedAt: new Date(Date.now() - ageMs).toISOString() });
 }
 
-test('MAX_LEASE_AGE_MS is DERIVED from MAX_LLM_STEP_DEADLINE_MS (the longest step deadline, not the default), not a literal that can drift past it', () => {
+test('MAX_LEASE_AGE_MS is DERIVED from MAX_LLM_STEP_OUTER_DEADLINE_MS (the longest step\'s OUTER deadline, not the inner one alone), not a literal that can drift past it', () => {
   // The exact derivation, restated so the intent is readable...
   assert.equal(
     MAX_LEASE_AGE_MS,
-    2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10),
-    'the bound must be computed from MAX_LLM_STEP_DEADLINE_MS'
+    2 * MAX_LLM_STEP_OUTER_DEADLINE_MS + Math.round(MAX_LLM_STEP_OUTER_DEADLINE_MS / 10),
+    'the bound must be computed from MAX_LLM_STEP_OUTER_DEADLINE_MS'
   );
   // ...and the relationship that actually has to survive a future edit to that constant. A
-  // hardcoded number fails this the moment MAX_LLM_STEP_DEADLINE_MS moves, which is the whole point:
-  // one lease can span TWO `claude` calls (intake's same-account timeout retry runs inside the
-  // lease), so the bound must stay strictly above 2x, with slack, and never balloon to 3x.
+  // hardcoded number fails this the moment MAX_LLM_STEP_OUTER_DEADLINE_MS moves, which is the
+  // whole point: one lease can span TWO `claude` calls (intake's same-account timeout retry runs
+  // inside the lease), so the bound must stay strictly above 2x, with slack, and never balloon to
+  // 3x.
   assert.ok(
-    MAX_LEASE_AGE_MS > 2 * MAX_LLM_STEP_DEADLINE_MS,
-    `the bound must exceed the worst legitimate hold (2 x ${MAX_LLM_STEP_DEADLINE_MS}ms), got ${MAX_LEASE_AGE_MS}`
+    MAX_LEASE_AGE_MS > 2 * MAX_LLM_STEP_OUTER_DEADLINE_MS,
+    `the bound must exceed the worst legitimate hold (2 x ${MAX_LLM_STEP_OUTER_DEADLINE_MS}ms), got ${MAX_LEASE_AGE_MS}`
   );
   assert.ok(
-    MAX_LEASE_AGE_MS < 3 * MAX_LLM_STEP_DEADLINE_MS,
+    MAX_LEASE_AGE_MS < 3 * MAX_LLM_STEP_OUTER_DEADLINE_MS,
     `the slack must stay a fraction of a step deadline, not another whole one, got ${MAX_LEASE_AGE_MS}`
+  );
+  // action A2 (card #239): the OUTER bound must itself exceed the INNER one, or the outer timer
+  // could fire before a healthy call's own inner deadline does -- the inverse of "the inner
+  // deadline always fires first" this whole action exists to guarantee (config.js's own
+  // LLM_STEP_DEADLINE_ENTRIES comment states the invariant).
+  assert.ok(
+    MAX_LLM_STEP_OUTER_DEADLINE_MS > MAX_LLM_STEP_DEADLINE_MS,
+    'the outer per-step deadline must exceed the inner one, or the outer timer could fire first'
   );
 });
 
@@ -533,9 +545,11 @@ test('leaseHealthyAccount: opts.monotonicNowMs drives the elapsed bound independ
 // `all-accounts-leased`. It shipped as 5 minutes, justified against MEASURED step durations
 // (90-265s) rather than against the bound it actually waits on. Every other C6 ceiling is derived
 // from its bound; this one was not, and the gap is not academic: a sibling's own two-attempt LLM
-// step can legitimately hold a lease for 2 x MAX_LLM_STEP_DEADLINE_MS = 60 min, and nothing may sweep
-// that lease until MAX_LEASE_AGE_MS = 63 min. A 5-minute waiter gave up while the holder was
-// still legitimately alive and still un-sweepable, and parked the exact park class per-step
+// step can legitimately hold a lease for 2 x MAX_LLM_STEP_OUTER_DEADLINE_MS = 64 min (action A2,
+// card #239, 2026-09-17 -- 60 min before it, back when the outer per-state deadline had no entry
+// for any LLM step and so could never fire against a real call), and nothing may sweep that lease
+// until MAX_LEASE_AGE_MS = 67.2 min (63 min before A2). A 5-minute waiter gave up while the holder
+// was still legitimately alive and still un-sweepable, and parked the exact park class per-step
 // leasing was built to avoid.
 test('accountLeaseWaitMs OUTLASTS every legitimate lease hold -- derived from MAX_LEASE_AGE_MS, not from an observed maximum', () => {
   const daemonConfig = require('../orchestrator/config');

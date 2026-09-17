@@ -851,3 +851,47 @@ None of these five are faked shut. Where the code cannot tell (`processStartUpti
 reboot check's own blind spot), the verdict is exactly what it would have been without card #219 --
 `'draining'` off liveness alone, or the pre-#208 wall-clock bound -- never a guess dressed up as a
 measurement.
+
+## 12 · `--deadline-ms` widened gap (action A2, card #239), 2026-09-17
+
+Action A2 gave PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE their own
+`config.stepDeadlineMsByState` entry (`deadlineMsForStep(step) + stepDeadlineMs`, clamped to
+Node's timer ceiling) so the outer `deadline.js` timer cannot retroactively kill a still-healthy
+LLM call once card #239's own transport swap makes that timer live in real mode -- see
+`orchestrator/config.js`'s own `LLM_STEP_DEADLINE_ENTRIES` comment for the full hazard. The
+`--deadline-ms` CLI flag (`daemon.js`) only ever overrides the GENERIC `config.stepDeadlineMs`
+default, never a state's own `stepDeadlineMsByState` entry, and that flag is not new to this
+action — `CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE` already had their own entries the flag could not
+reach, before card #239 was ever opened. What IS new is how much of the daemon's dispatch surface
+that gap now covers.
+
+**Measured.** `orchestrator/state-machine.js`'s `callWithDeadline(ctx, <state>, ...)` call sites
+name 12 distinct states: 7 literal (`CHECK`, `CI_CHECKS`, `FINISH`, `GATE`, `MERGE`, `PUSH_PR`,
+`WORKTREE`) plus 5 reached through `callLlmStep`'s own `stepName` variable
+(`PLAN`/`IMPLEMENT`/`DIAGNOSE`/`CITATION_VERIFIER`/`VALIDATE`) — `grep -oE
+"callWithDeadline\(ctx, '[A-Z_]+'" orchestrator/state-machine.js | sort -u` finds the 7; the other
+5 are read off `callLlmStep`'s own five call sites (`PLAN`/`IMPLEMENT`/`DIAGNOSE`/
+`CITATION_VERIFIER`/`VALIDATE`, each passed as a literal string argument, not a `callWithDeadline`
+literal itself). Before A2, 4 of the 12 carried their own `stepDeadlineMsByState` entry
+(`CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE`) — `--deadline-ms` reached the other 8 (the three scripted
+states plus all five LLM steps). After A2, 9 of the 12 carry their own entry — `--deadline-ms`
+reaches only the remaining 3 (`CHECK`, `PUSH_PR`, `MERGE`).
+
+**Why this is a live gap, not a cosmetic one.** `orchestrator/dispatcher.js`'s `buildWorkerArgv`
+(:291) forwards `config.stepDeadlineMs` as `--deadline-ms` to every `--worker` subprocess it
+spawns — the real, continuous-mode dispatch path a running daemon actually uses, not only the
+`--once`/test-harness invocations this repo's own suite drives directly. A maintainer (or a test)
+reaching for `--deadline-ms` to shrink every step's deadline for a live debugging session now
+shrinks only 3 of 12 states' worth of ceiling; the other 9 keep their derived, multi-minute
+figures regardless of the flag. This gap was found, not designed: card #239's own action A2 had to
+retarget two tests (`test/deadline-and-catchall.test.js`'s "step deadline expiry" test and
+`test/park-alert.test.js`'s "finalizePark: a shadow-mode park" test) off `IMPLEMENT` and onto
+`CHECK` specifically because `--deadline-ms` could no longer reach `IMPLEMENT`'s own new entry —
+the test comments at both sites state this verbatim.
+
+**Not fixed here**, per this register's own posture (a named, accepted gap, not a silently-shipped
+one): making `--deadline-ms` scale every `stepDeadlineMsByState` entry (proportionally, or as a
+hard ceiling) is a design decision about what a maintainer debugging a live daemon actually wants
+— scale the derived entries down with it, or leave them alone as "these are load-bearing, minimum
+safe values, not defaults" — and is left to chantier 9 or a future action to decide, not assumed
+here.

@@ -448,10 +448,19 @@ The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LL
 overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
 CITATION_VERIFIER, VALIDATE) take `LLM_STEP_DEADLINE_MS`'s own 900000ms default. Whichever figure
 applies is the `spawnSync` timeout `invokeClaudeReal` arms for that call (`orchestrator/steps/llm.js`)
-— but it governs real mode only. `state-machine.js` still wraps every LLM step in the outer
-`callWithDeadline` (`deadline.js`) using the generic `stepDeadlineMs` (120000ms; no `stepDeadlineMsByState`
-entry exists for any LLM state), which is inert in real mode (a JS timer cannot preempt the blocking
-`spawnSync` that the step's own deadline already bounds) but live in shadow mode, where a fixture delay races that 120s timer instead of whichever wall-clock figure the row above states. There is no per-step or per-size USD budget: `maxBudgetUsd` is plumbed
+— the INNER deadline, real mode only. `state-machine.js` also wraps every LLM step in the outer
+`callWithDeadline` (`deadline.js`); before action A2 (card #239, 2026-09-17) that outer wrap used the
+generic `stepDeadlineMs` (120000ms; no `stepDeadlineMsByState` entry existed for any LLM state), inert
+in real mode (a JS timer cannot preempt the blocking `spawnSync` the inner deadline already bounds)
+but live in shadow mode, where a fixture delay raced that flat 120s timer regardless of which inner
+figure the row above states. A2 gave each of the five its own `stepDeadlineMsByState` entry
+(`orchestrator/config.js`, generated from `STEP_CONTRACTS`'s own keys) — `deadlineMsForStep(step) +`
+one ordinary `stepDeadlineMs` of margin, so PLAN/IMPLEMENT now carry 1920000ms and the other three
+1020000ms — sized so the inner deadline always fires first, ahead of card #239's own transport swap
+(`steps/llm.js`'s `invokeClaudeReal` moving off blocking `spawnSync` onto an awaited stream), the
+change that will make this outer timer live in real mode for the first time. Shadow mode now races
+each step's own outer figure instead of the flat 120s every LLM step used to share. There is no
+per-step or per-size USD budget: `maxBudgetUsd` is plumbed
 end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
@@ -641,7 +650,7 @@ separate repos with no shared runtime.
 - The scheduler assigns each step an account; a limit error puts the account in **cooldown**
   and the step retries on the next healthy account. Cooldowns are journal events.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:953-955`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:958-960`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -705,12 +714,15 @@ separate repos with no shared runtime.
   a worker and the scanner can run at once. A lease is per-step, not per-task, released the
   instant the one LLM call it wraps finishes; a healthy account currently leased by another live
   process is `AllAccountsLeasedError`, worth a bounded, BLOCKING in-process wait
-  (`config.accountLeaseWaitMs`, default **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the
+  (`config.accountLeaseWaitMs`, default **67.2 min** (raised from 63 by action A2, card #239,
+  2026-09-17 — `orchestrator/config.js` now gives every LLM step its own `stepDeadlineMsByState`
+  entry, so `MAX_LEASE_AGE_MS` has to outlast the OUTER two-attempt bound, not the inner one alone;
+  see `step-contracts.js`'s own comment) — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the
   age at which a lease is swept as dead — never the ~90–265s a sibling's own step is *usually*
   measured at: a waiter has to outlast the longest a sibling can *legitimately* hold the lease, not
   its typical duration, and the old 5-minute default was found wrong in C6 verification for exactly
   that reason — it gave up while a legitimate holder was still alive and un-sweepable for up to
-  26.5 more minutes, parking a healthy card `all-accounts-leased`) — distinct from
+  62.2 more minutes, parking a healthy card `all-accounts-leased`) — distinct from
   `AllAccountsCoolingError` (a cooldown: still never worth a BLOCKING wait — the worker sleeping
   in-process for a 1h or 5h cooldown would pin the process for hours, doing nothing — but, since
   card #119 action 1.2, worth a DEFERRED one: the worker exits and the task is re-enqueued with

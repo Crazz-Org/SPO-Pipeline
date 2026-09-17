@@ -472,13 +472,32 @@ function nextLabel(card, cur) {
 
 // The wall-clock ceiling the orchestrator arms for this step, so the meter's full width is a
 // real number rather than a guess. Scripted steps carry per-state deadlines in config; LLM
-// steps carry step-contracts.js's own (PLAN and IMPLEMENT both have a 30-minute override,
-// DIAGNOSE and VALIDATE 15).
+// steps carry step-contracts.js's own INNER deadline (PLAN and IMPLEMENT both have a 30-minute
+// override, DIAGNOSE/CITATION_VERIFIER/VALIDATE 15) -- the figure that actually bounds one call
+// -- not config's own OUTER bookkeeping entry (deadlineMsForStep(step) plus a margin, action A2 /
+// card #239), which would make the meter's full width a few minutes wider than the call it is
+// meant to represent.
+//
+// Fix-pass F3 (Opus verifier, A2): CITATION_VERIFIER was missing from this list -- measured,
+// stepDeadlineMs('CITATION_VERIFIER') returned null before action A2 landed (falling through to
+// config.stepDeadlineMsByState.CITATION_VERIFIER, which had no entry) and, after A2 added that
+// entry, silently started returning the OUTER figure (1020000ms) instead of the INNER one
+// (900000ms) -- the one step of the five sized on a different bound than its siblings, with no
+// error to flag it. All five LLM steps are listed explicitly now, so a sixth would need its own
+// addition here too, the same "generated list, not an accident of which steps happened to have
+// no config.stepDeadlineMsByState entry" property STEP_CONTRACTS itself already has.
+//
+// This was the ONLY invalidated consumer: the verifier swept every reader of MAX_LEASE_AGE_MS and
+// the outer per-step deadlines across orchestrator/, console/, scripts/, bin/, accounts/ and found
+// everything else moves with the constant by construction (accountLeaseWaitMs, both
+// account-lease.js lease waits, daemon.js's --workers recompute at K=1/2/3, deadline.js's own
+// lookup) -- the derivation chain held everywhere it was derived FROM the source of truth; it
+// broke here, the one place a step list was hardcoded instead.
 function stepDeadlineMs(state) {
   try {
     const { deadlineMsForStep } = require('../orchestrator/step-contracts');
     const config = require('../orchestrator/config');
-    if (['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'].includes(state)) return deadlineMsForStep(state);
+    if (['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE'].includes(state)) return deadlineMsForStep(state);
     const d = config.stepDeadlineMsByState || {};
     return d[state] || null;
   } catch {

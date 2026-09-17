@@ -174,16 +174,27 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
 - `config.js`'s `stepDeadlineMs` (default 120000ms / 2min) — `deadline.js`'s `callWithDeadline`,
   the outer retry-once-then-park bookkeeping race wrapped around every step, scripted or LLM. It
   is a JS timer, not a process kill, so it cannot preempt a blocking `spawnSync`: it is a no-op
-  against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there)
-  and, in real mode, equally inert around an LLM step (bounded instead by
-  `LLM_STEP_DEADLINE_MS` below). The generic 120000ms default is live only in shadow mode, where
-  an LLM step has no blocking `spawnSync` underneath it and a fixture delay races this 120s timer
-  instead of whichever wall-clock figure below applies to that step (`doc/state-machine-spec.md`
-  § Step contracts) — but
+  against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there),
+  and, in real mode, it was — until action A2 (card #239, 2026-09-17) — equally inert around an
+  LLM step too, bounded instead by `LLM_STEP_DEADLINE_MS` below via a blocking `spawnSync` this JS
+  timer could never preempt.
   `deadline.js`'s `deadlineMsFor` consults `config.stepDeadlineMsByState[state]` before falling
-  back to this default, and that override IS live in real mode: `config.js` gives `CI_CHECKS`,
-  `WORKTREE` and `FINISH` their own, much larger entries (derived from the in-flight poll budget
-  and the product-repo mutex's own worst-case wait). `WORKTREE`/`FINISH`'s overrides were sized
+  back to this generic default, and that override IS live in real mode: `config.js` gives
+  `CI_CHECKS`, `WORKTREE`, `FINISH`, `GATE`, and — since action A2 — all five LLM steps
+  (`PLAN`/`IMPLEMENT`/`DIAGNOSE`/`CITATION_VERIFIER`/`VALIDATE`) their own, much larger entries.
+  `CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE`'s are derived from the in-flight poll budget, the
+  product-repo mutex's own worst-case wait, and (`GATE`) the `npm-gate` timeout plus its own
+  recovery wait; each LLM step's is `deadlineMsForStep(step)` (its own inner
+  `LLM_STEP_DEADLINE_MS` bound, below) plus one ordinary `stepDeadlineMs` of margin — PLAN/IMPLEMENT
+  1920000ms, DIAGNOSE/CITATION_VERIFIER/VALIDATE 1020000ms — sized so that inner bound always
+  fires first, once card #239's own transport swap (an awaited async stream in place of the
+  blocking `spawnSync` above) arms this outer timer for the LLM steps for the first time. Before
+  A2, the generic 120000ms default was live for an LLM step only in shadow mode, where a fixture
+  delay raced it directly instead of whichever wall-clock figure below applies to that step
+  (`doc/state-machine-spec.md` § Step contracts); it now races that step's own larger figure
+  instead, the same as every other overridden state, in shadow mode as well as real. Every OTHER
+  state (`INTAKE`, `CHECK`, `PUSH_PR`, `MERGE`) still falls back to this generic default.
+  `WORKTREE`/`FINISH`'s overrides were sized
   "large enough never to fire" against a purely-synchronous `spawnSync` body, but 6.4's
   product-repo mutex added the first `await` in that path (its poll loop's `await sleep(pollMs)`)
   — which armed a timer that had never been live before. Measured during 6.4's own verification:
@@ -289,7 +300,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:953-955`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:958-960`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -801,7 +812,7 @@ never fired), and released the instant that call finishes. Lease files live at
 `acquireShortLock`/`releaseShortLock` — the same pid-liveness stale-sweep idiom `daemon.lock`
 uses, and, since the measured 39%-torn-read defect (`lock.js:354-385`: 119 of 800 cooldown
 entries lost), the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too
-(`account-lease.js:156` → `lock.js:352` `acquireShortLock` → `:386` `tryCreate`) — a bare `'wx'`
+(`account-lease.js:167` → `lock.js:352` `acquireShortLock` → `:386` `tryCreate`) — a bare `'wx'`
 create is exactly the defect that idiom replaced, not a shortcut this path still takes.
 
 A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
@@ -811,15 +822,23 @@ BLOCKING wait, since a 1h or 5h cooldown would pin the process for hours doing n
 since card #119 action 1.2, worth a DEFERRED one instead: the worker exits and the task is
 re-enqueued with `notBefore` set to the cooldown's own deadline, see
 doc/state-machine-spec.md's Account pool section).
-The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×
-`MAX_LLM_STEP_DEADLINE_MS` plus 10% slack — the running maximum across every per-step override,
-never `LLM_STEP_DEADLINE_MS`'s own 900000ms default, which is what this figure was before PLAN's
-override raised it (IMPLEMENT's later entry ties that maximum rather than exceeding it, so the
-bound did not move again)) — the age at which a lease is presumed dead and swept
-regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That distinction
-was a real C6-verification bug: the original default (5 min, reasoned from the typical duration)
-gave up while a legitimately-held lease could still be alive and un-sweepable for up to another
-26.5 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
+The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **67.2 minutes**: 2 ×
+`MAX_LLM_STEP_OUTER_DEADLINE_MS` plus 10% slack — the running maximum OUTER bound across every
+per-step override, never `MAX_LLM_STEP_DEADLINE_MS` (the inner one alone) or
+`LLM_STEP_DEADLINE_MS`'s own 900000ms default. Raised from 63 minutes by action A2 (card #239,
+2026-09-17): before A2, `MAX_LEASE_AGE_MS` only had to outlast the INNER deadline, because the
+OUTER per-state timer (`deadline.js`'s `callWithDeadline`) had no `stepDeadlineMsByState` entry for
+any LLM step and so could never fire against a real call (a blocking `spawnSync` never yields the
+event loop). A2 gives every LLM step its own outer entry (`config.js`,
+`deadlineMsForStep(step) + STEP_DEADLINE_MARGIN_MS`), so once card #239's own transport swap
+replaces that blocking spawn with an awaited stream, the worst legitimate per-attempt hold becomes
+the OUTER bound (`MAX_LLM_STEP_OUTER_DEADLINE_MS` = `MAX_LLM_STEP_DEADLINE_MS` +
+`STEP_DEADLINE_MARGIN_MS` = 1,920,000ms), not the inner one alone — see `step-contracts.js`'s own
+`MAX_LEASE_AGE_MS` comment for the full arithmetic) — the age at which a lease is presumed dead and
+swept regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That
+distinction was a real C6-verification bug: the original default (5 min, reasoned from the typical
+duration) gave up while a legitimately-held lease could still be alive and un-sweepable for up to
+another 62.2 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
 always terminates one of two honest ways — it gets a lease, or the holder ages out and it takes
 that one — instead of parking early. `countHealthyAccounts` (the `K ≤ healthy accounts` clamp
 above) is deliberately blind to lease state, only to cooldowns: a lease frees every 90–265s, and
@@ -872,7 +891,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:899`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:961`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via

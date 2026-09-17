@@ -85,8 +85,13 @@ function canonicalPriority(raw) {
   return null;
 }
 
-// config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted/LLM steps and must stay
-// that way -- it is not a fit for either intake step. draftCard and reviewCard are the
+// config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted steps and must stay
+// that way -- it is not a fit for either intake step. (Action A2, card #239, 2026-09-17: it is no
+// longer the deadline an LLM step itself races either -- PLAN/IMPLEMENT/DIAGNOSE/
+// CITATION_VERIFIER/VALIDATE each carry their own config.stepDeadlineMsByState entry now,
+// `deadlineMsForStep(step) + stepDeadlineMs`; this constant survives there only as the MARGIN
+// added on top of a step's own inner deadline, not as the deadline itself. See config.js's own
+// LLM_STEP_DEADLINE_ENTRIES comment.) draftCard and reviewCard are the
 // maintainer-facing `spo ask` path (bin/spo's cmdAsk; cmdPull calls neither -- `spo pull` only
 // runs pullBoard + makeTask and writes queue files), not the daemon loop: reviewCard in particular runs
 // fable at effort high verifying citations into the sibling product repo, real cross-repo file

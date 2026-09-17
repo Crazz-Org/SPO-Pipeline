@@ -316,7 +316,9 @@ test('blankComments matches block comments lazily: two blocks do not swallow the
 
 test('blankComments blanks INDENTED whole-line comments, so a block opener inside one cannot open a phantom span (kills the trimStart mutant)', () => {
   // The repo carries indented line comments containing a block opener today -- among them
-  // orchestrator/state-machine.js:225 and orchestrator/config.js:916, both of which mention
+  // orchestrator/state-machine.js:225 and orchestrator/config.js:978 (re-pinned from :916 for
+  // action A2, card #239, 2026-09-17 -- a +62-line shift; content byte-identical, verified by
+  // re-reading the target line), both of which mention
   // `.claude/hooks/` with a glob in indented prose. Dropping `.trimStart()` leaves those lines
   // unblanked, and the opener inside them then reaches the next closer anywhere below.
   const raw = [

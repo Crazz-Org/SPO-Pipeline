@@ -611,6 +611,43 @@ function deadlineMsForStep(stepName) {
   return LLM_STEP_DEADLINE_MS_BY_STEP[stepName] || LLM_STEP_DEADLINE_MS;
 }
 
+// STEP_DEADLINE_MARGIN_MS -- action A2 (card #239, 2026-09-17)'s own copy of config.js's
+// STEP_DEADLINE_MS (120000ms, the daemon's generic per-step OUTER deadline -- the one deadline.js's
+// callWithDeadline races against every step, as opposed to the INNER deadlineMsForStep above,
+// which is the spawnSync/query() timeout that actually bounds one call). Duplicated, not
+// imported: config.js already requires this file (for MAX_LEASE_AGE_MS, re-exported below), and
+// the reverse -- this file requiring config.js -- would be a load-time cycle, the identical reason
+// MAX_LEASE_AGE_MS itself is defined here rather than in account-lease.js (see that constant's own
+// comment, and account-lease.js's re-export note). Kept from silently drifting by
+// test/llm-step-deadlines.test.js's own pin (`STEP_DEADLINE_MARGIN_MS === config.stepDeadlineMs`),
+// the same "typed independently of the code it checks" contract test/doc-constant-sweep.test.js
+// already runs for ~20 other numbers duplicated between code and prose (see that file's own
+// header for the two incidents that made it exist).
+//
+// WHAT IT'S FOR: config.js's own stepDeadlineMsByState now carries one entry per LLM step
+// (PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE, generated there from STEP_CONTRACTS's own
+// keys so a sixth LLM step cannot be added without one), each
+// `deadlineMsForStep(step) + STEP_DEADLINE_MARGIN_MS` -- the inner deadline plus this same margin
+// for everything runLlm legitimately does around the call itself (prompt fill, journal append,
+// reply parse, token-usage mapping), the identical "poll budget plus one step deadline of margin"
+// shape this file's own CI_CHECKS/GATE entries already use. MAX_LEASE_AGE_MS below has to know
+// this same margin, to re-derive the worst legitimate per-attempt hold now that the outer timer
+// is no longer permanently inert for an LLM step -- see that constant's own comment.
+const STEP_DEADLINE_MARGIN_MS = 120000;
+
+// MAX_LLM_STEP_OUTER_DEADLINE_MS -- the largest value any LLM step's own stepDeadlineMsByState
+// entry can take (config.js): MAX_LLM_STEP_DEADLINE_MS (the running-maximum INNER ceiling, above)
+// plus the one margin every entry adds. Named separately from MAX_LLM_STEP_DEADLINE_MS, not folded
+// into it, because the two now mean different things: MAX_LLM_STEP_DEADLINE_MS is still the bound
+// `deadlineMsForStep` hands to the call itself (steps/llm.js's spawnSync today; card #239's own
+// query()-based abort once its transport swap lands); this is the bound the OUTER
+// retry-once-then-park timer (deadline.js's callWithDeadline, armed from config.js's
+// stepDeadlineMsByState) now enforces around it. MAX_LEASE_AGE_MS below is derived from THIS one,
+// not MAX_LLM_STEP_DEADLINE_MS, for the same reason it was already derived from the running
+// maximum rather than the default: the moment one step's OUTER bound needed to be the worst
+// legitimate hold, deriving the lease bound from the inner one alone would understate it again.
+const MAX_LLM_STEP_OUTER_DEADLINE_MS = MAX_LLM_STEP_DEADLINE_MS + STEP_DEADLINE_MARGIN_MS;
+
 // MAX_LEASE_AGE_MS -- the age past which account-lease.js presumes a lease dead and sweeps it
 // regardless of pid liveness. Its full justification (why 2x, why the +10% slack, and the
 // residual SIGTERM-ignoring-child risk it deliberately does not close) lives in
@@ -623,24 +660,36 @@ function deadlineMsForStep(stepName) {
 // What config.js needs it for (cross-action defect, C6 verification): accountLeaseWaitMs is how
 // long a worker waits for a sibling's lease before parking `all-accounts-leased`, and it was the
 // single C6 bound derived from an OBSERVED maximum (measured step durations of 90-265s -> a
-// 5-minute wait) instead of from the bound it actually waits on. This constant IS that bound: a
-// lease younger than it is legitimately held and cannot be swept, and a sibling worker's own
-// two-attempt LLM step can legitimately hold one for 2 x MAX_LLM_STEP_DEADLINE_MS = 60 minutes --
-// not the 30 minutes this comment stated before PLAN's 2026-09-04 override and IMPLEMENT's own
-// above each raised the worst legitimate hold past LLM_STEP_DEADLINE_MS's default; that 30-minute
-// figure was this comment restating the DEFAULT rather than the MAXIMUM, the exact drift the
-// derivation two lines below was written to make impossible for the bound itself (only the prose
-// above it still drifted). A 5-minute waiter therefore gave up while the holder was still
-// legitimately alive and still un-sweepable for another 58 minutes, not 26.5 -- and parked the
-// exact park class per-step leasing was built to avoid. The conclusion this constant exists to
-// guarantee is unchanged either way: 63 minutes still outlasts the 60-minute worst legitimate
-// hold, by construction, whichever step (or steps) contribute the longer deadline -- which is
-// exactly why MAX_LEASE_AGE_MS is derived from MAX_LLM_STEP_DEADLINE_MS (the running maximum
-// across every override) below, never from LLM_STEP_DEADLINE_MS (the default) or from a literal.
-// Deriving the wait from this constant makes the wait outlast every legitimate hold by
-// construction -- the same asymmetry product-repo-lock.js states for its own wait bound: waiting
-// too long only delays a card, giving up too early parks a healthy one.
-const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10);
+// 5-minute wait) instead of from the bound it actually waits on. This constant IS that bound.
+//
+// RE-DERIVED for action A2 (card #239, 2026-09-17), and the reason is the action itself. Before A2,
+// "a lease younger than this is legitimately held" only ever had to account for the INNER deadline
+// (deadlineMsForStep): the OUTER per-state timer (deadline.js's callWithDeadline, armed from
+// config.js's stepDeadlineMsByState) had no entry for any LLM step and fell back to the generic
+// 120s stepDeadlineMs, which could never fire against a real call -- every command in real mode ran
+// through a BLOCKING spawnSync, so the event loop never yielded and that outer JS timer was dead
+// code for all five LLM steps. A2 gives every LLM step its own outer entry
+// (`deadlineMsForStep(step) + STEP_DEADLINE_MARGIN_MS`, config.js) so that once card #239's own
+// transport swap replaces that blocking spawn with an awaited stream, the outer timer does not
+// retroactively kill a call still inside its own inner deadline -- the exact hazard this file's own
+// comment above the GATE entry (config.js) already documents for the identical class of bug. That
+// makes the OUTER bound, not the inner one alone, the ceiling a two-attempt callLlmStep lease can
+// now legitimately be held against, once that outer timer is live: a sibling worker's own
+// two-attempt LLM step can legitimately hold a lease for 2 x MAX_LLM_STEP_OUTER_DEADLINE_MS =
+// 64 minutes (2 x 1,920,000ms) -- not the 60 minutes this comment stated before A2
+// (2 x MAX_LLM_STEP_DEADLINE_MS, correct only while the outer timer stayed dead code). Had this
+// constant been left at its pre-A2 value (2 x MAX_LLM_STEP_DEADLINE_MS + 10% = 63 minutes exactly),
+// it would now be SHORTER than that new 64-minute worst-case hold: a live holder's lease would
+// become sweepable the instant the outer timer went live -- two `claude` processes on one account,
+// the exact D1 failure MAX_LEASE_AGE_MS exists to prevent, reopened at the lease layer by a fix
+// applied only at the deadline layer. So: re-derived from MAX_LLM_STEP_OUTER_DEADLINE_MS (the
+// running maximum OUTER bound across every per-step override), never from MAX_LLM_STEP_DEADLINE_MS
+// (the inner one) or from a literal -- 67.2 minutes (4,032,000ms), still outlasting the new
+// 64-minute worst legitimate hold, by construction, whichever step (or steps) contribute the
+// longer deadline. Deriving the wait from this constant makes the wait outlast every legitimate
+// hold by construction -- the same asymmetry product-repo-lock.js states for its own wait bound:
+// waiting too long only delays a card, giving up too early parks a healthy one.
+const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_OUTER_DEADLINE_MS + Math.round(MAX_LLM_STEP_OUTER_DEADLINE_MS / 10);
 
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
 // to `escalatedModel` -- resolved by resolveStepContract() below, per
@@ -1149,6 +1198,13 @@ module.exports = {
   LLM_STEP_DEADLINE_MS,
   LLM_STEP_DEADLINE_MS_BY_STEP,
   MAX_LLM_STEP_DEADLINE_MS,
+  // Action A2 (card #239): STEP_DEADLINE_MARGIN_MS is config.js's own generic per-step deadline
+  // duplicated here (see that constant's own comment for why it cannot be imported instead), and
+  // MAX_LLM_STEP_OUTER_DEADLINE_MS is the running-maximum OUTER bound derived from it -- both
+  // exported for config.js's own stepDeadlineMsByState derivation and for
+  // test/llm-step-deadlines.test.js's drift pin.
+  STEP_DEADLINE_MARGIN_MS,
+  MAX_LLM_STEP_OUTER_DEADLINE_MS,
   deadlineMsForStep,
   shouldEscalateEffort,
   MAX_LEASE_AGE_MS,
