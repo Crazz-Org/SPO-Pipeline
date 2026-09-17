@@ -895,3 +895,53 @@ hard ceiling) is a design decision about what a maintainer debugging a live daem
 — scale the derived entries down with it, or leave them alone as "these are load-bearing, minimum
 safe values, not defaults" — and is left to chantier 9 or a future action to decide, not assumed
 here.
+
+## 13 · `settingSources` default-equivalence gap (action A3, card #239), 2026-09-17
+
+Action A3 (`orchestrator/steps/sdk-call.js`'s `buildQueryOptions`) pins the Agent SDK's
+`settingSources` option to `['user', 'project', 'local']` on every call, unconditionally — see
+that file's own `SETTING_SOURCES` comment for the full reasoning (`.claude/settings.json` is this
+pipeline's entire permission policy and must never depend on a CLI default this repo does not
+control). This is a genuinely NEW pin, not a preservation of today's behaviour: today's real-mode
+transport (`orchestrator/steps/llm.js`'s `buildArgv`) never emits `--setting-sources` at all — no
+flag, no opts field, nothing feeds one. No test in this repo's suite can catch a wrong choice
+here, by construction: every assertion that touches `settingSources` (this action's own
+`test/sdk-call-options.test.js`) compares against the SAME pinned constant on both sides of the
+equals sign. A test cannot discover what it does not independently know.
+
+**Measured (this action, against the real vendored SDK and a real `claude` 2.1.274 binary).**
+Half of the equivalence question is SETTLED: the CLI's internal allowed-source list is
+`["userSettings", "projectSettings", "localSettings", "flagSettings", "policySettings"]`, and its
+own `--setting-sources` flag only ever narrows the first THREE (its own `--help` enum is exactly
+`user`, `project`, `local`) — `flagSettings` (the CLI's real `--settings <file-or-json>` flag,
+confirmed against `claude --help` on 2.1.274 — there is no separate `--append-settings`) and
+`policySettings` (managed/enterprise policy) are added UNCONDITIONALLY, regardless of what
+`--setting-sources` names or omits. So pinning all three of the flag's own options can never cause
+a managed or enterprise-policy setting to be silently dropped — that failure mode does not exist
+for this flag at all, pinned or not.
+
+**Not settled:** whether OMITTING the flag entirely (today's behaviour) reads the same three
+sources as explicitly passing all three (this action's pin), or some different subset. That
+depends on the CLI's own launch-time
+default for the allowed-sources field, which lives inside a ~230 MB compiled binary this repo does
+not build from source. The trace so far: an `allowedSettingSources()` / `replaceAllowedSettingSources()`
+accessor pair gates both the hooks loader and the permission-rule loader, and a named constant
+literally spelled `["userSettings", "projectSettings", "localSettings"]` appears as what looks like
+that accessor's default value — strong circumstantial evidence that the flag-omitted default and
+this action's explicit pin already agree — but the accessor's actual INITIALIZER (what it is set to
+before any caller ever touches it) could not be pinned by static reading alone; only running a live
+session and comparing what it actually loads would settle it, and no such session was run for this
+gap.
+
+**Why this is a live gap, not a cosmetic one.** If the flag-omitted default ever turns out to
+differ from `['user', 'project', 'local']` (for instance, by ALSO reading some source this pin
+excludes, or by reading fewer), every LLM step running under the new transport reads a genuinely
+different permission surface than today's `claude -p` calls do, silently, with no test positioned
+to notice because the test and the code share one constant.
+
+**Not fixed here, and not fixable by more static reading** — per this register's own posture, a
+named gap rather than a silently-assumed one. **Closes at A10's live recette**: that action already
+runs one real card through the new transport end-to-end at real cost, which is the cheapest point
+in this chantier to also diff `claude --setting-sources=user,project,local`'s actual loaded
+settings against a flag-omitted invocation's, on a live account, and confirm or correct this pin
+from that one comparison rather than from another round of static tracing.
