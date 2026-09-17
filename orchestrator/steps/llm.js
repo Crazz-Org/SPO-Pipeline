@@ -31,8 +31,11 @@
 //     at least attempted (success, deadline kill, external signal, unparsable stdout) and null
 //     only when `claude` never started at all (an unreadable `oauthTokenFile`, or a spawn failure
 //     such as ENOENT/EACCES/E2BIG) -- see invokeClaudeReal's own inline comment for why each
-//     branch draws the line where it does. `deps.spawnSync` and `deps.randomUUID` are the two
-//     injection points for tests (and nothing else) -- production code never passes either.
+//     branch draws the line where it does. `deps.spawnSync` and `deps.randomUUID` are two
+//     injection points for tests; daemon production code never passes either. Action A5a (#239)
+//     added a third, `deps.onLlmCallAttempt` -- called immediately before the spawn below, an
+//     optional hook recette.js's makeCap uses to enforce its hard LLM-step cap at the one choke
+//     point every real LLM call passes through (see that call site's own comment for why).
 //     `durationS` (seconds, measured with
 //     process.hrtime.bigint() around the spawn itself, NOT Date.now()) is journaled as
 //     `duration_s` -- doc/state-machine-spec.md's Observability section already documented that
@@ -581,6 +584,32 @@ async function invokeClaudeReal(opts, deps = {}) {
   };
   if (typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0) {
     spawnOpts.timeout = opts.deadlineMs;
+  }
+
+  // Card #239 action A5a: the recette harness's hard LLM-step cap (orchestrator/recette.js's
+  // makeCap) used to enforce itself by wrapping deps.spawnSync and counting `command === 'claude'`
+  // -- exact only because this file's spawn WAS the sole way a real LLM call happened. A5b removes
+  // that spawn (Agent SDK query(), never a `claude` process), which would have silently degraded
+  // the cap to wall-clock-only: nothing fails, the ceiling just stops existing. Moved here instead,
+  // to the one choke point EVERY real LLM call passes through -- not just runLlm's, but also
+  // intake.js's draftCard/reviewCard/triageBugReport/report-intake, which never go through runLlm
+  // at all (verified by grep: `invokeClaudeReal(` has exactly four PRODUCTION call sites in this
+  // codebase -- two here, in runLlm's override and real-card branches, and two inside intake.js's
+  // shared callIntakeStepWithRotation helper, the primary attempt and its one same-account timeout
+  // retry -- every one of draftCard/reviewCard/triageBugReport/report-intake routes through that
+  // single helper, per intake.js's own header comment; test/ carries 52 more direct calls to this
+  // same function, mostly test/llm-real.test.js exercising invokeClaudeReal in isolation against
+  // an injected deps.spawnSync -- test code driving the real function under test, not production
+  // code paths).
+  // `deps.onLlmCallAttempt` is optional and a no-op on every daemon production call (undefined,
+  // like deps.spawnSync/deps.randomUUID) -- recette.js's makeCap is the one real caller, and it may
+  // throw RecetteCapExceededError to refuse this attempt before it is ever made. Placed here, not
+  // any earlier in this function, on purpose: the oauthTokenFile branch above already returns for a
+  // call that never reaches "about to spawn", and the old spawnSync-wrapping counter never counted
+  // that branch either (it only ever saw `command === 'claude'` at the moment of a real spawn) --
+  // this preserves that exact boundary rather than widening what counts as an attempt.
+  if (typeof deps.onLlmCallAttempt === 'function') {
+    deps.onLlmCallAttempt();
   }
 
   // duration_s (action 5.4, doc/state-machine-spec.md § Observability already documented this

@@ -19,6 +19,18 @@ require('./no-real-spawn');
 const recette = require('../orchestrator/recette');
 const { lockPath } = require('../orchestrator/lock');
 const { createDispatcher } = require('../orchestrator/dispatcher');
+// HANDLERS/buildCtx -- action A5a's own dry-run-does-not-count test only, below. Same
+// buildCtx(id, task, taskDir, config)/HANDLERS.PLAN(ctx) shape test/plan-writes.test.js's own
+// "--dry-run never builds an invariants baseline" regression already uses, borrowed rather than
+// re-derived: it is the simplest existing route to runLlm's ctx.dryRun short-circuit (the
+// legacy ctx.task.llm.<step> override path this file's own makeHappyPathSpawnSync/fixtures use
+// elsewhere does NOT check ctx.dryRun at all -- only the real `kind: "card"` path does).
+const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
+// invokeClaudeReal -- action A5a's own hook-placement-boundary test only, below (F4 fix pass):
+// calls the real function directly with an unreadable oauthTokenFile, the same idiom
+// test/llm-real.test.js's own "an unreadable oauthTokenFile returns sessionId: null ... claude
+// was never spawned" test already uses, extended with a spy on deps.onLlmCallAttempt.
+const { invokeClaudeReal } = require('../orchestrator/steps/llm');
 const { writePoolDir, mkTmp, writeTask, isolatedEnv, readState, readJournal } = require('./helpers');
 
 // ---------------------------------------------------------------------------------------------
@@ -663,6 +675,168 @@ test('recette: LLM-step cap trips before the 2nd claude call -- aborts and still
     !result.cleanupReport.steps.some((st) => st.name === 'journal-dir-remove'),
     'and must not report removing it'
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// Action A5a (card #239): the LLM-step cap moved off `deps.spawnSync`'s `command === 'claude'`
+// match and onto `deps.onLlmCallAttempt`, a hook steps/llm.js's invokeClaudeReal calls itself,
+// immediately before every real call it makes -- see that call site's own comment for why (A5b
+// removes the `claude` spawn the old count depended on). The six tests below are this action's
+// own: equivalence with the mechanism it replaces, the makeCap-level unit property that proves
+// the new counter is no longer coupled to spawnSync at all, the wall-clock-first trip-priority
+// pin and the hook-placement-boundary pin added in this action's own fix pass (F3/F4), dry-run
+// non-counting, and per-run isolation.
+// ---------------------------------------------------------------------------------------------
+
+// The measurement the chantier brief asked for: run the SAME scenario, on today's UNCHANGED
+// transport (invokeClaudeReal still spawns real `claude`), and compare the new onLlmCallAttempt
+// count (`result.llmSteps`) against the old count reconstructed post-hoc from the actual spawn
+// log (`calls.filter(c => c.command === 'claude').length`) -- the same `calls` array
+// makeHappyPathSpawnSync already records for the "recette --force overrides..." test above. This
+// does not require keeping the old counting CODE around: the spawn log itself is the old
+// mechanism's ground truth, on the same run, so the two numbers are directly comparable without
+// instrumenting two separate implementations.
+test('A5a equivalence: onLlmCallAttempt\'s count matches the old command === \'claude\' spawn count exactly, on today\'s transport', async () => {
+  const calls = [];
+  const result = await recette.runRecette(baseOpts(), { spawnSync: makeHappyPathSpawnSync({ calls }) });
+
+  assert.equal(result.finalState, 'DONE', JSON.stringify(result.assertions));
+  const oldStyleCount = calls.filter((c) => c.command === 'claude').length;
+  assert.ok(oldStyleCount > 0, 'sanity: the happy path must make at least one real claude spawn');
+  assert.equal(
+    result.llmSteps,
+    oldStyleCount,
+    `new onLlmCallAttempt count (${result.llmSteps}) must equal the old command==='claude' spawn ` +
+      `count (${oldStyleCount}) -- transport is unchanged in this action, so any difference is a ` +
+      'real finding, not something to paper over'
+  );
+});
+
+// makeCap unit test: the new counter trips at exactly the (capLlmSteps+1)th ATTEMPT, counted
+// entirely through onLlmCallAttempt() -- no `deps.spawnSync`, no wrapSpawnSync, no `command`
+// string anywhere in this test. This is deliberately the strongest test available for "the
+// counter is no longer keyed on a spawned command name": if a future edit reverted A5a (moved
+// the count back into wrapSpawnSync's `command === 'claude'` branch and dropped
+// onLlmCallAttempt), `cap.onLlmCallAttempt` would not even be a function, and this test would
+// fail immediately rather than silently pass by accident.
+test('makeCap: onLlmCallAttempt trips on the (capLlmSteps+1)th attempt, counted with no spawnSync call anywhere in this test', () => {
+  const config = recette.resolveConfig(baseOpts({ capLlmSteps: 2 }));
+  const cap = recette.makeCap(config);
+
+  cap.onLlmCallAttempt(); // 1st: allowed
+  cap.onLlmCallAttempt(); // 2nd: allowed (== capLlmSteps)
+  assert.equal(cap.tripped(), null);
+  assert.equal(cap.llmSteps(), 2);
+
+  assert.throws(() => cap.onLlmCallAttempt(), recette.RecetteCapExceededError); // 3rd: refused
+  assert.equal(cap.tripped().reason, 'llm-step-cap-exceeded');
+  assert.equal(cap.llmSteps(), 2, 'the over-cap attempt must never be counted as having run');
+});
+
+// F3 fix pass: onLlmCallAttempt's own comment argues the wall clock is checked FIRST, so a call
+// that crosses BOTH ceilings at once still reports 'wall-clock-cap-exceeded', never
+// 'llm-step-cap-exceeded' -- that priority was previously argued in prose only, never pinned.
+// Fully controlled fake clock, same idiom as the wall-clock unit test above: call 1 is inside
+// both ceilings, call 2 (after the clock advances past capMs, with capLlmSteps already exhausted
+// too) crosses both at once.
+test('makeCap: onLlmCallAttempt checks the wall clock BEFORE the LLM-step count -- a call crossing both ceilings reports wall-clock-cap-exceeded, never llm-step-cap-exceeded', () => {
+  let fakeNow = 1_000_000;
+  const config = recette.resolveConfig(baseOpts({ capMs: 1000, capLlmSteps: 1 }));
+  const cap = recette.makeCap(config, { now: () => fakeNow });
+
+  cap.onLlmCallAttempt(); // 1st: elapsed 0ms, llmSteps 0->1 -- inside both ceilings
+  assert.equal(cap.tripped(), null);
+
+  fakeNow += 2000; // now 2000ms elapsed (over capMs=1000) AND llmSteps+1=2 > capLlmSteps=1 --
+  // this next attempt crosses BOTH ceilings at once.
+  assert.throws(() => cap.onLlmCallAttempt(), recette.RecetteCapExceededError);
+  assert.equal(
+    cap.tripped().reason,
+    'wall-clock-cap-exceeded',
+    'wall clock must be checked first, even though the llm-step ceiling is ALSO exceeded on this same call'
+  );
+  assert.equal(cap.llmSteps(), 1, 'the over-cap attempt must not be counted, on either ceiling');
+});
+
+// F4 fix pass: invokeClaudeReal's own comment argues the hook sits AFTER the oauthTokenFile
+// branch on purpose, so a call that never reaches "about to spawn" is never counted -- that
+// boundary was previously argued in prose only, never pinned. Same idiom
+// test/llm-real.test.js's own "an unreadable oauthTokenFile returns sessionId: null ... claude
+// was never spawned" test already uses (an oauthTokenFile pointing nowhere), extended with a
+// spy on deps.onLlmCallAttempt: this call returns {ok: false, sessionId: null} well before the
+// spawn point the hook sits at, so the hook must never fire.
+test('invokeClaudeReal: deps.onLlmCallAttempt never fires on a call that never reaches "about to spawn" (unreadable oauthTokenFile)', async () => {
+  let hookCalls = 0;
+  const result = await invokeClaudeReal(
+    {
+      promptText: 'hi',
+      model: 'haiku',
+      effort: 'low',
+      cwd: '/tmp',
+      account: {
+        name: 'acct-missing-token',
+        configDir: null,
+        oauthTokenFile: '/nonexistent/spo-a5a-hook-boundary/does-not-exist',
+      },
+    },
+    { onLlmCallAttempt: () => { hookCalls += 1; } }
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.sessionId, null);
+  assert.equal(hookCalls, 0, 'a call that never reaches "about to spawn" must never count against the cap');
+});
+
+// Per-run isolation (design requirement 3: injection, not a global). A module-level counter
+// would leak between two recette runs sharing the same process -- this pins that a fresh
+// makeCap() always starts at zero and that two live instances never see each other's count.
+test('makeCap: llmSteps is per-instance -- a fresh makeCap() never inherits another instance\'s count', () => {
+  const config = recette.resolveConfig(baseOpts({ capLlmSteps: 5 }));
+  const cap1 = recette.makeCap(config);
+  cap1.onLlmCallAttempt();
+  cap1.onLlmCallAttempt();
+  assert.equal(cap1.llmSteps(), 2);
+
+  const cap2 = recette.makeCap(config); // a second, independent run's own cap
+  assert.equal(cap2.llmSteps(), 0, 'a new makeCap() must start at zero, unaffected by an earlier instance');
+  cap2.onLlmCallAttempt();
+  assert.equal(cap2.llmSteps(), 1);
+  assert.equal(cap1.llmSteps(), 2, 'and the earlier instance must not observe the later one\'s call either');
+});
+
+// Design requirement 4: runLlm's ctx.dryRun short-circuit returns before invokeClaudeReal is ever
+// called, so deps.onLlmCallAttempt must never fire on a dry run -- pinned directly (a spy on the
+// hook, through a real dry-run HANDLERS.PLAN(ctx) call), not inferred from "invokeClaudeReal
+// wasn't reached". Ctx shape borrowed from test/plan-writes.test.js's own
+// "handlePlan never builds an invariants baseline in --dry-run" regression (same buildCtx call,
+// same minimal task) -- that test already proves this ctx walks handlePlan to completion in
+// dry-run mode; this one adds the onLlmCallAttempt spy that test doesn't need.
+test('runLlm dry-run short-circuit never calls deps.onLlmCallAttempt', async () => {
+  const worktreePath = mkTmp('spo-recette-a5a-dryrun-wt-');
+  const taskDir = mkTmp('spo-recette-a5a-dryrun-taskdir-');
+  const accountsDir = mkTmp('spo-recette-a5a-dryrun-accts-');
+  writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
+  const task = {
+    id: 'card-a5a-dryrun',
+    kind: 'card',
+    issue: 605,
+    title: 'A5a dry run card',
+    criterion: 'n/a',
+    worktreePath,
+    size: 'S',
+  };
+
+  let calls = 0;
+  const ctx = buildCtx('card-a5a-dryrun', task, taskDir, {
+    shadowMode: false,
+    dryRun: true,
+    claudeAccountsDir: accountsDir,
+    stepDeadlineMs: 30000,
+    deps: { onLlmCallAttempt: () => { calls += 1; } },
+  });
+
+  const next = await HANDLERS.PLAN(ctx);
+  assert.equal(next, 'IMPLEMENT');
+  assert.equal(calls, 0, 'a dry-run PLAN must never reach invokeClaudeReal, so the cap hook must never fire');
 });
 
 // makeCap unit test, with a fully controlled fake clock: call 1 is inside the cap, call 2 (after
@@ -2052,7 +2226,7 @@ test('runDispatcherCapWatchdog: the full capLlmSteps budget is PERMITTED (never 
   // Both of the PERMITTED 2 calls (capLlmSteps: 2) already on disk before the watchdog even
   // starts -- post-verification correction: this used to trip the INSTANT the journal showed
   // exactly capLlmSteps calls, which would kill a run that had used its full, legitimate budget
-  // and needed no further call at all. makeCap's own wrapSpawnSync permits exactly capLlmSteps
+  // and needed no further call at all. makeCap's own onLlmCallAttempt permits exactly capLlmSteps
   // calls (refuses only the (capLlmSteps+1)th); this watchdog must agree.
   fs.writeFileSync(
     path.join(journalRoot, taskId, 'journal.jsonl'),

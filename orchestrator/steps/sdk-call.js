@@ -267,7 +267,7 @@ class ClaudeExecutableNotFoundError extends Error {
 // Thrown by buildQueryOptions when opts.jsonSchema is a STRING that is not valid JSON (F3, Opus
 // verifier, fix pass). This branch exists so this file can accept the same "already-JSON-encoded
 // string" shape today's buildArgv (llm.js) does -- and that shape is LIVE, not hypothetical: the
-// legacy override path (runLlm's `ctx.task.llm.<step>` branch, llm.js:1002) passes
+// legacy override path (runLlm's `ctx.task.llm.<step>` branch, llm.js:1031) passes
 // `override.jsonSchema` straight through into opts.jsonSchema with no validation of its own, the
 // same path orchestrator/README.md's own hand-written example documents. Today's transport never
 // looks at that string until `claude --json-schema <string>` runs and the CLI itself rejects a
@@ -446,7 +446,7 @@ function buildQueryOptions(opts, deps = {}) {
     // outputFormat.schema must be an OBJECT -- the SDK's own argv builder JSON.stringifies it
     // itself when it emits `--json-schema` (see this file's header measurement); today's
     // buildArgv accepts opts.jsonSchema as either an object or an already-JSON-encoded string
-    // (used verbatim, never re-parsed) -- LIVE on the legacy override path, llm.js:1002's
+    // (used verbatim, never re-parsed) -- LIVE on the legacy override path, llm.js:1031's
     // `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not merely a theoretical
     // shape, the same override path this file's allowedTools normalization already accounts for)
     // -- so a string here is parsed back into an object rather than nested as a

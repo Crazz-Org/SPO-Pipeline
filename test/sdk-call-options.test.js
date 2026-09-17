@@ -327,13 +327,13 @@ test('buildQueryOptions: unresolvable claude executable throws ClaudeExecutableN
 });
 
 // F2 (Opus verifier, fix pass): the string-jsonSchema parse branch is not a hypothetical shape --
-// it is LIVE on the legacy override path (runLlm's `ctx.task.llm.<step>` branch, llm.js:1002
+// it is LIVE on the legacy override path (runLlm's `ctx.task.llm.<step>` branch, llm.js:1031
 // passes `override.jsonSchema` straight through with no validation), the same path this file's
 // allowedTools normalization already accounts for its own string shape (orchestrator/README.md's
 // documented `allowedTools: 'Read Grep'` example). Every step-contract test above (test 1) only
 // exercises jsonSchema as an OBJECT (what resolveStepContract always builds) -- this is the only
 // test in the file that proves the string branch itself actually parses.
-test('buildQueryOptions: opts.jsonSchema as a JSON-encoded string parses into outputFormat.schema (legacy override path, llm.js:1002)', () => {
+test('buildQueryOptions: opts.jsonSchema as a JSON-encoded string parses into outputFormat.schema (legacy override path, llm.js:1031)', () => {
   const schemaObject = { type: 'object', required: ['foo'], properties: { foo: {} } };
   const { options } = buildQueryOptions(
     { promptText: 'hi', cwd: '/tmp', jsonSchema: JSON.stringify(schemaObject) },

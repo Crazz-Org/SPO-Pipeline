@@ -22,8 +22,12 @@
 // sites reach it this way (verified by `grep -n "spawnSync" orchestrator/*.js orchestrator/steps/*.js`,
 // not by counting from memory): command-timeout.js's armTimeout, park-alert.js's runSync,
 // steps/scripted.js's runSync/runScripted, steps/llm.js's invokeClaudeReal (the real `claude`
-// invocation itself, at :418 -- arguably the most consequential of the five), and recette.js's
-// wrapSpawnSync fallback (:1004, a live `require('child_process').spawnSync` property read rather
+// invocation itself, at :648 -- arguably the most consequential of the five; this citation was
+// already stale at :418 before action A5a (card #239, 2026-09-17) touched this file at all --
+// re-measured and corrected here, not carried forward as this action's own drift), and
+// recette.js's wrapSpawnSync fallback (:1023, re-pinned from :1004 -- a genuine A5a shift, that
+// action's own checkWallClock() extraction and header rewrite moved this line -- a live
+// `require('child_process').spawnSync` property read rather
 // than a module-load-time destructure, so it is immune to require ORDER but not to this guard,
 // which patches the same shared property either way).
 //

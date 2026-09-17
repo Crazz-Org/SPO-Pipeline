@@ -2560,17 +2560,20 @@ rather than per-task. A scenario that only changes what IMPLEMENT is asked to do
 not hold for a `dispatcher`-driver scenario: chantier 7 action 7.2 landed `parallel-doc-log`
 (`k: 2`) at `c0e4bbb`, which needed its own driver branch (`runDispatcherScenario`) and an
 out-of-process cap (`runDispatcherCapWatchdog`, summing `llm-call` events across every task the
-run owns), since the inline cap wraps `deps.spawnSync` in-process and a dispatcher runs its
-workers as separate OS processes the in-process wrapper never sees.
+run owns), since the inline cap's hooks (`deps.spawnSync`, `deps.onLlmCallAttempt`) are in-process
+and a dispatcher runs its workers as separate OS processes neither one ever sees.
 
 **The cap — `driver: 'inline'`.** The remediation plan's "capped budget" predates this project
 retiring dollars as a metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent,
-honestly-enforceable bounds, both checked at the one choke point every real spawn *the inline
-driver makes* (scripted **and** `claude -p`, per `steps/llm.js`'s `invokeClaudeReal`) already
-passes through: `deps.spawnSync`. This does not extend to `driver: 'dispatcher'` — its workers are
-separate OS processes, invisible to an in-process `deps.spawnSync` wrapper, which is exactly why
-that driver carries its own out-of-process watchdog (`runDispatcherCapWatchdog`, above) instead of
-reusing this mechanism.
+honestly-enforceable bounds, each checked at its own choke point. The wall clock is checked at the
+one choke point every real spawn *the inline driver makes* (scripted **and**, today, `claude -p`)
+already passes through: `deps.spawnSync`. The LLM-step count (action A5a, card #239) is checked at
+`steps/llm.js`'s `invokeClaudeReal` itself, via `deps.onLlmCallAttempt` called immediately before
+every real call it makes — moved off `deps.spawnSync` on purpose, so it survives action A5b's
+Agent SDK transport swap, which removes the `claude` spawn a spawn-keyed count depended on. This
+does not extend to `driver: 'dispatcher'` — its workers are separate OS processes, invisible to
+either in-process hook, which is exactly why that driver carries its own out-of-process watchdog
+(`runDispatcherCapWatchdog`, above) instead of reusing this mechanism.
 
 - **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
   spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
@@ -2579,9 +2582,11 @@ reusing this mechanism.
   flight when the cap is crossed (today, `npm-gate`'s 7800s) — this is "abort at the next
   opportunity", not "abort within `capMs` of the wall clock". It always terminates and always
   cleans up; it never hangs.
-- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Every real LLM
-  call in this codebase spawns literally `claude`, so this is an exact count, not a heuristic —
-  checked, and enforced, **before** the over-cap call spawns at all. 12 comfortably covers a
+- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Counted at
+  `invokeClaudeReal`'s own `deps.onLlmCallAttempt` hook — every real LLM call in this codebase
+  goes through that one function, so this is an exact count, not a heuristic, and unlike the old
+  `command === 'claude'` count it no longer depends on that call spawning a `claude` process at
+  all — checked, and enforced, **before** the over-cap call is ever made. 12 comfortably covers a
   trivial card's own budgets (`diagnoseBudget` 3, `validateRejectBudget` 3) stacked on the 3-call
   happy path (PLAN, IMPLEMENT, VALIDATE).
 
