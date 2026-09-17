@@ -1069,3 +1069,187 @@ by pattern-matching the word "`claude -p`":**
 not exist in `steps/llm.js` today — the real field is `timedOut` — a naming drift that predates
 card #239 and is not caused by the A5b transport swap). Found during this sweep, out of scope for
 it, named here rather than silently carried forward uncorrected.
+
+## 16 · `canUseTool` rejected as A8's mechanism — dead on three independent grounds, and wiring it would loosen policy (action A8, card #239), 2026-09-17
+
+**REWRITTEN WHOLE, not patched line by line** (verifier fix pass, 2026-09-17): the first version
+of this entry invented a CLAUDE.md quotation, argued from a false premise about `Task`, and
+proposed an "unlock" that its own quoted evidence already contradicted. Each defect is preserved
+below only where naming it is the honest way to present the corrected claim; this version is
+organized around the three things this action and its fix passes actually measured, plus the
+conclusion those three measurements support.
+
+Card #239's own text proposed `options.canUseTool` (the Agent SDK's permission-decision callback)
+as the way to make "per-step tool and permission policy expressed in code and covered by the
+suite" — its rationale being that `allowedTools`/`permissionMode` are strings pushed onto argv and
+resolved inside the child, while a callback moves the decision into code the suite can exercise.
+Action A3 (2026-09-17, same day) had already put `allowedTools`/`permissionMode` into code for
+STEP_CONTRACTS's five LLM steps (`step-contracts.js`, mapped by `buildQueryOptions`), table-driven
+tested (`test/sdk-call-options.test.js` test 1). But STEP_CONTRACTS's five are not this repo's
+whole in-code tool policy: `orchestrator/intake.js` builds three more inline
+(`draftCard`/`reviewCard`/`triageBugReport`) — EIGHT policies in total. A8's job was to rule
+whether `canUseTool` adds anything A3's five did not already close, the same discipline A7 applied
+to its own card-supplied mechanism before finding it wrong.
+
+**RULING: `canUseTool` is the wrong mechanism, on three independent grounds, all measured.**
+
+**1 — every one of the eight real policies shadows the callback by its OWN `allowedTools` shape.**
+The vendored SDK (`vendor/claude-agent-sdk/sdk.mjs`) ships its own diagnostic for this — a function
+pair (`RGe`/`n9`) that computes, from `(hasCanUseTool, permissionMode, allowedTools)`, whether the
+callback would ever actually be consulted, and calls `process.emitWarning(msg, {code:
+'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED'})` when it would not: a bare `allowedTools` entry (no `Bash(git
+*)`-style scoping) auto-approves that whole tool before the callback is ever consulted, and
+`permissionMode: 'bypassPermissions'` auto-approves every tool call regardless. All eight real
+policies declare every `allowedTools` entry bare — STEP_CONTRACTS's five (`PLAN: ['Read', 'Grep',
+'Glob', 'Bash']`, `IMPLEMENT: [...,'Edit','Write']`, `DIAGNOSE: ['Read','Grep','Bash']`,
+`CITATION_VERIFIER: ['Read','Grep']`, `VALIDATE: ['Read','Grep','Glob','Bash']`) and intake.js's
+three (`draftCard`/`reviewCard`/`triageBugReport`, all `['Read','Grep','Glob','Bash']`) — and none
+of the eight sets `bypassPermissions`. MEASURED (a real `query()` call per policy against a
+throwaway `node` fixture that exits immediately, never `claude`, no real spawn —
+`test/sdk-call-options.test.js`'s eight `canUseTool would be shadowed for <policy>` tests):
+attaching a `canUseTool` callback to each fires exactly one `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`
+warning, naming every tool that policy declares.
+
+**2 — the one case that looked like it would fire (a step's own subagent call) also does not,**
+closing HALF of the open question PLAN's own STEP_CONTRACTS entry raises (`allowedTools` is NOT
+the authority on what a call can spawn — 11 of a measured PLAN(fable) window's sessions carried an
+Opus subagent despite `Task` never being declared). An earlier draft of this entry read that as
+`canUseTool`'s one live-firing case; it is not, and NOT on the same mechanism as point 1 (the fix
+pass that added "on the SAME shadowing mechanism" here was itself wrong: PLAN declares neither
+`Task` nor `Agent` at all, so a bare-`allowedTools` entry cannot be what auto-approves this call --
+this is genuinely the SECOND independent ground the heading already promises, not a restatement of
+the first). What auto-approves it is the CLI's own NO-RULE-NEEDED DEFAULT-ALLOW SET, a mechanism
+point 1 never touches. MEASURED against the installed CLI binary (2.1.274,
+`~/.local/share/claude/versions/2.1.274`, direct byte search, not the vendored `sdk.mjs`): a
+legacy-tool-name alias table (`var i={Task:"Agent",...}`, consumed by `function qc(e){return
+Object.hasOwn(i,e)?i[e]:e}`, called on `e.tool_name` inside the binary's own
+`PermissionRequest`/`PermissionDenied` handling) canonicalizes the wire name `Task` to `Agent`
+before any permission check runs; and the permission-rule resolver (`function Jn(e,n,r={})`)
+contains `var gl=new Set(["Read","Glob","Grep","NotebookRead","Skill","AskUserQuestion",
+"TaskCreate","TaskGet","TaskList","TaskUpdate","TaskStop","TaskOutput","Agent","TodoWrite"])` and,
+inside `Jn`, `else if(gl.has(y.toolName))i.push(h)` — pushed straight onto the allowed list, no
+further check, no callback consulted. So a step's OWN `Agent`/`Task` call resolves `allow` in
+local rule evaluation and never reaches the `--permission-prompt-tool` fall-through — CLOSED, this
+agrees with the observed behaviour (those 11 PLAN(fable) subagent sessions ran with no
+`--permission-prompt-tool` wired at all; had the call instead required one, it would have been
+refused headless, and no subagent would have spawned). **This closes only the PARENT half.**
+Whether a spawned subagent's own NESTED tool calls (inside the `Agent`, not the `Agent` call
+itself) are separately gated by the parent `query()`'s `allowedTools` is genuinely unmeasured —
+the mechanism is plausible either way (`--allowedTools` becoming a session-scoped
+`alwaysAllowRules.cliArg` would inherit down; an agent definition carrying its own `tools` set
+would override) — and is answerable with **no LLM spend**: walk the PLAN(fable) session
+transcripts the way `console/usage-scan.js` already walks a session's `subagents` subtree, and
+look for a subagent `tool_use` naming a tool outside PLAN's own declared set that returned a
+result rather than a refusal. Left to A9, not resolved here.
+
+**3 — even rescoping `allowedTools` would not unlock the callback for most of these tools, because
+`.claude/settings.json` shadows them independently, and this action's own quoted SDK text already
+said so.** An earlier draft of this entry proposed rescoping a bare tool into a scoped one (e.g.
+`Bash(git *)`) as "what would unlock `canUseTool`", backed by a fabricated CLAUDE.md quotation.
+Both the mechanism and the citation were wrong. MEASURED (`.claude/settings.json`, pinned by
+`test/sdk-call-options.test.js`'s own settings-shape test): `permissions.allow` has 98 entries, of
+which exactly `Read`, `Grep`, `Glob`, `Edit`, `Write` (plus one MCP tool name) are bare; the other
+92 are scoped `Bash(...)`; all 14 `deny` entries are also scoped; there is no bare `Bash` anywhere
+in the file. This is not taken on CLAUDE.md's word alone -- VERIFIED at the use site and against
+the live machine: `bin/spo`'s `readPipelineSettingsText()` reads THIS EXACT FILE
+(`path.join(__dirname, '..', '.claude', 'settings.json')`) and passes it to
+`accounts.stampManagedSettings()`, which `cmdAccountSyncSettings` (`spo account sync-settings`,
+run automatically on `account add` and every `--real` startup) writes into every pool account's
+own `settings.json`, stamped `"//": "machine-owned -- written by \`spo account sync-settings\`
+from <repo>/.claude/settings.json..."`. MEASURED on this machine: both live pool directories
+(`~/.claude-accounts/pool1/settings.json`, `~/.claude-accounts/pool2/settings.json`) carry that
+exact stamp, and their PARSED `permissions` object is byte-identical to the repo's own
+`.claude/settings.json`'s right now -- the FILES differ (the pool copies additionally carry the
+`"//"` machine-owned stamp; the identity claim is about the `permissions` object only, not the
+file bytes) -- so the bare-allow shape above is not a claim about policy
+intent, it is the actual, live, installed state every real LLM call's `CLAUDE_CONFIG_DIR` resolves
+against, regardless of what STEP_CONTRACTS/intake.js say. And the SAME diagnostic named in point 1 (`RGe`)
+says, in the exact text it builds for the warning message, in so many words: *"Allow rules from
+settings files can also shadow the callback but are not visible here."* So rescoping `Read`/`Grep`/`Glob`/`Edit`/`Write`
+inside this repo's own code would unshadow NOTHING for those five — the settings file's own bare
+allow keeps shadowing them regardless of what STEP_CONTRACTS says. `Bash` is the only tool among
+all eight policies that settings.json does NOT bare-allow, so it is the only one this repo's own
+rescoping could actually affect at all — but SEVEN of the EIGHT policies ALSO declare `Bash` bare
+themselves (STEP_CONTRACTS's PLAN/IMPLEMENT/DIAGNOSE/VALIDATE and all three of intake.js's; only
+CITATION_VERIFIER omits it), which is itself a separate, larger structural gap than the
+`canUseTool` question — see the pointer below rather than this entry resolving it. The
+honest unlock, for the five tools settings.json bare-allows: editing `.claude/settings.json`
+itself, which CLAUDE.md says "cannot be edited by an agent: the harness refuses them as sensitive
+files, regardless of the repo's own rules." That is the real basis for reading this as the
+maintainer's decision, not a builder action's — not the invented quotation the first draft used.
+
+**CONCLUSION: wiring `canUseTool` would LOOSEN this pipeline's policy, not tighten it — this is
+the headline, not a footnote.** Attaching the callback pushes `--permission-prompt-tool stdio`
+onto every real call's argv (MEASURED, from the vendored SDK's own argv builder: `if(te){...
+W.push("--permission-prompt-tool","stdio")}` where `te` is `canUseTool`) — handing the callback
+exactly the tool calls that today are hard-refused, never soft-decided, because no rule anywhere
+covers them: `Bash` under CITATION_VERIFIER (the one policy that declares no `Bash` at all — a
+call there today is refused, not asked); and `WebFetch`/`WebSearch`, which MEASURED appear in
+**none** of the eight in-code policies, in neither `.claude/settings.json`'s allow nor its deny
+list, and not in the CLI's own no-rule-needed set (`gl`, point 2 above). CLAUDE.md § Permissions is
+explicit that DIAGNOSE/VALIDATE/CITATION_VERIFIER run with no human, so "whatever
+`.claude/settings.json` doesn't allow is refused, not queued" — never auto-approved instead. A
+`canUseTool` callback converts exactly that hard-refusal path into a decision our own code makes at
+runtime. Nothing available to this chantier makes the callback fire for any OTHER call, per points
+1–3 above — so the one behaviour change wiring it would actually produce is turning today's
+walls into decisions, dressed as a policy-tightening feature.
+
+**Filed separately, not resolved here**: point 3's own aside — `.claude/settings.json` carries no
+bare `Bash` (92 curated scoped rules instead), but SEVEN of this entry's own EIGHT policies give
+`Bash` bare (STEP_CONTRACTS's PLAN/IMPLEMENT/DIAGNOSE/VALIDATE, and all three of intake.js's
+draftCard/reviewCard/triageBugReport), which enters the CLI as a bare `alwaysAllowRules.cliArg`
+and auto-approves the whole tool regardless of those 92 rules. So for SEVEN of the EIGHT in-code
+tool policies the effective shell boundary is the 14 scoped denies and nothing else; the 92
+curated allow rules bind exactly ONE of the eight — CITATION_VERIFIER, the only policy that omits
+`Bash` entirely. This is a materially bigger gap than the `canUseTool` question (bigger than this
+entry's own first-draft count of "four of five" said, once intake.js's three are counted in) —
+and NOT seven uniform instances of one finding: STEP_CONTRACTS's four run in a DISPOSABLE
+per-issue worktree (PLAN/IMPLEMENT, `cwdKind: 'worktree'`) or the pipeline's own tree
+(DIAGNOSE/VALIDATE, `cwdKind: 'pipeline'`), but all three of intake.js's steps pass `cwd:
+productRepo` (`draftCard`/`reviewCard`/`triageBugReport`, each with its own comment on the call
+site), which `config.js` resolves to `process.env.SPO_PRODUCT_REPO || ~/SPO-WebClient` -- the
+LIVE, PERSISTENT checkout the daemon itself works against, not a disposable one. Of those three,
+`reviewCard` is the SHARPEST single instance, not merely one more of a flat seven: it is the ONE
+intake policy whose `permissionMode` is `default` rather than `plan` (MEASURED,
+`orchestrator/intake.js`'s own three call sites -- `draftCard`/`triageBugReport` are both `plan`,
+read-only-enforced; `reviewCard` alone is not), so its bare `Bash` is not even backed by the
+read-only posture the other two at least declare: it combines bare `Bash`, a non-read-only
+`permissionMode`, the live `productRepo` checkout, AND the heaviest model/effort pairing of the
+three (`fable`/`high`, against `draftCard`'s `sonnet`/`medium` and `triageBugReport`'s
+`opus`/`medium`) in one policy. `config.js`'s own comment on that constant already records a scar
+from something writing there unintentionally
+(a mutation-testing round on 2026-08-31 left 44 fixture-named worktrees and 61 branches inside the
+live product repo). A bare-`Bash` grant landing in that shared, persistent tree is a different,
+and worse, instance of this gap than one landing in a worktree FINISH later deletes or in the
+pipeline's own tree -- filed as its own card; this entry only points at it.
+
+**A test-suite note, so a future red run is not misread**: every shadow-probe test named above is
+written to PASS today and FAIL the day any of the eight policies ever gains a scoped `allowedTools`
+entry — the SDK's shadowing rule stops applying once one does (`test/sdk-call-options.test.js`'s
+"omits a SCOPED allowedTools entry" test proves the probe discriminates bare from scoped, not
+"always warns"). That is by design: a red result there means this ruling's premise changed and
+this entry needs re-reading, not that the suite or the SDK regressed.
+
+**What DOES satisfy the card's Done means** ("per-step tool and permission policy is expressed in
+code and covered by the suite") **is what A3 already built for STEP_CONTRACTS's five, now extended
+to intake.js's three** (M15, verifier fix pass — the card's own clause covers all in-code tool
+policy, and intake.js's three were previously covered by nothing but the doc-parity sweep):
+`test/sdk-call-options.test.js` now asserts, by name, over all eight policies: only IMPLEMENT's
+grants one of the CLI's own dedicated write tools (`Write`/`Edit`/`MultiEdit`/`NotebookEdit` —
+MEASURED against the installed binary's own `uWe`/`fAt` write-tool set, not a guessed
+`['Edit','Write']` pair, and stated honestly as NOT a general write-capability check: every other
+policy also declares bare `Bash`, which a tool-name whitelist cannot characterize); no policy's
+`permissionMode` is `bypassPermissions`, and each matches this BUILD's own chosen default exactly
+(`plan`/`acceptEdits`/`default`/`default`/`default`/`plan`/`default`/`plan` — stated as this
+build's own inferred default, per step-contracts.js's own header, never as something either
+spec/README document fixes a value for); and no policy declares `Task` OR its CLI-canonical alias
+`Agent`. Intake.js's three are read from its own source text (no accessor exists there the way
+`resolveStepContract` is one for STEP_CONTRACTS), so a future edit to any of the eight is caught by
+a named test instead of only the doc-parity sweep.
+
+**Not closed by this entry**: (a) the subagent question's CHILD half — whether a spawned
+subagent's own nested tool calls are gated by the parent's `allowedTools` — left to A9, with the
+no-LLM-spend transcript-walk method named above; (b) whether the sibling card's bare-`Bash`-vs-
+scoped-settings.json gap is worth closing, and how; (c) the "editing `.claude/settings.json`"
+lever itself, which this action cannot pull and does not recommend pulling. All three are the
+maintainer's call, not a builder action's.

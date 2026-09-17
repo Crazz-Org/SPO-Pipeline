@@ -1,8 +1,9 @@
 'use strict';
 // Unit tests for orchestrator/steps/sdk-call.js's buildQueryOptions (card #239 chantier, action
-// A3). This file never spawns the real `claude` CLI -- test 3 spawns a real `node` process
-// running a throwaway fixture script that only dumps its own argv, never a live agent (see that
-// test's own comment for why this is the one place in the file that crosses a process boundary).
+// A3). This file never spawns the real `claude` CLI -- test 3, and action A8's own canUseTool-
+// shadowing probes further down, spawn a real `node` process running a throwaway fixture script
+// that only dumps its own argv or exits immediately, never a live agent (see each test's own
+// comment for why crossing a process boundary is still hermetic there).
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -115,6 +116,287 @@ for (const step of REAL_STEPS) {
     assert.equal('maxBudgetUsd' in options, false);
   });
 }
+
+// ---- action A8 (card #239 chantier, "per-step tool and permission policy in code") -------------
+//
+// A8's brief asked whether `options.canUseTool` -- the SDK's own permission-decision callback --
+// is the mechanism that closes the card, or whether A3 above already closed it. RULING, MEASURED
+// (this action, no real spawn -- see the shadowing probe further down for the reproduction):
+// `canUseTool` would be COMPLETELY SHADOWED for every one of today's real per-step tool policies,
+// and re-verification (this fix pass) found the callback is dead for a SECOND, independent reason
+// on top of the first -- both are recorded in full, with their own measurements, in
+// doc/accepted-gaps.md entry 16 (read that entry for the ruling's narrative; this comment only
+// orients the tests below):
+//
+//   1. `step-contracts.js`'s STEP_CONTRACTS and `intake.js`'s three inline call sites
+//      (draftCard/reviewCard/triageBugReport -- EIGHT in-code tool policies total, not five; see
+//      ALL_POLICIES below) declare every `allowedTools` entry as a bare name. The vendored SDK's
+//      own diagnostic for this (`process.emitWarning(..., {code:
+//      'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED'})`, `vendor/claude-agent-sdk/sdk.mjs`'s `RGe`/`n9`
+//      functions) fires for every one of them.
+//   2. `.claude/settings.json` -- installed as the USER layer of every pool account regardless of
+//      which of the eight policies above is rescoped -- carries its OWN bare allows for `Read`,
+//      `Grep`, `Glob`, `Edit`, `Write` (MEASURED: `.claude/settings.json`'s `permissions.allow`
+//      has 98 entries, of which exactly those five tool names plus one MCP name are bare; the
+//      other 92 are scoped `Bash(...)`; all 14 `deny` entries are also scoped). The SDK's own
+//      warning text says this in so many words -- "Allow rules from settings files can also
+//      shadow the callback but are not visible here" -- so rescoping those five tool names inside
+//      STEP_CONTRACTS/intake.js would NOT unshadow them; the settings file would keep shadowing on
+//      its own. `Bash` is the only tool in every one of the eight policies (all but
+//      CITATION_VERIFIER's) that is NOT bare-allowed by settings.json today, so it is the only one
+//      rescoping could actually affect -- and doing that is the DECISION doc/accepted-gaps.md
+//      entry 16 hands to the maintainer, not something this test file asserts either way.
+//
+// So wiring `canUseTool` today would add a callback the real pipeline never actually calls for
+// ANY declared tool call, on either of the two independent reasons above -- the "callback added
+// but never exercised" anti-pattern this action's own brief explicitly forbade.
+//
+// What DOES satisfy the card's own Done means ("per-step tool and permission policy is expressed
+// in code and covered by the suite") is what A3 already built for STEP_CONTRACTS's five steps:
+// `allowedTools`/`permissionMode` live in code and test 1 above already checks every step's
+// `options.allowedTools`/`options.permissionMode` against its contract, table-driven. The
+// policy-audit tests immediately below are this action's actual addition on top of that: they
+// name the SECURITY PROPERTIES the table-driven equality check leaves implicit, they extend
+// coverage to the three intake.js policies A3 never touched (M15, verifier fix pass -- the card's
+// clause covers ALL of this repo's in-code tool policy, and intake.js's three were uncovered by
+// anything except the doc-parity sweep until this fix pass), and the shadowing probes further down
+// are the measurement backing the ruling above, not a policy check of their own.
+//
+// F7 (verifier fix pass): every shadow-probe test below is written to PASS TODAY and FAIL the
+// day any of these eight policies ever gains a scoped `allowedTools` entry (the SDK's own
+// shadowing rule stops applying to a scoped entry -- see the "omits a SCOPED allowedTools entry"
+// test further down). That is not a bug to fix if it happens: it is this suite correctly
+// reporting that the ruling's premise changed and needs re-reading, not evidence the SDK or this
+// file regressed. Read a red test here as "someone rescoped a tool, go re-read
+// doc/accepted-gaps.md entry 16", never as "revert whatever caused this".
+
+// M15 (verifier fix pass): intake.js builds its three LLM-step option objects inline
+// (draftCard/reviewCard/triageBugReport) -- there is no callable accessor for them the way
+// step-contracts.js's resolveStepContract is one for STEP_CONTRACTS, so this reads the file's
+// ACTUAL source text rather than hand-copying the arrays into this test file (a hand copy would
+// just be a second place for the same drift to hide from -- the exact failure mode
+// test/doc-constant-sweep.test.js exists to catch for prose, applied here to test fixtures
+// instead). Anchored on each call site's own `step: '<LABEL>'` literal, unique per site.
+const INTAKE_JS_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'intake.js'), 'utf8');
+
+// `source` defaults to the real file (every production call site below relies on that default);
+// the two boundary tests just below this function override it with a synthetic snippet so they
+// can probe the trailing-comma/spread distinction without needing intake.js itself to be edited.
+function extractIntakeStepPolicy(stepLabel, source = INTAKE_JS_SOURCE) {
+  const anchor = `step: '${stepLabel}'`;
+  const anchorIdx = source.indexOf(anchor);
+  assert.notEqual(anchorIdx, -1, `orchestrator/intake.js: could not find ${anchor}`);
+  const window = source.slice(anchorIdx, anchorIdx + 400);
+  const allowedToolsMatch = window.match(/allowedTools:\s*(\[[^\]]*\])/);
+  const permissionModeMatch = window.match(/permissionMode:\s*'([^']*)'/);
+  assert.ok(allowedToolsMatch, `orchestrator/intake.js: no allowedTools found near ${anchor}`);
+  assert.ok(permissionModeMatch, `orchestrator/intake.js: no permissionMode found near ${anchor}`);
+  // Tolerate exactly ONE reformatting variant -- a trailing comma before the closing bracket
+  // (valid JS array-literal syntax, invalid JSON) -- and nothing more permissive. MEASURED: a
+  // pure reformat with values unchanged (`['Read', 'Grep', 'Glob', 'Bash',]`) throws
+  // `SyntaxError: Unexpected token ']'` from a bare JSON.parse; stripping only `,\s*]$` fixes
+  // that one case and leaves a computed entry -- `[...BASE_TOOLS, 'Bash']`, which this static
+  // regex-and-parse extraction has no way to evaluate -- throwing exactly as loudly as before
+  // (`Unexpected token '.'`). A quiet catch-and-skip here would be the vacuous pass this whole
+  // audit exists to avoid: the policy genuinely cannot be read in that shape, so this must fail,
+  // not silently approve.
+  const jsonLiteral = allowedToolsMatch[1].replace(/'/g, '"').replace(/,\s*\]$/, ']');
+  return {
+    allowedTools: JSON.parse(jsonLiteral),
+    permissionMode: permissionModeMatch[1],
+  };
+}
+
+test('extractIntakeStepPolicy: tolerates a single trailing comma before the closing bracket -- a pure reformat, values unchanged, must not be mistaken for a policy change', () => {
+  const snippet = "step: 'DRAFT_CARD',\n    allowedTools: ['Read', 'Grep', 'Glob', 'Bash',],\n    permissionMode: 'plan',";
+  const result = extractIntakeStepPolicy('DRAFT_CARD', snippet);
+  assert.deepEqual(result, { allowedTools: ['Read', 'Grep', 'Glob', 'Bash'], permissionMode: 'plan' });
+});
+
+test('extractIntakeStepPolicy: a trailing comma PLUS an added tool still surfaces the added tool -- the tolerance is for formatting only, never for the policy content', () => {
+  const snippet = "step: 'DRAFT_CARD',\n    allowedTools: ['Read', 'Grep', 'Glob', 'Bash', 'NotebookEdit',],\n    permissionMode: 'plan',";
+  const result = extractIntakeStepPolicy('DRAFT_CARD', snippet);
+  assert.deepEqual(result.allowedTools, ['Read', 'Grep', 'Glob', 'Bash', 'NotebookEdit']);
+});
+
+test('extractIntakeStepPolicy: a computed allowedTools entry (spread) still throws loudly -- a static regex-and-parse extraction cannot evaluate it, and must not silently approve what it cannot read', () => {
+  const snippet = "step: 'DRAFT_CARD',\n    allowedTools: [...BASE_TOOLS, 'Bash'],\n    permissionMode: 'plan',";
+  assert.throws(() => extractIntakeStepPolicy('DRAFT_CARD', snippet), /Unexpected token/);
+});
+
+// The EIGHT in-code tool policies this repo actually has, audited uniformly: STEP_CONTRACTS's
+// five (via resolveStepContract, the real accessor) plus intake.js's three (via the source-text
+// extraction above, since intake.js exposes no accessor). `.contract()` is a function, not a
+// cached value, so each test call re-reads the live source/table rather than a snapshot taken at
+// module load.
+const ALL_POLICIES = [
+  ...REAL_STEPS.map((step) => ({ name: step, contract: () => resolveStepContract(step, {}) })),
+  { name: 'intake.draftCard', contract: () => extractIntakeStepPolicy('DRAFT_CARD') },
+  { name: 'intake.reviewCard', contract: () => extractIntakeStepPolicy('REVIEW_CARD') },
+  { name: 'intake.triageBugReport', contract: () => extractIntakeStepPolicy('TRIAGE_BUG_REPORT') },
+];
+
+test('.claude/settings.json: the bare-allow shape this ruling depends on is still what was measured (Read/Grep/Glob/Edit/Write bare, every Bash rule scoped, no bare deny)', () => {
+  // Not a claim about STEP_CONTRACTS/intake.js -- a claim about the OTHER policy layer
+  // (`.claude/settings.json`) that the comment block above says would keep shadowing `canUseTool`
+  // even if a maintainer rescoped one of these five tool names inside this repo's own code. If
+  // this ever changes, the "rescoping wouldn't help" half of the ruling needs re-reading before
+  // anyone acts on it -- this test exists to make that loud instead of silent.
+  const settings = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.claude', 'settings.json'), 'utf8'));
+  const allow = settings.permissions.allow;
+  const deny = settings.permissions.deny;
+  const bareAllow = allow.filter((rule) => !rule.includes('('));
+  const bareDeny = deny.filter((rule) => !rule.includes('('));
+  assert.deepEqual(new Set(bareAllow), new Set(['Read', 'Grep', 'Glob', 'Edit', 'Write', 'mcp__ccd_session_mgmt__set_session_title']));
+  assert.deepEqual(bareDeny, []);
+  assert.equal(allow.includes('Bash'), false, 'settings.json must not bare-allow Bash -- see the sibling card this entry points at');
+});
+
+// LEGACY_TOOL_ALIASES: MEASURED against the installed CLI binary (2.1.274,
+// `~/.local/share/claude/versions/2.1.274`, `strings -a` + direct byte search, not the vendored
+// sdk.mjs -- see doc/accepted-gaps.md entry 16's own measurement) -- a legacy-name alias table
+// (`var i={Task:"Agent",...}`) canonicalizes the wire name `Task` to `Agent` before any permission
+// check runs. A guard that only checks for the literal string `'Task'` (this test's first draft)
+// is evaded by the CLI's own canonical spelling -- checked here.
+const LEGACY_TOOL_ALIASES = { Task: 'Agent' };
+
+test('ALL_POLICIES: no policy declares "Task" OR its CLI-canonical alias "Agent" in allowedTools -- PLAN\'s own measured subagent gap stays undeclared, in EITHER spelling, never silently promoted to a grant', () => {
+  for (const policy of ALL_POLICIES) {
+    const contract = policy.contract();
+    assert.equal(contract.allowedTools.includes('Task'), false, `${policy.name} must not declare Task`);
+    for (const canonical of Object.values(LEGACY_TOOL_ALIASES)) {
+      assert.equal(contract.allowedTools.includes(canonical), false, `${policy.name} must not declare ${canonical} (Task's CLI-canonical name)`);
+    }
+  }
+});
+
+// CLI_WRITE_TOOLS: the CLI's OWN definition of "this is a write tool", not this test file's guess
+// -- MEASURED against the installed binary: `var Kyr=["Write","Edit","MultiEdit","NotebookEdit"],
+// fAt=new Set(Kyr);function uWe(e,n){...return fAt.has(qc(e))||...}` (`uWe`, consulted from the
+// CLI's own PostToolUse/PostToolUseFailure hook matching). An earlier draft of this test used
+// `['Edit','Write']`, missing `MultiEdit`/`NotebookEdit` from the CLI's own set.
+const CLI_WRITE_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'];
+
+test('ALL_POLICIES: IMPLEMENT is the only policy whose allowedTools grants one of the CLI\'s own dedicated write tools (Write/Edit/MultiEdit/NotebookEdit) -- NOT a general "can this policy write" check', () => {
+  // HONEST SCOPE, stated because a broader test NAME would be false regardless of any mutation:
+  // every OTHER policy here (PLAN, DIAGNOSE, VALIDATE, and all three intake.js steps) also
+  // declares bare `Bash`, which can write via redirection or a `git`/`gh` mutating command just as
+  // well as a dedicated tool can -- a whitelist over TOOL NAMES cannot characterize what an
+  // arbitrary Bash command does, and this test does not claim otherwise. What it DOES claim,
+  // narrowly and truthfully: none of the seven non-IMPLEMENT policies grants a dedicated write
+  // tool ON TOP OF whatever Bash already lets through.
+  for (const policy of ALL_POLICIES) {
+    const contract = policy.contract();
+    const grantsWrite = contract.allowedTools.some((tool) => CLI_WRITE_TOOLS.includes(tool));
+    assert.equal(grantsWrite, policy.name === 'IMPLEMENT', `${policy.name}'s allowedTools grants a dedicated write tool: ${grantsWrite}`);
+  }
+});
+
+test('ALL_POLICIES: permissionMode matches this build\'s own chosen per-step default exactly -- never "bypassPermissions"', () => {
+  // NOT "documented" -- step-contracts.js's own header is explicit that permissionMode is NOT
+  // sourced from state-machine-spec.md or prompts/README.md; it is "chosen so a step whose
+  // contract is 'read-only' never needs a human approval prompt it cannot answer (headless -p),
+  // and the one step with edit tools (IMPLEMENT) auto-accepts them" -- this build's OWN inferred
+  // default, stated as such rather than attributed to a doc that never fixed a value. A
+  // 'bypassPermissions' mode would skip `.claude/settings.json` (the single source of policy,
+  // installed on every pool account) entirely, not merely relax it -- CLAUDE.md § Permissions:
+  // DIAGNOSE/VALIDATE/CITATION_VERIFIER run headless with no human, so "whatever
+  // `.claude/settings.json` doesn't allow is refused, not queued", never auto-approved instead.
+  const EXPECTED = {
+    PLAN: 'plan',
+    IMPLEMENT: 'acceptEdits',
+    DIAGNOSE: 'default',
+    CITATION_VERIFIER: 'default',
+    VALIDATE: 'default',
+    'intake.draftCard': 'plan',
+    'intake.reviewCard': 'default',
+    'intake.triageBugReport': 'plan',
+  };
+  for (const policy of ALL_POLICIES) {
+    const contract = policy.contract();
+    assert.equal(contract.permissionMode, EXPECTED[policy.name]);
+    assert.notEqual(contract.permissionMode, 'bypassPermissions');
+  }
+});
+
+// ---- the canUseTool-shadowing probe itself, hermetic, one real query() spawn per step ----------
+//
+// Same fixture shape as test 3 further down (a throwaway `node` script, never `claude`, that
+// exits immediately with no output) -- proves the SHADOWED claim above against the REAL vendored
+// SDK rather than resting it on a reading of the minified source. `process.emitWarning` is a
+// process-wide EventEmitter, so each probe installs and removes its own listener rather than
+// sharing one across tests (node:test runs this file's tests in one process, sequentially).
+function fixtureThatExitsCleanly(tmpDir) {
+  const fixturePath = path.join(tmpDir, 'fake-claude-exit0.js');
+  fs.writeFileSync(fixturePath, '#!/usr/bin/env node\nprocess.exit(0);\n', { mode: 0o755 });
+  return fixturePath;
+}
+
+async function captureShadowWarnings(opts) {
+  const tmpDir = mkTmp('sdk-call-canusetool-probe-');
+  const fixturePath = fixtureThatExitsCleanly(tmpDir);
+  const warnings = [];
+  const onWarning = (warning) => {
+    if (warning && warning.code === 'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED') warnings.push(warning.message);
+  };
+  process.on('warning', onWarning);
+  try {
+    const { prompt, options } = buildQueryOptions(
+      { promptText: 'probe', cwd: tmpDir, account: null, ...opts.contractFields },
+      { resolveClaudeCodeExecutable: fakeResolver(fixturePath), isNoRealSpawnEnabled: () => false }
+    );
+    if (opts.canUseTool) options.canUseTool = opts.canUseTool;
+    const query = await loadQuery();
+    const q = query({ prompt, options });
+    // eslint-disable-next-line no-unused-vars
+    for await (const _msg of q) {
+      // the fixture exits(0) with no stdout -- nothing to consume
+    }
+    // n9()'s emitWarning call happens synchronously during query()'s own construction, well
+    // before this loop even starts, but yield once so a test runner that defers 'warning'
+    // dispatch to the next tick (Node does, per its own docs) has delivered it before we check.
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off('warning', onWarning);
+  }
+  return warnings;
+}
+
+for (const policy of ALL_POLICIES) {
+  test(`canUseTool would be shadowed for ${policy.name}'s exact declared allowedTools (MEASURED, not assumed)`, async () => {
+    const contract = policy.contract();
+    const warnings = await captureShadowWarnings({
+      contractFields: { allowedTools: contract.allowedTools, permissionMode: contract.permissionMode },
+      canUseTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+    });
+    assert.equal(warnings.length, 1, `expected exactly one shadow warning for ${policy.name}, got ${JSON.stringify(warnings)}`);
+    for (const tool of contract.allowedTools) {
+      assert.ok(
+        warnings[0].includes(tool),
+        `shadow warning for ${policy.name} must name ${tool}: ${warnings[0]}`
+      );
+    }
+  });
+}
+
+test('canUseTool shadow warning does NOT fire when no canUseTool callback is supplied (sanity: the warning is caused by the callback, not by allowedTools alone)', async () => {
+  const contract = resolveStepContract('PLAN', {});
+  const warnings = await captureShadowWarnings({
+    contractFields: { allowedTools: contract.allowedTools, permissionMode: contract.permissionMode },
+    canUseTool: undefined,
+  });
+  assert.deepEqual(warnings, []);
+});
+
+test('canUseTool shadow warning omits a SCOPED allowedTools entry (e.g. "Bash(git *)") -- proves the probe discriminates bare vs. scoped, not just "always warns"', async () => {
+  const warnings = await captureShadowWarnings({
+    contractFields: { allowedTools: ['Read', 'Bash(git *)'], permissionMode: 'default' },
+    canUseTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+  });
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('Read'), `expected Read to be named shadowed: ${warnings[0]}`);
+  assert.ok(!warnings[0].includes('Bash(git *)'), `scoped entry must not be named shadowed: ${warnings[0]}`);
+});
 
 // ---- test: action A5b's own additions to buildQueryOptions -- abortController and
 // spawnClaudeCodeProcess/getSpawnedProcess -----------------------------------------------------

@@ -31,24 +31,30 @@ exception — the opposite of the intent.
 
 `orchestrator/steps/llm.js`'s `invokeClaudeReal` drives the vendored Claude Agent SDK's `query()`
 (card #239 chantier, action A5b, 2026-09-17 — no longer a direct `claude -p` spawn) with
-`options.env.CLAUDE_CONFIG_DIR=~/.claude-accounts/poolN` (`sdk-call.js`'s `buildEnv`). These
-directories have **no** `settings.json`: user rules disappear for every LLM step. What
-remains are the *project* rules, resolved from the step's `cwd` (`config.js` → `cwdForStep`):
+`options.env.CLAUDE_CONFIG_DIR=~/.claude-accounts/poolN` (`sdk-call.js`'s `buildEnv`). **CORRECTED
+-- this used to say these directories have no `settings.json`, and once did, but no longer does**:
+that gap is CLOSED, at the USER layer, by the account-sync mechanism the section below this table
+documents in full (`bin/spo`'s `cmdAccountSyncSettings`, run on every `account add` and every
+`--real` daemon startup) -- read that section for the mechanism; this paragraph only stops
+asserting the stale half of it. What remains to state here are the *project* rules, resolved from
+the step's `cwd` (`config.js` → `cwdForStep`):
 
 | Step | `cwd` | Project rules visible |
 |---|---|---|
 | PLAN, IMPLEMENT | product worktree (`~/.spo-worktrees/issue-N/`) | the 70 WebClient rules (`.claude/settings.json` is versioned, so present in every worktree) ✅ |
-| DIAGNOSE, VALIDATE, CITATION_VERIFIER | SPO-Pipeline root | **none** ❌ |
+| DIAGNOSE, VALIDATE, CITATION_VERIFIER | SPO-Pipeline root | the repo's own 98 allow / 14 deny rules (`.claude/settings.json`, versioned at the pipeline root -- this row used to read "none ❌" before that file existed) ✅ |
 
 These three steps run in `permissionMode: 'default'` with no human to respond: any Bash command
-that isn't trivially read-only is **refused**, not queued.
+that isn't trivially read-only AND not covered by an allow rule (project or, since the fix below,
+user) is **refused**, not queued.
 
 ### The account layer counts too, and it's also plugged now
 
-The table above says *user* rules disappear for every LLM step. Project policy is enough as long
-as each step lands in a directory that carries one — which is the case today (pipeline root or
-product worktree), which **masks** the gap without closing it. A step whose `cwd` had no
-`.claude/settings.json` would run with no rules at all.
+The paragraph above the table used to say *user* rules disappear for every LLM step -- true once,
+corrected there now. Project policy ALONE would have been enough only as long as every step lands
+in a directory that carries one — which is the case today (pipeline root or product worktree),
+but that would have **masked** the user-layer gap without closing it: a step whose `cwd` had no
+`.claude/settings.json` of its own would still have run with no rules at all.
 
 An account's directory **is** its `CLAUDE_CONFIG_DIR`, so a `settings.json` placed inside it is
 its user layer. `spo account sync-settings` installs `<repo>/.claude/settings.json` there as-is,
@@ -68,11 +74,13 @@ hold real credentials?" by excluding the files the module manages itself. The sy
 `spo accounts` report every account as authenticated, including ones that aren't. Covered by a
 regression test.
 
-Direct consequence: DIAGNOSE is the safety net intended for CI forensics
-(`doc/improvisation-analysis.md`, cause R2 — `gh run view --log-failed`, `gh api …/jobs`) and it
-has none of these permissions. VALIDATE must read `git diff` from the product worktree and can't
-either. Creating `SPO-Pipeline/.claude/settings.json` fixes both at once, without touching the
-account directories.
+RESOLVED, past tense (this paragraph used to describe a live consequence; it no longer is one):
+DIAGNOSE is the safety net intended for CI forensics (`doc/improvisation-analysis.md`, cause R2 —
+`gh run view --log-failed`, `gh api …/jobs`), and before `SPO-Pipeline/.claude/settings.json`
+existed, it had none of these permissions; VALIDATE reads `git diff` from the product worktree
+and would not have been able to either. Both now have the repo's own 98 allow / 14 deny rules —
+`SPO-Pipeline/.claude/settings.json` exists (see the table above) — without touching the account
+directories, which is the separate, ALSO now-closed gap the rest of this section documents.
 
 ## Deny ↔ process contradictions (arbitrated on 2026-08-30)
 
