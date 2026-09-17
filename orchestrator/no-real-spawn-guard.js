@@ -18,18 +18,21 @@
 //
 // A mutated/regressed `isRealMode`/`config.real` gate inside a spawned worker or scanner child
 // would therefore reach the REAL `spawnSync` with no guard at all -- exactly the class of incident
-// test/no-real-spawn.js exists to close, just one process hop further out. Five production call
-// sites reach it this way (verified by `grep -n "spawnSync" orchestrator/*.js orchestrator/steps/*.js`,
-// not by counting from memory): command-timeout.js's armTimeout, park-alert.js's runSync,
-// steps/scripted.js's runSync/runScripted, steps/llm.js's invokeClaudeReal (the real `claude`
-// invocation itself, at :648 -- arguably the most consequential of the five; this citation was
-// already stale at :418 before action A5a (card #239, 2026-09-17) touched this file at all --
-// re-measured and corrected here, not carried forward as this action's own drift), and
-// recette.js's wrapSpawnSync fallback (:1023, re-pinned from :1004 -- a genuine A5a shift, that
-// action's own checkWallClock() extraction and header rewrite moved this line -- a live
-// `require('child_process').spawnSync` property read rather
-// than a module-load-time destructure, so it is immune to require ORDER but not to this guard,
-// which patches the same shared property either way).
+// test/no-real-spawn.js exists to close, just one process hop further out. FOUR production call
+// sites reach it this way as of action A5b (card #239, 2026-09-17 -- verified by
+// `grep -n "spawnSync" orchestrator/*.js orchestrator/steps/*.js`, not by counting from memory):
+// command-timeout.js's armTimeout (:160), park-alert.js's runSync (:32), steps/scripted.js's
+// runSync/runScripted (:80, :92), and recette.js's wrapSpawnSync fallback (:1023, re-pinned from
+// :1004 by action A5a -- a live `require('child_process').spawnSync` property read rather than a
+// module-load-time destructure, so it is immune to require ORDER but not to this guard, which
+// patches the same shared property either way). A FIFTH site, steps/llm.js's invokeClaudeReal (the
+// real `claude` invocation itself), was here through action A5a -- action A5b (this cutover) moved
+// that call onto the vendored Claude Agent SDK's `query()`, which this module does NOT and cannot
+// reach (it patches `child_process.spawnSync`/`execFileSync`/`execSync`/`execFile`/`exec` only,
+// never the ESM-imported, link-time-bound `spawn` the SDK itself uses internally -- see
+// orchestrator/steps/sdk-call.js's own header for the measurement, and its `isEnabled()` check
+// inside `spawnClaudeCodeProcess` plus the identical check at the top of `invokeClaudeReal` for
+// where that call's OWN killswitch now lives instead).
 //
 // ---- design: propagated by the ENVIRONMENT, not by module state --------------------------------
 //
@@ -49,12 +52,14 @@
 // real-process boundary (test/helpers.js's execFileSync launches of daemon.js/bin/spo) legitimately
 // needs `execFileSync` left alone. Neither exception applies here in the same shape: a spawned
 // worker/scanner child is `orchestrator/daemon.js` re-executed from scratch, `deps` is always `{}`
-// in it (no test harness reaches into a live child to inject anything), and all FIVE actual
+// in it (no test harness reaches into a live child to inject anything), and all FOUR actual
 // production call sites this guard defends -- command-timeout.js's armTimeout, park-alert.js's
-// runSync, steps/scripted.js's runSync/runScripted, steps/llm.js's invokeClaudeReal, and
-// recette.js's wrapSpawnSync fallback (see this file's own header for the line numbers and the
-// grep that found them) -- are all `spawnSync`. So this module patches every OTHER function
-// `child_process` exposes for running a named program, in two groups:
+// runSync, steps/scripted.js's runSync/runScripted, and recette.js's wrapSpawnSync fallback (see
+// this file's own header for the line numbers and the grep that found them) -- are all
+// `spawnSync`. steps/llm.js's invokeClaudeReal no longer belongs to this list (action A5b moved it
+// onto `query()`; see this file's own header for where that call's killswitch lives instead). So
+// this module patches every OTHER function `child_process` exposes for running a named program, in
+// two groups:
 //
 //   - SYNCHRONOUS, like `spawnSync` itself: `execSync`, `execFileSync`.
 //   - ASYNCHRONOUS, callback-based: `exec`, `execFile`. These are NOT synchronous -- a normal

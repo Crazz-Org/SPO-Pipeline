@@ -19,7 +19,16 @@ require('./no-real-spawn');
 const { COLUMN_BY_STATE, moveCard, moveIssueToColumn, runSync } = require('../orchestrator/board');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
-const { timeoutResult, mkTmp } = require('./helpers');
+const { timeoutResult, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
+
+// Card #239 chantier (A5b-2, Job 3): the claude LLM call now goes through `deps.spawn`/
+// `deps.resolveClaudeCodeExecutable`/`deps.isNoRealSpawnEnabled` (test/helpers.js's `fakeSpawnDeps`/
+// `fakeExecDeps`), never `deps.spawnSync` -- see test/llm-real-card.test.js's own header. Every
+// OTHER spawnSync fake in this file (npm board:move, git, gh) is untouched: only the two "real
+// mode: moves the card" tests below ever simulated a claude reply.
+function boardMoveInitMessage(sessionId) {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -431,19 +440,7 @@ test('moveIssueToColumn: a timed-out spawn returns {ok: false, exit: -1, timedOu
 // here to reach a real callLlmStep call without needing the full step-contracts.js /
 // prompt-template.js / task-values.js wiring a `kind: "card"` task would otherwise need.
 
-function realShapedPayload(resultString) {
-  return JSON.stringify({
-    result: resultString,
-    is_error: false,
-    num_turns: 1,
-    session_id: 'sess-board-1',
-    modelUsage: { 'claude-x': { costUSD: 0.001 } },
-    terminal_reason: 'success',
-    api_error_status: null,
-  });
-}
-
-function realCtxWithOneAccount(task, taskDir) {
+function realCtxWithOneAccount(task, taskDir, extraDeps = {}) {
   const accountsDir = mkTmp('spo-board-accts-');
   fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
   return buildCtx(task.id, task, taskDir, {
@@ -452,7 +449,7 @@ function realCtxWithOneAccount(task, taskDir) {
     real: true,
     stepDeadlineMs: 30000,
     claudeAccountsDir: accountsDir,
-    deps: { spawnSync: task.__spawnSync },
+    deps: { spawnSync: task.__spawnSync, ...extraDeps },
   });
 }
 
@@ -462,9 +459,14 @@ test('HANDLERS.IMPLEMENT (real mode): moves the card to "Implementing" before th
   const calls = [];
   const spawnSync = (command, args, opts) => {
     calls.push({ command, args: [...args], cwd: opts && opts.cwd });
-    if (command === 'claude') return ok(realShapedPayload('ok'));
     return ok('');
   };
+  const claudeCalls = [];
+  function spawn(command, args, spawnOpts) {
+    calls.push({ command: 'claude', args, cwd: spawnOpts.cwd });
+    claudeCalls.push({ command, args, cwd: spawnOpts.cwd, env: spawnOpts.env, signal: spawnOpts.signal });
+    return fakeSpawnedChild([boardMoveInitMessage('sess-board-1'), { type: 'result', subtype: 'success', is_error: false, num_turns: 1, session_id: 'sess-board-1', modelUsage: { 'claude-x': { costUSD: 0.001 } }, result: 'ok' }]);
+  }
   const task = {
     id: 'card-701',
     kind: 'card',
@@ -473,7 +475,7 @@ test('HANDLERS.IMPLEMENT (real mode): moves the card to "Implementing" before th
     llm: { IMPLEMENT: { model: 'sonnet', effort: 'low', promptText: 'implement it' } },
     __spawnSync: spawnSync,
   };
-  const ctx = realCtxWithOneAccount(task, taskDir);
+  const ctx = realCtxWithOneAccount(task, taskDir, fakeExecDeps({ spawn }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -500,21 +502,23 @@ test('HANDLERS.VALIDATE (real mode): moves the card to "Validation" before eithe
   // satisfy VALIDATE's own {{invariants_path}}/{{invariant_ids}} placeholders (task-values.js).
   const spawnSync = (command, args, opts) => {
     calls.push({ command, args: [...args], cwd: opts && opts.cwd });
-    if (command === 'claude') {
-      return ok(
-        JSON.stringify({
-          result: JSON.stringify({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }),
-          is_error: false,
-          num_turns: 1,
-          session_id: 'sess-validate-1',
-          modelUsage: { 'claude-x': { costUSD: 0.002 } },
-          terminal_reason: 'success',
-          api_error_status: null,
-        })
-      );
-    }
     return ok('');
   };
+  function spawn(command, args, spawnOpts) {
+    calls.push({ command: 'claude', args, cwd: spawnOpts.cwd });
+    return fakeSpawnedChild([
+      { type: 'system', subtype: 'init', session_id: 'sess-validate-1', apiKeySource: 'none', model: 'x', cwd: spawnOpts.cwd, tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-validate-1',
+        modelUsage: { 'claude-x': { costUSD: 0.002 } },
+        result: JSON.stringify({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }),
+      },
+    ]);
+  }
   const task = {
     id: 'card-702',
     kind: 'card',
@@ -525,7 +529,7 @@ test('HANDLERS.VALIDATE (real mode): moves the card to "Validation" before eithe
     touchesRdoMembers: false,
     __spawnSync: spawnSync,
   };
-  const ctx = realCtxWithOneAccount(task, taskDir);
+  const ctx = realCtxWithOneAccount(task, taskDir, fakeExecDeps({ spawn }));
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: {
       plan_path: path.join(taskDir, 'scratch', 'plan-702.md'),

@@ -29,10 +29,33 @@
 // Also NOT by a time-window match ("the session that started closest to this call's own
 // timestamp"): that happened to be unique across every corpus call measured, but is a property of
 // that corpus, not a guarantee -- two kills close enough together collapse into ambiguous
-// candidates under a loose-enough window. This module works only because
+// candidates under a loose-enough window. See orchestrator/README.md's Tokens section for the
+// measured numbers behind the design below.
+//
+// STALE CLAIM CORRECTED, THEN RESTORED (card #239 chantier). F7's own sibling-grep (Opus verifier
+// fix pass) found this paragraph claiming this module "works only because
 // orchestrator/steps/llm.js's invokeClaudeReal mints `sessionId` BEFORE spawning `claude`, so a
-// killed call still has an id to be found by. See orchestrator/README.md's Tokens section for the
-// measured numbers behind this.
+// killed call still has an id to be found by" -- true of the old spawnSync transport, but false
+// for the few days between action A5b's cutover (which dropped the mint: `state-machine.js` never
+// supplies `opts.sessionId` to a real card call, so `buildQueryOptions` omitted the option
+// entirely and the CLI minted its own id, reported back only once the `system`/`init` message
+// arrived) and this action's Job 2. A call killed before that first message had NO session id for
+// this module to search by during that window -- a real, measured loss of the guarantee this
+// paragraph describes, not a hypothetical one.
+//
+// Job 2 (this action, A5b-2 fix pass) restored it: `invokeClaudeReal` (orchestrator/steps/llm.js)
+// once again mints a UUID -- via `deps.randomUUID`, falling back to `crypto.randomUUID`, the same
+// injection convention this file's own `recoverSessionTokens` uses below -- before every real
+// `query()` call whose caller did not already supply `opts.sessionId`, and passes it through
+// `buildQueryOptions` as `options.sessionId` (a first-class SDK option, `--session-id=<uuid>` on
+// the real CLI's argv). So the guarantee this paragraph originally described holds again, restored
+// rather than reinvented: a call killed before the `system`/`init` message ever arrives still has
+// an id -- the one invokeClaudeReal generated and told `claude` to use -- for this module to search
+// a transcript by. The one behavioural difference from the pre-A5b transport: the CLI's own
+// reported id (once it exists) wins over the generated one if the two ever disagree, since the CLI
+// is the authority on what it actually named the session on disk (see invokeClaudeReal's own
+// `suppliedSessionId` fallback comment) -- in the ordinary case the two are the same value, exactly
+// as they always were.
 //
 // ---- roots searched, in order -------------------------------------------------------------------
 //

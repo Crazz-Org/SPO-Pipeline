@@ -7,17 +7,24 @@
 // scalar cursor convention), optionally preceded by an artificial delay read from
 // `delays.<stepName>` (ms), same mechanism as steps/scripted.js. Unchanged by everything below.
 //
-// Real mode spawns `claude -p ...` and parses its `--output-format json` stdout. Two layers:
+// Real mode drives the vendored Claude Agent SDK's `query()` (card #239 chantier, action A5b --
+// before this action, real mode spawned `claude -p ...` directly via `spawnSync` and parsed its
+// `--output-format json` stdout; that transport is gone, not merely superseded, and `buildArgv`
+// (its argv builder) has been deleted along with it, see this file's git history for its final
+// form). Two layers:
 //
-//   invokeClaudeReal(opts, deps) -- the primitive. Takes the per-call inputs the spec lists
+//   invokeClaudeReal(opts, deps) -- the primitive. Takes the same per-call inputs the spec lists
 //     (step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
-//     promptText|promptFile, cwd, account, deadlineMs) plus one more (action 4.1, token-ledger
-//     lot): an optional opts.sessionId, a caller-supplied UUID-v4 string used verbatim instead of
-//     generating one (see the sessionId paragraph below). Builds argv, spawns with the resolved
-//     prompt on the child's stdin, parses, classifies failures, and returns {ok, result,
+//     promptText|promptFile, cwd, account, deadlineMs, sessionId) it always has -- the CUTOVER
+//     changed the transport underneath, not this function's contract. Maps opts onto
+//     `{prompt, options}` via `orchestrator/steps/sdk-call.js`'s `buildQueryOptions`, drives
+//     `sdk.js`'s `loadQuery()`-resolved `query({prompt, options})`, reduces the resulting async
+//     message stream via that same file's `consumeQueryStream`, and returns {ok, result,
 //     sessionId, tokensSource, freshInputTokens, cacheCreationTokens, cacheReadTokens,
 //     outputTokens, billableTokens, cacheCreationEphemeral1h, cacheCreationEphemeral5m,
-//     modelUsage, numTurns, durationS, raw}. Card #214: `modelUsage` is the same four
+//     modelUsage, numTurns, durationS, raw} -- byte-identical field set to the old transport's,
+//     except `raw` is now always `undefined` (this transport reports no OS exit code at all --
+//     see consumeQueryStream's own header decision 1). Card #214: `modelUsage` is the same four
 //     billable-accounting fields plus `billableTokens`, broken out PER MODEL (keyed by the
 //     model name modelUsage's own reply used) instead of summed across every model the call
 //     touched -- present only when extractTokens() found at least one recognized field
@@ -27,20 +34,22 @@
 //     step-contracts.js's own comment on its `allowedTools` -- has the subagent's tokens
 //     summed into the same flat totals as the resolved model's own, with no way for a reader
 //     to pull them back apart; the journalled `model` field then names only the step's
-//     CONTRACT model, never the subagent's. `sessionId` is set on every branch representing a spawn that was
-//     at least attempted (success, deadline kill, external signal, unparsable stdout) and null
-//     only when `claude` never started at all (an unreadable `oauthTokenFile`, or a spawn failure
-//     such as ENOENT/EACCES/E2BIG) -- see invokeClaudeReal's own inline comment for why each
-//     branch draws the line where it does. `deps.spawnSync` and `deps.randomUUID` are two
-//     injection points for tests; daemon production code never passes either. Action A5a (#239)
-//     added a third, `deps.onLlmCallAttempt` -- called immediately before the spawn below, an
-//     optional hook recette.js's makeCap uses to enforce its hard LLM-step cap at the one choke
-//     point every real LLM call passes through (see that call site's own comment for why).
-//     `durationS` (seconds, measured with
-//     process.hrtime.bigint() around the spawn itself, NOT Date.now()) is journaled as
-//     `duration_s` -- doc/state-machine-spec.md's Observability section already documented that
-//     field before any code wrote it (measured 2026-09-01: zero of the 19 corpus journals'
-//     llm-call events carried it); true as of this change.
+//     CONTRACT model, never the subagent's. `sessionId` is set on every branch representing a
+//     call that was at least attempted (success, deadline kill, external signal, unparsable
+//     stream) and null only when `claude` never started at all (an unreadable `oauthTokenFile`,
+//     no `claude` resolved on PATH, or a malformed `opts.jsonSchema` string -- the three named
+//     error classes `buildQueryOptions` throws and this function catches, see its own try/catch
+//     below) -- see invokeClaudeReal's own inline comment for why each branch draws the line
+//     where it does. `deps.query` and `deps.buildQueryOptions` are the two injection points tests
+//     use; daemon production code passes neither. Action A5a (#239) added `deps.onLlmCallAttempt`
+//     -- called immediately before `query()` itself now (previously immediately before the
+//     spawn), the one choke point every real LLM call passes through (see that call site's own
+//     comment for why). `durationS` (seconds, measured with monotonicNowMs() around the whole
+//     query()/consume/confirm sequence, NOT Date.now() and NOT the SDK's own `duration_ms` --
+//     see the durationS assignment's own comment for why this function's own measurement still
+//     wins) is journaled as `duration_s` -- doc/state-machine-spec.md's Observability section
+//     already documented that field before any code wrote it (measured 2026-09-01: zero of the 19
+//     corpus journals' llm-call events carried it); true as of this change.
 //
 //     Token accounting (maintainer decision, 2026-08-31): the pool is Claude Max SUBSCRIPTION
 //     accounts with a quota, never metered API billing, so a dollar figure never meant money
@@ -84,36 +93,65 @@
 //     by the caller's account-rotation retry loop -- see state-machine.js's callLlmStep), and
 //     journals one event per call (an 'llm-call' for a real attempt, a 'dry-run' for a dry one).
 //
-// Deadline handling: spawnSync's own `timeout` option (set to opts.deadlineMs) is what actually
-// kills a hung `claude` process. deadline.js's callWithDeadline/withTimeout race is NOT reused
-// for that job here on purpose: it works by racing a Promise against a setTimeout, which cannot
-// preempt spawnSync -- spawnSync blocks the single JS thread synchronously, so no timer can fire
-// until spawnSync itself returns. Worse, deadline.js's race explicitly abandons the loser "to
-// finish in the background" (see its own comment), which for a real subprocess would mean an
-// orphaned `claude -p` process still spending budget. spawnSync's `timeout` avoids both problems
-// -- it is enforced by Node itself while the child runs, and it signals the child. The state
-// machine still wraps the whole call in callWithDeadline (see callLlmStep) for its existing
-// "retry once, then PARK" bookkeeping.
+// Deadline handling (rewritten by action A5b -- the paragraph this replaces described
+// spawnSync's own synchronous `timeout` option, which no longer exists on this transport; see git
+// history for that version if the pre-cutover doctrine is ever needed again). Going ASYNC means
+// this function now owns cancellation EXPLICITLY -- there is no thread-blocking spawnSync call for
+// a timer to preempt, and there is also no synchronous guarantee that returning means the child is
+// dead. deadline.js's callWithDeadline/withTimeout race is STILL not reused for this job, for the
+// original reason restated: it abandons the loser "to finish in the background" (see its own
+// comment), which for a real subprocess would mean an orphaned `claude` process still spending
+// budget -- exactly the property this function's own design refuses to accept as a limitation, and
+// beats outright rather than merely inherits (see below).
 //
-// One correction to what this paragraph used to claim, measured during action 6.2's verification
-// rather than reasoned: spawnSync's `timeout` sends `killSignal` (SIGTERM by default) and does
-// NOT escalate to SIGKILL. Measured directly -- an ordinary child returns
+// The mechanism: `options.abortController` (built fresh per call inside `buildQueryOptions`, one
+// controller per `query()` call, never reused) is aborted by a `setTimeout` armed against
+// `opts.deadlineMs`. MEASURED (this action, 2026-09-17, against the real vendored SDK -- see
+// sdk-call.js's own header for the full probe): aborting does NOT kill the child promptly, and
+// does NOT synchronize with the async iterator's own completion. The SDK's own internal escalation
+// (`ProcessTransport.close()`) waits 2000ms, then SIGTERMs, then waits another 5000ms before
+// SIGKILL -- a worst case of 7000ms from `abort()` to a GUARANTEED kill, which this transport
+// BEATS the old one on: spawnSync's `timeout` sent exactly one signal and never escalated (see the
+// corrected paragraph two below), so a `claude` process that traps and ignores SIGTERM ran to
+// completion regardless of the deadline; this transport forces it dead within a bounded,
+// MEASURED window regardless of whether it cooperates. But the async iterator (what
+// `consumeQueryStream` awaits) was ALSO measured to settle up to ~5-7s BEFORE that kill actually
+// lands -- so `invokeClaudeReal` does not treat "the stream ended" as "the call is over." After
+// every `consumeQueryStream` call, it awaits `sdk-call.js`'s `confirmProcessExit` (bounded by that
+// same file's `ABORT_CONFIRM_GRACE_MS`, derived from the two measured constants above plus
+// margin) against the real child handle `buildQueryOptions`'s `spawnClaudeCodeProcess` hook
+// captured -- and does not return until it knows whether the account lease its own caller
+// (state-machine.js's `callLlmStep`) is about to release in a `finally` is safe to release. A live
+// `claude` still holding that lease's `CLAUDE_CONFIG_DIR` when the lease frees would let a sibling
+// worker start a SECOND `claude` on the same account inside the gap -- exactly what `lock.js`'s
+// "never two `claude` processes on one `CLAUDE_CONFIG_DIR`" rule exists to prevent, reachable at
+// K>=2 workers, not theoretical. If the grace window expires without a confirmed exit, this
+// function does NOT claim a clean kill -- it returns `killConfirmed: false` and says so in
+// `error`, honestly, rather than reporting a kill it cannot back up (a false "killed" is worse
+// than a true "could not confirm": it is the field a maintainer reads when deciding whether the
+// pool is cooling for a real reason). The state machine still wraps the whole call in
+// callWithDeadline (see callLlmStep) for its existing "retry once, then PARK" bookkeeping.
+//
+// What this paragraph used to claim about spawnSync (kept, corrected, for the transport this
+// action retired -- the reasoning is exactly why the new transport had to beat it, not merely
+// match it): spawnSync's `timeout` sent `killSignal` (SIGTERM by default) and did NOT escalate to
+// SIGKILL. Measured (action 6.2's verification) -- an ordinary child returned
 // `signal=SIGTERM status=null error=ETIMEDOUT` after 410ms against a 400ms timeout, while a child
-// that INSTALLS A SIGTERM HANDLER AND IGNORES IT ran to its own completion at 27651ms and returned
-// `signal=null status=0`. So "invokeClaudeReal always returns once its own timeout elapses" is
-// true for a child that dies on SIGTERM, not unconditionally, and the outer callWithDeadline
-// cannot rescue it either (its timer cannot fire while spawnSync blocks the thread -- that is the
-// whole reason this paragraph exists). There is no evidence the `claude` CLI ignores SIGTERM, and
-// nothing here changes killSignal on a guess; this comment is corrected because C6's worker design
-// leans on this doctrine by name, and a doctrine has to say what it actually guarantees. A call
-// killed this way returns `{ok: false, timedOut: true, deadlineMs, error: "... ran but exceeded
-// the Xms deadline and was killed ..."}` -- callers that need to tell a deadline kill apart from
-// a genuine spawn/parse failure (e.g. intake.js's triageBugReport, to decide whether a retry is
-// worth it) test `timedOut`, never the message text.
+// that INSTALLED A SIGTERM HANDLER AND IGNORED IT ran to its own completion at 27651ms and
+// returned `signal=null status=0`, i.e. never killed at all. A call killed by a deadline returns
+// `{ok: false, timedOut: true, deadlineMs, killConfirmed, error: "... ran but exceeded the Xms
+// deadline ..."}` -- callers that need to tell a deadline kill apart from a genuine spawn/parse
+// failure (e.g. intake.js's triageBugReport, to decide whether a retry is worth it) test
+// `timedOut`, never the message text; unchanged by this action.
+//
+// One property this action measured but did NOT close, recorded rather than silently accepted:
+// `doc/accepted-gaps.md` carries this transport's own detached-grandchild finding -- a tool
+// subprocess `claude` itself spawns can outlive a killed `claude`, symmetric with the old
+// transport (neither ever signalled a process GROUP), pre-existing, not introduced or worsened
+// here.
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
 const { randomUUID } = require('crypto');
 
 const { sleep } = require('./scripted');
@@ -121,11 +159,29 @@ const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
 const { resolveStepContract, deadlineMsForStep, checkOutputTypes } = require('../step-contracts');
-const { isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
 const { monotonicNowMs } = require('../monotonic-clock');
 const { recoverSessionTokens: recoverSessionTokensDefault } = require('../token-recovery');
+const { loadQuery } = require('../sdk');
+const { isEnabled: isNoRealSpawnEnabled } = require('../no-real-spawn-guard');
+
+// sdk-call.js requires THIS file back (resolvePromptText, NONINTERACTIVE_ENV_DEFAULTS,
+// extractTokens, classifyFailure, limitKindForFailure -- see its own header). A plain top-level
+// `require('./sdk-call')` HERE would make that a genuine circular require: whichever of the two
+// files is required FIRST by the outside world runs its top-level body, hits the other file's
+// top-level `require()`, and -- because Node's require cache returns whatever the in-progress
+// module's `module.exports` object currently IS, not what it will eventually become -- the file
+// requiring THE ONE STILL MID-EXECUTION would destructure every name off an incomplete (still
+// `{}`) exports object and silently get `undefined` for all of them. Lazy instead: `getSdkCall()`
+// below calls `require('./sdk-call')` only from INSIDE invokeClaudeReal, i.e. only once this
+// file's own module body (and therefore its `module.exports` assignment at the bottom) has
+// already finished running for every real caller -- functions are only ever invoked after the
+// module that defines them has finished loading, which is exactly what breaks the cycle. Node's
+// own require cache makes the repeated `require()` calls this produces free after the first.
+function getSdkCall() {
+  return require('./sdk-call');
+}
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
 
@@ -140,12 +196,16 @@ const NONINTERACTIVE_ENV_DEFAULTS = {
   DISABLE_AUTOUPDATER: '1',
 };
 
-// Reads opts.promptText/opts.promptFile down to the final prompt string. Split out of
-// buildArgv because the prompt no longer lives in argv (see buildArgv's own comment) but two
-// callers still need the resolved text: invokeClaudeReal (to write it to the child's stdin) and
-// writeDryRunArtifact (to display it). Throws the same "needs promptText or promptFile" error
-// buildArgv used to, and at the same point in the call sequence -- invokeClaudeReal calls this
-// before touching the account/oauth-token file, so a missing prompt still fails first.
+// Reads opts.promptText/opts.promptFile down to the final prompt string. Historically split out
+// of the old transport's `buildArgv` (deleted by action A5b -- the prompt never lived in argv even
+// there, see the E2BIG lesson this function's own callers now carry forward at
+// sdk-call.js's buildQueryOptions, which calls this same function as its own first step) but two
+// callers here still need the resolved text: invokeClaudeReal indirectly, via buildQueryOptions
+// (to hand `query()` the prompt to write to the child's stdin) and writeDryRunArtifact (to display
+// it). Throws the same "needs promptText or promptFile" error this function always has, at the
+// same point in the call sequence -- buildQueryOptions calls this before touching the
+// account/oauth-token file, so a missing prompt still fails first, exactly as invokeClaudeReal
+// itself used to before this action moved that ordering into sdk-call.js.
 function resolvePromptText(opts) {
   let prompt = opts.promptText;
   if ((prompt === undefined || prompt === null || prompt === '') && opts.promptFile) {
@@ -155,50 +215,6 @@ function resolvePromptText(opts) {
     throw new Error('llm.js: real-mode call needs promptText or promptFile');
   }
   return prompt;
-}
-
-// Builds the argv for `claude`. Flag order:
-//   -p --model <model> --effort <effort> --output-format json [--session-id <uuid>]
-//   [--max-budget-usd <n>] [--allowedTools <tools>] [--permission-mode <mode>]
-//   [--json-schema <schema-json>]
-// --session-id is conditional, like the flags after it: pushed only when opts.sessionId is a
-// non-empty string. invokeClaudeReal is the only caller that ever supplies one -- it generates
-// the id itself (or uses the one the caller passed in opts.sessionId) immediately before the
-// spawn, so a killed or unparsable call can still be tied back to the `claude` session that
-// actually ran (see invokeClaudeReal's own comment on the token-ledger action this is for).
-// --max-budget-usd is conditional, like the other three: pushed only when opts.maxBudgetUsd is a
-// number. No daemon or intake path supplies it -- the only caller that does is the hand-run
-// scripts/smoke-llm.js (see doc/state-machine-spec.md / orchestrator/README.md § Budgets).
-//
-// The prompt is NOT one of these argv entries -- it goes to the child's stdin instead (see
-// invokeClaudeReal). Linux caps each INDIVIDUAL argv/environ string at MAX_ARG_STRLEN
-// (32 * PAGE_SIZE = 131072 bytes on this machine) -- a distinct, much smaller limit than ARG_MAX
-// (the cumulative argv+environ budget, never remotely approached here). A filled prompt bigger
-// than that made spawnSync fail with E2BIG before `claude` ever started, unconditionally, no
-// matter the model/account/step. Reproduced 2026-08-30 on card #452: its IMPLEMENT prompt was
-// 204826 bytes (a placeholder substituted twice into implement.md -- see that file's own fix);
-// its PLAN prompt, same task, was 105307 bytes and passed with only ~26KB of headroom -- the
-// cliff was one character-count away for every card, not particular to #452's size. `claude
-// --help` documents stdin as a first-class prompt channel ("Input must be provided either
-// through stdin or as a prompt argument when using --print"), and spawnSync's `input` option has
-// no size ceiling of its own (bounded only by `maxBuffer` below, sized generously for this).
-function buildArgv(opts) {
-  const argv = ['-p'];
-  if (opts.model) argv.push('--model', opts.model);
-  if (opts.effort) argv.push('--effort', opts.effort);
-  argv.push('--output-format', 'json');
-  if (typeof opts.sessionId === 'string' && opts.sessionId !== '') argv.push('--session-id', opts.sessionId);
-  if (typeof opts.maxBudgetUsd === 'number') argv.push('--max-budget-usd', String(opts.maxBudgetUsd));
-  if (opts.allowedTools) {
-    const tools = Array.isArray(opts.allowedTools) ? opts.allowedTools.join(' ') : opts.allowedTools;
-    argv.push('--allowedTools', tools);
-  }
-  if (opts.permissionMode) argv.push('--permission-mode', opts.permissionMode);
-  if (opts.jsonSchema) {
-    const schema = typeof opts.jsonSchema === 'string' ? opts.jsonSchema : JSON.stringify(opts.jsonSchema);
-    argv.push('--json-schema', schema);
-  }
-  return argv;
 }
 
 // Zero-value shape extractTokens returns when modelUsage is absent or carried nothing
@@ -368,7 +384,8 @@ function tokenFieldsFrom(raw) {
 // kind/ok/error/timedOut/killedBySignal/deadlineMs/numTurns/durationS/raw.
 //
 // deps.recoverSessionTokens is the injection point, following this file's existing
-// deps.spawnSync/deps.randomUUID convention -- production passes nothing and gets the real module.
+// deps.query/deps.buildQueryOptions convention -- production passes nothing and gets the real
+// module.
 // Never throws itself: recoverSessionTokens's own contract is "never throw" (see its header), and
 // the try/catch here is a backstop against that contract ever regressing, consistent with this
 // file's own "only a programming error (bad opts) throws" rule.
@@ -494,401 +511,301 @@ function limitKindForFailure(parsed) {
   return undefined;
 }
 
-// UUID-v4 shape check for opts.sessionId, used ONLY in invokeClaudeReal's resolution below --
-// deliberately NOT shared with buildArgv's own `typeof === 'string' && !== ''` guard, and
-// buildArgv must stay exactly that loose: runLlm's dry-run branch calls buildArgv directly with
-// the stable literal placeholder '<generated-at-spawn>' (see runLlm), which is not a UUID and
-// must still make it into the displayed argv. Factoring one shared predicate here would make
-// buildArgv reject that placeholder and silently break the dry-run artifact. The real `claude`
-// CLI's own `--help` says a supplied --session-id "must be a valid UUID", and rejects a
-// malformed one with exit 1 before any API call -- this regex is that same shape, checked before
-// the value ever reaches argv, not after.
-const SESSION_ID_UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-// The real-mode primitive: spawn `claude -p`, parse its JSON, classify, return. Never throws on
-// a failed/limited/malformed call -- those come back as {ok: false, kind, ...}; only a
-// programming error (bad opts) throws.
+// The real-mode primitive: drive `query()`, reduce its message stream, classify, return. Never
+// throws on a failed/limited/malformed/timed-out call -- those come back as {ok: false, kind,
+// ...}; only a programming error (bad opts -- a missing prompt, a malformed sessionId, an
+// unreadable oauthTokenFile is NOT a programming error and does NOT throw, see below) throws.
+//
+// Rewritten by action A5b (card #239 chantier) to drive the vendored Claude Agent SDK instead of
+// `spawnSync('claude', buildArgv(opts), ...)` -- see this file's own header for the full
+// deadline/abort design this replaced, and orchestrator/steps/sdk-call.js's own header for the
+// buildQueryOptions/consumeQueryStream/spawnClaudeCodeProcess/confirmProcessExit machinery this
+// function drives.
 async function invokeClaudeReal(opts, deps = {}) {
-  const spawnSyncFn = deps.spawnSync || spawnSync;
-  const randomUUIDFn = deps.randomUUID || randomUUID;
-  const promptText = resolvePromptText(opts);
-
-  const env = { ...process.env, ...NONINTERACTIVE_ENV_DEFAULTS };
-  if (opts.account && opts.account.configDir) {
-    env.CLAUDE_CONFIG_DIR = opts.account.configDir;
+  // "Both, not either" (sdk-call.js's own spawnClaudeCodeProcess throw is the defense-in-depth
+  // half; this is the fast, clean-shape half). Checked FIRST, before anything else in this
+  // function touches the account/oauth-token file or builds a single option -- an armed run must
+  // never even attempt to resolve `claude` on PATH.
+  const isEnabledFn = deps.isNoRealSpawnEnabled || isNoRealSpawnEnabled;
+  if (isEnabledFn(process.env)) {
+    return {
+      ok: false,
+      kind: 'error',
+      error:
+        'llm.js: SPO_NO_REAL_SPAWN is set -- refusing to start a real query() call instead of ' +
+        'silently reaching `claude` with live credentials. See orchestrator/no-real-spawn-guard.js.',
+      sessionId: null,
+      ...ZERO_TOKENS,
+      numTurns: undefined,
+      raw: undefined,
+    };
   }
-  // A registry entry may carry the account's long-lived subscription token in a file (the
-  // `claude setup-token` output, pasted there by the operator -- see accounts.js's registry
-  // format). Exported as CLAUDE_CODE_OAUTH_TOKEN for this one spawn only. An unreadable file
-  // is an authoring error surfaced as a normal step failure, never a throw.
-  if (opts.account && opts.account.oauthTokenFile) {
-    try {
-      env.CLAUDE_CODE_OAUTH_TOKEN = fs.readFileSync(opts.account.oauthTokenFile, 'utf8').trim();
-    } catch (err) {
+
+  const {
+    buildQueryOptions: buildQueryOptionsFn,
+    consumeQueryStream: consumeQueryStreamFn,
+    confirmProcessExit: confirmProcessExitFn,
+    ABORT_CONFIRM_GRACE_MS: abortConfirmGraceMs,
+    OauthTokenUnreadableError,
+    ClaudeExecutableNotFoundError,
+    JsonSchemaParseError,
+  } = getSdkCall();
+  const buildOptions = deps.buildQueryOptions || buildQueryOptionsFn;
+
+  // Session id parity, restored (card #239 chantier, action A5b-2 fix pass, Job 2). The old
+  // spawnSync transport minted a UUID and passed it as `--session-id` BEFORE every spawn, which is
+  // the only reason a call killed before `claude` ever wrote a line still had an id for
+  // token-recovery.js to search a transcript by (see that file's own header). The A5b cutover
+  // dropped this: `opts.sessionId` was passed through only when a caller already supplied one,
+  // otherwise `buildQueryOptions` omitted the option and let the CLI mint its own, reported back
+  // only once the `system`/`init` message arrived -- so a call killed before that message had NO
+  // session id at all, a real loss of the guarantee recovery exists for (see token-recovery.js's
+  // own "STALE CLAIM CORRECTED" paragraph, written by the fix pass that found this).
+  //
+  // Restored here, at the same point in the sequence the old transport minted it (immediately
+  // before the call is actually attempted, after every earlier check -- killswitch above -- that
+  // can still return sessionId: null for a call that never starts at all): opts.sessionId, when
+  // the caller already supplied one (a non-empty string), is used verbatim and nothing is
+  // generated -- deps.randomUUID (falling back to node's own crypto.randomUUID, following this
+  // file's existing deps.spawnSync/deps.randomUUID convention) is not even called in that case,
+  // same as the old transport's own pin. A supplied sessionId that is a non-empty string but not
+  // UUID-v4 shaped is left untouched here -- buildQueryOptions below still throws its own bare
+  // TypeError for it (reason 3 of the five), exactly the "programming error, not a call failure"
+  // contract this file has always applied to that field; minting must never paper over a caller's
+  // malformed input.
+  const randomUUIDFn = deps.randomUUID || randomUUID;
+  const suppliedSessionId =
+    typeof opts.sessionId === 'string' && opts.sessionId !== '' ? opts.sessionId : randomUUIDFn();
+  if (opts.sessionId !== suppliedSessionId) {
+    opts = { ...opts, sessionId: suppliedSessionId };
+  }
+
+  // buildQueryOptions throws for exactly five reasons (see its own header): a missing prompt
+  // (bare Error) and a malformed opts.sessionId (bare TypeError) are PROGRAMMING errors and must
+  // propagate exactly as this function always has for both; OauthTokenUnreadableError,
+  // ClaudeExecutableNotFoundError and JsonSchemaParseError are the three the old transport's
+  // invokeClaudeReal already treated as ordinary step failures (an unreadable oauthTokenFile
+  // could always happen; the other two are new failure modes this transport specifically
+  // introduces -- no `claude` resolved on PATH, or a malformed jsonSchema string caught before
+  // ever reaching the CLI instead of after) -- caught here and mapped onto the same
+  // `{ok:false, kind:'error', ...}` shape every other real-mode failure in this file already uses.
+  let built;
+  try {
+    built = buildOptions(opts, deps);
+  } catch (err) {
+    if (
+      err instanceof OauthTokenUnreadableError ||
+      err instanceof ClaudeExecutableNotFoundError ||
+      err instanceof JsonSchemaParseError
+    ) {
       return {
         ok: false,
         kind: 'error',
-        error: `llm.js: cannot read oauthTokenFile for account "${opts.account.name}": ${err.message}`,
+        error: err.message,
         sessionId: null,
         ...ZERO_TOKENS,
         numTurns: undefined,
-        raw: null,
+        raw: undefined,
       };
     }
+    throw err;
   }
+  const { prompt, options, getSpawnedProcess } = built;
 
-  // Session id (token-ledger lot, action 4.1). Generated HERE -- after the oauthTokenFile read
-  // above has already returned on failure, and immediately before the spawn below -- on purpose:
-  // the oauthTokenFile branch represents a call that never started (no `claude` process, no
-  // session transcript on disk), so it must keep reporting sessionId: null rather than a freshly
-  // minted id for a session that never existed. Every branch from here on represents a spawn that
-  // was at least attempted, so an id generated at this point is always honest.
-  //
-  // opts.sessionId, when the caller already supplied one (non-empty string), is used verbatim and
-  // nothing is generated -- deps.randomUUID (falling back to node's own crypto.randomUUID,
-  // following this file's existing deps.spawnSync injection convention) is not even called in
-  // that case, which the tests pin with a call counter.
-  //
-  // A supplied sessionId that is a non-empty string but NOT UUID-v4 shaped is a programming
-  // error, not a call failure: it would sail past buildArgv's looser guard, reach `claude
-  // --session-id`, and make the CLI exit 1 before any API call (per its own --help: "must be a
-  // valid UUID"). Left unguarded, that exit-1 falls into the "claude stdout was not valid JSON"
-  // branch below, which reports a *parse* failure for what is actually an *argument* fault --
-  // this file's own header already documents being burned by exactly that class of misdiagnosis
-  // twice. So this throws here, before any spawn, the same way a missing prompt already throws in
-  // resolvePromptText above -- this file's header's "only a programming error (bad opts) throws"
-  // contract, applied to the one opts field this action added.
-  let sessionId;
-  if (typeof opts.sessionId === 'string' && opts.sessionId !== '') {
-    if (!SESSION_ID_UUID_V4_RE.test(opts.sessionId)) {
-      throw new TypeError(
-        `llm.js: invokeClaudeReal opts.sessionId must be a valid UUID (claude --session-id ` +
-          `requires one and exits 1 before any API call otherwise) -- got ${JSON.stringify(opts.sessionId)}`
-      );
-    }
-    sessionId = opts.sessionId;
-  } else {
-    sessionId = randomUUIDFn();
-  }
-  const argv = buildArgv({ ...opts, sessionId });
-
-  const spawnOpts = {
-    cwd: opts.cwd,
-    env,
-    encoding: 'utf8',
-    // The prompt goes to the child's stdin, never argv -- see buildArgv's own comment on
-    // MAX_ARG_STRLEN. spawnSync writes `input` into the child's stdin pipe (the default
-    // 'pipe' stdio applies since spawnOpts sets no `stdio` of its own).
-    input: promptText,
-    maxBuffer: 64 * 1024 * 1024,
-  };
-  if (typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0) {
-    spawnOpts.timeout = opts.deadlineMs;
-  }
-
-  // Card #239 action A5a: the recette harness's hard LLM-step cap (orchestrator/recette.js's
-  // makeCap) used to enforce itself by wrapping deps.spawnSync and counting `command === 'claude'`
-  // -- exact only because this file's spawn WAS the sole way a real LLM call happened. A5b removes
-  // that spawn (Agent SDK query(), never a `claude` process), which would have silently degraded
-  // the cap to wall-clock-only: nothing fails, the ceiling just stops existing. Moved here instead,
-  // to the one choke point EVERY real LLM call passes through -- not just runLlm's, but also
-  // intake.js's draftCard/reviewCard/triageBugReport/report-intake, which never go through runLlm
-  // at all (verified by grep: `invokeClaudeReal(` has exactly four PRODUCTION call sites in this
-  // codebase -- two here, in runLlm's override and real-card branches, and two inside intake.js's
-  // shared callIntakeStepWithRotation helper, the primary attempt and its one same-account timeout
-  // retry -- every one of draftCard/reviewCard/triageBugReport/report-intake routes through that
-  // single helper, per intake.js's own header comment; test/ carries 52 more direct calls to this
-  // same function, mostly test/llm-real.test.js exercising invokeClaudeReal in isolation against
-  // an injected deps.spawnSync -- test code driving the real function under test, not production
-  // code paths).
-  // `deps.onLlmCallAttempt` is optional and a no-op on every daemon production call (undefined,
-  // like deps.spawnSync/deps.randomUUID) -- recette.js's makeCap is the one real caller, and it may
-  // throw RecetteCapExceededError to refuse this attempt before it is ever made. Placed here, not
-  // any earlier in this function, on purpose: the oauthTokenFile branch above already returns for a
-  // call that never reaches "about to spawn", and the old spawnSync-wrapping counter never counted
-  // that branch either (it only ever saw `command === 'claude'` at the moment of a real spawn) --
-  // this preserves that exact boundary rather than widening what counts as an attempt.
+  // Card #239 action A5a's choke point, moved from immediately-before-the-old-spawn to
+  // immediately-before query() itself -- this transport's equivalent point, and still the ONE
+  // place every real LLM call attempt is counted (see recette.js's makeCap and this call site's
+  // own A5a-era comment history for why it has to be here and not, say, inside buildQueryOptions,
+  // which can be called by a caller that never actually starts a query).
   if (typeof deps.onLlmCallAttempt === 'function') {
     deps.onLlmCallAttempt();
   }
 
-  // duration_s (action 5.4, doc/state-machine-spec.md § Observability already documented this
-  // field before any code wrote it -- measured 2026-09-01: zero of the 19 corpus journals'
-  // llm-call events carried it). Measured around the spawn itself, not the whole function
-  // (promptText/argv/env prep above is sub-millisecond and not what a maintainer means by "how
-  // long did this call take"), and captured BEFORE any of the branches below so every one of
-  // them -- success, spawn error, signal kill, deadline timeout, parse failure -- reports the
-  // real elapsed time this attempt burned. That matters most for exactly the failure a
-  // maintainer is most likely to be staring at: a deadline-killed call still ran for the full
-  // deadline, and previously that cost was invisible (ZERO_TOKENS records tokens as 0, which is
-  // honest, but said nothing about time spent).
-  //
-  // Monotonic clock (card #158), not Date.now(). The bound this measurement is checked
-  // against -- spawnOpts.timeout, armed a few lines above -- is enforced by libuv with a
-  // monotonic timer; Date.now() reads CLOCK_REALTIME, a clock this host demonstrably steps (14
-  // `spawn` events in this same corpus journal a negative elapsed time, down to -2,440ms --
-  // orchestrator/steps/scripted.js's own timing, a sibling symptom of the same stepping clock).
-  // The two can disagree about how much time passed for the same spawn. Measured against the
-  // per-issue journals under ~/.spo-state/journal/ (2026-09-08): all 9 deadline-killed calls in
-  // the corpus were armed with the identical 900,000ms deadline, and the 8 that carry a
-  // duration_s at all (the 9th, issue-385 on 2026-08-30, predates the field) ranged, under the
-  // old Date.now()-based measurement, 818.536s-960.461s -- from 81.5s under to 60.5s over a bound
-  // that is identical by construction. The decisive case is issue-517
-  // (2026-09-05T02:03:20.692Z): a successful IMPLEMENT (ok: true, 123 turns, never killed)
-  // journalled 920.322s against its own 900,000ms deadline under the old clock -- the monotonic
-  // timer that actually gates spawnSync never fired, so a call that provably finished under its
-  // deadline reported having run past it. process.hrtime.bigint() reads the same clock class
-  // libuv's timeout enforces (CLOCK_MONOTONIC vs the loop's CLOCK_MONOTONIC_COARSE -- one
-  // timebase, different read granularity), so a duration_s computed from it can no longer
-  // disagree with the deadline that produced it the way Date.now() did. A residual of tick
-  // granularity plus spawn/reap overhead remains: measured 2026-09-08, a 700ms deadline reports
-  // 703-706ms. That is milliseconds against a 900s bound. This does not repair any duration_s
-  // already written to a journal; the corpus figures above stay artefacts of the old clock.
+  const queryFn = deps.query || (await loadQuery());
   const startedAtMs = monotonicNowMs();
-  const spawnResult = spawnSyncFn('claude', argv, spawnOpts);
-  const durationS = (monotonicNowMs() - startedAtMs) / 1000;
-  const rawExit = spawnResult.status === undefined ? null : spawnResult.status;
 
-  // Deadline kill FIRST, before the generic `error` branch. When spawnOpts.timeout fires, Node
-  // fills in spawnResult.error with `.code === 'ETIMEDOUT'` -- so the `error` branch below used to
-  // swallow every deadline kill and report it as "failed to spawn claude", which is exactly
-  // backwards: claude spawned fine, ran, and was killed for running too long. Reproduced
-  // 2026-08-30 on card #449 (`spo triage --dry`: "triageBugReport: claude call failed (error):
-  // llm.js: failed to spawn claude: spawnSync claude ETIMEDOUT [exit=143]").
-  //
-  // The classification itself is command-timeout.js's isSpawnTimeout/isSpawnKilled -- the module
-  // PR #127 extracted for exactly this idiom, whose own header credits this function with
-  // learning it the hard way first. Sharing the definition is the point: the two copies had
-  // already drifted apart once, and this file was the half still carrying the defect.
-  //
-  // WHAT THIS FILE USED TO DO, AND WHY IT WAS WRONG. It read
-  //     (spawnResult.error && spawnResult.error.code === 'ETIMEDOUT') || (!!spawnResult.signal && deadlineArmed)
-  // and that second clause classified ANY externally-signalled child as a deadline kill.
-  // Re-measured on node v22.23.2, deadline armed in every row:
-  //
-  //   case                                        error.code   signal    status
-  //   genuine timeout expiry                      ETIMEDOUT    SIGTERM   null
-  //   genuine timeout, child traps TERM,          ETIMEDOUT    SIGKILL   null
-  //     killSignal: SIGKILL
-  //   genuine timeout, child traps TERM and       ETIMEDOUT    null      143
-  //     exits 143 itself  <-- what `claude` ACTUALLY does
-  //   external SIGTERM, nowhere near expiry       (none)       SIGTERM   null
-  //   external SIGKILL                            (none)       SIGKILL   null
-  //   ordinary non-zero exit                      (none)       null      3
-  //
-  // So `error.code === 'ETIMEDOUT'` is necessary AND sufficient, and it survives a different
-  // `killSignal`. The `signal` clause is true for precisely the two cases the contract excludes.
-  //
-  // The corpus (62 task journals in ~/.spo-state/journal, re-counted 2026-09-05) is blunter than
-  // "near-unreachable": of 22 `claude` transport failures, 11 were ETIMEDOUT, 8 were `exit 143`
-  // (claude handles SIGTERM itself and exits rather than dying of the signal), 3 were E2BIG, and
-  // ZERO were a bare signal. Every one of the 9 flagged `timedOut: true` events carries the
-  // detail `(ETIMEDOUT)`, not `(signal SIGTERM)` -- i.e. `spawnResult.signal` was null and the
-  // deleted clause did not fire on a single genuine timeout on record. It never once produced a
-  // true positive; its only reachable effect was to mislabel an external kill as a hang.
-  //
-  // That mislabelling is not cosmetic here, which is why #127 left this half for its own pass:
-  // `timedOut` drives intake.js's retry-once-on-the-SAME-account policy
-  // (intake.js's callIntakeStepWithRotation), so a deploy's SIGTERM bought a second full
-  // TRIAGE_BUG_REPORT/DRAFT_CARD/REVIEW_CARD call -- real metered spend, to re-run a prompt
-  // nobody had asked to stop running. Correcting `timedOut` stops that retry by itself; no
-  // routing change is needed for it.
-  //
-  // `kind` stays 'error' on BOTH branches on purpose: state-machine.js's four transport guards
-  // (:553, :674, :927, :1144) all route on `kind === 'error' || timedOut`, so `kind: 'error'`
-  // already dominates the disjunction and every one of them parks `llm-transport-failed:<STEP>`
-  // either way. Unlike steps/scripted.js -- where an unnamed external kill degraded to exit 1 and
-  // bought a real DIAGNOSE call -- nothing here ROUTES differently on the distinction. So
-  // `killedBySignal` is carried for the journal and the park detail, not for control flow: an
-  // operator reading a park needs "someone killed this" and "claude hung for 15 minutes" to be
-  // different sentences, because the remediations are opposite ones.
-  const deadlineArmed = typeof spawnOpts.timeout === 'number';
-
-  if (isSpawnTimeout(spawnResult, deadlineArmed)) {
-    const detail = spawnResult.signal
-      ? `signal ${spawnResult.signal}`
-      : (spawnResult.error && (spawnResult.error.code || spawnResult.error.message)) || 'no signal reported';
-    return await maybeRecoverTokens(
-      {
-        ok: false,
-        kind: 'error',
-        timedOut: true,
-        deadlineMs: spawnOpts.timeout,
-        error: `llm.js: claude ran but exceeded the ${spawnOpts.timeout}ms deadline and was killed (${detail})`,
-        // claude was spawned and ran (that's the whole premise of a deadline kill) -- the
-        // transcript exists on disk under this id even though the call was cut off, which is
-        // exactly what maybeRecoverTokens above tries to read back (token-ledger lot, action
-        // 4.3): tokensSource stays null here only until that recovery attempt runs.
-        sessionId,
-        ...ZERO_TOKENS,
-        numTurns: undefined,
-        durationS,
-        raw: rawExit,
-      },
-      opts,
-      deps
-    );
-  }
-
-  // An external kill: an operator's `kill`, an OOM kill, a service manager stopping the worker.
-  // Checked BEFORE the generic `error` branch for the same reason the timeout branch is: a
-  // signalled child leaves no `error` at all, so it would otherwise fall through to the
-  // JSON-parse branch and be reported as "claude stdout was not valid JSON (exit 1)" -- blaming
-  // the model for output it was never allowed to finish writing.
-  //
-  // Deliberately NOT gated on `deadlineArmed`, matching command-timeout.js's isSpawnKilled: the
-  // same SIGTERM classified differently depending on whether this call happened to arm a deadline
-  // was never a property anyone wanted. `timedOut` is left ABSENT rather than set to false, which
-  // is this file's existing convention for every non-timeout branch (the spawn-failure branch
-  // below does the same) and what intake.js's `raw.timedOut === true` test already reads.
-  //
-  // Since KillMode=mixed landed (PR #130), `systemctl stop` no longer signals a worker's
-  // children, so this branch is rarer BY CONSTRUCTION than it was -- which lowers the urgency of
-  // classifying it and changes nothing about whether the classification is correct.
-  if (isSpawnKilled(spawnResult)) {
-    return await maybeRecoverTokens(
-      {
-        ok: false,
-        kind: 'error',
-        killedBySignal: true,
-        signal: spawnResult.signal,
-        ...(deadlineArmed ? { deadlineMs: spawnOpts.timeout } : {}),
-        // When a deadline WAS armed, the fact that node did not raise ETIMEDOUT is itself the
-        // proof the deadline never fired -- so "inside" is measured, not assumed.
-        error: deadlineArmed
-          ? `llm.js: claude was killed by signal ${spawnResult.signal} after ${durationS}s, inside its ` +
-            `${spawnOpts.timeout}ms deadline (the deadline never fired) -- an external kill, not a timeout`
-          : `llm.js: claude was killed by signal ${spawnResult.signal} (no deadline was armed)`,
-        // Same reasoning as the deadline-kill branch above: claude was spawned and ran (something
-        // else signalled it), so the transcript exists under this id -- see maybeRecoverTokens.
-        sessionId,
-        ...ZERO_TOKENS,
-        numTurns: undefined,
-        durationS,
-        raw: rawExit,
-      },
-      opts,
-      deps
-    );
-  }
-
-  if (spawnResult.error) {
-    // A REAL spawn failure: ENOENT (no `claude` on PATH), EACCES, E2BIG, EAGAIN... `claude` was
-    // NEVER STARTED in any of these cases, so no session transcript exists anywhere on disk --
-    // reporting the generated id here would be a false measurement (exactly what this action
-    // exists to avoid: a follow-up action recovers spend from the session transcript named by
-    // this id, and an E2BIG call -- 3 recorded in this corpus on one card -- must read as
-    // unrecoverable, not as a recoverable id pointing at nothing).
+  let stream;
+  try {
+    stream = queryFn({ prompt, options });
+  } catch (err) {
+    // query() throws SYNCHRONOUSLY, before any child exists, for every failure mode this repo's
+    // own measurements found (sdk-call.js's ClaudeExecutableNotFoundError comment and its
+    // spawnClaudeCodeProcess header) -- including the killswitch's own ENOREALSPAWN throw, the
+    // defense-in-depth half of the check at the top of this function.
     return {
       ok: false,
       kind: 'error',
-      error: `llm.js: failed to spawn claude: ${spawnResult.error.message}`,
+      error: `llm.js: query() failed to start: ${err && err.message}`,
       sessionId: null,
       ...ZERO_TOKENS,
       numTurns: undefined,
-      durationS,
-      raw: rawExit,
+      durationS: (monotonicNowMs() - startedAtMs) / 1000,
+      raw: undefined,
     };
   }
 
-  const exit = spawnResult.status === null || spawnResult.status === undefined ? 1 : spawnResult.status;
+  // Deadline ownership -- see this file's own header for the full design and what it was measured
+  // against. Arms a real timer; on expiry, aborts the SAME AbortController buildQueryOptions built
+  // for this call (one per call, never reused -- see that function's own comment). Cleared the
+  // moment the stream settles for ANY reason, so a call that finishes before its deadline never
+  // pays for an unused timer.
+  //
+  // Deliberately NOT `.unref()`d, despite an earlier draft of this comment arguing the opposite.
+  // CORRECTED (Opus verifier, fix pass F3): that earlier draft attributed the fix to THIS timer
+  // being ref'd -- false as shipped. MEASURED (fix pass F3, 2026-09-17): restoring `.unref()` on
+  // this timer AND on sdk-call.js's confirmProcessExit timer, while leaving test/helpers.js's own
+  // fake child untouched, still passes all 81 llm-real.test.js/llm-real-card.test.js tests -- so
+  // ref'ing these two timers is, by itself, INERT; it fixes nothing on its own. The actual cure is
+  // test/helpers.js's `fakeSpawnedChild`'s own `keepalive` interval, which is ref'd on purpose: a
+  // fake/in-memory child (no real OS pipe handle) has nothing else to keep the event loop open, and
+  // unref'ing THAT one interval (with both production timers left exactly as shipped) is what
+  // reproduces the hang -- measured at 60/81 passing, 21 cancelled ("Promise resolution is still
+  // pending but the event loop has already resolved"), exit code 1, not a quiet hang. That failure
+  // mode is what makes this pattern safe to propagate to the 18+ files migrating next: a
+  // mis-built/mis-wired fake child fails LOUDLY (cancelled tests, non-zero exit), it does not pass
+  // silently while leaving a real hang uncovered.
+  //
+  // This timer stays ref'd anyway, for a DIFFERENT and better reason than the one the earlier
+  // draft gave: the vendored SDK's own internal kill-escalation timers (ProcessTransport.close(),
+  // see sdk-call.js's own SDK_ABORT_KILL_DELAY_MS/SDK_ABORT_SIGKILL_ESCALATION_MS header) are
+  // THEMSELVES unref'd in the vendored source -- so *something* ref'd has to hold the event loop
+  // open for the SDK's own SIGTERM/SIGKILL escalation to have a chance to land at all, in any
+  // process (real or test) that has nothing else keeping it alive at that moment. In PRODUCTION
+  // this is moot either way: the real child's stdio pipes (spawnClaudeCodeProcess's own real
+  // `child_process.spawn`) are ref'd by Node's own default and already keep the loop alive for as
+  // long as the call is genuinely in flight, so this timer being ref'd too changes nothing
+  // observable there -- it is cleared in the `finally` below well before this function returns
+  // either way.
+  let deadlineHit = false;
+  let deadlineTimer = null;
+  if (typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0) {
+    deadlineTimer = setTimeout(() => {
+      deadlineHit = true;
+      options.abortController.abort();
+    }, opts.deadlineMs);
+  }
 
-  let parsed = null;
+  let consumed;
   try {
-    parsed = JSON.parse(spawnResult.stdout || '');
-  } catch {
-    parsed = null;
+    consumed = await consumeQueryStreamFn(stream, {});
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 
-  if (!parsed || typeof parsed !== 'object') {
-    return await maybeRecoverTokens(
-      {
-        ok: false,
-        kind: 'error',
-        error: `llm.js: claude stdout was not valid JSON (exit ${exit})`,
-        // claude exited without the ETIMEDOUT/signal shapes checked above, but that does NOT mean
-        // it always ran long enough to write a session transcript: this branch is also where the
-        // CLI lands when it rejects its OWN argv and exits before creating a session at all (an
-        // unrecognised flag from a future CLI version, for instance -- the TypeError this function
-        // throws on a malformed opts.sessionId closes the one route to this we control, but not
-        // every route). So this id is
-        // the one `claude` was ASKED to use, not a guarantee that a transcript under it exists --
-        // maybeRecoverTokens's own search returning null (rather than a zero-filled object) is
-        // exactly how "not measured" stays distinguishable from "measured zero" for this branch.
-        sessionId,
-        ...ZERO_TOKENS,
-        numTurns: undefined,
-        durationS,
-        raw: exit,
-      },
+  // The CLI's own reported id wins over the one we supplied, falling back to ours (Job 2, restoring
+  // the old transport's `reportedSessionId = parsed.session_id || parsed.uuid || sessionId` pin --
+  // see this file's own comment above where `suppliedSessionId` is resolved). `consumed.sessionId`
+  // is whatever `consumeQueryStream` read off a `system`/`init` or `result` message -- null only
+  // when the stream never got far enough to see either (e.g. killed before the first line), never
+  // fabricated ahead of that evidence. By this point `queryFn` has already been called and returned
+  // a stream -- every branch that follows (the thrown/no-result/is_error/success shapes
+  // `consumeQueryStream` can return) represents a call that really started, so falling back to
+  // `suppliedSessionId` here can never resurrect a session id for a call that never spawned (those
+  // all return `sessionId: null` earlier in this function, before `queryFn` is ever reached, and are
+  // untouched by this line).
+  if (!consumed.sessionId) {
+    consumed = { ...consumed, sessionId: suppliedSessionId };
+  }
+
+  // THE PROPERTY THIS ACTION EXISTS TO PROVE. MEASURED (this action, live probes against the real
+  // vendored SDK -- see this file's own header and sdk-call.js's for the numbers): the async
+  // iterator/stream can settle well BEFORE the real child process has actually exited -- an
+  // abort-triggered rejection was measured landing ~5-7s ahead of the process's own confirmed
+  // death. So this function never treats "the stream ended" as "the call is over": it always
+  // confirms the real child's exit before deciding what to return, because its own caller
+  // (state-machine.js's callLlmStep) releases this call's account lease in a `finally` immediately
+  // after this function returns -- a live `claude` still holding that lease's CLAUDE_CONFIG_DIR at
+  // that moment is exactly the race lock.js's "never two claude processes on one CLAUDE_CONFIG_DIR"
+  // rule exists to prevent.
+  //
+  // COST, STATED PLAINLY (Opus verifier, fix pass F10; an earlier draft of this paragraph cited
+  // "confirmProcessExit's own comment for why this is cheap on the ordinary path" -- that comment
+  // states no such reason, so the claim was unbacked). MEASURED (fix pass F10, fakeSpawnDeps probe,
+  // deleted after use, not committed): a cooperative child that replies and exits promptly confirms
+  // in ~243ms -- confirmProcessExit reads `.exitCode`/`.signalCode` synchronously once the 'exit'
+  // event has fired, so this really is close to free. But a `claude` that emits its `result`
+  // message and then LINGERS (never exits on its own) is NOT cheap: this function still waits out
+  // the abort/kill escalation before giving up -- measured ~4035ms at `deadlineMs=2000`, returning
+  // `ok:false, timedOut:true` despite a structurally valid reply already having arrived. Bounded
+  // (never past ABORT_CONFIRM_GRACE_MS) and correctly classified (the reply is discarded, not
+  // silently returned as a success), and symmetric with the old spawnSync transport's own
+  // equivalent wait -- so not a regression -- but it is a real cost on that path, not a near-zero
+  // one, and this paragraph now says so instead of citing a reason that was never written down.
+  // F8 (Opus verifier, fix pass): sdk-call.js's own header advertises this as backward compatible
+  // with a caller/`deps.buildQueryOptions` that returns the pre-A5b `{ prompt, options }` shape
+  // (no `getSpawnedProcess` at all) -- but an unconditional `getSpawnedProcess()` call here throws
+  // `TypeError: getSpawnedProcess is not a function` on exactly that input instead of failing into
+  // this file's own `{ok:false, kind:'error', ...}` contract, a real gap for the 18+ files about to
+  // start injecting `deps` here (A5b-2). Guarded rather than assumed present; confirmProcessExitFn
+  // already treats `undefined` as vacuously confirmed (sdk-call.js's own confirmProcessExit: "child
+  // may be undefined ... treated as vacuously confirmed, since there is no process to wait for"),
+  // so this degrades exactly the way an absent capture already does, not a new code path.
+  const spawnedChild = typeof getSpawnedProcess === 'function' ? getSpawnedProcess() : undefined;
+  const exitInfo = await confirmProcessExitFn(spawnedChild, abortConfirmGraceMs);
+  const durationS = (monotonicNowMs() - startedAtMs) / 1000;
+
+  if (deadlineHit) {
+    // Honest, not optimistic (maintainer's own instruction, this action's design review): a false
+    // "killed" is worse than a true "could not confirm" -- `killConfirmed` says which one this is,
+    // separate from `timedOut` (which only ever means "we decided to cancel this call", not
+    // "and it is definitely dead now"). intake.js's retry policy and a maintainer reading a park
+    // both need `timedOut` for the same reason they always have (see this file's own header);
+    // `killConfirmed`/`killedBySignal`/`signal` are the exit=143-equivalent diagnostic this
+    // transport otherwise has no home for (consumeQueryStream's own header decision 1: `raw` is
+    // always undefined here, so there is no OS exit code to read "someone killed this" off of the
+    // way the old transport's isSpawnKilled branch could).
+    const timeoutResult = exitInfo.confirmed
+      ? {
+          ...consumed,
+          ok: false,
+          kind: 'error',
+          timedOut: true,
+          killConfirmed: true,
+          killedBySignal: exitInfo.signal != null,
+          signal: exitInfo.signal,
+          deadlineMs: opts.deadlineMs,
+          error:
+            `llm.js: claude ran but exceeded the ${opts.deadlineMs}ms deadline and was killed ` +
+            `(confirmed${exitInfo.signal ? `, signal ${exitInfo.signal}` : ''})`,
+        }
+      : {
+          ...consumed,
+          ok: false,
+          kind: 'error',
+          timedOut: true,
+          killConfirmed: false,
+          deadlineMs: opts.deadlineMs,
+          error:
+            `llm.js: claude ran but exceeded the ${opts.deadlineMs}ms deadline; abort() was sent ` +
+            `but the process did not confirm exit within the ${abortConfirmGraceMs}ms grace window ` +
+            '-- it may still be running',
+        };
+    return maybeRecoverTokens({ ...timeoutResult, ...ZERO_TOKENS, numTurns: undefined, durationS, raw: undefined }, opts, deps);
+  }
+
+  // Not a deadline kill. An EXTERNAL signal (an operator's kill, an OOM kill, a service manager
+  // stopping the worker -- KillMode=mixed makes this rarer than it once was, see the old
+  // transport's own comment history, but the classification is still correct when it happens)
+  // reaches this function through consumeQueryStream's own "stream threw mid-iteration" branch
+  // (its header item 4), already reported as kind:'error' with an honest message; enriched here
+  // with killedBySignal/signal when the directly-captured handle confirms a real signal killed it
+  // -- the same distinction the old transport's isSpawnKilled branch existed to draw, preserved in
+  // meaning even though the mechanism (a captured ChildProcess handle, not a spawnSync result
+  // object) is entirely new.
+  if (!consumed.ok && exitInfo.confirmed && exitInfo.signal != null) {
+    return maybeRecoverTokens(
+      { ...consumed, killedBySignal: true, signal: exitInfo.signal, durationS },
       opts,
       deps
     );
   }
 
-  const tokens = extractTokens(parsed.modelUsage);
-  // The CLI's own reported id wins over the one we generated and asked it to use: in practice
-  // they are the same value (we passed sessionId via --session-id above), but the CLI is the
-  // authority on what it actually named the session on disk, so if it ever disagrees the
-  // transcript is filed under ITS answer, not ours. Falls back to the generated id only when the
-  // reply carries neither `session_id` nor `uuid` (a call that ran without ever being asked to
-  // report one in its own reply's expected shape).
-  const reportedSessionId = parsed.session_id || parsed.uuid || sessionId;
-  // Card #214: `num_turns` counts AGENTIC LOOP TURNS, not API requests -- the Agent SDK's own
-  // agent-loop docs: "A turn is one round trip inside the loop: Claude produces output that
-  // includes tool calls, the SDK executes those tools, and the results feed back." The CLI's
-  // own `--output-format json` schema is not formally published and never defines the field
-  // either. No field in the reply reports a request count at all: `usage` covers only the main
-  // loop, `modelUsage` (extractTokens above) is whole-tree TOKEN and cost accounting, not a
-  // count of anything. Deduplicating the session transcript by `message.id` is the only
-  // reliable request count this repo has (console/usage-scan.js's `scanFile`), and it disagrees
-  // with `num_turns` badly: differs from it by more than 1.5x on 199 of 442 rejoinable calls
-  // (45%, typical ratio ~2.0), worst case `num_turns: 3` against 382 real requests on a call
-  // with NO subagents (so not even the subagent-folding shape this file's `modelUsage` comment
-  // describes explains it) -- which contradicts the documented definition too, since every tool
-  // round-trip should be a turn. The docs offer no explanation for that worst case and this
-  // build does not investigate further (see step-contracts.js's own prose on the same finding).
-  // Kept on `result`/the return shapes below (runLlm's ~12 return sites, `orchestrator/
-  // intake.js`'s internal use, and 24 test files construct/assert it) because stripping the
-  // INTERNAL field would churn all of them for no behavioural gain -- but deliberately NOT
-  // written into the journalled `llm-call` event (see both appendEvent call sites below): there
-  // is no correct source for a request count on the journalling path without walking the
-  // transcript, and journalling a number that is not reliably even what its own name says would
-  // be worse than journalling nothing. console/usage-scan.js's `requestCount`
-  // (computeStepDeltas/sessionRequestCount, fix pass) is the real, deduplicated per-step
-  // request count instead -- a transcript-derived figure, not a journalled one, subagent
-  // requests included, printed via `spo tokens --usage-delta` (card #214, action 4).
-  const numTurns = parsed.num_turns;
-
-  if (parsed.is_error || exit !== 0) {
-    const kind = classifyFailure(parsed);
-    return await maybeRecoverTokens(
-      {
-        ok: false,
-        kind,
-        // Only present on a 'limit' classification -- see limitKindForFailure's own comment.
-        // accounts.markLimit treats an absent/unrecognised limitKind as the usage-tier fail-safe,
-        // so omitting the key on a plain 'error' costs nothing.
-        ...(kind === 'limit' ? { limitKind: limitKindForFailure(parsed) } : {}),
-        result: parsed.result,
-        sessionId: reportedSessionId,
-        ...tokens,
-        numTurns,
-        durationS,
-        apiErrorStatus: parsed.api_error_status,
-        terminalReason: parsed.terminal_reason,
-        raw: exit,
-      },
-      opts,
-      deps
-    );
-  }
-
-  return await maybeRecoverTokens(
-    { ok: true, result: parsed.result, sessionId: reportedSessionId, ...tokens, numTurns, durationS, raw: exit },
-    opts,
-    deps
-  );
+  // durationS here OVERRIDES whatever consumeQueryStream itself set (the SDK's own `duration_ms`,
+  // when present) with this function's own monotonicNowMs()-based measurement -- same policy the
+  // old transport's header documented for preferring a monotonic clock over anything the CLI
+  // itself reports, for the same reason (this host's CLOCK_REALTIME demonstrably steps; see that
+  // paragraph, unchanged, elsewhere in this file's header).
+  return maybeRecoverTokens({ ...consumed, durationS }, opts, deps);
 }
 
 // snake_case -> camelCase, e.g. "root_cause" -> "rootCause". Used to bridge one real gap: every
@@ -964,20 +881,34 @@ function cannedDryRunPayload(stepName, contract, ctx) {
   }
 }
 
-// Writes journal/<id>/dryrun-<STATE>.md: the exact argv `claude` would have been spawned with
-// (buildArgv never spawns anything itself), and the filled prompt text, so a --dry-run run can
-// be inspected without ever having called the CLI. No elision needed here any more -- since the
-// prompt travels on stdin, not argv, "## argv" is already just the flag line
-// (--model/--effort/--json-schema) a reader wants to scan; the filled prompt is shown in full
-// underneath, its one and only copy in this file.
-function writeDryRunArtifact(taskDir, stepName, argv, promptText) {
+// Writes journal/<id>/dryrun-<STATE>.md: since action A5b, the `query()` OPTIONS this call would
+// actually have been built with (the old transport's argv array is gone along with buildArgv --
+// see this file's own header) plus the filled prompt text, so a --dry-run run can be inspected
+// without ever having called the CLI. `options` here is real, not synthetic: it is
+// buildQueryOptions's own output for these exact opts (see the call site below), so this artifact
+// can never silently drift from what a real call would build -- there is only the one mapping
+// function, used both times.
+//
+// `env` is DELIBERATELY EXCLUDED from what gets written. `options.env` (sdk-call.js's buildEnv)
+// carries the full ambient process.env plus, when an account resolved, that account's live
+// CLAUDE_CODE_OAUTH_TOKEN -- a credential, not debugging information, and this file is written
+// under journal/<id>/, readable by anyone who can read the journal. The old transport's own
+// dry-run artifact never carried env either (buildArgv never saw it -- invokeClaudeReal built the
+// child's env entirely separately, never touching buildArgv's return value), so this preserves
+// that same safety property under the new shape rather than introducing a leak the old artifact
+// never had. `abortController` (an AbortController instance) and `spawnClaudeCodeProcess` (a
+// function) are call MACHINERY, not information about what would be SENT to `claude` -- dropped
+// for the same "show what would actually be sent" reason this whole rewrite exists for, not for
+// safety.
+function writeDryRunArtifact(taskDir, stepName, options, promptText) {
   const file = path.join(taskDir, `dryrun-${stepName}.md`);
+  const { env, abortController, spawnClaudeCodeProcess, ...displayableOptions } = options;
   const body = [
     `# Dry run -- ${stepName}`,
     '',
-    '## argv',
+    '## query() options',
     '```json',
-    JSON.stringify(argv),
+    JSON.stringify(displayableOptions, null, 2),
     '```',
     '',
     '## filled prompt',
@@ -1113,21 +1044,39 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   };
 
   if (ctx.dryRun) {
-    // A dry run never spawns `claude`, so `opts` here carries no sessionId (only
-    // invokeClaudeReal ever generates or validates one, immediately before a real spawn -- see
-    // its own comment). Calling buildArgv(opts) unmodified would then omit --session-id entirely,
-    // showing an argv that is not what a real call would actually use -- this artifact's whole
-    // stated purpose is to show the argv.
+    // A dry run never calls query(), so `opts` here carries no sessionId (only a caller that
+    // actually intends to spawn ever supplies or lets invokeClaudeReal's own resolution generate
+    // one). Calling buildQueryOptions(opts) unmodified would then omit `options.sessionId`
+    // entirely, showing options that are not what a real call would actually use -- this
+    // artifact's whole stated purpose is to show what would be sent.
     //
-    // The fix is a STABLE LITERAL PLACEHOLDER, never a generated UUID: minting a real, joinable
-    // id here would fabricate a session that never existed -- the identical error the
-    // oauthTokenFile branch above already refuses to produce (a recoverable-looking id pointing
-    // at nothing), except self-inflicted on every single dry run instead of one failure mode. A
-    // downstream token-ledger action joining on it would then read "lost session" instead of "no
-    // call was made". A fixed literal is also stable across runs, so artifact diffs stay clean
-    // and no churning id enters a committed path.
-    const argv = buildArgv({ ...opts, sessionId: '<generated-at-spawn>' });
-    const dryrunFile = writeDryRunArtifact(ctx.taskDir, stepName, argv, promptText);
+    // The fix is the SAME stable literal placeholder this artifact has always used, never a
+    // generated UUID: minting a real, joinable id here would fabricate a session that never
+    // existed -- the identical error the OauthTokenUnreadableError branch already refuses to
+    // produce for a real call (a recoverable-looking id pointing at nothing), except
+    // self-inflicted on every single dry run instead of one failure mode. A downstream
+    // token-ledger action joining on it would then read "lost session" instead of "no call was
+    // made". A fixed literal is also stable across runs, so artifact diffs stay clean and no
+    // churning id enters a committed path.
+    //
+    // buildQueryOptions is called directly here (deps.buildQueryOptions, following this file's
+    // deps.query/deps.buildQueryOptions convention -- see invokeClaudeReal), not through
+    // invokeClaudeReal itself: a dry run must never touch the killswitch check or attempt-count
+    // hook invokeClaudeReal's own top does, and must never call query() at all. This DOES mean a
+    // dry run resolves a real `claude` on PATH (buildQueryOptions's own executable resolution) --
+    // deliberately: `pathToClaudeCodeExecutable` is itself part of "what would actually be sent",
+    // and a dry run that could not tell a maintainer `claude` is missing from PATH would be
+    // hiding a real misconfiguration behind its own convenience.
+    // Built from `opts` UNMODIFIED, never with the placeholder already substituted in --
+    // buildQueryOptions validates a supplied opts.sessionId as UUID-v4 shaped (a bare TypeError,
+    // a programming-error contract this function must not suppress -- see that function's own
+    // header, reason 3), and '<generated-at-spawn>' would trip that check immediately. The
+    // placeholder is overlaid onto the DISPLAY copy afterward instead, below.
+    const { buildQueryOptions: buildQueryOptionsFn } = getSdkCall();
+    const buildOptionsForDryRun = deps.buildQueryOptions || buildQueryOptionsFn;
+    const { options: dryRunOptions } = buildOptionsForDryRun(opts, deps);
+    const displayOptions = { ...dryRunOptions, sessionId: '<generated-at-spawn>' };
+    const dryrunFile = writeDryRunArtifact(ctx.taskDir, stepName, displayOptions, promptText);
     appendEvent(ctx.taskDir, stepName, 'dry-run', {
       step: stepName,
       promptFile: contract.promptFile,
@@ -1243,7 +1192,6 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
 module.exports = {
   runLlm,
   invokeClaudeReal,
-  buildArgv,
   resolvePromptText,
   extractTokens,
   tokenFieldsFrom,

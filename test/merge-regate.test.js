@@ -17,7 +17,7 @@ const path = require('path');
 const { realMerge } = require('../orchestrator/steps/scripted');
 const { buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
-const { mkTmp, writePoolDir } = require('./helpers');
+const { mkTmp, writePoolDir, fakeSpawnedChild } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -523,18 +523,36 @@ const LAP_STEP_PAYLOADS = {
   'verdict,reasons,findings': { verdict: 'PASS', reasons: [], findings: [] },
 };
 
-function lapFakeClaudeStdout(args) {
+// Card #239 chantier (A5b-2, Job 3): claude no longer spawns via spawnSync -- it drives the Agent
+// SDK's query() (orchestrator/steps/sdk-call.js), injected here as `deps.spawn`/`deps.resolveClaude
+// CodeExecutable`/`deps.isNoRealSpawnEnabled` (test/helpers.js's `fakeSpawnedChild`), same convention
+// as test/gate-legs-reachability.test.js's own `fakeClaudeSpawn`/`claudeReplyPayload`. Still parses
+// the real argv the SDK hands to `deps.spawn`'s `args` for the `--json-schema` lookup -- unchanged
+// shape from the old `lapFakeClaudeStdout`.
+function lapClaudeReplyPayload(args) {
   const i = args.indexOf('--json-schema');
   const schema = i >= 0 ? JSON.parse(args[i + 1]) : { required: [] };
   const key = (schema.required || []).join(',');
   const payload = LAP_STEP_PAYLOADS[key];
-  if (!payload) throw new Error(`lapFakeClaudeStdout: no canned payload for required=[${key}]`);
-  return JSON.stringify({
-    result: JSON.stringify(payload),
-    session_id: `fake-session-${key.length}`,
-    num_turns: 1,
-    modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
-  });
+  if (!payload) throw new Error(`lapClaudeReplyPayload: no canned payload for required=[${key}]`);
+  return { payload, key };
+}
+
+function lapFakeClaudeSpawn(command, args) {
+  const { payload, key } = lapClaudeReplyPayload(args);
+  const sessionId = `aaaaaaaa-bbbb-4ccc-8ddd-${String(key.length).padStart(12, '0')}`;
+  return fakeSpawnedChild([
+    { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: sessionId,
+      modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify(payload),
+    },
+  ]);
 }
 
 // `mainMovedFiles()` is the ONE thing the lap tests vary between laps: `git diff --name-only
@@ -543,7 +561,8 @@ function lapFakeClaudeStdout(args) {
 // is what a real second lap sees (a fresh bench verdict whose baseMain IS the main just merged),
 // so lap 2's CI_CHECKS finds "not moved" and hands straight on to VALIDATE.
 function lapCommonSpawnSync(command, args, mainMovedFiles) {
-  if (command === 'claude') return ok(lapFakeClaudeStdout(args));
+  // claude no longer spawns via spawnSync (card #239 chantier, action A5b) -- see
+  // lapFakeClaudeSpawn/deps.spawn above.
   if (command === 'git') {
     if (args.includes('fetch')) return ok('');
     if (args.includes('rev-parse') && args.includes('--verify')) return fail(1);
@@ -646,6 +665,12 @@ test('runTask (real mode, card): MERGE re-gates on a CONFLICTING probe and the c
       return r;
     },
     sleep: () => Promise.resolve(),
+    spawn: (command, args, spawnOpts) => {
+      calls.push({ command: 'claude', args });
+      return lapFakeClaudeSpawn(command, args, spawnOpts);
+    },
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const task = { id: 'regate-lap', kind: 'card', issue: 984, title: 'Synthetic re-gate lap', criterion: 'lap only', size: 'S' };

@@ -86,7 +86,14 @@ test('dry-run demo: a card task reaches DONE with dryrun-<STATE>.md for every LL
   ]);
 });
 
-test('dry-run demo: dryrun-PLAN.md shows the argv (--model/--effort/--json-schema/--session-id) and the filled prompt -- --session-id carries the stable placeholder, never a fabricated real id, since a dry run never spawns claude', () => {
+test('dry-run demo: dryrun-PLAN.md shows the query() options (model/effort/json-schema/sessionId) and the filled prompt -- sessionId carries the stable placeholder, never a fabricated real id, since a dry run never calls query()', () => {
+  // Action A5b (card #239 chantier, the cutover): this test used to assert against the old
+  // transport's argv array (`"--model","opus"`, etc, written under a `## argv` heading).
+  // steps/llm.js's writeDryRunArtifact now shows buildQueryOptions's own `options` object as
+  // JSON under a `## query() options` heading instead (see that function's own header for why:
+  // there is no argv any more, and the artifact's whole point is to show what would actually be
+  // sent). Rewritten to parse that JSON and assert on its fields directly, rather than pattern-
+  // matching a serialized array shape that no longer exists.
   const queueDir = mkTmp('spo-queue-dryrun-argv-');
   const journalDir = mkTmp('spo-journal-dryrun-argv-');
   const worktreePath = mkTmp('spo-dryrun-argv-worktree-');
@@ -107,23 +114,31 @@ test('dry-run demo: dryrun-PLAN.md shows the argv (--model/--effort/--json-schem
   const planFile = path.join(journalDir, 'card-dryrun-argv', 'dryrun-PLAN.md');
   const content = fs.readFileSync(planFile, 'utf8');
 
-  assert.match(content, /## argv/);
-  assert.match(content, /--model/);
-  // EXP-PLAN-OPUS (doc/model-experiments.md): no planInvalidRetry -> PLAN's base model, Opus. Matched
-  // as the exact argv pair, since a bare /opus/ or /high/ could match the filled prompt below it.
-  assert.match(content, /"--model","opus"/);
-  assert.match(content, /--effort/);
-  assert.match(content, /"--effort","high"/); // size "M" -> effort "high" (PLAN_EFFORT_BY_SIZE)
-  assert.match(content, /--json-schema/);
-  assert.match(content, /plan_markdown/); // PLAN's output contract, inside the json-schema
+  assert.match(content, /## query\(\) options/);
+  const jsonMatch = content.match(/## query\(\) options\n```json\n([\s\S]*?)\n```/);
+  assert.ok(jsonMatch, 'expected a fenced ```json block under "## query() options"');
+  const options = JSON.parse(jsonMatch[1]);
 
-  // A dry run never spawns `claude`, so no real session id exists to show -- steps/llm.js's
-  // runLlm builds the displayed argv with the stable literal placeholder '<generated-at-spawn>'
-  // instead (never a generated UUID, which would fabricate a real, joinable id for a call that
-  // never happened). Previously --session-id was omitted from this artifact entirely, which this
-  // test did not catch even though its own name claimed to show "the real argv".
-  assert.match(content, /--session-id/);
-  assert.match(content, /<generated-at-spawn>/);
+  // EXP-PLAN-OPUS (doc/model-experiments.md): no planInvalidRetry -> PLAN's base model, Opus.
+  assert.equal(options.model, 'opus');
+  assert.equal(options.effort, 'high'); // size "M" -> effort "high" (PLAN_EFFORT_BY_SIZE)
+  assert.equal(options.outputFormat.type, 'json_schema');
+  assert.ok('plan_markdown' in options.outputFormat.schema.properties, 'expected PLAN\'s output contract inside the json schema');
+
+  // A dry run never calls query(), so no real session id exists to show -- steps/llm.js's runLlm
+  // overlays the stable literal placeholder '<generated-at-spawn>' onto the DISPLAY copy of
+  // options instead (never a generated UUID, which would fabricate a real, joinable id for a call
+  // that never happened -- see writeDryRunArtifact's own call site comment). Previously
+  // --session-id was omitted from this artifact entirely, which an earlier version of this test
+  // did not catch even though its own name claimed to show "the real argv".
+  assert.equal(options.sessionId, '<generated-at-spawn>');
+
+  // env/abortController/spawnClaudeCodeProcess are deliberately EXCLUDED from the artifact (see
+  // writeDryRunArtifact's own header: env can carry a live CLAUDE_CODE_OAUTH_TOKEN, and the other
+  // two are call machinery, not information about what would be sent).
+  assert.equal('env' in options, false, 'the dry-run artifact must never carry env (it can hold a live credential)');
+  assert.equal('abortController' in options, false);
+  assert.equal('spawnClaudeCodeProcess' in options, false);
 
   assert.match(content, /## filled prompt/);
   assert.match(content, new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));

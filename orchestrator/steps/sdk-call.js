@@ -119,17 +119,166 @@
 //      any real process is created, the same "fails before any child exists" shape
 //      ClaudeExecutableNotFoundError above already uses for the executable-resolution failure.
 //
-// So the future hook is: A5 sets `options.spawnClaudeCodeProcess` here, in buildQueryOptions, to a
-// function that reads `no-real-spawn-guard`'s `isEnabled(process.env)` -- AT CALL TIME, never at
-// this module's require/load time, the same "read fresh every call" posture isEnabled() already
-// documents for itself -- and throws the guard's own shaped error instead of spawning when armed.
-// This action does not implement that: no `spawnClaudeCodeProcess` key is set on `options` below,
-// and no test in test/sdk-call-options.test.js exercises one. Recorded here so A5 does not have to
-// rediscover the two measurements above from scratch, and so this module's current
-// "unconditionally safe, nothing to hook yet" state is never mistaken for "the killswitch is
-// wired up."
+// A5b (this action) implements that: `makeSpawnClaudeCodeProcess` below builds a function that
+// reads `no-real-spawn-guard`'s `isEnabled(process.env)` AT CALL TIME (never at this module's
+// require/load time, or even at buildQueryOptions's own call time -- a deadline race could arm the
+// var well after `options` was built) and throws the guard's own `ENOREALSPAWN`-coded error
+// instead of spawning when armed.
+//
+// ---- the SECOND job this same hook does: capturing a real handle for A5b's own abort/no-orphan
+// proof -----------------------------------------------------------------------------------------
+//
+// `options.spawnClaudeCodeProcess` is called *instead of* the SDK's own internal
+// `spawnLocalProcess`, synchronously, during `query()`'s own construction, and MEASURED (this
+// action, 2026-09-17, against the real vendored SDK -- a real `query()` call, a fake `claude`
+// executable, script deleted after use, not committed) to receive `{command, args, cwd, env,
+// signal}` and expect back an object satisfying exactly the properties the transport actually
+// touches on it: `.stdin`, `.stdout`, `.kill(signal)`, `.killed`, `.exitCode`, `.signalCode`, and
+// `.on/.once/.off('exit', (code, signal) => ...)`. A raw `child_process.spawn(...)` result
+// satisfies every one of those natively (it IS a real `ChildProcess`) -- confirmed end-to-end
+// against a real `query()` call, both for an ordinary success (structured_output round-tripped
+// correctly through a hand-spawned child) and for an abort (the SDK's own `close()` method called
+// `.kill('SIGTERM')` then, after its own escalation delay, `.kill('SIGKILL')` on the exact object
+// this function returned -- see llm.js's own header for the timing that measurement produced and
+// what it's used for).
+//
+// Returning the raw `ChildProcess` INSTEAD OF reimplementing the SDK's own `spawnLocalProcess`
+// wrapping (a stderr-tail ring buffer for richer error text, and a 200ms post-exit grace waiting
+// for stdio streams to close before synthesizing its own `'exit'` event) is a deliberate choice,
+// not an oversight: those two things exist for diagnostic richness, not correctness, and
+// reimplementing them exactly would mean privately maintaining a second copy of internal SDK
+// plumbing that a future re-vendor could silently invalidate. The ONE correctness property losing
+// that wrapping does NOT excuse is stderr drainage: an OS pipe has a bounded buffer (historically
+// 64KB on Linux), and a child that writes enough to it without anyone reading blocks on its own
+// `write()` call -- a real hang risk for a chatty `claude` process, not a theoretical one.
+// MEASURED: a fake child that wrote >800KB to stderr before ever reading stdin completed normally
+// through this function's drain-and-discard handler below, with no hang; the same fixture without
+// the drain would have deadlocked (not itself re-measured, since that would mean shipping the
+// deadlock to prove it -- the pipe-buffer mechanism is standard POSIX behaviour, not a claim
+// specific to this SDK).
+function makeSpawnClaudeCodeProcess(deps = {}) {
+  const spawnFn = deps.spawn || spawn;
+  const isEnabledFn = deps.isNoRealSpawnEnabled || isNoRealSpawnEnabled;
+  let capturedProcess;
+
+  function spawnClaudeCodeProcess(spawnArgs) {
+    // "Both, not either" (this hook's own throw, plus invokeClaudeReal's own isEnabled() check at
+    // its top -- see that file's header): this is the defense-in-depth half, reached if a future
+    // caller ever gets to query() by some route that skips invokeClaudeReal's own check.
+    if (isEnabledFn(process.env)) {
+      const err = new Error(
+        'sdk-call.js: a real query() call reached spawnClaudeCodeProcess -- SPO_NO_REAL_SPAWN is ' +
+          'set, so this refuses to spawn a real `claude` process instead of silently reaching it ' +
+          'with live credentials. This means a mutated or regressed isRealMode/config.real gate let ' +
+          'a call reach this hook -- see orchestrator/no-real-spawn-guard.js.'
+      );
+      err.code = 'ENOREALSPAWN';
+      throw err;
+    }
+    const child = spawnFn(spawnArgs.command, spawnArgs.args, {
+      cwd: spawnArgs.cwd,
+      env: spawnArgs.env,
+      signal: spawnArgs.signal,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    // Drain and discard -- see this function's own header for why an unread stderr pipe is a real
+    // hang risk. This function's caller (llm.js's invokeClaudeReal) never reads stderr text back
+    // out of this object for its own error messages -- consumeQueryStream's failure branches build
+    // their diagnostic text from the stream's own result/errors fields, never from stderr -- so
+    // discarding rather than buffering costs nothing this pipeline actually uses today.
+    child.stderr.on('data', () => {});
+    child.stderr.on('error', () => {});
+    capturedProcess = child;
+    return child;
+  }
+
+  return { spawnClaudeCodeProcess, getSpawnedProcess: () => capturedProcess };
+}
+
+// ---- the SDK's own internal kill-escalation timing (measured, not assumed) ---------------------
+//
+// vendor/claude-agent-sdk/sdk.mjs's ProcessTransport.close() -- invoked when
+// `options.abortController` aborts -- does NOT kill immediately. MEASURED (grep against the
+// vendored file, both constants read directly off their own declaration, not inferred):
+// `var q1e=2000,hR=2048,uG="sdk-exit-after-stderr-drained",Z1e=200;` -- close() waits `q1e`
+// (2000ms) before even checking whether the process is still alive, and only if it is, sends
+// SIGTERM and arms a SECOND, unref'd `setTimeout(...,5000,...)` that sends SIGKILL if the process
+// still hasn't exited by then. So the SDK's own worst case, analytically: 2000 + 5000 = 7000ms from
+// `abortController.abort()` to a GUARANTEED SIGKILL delivery -- not the 5000ms an earlier static
+// read of this same file found in isolation (that read the SIGKILL escalation setTimeout but
+// missed the outer 2000ms gate it is nested inside).
+//
+// CROSS-VALIDATED against a LIVE run (this action, 2026-09-17; a fake `claude` that installs a
+// SIGTERM handler and never exits on its own, run through a real `query()` call from this repo's
+// vendored SDK via a custom spawnClaudeCodeProcess identical in shape to the one above, script
+// deleted after use, not committed): abort() called, the directly-captured child's own `'exit'`
+// event fired at t=5854ms in one run and t=7132ms in another -- both within the analytically-
+// derived 7000ms bound plus scheduling/reap overhead, never past it.
+//
+// Named as two separate constants, matching the vendored source's own two-stage shape, rather than
+// folded into one opaque number -- so a future re-vendor that changes either literal (triggered by
+// bumping VENDORED_SDK_VERSION/VENDORED_CLAUDE_CODE_VERSION in sdk.js, per that file's own pin) is
+// easy to re-derive from this comment instead of silently drifting. test/sdk-call-options.test.js
+// pins that both literals still appear together in the vendored file, the same "pin what a
+// re-vendor could silently change" posture sdk.js's own VENDORED_SDK_VERSION pair already uses.
+const SDK_ABORT_KILL_DELAY_MS = 2000;
+const SDK_ABORT_SIGKILL_ESCALATION_MS = 5000;
+// Margin for scheduling/event-loop/process-reap overhead ON TOP of the SDK's own analytically-
+// derived worst case -- both live measurements above landed inside this margin (largest observed
+// overshoot ~132ms), nowhere close to exhausting it.
+const ABORT_GRACE_MARGIN_MS = 1500;
+// llm.js's invokeClaudeReal holds its own return for up to this long, after calling abort(),
+// before giving up on confirming the real child actually exited -- see that file's own header for
+// the account-lease race this exists to close.
+const ABORT_CONFIRM_GRACE_MS = SDK_ABORT_KILL_DELAY_MS + SDK_ABORT_SIGKILL_ESCALATION_MS + ABORT_GRACE_MARGIN_MS;
+
+// confirmProcessExit(child, graceMs) -> Promise<{confirmed, code, signal}>
+//
+// Resolves once `child` (the object spawnClaudeCodeProcess captured/returned above) has actually
+// exited, or after `graceMs` has elapsed without that happening -- whichever comes first. Never
+// guesses: `confirmed` is only ever true when the real `'exit'` event fired (or had already fired
+// before this function was even called -- checked via `.exitCode`/`.signalCode`, both `null` only
+// while a process is still running, per Node's own ChildProcess contract). `child` may be
+// `undefined` (query() threw before ever calling spawnClaudeCodeProcess -- e.g. the killswitch
+// fired first) -- treated as vacuously confirmed, since there is no process to wait for.
+//
+// llm.js's invokeClaudeReal calls this, bounded by ABORT_CONFIRM_GRACE_MS, to hold its own return
+// until it knows whether the account lease its caller is about to release is safe to release -- see
+// that file's own header for the incident this closes.
+function confirmProcessExit(child, graceMs) {
+  if (!child) return Promise.resolve({ confirmed: true, code: null, signal: null });
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ confirmed: true, code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    // Deliberately NOT `.unref()`d -- see llm.js's own deadline-timer comment (invokeClaudeReal)
+    // for the full, corrected reasoning (fix pass F3): ref'ing THIS timer is not itself what fixes
+    // the hang (MEASURED: unref'ing both this timer and llm.js's deadline timer together, while
+    // leaving test/helpers.js's fake child's own ref'd `keepalive` interval untouched, still passes
+    // all 81 llm-real.test.js/llm-real-card.test.js tests). It stays ref'd for a different reason
+    // that IS real: the vendored SDK's own kill-escalation timers are themselves unref'd in the
+    // vendored source, so something ref'd has to hold the loop open for a SIGKILL to have a chance
+    // to land when nothing else in the process is doing so. Cleared as soon as either branch below
+    // settles either way.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ confirmed: false, code: child.exitCode, signal: child.signalCode });
+    }, graceMs);
+    child.once('exit', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ confirmed: true, code, signal });
+    });
+  });
+}
 const fs = require('fs');
+const { spawn } = require('child_process');
 const { resolveClaudeCodeExecutable } = require('../sdk');
+const { isEnabled: isNoRealSpawnEnabled } = require('../no-real-spawn-guard');
 const {
   resolvePromptText,
   NONINTERACTIVE_ENV_DEFAULTS,
@@ -266,13 +415,14 @@ class ClaudeExecutableNotFoundError extends Error {
 
 // Thrown by buildQueryOptions when opts.jsonSchema is a STRING that is not valid JSON (F3, Opus
 // verifier, fix pass). This branch exists so this file can accept the same "already-JSON-encoded
-// string" shape today's buildArgv (llm.js) does -- and that shape is LIVE, not hypothetical: the
-// legacy override path (runLlm's `ctx.task.llm.<step>` branch, llm.js:1031) passes
-// `override.jsonSchema` straight through into opts.jsonSchema with no validation of its own, the
-// same path orchestrator/README.md's own hand-written example documents. Today's transport never
-// looks at that string until `claude --json-schema <string>` runs and the CLI itself rejects a
-// malformed one (exit 1, a normal step failure via invokeClaudeReal's "stdout was not valid JSON"
-// or CLI-argument-error branches) -- nothing in this repo's own code ever parses it. This file's
+// string" shape the old transport's now-deleted buildArgv (llm.js) used to -- and that shape is
+// LIVE, not hypothetical: the legacy override path (runLlm's `ctx.task.llm.<step>` branch,
+// llm.js:962) passes `override.jsonSchema` straight through into opts.jsonSchema with no
+// validation of its own, the same path orchestrator/README.md's own hand-written example
+// documents. The OLD transport never looked at that string until `claude --json-schema <string>`
+// ran and the CLI itself rejected a malformed one (exit 1, a normal step failure via
+// invokeClaudeReal's "stdout was not valid JSON" or CLI-argument-error branches) -- nothing in
+// that transport's own code ever parsed it. This file's
 // mapping DOES parse it (outputFormat.schema must be an object, not a string -- see that block's
 // own comment), so a malformed string now fails inside buildQueryOptions instead of inside the
 // CLI. Left as a bare `JSON.parse` throw, that would surface as an uncaught SyntaxError -- a
@@ -352,7 +502,13 @@ function buildEnv(opts) {
   return env;
 }
 
-// buildQueryOptions(opts, deps = {}) -> { prompt, options }
+// buildQueryOptions(opts, deps = {}) -> { prompt, options, getSpawnedProcess }
+//
+// A5b added `getSpawnedProcess` to this return (previously just `{ prompt, options }`) -- a zero-
+// arg accessor for the real child `spawnClaudeCodeProcess` captures once query({prompt, options})
+// actually calls it (undefined until then, e.g. if the killswitch throws first). Existing callers
+// that destructure only `{ options }` (test/sdk-call-stream.test.js's own probe helper predates
+// this) are unaffected -- an extra property on the returned object is backward compatible.
 //
 // opts is exactly today's invokeClaudeReal opts (steps/llm.js's own header lists the authoritative
 // set): step, model, effort, allowedTools, permissionMode, maxBudgetUsd, jsonSchema,
@@ -390,6 +546,24 @@ function buildEnv(opts) {
 // (a missing prompt and a malformed sessionId are both already bare throws today, never a step
 // failure return).
 function buildQueryOptions(opts, deps = {}) {
+  // THE E2BIG LESSON (carried forward from the old transport's now-deleted `buildArgv`, action
+  // A5b -- record it here, not there, since this is where the prompt now travels through this
+  // pipeline's own code before reaching the child). Linux caps each INDIVIDUAL argv/environ string
+  // at MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072 bytes on this machine) -- a distinct, much smaller
+  // limit than ARG_MAX (the cumulative argv+environ budget, never remotely approached here). A
+  // filled prompt bigger than that made the OLD transport's spawnSync call fail with E2BIG before
+  // `claude` ever started, unconditionally, no matter the model/account/step. Reproduced
+  // 2026-08-30 on card #452: its IMPLEMENT prompt was 204826 bytes (a placeholder substituted
+  // twice into implement.md -- see that file's own fix); its PLAN prompt, same task, was 105307
+  // bytes and passed with only ~26KB of headroom -- the cliff was one character-count away for
+  // every card, not particular to #452's size. The lesson still applies on THIS transport: the
+  // prompt is never placed into `options` as an argv-shaped string anywhere in this function --
+  // it is returned here, separately, as `prompt`, and the SDK itself sends it to the child over
+  // STDIN as a stream-json `user` message (MEASURED, `vendor/claude-agent-sdk/sdk.mjs`'s `d0()`:
+  // `t.write(me({type:"user",...,content:[{type:"text",text:n}]})+"\n")` where `t` is the
+  // transport's own stdin writer) -- the same "prompt travels on stdin, never argv" property
+  // `buildArgv`'s own comment established, preserved by construction rather than by convention,
+  // since this function never has an opportunity to put it anywhere else.
   const prompt = resolvePromptText(opts);
 
   // Same relative order as invokeClaudeReal (llm.js): prompt first, then the account-derived env
@@ -444,11 +618,12 @@ function buildQueryOptions(opts, deps = {}) {
 
   if (opts.jsonSchema) {
     // outputFormat.schema must be an OBJECT -- the SDK's own argv builder JSON.stringifies it
-    // itself when it emits `--json-schema` (see this file's header measurement); today's
-    // buildArgv accepts opts.jsonSchema as either an object or an already-JSON-encoded string
-    // (used verbatim, never re-parsed) -- LIVE on the legacy override path, llm.js:1031's
-    // `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not merely a theoretical
-    // shape, the same override path this file's allowedTools normalization already accounts for)
+    // itself when it emits `--json-schema` (see this file's header measurement); the old
+    // transport's now-deleted buildArgv accepted opts.jsonSchema as either an object or an
+    // already-JSON-encoded string (used verbatim, never re-parsed) -- LIVE on the legacy override
+    // path, llm.js:962's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
+    // merely a theoretical shape, the same override path this file's allowedTools normalization
+    // already accounts for)
     // -- so a string here is parsed back into an object rather than nested as a
     // string-inside-JSON, which would double-encode it on the SDK's own stringify pass.
     let schema = opts.jsonSchema;
@@ -498,7 +673,23 @@ function buildQueryOptions(opts, deps = {}) {
     options.sessionId = opts.sessionId;
   }
 
-  return { prompt, options };
+  // A5b: own the AbortController rather than letting query() default one internally (`let{
+  // abortController:g=Pd()...}` in the vendored source -- MEASURED, `Pd()` is a plain
+  // `new AbortController()`). invokeClaudeReal needs a reference it can call `.abort()` on when
+  // its own deadline timer fires, and the SDK only ever reads `options.abortController` back OUT
+  // of what it was given (there is no "give me the one you built" accessor) -- so a caller-owned
+  // one, built here, is the only way to get one at all.
+  options.abortController = new AbortController();
+
+  // The killswitch AND the abort/no-orphan proof's own captured handle -- see
+  // makeSpawnClaudeCodeProcess's own header for both jobs this one hook does and why they share a
+  // seam. `getSpawnedProcess` is exposed on this function's return (not on `options` itself, which
+  // stays exactly the shape query() consumes) so invokeClaudeReal can read the real child back out
+  // after calling query({prompt, options}).
+  const { spawnClaudeCodeProcess, getSpawnedProcess } = makeSpawnClaudeCodeProcess(deps);
+  options.spawnClaudeCodeProcess = spawnClaudeCodeProcess;
+
+  return { prompt, options, getSpawnedProcess };
 }
 
 // consumeQueryStream(stream, ctx = {}) -> Promise<today's invokeClaudeReal return shape>
@@ -751,10 +942,23 @@ async function consumeQueryStream(stream, ctx = {}) {
         // The authoritative id: MEASURED, a `system`/`init` message's own `session_id` is the
         // first evidence a session exists at all, and a terminal `result` message's `session_id`
         // (set again below, once `resultMessage` is known) is the CLI's own last word on the same
-        // question -- both are CLI-reported, never one we generated ourselves (this transport,
-        // unlike invokeClaudeReal, never mints a sessionId of its own at all: `buildQueryOptions`
-        // passes `opts.sessionId` through when the caller already supplied one, and otherwise lets
-        // the CLI mint its own, which is what the `init` message's `session_id` then reports).
+        // question -- both are CLI-reported, never one this function generates itself (this
+        // function never mints anything -- see this file's own header, buildQueryOptions never has
+        // either). STALE CLAIM CORRECTED TWICE (Opus verifier fix pass F7, then this action's Job
+        // 2): an earlier draft here said "unlike invokeClaudeReal", as if invokeClaudeReal still
+        // minted its own session id -- true before action A5b, false right after it (A5b's cutover
+        // dropped the mint entirely). F7's own fix pass corrected THAT to "invokeClaudeReal never
+        // mints one either any more" -- true for the few days between A5b and this action's Job 2,
+        // false again now: Job 2 restored the mint in llm.js's invokeClaudeReal (a UUID, generated
+        // before `query()` is called and supplied as `options.sessionId`, following the same
+        // deps.randomUUID convention the pre-A5b transport used -- see token-recovery.js's own
+        // header for the recovery guarantee this restores). So this message's own `session_id`
+        // IS, in the ordinary case, the same value invokeClaudeReal already supplied -- this
+        // function still reports whatever the CLI actually says (the CLI is the authority on what
+        // it named the session, per invokeClaudeReal's own "CLI wins, falls back to ours"
+        // comment), it is only that "ours" is no longer a hypothetical the CLI always overrides in
+        // practice; it is a real id invokeClaudeReal's own fallback uses when this function's
+        // `sessionId` comes back null (the stream never got far enough to see either message).
         // The `subtype === 'init'` guard is UNPINNED (mutation-proof, Opus verifier fix pass:
         // dropping it leaves every test in this file green) but not a gap worth a test for --
         // every `system` message the CLI emits on a given run carries the SAME `session_id`, so a
@@ -942,8 +1146,14 @@ module.exports = {
   consumeQueryStream,
   normalizeAllowedTools,
   buildEnv,
+  makeSpawnClaudeCodeProcess,
+  confirmProcessExit,
   SETTING_SOURCES,
   ANTHROPIC_ENV_KEYS_TO_STRIP,
+  SDK_ABORT_KILL_DELAY_MS,
+  SDK_ABORT_SIGKILL_ESCALATION_MS,
+  ABORT_GRACE_MARGIN_MS,
+  ABORT_CONFIRM_GRACE_MS,
   OauthTokenUnreadableError,
   ClaudeExecutableNotFoundError,
   JsonSchemaParseError,

@@ -1,10 +1,15 @@
 'use strict';
 // Unit tests for orchestrator/intake.js (draftCard/loadDraftFile/reviewCard/fileCard/pullBoard/
-// makeTask) and bin/spo's cmdAsk/cmdPull wiring around them. Every LLM call is injected via
-// deps.spawnSync (same convention as test/llm-real-card.test.js); every gh/npm call is injected
-// the same way (same convention as test/real-steps.test.js). No real `claude`/`gh`/`npm`
-// process is ever spawned. cmdAsk/cmdPull are exercised through bin/spo's own `deps.intake`
-// override (see bin/spo's header comment on cmdAsk) rather than reimplementing their logic here.
+// makeTask) and bin/spo's cmdAsk/cmdPull wiring around them. Every gh/npm call is injected via
+// deps.spawnSync (same convention as test/real-steps.test.js) -- UNCHANGED by the card #239
+// chantier, since gh/npm never went through the Agent SDK cutover. Every `claude` LLM call
+// (draftCard/reviewCard/triageBugReport, which call orchestrator/steps/llm.js's invokeClaudeReal
+// directly) is injected via deps.spawn/deps.resolveClaudeCodeExecutable/deps.isNoRealSpawnEnabled
+// instead (card #239 chantier, action A5b-2 -- same convention as test/llm-real-card.test.js; see
+// its own header for the full design and test/helpers.js's fakeSpawnedChild/fakeExecDeps for the
+// seam itself). No real `claude`/`gh`/`npm` process is ever spawned. cmdAsk/cmdPull are exercised
+// through bin/spo's own `deps.intake` override (see bin/spo's header comment on cmdAsk) rather
+// than reimplementing their logic here.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -12,7 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { mkTmp, writePoolDir, timeoutResult } = require('./helpers');
+const { mkTmp, writePoolDir, timeoutResult, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
@@ -32,9 +37,16 @@ function fakeSpawnSync(responder) {
   return (command, args, opts) => responder(command, args, opts);
 }
 
-// The same shape invokeClaudeReal's real spawn parses (llm-real-card.test.js's own helper).
+// realShapedReply(resultObj, overrides) -- card #239 chantier, action A5b-2: this file's own
+// equivalent of llm-real-card.test.js's resultMessage(). Same field names as before this action
+// (result/is_error/num_turns/session_id/modelUsage/terminal_reason/api_error_status -- the OLD
+// flat `--output-format json` object this function has always built), now also a valid stream-json
+// `result` MESSAGE in its own right (consumeQueryStream's own contract) via the two added `type`/
+// `subtype` fields -- nothing else about its shape or its callers' own arguments changed.
 function realShapedReply(resultObj, overrides = {}) {
   return {
+    type: 'result',
+    subtype: 'success',
     result: typeof resultObj === 'string' ? resultObj : JSON.stringify(resultObj),
     is_error: false,
     num_turns: 1,
@@ -43,6 +55,48 @@ function realShapedReply(resultObj, overrides = {}) {
     terminal_reason: 'success',
     api_error_status: null,
     ...overrides,
+  };
+}
+
+// initMessage() -- the `system`/`init` stream-json message every fake `claude` reply now needs
+// before its `result` message (consumeQueryStream's own contract; see test/helpers.js's
+// fakeSpawnedChild header). Session id here is deliberately a DIFFERENT literal from
+// realShapedReply's own `session_id` default in every test that never overrides either --
+// consumeQueryStream prefers the LATER message's session_id when both are present (its own "last
+// word" rule), so this never actually surfaces; kept distinct only so a future reader can tell
+// which message a given id came from if that ever changes.
+function initMessage(sessionId = 'sess-intake-1') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+// fakeClaudeSpawn(responder) -- card #239 chantier, action A5b-2: the deps.spawn equivalent of
+// this file's own fakeSpawnSync, for the ONE thing that changed transport (the `claude` LLM call
+// draftCard/reviewCard/triageBugReport make through invokeClaudeReal). `responder(command, args,
+// spawnOpts)` returns one of:
+//   - a single stream-json message object (typically `realShapedReply(...)`) -- wrapped here as
+//     `[initMessage(), thatMessage]`, the ordinary one-init-one-result shape.
+//   - an ARRAY of message objects -- used as the full `lines` list verbatim (a responder that
+//     wants to omit the init message, or supply its own).
+//   - the literal string 'HANG' -- a child that writes its own init message and then never
+//     replies on its own, for a deadline-kill fixture (see timeoutSpawnResult below).
+//   - `{__externalKillSignal: '<signal>'}` -- a child that hangs, then is force-killed by an
+//     EXTERNAL actor (not this function's own deadline timer) 10ms later, for the
+//     external-signal-kill fixtures (see externalKillSpawnResult below).
+// Every spawn is still fake -- this file never touches a real `claude` CLI, or even a real
+// spawned OS process, for any test using this helper.
+function fakeClaudeSpawn(responder) {
+  return (command, args, spawnOpts) => {
+    const outcome = responder(command, args, spawnOpts);
+    if (outcome === 'HANG') {
+      return fakeSpawnedChild([initMessage()], { hang: true, signal: spawnOpts.signal });
+    }
+    if (outcome && typeof outcome === 'object' && outcome.__externalKillSignal) {
+      const child = fakeSpawnedChild([initMessage()], { hang: true, signal: spawnOpts.signal });
+      setTimeout(() => child.forceExit(null, outcome.__externalKillSignal), 10);
+      return child;
+    }
+    const lines = Array.isArray(outcome) ? outcome : [initMessage(), outcome];
+    return fakeSpawnedChild(lines, { signal: spawnOpts.signal });
   };
 }
 
@@ -60,12 +114,7 @@ function twoAccountPoolDir() {
 // steps/llm.js's own unambiguous classifyFailure rule (see its header comment): a structured
 // status, never the free-text scan action 3.5 removed.
 function limitSpawnResult() {
-  return {
-    status: 1,
-    stdout: JSON.stringify(realShapedReply('rate limited', { is_error: true, api_error_status: 429 })),
-    stderr: '',
-    signal: null,
-  };
+  return realShapedReply('rate limited', { is_error: true, api_error_status: 429 });
 }
 
 // A {kind: 'limit', limitKind: 'overloaded'} shaped raw spawn result -- api_error_status: 529 is
@@ -73,14 +122,7 @@ function limitSpawnResult() {
 // account's own quota, so accounts.markLimit cools it for the flat 5-minute tier, never the
 // usage tiers (1h probe / 5h escalated), no matter how often it recurs.
 function overloadedSpawnResult() {
-  return {
-    status: 1,
-    stdout: JSON.stringify(
-      realShapedReply('overloaded', { is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error' })
-    ),
-    stderr: '',
-    signal: null,
-  };
+  return realShapedReply('overloaded', { is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error' });
 }
 
 const VALID_DRAFT = {
@@ -105,14 +147,22 @@ const VALID_DRAFT = {
 
 test('draftCard: happy path sends model sonnet / effort medium and returns the validated draft', async () => {
   let seenArgv = null;
-  let seenInput = null;
+  let seenInput = '';
+  // The prompt travels over stdin now, never argv (sdk-call.js's own "E2BIG lesson" header) --
+  // fakeClaudeSpawn has no onStdinWrite hook of its own, so this one assertion drives
+  // fakeSpawnedChild directly instead of going through that helper.
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync((command, argv, opts) => {
+    spawn: (command, argv, spawnOpts) => {
       seenArgv = argv;
-      seenInput = opts.input;
-      return { status: 0, stdout: JSON.stringify(realShapedReply(VALID_DRAFT)), stderr: '', signal: null };
-    }),
+      return fakeSpawnedChild([initMessage(), realShapedReply(VALID_DRAFT)], {
+        signal: spawnOpts.signal,
+        onStdinWrite: (chunk) => {
+          seenInput += chunk;
+        },
+      });
+    },
   };
 
   const result = await intake.draftCard('the header has no connection badge', deps);
@@ -129,13 +179,9 @@ test('draftCard: happy path sends model sonnet / effort medium and returns the v
 
 test('draftCard: reply whose result is not valid JSON -> {ok:false, error}', async () => {
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply('not json at all')),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply('not json at all')),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -147,13 +193,9 @@ test('draftCard: reply missing a required key -> clear error, never a crash', as
   const incomplete = { ...VALID_DRAFT };
   delete incomplete.confirmed;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply(incomplete)),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply(incomplete)),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -164,13 +206,9 @@ test('draftCard: reply missing a required key -> clear error, never a crash', as
 test('draftCard: reply with an unrecognized category -> clear error', async () => {
   const bad = { ...VALID_DRAFT, category: 'urgent' };
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply(bad)),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply(bad)),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -201,11 +239,16 @@ test('draftCard: no account registered -> clear error, never spawns', async () =
 test('draftCard: a deadline timeout is retried exactly once, and the retry\'s answer is the result', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30, // small on purpose -- the 'HANG' fixture makes invokeClaudeReal's own real
+    // setTimeout(deadlineMs) actually fire and abort (card #239 chantier, action A5b-2; see
+    // timeoutSpawnResult's own comment). INTAKE_DEADLINE_MS's real 300000ms default would make
+    // this test genuinely wait 5 minutes.
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return calls === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_DRAFT);
-    },
+    }),
   };
   const result = await intake.draftCard('anything', deps);
   assert.equal(calls, 2);
@@ -218,28 +261,42 @@ test('draftCard: a deadline timeout is retried exactly once, and the retry\'s an
 test('draftCard: the retry uses the SAME account and the SAME deadline as the first attempt', async () => {
   const seenOpts = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    deadlineMs: 12345,
-    spawnSync: (command, args, opts) => {
-      seenOpts.push(opts);
+    deadlineMs: 30, // was 12345 -- see this test's own note below on why the exact value no
+    // longer needs to be large, or even the same literal, to prove the property.
+    spawn: fakeClaudeSpawn((command, args, spawnOpts) => {
+      seenOpts.push(spawnOpts);
       return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_DRAFT);
-    },
+    }),
   };
   await intake.draftCard('anything', deps);
   assert.equal(seenOpts.length, 2);
-  assert.equal(seenOpts[0].timeout, 12345);
-  assert.equal(seenOpts[1].timeout, 12345);
+  // "SAME deadline" can no longer be read off the spawn call's own options (card #239 chantier,
+  // action A5b-2): the old transport passed `{timeout: opts.deadlineMs}` straight to spawnSync,
+  // an observable proxy this assertion used to read; this transport's deadline lives entirely in
+  // invokeClaudeReal's own JS-level setTimeout and is never part of what reaches `deps.spawn`
+  // (sdk-call.js's spawnClaudeCodeProcess passes only {cwd, env, signal, stdio, windowsHide} --
+  // see that file's own header). What IS still true, and still worth pinning, is structural: both
+  // calls in callIntakeStepWithRotation's retry loop (orchestrator/intake.js) share the exact SAME
+  // `opts` object reference, built once by `buildOpts(account)` before the loop's own
+  // `invokeClaudeReal(opts, deps)` / retry `invokeClaudeReal(opts, deps)` pair -- provable by
+  // reading that loop directly, not independently observable at this boundary any more. The
+  // account-identity half of this test's own claim IS still directly observable, and is what this
+  // assertion is narrowed to.
   assert.deepEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR);
 });
 
 test('draftCard: two consecutive timeouts -- one retry only, then give up', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return timeoutSpawnResult();
-    },
+    }),
   };
   const result = await intake.draftCard('anything', deps);
   assert.equal(calls, 2);
@@ -249,7 +306,11 @@ test('draftCard: two consecutive timeouts -- one retry only, then give up', asyn
 });
 
 test('draftCard: a malformed reply is NOT retried', async () => {
-  const deps = { accountsDir: poolDir(), spawnSync: seqSpawnSync([{ status: 0, stdout: 'not json at all', stderr: '', signal: null }, okSpawnResult(VALID_DRAFT)]) };
+  const deps = {
+    ...fakeExecDeps(),
+    accountsDir: poolDir(),
+    spawn: seqSpawnSync([{ type: 'result', subtype: 'success', is_error: false, num_turns: 1, session_id: 'sess-intake-1', modelUsage: {}, result: 'not json at all' }, okSpawnResult(VALID_DRAFT)]),
+  };
   const result = await intake.draftCard('anything', deps);
   assert.equal(result.ok, false);
   assert.equal(result.retriedAfterTimeout, undefined);
@@ -264,12 +325,13 @@ test('draftCard: a kind:\'limit\' failure on the first account rotates to a heal
   const accountsDir = twoAccountPoolDir();
   const seenOpts = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) => {
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seenOpts.push(opts);
       if (opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')) return limitSpawnResult();
       return okSpawnResult(VALID_DRAFT);
-    },
+    }),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -285,9 +347,11 @@ test('draftCard: a kind:\'limit\' failure on the first account rotates to a heal
 test('draftCard: the limited account is actually cooled down (markLimit written to state.json)', async () => {
   const accountsDir = twoAccountPoolDir();
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) =>
-      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? limitSpawnResult() : okSpawnResult(VALID_DRAFT),
+    spawn: fakeClaudeSpawn((command, args, opts) =>
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? limitSpawnResult() : okSpawnResult(VALID_DRAFT)
+    ),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -308,9 +372,11 @@ test('draftCard: the limited account is actually cooled down (markLimit written 
 test('draftCard: a 529 (overloaded) failure cools the account for the short 5-minute tier, not the 5-hour usage tier', async () => {
   const accountsDir = twoAccountPoolDir();
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) =>
-      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? overloadedSpawnResult() : okSpawnResult(VALID_DRAFT),
+    spawn: fakeClaudeSpawn((command, args, opts) =>
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? overloadedSpawnResult() : okSpawnResult(VALID_DRAFT)
+    ),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -328,11 +394,12 @@ test('draftCard: every account limited -> {ok:false, error} naming the exhaustio
   const accountsDir = twoAccountPoolDir();
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: () => {
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return limitSpawnResult();
-    },
+    }),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -352,16 +419,12 @@ test('draftCard: a normal (non-limit, non-timeout) failure does not rotate at al
   const accountsDir = twoAccountPoolDir();
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: () => {
+    spawn: fakeClaudeSpawn(() => {
       calls++;
-      return {
-        status: 1,
-        stdout: JSON.stringify(realShapedReply('bad schema', { is_error: true, api_error_status: 400 })),
-        stderr: '',
-        signal: null,
-      };
-    },
+      return realShapedReply('bad schema', { is_error: true, api_error_status: 400 });
+    }),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -409,21 +472,15 @@ test('loadDraftFile: file does not exist -> clear error, never throws', () => {
 test('reviewCard: sends model fable / effort high, returns a DO_NOT_FILE verdict untouched', async () => {
   let seenArgv = null;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync((command, argv) => {
+    spawn: fakeClaudeSpawn((command, argv) => {
       seenArgv = argv;
-      return {
-        status: 0,
-        stdout: JSON.stringify(
-          realShapedReply({
-            verdict: 'DO_NOT_FILE',
-            corrections: [],
-            first_comment_markdown: '### Card review\n\nNot a defect -- documented behaviour.',
-          })
-        ),
-        stderr: '',
-        signal: null,
-      };
+      return realShapedReply({
+        verdict: 'DO_NOT_FILE',
+        corrections: [],
+        first_comment_markdown: '### Card review\n\nNot a defect -- documented behaviour.',
+      });
     }),
   };
 
@@ -438,17 +495,28 @@ test('reviewCard: sends model fable / effort high, returns a DO_NOT_FILE verdict
 });
 
 test('reviewCard: deps.humanConfirmed threads {{human_confirmed}} into the prompt ("yes"/"no")', async () => {
-  let seenPrompts = [];
-  const deps = {
-    accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync((command, argv, opts) => {
-      seenPrompts.push(opts.input);
-      return { status: 0, stdout: JSON.stringify(realShapedReply({ verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' })), stderr: '', signal: null };
-    }),
-  };
+  const seenPrompts = [];
+  // The prompt travels over stdin now, never argv -- see the draftCard happy-path test's own
+  // comment for why this drives fakeSpawnedChild directly rather than through fakeClaudeSpawn.
+  // A fresh accumulator per spawn call, pushed into seenPrompts once that call's own reviewCard()
+  // has resolved -- test/helpers.js's own fakeSpawnedChild header: a chunk may arrive in more than
+  // one write for a large prompt, so accumulate, never assume a single write.
+  function spawnCapturingInto(index) {
+    return (command, argv, spawnOpts) =>
+      fakeSpawnedChild(
+        [initMessage(), realShapedReply({ verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' })],
+        {
+          signal: spawnOpts.signal,
+          onStdinWrite: (chunk) => {
+            seenPrompts[index] = (seenPrompts[index] || '') + chunk;
+          },
+        }
+      );
+  }
 
-  await intake.reviewCard(VALID_DRAFT, { ...deps, humanConfirmed: true });
-  await intake.reviewCard(VALID_DRAFT, deps); // no humanConfirmed at all -- every other caller
+  await intake.reviewCard(VALID_DRAFT, { ...fakeExecDeps(), accountsDir: poolDir(), humanConfirmed: true, spawn: spawnCapturingInto(0) });
+  // no humanConfirmed at all -- every other caller
+  await intake.reviewCard(VALID_DRAFT, { ...fakeExecDeps(), accountsDir: poolDir(), spawn: spawnCapturingInto(1) });
 
   assert.ok(seenPrompts[0].includes('human_confirmed:  yes'));
   assert.ok(seenPrompts[1].includes('human_confirmed:  no'));
@@ -460,11 +528,13 @@ test('reviewCard: a deadline timeout is retried exactly once, and the retry\'s a
   let calls = 0;
   const VALID_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return calls === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_REVIEW);
-    },
+    }),
   };
   const result = await intake.reviewCard(VALID_DRAFT, deps);
   assert.equal(calls, 2);
@@ -478,28 +548,30 @@ test('reviewCard: the retry uses the SAME account and the SAME deadline as the f
   const seenOpts = [];
   const VALID_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    deadlineMs: 12345,
-    spawnSync: (command, args, opts) => {
+    deadlineMs: 30, // see draftCard's own identically-named test for why this is small and why
+    // the exact literal is no longer independently observable at the spawn boundary.
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seenOpts.push(opts);
       return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult(VALID_REVIEW);
-    },
+    }),
   };
   await intake.reviewCard(VALID_DRAFT, deps);
   assert.equal(seenOpts.length, 2);
-  assert.equal(seenOpts[0].timeout, 12345);
-  assert.equal(seenOpts[1].timeout, 12345);
   assert.deepEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR);
 });
 
 test('reviewCard: two consecutive timeouts -- one retry only, then give up', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return timeoutSpawnResult();
-    },
+    }),
   };
   const result = await intake.reviewCard(VALID_DRAFT, deps);
   assert.equal(calls, 2);
@@ -510,7 +582,11 @@ test('reviewCard: two consecutive timeouts -- one retry only, then give up', asy
 
 test('reviewCard: a malformed reply is NOT retried', async () => {
   const VALID_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
-  const deps = { accountsDir: poolDir(), spawnSync: seqSpawnSync([{ status: 0, stdout: 'not json at all', stderr: '', signal: null }, okSpawnResult(VALID_REVIEW)]) };
+  const deps = {
+    ...fakeExecDeps(),
+    accountsDir: poolDir(),
+    spawn: seqSpawnSync([{ type: 'result', subtype: 'success', is_error: false, num_turns: 1, session_id: 'sess-intake-1', modelUsage: {}, result: 'not json at all' }, okSpawnResult(VALID_REVIEW)]),
+  };
   const result = await intake.reviewCard(VALID_DRAFT, deps);
   assert.equal(result.ok, false);
   assert.equal(result.retriedAfterTimeout, undefined);
@@ -529,13 +605,9 @@ test('reviewCard: a split recommendation parses as an ordinary FILE_AMENDED, ver
       '### Card review\n\nThis reads as two independent changes; recommend splitting into two cards.',
   };
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply(SPLIT_REVIEW)),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply(SPLIT_REVIEW)),
   };
 
   const result = await intake.reviewCard(VALID_DRAFT, deps);
@@ -549,13 +621,9 @@ test('reviewCard: a reply naming no split at all still parses cleanly, and REVIE
 
   const PLAIN_REVIEW = { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' };
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply(PLAIN_REVIEW)),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply(PLAIN_REVIEW)),
   };
 
   const result = await intake.reviewCard(VALID_DRAFT, deps);
@@ -1247,13 +1315,9 @@ test('fileCard: target repo has ONLY size: (reverse of the existing cat:-only ca
 
 test('triageBugReport: outcome "draft" with a literal nested object -- accepted as-is', async () => {
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply({ outcome: 'draft', draft: VALID_DRAFT })),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply({ outcome: 'draft', draft: VALID_DRAFT })),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(result.ok, true);
@@ -1264,13 +1328,9 @@ test('triageBugReport: outcome "draft" with `draft` double-encoded as a JSON str
   // Reproduced live 2026-08-30: fable occasionally replies {"outcome":"draft","draft":"{...}"}
   // -- the nested object escaped into a string -- instead of a literal nested object.
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply({ outcome: 'draft', draft: JSON.stringify(VALID_DRAFT) })),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply({ outcome: 'draft', draft: JSON.stringify(VALID_DRAFT) })),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(result.ok, true);
@@ -1279,13 +1339,9 @@ test('triageBugReport: outcome "draft" with `draft` double-encoded as a JSON str
 
 test('triageBugReport: `draft` is a string but not valid JSON either -- clear error, never crashes', async () => {
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply({ outcome: 'draft', draft: 'not json at all' })),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply({ outcome: 'draft', draft: 'not json at all' })),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(result.ok, false);
@@ -1294,13 +1350,9 @@ test('triageBugReport: `draft` is a string but not valid JSON either -- clear er
 
 test('triageBugReport: outcome "not-reproduced" passes through untouched', async () => {
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(realShapedReply({ outcome: 'not-reproduced', reason: 'no matching log line' })),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => realShapedReply({ outcome: 'not-reproduced', reason: 'no matching log line' })),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(result.ok, true);
@@ -1312,29 +1364,46 @@ test('triageBugReport: outcome "not-reproduced" passes through untouched', async
 // Card #449, 2026-08-30: triageBugReport was the one intake LLM step with no retry at all, and
 // its prompt runs a `curl` against a third-party server -- a plausible, plausibly transient hang.
 
+// timeoutSpawnResult() -- card #239 chantier, action A5b-2: no longer a synchronous ETIMEDOUT-
+// shaped return (spawnSync's own `timeout` option no longer exists on this transport -- see
+// orchestrator/steps/llm.js's own header on the deadline redesign). The 'HANG' sentinel
+// (fakeClaudeSpawn's own contract) makes the fake child write its init message and then never
+// reply on its own, so invokeClaudeReal's own real setTimeout(opts.deadlineMs) is what actually
+// fires and aborts it -- every deadline-timeout test using this now needs a SMALL
+// `deps.deadlineMs` (see each test's own edit) so the real wait stays fast; the old transport's
+// tests never needed one because the "wait" was entirely synchronous/simulated.
 function timeoutSpawnResult() {
-  const err = new Error('spawnSync claude ETIMEDOUT');
-  err.code = 'ETIMEDOUT';
-  return { error: err, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' };
+  return 'HANG';
+}
+
+// externalKillSpawnResult(signal) -- card #239 chantier, action A5b-2: an EXTERNAL actor (an
+// operator's kill, an OOM kill, a deploy restart) kills the child, not this function's own
+// deadline timer -- see fakeClaudeSpawn's own `__externalKillSignal` contract for how that is
+// simulated (the child hangs, then is force-killed 10ms later by something OTHER than
+// invokeClaudeReal's own abort()).
+function externalKillSpawnResult(signal = 'SIGTERM') {
+  return { __externalKillSignal: signal };
 }
 
 function seqSpawnSync(responses) {
   let i = 0;
-  return fakeSpawnSync(() => responses[Math.min(i++, responses.length - 1)]);
+  return fakeClaudeSpawn(() => responses[Math.min(i++, responses.length - 1)]);
 }
 
 function okSpawnResult(resultObj) {
-  return { status: 0, stdout: JSON.stringify(realShapedReply(resultObj)), stderr: '', signal: null };
+  return realShapedReply(resultObj);
 }
 
 test('triageBugReport: a deadline timeout is retried exactly once, and the retry\'s answer is the result', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: (command, args, opts) => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return calls === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
-    },
+    }),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(calls, 2);
@@ -1347,28 +1416,30 @@ test('triageBugReport: a deadline timeout is retried exactly once, and the retry
 test('triageBugReport: the retry uses the SAME account and the SAME deadline as the first attempt', async () => {
   const seenOpts = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    deadlineMs: 12345,
-    spawnSync: (command, args, opts) => {
+    deadlineMs: 30, // see draftCard's identically-named test for why this is small and why the
+    // literal value is no longer independently observable at the spawn boundary.
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seenOpts.push(opts);
       return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' });
-    },
+    }),
   };
   await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(seenOpts.length, 2);
-  assert.equal(seenOpts[0].timeout, 12345);
-  assert.equal(seenOpts[1].timeout, 12345);
   assert.deepEqual(seenOpts[0].env.CLAUDE_CONFIG_DIR, seenOpts[1].env.CLAUDE_CONFIG_DIR);
 });
 
 test('triageBugReport: two consecutive timeouts -- one retry only, the failure says the call RAN past its deadline', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return timeoutSpawnResult();
-    },
+    }),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(calls, 2); // no loop -- exactly one retry attempted, then give up
@@ -1378,7 +1449,11 @@ test('triageBugReport: two consecutive timeouts -- one retry only, the failure s
 });
 
 test('triageBugReport: a malformed reply is NOT retried', async () => {
-  const deps = { accountsDir: poolDir(), spawnSync: seqSpawnSync([{ status: 0, stdout: 'not json at all', stderr: '', signal: null }, okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT })]) };
+  const deps = {
+    ...fakeExecDeps(),
+    accountsDir: poolDir(),
+    spawn: seqSpawnSync([{ type: 'result', subtype: 'success', is_error: false, num_turns: 1, session_id: 'sess-intake-1', modelUsage: {}, result: 'not json at all' }, okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT })]),
+  };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(result.ok, false);
   assert.equal(result.retriedAfterTimeout, undefined);
@@ -1391,39 +1466,44 @@ test('triageBugReport: a malformed reply is NOT retried', async () => {
 // restart, an operator's `kill`, an OOM kill -- used to arrive here as `timedOut: true` and buy a
 // second full TRIAGE_BUG_REPORT call on a metered account, re-running a prompt that had just been
 // deliberately stopped. Nothing about an external kill says "transient"; the retry rationale
-// (a hung third-party `curl`) does not apply to it at all.
-
-function externalKillSpawnResult(signal = 'SIGTERM') {
-  // No `error` field: node fills one in only when ITS OWN deadline fired. Measured on node
-  // v22.23.2 -- see test/llm-real.test.js's own block for the full table.
-  return { status: null, stdout: '', stderr: '', signal };
-}
+// (a hung third-party `curl`) does not apply to it at all. externalKillSpawnResult itself moved
+// next to timeoutSpawnResult above (card #239 chantier, action A5b-2) -- both are `fakeClaudeSpawn`
+// outcome sentinels now, so they read better defined together.
 
 test('triageBugReport: an EXTERNAL kill is NOT retried -- it is not a timeout, and the retry costs a real metered call', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return externalKillSpawnResult();
-    },
+    }),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(calls, 1, 'exactly one call -- the second one was the bug');
   assert.equal(result.ok, false);
   assert.equal(result.retriedAfterTimeout, undefined);
-  assert.match(result.error, /killed by signal SIGTERM/);
+  // Card #239 chantier, action A5b-2: the old transport's own message text ("llm.js: claude was
+  // killed by signal SIGTERM ...") does not exist on this transport -- an external kill now
+  // surfaces via consumeQueryStream's thrown-mid-iteration branch, whose text is the REAL vendored
+  // SDK's own `getProcessExitError` message (vendor/claude-agent-sdk/sdk.mjs, grepped directly):
+  // "Claude Code process terminated by signal SIGTERM". Different words, same distinguishing
+  // property this test cares about -- it names the SIGNAL, not a deadline.
+  assert.match(result.error, /terminated by signal SIGTERM/);
   assert.doesNotMatch(result.error, /exceeded the \d+ms deadline/);
 });
 
 test('triageBugReport: a genuine deadline kill is STILL retried -- the fix must not disarm the retry it was built for', async () => {
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return calls === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
-    },
+    }),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(calls, 2);
@@ -1434,18 +1514,19 @@ test('triageBugReport: a genuine deadline kill is STILL retried -- the fix must 
 test('triageBugReport: a genuine deadline kill in the shape the corpus records (signal null, exit 143) is retried too', async () => {
   // `claude` traps SIGTERM and exits 143 itself, so every one of the 9 recorded deadline kills in
   // ~/.spo-state/journal has `signal: null` -- the shape the deleted clause could never have
-  // classified, and the one this retry has always actually run on.
+  // classified, and the one this retry has always actually run on. This transport reports no OS
+  // exit code at all (sdk-call.js's own header, decision 1) -- timeoutSpawnResult's 'HANG'
+  // sentinel plus a real deadline is the equivalent fixture now; there is no separate "exit 143"
+  // shape left to construct.
   let calls = 0;
-  const err = new Error('spawnSync claude ETIMEDOUT');
-  err.code = 'ETIMEDOUT';
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
-      return calls === 1
-        ? { error: err, status: 143, stdout: '', stderr: '', signal: null }
-        : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
-    },
+      return calls === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
+    }),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(calls, 2);
@@ -1453,17 +1534,29 @@ test('triageBugReport: a genuine deadline kill in the shape the corpus records (
 });
 
 test('triageBugReport: a retry followed by an unusable reply still carries retriedAfterTimeout', async () => {
+  // "Unusable" here means unusable at the TRANSPORT level (raw.ok itself false), not merely a
+  // result string triageBugReport's own JSON.parse later rejects -- retriedAfterTimeout.retryOk is
+  // set from invokeClaudeReal's own raw.ok, before any content-level parsing runs (see
+  // callIntakeStepWithRotation's own loop, orchestrator/intake.js). The OLD fixture achieved this
+  // by making the WHOLE spawnSync stdout wrapper fail JSON.parse (`stdout: 'not json at all'`,
+  // never wrapped in a flat reply object at all) -- there is no equivalent "wrapper" on this
+  // transport (a message is already a real object, never a string needing an outer parse), so the
+  // faithful equivalent is a stream that never produces a result message at all (consumeQueryStream's
+  // own "stream ended with no result message" branch -- sdk-call.js's header item 5): an init
+  // message, then a clean exit, with nothing usable in between.
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
-      return calls === 1 ? timeoutSpawnResult() : { status: 0, stdout: 'not json at all', stderr: '', signal: null };
-    },
+      return calls === 1 ? timeoutSpawnResult() : [initMessage()];
+    }),
   };
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
   assert.equal(result.ok, false);
-  assert.match(result.error, /not valid JSON/);
+  assert.match(result.error, /no result message/);
   assert.equal(result.retriedAfterTimeout.retryOk, false);
 });
 
@@ -1477,12 +1570,13 @@ test('triageBugReport: a kind:\'limit\' failure on the first account rotates to 
   const accountsDir = twoAccountPoolDir();
   const seenOpts = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) => {
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seenOpts.push(opts);
       if (opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')) return limitSpawnResult();
       return okSpawnResult({ outcome: 'not-reproduced', reason: 'no matching log line' });
-    },
+    }),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1498,11 +1592,13 @@ test('triageBugReport: a kind:\'limit\' failure on the first account rotates to 
 test('triageBugReport: the limited account is actually cooled down (markLimit written to state.json)', async () => {
   const accountsDir = twoAccountPoolDir();
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) =>
+    spawn: fakeClaudeSpawn((command, args, opts) =>
       opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')
         ? limitSpawnResult()
-        : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' }),
+        : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' })
+    ),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1523,11 +1619,13 @@ test('triageBugReport: the limited account is actually cooled down (markLimit wr
 test('triageBugReport: a 529 (overloaded) failure cools the account for the short 5-minute tier, not the 5-hour usage tier', async () => {
   const accountsDir = twoAccountPoolDir();
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) =>
+    spawn: fakeClaudeSpawn((command, args, opts) =>
       opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')
         ? overloadedSpawnResult()
-        : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' }),
+        : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' })
+    ),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1545,11 +1643,12 @@ test('triageBugReport: every account limited -> {ok:false, error} naming the exh
   const accountsDir = twoAccountPoolDir();
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: () => {
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return limitSpawnResult();
-    },
+    }),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1586,16 +1685,12 @@ test('triageBugReport: a normal (non-limit, non-timeout) failure does not rotate
   const accountsDir = twoAccountPoolDir();
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: () => {
+    spawn: fakeClaudeSpawn(() => {
       calls++;
-      return {
-        status: 1,
-        stdout: JSON.stringify(realShapedReply('bad schema', { is_error: true, api_error_status: 400 })),
-        stderr: '',
-        signal: null,
-      };
-    },
+      return realShapedReply('bad schema', { is_error: true, api_error_status: 400 });
+    }),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1616,11 +1711,13 @@ test('triageBugReport: a timeout retries on the SAME account (never rotates) and
   const accountsDir = twoAccountPoolDir();
   const seenOpts = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seenOpts.push(opts);
       return seenOpts.length === 1 ? timeoutSpawnResult() : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' });
-    },
+    }),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1645,13 +1742,15 @@ test('triageBugReport: a timeout retry that then hits a limit still carries retr
   const accountsDir = twoAccountPoolDir();
   const seenOpts = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: (command, args, opts) => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seenOpts.push(opts);
       if (seenOpts.length === 1) return timeoutSpawnResult(); // acct1, first call
       if (seenOpts.length === 2) return limitSpawnResult(); // acct1, same-account retry -> limit
       return okSpawnResult({ outcome: 'not-reproduced', reason: 'x' }); // acct2
-    },
+    }),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -1672,11 +1771,13 @@ test('triageBugReport: a timeout retry followed by pool exhaustion still carries
   const accountsDir = twoAccountPoolDir();
   let calls = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir,
-    spawnSync: () => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       calls++;
       return calls === 1 ? timeoutSpawnResult() : limitSpawnResult();
-    },
+    }),
   };
 
   const result = await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -3025,11 +3126,12 @@ test(
 test('triageBugReport: runs on opus at medium effort -- the argv the CLI actually receives', async () => {
   const seenArgs = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: (command, args) => {
+    spawn: fakeClaudeSpawn((command, args) => {
       seenArgs.push(args);
       return okSpawnResult({ outcome: 'draft', draft: VALID_DRAFT });
-    },
+    }),
   };
 
   await intake.triageBugReport('/tmp/report.json', 501, deps);
@@ -3055,12 +3157,13 @@ test('draftCard: the account lease is HELD for the whole spawn, and released aft
   let leaseHeldDuringSpawn = null;
   let holderDuringSpawn = null;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: dir,
-    spawnSync: fakeSpawnSync((command, args, opts) => {
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       assert.ok(opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1'));
       leaseHeldDuringSpawn = fs.existsSync(leaseFile);
       holderDuringSpawn = leaseHeldDuringSpawn ? JSON.parse(fs.readFileSync(leaseFile, 'utf8')) : null;
-      return { status: 0, stdout: JSON.stringify(realShapedReply(VALID_DRAFT)), stderr: '', signal: null };
+      return realShapedReply(VALID_DRAFT);
     }),
   };
 
@@ -3083,10 +3186,11 @@ test('draftCard: an account leased by another LIVE process is skipped -- the oth
 
   const seen = [];
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: dir,
-    spawnSync: fakeSpawnSync((command, args, opts) => {
+    spawn: fakeClaudeSpawn((command, args, opts) => {
       seen.push(path.basename(opts.env.CLAUDE_CONFIG_DIR));
-      return { status: 0, stdout: JSON.stringify(realShapedReply(VALID_DRAFT)), stderr: '', signal: null };
+      return realShapedReply(VALID_DRAFT);
     }),
   };
 
@@ -3136,14 +3240,10 @@ function readDaemonLlmCalls(journalRoot) {
 test('draftCard: journals an `llm-call` into daemon.jsonl with the same fields a pipeline step writes', async () => {
   const journalRoot = mkTmp('spo-intake-journal-');
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
     journalRoot,
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 900, cc: 8000, cr: 21000, out: 50 })),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => replyWithTokens(VALID_DRAFT, { fi: 900, cc: 8000, cr: 21000, out: 50 })),
   };
 
   const result = await intake.draftCard('anything', deps);
@@ -3177,35 +3277,25 @@ test('draftCard: journals an `llm-call` into daemon.jsonl with the same fields a
 test('reviewCard and triageBugReport journal their own step names and models, never draftCard\'s', async () => {
   const journalRoot = mkTmp('spo-intake-journal-review-');
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
     journalRoot,
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(
-        replyWithTokens(
-          { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' },
-          { fi: 10, cc: 20, cr: 30, out: 40 }
-        )
-      ),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() =>
+      replyWithTokens(
+        { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' },
+        { fi: 10, cc: 20, cr: 30, out: 40 }
+      )
+    ),
   };
   const reviewed = await intake.reviewCard(VALID_DRAFT, deps);
   assert.equal(reviewed.ok, true);
 
   const triageJournalRoot = mkTmp('spo-intake-journal-triage-');
   const triaged = await intake.triageBugReport('/tmp/report.json', 501, {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
     journalRoot: triageJournalRoot,
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(
-        replyWithTokens({ outcome: 'draft', draft: VALID_DRAFT }, { fi: 3, cc: 4, cr: 5, out: 6 })
-      ),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => replyWithTokens({ outcome: 'draft', draft: VALID_DRAFT }, { fi: 3, cc: 4, cr: 5, out: 6 })),
   });
   assert.equal(triaged.ok, true);
 
@@ -3226,17 +3316,14 @@ test('a deadline-timeout retry journals TWO llm-call events -- one per call, bec
   const journalRoot = mkTmp('spo-intake-journal-retry-');
   let n = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
     journalRoot,
-    spawnSync: fakeSpawnSync(() => {
+    deadlineMs: 30,
+    spawn: fakeClaudeSpawn(() => {
       n += 1;
-      if (n === 1) return timeoutResult();
-      return {
-        status: 0,
-        stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 5, cc: 0, cr: 0, out: 1 })),
-        stderr: '',
-        signal: null,
-      };
+      if (n === 1) return timeoutSpawnResult();
+      return replyWithTokens(VALID_DRAFT, { fi: 5, cc: 0, cr: 0, out: 1 });
     }),
   };
 
@@ -3258,17 +3345,13 @@ test('an account rotation journals one llm-call per account tried -- the cooled 
   const journalRoot = mkTmp('spo-intake-journal-rotate-');
   let n = 0;
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: twoAccountPoolDir(),
     journalRoot,
-    spawnSync: fakeSpawnSync(() => {
+    spawn: fakeClaudeSpawn(() => {
       n += 1;
       if (n === 1) return limitSpawnResult();
-      return {
-        status: 0,
-        stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 7, cc: 0, cr: 0, out: 2 })),
-        stderr: '',
-        signal: null,
-      };
+      return replyWithTokens(VALID_DRAFT, { fi: 7, cc: 0, cr: 0, out: 2 });
     }),
   };
 
@@ -3285,13 +3368,9 @@ test('no journalRoot in deps -> no journal write, and the call still returns nor
   // requirement would have turned each of them into an ENOENT rather than a test failure with a
   // readable cause -- and `spo pull` and any future caller with no journal must stay callable.
   const deps = {
+    ...fakeExecDeps(),
     accountsDir: poolDir(),
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify(replyWithTokens(VALID_DRAFT, { fi: 1, cc: 1, cr: 1, out: 1 })),
-      stderr: '',
-      signal: null,
-    })),
+    spawn: fakeClaudeSpawn(() => replyWithTokens(VALID_DRAFT, { fi: 1, cc: 1, cr: 1, out: 1 })),
   };
   return intake.draftCard('anything', deps).then((result) => {
     assert.equal(result.ok, true);

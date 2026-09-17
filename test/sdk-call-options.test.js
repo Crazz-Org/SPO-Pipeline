@@ -15,21 +15,19 @@ const { mkTmp } = require('./helpers');
 // before the orchestrator require(s) below. It patches spawnSync only (not the async spawn()
 // query() itself uses for test 3 below) -- see that module's own "scope: spawnSync only" comment.
 //
-// F8 (Opus verifier, killswitch check, fix pass): this builder's own earlier "not a gap in the
-// guard" characterization of test 3's real `query()` spawn is CONFIRMED, but not for the reason
-// originally given (analogy with test/helpers.js's sanctioned execFileSync boundary). The real
-// reason: this whole FILE, like orchestrator/steps/sdk-call.js itself, never reaches a live
-// `claude` process either way -- test 3's `query()` spawns a throwaway `node` fixture, never
-// `claude`, and buildQueryOptions the module under test never spawns anything at all (it only
-// resolves a PATH string). SPO_NO_REAL_SPAWN has nothing to guard against here today. What DOES
-// need guarding -- a REAL `query()` call reaching a REAL `claude` -- does not exist until A5 wires
-// invokeClaudeReal to this module, and the killswitch's actual future hook is
-// `options.spawnClaudeCodeProcess`, not a `child_process.spawn` patch (patching `spawn` cannot
-// reliably intercept the SDK's own ESM-linked import of it, and would break dispatcher.js's three
-// legitimate spawn call sites besides) -- see orchestrator/steps/sdk-call.js's own header, "the
-// no-real-spawn killswitch: safe today, but its future hook belongs to A5, not here", for both
-// measurements. Nothing in THIS action or THIS test file needs to change as a result; the note
-// exists so A5 does not have to re-derive the mechanism.
+// F8 (Opus verifier, killswitch check, fix pass; UPDATED by action A5b, the cutover this note
+// used to describe as future work): the killswitch's real hook, `options.spawnClaudeCodeProcess`
+// (never a `child_process.spawn` patch -- patching `spawn` cannot reliably intercept the SDK's own
+// ESM-linked import of it, and would break dispatcher.js's three legitimate spawn call sites
+// besides), is now WIRED by `buildQueryOptions` itself, unconditionally, for every call this
+// module builds options for -- not merely a future hook A5 would add. That means this file's own
+// test 3 below (the one real `query()` spawn in this file, a throwaway `node` fixture that dumps
+// argv and exits, never `claude`) now ALSO passes through that same check, and this file's own
+// top-of-file `require('./no-real-spawn')` arms SPO_NO_REAL_SPAWN process-wide (see that require's
+// own comment) -- so test 3 opts back out explicitly, via `isNoRealSpawnEnabled: () => false` in
+// its own deps, rather than being silently blocked. See that test's own comment for why this is
+// safe (the fixture is not `claude`, and the override is deps-scoped, not an env mutation that
+// could leak into a sibling test).
 require('./no-real-spawn');
 
 const {
@@ -38,11 +36,12 @@ const {
   buildEnv,
   SETTING_SOURCES,
   ANTHROPIC_ENV_KEYS_TO_STRIP,
+  SDK_ABORT_KILL_DELAY_MS,
+  SDK_ABORT_SIGKILL_ESCALATION_MS,
   OauthTokenUnreadableError,
   ClaudeExecutableNotFoundError,
   JsonSchemaParseError,
 } = require('../orchestrator/steps/sdk-call');
-const { buildArgv } = require('../orchestrator/steps/llm');
 const { resolveStepContract } = require('../orchestrator/step-contracts');
 const { loadQuery } = require('../orchestrator/sdk');
 
@@ -52,9 +51,9 @@ function fakeResolver(returnValue) {
   return () => returnValue;
 }
 
-// Splits a flat argv array into a map of flag -> value(s), the same shape both buildArgv's output
-// and options-derived expectations can be read back from generically, so test 1 below can compare
-// the two transports' outputs without hand-copying either one's literal argv.
+// Splits a flat argv array (as dumped by test 3's real `query()` fixture, below) into a map of
+// flag -> value, so that test can read the SDK's own real argv output back generically instead of
+// hand-parsing a positional array.
 function argvFlagValue(argv, flag) {
   const i = argv.indexOf(flag);
   return i === -1 ? undefined : argv[i + 1];
@@ -63,10 +62,16 @@ function argvFlagValue(argv, flag) {
 // ---- test 1: contract parity, table-driven over the five real step contracts -------------------
 //
 // Derives its expectations from resolveStepContract's own output (the ground truth every real
-// `kind: "card"` call resolves against, steps/llm.js's runLlm) and cross-checks them against
-// buildArgv's argv (today's actual transport) rather than against hand-copied literals -- so a
-// future change to any step's model/effort/tools/schema is caught here without this file needing
-// an edit.
+// `kind: "card"` call resolves against, steps/llm.js's runLlm) and checks buildQueryOptions's
+// `options` directly against it -- so a future change to any step's model/effort/tools/schema is
+// caught here without this file needing an edit.
+//
+// Action A5b (card #239 chantier, the cutover): this test used to ALSO cross-check against
+// buildArgv's argv (the old spawnSync transport, kept alive purely so this test could compare the
+// two). buildArgv is deleted -- there is only one transport now, so there is nothing left to cross
+// -check against; this test lost that half of its own value the moment the thing it was comparing
+// against stopped existing, not because this action weakened it. What remains (the assertions
+// against `contract` directly) is the SAME rigor the old test always had on that half.
 const REAL_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE', 'CITATION_VERIFIER'];
 
 for (const step of REAL_STEPS) {
@@ -86,40 +91,112 @@ for (const step of REAL_STEPS) {
     };
 
     const { options } = buildQueryOptions(opts, { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) });
-    const argv = buildArgv(opts); // today's actual transport, for cross-checking below
 
     // model / effort / permissionMode: every one of these five contracts sets all three, so
     // asserting equality (not just "when truthy") is a real assertion, not a vacuous one.
     assert.equal(options.model, contract.model);
-    assert.equal(argvFlagValue(argv, '--model'), options.model);
     assert.equal(options.effort, contract.effort);
-    assert.equal(argvFlagValue(argv, '--effort'), options.effort);
     assert.equal(options.permissionMode, contract.permissionMode);
-    assert.equal(argvFlagValue(argv, '--permission-mode'), options.permissionMode);
 
-    // allowedTools: the SDK wants an array (comma-joined internally); buildArgv's argv carries the
-    // SAME set space-joined into one string. Splitting that string on whitespace must reproduce
-    // the array buildQueryOptions produced -- this is the parity check for the one silent
-    // behaviour change this action's header documents (comma vs space join).
+    // allowedTools: the SDK wants an array (comma-joined internally, see this file's own header
+    // measurement) -- step-contracts.js's own contract already carries one.
     assert.deepEqual(options.allowedTools, contract.allowedTools);
-    assert.deepEqual(argvFlagValue(argv, '--allowedTools').split(' '), options.allowedTools);
 
     // jsonSchema -> outputFormat.schema: every one of these five contracts declares a jsonSchema
     // object (resolveStepContract always builds one, even when `properties` is undefined -- see
     // step-contracts.js's own `jsonSchema: {type: 'object', required: ..., ...}`).
     assert.deepEqual(options.outputFormat, { type: 'json_schema', schema: contract.jsonSchema });
-    assert.deepEqual(JSON.parse(argvFlagValue(argv, '--json-schema')), contract.jsonSchema);
 
     // maxBudgetUsd: none of the five real contracts set one (resolveStepContract's own comment:
     // "No $ cap ... no production path sets this any more") -- so the key must be OMITTED from
-    // options, not merely falsy, and --max-budget-usd must be absent from argv too. Asserted
-    // structurally (typeof, 'in') rather than assuming the value, so this still holds if that
-    // ever changes for one step.
+    // options, not merely falsy. Asserted structurally (typeof, 'in') rather than assuming the
+    // value, so this still holds if that ever changes for one step.
     assert.equal(typeof contract.maxBudgetUsd, 'undefined');
     assert.equal('maxBudgetUsd' in options, false);
-    assert.equal(argv.includes('--max-budget-usd'), false);
   });
 }
+
+// ---- test: action A5b's own additions to buildQueryOptions -- abortController and
+// spawnClaudeCodeProcess/getSpawnedProcess -----------------------------------------------------
+test('buildQueryOptions: sets a fresh, real AbortController on options.abortController, one per call', () => {
+  const first = buildQueryOptions(
+    { promptText: 'a', cwd: '/tmp' },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+  );
+  const second = buildQueryOptions(
+    { promptText: 'b', cwd: '/tmp' },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+  );
+  assert.ok(first.options.abortController instanceof AbortController);
+  assert.ok(second.options.abortController instanceof AbortController);
+  assert.notEqual(first.options.abortController, second.options.abortController, 'each call must get its own controller, never a shared one');
+  assert.equal(first.options.abortController.signal.aborted, false);
+});
+
+test('buildQueryOptions: sets options.spawnClaudeCodeProcess to a function, and returns a getSpawnedProcess accessor', () => {
+  const { options, getSpawnedProcess } = buildQueryOptions(
+    { promptText: 'a', cwd: '/tmp' },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+  );
+  assert.equal(typeof options.spawnClaudeCodeProcess, 'function');
+  assert.equal(typeof getSpawnedProcess, 'function');
+  // Nothing has called query() yet in this test -- the hook has never fired, so there is no
+  // captured process to read back.
+  assert.equal(getSpawnedProcess(), undefined);
+});
+
+test('buildQueryOptions: spawnClaudeCodeProcess throws ENOREALSPAWN when SPO_NO_REAL_SPAWN is armed, and spawns nothing', () => {
+  const { options } = buildQueryOptions(
+    { promptText: 'a', cwd: '/tmp' },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH), isNoRealSpawnEnabled: () => true }
+  );
+  assert.throws(
+    () => options.spawnClaudeCodeProcess({ command: 'node', args: [], cwd: '/tmp', env: {} }),
+    (err) => err.code === 'ENOREALSPAWN'
+  );
+});
+
+test('buildQueryOptions: spawnClaudeCodeProcess reads the killswitch fresh at CALL time, not at buildQueryOptions\'s own call time', () => {
+  // The armed/unarmed decision must not be baked in when `options` is built -- a deadline race
+  // could arm the var well after this function returned (see sdk-call.js's own header on this
+  // hook). Simulated here with a stateful injected isNoRealSpawnEnabled rather than mutating
+  // process.env, so this test can never leak a real env change into a sibling test.
+  let armed = false;
+  const { options } = buildQueryOptions(
+    { promptText: 'a', cwd: '/tmp' },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH), isNoRealSpawnEnabled: () => armed }
+  );
+  armed = true;
+  assert.throws(
+    () => options.spawnClaudeCodeProcess({ command: 'node', args: [], cwd: '/tmp', env: {} }),
+    (err) => err.code === 'ENOREALSPAWN'
+  );
+});
+
+// ---- test: the SDK's own kill-escalation constants stay pinned to the vendored source ----------
+test('SDK_ABORT_KILL_DELAY_MS and SDK_ABORT_SIGKILL_ESCALATION_MS are still the literals the vendored SDK declares -- a re-vendor that changes either must fail this, not silently invalidate the grace-window derivation', () => {
+  const vendoredSrc = fs.readFileSync(path.join(__dirname, '..', 'vendor', 'claude-agent-sdk', 'sdk.mjs'), 'utf8');
+  assert.match(
+    vendoredSrc,
+    new RegExp(`q1e=${SDK_ABORT_KILL_DELAY_MS}\\b`),
+    'the vendored source no longer declares the 2000ms outer delay this constant was measured from -- re-derive ABORT_CONFIRM_GRACE_MS from the new source before trusting it'
+  );
+  // F1 (Opus verifier, fix pass): `new RegExp(\`,${SDK_ABORT_SIGKILL_ESCALATION_MS},\`)` (a bare
+  // `,5000,`) is UNANCHORED -- the vendored source declares TWO separate `,5000,` sites (win32's
+  // `setTimeout((l,u)=>{...},5000,a,c).unref()` and the POSIX branch below), so this pin could go
+  // on passing even if the ONE branch Linux actually takes (the POSIX SIGTERM->SIGKILL escalation
+  // this file's own ABORT_CONFIRM_GRACE_MS is derived from) changed its literal, as long as the
+  // OTHER, platform-irrelevant site still said 5000. MEASURED: mutating only the POSIX literal
+  // (5000 -> 3000, in a /tmp clone of the vendored file, never this worktree) left the old pin
+  // GREEN. Anchored to the POSIX branch's own exact surrounding code instead -- the SIGTERM kill
+  // immediately followed by the SIGKILL-escalation setTimeout literal -- so a change to either
+  // `,5000,` site this constant does NOT derive from can no longer masquerade as the one it does.
+  assert.match(
+    vendoredSrc,
+    new RegExp(`kill\\("SIGTERM"\\),setTimeout\\(\\(l\\)=>\\{if\\(l\\.exitCode===null\\)l\\.kill\\("SIGKILL"\\)\\},${SDK_ABORT_SIGKILL_ESCALATION_MS},`),
+    'the vendored source no longer declares the 5000ms SIGTERM->SIGKILL escalation this constant was measured from -- re-derive ABORT_CONFIRM_GRACE_MS from the new source before trusting it'
+  );
+});
 
 // ---- test: normalizeAllowedTools's own two supported shapes ------------------------------------
 
@@ -485,7 +562,15 @@ test('buildQueryOptions: a real query() spawn emits the exact measured argv shap
         cwd: tmpDir,
         account: null,
       },
-      { resolveClaudeCodeExecutable: fakeResolver(fixturePath) }
+      // Action A5b wired `options.spawnClaudeCodeProcess` to the SAME killswitch check
+      // (no-real-spawn-guard's isEnabled(process.env)) this file's own top-of-file
+      // `require('./no-real-spawn')` arms process-wide (see that require's own comment). This
+      // test's spawn is the one this file's header already argues is legitimate -- a throwaway
+      // `node` fixture that dumps argv and exits, never `claude`, no network call, no session --
+      // so it opts out of that check the same explicit way a real production call never would:
+      // isNoRealSpawnEnabled is a deps injection point, not an env mutation, so nothing here
+      // weakens the killswitch for any other test or any real call.
+      { resolveClaudeCodeExecutable: fakeResolver(fixturePath), isNoRealSpawnEnabled: () => false }
     ));
 
     const query = await loadQuery();

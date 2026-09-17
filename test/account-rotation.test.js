@@ -18,7 +18,7 @@ const { callLlmStep, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const accounts = require('../orchestrator/accounts');
 const { leaseFilePath } = require('../orchestrator/account-lease');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 
 // Discovery-based pool: one subdirectory per account (see orchestrator/accounts.js). `list` is
@@ -32,17 +32,46 @@ function writeRegistry(dir, list) {
   );
 }
 
-function realShapedPayload(overrides = {}) {
+// Card #239 chantier, action A5b-2 (Job 3): migrated off `deps.spawnSync`/the old
+// `claude -p`/`--output-format json` transport onto `deps.spawn` (test/helpers.js's
+// `fakeSpawnedChild`) and `deps.resolveClaudeCodeExecutable`/`deps.isNoRealSpawnEnabled`
+// (`fakeExecDeps`) -- same seam as test/llm-real-card.test.js. `initMessage`/`resultMessage` are
+// this file's equivalent of the old flat `realShapedPayload()`: a `system`/`init` stream-json
+// message reporting a session id, then a `result` message. Every `spawn(command, args, opts)`
+// fake below can still inspect `opts.env.CLAUDE_CONFIG_DIR` exactly as the old `spawnSync(command,
+// args, opts)` fakes did -- `sdk-call.js`'s `spawnClaudeCodeProcess` calls the injected `deps.spawn`
+// with the SAME `{cwd, env, signal, ...}` third argument shape the old transport's spawnSync got.
+function initMessage(sessionId = 'sess-abc') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+function resultMessage(overrides = {}) {
   return {
-    result: 'ok',
+    type: 'result',
+    subtype: 'success',
     is_error: false,
     num_turns: 1,
     session_id: 'sess-abc',
-    modelUsage: { 'claude-haiku-4-5': { costUSD: 0.001 } },
+    modelUsage: { 'claude-haiku-4-5': { inputTokens: 10, outputTokens: 5 } },
+    result: 'ok',
     terminal_reason: 'success',
     api_error_status: null,
     ...overrides,
   };
+}
+
+// cardShapedResult(resultObj, overrides) -- the real `kind: "card"` path's reply needs `result` to
+// be the JSON-ENCODED payload string (runLlm's `JSON.parse(raw.result)`), not the bare string
+// literal `resultMessage()`'s own default carries -- mirrors test/llm-real-card.test.js's own
+// `resultMessage(resultObj, overrides)` helper, kept as a separate name here since this file also
+// keeps the flat `resultMessage(overrides)` shape for its many non-card (`ctx.task.llm.<step>`
+// override path) tests above.
+function cardShapedResult(resultObj, overrides = {}) {
+  return resultMessage({
+    result: JSON.stringify(resultObj),
+    modelUsage: { 'claude-fable-5': { inputTokens: 20, outputTokens: 8 } },
+    ...overrides,
+  });
 }
 
 function makeCtx({ taskDir, accountsDir, task }) {
@@ -76,20 +105,15 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
   });
 
   let call = 0;
-  const spawnSync = () => {
+  const spawn = () => {
     call += 1;
     if (call === 1) {
-      return {
-        status: 1,
-        stdout: JSON.stringify(realShapedPayload({ is_error: true, api_error_status: 429, result: 'rate limited' })),
-        stderr: '',
-        signal: null,
-      };
+      return fakeSpawnedChild([initMessage(), resultMessage({ is_error: true, api_error_status: 429, result: 'rate limited' })]);
     }
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(call, 2);
   assert.equal(result.ok, true);
@@ -177,14 +201,9 @@ test('429 (usage limit) through callLlmStep on an account whose PROBE already ex
     task: { id: 't2', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan it' } } },
   });
 
-  const spawnSync = () => ({
-    status: 1,
-    stdout: JSON.stringify(realShapedPayload({ is_error: true, api_error_status: 429, result: 'rate limited again' })),
-    stderr: '',
-    signal: null,
-  });
+  const spawn = () => fakeSpawnedChild([initMessage(), resultMessage({ is_error: true, api_error_status: 429, result: 'rate limited again' })]);
 
-  await assert.rejects(() => callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync }), ParkSignal);
+  await assert.rejects(() => callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn })), ParkSignal);
 
   const state = accounts.readState(accountsDir);
   // Same fix as the probe-tier test above: an exact relationship between the two fields
@@ -223,22 +242,18 @@ test('529 (overloaded) on the first account cools it for 5 minutes only, and rot
   });
 
   let call = 0;
-  const spawnSync = () => {
+  const spawn = () => {
     call += 1;
     if (call === 1) {
-      return {
-        status: 1,
-        stdout: JSON.stringify(
-          realShapedPayload({ is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error', result: 'overloaded' })
-        ),
-        stderr: '',
-        signal: null,
-      };
+      return fakeSpawnedChild([
+        initMessage(),
+        resultMessage({ is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error', result: 'overloaded' }),
+      ]);
     }
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(call, 2);
   assert.equal(result.ok, true);
@@ -306,46 +321,30 @@ test('529 (overloaded) through the REAL kind:"card" path (no llm.<step> override
     },
   });
 
-  function cardShapedReply(resultObj, overrides = {}) {
-    return realShapedPayload({
-      result: JSON.stringify(resultObj),
-      modelUsage: { 'claude-fable-5': { costUSD: 0.002 } },
-      ...overrides,
-    });
-  }
-
   let call = 0;
-  const spawnSync = () => {
+  const spawn = () => {
     call += 1;
     if (call === 1) {
-      return {
-        status: 1,
-        stdout: JSON.stringify(
-          cardShapedReply(
-            {},
-            { is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error', result: 'overloaded' }
-          )
-        ),
-        stderr: '',
-        signal: null,
-      };
+      return fakeSpawnedChild([
+        initMessage(),
+        // is_error on this subtype carries no `result` payload string to JSON.parse -- see
+        // cardShapedResult's own header; a 529 failure never reaches runLlm's JSON.parse at all
+        // (raw.ok is false first), so passing `{}` through the JSON-encode here is harmless.
+        cardShapedResult({}, { is_error: true, api_error_status: 529, terminal_reason: 'overloaded_error', result: 'overloaded' }),
+      ]);
     }
-    return {
-      status: 0,
-      stdout: JSON.stringify(
-        cardShapedReply({
-          plan_markdown: '# Plan\n\nAdd a widget.\n',
-          invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
-          invariant_ids: [],
-          check_commands: ['npm run typecheck'],
-        })
-      ),
-      stderr: '',
-      signal: null,
-    };
+    return fakeSpawnedChild([
+      initMessage(),
+      cardShapedResult({
+        plan_markdown: '# Plan\n\nAdd a widget.\n',
+        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+        invariant_ids: [],
+        check_commands: ['npm run typecheck'],
+      }),
+    ]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(call, 2, 'first account 529s, second serves the real reply');
   assert.equal(result.ok, true);
@@ -382,17 +381,12 @@ test('a non-limit error fails on the first attempt without rotating accounts', a
   });
 
   let call = 0;
-  const spawnSync = () => {
+  const spawn = () => {
     call += 1;
-    return {
-      status: 1,
-      stdout: JSON.stringify(realShapedPayload({ is_error: true, api_error_status: 400, result: 'bad schema' })),
-      stderr: '',
-      signal: null,
-    };
+    return fakeSpawnedChild([initMessage(), resultMessage({ is_error: true, api_error_status: 400, result: 'bad schema' })]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(call, 1, 'must not retry on a non-limit failure');
   assert.equal(result.ok, false);
@@ -417,14 +411,9 @@ test('every account limited -> one pass over the registry, then ParkSignal', asy
   });
 
   let call = 0;
-  const spawnSync = () => {
+  const spawn = () => {
     call += 1;
-    return {
-      status: 1,
-      stdout: JSON.stringify(realShapedPayload({ is_error: true, api_error_status: 429, result: 'rate limited' })),
-      stderr: '',
-      signal: null,
-    };
+    return fakeSpawnedChild([initMessage(), resultMessage({ is_error: true, api_error_status: 429, result: 'rate limited' })]);
   };
 
   // R6 (F3): exhausting the pool inside the loop means callLlmStep's own ParkSignal, not pick()'s
@@ -432,7 +421,7 @@ test('every account limited -> one pass over the registry, then ParkSignal', asy
   // count and a stale lastResult.
   let caught = null;
   try {
-    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   } catch (err) {
     caught = err;
   }
@@ -460,14 +449,14 @@ test('starting with every account already cooling -> ParkSignal without spawning
   });
 
   let called = false;
-  const spawnSync = () => {
+  const spawn = () => {
     called = true;
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
   let caught = null;
   try {
-    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   } catch (err) {
     caught = err;
   }
@@ -487,14 +476,14 @@ test('an empty pool (no accounts registered at all) -> ParkSignal("no-accounts-r
   });
 
   let called = false;
-  const spawnSync = () => {
+  const spawn = () => {
     called = true;
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
   let caught = null;
   try {
-    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   } catch (err) {
     caught = err;
   }
@@ -516,8 +505,8 @@ test('callLlmStep: the leased account is released once the call succeeds', async
     task: { id: 't1', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan it' } } },
   });
 
-  const spawnSync = () => ({ status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null });
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const spawn = () => fakeSpawnedChild([initMessage(), resultMessage()]);
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(result.ok, true);
   assert.equal(
@@ -538,16 +527,29 @@ test('callLlmStep: the leased account is released even when the step THROWS', as
     task: { id: 't1', llm: { PLAN: { model: 'fable', effort: 'medium', promptText: 'plan it' } } },
   });
 
-  // A spawnSync that throws synchronously reaches invokeClaudeReal as an unhandled rejection
-  // (steps/llm.js's own header: "only a programming error throws"), which propagates straight
-  // through callWithDeadline (it only ever catches DeadlineError) and out of callLlmStep's own
-  // try block -- exactly the path the spec's item 9 asks to be covered, and exactly why the
-  // release has to live in a `finally`, not just after a normal return.
-  const spawnSync = () => {
+  // Card #239 chantier, action A5b-2 (Job 3): a `deps.spawn` that throws synchronously no longer
+  // reaches callLlmStep as an uncaught exception on this transport -- MEASURED (this action):
+  // `spawnClaudeCodeProcess` (sdk-call.js) calls the injected `deps.spawn` synchronously during
+  // `query()`'s own construction, and a throw there DOES propagate out of `query()` itself (that
+  // file's own header), but `invokeClaudeReal`'s `stream = queryFn({prompt, options})` call site
+  // (llm.js) wraps that in an UNCONDITIONAL try/catch that turns ANY throw there into an ordinary
+  // `{ok:false, kind:'error', error:'llm.js: query() failed to start: ...'}` step failure -- never
+  // a rethrow. So a throwing `deps.spawn` can no longer stand in for "a real programming-error-
+  // shaped throw" the way the old transport's throwing `deps.spawnSync` did (a real synchronous
+  // spawnSync call had no such catch around it).
+  //
+  // The equivalent seam that DOES still propagate uncaught: `deps.buildQueryOptions`, called from
+  // `invokeClaudeReal`'s OWN try/catch (llm.js) which only ever swallows THREE named error classes
+  // (OauthTokenUnreadableError/ClaudeExecutableNotFoundError/JsonSchemaParseError) and rethrows
+  // anything else -- exactly the "only a programming error throws" contract this test exists to
+  // exercise, unchanged by the cutover, just moved one seam over. A bare Error from
+  // `deps.buildQueryOptions` propagates through callLlmStep exactly like the old throwing spawnSync
+  // did, exercising the identical release-in-a-`finally` path this test's own title names.
+  const buildQueryOptions = () => {
     throw new Error('boom -- a real programming-error-shaped throw, not a normal step failure');
   };
 
-  await assert.rejects(() => callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync }), /boom/);
+  await assert.rejects(() => callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ buildQueryOptions })), /boom/);
 
   assert.equal(
     fs.existsSync(leaseFilePath(accountsDir, 'acct-a')),
@@ -574,12 +576,12 @@ test('callLlmStep: an account already leased by another live process is skipped 
   });
 
   const seenConfigDirs = [];
-  const spawnSync = (command, args, opts) => {
+  const spawn = (command, args, opts) => {
     seenConfigDirs.push(opts.env.CLAUDE_CONFIG_DIR);
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(result.ok, true);
   assert.equal(ctx.account.name, 'acct-b', 'acct-a is leased by a live sibling -- must land on acct-b, never call it');
@@ -614,14 +616,14 @@ test('callLlmStep: every healthy account leased -> waits (injected clock/sleep, 
   };
 
   let called = false;
-  const spawnSync = () => {
+  const spawn = () => {
     called = true;
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
   let caught = null;
   try {
-    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync, leaseNow, leaseSleep });
+    await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn, leaseNow, leaseSleep }));
   } catch (err) {
     caught = err;
   }
@@ -656,15 +658,15 @@ test('callLlmStep: the lease is HELD for the whole spawn -- the lease file exist
 
   let leaseSeenDuringSpawn = null;
   let holderDuringSpawn = null;
-  const spawnSync = (command, args, opts) => {
+  const spawn = (command, args, opts) => {
     const name = path.basename(opts.env.CLAUDE_CONFIG_DIR);
     const file = leaseFilePath(accountsDir, name);
     leaseSeenDuringSpawn = fs.existsSync(file);
     holderDuringSpawn = leaseSeenDuringSpawn ? JSON.parse(fs.readFileSync(file, 'utf8')) : null;
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(result.ok, true);
   assert.equal(
@@ -696,7 +698,7 @@ test('callLlmStep: on a limit rotation, each account is leased during its OWN ca
 
   const observed = [];
   let call = 0;
-  const spawnSync = (command, args, opts) => {
+  const spawn = (command, args, opts) => {
     const name = path.basename(opts.env.CLAUDE_CONFIG_DIR);
     observed.push({
       name,
@@ -705,17 +707,12 @@ test('callLlmStep: on a limit rotation, each account is leased during its OWN ca
     });
     call += 1;
     if (call === 1) {
-      return {
-        status: 1,
-        stdout: JSON.stringify(realShapedPayload({ is_error: true, api_error_status: 429, result: 'usage limit' })),
-        stderr: '',
-        signal: null,
-      };
+      return fakeSpawnedChild([initMessage(), resultMessage({ is_error: true, api_error_status: 429, result: 'usage limit' })]);
     }
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
 
-  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', { spawnSync });
+  const result = await callLlmStep(ctx, 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.deepEqual(
     observed,

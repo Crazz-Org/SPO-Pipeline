@@ -1073,3 +1073,152 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });
+
+// ---- addendum, action A5b (card #239 chantier): every real query() call site under orchestrator/
+// uses options buildQueryOptions produced ------------------------------------------------------
+//
+// A DIFFERENT bypass than the rest of this file: not a child process the in-process guard can't
+// see into, but the no-real-spawn KILLSWITCH's own hook (sdk-call.js's `spawnClaudeCodeProcess`,
+// set inside `buildQueryOptions`) being PER-CALL, not global -- a future action that builds its
+// own `{prompt, options}` object by hand (never calling `buildQueryOptions` at all) would construct
+// a `query()` call with no `spawnClaudeCodeProcess` hook at all, and SPO_NO_REAL_SPAWN would have
+// nothing to intercept: `orchestrator/steps/llm.js`'s own top-of-function `isEnabled()` check would
+// still catch it for THAT ONE call site, but only because this action happened to also add that
+// redundant check there -- a new call site copying the "just call query()" shape without also
+// copying that check would slip through both layers at once. This addendum is the guard against
+// that: it does not re-scan for `spawnSync`-shaped calls (the rest of this file's whole subject),
+// it scans for `query(`-shaped calls and checks PROVENANCE of their `options` argument instead.
+//
+// Scope: every `.js` file under orchestrator/ (never vendor/claude-agent-sdk/, which is vendored,
+// not ours to police, and never test/, which is this file's own sibling corpus for a different
+// concern). A call site counts as a real `query()` invocation when it matches
+// `\b(?:query|queryFn)\(\s*\{` with `prompt` and `options` both appearing as keys inside that same
+// balanced `{...}` argument -- deliberately NOT matched against the bare token `query(` alone,
+// which would also catch `orchestrator/project-board.js`'s unrelated GraphQL query STRING
+// (`'query=query($item:ID!...'`) and every comment in sdk-call.js/sdk.js/llm.js that merely
+// mentions `query()` in prose (dozens, see this action's own header comments) -- neither is a real
+// invocation and neither should ever need an ALLOWLIST entry just to be ignored.
+function collectOrchestratorDir(dir) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'vendor') continue; // vendored SDK source, never ours to police
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...collectOrchestratorDir(full));
+    else if (entry.name.endsWith('.js')) out.push(full);
+  }
+  return out;
+}
+
+const ORCHESTRATOR_DIR = path.join(TEST_DIR, '..', 'orchestrator');
+
+// This repo's own comment style is exclusively `//` (grep confirms zero `/* */` blocks in
+// orchestrator/), and its `//` block comments are always whole lines, never a trailing comment
+// appended after real code on the same line at a query() call site -- so blanking every line whose
+// first non-whitespace characters are `//` (replaced with a same-length blank line, to keep every
+// OTHER match's line number correct) removes the dozens of prose mentions of `query({prompt,
+// options})` this file's own header comments carry (sdk-call.js and llm.js each narrate the design
+// this way repeatedly) without needing a real tokenizer for a two-line regex's sake.
+function stripCommentLines(src) {
+  return src
+    .split('\n')
+    .map((line) => (/^\s*\/\//.test(line) ? '' : line))
+    .join('\n');
+}
+
+// F2 (Opus verifier, fix pass): the original `QUERY_CALL_RE` (`/\b(?:query|queryFn)\(\s*\{([^}]{0,
+// 200})\}\s*\)/g`) could not span a NESTED `{...}` inside the call's argument object -- `[^}]`
+// stops at the first `}` it meets, so a hand-built call like `queryFn({prompt, options:{model,
+// cwd}})` never matched the regex AT ALL (the text between the outer braces contains an inner `}`
+// before the pattern's own closing `\}\s*\)`), and silently vanished from the corpus rather than
+// being flagged as an offender -- exactly the shape a bypass would take, and exactly why "a query()
+// call this sweep cannot parse" must never be treated the same as "no query() call here". Replaced
+// with a brace-matching scan (reusing this file's own `matchBalanced`/`skipStringOrComment`, the
+// same helpers the rest of this file already uses to stay string/comment-safe) that finds the
+// REAL end of a `query(`/`queryFn(` call's argument list regardless of nesting depth, and reports
+// -- rather than silently drops -- any call this scan cannot balance-match at all.
+const QUERY_CALL_START_RE = /\b(query|queryFn)\(/g;
+
+function collectQueryCallSites() {
+  const sites = [];
+  for (const file of collectOrchestratorDir(ORCHESTRATOR_DIR)) {
+    const src = stripCommentLines(fs.readFileSync(file, 'utf8'));
+    const rel = path.relative(ORCHESTRATOR_DIR, file);
+    let m;
+    QUERY_CALL_START_RE.lastIndex = 0;
+    while ((m = QUERY_CALL_START_RE.exec(src))) {
+      const lineNo = src.slice(0, m.index).split('\n').length;
+      const openIdx = m.index + m[0].length - 1; // index of the call's own '('
+      const closeIdx = matchBalanced(src, openIdx, '(', ')');
+      if (closeIdx === -1) {
+        sites.push({ file: rel, lineNo, unparseable: true, match: m[0] });
+        continue;
+      }
+      const argsText = src.slice(openIdx + 1, closeIdx).trim();
+      // Only the `query(/queryFn({ ... })` shape (a single object-literal argument) is this
+      // action's own established call shape -- anything else (no args, a bare identifier, several
+      // positional args) is not a candidate for "hand-built options object" at all, and is left
+      // alone the same way the old regex left it alone.
+      if (!(argsText.startsWith('{') && argsText.endsWith('}'))) continue;
+      if (!/\bprompt\b/.test(argsText) || !/\boptions\b/.test(argsText)) continue;
+      sites.push({ file: rel, lineNo, match: `${m[1]}(${argsText})`, argsText });
+    }
+  }
+  return sites;
+}
+
+test('every real query() call site under orchestrator/ passes an `options` argument, never a hand-built object', () => {
+  const sites = collectQueryCallSites();
+
+  // F2 (Opus verifier, fix pass): a call this scan could not balance-match is never silently
+  // dropped -- reported by name here, the same posture the rest of this file already takes for an
+  // unparseable spawn call (see "every real-spawn call site in test/ parses cleanly enough to
+  // classify" above).
+  const unparseable = sites.filter((s) => s.unparseable).map((s) => `${s.file}:${s.lineNo}`);
+  assert.deepEqual(
+    unparseable,
+    [],
+    "query()/queryFn( call site(s) this sweep could not balance-match -- never silently skipped; " +
+      `make the call parseable or fix this sweep's own scanner:\n  ${unparseable.join('\n  ')}`
+  );
+
+  const parsed = sites.filter((s) => !s.unparseable);
+  // Pinned to the ONE real call site this repo has today (steps/llm.js's invokeClaudeReal, action
+  // A5b) -- not an open-ended "at least one", so a second call site added anywhere else forces
+  // whoever adds it to update this list and therefore to read this comment first, rather than
+  // silently joining an already-passing corpus.
+  const expectedFiles = new Set(['steps/llm.js']);
+  const unexpectedFiles = parsed.map((s) => s.file).filter((f) => !expectedFiles.has(f));
+  assert.deepEqual(unexpectedFiles, [], 'a new query() call site appeared outside the audited corpus -- see this test\'s own header before adding it here');
+  assert.ok(parsed.length >= 1, 'expected at least the one known query() call site (steps/llm.js) -- none found, this sweep may have silently stopped matching');
+});
+
+test('every real query() call site under orchestrator/ is fed options that came from buildQueryOptions, in the SAME file', () => {
+  // Provenance, not merely presence: the call argument must be the literal identifier `options`
+  // (matching this repo's own established shape -- destructured off buildQueryOptions's own return
+  // as `{ prompt, options, getSpawnedProcess } = built`), and the containing file must itself
+  // reference `buildQueryOptions` -- either by requiring it directly, or (steps/llm.js's own shape,
+  // to break the circular require with sdk-call.js -- see that file's own header) through a lazy
+  // `require('./sdk-call')` whose destructure names `buildQueryOptions`. A file that calls
+  // `query(` with an `options` argument but never mentions `buildQueryOptions` anywhere in its own
+  // source is exactly the bypass this addendum exists to catch.
+  //
+  // F2 (Opus verifier, fix pass): `referencesBuildQueryOptions` used to be checked against the
+  // RAW file source, which a file's own PROSE satisfies just as well as a real call does -- llm.js's
+  // own header narrates `buildQueryOptions` by name many times over, so a hand-built `options`
+  // object placed anywhere in that file would still read as "references buildQueryOptions" and slip
+  // through. Checked against `stripCommentLines(src)` instead -- the exact same comment-blanking
+  // this file already applies to the call-site scan itself -- so only a REAL, live reference (an
+  // import/require or an actual identifier use in code) counts.
+  const sites = collectQueryCallSites().filter((s) => !s.unparseable);
+  const offenders = [];
+  for (const site of sites) {
+    const argIsOptionsIdentifier = /\boptions\s*[,}]/.test(site.argsText) && !/\boptions\s*:/.test(site.argsText);
+    const fullPath = path.join(ORCHESTRATOR_DIR, site.file);
+    const src = stripCommentLines(fs.readFileSync(fullPath, 'utf8'));
+    const referencesBuildQueryOptions = src.includes('buildQueryOptions');
+    if (!argIsOptionsIdentifier || !referencesBuildQueryOptions) {
+      offenders.push(`${site.file}:${site.lineNo} (${site.match})`);
+    }
+  }
+  assert.deepEqual(offenders, [], 'a query() call site was fed an `options` argument not provably built by buildQueryOptions -- see this test\'s own header');
+});

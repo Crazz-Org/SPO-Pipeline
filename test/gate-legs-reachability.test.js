@@ -114,7 +114,7 @@ const path = require('path');
 require('./no-real-spawn');
 
 const { runTask } = require('../orchestrator/state-machine');
-const { mkTmp, writePoolDir } = require('./helpers');
+const { mkTmp, writePoolDir, fakeSpawnedChild } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -149,7 +149,19 @@ function accountsDir() {
   return dir;
 }
 
+// Card #239 chantier, action A5b-2 (Job 3): every test below builds its own `overrides.deps`
+// (usually just `{spawnSync: makeSpawnSync(...)}`), which used to be the WHOLE deps object a real
+// card call needed. Since the claude call moved off spawnSync onto deps.spawn (the SDK transport's
+// spawnClaudeCodeProcess hook), a bare `{spawnSync}` override would now leave deps.spawn/
+// resolveClaudeCodeExecutable/isNoRealSpawnEnabled unset -- invokeClaudeReal would try to resolve
+// a REAL `claude` on PATH under this file's own top-of-file SPO_NO_REAL_SPAWN arm (require('./no-
+// real-spawn')) and refuse, parking every test on a transport failure instead of the leg under
+// test. Rather than touch each of this file's ~15 `deps: {spawnSync: ...}` call sites individually,
+// `deps` is merged HERE: fakeClaudeSpawn/the fake executable resolver/the killswitch opt-out are
+// defaults, and a test's own `overrides.deps` (spawnSync, or any of these three if a test ever
+// needs to override the claude behaviour itself) still wins field-by-field.
 function realConfig(overrides = {}) {
+  const { deps: depsOverride, ...rest } = overrides;
   return {
     shadowMode: false,
     dryRun: false,
@@ -165,7 +177,13 @@ function realConfig(overrides = {}) {
     ciChecksPollIntervalMs: 1000,
     mainMovedRegateBudget: 1,
     claudeAccountsDir: accountsDir(),
-    ...overrides,
+    ...rest,
+    deps: {
+      spawn: fakeClaudeSpawn,
+      resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+      isNoRealSpawnEnabled: () => false,
+      ...depsOverride,
+    },
   };
 }
 
@@ -200,18 +218,44 @@ const STEP_PAYLOADS = {
   },
 };
 
-function fakeClaudeStdout(args) {
+// Card #239 chantier, action A5b-2 (Job 3): the LLM call no longer goes through spawnSync at all
+// (it drives the Agent SDK's query() instead -- orchestrator/steps/sdk-call.js) -- so this no
+// longer builds a fake `claude --output-format json` STDOUT string. It builds the payload object
+// step-contracts.js's --json-schema argv would ask for, same key/lookup as before (still parsed
+// off the real argv the SDK hands to deps.spawn's `args`, unchanged shape -- see this file's own
+// header on `commonSpawnSync`), for `fakeClaudeSpawn` below to wrap into stream-json messages.
+function claudeReplyPayload(args) {
   const schemaFlagIndex = args.indexOf('--json-schema');
   const schema = schemaFlagIndex >= 0 ? JSON.parse(args[schemaFlagIndex + 1]) : { required: [] };
   const key = (schema.required || []).join(',');
   const payload = STEP_PAYLOADS[key];
-  if (!payload) throw new Error(`fakeClaudeStdout: no canned payload for required=[${key}]`);
-  return JSON.stringify({
-    result: JSON.stringify(payload),
-    session_id: `fake-session-${key.length}`,
-    num_turns: 1,
-    modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
-  });
+  if (!payload) throw new Error(`claudeReplyPayload: no canned payload for required=[${key}]`);
+  return { payload, key };
+}
+
+// fakeClaudeSpawn -- the `deps.spawn` this file's happy path claude call is faked with (the
+// `spawnClaudeCodeProcess` hook's own injection seam, orchestrator/steps/sdk-call.js's
+// makeSpawnClaudeCodeProcess). Builds the same two stream-json messages
+// test/llm-real-card.test.js's own `initMessage`/`resultMessage` helpers use: a `system`/`init`
+// message reporting a session id, then a `result` message carrying the JSON-schema payload as a
+// JSON-encoded string in `result` (consumeQueryStream's own structured_output/result precedence --
+// no `outputFormat.type: 'json_schema'` structured_output is synthesized here, so it falls back to
+// the `result` string, exactly like a real json-schema reply that only set `result`).
+function fakeClaudeSpawn(command, args) {
+  const { payload, key } = claudeReplyPayload(args);
+  const sessionId = `aaaaaaaa-bbbb-4ccc-8ddd-${String(key.length).padStart(12, '0')}`;
+  return fakeSpawnedChild([
+    { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: sessionId,
+      modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify(payload),
+    },
+  ]);
 }
 
 // The shared happy path: WORKTREE -> PLAN -> IMPLEMENT -> CHECK -> PUSH_PR, byte-for-byte the
@@ -222,8 +266,8 @@ function fakeClaudeStdout(args) {
 // anything neither an override nor this function recognizes, so an unexpected call shape is a
 // loud, named test failure rather than a silent `ok('')`.
 function commonSpawnSync(command, args) {
-  if (command === 'claude') return ok(fakeClaudeStdout(args));
-
+  // claude no longer spawns via spawnSync (card #239 chantier, action A5b) -- see
+  // fakeClaudeSpawn/realConfig's own default `deps.spawn` below for its replacement.
   if (command === 'git') {
     if (args.includes('fetch')) return ok('');
     if (args.includes('rev-parse') && args.includes('--verify')) return fail(1); // no leftovers, ever
@@ -371,6 +415,7 @@ test('runTask (real mode, card): GATE passes, CI_CHECKS finds main moved and nig
   // origin/main sometime between WORKTREE and CI_CHECKS, so CI_CHECKS is the one that actually
   // parks main-red-no-merge.
   config.deps = {
+    ...config.deps,
     spawnSync: makeSpawnSync((command, args) => {
       if (command === 'npm' && args[0] === 'ci') {
         writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: ORIGIN_MAIN_SHA });
@@ -401,6 +446,7 @@ test('runTask (real mode, card): GATE/CI_CHECKS/VALIDATE all pass, pr:wait exits
   // rule above skips straight past any main-moved machinery this test is not about.
   let waitCalls = 0;
   config.deps = {
+    ...config.deps,
     spawnSync: makeSpawnSync((command, args) => {
       if (command === 'npm' && args[1] === 'pr:wait') {
         waitCalls += 1;
@@ -436,7 +482,7 @@ test('runTask (real mode, card): WORKTREE finds nightly FAIL at the exact fetche
   const config = realConfig();
   writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: ORIGIN_MAIN_SHA });
   const calls = [];
-  config.deps = { spawnSync: makeSpawnSync(undefined, calls) };
+  config.deps = { ...config.deps, spawnSync: makeSpawnSync(undefined, calls) };
 
   const task = cardTask('glr-wt-real', 905);
 
@@ -470,7 +516,7 @@ test('runTask (real mode, card): a task shaped like NO real card ever is (task.s
   const taskDir = mkTmp('spo-glr-wtshadowfires-taskdir-');
   const config = realConfig();
   const calls = [];
-  config.deps = { spawnSync: makeSpawnSync(undefined, calls) };
+  config.deps = { ...config.deps, spawnSync: makeSpawnSync(undefined, calls) };
 
   const task = cardTask('glr-wt-shadow-fires', 907);
   task.shadow = { nightlyMainRed: true }; // the one shape intake.js's makeTask never produces

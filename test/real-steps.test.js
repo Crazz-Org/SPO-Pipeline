@@ -43,7 +43,7 @@ const { runLlm } = require('../orchestrator/steps/llm');
 const { formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
 const { buildBaseline } = require('../orchestrator/invariants');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeSpawnDeps } = require('./helpers');
 
 
 function ok(stdout = '') {
@@ -1417,24 +1417,25 @@ test('realCheck: the invariants file itself missing/unparsable at CHECK time -> 
 // recording the true, unmodified broken array regardless of relief -- relief is an ADDITIONAL
 // event, never a rewrite of what actually broke.
 
-// A minimal real-mode PLAN spawnSync stand-in, same envelope as steps/llm.js's invokeClaudeReal
-// expects (mirrors test/plan-writes.test.js's own fakePlanSpawn, duplicated here rather than
-// imported since neither test file exports helpers to the other).
+// A minimal real-mode PLAN `deps.spawn` stand-in, the SDK-transport envelope orchestrator/steps/
+// sdk-call.js's consumeQueryStream expects (card #239 chantier, action A5b-2 -- mirrors
+// test/llm-real-card.test.js's own initMessage/resultMessage shape; mirrors test/plan-writes.test.js's
+// own fakePlanSpawn, duplicated here rather than imported since neither test file exports helpers
+// to the other).
 function fakePlanSpawnEnvelope(planPayload) {
-  return () => ({
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-plan-span-check',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
-  });
+  return () =>
+    fakeSpawnedChild([
+      { type: 'system', subtype: 'init', session_id: 'sess-plan-span-check', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-plan-span-check',
+        modelUsage: { 'claude-fable-5': { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify(planPayload),
+      },
+    ]);
 }
 
 test('realCheck: a PLAN-flagged plan-span conflict is relieved end to end -- the flag is DERIVED via a real HANDLERS.PLAN call, then broken by editing the worktree, then relieved by realCheck', async () => {
@@ -1449,12 +1450,14 @@ test('realCheck: a PLAN-flagged plan-span conflict is relieved end to end -- the
   const planMarkdown = '# Plan\n\nMove the code at foo.js:2-6 up.\n';
 
   const planDeps = {
-    spawnSync: fakePlanSpawnEnvelope({
+    spawn: fakePlanSpawnEnvelope({
       plan_markdown: planMarkdown,
       invariants_markdown: invariantsMarkdown,
       invariant_ids: ['INV-1'],
       check_commands: ['npm run typecheck'],
     }),
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const task = {
@@ -2095,33 +2098,30 @@ test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the
   });
 
   ctx.account = { name: 'default', configDir: null };
-  let seenArgv = null;
-  const llmDeps = {
-    spawnSync: (command, argv) => {
-      seenArgv = argv;
-      const reply = {
-        result: JSON.stringify({
-          summary: 'unrelated change',
-          files_changed: ['src/other-file.ts'],
-          invariants: [{ id: 'INV-1', status: 'HELD' }],
-          tests_run: ['npm run typecheck'],
-          all_green: true,
-        }),
-        is_error: false,
-        num_turns: 1,
-        session_id: 'sess-rdo-symmetry',
-        modelUsage: { 'claude-opus-5': { costUSD: 0.01 } },
-        terminal_reason: 'success',
-        api_error_status: null,
-      };
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn, calls } = fakeSpawnDeps([
+    { type: 'system', subtype: 'init', session_id: 'sess-rdo-symmetry', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-rdo-symmetry',
+      modelUsage: { 'claude-opus-5': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify({
+        summary: 'unrelated change',
+        files_changed: ['src/other-file.ts'],
+        invariants: [{ id: 'INV-1', status: 'HELD' }],
+        tests_run: ['npm run typecheck'],
+        all_green: true,
+      }),
     },
-  };
+  ]);
+  const llmDeps = { spawn, resolveClaudeCodeExecutable: () => '/fake/bin/claude', isNoRealSpawnEnabled: () => false };
 
   const result = await runLlm(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', llmDeps);
   assert.equal(result.ok, true);
-  const modelIdx = seenArgv.indexOf('--model');
-  assert.equal(seenArgv[modelIdx + 1], 'opus', 'IMPLEMENT must still escalate to opus even though the diff missed the catalogue');
+  const modelIdx = calls[0].args.indexOf('--model');
+  assert.equal(calls[0].args[modelIdx + 1], 'opus', 'IMPLEMENT must still escalate to opus even though the diff missed the catalogue');
 });
 
 test('realPushPr: a diff that does NOT touch the catalogue sets ctx.task.rdoDiffTouched to strict boolean false and journals rdo-diff-derived', async () => {
@@ -2235,23 +2235,29 @@ test('end-to-end: realPushPr feeds CITATION_VERIFIER, in-process and after a sim
   // buildPromptValues/fillPromptTemplate ran, never reaching invokeClaudeReal at all.
   assert.ok(ctx.task.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
 
-  let seenInput = null;
-  const llmDeps = {
-    spawnSync: (command, argv, opts) => {
-      assert.equal(command, 'claude');
-      seenInput = opts.input;
-      const reply = {
-        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+  // The prompt no longer travels as spawnSync's own `input` option (card #239 chantier, action
+  // A5b) -- the SDK writes it to the child's stdin itself, as a stream-json `user` message. Same
+  // property, one layer down: `onStdinWrite` accumulates every raw chunk written to `.stdin`
+  // (test/helpers.js's fakeSpawnedChild), and the filled prompt's own text (including this
+  // citation, which contains no characters JSON-escaping would alter) still appears verbatim
+  // inside that stream-json line.
+  let seenInput = '';
+  const { spawn: citeVerifySpawn } = fakeSpawnDeps(
+    [
+      { type: 'system', subtype: 'init', session_id: 'sess-citeverify-e2e', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
         is_error: false,
         num_turns: 1,
         session_id: 'sess-citeverify-e2e',
-        modelUsage: { fable: { costUSD: 0.001 } },
-        terminal_reason: 'success',
-        api_error_status: null,
-      };
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    },
-  };
+        modelUsage: { fable: { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+      },
+    ],
+    { onStdinWrite: (chunk) => { seenInput += chunk; } }
+  );
+  const llmDeps = { spawn: citeVerifySpawn, resolveClaudeCodeExecutable: () => '/fake/bin/claude', isNoRealSpawnEnabled: () => false };
 
   // buildCtx() (state-machine.js) leaves ctx.account null until callLlmStep's account-rotation
   // loop sets it per-attempt; runLlm's real non-override path reads `account.name` unconditionally
@@ -2283,21 +2289,26 @@ test('end-to-end: realPushPr feeds CITATION_VERIFIER, in-process and after a sim
   assert.equal(restartedCtx.task.citations, undefined);
   restartedCtx.account = { name: 'default', configDir: null };
 
-  let seenInputAfterRestart = null;
-  const llmDepsAfterRestart = {
-    spawnSync: (command, argv, opts) => {
-      seenInputAfterRestart = opts.input;
-      const reply = {
-        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+  let seenInputAfterRestart = '';
+  const { spawn: citeVerifyRestartSpawn } = fakeSpawnDeps(
+    [
+      { type: 'system', subtype: 'init', session_id: 'sess-citeverify-e2e-restart', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
         is_error: false,
         num_turns: 1,
         session_id: 'sess-citeverify-e2e-restart',
-        modelUsage: { fable: { costUSD: 0.001 } },
-        terminal_reason: 'success',
-        api_error_status: null,
-      };
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    },
+        modelUsage: { fable: { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+      },
+    ],
+    { onStdinWrite: (chunk) => { seenInputAfterRestart += chunk; } }
+  );
+  const llmDepsAfterRestart = {
+    spawn: citeVerifyRestartSpawn,
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const cvAfterRestart = await runLlm(restartedCtx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', llmDepsAfterRestart);
@@ -5777,12 +5788,25 @@ test('prepareJudgeInputs: VALIDATE with a producible diff -- diff.patch exists a
   // CITATION_VERIFIER end-to-end test above, bypassing callLlmStep's account-rotation loop.
   ctx.account = { name: 'default', configDir: null };
   let claudeInvoked = false;
-  const llmDeps = {
-    spawnSync: (command) => {
-      claudeInvoked = true;
-      assert.equal(command, 'claude');
-      return realShapedLlmReply({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }, { session_id: 'sess-validate-ok' });
+  const { spawn: validateSpawn } = fakeSpawnDeps([
+    { type: 'system', subtype: 'init', session_id: 'sess-validate-ok', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-validate-ok',
+      modelUsage: { 'claude-fable-5': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }),
     },
+  ]);
+  const llmDeps = {
+    spawn: (command, args, opts) => {
+      claudeInvoked = true;
+      return validateSpawn(command, args, opts);
+    },
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const verdict = await runLlm(ctx, 'VALIDATE', 'llm.VALIDATE', llmDeps);

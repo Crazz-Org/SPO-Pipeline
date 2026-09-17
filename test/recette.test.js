@@ -1,9 +1,17 @@
 'use strict';
 // Unit + integration tests for orchestrator/recette.js (ACTION 2.9, `spo recette`). Every real
-// `git`/`gh`/`npm`/`claude` call is a fake injected via `deps.spawnSync` (same convention as
+// `git`/`gh`/`npm` call is a fake injected via `deps.spawnSync` (same convention as
 // test/real-steps.test.js) -- this file never touches a real binary, a real GitHub repo, or the
 // real ~/SPO-WebClient/journal/queue. `deps.isAlive` is the equivalent injection point for the
 // daemon-lock safety check (orchestrator/lock.js's own convention).
+//
+// Card #239 chantier, action A5b-2 (Job 3): `claude` moved OFF `deps.spawnSync` -- a real LLM
+// call now goes through the Agent SDK's `query()` (orchestrator/steps/sdk-call.js's
+// spawnClaudeCodeProcess hook), never `spawnSync`. `deps.spawn`/`deps.resolveClaudeCodeExecutable`/
+// `deps.isNoRealSpawnEnabled` (test/helpers.js's `fakeSpawnedChild`/`fakeExecDeps`, same seam
+// test/llm-real-card.test.js uses) are the fake `claude`'s new home -- see
+// `makeHappyPathClaudeSpawn`/`makeHappyPathDeps` below, which every call site that needs a
+// successful (or a specific) `claude` reply now injects alongside `spawnSync`.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -31,7 +39,7 @@ const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 // test/llm-real.test.js's own "an unreadable oauthTokenFile returns sessionId: null ... claude
 // was never spawned" test already uses, extended with a spy on deps.onLlmCallAttempt.
 const { invokeClaudeReal } = require('../orchestrator/steps/llm');
-const { writePoolDir, mkTmp, writeTask, isolatedEnv, readState, readJournal } = require('./helpers');
+const { writePoolDir, mkTmp, writeTask, isolatedEnv, readState, readJournal, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 // ---------------------------------------------------------------------------------------------
 // ACTION 7.2 -- driver: 'dispatcher' (parallel-doc-log, K=2) test helpers.
@@ -146,8 +154,15 @@ function fail(status, stderr = '') {
 // steps a happy-path docs-only card actually calls (PLAN, IMPLEMENT, VALIDATE -- touchesRdoMembers
 // is false, so CITATION_VERIFIER never runs; DIAGNOSE never runs on a clean happy path).
 // Distinguished by the exact `required` key set step-contracts.js's resolveStepContract puts in
-// `--json-schema`, since the step name itself never appears in argv (only the prompt TEXT, on
-// stdin, differs -- see steps/llm.js's buildArgv).
+// `--json-schema`, since the step name itself never appears in the call's own options, on this
+// transport any more than the old one (only the prompt TEXT, sent over stdin either way, differs
+// -- action A5b (card #239 chantier) moved this call from steps/llm.js's now-deleted buildArgv
+// onto orchestrator/steps/sdk-call.js's buildQueryOptions). Action A5b-2 (Job 3) finished the
+// migration this comment used to flag as pending: `fakeClaudeReplyPayload`/
+// `makeHappyPathClaudeSpawn` below now answer through `deps.spawn`, the seam the real
+// invokeClaudeReal actually calls -- the routing logic (schema `required` list -> canned payload)
+// is unchanged, only the return SHAPE moved from a flat `--output-format json` blob to a
+// stream-json message pair.
 const STEP_PAYLOADS = {
   'plan_markdown,invariants_markdown,invariant_ids,check_commands': {
     plan_markdown: '# Plan\n\nAppend one line to doc/recette-log.md.\n',
@@ -174,23 +189,75 @@ const STEP_PAYLOADS = {
   },
 };
 
-function fakeClaudeStdout(args) {
+// fakeClaudeReplyPayload(args) -- looks at the real CLI argv's `--json-schema` flag (present on
+// every real card-shaped LLM call; buildQueryOptions always sets it) to route to the canned
+// STEP_PAYLOADS entry for PLAN/IMPLEMENT/VALIDATE, keyed by the schema's own `required` list --
+// the SAME routing this file's pre-migration `fakeClaudeStdout` used, now returning the raw
+// payload object rather than the old flat `--output-format json` blob, so a caller can build a
+// stream-json `result` message out of it however it needs to (see makeHappyPathClaudeSpawn below,
+// and the "parked run pushes a wip/ ref" test further down for a caller that overrides one key
+// to a REJECT payload instead of using this function at all).
+function fakeClaudeReplyPayload(args) {
   const schemaFlagIndex = args.indexOf('--json-schema');
   const schema = schemaFlagIndex >= 0 ? JSON.parse(args[schemaFlagIndex + 1]) : { required: [] };
   const key = (schema.required || []).join(',');
   const payload = STEP_PAYLOADS[key];
   if (!payload) {
-    throw new Error(`fakeClaudeStdout: no canned payload for required=[${key}]`);
+    throw new Error(`fakeClaudeReplyPayload: no canned payload for required=[${key}]`);
   }
-  return JSON.stringify({
-    result: JSON.stringify(payload),
-    session_id: `fake-session-${key.length}`,
-    num_turns: 1,
-    modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
-  });
+  return payload;
 }
 
-// A full, real-mode, happy-path fake spawnSync: every git/gh/npm/claude call a docs-only
+// makeHappyPathClaudeSpawn({calls}) -- card #239 chantier, action A5b-2 (Job 3): the `deps.spawn`
+// half of the happy-path fixture, now that a real `claude` LLM call goes through the Agent SDK's
+// `query()` (orchestrator/steps/sdk-call.js's spawnClaudeCodeProcess hook) instead of
+// `deps.spawnSync`. `test/helpers.js`'s `fakeSpawnedChild` is the duck-typed in-memory
+// ChildProcess stand-in every migrated file in this suite uses (see test/llm-real-card.test.js's
+// own header) -- a `system`/`init` message reporting a session id, then a `result` message
+// carrying the JSON-schema reply. Pushes `{command, args}` onto the SAME shared `calls` array the
+// git/gh/npm branches of makeHappyPathSpawnSync already record into -- every existing
+// `calls.some(c => c.command === 'claude')`/`calls.filter(...)` assertion in this file keeps
+// working unchanged, paired with `resolveClaudeCodeExecutable: () => 'claude'` (makeHappyPathDeps
+// below) so `command` really is the bare string `'claude'`, not a resolved path.
+function makeHappyPathClaudeSpawn({ calls } = {}) {
+  return function spawn(command, args, spawnOpts) {
+    if (calls) calls.push({ command, args: [...args] });
+    const payload = fakeClaudeReplyPayload(args);
+    const sessionId = `fake-session-${args.length}`;
+    return fakeSpawnedChild(
+      [
+        { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: spawnOpts.cwd, tools: [], mcp_servers: [] },
+        {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          num_turns: 1,
+          session_id: sessionId,
+          modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
+          result: JSON.stringify(payload),
+        },
+      ],
+      { signal: spawnOpts.signal }
+    );
+  };
+}
+
+// makeHappyPathDeps({calls}) -- the ONE bundle every call site below now injects in place of the
+// old `{ spawnSync: makeHappyPathSpawnSync(...) }`: `spawnSync` still answers every real git/gh/npm
+// call exactly as before (its own `'claude'` branch removed -- see that function's own comment
+// just below), and `spawn`/`resolveClaudeCodeExecutable`/`isNoRealSpawnEnabled` answer the claude
+// LLM call through the new seam. `fakeExecDeps` (test/helpers.js) supplies the last two,
+// overridden here to resolve to the bare string `'claude'` (not helpers.js's own default
+// `/fake/bin/claude`) so this file's pre-existing `command === 'claude'` assertions keep matching
+// unchanged.
+function makeHappyPathDeps({ calls } = {}) {
+  return {
+    spawnSync: makeHappyPathSpawnSync({ calls }),
+    ...fakeExecDeps({ spawn: makeHappyPathClaudeSpawn({ calls }), resolveClaudeCodeExecutable: () => 'claude' }),
+  };
+}
+
+// A full, real-mode, happy-path fake spawnSync: every git/gh/npm call a docs-only
 // `trivial-doc-log` card makes on a clean run to DONE, INCLUDING recette's own `gh issue create`
 // and (after --keep is false) its cleanup calls. Pattern-matched on argv, not on call order --
 // order-independent so the exact sequence real-steps.js's handlers issue calls in is never
@@ -202,7 +269,9 @@ function makeHappyPathSpawnSync({ calls } = {}) {
   return (command, args, opts) => {
     if (calls) calls.push({ command, args: [...args] });
 
-    if (command === 'claude') return ok(fakeClaudeStdout(args));
+    // claude moved off deps.spawnSync entirely (card #239 chantier, action A5b) -- a real LLM
+    // call now goes through the Agent SDK's query() (deps.spawn), never spawnSync. See
+    // makeHappyPathClaudeSpawn/makeHappyPathDeps above for this fixture's own migration.
 
     if (command === 'git') {
       if (args.includes('fetch')) return ok('');
@@ -363,7 +432,7 @@ test('recette --force overrides the daemon-lock refusal', async () => {
   const calls = [];
   const result = await recette.runRecette(opts, {
     isAlive: () => true,
-    spawnSync: makeHappyPathSpawnSync({ calls }),
+    ...makeHappyPathDeps({ calls }),
   });
 
   assert.notEqual(result.refused, true);
@@ -377,7 +446,7 @@ test('a lock file whose pid is dead is not a refusal (liveDaemonHolder returns n
 
   const result = await recette.runRecette(opts, {
     isAlive: () => false,
-    spawnSync: makeHappyPathSpawnSync(),
+    ...makeHappyPathDeps(),
   });
 
   assert.notEqual(result.refused, true);
@@ -483,7 +552,7 @@ test(
     const calls = [];
     const result = await recette.runRecette(opts, {
       isAlive: () => true, // the real lock's pid WOULD read alive, if it were ever consulted
-      spawnSync: makeHappyPathSpawnSync({ calls }),
+      ...makeHappyPathDeps({ calls }),
     });
 
     assert.notEqual(result.refused, true);
@@ -557,7 +626,7 @@ test('recette does NOT refuse trivial-doc-log (inline driver) even with SPO_REMO
   process.env.SPO_REMOTE_REPORT_URL = 'https://reports.example.com';
   try {
     const opts = baseOpts();
-    const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync() });
+    const result = await recette.runRecette(opts, makeHappyPathDeps());
     assert.notEqual(result.refused, true);
     assert.equal(result.finalState, 'DONE');
   } finally {
@@ -609,7 +678,7 @@ test('recette: trivial-doc-log happy path reaches DONE, all assertions pass, cle
   const opts = baseOpts();
   const calls = [];
 
-  const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync({ calls }) });
+  const result = await recette.runRecette(opts, makeHappyPathDeps({ calls }));
 
   assert.equal(result.finalState, 'DONE', JSON.stringify(result.assertions));
   assert.equal(result.capTripped, null);
@@ -637,7 +706,7 @@ test('recette: trivial-doc-log happy path reaches DONE, all assertions pass, cle
 
 test('recette --keep skips cleanup and leaves the run dir behind', async () => {
   const opts = baseOpts({ keep: true });
-  const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync() });
+  const result = await recette.runRecette(opts, makeHappyPathDeps());
 
   assert.equal(result.finalState, 'DONE');
   assert.equal(result.cleanupReport, null);
@@ -652,7 +721,7 @@ test('recette --keep skips cleanup and leaves the run dir behind', async () => {
 
 test('recette: LLM-step cap trips before the 2nd claude call -- aborts and still cleans up', async () => {
   const opts = baseOpts({ capLlmSteps: 1 }); // PLAN is allowed; IMPLEMENT's claude call must not be
-  const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync() });
+  const result = await recette.runRecette(opts, makeHappyPathDeps());
 
   assert.equal(result.ok, false);
   assert.ok(result.capTripped, 'cap must have tripped');
@@ -688,17 +757,25 @@ test('recette: LLM-step cap trips before the 2nd claude call -- aborts and still
 // non-counting, and per-run isolation.
 // ---------------------------------------------------------------------------------------------
 
-// The measurement the chantier brief asked for: run the SAME scenario, on today's UNCHANGED
-// transport (invokeClaudeReal still spawns real `claude`), and compare the new onLlmCallAttempt
-// count (`result.llmSteps`) against the old count reconstructed post-hoc from the actual spawn
-// log (`calls.filter(c => c.command === 'claude').length`) -- the same `calls` array
-// makeHappyPathSpawnSync already records for the "recette --force overrides..." test above. This
-// does not require keeping the old counting CODE around: the spawn log itself is the old
-// mechanism's ground truth, on the same run, so the two numbers are directly comparable without
-// instrumenting two separate implementations.
+// The measurement the chantier brief asked for: run the SAME scenario and compare the new
+// onLlmCallAttempt count (`result.llmSteps`) against the old count reconstructed post-hoc from the
+// actual spawn log (`calls.filter(c => c.command === 'claude').length`) -- the same `calls` array
+// makeHappyPathSpawnSync/makeHappyPathClaudeSpawn already record into for the "recette --force
+// overrides..." test above. This does not require keeping the old counting CODE around: the spawn
+// log itself is the old mechanism's ground truth, on the same run, so the two numbers are directly
+// comparable without instrumenting two separate implementations.
+//
+// UPDATED for action A5b-2 (Job 3, card #239 chantier): when this test was first written (action
+// A5a), the transport underneath was still genuinely UNCHANGED (invokeClaudeReal still spawned
+// real `claude` via `deps.spawnSync`) -- this test's own name still says "on today's transport"
+// deliberately, since that phrase stays true either way, but an earlier draft of THIS comment said
+// "UNCHANGED", which stopped being true the moment A5b cut the transport over. `calls` now records
+// a `claude` entry per real `deps.spawn` call (makeHappyPathClaudeSpawn), not per `deps.spawnSync`
+// call -- the equivalence this test proves (onLlmCallAttempt's count matches the spawn log) still
+// holds, just one layer lower than when this comment was first written.
 test('A5a equivalence: onLlmCallAttempt\'s count matches the old command === \'claude\' spawn count exactly, on today\'s transport', async () => {
   const calls = [];
-  const result = await recette.runRecette(baseOpts(), { spawnSync: makeHappyPathSpawnSync({ calls }) });
+  const result = await recette.runRecette(baseOpts(), makeHappyPathDeps({ calls }));
 
   assert.equal(result.finalState, 'DONE', JSON.stringify(result.assertions));
   const oldStyleCount = calls.filter((c) => c.command === 'claude').length;
@@ -866,7 +943,7 @@ test('makeCap: wall-clock cap trips on the call that crosses it, never on the on
 // elapsed, so the run reliably trips well before WORKTREE finishes, aborts, and still cleans up.
 test('recette: wall-clock cap trips in a full run -- aborts before completion and still cleans up', async () => {
   const opts = baseOpts({ capMs: 1 });
-  const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync() });
+  const result = await recette.runRecette(opts, makeHappyPathDeps());
 
   assert.equal(result.ok, false);
   assert.ok(result.capTripped, 'cap must have tripped');
@@ -1021,7 +1098,7 @@ test('a second scenario can be registered and run without any change to the runn
 
   try {
     const opts = baseOpts({ scenario: customName });
-    const result = await recette.runRecette(opts, { spawnSync: makeHappyPathSpawnSync() });
+    const result = await recette.runRecette(opts, makeHappyPathDeps());
     assert.equal(result.scenario, customName);
     assert.equal(result.finalState, 'DONE');
     assert.equal(result.ok, true);
@@ -1087,26 +1164,45 @@ test('a parked run pushes a wip/ ref and cleanup deletes that exact ref (leak re
   const calls = [];
   const happy = makeHappyPathSpawnSync({ calls });
   const spawnSync = (command, args, o) => {
-    // VALIDATE rejects every time -> validateRejectBudget exhausted -> PARKED, dirty worktree.
-    if (command === 'claude') {
-      const i = args.indexOf('--json-schema');
-      const required = ((i >= 0 ? JSON.parse(args[i + 1]) : {}).required || []).join(',');
-      if (required === 'verdict,reasons,findings') {
-        return ok(JSON.stringify({
-          result: JSON.stringify({ verdict: 'REJECT', reasons: ['synthetic reject'], findings: [] }),
-          session_id: 'fake', num_turns: 1, modelUsage: { 'fake-model': { input_tokens: 1, output_tokens: 1 } },
-        }));
-      }
-    }
     // a dirty tree at park time is what makes preserveWorktreeWip push at all
     if (command === 'git' && args.includes('status') && args.includes('--porcelain')) return ok(' M doc/recette-log.md\n');
     if (command === 'git' && args.includes('checkout') && args.includes('--detach')) return ok('');
     return happy(command, args, o);
   };
 
+  // VALIDATE rejects every time -> validateRejectBudget exhausted -> PARKED, dirty worktree.
+  // PLAN/IMPLEMENT still answer through the ordinary happy-path payload (card #239 chantier,
+  // action A5b-2 -- claude moved off deps.spawnSync onto deps.spawn, see makeHappyPathClaudeSpawn's
+  // own comment; this test overrides just the VALIDATE reply instead of using that helper
+  // unmodified, so it builds the stream-json shape by hand for that one schema).
+  const happyClaudeSpawn = makeHappyPathClaudeSpawn({ calls });
+  const spawn = (command, args, spawnOpts) => {
+    const i = args.indexOf('--json-schema');
+    const required = ((i >= 0 ? JSON.parse(args[i + 1]) : {}).required || []).join(',');
+    if (required === 'verdict,reasons,findings') {
+      if (calls) calls.push({ command, args: [...args] });
+      return fakeSpawnedChild(
+        [
+          { type: 'system', subtype: 'init', session_id: 'fake-reject', apiKeySource: 'none', model: 'x', cwd: spawnOpts.cwd, tools: [], mcp_servers: [] },
+          {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            num_turns: 1,
+            session_id: 'fake-reject',
+            modelUsage: { 'fake-model': { input_tokens: 1, output_tokens: 1 } },
+            result: JSON.stringify({ verdict: 'REJECT', reasons: ['synthetic reject'], findings: [] }),
+          },
+        ],
+        { signal: spawnOpts.signal }
+      );
+    }
+    return happyClaudeSpawn(command, args, spawnOpts);
+  };
+
   const result = await recette.runRecette(
     baseOpts({ configOverrides: { pipelineWorktreesDir: worktreesDir } }),
-    { spawnSync }
+    { spawnSync, ...fakeExecDeps({ spawn, resolveClaudeCodeExecutable: () => 'claude' }) }
   );
 
   assert.equal(result.finalState, 'PARKED');
@@ -1137,7 +1233,7 @@ test('RecetteCapExceededError is NOT a ParkSignal -- a cap must propagate, never
   assert.ok(!(err instanceof ParkSignal), 'a cap trip is not a park -- runTask must rethrow it');
 
   // And end to end: a capped run must not come back PARKED.
-  const result = await recette.runRecette(baseOpts({ capMs: 1 }), { spawnSync: makeHappyPathSpawnSync() });
+  const result = await recette.runRecette(baseOpts({ capMs: 1 }), makeHappyPathDeps());
   assert.ok(result.capTripped);
   assert.notEqual(result.finalState, 'PARKED', 'a cap trip must abort the run, not park the task');
 });

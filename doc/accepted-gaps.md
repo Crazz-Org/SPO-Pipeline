@@ -945,3 +945,55 @@ runs one real card through the new transport end-to-end at real cost, which is t
 in this chantier to also diff `claude --setting-sources=user,project,local`'s actual loaded
 settings against a flag-omitted invocation's, on a live account, and confirm or correct this pin
 from that one comparison rather than from another round of static tracing.
+
+## 14 · Detached grandchild survives a deadline kill (action A5b, card #239), 2026-09-17
+
+Action A5b (`orchestrator/steps/llm.js`'s `invokeClaudeReal`, driving `query()` instead of
+`spawnSync`) was built to prove "a call exceeding `opts.deadlineMs` is terminated ... and leaves
+no live child" — the brief's own wording, and the property `sdk-call.js`'s `confirmProcessExit`
+exists to hold this function's own return open until it can honestly claim. That property holds
+for the DIRECT child (the `claude` process itself, or its equivalent in this action's own fake --
+see `test/helpers.js`'s `fakeSpawnedChild`), confirmed by an event-driven `'exit'` listener on the
+real handle `spawnClaudeCodeProcess` captures, not a guess. It does **not** hold, and cannot be
+made to hold from this action alone, for a DETACHED GRANDCHILD -- a tool subprocess `claude` itself
+spawns (its own Bash tool, most concretely).
+
+**Measured (this action, live probe against the real vendored SDK -- a fake `claude` that ignores
+SIGTERM and spawns a `{ detached: true }` grandchild that also ignores SIGTERM, script deleted
+after use, not committed).** After `abortController.abort()` drove the SDK's own kill escalation
+through to a confirmed SIGKILL of the direct child (~5.9-7.1s, matching `SDK_ABORT_KILL_DELAY_MS`
++ `SDK_ABORT_SIGKILL_ESCALATION_MS`), the detached grandchild was still alive and still emitting
+heartbeats at the end of a 9-second observation window -- it never received any signal at all. This
+is not new to this transport: neither the OLD transport's `spawnSync` `killSignal`, nor the abort
+path this action wires up, ever signals a process GROUP (a negative-pid `kill`) -- the one place the
+vendored SDK's own source does that (`process.kill(-pid, "SIGKILL")`, grepped directly) is the
+Bash-tool's OWN subprocess manager, a different class entirely, reachable only when the SDK itself
+runs a tool in-process (not this pipeline's usage, which only ever drives `query()` for a single
+`claude` child). So "no live child" was never a group guarantee under either transport -- a
+detached tool subprocess has always been able to outlive a killed `claude`, on the old transport
+and the new one alike.
+
+**Why this is a live gap, not a cosmetic one.** The card's own "leaves no live child" language,
+read literally (every process in the call's subtree, not only the one this pipeline directly
+spawned), is false the moment `claude`'s own Bash tool detaches a long-running command before a
+deadline kills the parent. In practice the blast radius is bounded by what PLAN/IMPLEMENT/DIAGNOSE/
+CITATION_VERIFIER/VALIDATE actually run inside the sandboxed worktree each step already operates
+in (never a `nohup`-style detach by the STEP's own prompts, as far as this action's own reading of
+`prompts/*.md` goes) -- but nothing in this transport, or the old one, structurally prevents a
+future tool call (or a future SDK version's own tool implementation) from detaching a process that
+then outlives a deadline-killed `claude`.
+
+`interrupt()` (the SDK's own protocol-level graceful-cancel message, distinct from `abort()`'s hard
+kill) was checked and is not a substitute: it asks the CLI to stop its current turn cooperatively,
+which a hung or misbehaving call is by construction not guaranteed to honour, and it does nothing
+for a grandchild that has already detached regardless.
+
+**Not fixed here, and not fixable from this action alone** — per this register's own posture. A
+real fix (killing the process GROUP the direct child belongs to, which requires either spawning
+`claude` itself with its own session/pgid via a custom `spawnClaudeCodeProcess` that takes over
+process management from the SDK's own default — a materially larger, riskier scope than this
+action's brief called for — or a future SDK-provided hook for exactly this) is left to a future
+action or card, named here rather than silently accepted. Closing condition: either the vendored
+SDK ships its own process-group kill for `spawnClaudeCodeProcess`-managed children, or a future
+action measures the real blast radius of detached tool subprocesses against the live corpus and
+decides the custom-spawn approach is worth its own risk.
