@@ -3187,13 +3187,15 @@ measured rather than styled:
 - **What an LLM step is doing right now** comes from `console/live-step.js`. PLAN, IMPLEMENT,
   DIAGNOSE and VALIDATE run through `invokeClaudeReal` (an awaited async `query()` call since card
   #239's transport cutover, action A5b, 2026-09-17 -- no longer a blocking `spawnSync`), and
-  nothing is journalled per intermediate message, so no
-  log grows until the call returns -- twelve minutes at IMPLEMENT's p90. The `claude` CLI's own
-  session transcript does move, and is reachable by an exact chain of identities: `state.json`'s
-  `owner.workerPid` names the worker, the lease file naming that pid names the account,
-  `config.cwdForStep` names the directory, and the session file created after the split's
-  `enteredAt` is this step's. Any break in that chain returns a named miss and the deck falls
-  back to the clock alone -- it never guesses which transcript belongs to which card.
+  `runLlm` only journals once the whole call returns, so no log grows until then -- twelve minutes
+  at IMPLEMENT's p90. Since action A6 (2026-09-17, same day), the worker itself closes that gap:
+  it already reads the SDK's message stream one message at a time to build its own return value,
+  and folds that same stream into a small, throttled record at
+  `<journalRoot>/<id>/live-progress.json` (`orchestrator/live-progress.js`). The dashboard just
+  reads that file — no identity chain to walk, no transcript to find, because the process running
+  the call is the one writing what it saw. A record that goes stale (`LIVE_PROGRESS_STALE_MS`,
+  live-progress.js) or names a step other than the one the card is currently in returns a named
+  miss, and the deck falls back to the clock alone — same fallback as before A6, different cause.
 
 The deck shows LIVE cards only: no history list, no Todo. A finished run lingers for ten minutes
 (`DECK_LINGER_MS`) so a run that ends while you are looking at it does not vanish mid-glance --

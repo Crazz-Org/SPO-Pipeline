@@ -165,6 +165,7 @@ const { monotonicNowMs } = require('../monotonic-clock');
 const { recoverSessionTokens: recoverSessionTokensDefault } = require('../token-recovery');
 const { loadQuery } = require('../sdk');
 const { isEnabled: isNoRealSpawnEnabled } = require('../no-real-spawn-guard');
+const { createProgressCallback, clearLiveProgress } = require('../live-progress');
 
 // sdk-call.js requires THIS file back (resolvePromptText, NONINTERACTIVE_ENV_DEFAULTS,
 // extractTokens, classifyFailure, limitKindForFailure -- see its own header). A plain top-level
@@ -687,11 +688,28 @@ async function invokeClaudeReal(opts, deps = {}) {
     }, opts.deadlineMs);
   }
 
+  // Card #239 chantier, action A6: live-progress.js's own onMessage seam, attached only when the
+  // caller supplied a taskDir (runLlm always does for a real card; a handful of hand-built test
+  // contexts that call invokeClaudeReal directly do not, and simply get no progress recording --
+  // the same "degrades to nothing extra" posture the old transcript probe had for a step it could
+  // not identify). Built fresh per call (never reused across two invokeClaudeReal calls) because
+  // its accumulated turn/tool/text state belongs to exactly one query() stream.
+  const onMessage = opts.taskDir
+    ? createProgressCallback({ taskDir: opts.taskDir, step: opts.step, account: opts.account && opts.account.name })
+    : null;
+
   let consumed;
   try {
-    consumed = await consumeQueryStreamFn(stream, {});
+    consumed = await consumeQueryStreamFn(stream, onMessage ? { onMessage } : {});
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
+    // Cleared unconditionally here, not only on a success path -- a step that finished by
+    // failure, limit, or deadline timeout is exactly as finished as one that succeeded, and must
+    // not leave a record a reader could mistake for still-live work (card #239's Done means, this
+    // action's own brief, verbatim). The one path this cannot cover is a hard crash (kill -9)
+    // between a write and this line -- see live-progress.js's own LIVE_PROGRESS_STALE_MS comment
+    // for the bound that covers that case instead.
+    if (opts.taskDir) clearLiveProgress(opts.taskDir);
   }
 
   // The CLI's own reported id wins over the one we supplied, falling back to ours (Job 2, restoring
@@ -966,6 +984,12 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       promptFile: override.promptFile,
       cwd,
       account,
+      // Card #239 action A6: threaded through so invokeClaudeReal can attach live-progress.js's
+      // per-message callback and clear its record when the call ends. Absent only for the
+      // handful of hand-built test contexts that call runLlm with no ctx.taskDir at all -- see
+      // invokeClaudeReal's own comment on why that degrades to "no progress recording" rather
+      // than a throw.
+      taskDir: ctx.taskDir,
       // Per-step (PLAN and IMPLEMENT 1800000ms, every other step 900000ms). This legacy override
       // path has no resolved contract to read the figure off, so it asks step-contracts directly
       // -- same source, so the two paths can never disagree about how long a call may run.
@@ -1043,6 +1067,8 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     cwd,
     account,
     deadlineMs: contract.deadlineMs,
+    // Card #239 action A6 -- see the override branch above's identical field for why.
+    taskDir: ctx.taskDir,
   };
 
   if (ctx.dryRun) {
