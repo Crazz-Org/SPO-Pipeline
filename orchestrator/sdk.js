@@ -16,8 +16,8 @@
 // `CORPUS_FILES`. MEASURED (2026-09-17, this fix pass, R4): replacing its line range with a range
 // past that file's end produces zero new test failures -- a wrong line number here would go
 // undetected. Widening `CITATION_RE` to cover `.yml` is out of scope here -- it needs its own
-// `EXPECTED_CITATIONS` entry and RANGE pin, and part 2's test #39 fires without them -- and belongs
-// to A9, not this action. (This paragraph itself avoids writing a bare `file.ext:N-M`-shaped
+// `EXPECTED_CITATIONS` entry and RANGE pin, and part 2's test #39 fires without them -- and A9
+// ruled on it, left open, in doc/accepted-gaps.md § 17. (This paragraph itself avoids writing a bare `file.ext:N-M`-shaped
 // string for that reason: the corpus scanner reads THIS comment too, and a literal example in that
 // exact shape would be extracted as a real, unanchored citation -- measured the hard way while
 // drafting this note.)

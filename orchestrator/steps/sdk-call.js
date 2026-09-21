@@ -11,6 +11,11 @@
 // and it does not own the deadline or the journal (see steps/llm.js's own header for what A5b
 // added around it).
 //
+// TENSE (corrected by A9): A3/A4 wrote most of this file BEFORE the cutover, so comments below
+// still say "today's transport", "today's `claude -p`" or "today's buildArgv". Read each of those
+// as the PRE-cutover transport (commit 41fb081, deleted by A5b), not as anything now running.
+// "Today's invokeClaudeReal return shape" is the exception: that shape is still the current one.
+//
 // buildQueryOptions(opts, deps) -> { prompt, options } takes today's invokeClaudeReal opts shape
 // (see steps/llm.js's own header for the authoritative field list) and produces the
 // `{prompt, options}` argument `sdk.js`'s loadQuery()-resolved `query` function expects. It never
@@ -286,7 +291,7 @@ const {
   resolvePromptText,
   NONINTERACTIVE_ENV_DEFAULTS,
   // Reused, never reimplemented, by consumeQueryStream below -- all three are the SAME functions
-  // today's `claude -p`/`--output-format json` transport already uses on `invokeClaudeReal`'s
+  // the pre-cutover `claude -p`/`--output-format json` transport used on `invokeClaudeReal`'s
   // parsed stdout. MEASURED (this action, 2026-09-17, against the REAL vendored SDK -- a fake
   // `claude` executable emitting stream-json lines, consumed through a real `query()` call, see
   // consumeQueryStream's own header): the SDK's `result` message carries `api_error_status` and
@@ -1134,9 +1139,9 @@ async function consumeQueryStream(stream, ctx = {}) {
       // (required there). This is the shape the one limit this repo has ever recorded (the Fable
       // 429 incident) actually arrives as: the loop completed, `is_error:true`,
       // `api_error_status:429`, and the CLI's own limit-reached text sits in `result` -- the same
-      // field today's `claude -p` transport already carries it in (`invokeClaudeReal`'s
+      // field the pre-cutover `claude -p` transport carried it in (`invokeClaudeReal`'s
       // `is_error`/`exit!==0` branch, llm.js, sets `result: parsed.result` unconditionally on
-      // failure). No `error` key is set alongside it -- matching today's transport exactly, which
+      // failure). No `error` key is set alongside it -- matching that transport exactly, which
       // never sets one on this branch either; `result` alone is the diagnostic text, and
       // `orchestrator/intake.js`'s `formatLlmFailure` (`raw.error || raw.result || ''`) already
       // falls back to it.

@@ -1,5 +1,5 @@
 'use strict';
-// llm.js -- the "claude -p" step interface (PLAN, IMPLEMENT, DIAGNOSE, VALIDATE's two
+// llm.js -- the LLM step interface (PLAN, IMPLEMENT, DIAGNOSE, VALIDATE's two
 // verifiers). state-machine-spec.md § Step contracts.
 //
 // Shadow mode (ctx.shadowMode === true): never touches the `claude` CLI. Returns the canned

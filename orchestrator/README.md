@@ -3,7 +3,7 @@
 Implements the lifecycle table in [../doc/state-machine-spec.md](../doc/state-machine-spec.md)
 (v1.1): INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI_CHECKS → VALIDATE →
 MERGE → FINISH → DONE, with DIAGNOSE as the retry hub and PARKED as the catch-all terminal
-state. Node 22 built-ins only, zero dependencies.
+state. Node 22 built-ins only; the one third-party piece is the vendored Agent SDK (`vendor/`), committed, never installed.
 
 ## Running shadow mode
 
@@ -207,8 +207,8 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
   `withTimeout` abandons the loser rather than cancelling it, so the abandoned invocation kept
   running alongside its own retry). See `config.js`'s own comment on `stepDeadlineMsByState` for
   the full incident and the derivation.
-- `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the `spawnSync` timeout
-  `invokeClaudeReal` arms, in real mode, for an LLM step call with no override (DIAGNOSE,
+- `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the abort timer
+  `invokeClaudeReal` arms on its `query()` call (a `spawnSync` `timeout` before card #239's A5b), in real mode, for an LLM step call with no override (DIAGNOSE,
   CITATION_VERIFIER, VALIDATE). PLAN and IMPLEMENT each carry a raised
   `LLM_STEP_DEADLINE_MS_BY_STEP` override instead (both 1800000ms / 30min) — never uniform across
   task size or model, only per step.
@@ -363,12 +363,14 @@ would silently produce `kind:'limit'` with `limitKind: undefined` (the fail-safe
 indistinguishable in the journal from a genuine limit). See "Account registry" below for what
 each tier costs.
 
-**Deadline handling**: the wall-clock budget is enforced by `spawnSync`'s own `timeout` option
-(set from `deadlineMs`), not by `orchestrator/deadline.js`'s promise-race. That race can't
-preempt a blocking `spawnSync` call — the single JS thread is inside it — and would otherwise
-leave a killed step's `claude` process running unsupervised in the background. `deadline.js`
-still wraps the whole call at the state-machine level (`callLlmStep`, see below) for its
-existing "retry once, then PARK" bookkeeping; it just isn't what kills the child process.
+**Deadline handling** (rewritten in card #239's A9 -- it described the deleted `spawnSync`
+`timeout` option): the wall-clock budget is a `setTimeout` armed against `deadlineMs` that aborts
+the call's `AbortController`, followed by a bounded wait for the child's confirmed exit
+(`sdk-call.js`'s `confirmProcessExit`, `ABORT_CONFIRM_GRACE_MS`); `steps/llm.js`'s own header, §
+Deadline, has the measured mechanism. It is not `orchestrator/deadline.js`'s promise-race, which
+abandons the loser and would leave a killed step's `claude` running. `deadline.js` still wraps the
+whole call at the state-machine level (`callLlmStep`, see below) for its existing "retry once,
+then PARK" bookkeeping; it just isn't what kills the child process.
 
 **Account rotation**: `orchestrator/state-machine.js` exports `callLlmStep(ctx, stepName,
 fixtureKey)`, used by every state that calls an LLM step (PLAN, IMPLEMENT, DIAGNOSE,
@@ -502,7 +504,7 @@ Each prompt's `{{placeholder}}` values come from one of two places
   see `doc/state-machine-spec.md`'s DIAGNOSE row.
 
 **Action 3.1 — PLAN reuse on retry.** `handlePlan` is the one LLM step that can skip its own
-`claude -p` call entirely. On a maintainer's `retry` after a park, INTAKE restarts the task from
+LLM call entirely. On a maintainer's `retry` after a park, INTAKE restarts the task from
 scratch and WORKTREE creates a fresh worktree off the current `origin/main` — but the plan and
 invariants files a *previous* run's PLAN wrote under `journal/<id>/scratch/` are still sitting on
 disk, keyed by task id, never cleaned between runs. `decidePlanReuse` (`state-machine.js`) decides
@@ -660,8 +662,9 @@ that is the account-rotation retry path, unrelated.
 classify a deadline kill as `(error.code === 'ETIMEDOUT') || (signal && deadlineArmed)` — the same
 defect PR #127 fixed in `command-timeout.js`, of which this was the second copy — so ANY externally
 signalled `claude` (a deploy restart, an operator's `kill`, an OOM kill) was reported as a hang.
-Both halves are now `command-timeout.js`'s shared `isSpawnTimeout`/`isSpawnKilled`, and an external
-kill returns `{kind: 'error', killedBySignal: true, signal}` with no `timedOut`. The four guards
+That fix routed both halves through `command-timeout.js`'s shared `isSpawnTimeout`/`isSpawnKilled`
+(past tense: since card #239's A5b `invokeClaudeReal` references neither; `killedBySignal` now comes
+from the captured child's `exitInfo`), and an external kill returns `{kind: 'error', killedBySignal: true, signal}` with no `timedOut`. The four guards
 above are unaffected — `kind: 'error'` already dominates their disjunction, so an external kill
 parked `llm-transport-failed:<STEP>` before the fix and still does. What changes is
 `intake.js`'s `callIntakeStepWithRotation`, the one place in this codebase that *spends* on the
@@ -1394,7 +1397,7 @@ The trap this closes: `spawnSync` on a `timeout` kill sets BOTH `signal` (e.g. `
 the pre-existing code mapped both to exit 1 indistinguishably, so a timeout-killed GATE (exit 1
 → DIAGNOSE) used to pay a real LLM call diagnosing a hang the daemon itself caused. `spawnStep`
 now branches on `signal`/`error` **before** the exit-code mapping (mirroring `steps/llm.js`'s
-own `killedByDeadline` idiom for `claude -p` calls, not a third convention), and never returns a
+own `timedOut` result field for LLM calls, not a third convention), and never returns a
 `timedOut` result to a caller at all — a caller's exit-code routing (`realGate`'s 0/1/2/3/4,
 `realCheck`, `realCiChecks`, `realWorktree`'s claim codes, `realMerge`, `realPushPr`) is
 therefore completely unchanged; it simply never runs on a timeout.
@@ -2343,7 +2346,7 @@ the full correction text still reaches the maintainer, since `review-card`'s own
 `first_comment_markdown` is posted verbatim as the filed issue's first comment (`gh label list` +
 `gh issue create` + `gh issue comment`, `orchestrator/intake.js`).
 
-**Cost**: `spo ask` makes about two real `claude -p` calls per request -- one DRAFT_CARD (skipped
+**Cost**: `spo ask` makes about two real LLM calls per request -- one DRAFT_CARD (skipped
 entirely in the brainstorm lane) and one review-card -- both with `maxBudgetUsd: undefined`
 (no cap; `step-contracts.js` -- no `SMALL_BUDGET_USD` constant exists in this build), an order
 of magnitude cheaper in practice than a single PLAN/IMPLEMENT call by task shape alone.
@@ -2799,7 +2802,7 @@ Set the phone channel with a drop-in rather than editing the unit:
 Dollars are retired as the headline metric entirely (maintainer decision, 2026-08-31): the
 pool is Claude Max *subscription* accounts with a *quota*, never the metered API, so a dollar
 figure never meant money spent. `orchestrator/tokens.js` reads token efficiency back out of the
-journals instead — every real `claude -p` call already records its own token counts in an
+journals instead — every real LLM call already records its own token counts in an
 `llm-call` event (`steps/llm.js`'s `extractTokens`: `tokensSource`, `freshInputTokens`,
 `cacheCreationTokens`, `cacheReadTokens`, `outputTokens`, `billableTokens`, and — since card
 #214 — `modelUsage`, the same four fields plus each model's own `billableTokens`, broken out
@@ -2856,7 +2859,7 @@ footer naming how many of the run's calls lacked the fields. Two things land the
 written **before** token capture shipped (2026-08-31), whose events recorded only the retired
 `costUsd`, and a call for which NEITHER `modelUsage` nor a recovered transcript had anything —
 durably true for E2BIG and the other spawn-never-started failures (`tokensSource: null`), and true
-for a deadline kill/signal kill/non-JSON stdout only when its own transcript recovery also came up
+for a deadline kill/signal kill/non-JSON reply only when its own transcript recovery also came up
 empty. `billableTokensPerDoneCard` is `null` (rendered `n/a`) whenever
 *no* call reported tokens, because a per-card figure computed off journals with no token data is
 a false measurement rather than a small one. **Every historical journal in this repo is in that

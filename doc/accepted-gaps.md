@@ -1056,7 +1056,8 @@ by pattern-matching the word "`claude -p`":**
    where the actual mechanism is described.
 4. **Cost/count shorthand describing WHAT an LLM call costs, not HOW it runs** — "`spo ask` makes
    about two real `claude -p` calls per request", "every real `claude -p` call already records its
-   own token counts", "a real `claude -p` reproduction" (account-pool exhaustion cost), "a wide
+   own token counts" (these two -- `orchestrator/README.md`'s `spo ask` cost line and its token-count line -- and
+   `tokens.js`'s twin at its line 15 were changed to "LLM call" by card #239's action A9), "a real `claude -p` reproduction" (account-pool exhaustion cost), "a wide
    `claude -p` outage" (auto-triage's incident-class name) — none of these assert the `-p` flag,
    `spawnSync`, or argv construction; they use "`claude -p`" as this repo's established informal
    name for "one real LLM invocation," the same way "a claude -p call" and "an LLM call" are used
@@ -1064,11 +1065,12 @@ by pattern-matching the word "`claude -p`":**
    would mislead a maintainer about the CURRENT transport's mechanics, only about a naming
    convention that predates this chantier and is unrelated to it.
 
-**Not closed by this entry**: the pre-existing `killedByDeadline` field-name references in
-`orchestrator/README.md:1396` and `steps/scripted.js`'s own comment (both cite a field that does
-not exist in `steps/llm.js` today — the real field is `timedOut` — a naming drift that predates
-card #239 and is not caused by the A5b transport swap). Found during this sweep, out of scope for
-it, named here rather than silently carried forward uncorrected.
+**Not closed by this entry** *(closed by A9, 2026-09-21 — see § 17)*: the pre-existing
+`killedByDeadline` field-name references in `orchestrator/README.md` and `steps/scripted.js`'s own
+comment (both cite a field that does not exist in `steps/llm.js` today — the real field is
+`timedOut` — a naming drift that predates card #239 and is not caused by the A5b transport swap).
+Found during this sweep, out of scope for it, named here rather than silently carried forward
+uncorrected.
 
 ## 16 · `canUseTool` rejected as A8's mechanism — dead on three independent grounds, and wiring it would loosen policy (action A8, card #239), 2026-09-17
 
@@ -1134,13 +1136,12 @@ agrees with the observed behaviour (those 11 PLAN(fable) subagent sessions ran w
 `--permission-prompt-tool` wired at all; had the call instead required one, it would have been
 refused headless, and no subagent would have spawned). **This closes only the PARENT half.**
 Whether a spawned subagent's own NESTED tool calls (inside the `Agent`, not the `Agent` call
-itself) are separately gated by the parent `query()`'s `allowedTools` is genuinely unmeasured —
-the mechanism is plausible either way (`--allowedTools` becoming a session-scoped
-`alwaysAllowRules.cliArg` would inherit down; an agent definition carrying its own `tools` set
-would override) — and is answerable with **no LLM spend**: walk the PLAN(fable) session
-transcripts the way `console/usage-scan.js` already walks a session's `subagents` subtree, and
-look for a subagent `tool_use` naming a tool outside PLAN's own declared set that returned a
-result rather than a refusal. Left to A9, not resolved here.
+itself) are separately gated by the parent `query()`'s `allowedTools` was unmeasured when this
+entry was written — the mechanism is plausible either way (`--allowedTools` becoming a
+session-scoped `alwaysAllowRules.cliArg` would inherit down; an agent definition carrying its own
+`tools` set would override) — and answerable with **no LLM spend**. A9 ran the walk (2026-09-21,
+below, § *A9's transcript walk*): **the answer is still NOT known** — the corpus holds no subagent
+call that could have told the two mechanisms apart.
 
 **3 — even rescoping `allowedTools` would not unlock the callback for most of these tools, because
 `.claude/settings.json` shadows them independently, and this action's own quoted SDK text already
@@ -1247,9 +1248,117 @@ spec/README document fixes a value for); and no policy declares `Task` OR its CL
 `resolveStepContract` is one for STEP_CONTRACTS), so a future edit to any of the eight is caught by
 a named test instead of only the doc-parity sweep.
 
+**A9's transcript walk (2026-09-21, card #239) — the CHILD half, measured, NOT answered.**
+Method: `listCandidateFiles` from `console/usage-scan.js` itself (so the `<sessionId>/subagents/`
+subdirectory a flat readdir misses is included) over both pool accounts' `projects/` trees, each
+subagent transcript attributed to its parent session by the parent's own first user message (the
+`# PLAN` / `# IMPLEMENT` / `# triage-bug-report` heading). MEASURED: 131 subagent transcripts, 67
+distinct parent sessions (the `Agent`/`Task` spawns in those parents: 128 `Explore`, 1
+`general-purpose`, 1 `Plan`, 1 default), 4,924 subagent `tool_use` calls — `Bash` 3,834, `Read`
+792, `Grep` 255, `Edit` 31, `Glob` 12. Against each parent step's declared set (PLAN
+`Read/Grep/Glob/Bash`; IMPLEMENT plus `Edit/Write`; triage `Read/Grep/Glob/Bash`): **zero**
+subagent calls name a tool outside it, so there is **no** call that returned a result where the
+parent's set would have refused — and none that was refused either. This is a corpus-wide ABSENCE
+and is weak evidence, not a negative finding. It is NOT that the corpus could not have shown an
+escape: `Explore`'s tool set includes `WebFetch`/`WebSearch` (`Edit`/`Write`/`NotebookEdit`
+and `Agent` are among the excluded ones, per the agent-type listing), and none of the 131 transcripts contains a `tool_use` naming either —
+the subagents simply never tried. The method can see a refusal, though the evidence is thinner than
+first written. Parent-level `WebFetch` calls: three `tool_use`s in two sessions. In the first
+(`pool1/projects/-home-crazz-SPO-Pipeline-worktrees-issue-486/1e734be4-…`) two were refused by two
+DIFFERENT layers — one `Claude requested permissions to use WebFetch, but you haven't granted it
+yet.` (that string appears twice on one line: the `tool_result` and its `toolUseResult` echo, so it
+is ONE refusal) and one `denied by the Claude Code auto mode classifier`. In the second
+(`pool2/…issue-516/61e17910-…`) the call was not refused at all: it reached the network and failed
+`connect ECONNREFUSED`. Both sessions ran under TODAY'S PLAN `permissionMode` (`'plan'` -- both
+transcripts record it, and `step-contracts.js`'s PLAN value has been `'plan'` since 2026-08-29,
+before either session), on the PRE-cutover CLI transport, with the auto-mode classifier active
+inside plan mode. And it is the SAME URL in both: blocked by the classifier in issue-486 and let
+through to the network in issue-516, a day apart, under the same permission mode. So they DO speak
+to PLAN's policy -- the classifier's verdict on an identical call is not stable -- and say nothing
+about the SDK transport's own permission layer, which neither session ran through. One subagent transcript
+(`779d6fec-…/subagents/agent-a417d3697efc32ad1`, an IMPLEMENT parent) shows a path-scoped
+`requested permissions to write to …/.claude/agents/card-reviewer.md` refusal, i.e. a subagent's
+own call does reach a permission gate. That last one proves the gate is there, not that
+`allowedTools` membership feeds it: `Edit`/`Write` were in that parent's declared set. Every
+transcript walked predates the SDK cutover (mtimes 2026-08-30 to 2026-09-16; `abf11db` landed
+2026-09-17), so this says nothing about the SDK transport's own subagent handling.
+
+**What would answer it**: one deliberate probe — a PLAN-shaped `query()` whose prompt makes an
+`Explore`/`general-purpose` subagent attempt `WebFetch` (or `Write`) — one call, worth spending only
+if the answer would change what PLAN may declare; it is filed here, not run. Its limit, stated
+now: it answers the PRACTICAL question (can a subagent escape PLAN's set?) only if the call
+RETURNS A RESULT. A refusal is ambiguous about mechanism — the two hypotheses this entry frames
+(`cliArg` inheritance versus an agent's own `tools` overriding) both predict a refusal for some
+tool, and the parent's own denials above already came from two different layers — so a refusal
+would close the practical question the other way without ever choosing between them.
+
 **Not closed by this entry**: (a) the subagent question's CHILD half — whether a spawned
-subagent's own nested tool calls are gated by the parent's `allowedTools` — left to A9, with the
-no-LLM-spend transcript-walk method named above; (b) whether the sibling card's bare-`Bash`-vs-
+subagent's own nested tool calls are gated by the parent's `allowedTools` — walked by A9 (above)
+and still open, with the one probe that would close it named; (b) whether the sibling card's bare-`Bash`-vs-
 scoped-settings.json gap is worth closing, and how; (c) the "editing `.claude/settings.json`"
 lever itself, which this action cannot pull and does not recommend pulling. All three are the
 maintainer's call, not a builder action's.
+
+## 17 · A9's sibling grep and the two mechanical checks it earned (card #239), 2026-09-21
+
+**Rule B — a pin's closing testimony must name the pin's own line.** `test/doc-constant-sweep.test.js`
+proved an `EXPECTED_CITATIONS` key *points* at a real line and never that the sentence describing
+the pin is true. Measured at A9's start: 8 of 96 entries had a correct key and a closing
+`content byte-identical at :M` clause naming a different line (0 after the fix). Three of the eight
+(`auto-triage.js → park-loop.js:1569`, `auto-triage.js → state-machine.js:3436`,
+`state-machine.js → park-loop.js:1457`) already existed at `41fb081`, the merge before this
+chantier: the class predates the card that found it. The check is `pinTestimonyOffenders`, the LAST
+clause only — earlier hop-history is legitimate (the naive "no foreign line number" rule fired on
+37 of 48 entries, every one a false positive, per the Opus verifier that measured it). Known limit: it reads the registry's own source lines, so it
+needs one entry per line; the same test asserts the keys it extracts deepEqual `EXPECTED_CITATIONS`
+so a reformatted entry fails loudly instead of leaving the check.
+
+**Still open, deliberately: `.yml` citations are resolver-invisible.** `CITATION_RE` matches
+`js|md|sh|ts|json` only. Exactly three `file.yml:N` citations existed (`orchestrator/sdk.js:11`,
+`test/sdk-loader.test.js:123`, a mention in `test/doc-constant-sweep.test.js`'s CORPUS_FILES
+comment), all `.github/workflows/gate.yml:9-12`; this section's own mention makes four, verified by hand this pass (that range still
+opens `Deterministic by construction`). Widening the regex is a change to `test/citation-pins.js`, whose
+extractor `doc-constant-sweep` and `test-comment-citation-sweep` both use; for three citations it
+was not done here, and not measured beyond counting them.
+
+**`orchestrator/live-progress.js` is now in `CORPUS_FILES`** (70 files): it names four other
+modules, holds zero `file:N` citations today (measured), and registering costs no
+`EXPECTED_CITATIONS` row. Planting `orchestrator/journal.js:99999` in its header turns test 21
+("every file:line citation ... resolves") red by name. Not every module is in the corpus; this one
+carries cross-file claims about the transport, which is what earns a place.
+
+**The sibling grep.** Scope: `doc/ prompts/ orchestrator/ bin/spo console/ scripts/ accounts/
+.github/ README.md CLAUDE.md test/ vendor/claude-agent-sdk/README.md`, excluding the dated
+records §15 category 1 names. Claims this chantier corrected, old phrasing → new phrasing:
+
+- *Transport* (`claude -p`, `spawnSync`+claude, `buildArgv`, `--output-format json`, "parses
+  stdout") → `query()`: §15 did the first pass. A9 additionally fixed `README.md` (headless
+  `claude -p` intro, the "every `claude -p` step" bullet), `steps/llm.js`'s file title,
+  `prompt-template.js`, `orchestrator/README.md`'s PLAN-reuse sentence, and `steps/sdk-call.js`'s
+  three explicit "today's `claude -p` transport" lines plus a header note that its other
+  "today's transport" wording means the pre-cutover one (rewriting all ~14 was judged riskier than
+  one note — recorded, not silently kept).
+- *Deadline* (`spawnSync` `timeout` bounds LLM steps) → abort timer: `orchestrator/README.md`
+  (`LLM_STEP_DEADLINE_MS` bullet, the "Deadline handling" paragraph) and `doc/state-machine-spec.md`
+  (the `duration_s` sentence) corrected; the `commandTimeoutsMs` sentences describe SCRIPTED
+  spawns, which really are `spawnSync`, and stay.
+- *Live progress* (transcript chain → `live-progress.json`): `README.md` and
+  `console/render-deck.js` corrected; `console/serve.js`, `console/live-step.js`,
+  `orchestrator/README.md` were already right.
+- *`killedByDeadline`* → `timedOut`: `orchestrator/README.md` and `steps/scripted.js`. It was a
+  local variable in `steps/llm.js` (`3396eae`), gone before this chantier (absent at `41fb081`).
+- *No `package.json`* → root only, `vendor/` explained: `scripts/gate.sh`, `.github/workflows/gate.yml`,
+  `orchestrator/README.md`'s "zero dependencies", `doc/operating.md` (deploy carries `vendor/`
+  with no extra step; measured with the two commands `scripts/release.sh` cuts a release by).
+- *Token recovery kept* (A7) and *`canUseTool` ruled against* (A8): grep of `token-recovery`,
+  `maybeRecoverTokens`, `canUseTool`, `permission-prompt-tool` finds no doc still claiming the
+  recovery path is removed, and `canUseTool` outside `doc/accepted-gaps.md` and its own tests.
+
+**Left alone, on purpose, each with its reason:** `doc/state-machine-spec.md`'s step-table
+`claude -p` labels (§15 category 3, unchanged: a kind label, not a mechanism claim); `doc/driver-wait-protocol.md`'s quote of "disposition 6" (a dated quotation of an
+older document, not a present claim); `orchestrator/config.js`'s "verified by running `claude -p`
+in `worktrees/issue-640`" (a dated measurement of what actually ran); `E2BIG` as the example of a
+call `claude` never started in `tokens.js`/`task-summary.js`/`bin/spo` (the class survives via
+ENOENT/EACCES, and `orchestrator/README.md` states plainly that a prompt can no longer reach it);
+`orchestrator/README.md`'s inline-cap "checked before every spawn ... `spawnSync` is synchronous"
+(describes the SCRIPTED spawns the cap wraps; the LLM half is described in the paragraph above it).

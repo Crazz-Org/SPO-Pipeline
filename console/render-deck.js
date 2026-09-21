@@ -361,7 +361,7 @@ function renderLives(counters, budgets) {
 // ---- the NOW panel -------------------------------------------------------------------------
 //
 // The plain-language half of the deck. Says what is happening in words a reader who has never
-// seen the state machine can act on, then backs it with the live transcript when there is one.
+// seen the state machine can act on, then backs it with the live-progress record when there is one.
 //
 // THE BAR IS ELAPSED AGAINST PAR, NOT COMPLETION. There is no completion signal inside a step --
 // see live-step.js. The scale is labelled with the three real numbers (zero, par, the deadline)

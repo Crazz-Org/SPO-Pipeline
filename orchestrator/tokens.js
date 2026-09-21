@@ -12,7 +12,7 @@
 // read tokens dominate raw counts by orders of magnitude"). A single "total tokens" figure would
 // just be measuring cache hit rate, not the thing worth watching.
 //
-// Every real `claude -p` call already records its own token counts in an `llm-call` event
+// Every real LLM call already records its own token counts in an `llm-call` event
 // (steps/llm.js's extractTokens, journaled as freshInputTokens/cacheCreationTokens/
 // cacheReadTokens/outputTokens/billableTokens/tokensSource) -- this module only adds them up.
 // There is no second ledger to keep in sync.

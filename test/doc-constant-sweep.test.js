@@ -1037,8 +1037,16 @@ test('every "action N.Na" banner comment names an id that appears in one of the 
 // deck could share one derivation instead of each carrying a copy, plus `orchestrator/sdk.js`,
 // added by card #239's chantier action A1 (2026-09-17) when the vendored Agent SDK's loader
 // module picked up its own `gate.yml:9-12` citation -- see this file's own header comment for
-// what it cites. A file added to or removed from this scope is a deliberate act -- update this
-// array in the same change, by name, the same way PINS's name list above works.
+// what it cites, plus `orchestrator/steps/sdk-call.js` (registered by its own action, A5b) and
+// `orchestrator/live-progress.js` (card #239 action A9, 2026-09-21): A6 wrote it with a header that
+// names four other modules and carries the transport's cross-file claims, it holds zero
+// `file:N` citations today (measured), so registering it costs no EXPECTED_CITATIONS row -- and the
+// next comment edit that adds one is checked instead of silently trusted. Not every orchestrator
+// module is here (19 other `.js`/`.sh` files under orchestrator/, console/ and scripts/ are not,
+// measured 2026-09-21 by diffing readdir against this array); a new module earns
+// its place by carrying cross-file claims, not by existing. A file added to or removed from this
+// scope is a deliberate act -- update this array in the same change, by name, the same way PINS's
+// name list above works.
 const CORPUS_FILES = [
   'README.md',
   'accounts/spo-test-accounts.yml',
@@ -1078,6 +1086,7 @@ const CORPUS_FILES = [
   'orchestrator/intake.js',
   'orchestrator/invariants.js',
   'orchestrator/journal.js',
+  'orchestrator/live-progress.js',
   'orchestrator/lock.js',
   'orchestrator/main-moved-budget.js',
   'orchestrator/monotonic-clock.js',
@@ -1283,7 +1292,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110", // KEPT as originally written -- action 11.1 (#206) first pass wrongly "corrected" this to :111-112 against d03ea8b7; fix pass D6 found the audit was actually measured against `93528389` (remediation-plan row 1.2, confirmed an ancestor of origin/main), where :109-110 IS the finished_marker/if-guard pair that reads `.finished` -- the :111-112 figure only held two lines later, at the wrong base commit.
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
-  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:389", // re-pinned from :157, then :166, then :207 (card #212 C1), then :270 (card #212 C2), then :315, then :318 -- card #212's fix pass (F1/F2/F3/F6, 45 net lines) landed above the step table, a true pure shift; content byte-identical at :315 (verified: the FINISH row's own "Action B1.4: FINISH now actually keeps the promise this row always made -- fast-forward the main product checkout" opens it). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :318 -> :387, a pure +69-line shift when doc/state-machine-spec.md gained the `continue` verb's own "Resume at CHECK" subsection above the step table; content byte-identical at :387, verified by re-reading the target line.
+  "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:389", // re-pinned from :157, then :166, then :207 (card #212 C1), then :270 (card #212 C2), then :315, then :318 -- card #212's fix pass (F1/F2/F3/F6, 45 net lines) landed above the step table, a true pure shift; content byte-identical at :315 (verified: the FINISH row's own "Action B1.4: FINISH now actually keeps the promise this row always made -- fast-forward the main product checkout" opens it). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :318 -> :387, a pure +69-line shift when doc/state-machine-spec.md gained the `continue` verb's own "Resume at CHECK" subsection above the step table; content byte-identical at :387, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :387 -> :389 without this sentence being told, which the Rule B check in this file found): content byte-identical at :389, verified by re-reading the target line.
   "doc/bench-audit-2026-09-02.md :: finish.sh:275-276",
   "doc/bench-audit-2026-09-02.md :: merge-queue.ts:178-188",
   "doc/bench-audit-2026-09-02.md :: run.ts:109",
@@ -1322,7 +1331,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-plan-derived-2026-09-02.md :: src/e2e/config.ts:93",
   "doc/bench-plan-derived-2026-09-02.md :: test/helpers.js:65-94", // same re-pin, same reason as bench-audit's own entry above (fix pass D7).
   "doc/bench-plan-derived-2026-09-02.md :: worker.ts:302", // same re-pin, same reason as bench-audit's own entry above.
-  "doc/board-audit.md :: config.js:1104", // re-pinned from :900, then :965, then :1003, then :1035, then :1097 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :1097 -> :1102, a pure +5-line shift when F3's own config.js edits (correcting the LLM_STEP_DEADLINE_ENTRIES/MAX_LEASE_AGE_MS-table comments from future to past tense) landed above reportIntakeColumn; content byte-identical at :1102, verified by re-reading the target line.
+  "doc/board-audit.md :: config.js:1104", // re-pinned from :900, then :965, then :1003, then :1035, then :1097 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :1097 -> :1102, a pure +5-line shift when F3's own config.js edits (correcting the LLM_STEP_DEADLINE_ENTRIES/MAX_LEASE_AGE_MS-table comments from future to past tense) landed above reportIntakeColumn; content byte-identical at :1102, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :1102 -> :1104 without this sentence being told, which the Rule B check in this file found): content byte-identical at :1104, verified by re-reading the target line.
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1396", // re-pinned from :1382, then :1389 (card #212) -- see this file's own prior history. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :1389 -> :1394, a pure +5-line shift when F3's own scripted.js header edit (the dry-run/--real prose, `query()` options not argv) landed above realWorktree; content byte-identical at :1394. Re-pinned once more in the SAME fix pass's second sweep round (team-lead cross-check): :1394 -> :1396, a pure +2-line shift when the round's own `runSync`'s `deps.spawnSync` comment fix landed above realWorktree too; content byte-identical at :1396, verified by re-reading the target line.
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1242", // re-pinned in card #214 (Lot 9, 2026-09-13): :1202 -> :1232, a pure +30-line shift when that action's `cmdTokens` gained the opt-in `--usage-delta` section (see this file's own EXPECTED_CITATIONS entry for `bin/spo:1284`, the `collectAll` pin shifted by the same edit) landed above `cmdDashboard` in the same file. Re-pinned again in card #219 (2026-09-14): :1232 -> :1235, a pure +3-line shift when that card's bin/spo cmdStatus injection (monotonicNowMs require plus two option lines) landed above `cmdDashboard`. Re-pinned a third time in card #219's OWN fix pass, same day: :1235 -> :1242, a pure +7-line shift when the fix pass expanded that same injected-deps comment (naming `processStartUptimeMs`/`monotonicNowMs()` explicitly) above `cmdDashboard` in the same file; content byte-identical (`function cmdDashboard(opts) {`) at :1242, verified by re-reading the target line.
@@ -1331,16 +1340,16 @@ const EXPECTED_CITATIONS = [
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127", // fix pass R1 (#206): the citation was true all along, it just cites the OTHER repo -- issue-429's PLAN ran with cwd in an SPO-WebClient worktree (base de2039e9), and `.claude/settings.json:109-127` there is the `"hooks": {` block through the third PreToolUse hook's `"timeout": 10` line, byte-identical at de2039e9/93528389/HEAD. Re-spelled with the `SPO-WebClient/` prefix so resolveCitationTarget routes it to the product repo instead of this one's own (109-line-shorter) settings.json.
   "orchestrator/README.md :: account-lease.js:167", // re-pinned from :156 -- action A2 (card #239, 2026-09-17) added ~11 net lines to the "why 2x" and "roughly 7.6x the longest full two-attempt step" paragraphs above tryAcquireLease in the same file, a true pure shift; content byte-identical at :167, verified by re-reading the target line.
-  "orchestrator/README.md :: config.js:968", // re-pinned from :773, then :829, then :867, then :899, then :961 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :961 -> :966, the SAME +5-line shift as config.js:1097 -> :1102 above; content byte-identical at :966, verified by re-reading the target line.
+  "orchestrator/README.md :: config.js:968", // re-pinned from :773, then :829, then :867, then :899, then :961 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :961 -> :966, the SAME +5-line shift as config.js:1097 -> :1102 above; content byte-identical at :966, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :966 -> :968 without this sentence being told, which the Rule B check in this file found): content byte-identical at :968, verified by re-reading the target line.
   "orchestrator/README.md :: dispatcher.js:643-656", // re-pinned from :634-648 -- action 11.1 fix pass (D3): the same sibling fact as doc/state-machine-spec.md's own entry above, missed in the first pass; :634 is a blank line, :635 is "if (childrenSignalled && outcome === 'crashed') {". Re-pinned again for this chantier's own A5b-2 fix pass, F3, same reason and same shift as the doc/state-machine-spec.md entry above.
-  "orchestrator/README.md :: doc/state-machine-spec.md:382", // re-pinned from :150, then :159, then :200 (card #212 C1), then :263 (card #212 C2), then :308, then :311 -- card #212's fix pass (F1/F2/F3/F6, 45 net lines) landed above the step table, a true pure shift; content byte-identical at :308 (the CHECK row). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :311 -> :380, a pure +69-line shift when doc/state-machine-spec.md gained the `continue` verb's own "Resume at CHECK" subsection above the step table; content byte-identical at :380, verified by re-reading the target line.
+  "orchestrator/README.md :: doc/state-machine-spec.md:382", // re-pinned from :150, then :159, then :200 (card #212 C1), then :263 (card #212 C2), then :308, then :311 -- card #212's fix pass (F1/F2/F3/F6, 45 net lines) landed above the step table, a true pure shift; content byte-identical at :308 (the CHECK row). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :311 -> :380, a pure +69-line shift when doc/state-machine-spec.md gained the `continue` verb's own "Resume at CHECK" subsection above the step table; content byte-identical at :380, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :380 -> :382 without this sentence being told, which the Rule B check in this file found): content byte-identical at :382, verified by re-reading the target line.
   "orchestrator/README.md :: intake.js:958-960", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines. Re-pinned again in card #218 (Lot 12, 2026-09-14): :938-940 -> :953-955, a net +15-line shift when that action's resolveLabelArgs fix (issue #218: replacing the binary `flag === '--label' ? ... : ...` ternaries with the frozen, throwing LABEL_ARGS_BY_FLAG lookup, plus the corrected header-comment sentence) landed above this point in the same file; content byte-identical at :953-955, verified by re-reading the target lines. Re-pinned again for action A2 (card #239, 2026-09-17): :953-955 -> :958-960, the SAME +5-line shift as the doc/state-machine-spec.md entry above; content byte-identical at :958-960, verified by re-reading the target lines.
   "orchestrator/README.md :: lock.js:352", // re-pinned from :276, then :328 -- card #219's fix pass added the future-guard and an expanded LINUX_CLK_TCK comment (24 more lines) above acquireShortLock in the same file, a true pure shift; content byte-identical at :352
   "orchestrator/README.md :: lock.js:354-385", // re-pinned from :278-309, then :330-361, same reason as :276 -> :352 immediately above; content byte-identical at :354-385
   "orchestrator/README.md :: lock.js:386", // re-pinned from :310, then :362, same reason; content byte-identical at :386
-  "orchestrator/auto-triage.js :: park-loop.js:1569", // re-pinned from :1396 -- card #212 added buildGateFactLine/shortSha and their own header comment (~50 net lines) above this precedent in the same file, a true pure shift; then :1446 -> :1453 in the same card's fix-pass (measured-figures correction + retry-cost rewording, +7 net lines) above the same precedent. Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :1453 -> :1566, a pure +113-line shift when park-loop.js gained RESUMABLE_PARK_REASONS/buildContinueLine/continueEligibility/buildContinueRefusedAck and the `continue` verb's own header/journal-doc comments above this precedent in the same file; content byte-identical at :1566, verified by re-reading the target line.
+  "orchestrator/auto-triage.js :: park-loop.js:1569", // re-pinned from :1396 -- card #212 added buildGateFactLine/shortSha and their own header comment (~50 net lines) above this precedent in the same file, a true pure shift; then :1446 -> :1453 in the same card's fix-pass (measured-figures correction + retry-cost rewording, +7 net lines) above the same precedent. Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :1453 -> :1566, a pure +113-line shift when park-loop.js gained RESUMABLE_PARK_REASONS/buildContinueLine/continueEligibility/buildContinueRefusedAck and the `continue` verb's own header/journal-doc comments above this precedent in the same file; content byte-identical at :1566, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :1566 -> :1569 without this sentence being told, which the Rule B check in this file found): content byte-identical at :1569, verified by re-reading the target line.
   "orchestrator/auto-triage.js :: remote-report-pull.js:193",
-  "orchestrator/auto-triage.js :: state-machine.js:3436", // re-pinned from :3402 -- the no-worktree-change fix (readWorktreeHead plus the pre-attempt HEAD read in handleImplement, +34 net lines) landed above this precedent in the same file, a true pure shift; content byte-identical at :3436, verified by re-reading the target line. Before that, re-pinned from :3006, then :3105, then :3171 (Lot 10, card #212's build), then :3276 (card #212 C1), then :3304 (card #212 C2), now :3392 (the comment line itself, as at HEAD :3276, not the appendDaemonEvent call below it) -- card #212's fix pass (F1/F2: the prior-state.json capture, the buildCtx skipWipPreserve field, and the prepareResume-catch's untrusted-path recovery/skip-preserve additions, +58 net lines) landed above this appendDaemonEvent precedent (the `queue-claim-failed` catch) in the same file, a true pure shift; content byte-identical at :3392, verified by re-reading the target line. Previously re-pinned from :2923 by card #174, same pure-shift reason.
+  "orchestrator/auto-triage.js :: state-machine.js:3436", // re-pinned from :3402 -- the no-worktree-change fix (readWorktreeHead plus the pre-attempt HEAD read in handleImplement, +34 net lines) landed above this precedent in the same file, a true pure shift; content byte-identical at :3436, verified by re-reading the target line. Before that, re-pinned from :3006, then :3105, then :3171 (Lot 10, card #212's build), then :3276 (card #212 C1), then :3304 (card #212 C2), now :3392 (the comment line itself, as at HEAD :3276, not the appendDaemonEvent call below it) -- card #212's fix pass (F1/F2: the prior-state.json capture, the buildCtx skipWipPreserve field, and the prepareResume-catch's untrusted-path recovery/skip-preserve additions, +58 net lines) landed above this appendDaemonEvent precedent (the `queue-claim-failed` catch) in the same file, a true pure shift; content byte-identical at :3392, verified by re-reading the target line. Previously re-pinned from :2923 by card #174, same pure-shift reason. Closing testimony restated for card #239 A9 (the hops above run newest-first here, so the last clause named the OLDEST value, :3392): content byte-identical at :3436, verified by re-reading the target line.
   "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
   "orchestrator/config.js :: worker.ts:1542",
   "orchestrator/dispatcher.js :: daemon.js:658", // re-pinned from :607, then :637, then :646, then :650 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :650 -> :656, a pure +6-line shift when F3's own daemon.js header edit (correcting the "--scanner split" rationale's now-stale "BLOCKING spawnSync" claim to "STALE SINCE, NOT RE-VERIFIED") landed above this point. Re-pinned once more in the SAME fix pass's second sweep round: :656 -> :658, a pure +2-line shift when that round's own daemon.js dry-run-artifact comment fix (the argv/`query()` options correction) landed above this point too; content byte-identical at :658 (the "CARD #78" `includeReparking` comment), verified by re-reading the target line.
@@ -1356,9 +1365,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: orchestrator/steps/llm.js:1105", // card #213 action 2 (2026-09-12): handleImplement's own comment on why planDeclaresRdoMembers/diagnoseOrValidateRetry are assigned onto ctx.task before the call cites llm.js's `resolveStepContract(stepName, ctx.task || {})` call site. Cited by the FULL path (not the bare basename "steps/llm.js") -- the citation resolver's basename fallback did not resolve the bare form; measured against the real corpus, only the full path resolves. Re-pinned across card #207, #214 (twice), action A5a, and action A5b (see this file's own prior history at each hop, up to :1009). Re-pinned once more for this chantier's own A5b-2 fix pass, F2 (card #239, 2026-09-17): :1009 -> :1011, a pure +2-line shift when F2's correction to the `suppliedSessionId`-block comment landed above this call site in llm.js. Re-pinned once more for this chantier's own action A6 (card #239, 2026-09-17): :1011 -> :1035, a pure +24-line shift when A6 added the `../live-progress` require above invokeClaudeReal, its own onMessage/finally-clear block inside invokeClaudeReal, and the `taskDir: ctx.taskDir,` field (with its own comment) to runLlm's legacy override branch -- all landing above this call site in the same file. Re-pinned once more for this chantier's own action A7 (card #239, 2026-09-17): :1035 -> :1065, a pure +30-line shift when A7's ruling on `maybeRecoverTokens` (ruled load-bearing, not dead code -- see that function's own comment) added a measured-evidence paragraph above this call site in the same file. Re-pinned once more for A7's OWN Opus verifier fix pass, same day: :1065 -> :1105, a pure +40-line shift when the fix pass corrected the ruling's corpus figure (F1: 117/12.8%/"dominant shape" was the retroactive backfill's own writes, not live recoveries -- corrected to 25/810/3.09%, all `ok:false`) and downgraded the architectural claim from measured to a named structural inference (F2) -- both landing above this call site in the same file; content byte-identical at :1105 (still `const contract = resolveStepContract(stepName, ctx.task || {});`), verified by re-reading the target line.
-  "orchestrator/state-machine.js :: park-loop.js:1457", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Re-pinned in card #212 (Lot 10, 2026-09-13): :1283 -> :1334, a pure +51-line shift when park-loop.js gained buildGateFactLine/shortSha and the new buildParkComment tests' worth of header comment above this point in the file; then :1334 -> :1341 in the same card's fix-pass (+7 net lines, measured-figures correction + retry-cost rewording above the same point). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :1341 -> :1454, a pure +113-line shift when park-loop.js gained RESUMABLE_PARK_REASONS/buildContinueLine/continueEligibility/buildContinueRefusedAck and the `continue` verb's own header/journal-doc comments above this gate in the same file; content byte-identical at :1454, verified by re-reading the target line.
+  "orchestrator/state-machine.js :: park-loop.js:1457", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Re-pinned in card #212 (Lot 10, 2026-09-13): :1283 -> :1334, a pure +51-line shift when park-loop.js gained buildGateFactLine/shortSha and the new buildParkComment tests' worth of header comment above this point in the file; then :1334 -> :1341 in the same card's fix-pass (+7 net lines, measured-figures correction + retry-cost rewording above the same point). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :1341 -> :1454, a pure +113-line shift when park-loop.js gained RESUMABLE_PARK_REASONS/buildContinueLine/continueEligibility/buildContinueRefusedAck and the `continue` verb's own header/journal-doc comments above this gate in the same file; content byte-identical at :1454, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :1454 -> :1457 without this sentence being told, which the Rule B check in this file found): content byte-identical at :1457, verified by re-reading the target line.
   "orchestrator/state-machine.js :: run.ts:63",
-  "orchestrator/state-machine.js :: step-contracts.js:1102", // re-pinned FIVE TIMES within card #213 (2026-09-12), each a pure relocation of the same `touchesRdoMembers === true` line, content unchanged: :432 -> :527 when action 2 rewrote shouldEscalate into the three-source order, then :527 -> :546 when the D1 fix hoisted trigger 4 above that block, then :546 -> :559 as D6/D7 and the name-only rewording added record comments above it, then :559 -> :880 when card #207 (Lot 9)'s FIRST build landed its own ~273-line addition (the outputContract `types` mechanism, its header comment, checkOutputTypes/valueSatisfiesType/jsonSchemaPropertiesFor, and per-step `types` maps) entirely ABOVE shouldEscalate in the file. Re-pinned again, same day, in that same card's first Opus-verifier fix pass (removing the two `types` declarations the corpus replay found unsafe and adding ~55 net lines of measured-evidence comment to the header instead): :880 -> :935. Re-pinned a THIRD time within card #207 itself, in the SECOND Opus-verifier fix pass (2026-09-13, honesty fixes F/G: stale wording corrections and a corrected corpus count added ~16 more net lines above this point): :935 -> :951. Re-pinned a SIXTH time in card #214 (Lot 9, 2026-09-13): :951 -> :978, a pure shift when that action added a measured comment above PLAN's `allowedTools` (allowedTools does not bind subagent spawning) and rewrote the IMPLEMENT_EFFORT_BY_SIZE per-turn-fit prose, both entirely above this point in the file; content byte-identical at :978, verified by re-reading the target line. Re-pinned a SEVENTH time in card #214's own fix pass (2026-09-13, F1): :978 -> :979, a pure +1-line shift when that pass widened the DIAGNOSE baseline comment's parenthetical (naming the new `requestCount`/`sessionRequestCount` replacement by name), above this point in the file; content byte-identical at :979, verified by re-reading the target line. Re-pinned an EIGHTH time in the SAME fix pass (F4): :979 -> :987, a pure +8-line shift when F4 dated/corrected PLAN's allowedTools comment itself (PR #222, and the corrected "IMPLEMENT can delegate too" finding, both above shouldEscalate in the file); content byte-identical at :987, verified by re-reading the target line. Re-pinned a NINTH time in a follow-up fix pass on the same card (2026-09-13, tense-neutral PR #222 wording): :987 -> :986, a pure -1-line shift when that pass tightened PLAN's allowedTools comment (cutting a "likely to merge" forecast clause), above shouldEscalate in the file; content byte-identical at :986, verified by re-reading the target line. Re-pinned a TENTH time when Lot 9's branch merged origin/main after PR #222 (2026-09-13): :986 -> :1029, a pure relocation -- #222 rewrote the shared EFFORT_BY_SIZE comment and added PLAN_EFFORT_BY_SIZE with its Fable baseline, all above shouldEscalate in the file (main alone had it at :603); content byte-identical at :1029, verified by re-reading the target line. Re-pinned an ELEVENTH time for action A2 (card #239, 2026-09-17): :1029 -> :1078, a pure +49-line shift when that action's STEP_DEADLINE_MARGIN_MS/MAX_LLM_STEP_OUTER_DEADLINE_MS constants and their own header comments, plus the rewritten MAX_LEASE_AGE_MS comment, landed above shouldEscalate in the same file; content byte-identical at :1078, verified by re-reading the target line. Re-pinned a TWELFTH time for action A5b (card #239, 2026-09-17): :1078 -> :1087, a pure +9-line shift when this action expanded the MAX_LLM_STEP_OUTER_DEADLINE_MS comment to state and check the arithmetic against sdk-call.js's own ABORT_CONFIRM_GRACE_MS, above shouldEscalate in the same file; content byte-identical at :1087, verified by re-reading the target line. Re-pinned a THIRTEENTH time for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :1087 -> :1100, a pure +13-line shift when F3's own step-contracts.js edits (correcting the LLM_STEP_DEADLINE_MS/deadlineMsForStep/MAX_LEASE_AGE_MS comments from spawnSync-era to query()-era wording, and from future to past tense) landed above shouldEscalate in the same file; content byte-identical at :1100, verified by re-reading the target line. It is still source 3 (intake's guess, reached only when the plan declared nothing at all). Every move was verified by re-reading the target line, not inferred from a diff offset.
+  "orchestrator/state-machine.js :: step-contracts.js:1102", // re-pinned FIVE TIMES within card #213 (2026-09-12), each a pure relocation of the same `touchesRdoMembers === true` line, content unchanged: :432 -> :527 when action 2 rewrote shouldEscalate into the three-source order, then :527 -> :546 when the D1 fix hoisted trigger 4 above that block, then :546 -> :559 as D6/D7 and the name-only rewording added record comments above it, then :559 -> :880 when card #207 (Lot 9)'s FIRST build landed its own ~273-line addition (the outputContract `types` mechanism, its header comment, checkOutputTypes/valueSatisfiesType/jsonSchemaPropertiesFor, and per-step `types` maps) entirely ABOVE shouldEscalate in the file. Re-pinned again, same day, in that same card's first Opus-verifier fix pass (removing the two `types` declarations the corpus replay found unsafe and adding ~55 net lines of measured-evidence comment to the header instead): :880 -> :935. Re-pinned a THIRD time within card #207 itself, in the SECOND Opus-verifier fix pass (2026-09-13, honesty fixes F/G: stale wording corrections and a corrected corpus count added ~16 more net lines above this point): :935 -> :951. Re-pinned a SIXTH time in card #214 (Lot 9, 2026-09-13): :951 -> :978, a pure shift when that action added a measured comment above PLAN's `allowedTools` (allowedTools does not bind subagent spawning) and rewrote the IMPLEMENT_EFFORT_BY_SIZE per-turn-fit prose, both entirely above this point in the file; content byte-identical at :978, verified by re-reading the target line. Re-pinned a SEVENTH time in card #214's own fix pass (2026-09-13, F1): :978 -> :979, a pure +1-line shift when that pass widened the DIAGNOSE baseline comment's parenthetical (naming the new `requestCount`/`sessionRequestCount` replacement by name), above this point in the file; content byte-identical at :979, verified by re-reading the target line. Re-pinned an EIGHTH time in the SAME fix pass (F4): :979 -> :987, a pure +8-line shift when F4 dated/corrected PLAN's allowedTools comment itself (PR #222, and the corrected "IMPLEMENT can delegate too" finding, both above shouldEscalate in the file); content byte-identical at :987, verified by re-reading the target line. Re-pinned a NINTH time in a follow-up fix pass on the same card (2026-09-13, tense-neutral PR #222 wording): :987 -> :986, a pure -1-line shift when that pass tightened PLAN's allowedTools comment (cutting a "likely to merge" forecast clause), above shouldEscalate in the file; content byte-identical at :986, verified by re-reading the target line. Re-pinned a TENTH time when Lot 9's branch merged origin/main after PR #222 (2026-09-13): :986 -> :1029, a pure relocation -- #222 rewrote the shared EFFORT_BY_SIZE comment and added PLAN_EFFORT_BY_SIZE with its Fable baseline, all above shouldEscalate in the file (main alone had it at :603); content byte-identical at :1029, verified by re-reading the target line. Re-pinned an ELEVENTH time for action A2 (card #239, 2026-09-17): :1029 -> :1078, a pure +49-line shift when that action's STEP_DEADLINE_MARGIN_MS/MAX_LLM_STEP_OUTER_DEADLINE_MS constants and their own header comments, plus the rewritten MAX_LEASE_AGE_MS comment, landed above shouldEscalate in the same file; content byte-identical at :1078, verified by re-reading the target line. Re-pinned a TWELFTH time for action A5b (card #239, 2026-09-17): :1078 -> :1087, a pure +9-line shift when this action expanded the MAX_LLM_STEP_OUTER_DEADLINE_MS comment to state and check the arithmetic against sdk-call.js's own ABORT_CONFIRM_GRACE_MS, above shouldEscalate in the same file; content byte-identical at :1087, verified by re-reading the target line. Re-pinned a THIRTEENTH time for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :1087 -> :1100, a pure +13-line shift when F3's own step-contracts.js edits (correcting the LLM_STEP_DEADLINE_MS/deadlineMsForStep/MAX_LEASE_AGE_MS comments from spawnSync-era to query()-era wording, and from future to past tense) landed above shouldEscalate in the same file; content byte-identical at :1100, verified by re-reading the target line. It is still source 3 (intake's guess, reached only when the plan declared nothing at all). Every move was verified by re-reading the target line, not inferred from a diff offset. Closing testimony corrected for card #239 A9 (the value had moved :1100 -> :1102 without this sentence being told, which the Rule B check in this file found): content byte-identical at :1102, verified by re-reading the target line.
   "orchestrator/steps/llm.js :: intake.js:958-960", // re-pinned from :797-799, then :854-856 by issue #196's own action (+57 lines), then :869-871, then :906-908 by the Priority-as-a-field action (+37 lines); issue #198's resolveLabelArgs extraction (2026-09-12) added a net 30 lines to intake.js above triageBugReport's own header comment (the new shared label-inventory helper used by fileCard and amendCard, netted against fileCard's shrunk header/inlined-label-code and amendCard's grown header). A TRUE pure shift: content byte-identical at :936-938, diffed line by line against the pre-action file. Re-pinned again in card #214 (Lot 9, 2026-09-13): :936-938 -> :938-940, a pure +2-line shift when that action's journalIntakeLlmCall fix (removing `numTurns: raw.numTurns,` and adding a 3-line replacement comment explaining why) landed above this point in the same file; content byte-identical at :938-940, verified by re-reading the target lines. Re-pinned again in card #218 (Lot 12, 2026-09-14): :938-940 -> :953-955, a net +15-line shift when that action's resolveLabelArgs fix (issue #218: replacing the binary `flag === '--label' ? ... : ...` ternaries with the frozen, throwing LABEL_ARGS_BY_FLAG lookup, plus the corrected header-comment sentence) landed above this point in the same file; content byte-identical at :953-955, verified by re-reading the target lines. Re-pinned again for action A2 (card #239, 2026-09-17): :953-955 -> :958-960, the SAME +5-line shift as the doc/state-machine-spec.md entry above; content byte-identical at :958-960, verified by re-reading the target lines.
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:336",
@@ -1374,13 +1383,13 @@ const EXPECTED_CITATIONS = [
   "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18",
 ];
 
-test('every file:line citation in the 68-file corpus resolves, or is on the named allowlist', () => {
+test('every file:line citation in the 70-file corpus resolves, or is on the named allowlist', () => {
   // Immediate, named diagnosis if a file is added to or dropped from CORPUS_FILES without
   // updating this pin -- the EXPECTED_CITATIONS deepEqual below would also catch it (every
   // citation that file held would vanish from `found`), but that failure reads as "which
   // citations changed," not "the corpus scope itself changed." Checked first so the more likely
   // cause is named up front.
-  assert.equal(CORPUS_FILES.length, 69, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
+  assert.equal(CORPUS_FILES.length, 70, 'CORPUS_FILES gained or lost a file -- update the pinned list (and its own comment) in the same change, by name.');
 
   const found = [];
   for (const rel of CORPUS_FILES) {
@@ -1397,7 +1406,7 @@ test('every file:line citation in the 68-file corpus resolves, or is on the name
   // FINDING (this action): a numeric floor cannot say WHICH citation died, added, or drifted --
   // gate C7's own history and this suite's E18 finding are both about exactly that failure mode.
   // deepEqual against the exact pinned set fails by NAME (assert.deepEqual's own diff) the moment
-  // a single citation is added, removed, or reworded anywhere in the 68-file corpus.
+  // a single citation is added, removed, or reworded anywhere in the 70-file corpus.
   assert.deepEqual(
     foundKeys,
     EXPECTED_CITATIONS,
@@ -3876,7 +3885,7 @@ test('DANGLING_DOC_REF_ALLOWLIST holds exactly the paths this action found dangl
   );
 });
 
-test('every bare "doc/<name>.md" reference in the 68-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
+test('every bare "doc/<name>.md" reference in the 70-file corpus resolves here, in the product repo, or is on DANGLING_DOC_REF_ALLOWLIST', () => {
   const found = new Map(); // path -> [rel,...]
   for (const rel of CORPUS_FILES) {
     const src = read(rel);
@@ -3972,4 +3981,141 @@ test('every SPO_DEPLOY_ARTIFACTS filename actually exists in SPO-Deploy, or its 
     [],
     `SPO-Deploy artifact(s) this corpus names by filename but that do not exist at ${DEPLOY_REPO}:\n  ${missing.join('\n  ')}`
   );
+});
+
+// ---- Rule B: a pin's closing testimony must name the pin's own line -------------------------
+//
+// Found in card #239 (SDK transport chantier) by an Opus verifier's mutation round. The citation
+// checks above prove a `doc :: target:N` key POINTS at something real; nothing proved that the
+// SENTENCE describing the pin is true. Eight entries of EXPECTED_CITATIONS had a correct value and
+// a closing "content byte-identical at :M" that named a DIFFERENT line -- every re-pin edits the
+// key and (sometimes) forgets the prose, and a reader trusting the prose re-verifies the wrong
+// line. Three of the eight predate that chantier entirely (they exist at 41fb081, the merge that
+// preceded it): the class is older than the card that found it.
+//
+// The rule: the LAST `content byte-identical at :N[-M]` clause in an entry's prose must equal the
+// key's own line (or range). NOT "no foreign line number anywhere": earlier hop-history in the same
+// comment ("... then :1029 -> :1078 ...; content byte-identical at :1078 ...") is legitimate, and
+// that naive rule fired on 37 of 48 measured entries, every one a false positive. Rule B measured
+// 7 of 48 with zero false positives when first run, and 8 of 96 by the time it shipped.
+//
+// It reads the registry's own source lines (a `//` comment has no runtime value to read) and
+// refuses to run blind: the keys it extracts must deepEqual EXPECTED_CITATIONS, so an entry
+// reformatted onto two lines fails loudly here, and so does ANY non-entry line inside the literal
+// (a `//` continuation, a comment above an entry): extractPinProse throws instead of skipping it.
+
+// Pure: (source lines of the file) -> [{ key, prose }] for the EXPECTED_CITATIONS literal.
+function extractPinProse(lines) {
+  const start = lines.findIndex((l) => l.startsWith('const EXPECTED_CITATIONS = ['));
+  if (start < 0) throw new Error('const EXPECTED_CITATIONS = [ not found');
+  let end = start + 1;
+  while (end < lines.length && lines[end] !== '];') end++;
+  const out = [];
+  for (let i = start + 1; i < end; i++) {
+    if (lines[i].trim() === '') continue;
+    const m = lines[i].match(/^\s*"([^"]+)",(?:\s*\/\/\s*(.*))?$/);
+    // ANY other line inside the literal -- a `//` continuation, a comment above an entry, a
+    // reformatted entry -- is prose this check can no longer see, so it is refused, not skipped.
+    if (!m) throw new Error(`EXPECTED_CITATIONS line ${i + 1} is not a one-line \`"key", // prose\` entry: ${lines[i].slice(0, 80)}`);
+    out.push({ key: m[1], prose: m[2] || '' });
+  }
+  return out;
+}
+
+// `byte-identical` ... `at :N`, tolerating a parenthetical between them (`byte-identical
+// (\`function cmdDashboard(opts) {\`) at :1242`, a real entry) and a wording without "content".
+const TESTIMONY_CLAUSE_RE = /byte-identical\b[^.;]{0,80}?\bat :(\d+)(?:-(\d+))?/g;
+
+// Pure: [{ key, prose }] -> one offender string per pin whose LAST testimony clause names a
+// different line than the key's own. A pin with no testimony clause is not this rule's business.
+function pinTestimonyOffenders(entries) {
+  const offenders = [];
+  for (const { key, prose } of entries) {
+    const own = key.match(/:(\d+)(?:-(\d+))?$/);
+    const clauses = [...prose.matchAll(TESTIMONY_CLAUSE_RE)];
+    if (!own || clauses.length === 0) continue;
+    const last = clauses[clauses.length - 1];
+    if (last[1] !== own[1] || (last[2] || '') !== (own[2] || '')) {
+      offenders.push(`${key} -- closing testimony names ${last[0].replace('content ', '')}, the pin is ${own[0]}`);
+    }
+  }
+  return offenders;
+}
+
+const readOwnSource = () => fs.readFileSync(__filename, 'utf8').split('\n');
+
+test('every EXPECTED_CITATIONS pin\'s closing "byte-identical at" clause names the pin\'s own line (Rule B)', () => {
+  const entries = extractPinProse(readOwnSource());
+  assert.deepEqual(
+    entries.map((e) => e.key),
+    EXPECTED_CITATIONS,
+    'the extractor no longer sees every EXPECTED_CITATIONS entry on its own line -- it would be ' +
+      'checking a subset and reporting green. Keep each entry `"key", // prose` on ONE line.'
+  );
+  // EXACT, not a floor (a floor is a bound: five pins could go blind under `>= 20` against 25):
+  // 26 of 96 carry a testimony clause today (measured 2026-09-21 with the wide regex; the narrow
+  // `content byte-identical at :` form finds 25 -- the 26th is bin/spo:1242's parenthetical form).
+  // A pin gaining or losing a clause is a deliberate act, updated here by name, the way
+  // CORPUS_FILES.length is.
+  const withTestimony = entries.filter((e) => [...e.prose.matchAll(TESTIMONY_CLAUSE_RE)].length > 0).length;
+  assert.equal(withTestimony, 26, `${withTestimony} pins carry a testimony clause, expected 26 -- a clause was reworded past TESTIMONY_CLAUSE_RE (the check is going blind) or one was added/removed; update this pin by name`);
+  assert.deepEqual(pinTestimonyOffenders(entries), []);
+});
+
+test('Rule B fires on a pin whose closing testimony names a different line, and only on that', () => {
+  const key = 'doc/x.md :: config.js:1104';
+  // The real shape of the 8 found: a correct key, a stale closing clause.
+  assert.deepEqual(
+    pinTestimonyOffenders([{ key, prose: 're-pinned from :900; content byte-identical at :1102, verified.' }]),
+    [`${key} -- closing testimony names byte-identical at :1102, the pin is :1104`]
+  );
+  // Legitimate hop-history: an EARLIER foreign clause, the LAST one is the pin's own. Must not fire.
+  assert.deepEqual(
+    pinTestimonyOffenders([{ key, prose: 'content byte-identical at :900 ... then content byte-identical at :1102 ... content byte-identical at :1104, verified.' }]),
+    []
+  );
+  // Foreign line numbers with no testimony clause at all are ordinary prose, not this rule's business.
+  assert.deepEqual(pinTestimonyOffenders([{ key, prose: 're-pinned from :900, then :1035, then :1097.' }]), []);
+  // Newest-first prose whose OLDEST hop comes last is exactly the state-machine.js:3436 shape: it fires.
+  assert.equal(
+    pinTestimonyOffenders([{ key: 'a :: s.js:3436', prose: 'content byte-identical at :3436. Before that content byte-identical at :3392.' }]).length,
+    1
+  );
+  // A range pin needs the range, not just its first line.
+  assert.equal(pinTestimonyOffenders([{ key: 'a :: d.js:643-656', prose: 'content byte-identical at :643.' }]).length, 1);
+  assert.deepEqual(pinTestimonyOffenders([{ key: 'a :: d.js:643-656', prose: 'content byte-identical at :643-656.' }]), []);
+});
+
+test('Rule B is live against the real registry: re-introducing a stale closing clause turns it red', () => {
+  const lines = readOwnSource();
+  const entries = extractPinProse(lines);
+  const target = entries.find((e) => e.key === 'orchestrator/README.md :: config.js:968');
+  assert.ok(target, 'fixture pin moved -- pick another entry that ends in a testimony clause');
+  // Mutate a COPY of the real prose the way a careless re-pin does: same key, old line in the clause.
+  const mutated = entries.map((e) =>
+    e === target ? { key: e.key, prose: e.prose.replace(/content byte-identical at :968/g, 'content byte-identical at :966') } : e
+  );
+  assert.notDeepEqual(mutated, entries, 'the mutation did not change the prose -- the fixture is stale');
+  assert.equal(pinTestimonyOffenders(mutated).length, 1);
+  assert.deepEqual(pinTestimonyOffenders(entries), []);
+});
+
+test('Rule B cannot be evaded by moving prose off the entry line, or by rewording the clause', () => {
+  const src = (body) => ['const EXPECTED_CITATIONS = [', ...body, '];'];
+  const entry = '  "a :: s.js:10", // content byte-identical at :10.';
+  assert.deepEqual(extractPinProse(src([entry, '']))[0].key, 'a :: s.js:10');
+  // A `//` continuation, a comment line above an entry, and a two-line entry are all refused
+  // (a stale clause hidden there was invisible to the key-parity check alone).
+  for (const bad of ['  // content byte-identical at :999.', '  "b :: s.js:11",\n', '  // a stray note']) {
+    assert.throws(() => extractPinProse(src([entry, bad])), /not a one-line/);
+  }
+  // The clause forms the narrow regex missed: a parenthetical, and no leading "content".
+  const key = 'a :: bin/spo:1242';
+  for (const stale of [
+    'byte-identical (`function cmdDashboard(opts) {`) at :1200.',
+    'the target is byte-identical at :1200, verified.',
+  ]) {
+    assert.equal(pinTestimonyOffenders([{ key, prose: stale }]).length, 1, stale);
+  }
+  assert.deepEqual(pinTestimonyOffenders([{ key, prose: 'byte-identical (`function cmdDashboard(opts) {`) at :1242.' }]), []);
 });

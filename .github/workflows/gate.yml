@@ -6,10 +6,16 @@
 # one runs on GitHub's machine, from a clean checkout, and its result is attached to the commit
 # whether anyone reads it or not.
 #
-# Deterministic by construction: this repo has no package.json, no node_modules and no network
+# Deterministic by construction: this repo has no root package.json, no node_modules and no network
 # calls in its suite (`test/no-real-spawn.js` fails any test that tries to spawn a real
 # git/gh/npm/claude), so there is no install step, no lockfile to resolve and nothing to fetch. The
 # same commit yields the same verdict here and on a laptop.
+#
+# `vendor/claude-agent-sdk/` is the one third-party thing in the tree and it leaves that untouched:
+# three files committed verbatim (`vendor/claude-agent-sdk/README.md` has the provenance), never
+# installed, so a checkout already holds them -- still no install step, no lockfile, nothing to
+# fetch (the SDK's own `package.json` among them is an inert provenance record, nothing resolves
+# from it). What they would drive, the real `claude`, is barred from the suite by the same guard.
 #
 # Cheap by construction too: no dependency install, a shallow checkout, ~20s of `node --test`, and
 # superseded PR runs cancelled. A gate that costs real money per push is one that eventually gets

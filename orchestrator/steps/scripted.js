@@ -140,11 +140,11 @@ function appendSpawnLog(taskDir, state, header, text) {
 // `status: null` (which a timeout kill also produces) straight to exit 1, indistinguishable
 // from a genuine failure -- so a timeout-killed GATE (exit 1 -> DIAGNOSE) paid a real LLM call
 // to diagnose a hang. `timedOut` is therefore branched FIRST, before the exit mapping, mirroring
-// llm.js's own `killedByDeadline` idiom (not a new third convention -- though that one still
-// carries the `|| (signal && deadlineArmed)` clause corrected here, and is left alone on purpose:
-// its `timedOut` drives intake.js's retry-once-on-the-same-account policy, so it is worth its own
-// corpus pass rather than a ride-along, and `claude` is measurably the wrong child to hit it --
-// it handles SIGTERM and exits 143 rather than dying by signal, so the clause barely fires there).
+// llm.js's own `timedOut` result field (not a new third convention; card #239 A9 corrected this
+// line, which named a `killedByDeadline` that is not a field and was only ever a local variable
+// long since removed). llm.js no longer has the `|| (signal && deadlineArmed)` clause corrected
+// here: invokeClaudeReal aborts a `query()` explicitly rather than through spawnSync's `timeout`,
+// so there is no bare `signal` there to classify -- see that file's own header, § Deadline.
 // A bare `signal` -- an
 // operator's kill, an OOM kill, the SIGTERM a deploy restart sends -- is NOT a timeout, and since
 // the isSpawnTimeout correction it is no longer misreported as one; it gets `killedBySignal`

@@ -795,13 +795,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   `duration_s` was documented here well before any code wrote it — action 5.4 measured
   2026-09-01 that zero of the 19 corpus journals' `llm-call` events carried it, and made it
   true the same day: `orchestrator/steps/llm.js`'s `invokeClaudeReal` measures the seconds a
-  call burned around the `claude` spawn itself and reports it on every branch (success, spawn
+  call burned around the `claude` call itself and reports it on every branch (success, spawn
   error, external signal, and — the one a maintainer most wants — a deadline timeout, which
   still burned the full deadline even though it produced no result). The reading is taken on a
   monotonic clock (`process.hrtime.bigint()`, via `orchestrator/monotonic-clock.js` — card #158,
   2026-09-08; 5.4 itself used `Date.now()`), the same clock class libuv uses to enforce the
-  `spawnSync` deadline, so a duration and the deadline bounding it can no longer disagree the
-  way a realtime reading and that deadline once did.
+  `spawnSync` deadline (card #239's A5b replaced that deadline with an abort timer; the claim
+  was not re-measured for the new one), so a duration and the deadline bounding it can no longer
+  disagree the way a realtime reading and that deadline once did.
   Account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled on the re-enqueue itself,
   once the queue entry is written, with NO `parked` line — the task never reaches the `PARKED`
