@@ -66,7 +66,11 @@ const {
   // drift is silent (the old copy treated INTERRUPTED as a clean PASS for months).
   classifyNightly,
 } = require('./steps/scripted');
-const { runLlm } = require('./steps/llm');
+// card #167: `resolveCallModel` answers which model a step's `claude -p` call will actually run
+// on, from the same two branches runLlm itself resolves it from -- callLlmStep leases and cools
+// against that answer. See that function's own header for why the step contract alone was not
+// a safe substitute.
+const { runLlm, resolveCallModel } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const { resolveMainMovedRegateBudget } = require('./main-moved-budget');
 const accounts = require('./accounts');
@@ -135,12 +139,31 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   const accountsDir = ctx.config.claudeAccountsDir;
   const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
 
+  // card #167: WHICH model this step will spend, resolved BEFORE leasing, so the lease asks for an
+  // account healthy for THAT model (a Fable cooldown no longer removes this account's Sonnet
+  // capacity) and a limit cools THAT model's quota rather than the whole account.
+  //
+  // It must be the SAME model the call actually runs on, or the pool state would describe a spend
+  // that never happened -- cooling a quota nobody used while the one that really limited stays
+  // hot. steps/llm.js's resolveCallModel is that answer, resolved from the same two inputs and
+  // the same two branches runLlm itself uses (the legacy ctx.task.llm.<step> override first, the
+  // step contract otherwise -- reaching for resolveStepContract here would have been wrong on
+  // every overridden task, and wrong silently). test/accounts-per-model-cooldown.test.js pins the
+  // correspondence by capturing the opts runLlm actually hands to invokeClaudeReal.
+  //
+  // Resolved ONCE, above the rotation loop, because neither input changes across attempts:
+  // rotation changes the ACCOUNT, never the step or the task shape. It reads ctx.task after the
+  // callers that stage escalation signals onto it have done so (handleImplement's
+  // planDeclaresRdoMembers/rdoDiffTouched assignments happen before this function is entered),
+  // which is the same ordering llm.js's own resolution sees.
+  const stepModel = resolveCallModel(ctx, stepName);
+
   let result;
   // R6 (F3): with maxAttempts === pool size, exhausting every account inside this loop exits
   // WITHOUT re-calling pick() -- so the maintainer never sees pick()'s own good
   // `all-accounts-cooling-until-<ISO>` reason on the park below, only {attempts, lastResult}.
   // That named a real wall-clock time back when cooldowns were flat; now that R1 makes cooldown
-  // duration escalate per-account, it says nothing at all. Carry the last cooldown event's own
+  // duration escalate per (account, model), it says nothing at all. Carry the last cooldown event's own
   // cooldownUntilIso through instead, so the park always names when to retry.
   let lastCooldownUntilIso = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -152,6 +175,7 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
         sleep: deps.leaseSleep,
         now: deps.leaseNow,
         isAlive: deps.leaseIsAlive,
+        model: stepModel,
       });
     } catch (err) {
       if (
@@ -178,7 +202,11 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
       return result;
     }
 
-    const event = accounts.markLimit(accountsDir, leased.account.name, result.limitKind);
+    // card #167: cool THIS STEP'S model on that account, not the account as a whole -- `stepModel`
+    // is the same value the lease above asked for and the same one runLlm just spent.
+    const event = accounts.markLimit(accountsDir, leased.account.name, result.limitKind, Date.now(), {
+      model: stepModel,
+    });
     lastCooldownUntilIso = event.cooldownUntilIso;
     appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
   }
@@ -1044,7 +1072,7 @@ async function handleImplement(ctx) {
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
   // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
-  // (orchestrator/steps/llm.js:1063 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // (orchestrator/steps/llm.js:1091 calls `resolveStepContract(stepName, ctx.task || {})`), never
   // ctx.counters or ctx.taskDir directly.
   //
   // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact
@@ -1591,7 +1619,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:1073's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1084's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;

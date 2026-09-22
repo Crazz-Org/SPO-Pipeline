@@ -59,6 +59,9 @@ require('./no-real-spawn');
 const { STEP_CONTRACTS } = require('../orchestrator/step-contracts');
 const { buildPromptValues } = require('../orchestrator/task-values');
 const { extractPlaceholders, splitHeaderAndBody } = require('../orchestrator/prompt-template');
+// card #167: the three intake steps' models are now one shared constant per step rather than an
+// inline literal -- see intakeContract below for why this sweep resolves through it.
+const { INTAKE_MODELS } = require('../orchestrator/intake');
 const { mkTmp } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
@@ -429,9 +432,22 @@ function intakeContract({ name, promptFileName, sliceStart, sliceEnd, promptMark
   }
   const allowedTools = Array.from(allowedToolsMatch[1].matchAll(/'([^']+)'/g)).map((m) => m[1]);
 
-  const modelMatch = slice.match(/\bmodel:\s*'([^']*)'/);
+  // card #167: the model moved from an inline literal to `INTAKE_MODELS.<step>`, because it is
+  // now needed in TWO places -- the invokeClaudeReal opts this slice builds, and the lease /
+  // markLimit calls inside callIntakeStepWithRotation, which must name the SAME model or the pool
+  // would lease against one quota and cool another. Two literals could drift; one constant cannot.
+  // Both spellings are accepted here, and the constant is resolved through intake.js's own export
+  // rather than by reading the identifier's name -- so this sweep keeps checking the value that
+  // actually reaches `claude -p`, not the spelling of the thing that holds it.
+  const modelMatch = slice.match(/\bmodel:\s*(?:'([^']*)'|INTAKE_MODELS\.([A-Za-z0-9_$]+))/);
   if (!modelMatch) {
     throw new Error(`prompt-contract-sweep: no model found for intake step ${name}`);
+  }
+  const baseModel = modelMatch[1] !== undefined ? modelMatch[1] : INTAKE_MODELS[modelMatch[2]];
+  if (typeof baseModel !== 'string') {
+    throw new Error(
+      `prompt-contract-sweep: intake step ${name} names INTAKE_MODELS.${modelMatch[2]}, which orchestrator/intake.js does not export`
+    );
   }
 
   const valuesSpan = objectLiteralAfter(slice, promptMarker);
@@ -443,7 +459,7 @@ function intakeContract({ name, promptFileName, sliceStart, sliceEnd, promptMark
     step: name,
     promptFile: path.join(PROMPTS_DIR, promptFileName),
     allowedTools,
-    baseModel: modelMatch[1],
+    baseModel,
     escalatedModel: null, // none of the three intake steps escalate
     derivedKeys: objectLiteralKeys(valuesSpan),
     readmeRow: readmeRowFor(name),

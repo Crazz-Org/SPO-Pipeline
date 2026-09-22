@@ -872,11 +872,22 @@ const STEP_CONTRACTS = {
     // least Fable's equal as a JUDGE on this project -- that finding was taken on the one step
     // where it was examined and never propagated to the four steps that judge.
     //
-    // AVAILABILITY. Four of five steps defaulted to Fable, and accounts.markLimit keys its cooldown
-    // by ACCOUNT, not by model -- so a Fable-only usage limit takes the whole account out for every
-    // model, Sonnet IMPLEMENT included. That has stalled the pool twice: 12.8h on 2026-08-30/31 (53
-    // cycles, 128 attempts) and again on 2026-09-04 with every account at 100% Fable quota. DIAGNOSE
-    // is the cheapest step to take off that single point of failure.
+    // AVAILABILITY. Four of five steps defaulted to Fable, and (as of this move, 2026-09-04)
+    // accounts.markLimit keyed its cooldown by ACCOUNT, not by model -- so a Fable-only usage limit
+    // took the whole account out for every model, Sonnet IMPLEMENT included. That has stalled the
+    // pool twice: 12.8h on 2026-08-30/31 (53 cycles, 128 attempts) and again on 2026-09-04 with
+    // every account at 100% Fable quota. DIAGNOSE is the cheapest step to take off that single
+    // point of failure.
+    //
+    // ERRATUM, card #167 (2026-09-22): that cooldown is now keyed by (account, MODEL), so the
+    // mechanism as stated above is no longer live -- a Fable limit cools Fable alone and leaves
+    // Sonnet IMPLEMENT untouched. The AVAILABILITY reason is NOT thereby void, but it is narrower
+    // than it reads: what remains is CONCENTRATION. Four of five steps on one model means one
+    // pool-WIDE Fable exhaustion (the 2026-09-04 shape: every account at 100% Fable quota) still
+    // stalls all four at once, and no cooldown granularity can help with that -- it is a model-
+    // fallback question, SPO-Pipeline#166. The 2026-08-30/31 and 2026-09-04 incidents are both
+    // still real; only the "takes the whole account out for every model" half of the explanation
+    // has been retired.
     //
     // NOT because Fable was diagnosing badly. Post-C1 the corpus shows 8/8 DIAGNOSE calls succeeded
     // and ZERO diagnose-* parks across 10 cards -- every card that entered a DIAGNOSE->IMPLEMENT

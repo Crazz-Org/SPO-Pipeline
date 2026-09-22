@@ -301,7 +301,11 @@ test('draftCard: the limited account is actually cooled down (markLimit written 
 
   const state = accounts.readState(accountsDir);
   assert.ok(state.acct1, 'acct1 should be cooling');
-  assert.ok(state.acct1.cooldownUntil > Date.now());
+  // card #167: the cooldown lands under the model THIS intake step spends
+  // (intake.INTAKE_MODELS.draftCard), never on the account as a whole -- so the other two intake
+  // models, and every pipeline step's model, keep their capacity on acct1.
+  assert.ok(state.acct1.byModel[intake.INTAKE_MODELS.draftCard].cooldownUntil > Date.now());
+  assert.deepEqual(Object.keys(state.acct1.byModel), [intake.INTAKE_MODELS.draftCard]);
   assert.ok(!state.acct2, 'acct2 should not be cooling');
 });
 
@@ -321,7 +325,9 @@ test('draftCard: a 529 (overloaded) failure cools the account for the short 5-mi
   assert.equal(result.cooldowns[0].cooldownMs, accounts.OVERLOADED_COOLDOWN_MS);
 
   const state = accounts.readState(accountsDir);
-  assert.ok(state.acct1.cooldownUntil <= Date.now() + accounts.OVERLOADED_COOLDOWN_MS + 5000);
+  assert.ok(
+    state.acct1.byModel[intake.INTAKE_MODELS.draftCard].cooldownUntil <= Date.now() + accounts.OVERLOADED_COOLDOWN_MS + 5000
+  );
 });
 
 test('draftCard: every account limited -> {ok:false, error} naming the exhaustion, never a throw', async () => {
@@ -1516,7 +1522,11 @@ test('triageBugReport: the limited account is actually cooled down (markLimit wr
 
   const state = accounts.readState(accountsDir);
   assert.ok(state.acct1, 'acct1 should be cooling');
-  assert.ok(state.acct1.cooldownUntil > Date.now());
+  // card #167: the cooldown lands under the model THIS intake step spends
+  // (intake.INTAKE_MODELS.triageBugReport), never on the account as a whole -- so the other two intake
+  // models, and every pipeline step's model, keep their capacity on acct1.
+  assert.ok(state.acct1.byModel[intake.INTAKE_MODELS.triageBugReport].cooldownUntil > Date.now());
+  assert.deepEqual(Object.keys(state.acct1.byModel), [intake.INTAKE_MODELS.triageBugReport]);
   assert.ok(!state.acct2, 'acct2 should not be cooling');
 });
 
@@ -1538,7 +1548,9 @@ test('triageBugReport: a 529 (overloaded) failure cools the account for the shor
   assert.equal(result.cooldowns[0].cooldownMs, accounts.OVERLOADED_COOLDOWN_MS);
 
   const state = accounts.readState(accountsDir);
-  assert.ok(state.acct1.cooldownUntil <= Date.now() + accounts.OVERLOADED_COOLDOWN_MS + 5000);
+  assert.ok(
+    state.acct1.byModel[intake.INTAKE_MODELS.triageBugReport].cooldownUntil <= Date.now() + accounts.OVERLOADED_COOLDOWN_MS + 5000
+  );
 });
 
 test('triageBugReport: every account limited -> {ok:false, error} naming the exhaustion, never a throw', async () => {

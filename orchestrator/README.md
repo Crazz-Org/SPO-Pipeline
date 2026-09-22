@@ -291,11 +291,11 @@ replacing a `/limit|overloaded|rate/i` scan over the free text of `result`/`term
 misclassified any message merely containing "rate" — "invalid rate parameter", "could not
 generate", "accurate output required" — as a rate limit; expensive, because `callLlmStep`'s
 response to `'limit'` is to rotate to the next account, re-paying the whole step, and once the
-pool is exhausted cool *every* account for hours). `'limit'` now requires a **structured**
+pool is exhausted cool *every* account, for that model, for hours). `'limit'` now requires a **structured**
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:963-965`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:986-988`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -309,7 +309,7 @@ signal, never a substring test:
 Everything else is `'error'` — including an unrecognised limit-shaped message, which now PARKS
 the task instead of rotating. That trade is deliberate: an unrecognised shape parking is one card
 a maintainer retries, versus a false positive re-paying the step on every account and cooling the
-whole pool. The failure result carries `terminalReason`/`apiErrorStatus` (and, on a `'limit'`
+whole pool for that model. The failure result carries `terminalReason`/`apiErrorStatus` (and, on a `'limit'`
 classification, `limitKind` — see below) and both are journalled with the step's `result`
 payload, so an unrecognised limit shape leaves exactly the evidence needed to extend the
 allowlist above as entries move from anticipated/guessed to actually observed — extend it from
@@ -337,10 +337,12 @@ existing "retry once, then PARK" bookkeeping; it just isn't what kills the child
 **Account rotation**: `orchestrator/state-machine.js` exports `callLlmStep(ctx, stepName,
 fixtureKey)`, used by every state that calls an LLM step (PLAN, IMPLEMENT, DIAGNOSE,
 VALIDATE's citation-verifier and change-validator). In shadow mode it is identical to calling
-`runLlm` directly. In real mode it picks a healthy account (`orchestrator/accounts.js`), and if
-that call comes back `{kind: 'limit'}`, cools the account down (journaled as
-`account-cooldown`) and tries the next one — one pass over the enabled accounts in the
-registry, never a second lap. If `accounts.pick()` finds nothing healthy to begin with, or the
+`runLlm` directly. In real mode it resolves the model this step will actually spend
+(`steps/llm.js`'s `resolveCallModel`), picks an account healthy **for that model**
+(`orchestrator/accounts.js`), and if that call comes back `{kind: 'limit'}`, cools **that
+`(account, model)` pair** down (journaled as `account-cooldown`) and tries the next one — one
+pass over the enabled accounts in the registry, never a second lap. Card #167: an account
+cooling on Fable is still leased for an IMPLEMENT/Sonnet step, because the quota is per model. If `accounts.pick()` finds nothing healthy to begin with, or the
 whole pass is exhausted, the task is PARKED (`all-accounts-cooling-until-<iso>` /
 `all-accounts-cooling-after-retry`).
 
@@ -696,8 +698,11 @@ dir). Full guided procedure: `doc/setup.md` § Accounts.
                              here by the operator
   disabled                  optional marker file (content ignored) — its presence disables the
                              account
-<poolDir>/state.json        machine-written, runtime cooldowns: {accountName: {cooldownUntil:
-                             epochMs, lastUsageLimitAt?: epochMs, usageLimitStreak?: int}}.
+<poolDir>/state.json        machine-written, runtime cooldowns, keyed per (account, model)
+                             since card #167: {accountName: {byModel: {<model>: {cooldownUntil:
+                             epochMs, lastUsageLimitAt?: epochMs, usageLimitStreak?: int}}}},
+                             <model> being one of step-contracts.js's own baseModel/
+                             escalatedModel values (fable/opus/sonnet today).
                              Disposable — deleting it clears every cooldown (and escalation
                              streak with it).
 ```
@@ -743,20 +748,26 @@ simplified to `accounts.markLimit(accountsDir, account.name, result.limitKind)`)
   gets mistaken for a continuation of the same exhausted one.
 - **`'overloaded'` → 5 minutes** (`accounts.OVERLOADED_COOLDOWN_MS`), flat, **never escalates**,
   and never touches the usage-escalation fields above. A busy *server* (529 / `overloaded_error`)
-  says nothing about this account's own quota, so nothing about it should compound the way
-  repeated usage hits do.
+  says nothing about this account's own quota — on any model — so nothing about it should
+  compound the way repeated usage hits do.
 - **An absent/unrecognised `limitKind`** (anything that isn't exactly `'usage'` or `'overloaded'`)
   falls back to the usage flow above (probe or escalated, by the same history check) — fail-safe:
   cool at least as long as a real usage hit would, rather than risk immediately re-hammering a
-  still-limited account. `state.json` written by pre-3.5 code (bare `{cooldownUntil}`, no
-  `lastUsageLimitAt`/`usageLimitStreak`) reads back the same way: no history on record, so it
-  probes fresh at 1h — never throws, never misbehaves.
+  still-limited account. A per-model record lacking `lastUsageLimitAt`/`usageLimitStreak` reads
+  back the same way: no history on record for that model, so it probes fresh at 1h — never
+  throws, never misbehaves. A pre-#167 **flat** entry (no `byModel` key at all) goes further: it
+  carries no attribution of its cooldown to any model, so it is read as nothing on record in
+  every dimension, including `cooldownUntil`. One stale flat cooldown is lost per account on the
+  upgrade; this file is machine-owned and disposable, and `rm state.json` has always been a
+  supported way to clear every cooldown in the pool.
 
 The CLI never actually supplies a retry-after hint on any path — `invokeClaudeReal` doesn't set
 one — so there is no "use the server's hint, else default" branch here; it's always the escalation
 decision above. `markLimit`'s returned event payload (journalled as `account-cooldown` by
 `callLlmStep`, or returned on `cooldowns` by `callIntakeStepWithRotation`) is `{account, limitKind,
-cooldownMs, cooldownUntil, cooldownUntilIso, escalated, defaulted}` — `limitKind` is the value
+model, models, cooldownMs, cooldownUntil, cooldownUntilIso, escalated, defaulted}` — `model` is
+the model named by the caller (`null` when none was) and `models` the models actually cooled
+(card #167: the two differ only on the cool-every-model fail-safe path), `limitKind` is the value
 `markLimit` was called with (`null` when absent, never swallowed), `escalated` is true exactly
 when the 5-hour tier fired, and `defaulted: true` means the value passed as `limitKind` wasn't
 `'usage'` or `'overloaded'` and the usage-tier fail-safe applied. Before this action's R2 fix,
@@ -786,7 +797,12 @@ token, the `chmod 600`, then `spo accounts` to verify) — it never runs `claude
 it deletes the account's whole `state.json` entry under the same short lock `markLimit` takes.
 Clearing `cooldownUntil` by hand is not equivalent -- `computeLimitUpdate` also stores
 `lastUsageLimitAt`, and leaving it behind means the next limit inside `ESCALATION_WINDOW_MS`
-escalates straight to the 5h tier as though nothing had been cleared. It exists because the
+escalates straight to the 5h tier as though nothing had been cleared. It takes **no `--model`
+flag** and clears every model's cooldown for that account (card #167's decision, recorded in
+`accounts.js`'s `clearCooldown`): the documented UX is "fully reset this account", and entry
+deletion gives that for free under the per-model shape exactly as it did under the flat one. The
+printed report names `clearedModels` and `coolingModels`, so a maintainer sees that clearing what
+turned out to be a fable-only cooldown was fable-only. It exists because the
 cooldown is invented locally and never reconciled against the server (issue #483): 4 of the 7
 cooldowns in the live journal carry `defaulted: true`, i.e. the server supplied no retry-after
 and the code guessed.
@@ -878,7 +894,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1000`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1003`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via

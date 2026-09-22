@@ -19,17 +19,42 @@
 //     disabled                     optional marker file (content ignored) -- its presence
 //                                  disables the account, same effect as `enabled: false` used
 //                                  to have in the old accounts.json.
-//   <poolDir>/state.json           runtime-written cooldowns -- {accountName: {cooldownUntil:
-//                                  epochMs, lastUsageLimitAt?: epochMs, usageLimitStreak?:
-//                                  int}}. The latter two (action 3.5) exist only to decide
-//                                  whether the NEXT usage limit escalates -- see markLimit's own
-//                                  comment; an 'overloaded' cooldown never writes them, and an
-//                                  entry from before 3.5 (bare {cooldownUntil}) simply lacks them,
-//                                  which reads as "no prior usage hit on record". Machine-owned,
+//   <poolDir>/state.json           runtime-written cooldowns -- {accountName: {byModel:
+//                                  {<model>: {cooldownUntil: epochMs, lastUsageLimitAt?: epochMs,
+//                                  usageLimitStreak?: int}}}}. The latter two (action 3.5) exist
+//                                  only to decide whether the NEXT usage limit escalates -- see
+//                                  markLimit's own comment; an 'overloaded' cooldown never writes
+//                                  them, and a per-model record that lacks them simply reads as
+//                                  "no prior usage hit on record for this model". Machine-owned,
 //                                  disposable: deleting it clears every cooldown (and every
 //                                  escalation streak with it). Lives next to the accounts on
 //                                  purpose -- one directory, one source of truth for the whole
 //                                  pool.
+//
+// COOLDOWN IS PER (ACCOUNT, MODEL), NOT PER ACCOUNT -- card #167. The Anthropic usage quota this
+// module models is per MODEL, and the pool's own corpus said so unambiguously: every `kind:'limit'`
+// classification ever observed was on Fable (186 calls / 12 limited; sonnet 107 / 0; opus 30 / 0),
+// and on one real account `IMPLEMENT/sonnet ok=true` at 07:55:26 sat seven minutes before
+// `VALIDATE/fable` hit a limit at 08:02:42 -- Sonnet was demonstrably usable on an account the
+// old whole-account cooldown was about to mark unavailable. Cooling the whole account therefore
+// threw away IMPLEMENT (sonnet) capacity that provably existed, for the whole 1h-or-5h window,
+// on every routine Fable limit.
+//
+// WHAT THIS DOES NOT FIX, stated here because it is the obvious next question: pool-wide
+// exhaustion of ONE model. All seven historical `all-accounts-*` parks were at PLAN or VALIDATE,
+// both `baseModel: 'fable'` (step-contracts.js) -- when Fable itself is what is exhausted across
+// the whole pool, a per-model cooldown cannot conjure a Fable account, and this change is neutral
+// on every one of those parks by construction (test/accounts-per-model-cooldown.test.js proves
+// it). The structural answer to that is model fallback, which is a separate DECISION card,
+// SPO-Pipeline#166 -- deliberately not attempted here.
+//
+// LEGACY (pre-#167) FLAT ENTRIES: an entry with no `byModel` key carries no per-model information
+// at all, so there is no honest way to attribute its cooldown to a model. It is read as "no
+// cooldown recorded for any model" -- see byModelOf() below, which is the single place that
+// decision is made. The cost is one stale flat cooldown lost per account on the upgrade, which
+// this same header already declares acceptable two paragraphs up: the file is machine-owned and
+// disposable, and `rm state.json` has always been a supported way to clear every cooldown in the
+// pool. A fancier migration would have to invent the missing attribution.
 //
 // Every function here takes the pool directory as an explicit first argument -- this is what
 // lets the test suite point at a fs.mkdtempSync(os.tmpdir()) directory instead of the real
@@ -49,7 +74,26 @@ const path = require('path');
 // anything that transitively requires it), so this is not a cycle -- see config.js itself.
 const lock = require('./lock');
 const config = require('./config');
+const { STEP_CONTRACTS } = require('./step-contracts');
 const { monotonicNowMs } = require('./monotonic-clock');
+
+// The model vocabulary this module's per-(account, model) state is keyed by -- DERIVED from
+// step-contracts.js's own table, never restated as a literal list, so a step that introduces a
+// fourth model moves this with it instead of leaving a silent gap. Not a cycle: step-contracts.js
+// requires only `path` and ./bash-policy, and this module already reaches it transitively through
+// config.js. Today it resolves to fable/opus/sonnet.
+//
+// Used for exactly ONE thing -- markLimit's fail-safe when no model is named (see its own
+// comment). Every other function here treats the model as an opaque string key and never consults
+// this set, so a model string that is not in it (a test's 'haiku', a future step's) still cools
+// and still reads back correctly.
+const KNOWN_MODELS = Object.freeze(
+  Array.from(
+    new Set(
+      Object.values(STEP_CONTRACTS).flatMap((def) => [def.baseModel, def.escalatedModel].filter((m) => typeof m === 'string'))
+    )
+  ).sort()
+);
 
 const OAUTH_TOKEN_FILENAME = 'oauth-token';
 const DISABLED_MARKER_FILENAME = 'disabled';
@@ -323,6 +367,73 @@ function writeState(poolDir, state) {
   }
 }
 
+// ---- per-(account, model) cooldown reads (card #167) ----------------------------------------
+//
+// byModelOf(entry) -- one account's per-model cooldown records, or {} when there are none. The
+// SINGLE place the legacy-flat-entry decision documented in this file's header is made: an entry
+// written before #167 has no `byModel` key, carries no attribution of its cooldown to any model,
+// and is therefore read as "nothing on record" -- {} -- rather than guessed at. Also the place
+// that absorbs a torn/hand-edited entry (a string, null, a byModel that isn't an object): every
+// reader below goes through here, so none of them has to re-check the shape, and none of them can
+// throw on a state.json a human edited badly.
+function byModelOf(entry) {
+  if (!entry || typeof entry !== 'object') return {};
+  const byModel = entry.byModel;
+  if (!byModel || typeof byModel !== 'object') return {};
+  return byModel;
+}
+
+// activeCooldownUntil(entry, model, now) -- when this account becomes usable again for the
+// request described by `model`, or null if it already is. This is THE health test; pick(),
+// countHealthyAccounts() and the CLI/dashboard readers all derive from it, so "healthy" has one
+// definition in this codebase rather than four.
+//
+//   `model` a string  -- exactly that model's own cooldownUntil. Cooling on a DIFFERENT model is
+//                        invisible here, which is the whole point of card #167: a Fable limit
+//                        must not remove this account's Sonnet (IMPLEMENT) capacity.
+//   `model` omitted   -- the UNION: the account counts as cooling while ANY model's cooldown is
+//     (or null)        still in the future, so it becomes healthy again only once the LAST of
+//                      them expires -- hence `max`, not `min`. That is the honest answer to the
+//                      question a caller with no model in hand is really asking ("is this account
+//                      cooling at all"), and it keeps every pre-#167 caller (bin/spo's bare
+//                      pick(), the dashboard) behaving exactly as it did.
+function activeCooldownUntil(entry, model, now) {
+  const byModel = byModelOf(entry);
+  if (typeof model === 'string') {
+    const until = byModel[model] && byModel[model].cooldownUntil;
+    return typeof until === 'number' && until > now ? until : null;
+  }
+  let latest = null;
+  for (const key of Object.keys(byModel)) {
+    const until = byModel[key] && byModel[key].cooldownUntil;
+    if (typeof until === 'number' && until > now && (latest === null || until > latest)) latest = until;
+  }
+  return latest;
+}
+
+// coolingSummary(entry, now) -- the read the CLI (`spo accounts`, `spo status`) and the dashboard
+// (console/collect.js) share, so a maintainer can tell a FABLE-ONLY cooldown from a real
+// whole-account outage instead of seeing one undifferentiated "cooling: yes". Exported for that
+// reason: those two are the places card #167's issue text calls out as currently misreporting,
+// and re-deriving the new shape in each of them would be the "second source of truth" this
+// module's own header forbids.
+//
+//   cooling        -- any model cooling right now (activeCooldownUntil's union answer, negated).
+//   coolingModels  -- [{model, cooldownUntil, cooldownUntilIso}] for the models actually cooling,
+//                     sorted by model name so the rendered line is stable between reads.
+//   cooldownUntil  -- the LATEST of those (when the account is usable for every model again), or
+//                     null. Same number the union pick() reports, for the same reason.
+function coolingSummary(entry, now = Date.now()) {
+  const byModel = byModelOf(entry);
+  const coolingModels = Object.keys(byModel)
+    .sort()
+    .map((model) => ({ model, cooldownUntil: byModel[model] && byModel[model].cooldownUntil }))
+    .filter((m) => typeof m.cooldownUntil === 'number' && m.cooldownUntil > now)
+    .map((m) => ({ ...m, cooldownUntilIso: new Date(m.cooldownUntil).toISOString() }));
+  const cooldownUntil = coolingModels.reduce((max, m) => (max === null || m.cooldownUntil > max ? m.cooldownUntil : max), null);
+  return { cooling: coolingModels.length > 0, coolingModels, cooldownUntil };
+}
+
 // First enabled account (registry order = pick order -- no round robin, no load balancing;
 // spreading calls across K healthy accounts is a scheduler-level concern, not this module's)
 // whose cooldownUntil is absent or already past `now`. `now` is a parameter, not always
@@ -347,6 +458,16 @@ function writeState(poolDir, state) {
 // never pick()-able either way, so there IS a healthy candidate, just not an available one),
 // which is why healthyCount is tracked independently of the early return below rather than
 // inferred from whether the loop reached the end.
+//
+// card #167: `opts.model` (optional, one of step-contracts.js's baseModel/escalatedModel strings)
+// scopes the cooldown filter to the model the caller is about to actually spend -- an account
+// cooling on 'fable' is still returned for a 'sonnet' request. OMITTING it keeps the union
+// behaviour byte-for-byte (see activeCooldownUntil): bin/spo and every pre-#167 test call this
+// bare and must keep getting "is this account cooling at all". Deliberately additive in the same
+// way opts.excludeAccounts is -- neither the returned account shape nor either error's `reason`
+// and `detail` changed, because park-loop.js's countRepeatedParks fingerprints a park as
+// `reason + JSON.stringify(detail)` and #119/PR #156's wait behaviour is pinned on exactly those
+// bytes. A per-model pick that found nothing parks EXACTLY as a whole-account one did.
 function pick(poolDir, now = Date.now(), opts = {}) {
   const registry = readRegistry(poolDir);
   if (registry.length === 0) {
@@ -355,15 +476,14 @@ function pick(poolDir, now = Date.now(), opts = {}) {
 
   const state = readState(poolDir);
   const excludeAccounts = opts.excludeAccounts;
+  const model = opts.model;
 
   let earliestCooldown = null;
   let healthyCount = 0;
   for (const account of registry) {
     if (!account.enabled) continue;
-    const entry = state[account.name];
-    const cooldownUntil = entry && entry.cooldownUntil;
-    const healthy = !cooldownUntil || cooldownUntil <= now;
-    if (!healthy) {
+    const cooldownUntil = activeCooldownUntil(state[account.name], model, now);
+    if (cooldownUntil !== null) {
       if (earliestCooldown === null || cooldownUntil < earliestCooldown) {
         earliestCooldown = cooldownUntil;
       }
@@ -406,16 +526,26 @@ function pick(poolDir, now = Date.now(), opts = {}) {
 // hours-long cooldown is -- clamping K on lease state too would make K flap on every single LLM
 // call across every worker instead of settling once per cooldown/recovery event, which is not
 // what "K workers" is supposed to mean (K is a concurrency budget, not "accounts idle right now").
-function countHealthyAccounts(poolDir, now = Date.now()) {
+//
+// card #167: the optional third argument scopes the count to accounts healthy FOR THAT MODEL,
+// with exactly pick(opts.model)'s semantics -- this is the card's "the concurrency clamp is
+// derived from accounts healthy for the requested model" bullet, and an account cooling only on
+// 'fable' still counts toward 'sonnet' capacity.
+//
+// SCOPE BOUNDARY, deliberate: dispatcher.js's fillSlots still calls this BARE (no model), and
+// that is not an oversight -- see the comment at that call site. A worker slot is not bound to
+// one model at spawn time (a card runs INTAKE -> WORKTREE -> PLAN/opus -> IMPLEMENT/sonnet ->
+// VALIDATE/fable over its life), so "the requested model" has no single answer there; the bare
+// union count is the honest one. The capability lives here, tested here, for the callers that DO
+// have one model in hand.
+function countHealthyAccounts(poolDir, now = Date.now(), model = undefined) {
   const registry = readRegistry(poolDir);
   if (registry.length === 0) return 0;
   const state = readState(poolDir);
   let healthy = 0;
   for (const account of registry) {
     if (!account.enabled) continue;
-    const entry = state[account.name];
-    const cooldownUntil = entry && entry.cooldownUntil;
-    if (!cooldownUntil || cooldownUntil <= now) healthy += 1;
+    if (activeCooldownUntil(state[account.name], model, now) === null) healthy += 1;
   }
   return healthy;
 }
@@ -459,39 +589,85 @@ function countHealthyAccounts(poolDir, now = Date.now()) {
 // computation (and the state.json shape it produces) must be identical whether or not the lock
 // was acquired; only whether a concurrent writer could interleave with it differs. Returns
 // {nextState, event}; never touches disk itself.
-function computeLimitUpdate(state, name, limitKind, now) {
+// card #167: `model` names WHICH model hit the limit, and the cooldown lands under
+// `byModel[model]` -- the escalation history (lastUsageLimitAt/usageLimitStreak) is per-model too,
+// because the quota it models is. Real callers always name it (state-machine.js resolves it from
+// the step contract, intake.js passes each function's own hardcoded literal).
+//
+// WHEN NO MODEL IS NAMED this cools EVERY model in KNOWN_MODELS -- i.e. exactly the pre-#167
+// whole-account behaviour. That is the fail-safe direction on purpose: the alternative (cool
+// nothing, or cool one sentinel pseudo-model) would turn a caller that forgot the argument into a
+// SILENT no-op, handing work straight back to a rate-limited account -- the loop action 3.6 was
+// written to end. Over-cooling costs capacity for one window and is visible in `spo accounts`;
+// under-cooling costs a burn loop and is invisible. Each model still escalates off its OWN
+// history, so an account that only ever limits on fable does not accumulate a streak on sonnet.
+//
+// On the multi-model (no model named) path the returned event's `cooldownMs`/`cooldownUntil`
+// report the LATEST of the per-model cooldowns (when the account is usable for every model
+// again), and `escalated` is true if ANY of them escalated -- the same union answer
+// activeCooldownUntil gives for a caller with no model in hand. On the single-model path, which
+// is every real call site, all three are exact.
+function computeLimitUpdate(state, name, limitKind, now, model = undefined) {
   const entry = state[name] || {};
+  const byModel = byModelOf(entry);
+  const targets = typeof model === 'string' ? [model] : KNOWN_MODELS;
 
   const overloaded = limitKind === 'overloaded';
   const defaulted = !overloaded && limitKind !== 'usage';
 
-  let ms;
+  const nextByModel = { ...byModel };
+  let ms = null;
+  let cooldownUntil = null;
   let escalated = false;
-  if (overloaded) {
-    ms = OVERLOADED_COOLDOWN_MS;
-  } else {
-    const last = typeof entry.lastUsageLimitAt === 'number' ? entry.lastUsageLimitAt : null;
-    escalated = last !== null && now - last <= ESCALATION_WINDOW_MS;
-    ms = escalated ? USAGE_ESCALATED_COOLDOWN_MS : USAGE_PROBE_COOLDOWN_MS;
-  }
-  const cooldownUntil = now + ms;
 
-  const nextState = { ...state };
-  if (overloaded) {
-    nextState[name] = { ...entry, cooldownUntil };
-  } else {
-    const prevStreak = typeof entry.usageLimitStreak === 'number' ? entry.usageLimitStreak : 0;
-    nextState[name] = {
-      ...entry,
-      cooldownUntil,
-      lastUsageLimitAt: now,
-      usageLimitStreak: escalated ? prevStreak + 1 : 1,
-    };
+  for (const target of targets) {
+    const prev = byModel[target] && typeof byModel[target] === 'object' ? byModel[target] : {};
+
+    let targetMs;
+    let targetEscalated = false;
+    if (overloaded) {
+      targetMs = OVERLOADED_COOLDOWN_MS;
+    } else {
+      const last = typeof prev.lastUsageLimitAt === 'number' ? prev.lastUsageLimitAt : null;
+      targetEscalated = last !== null && now - last <= ESCALATION_WINDOW_MS;
+      targetMs = targetEscalated ? USAGE_ESCALATED_COOLDOWN_MS : USAGE_PROBE_COOLDOWN_MS;
+    }
+    const targetUntil = now + targetMs;
+
+    if (overloaded) {
+      nextByModel[target] = { ...prev, cooldownUntil: targetUntil };
+    } else {
+      const prevStreak = typeof prev.usageLimitStreak === 'number' ? prev.usageLimitStreak : 0;
+      nextByModel[target] = {
+        ...prev,
+        cooldownUntil: targetUntil,
+        lastUsageLimitAt: now,
+        usageLimitStreak: targetEscalated ? prevStreak + 1 : 1,
+      };
+    }
+
+    if (cooldownUntil === null || targetUntil > cooldownUntil) {
+      cooldownUntil = targetUntil;
+      ms = targetMs;
+    }
+    escalated = escalated || targetEscalated;
   }
+
+  // The rewritten entry is `{byModel}` ALONE, not `{...entry, byModel}` -- writing a limit is
+  // where a surviving legacy flat entry (pre-#167 `{cooldownUntil, lastUsageLimitAt,
+  // usageLimitStreak}` at the top level) is finally dropped. byModelOf already reads those fields
+  // as nothing; carrying them forward would leave a number in state.json that looks like a
+  // cooldown, is displayed by nothing, and is honoured by nothing.
+  const nextState = { ...state, [name]: { byModel: nextByModel } };
 
   const event = {
     account: name,
     limitKind: limitKind ?? null,
+    // card #167: WHICH model was cooled. `model` is what the caller named (null when it named
+    // nothing), `models` is what was actually written -- the two differ only on the fail-safe
+    // path above, and the journalled `account-cooldown` event needs both to stay readable.
+    model: typeof model === 'string' ? model : null,
+    models: targets,
     cooldownMs: ms,
     cooldownUntil,
     cooldownUntilIso: new Date(cooldownUntil).toISOString(),
@@ -524,18 +700,26 @@ function sleepSyncMs(ms) {
 // would mean every caller still has to remember to call it AND pass the result in, for no benefit
 // now that there is exactly one place (here) that needs the mapping. Both real call sites
 // simplified accordingly, straight to `accounts.markLimit(accountsDir, account.name,
-// result.limitKind)`.
+// result.limitKind, Date.now(), {model})`.
 //
 // `limitKind`:
 //   'overloaded' -- flat OVERLOADED_COOLDOWN_MS (5 min). Never escalates, and never touches (or
 //                   even reads) the usage-escalation fields below -- a busy server says nothing
 //                   about this account's own quota.
 //   'usage', or anything else (undefined/null/an unrecognised string -- fail-safe, see below) --
-//                   USAGE_ESCALATED_COOLDOWN_MS (5h) if `state[name].lastUsageLimitAt` is within
+//                   USAGE_ESCALATED_COOLDOWN_MS (5h) if this account's record FOR THIS MODEL
+//                   (`state[name].byModel[model].lastUsageLimitAt`) is within
 //                   ESCALATION_WINDOW_MS of `now`, otherwise USAGE_PROBE_COOLDOWN_MS (1h).
 //                   `usageLimitStreak` counts consecutive escalated hits; the decision above
 //                   doesn't consult it, it exists so a maintainer reading state.json by hand can
 //                   see how long an account has been stuck without doing the arithmetic.
+//
+// `opts.model` (card #167) -- WHICH model hit the limit, so the cooldown lands on that model's
+// quota alone instead of taking the account's other models down with it. See computeLimitUpdate
+// above for the semantics, including what happens when it is omitted (cool every known model --
+// the pre-#167 behaviour, kept as the fail-safe). Real callers resolve it from the step contract
+// (state-machine.js) or pass their own hardcoded literal (intake.js) -- never guess it from
+// `limitKind`, which says what KIND of limit fired, not which quota it was drawn against.
 //
 // `defaulted` means exactly what R2 (F2) needed it to mean again: no *recognised* limitKind
 // ('usage' or 'overloaded') was supplied, and the usage fail-safe applied anyway. Before this
@@ -544,7 +728,9 @@ function sleepSyncMs(ms) {
 // all -- the one case the fallback exists for (a limit shape classifyFailure recognizes but that
 // isn't in a limitKind bucket) was indistinguishable from a genuine 429/529 in the journal. Both
 // are fixed here: `limitKind` is always on the returned event (`null` when absent), and
-// `defaulted` is true exactly when that value wasn't 'usage' or 'overloaded'.
+// `defaulted` is true exactly when that value wasn't 'usage' or 'overloaded'. It is about
+// `limitKind` ONLY, and says nothing about whether `opts.model` was supplied -- the event's own
+// `model`/`models` pair answers that.
 //
 // action 6.2: the read-modify-write above used to run completely unlocked -- two processes each
 // reading state.json, each computing their own account's new entry off that same snapshot, each
@@ -602,7 +788,7 @@ function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
 
   try {
     const state = readState(poolDir);
-    const { nextState, event } = computeLimitUpdate(state, name, limitKind, now);
+    const { nextState, event } = computeLimitUpdate(state, name, limitKind, now, opts.model);
     writeState(poolDir, nextState);
     return { ...event, degraded };
   } finally {
@@ -628,11 +814,20 @@ function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
 // account that re-limited straight into the 5h tier instead of a fresh 1h probe.
 //
 // Implemented as one entry DELETION, not three field deletions: state.json's own header
-// documents an account's entry as having ONLY these three fields (cooldownUntil,
+// documents an account's per-model record as having ONLY these three fields (cooldownUntil,
 // lastUsageLimitAt?, usageLimitStreak?), so removing the whole key is equivalent to zeroing all
 // three, and there is nothing left for a future field to accidentally survive a clear that only
 // named the three fields explicitly. readState/pick/markLimit already treat "no entry for this
 // account" as "nothing on record" -- the same posture a missing state.json gets.
+//
+// card #167 -- CLEARS EVERY MODEL, and takes no `--model` flag. Decided, not defaulted into:
+// this is the maintainer's manual escape hatch, its documented UX is "fully reset this account",
+// and the situation it exists for is "the server would have let this through, unblock it". A
+// per-model clear would be a second thing to get right at 3am for a saving (keeping an unrelated
+// model's cooldown armed) that nobody has asked for. Entry deletion gives the whole-account reset
+// for free under the new shape exactly as it did under the old one; if a per-model clear is ever
+// wanted, `--model` is a strictly additive argument to add then. The report below names
+// `clearedModels`/`coolingModels` so the maintainer sees exactly what the clear covered.
 //
 // Same lock idiom as markLimit above (see that function's own comment for the full reasoning):
 // acquire stateLockPath(poolDir) via lock.acquireShortLock, poll with a bounded wait keyed off a
@@ -696,10 +891,26 @@ function clearCooldown(poolDir, name, now = Date.now(), opts = {}) {
     const state = readState(poolDir);
     const entry = state[name];
     const hadEntry = Boolean(entry);
-    const cooldownUntil = hadEntry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
+
+    // card #167: the three report numbers are now derived across EVERY model this account has a
+    // record for, because the deletion below clears every model (see this function's header).
+    // `cooldownUntil` is the LATEST one on record whether or not it has expired -- the caller
+    // prints it either as "was cooling until X" or as "had a stale cooldownUntil X (already
+    // past)", and both of those need the value, not just the active ones.
+    const records = byModelOf(entry);
+    const clearedModels = Object.keys(records).sort();
+    let cooldownUntil = null;
+    let escalationWasArmed = false;
+    for (const model of clearedModels) {
+      const record = records[model] || {};
+      if (typeof record.cooldownUntil === 'number' && (cooldownUntil === null || record.cooldownUntil > cooldownUntil)) {
+        cooldownUntil = record.cooldownUntil;
+      }
+      const lastUsageLimitAt = typeof record.lastUsageLimitAt === 'number' ? record.lastUsageLimitAt : null;
+      if (lastUsageLimitAt !== null && now - lastUsageLimitAt <= ESCALATION_WINDOW_MS) escalationWasArmed = true;
+    }
     const wasCooling = cooldownUntil !== null && cooldownUntil > now;
-    const lastUsageLimitAt = hadEntry && typeof entry.lastUsageLimitAt === 'number' ? entry.lastUsageLimitAt : null;
-    const escalationWasArmed = lastUsageLimitAt !== null && now - lastUsageLimitAt <= ESCALATION_WINDOW_MS;
+    const coolingModels = coolingSummary(entry, now).coolingModels.map((m) => m.model);
 
     let cleared = false;
     if (hadEntry) {
@@ -716,6 +927,11 @@ function clearCooldown(poolDir, name, now = Date.now(), opts = {}) {
       cooldownUntil,
       cooldownUntilIso: cooldownUntil !== null ? new Date(cooldownUntil).toISOString() : null,
       escalationWasArmed,
+      // card #167: which models had a record at all (all of them are cleared), and which of
+      // those were still cooling at `now`. The CLI prints the second so a maintainer sees that
+      // clearing a fable-only cooldown did not also "unblock" a sonnet that was never blocked.
+      clearedModels,
+      coolingModels,
       cleared,
       degraded,
     };
@@ -732,6 +948,13 @@ module.exports = {
   readRegistry,
   readState,
   writeState,
+  // card #167 -- the per-(account, model) cooldown reads. Exported so the CLI (bin/spo) and the
+  // dashboard (console/collect.js) share this module's definition of "cooling" instead of each
+  // re-deriving the state.json shape, which is what let them both go stale on it before.
+  byModelOf,
+  activeCooldownUntil,
+  coolingSummary,
+  KNOWN_MODELS,
   hasCredentials,
   readLabels,
   syncSettings,

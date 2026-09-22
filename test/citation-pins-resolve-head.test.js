@@ -274,9 +274,9 @@ test('historical drift replay: intake.js -- old citation :938-940 (unchanged tex
   const [result] = resolvePins([pin]);
   assert.equal(result.ok, true, `expected ok: true: ${result.why}`);
   assert.ok(result.correction, 'expected a correction to be reported');
-  assert.equal(result.correction.start, 963);
-  assert.equal(result.correction.stop, 965);
-  assert.equal(result.correction.citation, 'orchestrator/intake.js:963-965');
+  assert.equal(result.correction.start, 986);
+  assert.equal(result.correction.stop, 988);
+  assert.equal(result.correction.citation, 'orchestrator/intake.js:986-988');
 });
 
 test('historical drift replay: lock.js -- old citation :278-309 (one shift back, the position immediately before today\'s; unchanged text) resolves ok with a correction to the real current lines', () => {

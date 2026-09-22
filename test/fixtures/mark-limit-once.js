@@ -7,7 +7,11 @@
 // writeFileSync could honestly reproduce (a mock never actually interleaves two independent
 // event loops the way two OS processes hitting the same file at once do).
 //
-// argv: <poolDir> <accountName> <limitKind> [<barrierFile>]
+// argv: <poolDir> <accountName> <limitKind> [<barrierFile>] [<model>]
+//
+// card #167: `model` names which model's quota the limit is drawn against. Passing it here
+// keeps this fixture on the REAL production call shape (every real call site names a model);
+// omitting it exercises markLimit's cool-every-known-model fail-safe instead.
 //
 // The optional barrier is what makes this a real race rather than a lucky one. Node takes tens of
 // milliseconds to boot and markLimit's critical section is microseconds long, so four children
@@ -23,7 +27,7 @@ const path = require('path');
 
 const accounts = require(path.join(__dirname, '..', '..', 'orchestrator', 'accounts'));
 
-const [, , poolDir, accountName, limitKind, barrierFile] = process.argv;
+const [, , poolDir, accountName, limitKind, barrierFile, model] = process.argv;
 
 if (barrierFile) {
   const spin = new Int32Array(new SharedArrayBuffer(4));
@@ -31,4 +35,4 @@ if (barrierFile) {
   while (!fs.existsSync(barrierFile) && Date.now() < deadline) Atomics.wait(spin, 0, 0, 1);
 }
 
-accounts.markLimit(poolDir, accountName, limitKind, Date.now());
+accounts.markLimit(poolDir, accountName, limitKind, Date.now(), { model });

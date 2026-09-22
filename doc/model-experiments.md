@@ -57,7 +57,13 @@ Caveats that apply to every entry:
   - Transport failures and deadline kills never fall back.
 - **Hypothesis:** Opus plans well enough that downstream cost per merged card does not rise, and
   PLAN's own quota cost drops. A second effect: Fable-quota exhaustion stops blocking cards at
-  PLAN, because a Fable limit cools the whole account (#483).
+  PLAN — as originally written, "because a Fable limit cools the whole account (#483)".
+  **That stated mechanism no longer holds** (card #167, 2026-09-22): a limit now cools only the
+  `(account, model)` pair it fired on, so a Fable limit leaves that account's Opus quota intact.
+  The second effect itself survives, on the narrower and still-true reason it always really had:
+  a PLAN that does not call Fable at all is unaffected by Fable being exhausted **pool-wide**,
+  which is the case a per-model cooldown cannot help with (SPO-Pipeline#166). The verdict below
+  must not be read as evidence for the retired mechanism.
 - **Baseline** (Fable, all PLAN calls up to 2026-09-13,
   `node scripts/model-report.js --until=2026-09-13`; medians over all calls, failed ones included):
 

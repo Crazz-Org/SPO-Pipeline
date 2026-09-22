@@ -736,7 +736,13 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
   const poolDir = mkTmp('spo-disp-accts-');
   writePoolDir(poolDir, [{ name: 'acct0' }]);
   const coolUntil = Date.now() + 60_000;
-  fs.writeFileSync(path.join(poolDir, 'state.json'), JSON.stringify({ acct0: { cooldownUntil: coolUntil } }));
+  // card #167: cooldowns are per (account, model); acct0 is cooling on EVERY model here, which
+  // is what makes countHealthyAccounts' bare (union) count fall to zero. The dispatcher's clamp
+  // deliberately asks the union question -- see its own comment at the countHealthyAccounts call.
+  fs.writeFileSync(
+    path.join(poolDir, 'state.json'),
+    JSON.stringify({ acct0: { byModel: Object.fromEntries(accounts.KNOWN_MODELS.map((m) => [m, { cooldownUntil: coolUntil }])) } })
+  );
 
   const config = baseConfig({
     claudeAccountsDir: poolDir,
@@ -769,7 +775,10 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
     assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 1);
 
     // The cooldown expires: the recovery edge fires, and the task finally starts.
-    fs.writeFileSync(path.join(poolDir, 'state.json'), JSON.stringify({ acct0: { cooldownUntil: Date.now() - 1000 } }));
+    fs.writeFileSync(
+      path.join(poolDir, 'state.json'),
+      JSON.stringify({ acct0: { byModel: { fable: { cooldownUntil: Date.now() - 1000 } } } })
+    );
     await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-healthy-accounts-returned'));
     const back = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-healthy-accounts-returned');
     assert.equal(back.healthy, 1);
@@ -819,7 +828,9 @@ test('K is clamped to the number of healthy accounts before each spawn, even whe
 
   const poolDir = onePoolDir(2); // acct0, acct1
   // acct1 is cooling for a long time -- only acct0 is healthy, so K=2 configured must behave as K=1.
-  accounts.writeState(poolDir, { acct1: { cooldownUntil: Date.now() + 60 * 60 * 1000 } });
+  accounts.writeState(poolDir, {
+    acct1: { byModel: Object.fromEntries(accounts.KNOWN_MODELS.map((m) => [m, { cooldownUntil: Date.now() + 60 * 60 * 1000 }])) },
+  });
 
   const config = baseConfig({ workers: 2, claudeAccountsDir: poolDir, deps: { spawn: spawnIsolated } });
   const dispatcher = createDispatcher(queueDir, journalDir, config);

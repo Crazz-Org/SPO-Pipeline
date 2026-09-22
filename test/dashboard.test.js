@@ -167,7 +167,10 @@ test('a cooling account renders in the accounts table with its cooldown timestam
     { name: 'acct-healthy', extraFile: '.credentials.json' }, // no token, but real credentials present
   ]);
   const cooldownUntil = Date.now() + 60 * 60 * 1000;
-  writeJson(path.join(accountsDir, 'state.json'), { 'acct-cooling': { cooldownUntil } });
+  // card #167: a cooldown belongs to a (account, model) pair. Fable alone here, deliberately --
+  // it is the shape every limit this pool has ever seen actually takes, and the row must render
+  // the model beside the timestamp rather than implying the whole account is out.
+  writeJson(path.join(accountsDir, 'state.json'), { 'acct-cooling': { byModel: { fable: { cooldownUntil } } } });
 
   const html = renderDashboard(collectAll({ accountsDir }), { view: 'health' });
 
@@ -175,6 +178,7 @@ test('a cooling account renders in the accounts table with its cooldown timestam
   assert.match(html, /acct-healthy/);
   assert.match(html, /class="cooling"/);
   assert.match(html, new RegExp(new Date(cooldownUntil).toISOString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(html, /\(fable\)/, 'card #167: the cell must name WHICH model is cooling, not just when it clears');
 });
 
 test('bin/spo dashboard honors --out, writes BOTH pages there, and prints both absolute paths', () => {

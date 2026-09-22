@@ -792,7 +792,9 @@ module.exports = {
   // spawn regardless of this value -- see dispatcher.js and account-lease.js's own header for why
   // the measured ceiling on the real two-account pool is K=2, and why K=1 (one account cooling)
   // is a routine state, not an edge case: one account sat in a 5-hour cooldown for most of
-  // 2026-09-01. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
+  // 2026-09-01. That clamp reads countHealthyAccounts BARE (card #167): "not cooling on any
+  // model", since a worker slot spans several models over one card's life -- see dispatcher.js's
+  // own comment at the call site. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
   // this default rather than to 0 (which would spawn nothing, silently, forever).
   workers: WORKERS,
 
@@ -907,7 +909,8 @@ module.exports = {
 
   // Claude Max account pool directory -- the single source of truth (maintainer decision,
   // 2026-08-29): every subdirectory is one account, plus a machine-written state.json for
-  // cooldowns. See orchestrator/accounts.js and doc/setup.md § Accounts. Machine-level by
+  // cooldowns -- keyed per (account, model) since card #167, the Anthropic quota's own
+  // granularity. See orchestrator/accounts.js and doc/setup.md § Accounts. Machine-level by
   // default, deliberately outside the repo (never git-ignored-but-present here) -- overridable
   // with the SPO_ACCOUNTS_DIR env var, and as always by the explicit first argument every
   // accounts.js function takes (tests point this at a temp dir). A missing or empty pool
@@ -1294,8 +1297,9 @@ module.exports = {
   // real dollar spend to cap. What is worth measuring, and what `spo tokens`
   // (orchestrator/tokens.js) reports, is TOKEN efficiency: fresh input + cache-creation + output
   // ("billable-weighted tokens"), cache-read kept separate since it is near-free on a quota plan.
-  // What actually constrains a run is the pool itself: per-account rate limits and the cooldowns
-  // accounts.js already tracks.
+  // What actually constrains a run is the pool itself: rate limits -- per (account, MODEL), which
+  // is what the Anthropic quota is actually metered on and what accounts.js keys its cooldowns by
+  // since card #167 -- and the cooldowns accounts.js already tracks.
   //
   // The PER-STEP caps in step-contracts.js stay, and were never about money either: they cut off
   // a step that has run away, whoever/whatever pays.

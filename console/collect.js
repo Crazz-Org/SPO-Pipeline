@@ -525,16 +525,24 @@ function collectAccounts(accountsDir) {
   const now = Date.now();
 
   const rows = registry.map((a) => {
-    const entry = state[a.name];
-    const cooldownUntil = entry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
-    const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
+    // card #167: a cooldown is per (account, model) now, so this asks accounts.js for the derived
+    // answer instead of re-reading `entry.cooldownUntil` -- the flat field it used to read no
+    // longer exists, and re-deriving the nested shape here would be the second source of truth
+    // this function's own header rules out. `cooling` keeps its meaning honestly rather than
+    // conveniently: it is "cooling on at least one model", and `coolingModels` says WHICH, so the
+    // dashboard can no longer present a fable-only cooldown as a whole-account outage. The
+    // rendered `cooldownUntil` is the LATEST of them -- when the account is usable for every
+    // model again.
+    const summary = accountsModule.coolingSummary(state[a.name], now);
+    const cooling = summary.cooling;
     const label = labels[a.name] || {};
     return {
       name: a.name,
       email: label.email || null,
       plan: label.plan || null,
       enabled: a.enabled,
-      cooldownUntil: cooling ? new Date(cooldownUntil).toISOString() : null,
+      cooldownUntil: cooling ? new Date(summary.cooldownUntil).toISOString() : null,
+      coolingModels: summary.coolingModels.map((m) => m.model),
       cooling,
       hasToken: !!a.oauthTokenFile,
       hasCredentials: accountsModule.hasCredentials(a.configDir),

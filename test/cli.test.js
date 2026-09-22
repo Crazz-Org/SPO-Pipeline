@@ -231,11 +231,13 @@ test('spo account clear-cooldown on a cooling, escalation-armed account reports 
 
   // Real markLimit (not a hand-built fixture) puts the account in the exact state a live rate
   // limit produces: cooling, and lastUsageLimitAt freshly armed for the escalation window.
-  const markEvent = accounts.markLimit(accountsDir, 'pool1', 'usage');
+  const markEvent = accounts.markLimit(accountsDir, 'pool1', 'usage', Date.now(), { model: 'fable' });
   assert.equal(markEvent.escalated, false, 'test setup: this must be a first-ever probe hit, not already escalated');
 
   const out = runSpo(['account', 'clear-cooldown', 'pool1', '--accounts-dir', accountsDir, '--journal', journalDir]);
-  assert.match(out, /pool1: cleared -- was cooling until/);
+  // card #167: the report names which model(s) were cooling -- clearing a fable-only cooldown
+  // must not read as if the whole account had been unavailable.
+  assert.match(out, /pool1: cleared -- was cooling on fable until/);
   assert.match(out, /escalation state WAS armed \(the next usage limit would have jumped straight to the 5h tier\) -- cleared/);
 
   // The clear must have actually landed in state.json -- the CLI's own report is not the proof.
@@ -254,6 +256,8 @@ test('spo account clear-cooldown on a cooling, escalation-armed account reports 
   assert.equal(event.wasCooling, true);
   assert.equal(event.escalationWasArmed, true);
   assert.equal(event.degraded, false);
+  assert.deepEqual(event.clearedModels, ['fable'], 'card #167: the journal records which models the clear covered');
+  assert.deepEqual(event.coolingModels, ['fable']);
 });
 
 test('SPO_ACCOUNTS_DIR env var picks the pool directory when --accounts-dir is not given', () => {

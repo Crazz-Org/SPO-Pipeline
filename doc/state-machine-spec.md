@@ -603,7 +603,8 @@ separate repos with no shared runtime.
   `pick()` throws `NoAccountsRegisteredError('no-accounts-registered', ...)`, `callLlmStep`
   (`state-machine.js`) rethrows it verbatim as `ParkSignal('no-accounts-registered', ...)`, and
   `daemon.js --real` refuses to even start. `pick()`'s other sibling for a non-empty pool that
-  still yields nobody healthy — every enabled account cooling, `AllAccountsCoolingError` — is
+  still yields nobody healthy — every enabled account cooling *for the model the step needs*,
+  `AllAccountsCoolingError` — is
   `'all-accounts-cooling-unknown'` when nothing in the registry ever recorded a cooldown to report
   a time for, else `` `all-accounts-cooling-until-${ISO timestamp}` `` naming the earliest cooldown
   any checked account will clear; both are rethrown the same verbatim way, distinct from
@@ -645,10 +646,37 @@ separate repos with no shared runtime.
   (issue-497); the observed maximum number of re-enqueues for any one card is 2. NEVER cite
   16.69h — that figure does not reproduce: the whole-cluster span is 16.63h, but it contains a
   ~3.6h window in which the pool was not limited at all, so it is not an outage duration.
-- The scheduler assigns each step an account; a limit error puts the account in **cooldown**
-  and the step retries on the next healthy account. Cooldowns are journal events.
+- The scheduler assigns each step an account; a limit error puts that account in **cooldown**
+  *for the model the call was running on* and the step retries on the next healthy account.
+  Cooldowns are journal events.
+
+  **Cooldown is per `(account, model)`, not per account** (card #167). The Anthropic quota is
+  per model, and the pool's own corpus said so unambiguously: every `kind:'limit'` ever
+  classified was on Fable (fable 186 calls / 12 limited; sonnet 107 / 0; opus 30 / 0), and one
+  real account ran `IMPLEMENT/sonnet ok=true` at 07:55:26 seven minutes before `VALIDATE/fable`
+  hit a limit at 08:02:42. The pre-#167 whole-account cooldown then removed that account's
+  Sonnet (IMPLEMENT) capacity for the full 1h-or-5h window, though Sonnet was demonstrably
+  usable. So `state.json` keys every cooldown, and its escalation history, under the model:
+  `{accountName: {byModel: {<model>: {cooldownUntil, lastUsageLimitAt?, usageLimitStreak?}}}}`,
+  where `<model>` is one of `step-contracts.js`'s own `baseModel`/`escalatedModel` values.
+  `pick(poolDir, now, {model})` and `countHealthyAccounts(poolDir, now, model)` honour it;
+  omitting the model keeps the old union answer ("cooling on anything"), which is what
+  `bin/spo` and the dashboard ask. `callLlmStep` resolves the model through
+  `steps/llm.js`'s `resolveCallModel` — the same two branches `runLlm` itself resolves it from,
+  so the model leased and cooled is always the model `claude -p` actually ran on.
+
+  **This does NOT address pool-wide exhaustion of one model, and is not meant to.** All seven
+  historical `all-accounts-*` parks were at PLAN or VALIDATE, both `baseModel: 'fable'` at the
+  time; a per-model cooldown cannot conjure a Fable account when Fable is what is exhausted
+  across the whole pool, so it would have prevented none of them and is measured neutral on
+  that shape (`test/accounts-per-model-cooldown.test.js`). The structural answer there is model
+  fallback, tracked separately as SPO-Pipeline#166.
+
+  A pre-#167 flat entry (no `byModel`) carries no attribution of its cooldown to any model and
+  is read as nothing on record, never honoured and never an error — `state.json` is
+  machine-owned and disposable, as `accounts.js`'s own header has always said.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:963-965`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:986-988`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -669,12 +697,17 @@ separate repos with no shared runtime.
   its own regardless.) A flat 5h also over-waits by construction — the Claude Max
   session window resets 5h after the *session's first message*, not after the limit hit, so
   `now + 5h` sleeps for (5h − the true remaining wait) longer than necessary, often 4h+. So:
-  a first usage limit for an account (`limitKind: 'usage'`, i.e. 429 / `rate_limit_error` /
-  `usage_limit_reached`) cools it for a **1-hour probe**; a usage limit landing again within a
-  **2-hour escalation window** of that account's last one cools it for the real observed
-  **5-hour** Claude Max session window instead (the probe just proved the window is still open).
-  `overloaded` (529 / `overloaded_error`) stays a flat **5 minutes** and never escalates — a busy
-  *server* says nothing about this account's own quota. An absent/unrecognised limit kind falls
+  a first usage limit for an `(account, model)` pair (`limitKind: 'usage'`, i.e. 429 /
+  `rate_limit_error` / `usage_limit_reached`) cools **that pair** for a **1-hour probe**; a usage
+  limit landing again within a **2-hour escalation window** of *that same pair's* last one cools
+  it for the real observed **5-hour** Claude Max session window instead (the probe just proved
+  the window is still open). The history is per-model for the same reason the cooldown is: a busy
+  Fable hour must not put this account's Sonnet straight onto the 5h tier the first time it
+  blinks. `overloaded` (529 / `overloaded_error`) stays a flat **5 minutes** and never escalates
+  — a busy *server* says nothing about this account's own quota, on any model. A `markLimit` call
+  that names no model at all cools **every** known model, i.e. exactly the pre-#167 behaviour:
+  the fail-safe direction, since under-cooling would hand work straight back to a limited
+  account, silently. An absent/unrecognised limit kind falls
   back to the usage flow (probe or escalated, by the same history check), never a shorter tier.
   Exhausting the pool inside one rotation pass never re-calls `pick()`, so the resulting park —
   `ParkSignal('all-accounts-cooling-after-retry', {attempts, lastResult, cooldownUntilIso})`,
@@ -696,7 +729,12 @@ separate repos with no shared runtime.
   `Math.min(config.workers, accounts.countHealthyAccounts(accountsDir))` immediately before
   *every* worker spawn — not once per loop, not once at startup — so an account that cools down
   mid-cycle (one of this dispatcher's own workers just hit a limit) is reflected on the very next
-  spawn decision. A clamp to zero healthy accounts is journalled
+  spawn decision. That call is deliberately **bare** — the union count, not a per-model one
+  (card #167). A worker slot is not bound to one model at spawn time: the card that fills it runs
+  INTAKE → WORKTREE (no model) → PLAN (opus) → IMPLEMENT (sonnet) → VALIDATE (fable) over its
+  life, so "the requested model" has no single answer there. The per-model question is asked
+  where it can be answered — `account-lease.js`, once per LLM call, with that call's model in
+  hand. A clamp to zero healthy accounts is journalled
   (`dispatcher-idle-no-healthy-accounts`) and the recovery edge journalled the same way
   (`dispatcher-healthy-accounts-returned`). Parallelism scales implementation capacity; the gate
   stays serialized — adding a *Claude* account does not add gate throughput. *(Corrected
@@ -723,7 +761,8 @@ separate repos with no shared runtime.
   card #119 action 1.2, worth a DEFERRED one: the worker exits and the task is re-enqueued with
   `notBefore` set to the cooldown's own deadline, see the Account pool bullets above) — and parks
   `all-accounts-leased` if the lease wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
-  `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns), since
+  `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns, and in
+  the dispatcher's case to cooldowns on *any* model), since
   clamping K on lease churn — a lease frees every 90–265s — would make K flap on every single LLM
   call.
 - `scripts/usage-report.js` becomes per-account: it is the instrument that says when one

@@ -401,10 +401,10 @@ function collectBenchQueueDepth(benchDir) {
 
 // collectAccountsStatus(accountsDir, now) -- the SAME two reads cmdAccounts uses
 // (accounts.readRegistry + accounts.readState), not a second derivation of the pool's on-disk
-// shape. `cooling` is false the moment `cooldownUntil` is in the past -- an EXPIRED cooldown
-// (the live example in this action's own spec: `{"pool1":{"cooldownUntil":1788247210631,...}}`,
-// which is already in the past relative to "today" 2026-09-01) must render as "not cooling", the
-// same rule `spo accounts` and the dashboard's `collectAccounts` both already apply.
+// shape. An EXPIRED cooldown must render as "not cooling", the same rule `spo accounts` and the
+// dashboard's `collectAccounts` both already apply -- which is why the per-(account, model)
+// verdict comes from accounts.coolingSummary (card #167) rather than from a flat field read
+// here: one definition of "cooling", in the module that owns the state, for all three readers.
 function collectAccountsStatus(accountsDir, now = Date.now()) {
   let registry;
   try {
@@ -415,10 +415,10 @@ function collectAccountsStatus(accountsDir, now = Date.now()) {
   if (registry.length === 0) return [];
   const state = accounts.readState(accountsDir);
   return registry.map((a) => {
-    const entry = state[a.name];
-    const cooldownUntil = entry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
-    const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
-    return { name: a.name, enabled: a.enabled, cooling, cooldownUntil: cooling ? cooldownUntil : null };
+    const summary = accounts.coolingSummary(state[a.name], now);
+    const { cooling, cooldownUntil } = summary;
+    const coolingModels = summary.coolingModels.map((m) => m.model);
+    return { name: a.name, enabled: a.enabled, cooling, cooldownUntil, coolingModels };
   });
 }
 
@@ -541,7 +541,7 @@ function cmdStatus(opts) {
     console.log(`accounts: (none registered in ${accountsDir})`);
   } else {
     for (const a of accountRows) {
-      const cooldown = a.cooling ? `cooling, ${formatRemaining(a.cooldownUntil - now)} remaining` : 'none';
+      const cooldown = a.cooling ? `cooling ${a.coolingModels.join('+')}, ${formatRemaining(a.cooldownUntil - now)} remaining` : 'none';
       console.log(`account ${a.name}  enabled=${a.enabled}  cooldown=${cooldown}`);
     }
   }
@@ -1319,13 +1319,21 @@ function cmdAccounts(opts) {
   const state = accounts.readState(accountsDir);
   const now = Date.now();
   for (const a of registry) {
-    const entry = state[a.name];
-    const cooldownUntil = entry && typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null;
-    const cooling = typeof cooldownUntil === 'number' && cooldownUntil > now;
+    // card #167: a cooldown belongs to a (account, model) pair, so the column names the MODEL(S)
+    // -- `cooldownUntil=fable:2026-...Z` -- instead of a bare timestamp that reads as "this
+    // account is gone". That distinction is the whole point of the card: on the real pool every
+    // limit ever observed was on Fable, and a fable-only cooldown leaves IMPLEMENT's Sonnet
+    // capacity on that same account fully usable. Printing the timestamp alone would have the CLI
+    // assert the defect this card removed. Not cooling on anything still prints exactly `-`, the
+    // same token as before, so "is anything wrong here" stays a one-glance question.
+    const summary = accounts.coolingSummary(state[a.name], now);
+    const cooldownUntil = summary.cooling
+      ? summary.coolingModels.map((m) => `${m.model}:${m.cooldownUntilIso}`).join(',')
+      : '-';
     const token = a.oauthTokenFile ? 'yes' : 'no';
     const credentials = accounts.hasCredentials(a.configDir) ? 'yes' : 'no';
     console.log(
-      `${a.name}  enabled=${a.enabled}  cooldownUntil=${cooling ? new Date(cooldownUntil).toISOString() : '-'}  token=${token}  credentials=${credentials}`
+      `${a.name}  enabled=${a.enabled}  cooldownUntil=${cooldownUntil}  token=${token}  credentials=${credentials}`
     );
   }
 }
@@ -1474,8 +1482,14 @@ function cmdAccountClearCooldown(name, opts) {
     return;
   }
 
+  // card #167: name the models. `clearedModels` is every model that had a record (all of them are
+  // cleared -- this command has no `--model` flag, by decision; see accounts.js's clearCooldown),
+  // `coolingModels` the subset still cooling at clear time. A maintainer clearing what turns out
+  // to be a fable-only cooldown should see that it was fable-only, not be left believing the
+  // account had been wholly unavailable.
+  const modelsNote = result.coolingModels.length > 0 ? ` on ${result.coolingModels.join(', ')}` : '';
   const coolingNote = result.wasCooling
-    ? `was cooling until ${result.cooldownUntilIso}`
+    ? `was cooling${modelsNote} until ${result.cooldownUntilIso}`
     : `had a stale cooldownUntil ${result.cooldownUntilIso} (already past)`;
   const escalationNote = result.escalationWasArmed
     ? 'escalation state WAS armed (the next usage limit would have jumped straight to the 5h tier) -- cleared'
@@ -1498,6 +1512,9 @@ function cmdAccountClearCooldown(name, opts) {
     cooldownUntil: result.cooldownUntil,
     cooldownUntilIso: result.cooldownUntilIso,
     escalationWasArmed: result.escalationWasArmed,
+    // card #167 -- which models the clear actually covered, and which were still cooling.
+    clearedModels: result.clearedModels,
+    coolingModels: result.coolingModels,
     degraded: result.degraded,
   });
 }
