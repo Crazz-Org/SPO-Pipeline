@@ -163,7 +163,7 @@ const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-templ
 const { buildPromptValues } = require('../task-values');
 const { monotonicNowMs } = require('../monotonic-clock');
 const { recoverSessionTokens: recoverSessionTokensDefault } = require('../token-recovery');
-const { loadQuery } = require('../sdk');
+const { loadQuery, resolveClaudeCodeExecutable } = require('../sdk');
 const { isEnabled: isNoRealSpawnEnabled } = require('../no-real-spawn-guard');
 const { createProgressCallback, clearLiveProgress } = require('../live-progress');
 
@@ -217,6 +217,14 @@ function resolvePromptText(opts) {
   }
   return prompt;
 }
+
+// runLlm's dry-run branch overlays this onto `options.pathToClaudeCodeExecutable` when the real
+// PATH walk (sdk.js's resolveClaudeCodeExecutable) finds nothing and no test has injected its own
+// deps.resolveClaudeCodeExecutable -- see that branch's own comment for why a dry run must never
+// let the real absence of `claude` on PATH throw. Deliberately not a real-looking path (no
+// leading `/`, spelled out in words) so an artifact reader -- or a future citation grep -- can
+// never mistake it for something the pipeline actually resolved.
+const DRY_RUN_CLAUDE_UNRESOLVED_PLACEHOLDER = '<claude not found on PATH -- dry run>';
 
 // Zero-value shape extractTokens returns when modelUsage is absent or carried nothing
 // recognizable -- kept as one literal so every caller's "no tokens" result is byte-identical.
@@ -1160,19 +1168,46 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     // buildQueryOptions is called directly here (deps.buildQueryOptions, following this file's
     // deps.query/deps.buildQueryOptions convention -- see invokeClaudeReal), not through
     // invokeClaudeReal itself: a dry run must never touch the killswitch check or attempt-count
-    // hook invokeClaudeReal's own top does, and must never call query() at all. This DOES mean a
-    // dry run resolves a real `claude` on PATH (buildQueryOptions's own executable resolution) --
-    // deliberately: `pathToClaudeCodeExecutable` is itself part of "what would actually be sent",
-    // and a dry run that could not tell a maintainer `claude` is missing from PATH would be
-    // hiding a real misconfiguration behind its own convenience.
-    // Built from `opts` UNMODIFIED, never with the placeholder already substituted in --
+    // hook invokeClaudeReal's own top does, and must never call query() at all.
+    //
+    // Fix pass (CI run 35620555644, all 8 of that run's failures traced to this one throw): the
+    // ORIGINAL version of this comment argued a dry run should resolve a REAL `claude` on PATH so
+    // `pathToClaudeCodeExecutable` -- "part of what would actually be sent" -- could tell a
+    // maintainer their PATH is misconfigured instead of hiding it. True in spirit, wrong in
+    // effect: buildQueryOptions's resolution is a real fs.accessSync PATH walk (sdk.js), and when
+    // it finds nothing it THROWS ClaudeExecutableNotFoundError uncaught here, killing the whole
+    // task (and, run through daemon.js as this suite's dry-run-demo/regression tests do, the
+    // whole process) before it ever reaches DONE. That makes every dry run -- the one thing
+    // gate.sh and this action's own --dry-run gate leg promise is hermetic ("no network calls...
+    // the same commit yields the same verdict here and on a laptop", that script's own header;
+    // scripted.js's dry-run half is "zero subprocesses" for the identical reason) -- depend on
+    // whether the HOST happens to have a real `claude` binary on PATH. GitHub Actions' runner does
+    // not, so CI failed 8/8 on exactly this while a laptop with `claude` installed (this session's
+    // own worktree included) does not reproduce it at all -- measured, not assumed.
+    //
+    // The fix keeps the original intent (a real misconfiguration IS worth showing) without the
+    // throw: deps.resolveClaudeCodeExecutable, when a caller already injects one (every existing
+    // test that asserts against a specific resolution), is used verbatim, same as
+    // buildQueryOptions's own convention. Only when nothing is injected -- the production path,
+    // and every dry-run-demo/regression test above -- does this wrap the real resolver so an
+    // absent PATH entry becomes the placeholder string below (still visible in the artifact,
+    // still names the misconfiguration) instead of an uncaught throw.
+    //
+    // Built from `opts` UNMODIFIED, never with the sessionId placeholder already substituted in --
     // buildQueryOptions validates a supplied opts.sessionId as UUID-v4 shaped (a bare TypeError,
     // a programming-error contract this function must not suppress -- see that function's own
     // header, reason 3), and '<generated-at-spawn>' would trip that check immediately. The
     // placeholder is overlaid onto the DISPLAY copy afterward instead, below.
     const { buildQueryOptions: buildQueryOptionsFn } = getSdkCall();
     const buildOptionsForDryRun = deps.buildQueryOptions || buildQueryOptionsFn;
-    const { options: dryRunOptions } = buildOptionsForDryRun(opts, deps);
+    const dryRunDeps = deps.resolveClaudeCodeExecutable
+      ? deps
+      : {
+          ...deps,
+          resolveClaudeCodeExecutable: (pathEnv) =>
+            resolveClaudeCodeExecutable(pathEnv) || DRY_RUN_CLAUDE_UNRESOLVED_PLACEHOLDER,
+        };
+    const { options: dryRunOptions } = buildOptionsForDryRun(opts, dryRunDeps);
     const displayOptions = { ...dryRunOptions, sessionId: '<generated-at-spawn>' };
     const dryrunFile = writeDryRunArtifact(ctx.taskDir, stepName, displayOptions, promptText);
     appendEvent(ctx.taskDir, stepName, 'dry-run', {
