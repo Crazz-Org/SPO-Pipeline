@@ -423,10 +423,21 @@ function classifyNightly(nightly, targetSha) {
   // because it is truthy (a number, an object, `true`, ... are all valid JSON and all crash
   // `.slice`). A non-string sha can never equal targetSha anyway, so it is unknown either way;
   // the only change here is not throwing on the way to that answer.
+  //
+  // Card #226 fix pass: `targetSha` needs the SAME guard as `nightly.sha` above, not just the
+  // truthiness check the ternary used to apply. Every call site before #226 always passed a
+  // `git rev-parse` stdout string, so `targetSha` was safe by construction -- #226 added a new
+  // call site (state-machine.js's INTAKE pre-gate) that passes `nightly.sha` itself as
+  // `targetSha` when re-deriving "is there any sha this record would refuse", and that value
+  // carries the exact untrusted shape this comment already warns about. A truthy non-string
+  // (a number, an object, `true`) reached `.slice` and crashed every card identically, since
+  // the nightly record is one pipeline-wide file -- reproduced and fixed here rather than only
+  // at that one call site, so no future caller can reintroduce the same crash.
   const shaIsString = typeof nightly.sha === 'string' && nightly.sha.length > 0;
+  const targetShaIsString = typeof targetSha === 'string' && targetSha.length > 0;
   if (!shaIsString || nightly.sha !== targetSha) {
     const got = shaIsString ? nightly.sha.slice(0, 8) : '(no sha)';
-    const want = targetSha ? targetSha.slice(0, 8) : '(none)';
+    const want = targetShaIsString ? targetSha.slice(0, 8) : '(none)';
     return {
       status: 'unknown',
       reason: `nightly ${verdict} recorded for ${got}, not the sha in question (${want})`,
