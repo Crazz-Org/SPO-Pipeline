@@ -182,8 +182,11 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
   § Step contracts) — but
   `deadline.js`'s `deadlineMsFor` consults `config.stepDeadlineMsByState[state]` before falling
   back to this default, and that override IS live in real mode: `config.js` gives `CI_CHECKS`,
-  `WORKTREE` and `FINISH` their own, much larger entries (derived from the in-flight poll budget
-  and the product-repo mutex's own worst-case wait). `WORKTREE`/`FINISH`'s overrides were sized
+  `WORKTREE`, `FINISH`, `GATE` (card #211) and `MERGE` (card #224) their own, much larger entries,
+  each derived from that step's own worst-case bound — the in-flight poll budget, the product-repo
+  mutex's own worst-case wait, the gate's spawn timeout plus its recovery wait, and (MERGE) every
+  spawn timeout on every path `realMerge` can take, `spawnStep`'s retry-once included.
+  `WORKTREE`/`FINISH`'s overrides were sized
   "large enough never to fire" against a purely-synchronous `spawnSync` body, but 6.4's
   product-repo mutex added the first `await` in that path (its poll loop's `await sleep(pollMs)`)
   — which armed a timer that had never been live before. Measured during 6.4's own verification:
@@ -875,7 +878,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:899`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1000`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via

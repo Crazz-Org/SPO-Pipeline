@@ -4173,4 +4173,12 @@ module.exports = {
   // same file still exercise the real call sites for the properties a unit test cannot see
   // (which park reason fires, that the 'unknown' journal event actually lands, ordering).
   classifyNightly,
+  // Card #224: exported so test/real-steps.test.js can pin config.js's mirrors of these two
+  // (`mergeProbeMaxAttempts`/`mergeProbePollIntervalMs`, the inputs its derived
+  // `stepDeadlineMsByState.MERGE` is built from) against the values `probeMergeability` above
+  // actually runs on. config.js cannot require this module (it is inert data, and this module
+  // requires ../board, which would make the cycle real), so the two files hold the same numbers --
+  // pinned by a test rather than by hand. No behaviour of this module changes.
+  MERGE_PROBE_MAX_ATTEMPTS,
+  MERGE_PROBE_POLL_INTERVAL_MS,
 };
