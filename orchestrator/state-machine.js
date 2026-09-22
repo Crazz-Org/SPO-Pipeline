@@ -341,12 +341,29 @@ async function handleIntake(ctx) {
     // make this record red, so the rev-parse below would be pure waste -- and the common case,
     // nightly green, therefore costs this gate zero subprocesses on every card.
     if (classifyNightly(nightly, nightly && nightly.sha).status === 'red') {
-      const revParse = spawnStep(ctx, ctx.deps, 'INTAKE', 'git', [
-        '-C',
-        ctx.config.productRepo,
-        'rev-parse',
-        'origin/main',
-      ]);
+      // Card #226 fix pass: spawnStep does not always RETURN a non-zero exit for "could not
+      // answer" -- it THROWS a ParkSignal ('command-killed-by-signal' / 'git-timed-out', both
+      // deliberately terminal, steps/scripted.js) when the child is killed by a signal or times
+      // out twice. Before this fix only the `revParse.exit === 0` branch below was handled, so
+      // either of those two throws escaped this function uncaught by anything that treats it as
+      // "fall through to WORKTREE" -- it propagated as a real park, on a reason
+      // (`command-killed-by-signal`/`git-timed-out`) that is NOT in TRANSIENT_RETRY_REASONS,
+      // exactly the "one human retry per card" cost point 2's own header says this gate must
+      // never reintroduce. A deploy SIGTERM landing mid-rev-parse while nightly happens to be red
+      // is the textbook trigger. The try/catch below makes "cannot tell" and "answered but exit
+      // != 0" the SAME outcome (proceed to WORKTREE), which is what point 2 above already claims
+      // this gate does.
+      let revParse;
+      try {
+        revParse = spawnStep(ctx, ctx.deps, 'INTAKE', 'git', [
+          '-C',
+          ctx.config.productRepo,
+          'rev-parse',
+          'origin/main',
+        ]);
+      } catch {
+        revParse = { exit: 1 };
+      }
       // Journalled under 'INTAKE', never 'WORKTREE': the acceptance bar for this card is that a
       // held task produces NO WORKTREE journal entry, and a spawn journalled under the wrong
       // state would fake one.

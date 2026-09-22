@@ -726,6 +726,113 @@ test('runTask (real mode, card): with NO nightly file on disk the pre-gate costs
   );
 });
 
+// ---- card #226 fix-pass regression tests, added after an independent adversarial audit found -
+// ---- two real defects in the tests above: neither ever fed the gate a malformed nightly.sha ---
+// ---- or a spawnStep THROW (as opposed to a non-zero exit) -------------------------------------
+
+test('runTask (real mode, card): a nightly record with a malformed (non-string) `sha` does NOT crash the pre-gate -- classifies unknown and proceeds to WORKTREE (card #226 fix regression guard)', async () => {
+  // Reproduces the actual production defect: handleIntake's short-circuit asks
+  // `classifyNightly(nightly, nightly && nightly.sha)`, feeding `nightly.sha` back in as
+  // `targetSha`. Before the fix, a truthy non-string `sha` (a number here -- an object or `true`
+  // are the same bug, pinned at the unit level in test/nightly-verdict-semantics.test.js) crashed
+  // `targetSha.slice(0, 8)` with an uncaught TypeError, at the free `fs`-read short-circuit --
+  // before any subprocess, before any ParkSignal, escaping runTask entirely. Since the nightly
+  // record is one pipeline-wide file, this took down every card identically.
+  const taskDir = mkTmp('spo-glr-intakegate-malformed-sha-taskdir-');
+  const config = realConfig();
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: 123 });
+  const calls = [];
+  config.deps = { spawnSync: makeSpawnSync(undefined, calls) };
+
+  const task = cardTask('glr-intake-malformed-sha', 913);
+
+  // The assertion that matters: this must not reject/throw at all. Pre-fix, the TypeError
+  // propagated straight out of runTask and this `await` would have rejected the test.
+  // The assertion that matters: this must not reject/throw at all. Pre-fix, the TypeError
+  // propagated straight out of runTask and this `await` would have rejected the test.
+  await runTask(task.id, task, taskDir, config);
+
+  // A non-string sha can never equal a real target sha, so this classifies 'unknown' -- same
+  // outcome as the existing "recorded for a DIFFERENT sha" test just above, proceeding to
+  // WORKTREE rather than holding on a record that cannot actually be attributed to any sha. This
+  // fake spawnSync has no full happy-path implementation past WORKTREE's own leftover sweep, so
+  // the card still parks somewhere further downstream (an unrelated, expected park) -- the same
+  // shape the "different sha" test above already tolerates; only the ABSENCE of the pre-gate's
+  // own reason, and the PRESENCE of a WORKTREE entry, are this test's actual property.
+  const journal = readJournal(taskDir);
+  assert.equal(
+    journal.filter((e) => e.event === 'parked' && e.reason === 'nightly-red-holding-intake').length,
+    0,
+    'a malformed sha must never be read as red -- the pre-gate must not hold the queue on it'
+  );
+  assert.ok(journal.some((e) => e.state === 'WORKTREE'), 'the card proceeds into WORKTREE');
+  // The pre-gate's own free short-circuit must still have run BEFORE any subprocess -- confirms
+  // the crash (pre-fix) happened inside the `fs`-read path itself, not somewhere spawn-adjacent.
+  assert.equal(
+    `${calls[0].command} ${calls[0].args.join(' ')}`,
+    `git -C ${config.productRepo} fetch origin`,
+    'no rev-parse is spawned either -- classifyNightly answers unknown from the free read alone'
+  );
+});
+
+test('runTask (real mode, card): the pre-gate FAILS OPEN when the rev-parse is KILLED BY A SIGNAL (a deploy restart), not just on a non-zero exit -- proceeds to WORKTREE, never parks command-killed-by-signal (card #226 fix regression guard)', async () => {
+  // spawnStep does not always RETURN a non-zero exit for "could not answer" -- it THROWS a
+  // ParkSignal ('command-killed-by-signal' for a killed child, 'git-timed-out' for a double
+  // timeout; steps/scripted.js). Before the fix, only the `revParse.exit === 0` branch was
+  // handled below the spawnStep call, so either throw escaped uncaught by the pre-gate and
+  // propagated as a REAL park -- on a reason that is NOT in TRANSIENT_RETRY_REASONS, i.e. exactly
+  // the "one human retry per card" cost this whole card exists to remove. A deploy SIGTERM
+  // landing mid-rev-parse while nightly happens to be red is the textbook trigger.
+  const taskDir = mkTmp('spo-glr-intakegate-signalkilled-taskdir-');
+  const config = realConfig();
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: STALE_MAIN_SHA });
+  // spawnStep retries once on a signal kill (same branch as a timeout, scripted.js) before it
+  // throws -- so the fake must answer KILLED on both attempts of the PRE-fetch rev-parse to reach
+  // that throw. Only the pre-gate's own rev-parse is killed; WORKTREE's post-fetch one (and the
+  // fetch itself) answer normally, isolating this test to the pre-gate's own throw handling.
+  let fetched = false;
+  config.deps = {
+    spawnSync: makeSpawnSync((command, args) => {
+      if (command === 'git' && args.includes('fetch')) {
+        fetched = true;
+        return undefined; // fall through to the shared happy path
+      }
+      if (command === 'git' && args.includes('rev-parse') && args.includes('origin/main') && !fetched) {
+        return { status: null, stdout: '', stderr: '', signal: 'SIGTERM' };
+      }
+      return undefined;
+    }),
+  };
+
+  const task = cardTask('glr-intake-signalkilled', 914);
+
+  // The assertion that matters: this must not reject/throw at all. Pre-fix, the pre-gate's
+  // uncaught spawnStep throw (command-killed-by-signal) propagated straight out of runTask as a
+  // REAL park before this state was ever written; this `await` resolving at all is part of the
+  // proof. This fake spawnSync has no full happy-path implementation past WORKTREE's own leftover
+  // sweep, so the card can still legitimately park somewhere further downstream (an unrelated,
+  // expected park, the same shape the "different sha" test above tolerates) -- what this test
+  // actually pins is the ABSENCE of the two reasons a throw here could wrongly produce, and the
+  // PRESENCE of a WORKTREE entry proving the gate really did fall through rather than hold.
+  await runTask(task.id, task, taskDir, config);
+
+  const journal = readJournal(taskDir);
+  assert.equal(
+    journal.filter((e) => e.event === 'parked' && e.reason === 'command-killed-by-signal').length,
+    0,
+    'the pre-gate must swallow its own spawnStep throw, never let it surface as a real park'
+  );
+  assert.equal(
+    journal.filter((e) => e.event === 'parked' && e.reason === 'nightly-red-holding-intake').length,
+    0,
+    'a signal kill answers nothing about nightly -- it must never be misread as a red verdict'
+  );
+  assert.ok(
+    journal.some((e) => e.state === 'WORKTREE'),
+    'failing open on a throw means the card proceeds into WORKTREE, exactly as a non-zero exit already did'
+  );
+});
+
 // =================================================================================================
 // ---- source anchor: the seven throw sites this file's tests assume still exist, exactly --------
 // =================================================================================================
