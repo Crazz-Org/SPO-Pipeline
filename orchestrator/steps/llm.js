@@ -190,6 +190,17 @@ function buildArgv(opts) {
     const tools = Array.isArray(opts.allowedTools) ? opts.allowedTools.join(' ') : opts.allowedTools;
     argv.push('--allowedTools', tools);
   }
+  // --disallowedTools (card #240). Same one-argv-string, space-joined shape as --allowedTools
+  // above: `claude --help` documents both flags as taking a "Comma or space-separated list of
+  // tool names", and gives the SAME example for both -- "Bash(git *) Edit" -- a single string
+  // whose first entry itself contains a space inside its parentheses, so the CLI's own splitter
+  // is parenthesis-aware and a rule like `Bash(git reset --hard*)` survives the join.
+  // Pushed only for a policy that carries a non-empty list, so CITATION_VERIFIER (no entry in
+  // step-contracts.js) and every hand-built test context keep the argv they had before.
+  if (opts.disallowedTools) {
+    const denied = Array.isArray(opts.disallowedTools) ? opts.disallowedTools.join(' ') : opts.disallowedTools;
+    if (denied !== '') argv.push('--disallowedTools', denied);
+  }
   if (opts.permissionMode) argv.push('--permission-mode', opts.permissionMode);
   if (opts.jsonSchema) {
     const schema = typeof opts.jsonSchema === 'string' ? opts.jsonSchema : JSON.stringify(opts.jsonSchema);
@@ -429,7 +440,7 @@ async function maybeRecoverTokens(result, opts, deps) {
 // has actually observed plus the API's documented error type names", which overstated the
 // evidence for more than one entry below):
 //   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
-//     intake.js:953-955's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     intake.js:963-965's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
 //     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
 //   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
 //     observed as a real reply in this repo; included because it is structured (not free text)
@@ -997,6 +1008,9 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       model: override.model,
       effort: override.effort,
       allowedTools: override.allowedTools,
+      // Card #240: honoured verbatim like every other field on this legacy path -- a
+      // hand-authored task file that sets neither gets the pre-#240 argv, unchanged.
+      disallowedTools: override.disallowedTools,
       permissionMode: override.permissionMode,
       maxBudgetUsd: override.maxBudgetUsd,
       jsonSchema: override.jsonSchema,
@@ -1074,6 +1088,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     model: contract.model,
     effort: contract.effort,
     allowedTools: contract.allowedTools,
+    disallowedTools: contract.disallowedTools, // card #240 -- see orchestrator/bash-policy.js
     permissionMode: contract.permissionMode,
     maxBudgetUsd: contract.maxBudgetUsd,
     jsonSchema: contract.jsonSchema,

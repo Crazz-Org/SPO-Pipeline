@@ -810,3 +810,82 @@ None of these five are faked shut. Where the code cannot tell (`processStartUpti
 reboot check's own blind spot), the verdict is exactly what it would have been without card #219 --
 `'draining'` off liveness alone, or the pre-#208 wall-clock bound -- never a guess dressed up as a
 measurement.
+
+## 12 · Bare `Bash` in 7 of 8 tool policies — what card #240 closed, and what it did not, 2026-09-22
+
+**What this supersedes.** Card #239's action A8 (2026-09-17) established the finding and filed it
+as issue #240: seven of the eight in-repo tool policies declare bare `Bash`, which the CLI reads as
+an allow rule covering the whole tool ("Any Bash command"), so `.claude/settings.json`'s 92 scoped
+`Bash(...)` allows bound **exactly one** policy — CITATION_VERIFIER, the only contract that omits
+`Bash` — and for the other seven the effective shell boundary was the 14 scoped denies alone. That
+finding stands unchanged and is *not* restated here. Issue #240's "Done means" points at
+"`doc/accepted-gaps.md` entry 16"; **no entry 16 exists or existed** — this register ran `## 1`
+through `## 11` on the day the issue was written and this section is the entry that discharges
+that line. What follows is what card #240 added on top: the measurement, the decision, and the
+residual surface the fix deliberately leaves open.
+
+**The measurement (2026-09-22).** Source: every pool-account transcript,
+`~/.claude-accounts/pool{1,2}/projects/**/*.jsonl` — 1520 files, of which 1379 carry a prompt whose
+own `# <step>` heading identifies the policy that launched the session; the remaining 141 (subagent
+and hand-run sessions, holding 3834 further `Bash` calls) were left out rather than attributed by
+guess. Window 2026-08-29 → 2026-09-22, **13001 `Bash` tool_use calls**: PLAN 3581, IMPLEMENT 6384,
+VALIDATE 969, DIAGNOSE 706, reviewCard 776, triageBugReport 580, draftCard 4, CITATION_VERIFIER 1.
+Three results, each of which changed what got built:
+
+1. **A scoped `allowedTools` cannot express this corpus.** 10886 of 13001 calls (83.7%) are
+   compound shell. Testing every top-level segment against the 92 curated allow patterns, only
+   5543 (42.6%) have every segment covered — so simply dropping bare `Bash` to let the curated
+   rules bind would refuse about 57% of the pipeline's real shell traffic.
+2. **A deny binds, and it binds per subcommand.** Three real IMPLEMENT calls in the window were
+   refused by the existing 14 denies *while bare `Bash` was granted*, one with the denied part in
+   the middle of an `&&` chain. Deny beats the whole-tool allow, and the CLI evaluates parsed
+   subcommands, not the raw string.
+3. **The read-only contracts were read-only in prose only.** PLAN, running `permissionMode: 'plan'`,
+   ran `cp /tmp/te-probe.test.tsx src/client/report/__te_probe.test.tsx` twice and
+   `rm -rf "$TMPD/…"` seven times: plan mode blocks `Edit`/`Write`, not a write made through the
+   shell. The three intake policies, by contrast, mutated nothing at all across 1360 calls.
+
+**The fix.** Per-policy `--disallowedTools` lists (`orchestrator/bash-policy.js`), passed on the
+`claude` command line — not new rules in `.claude/settings.json`, which no agent can edit
+(`doc/permissions.md` § *Walls that `settings.json` can't tune*). Bare `Bash` stays in every
+`allowedTools`; the 14 shared denies stay the single source and are not duplicated. Details and
+the per-policy cost in `doc/permissions.md` § *The shell boundary the 92 rules never reached*.
+
+**Residual gaps, named rather than shipped as closed.**
+
+1. **String-carried payloads bypass subcommand analysis.** `bash -c '<script>'`, `sh -c`,
+   `python3 -c`, `node -e`, `xargs` and `env` put their real command inside a quoted argument; the
+   rule matcher sees only the outer verb. PLAN made 46 `bash -c` calls in the window and IMPLEMENT
+   29, so denying the form would break real work. A read-only step that wants to write can still
+   do it this way. **The deny list narrows the accidental and the observable surface; it is not a
+   sandbox.**
+2. **Shell redirection is not a command.** `cat > f <<'EOF'`, `echo x > f` and friends parse as
+   `cat`/`echo`, both allowed. IMPLEMENT used 213 heredocs in the window. Same consequence as (1),
+   same reason for not covering it.
+3. **`systemctl` is not denied anywhere.** DIAGNOSE is the pipeline's CI-forensics step and used
+   `systemctl --user list-units` (2 calls) and `journalctl --user -u …` (6) for exactly that. A
+   prefix rule cannot separate those from `systemctl --user stop` without enumerating both flag
+   spellings of every mutating subcommand, so the verb is left alone in all three lists.
+4. **`gh api` mutations are only partly reachable by prefix rules.** The intake list denies
+   `gh api -X …`, `gh api --method P…`, `gh api --method DELETE…`, `gh api * -X *`, `gh api * -f *`
+   and `gh api * -F *` — the spellings the corpus actually shows. A fourth spelling, or the flag in
+   a position none of those match, is not covered. (`gh api graphql*` is denied outright for
+   intake: POST by definition.)
+5. **Nothing here is enforced against a LIVE `claude` call.** Everything above is measured from
+   past transcripts and from the CLI's own documented flag semantics; `test/bash-deny-policy.test.js`
+   evaluates the lists with a local matcher that mirrors those semantics, deliberately independent
+   of the CLI. **No deny rule in these lists has yet been observed firing in production** — the
+   first real PLAN/IMPLEMENT/DIAGNOSE/VALIDATE/intake call after this ships is its first live
+   exercise. The precedent that deny beats a bare-`Bash` allow, and fires on a mid-chain
+   subcommand, *is* live-measured — but on `.claude/settings.json`'s rules, not these.
+6. **`reviewCard` keeps `permissionMode: 'default'`.** Issue #240 names it the sharpest instance
+   partly because its two intake siblings run `'plan'`. It was left as-is on purpose: the corpus
+   shows no behavioural difference to key on (zero mutations under either mode, in 776 and 584
+   calls respectively), the deny list is what binds now, and changing the permission mode of a live
+   intake path is a second, unmeasured change. Recorded as a deliberate non-change, not an
+   oversight.
+7. **The 141 unclassified transcripts were not attributed.** They hold 3834 further `Bash` calls.
+   Most are subagent side-transcripts, which matter here because `allowedTools` is already known
+   not to bind subagent spawning (`step-contracts.js`'s own comment on PLAN's `allowedTools`);
+   whether `--disallowedTools` propagates into a spawned subagent's own tool pool is **not
+   measured by this card**.

@@ -25,6 +25,8 @@
 //     (IMPLEMENT) auto-accepts them since nothing reviews a diff before the mechanical checks.
 
 const path = require('path');
+// Card #240: the per-policy `Bash` deny lists, with the measurement that chose them.
+const { READ_ONLY_STEP_BASH_DENY, WRITE_STEP_BASH_DENY } = require('./bash-policy');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 
@@ -742,6 +744,12 @@ const STEP_CONTRACTS = {
     // an open question this card raises but does not decide; it is the maintainer's call, not
     // this table's.
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    // Card #240: bare `Bash` above is an allow rule covering the whole tool, so the 92 scoped
+    // rules in .claude/settings.json never bound this step. This is the deny that does -- and it
+    // is what finally makes the "(ro)" in every doc's "Read, Grep, Glob, Bash(ro)" mean something
+    // at the tool layer instead of only in the prompt's prose. Measured: PLAN ran `cp` into
+    // `src/` and `rm -rf` from inside permissionMode 'plan'. See orchestrator/bash-policy.js.
+    disallowedTools: READ_ONLY_STEP_BASH_DENY,
     permissionMode: 'plan', // read-only planning mode; matches the state's own name
     cwdKind: 'worktree', // reads {{worktree}}; config.cwdForStep already encodes this split
     outputContract: {
@@ -795,6 +803,9 @@ const STEP_CONTRACTS = {
     // pass a real --allowedTools value. Read/Grep/Glob to navigate the plan and invariants,
     // Bash to run the check commands, Edit/Write to make the change.
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash', 'Edit', 'Write'],
+    // Card #240: the one policy whose contract IS to write, so its deny covers only the host and
+    // daemon control surface -- nothing its 6384 measured Bash calls use. See bash-policy.js.
+    disallowedTools: WRITE_STEP_BASH_DENY,
     permissionMode: 'acceptEdits', // no human in the loop to approve each edit
     cwdKind: 'worktree',
     outputContract: {
@@ -860,6 +871,11 @@ const STEP_CONTRACTS = {
     escalatesOn: [],
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Bash'],
+    // Card #240: read-only contract, now denied at the tool layer too. Measured cost on the
+    // 706-call DIAGNOSE corpus: zero -- its forensics (`gh api --method GET`, `gh run view
+    // --log-failed`, `journalctl`, `systemctl --user list-units`, `git stash list`,
+    // `git branch -vv`) all survive by construction. See bash-policy.js.
+    disallowedTools: READ_ONLY_STEP_BASH_DENY,
     permissionMode: 'default',
     cwdKind: 'pipeline', // judges artifacts the orchestrator already produced
     // diagnose.md's header declares two mutually-exclusive shapes; "root_cause" (possibly
@@ -933,6 +949,9 @@ const STEP_CONTRACTS = {
     neverModel: 'sonnet', // documentation only -- 'sonnet' never appears as base or escalated
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    // Card #240: read-only contract, now denied at the tool layer too. Measured cost on the
+    // 969-call VALIDATE corpus: zero. See bash-policy.js.
+    disallowedTools: READ_ONLY_STEP_BASH_DENY,
     permissionMode: 'default',
     cwdKind: 'pipeline',
     outputContract: {
@@ -1118,6 +1137,11 @@ function resolveStepContract(stepName, task = {}) {
     // reading the constant itself.
     deadlineMs: deadlineMsForStep(stepName),
     allowedTools: stepDef.allowedTools,
+    // Card #240: undefined for CITATION_VERIFIER, the one contract that declares no `Bash` at all
+    // and therefore already falls through to .claude/settings.json's 92 curated rules --
+    // deliberately left exactly as it was. steps/llm.js's buildArgv omits --disallowedTools when
+    // this is absent or empty, so that step's argv is byte-for-byte what it was before this card.
+    disallowedTools: stepDef.disallowedTools,
     permissionMode: stepDef.permissionMode,
     // No $ cap: steps/llm.js's buildArgv only passes --max-budget-usd when this is a number.
     maxBudgetUsd: undefined,
