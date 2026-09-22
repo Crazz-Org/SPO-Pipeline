@@ -1186,12 +1186,18 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     // own worktree included) does not reproduce it at all -- measured, not assumed.
     //
     // The fix keeps the original intent (a real misconfiguration IS worth showing) without the
-    // throw: deps.resolveClaudeCodeExecutable, when a caller already injects one (every existing
-    // test that asserts against a specific resolution), is used verbatim, same as
-    // buildQueryOptions's own convention. Only when nothing is injected -- the production path,
-    // and every dry-run-demo/regression test above -- does this wrap the real resolver so an
-    // absent PATH entry becomes the placeholder string below (still visible in the artifact,
-    // still names the misconfiguration) instead of an uncaught throw.
+    // throw: deps.resolveClaudeCodeExecutable, when a caller already injects one, is used
+    // verbatim, same as buildQueryOptions's own convention -- not because any test in this repo
+    // currently depends on that exact resolution (VERIFIED 2026-09-22: forcing this branch to
+    // throw on entry left `node --test test/*.test.js` at the identical 3321 pass / 1
+    // pre-existing fail as an unmodified run, so no test in the suite reaches the dry-run branch
+    // with an injected resolver today), but because it is the same injection contract
+    // deps.query/deps.buildQueryOptions already use throughout this file, and a caller that
+    // deliberately injects a resolver is trusted to mean it rather than silently overridden.
+    // Only when nothing is injected -- the production path, and every dry-run-demo/regression
+    // test above -- does this wrap the real resolver so an absent PATH entry becomes the
+    // placeholder string below (still visible in the artifact, still names the misconfiguration)
+    // instead of an uncaught throw.
     //
     // Built from `opts` UNMODIFIED, never with the sessionId placeholder already substituted in --
     // buildQueryOptions validates a supplied opts.sessionId as UUID-v4 shaped (a bare TypeError,
@@ -1341,6 +1347,10 @@ module.exports = {
   withCamelAliases,
   cannedDryRunPayload,
   NONINTERACTIVE_ENV_DEFAULTS,
+  // Exported for test/llm-dryrun-placeholder.test.js's M1/M4 pins (fix pass on card #239's
+  // dry-run CI fix) -- those tests read the artifact's displayed executable field back and
+  // compare it against this same literal, rather than duplicating the string.
+  DRY_RUN_CLAUDE_UNRESOLVED_PLACEHOLDER,
   // Exported for test/llm-real.test.js's A3/A5 pins (token-ledger lot, action 4.3): both need to
   // exercise the recovery DECISION directly, against a fixed synthetic result object, without a
   // live spawn's own timing jitter (durationS) making a byte-for-byte comparison flaky.

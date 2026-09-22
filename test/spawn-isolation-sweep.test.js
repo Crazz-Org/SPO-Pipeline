@@ -1059,6 +1059,13 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // override at all, falls back to HOME" path this guard exists for; SPO_STATE_DIR is then
   // deleted or re-set from the isolatedEnv()-derived object, never left as isolatedEnv()'s own
   // throwaway value when the test wants the DEFAULT resolution), no `--real`.
+  // Fix pass on card #239's dry-run CI fix (2026-09-22): llm-dryrun-placeholder.test.js's
+  // runDaemonDryRunWithEnv spawns daemon.js via execFileSync(process.execPath, [DAEMON, ...],
+  // { encoding: 'utf8', env }) where `env = { ...isolatedEnv(), ...envOverrides }` --
+  // isolatedEnv() spread first, with only a PATH override layered after it (to reproduce
+  // CI's claude-free PATH, or to prepend a throwaway fake `claude` executable's bin dir), the
+  // same posture daemon-live-state-root-guard.test.js's HOME override already takes above. No
+  // `--real`.
   // #206 action 4 (2026-09-14): fix-citations.test.js spawns scripts/fix-citations.js via
   // spawnSync(process.execPath, [...], { encoding: 'utf8', env: isolatedEnv() }) -- audited: env
   // is isolatedEnv() alone (no bare process.env spread, nothing layered after it), no `--real`.
@@ -1069,7 +1076,7 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // own audit note above takes. (Those two env vars are deliberately NOT spelled out here:
   // gate-scope.test.js records this file as naming them ONLY inside an assertion-failure message
   // string, and a comment that spelled them would quietly make that recorded justification false.)
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });
