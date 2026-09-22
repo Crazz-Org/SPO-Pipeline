@@ -46,7 +46,11 @@ test('fillPromptTemplate: happy path substitutes every declared placeholder, no 
   assert.ok(filled.includes('Add widget'));
 });
 
-test('fillPromptTemplate: an array value is joined with ", "', () => {
+// Until #231 this test asserted the opposite -- that an invariant_ids/check_commands ARRAY joins
+// on ", " like any other array. It was written when that branch was unreachable for these two
+// keys (PLAN sent JSON strings), and #229 made it reachable, which is how the ", " rendering #153
+// had measured and rejected shipped live. See the stringifyValue section further down.
+test('fillPromptTemplate: an invariant_ids/check_commands array renders as JSON, never joined on ", "', () => {
   const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
     issue_number: 1,
     worktree: '/tmp/w',
@@ -57,8 +61,10 @@ test('fillPromptTemplate: an array value is joined with ", "', () => {
     check_commands: ['npm run typecheck', 'npm run lint'],
     diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
   });
-  assert.ok(filled.includes('INV-1, INV-2'));
-  assert.ok(filled.includes('npm run typecheck, npm run lint'));
+  assert.ok(filled.includes('["INV-1","INV-2"]'));
+  assert.ok(filled.includes('["npm run typecheck","npm run lint"]'));
+  assert.ok(!filled.includes('INV-1, INV-2'));
+  assert.ok(!filled.includes('npm run typecheck, npm run lint'));
 });
 
 test('fillPromptTemplate: one missing placeholder throws MissingPlaceholderError naming it, no partial fill', () => {
@@ -102,14 +108,20 @@ test('fillPromptTemplate: an empty array is a valid value, not "missing" (zero i
   assert.ok(!/\{\{\w+\}\}/.test(filled));
 });
 
-// ---- stringifyValue: pin the measured JSON-STRING decision from #153 (won't-fix), 2026-09-08 ---
+// ---- stringifyValue: pin the JSON rendering of invariant_ids/check_commands (#153, #231) -------
 // #153 proposed joining invariant_ids/check_commands with ", " like the array branch. Measured on
-// the live journal corpus and closed as won't-fix: 158/158 successful PLAN result payloads send
-// these fields as a JSON-ENCODED STRING, never a real array, and normalizing that string here
-// would be a regression for check_commands (14.5% of declared commands contain a comma, so
-// join(", ") is not losslessly reversible). The three tests below pin the three distinct shapes
-// stringifyValue must tell apart, and the fourth makes the round-trip hazard that justifies the
-// decision executable rather than just asserted in a comment.
+// the live journal corpus and closed as won't-fix: normalizing them would be a regression for
+// check_commands (14.5% of declared commands contain a comma, so join(", ") is not losslessly
+// reversible), and at the time the question was theoretical because the wire sent these fields as
+// a JSON-ENCODED STRING in 158 of 158 successful PLAN result payloads, never a real array.
+//
+// #229 (2026-09-13) then made PLAN's --json-schema declare every key, and the model started
+// sending both as REAL ARRAYS (re-measured 2026-09-22: 125/125 post-#229 records are arrays,
+// 0 strings) -- which fired stringifyValue's Array.isArray branch and shipped the exact join(", ")
+// rendering #153 had rejected, on every card. #231 fixes that on the render side: both keys are
+// JSON-stringified, so an array and a JSON string holding one now render identically and the
+// pre-#229 prompt text is back. The tests below pin the distinct shapes stringifyValue must tell
+// apart, and make the round-trip property executable rather than just asserted in a comment.
 
 test('fillPromptTemplate: a JSON-ENCODED STRING (the real PLAN wire shape) passes through verbatim, NOT re-joined as INV-1, INV-2', () => {
   const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
@@ -179,6 +191,121 @@ test('fillPromptTemplate: the regression guard -- check_commands containing comm
   const badRecovery = joined.split(', ');
   assert.notDeepEqual(badRecovery, commands, 'join(", ").split(", ") must NOT recover the original list');
   assert.equal(badRecovery.length, 3, 'the embedded comma splits one command into two, corrupting the count');
+});
+
+// ---- #231: the post-#229 wire shape (a REAL array) must render unambiguously too --------------
+// The four tests above all feed the PRE-#229 shape (a JSON-encoded string), which is why the
+// whole suite stayed green while #229 changed the shape underneath stringifyValue and the array
+// branch started joining these two keys on ", " for real, on every card.
+
+test('#231: a check_commands ARRAY whose command contains a comma renders so the original list is recoverable', () => {
+  // The hazard in one value: split the rendered text on ", " and you get three commands, not two.
+  const commands = ['echo "a, b"', 'npm test'];
+  const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
+    issue_number: 1,
+    worktree: '/tmp/w',
+    task_criterion: 'c',
+    plan_path: '/tmp/scratch/plan-1.md',
+    invariants_path: '/tmp/scratch/invariants-1.md',
+    invariant_ids: ['INV-1', 'INV-2'],
+    check_commands: commands,
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
+  });
+
+  // The rendered list round-trips: JSON.parse of the text that reached the prompt gives back
+  // exactly the two commands PLAN declared, comma and all.
+  assert.ok(filled.includes(JSON.stringify(commands)), 'the array must render as its JSON form');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(commands)),
+    commands,
+    'the rendered form parses back into exactly the original N commands'
+  );
+  assert.ok(
+    !filled.includes(commands.join(', ')),
+    'check_commands must NOT be joined on ", " -- that rendering cannot be split back into two commands'
+  );
+  assert.ok(filled.includes('["INV-1","INV-2"]'), 'invariant_ids renders the same JSON form');
+  assert.ok(!filled.includes('INV-1, INV-2'), 'invariant_ids must NOT be joined on ", " either');
+});
+
+test('#231: the pre-#229 JSON string and the post-#229 array render the SAME prompt text', () => {
+  const ids = ['INV-1', 'INV-2'];
+  const commands = ['node -e "a(1, 2)"', 'npm run lint'];
+  const base = {
+    issue_number: 1,
+    worktree: '/tmp/w',
+    task_criterion: 'c',
+    plan_path: '/tmp/scratch/plan-1.md',
+    invariants_path: '/tmp/scratch/invariants-1.md',
+    diagnosis: '(none yet -- this is the first IMPLEMENT attempt for this task)',
+  };
+  const fromArray = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
+    ...base,
+    invariant_ids: ids,
+    check_commands: commands,
+  });
+  const fromJsonString = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, {
+    ...base,
+    invariant_ids: JSON.stringify(ids),
+    check_commands: JSON.stringify(commands),
+  });
+  assert.equal(fromArray, fromJsonString, 'both wire shapes must reach the model as the same text');
+});
+
+test('#231: VALIDATE\'s invariant_ids array renders as JSON, not joined on ", "', () => {
+  const filled = fillPromptTemplate(STEP_CONTRACTS.VALIDATE.promptFile, {
+    diff_path: '/tmp/diff.patch',
+    task_criterion: 'c',
+    invariants_path: '/tmp/scratch/invariants-1.md',
+    invariant_ids: ['INV-1', 'INV-2'],
+    gate_report_path: '/tmp/scratch/gate-1.txt',
+  });
+  assert.ok(filled.includes('["INV-1","INV-2"]'));
+  assert.ok(!filled.includes('INV-1, INV-2'));
+});
+
+test('#231: citations is NOT JSON-rendered -- the join(", ") branch still serves the one array that wants it', () => {
+  // Same expectation as the citations test above, asserted here as the explicit negative of the
+  // two JSON-rendered names: widening that set to every array would turn this text into
+  // ["AdmMembersRDO.pas:512","AdmMembersRDO.pas:640"].
+  const filled = fillPromptTemplate(STEP_CONTRACTS.CITATION_VERIFIER.promptFile, {
+    diff_path: '/tmp/diff.patch',
+    spo_original_path: '/tmp/SPO-Original',
+    citations: ['AdmMembersRDO.pas:512', 'AdmMembersRDO.pas:640'],
+  });
+  assert.ok(filled.includes('AdmMembersRDO.pas:512, AdmMembersRDO.pas:640'));
+  assert.ok(!filled.includes('["AdmMembersRDO.pas:512","AdmMembersRDO.pas:640"]'));
+});
+
+test('#231 end-to-end: a post-#229 PLAN result (real arrays) reaches IMPLEMENT unambiguously', () => {
+  const taskDir = mkTmp('spo-values-array-wire-shape-');
+  // The shape PLAN actually sends since #229: real arrays (125 of 125 post-#229 PLAN `result`
+  // records on the live journal, measured 2026-09-22; 0 JSON strings).
+  const commands = ['node -e "a(1, 2)"', 'npm run lint'];
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/scratch/plan-7.md',
+      invariants_path: '/tmp/scratch/invariants-7.md',
+      invariant_ids: ['INV-1', 'INV-2'],
+      check_commands: commands,
+    },
+  });
+  const ctx = {
+    taskDir,
+    task: { issue: 7, criterion: 'the thing is fixed', worktreePath: '/tmp/worktree-7' },
+  };
+
+  const values = buildPromptValues(ctx, 'IMPLEMENT');
+  assert.deepEqual(values.check_commands, commands, 'derivation must not re-shape the wire value');
+
+  const filled = fillPromptTemplate(STEP_CONTRACTS.IMPLEMENT.promptFile, values);
+  assert.ok(filled.includes(JSON.stringify(commands)), 'the rendered prompt carries the JSON form');
+  assert.ok(
+    !filled.includes(commands.join(', ')),
+    'the rendered prompt must NOT carry the ", "-joined form'
+  );
+  assert.ok(!filled.includes('INV-1, INV-2'), 'invariant_ids must not be joined either');
 });
 
 // The end-to-end guard. The four tests above bind to stringifyValue, but #153's own "Scope"

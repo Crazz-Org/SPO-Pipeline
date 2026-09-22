@@ -617,18 +617,25 @@ test('checkOutputTypes: VALIDATE findings has no declared type -- a malformed va
 // exclusions NOTHING today would fail if they were reinstated (unlike `tests_run`/`invariants`,
 // which the corpus replay above pins) -- reinstating either as `'string[]'` makes every existing
 // test in this suite pass, because nothing else in the hermetic suite constructs a value with a
-// comma INSIDE one array element (the shape that actually breaks prompt-template.js's
+// comma INSIDE one array element (the shape that used to break prompt-template.js's
 // `stringifyValue` re-join, per card #153: 14.5% of real `check_commands` contain one). This test
 // exists so that a future "tidy-up" reinstating either declaration goes red here, even though it
 // would go green everywhere else.
+//
+// #231 note (2026-09-22): the DOWNSTREAM half of this guard has moved. #229 made PLAN send these
+// fields as real arrays, so the re-join happened regardless of what this checker does, and
+// prompt-template.js now JSON-renders both placeholders instead (test/prompt-template.test.js's
+// #231 tests). What this test still pins is narrower and still true: `checkOutputTypes` hands its
+// caller the field byte-identical, never normalized in place.
 test('checkOutputTypes: PLAN check_commands/invariant_ids have no declared type -- a JSON-encoded array containing a comma inside one element reaches the consumer BYTE-IDENTICAL, never normalized in place (card #153\'s comma-corruption guard)', () => {
   const outputContract = STEP_CONTRACTS.PLAN.outputContract;
   assert.ok(!('check_commands' in outputContract.types), 'sanity: check_commands is deliberately undeclared');
   assert.ok(!('invariant_ids' in outputContract.types), 'sanity: invariant_ids is deliberately undeclared');
 
-  // The comma sits INSIDE one command -- exactly the shape stringifyValue's `', '.join` would
-  // corrupt if this were a real array instead of a JSON string re-read verbatim by
-  // task-values.js/prompt-template.js.
+  // The comma sits INSIDE one command -- the shape stringifyValue's `', '.join` corrupted once
+  // #229 turned this field into a real array; prompt-template.js renders it as JSON since #231.
+  // Here the value is the pre-#229 JSON string, and the assertion is that it is re-read verbatim
+  // by task-values.js/prompt-template.js, not normalized in place.
   const checkCommandsRaw = JSON.stringify(['grep -Eq "kind, arity, and citation" src/foo.ts']);
   const invariantIdsRaw = JSON.stringify(['INV-1, the comma-bearing id']);
   const payload = {
@@ -639,7 +646,7 @@ test('checkOutputTypes: PLAN check_commands/invariant_ids have no declared type 
   };
   const { payload: out, failures } = checkOutputTypes(payload, outputContract);
   assert.deepEqual(failures, []);
-  assert.equal(out.check_commands, checkCommandsRaw, 'must stay the exact same JSON-encoded STRING -- normalizing to a real array here would silently reintroduce #153\'s comma-corruption once prompt-template.js\'s stringifyValue re-joins it with ", " for the next prompt');
+  assert.equal(out.check_commands, checkCommandsRaw, 'must stay the exact same JSON-encoded STRING -- this checker never normalizes in place, so what PLAN sent is what task-values.js/prompt-template.js read back (pre-#231 that also kept stringifyValue from re-joining it with ", "; #231 removed that second hazard at the renderer)');
   assert.equal(out.invariant_ids, invariantIdsRaw, 'same guard, same reason, for invariant_ids');
 });
 
