@@ -191,8 +191,11 @@ test('PLAN real card path: check_commands as a JSON-encoded string containing a 
     size: 'S',
   };
 
-  // The comma sits INSIDE one command -- exactly the shape stringifyValue's `', '.join` would
-  // corrupt if this ever became a real array instead of the JSON string the model actually sent.
+  // The comma sits INSIDE one command -- exactly the shape stringifyValue's `', '.join` DID
+  // corrupt once #229 (2026-09-13) turned this field into a real array instead of the JSON string
+  // the model sent when this test was written. That regression is fixed in prompt-template.js by
+  // #231 (both shapes now render as JSON); this test still pins the OTHER half of the property --
+  // that runLlm hands its caller the field byte-identical, whatever the renderer later does.
   const checkCommandsRaw = JSON.stringify(['grep -Eq "kind, arity, and citation" src/foo.ts']);
   const invariantIdsRaw = JSON.stringify(['INV-1, the comma-bearing id']);
 

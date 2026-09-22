@@ -438,7 +438,8 @@ test('handlePlan: PLAN declaring invariant ids as a JSON-STRING (the real wire s
     spawnSync: fakePlanSpawn({
       plan_markdown: '# Plan\n\nDo the thing.\n',
       invariants_markdown: invariantsMarkdown,
-      // The real wire shape: a JSON-encoded string, not a real array.
+      // The pre-#229 wire shape: a JSON-encoded string, not a real array (#229 flipped it to a
+      // real array on 2026-09-13; both shapes must keep normalizing the same way here).
       invariant_ids: '["INV-1", "INV-2"]',
       check_commands: ['npm run typecheck'],
     }),

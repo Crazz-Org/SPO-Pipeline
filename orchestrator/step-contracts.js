@@ -137,7 +137,19 @@ const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 // found that reasoning wrong (see their own bullets below for the measured numbers). This is why
 // the module header above states the enforced set as a closed, corpus-checked list rather than
 // claiming this section's absence of a consumer proves a wider shape is safe: absence-of-evidence
-// was exactly the mistake the first build made:
+// was exactly the mistake the first build made.
+//
+// READ THE CORPUS FIGURES IN THE BULLETS BELOW AS PRE-#229 MEASUREMENTS. #229 (this module's own
+// change, merged 2026-09-13T23:49Z) made `--json-schema` declare every required and optional key
+// in `properties`, and that flipped the wire shape of essentially every one of them. Re-measured
+// on the live journal 2026-09-22, per `result` record, pre-#229 -> post-#229: PLAN's
+// `invariant_ids`/`check_commands`/`files_to_change` 386/386/333 strings -> 125/125/125 real
+// arrays, 0 strings each; IMPLEMENT's `tests_run` 229 strings -> 86 arrays (+1 object),
+// `files_changed` 229 strings -> 85 arrays (+2 objects), `invariants` 229 strings -> 57 objects +
+// 30 arrays, `all_green` 229 strings -> 87 real booleans. The leniency and the left-undeclared
+// verdicts below were reasoned from the string-shaped corpus; whether any of them should change
+// now is #221's open DECISION, deliberately not settled here. What IS already fixed is the one
+// place the flip caused a live defect: prompt-template.js's renderer (#231).
 //
 //   - VALIDATE's `findings` -- test/validate-findings.test.js's real-mode "malformed findings ...
 //     never throw and never block the merge" case sends `findings` as an unparsable string
@@ -184,20 +196,28 @@ const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 //     sentence, an unparsable fragment, or a JSON array of something other than an object.
 //     Declaring `object[]` would have parked those 22 as `llm-transport-failed:IMPLEMENT`, into
 //     the same auto-retry loop as `tests_run` above. Left undeclared.
-//   - PLAN's `invariant_ids` and `check_commands` -- NOT because their shape is uncertain (it is
-//     the most confidently measured shape in this whole table): prompt-template.js's own
-//     `stringifyValue` comment records that 158 of 158 successful PLAN `result` payloads send BOTH
-//     fields as a JSON-ENCODED STRING, never a real array, and that this is deliberate, not a
-//     defect -- card #153 measured and closed "won't-fix" a proposal to normalize them, because
-//     14.5% of declared `check_commands` contain a comma, and re-joining a real array with ", "
-//     for the IMPLEMENT/VALIDATE prompt that reads them back (task-values.js: "PLAN's plan_path/
+//   - PLAN's `invariant_ids` and `check_commands` -- left undeclared when this table was written
+//     on the strength of prompt-template.js's `stringifyValue` comment, which recorded 158 of 158
+//     successful PLAN `result` payloads sending BOTH fields as a JSON-ENCODED STRING, never a
+//     real array, and card #153's measured "won't-fix" on normalizing them: 14.5% of declared
+//     `check_commands` contain a comma, so re-joining a real array with ", " for the
+//     IMPLEMENT/VALIDATE prompt that reads them back (task-values.js: "PLAN's plan_path/
 //     invariants_path/invariant_ids/check_commands feed IMPLEMENT and VALIDATE") is NOT losslessly
-//     reversible. `checkOutputTypes`'s own JSON-string leniency would NORMALIZE this field in
-//     place -- turning the on-the-wire JSON string into a real array BEFORE task-values.js reads
-//     it back -- which would make `stringifyValue`'s `Array.isArray` branch fire on the very next
-//     prompt fill and silently reintroduce the exact comma-corruption #153 was closed to prevent,
-//     on 100% of cards, not an edge case. `plan_markdown`/`invariants_markdown` carry no such
-//     downstream re-render and are declared `string` below without incident.
+//     reversible. The argument stated here was that `checkOutputTypes`'s JSON-string leniency
+//     would NORMALIZE the field in place, making `stringifyValue`'s `Array.isArray` branch fire on
+//     the very next prompt fill and reintroduce that comma-corruption.
+//     **BOTH of those premises have since changed, and this bullet's own reasoning with them.**
+//     #229 (2026-09-13) made this module declare every contract key in `--json-schema`
+//     `properties`, and the model now sends both fields as REAL ARRAYS -- re-measured on the live
+//     journal 2026-09-22: 125 of 125 post-#229 PLAN `result` records are arrays, 0 strings (386 of
+//     386 pre-#229 records are strings, 0 arrays). So there is no JSON string left for the
+//     leniency to normalize, and the comma-corruption it was feared to cause happened anyway,
+//     through the shape flip instead: #231 found it live and fixed it where it belongs, in
+//     prompt-template.js, which now JSON-renders these two placeholders whichever shape arrives.
+//     What that leaves is only the question of whether these two keys should now be DECLARED --
+//     which is #221's open DECISION, not this comment's to settle, and not something #231 touched.
+//     `plan_markdown`/`invariants_markdown` carry no such downstream re-render and are declared
+//     `string` below without incident.
 //   - PLAN's `files_to_change` -- OPTIONAL (see `optional` below), so a declared type here was
 //     always schema-only: `checkOutputTypes` never enforces or normalizes a key that is not also
 //     in `required` (see its own header comment further down). The first build declared it
@@ -762,13 +782,18 @@ const STEP_CONTRACTS = {
       // Card #207: `plan_markdown`/`invariants_markdown` are plan.md/invariants.md's full text
       // (prose) -- 'string'. `invariant_ids`/`check_commands` are REQUIRED but deliberately left
       // OUT of `types` -- see this file's own "outputContract types" header comment for why (158
-      // of 158 measured PLAN replies send them as a JSON-encoded STRING on purpose, per card #153,
-      // and this checker's own JSON-string leniency would normalize that string into a real array
-      // before task-values.js/prompt-template.js read it back for IMPLEMENT's/VALIDATE's own
-      // prompt, silently reintroducing #153's comma-corruption regression). `files_to_change` is
+      // of 158 PLAN replies measured pre-#229 sent them as a JSON-encoded STRING, and this
+      // checker's JSON-string leniency would have normalized that string into a real array before
+      // task-values.js/prompt-template.js read it back for IMPLEMENT's/VALIDATE's own prompt,
+      // where stringifyValue's `', '.join` would then corrupt a comma-bearing command -- #153's
+      // regression. #229 (2026-09-13) made the model send real arrays anyway, so that corruption
+      // shipped through the shape flip instead of through this leniency; #231 fixed it in
+      // prompt-template.js, which now JSON-renders both placeholders. Whether to declare them NOW
+      // is #221's open DECISION; the exclusion stands until it is taken). `files_to_change` is
       // ALSO left out of `types` entirely, as of this same card's fix pass (2026-09-12) -- see the
-      // header comment for the measured reason (130 of 130 DISTINCT replies that declare it send a
-      // JSON-encoded string, 0 a real array; it stays `optional` below regardless).
+      // header comment for the measured reason (130 of 130 DISTINCT pre-#229 replies that declare
+      // it send a JSON-encoded string, 0 a real array; post-#229 it is a real array, 125 of 125,
+      // re-measured 2026-09-22; it stays `optional` below regardless).
       types: {
         plan_markdown: 'string',
         invariants_markdown: 'string',

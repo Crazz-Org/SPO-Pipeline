@@ -403,7 +403,12 @@ function decidePlanReuse(ctx) {
 // action 3.1's reuse of a plan already on disk.
 //
 // The shape test used to be `Array.isArray(payload.files_to_change)`, inline, and it never once
-// passed. Measured across the whole journal corpus on 2026-09-05: of 151 PLAN 'result' events, 93
+// passed -- until #229 (2026-09-13) made PLAN declare every key in its `--json-schema`
+// `properties` and the model switched to real arrays for this field too (125 of 125 post-#229
+// PLAN `result` records, re-measured 2026-09-22; 333 of 333 pre-#229 records are strings). The
+// figures below are therefore the pre-#229 corpus, and normalizing BOTH shapes here is what keeps
+// the guard alive across the flip.
+// Measured across the whole journal corpus on 2026-09-05: of 151 PLAN 'result' events, 93
 // carry files_to_change and every single one of them delivers it as a JSON-ENCODED STRING
 // ('["/abs/path", ...]'), 0 as a real array. So the scan sat in an `else if` no live card ever
 // reached and action 3.2's guard had never run, on any card, since it was built -- 44 journalled
@@ -569,12 +574,22 @@ function annotatePlanSpanConflicts(ctx, baseline, planMarkdown) {
 // `Array.isArray(x.invariant_ids) ? x.invariant_ids : []` -- the identical shape bug #118 fixed
 // for files_to_change, unpropagated here. Measured on the live journal corpus (every task dir's
 // journal.jsonl under ~/.spo-state/journal) on 2026-09-07 (re-derived Lot 6, 2026-09-08):
-// invariant_ids occurs 159 times on the wire and is a JSON-ENCODED STRING in all 159, never a
+// invariant_ids occurred 159 times on the wire and was a JSON-ENCODED STRING in all 159, never a
 // real array -- the same wire shape files_to_change turned out to have. 158 of those 159 are in
 // a `PLAN/result` event; the 159th is in a `PLAN/parked` event (issue-483, `plan-invalid`), which
 // neither of this function's two call sites ever reaches -- both are fed a PLAN *result* payload
 // (handlePlan's own `payload`, and the reuse path's `lastResultPayload`), so 158 of 158 is the
 // population that actually reaches here.
+//
+// **That measurement is now historical, and only the pre-#229 half of the story.** #229 (merged
+// 2026-09-13T23:49Z) made PLAN's `--json-schema` declare every contract key in `properties`, and
+// the model switched to sending REAL ARRAYS: re-measured on the live journal 2026-09-22, 125 of
+// 125 post-#229 PLAN `result` records carry `invariant_ids` as an array and 0 as a string (386 of
+// 386 pre-#229 records are strings and 0 arrays). Both shapes are still in the corpus, and a
+// `retry`/plan-reuse path can still hand this function a pre-#229 payload, so normalizing both
+// here is now load-bearing rather than defensive -- which is exactly why this function, not an
+// inline shape test, is the one place it happens. (The same flip broke prompt-template.js's
+// renderer, silently: see #231.)
 // Array.isArray therefore rejected the field's own shape on every card, so `declared` was always
 // 0 and `declaredIds` always []: of the 58
 // invariants-declared-parsed-mismatch events on record, all 58 fire with declared: 0 against
@@ -809,7 +824,8 @@ async function handlePlan(ctx) {
     // Journalled, deliberately never a park: PLAN's prose and its id list disagreeing is not
     // grounds to fail a card, it is grounds to go look at the parser.
     //
-    // invariant_ids arrives the same JSON-ENCODED-STRING way files_to_change does (#118) --
+    // invariant_ids arrived the same JSON-ENCODED-STRING way files_to_change did (#118) until
+    // #229 flipped both to real arrays (2026-09-13; see normalizeDeclaredInvariantIds's header) --
     // measured 158 of 158 successful PLAN `result` payloads on the live journal corpus, 2026-09-07
     // (159 occurrences exist on the wire; the 159th is in a `PLAN/parked` event this call site
     // never sees, since `payload` here is always a result payload -- re-derived Lot 6, 2026-09-08)
@@ -1463,7 +1479,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:1048's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1073's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
