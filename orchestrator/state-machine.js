@@ -59,6 +59,12 @@ const {
   preserveWorktreeWip,
   prepareJudgeInputs,
   prepareResume,
+  // Card #226: the ONE definition of "is the nightly bench red at this sha", shared with
+  // realWorktree's own per-card check and with guardNightlyRed -- imported here rather than
+  // re-derived, for exactly the reason action B3.2 gave when it collapsed realWorktree's second
+  // copy of the FAIL-and-sha-match predicate into this function: a second copy drifts, and the
+  // drift is silent (the old copy treated INTERRUPTED as a clean PASS for months).
+  classifyNightly,
 } = require('./steps/scripted');
 const { runLlm } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
@@ -234,6 +240,104 @@ async function handleIntake(ctx) {
   // (guardDeclaredFiles below), documented in prompts/plan.md as the files the plan will CHANGE,
   // never the ones it reads, cites, or asserts the absence of. #118 made that site reachable for
   // the first time, which is what makes dropping this one affordable.
+  // ---- card #226: the nightly-red PRE-GATE ---------------------------------------------------
+  //
+  // "Is main red" is ONE pipeline-wide fact, knowable before any card is touched. Until this
+  // gate, the only thing that knew it was realWorktree (steps/scripted.js), which asks the
+  // question AFTER the card has already been claimed off Todo and has already paid for
+  // withProductRepoLock + payBenchReinstallDebtIfOwed + `git fetch origin` + `git rev-parse
+  // origin/main` -- all serialized, through the shared product-repo mutex, against every other
+  // worker's real work. So one red nightly cost one lock-serialized WORKTREE attempt PER CARD
+  // sitting in Todo, and then, because `nightly-main-red` is terminal, one human `retry` comment
+  // per card to get each of them moving again once nightly went green.
+  //
+  // handleIntake is the right place for it, and the only one: it is the single choke point every
+  // task passes through exactly once regardless of how it entered `queue/` (auto-pull, a manual
+  // `spo ask`, or a retry re-enqueue), reached identically by dispatcher.js's `fillSlots` in real
+  // mode and by this file's own `drainQueueOnce` for `--once`/tests -- both call `takeNextTask`
+  // then `runTask`, which starts here. Gating here means a red nightly never causes a transition
+  // into WORKTREE at all: realWorktree's lock/fetch/rev-parse/npm-ci cost is never paid, and no
+  // `WORKTREE` journal entry is ever produced for a card that does not start.
+  //
+  // Three deliberate properties, each of which is the answer to an obvious "why not just ...":
+  //
+  //   1. NO `git fetch`, and NO withProductRepoLock. Paying either one here would reintroduce
+  //      exactly the per-card serialized cost this gate exists to remove. The rev-parse below
+  //      reads the LOCALLY-KNOWN `origin/main` -- possibly a few minutes stale, which is fine:
+  //      a stale sha can only make classifyNightly answer 'unknown' (sha mismatch), and 'unknown'
+  //      proceeds. The gate can therefore miss a red nightly; it can never invent one. The card
+  //      that slips through is caught by realWorktree's own check a moment later, against the
+  //      freshly FETCHED sha -- which is why that check stays exactly as it is (see point 3).
+  //
+  //   2. It FAILS OPEN. A non-zero rev-parse (no product repo cloned yet, a corrupt `.git`, any
+  //      other reason) proceeds to WORKTREE exactly as before, no park -- the same posture
+  //      guardNightlyRed's 'unknown' handling already takes, and the same one every "can't tell"
+  //      case in this codebase takes. An INTAKE gate that parked on its own inability to answer
+  //      would be a single point of failure in front of the entire queue.
+  //
+  //   3. The park reason is NEW and TRANSIENT. New, because `nightly-main-red` (real, WORKTREE)
+  //      and `main-red-refuse-worktree` (shadow, WORKTREE) are each pinned by existing tests as
+  //      that state's own fallback -- reusing either name would corrupt what those tests mean.
+  //      Transient (TRANSIENT_RETRY_REASONS, below) because that is what actually kills the
+  //      "one human retry per card" cost: the existing backoff/re-enqueue machinery in
+  //      finalizePark carries the card back around by itself once nightly turns green, with no
+  //      new re-enqueue mechanism and no maintainer in the loop.
+  //
+  // Real cards only (isRealMode + kind === 'card'), mirroring cardRequiresRealFlag's own
+  // condition shape just above. Shadow mode keeps its own `nightlyMainRed` fixture check at the
+  // top of handleWorktree, untouched: it is fixture-driven, and a fixture-driven refusal has none
+  // of the cost this gate exists to avoid.
+  // `typeof ... === 'string'` on BOTH paths, not a truthiness check on ctx.config, and not
+  // optional chaining that would still hand `undefined` to path.join. A ctx built by hand -- a
+  // test, orphan-scan.js, a future scheduler -- can carry a config with neither key, and
+  // `path.join(undefined, ...)` THROWS. A throw here is not a park: it is an uncaught JavaScript
+  // error inside a state handler, which this file's own header says is deliberately not caught and
+  // fails the daemon run loudly. A cost optimisation must never be able to do that, so an
+  // incomplete config takes the same fail-open exit as an unanswerable rev-parse.
+  if (
+    isRealMode(ctx) &&
+    ctx.task.kind === 'card' &&
+    typeof ctx.config.spoBenchDir === 'string' &&
+    typeof ctx.config.productRepo === 'string'
+  ) {
+    const nightly = readJsonSafe(path.join(ctx.config.spoBenchDir, 'nightly', 'latest.json'));
+    // Free `fs` read FIRST, and the subprocess only if that read could possibly matter. The
+    // question asked here is "is there ANY sha this nightly record would refuse" -- and it is put
+    // to classifyNightly itself, by classifying the record against its OWN recorded sha, rather
+    // than to a local restatement of classifyNightly's table ("verdict === 'FAIL'"). That
+    // distinction is the whole B3.2 lesson: a second copy of the predicate drifts silently, and
+    // this one would drift in the worst direction -- skipping the gate for a verdict that had
+    // become refusable. Asking the shared function cannot drift.
+    //
+    // When the answer is no (no nightly file at all, a PASS, a non-attesting verdict), no sha can
+    // make this record red, so the rev-parse below would be pure waste -- and the common case,
+    // nightly green, therefore costs this gate zero subprocesses on every card.
+    if (classifyNightly(nightly, nightly && nightly.sha).status === 'red') {
+      const revParse = spawnStep(ctx, ctx.deps, 'INTAKE', 'git', [
+        '-C',
+        ctx.config.productRepo,
+        'rev-parse',
+        'origin/main',
+      ]);
+      // Journalled under 'INTAKE', never 'WORKTREE': the acceptance bar for this card is that a
+      // held task produces NO WORKTREE journal entry, and a spawn journalled under the wrong
+      // state would fake one.
+      if (revParse.exit === 0) {
+        const sha = revParse.stdout.trim();
+        const classification = classifyNightly(nightly, sha);
+        if (classification.status === 'red') {
+          throw new ParkSignal('nightly-red-holding-intake', { sha });
+        }
+        if (classification.status === 'unknown') {
+          // Reached when a red nightly is on file for a DIFFERENT sha than the one this box knows
+          // locally -- the routine stale case. Recorded, never acted on, exactly as
+          // realWorktree/guardNightlyRed treat 'unknown', and under the same event name so
+          // `nightly-unknown` stays one searchable fact across every state that can emit it.
+          appendEvent(ctx.taskDir, 'INTAKE', 'nightly-unknown', { sha, reason: classification.reason });
+        }
+      }
+    }
+  }
   appendEvent(ctx.taskDir, 'INTAKE', 'ok', { title: ctx.task.title, kind: ctx.task.kind });
   return 'WORKTREE';
 }
@@ -248,6 +352,14 @@ async function handleWorktree(ctx) {
   // <spoBenchDir>/nightly/latest.json), which throws ParkSignal('nightly-main-red', ...) on a
   // genuine red main and IS wired to the real signal -- see doc/state-machine-spec.md's WORKTREE
   // row and test/gate-legs-reachability.test.js for both legs firing, each in the one mode it can.
+  //
+  // Card #226: WORKTREE is no longer the FIRST place a real card meets this question -- handleIntake
+  // now pre-gates on the same classifyNightly against the locally-known origin/main sha, parking
+  // the transient `nightly-red-holding-intake` before any transition into this state. Neither
+  // check below is redundant because of it: the pre-gate deliberately does not fetch, so it sees a
+  // possibly-stale sha and classifies 'unknown' (proceed) where this one, running after
+  // realWorktree's `git fetch origin`, sees the true tip. This is the fallback for the card that
+  // started before main went red, and for the card whose base moved under it between the two.
   if (ctx.fixture('nightlyMainRed', false)) {
     throw new ParkSignal('main-red-refuse-worktree', {});
   }
@@ -2128,6 +2240,16 @@ function carriedResume(ctx) {
 const TRANSIENT_RETRY_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
 const TRANSIENT_RETRY_REASONS = new Set([
   'claim-rate-limited',
+  // Card #226. The INTAKE pre-gate's reason, and the ONE thing that makes that gate cheaper than
+  // the WORKTREE check it front-runs rather than just earlier than it. The condition it parks on
+  // ("the nightly bench recorded a FAIL at the origin/main sha this box knows about") is
+  // pipeline-wide, not card-specific, and it clears by itself the moment a nightly goes green --
+  // nothing about the card needs fixing, or even looking at. Its WORKTREE-state siblings
+  // (`nightly-main-red`, `main-red-refuse-worktree`) stay TERMINAL on purpose and are NOT being
+  // reclassified here: by the time either of those fires the card has already paid the
+  // lock-serialized fetch, so a card that reaches them has genuinely started, and the existing
+  // human-`retry` contract for them is what several tests pin.
+  'nightly-red-holding-intake',
   'gate-non-attesting',
   'gate-live-blocked',
   'gate-environment',

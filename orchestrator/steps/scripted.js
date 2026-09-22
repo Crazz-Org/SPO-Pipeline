@@ -359,8 +359,10 @@ function splitLines(text) {
 // ---- shared: nightly-verdict semantics (action B3.2) ---------------------------------------
 //
 // One classification, three states, read by every real-mode consumer of
-// `<spoBenchDir>/nightly/latest.json` in this file (realWorktree's own nightly-main-red check
-// and guardNightlyRed below, shared by CI_CHECKS' and GATE's main-moved paths) -- mirrored,
+// `<spoBenchDir>/nightly/latest.json` -- in this file, realWorktree's own nightly-main-red check
+// and guardNightlyRed below (shared by CI_CHECKS' and GATE's main-moved paths); since card #226
+// also OUTSIDE it, by state-machine.js's handleIntake nightly-red pre-gate, which imports this
+// function rather than growing a fourth copy of the predicate -- mirrored,
 // case for case, by SPO-WebClient's `scripts/nightly-check.sh` (the human-facing
 // `npm run bench:nightly` probe over the SAME file, from the other repo). The two cannot share
 // one implementation across the repo boundary (bash vs. Node, two separate repos, no shared
@@ -368,8 +370,9 @@ function splitLines(text) {
 // each side's header pointing at the other's, rather than by import. Before this action, this
 // file itself had already drifted from ONE implementation into an inline duplicate a second
 // time (realWorktree's own read-compare-throw next to this function, below) -- exactly the
-// class of copy this comment used to warn about while itself being a second copy. Both real-mode
-// call sites now go through classifyNightly.
+// class of copy this comment used to warn about while itself being a second copy. All real-mode
+// call sites now go through classifyNightly -- the two in this file, and (card #226)
+// handleIntake's pre-gate in state-machine.js.
 //
 // - 'green'   -- a positive attestation that `main` AT THIS EXACT SHA passed: verdict PASS, a
 //                sha recorded, and it equals the sha being asked about.

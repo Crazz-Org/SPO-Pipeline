@@ -97,10 +97,21 @@ function resolveOriginMainTip(productRepo, execFileSync) {
   return { sha: null, source: 'unresolved' };
 }
 
-// Cards the red nightly parked and that are still waiting. `nightly-main-red` is a TERMINAL park
-// reason (state-machine.js's TERMINAL_PARK_REASONS), so a green nightly releases none of them on
-// its own -- each needs a `retry`. Listed so that consequence is on screen at the moment a human
-// is deciding whether to ask for a proof.
+// Cards the red nightly parked and that are still waiting. Both of the nightly-red park reasons
+// that can leave a card sitting in PARKED are counted, not just one -- card #226 added
+// `nightly-red-holding-intake` (handleIntake's pre-gate) beside the existing `nightly-main-red`
+// (realWorktree's check), and a listing that knew only the older name would silently under-report
+// exactly what this screen exists to show.
+//
+// Both are, AT THIS POINT, equally stuck. `nightly-main-red` is terminal outright
+// (TERMINAL_PARK_REASONS). `nightly-red-holding-intake` is transient
+// (TRANSIENT_RETRY_REASONS) and self-resumes -- but a task only reaches PARKED under it once
+// finalizePark's bounded retry budget is spent, so a card that appears in THIS list has already
+// used its automatic resumes and needs a `retry` like the other. A green nightly releases
+// neither. Listed so that consequence is on screen at the moment a human is deciding whether to
+// ask for a proof.
+const NIGHTLY_RED_PARK_REASONS = new Set(['nightly-main-red', 'nightly-red-holding-intake']);
+
 function listNightlyRedParks(journalRoot) {
   let names = [];
   try {
@@ -111,7 +122,7 @@ function listNightlyRedParks(journalRoot) {
   const rows = [];
   for (const id of names) {
     const state = readJson(path.join(journalRoot, id, 'state.json'));
-    if (state && state.state === 'PARKED' && state.reason === 'nightly-main-red' && !state.externallyResolved) {
+    if (state && state.state === 'PARKED' && NIGHTLY_RED_PARK_REASONS.has(state.reason) && !state.externallyResolved) {
       rows.push({ id, title: state.title || '' });
     }
   }
@@ -163,7 +174,7 @@ function formatNightlyStatus({ latest, manualRequest, manualRecords, tip, classi
     lines.push(`  manual run   ${r.verdict || r.outcome || '?'} ${r.finishedAt || ''}${r.attested === false ? ' (did not replace latest.json)' : ''}`);
   }
   if (parks.length) {
-    lines.push(`  parked       ${parks.length} card(s) on nightly-main-red -- a terminal reason: a green nightly releases none of them; each needs a \`retry\``);
+    lines.push(`  parked       ${parks.length} card(s) on nightly-main-red / nightly-red-holding-intake -- a green nightly releases none of them; each needs a \`retry\``);
     for (const p of parks) lines.push(`               ${p.id}  ${p.title}`);
   }
   if (classification.status === 'red') {

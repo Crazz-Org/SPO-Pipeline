@@ -1039,7 +1039,8 @@ module.exports = {
   ghRepo: 'Crazz-Org/SPO-WebClient',
 
   // Local surfaces this build reads instead of polling GitHub/the bench for state that already
-  // has one: ~/.spo-bench/nightly/latest.json (WORKTREE's/CI_CHECKS' nightly-red refusal),
+  // has one: ~/.spo-bench/nightly/latest.json (INTAKE's nightly-red pre-gate, card #226, plus
+  // WORKTREE's and CI_CHECKS'/GATE's own nightly-red refusals),
   // ~/.spo-bench/verdicts/<sha>.json (CI_CHECKS' baseMain, for the main-moved intersection), and
   // (action 5.4) ~/.spo-bench/spool + ~/.spo-bench/running for `spo status`'s bench queue depth.
   // SPO_BENCH_DIR override added by that same action, matching the SPO_ACCOUNTS_DIR /

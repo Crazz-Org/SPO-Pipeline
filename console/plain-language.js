@@ -236,6 +236,8 @@ const PARK_REASONS = {
   'main-red-refuse-worktree': 'Main is failing its own tests — it refused to start on a broken base.',
   'main-red-no-merge': 'Main is failing its own tests — it refused to merge into a broken base.',
   'nightly-main-red': "Last night's full test run on main failed.",
+  'nightly-red-holding-intake':
+    "Last night's full test run on main failed, so this card was held before it started. It comes back on its own once main is green again — no action needed.",
 
   // --- claiming the card -------------------------------------------------------------------------
   'claim-lost': 'Another worker claimed this card first.',
@@ -276,6 +278,10 @@ const SELF_RETRYING_LLM_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'VALIDATE'];
 
 const SELF_RETRYING = new Set([
   'claim-rate-limited',
+  // Card #226 -- the INTAKE nightly pre-gate's reason. Mirrors the orchestrator's own entry in
+  // TRANSIENT_RETRY_REASONS; its two WORKTREE-state siblings (`nightly-main-red`,
+  // `main-red-refuse-worktree`) are terminal there and so are deliberately absent here.
+  'nightly-red-holding-intake',
   'gate-non-attesting',
   'gate-live-blocked',
   'gate-environment',
