@@ -34,7 +34,7 @@
 //     cites 5 ref samples (123/123/124/125/161s, part of a stated n=8 across both job types);
 //     this file's directory held only 3 ref + 2 nightly reports when re-measured for THIS
 //     action, days later, on the same machine. THE SPOOL ROTATES, and that is what explains the
-//     drop from 8 to 5: SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 325) rmSync's
+//     drop from 8 to 5: SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 361) rmSync's
 //     every report whose mtime is older than the retention window it is passed, and
 //     `worker.ts`'s `purgeDone` call site passes it `worker.ts`'s `DONE_RETENTION_MS` = 24h on
 //     every pass. So ~/.spo-bench/done is a ONE-DAY sliding window, and every number below is
