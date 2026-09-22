@@ -1321,8 +1321,8 @@ const EXPECTED_CITATIONS = [
   "orchestrator/auto-triage.js :: park-loop.js:1569", // re-pinned from :1396 -- card #212 added buildGateFactLine/shortSha and their own header comment (~50 net lines) above this precedent in the same file, a true pure shift; then :1446 -> :1453 in the same card's fix-pass (measured-figures correction + retry-cost rewording, +7 net lines) above the same precedent. Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :1453 -> :1566, a pure +113-line shift when park-loop.js gained RESUMABLE_PARK_REASONS/buildContinueLine/continueEligibility/buildContinueRefusedAck and the `continue` verb's own header/journal-doc comments above this precedent in the same file; content byte-identical at :1566, verified by re-reading the target line.
   "orchestrator/auto-triage.js :: remote-report-pull.js:193",
   "orchestrator/auto-triage.js :: state-machine.js:3452", // re-pinned in card #231 (2026-09-22): :3436 -> :3452, a pure +16-line shift -- that card dated and corrected the two PLAN wire-shape comments above it in this file (guardDeclaredFiles's header on files_to_change, and normalizeDeclaredInvariantIds's header on invariant_ids, both now recording #229's flip from JSON string to real array); content byte-identical at :3452, verified by re-reading the target line. Before that, re-pinned from :3402 -- the no-worktree-change fix (readWorktreeHead plus the pre-attempt HEAD read in handleImplement, +34 net lines) landed above this precedent in the same file, a true pure shift; content byte-identical at :3436, verified by re-reading the target line. Before that, re-pinned from :3006, then :3105, then :3171 (Lot 10, card #212's build), then :3276 (card #212 C1), then :3304 (card #212 C2), now :3392 (the comment line itself, as at HEAD :3276, not the appendDaemonEvent call below it) -- card #212's fix pass (F1/F2: the prior-state.json capture, the buildCtx skipWipPreserve field, and the prepareResume-catch's untrusted-path recovery/skip-preserve additions, +58 net lines) landed above this appendDaemonEvent precedent (the `queue-claim-failed` catch) in the same file, a true pure shift; content byte-identical at :3392, verified by re-reading the target line. Previously re-pinned from :2923 by card #174, same pure-shift reason.
-  "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325",
-  "orchestrator/config.js :: worker.ts:1542",
+  "orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:361", // re-pinned from :325 -- SPO-WebClient's job.ts drifted independently of this repo; purgeDone's mtime-gated `fs.rmSync(file, { force: true })` call this prose describes now sits at :361 (purgeDone's own declaration is :356), verified by reading SPO-WebClient/src/e2e/bench/job.ts directly, not inferred from a diff offset.
+  "orchestrator/config.js :: worker.ts:1636", // re-pinned from :1542 -- SPO-WebClient's worker.ts drifted independently of this repo; the `process.on('SIGTERM', () => process.exit(0))` line this prose describes now sits at :1636, verified by reading SPO-WebClient/src/e2e/bench/worker.ts directly, not inferred from a diff offset.
   "orchestrator/dispatcher.js :: daemon.js:646", // re-pinned from :607, then :637 -- the 2026-09-13 incident fix (state-root.js's isLiveStateRoot dry-run/shadow live-root refusal, plus its taskDir-containment verifier fix) added net lines to daemon.js's main() above this point in the same file, a true pure shift; content byte-identical at :646, verified by re-reading the target line.
   "orchestrator/dispatcher.js :: daemon.js:665-666", // re-pinned from :626-627, then :656-657 -- same shift history as the :607 -> :646 re-pin above (isLiveStateRoot guard and its taskDir-containment fix, both added to daemon.js's main()); content byte-identical at :665-666, verified by re-reading the target lines.
   "orchestrator/invariants.js :: doc/state-machine-spec.md:380", // re-pinned from :150, then :159, then :200 (card #212 C1), then :263 (card #212 C2), then :308, then :311, then :380 (card #212 C4/C5, +69 net lines) -- same shift/reason as orchestrator/README.md's own entry above
@@ -1343,7 +1343,7 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:336",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
-  "orchestrator/steps/scripted.js :: worker.ts:1542",
+  "orchestrator/steps/scripted.js :: worker.ts:1636", // re-pinned from :1542 -- same drift and same target as orchestrator/config.js's own entry above (SPO-WebClient's worker.ts:1636 is the `process.on('SIGTERM', () => process.exit(0))` line), verified by reading SPO-WebClient/src/e2e/bench/worker.ts directly.
   "orchestrator/steps/scripted.js :: worker.ts:751", // card #212: isGateMergeRefusalConfirmed's own comment cites worker.ts:751's refusal-detail literal ("<ref> does not merge cleanly with origin/main (base <sha>)"), confirmed against the real product repo (SPO-WebClient `0b5b5687`+).
   "prompts/README.md :: plan.md:103",
   "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18",
@@ -2233,8 +2233,8 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'orchestrator/auto-triage.js :: park-loop.js:1569',
   'orchestrator/auto-triage.js :: remote-report-pull.js:193',
   'orchestrator/auto-triage.js :: state-machine.js:3452',
-  'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:325',
-  'orchestrator/config.js :: worker.ts:1542',
+  'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:361', // re-pinned from :325, see EXPECTED_CITATIONS's own entry above for the drift.
+  'orchestrator/config.js :: worker.ts:1636', // re-pinned from :1542, see EXPECTED_CITATIONS's own entry above for the drift.
   'orchestrator/dispatcher.js :: daemon.js:646',
   'orchestrator/invariants.js :: doc/state-machine-spec.md:380',
   'orchestrator/orphan-scan.js :: daemon.js:951',
@@ -2243,7 +2243,7 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'orchestrator/state-machine.js :: run.ts:63',
   'orchestrator/state-machine.js :: step-contracts.js:1073',
   'orchestrator/steps/scripted.js :: run.ts:63',
-  'orchestrator/steps/scripted.js :: worker.ts:1542',
+  'orchestrator/steps/scripted.js :: worker.ts:1636', // re-pinned from :1542, see EXPECTED_CITATIONS's own entry above for the drift.
   'prompts/README.md :: plan.md:103',
 ];
 

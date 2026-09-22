@@ -7080,7 +7080,7 @@ test('npm-gate timeout also covers K workers\' worst-case bench queue wait, incl
 // shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
 //
 // A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
-// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 325) deletes
+// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 361) deletes
 // every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
 // worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
 // all-time records, and re-measuring on a different day legitimately yields a different sample
