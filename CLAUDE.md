@@ -65,8 +65,10 @@ card:
   plan requires editing them cannot succeed — park it with that reason instead of failing it
   in IMPLEMENT.
 - DIAGNOSE / VALIDATE / CITATION_VERIFIER run from the repo root in
-  `permissionMode: 'default'` **with no human**: whatever `.claude/settings.json` doesn't
-  allow is refused, not queued.
+  `permissionMode: 'default'` **with no human**: a refusal is terminal, never queued. But only
+  CITATION_VERIFIER is bounded by `.claude/settings.json` — the other 7 policies declare bare
+  `Bash`, which allows the whole tool. Their bound is the per-policy deny in
+  `orchestrator/bash-policy.js` (card #240, measured on 13001 real Bash calls).
 - `.claude/settings.json` is the **single source** of policy: it is also installed as the
   user layer of every account in the pool (`spo account sync-settings`, automatic on
   `account add` and on every `--real` startup). Resync after editing it.

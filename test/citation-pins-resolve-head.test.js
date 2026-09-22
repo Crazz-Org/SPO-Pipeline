@@ -242,7 +242,10 @@ test('historical drift replay: bin/spo -- old citation :1273 (was :1273 before c
 // (walking the anchor's own line number commit by commit), not assumed: 626-627 moved to 665-666 in
 // a483724 ("refuse --dry-run/--shadow against the live state root" -- ~39 lines added ABOVE the
 // exit hook, which itself was untouched), 1273 moved to 1283 in df48670 (card #219), 938-940 moved
-// to 953-955, and lock.js's span has held exactly three positions in this repo's whole history --
+// to 953-955 and then, in card #240, to today's 963-965 (that card's `bash-policy` require and its
+// header comment landed above this anchor -- a pure +10 shift, anchor text untouched; the replay
+// below asserts the CURRENT correction, so it re-pins on every such shift),
+// and lock.js's span has held exactly three positions in this repo's whole history --
 // 257-288, then 278-309, then today's 354-385 -- which is what the two lock.js replays use.
 test('historical drift replay: daemon.js -- old citation :626-627 (its real position until a483724 added ~39 lines above the exit hook; unchanged text) resolves ok with a correction to the real current lines', () => {
   const pin = {
@@ -271,9 +274,9 @@ test('historical drift replay: intake.js -- old citation :938-940 (unchanged tex
   const [result] = resolvePins([pin]);
   assert.equal(result.ok, true, `expected ok: true: ${result.why}`);
   assert.ok(result.correction, 'expected a correction to be reported');
-  assert.equal(result.correction.start, 953);
-  assert.equal(result.correction.stop, 955);
-  assert.equal(result.correction.citation, 'orchestrator/intake.js:953-955');
+  assert.equal(result.correction.start, 963);
+  assert.equal(result.correction.stop, 965);
+  assert.equal(result.correction.citation, 'orchestrator/intake.js:963-965');
 });
 
 test('historical drift replay: lock.js -- old citation :278-309 (one shift back, the position immediately before today\'s; unchanged text) resolves ok with a correction to the real current lines', () => {

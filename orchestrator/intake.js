@@ -45,6 +45,14 @@ const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
 const { appendDaemonEvent } = require('./journal');
 const { armTimeout } = require('./command-timeout');
+// Card #240. All three intake steps run against config.productRepo -- `~/SPO-WebClient`, the LIVE
+// persistent product checkout the daemon itself works from, not a disposable per-card worktree --
+// and they fire outside any card's lifecycle, so there is no worktree to discard and no park path
+// to halt a bad run. Their bare `Bash` grant therefore had the widest blast radius of the eight
+// in-repo tool policies while binding none of .claude/settings.json's 92 scoped rules. Measured
+// across 1360 real intake Bash calls (427 sessions): zero writes, zero `gh` mutations, zero
+// installs -- so this deny costs nothing and closes that. Lists and evidence: ./bash-policy.js.
+const { INTAKE_BASH_DENY } = require('./bash-policy');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 const DRAFT_CARD_PROMPT = path.join(PROMPTS_DIR, 'draft-card.md');
@@ -391,6 +399,7 @@ async function draftCard(requestText, deps = {}) {
     model: 'sonnet',
     effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    disallowedTools: INTAKE_BASH_DENY, // card #240 -- see the note above INTAKE_BASH_DENY's import
     permissionMode: 'plan', // read-only -- draft-card.md: "you hold no edit tool"
     maxBudgetUsd: undefined, // no $ cap -- Claude Max subscription, no overage risk
     jsonSchema: { type: 'object', required: DRAFT_REQUIRED },
@@ -518,6 +527,7 @@ async function reviewCard(draft, deps = {}) {
     model: 'fable',
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'], // review-card.md: "Read, Grep, Glob, Bash(ro)"
+    disallowedTools: INTAKE_BASH_DENY, // card #240 -- the "(ro)" above, enforced at the tool layer
     permissionMode: 'default',
     maxBudgetUsd: undefined, // no $ cap -- Claude Max subscription, no overage risk
     jsonSchema: { type: 'object', required: REVIEW_REQUIRED },
@@ -1029,6 +1039,9 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
     model: 'opus',
     effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    // Card #240. "never file, never post" is exactly what BASH_DENY_REMOTE_WRITES enforces; the
+    // step's own `curl -s ... -o /tmp/...` model-server fetch (53 measured calls) is untouched.
+    disallowedTools: INTAKE_BASH_DENY,
     permissionMode: 'plan', // read-only -- triage-bug-report.md: "never file, never post, never move the report"
     maxBudgetUsd: deps.maxBudgetUsd, // no $ cap by default -- Claude Max subscription, no overage risk
     jsonSchema: { type: 'object', required: ['outcome'] },
