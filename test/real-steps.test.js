@@ -5630,6 +5630,116 @@ test('--real gating: --dry-run bypasses the gate even for a card task with no co
   assert.equal(next, 'WORKTREE');
 });
 
+// ---- card #226 fix pass: the nightly-red PRE-GATE's own `isRealMode(ctx)` conjunct, untested ---
+// ---- until now -- an Opus verifier found the whole 3231-test suite stayed green with
+// ---- `isRealMode(ctx)` replaced by `true` inside handleIntake's pre-gate condition
+// ---- (state-machine.js:298). That is a real hazard, not a paperwork gap: `ctx.config.spoBenchDir` and
+// ---- `ctx.config.productRepo` are UNCONDITIONAL strings in production config.js, so nothing else
+// ---- stands between a dropped isRealMode conjunct and `--dry-run` -- the gate command this repo's
+// ---- own pre-push/CI leg runs -- reading live `~/.spo-bench` and spawning a real `git rev-parse`
+// ---- against the real product repo.
+//
+// Design note (this repo already paid for the alternative): isolating this test by injecting the
+// resolved isRealMode() value itself, or asserting on ctx.dryRun/ctx.shadowMode directly, would
+// let a dead or evadable guard pass anyway -- proving nothing about what handleIntake actually
+// DOES. So this drives the real HANDLERS.INTAKE entry point (the exact dispatch runTask uses,
+// state-machine.js:2017) the same way production configures dry-run (ctx.dryRun: true, the flag
+// daemon.js --dry-run sets), plants a genuinely red nightly record on disk, and asserts on the
+// two OBSERVABLE effects a live gate would have: a `git` spawn, and a ParkSignal. Neither may
+// occur when the run is not real.
+test('handleIntake (--dry-run, card, red nightly on disk): the nightly pre-gate is INERT -- no rev-parse spawn, no ParkSignal, falls through to WORKTREE exactly as a healthy nightly would (card #226 fix pass -- guards the isRealMode(ctx) conjunct)', async () => {
+  const taskDir = mkTmp('spo-real-gate-nightlygate-dryrun-taskdir-');
+  const task = { id: 'card-gate-dryrun-nightlyred', kind: 'card', issue: 226, title: 't' };
+  const config = testConfig();
+  // A genuinely red record, self-consistent (verdict FAIL at its OWN recorded sha) so that IF the
+  // pre-gate's condition were ever entered, classifyNightly would answer 'red' deterministically --
+  // no ambiguity for the mutation check below to hide behind.
+  const REV_SHA = 'e'.repeat(40);
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: REV_SHA });
+  const calls = [];
+  const ctx = buildCtx(task.id, task, taskDir, {
+    ...config,
+    shadowMode: false,
+    dryRun: true,
+    real: true,
+    deps: {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        // A truthful rev-parse answer, matching the red record's own sha -- if the pre-gate DID
+        // run (the mutant below), this guarantees it reads the nightly as red rather than
+        // 'unknown', so the mutation is caught by an actual ParkSignal, not a coincidence of a
+        // mismatched sha.
+        return { status: 0, stdout: `${REV_SHA}\n`, stderr: '', signal: null };
+      },
+    },
+  });
+
+  let next;
+  let thrown = null;
+  try {
+    next = await HANDLERS.INTAKE(ctx);
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(
+    thrown,
+    null,
+    `dry-run with a red nightly on disk must never throw from the pre-gate -- got: ${thrown && thrown instanceof ParkSignal ? `ParkSignal(${thrown.reason})` : thrown}`
+  );
+  assert.equal(next, 'WORKTREE', 'a non-real run must fall through to WORKTREE, exactly as a healthy nightly would');
+  assert.deepEqual(
+    calls,
+    [],
+    `dry-run must never spawn the pre-gate's own rev-parse -- it is a real-mode-only cost; spawns were ${JSON.stringify(calls)}`
+  );
+});
+
+// The sibling conjunct in the same condition (ctx.task.kind === 'card'), covered cheaply with the
+// same discipline: a genuinely REAL run (isRealMode(ctx) actually true here, nothing mutated) of a
+// non-card task must still leave the gate inert, because the gate is card-only by design (the
+// same condition shape cardRequiresRealFlag uses just above it, state-machine.js:205).
+test('handleIntake (real mode, non-card task, red nightly on disk): the nightly pre-gate is INERT -- no rev-parse spawn, no ParkSignal (guards the ctx.task.kind === \'card\' conjunct)', async () => {
+  const taskDir = mkTmp('spo-real-gate-nightlygate-noncard-taskdir-');
+  const task = { id: 'synthetic-gate-nightlyred', kind: 'synthetic', title: 't' };
+  const config = testConfig();
+  const REV_SHA = 'f'.repeat(40);
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: REV_SHA });
+  const calls = [];
+  const ctx = buildCtx(task.id, task, taskDir, {
+    ...config,
+    shadowMode: false,
+    dryRun: false,
+    real: true,
+    deps: {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        return { status: 0, stdout: `${REV_SHA}\n`, stderr: '', signal: null };
+      },
+    },
+  });
+
+  let next;
+  let thrown = null;
+  try {
+    next = await HANDLERS.INTAKE(ctx);
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(
+    thrown,
+    null,
+    `a real non-card task with a red nightly on disk must never throw from the pre-gate -- got: ${thrown && thrown instanceof ParkSignal ? `ParkSignal(${thrown.reason})` : thrown}`
+  );
+  assert.equal(next, 'WORKTREE');
+  assert.deepEqual(
+    calls,
+    [],
+    `a non-card task must never reach the pre-gate's rev-parse; spawns were ${JSON.stringify(calls)}`
+  );
+});
+
 // ---- full WORKTREE -> FINISH argv walkthrough (fake runner, one fictional card) -------------
 
 test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> MERGE -> FINISH, one fictional card', async () => {
