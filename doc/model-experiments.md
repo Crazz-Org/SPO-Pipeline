@@ -36,6 +36,48 @@ Caveats that apply to every entry:
 
 ## Open experiments
 
+### EXP-IMPLEMENT-OPUS-5-5 — IMPLEMENT on Opus 5.5 at low/medium; every `opus` step moves to Opus 5.5
+
+- **Started:** 2026-09-23 (deploy = the `git pull` in `~/SPO-Pipeline` that brings this change in).
+  The first IMPLEMENT `llm-call` with `model: "claude-opus-5-5"` in the journal is the real start.
+- **Decided by:** the maintainer: "Opus 5.5 for the coding agent in place of Sonnet 5", "try Opus
+  5.5 at low or medium effort on a few real tasks", "replace also all Opus 5 for Opus 5.5 with same
+  level of effort". Sonnet stays for high-volume mechanical work (DRAFT_CARD is unchanged).
+- **What changed** (`orchestrator/step-contracts.js`):
+  - A constant `OPUS_5_5 = 'claude-opus-5-5'`, the full model id. The `opus` alias is **not**
+    used: all 372 `opus` calls in the journal up to 2026-09-22 resolved to `claude-opus-5`.
+  - **IMPLEMENT:** `baseModel` `sonnet` → `OPUS_5_5`; the model escalation (`escalatedModel:
+    'opus'`) is gone, since Opus 5.5 → Opus 5 would be a downgrade. The four triggers
+    (`planDeclaresRdoMembers` with its three sources, `lSize`, `diagnoseOrValidateRetry`) now raise
+    **effort** to `medium` instead (`escalatedEffort`/`escalatesEffortOn`, resolved by the same
+    `escalationSignalFires` that `shouldEscalate` uses). `IMPLEMENT_EFFORT_BY_SIZE` = S/M/L →
+    **low/medium/medium**, so `low` only runs on a plain S card with no signal.
+  - **PLAN, DIAGNOSE, triage-bug-report:** `opus` → `OPUS_5_5`, efforts unchanged (PLAN
+    medium/high/high, DIAGNOSE high, triage medium). PLAN's Fable fallback is unchanged.
+- **Confound for EXP-PLAN-OPUS:** its Opus arm changes model version mid-experiment. Compare the
+  `cardsByPlanModel.opus` rows (Opus 5) and `cardsByPlanModel["claude-opus-5-5"]` separately.
+- **Baseline** (IMPLEMENT, `node scripts/model-report.js --step=IMPLEMENT --since=2026-09-13
+  --until=2026-09-23`, medians over all calls, measured 2026-09-23):
+
+  | IMPLEMENT cell | calls | ok | duration | billable tokens |
+  |---|---|---|---|---|
+  | sonnet/medium | 84 | 74 | 544s | 121,319 |
+  | opus/medium (escalated) | 36 | 35 | 451s | 89,957 |
+  | opus/high (escalated, L) | 5 | 5 | 1,338s | 245,751 |
+
+  Cards planned on Opus 5 over the same window: 56 cards, 49 done, **1.76 IMPLEMENT calls and 0.29
+  DIAGNOSE calls per done card**, median 337,076 billable per done card.
+- **Metrics that settle it** (`--since=<start>`): IMPLEMENT ok rate per cell; IMPLEMENT and
+  DIAGNOSE calls per done card; median billable per done card; IMPLEMENT duration against its
+  1,800,000ms deadline. Tokens are not comparable across models as quota cost — read that from the
+  account usage dashboards.
+- **Minimum sample:** "a few real tasks" (maintainer) — 5 done cards for a first look, 10 to adopt.
+- **Revert criterion.** Back to Sonnet 5 base with the old escalation when either holds:
+  IMPLEMENT calls per done card above **2.1**, or DIAGNOSE calls per done card above **0.45**
+  (about +20 % and +50 % on the baseline). If quality holds but the S/`low` cell alone is worse,
+  raise S to `medium` before touching the model.
+- **Verdict log:** *(none yet)*
+
 ### EXP-PLAN-OPUS — PLAN on Opus first, Fable as fallback, one effort rung up
 
 - **Started:** 2026-09-13 (deploy = the `git pull` in `~/SPO-Pipeline` that brings this change in).
@@ -100,6 +142,10 @@ Caveats that apply to every entry:
 
 ### EXP-IMPLEMENT-S-MEDIUM — IMPLEMENT's S cards at `medium` instead of `low`
 
+> **Closed without a verdict, 2026-09-23.** It was measured on Sonnet 5, and IMPLEMENT no longer
+> runs Sonnet (EXP-IMPLEMENT-OPUS-5-5, above, puts S back at `low` on Opus 5.5). Its numbers stay
+> as the Sonnet-era record; do not judge it against Opus 5.5 calls.
+
 - **Started:** 2026-09-04. `IMPLEMENT_EFFORT_BY_SIZE` = S/M/L → medium/medium/high.
 - **Why:** `low` is below the CLI's own default for agentic coding, and IMPLEMENT is the only step
   that writes code. This is a reason to try it, not evidence that it wins. Full reasoning is in the
@@ -114,13 +160,13 @@ Caveats that apply to every entry:
 
 | Step | Choice | Since | Why, in one line |
 |---|---|---|---|
-| IMPLEMENT | Sonnet 5, **Opus 5** on RDO catalogue signals, L size, or a retry after DIAGNOSE/VALIDATE reject | card #213, 2026-09-12 | escalate on evidence (diff, plan declaration, observed difficulty), not on the intake guess |
-| DIAGNOSE | Opus 5, high | 2026-09-04 (was Fable 5) | half the token price, and fewer steps sharing Fable's quota; 8/8 after the switch |
+| IMPLEMENT (history) | Sonnet 5, **Opus 5** on RDO catalogue signals, L size, or a retry after DIAGNOSE/VALIDATE reject | card #213, 2026-09-12 → 2026-09-22 | escalate on evidence (diff, plan declaration, observed difficulty), not on the intake guess. Superseded by EXP-IMPLEMENT-OPUS-5-5; the same triggers now raise effort |
+| DIAGNOSE | Opus 5.5, high (Opus 5 until 2026-09-23) | 2026-09-04 (was Fable 5) | half the token price, and fewer steps sharing Fable's quota; 8/8 after the switch |
 | VALIDATE change-validator | Fable 5, high; **xhigh** when the real diff touched the RDO catalogue | 2026-09-04 / card #213 | the judge must never be the executor's model or a weaker one; escalate effort, not model (card #462) |
 | VALIDATE citation-verifier | Fable 5, high | — | runs only when the real diff touched the RDO catalogue |
-| triage-bug-report (intake) | Opus 5, medium | 2026-08-31 (was Fable 5) | maintainer decision |
+| triage-bug-report (intake) | Opus 5.5, medium (Opus 5 until 2026-09-23) | 2026-08-31 (was Fable 5) | maintainer decision |
 | draft-card / review-card (intake) | Sonnet 5 medium drafts, Fable 5 high reviews | — | the reviewer is deliberately a different model from the drafter |
-| Driver sessions (chantiers) | Sonnet builder (medium), Opus verifier (high); audits are a Fable 5.1 sweep with every finding re-probed by Opus | — | `CLAUDE.md` § Working a chantier |
+| Driver sessions (chantiers) | Opus 5.5 builder (low/medium), Sonnet 5 or Haiku only for high-volume mechanical work; Opus 5.5 verifier (high); audits are a Fable 5.1 sweep with every finding re-probed by Opus 5.5 | 2026-09-23 (Sonnet builder until then) | `CLAUDE.md` § Working a chantier |
 
 A settled decision can still be re-opened by an audit. Doing so moves it back up as an open entry,
 with a baseline, before anything changes.

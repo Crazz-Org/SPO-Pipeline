@@ -596,7 +596,7 @@ function guardDeclaredFiles(ctx, rawFilesToChange, provenance) {
   }
   // Action 2 (card #213): propagate the normalized declaration onto ctx.task -- until now it was
   // used for protectedMatches/the park detail below and then dropped, so nothing downstream
-  // (IMPLEMENT's Opus escalation, in particular) could ever see what PLAN actually declared.
+  // (IMPLEMENT's escalation, in particular) could ever see what PLAN actually declared.
   // Set for BOTH the array and json-string shapes, including an EMPTY list (this line runs
   // before the length check below) -- an empty declaration is real information ("this plan
   // changes nothing already on record", see this function's own header) and callers reading
@@ -1608,7 +1608,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:1073's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1102's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
@@ -1645,9 +1645,9 @@ async function handleValidate(ctx) {
   // (intake.js's makeTask: `area === 'rdo'` or a literal "rdo-members.ts" mention) and realPushPr
   // only ever promotes it false -> true when the real diff disagrees (the
   // `touches-rdo-members-rederived` event, added for card #385) -- never true -> false, because
-  // that same field also feeds IMPLEMENT's Opus escalation (step-contracts.js's shouldEscalate)
+  // that same field also feeds IMPLEMENT's escalation (step-contracts.js's escalationSignalFires)
   // across every DIAGNOSE/VALIDATE-REJECT/CI retry that follows, and lowering it here would
-  // silently demote those retries to sonnet. So an intake false positive used to survive all the
+  // silently demote those retries (to low effort since 2026-09-23). So an intake false positive used to survive all the
   // way to here and either meet an empty citations list (case: card #489, 2026-09-03 -- built,
   // gated green, opened PR #659, then parked `prompt-missing-placeholder:citations` because its
   // diff touched no catalogue file) or hide inside the same "no citations" skip as a genuine

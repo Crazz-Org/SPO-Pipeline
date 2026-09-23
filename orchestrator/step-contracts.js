@@ -30,6 +30,13 @@ const { READ_ONLY_STEP_BASH_DENY, WRITE_STEP_BASH_DENY } = require('./bash-polic
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 
+// OPUS_5_5 -- the full model id, never the `opus` alias. Measured 2026-09-22: every `opus` call in
+// ~/.spo-state/journal (372 of them, the latest that day) resolved to `claude-opus-5`, so the alias
+// does NOT follow a new release by itself. Every step that was `opus` moved to this id on
+// 2026-09-23 at its unchanged effort (maintainer decision), and IMPLEMENT moved to it from Sonnet
+// 5 -- registered as EXP-IMPLEMENT-OPUS-5-5 in doc/model-experiments.md.
+const OPUS_5_5 = 'claude-opus-5-5';
+
 // ---- outputContract types (card #207) --------------------------------------------------------
 //
 // Every outputContract below was `{ required: [...] }` (PLAN also carries `optional`) with no
@@ -412,7 +419,14 @@ const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 // that had never completed, until #516 completed it twice post-raise (864.152s, 1123.965s, both
 // `ok: true`) -- see
 // LLM_STEP_DEADLINE_MS_BY_STEP.
-const IMPLEMENT_EFFORT_BY_SIZE = { S: 'medium', M: 'medium', L: 'high' };
+//
+// SUPERSEDED 2026-09-23 (EXP-IMPLEMENT-OPUS-5-5, doc/model-experiments.md). Everything above was
+// measured on Sonnet 5. IMPLEMENT now runs Opus 5.5, and the maintainer's instruction is "low or
+// medium effort": S drops back to 'low' and L comes down from 'high' to 'medium'. A card that
+// fires one of IMPLEMENT's escalation signals gets 'medium' whatever its size (see the IMPLEMENT
+// entry's escalatedEffort), so 'low' only ever runs on a plain S card. The Sonnet-era S/medium
+// experiment above is closed without a verdict: its model is gone from this step.
+const IMPLEMENT_EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'medium' };
 
 // PLAN_EFFORT_BY_SIZE -- PLAN's own map since 2026-09-13, the day PLAN moved from Fable-only to
 // Opus-first with Fable as its fallback (maintainer decision, for cost -- see the PLAN entry in
@@ -726,7 +740,7 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_
 const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
-    baseModel: 'opus',
+    baseModel: OPUS_5_5, // was the `opus` alias (= claude-opus-5) until 2026-09-23 -- see OPUS_5_5
     // EXP-PLAN-OPUS (2026-09-13, maintainer decision, for cost): Opus first, Fable as the fallback.
     // Until then PLAN was Fable with no escalation. The "Opus 5 fallback" promised before 2026-09-04
     // hung on 'escalateFlag', which nothing set -- see the removal note above. This trigger is
@@ -812,17 +826,25 @@ const STEP_CONTRACTS = {
 
   IMPLEMENT: {
     promptFile: path.join(PROMPTS_DIR, 'implement.md'),
-    baseModel: 'sonnet',
-    escalatedModel: 'opus',
+    // EXP-IMPLEMENT-OPUS-5-5 (2026-09-23, maintainer decision): Opus 5.5 on every path, at low or
+    // medium effort. Until then this was Sonnet 5, escalating to the `opus` alias (= Opus 5) on the
+    // signals below -- and escalating Opus 5.5 to Opus 5 would be a downgrade, the same inversion
+    // VALIDATE's entry records for fable -> opus. So, like VALIDATE, the escalation moved to the
+    // EFFORT axis: the same signals now raise effort to 'medium' instead of switching model.
+    baseModel: OPUS_5_5,
+    escalatedModel: null,
+    escalatesOn: [],
     // Card #213, action 2 (+ 2026-09-12 amendment): 'touchesRdoMembers' (the intake guess) is
     // gone from this list -- see this table's own preamble comment on 'touchesRdoMembers' and
     // 'planDeclaresRdoMembers' for the three-source resolution the latter now drives, and
     // shouldEscalate's header for why the intake guess is still read, just no longer named here.
     // 'lSize' is untouched -- an L-sized card still escalates on size alone, independent of the
-    // other two.
-    escalatesOn: ['planDeclaresRdoMembers', 'lSize', 'diagnoseOrValidateRetry'],
+    // other two. (Since 2026-09-23 these signals are read by shouldEscalateEffort, through
+    // escalationSignalFires -- the same resolution shouldEscalate applies to a model escalation.)
+    escalatedEffort: 'medium',
+    escalatesEffortOn: ['planDeclaresRdoMembers', 'lSize', 'diagnoseOrValidateRetry'],
     effort: 'bySize',
-    effortBySize: IMPLEMENT_EFFORT_BY_SIZE, // floor raised to 'medium' -- see that map's comment
+    effortBySize: IMPLEMENT_EFFORT_BY_SIZE, // low/medium since Opus 5.5 -- see that map's comment
     // Neither doc enumerates the literal tool names behind "full edit tools in the worktree"
     // (spec) / "full edit tools" (README) -- this is the concretization this build needs to
     // pass a real --allowedTools value. Read/Grep/Glob to navigate the plan and invariants,
@@ -891,7 +913,10 @@ const STEP_CONTRACTS = {
     // at all; console/usage-scan.js's `requestCount` (computeStepDeltas/sessionRequestCount, fix
     // pass) is the real per-step deduplicated request count for a reader who wants a comparable
     // number here -- subagent requests included, printed via `spo tokens --usage-delta`.)
-    baseModel: 'opus',
+    //
+    // Opus 5 -> Opus 5.5, 2026-09-23, same effort (maintainer decision). The price argument above
+    // was made for Opus 5; this move was not made on price and has not been re-measured.
+    baseModel: OPUS_5_5,
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
     effort: 'high',
@@ -1040,9 +1065,13 @@ const STEP_CONTRACTS = {
 // INDEPENDENT is the whole point of it, so it is evaluated BEFORE the three-source block, which
 // returns out of the entire function on a `planDeclaresRdoMembers === false` card -- see the
 // comment at its call site for the 19-of-26 measurement that placement cost when it sat below.
-function shouldEscalate(stepDef, task) {
-  if (!stepDef.escalatedModel) return false;
-  if (task && task.size === 'L' && stepDef.escalatesOn.includes('lSize')) return true;
+//
+// Since 2026-09-23 the signal resolution lives in escalationSignalFires, which takes the signal
+// LIST rather than the step: IMPLEMENT (EXP-IMPLEMENT-OPUS-5-5) escalates effort on exactly the
+// signals it used to escalate model on, so both functions below read one resolver and the
+// three-source order cannot drift between them.
+function escalationSignalFires(on, task) {
+  if (task && task.size === 'L' && on.includes('lSize')) return true;
   // Trigger 4 is evaluated HERE, ahead of the RDO block, and the placement is load-bearing rather
   // than stylistic. The block below ends a `planDeclaresRdoMembers === false` card by returning
   // out of the WHOLE function, so with trigger 4 underneath it the amendment's own "independent"
@@ -1058,15 +1087,15 @@ function shouldEscalate(stepDef, task) {
   // realPushPr's one-way touchesRdoMembers promotion (steps/scripted.js) exists to prevent.
   // Referred to by name, not by file:line, deliberately: this card moved that block's line numbers
   // three times in one lot, and a name does not drift.
-  if (task && task.diagnoseOrValidateRetry === true && stepDef.escalatesOn.includes('diagnoseOrValidateRetry')) {
+  if (task && task.diagnoseOrValidateRetry === true && on.includes('diagnoseOrValidateRetry')) {
     return true;
   }
   // PLAN's Fable fallback (EXP-PLAN-OPUS). Independent of every other signal, so it sits above
   // the RDO block for the same reason trigger 4 does.
-  if (task && task.planInvalidRetry === true && stepDef.escalatesOn.includes('planInvalidRetry')) {
+  if (task && task.planInvalidRetry === true && on.includes('planInvalidRetry')) {
     return true;
   }
-  if (task && stepDef.escalatesOn.includes('planDeclaresRdoMembers')) {
+  if (task && on.includes('planDeclaresRdoMembers')) {
     if (task.rdoDiffTouched === true) return true; // source 1: the real diff
     if (task.planDeclaresRdoMembers === true) return true; // source 2: the plan declared it
     if (task.planDeclaresRdoMembers === false) return false; // declared, and said no -- blocks SOURCE 3 only; trigger 4 already ran above
@@ -1075,11 +1104,17 @@ function shouldEscalate(stepDef, task) {
   return false;
 }
 
+function shouldEscalate(stepDef, task) {
+  if (!stepDef.escalatedModel) return false;
+  return escalationSignalFires(stepDef.escalatesOn, task);
+}
+
 // The effort-side twin of shouldEscalate, reading `escalatedEffort`/`escalatesEffortOn` instead of
 // `escalatedModel`/`escalatesOn`. Deliberately a SEPARATE function and a separate pair of fields:
 // a step may escalate on one axis, the other, or neither, and VALIDATE is the case that forced the
 // split -- it escalates effort and must never escalate model (see its entry). False for any step
-// with no escalatedEffort at all, which is every step except VALIDATE.
+// with no escalatedEffort at all, which is every step except VALIDATE and (since 2026-09-23)
+// IMPLEMENT.
 //
 // ACTION 1 (card #213), measured 2026-09-12: 'rdoDiffTouched' replaces 'touchesRdoMembers' in
 // THIS function's own vocabulary -- the two functions no longer share one signal set for the RDO
@@ -1105,8 +1140,9 @@ function shouldEscalateEffort(stepDef, task) {
   if (!stepDef.escalatedEffort) return false;
   const on = stepDef.escalatesEffortOn || [];
   if (task && task.rdoDiffTouched === true && on.includes('rdoDiffTouched')) return true;
-  if (task && task.size === 'L' && on.includes('lSize')) return true;
-  return false;
+  // IMPLEMENT's signals (2026-09-23): the model-escalation vocabulary, resolved exactly as
+  // shouldEscalate resolves it. VALIDATE's list names none of them, so this is a no-op for it.
+  return escalationSignalFires(on, task);
 }
 
 // Resolves the per-task-shaped call config for one step: model/effort/budget as the table and
@@ -1202,6 +1238,8 @@ module.exports = {
   shouldEscalateEffort,
   MAX_LEASE_AGE_MS,
   shouldEscalate,
+  escalationSignalFires,
+  OPUS_5_5,
   resolveStepContract,
   // Card #207: exported for llm.js's reply check (checkOutputTypes) and for the table-driven
   // type-checker tests in test/step-contracts.test.js (valueSatisfiesType, jsonSchemaPropertiesFor).

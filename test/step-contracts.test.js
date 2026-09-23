@@ -15,6 +15,9 @@ const {
   STEP_CONTRACTS,
   resolveStepContract,
   shouldEscalate,
+  shouldEscalateEffort,
+  escalationSignalFires,
+  OPUS_5_5,
   EFFORT_BY_SIZE,
   IMPLEMENT_EFFORT_BY_SIZE,
   PLAN_EFFORT_BY_SIZE,
@@ -78,7 +81,7 @@ test('cwdKind matches config.js WORKTREE_SIDE_STEPS exactly (one policy, not dup
 
 test('resolveStepContract: PLAN never escalates on touchesRdoMembers (spec wins over prompts/README.md)', () => {
   const c = resolveStepContract('PLAN', { size: 'S', touchesRdoMembers: true });
-  assert.equal(c.model, 'opus');
+  assert.equal(c.model, OPUS_5_5);
   assert.equal(c.escalated, false);
 });
 
@@ -100,13 +103,15 @@ test('resolveStepContract: PLAN is Opus-first and falls back to Fable ONLY on pl
   };
   for (const task of [{ size: 'S' }, { size: 'S', escalate: true }, everyOtherSignal]) {
     const c = resolveStepContract('PLAN', task);
-    assert.equal(c.model, 'opus', `PLAN must stay Opus for ${JSON.stringify(task)}`);
+    assert.equal(c.model, OPUS_5_5, `PLAN must stay Opus 5.5 for ${JSON.stringify(task)}`);
     assert.equal(c.escalated, false);
   }
   const fallback = resolveStepContract('PLAN', { size: 'M', planInvalidRetry: true });
   assert.equal(fallback.model, 'fable');
   assert.equal(fallback.escalated, true);
-  assert.equal(STEP_CONTRACTS.PLAN.baseModel, 'opus');
+  assert.equal(STEP_CONTRACTS.PLAN.baseModel, OPUS_5_5);
+  // The full id, never the `opus` alias: the alias resolved to claude-opus-5, not 5.5 (2026-09-22).
+  assert.equal(OPUS_5_5, 'claude-opus-5-5');
   assert.equal(STEP_CONTRACTS.PLAN.escalatedModel, 'fable');
   assert.deepEqual(STEP_CONTRACTS.PLAN.escalatesOn, ['planInvalidRetry']);
 });
@@ -114,7 +119,7 @@ test('resolveStepContract: PLAN is Opus-first and falls back to Fable ONLY on pl
 // Same strictness convention as IMPLEMENT's signals below: only a boolean `true` buys the fallback.
 for (const bogus of ['false', 'true', 0, 1, {}, []]) {
   test(`resolveStepContract: PLAN planInvalidRetry ${JSON.stringify(bogus)} is not boolean true -- stays Opus`, () => {
-    assert.equal(resolveStepContract('PLAN', { size: 'S', planInvalidRetry: bogus }).model, 'opus');
+    assert.equal(resolveStepContract('PLAN', { size: 'S', planInvalidRetry: bogus }).model, OPUS_5_5);
   });
 }
 
@@ -124,8 +129,10 @@ test('resolveStepContract: no step other than PLAN escalates on planInvalidRetry
   for (const [name, def] of Object.entries(STEP_CONTRACTS)) {
     if (name === 'PLAN') continue;
     assert.ok(!def.escalatesOn.includes('planInvalidRetry'), `${name} must not list planInvalidRetry`);
+    assert.ok(!(def.escalatesEffortOn || []).includes('planInvalidRetry'), `${name} must not list planInvalidRetry for effort`);
     const task = { size: 'S', planInvalidRetry: true };
     assert.equal(resolveStepContract(name, task).model, def.baseModel, `${name} moved on planInvalidRetry`);
+    assert.equal(resolveStepContract(name, task).effortEscalated, false, `${name} effort moved on planInvalidRetry`);
   }
 });
 
@@ -136,64 +143,95 @@ test('resolveStepContract: no step escalates on the deleted `escalate` flag', ()
   for (const [name, def] of Object.entries(STEP_CONTRACTS)) {
     assert.ok(!def.escalatesOn.includes('escalateFlag'), `${name} still lists the deleted escalateFlag trigger`);
     assert.equal(shouldEscalate(def, task), false, `${name} escalated on a flag nothing sets`);
+    assert.equal(shouldEscalateEffort(def, task), false, `${name} escalated effort on a flag nothing sets`);
   }
 });
 
+// EXP-IMPLEMENT-OPUS-5-5 (2026-09-23, maintainer decision): IMPLEMENT runs OPUS_5_5 on every path,
+// and the signals below -- which used to switch Sonnet -> Opus -- now raise EFFORT to 'medium'
+// instead (shouldEscalateEffort, through escalationSignalFires). So the discriminating observable
+// in every IMPLEMENT test below is EFFORT, not model, and every card that must discriminate is
+// S-sized: S's base effort is 'low', its escalated effort 'medium'. An M card is 'medium' either
+// way (and DEFAULT_SIZE is M), so an M or size-less card cannot tell escalated from not.
+// `effortEscalated` is asserted alongside, because it is the only observable on an L card, whose
+// base effort is already 'medium'.
+function assertImplementEscalated(c, msg) {
+  assert.equal(c.model, OPUS_5_5, msg);
+  assert.equal(c.escalated, false, 'IMPLEMENT never escalates MODEL any more');
+  assert.equal(c.effortEscalated, true, msg);
+  assert.equal(c.effort, 'medium', msg);
+}
+function assertImplementBaseS(c, msg) {
+  assert.equal(c.model, OPUS_5_5, msg);
+  assert.equal(c.escalated, false);
+  assert.equal(c.effortEscalated, false, msg);
+  assert.equal(c.effort, 'low', msg);
+}
+
 // Card #213, action 2: no plan declaration at all (task carries no planDeclaresRdoMembers key)
-// means shouldEscalate's source 2 resolves to undefined, and it falls through to source 3 --
+// means escalationSignalFires's source 2 resolves to undefined, and it falls through to source 3 --
 // touchesRdoMembers, today's pre-#213 behaviour. This covers acceptance criterion 2's
 // declared-nothing case -- the phrase "a reply that declared NOTHING AT ALL falls through to step
 // 3" is Action 2's own spec prose, NOT a numbered criterion (criterion 5 is the deadline record).
-test('resolveStepContract: IMPLEMENT escalates on touchesRdoMembers when the plan never declared anything (source 3, the fallback)', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', touchesRdoMembers: true });
-  assert.equal(c.model, 'opus');
+test('resolveStepContract: IMPLEMENT escalates effort on touchesRdoMembers when the plan never declared anything (source 3, the fallback)', () => {
+  assertImplementEscalated(resolveStepContract('IMPLEMENT', { size: 'S', touchesRdoMembers: true }));
 });
 
-test('resolveStepContract: IMPLEMENT escalates on an L-sized task even with no RDO touch', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'L', touchesRdoMembers: false });
-  assert.equal(c.model, 'opus');
+test('resolveStepContract: IMPLEMENT escalates effort on an L-sized task even with no RDO touch', () => {
+  assertImplementEscalated(resolveStepContract('IMPLEMENT', { size: 'L', touchesRdoMembers: false }));
 });
 
 // Criterion 2 (its lSize clause): lSize is untouched by the #213 rework -- still escalates on size alone, whatever
 // the (now three-source) RDO signals say.
-test('resolveStepContract: IMPLEMENT escalates on an L-sized task even when the plan explicitly declared no RDO touch', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'L', planDeclaresRdoMembers: false, touchesRdoMembers: false });
-  assert.equal(c.model, 'opus');
+test('resolveStepContract: IMPLEMENT escalates effort on an L-sized task even when the plan explicitly declared no RDO touch', () => {
+  assertImplementEscalated(
+    resolveStepContract('IMPLEMENT', { size: 'L', planDeclaresRdoMembers: false, touchesRdoMembers: false })
+  );
 });
 
-test('resolveStepContract: IMPLEMENT stays Sonnet for a plain S/M task', () => {
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'S' }).model, 'sonnet');
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'M' }).model, 'sonnet');
+test('resolveStepContract: IMPLEMENT stays at base effort for a plain S/M task (low on S, medium on M), always on Opus 5.5', () => {
+  assertImplementBaseS(resolveStepContract('IMPLEMENT', { size: 'S' }));
+  const m = resolveStepContract('IMPLEMENT', { size: 'M' });
+  assert.equal(m.model, OPUS_5_5);
+  assert.equal(m.effortEscalated, false);
+  assert.equal(m.effort, 'medium');
 });
 
 // =============================================================================================
 // ---- Card #213, action 2: IMPLEMENT's three-source RDO escalation + trigger 4 -----------------
 // =============================================================================================
-// shouldEscalate resolves IMPLEMENT's 'planDeclaresRdoMembers' branch from THREE sources, most
-// trustworthy first (see that function's own header in step-contracts.js for the full argument):
+// escalationSignalFires resolves the 'planDeclaresRdoMembers' signal from THREE sources, most
+// trustworthy first (see shouldEscalate's header in step-contracts.js for the full argument):
 //   1. task.rdoDiffTouched === true -- the real diff, once PUSH_PR has run.
 //   2. task.planDeclaresRdoMembers -- the plan's own declaration (true/false/undefined).
 //   3. task.touchesRdoMembers === true -- the fallback, reached only when source 2 is undefined.
 // Plus trigger 4 (2026-09-12 amendment), independent of the three above: task.diagnoseOrValidateRetry.
+// Since 2026-09-23 IMPLEMENT reads that resolution through shouldEscalateEffort (it escalated MODEL
+// through shouldEscalate until then); the resolver itself is also pinned directly on a plain signal
+// list further down, so the order is not only covered through IMPLEMENT.
 // These tests pass `task` objects with the fields already resolved (as state-machine.js's
 // resolvePlanDeclaresRdoMembers / handleImplement would have set them) -- the WIRING that derives
 // those fields (guardDeclaredFiles, lastJournaledPlanFiles, ctx.counters at the call site) is
 // covered end to end in test/implement-rdo-escalation.test.js, which also pins restart-durability
 // against reparkCrashedTask/orphan-scan.js's exact counter-restore shape.
 
-test('resolveStepContract: IMPLEMENT source 1 -- rdoDiffTouched === true escalates, independent of the plan/intake signals', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', rdoDiffTouched: true, planDeclaresRdoMembers: false, touchesRdoMembers: false });
-  assert.equal(c.model, 'opus');
+test('resolveStepContract: IMPLEMENT source 1 -- rdoDiffTouched === true escalates effort, independent of the plan/intake signals', () => {
+  assertImplementEscalated(
+    resolveStepContract('IMPLEMENT', { size: 'S', rdoDiffTouched: true, planDeclaresRdoMembers: false, touchesRdoMembers: false })
+  );
 });
 
 test('resolveStepContract: IMPLEMENT source 2 -- an EMPTY plan declaration (planDeclaresRdoMembers: false) does NOT fall back to touchesRdoMembers', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', planDeclaresRdoMembers: false, touchesRdoMembers: true });
-  assert.equal(c.model, 'sonnet', 'the plan declared and said no -- must not fall through to source 3');
+  assertImplementBaseS(
+    resolveStepContract('IMPLEMENT', { size: 'S', planDeclaresRdoMembers: false, touchesRdoMembers: true }),
+    'the plan declared and said no -- must not fall through to source 3'
+  );
 });
 
-test('resolveStepContract: IMPLEMENT source 2 -- a plan declaring rdo-members.ts escalates, even with touchesRdoMembers false', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', planDeclaresRdoMembers: true, touchesRdoMembers: false });
-  assert.equal(c.model, 'opus');
+test('resolveStepContract: IMPLEMENT source 2 -- a plan declaring rdo-members.ts escalates effort, even with touchesRdoMembers false', () => {
+  assertImplementEscalated(
+    resolveStepContract('IMPLEMENT', { size: 'S', planDeclaresRdoMembers: true, touchesRdoMembers: false })
+  );
 });
 
 // REGRESSION (card #213's own acceptance criterion 3): the hole scripted.js:1924-1927's
@@ -201,18 +239,17 @@ test('resolveStepContract: IMPLEMENT source 2 -- a plan declaring rdo-members.ts
 // a plan that did NOT declare rdo-members.ts on a card whose real diff DID touch it must still
 // escalate. Source 1 must win over source 2 here.
 test('REGRESSION: rdoDiffTouched === true wins over a plan declaration that said no', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', rdoDiffTouched: true, planDeclaresRdoMembers: false, touchesRdoMembers: false });
-  assert.equal(c.model, 'opus');
+  assertImplementEscalated(
+    resolveStepContract('IMPLEMENT', { size: 'S', rdoDiffTouched: true, planDeclaresRdoMembers: false, touchesRdoMembers: false })
+  );
 });
 
-test('resolveStepContract: IMPLEMENT trigger 4 -- diagnoseOrValidateRetry escalates on its own, no wire/plan/size signal at all', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', diagnoseOrValidateRetry: true });
-  assert.equal(c.model, 'opus');
+test('resolveStepContract: IMPLEMENT trigger 4 -- diagnoseOrValidateRetry escalates effort on its own, no wire/plan/size signal at all', () => {
+  assertImplementEscalated(resolveStepContract('IMPLEMENT', { size: 'S', diagnoseOrValidateRetry: true }));
 });
 
-test('resolveStepContract: IMPLEMENT trigger 4 false, nothing else set -- stays Sonnet', () => {
-  const c = resolveStepContract('IMPLEMENT', { size: 'S', diagnoseOrValidateRetry: false });
-  assert.equal(c.model, 'sonnet');
+test('resolveStepContract: IMPLEMENT trigger 4 false, nothing else set -- stays at low effort', () => {
+  assertImplementBaseS(resolveStepContract('IMPLEMENT', { size: 'S', diagnoseOrValidateRetry: false }));
 });
 
 // REGRESSION (card #213, found by the Opus verifier 2026-09-12): trigger 4 must be INDEPENDENT of
@@ -223,74 +260,127 @@ test('resolveStepContract: IMPLEMENT trigger 4 false, nothing else set -- stays 
 // fired on 7. The original tests missed it because none crossed the two axes -- one had the
 // declaration with counters at 0, the other the counter with no declaration. These three cross it.
 test('resolveStepContract: IMPLEMENT trigger 4 fires even when the plan declared files that do NOT name the catalogue', () => {
-  const c = resolveStepContract('IMPLEMENT', {
-    size: 'S',
-    planDeclaresRdoMembers: false,
-    touchesRdoMembers: false,
-    diagnoseOrValidateRetry: true,
-  });
-  assert.equal(c.model, 'opus');
+  assertImplementEscalated(
+    resolveStepContract('IMPLEMENT', {
+      size: 'S',
+      planDeclaresRdoMembers: false,
+      touchesRdoMembers: false,
+      diagnoseOrValidateRetry: true,
+    })
+  );
 });
 
 test('resolveStepContract: IMPLEMENT trigger 4 fires on an EMPTY plan declaration (which is still a declaration, so source 2 says false)', () => {
-  const c = resolveStepContract('IMPLEMENT', {
-    size: 'S',
-    planDeclaresRdoMembers: false,
-    touchesRdoMembers: true,
-    diagnoseOrValidateRetry: true,
-  });
-  assert.equal(c.model, 'opus');
+  assertImplementEscalated(
+    resolveStepContract('IMPLEMENT', {
+      size: 'S',
+      planDeclaresRdoMembers: false,
+      touchesRdoMembers: true,
+      diagnoseOrValidateRetry: true,
+    })
+  );
 });
 
-test('resolveStepContract: IMPLEMENT -- a no-catalogue declaration with NO retry still stays Sonnet (the hoist must not turn trigger 4 into a free pass)', () => {
-  const c = resolveStepContract('IMPLEMENT', {
-    size: 'S',
-    planDeclaresRdoMembers: false,
-    touchesRdoMembers: true,
-    diagnoseOrValidateRetry: false,
-  });
-  assert.equal(c.model, 'sonnet');
+test('resolveStepContract: IMPLEMENT -- a no-catalogue declaration with NO retry still stays at low effort (the hoist must not turn trigger 4 into a free pass)', () => {
+  assertImplementBaseS(
+    resolveStepContract('IMPLEMENT', {
+      size: 'S',
+      planDeclaresRdoMembers: false,
+      touchesRdoMembers: true,
+      diagnoseOrValidateRetry: false,
+    })
+  );
 });
 
 // STRICTNESS (card #213, D2 from the same verification): this repo's convention is a strict
 // `=== true` on every escalation signal, so a task.json field rebuilt as the STRING "false", or a
-// 0/1, never coerces into an escalation. The effort side had this loop; the model side -- which is
-// $78-82 of the card's ~$88 -- had none, and relaxing `=== true` to a truthy check left all 2780
-// tests passing. Each row below turns red on that relaxation.
+// 0/1, never coerces into an escalation. Relaxing `=== true` to a truthy check left all 2780 tests
+// passing when this loop did not exist. Each row below turns red on that relaxation (S-sized, so
+// the relaxation shows as 'medium' instead of 'low').
 for (const bogus of ['false', 'true', 0, 1, {}, []]) {
   test(`resolveStepContract: IMPLEMENT rdoDiffTouched ${JSON.stringify(bogus)} is not boolean true -- no source-1 escalation`, () => {
-    const c = resolveStepContract('IMPLEMENT', {
-      size: 'S',
-      rdoDiffTouched: bogus,
-      planDeclaresRdoMembers: false,
-      touchesRdoMembers: false,
-    });
-    assert.equal(c.model, 'sonnet');
+    assertImplementBaseS(
+      resolveStepContract('IMPLEMENT', {
+        size: 'S',
+        rdoDiffTouched: bogus,
+        planDeclaresRdoMembers: false,
+        touchesRdoMembers: false,
+      })
+    );
   });
 
   test(`resolveStepContract: IMPLEMENT diagnoseOrValidateRetry ${JSON.stringify(bogus)} is not boolean true -- trigger 4 does not fire`, () => {
-    const c = resolveStepContract('IMPLEMENT', {
-      size: 'S',
-      diagnoseOrValidateRetry: bogus,
-      planDeclaresRdoMembers: false,
-      touchesRdoMembers: false,
-    });
-    assert.equal(c.model, 'sonnet');
+    assertImplementBaseS(
+      resolveStepContract('IMPLEMENT', {
+        size: 'S',
+        diagnoseOrValidateRetry: bogus,
+        planDeclaresRdoMembers: false,
+        touchesRdoMembers: false,
+      })
+    );
   });
 
   test(`resolveStepContract: IMPLEMENT touchesRdoMembers ${JSON.stringify(bogus)} is not boolean true -- source 3 does not fire`, () => {
-    const c = resolveStepContract('IMPLEMENT', { size: 'S', touchesRdoMembers: bogus });
-    assert.equal(c.model, 'sonnet');
+    assertImplementBaseS(resolveStepContract('IMPLEMENT', { size: 'S', touchesRdoMembers: bogus }));
   });
 }
 
-// Sweep: IMPLEMENT's own table entry no longer names 'touchesRdoMembers' literally (folded into
-// 'planDeclaresRdoMembers' as shouldEscalate's own step 3) -- pin that the token itself is gone
+// Sweep: IMPLEMENT's own signal list no longer names 'touchesRdoMembers' literally (folded into
+// 'planDeclaresRdoMembers' as the resolver's own step 3) -- pin that the token itself is gone
 // from the array, since a future edit re-adding it verbatim would silently create a SECOND,
-// unconditional touchesRdoMembers branch alongside the resolution order above.
-test("resolveStepContract: IMPLEMENT's escalatesOn no longer names the literal string 'touchesRdoMembers'", () => {
-  assert.ok(!STEP_CONTRACTS.IMPLEMENT.escalatesOn.includes('touchesRdoMembers'));
-  assert.deepEqual(STEP_CONTRACTS.IMPLEMENT.escalatesOn, ['planDeclaresRdoMembers', 'lSize', 'diagnoseOrValidateRetry']);
+// unconditional touchesRdoMembers branch alongside the resolution order above. Since 2026-09-23
+// the list lives in escalatesEffortOn, and the model-side list is empty.
+test("resolveStepContract: IMPLEMENT's escalatesEffortOn no longer names the literal string 'touchesRdoMembers'", () => {
+  assert.ok(!STEP_CONTRACTS.IMPLEMENT.escalatesEffortOn.includes('touchesRdoMembers'));
+  assert.deepEqual(STEP_CONTRACTS.IMPLEMENT.escalatesEffortOn, ['planDeclaresRdoMembers', 'lSize', 'diagnoseOrValidateRetry']);
+  assert.equal(STEP_CONTRACTS.IMPLEMENT.escalatedEffort, 'medium');
+  // EXP-IMPLEMENT-OPUS-5-5: no model escalation. Escalating Opus 5.5 to any other model we run
+  // would be a downgrade or a lateral move, the inversion VALIDATE's entry records for fable -> opus.
+  assert.equal(STEP_CONTRACTS.IMPLEMENT.baseModel, OPUS_5_5);
+  assert.equal(STEP_CONTRACTS.IMPLEMENT.escalatedModel, null);
+  assert.deepEqual(STEP_CONTRACTS.IMPLEMENT.escalatesOn, []);
+});
+
+// escalationSignalFires takes a signal LIST, not a step, so its three-source order must hold on its
+// own -- not only as observed through IMPLEMENT's effort. Pinned on the bare list here, with a
+// second list that omits planDeclaresRdoMembers to show the RDO block is gated on the list.
+test('escalationSignalFires: resolves the three-source RDO order + trigger 4 + lSize on a plain signal list', () => {
+  const on = ['planDeclaresRdoMembers', 'lSize', 'diagnoseOrValidateRetry'];
+  // source 1 beats a source-2 "no"
+  assert.equal(escalationSignalFires(on, { rdoDiffTouched: true, planDeclaresRdoMembers: false }), true);
+  // source 2 "yes" beats a source-3 "no"
+  assert.equal(escalationSignalFires(on, { planDeclaresRdoMembers: true, touchesRdoMembers: false }), true);
+  // source 2 "no" blocks source 3
+  assert.equal(escalationSignalFires(on, { planDeclaresRdoMembers: false, touchesRdoMembers: true }), false);
+  // source 2 undefined falls through to source 3
+  assert.equal(escalationSignalFires(on, { touchesRdoMembers: true }), true);
+  assert.equal(escalationSignalFires(on, { touchesRdoMembers: false }), false);
+  // trigger 4 is hoisted above the RDO block: fires through a source-2 "no"
+  assert.equal(escalationSignalFires(on, { planDeclaresRdoMembers: false, diagnoseOrValidateRetry: true }), true);
+  // lSize fires through a source-2 "no" too
+  assert.equal(escalationSignalFires(on, { size: 'L', planDeclaresRdoMembers: false }), true);
+  // nothing set, or no task at all
+  assert.equal(escalationSignalFires(on, { size: 'S' }), false);
+  assert.equal(escalationSignalFires(on, undefined), false);
+  // a signal the list does not name never fires
+  assert.equal(escalationSignalFires(['lSize'], { rdoDiffTouched: true, planDeclaresRdoMembers: true, touchesRdoMembers: true }), false);
+  assert.equal(escalationSignalFires([], { size: 'L', diagnoseOrValidateRetry: true }), false);
+  assert.equal(escalationSignalFires(['planInvalidRetry'], { planInvalidRetry: true }), true);
+  assert.equal(escalationSignalFires(['planInvalidRetry'], { planInvalidRetry: 'true' }), false);
+});
+
+// shouldEscalate's MODEL path is still live -- PLAN is the step that exercises it (Opus 5.5 ->
+// Fable on planInvalidRetry). Pinned directly, since IMPLEMENT no longer reaches it at all.
+test('shouldEscalate: the model path still fires for PLAN on planInvalidRetry, and never for IMPLEMENT', () => {
+  assert.equal(shouldEscalate(STEP_CONTRACTS.PLAN, { size: 'S', planInvalidRetry: true }), true);
+  assert.equal(shouldEscalate(STEP_CONTRACTS.PLAN, { size: 'L', rdoDiffTouched: true, diagnoseOrValidateRetry: true }), false);
+  const everySignal = { size: 'L', rdoDiffTouched: true, planDeclaresRdoMembers: true, touchesRdoMembers: true, diagnoseOrValidateRetry: true };
+  assert.equal(shouldEscalate(STEP_CONTRACTS.IMPLEMENT, everySignal), false);
+  assert.equal(shouldEscalateEffort(STEP_CONTRACTS.IMPLEMENT, everySignal), true);
+  // A step with an escalatedModel but a signal list that does not name the task's signal stays put.
+  assert.equal(shouldEscalate({ escalatedModel: 'x', escalatesOn: ['lSize'] }, { size: 'S', diagnoseOrValidateRetry: true }), false);
+  assert.equal(shouldEscalate({ escalatedModel: 'x', escalatesOn: ['lSize'] }, { size: 'L' }), true);
+  assert.equal(shouldEscalate({ escalatedModel: null, escalatesOn: ['lSize'] }, { size: 'L' }), false);
 });
 
 // Rewritten 2026-09-04: VALIDATE escalates EFFORT, never model. `fable -> opus` was a downgrade
@@ -357,7 +447,8 @@ test('resolveStepContract: DIAGNOSE and CITATION_VERIFIER never escalate, whatev
   // DIAGNOSE's BASE model moved fable -> opus on 2026-09-04 (price and Fable-quota concentration,
   // not diagnosis quality -- 7/7 calls succeeded post-C1). What this test pins is unchanged: no
   // task signal may move either step off its base.
-  assert.equal(resolveStepContract('DIAGNOSE', task).model, 'opus');
+  // 2026-09-23: the `opus` alias (= claude-opus-5) became the full id OPUS_5_5, same effort.
+  assert.equal(resolveStepContract('DIAGNOSE', task).model, OPUS_5_5);
   assert.equal(resolveStepContract('CITATION_VERIFIER', task).model, 'fable');
   assert.equal(shouldEscalate(STEP_CONTRACTS.DIAGNOSE, task), false);
   assert.equal(shouldEscalate(STEP_CONTRACTS.CITATION_VERIFIER, task), false);
@@ -378,25 +469,33 @@ test('resolveStepContract: PLAN effort follows task.size through PLAN_EFFORT_BY_
   }
 });
 
-// IMPLEMENT stopped sharing PLAN's map on 2026-09-04: its S row is 'medium'. That change is a
-// deliberate EXPERIMENT, not a measured win -- the corpus cannot settle it, because `effort` is a
-// pure function of `size` through this map and so contains zero S-at-medium observations. See
-// IMPLEMENT_EFFORT_BY_SIZE's comment for the real numbers and the revert criterion. What this test
-// pins is only the FLOOR, so a future edit cannot restore `low` by accident rather than by
-// deciding the experiment answered no.
-test('resolveStepContract: IMPLEMENT has its own size map with a `medium` floor, never `low`', () => {
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'S' }).effort, 'medium');
+// IMPLEMENT stopped sharing PLAN's map on 2026-09-04 (S raised to 'medium', a Sonnet-era
+// experiment). SUPERSEDED 2026-09-23 by EXP-IMPLEMENT-OPUS-5-5: on Opus 5.5 the maintainer's
+// instruction is "low or medium effort", so S is back to 'low' and L comes DOWN from 'high' to
+// 'medium'. What this test pins is the new CEILING: IMPLEMENT never runs above 'medium', on any
+// size and on any escalation (escalatedEffort is 'medium' too), and 'low' only on a plain S card.
+test("resolveStepContract: IMPLEMENT has its own size map, low/medium only -- never above 'medium'", () => {
+  assert.equal(resolveStepContract('IMPLEMENT', { size: 'S' }).effort, 'low');
   assert.equal(resolveStepContract('IMPLEMENT', { size: 'M' }).effort, 'medium');
-  assert.equal(resolveStepContract('IMPLEMENT', { size: 'L' }).effort, 'high');
+  assert.equal(resolveStepContract('IMPLEMENT', { size: 'L' }).effort, 'medium');
+  const everySignal = { rdoDiffTouched: true, planDeclaresRdoMembers: true, touchesRdoMembers: true, diagnoseOrValidateRetry: true };
   for (const size of ['S', 'M', 'L', undefined, 'nonsense']) {
-    assert.notEqual(resolveStepContract('IMPLEMENT', { size }).effort, 'low', `size ${size} fell back to low`);
+    for (const task of [{ size }, { size, ...everySignal }]) {
+      const { effort, model } = resolveStepContract('IMPLEMENT', task);
+      assert.ok(effort === 'low' || effort === 'medium', `${JSON.stringify(task)} resolved IMPLEMENT effort ${effort}`);
+      assert.equal(model, OPUS_5_5);
+    }
+    // 'low' only on a plain S card -- a size fallback (undefined/nonsense -> DEFAULT_SIZE M) is 'medium'.
+    if (size !== 'S') assert.equal(resolveStepContract('IMPLEMENT', { size }).effort, 'medium', `size ${size}`);
   }
 });
 
 // The maps must stay independent objects. Sharing one again would silently re-couple the two
 // experiments, so reverting one of them would move the other.
 test('resolveStepContract: PLAN and IMPLEMENT each carry their own size->effort map', () => {
-  assert.notEqual(EFFORT_BY_SIZE.S, IMPLEMENT_EFFORT_BY_SIZE.S);
+  // Since 2026-09-23 IMPLEMENT's S row equals the shared map's again ('low'); they differ on L.
+  assert.notEqual(EFFORT_BY_SIZE, IMPLEMENT_EFFORT_BY_SIZE);
+  assert.notEqual(EFFORT_BY_SIZE.L, IMPLEMENT_EFFORT_BY_SIZE.L);
   assert.notEqual(EFFORT_BY_SIZE.S, PLAN_EFFORT_BY_SIZE.S);
   assert.notEqual(PLAN_EFFORT_BY_SIZE, IMPLEMENT_EFFORT_BY_SIZE);
   assert.equal(STEP_CONTRACTS.PLAN.effortBySize, PLAN_EFFORT_BY_SIZE);

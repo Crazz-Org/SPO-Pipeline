@@ -16,6 +16,7 @@ const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { writePoolDir, mkTmp } = require('./helpers');
+const { OPUS_5_5 } = require('../orchestrator/step-contracts');
 
 function readJournal(taskDir) {
   const p = path.join(taskDir, 'journal.jsonl');
@@ -89,9 +90,9 @@ test('a valid Opus plan: one call, on Opus, at PLAN_EFFORT_BY_SIZE, no fallback 
   const next = await HANDLERS.PLAN(realCtx({ id: 'card-701', taskDir, spawnSync, size: 'M' }));
 
   assert.equal(next, 'IMPLEMENT');
-  assert.deepEqual(spawnSync.calls, [{ model: 'opus', effort: 'high' }]);
+  assert.deepEqual(spawnSync.calls, [{ model: OPUS_5_5, effort: 'high' }]);
   assert.deepEqual(fallbackEvents(taskDir), []);
-  assert.deepEqual(llmCallModels(taskDir), ['opus']);
+  assert.deepEqual(llmCallModels(taskDir), [OPUS_5_5]);
 });
 
 test('an invalid Opus reply falls back to ONE Fable call in the same run, which plans the card', async () => {
@@ -102,14 +103,14 @@ test('an invalid Opus reply falls back to ONE Fable call in the same run, which 
   assert.equal(next, 'IMPLEMENT');
   assert.deepEqual(
     spawnSync.calls.map((c) => c.model),
-    ['opus', 'fable']
+    [OPUS_5_5, 'fable']
   );
   assert.equal(spawnSync.calls[1].effort, 'medium', 'the fallback runs at the same PLAN effort');
   const events = fallbackEvents(taskDir);
   assert.equal(events.length, 1);
   assert.equal(events[0].cause, 'plan-invalid-reply');
   assert.deepEqual(events[0].missing, ['invariants_markdown']);
-  assert.deepEqual(llmCallModels(taskDir), ['opus', 'fable']);
+  assert.deepEqual(llmCallModels(taskDir), [OPUS_5_5, 'fable']);
   assert.ok(readJournal(taskDir).some((e) => e.event === 'files-written'), 'the Fable plan was written');
 });
 
@@ -159,7 +160,7 @@ test('a plan-invalid park followed by an orthogonal park does not keep the card 
   assert.equal(await HANDLERS.PLAN(realCtx({ id: 'card-706', taskDir, spawnSync })), 'IMPLEMENT');
   assert.deepEqual(
     spawnSync.calls.map((c) => c.model),
-    ['opus']
+    [OPUS_5_5]
   );
   assert.deepEqual(fallbackEvents(taskDir), []);
 });
