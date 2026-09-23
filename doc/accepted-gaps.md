@@ -888,7 +888,7 @@ snapshot and is left as originally written, since the gap's shape (some states a
 the flag) is unchanged by which state closed the last one.
 
 **Why this is a live gap, not a cosmetic one.** `orchestrator/dispatcher.js`'s `buildWorkerArgv`
-(:291) forwards `config.stepDeadlineMs` as `--deadline-ms` to every `--worker` subprocess it
+(:296) forwards `config.stepDeadlineMs` as `--deadline-ms` to every `--worker` subprocess it
 spawns — the real, continuous-mode dispatch path a running daemon actually uses, not only the
 `--once`/test-harness invocations this repo's own suite drives directly. A maintainer (or a test)
 reaching for `--deadline-ms` to shrink every step's deadline for a live debugging session now
@@ -1379,10 +1379,15 @@ an allow rule covering the whole tool ("Any Bash command"), so `.claude/settings
 `Bash(...)` allows bound **exactly one** policy — CITATION_VERIFIER, the only contract that omits
 `Bash` — and for the other seven the effective shell boundary was the 14 scoped denies alone. That
 finding stands unchanged and is *not* restated here. Issue #240's "Done means" points at
-"`doc/accepted-gaps.md` entry 16"; **no entry 16 exists or existed** — this register ran `## 1`
-through `## 11` on the day the issue was written and this section is the entry that discharges
-that line. What follows is what card #240 added on top: the measurement, the decision, and the
-residual surface the fix deliberately leaves open.
+"`doc/accepted-gaps.md` entry 16"; **on main, where this section was written, no entry 16
+existed** — that register ran `## 1` through `## 11` on the day the issue was written, so this
+section is the entry that discharged that line there. This merge changes that: the combined
+register now has an entry 16 (`## 16`, action A8's own `canUseTool`-rejection write-up,
+chantier-side, also 2026-09-17) — the same entry issue #240's own opening paragraph already cites
+for the A8 measurement's full trace. It is not a second copy of this section, and this section is
+still the write-up that discharges the "Done means" line — entry 16 was never rewritten to hold
+the fix decision itself. What follows is what card #240 added on top: the measurement, the
+decision, and the residual surface the fix deliberately leaves open.
 
 **The measurement (2026-09-22).** Source: every pool-account transcript,
 `~/.claude-accounts/pool{1,2}/projects/**/*.jsonl` — 1520 files, of which 1379 carry a prompt whose

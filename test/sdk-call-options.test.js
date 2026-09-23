@@ -34,6 +34,7 @@ require('./no-real-spawn');
 const {
   buildQueryOptions,
   normalizeAllowedTools,
+  normalizeDisallowedTools,
   buildEnv,
   SETTING_SOURCES,
   ANTHROPIC_ENV_KEYS_TO_STRIP,
@@ -587,6 +588,99 @@ test('normalizeAllowedTools: absent/empty returns undefined so buildQueryOptions
   assert.equal(normalizeAllowedTools(null), undefined);
   assert.equal(normalizeAllowedTools(''), undefined);
   assert.equal(normalizeAllowedTools('   '), undefined);
+});
+
+// ---- normalizeDisallowedTools: F10 fix pass (Opus verifier) ------------------------------------
+//
+// A DENY rule's pattern routinely has a space INSIDE its own parentheses (`Bash(git reset
+// --hard*)`, `Bash(sudo *)`) -- normalizeAllowedTools's whitespace `.split` would tear a legacy
+// override string carrying one of these into fragments that match nothing, silently dropping the
+// deny with no error. normalizeDisallowedTools exists specifically so that never happens: unlike
+// normalizeAllowedTools, a string is kept as ONE opaque rule, never split. See that function's own
+// header comment (orchestrator/steps/sdk-call.js) for why this is what the OLD transport's
+// now-deleted buildArgv actually did (card #240, commit a0ecec4) -- pushing a string disallowedTools
+// to argv completely unchanged, relying on the real `claude` CLI's own parenthesis-aware splitter --
+// and why splitting it here would be a regression, not a neutral cleanup.
+test('normalizeDisallowedTools: an array passes through unchanged', () => {
+  const input = ['Bash(git reset --hard*)', 'Bash(sudo *)'];
+  assert.deepEqual(normalizeDisallowedTools(input), input);
+});
+
+test('normalizeDisallowedTools: a string with a space INSIDE parentheses is NOT split -- kept as one opaque rule, unlike normalizeAllowedTools', () => {
+  const rule = 'Bash(git reset --hard*) Bash(sudo *)';
+  // The defect this guards against: normalizeAllowedTools would shred this into five broken
+  // fragments (`Bash(git`, `reset`, `--hard*)`, `Bash(sudo`, `*)`), none of which match anything.
+  assert.notDeepEqual(normalizeAllowedTools(rule), normalizeDisallowedTools(rule));
+  assert.deepEqual(normalizeDisallowedTools(rule), [rule]);
+});
+
+test('normalizeDisallowedTools: a single-word string still becomes a one-element array (no spurious split)', () => {
+  assert.deepEqual(normalizeDisallowedTools('Bash(sudo *)'), ['Bash(sudo *)']);
+});
+
+test('normalizeDisallowedTools: absent/empty returns undefined so buildQueryOptions omits the key entirely', () => {
+  assert.equal(normalizeDisallowedTools(undefined), undefined);
+  assert.equal(normalizeDisallowedTools(null), undefined);
+  assert.equal(normalizeDisallowedTools(''), undefined);
+  assert.equal(normalizeDisallowedTools('   '), undefined);
+});
+
+test('buildQueryOptions: a string disallowedTools (legacy override shape) is NOT split on whitespace -- reaches options.disallowedTools as a one-element array carrying the original text verbatim', () => {
+  const rule = 'Bash(git reset --hard*) Bash(sudo *)';
+  const { options } = buildQueryOptions(
+    { promptText: 'hi', cwd: '/tmp', disallowedTools: rule },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+  );
+  assert.deepEqual(options.disallowedTools, [rule]);
+});
+
+// ---- test 1b: one real argv-level probe pinning that a legacy-override STRING disallowedTools
+// survives intact all the way to the SDK's own argv, not merely into buildQueryOptions's return
+// value (F10, this fix pass -- the standing lesson this repo has paid for before: calling a step
+// function directly proves the function works, not that production reaches it). Same throwaway
+// `node` fixture pattern as test 3 below -- never `claude`, no network call, no session.
+test('buildQueryOptions -> real query(): a legacy-override string disallowedTools reaches --disallowedTools byte-for-byte unsplit, relying on the CLI\'s own parenthesis-aware splitter exactly as the old buildArgv did', async () => {
+  const tmpDir = mkTmp('sdk-call-disallowed-argv-probe-');
+  const dumpFile = path.join(tmpDir, 'argv-dump.json');
+  const fixturePath = path.join(tmpDir, 'fake-claude.js');
+  fs.writeFileSync(
+    fixturePath,
+    [
+      '#!/usr/bin/env node',
+      'const fs = require("fs");',
+      'fs.writeFileSync(process.env.SDK_CALL_TEST_DENY_ARGV_DUMP_FILE, JSON.stringify(process.argv.slice(2)));',
+      'process.exit(0);',
+      '',
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+
+  const rule = 'Bash(git reset --hard*) Bash(sudo *)';
+  process.env.SDK_CALL_TEST_DENY_ARGV_DUMP_FILE = dumpFile;
+  let prompt, options;
+  try {
+    ({ prompt, options } = buildQueryOptions(
+      { promptText: 'hello from the deny-list argv probe', disallowedTools: rule, cwd: tmpDir, account: null },
+      { resolveClaudeCodeExecutable: fakeResolver(fixturePath), isNoRealSpawnEnabled: () => false }
+    ));
+
+    const query = await loadQuery();
+    const q = query({ prompt, options });
+    // eslint-disable-next-line no-unused-vars
+    for await (const _msg of q) {
+      // the fixture only writes a file and exits -- no messages expected
+    }
+  } finally {
+    delete process.env.SDK_CALL_TEST_DENY_ARGV_DUMP_FILE;
+  }
+
+  assert.ok(fs.existsSync(dumpFile), 'the fixture executable must have run and written the dump file');
+  const argv = JSON.parse(fs.readFileSync(dumpFile, 'utf8'));
+  assert.equal(
+    argvFlagValue(argv, '--disallowedTools'),
+    rule,
+    'a legacy-override string must reach --disallowedTools completely unsplit, one argv token, exactly as the old transport\'s buildArgv delivered it'
+  );
 });
 
 // ---- test 2: resolved-env assertions ------------------------------------------------------------

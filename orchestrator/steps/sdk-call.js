@@ -484,6 +484,46 @@ function normalizeAllowedTools(allowedTools) {
   return undefined;
 }
 
+// normalizeDisallowedTools(disallowedTools) -> string[] | undefined
+//
+// F10 (Opus verifier, fix pass): NOT the same normalization as normalizeAllowedTools above, on
+// purpose. A DENY rule's own pattern routinely contains a space inside its parentheses --
+// `Bash(git reset --hard*)`, `Bash(sudo *)` -- and `normalizeAllowedTools`'s whitespace `.split`
+// would tear a rule like that into fragments that match nothing (`Bash(git`, `reset`, `--hard*)`,
+// ...), silently dropping the deny with no error. That is not hypothetical: it is exactly what
+// happens if this function is skipped and the generic one reused here instead, and only a
+// hand-authored task file's legacy override can produce a string in the first place --
+// step-contracts.js/orchestrator/bash-policy.js always hand this an array (see
+// resolveStepContract's own `disallowedTools` field) -- so nothing in today's real traffic would
+// ever exercise the bug, which is exactly why it is worth naming rather than trusting review to
+// catch it later.
+//
+// The OLD transport's now-deleted `buildArgv` (card #240, commit a0ecec4) is the specification
+// here, not a guess: given a string, it pushed it to argv COMPLETELY UNCHANGED as a single argv
+// token (`if (denied !== '') argv.push('--disallowedTools', denied)` -- no split, no join), and
+// relied on the real `claude` CLI's own parenthesis-aware splitter (`claude --help`: "Comma or
+// space-separated list of tool names", with a worked example whose first entry itself contains an
+// embedded space) to parse it correctly at the other end. This function reproduces that exact
+// byte-for-byte behaviour under the SDK's array-shaped `options.disallowedTools`: a string becomes
+// a ONE-ELEMENT array, so the SDK's own comma-join (`vendor/claude-agent-sdk/sdk.mjs`'s
+// `ut.join(",")`) has nothing to join against and emits the string verbatim as the sole
+// `--disallowedTools` argument -- the same text, unaltered, that used to reach the same flag on
+// the old transport. Splitting it here would be a REGRESSION from the old transport's own
+// behaviour, not a neutral choice; rejecting the string loudly (throwing) was the other option
+// this fix pass considered, but the old transport never refused a string, so silently breaking a
+// legacy override that worked before this cutover is worse than preserving it.
+//
+// An array (the real, non-legacy shape) is returned as-is, same "no copy here" contract as
+// normalizeAllowedTools -- buildQueryOptions is still the one that copies before storing onto
+// `options` (see its own disallowedTools comment).
+function normalizeDisallowedTools(disallowedTools) {
+  if (Array.isArray(disallowedTools)) return disallowedTools;
+  if (typeof disallowedTools === 'string' && disallowedTools.trim() !== '') {
+    return [disallowedTools.trim()];
+  }
+  return undefined;
+}
+
 // buildEnv(opts) -- the child environment for the eventual query() spawn, built the same way
 // invokeClaudeReal (llm.js) builds it today so PATH/HOME/DISABLE_AUTOUPDATER all survive (query's
 // own `env` REPLACES the child's environment wholesale rather than merging with it -- MEASURED
@@ -636,11 +676,17 @@ function buildQueryOptions(opts, deps = {}) {
   // `options.disallowedTools` as its own first-class array field (measured,
   // `vendor/claude-agent-sdk/sdk.mjs`: `disallowedTools:F=[]` on its own options destructure,
   // comma-joined into `--disallowedTools` by the SDK's own argv builder) -- so, unlike the OLD
-  // transport's hand-built space-joined string, this needs no join of its own; the array travels
-  // to the SDK exactly the way allowedTools already does. Omitted (not set to `[]`) when empty or
-  // absent, matching buildArgv's own "omit the flag entirely" behaviour for CITATION_VERIFIER
-  // (the one policy step-contracts.js gives no disallowedTools entry at all).
-  const disallowedTools = normalizeAllowedTools(opts.disallowedTools);
+  // transport's hand-built space-joined string, this needs no join of its own for the real (array)
+  // shape; the array travels to the SDK exactly the way allowedTools already does. Omitted (not
+  // set to `[]`) when empty or absent, matching buildArgv's own "omit the flag entirely" behaviour
+  // for CITATION_VERIFIER (the one policy step-contracts.js gives no disallowedTools entry at
+  // all).
+  //
+  // F10 (Opus verifier, fix pass): normalizeDisallowedTools here, NOT normalizeAllowedTools --
+  // see that function's own comment for why the two must not share a normalizer. Reusing
+  // normalizeAllowedTools would split a legacy-override string like `Bash(git reset --hard*)` on
+  // its own internal spaces and silently deliver a deny rule that matches nothing.
+  const disallowedTools = normalizeDisallowedTools(opts.disallowedTools);
   if (disallowedTools !== undefined && disallowedTools.length > 0) {
     options.disallowedTools = [...disallowedTools];
   }
@@ -1212,6 +1258,7 @@ module.exports = {
   buildQueryOptions,
   consumeQueryStream,
   normalizeAllowedTools,
+  normalizeDisallowedTools,
   buildEnv,
   makeSpawnClaudeCodeProcess,
   confirmProcessExit,

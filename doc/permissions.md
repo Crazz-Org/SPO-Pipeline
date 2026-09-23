@@ -193,8 +193,12 @@ every top-level segment covered by the 92    5543 / 13001   42.6%
 ### What landed
 
 Per-policy deny lists in **`orchestrator/bash-policy.js`**, passed on the command line as
-`--disallowedTools` (`steps/llm.js`'s `buildArgv`). Nothing in `.claude/settings.json` changed, and
-nothing could have: an agent cannot edit it (§ *Walls that `settings.json` can't tune*). The 14
+`--disallowedTools` (`orchestrator/steps/sdk-call.js`'s `buildQueryOptions`, which sets
+`options.disallowedTools` on every real `query()` call; the vendored Claude Agent SDK itself
+comma-joins that array into the flag when it spawns `claude` — `steps/llm.js`'s `buildArgv`, the
+old transport's argv builder, was deleted by card #239's cutover). Nothing in
+`.claude/settings.json` changed, and nothing could have: an agent cannot edit it (§ *Walls that
+`settings.json` can't tune*). The 14
 shared denies stay the single source and are **not** duplicated — `test/bash-deny-policy.test.js`
 fails on any duplicate, so the two layers cannot fork.
 
