@@ -45,7 +45,7 @@ const path = require('path');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
-const { mkTmp } = require('./helpers');
+const { mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 function readJournal(taskDir) {
   return fs
@@ -485,24 +485,32 @@ function realVrcCtx(id, claudeReplyPayload) {
       if (args.includes('diff')) return ok('diff --git a/z.ts b/z.ts\n+change\n');
       return ok('');
     }
-    if (command === 'claude') {
-      return {
-        status: 0,
-        stdout: JSON.stringify({
-          result: JSON.stringify(claudeReplyPayload),
-          is_error: false,
-          num_turns: 1,
-          session_id: 'sess-vrc-1',
-          modelUsage: { fable: { costUSD: 0.001 } },
-          terminal_reason: 'success',
-          api_error_status: null,
-        }),
-        stderr: '',
-        signal: null,
-      };
-    }
     return ok('');
   };
+  // Card #239 chantier (A5b-2, Job 3): claude no longer spawns via spawnSync -- it drives the
+  // Agent SDK's query() (orchestrator/steps/sdk-call.js). Migrated onto `deps.spawn`
+  // (test/helpers.js's `fakeSpawnedChild`), same stream-json shape test/llm-real-card.test.js's
+  // own `initMessage`/`resultMessage` use. Before this fix, the spawnSync-shaped `claude` branch
+  // above was dead code: invokeClaudeReal never reads deps.spawnSync any more, so every real-mode
+  // test in this file drove a REAL (failed) executable resolution instead -- (f)'s own assertion
+  // ("parks llm-transport-failed:VALIDATE") happened to pass for the WRONG reason (a transport
+  // failure, not a missing-key reply), which is exactly the "test passing for the wrong reason"
+  // class this chantier's mutation-testing verifier exists to catch. Fixed for both tests in this
+  // file that use realVrcCtx, not just the one measured failing.
+  function spawn() {
+    return fakeSpawnedChild([
+      { type: 'system', subtype: 'init', session_id: 'sess-vrc-1', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-vrc-1',
+        modelUsage: { fable: { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify(claudeReplyPayload),
+      },
+    ]);
+  }
 
   const ctx = buildCtx(id, task, taskDir, {
     shadowMode: false,
@@ -512,7 +520,7 @@ function realVrcCtx(id, claudeReplyPayload) {
     validateRejectBudget: 3, // config.js's own default -- named explicitly, not left undefined
     ghRepo: 'Crazz-Org/SPO-WebClient',
     claudeAccountsDir: accountsDir,
-    deps: { spawnSync },
+    deps: { spawnSync, ...fakeExecDeps({ spawn }) },
   });
   const { appendEvent } = require('../orchestrator/journal');
   appendEvent(ctx.taskDir, 'PLAN', 'result', {

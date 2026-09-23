@@ -5,8 +5,10 @@
 // (see orchestrator/README.md "Real mode" / "Tests" for why it deliberately lives outside
 // test/, where `node --test test/*.test.js` would otherwise pick it up).
 //
-// Exercises the real llm.js path end to end (argv construction, spawn, JSON parse, token
-// extraction) against a trivial, cheap call: haiku, low effort, a $0.10 budget cap (the CLI's
+// Exercises the real llm.js path end to end (query() options construction, spawn, stream
+// consumption, JSON parse, token extraction -- since card #239's transport cutover, action A5b,
+// 2026-09-17; no argv builder exists any more, see steps/llm.js/sdk-call.js's own headers) against
+// a trivial, cheap call: haiku, low effort, a $0.10 budget cap (the CLI's
 // own `--max-budget-usd` guardrail, unrelated to this build's token accounting), run from this
 // repo's own root (the orchestration-side cwd policy -- see config.js).
 //

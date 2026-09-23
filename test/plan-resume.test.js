@@ -28,7 +28,7 @@ const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
 const { lastResultPayload } = require('../orchestrator/task-values');
 const { realWorktree } = require('../orchestrator/steps/scripted');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild } = require('./helpers');
 
 
 function readJournal(taskDir) {
@@ -39,23 +39,25 @@ function readJournal(taskDir) {
     .map((l) => JSON.parse(l));
 }
 
-// The envelope invokeClaudeReal (steps/llm.js) expects from a real spawnSync call -- same shape
-// test/plan-writes.test.js's fakePlanSpawn returns, `result` itself a JSON-encoded PLAN payload.
+// The stream-json messages invokeClaudeReal (steps/llm.js) expects from a real `deps.spawn` call
+// (card #239 chantier, action A5b-2 -- claude no longer spawns via spawnSync, see
+// orchestrator/steps/sdk-call.js), same shape test/llm-real-card.test.js's own
+// initMessage/resultMessage helpers use. `result` itself is a JSON-encoded PLAN payload, same as
+// before this migration.
 function planReplyEnvelope(planPayload) {
-  return {
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
+  const sessionId = 'sess-plan-resume';
+  return [
+    { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
       is_error: false,
       num_turns: 1,
-      session_id: 'sess-plan-resume',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
-  };
+      session_id: sessionId,
+      modelUsage: { 'claude-fable-5': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify(planPayload),
+    },
+  ];
 }
 
 // A valid PLAN reply -- used by every "must run PLAN normally" test so a successful non-reuse
@@ -70,13 +72,15 @@ function validPlanPayload() {
   };
 }
 
-// Wraps a fixed spawnSync reply with a call counter. The reuse path's entire point is that
+// Wraps a fixed set of stream-json messages (planReplyEnvelope's own return) with a call counter,
+// as a `deps.spawn`-shaped spy (card #239 chantier, A5b-2) -- a fresh fakeSpawnedChild per call,
+// since a real child can only be consumed once. The reuse path's entire point is that
 // callLlmStep -- and therefore this -- is never invoked at all; every reuse test asserts
 // spy.callCount === 0, every "runs normally" test asserts it is exactly 1.
-function countingSpawn(reply) {
+function countingSpawn(messages) {
   function spy() {
     spy.callCount += 1;
-    return reply;
+    return fakeSpawnedChild(messages);
   }
   spy.callCount = 0;
   return spy;
@@ -95,7 +99,13 @@ function baseTask(overrides = {}) {
 }
 
 // A real-mode ctx wired for handlePlan: an account pool (only ever actually consulted if the
-// reuse guard falls through and callLlmStep runs for real) and an injectable spawnSync.
+// reuse guard falls through and callLlmStep runs for real) and an injectable claude spawn.
+// `spawnSync` is the parameter's historical name (every call site below still passes
+// `spawnSync: countingSpawn(...)`) -- since card #239's cutover (A5b-2) it is actually a
+// `deps.spawn`-shaped function (countingSpawn's own comment), so it is wired onto `deps.spawn`
+// here, alongside the fake executable resolver and the killswitch opt-out every real-mode call in
+// this suite needs (test/helpers.js's fakeExecDeps convention, inlined rather than imported since
+// this function already owns its own `deps` object shape).
 function realPlanCtx({ task, taskDir, worktreePath, spawnSync }) {
   const accountsDir = mkTmp('spo-plan-resume-accts-');
   writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
@@ -104,7 +114,7 @@ function realPlanCtx({ task, taskDir, worktreePath, spawnSync }) {
     dryRun: false,
     claudeAccountsDir: accountsDir,
     stepDeadlineMs: 30000,
-    deps: { spawnSync },
+    deps: { spawn: spawnSync, resolveClaudeCodeExecutable: () => '/fake/bin/claude', isNoRealSpawnEnabled: () => false },
   });
 }
 

@@ -7,6 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
+const { EventEmitter } = require('events');
+const { Readable, Writable } = require('stream');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const DAEMON = path.join(REPO_ROOT, 'orchestrator', 'daemon.js');
@@ -49,6 +51,251 @@ function timeoutResult(signal = 'SIGTERM') {
   const error = new Error(`spawnSync ${signal} ETIMEDOUT`);
   error.code = 'ETIMEDOUT';
   return { status: null, stdout: '', stderr: '', signal, error };
+}
+
+// fakeSpawnedChild(lines, opts) -- card #239 chantier, action A5b. This suite's migration seam
+// for the transport cutover: a duck-typed, in-memory stand-in for the real ChildProcess
+// orchestrator/steps/sdk-call.js's spawnClaudeCodeProcess hook returns, injected via `deps.spawn`
+// (makeSpawnClaudeCodeProcess reads it, same injection convention this file's own timeoutResult()
+// already documents -- "share, don't duplicate"). Plays the same role `deps.spawnSync`'s fake
+// result object played for the old transport, one layer lower: a test using this never touches a
+// real `claude` process OR even a real spawned `node` subprocess -- the SDK's own real `query()`
+// call runs for real and parses real stream-json off this object's `.stdout`, but the "process" it
+// is reading from is pure JS, so every test using this is as fast as a unit test, not a subprocess
+// integration test. MEASURED (this action, throwaway probe against the real vendored SDK, deleted
+// after use, not committed): a real `query()` call consumes messages off this shape identically to
+// a real spawned process -- init/result messages round-trip, and `.kill()`/`.exitCode`/
+// `.signalCode` drive the SAME escalation path a real child would (see sdk-call.js's own header on
+// SDK_ABORT_KILL_DELAY_MS/SDK_ABORT_SIGKILL_ESCALATION_MS for what that escalation actually does).
+//
+// `lines` -- plain JS objects, written as one stream-json line each to `.stdout` the moment
+// anything is written to `.stdin` (mirrors a real `claude` reading the whole prompt, then
+// replying) -- pass `[]` for a child that never replies (deadline/hang tests).
+// `opts.exitCode`/`opts.exitSignal` -- what `.exitCode`/`.signalCode` settle to once `lines` have
+// been written (default: exit 0, no signal). Pass `opts.hang: true` to suppress this entirely --
+// the child never exits on its own no matter what it was told to say.
+// `opts.ignoreSignal` -- true makes `.kill()` a no-op that does NOT schedule an exit -- the
+// fake "traps and ignores" every signal, the exact shape llm.js's own header measures the SDK's
+// kill escalation against (a SIGTERM-ignoring child). The test itself decides when/whether the
+// fake ever exits by calling `.forceExit(code, signal)` directly (exposed on the returned object)
+// -- e.g. to simulate an EXTERNAL kill succeeding where the first SIGTERM/SIGKILL from the SDK's
+// own escalation would not, or to simulate a child that exits on its own after some delay despite
+// having ignored an earlier signal.
+function fakeSpawnedChild(lines, opts = {}) {
+  const emitter = new EventEmitter();
+  let respondedOnce = false;
+  let exited = false;
+  let killedFlag = false;
+  let exitCodeVal = null;
+  let signalCodeVal = null;
+
+  const stdout = new Readable({ read() {} });
+  const stderr = new Readable({ read() {} });
+  stderr.push(null);
+
+  // Keepalive, REF'd on purpose (never `.unref()`d) -- MEASURED (this action): the vendored SDK's
+  // own internal kill-escalation timer (ProcessTransport.close(), see sdk-call.js's own header on
+  // SDK_ABORT_KILL_DELAY_MS/SDK_ABORT_SIGKILL_ESCALATION_MS) is ITSELF unref'd in the vendored
+  // source -- fine in production, where the real child's own OS-level stdio pipes are ref'd handles
+  // that keep the event loop alive regardless, but this fake has no such handle (a plain
+  // stream.Readable/Writable is pure JS, backed by no libuv handle at all). Without something
+  // else ref'd, Node considers the event loop "resolved" and the process idle the instant this
+  // fake's OWN synchronous work is done -- reproduced as a genuine hang (not a slow test) in this
+  // file's own migrated test suite before this fix: `invokeClaudeReal`'s deadline path would call
+  // `abort()`, and the vendored SDK's own unref'd escalation timer would simply never get a chance
+  // to fire. This interval does nothing but keep the loop alive for as long as this fake child
+  // hasn't exited -- cleared the moment it does, in forceExit below, so it can never outlive the
+  // fake or leak into a later, unrelated test.
+  // `opts.signal` (an AbortSignal) -- MEASURED (this action, against a REAL child_process.spawn):
+  // Node's own `{signal}` spawn option does TWO things when that signal aborts, not one: it calls
+  // `child.kill()` (default SIGTERM) AND emits an `'error'` event on the child with an
+  // `AbortError` -- observed firing near-instantly, well before the process itself has actually
+  // exited. This is what made this repo's OWN live probe (a real, SIGTERM-ignoring `claude`
+  // fixture) see the async iterator throw at ~800ms rather than waiting for the SDK's own
+  // 2000ms-later escalation -- the transport's `process.on('error', ...)` handler checks
+  // `abortController.signal.aborted` and short-circuits to "aborted by user" the moment that fires.
+  // A fake with no real OS process behind it has no such native integration -- reproduced as a
+  // genuine hang (the async iterator never threw, even 14s past a SIGTERM-ignoring fake's own
+  // `.kill()`) before this fix. `sdk-call.js`'s spawnClaudeCodeProcess passes `spawnArgs.signal`
+  // straight through to a real `child_process.spawn(...,{signal})` in production, so this fake
+  // reproduces exactly that option, not a new one this file invents.
+  if (opts.signal) {
+    const onAbort = () => {
+      const err = new Error('The operation was aborted');
+      err.name = 'AbortError';
+      emitter.emit('error', err);
+      // Real Node also calls .kill() -- routed through THIS fake's own kill() so
+      // opts.ignoreSignal still governs whether the process ITSELF ever actually dies from it,
+      // matching a real SIGTERM-ignoring child (which also receives the signal, and also does not
+      // exit from it).
+      emitter.kill();
+    };
+    // Always async (never a synchronous call from inside this constructor) -- matching a real
+    // event listener's own timing, and sidestepping the construction-order hazard of calling
+    // `emitter.kill()` before Object.defineProperties (below) has defined it.
+    if (opts.signal.aborted) process.nextTick(onAbort);
+    else opts.signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  const keepalive = setInterval(() => {}, 1000);
+  // Safety net, not itself load-bearing for correctness: if NOTHING ever calls forceExit (a test
+  // deliberately simulating a child that ignores every signal and is never confirmed dead, e.g.
+  // this file's "grace window expires" test), `keepalive` would otherwise run forever and hang
+  // the whole test FILE process after that one test finishes. 20s is comfortably past
+  // sdk-call.js's own ABORT_CONFIRM_GRACE_MS (~8.5s, the longest any real wait in this suite
+  // should take), so it never fires before a legitimately-finishing test's own assertions have
+  // already run -- it only guards against a fake nobody ever tears down. Unref'd: it does not
+  // itself need to keep anything alive, only to eventually clear what does.
+  const safetyNet = setTimeout(() => clearInterval(keepalive), 20000);
+  if (typeof safetyNet.unref === 'function') safetyNet.unref();
+
+  function forceExit(code, signal) {
+    if (exited) return;
+    exited = true;
+    exitCodeVal = code === undefined ? null : code;
+    signalCodeVal = signal === undefined ? null : signal;
+    clearInterval(keepalive);
+    stdout.push(null);
+    process.nextTick(() => emitter.emit('exit', exitCodeVal, signalCodeVal));
+  }
+
+  const stdin = new Writable({
+    write(chunk, encoding, callback) {
+      callback();
+      // Every chunk is forwarded to onStdinWrite, not only the first -- MEASURED (this action): a
+      // large prompt (the 200KB-over-MAX_ARG_STRLEN regression test) arrives across MULTIPLE
+      // separate `.write()` calls, not one, so capturing only the first chunk silently truncated
+      // it. The "respond after the prompt arrives" logic below still fires only once
+      // (respondedOnce), matching a real `claude` reading the whole prompt before replying.
+      if (typeof opts.onStdinWrite === 'function') opts.onStdinWrite(chunk.toString('utf8'));
+      if (respondedOnce) return;
+      respondedOnce = true;
+      process.nextTick(() => {
+        for (const line of lines) {
+          stdout.push((typeof line === 'string' ? line : JSON.stringify(line)) + '\n');
+        }
+        if (!opts.hang) {
+          forceExit(opts.exitCode === undefined ? 0 : opts.exitCode, opts.exitSignal === undefined ? null : opts.exitSignal);
+        }
+      });
+    },
+  });
+
+  // Object.assign, NOT used here: it would invoke each `get killed()`/`get exitCode()`/
+  // `get signalCode()` accessor exactly ONCE, at this construction moment (before anything has
+  // happened), and copy the resulting SNAPSHOT VALUE onto `emitter` as a plain, frozen data
+  // property -- a real bug this helper shipped with and caught the hard way: `.exitCode` read
+  // back `null` forever even after `forceExit` had already set the real value, because
+  // Object.assign does not preserve accessor descriptors, only their current value. The vendored
+  // SDK reads `.exitCode`/`.signalCode`/`.killed` AFTER the 'exit' event fires (its own close()/
+  // getProcessExitError logic), so a frozen snapshot silently broke every consumer of this fake
+  // that isn't the very first (never-changing) read. Object.defineProperties keeps these as LIVE
+  // accessors on the returned object instead.
+  Object.defineProperties(emitter, {
+    stdin: { value: stdin, enumerable: true },
+    stdout: { value: stdout, enumerable: true },
+    stderr: { value: stderr, enumerable: true },
+    forceExit: { value: forceExit, enumerable: true },
+    killed: {
+      enumerable: true,
+      get() {
+        return killedFlag;
+      },
+    },
+    exitCode: {
+      enumerable: true,
+      get() {
+        return exitCodeVal;
+      },
+    },
+    signalCode: {
+      enumerable: true,
+      get() {
+        return signalCodeVal;
+      },
+    },
+    kill: {
+      enumerable: true,
+      value(signal) {
+        killedFlag = true;
+        if (!opts.ignoreSignal) forceExit(null, signal);
+        return true;
+      },
+    },
+  });
+  return emitter;
+}
+
+// fakeSpawnDeps(lines, opts) -- the `deps.spawn` function makeSpawnClaudeCodeProcess reads,
+// wrapping fakeSpawnedChild above and recording the (command, args, spawnOpts) it was called with
+// so a test can assert on cwd/env/signal the same way the old transport's tests asserted on
+// spawnSync's own (command, argv, opts). Returns `{ spawn, calls }` -- `calls` accumulates one
+// entry per invocation (there is exactly one per real invokeClaudeReal call in every test in this
+// suite, but kept as an array rather than a single object so a test can assert "never called" by
+// checking `calls.length === 0`, mirroring this file's own spawnCalls-counter convention).
+function fakeSpawnDeps(lines, opts = {}) {
+  const calls = [];
+  function spawn(command, args, spawnOpts) {
+    calls.push({ command, args, cwd: spawnOpts.cwd, env: spawnOpts.env, signal: spawnOpts.signal });
+    // spawnOpts.signal -- threaded through to fakeSpawnedChild so it can reproduce Node's own
+    // `{signal}` spawn-option behaviour (see that function's own header on `opts.signal`).
+    return fakeSpawnedChild(lines, { ...opts, signal: spawnOpts.signal });
+  }
+  return { spawn, calls };
+}
+
+// fakeExecDeps(extra) -- card #239 chantier, action A5b fix pass F9. The `deps.resolveClaude
+// CodeExecutable`/`deps.isNoRealSpawnEnabled` pair every `invokeClaudeReal`-level test needs
+// alongside `fakeSpawnDeps`'s own `spawn`: a fixed, never-resolved-for-real fake `claude` path, and
+// an explicit opt-out of the SPO_NO_REAL_SPAWN killswitch this suite's own top-of-file
+// `require('./no-real-spawn')` arms process-wide (see that require's own comment). The opt-out is
+// deps-scoped, never an env mutation, so it can never leak into a sibling test.
+//
+// Was hand-rolled identically in test/llm-real.test.js and test/llm-real-card.test.js (both named
+// `fakeExecDeps`, both resolving to the same literal `/fake/bin/claude`) before this fix pass --
+// exported here once so the 18+ files migrating onto this seam next (A5b-2) do not have to hand-roll
+// it a third, fourth, ... time. `extra` overrides/extends the three defaults (e.g. a test that wants
+// `isNoRealSpawnEnabled: () => true` to exercise the killswitch itself).
+//
+// F4 (card #239 chantier, fix pass, this action). `isNoRealSpawnEnabled: () => false` above
+// disarms BOTH killswitch layers (llm.js's invokeClaudeReal, and sdk-call.js's
+// spawnClaudeCodeProcess -- see the latter's own "Both, not either" header) for every call site
+// that spreads this helper in. With both disarmed, `makeSpawnClaudeCodeProcess`'s own
+// `deps.spawn || spawn` falls back to the REAL `child_process.spawn` the instant a call site
+// forgets to override `spawn` -- and on this machine (and every pool worker image) a real `claude`
+// really is on PATH, so that is not a theoretical gap: a forgotten override would reach it, with
+// whatever OAuth credential this process happens to carry. Latent today only because every one of
+// this suite's 22+ call sites happens to also supply its own `spawn` (as an `extra.spawn`, or as a
+// sibling key in an object spread AFTER `...fakeExecDeps()`) -- nothing STRUCTURAL enforced that
+// pairing before this fix, so a future call site that disarms and forgets would fail silently
+// (or, worse, "succeed" by actually talking to a real process) rather than failing loud.
+//
+// The fix: this function itself supplies a POISON-PILL `spawn` default, bundled in the same place
+// as the disarm, so the guard can never be disarmed here WITHOUT also getting a fake spawn. A call
+// site that overrides `spawn` (directly, or via a later object-spread key -- `...extra` below, or
+// `{...fakeExecDeps(), spawn: ...}` at the call site, both land the same way: the override wins)
+// gets its own real fake, exactly as before. A call site that does NOT is handed a function that
+// throws loudly and synchronously the moment `makeSpawnClaudeCodeProcess` actually invokes it --
+// never a silent fallthrough to the real OS spawn. test/no-real-spawn-guard-pairing.test.js is the
+// standing proof this actually fires (it disarms via fakeExecDeps() with no spawn override at all,
+// drives a real call, and asserts the poison pill's own error surfaces instead of a hang or a real
+// process).
+function fakeExecDeps(extra = {}) {
+  return {
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
+    spawn: () => {
+      throw new Error(
+        'test/helpers.js: fakeExecDeps() disarmed the no-real-spawn killswitch ' +
+          '(isNoRealSpawnEnabled: () => false) but this call site never supplied its own deps.spawn ' +
+          'override -- refusing to fall through to the REAL child_process.spawn, which on this ' +
+          'machine would reach a real `claude` executable (and whatever live account credentials ' +
+          'this process carries) instead of a fake one. Pass fakeExecDeps({ spawn: ... }), or spread ' +
+          '...fakeExecDeps() and add your own `spawn` key alongside it.'
+      );
+    },
+    ...extra,
+  };
 }
 
 function writeTask(queueDir, filename, taskObj) {
@@ -317,4 +564,7 @@ module.exports = {
   readState,
   readLedger,
   timeoutResult,
+  fakeSpawnedChild,
+  fakeSpawnDeps,
+  fakeExecDeps,
 };

@@ -43,6 +43,10 @@ const { leaseHealthyAccount } = require('./account-lease');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
+// card #167: INTAKE_MODELS lives in step-contracts.js (see its own comment there for why not
+// here) -- this file consumes it at each step's opts AND at callIntakeStepWithRotation's
+// lease/markLimit, and re-exports it below.
+const { INTAKE_MODELS } = require('./step-contracts');
 const { appendDaemonEvent } = require('./journal');
 const { armTimeout } = require('./command-timeout');
 // Card #240. All three intake steps run against config.productRepo -- `~/SPO-WebClient`, the LIVE
@@ -93,8 +97,13 @@ function canonicalPriority(raw) {
   return null;
 }
 
-// config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted/LLM steps and must stay
-// that way -- it is not a fit for either intake step. draftCard and reviewCard are the
+// config.stepDeadlineMs (120000ms) is sized for the daemon's own scripted steps and must stay
+// that way -- it is not a fit for either intake step. (Action A2, card #239, 2026-09-17: it is no
+// longer the deadline an LLM step itself races either -- PLAN/IMPLEMENT/DIAGNOSE/
+// CITATION_VERIFIER/VALIDATE each carry their own config.stepDeadlineMsByState entry now,
+// `deadlineMsForStep(step) + stepDeadlineMs`; this constant survives there only as the MARGIN
+// added on top of a step's own inner deadline, not as the deadline itself. See config.js's own
+// LLM_STEP_DEADLINE_ENTRIES comment.) draftCard and reviewCard are the
 // maintainer-facing `spo ask` path (bin/spo's cmdAsk; cmdPull calls neither -- `spo pull` only
 // runs pullBoard + makeTask and writes queue files), not the daemon loop: reviewCard in particular runs
 // fable at effort high verifying citations into the sibling product repo, real cross-repo file
@@ -207,19 +216,13 @@ function normalizeExit(result) {
 // two calls on the account it gave up on, still inside the same bound, and it keeps its
 // `retriedAfterTimeout` record (see the hoist comment inside the loop).
 //
-// card #167: the model each intake step spends, as ONE constant per step. Unlike the pipeline
-// steps (whose model is task-shaped and resolved by step-contracts.js's resolveStepContract),
-// each of these three is a fixed literal -- but it is now needed in TWO places, the
-// `invokeClaudeReal` opts the step builds and the lease/markLimit calls in the rotation loop
-// below, and two literals is one drift away from leasing for one model while cooling another.
-// Naming it once removes that possibility by construction; test/accounts-per-model-cooldown.test.js
-// asserts the model handed to the lease is the same one that reaches invokeClaudeReal's opts.
-const INTAKE_MODELS = Object.freeze({
-  draftCard: 'sonnet',
-  reviewCard: 'fable',
-  triageBugReport: 'opus',
-});
-
+// card #167: the model each intake step spends is ONE constant per step, INTAKE_MODELS (defined
+// in step-contracts.js, imported above) -- it is needed in TWO places, the `invokeClaudeReal` opts
+// the step builds and the lease/markLimit calls in the rotation loop below, and two literals is
+// one drift away from leasing for one model while cooling another.
+// test/accounts-per-model-cooldown.test.js asserts the model handed to the lease is the same one
+// that reaches the real query() argv's `--model`.
+//
 // `buildOpts(account)` builds the exact `invokeClaudeReal` opts object the caller already built
 // inline, with `account` now supplied by this loop instead of a single `pickAccount()` call.
 // `model` (card #167) is the model every call in this pass will spend -- the caller's own
@@ -1483,8 +1486,9 @@ module.exports = {
   // same-account timeout retry) rather than against a number a comment claims -- see
   // test/account-lease.test.js's own derivation test.
   INTAKE_DEADLINE_MS,
-  // card #167: exported so a test can assert that the model each intake step LEASES and COOLS is
-  // the same one that reaches invokeClaudeReal's opts -- the correspondence this constant exists
-  // to make unbreakable. See test/accounts-per-model-cooldown.test.js.
+  // card #167: re-exported (defined in step-contracts.js) so a test can assert that the model each
+  // intake step LEASES and COOLS is the same one that reaches the real query() argv -- the
+  // correspondence this constant exists to make unbreakable. See
+  // test/accounts-per-model-cooldown.test.js.
   INTAKE_MODELS,
 };

@@ -36,17 +36,24 @@ exception — the opposite of the intent.
 
 ## Why it also hits the automated steps
 
-`orchestrator/steps/llm.js` launches `claude -p` with `CLAUDE_CONFIG_DIR=~/.claude-accounts/poolN`.
-These directories have **no** `settings.json`: user rules disappear for every LLM step. What
-remains are the *project* rules, resolved from the step's `cwd` (`config.js` → `cwdForStep`):
+`orchestrator/steps/llm.js`'s `invokeClaudeReal` drives the vendored Claude Agent SDK's `query()`
+(card #239 chantier, action A5b, 2026-09-17 — no longer a direct `claude -p` spawn) with
+`options.env.CLAUDE_CONFIG_DIR=~/.claude-accounts/poolN` (`sdk-call.js`'s `buildEnv`). **CORRECTED
+-- this used to say these directories have no `settings.json`, and once did, but no longer does**:
+that gap is CLOSED, at the USER layer, by the account-sync mechanism the section below this table
+documents in full (`bin/spo`'s `cmdAccountSyncSettings`, run on every `account add` and every
+`--real` daemon startup) -- read that section for the mechanism; this paragraph only stops
+asserting the stale half of it. What remains to state here are the *project* rules, resolved from
+the step's `cwd` (`config.js` → `cwdForStep`):
 
 | Step | `cwd` | Project rules visible |
 |---|---|---|
 | PLAN, IMPLEMENT | product worktree (`~/.spo-worktrees/issue-N/`) | the 70 WebClient rules (`.claude/settings.json` is versioned, so present in every worktree) ✅ |
-| DIAGNOSE, VALIDATE, CITATION_VERIFIER | SPO-Pipeline root | **none** ❌ |
+| DIAGNOSE, VALIDATE, CITATION_VERIFIER | SPO-Pipeline root | the repo's own 98 allow / 14 deny rules (`.claude/settings.json`, versioned at the pipeline root -- this row used to read "none ❌" before that file existed) ✅ |
 
 These three steps run in `permissionMode: 'default'` with no human to respond: any Bash command
-that isn't trivially read-only is **refused**, not queued.
+that isn't trivially read-only AND not covered by an allow rule (project or, since the fix below,
+user) is **refused**, not queued.
 
 > **Corrected 2026-09-22 (card #240).** That last sentence was true only of CITATION_VERIFIER.
 > DIAGNOSE and VALIDATE declare bare `Bash` in `allowedTools`, which is itself an allow rule
@@ -61,10 +68,11 @@ that isn't trivially read-only is **refused**, not queued.
 
 ### The account layer counts too, and it's also plugged now
 
-The table above says *user* rules disappear for every LLM step. Project policy is enough as long
-as each step lands in a directory that carries one — which is the case today (pipeline root or
-product worktree), which **masks** the gap without closing it. A step whose `cwd` had no
-`.claude/settings.json` would run with no rules at all.
+The paragraph above the table used to say *user* rules disappear for every LLM step -- true once,
+corrected there now. Project policy ALONE would have been enough only as long as every step lands
+in a directory that carries one — which is the case today (pipeline root or product worktree),
+but that would have **masked** the user-layer gap without closing it: a step whose `cwd` had no
+`.claude/settings.json` of its own would still have run with no rules at all.
 
 An account's directory **is** its `CLAUDE_CONFIG_DIR`, so a `settings.json` placed inside it is
 its user layer. `spo account sync-settings` installs `<repo>/.claude/settings.json` there as-is,
@@ -84,11 +92,13 @@ hold real credentials?" by excluding the files the module manages itself. The sy
 `spo accounts` report every account as authenticated, including ones that aren't. Covered by a
 regression test.
 
-Direct consequence: DIAGNOSE is the safety net intended for CI forensics
-(`doc/improvisation-analysis.md`, cause R2 — `gh run view --log-failed`, `gh api …/jobs`) and it
-has none of these permissions. VALIDATE must read `git diff` from the product worktree and can't
-either. Creating `SPO-Pipeline/.claude/settings.json` fixes both at once, without touching the
-account directories.
+RESOLVED, past tense (this paragraph used to describe a live consequence; it no longer is one):
+DIAGNOSE is the safety net intended for CI forensics (`doc/improvisation-analysis.md`, cause R2 —
+`gh run view --log-failed`, `gh api …/jobs`), and before `SPO-Pipeline/.claude/settings.json`
+existed, it had none of these permissions; VALIDATE reads `git diff` from the product worktree
+and would not have been able to either. Both now have the repo's own 98 allow / 14 deny rules —
+`SPO-Pipeline/.claude/settings.json` exists (see the table above) — without touching the account
+directories, which is the separate, ALSO now-closed gap the rest of this section documents.
 
 ## Deny ↔ process contradictions (arbitrated on 2026-08-30)
 
@@ -183,8 +193,12 @@ every top-level segment covered by the 92    5543 / 13001   42.6%
 ### What landed
 
 Per-policy deny lists in **`orchestrator/bash-policy.js`**, passed on the command line as
-`--disallowedTools` (`steps/llm.js`'s `buildArgv`). Nothing in `.claude/settings.json` changed, and
-nothing could have: an agent cannot edit it (§ *Walls that `settings.json` can't tune*). The 14
+`--disallowedTools` (`orchestrator/steps/sdk-call.js`'s `buildQueryOptions`, which sets
+`options.disallowedTools` on every real `query()` call; the vendored Claude Agent SDK itself
+comma-joins that array into the flag when it spawns `claude` — `steps/llm.js`'s `buildArgv`, the
+old transport's argv builder, was deleted by card #239's cutover). Nothing in
+`.claude/settings.json` changed, and nothing could have: an agent cannot edit it (§ *Walls that
+`settings.json` can't tune*). The 14
 shared denies stay the single source and are **not** duplicated — `test/bash-deny-policy.test.js`
 fails on any duplicate, so the two layers cannot fork.
 
@@ -202,7 +216,7 @@ file") mean something at the tool layer instead of only in the prompt's prose.
 **It is not a sandbox.** `bash -c`, `python3 -c`, `node -e`, `xargs` and `env` carry their payload
 inside a string argument the matcher never parses, and shell redirection (`cat > f <<'EOF'`) is not
 a command at all. Those channels stay open on purpose — denying them would break real work — and
-they are named, with their measured counts, in `doc/accepted-gaps.md` § 12, together with the four
+they are named, with their measured counts, in `doc/accepted-gaps.md` § 18, together with the four
 other residual gaps this fix leaves open.
 
 ## The content applied in `SPO-Pipeline/.claude/settings.json`

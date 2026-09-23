@@ -31,8 +31,9 @@
 //
 // "The one rule": this file never reads report CONTENT -- it only reads daemon.jsonl's own
 // journaled events (issue numbers, file paths, outcomes it already judged) to decide what to
-// process next. All schema and reproduction knowledge stays inside the `claude -p` session
-// triageBugReport spawns, reasoning against the product tree itself.
+// process next. All schema and reproduction knowledge stays inside the real LLM call
+// triageBugReport makes (via `invokeClaudeReal`, the vendored Agent SDK's `query()` since card
+// #239's transport cutover, action A5b, 2026-09-17), reasoning against the product tree itself.
 
 const fs = require('fs');
 const os = require('os');
@@ -1034,7 +1035,7 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
     // branch was written to make survivable. Best-effort; if the write fails the loop simply
     // resumes next cycle with nothing better available -- the identical appendDaemonEvent
     // precedent guards park-loop.js:1569, the same appendDaemonEvent guard sits at
-    // remote-report-pull.js:193, and appendDaemonEvent again at state-machine.js:3602 (plus this
+    // remote-report-pull.js:193, and appendDaemonEvent again at state-machine.js:3620 (plus this
     // file's own moveReportTo).
     const reason =
       claim.reason === 'no-pending-path'

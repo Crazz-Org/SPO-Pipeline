@@ -94,7 +94,14 @@ test('finalizePark: a shadow-mode park lands one `parked` event in <journalRoot>
     id: 'alert-park-demo',
     title: 'parks on deadline',
     kind: 'synthetic',
-    shadow: { delays: { IMPLEMENT: 80 } },
+    // CHECK, not IMPLEMENT (action A2, card #239, 2026-09-17): IMPLEMENT now carries its own
+    // stepDeadlineMsByState entry (~1,920,000ms, config.js), which daemon.js's --deadline-ms below
+    // does not reach -- that flag only ever patched the GENERIC config.stepDeadlineMs, same gap
+    // WORKTREE/FINISH/GATE/CI_CHECKS's own pre-existing overrides already had. CHECK has no entry
+    // of its own, so it stays governed by the generic stepDeadlineMs --deadline-ms actually reaches
+    // -- see test/deadline-and-catchall.test.js's own "step deadline expiry" test for the full
+    // writeup of this same fix.
+    shadow: { forceState: 'CHECK', delays: { check: 80 } },
   });
 
   // SPO_PARK_ALERT_CMD deliberately set to a missing binary: shadow mode must spawn NOTHING
@@ -117,7 +124,7 @@ test('finalizePark: a shadow-mode park lands one `parked` event in <journalRoot>
   assert.equal(parked.length, 1);
   assert.equal(parked[0].id, 'alert-park-demo');
   assert.equal(parked[0].reason, 'step-deadline-exceeded-twice');
-  assert.equal(parked[0].lastState, 'IMPLEMENT');
+  assert.equal(parked[0].lastState, 'CHECK');
 
   // And the shadow park fired no alert.
   const taskEvents = readTaskJournal(path.join(journalDir, 'alert-park-demo'));

@@ -3,7 +3,7 @@
 Implements the lifecycle table in [../doc/state-machine-spec.md](../doc/state-machine-spec.md)
 (v1.1): INTAKE → WORKTREE → PLAN → IMPLEMENT → CHECK → PUSH_PR → GATE → CI_CHECKS → VALIDATE →
 MERGE → FINISH → DONE, with DIAGNOSE as the retry hub and PARKED as the catch-all terminal
-state. Node 22 built-ins only, zero dependencies.
+state. Node 22 built-ins only; the one third-party piece is the vendored Agent SDK (`vendor/`), committed, never installed.
 
 ## Running shadow mode
 
@@ -25,9 +25,12 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
   scripted steps" below. `--real` and `--shadow` are mutually exclusive (daemon.js refuses to
   start); if `--dry-run` is also given, `--dry-run` wins, same precedence as `--shadow` winning
   over `--dry-run`. No test that runs the real-mode functions in-process spawns a real
-  `git`/`npm`/`gh`/`claude` process — every real-mode test (`test/llm-real*.test.js`,
-  `test/account-rotation.test.js`, `test/real-steps.test.js`) injects `deps.spawnSync` and calls
-  the real-mode functions directly, never through `daemon.js`'s own child-process dispatch. That
+  `git`/`npm`/`gh`/`claude` process — every real-mode test calls the real-mode functions directly,
+  never through `daemon.js`'s own child-process dispatch, injecting the fake seam each layer
+  actually reads: `test/real-steps.test.js` (the scripted steps) injects `deps.spawnSync`, while
+  `test/llm-real*.test.js` and `test/account-rotation.test.js` (the LLM call, since card #239's
+  cutover, action A5b) inject `deps.spawn`/`deps.resolveClaudeCodeExecutable` instead (see "Real
+  mode" below) — `deps.spawnSync` was that seam only on the OLD, now-deleted transport. That
   guarantee used to stop at a process boundary; `orchestrator/no-real-spawn-guard.js` now carries
   it across one via the `SPO_NO_REAL_SPAWN` environment variable — see "The hermeticity guarantee
   crosses the process boundary by environment" below.
@@ -174,18 +177,28 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
 - `config.js`'s `stepDeadlineMs` (default 120000ms / 2min) — `deadline.js`'s `callWithDeadline`,
   the outer retry-once-then-park bookkeeping race wrapped around every step, scripted or LLM. It
   is a JS timer, not a process kill, so it cannot preempt a blocking `spawnSync`: it is a no-op
-  against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there)
-  and, in real mode, equally inert around an LLM step (bounded instead by
-  `LLM_STEP_DEADLINE_MS` below). The generic 120000ms default is live only in shadow mode, where
-  an LLM step has no blocking `spawnSync` underneath it and a fixture delay races this 120s timer
-  instead of whichever wall-clock figure below applies to that step (`doc/state-machine-spec.md`
-  § Step contracts) — but
+  against a scripted step's commands (`commandTimeoutsMs` above is what actually fires there),
+  and, in real mode, it was — until action A2 (card #239, 2026-09-17) — equally inert around an
+  LLM step too, bounded instead by `LLM_STEP_DEADLINE_MS` below via a blocking `spawnSync` this JS
+  timer could never preempt.
   `deadline.js`'s `deadlineMsFor` consults `config.stepDeadlineMsByState[state]` before falling
-  back to this default, and that override IS live in real mode: `config.js` gives `CI_CHECKS`,
-  `WORKTREE`, `FINISH`, `GATE` (card #211) and `MERGE` (card #224) their own, much larger entries,
-  each derived from that step's own worst-case bound — the in-flight poll budget, the product-repo
-  mutex's own worst-case wait, the gate's spawn timeout plus its recovery wait, and (MERGE) every
-  spawn timeout on every path `realMerge` can take, `spawnStep`'s retry-once included.
+  back to this generic default, and that override IS live in real mode: `config.js` gives
+  `CI_CHECKS`, `WORKTREE`, `FINISH`, `GATE` (card #211), `MERGE` (card #224), and — since action A2
+  — all five LLM steps (`PLAN`/`IMPLEMENT`/`DIAGNOSE`/`CITATION_VERIFIER`/`VALIDATE`) their own,
+  much larger entries. `CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE`/`MERGE`'s are each derived from that
+  step's own worst-case bound — the in-flight poll budget, the product-repo mutex's own worst-case
+  wait, the gate's spawn timeout plus its recovery wait, and (MERGE) every spawn timeout on every
+  path `realMerge` can take, `spawnStep`'s retry-once included; each LLM step's is
+  `deadlineMsForStep(step)` (its own inner `LLM_STEP_DEADLINE_MS` bound, below) plus one ordinary
+  `stepDeadlineMs` of margin — PLAN/IMPLEMENT 1920000ms, DIAGNOSE/CITATION_VERIFIER/VALIDATE
+  1020000ms — sized so that inner bound always fires first, ahead of card #239's own transport swap
+  (action A5b, 2026-09-17: an awaited async stream in place of the blocking `spawnSync` above), the
+  swap that armed this outer timer for the LLM steps for the first time — done now, not merely
+  anticipated. Before A2, the generic 120000ms default was live for an LLM step only in shadow
+  mode, where a fixture delay raced it directly instead of whichever wall-clock figure below
+  applies to that step (`doc/state-machine-spec.md` § Step contracts); it now races that step's own
+  larger figure instead, the same as every other overridden state, in shadow mode as well as real.
+  Every OTHER state (`INTAKE`, `CHECK`, `PUSH_PR`) still falls back to this generic default.
   `WORKTREE`/`FINISH`'s overrides were sized
   "large enough never to fire" against a purely-synchronous `spawnSync` body, but 6.4's
   product-repo mutex added the first `await` in that path (its poll loop's `await sleep(pollMs)`)
@@ -195,8 +208,8 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
   `withTimeout` abandons the loser rather than cancelling it, so the abandoned invocation kept
   running alongside its own retry). See `config.js`'s own comment on `stepDeadlineMsByState` for
   the full incident and the derivation.
-- `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the `spawnSync` timeout
-  `invokeClaudeReal` arms, in real mode, for an LLM step call with no override (DIAGNOSE,
+- `step-contracts.js`'s `LLM_STEP_DEADLINE_MS` (900000ms / 15min) — the abort timer
+  `invokeClaudeReal` arms on its `query()` call (a `spawnSync` `timeout` before card #239's A5b), in real mode, for an LLM step call with no override (DIAGNOSE,
   CITATION_VERIFIER, VALIDATE). PLAN and IMPLEMENT each carry a raised
   `LLM_STEP_DEADLINE_MS_BY_STEP` override instead (both 1800000ms / 30min) — never uniform across
   task size or model, only per step.
@@ -268,24 +281,47 @@ const result = await invokeClaudeReal({
 > measured reason it exists (PLAN spawning Opus subagents under a Fable call). Present only when
 > `tokensSource` is `'modelUsage'` -- absent, not an empty object, otherwise.
 
-It spawns `claude -p --model <model> --effort <effort> --output-format json --session-id <uuid>`
-(the id is generated by `invokeClaudeReal` itself immediately before the spawn — or, action 4.1,
-used verbatim when a caller already supplies one — so a killed or unparsable call can still be
-tied back to the `claude` session that actually ran) plus
-`--allowedTools`/`--disallowedTools`/`--permission-mode`/`--json-schema`/`--max-budget-usd` when
-given (no daemon or intake path supplies `maxBudgetUsd`; the only caller that does is the hand-run
-`scripts/smoke-llm.js`, see § Budgets. `--disallowedTools` is the opposite case — every production
-policy but CITATION_VERIFIER supplies it, from `orchestrator/bash-policy.js`; card #240, and
-`doc/permissions.md` § *The shell boundary the 92 rules never reached* for why) with
-the resolved prompt written to the child's stdin — never as an argv entry, since Linux caps each
-individual argv string at `MAX_ARG_STRLEN` (128KB) and a large filled prompt (a big plan/diff/
-criterion) would fail the spawn with `E2BIG` before `claude` ever started (reproduced on card
-#452's ~200KB IMPLEMENT prompt). It parses the JSON on stdout, extracts token counts (fresh
-input, cache-creation, cache-read, output -- `extractTokens`, defensive across both snake_case
-and camelCase `modelUsage` key spellings, since that field is produced by the `claude` CLI and
-never appears in the session JSONL to verify against) summed across every entry of `modelUsage`
--- no dollar figure is computed anywhere (maintainer decision, 2026-08-31: the pool is a Claude
-Max quota, never metered API billing) -- and classifies a
+**Since card #239's cutover (action A5b, 2026-09-17), this no longer spawns `claude -p` directly.**
+`invokeClaudeReal` drives the vendored Claude Agent SDK's `query({prompt, options})`
+(`orchestrator/sdk.js`'s `loadQuery()`), built from `opts` by
+`orchestrator/steps/sdk-call.js`'s `buildQueryOptions` — see that file's own header for the
+measured argv shape (checked against the real vendored SDK, not read off its source by
+inspection): `options.model`/`options.effort`/`options.permissionMode`/`options.allowedTools`/
+`options.maxBudgetUsd`/`options.outputFormat.schema` map onto `--model`/`--effort`/
+`--permission-mode`/`--allowedTools` (comma-joined)/`--max-budget-usd`/`--json-schema`, and
+`options.sessionId` maps onto `--session-id=<uuid>` as a first-class option, never via
+`extraArgs` — the id is generated by `invokeClaudeReal` itself immediately before the call (or,
+action 4.1, used verbatim when a caller already supplies one, restored after this chantier's own
+cutover briefly dropped it — see `token-recovery.js`'s header) so a killed or unparsable call can
+still be tied back to the `claude` session that actually ran. `--output-format` is always forced
+to `stream-json` by the SDK itself, never `json` — there is no `--output-format json` flag any
+more. `options.settingSources` is pinned unconditionally to `['user', 'project', 'local']` — a
+flag the OLD transport never emitted at all — because `.claude/settings.json`/`CLAUDE.md` are
+this pipeline's whole permission/context policy and must never depend on an unverified CLI
+default (see `sdk-call.js`'s own `SETTING_SOURCES` comment, and `doc/accepted-gaps.md` §13 for the
+one half of that equivalence question this action did not settle). No daemon or intake path
+supplies `maxBudgetUsd`; the only caller that does is the hand-run `scripts/smoke-llm.js` (see
+§ Budgets). `options.disallowedTools` (card #240, `orchestrator/bash-policy.js` — merged into this
+transport by this same chantier's merge with main, since action A5b's own `buildQueryOptions`
+predates card #240 and never carried this field until now) maps onto `--disallowedTools`
+the same comma-joined way `allowedTools` does — every production policy but CITATION_VERIFIER
+supplies it; see `doc/permissions.md` § *The shell boundary the 92 rules never reached* for why.
+The resolved prompt travels to the child over stdin, as a stream-json `user` message — never as
+an argv entry, since Linux caps each individual argv string at `MAX_ARG_STRLEN` (128KB) and a
+large filled prompt (a big plan/diff/criterion) would have failed the OLD transport's spawn with
+`E2BIG` before `claude` ever started (reproduced on card #452's ~200KB IMPLEMENT prompt) —
+unreachable on this transport by construction, see `sdk-call.js`'s own "E2BIG lesson" comment.
+`orchestrator/steps/sdk-call.js`'s `consumeQueryStream` reduces the async message stream down to
+today's return shape, reading the `result` message's `is_error`/`api_error_status`/
+`terminal_reason`/`result`/`modelUsage`/`num_turns` fields byte-identical to how the OLD
+`--output-format json` reply's own parsed object already read them (MEASURED, same file's own
+header) — so `classifyFailure`/`limitKindForFailure`/`extractTokens` are all unchanged, still
+called on the exact same field names. `extractTokens` sums fresh input, cache-creation,
+cache-read, and output tokens (defensive across both snake_case and camelCase `modelUsage` key
+spellings, since that field is produced by the `claude` CLI and never appears in the session
+JSONL to verify against) across every entry of `modelUsage` — no dollar figure is computed
+anywhere (maintainer decision, 2026-08-31: the pool is a Claude Max quota, never metered API
+billing) — and classifies a
 failure as `{kind: 'limit'}` or `{kind: 'error'}` via `classifyFailure` (action 3.5, 2026-08-31 —
 replacing a `/limit|overloaded|rate/i` scan over the free text of `result`/`terminal_reason` that
 misclassified any message merely containing "rate" — "invalid rate parameter", "could not
@@ -295,7 +331,7 @@ pool is exhausted cool *every* account, for that model, for hours). `'limit'` no
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:986-988`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:989-991`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -313,9 +349,15 @@ whole pool for that model. The failure result carries `terminalReason`/`apiError
 classification, `limitKind` — see below) and both are journalled with the step's `result`
 payload, so an unrecognised limit shape leaves exactly the evidence needed to extend the
 allowlist above as entries move from anticipated/guessed to actually observed — extend it from
-that journal evidence, never from further guesswork about what a message might say. `deps.spawnSync`
-is the test injection point — production code never passes it, so a real call always spawns the
-real `claude` binary on `PATH`.
+that journal evidence, never from further guesswork about what a message might say. `deps.spawn`
+(the child-process boundary `sdk-call.js`'s `makeSpawnClaudeCodeProcess` reads) and
+`deps.resolveClaudeCodeExecutable` are the test injection points now — production code never
+passes either, so a real call always resolves and spawns the real `claude` binary on `PATH`.
+`deps.spawnSync` is still the right injection point for the OTHER real spawns this file's own
+callers make (the scripted steps' `git`/`gh`/`npm` commands, "Real scripted steps" below) — it was
+the LLM call's own seam too on the OLD, now-deleted `spawnSync`-based transport, but this cutover
+moved that one call site onto `deps.spawn`/`deps.resolveClaudeCodeExecutable` and left every other
+`deps.spawnSync` call site in this file untouched.
 
 A `'limit'` result also carries `limitKind`, splitting *which* kind of limit it was so the
 cooldown can match: `'usage'` (429 / `rate_limit_error` / `usage_limit_reached` — this
@@ -327,12 +369,14 @@ would silently produce `kind:'limit'` with `limitKind: undefined` (the fail-safe
 indistinguishable in the journal from a genuine limit). See "Account registry" below for what
 each tier costs.
 
-**Deadline handling**: the wall-clock budget is enforced by `spawnSync`'s own `timeout` option
-(set from `deadlineMs`), not by `orchestrator/deadline.js`'s promise-race. That race can't
-preempt a blocking `spawnSync` call — the single JS thread is inside it — and would otherwise
-leave a killed step's `claude` process running unsupervised in the background. `deadline.js`
-still wraps the whole call at the state-machine level (`callLlmStep`, see below) for its
-existing "retry once, then PARK" bookkeeping; it just isn't what kills the child process.
+**Deadline handling** (rewritten in card #239's A9 -- it described the deleted `spawnSync`
+`timeout` option): the wall-clock budget is a `setTimeout` armed against `deadlineMs` that aborts
+the call's `AbortController`, followed by a bounded wait for the child's confirmed exit
+(`sdk-call.js`'s `confirmProcessExit`, `ABORT_CONFIRM_GRACE_MS`); `steps/llm.js`'s own header, §
+Deadline, has the measured mechanism. It is not `orchestrator/deadline.js`'s promise-race, which
+abandons the loser and would leave a killed step's `claude` running. `deadline.js` still wraps the
+whole call at the state-machine level (`callLlmStep`, see below) for its existing "retry once,
+then PARK" bookkeeping; it just isn't what kills the child process.
 
 **Account rotation**: `orchestrator/state-machine.js` exports `callLlmStep(ctx, stepName,
 fixtureKey)`, used by every state that calls an LLM step (PLAN, IMPLEMENT, DIAGNOSE,
@@ -342,7 +386,7 @@ VALIDATE's citation-verifier and change-validator). In shadow mode it is identic
 (`orchestrator/accounts.js`), and if that call comes back `{kind: 'limit'}`, cools **that
 `(account, model)` pair** down (journaled as `account-cooldown`) and tries the next one — one
 pass over the enabled accounts in the registry, never a second lap. Card #167: an account
-cooling on Fable is still leased for an IMPLEMENT/Sonnet step, because the quota is per model. If `accounts.pick()` finds nothing healthy to begin with, or the
+cooling on Fable is still leased for an IMPLEMENT step (Opus 5.5 since 2026-09-23), because the quota is per model. If `accounts.pick()` finds nothing healthy to begin with, or the
 whole pass is exhausted, the task is PARKED (`all-accounts-cooling-until-<iso>` /
 `all-accounts-cooling-after-retry`).
 
@@ -352,7 +396,9 @@ the 2026-08-30/31 incident where a bare `accounts.pick()` re-picked the same rat
 for 53 consecutive auto-triage cycles). Same pick/call/cool/rotate mechanics, bounded to one pass
 over the pool — but intake never throws: exhausting the pool becomes `{ok: false, error}`, never
 a `ParkSignal`, since every intake function's contract is "report a mechanical failure, never
-crash." And since intake has no `ctx.taskDir` to journal into, a cooldown is returned on the
+crash." Per card #167 each step leases and cools its own model -- step-contracts.js's
+`INTAKE_MODELS` entry, the same constant its call options carry to the `query()` argv. And since
+intake has no `ctx.taskDir` to journal into, a cooldown is returned on the
 result's `cooldowns` array instead, for the CALLER to journal — `auto-triage.js` appends one
 `report-triage-cooldown` event per cooled account (see its own header comment). The existing
 one-retry-on-timeout discipline (same account, same deadline — a hang says nothing about account
@@ -424,7 +470,7 @@ the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` VALIDATE
 old trigger judged a diff with no RDO in it at all.
 The sample above no longer carries `escalate`: the field is **dead — nothing reads
 it on any step**. Measured, a task carrying `escalate: true` (or `escalateFlag: true`) still
-resolves IMPLEMENT to sonnet. The "Opus 5 fallback" it used to name was only ever reachable
+resolves IMPLEMENT to its base (Sonnet then; Opus 5.5 at the size-mapped effort since 2026-09-23). The "Opus 5 fallback" it used to name was only ever reachable
 through this flag and was removed 2026-09-04. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and only when the
 diff-derived `rdoDiffTouched` says the real diff touched the catalogue. `citations` in the JSON above is shown as a hand-set task
 field for illustration, and a maintainer-supplied value there does still win, but in practice
@@ -468,7 +514,7 @@ Each prompt's `{{placeholder}}` values come from one of two places
   see `doc/state-machine-spec.md`'s DIAGNOSE row.
 
 **Action 3.1 — PLAN reuse on retry.** `handlePlan` is the one LLM step that can skip its own
-`claude -p` call entirely. On a maintainer's `retry` after a park, INTAKE restarts the task from
+LLM call entirely. On a maintainer's `retry` after a park, INTAKE restarts the task from
 scratch and WORKTREE creates a fresh worktree off the current `origin/main` — but the plan and
 invariants files a *previous* run's PLAN wrote under `journal/<id>/scratch/` are still sitting on
 disk, keyed by task id, never cleaned between runs. `decidePlanReuse` (`state-machine.js`) decides
@@ -626,8 +672,9 @@ that is the account-rotation retry path, unrelated.
 classify a deadline kill as `(error.code === 'ETIMEDOUT') || (signal && deadlineArmed)` — the same
 defect PR #127 fixed in `command-timeout.js`, of which this was the second copy — so ANY externally
 signalled `claude` (a deploy restart, an operator's `kill`, an OOM kill) was reported as a hang.
-Both halves are now `command-timeout.js`'s shared `isSpawnTimeout`/`isSpawnKilled`, and an external
-kill returns `{kind: 'error', killedBySignal: true, signal}` with no `timedOut`. The four guards
+That fix routed both halves through `command-timeout.js`'s shared `isSpawnTimeout`/`isSpawnKilled`
+(past tense: since card #239's A5b `invokeClaudeReal` references neither; `killedBySignal` now comes
+from the captured child's `exitInfo`), and an external kill returns `{kind: 'error', killedBySignal: true, signal}` with no `timedOut`. The four guards
 above are unaffected — `kind: 'error'` already dominates their disjunction, so an external kill
 parked `llm-transport-failed:<STEP>` before the fix and still does. What changes is
 `intake.js`'s `callIntakeStepWithRotation`, the one place in this codebase that *spends* on the
@@ -659,9 +706,13 @@ in ~150ms). Point it at a throwaway root instead:
 `SPO_STATE_DIR="$(mktemp -d)" node orchestrator/daemon.js --dry-run --once`. `--shadow` carries
 the identical exposure and is refused the same way — see "Running shadow mode" above.
 
-- an **LLM step** builds the real prompt and the real argv (via the same `buildArgv` real mode
-  uses), writes both to `journal/<id>/dryrun-<STATE>.md` (the argv — just the flag line, since
-  the prompt itself travels on stdin, not argv — then the filled prompt in full underneath),
+- an **LLM step** builds the real prompt and the real `query()` options (via the same
+  `buildQueryOptions` real mode uses, `orchestrator/steps/sdk-call.js` — since card #239's cutover
+  there is no argv builder any more; the old `buildArgv` this bullet used to name is deleted, not
+  merely superseded), writes both to `journal/<id>/dryrun-<STATE>.md` (the options, JSON-formatted
+  — minus `env`, a credential, and the `abortController`/`spawnClaudeCodeProcess` call machinery,
+  see `writeDryRunArtifact`'s own comment for why each is dropped — then the filled prompt in full
+  underneath, since the prompt itself travels over stdin, never through the options object),
   journals a `dry-run` event (never `llm-call`), and returns a minimal
   `outputContract`-satisfying payload marked `{dryRun: true}` — enough to walk the state machine
   forward, never a stand-in for a real judgement. PLAN's canned `plan_path`/`invariants_path`
@@ -702,7 +753,8 @@ dir). Full guided procedure: `doc/setup.md` § Accounts.
                              since card #167: {accountName: {byModel: {<model>: {cooldownUntil:
                              epochMs, lastUsageLimitAt?: epochMs, usageLimitStreak?: int}}}},
                              <model> being one of step-contracts.js's own baseModel/
-                             escalatedModel values (fable/opus/sonnet today).
+                             escalatedModel values or its INTAKE_MODELS (intake.js's three
+                             steps) -- claude-opus-5-5/fable/sonnet today.
                              Disposable — deleting it clears every cooldown (and escalation
                              streak with it).
 ```
@@ -823,7 +875,7 @@ never fired), and released the instant that call finishes. Lease files live at
 `acquireShortLock`/`releaseShortLock` — the same pid-liveness stale-sweep idiom `daemon.lock`
 uses, and, since the measured 39%-torn-read defect (`lock.js:354-385`: 119 of 800 cooldown
 entries lost), the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too
-(`account-lease.js:156` → `lock.js:352` `acquireShortLock` → `:386` `tryCreate`) — a bare `'wx'`
+(`account-lease.js:189` → `lock.js:352` `acquireShortLock` → `:386` `tryCreate`) — a bare `'wx'`
 create is exactly the defect that idiom replaced, not a shortcut this path still takes.
 
 A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
@@ -833,15 +885,25 @@ BLOCKING wait, since a 1h or 5h cooldown would pin the process for hours doing n
 since card #119 action 1.2, worth a DEFERRED one instead: the worker exits and the task is
 re-enqueued with `notBefore` set to the cooldown's own deadline, see
 doc/state-machine-spec.md's Account pool section).
-The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **63 minutes**: 2 ×
-`MAX_LLM_STEP_DEADLINE_MS` plus 10% slack — the running maximum across every per-step override,
-never `LLM_STEP_DEADLINE_MS`'s own 900000ms default, which is what this figure was before PLAN's
-override raised it (IMPLEMENT's later entry ties that maximum rather than exceeding it, so the
-bound did not move again)) — the age at which a lease is presumed dead and swept
-regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That distinction
-was a real C6-verification bug: the original default (5 min, reasoned from the typical duration)
-gave up while a legitimately-held lease could still be alive and un-sweepable for up to another
-26.5 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
+The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **67.2 minutes**: 2 ×
+`MAX_LLM_STEP_OUTER_DEADLINE_MS` plus 10% slack — the running maximum OUTER bound across every
+per-step override, never `MAX_LLM_STEP_DEADLINE_MS` (the inner one alone) or
+`LLM_STEP_DEADLINE_MS`'s own 900000ms default. Raised from 63 minutes by action A2 (card #239,
+2026-09-17): before A2, `MAX_LEASE_AGE_MS` only had to outlast the INNER deadline, because the
+OUTER per-state timer (`deadline.js`'s `callWithDeadline`) had no `stepDeadlineMsByState` entry for
+any LLM step and so could never fire against a real call (a blocking `spawnSync` never yields the
+event loop). A2 gives every LLM step its own outer entry (`config.js`,
+`deadlineMsForStep(step) + STEP_DEADLINE_MS` -- config.js's own constant, not step-contracts.js's
+same-valued but separate `STEP_DEADLINE_MARGIN_MS` used below), so that once card #239's own transport swap
+(action A5b, landed the same day) replaced that blocking spawn with an awaited stream, the worst
+legitimate per-attempt hold would become -- and now, with that swap done, genuinely has become --
+the OUTER bound (`MAX_LLM_STEP_OUTER_DEADLINE_MS` = `MAX_LLM_STEP_DEADLINE_MS` +
+`STEP_DEADLINE_MARGIN_MS` = 1,920,000ms), not the inner one alone — see `step-contracts.js`'s own
+`MAX_LEASE_AGE_MS` comment for the full arithmetic) — the age at which a lease is presumed dead and
+swept regardless of pid liveness, not the ~90–265s a sibling's step typically takes. That
+distinction was a real C6-verification bug: the original default (5 min, reasoned from the typical
+duration) gave up while a legitimately-held lease could still be alive and un-sweepable for up to
+another 62.2 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
 always terminates one of two honest ways — it gets a lease, or the holder ages out and it takes
 that one — instead of parking early. `countHealthyAccounts` (the `K ≤ healthy accounts` clamp
 above) is deliberately blind to lease state, only to cooldowns: a lease frees every 90–265s, and
@@ -887,14 +949,16 @@ product-repo command: `realWorktree`, `realCheck`, `realPushPr`, `realGate`, `re
 already dispatch `steps/llm.js`'s `runLlm` — only once neither `--shadow` nor `--dry-run`
 applies (`isRealMode(ctx)`, i.e. `daemon.js --real`) — and `runScripted`'s shadow/dry-run
 branches are otherwise unchanged from the shadow-mode skeleton. Every real function takes
-`(ctx, deps = {})`; `deps.spawnSync` is the same test-injection point `steps/llm.js`'s
-`invokeClaudeReal` already uses (production never passes it, so a real call always spawns the
-real binary on `PATH`). Each function is judged on exit codes only (principle 1,
+`(ctx, deps = {})`; `deps.spawnSync` is the test-injection point (production never passes it, so a
+real call always spawns the real binary on `PATH`) — the SAME seam `steps/llm.js`'s
+`invokeClaudeReal` used before card #239's cutover (action A5b, 2026-09-17), but not since:
+`invokeClaudeReal` now injects `deps.spawn`/`deps.resolveClaudeCodeExecutable` instead (see "Real
+mode" above), production still never passing either. Each function is judged on exit codes only (principle 1,
 doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure, or returns the
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1003`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1072`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -948,7 +1012,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:380` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:382` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1358,7 +1422,7 @@ The trap this closes: `spawnSync` on a `timeout` kill sets BOTH `signal` (e.g. `
 the pre-existing code mapped both to exit 1 indistinguishably, so a timeout-killed GATE (exit 1
 → DIAGNOSE) used to pay a real LLM call diagnosing a hang the daemon itself caused. `spawnStep`
 now branches on `signal`/`error` **before** the exit-code mapping (mirroring `steps/llm.js`'s
-own `killedByDeadline` idiom for `claude -p` calls, not a third convention), and never returns a
+own `timedOut` result field for LLM calls, not a third convention), and never returns a
 `timedOut` result to a caller at all — a caller's exit-code routing (`realGate`'s 0/1/2/3/4,
 `realCheck`, `realCiChecks`, `realWorktree`'s claim codes, `realMerge`, `realPushPr`) is
 therefore completely unchanged; it simply never runs on a timeout.
@@ -2004,7 +2068,8 @@ Rendering the RAW card -- the one step that necessarily needs that content -- li
 schema it reads: `SPO-WebClient/scripts/report-card.js`, spawned via `npm run report:card` and
 relayed as opaque stdout, the exact same relationship `pullBoard` already has with
 `npm run board:claim`. `intake.triageBugReport`'s own reproduction reasoning still runs entirely
-inside a `claude -p` session with `cwd = config.productRepo`, same as before.
+inside a real LLM call (via `invokeClaudeReal`, the vendored Agent SDK's `query()` since card
+#239's transport cutover, action A5b, 2026-09-17) with `cwd = config.productRepo`, same as before.
 
 **Config** (`orchestrator/config.js`):
 
@@ -2306,7 +2371,7 @@ the full correction text still reaches the maintainer, since `review-card`'s own
 `first_comment_markdown` is posted verbatim as the filed issue's first comment (`gh label list` +
 `gh issue create` + `gh issue comment`, `orchestrator/intake.js`).
 
-**Cost**: `spo ask` makes about two real `claude -p` calls per request -- one DRAFT_CARD (skipped
+**Cost**: `spo ask` makes about two real LLM calls per request -- one DRAFT_CARD (skipped
 entirely in the brainstorm lane) and one review-card -- both with `maxBudgetUsd: undefined`
 (no cap; `step-contracts.js` -- no `SMALL_BUDGET_USD` constant exists in this build), an order
 of magnitude cheaper in practice than a single PLAN/IMPLEMENT call by task shape alone.
@@ -2447,7 +2512,7 @@ child instead and returns immediately, with `finalizePark` itself running inside
 scan. The scanner-based mechanism below exists for what the dispatcher itself cannot cover: a
 worker killed during the dispatcher's OWN shutdown (deliberately never reparked in that window —
 spawning a repark child mid-shutdown would only move the same risk into it, since a park half-
-written by a process about to be SIGKILLed can never be recovered later — `dispatcher.js:635-648`)
+written by a process about to be SIGKILLed can never be recovered later — `dispatcher.js:643-656`)
 and any owning daemon process that simply never comes back to run `handleExit` at all (a hard kill
 of the whole process tree).
 A deploy produces that shutdown case only for a card that outlives the drain: the pull's
@@ -2563,17 +2628,26 @@ rather than per-task. A scenario that only changes what IMPLEMENT is asked to do
 not hold for a `dispatcher`-driver scenario: chantier 7 action 7.2 landed `parallel-doc-log`
 (`k: 2`) at `c0e4bbb`, which needed its own driver branch (`runDispatcherScenario`) and an
 out-of-process cap (`runDispatcherCapWatchdog`, summing `llm-call` events across every task the
-run owns), since the inline cap wraps `deps.spawnSync` in-process and a dispatcher runs its
-workers as separate OS processes the in-process wrapper never sees.
+run owns), since the inline cap's hooks (`deps.spawnSync`, `deps.onLlmCallAttempt`) are in-process
+and a dispatcher runs its workers as separate OS processes neither one ever sees.
 
 **The cap — `driver: 'inline'`.** The remediation plan's "capped budget" predates this project
 retiring dollars as a metric (`spo tokens`, 2026-08-31) — recalibrated here as two independent,
-honestly-enforceable bounds, both checked at the one choke point every real spawn *the inline
-driver makes* (scripted **and** `claude -p`, per `steps/llm.js`'s `invokeClaudeReal`) already
-passes through: `deps.spawnSync`. This does not extend to `driver: 'dispatcher'` — its workers are
-separate OS processes, invisible to an in-process `deps.spawnSync` wrapper, which is exactly why
-that driver carries its own out-of-process watchdog (`runDispatcherCapWatchdog`, above) instead of
-reusing this mechanism.
+honestly-enforceable bounds, each checked at its own choke point. The wall clock is checked at the
+one choke point every real SCRIPTED spawn *the inline driver makes* already passes through:
+`deps.spawnSync`. LLM calls used to pass through this same hook too (`claude -p`, before card
+#239's transport cutover, action A5b, 2026-09-17); since that action moved the real LLM spawn off
+`deps.spawnSync` entirely, the wall clock is checked for an LLM call at `onLlmCallAttempt`'s own
+`checkWallClock()` call instead (`makeCap`, same file) -- the SAME function `wrapSpawnSync`'s own
+closure calls, so both halves still share one clock and one `tripped` state, just through two
+different call sites now instead of one shared spawn hook.
+The LLM-step count (action A5a, card #239) is checked at
+`steps/llm.js`'s `invokeClaudeReal` itself, via `deps.onLlmCallAttempt` called immediately before
+every real call it makes — moved off `deps.spawnSync` on purpose, so it survives action A5b's
+Agent SDK transport swap, which removes the `claude` spawn a spawn-keyed count depended on. This
+does not extend to `driver: 'dispatcher'` — its workers are separate OS processes, invisible to
+either in-process hook, which is exactly why that driver carries its own out-of-process watchdog
+(`runDispatcherCapWatchdog`, above) instead of reusing this mechanism.
 
 - **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
   spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
@@ -2582,9 +2656,11 @@ reusing this mechanism.
   flight when the cap is crossed (today, `npm-gate`'s 7800s) — this is "abort at the next
   opportunity", not "abort within `capMs` of the wall clock". It always terminates and always
   cleans up; it never hangs.
-- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Every real LLM
-  call in this codebase spawns literally `claude`, so this is an exact count, not a heuristic —
-  checked, and enforced, **before** the over-cap call spawns at all. 12 comfortably covers a
+- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Counted at
+  `invokeClaudeReal`'s own `deps.onLlmCallAttempt` hook — every real LLM call in this codebase
+  goes through that one function, so this is an exact count, not a heuristic, and unlike the old
+  `command === 'claude'` count it no longer depends on that call spawning a `claude` process at
+  all — checked, and enforced, **before** the over-cap call is ever made. 12 comfortably covers a
   trivial card's own budgets (`diagnoseBudget` 3, `validateRejectBudget` 3) stacked on the 3-call
   happy path (PLAN, IMPLEMENT, VALIDATE).
 
@@ -2751,7 +2827,7 @@ Set the phone channel with a drop-in rather than editing the unit:
 Dollars are retired as the headline metric entirely (maintainer decision, 2026-08-31): the
 pool is Claude Max *subscription* accounts with a *quota*, never the metered API, so a dollar
 figure never meant money spent. `orchestrator/tokens.js` reads token efficiency back out of the
-journals instead — every real `claude -p` call already records its own token counts in an
+journals instead — every real LLM call already records its own token counts in an
 `llm-call` event (`steps/llm.js`'s `extractTokens`: `tokensSource`, `freshInputTokens`,
 `cacheCreationTokens`, `cacheReadTokens`, `outputTokens`, `billableTokens`, and — since card
 #214 — `modelUsage`, the same four fields plus each model's own `billableTokens`, broken out
@@ -2808,7 +2884,7 @@ footer naming how many of the run's calls lacked the fields. Two things land the
 written **before** token capture shipped (2026-08-31), whose events recorded only the retired
 `costUsd`, and a call for which NEITHER `modelUsage` nor a recovered transcript had anything —
 durably true for E2BIG and the other spawn-never-started failures (`tokensSource: null`), and true
-for a deadline kill/signal kill/non-JSON stdout only when its own transcript recovery also came up
+for a deadline kill/signal kill/non-JSON reply only when its own transcript recovery also came up
 empty. `billableTokensPerDoneCard` is `null` (rendered `n/a`) whenever
 *no* call reported tokens, because a per-card figure computed off journals with no token data is
 a false measurement rather than a small one. **Every historical journal in this repo is in that
@@ -3137,13 +3213,17 @@ measured rather than styled:
   exit transition moved to an earlier position on the track, or to DIAGNOSE. 22 of 39 journals in
   the corpus loop at least once; only 17 walk the track cleanly.
 - **What an LLM step is doing right now** comes from `console/live-step.js`. PLAN, IMPLEMENT,
-  DIAGNOSE and VALIDATE run through `spawnSync` with piped stdio, so nothing is journalled and no
-  log grows until the call returns -- twelve minutes at IMPLEMENT's p90. The `claude` CLI's own
-  session transcript does move, and is reachable by an exact chain of identities: `state.json`'s
-  `owner.workerPid` names the worker, the lease file naming that pid names the account,
-  `config.cwdForStep` names the directory, and the session file created after the split's
-  `enteredAt` is this step's. Any break in that chain returns a named miss and the deck falls
-  back to the clock alone -- it never guesses which transcript belongs to which card.
+  DIAGNOSE and VALIDATE run through `invokeClaudeReal` (an awaited async `query()` call since card
+  #239's transport cutover, action A5b, 2026-09-17 -- no longer a blocking `spawnSync`), and
+  `runLlm` only journals once the whole call returns, so no log grows until then -- twelve minutes
+  at IMPLEMENT's p90. Since action A6 (2026-09-17, same day), the worker itself closes that gap:
+  it already reads the SDK's message stream one message at a time to build its own return value,
+  and folds that same stream into a small, throttled record at
+  `<journalRoot>/<id>/live-progress.json` (`orchestrator/live-progress.js`). The dashboard just
+  reads that file — no identity chain to walk, no transcript to find, because the process running
+  the call is the one writing what it saw. A record that goes stale (`LIVE_PROGRESS_STALE_MS`,
+  live-progress.js) or names a step other than the one the card is currently in returns a named
+  miss, and the deck falls back to the clock alone — same fallback as before A6, different cause.
 
 The deck shows LIVE cards only: no history list, no Todo. A finished run lingers for ten minutes
 (`DECK_LINGER_MS`) so a run that ends while you are looking at it does not vanish mid-glance --
@@ -3289,10 +3369,13 @@ real nested `node --test` child, with an unregistered directory alongside as the
 `test/llm-real.test.js`, `test/llm-real-card.test.js` and `test/account-rotation.test.js`
 exercise **real-mode** LLM code (`invokeClaudeReal`, `callLlmStep`) and `test/real-steps.test.js`
 exercises the real-mode **scripted** functions ("Real scripted steps" above, now including each
-one's own `board.js` `moveCard` call) — all of them only ever through an injected fake
-`spawnSync` (`deps.spawnSync`), calling
+one's own `board.js` `moveCard` call) — all of them only ever through an injected fake seam, never
+a real spawn: `test/real-steps.test.js` fakes `spawnSync` (`deps.spawnSync`), calling
 `realWorktree`/`realCheck`/`realPushPr`/`realGate`/`realCiChecks`/`realMerge`/`realFinish`
-directly rather than through `daemon.js`'s own dispatch (which has no injection point). Kanban
+directly rather than through `daemon.js`'s own dispatch (which has no injection point); the three
+LLM-real files fake `deps.spawn`/`deps.resolveClaudeCodeExecutable` instead (card #239's cutover,
+action A5b, 2026-09-17 — see "Real mode" above), calling `invokeClaudeReal`/`callLlmStep` the same
+direct way. Kanban
 piloting's own tests follow the same convention one layer up: `test/board-move.test.js` covers
 `board.js`'s `moveCard` directly plus `HANDLERS.IMPLEMENT`/`HANDLERS.VALIDATE`'s real-mode move
 (via `buildCtx`'s `config.deps`, since neither state has a `realX(ctx, deps)` split of its own);

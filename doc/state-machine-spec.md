@@ -76,7 +76,7 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    side effects, so both shapes only detect the orphan and journal
    `orphan-scan-would-repark` — neither ever parks. `handleExit` also
    deliberately declines to call `reparkCrashedWorker` for a worker that crashes **during the
-   dispatcher's own shutdown** (`dispatcher.js:635-648`, `childrenSignalled && outcome === 'crashed'`
+   dispatcher's own shutdown** (`dispatcher.js:643-656`, `childrenSignalled && outcome === 'crashed'`
    — keyed on "did we actually signal this child", not on `stopReason`, since a DRAIN sets
    `stopReason` and then waits minutes having signalled nobody):
    reparking here would spawn a fresh `daemon.js --repark-task` child in the middle of a shutdown
@@ -126,7 +126,9 @@ park-reason and documented-constant facts a sweep checks — see `accepted-gaps.
    `state` value with no entry in `HANDLERS` parks `unrecognized-state` (`{state}`) — defensive
    only, since every `state.json`/task-journal write in this codebase is produced by the state
    names this same file defines.
-3. **LLM steps are stateless calls.** Each judgement step is one `claude -p` invocation with
+3. **LLM steps are stateless calls.** Each judgement step is one `claude` invocation (since card
+   #239's transport cutover, action A5b, 2026-09-17: the vendored Claude Agent SDK's `query()`,
+   never `claude -p` spawned directly -- see `orchestrator/steps/llm.js`'s own header) with
    a pinned model, effort, tool set, JSON output schema and budget. Continuity between steps
    travels through files (plan, ledger, diff), never through a long-lived conversation.
 4. **The jewels are not re-implemented.** The bench, the validators' criteria and the
@@ -438,20 +440,36 @@ low.
 
 | Step | Model | Effort | Tools | Output | Wall-clock deadline |
 |---|---|---|---|---|---|
-| PLAN | Opus 5, **Fable 5 fallback** on `task.planInvalidRetry` (since 2026-09-13; experiment `EXP-PLAN-OPUS`, `doc/model-experiments.md`). `handlePlan` sets it for one in-run retry after a real-mode Opus reply that would park `plan-invalid`, or from the start when the card's most recent park was `plan-invalid`; each switch journals `plan-model-fallback`. Transport failures never fall back. Was Fable 5 with no escalation until 2026-09-13 | per task size S/M/L → medium/high/high (`PLAN_EFFORT_BY_SIZE`; low/medium/high until 2026-09-13) | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
-| IMPLEMENT | Sonnet 5 — **Opus 5** on any of four triggers (`step-contracts.js`'s `shouldEscalate`, card #213 action 2 + its 2026-09-12 amendment): (1) `task.rdoDiffTouched === true`, the real diff once PUSH_PR has run; (2) `task.planDeclaresRdoMembers`, the PLAN's own `files_to_change` declaration naming `rdo-members.ts` (resolved by `state-machine.js`'s `resolvePlanDeclaresRdoMembers` before the call — an EMPTY declared list still counts and resolves `false`, with no fallback to (3)); (3) `task.touchesRdoMembers === true`[^rdo-wire], the intake guess, read only when (2) is undefined (PLAN never declared a list at all); or (4) `task.diagnoseOrValidateRetry === true` — a retry after a DIAGNOSE or a VALIDATE reject, independent of the RDO signals, escalating on observed difficulty; or an L-sized task | per size | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
-| DIAGNOSE | Opus 5 (was Fable 5 until 2026-09-04) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
+| PLAN | Opus 5.5 (`claude-opus-5-5`, since 2026-09-23; Opus 5 before), **Fable 5 fallback** on `task.planInvalidRetry` (since 2026-09-13; experiment `EXP-PLAN-OPUS`, `doc/model-experiments.md`). `handlePlan` sets it for one in-run retry after a real-mode Opus reply that would park `plan-invalid`, or from the start when the card's most recent park was `plan-invalid`; each switch journals `plan-model-fallback`. Transport failures never fall back. Was Fable 5 with no escalation until 2026-09-13 | per task size S/M/L → medium/high/high (`PLAN_EFFORT_BY_SIZE`; low/medium/high until 2026-09-13) | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
+| IMPLEMENT | **Opus 5.5** on every path since 2026-09-23 (`EXP-IMPLEMENT-OPUS-5-5`; Sonnet 5 escalating to Opus 5 before) — effort escalates to **medium** on any of four triggers (`step-contracts.js`'s `escalationSignalFires` via `shouldEscalateEffort`, card #213 action 2 + its 2026-09-12 amendment): (1) `task.rdoDiffTouched === true`, the real diff once PUSH_PR has run; (2) `task.planDeclaresRdoMembers`, the PLAN's own `files_to_change` declaration naming `rdo-members.ts` (resolved by `state-machine.js`'s `resolvePlanDeclaresRdoMembers` before the call — an EMPTY declared list still counts and resolves `false`, with no fallback to (3)); (3) `task.touchesRdoMembers === true`[^rdo-wire], the intake guess, read only when (2) is undefined (PLAN never declared a list at all); or (4) `task.diagnoseOrValidateRetry === true` — a retry after a DIAGNOSE or a VALIDATE reject, independent of the RDO signals, escalating on observed difficulty; or an L-sized task | per size: S/M/L → low/medium/medium (`IMPLEMENT_EFFORT_BY_SIZE`); medium when a trigger fires | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
+| DIAGNOSE | Opus 5.5 since 2026-09-23 (Opus 5 from 2026-09-04; Fable 5 before) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
 | VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
-| VALIDATE: change-validator | Fable 5 (never Sonnet — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when `task.rdoDiffTouched` is true (`step-contracts.js`'s `escalatesEffortOn`) — **action 1 of card #213 (2026-09-12)** moved this off `task.touchesRdoMembers` (an intake guess): on the 36-card window measured that day, the guess fired on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` calls under the old trigger judged a diff with no RDO in it. `rdoDiffTouched` is written onto `ctx.task` by `handleValidate` (`state-machine.js`, from `resolveRdoDiffTouched`) before this call, so a `--worker` resume that rebuilt `ctx.task` from `task.json` still escalates correctly, the same restart-durability `resolveRdoDiffTouched` already gave CITATION_VERIFIER's own trigger (#105) | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never the executor's model — Opus 5.5 since 2026-09-23, Sonnet before — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when `task.rdoDiffTouched` is true (`step-contracts.js`'s `escalatesEffortOn`) — **action 1 of card #213 (2026-09-12)** moved this off `task.touchesRdoMembers` (an intake guess): on the 36-card window measured that day, the guess fired on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` calls under the old trigger judged a diff with no RDO in it. `rdoDiffTouched` is written onto `ctx.task` by `handleValidate` (`state-machine.js`, from `resolveRdoDiffTouched`) before this call, so a `--worker` resume that rebuilt `ctx.task` from `task.json` still escalates correctly, the same restart-durability `resolveRdoDiffTouched` already gave CITATION_VERIFIER's own trigger (#105) | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
 
 The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LLM_STEP_DEADLINE_MS_BY_STEP`
 overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
 CITATION_VERIFIER, VALIDATE) take `LLM_STEP_DEADLINE_MS`'s own 900000ms default. Whichever figure
-applies is the `spawnSync` timeout `invokeClaudeReal` arms for that call (`orchestrator/steps/llm.js`)
-— but it governs real mode only. `state-machine.js` still wraps every LLM step in the outer
-`callWithDeadline` (`deadline.js`) using the generic `stepDeadlineMs` (120000ms; no `stepDeadlineMsByState`
-entry exists for any LLM state), which is inert in real mode (a JS timer cannot preempt the blocking
-`spawnSync` that the step's own deadline already bounds) but live in shadow mode, where a fixture delay races that 120s timer instead of whichever wall-clock figure the row above states. There is no per-step or per-size USD budget: `maxBudgetUsd` is plumbed
+applies is the deadline `invokeClaudeReal` arms for that call (`orchestrator/steps/llm.js`)
+— the INNER deadline, real mode only. Since card #239's transport cutover (action A5b, 2026-09-17)
+this is a real `setTimeout` that calls `options.abortController.abort()` on the vendored Claude
+Agent SDK's `query()` stream, never a `spawnSync` `timeout` option — that mechanism, and the
+blocking spawn it bounded, are both deleted, not merely superseded (see `steps/llm.js`'s own
+"Deadline handling" header for the full design and the measured abort/kill-escalation timing).
+`state-machine.js` also wraps every LLM step in the outer
+`callWithDeadline` (`deadline.js`); before action A2 (card #239, 2026-09-17) that outer wrap used the
+generic `stepDeadlineMs` (120000ms; no `stepDeadlineMsByState` entry existed for any LLM state), inert
+in real mode (a JS timer cannot preempt the blocking `spawnSync` the inner deadline USED TO bound)
+but live in shadow mode, where a fixture delay raced that flat 120s timer regardless of which inner
+figure the row above states. A2 gave each of the five its own `stepDeadlineMsByState` entry
+(`orchestrator/config.js`, generated from `STEP_CONTRACTS`'s own keys) — `deadlineMsForStep(step) +`
+one ordinary `stepDeadlineMs` of margin, so PLAN/IMPLEMENT now carry 1920000ms and the other three
+1020000ms — sized so the inner deadline always fires first, in anticipation of card #239's own
+transport swap (`steps/llm.js`'s `invokeClaudeReal` moving off blocking `spawnSync` onto an awaited
+stream, action A5b, landed the same day) — the change that made this outer timer genuinely LIVE in
+real mode, racing the inner deadline for real on every LLM call now, not merely inert insurance.
+Shadow mode still races each step's own outer figure instead of the flat 120s every LLM step used
+to share, unaffected by the transport swap (shadow mode never spawns anything). There is no
+per-step or per-size USD budget: `maxBudgetUsd` is plumbed
 end to end (`step-contracts.js` → `steps/llm.js`'s conditional `--max-budget-usd`) but no
 daemon or intake path sets it — see `orchestrator/README.md` § Budgets for the maintainer
 decision and the bounds that actually are enforced.
@@ -509,7 +527,8 @@ before this card.
     `ci-cause-table.js`'s `classifyCiFailure` — runs with the corrected flag (or, by then, with
     `rdoDiffTouched` itself already resolved and taking priority over it), and was measured
     spawning `--model opus` on exactly that path before #213. The promotion is one-way for this
-    reason: lowering it at PUSH_PR would silently demote those retries to sonnet — the exact hole a
+    reason: lowering it at PUSH_PR would silently demote those retries to sonnet (since 2026-09-23:
+    to `low` effort on an S card — IMPLEMENT is Opus 5.5 on every path) — the exact hole a
     naive "plan declaration always wins" order would have reopened from the other side, which is
     why `rdoDiffTouched` outranks the plan declaration rather than the reverse. The diff-derived
     truth for VALIDATE's citation-verifier lives in the separate `rdoDiffTouched` field, shared with
@@ -528,15 +547,26 @@ templates park distinguishably rather than colliding on one generic reason. A ma
 this park fixes the named prompt file's header/body mismatch and retries; nothing about the task
 itself is at fault.
 
-Every `claude -p` call: `--output-format json` (result, cost, **session_id**),
-`--session-id <uuid>` (action 4.1: generated by `invokeClaudeReal` immediately before the spawn,
-or used verbatim when a caller already supplies one, so a killed or unparsable call can still be
-tied back to the `claude` session that actually ran), `--json-schema` for the payload,
-`--allowedTools`, `--model`, `--effort`,
+Every LLM call, since card #239's cutover (action A5b, 2026-09-17): the vendored Claude Agent
+SDK's `query({prompt, options})`, never `claude -p` spawned directly any more (the old transport's
+`spawnSync`/`buildArgv` are deleted, not merely superseded — see `orchestrator/steps/llm.js`'s and
+`orchestrator/steps/sdk-call.js`'s own headers for the full design and what was MEASURED against
+the real vendored SDK). `options` carries `--session-id=<uuid>` (action 4.1: generated by
+`invokeClaudeReal` immediately before the call, or used verbatim when a caller already supplies
+one, so a killed or unparsable call can still be tied back to the `claude` session that actually
+ran; a first-class SDK option, not routed through `extraArgs`), `--json-schema` for the payload,
+`--allowedTools` (comma-joined by the SDK's own argv builder), `--model`, `--effort`,
 `--permission-mode` per step (plus `--max-budget-usd` when a caller supplies a numeric
 `maxBudgetUsd` — no daemon or intake path does; the only caller that does is the hand-run
-`scripts/smoke-llm.js`), run under the account chosen by the scheduler
-(`CLAUDE_CONFIG_DIR=<account dir>`). Domain context comes from whatever `CLAUDE.md` sits in the
+`scripts/smoke-llm.js`), and `--setting-sources=user,project,local`, pinned unconditionally — a
+flag the OLD transport never emitted at all (see `sdk-call.js`'s own `SETTING_SOURCES` comment).
+The result comes back as a `stream-json` message stream — never `--output-format json`'s single
+flat reply — reduced by `sdk-call.js`'s `consumeQueryStream` down to the same `{result, cost,
+**session_id**, ...}`-shaped object the old transport's parsed stdout produced (MEASURED,
+byte-identical field names, same file's own header). Every call runs under the account chosen by
+the scheduler (`CLAUDE_CONFIG_DIR=<account dir>`, now set via the SDK's own `options.env` rather
+than a spawned child's inherited environment — same effect, different plumbing). Domain context
+comes from whatever `CLAUDE.md` sits in the
 step's own `cwd` -- the CLI loads it itself (`steps/llm.js` deliberately passes neither
 `--safe-mode` nor `--bare`), and **nothing trims it**: an earlier "(trimmed)" here described an
 intention nobody implemented. Which file that is depends on the step: `config.js`'s `cwdForStep`
@@ -658,12 +688,14 @@ separate repos with no shared runtime.
   Sonnet (IMPLEMENT) capacity for the full 1h-or-5h window, though Sonnet was demonstrably
   usable. So `state.json` keys every cooldown, and its escalation history, under the model:
   `{accountName: {byModel: {<model>: {cooldownUntil, lastUsageLimitAt?, usageLimitStreak?}}}}`,
-  where `<model>` is one of `step-contracts.js`'s own `baseModel`/`escalatedModel` values.
+  where `<model>` is one of `step-contracts.js`'s own `baseModel`/`escalatedModel` values or
+  one of its `INTAKE_MODELS` (the three intake steps' fixed models).
   `pick(poolDir, now, {model})` and `countHealthyAccounts(poolDir, now, model)` honour it;
   omitting the model keeps the old union answer ("cooling on anything"), which is what
   `bin/spo` and the dashboard ask. `callLlmStep` resolves the model through
   `steps/llm.js`'s `resolveCallModel` — the same two branches `runLlm` itself resolves it from,
-  so the model leased and cooled is always the model `claude -p` actually ran on.
+  so the model leased and cooled is always the `--model` the call's vendored-SDK `query()`
+  argv actually carried (`test/accounts-per-model-cooldown.test.js` reads it off that argv).
 
   **This does NOT address pool-wide exhaustion of one model, and is not meant to.** All seven
   historical `all-accounts-*` parks were at PLAN or VALIDATE, both `baseModel: 'fable'` at the
@@ -676,7 +708,7 @@ separate repos with no shared runtime.
   is read as nothing on record, never honoured and never an error — `state.json` is
   machine-owned and disposable, as `accounts.js`'s own header has always said.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:986-988`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:989-991`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`
@@ -750,12 +782,15 @@ separate repos with no shared runtime.
   a worker and the scanner can run at once. A lease is per-step, not per-task, released the
   instant the one LLM call it wraps finishes; a healthy account currently leased by another live
   process is `AllAccountsLeasedError`, worth a bounded, BLOCKING in-process wait
-  (`config.accountLeaseWaitMs`, default **63 min** — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the
+  (`config.accountLeaseWaitMs`, default **67.2 min** (raised from 63 by action A2, card #239,
+  2026-09-17 — `orchestrator/config.js` now gives every LLM step its own `stepDeadlineMsByState`
+  entry, so `MAX_LEASE_AGE_MS` has to outlast the OUTER two-attempt bound, not the inner one alone;
+  see `step-contracts.js`'s own comment) — `MAX_LEASE_AGE_MS`, `step-contracts.js`, the
   age at which a lease is swept as dead — never the ~90–265s a sibling's own step is *usually*
   measured at: a waiter has to outlast the longest a sibling can *legitimately* hold the lease, not
   its typical duration, and the old 5-minute default was found wrong in C6 verification for exactly
   that reason — it gave up while a legitimate holder was still alive and un-sweepable for up to
-  26.5 more minutes, parking a healthy card `all-accounts-leased`) — distinct from
+  62.2 more minutes, parking a healthy card `all-accounts-leased`) — distinct from
   `AllAccountsCoolingError` (a cooldown: still never worth a BLOCKING wait — the worker sleeping
   in-process for a 1h or 5h cooldown would pin the process for hours, doing nothing — but, since
   card #119 action 1.2, worth a DEFERRED one: the worker exits and the task is re-enqueued with
@@ -809,13 +844,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   `duration_s` was documented here well before any code wrote it — action 5.4 measured
   2026-09-01 that zero of the 19 corpus journals' `llm-call` events carried it, and made it
   true the same day: `orchestrator/steps/llm.js`'s `invokeClaudeReal` measures the seconds a
-  call burned around the `claude` spawn itself and reports it on every branch (success, spawn
+  call burned around the `claude` call itself and reports it on every branch (success, spawn
   error, external signal, and — the one a maintainer most wants — a deadline timeout, which
   still burned the full deadline even though it produced no result). The reading is taken on a
   monotonic clock (`process.hrtime.bigint()`, via `orchestrator/monotonic-clock.js` — card #158,
   2026-09-08; 5.4 itself used `Date.now()`), the same clock class libuv uses to enforce the
-  `spawnSync` deadline, so a duration and the deadline bounding it can no longer disagree the
-  way a realtime reading and that deadline once did.
+  `spawnSync` deadline (card #239's A5b replaced that deadline with an abort timer; the claim
+  was not re-measured for the new one), so a duration and the deadline bounding it can no longer
+  disagree the way a realtime reading and that deadline once did.
   Account cooldowns, parkings (with reason), attempts, transient retries (action 4.4 —
   `transient-retry`, `{reason, attempt, delayMs, notBefore}`, journalled on the re-enqueue itself,
   once the queue entry is written, with NO `parked` line — the task never reaches the `PARKED`
@@ -956,14 +992,31 @@ The analysis's top families are mostly **states not to have** rather than branch
    the deadline, not merely the first attempt — parks `step-deadline-exceeded-twice`, `detail`
    naming the state; a single timeout is retried silently, journalled `deadline-exceeded` but
    never parked). Never two live executors for one
-   task. Two independent mechanisms enforce this, because a JS timer cannot preempt a
-   synchronous child: `claude -p` calls (LLM steps) are killed by `spawnSync`'s own `timeout`
-   option inside `steps/llm.js`'s `invokeClaudeReal`, racing `deadline.js`'s `callWithDeadline`
-   as a belt-and-suspenders around the whole call; every `git`/`gh`/`npm` command a scripted step
-   spawns *through `spawnStep`* is killed the same way, per `orchestrator/config.js`'s
-   `commandTimeoutsMs` table (see below). `callWithDeadline`'s own JS-timer race is a no-op here,
-   since a blocking `spawnSync` never yields the event loop for the timer to fire in. Action 2.1
-   closed this gap for `spawnStep`'s own call sites: before it, a hung `gh`/`git`/`npm` child
+   task. **Two DIFFERENT mechanisms now enforce this, for two DIFFERENT reasons — one story
+   before card #239's transport cutover (action A5b, 2026-09-17), a different one since.**
+   `git`/`gh`/`npm` commands a scripted step spawns *through `spawnStep`* are still a genuinely
+   BLOCKING `child_process.spawnSync` (the JS event loop never yields while one runs): `spawnSync`'s
+   own `timeout` option, per `orchestrator/config.js`'s `commandTimeoutsMs` table (see below), is
+   what actually kills those, and `deadline.js`'s `callWithDeadline` race around them is a no-op,
+   exactly as it always was, for exactly the reason it always was — a blocking `spawnSync` never
+   yields the event loop for a JS timer to fire in. LLM steps (PLAN/IMPLEMENT/DIAGNOSE/
+   CITATION_VERIFIER/VALIDATE) no longer work this way at all: `steps/llm.js`'s `invokeClaudeReal`
+   now drives the vendored Claude Agent SDK's `query()`, an AWAITED ASYNC STREAM that DOES yield
+   the event loop — so `callWithDeadline`'s own JS-timer race for these five steps, genuinely a
+   no-op before this cutover, became LIVE the moment it landed (`orchestrator/config.js`'s own
+   comment on `LLM_STEP_DEADLINE_ENTRIES`, action A2 of the same chantier, says this outright: the
+   outer timer every step already raced "becomes LIVE... for the first time"). Two mechanisms
+   race for real now, not one live and one inert: the INNER deadline (`step-contracts.js`'s
+   `deadlineMsForStep`, armed inside `invokeClaudeReal` itself as a real `setTimeout` that calls
+   `options.abortController.abort()`, then confirms the real child's exit before returning — see
+   `steps/llm.js`'s own "Deadline handling" header for the full design and the measured
+   abort/kill-escalation timing) is the one that actually bounds a single call, designed to always
+   fire FIRST; the OUTER deadline (`deadline.js`'s `callWithDeadline`) is retry-once-then-park
+   bookkeeping, sized by `orchestrator/config.js`'s `LLM_STEP_DEADLINE_ENTRIES` as the inner
+   deadline plus one `STEP_DEADLINE_MS` of margin (clamped to `MAX_TIMER_DELAY_MS`) specifically so
+   it never fires before the inner one on a healthy call. Action 2.1 closed an unrelated, still-
+   valid gap for `spawnStep`'s own call sites (the scripted-step half above, untouched by this
+   cutover): before it, a hung `gh`/`git`/`npm` child
    froze the single-threaded daemon forever, holding the task lock, with nothing to recover it.
    Action 2.1b then found and closed the remaining gap: `board.js`'s `moveCard`, `park-loop.js`'s
    park comment and unpark scan, `report-intake.js`'s report-card/dedup/comment-scan spawns, and

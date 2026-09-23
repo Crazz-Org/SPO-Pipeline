@@ -119,6 +119,14 @@ both units. A pull or `git merge --ff-only` in **any other worktree** deploys no
 before the release layout it restarted the services, which would now have deployed that worktree's
 branch.
 
+The release is a local clone checked out at the pulled sha, so it carries `vendor/claude-agent-sdk/`
+(the Agent SDK every LLM step runs through, committed here, never installed) with no extra step:
+there is still no `npm install` in the deploy path and nothing to fetch. Measured 2026-09-21: a
+`git clone --local --no-checkout` + `checkout --detach HEAD` (the two commands `scripts/release.sh`
+cuts a release with) holds all four files, and `require('./orchestrator/sdk.js').loadSdk()` loads
+from that clone. The SDK still needs a `claude` binary on the service's `PATH`
+(`orchestrator/sdk.js`'s `resolveClaudeCodeExecutable`), exactly as the old spawn did.
+
 Deploying by hand, without a pull:
 
 ```bash

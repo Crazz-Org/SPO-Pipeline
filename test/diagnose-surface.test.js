@@ -19,7 +19,7 @@ const path = require('path');
 require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { buildDiagnoseSurfaceComment } = require('../orchestrator/park-loop');
-const { timeoutResult, mkTmp } = require('./helpers');
+const { timeoutResult, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -35,28 +35,45 @@ function readJournal(taskDir) {
     .map((l) => JSON.parse(l));
 }
 
-// invokeClaudeReal's own real-shaped reply -- same helper shape test/board-move.test.js's
-// realShapedPayload uses for the legacy ctx.task.llm.<step> override path (no root_cause key on
-// the raw {ok, result, ...} shape, so handleDiagnose falls back to its own unique
-// unspecified-cause-N per attempt -- irrelevant to this action, but it keeps every attempt out of
-// the duplicate-root-cause park so the "second entry" case below can actually be reached).
-function realShapedPayload(resultString) {
-  return JSON.stringify({
-    result: resultString,
+// Card #239 chantier (A5b-2, Job 3): the claude LLM call now goes through `deps.spawn`/
+// `deps.resolveClaudeCodeExecutable`/`deps.isNoRealSpawnEnabled` (test/helpers.js's
+// `fakeSpawnedChild`/`fakeExecDeps`), never `deps.spawnSync` -- see test/llm-real-card.test.js's
+// own header. `order`/`ghCalls` tracking that used to happen inside the shared spawnSync fake's
+// `command === 'claude'` branch now happens inside a separate `spawn` function instead, pushed
+// into the SAME `order` array so the "gh before claude" ordering assertions still hold.
+//
+// No root_cause key on the raw {ok, result, ...} shape, so handleDiagnose falls back to its own
+// unique unspecified-cause-N per attempt -- irrelevant to this action, but it keeps every attempt
+// out of the duplicate-root-cause park so the "second entry" case below can actually be reached.
+function diagnoseInitMessage() {
+  return { type: 'system', subtype: 'init', session_id: 'sess-diag-surface-1', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+function diagnoseResultMessage(resultString) {
+  return {
+    type: 'result',
+    subtype: 'success',
     is_error: false,
     num_turns: 1,
     session_id: 'sess-diag-surface-1',
     modelUsage: { 'claude-x': { costUSD: 0.001 } },
-    terminal_reason: 'success',
-    api_error_status: null,
-  });
+    result: resultString,
+  };
+}
+// makeDiagnoseSpawn(order) -- the deps.spawn function, pushing 'claude' into the SAME `order`
+// array a test's own spawnSync fake pushes 'gh'/'npm' into, so ordering assertions across both
+// transports still hold.
+function makeDiagnoseSpawn(order) {
+  return function spawn() {
+    if (order) order.push('claude');
+    return fakeSpawnedChild([diagnoseInitMessage(), diagnoseResultMessage('diagnosis text')]);
+  };
 }
 
 // Same convention as test/board-move.test.js's realCtxWithOneAccount: a real (non-shadow, non-
 // dry-run) ctx driven through the legacy ctx.task.llm.DIAGNOSE override, which bypasses step-
 // contracts.js entirely -- the cheapest way to reach a real handleDiagnose call without the full
 // PLAN/prompt-template wiring a `kind: "card"` task would otherwise need.
-function diagnoseCtx({ id, issue, spawnSync, configOverrides = {} }) {
+function diagnoseCtx({ id, issue, spawnSync, spawn, configOverrides = {} }) {
   const accountsDir = mkTmp('spo-diagsurf-accts-');
   fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
   const task = {
@@ -73,7 +90,7 @@ function diagnoseCtx({ id, issue, spawnSync, configOverrides = {} }) {
     diagnoseBudget: 3,
     ghRepo: 'Crazz-Org/SPO-WebClient',
     claudeAccountsDir: accountsDir,
-    deps: { spawnSync },
+    deps: { spawnSync, ...fakeExecDeps({ spawn: spawn || makeDiagnoseSpawn() }) },
     ...configOverrides,
   });
 }
@@ -94,14 +111,13 @@ test('handleDiagnose (real mode): first entry posts exactly one "pipeline diagno
   const order = [];
   const spawnSync = (command, args) => {
     order.push(command);
-    if (command === 'claude') return ok(realShapedPayload('diagnosis text'));
     if (command === 'gh') {
       ghCalls.push([...args]);
       return ok('https://github.com/Crazz-Org/SPO-WebClient/issues/512#issuecomment-777\n');
     }
     return ok('');
   };
-  const ctx = diagnoseCtx({ id: 'card-diagsurf-1', issue: 512, spawnSync });
+  const ctx = diagnoseCtx({ id: 'card-diagsurf-1', issue: 512, spawnSync, spawn: makeDiagnoseSpawn(order) });
 
   const next1 = await HANDLERS.DIAGNOSE(ctx);
   assert.equal(next1, 'IMPLEMENT');
@@ -134,7 +150,6 @@ test('handleDiagnose (real mode): first entry posts exactly one "pipeline diagno
 test('handleDiagnose (real mode): a failing gh issue comment never blocks -- journals diagnose-surface-failed, DIAGNOSE still resolves normally', async () => {
   const ghCalls = [];
   const spawnSync = (command, args) => {
-    if (command === 'claude') return ok(realShapedPayload('diagnosis text'));
     if (command === 'gh') {
       ghCalls.push([...args]);
       return fail(1);
@@ -157,7 +172,6 @@ test('handleDiagnose (real mode): a failing gh issue comment never blocks -- jou
 test('handleDiagnose (real mode): a timed-out gh issue comment never throws -- journalled as diagnose-surface-failed with timedOut: true, task proceeds regardless', async () => {
   const ghCalls = [];
   const spawnSync = (command, args) => {
-    if (command === 'claude') return ok(realShapedPayload('diagnosis text'));
     if (command === 'gh') {
       ghCalls.push([...args]);
       return timeoutResult();

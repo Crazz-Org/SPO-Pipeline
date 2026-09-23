@@ -31,7 +31,7 @@
 // own loop, reasoning that bounding each iteration by `Promise.race(nextWorkerExit,
 // sleep(pollIntervalMs))` -- instead of runForever's `await drainQueueOnce` -- was enough to stop
 // the scans starving worker-slot refills and SIGTERM handling. Verification found that reasoning
-// wrong: one of those scans (auto-triage, via intake.js's callIntakeStepWithRotation) makes a
+// wrong: one of those scans (auto-triage, via intake.js's callIntakeStepWithRotation) made a
 // BLOCKING `spawnSync('claude', ...)` call -- measured at 3m24.9s and 3m11.5s on the live
 // daemon's own journal (issues #471/#473) -- and `Promise.race` cannot rescue a single-threaded
 // process from a call that blocks the thread itself for that long: this loop simply would not
@@ -41,7 +41,15 @@
 // SIGTERM response, and -- since the unit's TimeoutStopSec bounds the stop (90s when this was
 // measured; 2760s since the drain landed, scripts/daemon-install.sh) -- a deploy SIGKILLs the
 // whole process before `killAllChildren` below ever runs. The larger bound makes that far less
-// likely; it does not make a scan that blocks this loop for minutes any less wrong.
+// likely; it does not make a scan that blocks this loop for minutes any less wrong -- AT THE TIME
+// THIS WAS MEASURED. STALE SINCE, NOT RE-VERIFIED (card #239 chantier, action A5b, 2026-09-17):
+// `callIntakeStepWithRotation` no longer blocks via `spawnSync` at all -- `invokeClaudeReal` now
+// drives the vendored Agent SDK's `query()`, an AWAITED ASYNC call that yields the event loop
+// rather than freezing the process for the call's duration. The wall-clock cost this measurement
+// found is still real (an LLM call still takes minutes); whether the specific failure mode this
+// paragraph documents (the loop cannot iterate AT ALL for that window) still holds under an
+// awaited async call instead of a blocking sync one is not re-examined here -- framed, not
+// resolved; a maintainer DECISION, since it bears on whether this process split is still required.
 //
 // The obvious-looking alternative fix (spawn a fresh child per scan CYCLE instead of a long-lived
 // one) is ALSO wrong, and is recorded here as a trap: comment-scan.js's own header says its
@@ -1024,8 +1032,8 @@ function createDispatcher(queueDir, journalRoot, config) {
       // card #167 made cooldowns per (account, model) and gave countHealthyAccounts an optional
       // `model` argument. This call stays BARE on purpose -- it is a scope boundary, not an
       // oversight. A worker SLOT is not bound to one model at spawn time: the card that fills it
-      // runs INTAKE -> WORKTREE (no model at all) -> PLAN (opus) -> IMPLEMENT (sonnet) -> VALIDATE
-      // (fable) over its lifetime, so "the requested model" has no single answer at the moment K
+      // runs INTAKE -> WORKTREE (no model at all) -> PLAN (claude-opus-5-5, fable on fallback) ->
+      // IMPLEMENT (claude-opus-5-5) -> VALIDATE (fable) over its lifetime, so "the requested model" has no single answer at the moment K
       // is computed. The bare (union) count -- "accounts not cooling on anything" -- is the honest
       // one for a budget that has to cover every step the slot will run, and the per-model
       // question is asked where it can actually be answered: account-lease.js, once per LLM call,
@@ -1282,12 +1290,12 @@ function createDispatcher(queueDir, journalRoot, config) {
         //
         // WORSE since card #162's hoist than when this guard was first written: `killAllChildren`
         // and `reapSignalledChildren` both run AFTER this emit now, so an escaping throw here
-        // would skip both. daemon.js's own `process.once('exit')` hook (daemon.js:665-666) still fires
+        // would skip both. daemon.js's own `process.once('exit')` hook (daemon.js:677-678) still fires
         // an ordinary `killAllChildren('SIGTERM')`, so live workers and the scanner are at least
         // signalled on the way out -- but nothing REAPS them: no bounded wait, no SIGKILL
         // escalation, so a straggler that ignores SIGTERM is handed straight back to systemd's
         // cgroup kill, the exact outcome `reapSignalledChildren` exists to prevent. A reparking
-        // child is signalled by neither (that hook passes no `includeReparking`, daemon.js:646).
+        // child is signalled by neither (that hook passes no `includeReparking`, daemon.js:658).
         // Measured in-process, where no such exit hook exists: with this guard deleted the test
         // fails its assertion and then never exits. One process survives -- the scanner stand-in,
         // un-signalled because `killAllChildren` was skipped; it never exits on its own and its

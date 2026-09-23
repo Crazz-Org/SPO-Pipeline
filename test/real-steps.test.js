@@ -43,7 +43,7 @@ const { runLlm } = require('../orchestrator/steps/llm');
 const { formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
 const { buildBaseline } = require('../orchestrator/invariants');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeSpawnDeps } = require('./helpers');
 
 
 function ok(stdout = '') {
@@ -1417,24 +1417,25 @@ test('realCheck: the invariants file itself missing/unparsable at CHECK time -> 
 // recording the true, unmodified broken array regardless of relief -- relief is an ADDITIONAL
 // event, never a rewrite of what actually broke.
 
-// A minimal real-mode PLAN spawnSync stand-in, same envelope as steps/llm.js's invokeClaudeReal
-// expects (mirrors test/plan-writes.test.js's own fakePlanSpawn, duplicated here rather than
-// imported since neither test file exports helpers to the other).
+// A minimal real-mode PLAN `deps.spawn` stand-in, the SDK-transport envelope orchestrator/steps/
+// sdk-call.js's consumeQueryStream expects (card #239 chantier, action A5b-2 -- mirrors
+// test/llm-real-card.test.js's own initMessage/resultMessage shape; mirrors test/plan-writes.test.js's
+// own fakePlanSpawn, duplicated here rather than imported since neither test file exports helpers
+// to the other).
 function fakePlanSpawnEnvelope(planPayload) {
-  return () => ({
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-plan-span-check',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
-  });
+  return () =>
+    fakeSpawnedChild([
+      { type: 'system', subtype: 'init', session_id: 'sess-plan-span-check', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-plan-span-check',
+        modelUsage: { 'claude-fable-5': { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify(planPayload),
+      },
+    ]);
 }
 
 test('realCheck: a PLAN-flagged plan-span conflict is relieved end to end -- the flag is DERIVED via a real HANDLERS.PLAN call, then broken by editing the worktree, then relieved by realCheck', async () => {
@@ -1449,12 +1450,14 @@ test('realCheck: a PLAN-flagged plan-span conflict is relieved end to end -- the
   const planMarkdown = '# Plan\n\nMove the code at foo.js:2-6 up.\n';
 
   const planDeps = {
-    spawnSync: fakePlanSpawnEnvelope({
+    spawn: fakePlanSpawnEnvelope({
       plan_markdown: planMarkdown,
       invariants_markdown: invariantsMarkdown,
       invariant_ids: ['INV-1'],
       check_commands: ['npm run typecheck'],
     }),
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const task = {
@@ -2049,15 +2052,17 @@ test('realPushPr: sets ctx.task.citations from the criterion fallback when the d
 // CITATION_VERIFIER trigger reads instead. See orchestrator/state-machine.js's
 // resolveRdoDiffTouched and orchestrator/task-values.js's lastJournaledRdoDiffTouched.
 
-// THE LOAD-BEARING TEST. Proves the Opus escalation at IMPLEMENT survives a diff that does NOT
-// touch the RDO catalogue. Deliberately does NOT inject or hand-set touchesRdoMembers after the
+// THE LOAD-BEARING TEST. Proves the escalation at IMPLEMENT survives a diff that does NOT
+// touch the RDO catalogue. Since 2026-09-23 (EXP-IMPLEMENT-OPUS-5-5) that escalation is on EFFORT
+// ('low' -> 'medium' on this S card, through shouldEscalateEffort/escalationSignalFires), not model:
+// IMPLEMENT runs claude-opus-5-5 on every path, so the argv's --effort is what discriminates. Deliberately does NOT inject or hand-set touchesRdoMembers after the
 // task is built: the escalation guard (step-contracts.js's shouldEscalate) reads
 // task.touchesRdoMembers, so setting that value again here would make a dead or bypassed guard
 // look green. Instead this drives the REAL inputs -- a real realPushPr call with an injected git
 // diff that omits the catalogue file, then a real runLlm('IMPLEMENT', ...) call on the SAME ctx
 // with an injected spawn -- and asserts on the spawned argv, not on resolveStepContract's return
 // value.
-test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the Opus escalation intact (touchesRdoMembers is never lowered)', async () => {
+test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the effort escalation intact (touchesRdoMembers is never lowered)', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-pushpr-rdo-symmetry-wt-');
   // Starting state only, from intake -- never touched again below.
@@ -2067,7 +2072,7 @@ test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the
     issue: 640,
     criterion: 'rdo-members.ts already covered elsewhere',
     worktreePath,
-    size: 'S',
+    size: 'S', // S on purpose: base effort 'low', escalated 'medium' -- an M card reads 'medium' either way
     touchesRdoMembers: true,
   };
   const ctx = testCtx({ id: 'card-rdo-symmetry', task, config });
@@ -2095,33 +2100,38 @@ test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the
   });
 
   ctx.account = { name: 'default', configDir: null };
-  let seenArgv = null;
-  const llmDeps = {
-    spawnSync: (command, argv) => {
-      seenArgv = argv;
-      const reply = {
-        result: JSON.stringify({
-          summary: 'unrelated change',
-          files_changed: ['src/other-file.ts'],
-          invariants: [{ id: 'INV-1', status: 'HELD' }],
-          tests_run: ['npm run typecheck'],
-          all_green: true,
-        }),
-        is_error: false,
-        num_turns: 1,
-        session_id: 'sess-rdo-symmetry',
-        modelUsage: { 'claude-opus-5': { costUSD: 0.01 } },
-        terminal_reason: 'success',
-        api_error_status: null,
-      };
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn, calls } = fakeSpawnDeps([
+    { type: 'system', subtype: 'init', session_id: 'sess-rdo-symmetry', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-rdo-symmetry',
+      modelUsage: { 'claude-opus-5': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify({
+        summary: 'unrelated change',
+        files_changed: ['src/other-file.ts'],
+        invariants: [{ id: 'INV-1', status: 'HELD' }],
+        tests_run: ['npm run typecheck'],
+        all_green: true,
+      }),
     },
-  };
+  ]);
+  const llmDeps = { spawn, resolveClaudeCodeExecutable: () => '/fake/bin/claude', isNoRealSpawnEnabled: () => false };
 
   const result = await runLlm(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', llmDeps);
   assert.equal(result.ok, true);
+  const seenArgv = calls[0].args;
   const modelIdx = seenArgv.indexOf('--model');
-  assert.equal(seenArgv[modelIdx + 1], 'opus', 'IMPLEMENT must still escalate to opus even though the diff missed the catalogue');
+  assert.equal(seenArgv[modelIdx + 1], 'claude-opus-5-5');
+  const effortIdx = seenArgv.indexOf('--effort');
+  assert.ok(effortIdx !== -1, 'expected --effort in argv');
+  assert.equal(
+    seenArgv[effortIdx + 1],
+    'medium',
+    'IMPLEMENT must still escalate effort even though the diff missed the catalogue'
+  );
 });
 
 test('realPushPr: a diff that does NOT touch the catalogue sets ctx.task.rdoDiffTouched to strict boolean false and journals rdo-diff-derived', async () => {
@@ -2235,23 +2245,29 @@ test('end-to-end: realPushPr feeds CITATION_VERIFIER, in-process and after a sim
   // buildPromptValues/fillPromptTemplate ran, never reaching invokeClaudeReal at all.
   assert.ok(ctx.task.citations.some((c) => c.includes('AdmMembersRDO.pas:512')));
 
-  let seenInput = null;
-  const llmDeps = {
-    spawnSync: (command, argv, opts) => {
-      assert.equal(command, 'claude');
-      seenInput = opts.input;
-      const reply = {
-        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+  // The prompt no longer travels as spawnSync's own `input` option (card #239 chantier, action
+  // A5b) -- the SDK writes it to the child's stdin itself, as a stream-json `user` message. Same
+  // property, one layer down: `onStdinWrite` accumulates every raw chunk written to `.stdin`
+  // (test/helpers.js's fakeSpawnedChild), and the filled prompt's own text (including this
+  // citation, which contains no characters JSON-escaping would alter) still appears verbatim
+  // inside that stream-json line.
+  let seenInput = '';
+  const { spawn: citeVerifySpawn } = fakeSpawnDeps(
+    [
+      { type: 'system', subtype: 'init', session_id: 'sess-citeverify-e2e', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
         is_error: false,
         num_turns: 1,
         session_id: 'sess-citeverify-e2e',
-        modelUsage: { fable: { costUSD: 0.001 } },
-        terminal_reason: 'success',
-        api_error_status: null,
-      };
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    },
-  };
+        modelUsage: { fable: { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+      },
+    ],
+    { onStdinWrite: (chunk) => { seenInput += chunk; } }
+  );
+  const llmDeps = { spawn: citeVerifySpawn, resolveClaudeCodeExecutable: () => '/fake/bin/claude', isNoRealSpawnEnabled: () => false };
 
   // buildCtx() (state-machine.js) leaves ctx.account null until callLlmStep's account-rotation
   // loop sets it per-attempt; runLlm's real non-override path reads `account.name` unconditionally
@@ -2283,21 +2299,26 @@ test('end-to-end: realPushPr feeds CITATION_VERIFIER, in-process and after a sim
   assert.equal(restartedCtx.task.citations, undefined);
   restartedCtx.account = { name: 'default', configDir: null };
 
-  let seenInputAfterRestart = null;
-  const llmDepsAfterRestart = {
-    spawnSync: (command, argv, opts) => {
-      seenInputAfterRestart = opts.input;
-      const reply = {
-        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+  let seenInputAfterRestart = '';
+  const { spawn: citeVerifyRestartSpawn } = fakeSpawnDeps(
+    [
+      { type: 'system', subtype: 'init', session_id: 'sess-citeverify-e2e-restart', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
         is_error: false,
         num_turns: 1,
         session_id: 'sess-citeverify-e2e-restart',
-        modelUsage: { fable: { costUSD: 0.001 } },
-        terminal_reason: 'success',
-        api_error_status: null,
-      };
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    },
+        modelUsage: { fable: { input_tokens: 100, output_tokens: 50 } },
+        result: JSON.stringify({ verdict: 'PASS', entries: [] }),
+      },
+    ],
+    { onStdinWrite: (chunk) => { seenInputAfterRestart += chunk; } }
+  );
+  const llmDepsAfterRestart = {
+    spawn: citeVerifyRestartSpawn,
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const cvAfterRestart = await runLlm(restartedCtx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', llmDepsAfterRestart);
@@ -5630,6 +5651,116 @@ test('--real gating: --dry-run bypasses the gate even for a card task with no co
   assert.equal(next, 'WORKTREE');
 });
 
+// ---- card #226 fix pass: the nightly-red PRE-GATE's own `isRealMode(ctx)` conjunct, untested ---
+// ---- until now -- an Opus verifier found the whole 3231-test suite stayed green with
+// ---- `isRealMode(ctx)` replaced by `true` inside handleIntake's pre-gate condition
+// ---- (state-machine.js:298). That is a real hazard, not a paperwork gap: `ctx.config.spoBenchDir` and
+// ---- `ctx.config.productRepo` are UNCONDITIONAL strings in production config.js, so nothing else
+// ---- stands between a dropped isRealMode conjunct and `--dry-run` -- the gate command this repo's
+// ---- own pre-push/CI leg runs -- reading live `~/.spo-bench` and spawning a real `git rev-parse`
+// ---- against the real product repo.
+//
+// Design note (this repo already paid for the alternative): isolating this test by injecting the
+// resolved isRealMode() value itself, or asserting on ctx.dryRun/ctx.shadowMode directly, would
+// let a dead or evadable guard pass anyway -- proving nothing about what handleIntake actually
+// DOES. So this drives the real HANDLERS.INTAKE entry point (the exact dispatch runTask uses,
+// state-machine.js:2017) the same way production configures dry-run (ctx.dryRun: true, the flag
+// daemon.js --dry-run sets), plants a genuinely red nightly record on disk, and asserts on the
+// two OBSERVABLE effects a live gate would have: a `git` spawn, and a ParkSignal. Neither may
+// occur when the run is not real.
+test('handleIntake (--dry-run, card, red nightly on disk): the nightly pre-gate is INERT -- no rev-parse spawn, no ParkSignal, falls through to WORKTREE exactly as a healthy nightly would (card #226 fix pass -- guards the isRealMode(ctx) conjunct)', async () => {
+  const taskDir = mkTmp('spo-real-gate-nightlygate-dryrun-taskdir-');
+  const task = { id: 'card-gate-dryrun-nightlyred', kind: 'card', issue: 226, title: 't' };
+  const config = testConfig();
+  // A genuinely red record, self-consistent (verdict FAIL at its OWN recorded sha) so that IF the
+  // pre-gate's condition were ever entered, classifyNightly would answer 'red' deterministically --
+  // no ambiguity for the mutation check below to hide behind.
+  const REV_SHA = 'e'.repeat(40);
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: REV_SHA });
+  const calls = [];
+  const ctx = buildCtx(task.id, task, taskDir, {
+    ...config,
+    shadowMode: false,
+    dryRun: true,
+    real: true,
+    deps: {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        // A truthful rev-parse answer, matching the red record's own sha -- if the pre-gate DID
+        // run (the mutant below), this guarantees it reads the nightly as red rather than
+        // 'unknown', so the mutation is caught by an actual ParkSignal, not a coincidence of a
+        // mismatched sha.
+        return { status: 0, stdout: `${REV_SHA}\n`, stderr: '', signal: null };
+      },
+    },
+  });
+
+  let next;
+  let thrown = null;
+  try {
+    next = await HANDLERS.INTAKE(ctx);
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(
+    thrown,
+    null,
+    `dry-run with a red nightly on disk must never throw from the pre-gate -- got: ${thrown && thrown instanceof ParkSignal ? `ParkSignal(${thrown.reason})` : thrown}`
+  );
+  assert.equal(next, 'WORKTREE', 'a non-real run must fall through to WORKTREE, exactly as a healthy nightly would');
+  assert.deepEqual(
+    calls,
+    [],
+    `dry-run must never spawn the pre-gate's own rev-parse -- it is a real-mode-only cost; spawns were ${JSON.stringify(calls)}`
+  );
+});
+
+// The sibling conjunct in the same condition (ctx.task.kind === 'card'), covered cheaply with the
+// same discipline: a genuinely REAL run (isRealMode(ctx) actually true here, nothing mutated) of a
+// non-card task must still leave the gate inert, because the gate is card-only by design (the
+// same condition shape cardRequiresRealFlag uses just above it, state-machine.js:205).
+test('handleIntake (real mode, non-card task, red nightly on disk): the nightly pre-gate is INERT -- no rev-parse spawn, no ParkSignal (guards the ctx.task.kind === \'card\' conjunct)', async () => {
+  const taskDir = mkTmp('spo-real-gate-nightlygate-noncard-taskdir-');
+  const task = { id: 'synthetic-gate-nightlyred', kind: 'synthetic', title: 't' };
+  const config = testConfig();
+  const REV_SHA = 'f'.repeat(40);
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: REV_SHA });
+  const calls = [];
+  const ctx = buildCtx(task.id, task, taskDir, {
+    ...config,
+    shadowMode: false,
+    dryRun: false,
+    real: true,
+    deps: {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        return { status: 0, stdout: `${REV_SHA}\n`, stderr: '', signal: null };
+      },
+    },
+  });
+
+  let next;
+  let thrown = null;
+  try {
+    next = await HANDLERS.INTAKE(ctx);
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(
+    thrown,
+    null,
+    `a real non-card task with a red nightly on disk must never throw from the pre-gate -- got: ${thrown && thrown instanceof ParkSignal ? `ParkSignal(${thrown.reason})` : thrown}`
+  );
+  assert.equal(next, 'WORKTREE');
+  assert.deepEqual(
+    calls,
+    [],
+    `a non-card task must never reach the pre-gate's rev-parse; spawns were ${JSON.stringify(calls)}`
+  );
+});
+
 // ---- full WORKTREE -> FINISH argv walkthrough (fake runner, one fictional card) -------------
 
 test('full lifecycle walkthrough: WORKTREE -> CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> MERGE -> FINISH, one fictional card', async () => {
@@ -5969,12 +6100,25 @@ test('prepareJudgeInputs: VALIDATE with a producible diff -- diff.patch exists a
   // CITATION_VERIFIER end-to-end test above, bypassing callLlmStep's account-rotation loop.
   ctx.account = { name: 'default', configDir: null };
   let claudeInvoked = false;
-  const llmDeps = {
-    spawnSync: (command) => {
-      claudeInvoked = true;
-      assert.equal(command, 'claude');
-      return realShapedLlmReply({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }, { session_id: 'sess-validate-ok' });
+  const { spawn: validateSpawn } = fakeSpawnDeps([
+    { type: 'system', subtype: 'init', session_id: 'sess-validate-ok', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-validate-ok',
+      modelUsage: { 'claude-fable-5': { input_tokens: 100, output_tokens: 50 } },
+      result: JSON.stringify({ verdict: 'PASS', reasons: ['looks fine'], findings: [] }),
     },
+  ]);
+  const llmDeps = {
+    spawn: (command, args, opts) => {
+      claudeInvoked = true;
+      return validateSpawn(command, args, opts);
+    },
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
   };
 
   const verdict = await runLlm(ctx, 'VALIDATE', 'llm.VALIDATE', llmDeps);
@@ -7272,7 +7416,7 @@ test('npm-gate timeout also covers K workers\' worst-case bench queue wait, incl
 // shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
 //
 // A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
-// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 325) deletes
+// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 361) deletes
 // every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
 // worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
 // all-time records, and re-measuring on a different day legitimately yields a different sample

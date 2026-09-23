@@ -1,6 +1,11 @@
 'use strict';
-// bash-policy.js -- the per-policy `Bash` deny lists the orchestrator passes to `claude` on the
-// command line (`--disallowedTools`, steps/llm.js's buildArgv). Card #240.
+// bash-policy.js -- the per-policy `Bash` deny lists the orchestrator passes to `claude` via the
+// Agent SDK's `query()` (`options.disallowedTools`, `orchestrator/steps/sdk-call.js`'s
+// `buildQueryOptions`). Card #240. Written on top of the OLD spawnSync/`claude -p` transport's
+// argv builder (a function this repo no longer has -- deleted by card #239's action A5b, which
+// had already landed on this chantier before this card merged in) -- `--disallowedTools` there
+// is the SAME flag this file's own point 2 describes, carried forward onto the one transport
+// that remains.
 //
 // WHY THIS FILE EXISTS
 //

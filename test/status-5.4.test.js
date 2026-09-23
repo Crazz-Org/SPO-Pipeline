@@ -25,11 +25,20 @@ const path = require('path');
 // require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 
-const { mkTmp, writeTask, writePoolDir, runSpo } = require('./helpers');
+const { mkTmp, writeTask, writePoolDir, runSpo, fakeSpawnedChild, fakeSpawnDeps, fakeExecDeps } = require('./helpers');
 const { tokenReport, todaySpend } = require('../orchestrator/tokens');
 const { collectDaemonStats, collectJournalTasks } = require('../console/collect');
 const { writeBenchReinstallOwed } = require('../orchestrator/journal');
 const { invokeClaudeReal } = require('../orchestrator/steps/llm');
+
+// Card #239 chantier (A5b-2, Job 3): the three durationS tests below used to fake the old
+// `claude -p`/spawnSync transport directly; migrated onto `deps.spawn`/`deps.resolveClaudeCode
+// Executable`/`deps.isNoRealSpawnEnabled` (test/helpers.js's `fakeSpawnedChild`/`fakeSpawnDeps`/
+// `fakeExecDeps` -- see test/llm-real-card.test.js's own header for the full design). `init
+// Message`/`resultMessage` mirror that file's own local helpers.
+function initMessage(sessionId = 's1') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
 
 function writeJournalLines(taskDir, lines) {
   fs.mkdirSync(taskDir, { recursive: true });
@@ -367,44 +376,38 @@ test("spo status: an intake llm-call in daemon.jsonl counts toward today's spend
 // ---- E: llm-call gains duration_s ----------------------------------------------------------------
 
 test('invokeClaudeReal: a successful call reports durationS in SECONDS, measured around the spawn', async () => {
-  // The fake spawn burns real time, and the assertion is a RANGE. `typeof === number` and `>= 0`
-  // were the original assertions, and deleting the `/ 1000` passed the whole suite -- a field
-  // named `_s` silently carrying milliseconds is a 1000x lie in the one journal field this
-  // action exists to add.
+  // The fake spawn burns real (wall-clock) time, and the assertion is a RANGE. `typeof === number`
+  // and `>= 0` were the original assertions, and deleting the `/ 1000` passed the whole suite -- a
+  // field named `_s` silently carrying milliseconds is a 1000x lie in the one journal field this
+  // action exists to add. The old transport's spawnSync was fully synchronous, so a busy-wait
+  // inside the fake was the only way to make it cost time; this transport is async, so a real
+  // `setTimeout` delay before the fake child replies is the natural equivalent -- same property
+  // (durationS reports real elapsed seconds), same order of magnitude, no weaker an assertion.
   const BURN_MS = 200;
-  const fakeSpawnSync = () => {
-    const until = Date.now() + BURN_MS;
-    while (Date.now() < until) {
-      /* busy-wait: spawnSync is synchronous, so this is the only way to make it cost time */
-    }
-    return {
-      status: 0,
-      stdout: JSON.stringify({ result: '{"ok":true}', session_id: 's1', is_error: false }),
-      stderr: '',
-    };
-  };
-  const result = await invokeClaudeReal(
-    { promptText: 'hi', cwd: '/tmp', model: 'sonnet', effort: 'low' },
-    { spawnSync: fakeSpawnSync }
-  );
+  const calls = [];
+  function spawn(command, args, spawnOpts) {
+    calls.push({ command, args });
+    const child = fakeSpawnedChild([], { hang: true, signal: spawnOpts.signal });
+    setTimeout(() => {
+      for (const line of [initMessage(), { type: 'result', subtype: 'success', is_error: false, session_id: 's1', num_turns: 1, result: '{"ok":true}' }]) {
+        child.stdout.push(JSON.stringify(line) + '\n');
+      }
+      child.forceExit(0, null);
+    }, BURN_MS);
+    return child;
+  }
+  const result = await invokeClaudeReal({ promptText: 'hi', cwd: '/tmp', model: 'sonnet', effort: 'low' }, fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(typeof result.durationS, 'number');
   assert.ok(
     result.durationS >= 0.15 && result.durationS < 5,
-    `durationS must be SECONDS (~0.2 for a ${BURN_MS}ms spawn), got ${result.durationS}`
+    `durationS must be SECONDS (~0.2 for a ${BURN_MS}ms delayed spawn), got ${result.durationS}`
   );
 });
 
 test('invokeClaudeReal: a deadline-killed call still reports the durationS it burned', async () => {
-  const fakeSpawnSync = () => {
-    const error = new Error('spawnSync SIGTERM ETIMEDOUT');
-    error.code = 'ETIMEDOUT';
-    return { status: null, stdout: '', stderr: '', signal: 'SIGTERM', error };
-  };
-  const result = await invokeClaudeReal(
-    { promptText: 'hi', cwd: '/tmp', model: 'sonnet', effort: 'low', deadlineMs: 1000 },
-    { spawnSync: fakeSpawnSync }
-  );
+  const { spawn } = fakeSpawnDeps([initMessage()], { hang: true }); // never replies on its own
+  const result = await invokeClaudeReal({ promptText: 'hi', cwd: '/tmp', model: 'sonnet', effort: 'low', deadlineMs: 30 }, fakeExecDeps({ spawn }));
   assert.equal(result.ok, false);
   assert.equal(result.timedOut, true);
   assert.equal(typeof result.durationS, 'number');
@@ -412,15 +415,8 @@ test('invokeClaudeReal: a deadline-killed call still reports the durationS it bu
 });
 
 test('invokeClaudeReal: a failed (is_error) call also reports a numeric durationS', async () => {
-  const fakeSpawnSync = () => ({
-    status: 1,
-    stdout: JSON.stringify({ result: 'boom', is_error: true, session_id: 's2' }),
-    stderr: '',
-  });
-  const result = await invokeClaudeReal(
-    { promptText: 'hi', cwd: '/tmp', model: 'sonnet', effort: 'low' },
-    { spawnSync: fakeSpawnSync }
-  );
+  const { spawn } = fakeSpawnDeps([initMessage(), { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 's2', errors: ['boom'] }]);
+  const result = await invokeClaudeReal({ promptText: 'hi', cwd: '/tmp', model: 'sonnet', effort: 'low' }, fakeExecDeps({ spawn }));
   assert.equal(result.ok, false);
   assert.equal(typeof result.durationS, 'number');
 });

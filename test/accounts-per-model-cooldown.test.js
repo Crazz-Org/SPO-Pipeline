@@ -18,8 +18,12 @@
 //      change, so #119 (PR #156)'s wait behaviour is untouched.
 //   4. The positive case the card exists for: fable cooled, sonnet leased, no park.
 // Plus the correspondence that makes the whole thing safe -- the model LEASED and COOLED is the
-// model the `claude -p` call actually ran on, for both of runLlm's branches and for all three
-// intake steps.
+// model the call actually ran on, read as `--model` off the argv the vendored Agent SDK's REAL
+// query() builds (card #241's transport; test/helpers.js's fakeSpawnDeps/fakeSpawnedChild fake
+// only the child process), for both of runLlm's branches, every step's escalation flags, and all
+// three intake steps. A limit is driven the same way -- a `result` message with `is_error:true,
+// api_error_status:429` through the real query() and sdk-call.js's consumeQueryStream -- never by
+// calling markLimit directly.
 //
 // NOT covered, deliberately, and stated here because it is the obvious next question: pool-WIDE
 // exhaustion of one model. A per-model cooldown cannot conjure a Fable account when Fable is what
@@ -38,10 +42,11 @@ const accounts = require('../orchestrator/accounts');
 const { leaseHealthyAccount } = require('../orchestrator/account-lease');
 const { callLlmStep, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
-const { resolveCallModel } = require('../orchestrator/steps/llm');
-const { STEP_CONTRACTS, resolveStepContract } = require('../orchestrator/step-contracts');
+const { resolveCallModel, runLlm } = require('../orchestrator/steps/llm');
+const { STEP_CONTRACTS, INTAKE_MODELS, OPUS_5_5, resolveStepContract } = require('../orchestrator/step-contracts');
+const { appendEvent } = require('../orchestrator/journal');
 const intake = require('../orchestrator/intake');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnDeps, fakeExecDeps, fakeSpawnedChild } = require('./helpers');
 
 const HOUR = 60 * 60 * 1000;
 
@@ -202,14 +207,27 @@ test('card #167 markLimit(): NO model named is the fail-safe -- every known mode
 });
 
 test('card #167 markLimit(): KNOWN_MODELS is DERIVED from step-contracts.js, never a second literal list', () => {
-  // A step that introduces a fourth model must move the fail-safe's reach with it. Re-derived
-  // here from the table itself rather than compared against a spelled-out ['fable','opus',
-  // 'sonnet'] -- a literal here would pass even after accounts.js stopped reading the table.
+  // A step that introduces another model must move the fail-safe's reach with it. Re-derived here
+  // from step-contracts.js itself -- every STEP_CONTRACTS baseModel/escalatedModel PLUS the three
+  // intake steps' INTAKE_MODELS -- rather than compared against a spelled-out list: a literal here
+  // would pass even after accounts.js stopped reading the table.
   const fromTable = Array.from(
-    new Set(Object.values(STEP_CONTRACTS).flatMap((d) => [d.baseModel, d.escalatedModel].filter((m) => typeof m === 'string')))
+    new Set(
+      Object.values(STEP_CONTRACTS)
+        .flatMap((d) => [d.baseModel, d.escalatedModel])
+        .concat(Object.values(INTAKE_MODELS))
+        .filter((m) => typeof m === 'string')
+    )
   ).sort();
   assert.deepEqual([...accounts.KNOWN_MODELS], fromTable);
-  assert.ok(fromTable.includes('fable') && fromTable.includes('sonnet') && fromTable.includes('opus'));
+  // Every model any real call can spend is in the fail-safe's reach. `sonnet` is the one that
+  // proves INTAKE_MODELS is read at all: since IMPLEMENT moved to OPUS_5_5 (2026-09-23) no
+  // STEP_CONTRACTS entry names it, and DRAFT_CARD is its only spender.
+  for (const m of [OPUS_5_5, 'fable', 'sonnet']) assert.ok(accounts.KNOWN_MODELS.includes(m), `${m} must be in KNOWN_MODELS`);
+  assert.ok(
+    !Object.values(STEP_CONTRACTS).some((d) => d.baseModel === 'sonnet' || d.escalatedModel === 'sonnet'),
+    'test premise: no pipeline step spends sonnet, so only INTAKE_MODELS can put it in KNOWN_MODELS'
+  );
 });
 
 test('card #167 markLimit(): a legacy pre-#167 flat entry is migrated away, not carried alongside the new shape', () => {
@@ -301,108 +319,231 @@ function makeCtx({ taskDir, accountsDir, task }) {
   });
 }
 
-function realShapedPayload(overrides = {}) {
+// The SDK stream a fake child replays (same shapes as test/account-rotation.test.js and
+// test/sdk-deny-list-e2e.test.js): a system/init message, then one `result` message. The vendored
+// query() parses these off the fake child's stdout exactly as it would a real `claude`'s.
+const SESSION_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+function initMessage() {
+  return { type: 'system', subtype: 'init', session_id: SESSION_ID, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+function resultMessage(overrides = {}) {
   return {
-    result: 'ok',
+    type: 'result',
+    subtype: 'success',
     is_error: false,
     num_turns: 1,
-    session_id: 'sess-167',
-    modelUsage: { 'claude-haiku-4-5': { costUSD: 0.001 } },
+    session_id: SESSION_ID,
+    modelUsage: { 'claude-haiku-4-5': { inputTokens: 10, outputTokens: 5 } },
+    result: 'ok',
     terminal_reason: 'success',
     api_error_status: null,
     ...overrides,
   };
 }
+// The real observed limit shape (sdk-call.js's consumeQueryStream header, item 3): subtype
+// 'success', is_error true, api_error_status 429 -- classified `kind:'limit'` by llm.js's
+// classifyFailure/limitKindForFailure.
+const LIMIT_429 = { is_error: true, api_error_status: 429, result: "You've reached your limit" };
 
-test('card #167: resolveCallModel answers with the model runLlm actually puts in invokeClaudeReal\'s opts -- BOTH branches', () => {
-  // The bug this test exists to make impossible: leasing/cooling for one model while the spawn
-  // runs on another. runLlm has two branches and they resolve the model differently -- the legacy
-  // ctx.task.llm.<step> override wins over the step contract. A callLlmStep that reached for
-  // resolveStepContract alone would be wrong on every overridden task, and wrong SILENTLY.
+// `--model <value>` off the real argv the vendored query() handed to spawnClaudeCodeProcess;
+// undefined when no --model was emitted at all.
+function modelArgvValue(argv) {
+  const i = argv.indexOf('--model');
+  return i === -1 ? undefined : argv[i + 1];
+}
+
+// A card-shaped task every real step's prompt template can fill (sdk-deny-list-e2e.test.js's own
+// shape), plus IMPLEMENT's PLAN-output prerequisite in the journal.
+function cardTask(extra = {}) {
+  return {
+    id: 't-167-card',
+    kind: 'card',
+    issue: 1,
+    title: 'per-model cooldown probe',
+    criterion: 'the model leased and cooled is the model on the argv',
+    worktreePath: '/tmp/wt-167',
+    size: 'S',
+    citations: ['AdmMembersRDO.pas:512'],
+    ...extra,
+  };
+}
+function seedPlan(taskDir) {
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: { plan_path: '/p', invariants_path: '/i', invariant_ids: ['INV-1'], check_commands: ['x'] },
+  });
+}
+
+// Every branch resolveCallModel has to mirror: each real step on the contract path, each
+// escalation flag that could move a model (PLAN's planInvalidRetry is the only one that does
+// today; IMPLEMENT's and VALIDATE's triggers move effort, not model, since 2026-09-23 -- included
+// so a future model escalation there is covered too), and the legacy override branch with a model,
+// with none, and with an empty one.
+const CORRESPONDENCE_CASES = [
+  { name: 'PLAN, base', step: 'PLAN', task: cardTask() },
+  { name: 'PLAN, planInvalidRetry (model escalation -> fable)', step: 'PLAN', task: cardTask({ planInvalidRetry: true }) },
+  { name: 'IMPLEMENT, S', step: 'IMPLEMENT', task: cardTask() },
+  { name: 'IMPLEMENT, L (lSize trigger)', step: 'IMPLEMENT', task: cardTask({ size: 'L' }) },
+  { name: 'IMPLEMENT, diagnoseOrValidateRetry', step: 'IMPLEMENT', task: cardTask({ diagnoseOrValidateRetry: true }) },
+  { name: 'IMPLEMENT, planDeclaresRdoMembers', step: 'IMPLEMENT', task: cardTask({ planDeclaresRdoMembers: true }) },
+  { name: 'DIAGNOSE', step: 'DIAGNOSE', task: cardTask() },
+  { name: 'VALIDATE', step: 'VALIDATE', task: cardTask() },
+  { name: 'VALIDATE, rdoDiffTouched', step: 'VALIDATE', task: cardTask({ rdoDiffTouched: true }) },
+  { name: 'CITATION_VERIFIER', step: 'CITATION_VERIFIER', task: cardTask() },
+  {
+    name: 'legacy override wins over the contract (VALIDATE -> sonnet, contract says fable)',
+    step: 'VALIDATE',
+    task: { id: 'c-ovr', llm: { VALIDATE: { model: 'sonnet', effort: 'medium', promptText: 'x' } } },
+  },
+  {
+    name: 'legacy override naming NO model (no --model on the argv at all)',
+    step: 'VALIDATE',
+    task: { id: 'c-ovr-none', llm: { VALIDATE: { effort: 'medium', promptText: 'x' } } },
+  },
+  {
+    name: 'legacy override naming an EMPTY model (buildQueryOptions drops it too)',
+    step: 'VALIDATE',
+    task: { id: 'c-ovr-empty', llm: { VALIDATE: { model: '', effort: 'medium', promptText: 'x' } } },
+  },
+];
+
+test("card #167: resolveCallModel equals the --model the vendored SDK's REAL query() argv carries -- every step, every escalation flag, both branches", async () => {
+  // The bug this test exists to make impossible: leasing/cooling for one model while the call
+  // runs on another. Measured, not reviewed: each case runs the real runLlm -> buildQueryOptions ->
+  // vendored query(), which builds the real argv and hands it to a fake spawnClaudeCodeProcess;
+  // `--model` is read back off THAT argv and compared against resolveCallModel's answer for the
+  // same ctx. The two are independent expressions (llm.js's resolveCallModel is deliberately not
+  // called by runLlm -- see its own header), so a mutation to either side shows up here.
+  const seen = new Set();
+  for (const c of CORRESPONDENCE_CASES) {
+    const taskDir = mkTmp('spo-167-corr-');
+    seedPlan(taskDir);
+    const ctx = makeCtx({ taskDir, accountsDir: mkTmp('spo-167-corr-accts-'), task: c.task });
+    ctx.account = { name: 'acct-a', configDir: null };
+    const { spawn, calls } = fakeSpawnDeps([initMessage(), resultMessage({ result: JSON.stringify({ verdict: 'PASS' }) })]);
+    try {
+      await runLlm(ctx, c.step, `llm.${c.step}`, fakeExecDeps({ spawn }));
+    } catch (err) {
+      // The fake reply is not shaped to satisfy every step's outputContract; only a spawn that
+      // never happened is a failure for THIS test.
+      if (!calls.length) throw err;
+    }
+    assert.equal(calls.length, 1, `${c.name}: must reach exactly one real query() spawn`);
+    const argvModel = modelArgvValue(calls[0].args);
+    assert.equal(resolveCallModel(ctx, c.step), argvModel, `${c.name}: resolveCallModel must equal the argv's --model`);
+    seen.add(String(argvModel));
+  }
+  // The table must actually discriminate: a resolveCallModel returning one constant, or always
+  // the contract's answer, must fail at least one case above. These are the distinct values the
+  // real argv carried across the table.
+  assert.deepEqual([...seen].sort(), [OPUS_5_5, 'fable', 'sonnet', 'undefined'].sort());
+});
+
+test("card #167: a 429 through the real query() stream cools EXACTLY the argv's --model on that account -- contract and override branches", async () => {
+  // A limit on the SDK path is classified by llm.js's classifyFailure / limitKindForFailure off
+  // the `result` message's api_error_status, not by any code this card wrote. This drives that
+  // whole path -- vendored query() -> sdk-call.js's consumeQueryStream -> invokeClaudeReal ->
+  // callLlmStep's markLimit -- and asserts the cooled key is the model the argv carried.
   //
-  // Measured, not reviewed: each case below runs the real runLlm with an injected spawnSync that
-  // CAPTURES the argv, and compares the `--model` value that actually went to `claude` against
-  // resolveCallModel's answer for the same ctx. The two are independent expressions in two files.
+  // Each case also PRE-COOLS the account on every other known model. The call can only have
+  // spawned if the LEASE asked for the argv's own model (every other model is cooling), so one
+  // run pins lease model == argv model == cooled model.
   const cases = [
-    { name: 'contract path, PLAN', step: 'PLAN', task: { id: 'c1', kind: 'card', issue: 1, size: 'S' } },
-    { name: 'contract path, IMPLEMENT (S) -- sonnet', step: 'IMPLEMENT', task: { id: 'c2', kind: 'card', issue: 1, size: 'S' } },
+    { name: 'contract path, VALIDATE (fable)', step: 'VALIDATE', task: cardTask() },
+    { name: 'contract path, IMPLEMENT (OPUS_5_5)', step: 'IMPLEMENT', task: cardTask() },
+    { name: 'contract path, PLAN escalated by planInvalidRetry (fable)', step: 'PLAN', task: cardTask({ planInvalidRetry: true }) },
     {
-      name: 'contract path, IMPLEMENT escalated by size L -- opus',
-      step: 'IMPLEMENT',
-      task: { id: 'c3', kind: 'card', issue: 1, size: 'L' },
-    },
-    { name: 'contract path, VALIDATE -- fable', step: 'VALIDATE', task: { id: 'c4', kind: 'card', issue: 1, size: 'S' } },
-    {
-      name: 'legacy override path wins over the contract',
+      // VALIDATE with an override naming SONNET, chosen because the contract says `fable`: the
+      // two DISAGREE, which is what discriminates a callLlmStep that cooled the contract's answer
+      // instead of the model the call really used.
+      name: 'legacy override path, VALIDATE -> sonnet',
       step: 'VALIDATE',
-      task: { id: 'c5', llm: { VALIDATE: { model: 'sonnet', effort: 'medium', promptText: 'x' } } },
+      task: { id: 't-argv', llm: { VALIDATE: { model: 'sonnet', effort: 'medium', promptText: 'do it' } } },
     },
   ];
+  assert.equal(resolveStepContract('VALIDATE', {}).model, 'fable', 'test setup: the override must disagree with the contract');
 
   for (const c of cases) {
-    const ctx = makeCtx({ taskDir: mkTmp('spo-167-corr-'), accountsDir: mkTmp('spo-167-corr-accts-'), task: c.task });
-    const resolved = resolveCallModel(ctx, c.step);
-    // The contract branch is the one resolveCallModel falls through to; assert it agrees with the
-    // table directly too, so a mutation that made resolveCallModel return a constant is caught
-    // even for the cases where no override exists.
-    if (!(c.task.llm && c.task.llm[c.step])) {
-      assert.equal(resolved, resolveStepContract(c.step, c.task).model, `${c.name}: contract branch`);
-    } else {
-      assert.equal(resolved, c.task.llm[c.step].model, `${c.name}: override branch`);
-    }
-    assert.ok(typeof resolved === 'string' && resolved.length > 0, `${c.name}: resolved to something`);
+    const taskDir = mkTmp('spo-167-429-taskdir-');
+    seedPlan(taskDir);
+    const accountsDir = poolWith('spo-167-429-accts-', ['acct-a']);
+    const ctx = makeCtx({ taskDir, accountsDir, task: c.task });
+    const expected = resolveCallModel(ctx, c.step);
+    const others = accounts.KNOWN_MODELS.filter((m) => m !== expected);
+    assert.ok(others.length >= 2, `${c.name}: test premise -- at least two other models are pre-cooled`);
+    accounts.writeState(accountsDir, { 'acct-a': coolingEntry(others, Date.now() + HOUR) });
+
+    let argvSeen = null;
+    const spawn = (command, args, spawnOpts) => {
+      argvSeen = args;
+      return fakeSpawnedChild([initMessage(), resultMessage(LIMIT_429)], { signal: spawnOpts.signal });
+    };
+
+    await assert.rejects(() => callLlmStep(ctx, c.step, `llm.${c.step}`, fakeExecDeps({ spawn })), ParkSignal, c.name);
+
+    assert.ok(argvSeen, `${c.name}: the lease must have granted the account for its own model, and the call spawned`);
+    const argvModel = modelArgvValue(argvSeen);
+    assert.equal(argvModel, expected, `${c.name}: the argv's --model is resolveCallModel's answer`);
+    const byModel = accounts.readState(accountsDir)['acct-a'].byModel;
+    const newlyCooled = Object.keys(byModel).filter((m) => byModel[m].lastUsageLimitAt !== undefined);
+    assert.deepEqual(
+      newlyCooled,
+      [argvModel],
+      `${c.name}: the cooled model must be exactly the one the query() argv carried -- anything else cools a quota nobody spent`
+    );
+    assert.equal(byModel[argvModel].usageLimitStreak, 1, `${c.name}: classified as a usage limit (429), first hit`);
   }
 });
 
-test('card #167: callLlmStep leases and cools the SAME model the spawn ran on (legacy override branch, measured from the argv)', async () => {
-  const taskDir = mkTmp('spo-167-argv-taskdir-');
-  const accountsDir = poolWith('spo-167-argv-accts-', ['acct-a']);
+test('card #167: each intake step leases, spends and cools ONE model -- INTAKE_MODELS, read off the real query() argv', async () => {
+  // INTAKE_MODELS (step-contracts.js) is passed BOTH into each intake step's call opts and into
+  // callIntakeStepWithRotation's lease/markLimit. This drives each step through the real vendored
+  // query() with a 429 reply, on a one-account pool pre-cooled on every OTHER known model: the
+  // call spawning at all proves the lease asked for the step's own model, the argv's --model
+  // proves the spend, and the one newly-cooled key proves markLimit's.
+  assert.equal(intake.INTAKE_MODELS, INTAKE_MODELS, "intake.js re-exports step-contracts.js's own object");
+  assert.deepEqual({ ...INTAKE_MODELS }, { draftCard: 'sonnet', reviewCard: 'fable', triageBugReport: OPUS_5_5 });
 
-  // VALIDATE with an override naming SONNET, chosen precisely because the step contract says
-  // `fable` for VALIDATE: the override's model and the contract's model DISAGREE here. That is
-  // what makes this test discriminate the mutation that matters -- a callLlmStep that cooled the
-  // contract's answer instead of the model the spawn really used would cool fable while `claude`
-  // ran on sonnet, and the assertion below would catch it. With a step where the two agree, the
-  // same mutation would pass.
-  assert.equal(resolveStepContract('VALIDATE', {}).model, 'fable', 'test setup: the override must disagree with the contract');
-
-  const ctx = makeCtx({
-    taskDir,
-    accountsDir,
-    task: { id: 't-argv', llm: { VALIDATE: { model: 'sonnet', effort: 'medium', promptText: 'do it' } } },
-  });
-
-  let argvSeen = null;
-  const spawnSync = (command, args) => {
-    argvSeen = args;
-    return {
-      status: 1,
-      stdout: JSON.stringify(realShapedPayload({ is_error: true, api_error_status: 429, result: 'rate limited' })),
-      stderr: '',
-      signal: null,
-    };
+  const calls = {
+    draftCard: (deps) => intake.draftCard('add a widget', deps),
+    reviewCard: (deps) =>
+      intake.reviewCard(
+        { title: 't', body_markdown: 'b', category: 'feature', size: 'S', area: 'client', priority: 'Low', is_bug_report: false, confirmed: false },
+        deps
+      ),
+    triageBugReport: (deps) => {
+      const reportFile = path.join(mkTmp('spo-167-intake-report-'), 'report.json');
+      fs.writeFileSync(reportFile, '{}');
+      return intake.triageBugReport(reportFile, 1, deps);
+    },
   };
+  assert.deepEqual(Object.keys(calls).sort(), Object.keys(INTAKE_MODELS).sort(), 'every intake step is covered');
 
-  await assert.rejects(() => callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', { spawnSync }), ParkSignal);
+  for (const [name, call] of Object.entries(calls)) {
+    const model = INTAKE_MODELS[name];
+    assert.ok(accounts.KNOWN_MODELS.includes(model), `${name}: ${model} must be in markLimit's no-model fail-safe`);
+    const accountsDir = poolWith(`spo-167-intake-${name}-`, ['acct-a']);
+    const others = accounts.KNOWN_MODELS.filter((m) => m !== model);
+    accounts.writeState(accountsDir, { 'acct-a': coolingEntry(others, Date.now() + HOUR) });
 
-  const modelInArgv = argvSeen[argvSeen.indexOf('--model') + 1];
-  assert.equal(modelInArgv, 'sonnet', 'test setup: the override really did reach the spawn');
+    let argvSeen = null;
+    const deps = {
+      ...fakeExecDeps(),
+      accountsDir,
+      journalRoot: mkTmp(`spo-167-intake-journal-${name}-`),
+      spawn: (command, args, spawnOpts) => {
+        argvSeen = args;
+        return fakeSpawnedChild([initMessage(), resultMessage(LIMIT_429)], { signal: spawnOpts.signal });
+      },
+    };
 
-  const byModel = accounts.readState(accountsDir)['acct-a'].byModel;
-  assert.deepEqual(
-    Object.keys(byModel),
-    [modelInArgv],
-    'the cooled model must be exactly the one `claude` was invoked with -- anything else cools a quota nobody spent'
-  );
-});
+    const result = await call(deps);
 
-test('card #167: each intake step leases/cools the model it actually invokes claude with', () => {
-  // INTAKE_MODELS is passed BOTH into the invokeClaudeReal opts and into the lease/markLimit
-  // calls; the whole reason it is a constant rather than two literals is that those two must not
-  // drift. The three values are asserted here against the steps' own documented models.
-  assert.deepEqual(intake.INTAKE_MODELS, { draftCard: 'sonnet', reviewCard: 'fable', triageBugReport: 'opus' });
-  for (const model of Object.values(intake.INTAKE_MODELS)) {
-    assert.ok(accounts.KNOWN_MODELS.includes(model), `${model} must be a model the pool state can key on`);
+    assert.ok(argvSeen, `${name}: must spawn -- the lease was for ${model}, the only model not cooling`);
+    assert.equal(modelArgvValue(argvSeen), model, `${name}: the argv's --model is INTAKE_MODELS.${name}`);
+    assert.equal(result.ok, false, `${name}: a one-account pool exhausted by a 429 reports failure`);
+    const byModel = accounts.readState(accountsDir)['acct-a'].byModel;
+    const newlyCooled = Object.keys(byModel).filter((m) => byModel[m].lastUsageLimitAt !== undefined);
+    assert.deepEqual(newlyCooled, [model], `${name}: exactly the argv's model was cooled`);
   }
 });
 
@@ -441,14 +582,14 @@ test('card #167 NEUTRALITY: every account cooling on the step\'s OWN model parks
   const ctx = makeCtx({ taskDir, accountsDir, task: { id: 't-neutral', kind: 'card', issue: 501, size: 'S' } });
 
   let spawned = 0;
-  const spawnSync = () => {
+  const spawn = (command, args, spawnOpts) => {
     spawned += 1;
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+    return fakeSpawnedChild([initMessage(), resultMessage()], { signal: spawnOpts.signal });
   };
 
   let caught = null;
   try {
-    await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', { spawnSync });
+    await callLlmStep(ctx, 'VALIDATE', 'llm.VALIDATE', fakeExecDeps({ spawn }));
   } catch (err) {
     caught = err;
   }
@@ -473,35 +614,35 @@ test('card #167 NEUTRALITY: every account cooling on the step\'s OWN model parks
 
 // ---- 4. the positive case: the capacity this card gives back ---------------------------------
 
-test('card #167 POSITIVE: fable cooled on the only account, and a SONNET step leases it instead of parking', async () => {
+test('card #167 POSITIVE: fable cooled on the only account, and an OPUS_5_5 step leases it instead of parking', async () => {
   // The issue's own decisive observation, reconstructed: `IMPLEMENT/sonnet ok=true` at 07:55:26,
   // `VALIDATE/fable` limited at 08:02:42, same account, seven minutes apart. Before this change
-  // the fable limit would have taken that account's IMPLEMENT capacity with it.
+  // the fable limit would have taken that account's IMPLEMENT capacity with it. IMPLEMENT has run
+  // OPUS_5_5 since 2026-09-23 (EXP-IMPLEMENT-OPUS-5-5), so that is the model reconstructed here --
+  // on the real contract branch, so the lease's model is resolveCallModel's own contract answer.
   const taskDir = mkTmp('spo-167-positive-taskdir-');
+  seedPlan(taskDir);
   const accountsDir = poolWith('spo-167-positive-accts-', ['acct-a']);
   const now = Date.now();
   accounts.writeState(accountsDir, { 'acct-a': coolingEntry(['fable'], now + 5 * HOUR) });
 
-  const ctx = makeCtx({
-    taskDir,
-    accountsDir,
-    // IMPLEMENT's model, on the legacy branch so this test needs no prompt-template fill; the
-    // contract branch's own IMPLEMENT -> sonnet resolution is pinned by the correspondence test
-    // above, and resolveCallModel is what joins the two.
-    task: { id: 't-positive', llm: { IMPLEMENT: { model: 'sonnet', effort: 'medium', promptText: 'implement it' } } },
-  });
+  const ctx = makeCtx({ taskDir, accountsDir, task: cardTask() });
+  assert.equal(resolveCallModel(ctx, 'IMPLEMENT'), OPUS_5_5, 'test premise: IMPLEMENT resolves to OPUS_5_5');
 
-  let spawned = 0;
-  const spawnSync = () => {
-    spawned += 1;
-    return { status: 0, stdout: JSON.stringify(realShapedPayload()), stderr: '', signal: null };
+  let argvSeen = null;
+  const spawn = (command, args, spawnOpts) => {
+    argvSeen = args;
+    return fakeSpawnedChild([initMessage(), resultMessage({ result: JSON.stringify({ summary: 'done', files_changed: [], invariants: [], tests_run: [], all_green: true }) })], {
+      signal: spawnOpts.signal,
+    });
   };
 
-  const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', { spawnSync });
+  const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
 
-  assert.equal(result.ok, true, 'a fable-only cooldown must not park a sonnet step');
-  assert.equal(spawned, 1);
-  assert.equal(ctx.account.name, 'acct-a', 'the very account that is cooling on fable did the sonnet work');
+  assert.equal(result.ok, true, 'a fable-only cooldown must not park an OPUS_5_5 step');
+  assert.ok(argvSeen, 'the call spawned');
+  assert.equal(modelArgvValue(argvSeen), OPUS_5_5);
+  assert.equal(ctx.account.name, 'acct-a', 'the very account that is cooling on fable did the Opus 5.5 work');
   // Pre-#167 this same state would have refused: the union question still says "cooling".
   assert.throws(() => accounts.pick(accountsDir, now), accounts.AllAccountsCoolingError);
 });

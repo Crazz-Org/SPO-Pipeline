@@ -37,11 +37,11 @@ measurement, both directions, as `task.rdoDiffTouched` (`rdo-diff-derived` in th
 diff-derived field is what gates the citation-verifier ahead of you, and (card #213, 2026-09-12)
 is also what raises your own **effort** to `xhigh` when it is `true` — it never changes your model
 (`step-contracts.js`: VALIDATE's `escalatedModel` is `null`). `task.touchesRdoMembers` remains a
-separate, one-way (false→true) intake guess that still drives IMPLEMENT's Opus escalation across
+separate, one-way (false→true) intake guess that still drives IMPLEMENT's escalation across
 retries; it no longer moves anything of yours — on the 36-card window measured 2026-09-12, it fired
 on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so most of what used to
 buy you `xhigh` was never really RDO work. You run as
-Fable 5 on every path a real card can take — never Sonnet 5: Sonnet is the executor, and a same-model judge tends to ratify precisely
+Fable 5 on every path a real card can take — never the executor's model (IMPLEMENT runs Opus 5.5 since 2026-09-23, Sonnet 5 before), because a same-model judge tends to ratify precisely
 the misunderstandings its author had. There is no per-attempt fallback to another model either: a
 retry after an account limit (`state-machine.js`'s `callLlmStep`) rotates only the account leased
 for the call, re-resolving the same step's contract on the same task each time, so the model never

@@ -31,7 +31,7 @@ const path = require('path');
 const { buildCtx, finalizePark, takeNextTask, HANDLERS } = require('../orchestrator/state-machine');
 const { countRepeatedParks } = require('../orchestrator/park-loop');
 const { appendEvent } = require('../orchestrator/journal');
-const { mkTmp, writePoolDir } = require('./helpers');
+const { mkTmp, writePoolDir, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -143,21 +143,24 @@ test('T-A: two transient re-enqueues then one genuine park (budget exhausted, pr
 // INVALIDATING_REASONS loop reaches it: through HANDLERS.PLAN, counting whether callLlmStep's
 // injected spawnSync was invoked (reuse skips it entirely; a normal run calls it exactly once).
 
-function planReplyEnvelope(planPayload) {
+// Card #239 chantier (A5b-2, Job 3): claude no longer spawns via spawnSync -- it drives the Agent
+// SDK's query() (orchestrator/steps/sdk-call.js), injected here as `deps.spawn` (test/helpers.js's
+// `fakeSpawnedChild`). `planResultMessage` mirrors the old `planReplyEnvelope`'s content, one layer
+// down (a stream-json `result` message, not a parsed `--output-format json` object).
+function planResultMessage(planPayload) {
   return {
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-phantom-park',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 1,
+    session_id: 'sess-phantom-park',
+    modelUsage: { 'claude-fable-5': { input_tokens: 100, output_tokens: 50 } },
+    result: JSON.stringify(planPayload),
   };
+}
+
+function planInitMessage() {
+  return { type: 'system', subtype: 'init', session_id: 'sess-phantom-park', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
 }
 
 function validPlanPayload() {
@@ -170,10 +173,13 @@ function validPlanPayload() {
   };
 }
 
-function countingSpawn(reply) {
+// countingSpawn(messages) -- the `deps.spawn` counterpart of the old countingSpawn(reply): a fresh
+// fakeSpawnedChild per call (a real child can only be consumed once), with `spy.callCount` counted
+// the same way the old spawnSync-based spy counted invocations.
+function countingSpawn(messages) {
   function spy() {
     spy.callCount += 1;
-    return reply;
+    return fakeSpawnedChild(messages);
   }
   spy.callCount = 0;
   return spy;
@@ -209,7 +215,7 @@ function setupInvalidatingParkFixture(baseMainSha) {
 }
 
 async function decidePlanReuseVerdict(taskDir, baseMainSha, accountsDir) {
-  const spawnSync = countingSpawn(planReplyEnvelope(validPlanPayload()));
+  const spawn = countingSpawn([planInitMessage(), planResultMessage(validPlanPayload())]);
   const worktreePath = mkTmp('spo-phantom-tb-wt-');
   const task = { id: 'card-900', kind: 'card', issue: 900, title: 'x', criterion: 'x', size: 'S', baseMainSha, worktreePath };
   const ctx = buildCtx(task.id, task, taskDir, {
@@ -217,10 +223,10 @@ async function decidePlanReuseVerdict(taskDir, baseMainSha, accountsDir) {
     dryRun: false,
     claudeAccountsDir: accountsDir,
     stepDeadlineMs: 30000,
-    deps: { spawnSync },
+    deps: fakeExecDeps({ spawn }),
   });
   const next = await HANDLERS.PLAN(ctx);
-  return { next, llmCallCount: spawnSync.callCount };
+  return { next, llmCallCount: spawn.callCount };
 }
 
 test('T-B: decidePlanReuse reaches the SAME verdict (refuse) before and after a transient re-enqueue that does not park', async () => {

@@ -15,7 +15,8 @@ require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
+const { OPUS_5_5 } = require('../orchestrator/step-contracts');
 
 function readJournal(taskDir) {
   const p = path.join(taskDir, 'journal.jsonl');
@@ -27,21 +28,29 @@ function readJournal(taskDir) {
     .map((l) => JSON.parse(l));
 }
 
+// Card #239 chantier, action A5b-2 (Job 3): migrated off `deps.spawnSync`'s old flat
+// `--output-format json` envelope onto the SDK's stream-json shape (test/helpers.js's
+// `fakeSpawnedChild`, same seam as test/llm-real-card.test.js). `envelope(planPayload)` now
+// returns the LINES array `fakeSpawnedChild` consumes, not a pre-built spawnSync result object.
+function initMessage(sessionId = 'sess-plan-fallback') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
 function envelope(planPayload) {
-  return {
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
+  return [
+    initMessage(),
+    {
+      type: 'result',
+      subtype: 'success',
       is_error: false,
       num_turns: 1,
       session_id: 'sess-plan-fallback',
-      modelUsage: { 'claude-opus-5': { costUSD: 0.001 } },
+      modelUsage: { 'claude-opus-5': { inputTokens: 10, outputTokens: 5 } },
+      result: JSON.stringify(planPayload),
       terminal_reason: 'success',
       api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
-  };
+    },
+  ];
 }
 
 const VALID = {
@@ -52,15 +61,35 @@ const VALID = {
   check_commands: ['npm run typecheck'],
 };
 const INVALID = { ...VALID, invariants_markdown: '' };
-const TRANSPORT_FAILURE = { status: 0, stdout: 'not json at all', stderr: '', signal: null };
+// A reply whose `result` field is not JSON at all (runLlm's `JSON.parse(raw.result)` fails) --
+// the new transport's equivalent of the old flat `{status:0, stdout:'not json at all', ...}`
+// spawnSync shape (see test/llm-real-card.test.js's own "reply whose result field is not JSON at
+// all" test for the same construction).
+const TRANSPORT_FAILURE = [
+  initMessage(),
+  {
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 1,
+    session_id: 'sess-plan-fallback',
+    modelUsage: { 'claude-opus-5': { inputTokens: 10, outputTokens: 5 } },
+    result: 'not json at all',
+    terminal_reason: 'success',
+    api_error_status: null,
+  },
+];
 
-// Replies in order, one per spawn. Records each call's --model and --effort.
+// Replies in order, one per spawn -- each a LINES array `fakeSpawnedChild` consumes. Records each
+// call's --model and --effort off the REAL argv the SDK built (`args`, the same array
+// test/helpers.js's `fakeSpawnDeps` records as `calls[i].args` -- built inline here instead since
+// this file needs per-call scripted replies, not just a recorder).
 function scriptedSpawn(replies) {
   const calls = [];
-  function spawn(command, argv) {
-    calls.push({ model: argv[argv.indexOf('--model') + 1], effort: argv[argv.indexOf('--effort') + 1] });
+  function spawn(command, args) {
+    calls.push({ model: args[args.indexOf('--model') + 1], effort: args[args.indexOf('--effort') + 1] });
     if (replies.length === 0) throw new Error('scriptedSpawn: more calls than scripted replies');
-    return replies.shift();
+    return fakeSpawnedChild(replies.shift());
   }
   spawn.calls = calls;
   return spawn;
@@ -76,7 +105,7 @@ function realCtx({ id, taskDir, spawnSync, size = 'S' }) {
     dryRun: false,
     claudeAccountsDir: accountsDir,
     stepDeadlineMs: 30000,
-    deps: { spawnSync },
+    deps: fakeExecDeps({ spawn: spawnSync }),
   });
 }
 
@@ -89,9 +118,9 @@ test('a valid Opus plan: one call, on Opus, at PLAN_EFFORT_BY_SIZE, no fallback 
   const next = await HANDLERS.PLAN(realCtx({ id: 'card-701', taskDir, spawnSync, size: 'M' }));
 
   assert.equal(next, 'IMPLEMENT');
-  assert.deepEqual(spawnSync.calls, [{ model: 'opus', effort: 'high' }]);
+  assert.deepEqual(spawnSync.calls, [{ model: OPUS_5_5, effort: 'high' }]);
   assert.deepEqual(fallbackEvents(taskDir), []);
-  assert.deepEqual(llmCallModels(taskDir), ['opus']);
+  assert.deepEqual(llmCallModels(taskDir), [OPUS_5_5]);
 });
 
 test('an invalid Opus reply falls back to ONE Fable call in the same run, which plans the card', async () => {
@@ -102,14 +131,14 @@ test('an invalid Opus reply falls back to ONE Fable call in the same run, which 
   assert.equal(next, 'IMPLEMENT');
   assert.deepEqual(
     spawnSync.calls.map((c) => c.model),
-    ['opus', 'fable']
+    [OPUS_5_5, 'fable']
   );
   assert.equal(spawnSync.calls[1].effort, 'medium', 'the fallback runs at the same PLAN effort');
   const events = fallbackEvents(taskDir);
   assert.equal(events.length, 1);
   assert.equal(events[0].cause, 'plan-invalid-reply');
   assert.deepEqual(events[0].missing, ['invariants_markdown']);
-  assert.deepEqual(llmCallModels(taskDir), ['opus', 'fable']);
+  assert.deepEqual(llmCallModels(taskDir), [OPUS_5_5, 'fable']);
   assert.ok(readJournal(taskDir).some((e) => e.event === 'files-written'), 'the Fable plan was written');
 });
 
@@ -159,7 +188,7 @@ test('a plan-invalid park followed by an orthogonal park does not keep the card 
   assert.equal(await HANDLERS.PLAN(realCtx({ id: 'card-706', taskDir, spawnSync })), 'IMPLEMENT');
   assert.deepEqual(
     spawnSync.calls.map((c) => c.model),
-    ['opus']
+    [OPUS_5_5]
   );
   assert.deepEqual(fallbackEvents(taskDir), []);
 });

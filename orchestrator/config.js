@@ -14,11 +14,17 @@ const os = require('os');
 const productRepoHold = require('./product-repo-hold');
 // MAX_LEASE_AGE_MS is defined in step-contracts.js (which requires nothing local) rather than in
 // account-lease.js, because account-lease.js requires THIS file -- see its own comment.
-const { MAX_LEASE_AGE_MS } = require('./step-contracts');
+// STEP_CONTRACTS/deadlineMsForStep: action A2 (card #239) generates the five LLM entries of
+// stepDeadlineMsByState below FROM STEP_CONTRACTS's own keys (never a sixth hand-written pair of
+// lines) and from deadlineMsForStep's own resolution -- see that block's comment.
+const stepContracts = require('./step-contracts');
+const { MAX_LEASE_AGE_MS } = stepContracts;
 
 const REPO_ROOT = path.join(__dirname, '..');
 
-// cwd policy for real-mode `claude -p` calls (steps/llm.js). Shadow mode never spawns anything,
+// cwd policy for real-mode LLM calls (steps/llm.js's invokeClaudeReal, the vendored Agent SDK's
+// query() since card #239's transport cutover, action A5b, 2026-09-17 -- no longer `claude -p`
+// spawned directly). Shadow mode never spawns anything,
 // so it never calls cwdForStep -- this only matters once real mode is actually reached.
 //
 // Split by where the step's authority lives, not by which model runs it:
@@ -62,7 +68,7 @@ const DRAIN_TIMEOUT_MS = nonNegativeMsFromEnv('SPO_DRAIN_TIMEOUT_MS', 45 * 60 * 
 const CI_CHECKS_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVAL_MS', 20000);
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` (worker.ts:1542 maps the SIGTERM straight to
+// `systemctl --user restart spo-bench-worker.service` (worker.ts:1636 maps the SIGTERM straight to
 // `process.exit(0)`, no drain), and this daemon runs K=2 in production (SPO_WORKERS=2 on the live
 // systemd drop-in) -- so a card reaching FINISH's reinstall step can cut a SIBLING card's
 // in-flight GATE. That recovers as `gate-non-attesting` (transient-retryable -- see
@@ -414,6 +420,56 @@ function boundedPositiveIntFromEnv(name, defaultN, maxN) {
   return parsed;
 }
 
+// ---- action A2 (card #239, 2026-09-17): per-state OUTER deadlines for the five LLM steps -------
+//
+// Action A2 landed AHEAD of action A5b (card #239, 2026-09-17, same day), which then replaced
+// steps/llm.js's invokeClaudeReal spawnSync (BLOCKING -- the event loop never
+// yielded, so deadline.js's setTimeout could not fire while a real `claude` call ran) with
+// an awaited async stream. STALE UNTIL THIS FIX PASS: this comment used to describe A5b in the
+// future tense ("the moment that lands... becomes LIVE") -- A5b has since landed (invokeClaudeReal
+// now drives the vendored Agent SDK's query(), see steps/llm.js's own header), so the outer timer
+// every step already races (deadline.js's callWithDeadline) genuinely IS LIVE now for PLAN/
+// IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE, not merely about to become so -- and until THIS
+// action (A2), none of the five had an entry below, so
+// every one fell back to the generic STEP_DEADLINE_MS (120000ms). A call that legitimately runs
+// 900000-1800000ms (LLM_STEP_DEADLINE_MS_BY_STEP, step-contracts.js) would be killed by that 120s
+// ceiling on its very first event-loop turn, retried once (a SECOND full LLM call, real spend, per
+// deadline.js's callWithDeadline), and parked step-deadline-exceeded-twice -- while
+// deadline.js's withTimeout abandons the loser rather than cancelling it, so the first, still
+// in-flight call keeps running and keeps spending the account's quota after the lease that was
+// guarding it has already been released (state-machine.js's callLlmStep releases in a `finally`,
+// the instant callWithDeadline returns OR throws) -- two live `claude` processes on one
+// CLAUDE_CONFIG_DIR, the exact state account-lease.js exists to prevent, reopened at the deadline
+// layer instead of the lease layer. This is the identical argument this file's own GATE entry
+// above already makes for card #211, and the identical production incident MERGE's own
+// (separate, un-fixed) defect recorded for card #587.
+//
+// Same derivation shape as CI_CHECKS/GATE above: the step's own INNER deadline
+// (step-contracts.js's deadlineMsForStep -- the timeout that actually bounds one call) plus one
+// ordinary STEP_DEADLINE_MS of margin for everything runLlm legitimately does around the call
+// itself (prompt fill, journal append, reply parse, token-usage mapping), clamped to
+// MAX_TIMER_DELAY_MS exactly as GATE's own entry is. THE INVARIANT THIS BUILDS, stated plainly
+// because every other entry in this block exists to keep it true: the inner deadline always fires
+// first. This outer timer is retry-once-then-park bookkeeping, and must never be the thing that
+// cuts off a call that is still healthy.
+//
+// Generated from STEP_CONTRACTS's own keys (step-contracts.js), not five hand-written lines: a
+// sixth LLM step added to that table with no entry here is exactly the drift this loop makes
+// impossible -- see test/llm-step-deadlines.test.js's table-driven pin, which fails the moment a
+// STEP_CONTRACTS key has no corresponding (and correctly derived) entry below.
+//
+// step-contracts.js's own MAX_LEASE_AGE_MS is re-derived alongside this, in the same action,
+// because a bound sized for "the outer deadline never fires" (true before this action) is no
+// longer safe for "the outer deadline IS the enforced ceiling on one attempt" (true once card
+// #239's transport swap lands) -- see that constant's own header for the arithmetic.
+const LLM_STEP_DEADLINE_ENTRIES = {};
+for (const stepName of Object.keys(stepContracts.STEP_CONTRACTS)) {
+  LLM_STEP_DEADLINE_ENTRIES[stepName] = Math.min(
+    stepContracts.deadlineMsForStep(stepName) + STEP_DEADLINE_MS,
+    MAX_TIMER_DELAY_MS
+  );
+}
+
 module.exports = {
   // Wall-clock deadline for a single step invocation (scripted or llm), in milliseconds.
   // On expiry the step is treated as killed, retried once, and PARKED if it expires again.
@@ -630,6 +686,9 @@ module.exports = {
   // the mutex ((K-1) x worst hold), plus that phase's own longest legitimate WORK, plus one
   // ordinary step deadline of margin -- the identical shape CI_CHECKS uses above.
   stepDeadlineMsByState: {
+    // Action A2 (card #239): PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE -- see
+    // LLM_STEP_DEADLINE_ENTRIES's own derivation and full hazard writeup just above this export.
+    ...LLM_STEP_DEADLINE_ENTRIES,
     CI_CHECKS: CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS,
     WORKTREE: productRepoHold.lockedStepDeadlineMs(
       COMMAND_TIMEOUTS_MS,
@@ -933,22 +992,32 @@ module.exports = {
   // waiter must outlast is not the duration a step USUALLY takes, it is the longest a sibling can
   // LEGITIMATELY hold the lease, and that is a bound this codebase already states:
   //
-  //   sibling worker, one two-attempt LLM step   2 x MAX_LLM_STEP_DEADLINE_MS = 60   min
-  //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS       = 10   min
-  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS             = 63   min
+  //   sibling worker, one two-attempt LLM step   2 x MAX_LLM_STEP_OUTER_DEADLINE_MS = 64    min
+  //   scanner, one two-call triage step          2 x INTAKE_DEADLINE_MS             = 10    min
+  //   the age at which a lease is swept as dead  MAX_LEASE_AGE_MS                   = 67.2  min
   //
-  // The first row reads 60 min, not the 30 min this table once stated -- that 30-minute figure was
-  // LLM_STEP_DEADLINE_MS's own default, true only before PLAN's 2026-09-04 override and
-  // IMPLEMENT's own (step-contracts.js, action 2.2) each raised the worst legitimate hold to
-  // MAX_LLM_STEP_DEADLINE_MS instead. MAX_LEASE_AGE_MS is derived from that running maximum for
-  // exactly this reason: the 63-minute figure on the third row already tracked the raise without
-  // an edit here; only this table's prose had drifted from the code it describes.
+  // The first row reads 64 min, not the 60 min this table stated before action A2 (card #239,
+  // 2026-09-17) -- that 60-minute figure was 2 x MAX_LLM_STEP_DEADLINE_MS, the INNER deadline
+  // alone, correct only while the OUTER per-state timer (deadline.js's callWithDeadline, armed
+  // from this file's own stepDeadlineMsByState) had no entry for any LLM step and so could never
+  // fire against a real call -- a blocking spawnSync never yielded the event loop. A2 gave every
+  // LLM step an outer entry (deadlineMsForStep(step) + STEP_DEADLINE_MS, this file's own
+  // stepDeadlineMsByState above), so that once card #239's transport swap (action A5b, landed the
+  // same day) made that timer live -- which it now is, not merely anticipated -- the
+  // worst legitimate per-attempt hold becomes the OUTER bound, not the inner one alone --
+  // MAX_LLM_STEP_OUTER_DEADLINE_MS = MAX_LLM_STEP_DEADLINE_MS + STEP_DEADLINE_MARGIN_MS =
+  // 1,920,000ms (step-contracts.js). MAX_LEASE_AGE_MS is derived from that running maximum for
+  // exactly this reason: the 67.2-minute figure on the third row already tracks the new bound
+  // without a second edit here; only this table's prose has to be kept honest by hand -- the same
+  // drift this exact table already recorded once, when the first row read 30 min after PLAN's
+  // 2026-09-04 override and IMPLEMENT's own (step-contracts.js, action 2.2) had already raised the
+  // bound the row describes.
   //
   // Against a 5-minute wait every one of those is longer. A worker at K=2 therefore gave up while
-  // the holder was still legitimately alive AND still un-sweepable for up to another 58 minutes,
-  // and parked `all-accounts-leased` -- the exact park class per-step leasing exists to avoid. The
-  // real pool is 2 accounts against 3 contenders (2 workers + the scanner), so this is an ordinary
-  // operating point, not an exotic one.
+  // the holder was still legitimately alive AND still un-sweepable for up to another 62.2 minutes
+  // (67.2 - 5), and parked `all-accounts-leased` -- the exact park class per-step leasing exists to
+  // avoid. The real pool is 2 accounts against 3 contenders (2 workers + the scanner), so this is
+  // an ordinary operating point, not an exotic one.
   //
   // MAX_LEASE_AGE_MS is the correct derivation because it is the ceiling by CONSTRUCTION: a lease
   // younger than it may be legitimately held, and one older than it is swept and taken by the very

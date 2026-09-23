@@ -20,7 +20,7 @@ require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { buildValidateFindingsComment, normalizeFindingsPayload } = require('../orchestrator/park-loop');
 const { appendEvent } = require('../orchestrator/journal');
-const { timeoutResult, writePoolDir, mkTmp } = require('./helpers');
+const { timeoutResult, writePoolDir, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -254,29 +254,40 @@ test('buildValidateFindingsComment: stays pure -- no filesystem access, callable
 // Part 2 -- end-to-end through HANDLERS.VALIDATE (state-machine.js's handleValidate), real mode.
 // ==================================================================================================
 
-function realShapedLlmReply(payload, overrides = {}) {
+// Card #239 chantier, action A5b-2: migrated off `deps.spawnSync`'s `{status, stdout: JSON string,
+// stderr, signal}` shape onto `deps.spawn` (test/helpers.js's `fakeSpawnDeps`/`fakeSpawnedChild`) --
+// same seam and idioms as test/llm-real-card.test.js's own `initMessage`/`resultMessage`. `overrides`
+// still lands on the MESSAGE itself (is_error, session_id, ...), matching the old function's own
+// `overrides` parameter one for one.
+function vfInitMessage(sessionId = 'sess-vf-1') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+function vfResultMessage(payload, overrides = {}) {
   return {
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(payload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-vf-1',
-      modelUsage: { fable: { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-      ...overrides,
-    }),
-    stderr: '',
-    signal: null,
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 1,
+    session_id: 'sess-vf-1',
+    modelUsage: { fable: { inputTokens: 10, outputTokens: 5 } },
+    result: JSON.stringify(payload),
+    ...overrides,
   };
+}
+
+// claudeReplyLines(payload, overrides) -- this file's equivalent of the old claudeReplyLines():
+// the two stream-json lines a fake `claude` now writes for one call, one entry of the
+// `claudeReplies` array `makeValidateSpawn` below consumes in call order.
+function claudeReplyLines(payload, overrides = {}) {
+  return [vfInitMessage(), vfResultMessage(payload, overrides)];
 }
 
 // Full `kind: "card"` real path (step-contracts.js + prompt-template.js), the only way to reach
 // handleValidate with an actual verdict/findings payload -- the legacy ctx.task.llm.<step>
 // override (test/diagnose-surface.test.js's own convention) returns invokeClaudeReal's raw shape
 // with no JSON-parsing of `result` at all, so it can never carry a `verdict` key; unsuitable here.
-function validateCtx({ id, issue, touchesRdoMembers = false, spawnSync, prNumber, configOverrides = {} }) {
+function validateCtx({ id, issue, touchesRdoMembers = false, spawnSync, spawn, prNumber, configOverrides = {} }) {
   const accountsDir = mkTmp('spo-vf-accts-');
   fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
   const worktreePath = mkTmp('spo-vf-wt-');
@@ -298,7 +309,10 @@ function validateCtx({ id, issue, touchesRdoMembers = false, spawnSync, prNumber
     stepDeadlineMs: 30000,
     ghRepo: 'Crazz-Org/SPO-WebClient',
     claudeAccountsDir: accountsDir,
-    deps: { spawnSync },
+    // `claude` moved off deps.spawnSync entirely (card #239 chantier, A5b-2) -- deps.spawnSync
+    // stays for git/npm/gh (makeValidateSpawn's own dispatch below), deps.spawn (fakeExecDeps)
+    // is the new seam the real `claude` call actually uses.
+    deps: { ...fakeExecDeps({ spawn }), spawnSync },
     ...configOverrides,
   });
   // VALIDATE's prompt declares invariants_path/invariant_ids, PLAN's own output -- same minimal
@@ -310,12 +324,16 @@ function validateCtx({ id, issue, touchesRdoMembers = false, spawnSync, prNumber
   return ctx;
 }
 
-// Standard git/npm plumbing every HANDLERS.VALIDATE call needs (moveCard's board:move,
-// prepareJudgeInputs' diff.patch) -- `claudeReplies` is consumed in call order: CITATION_VERIFIER
-// first (only when touchesRdoMembers), then VALIDATE. `ghResult` answers every `gh issue comment`
-// call (there is at most one per test here).
-function makeValidateSpawn({ claudeReplies, ghResult, calls = [] }) {
-  let claudeIdx = 0;
+// Standard git/npm/gh plumbing every HANDLERS.VALIDATE call needs (moveCard's board:move,
+// prepareJudgeInputs' diff.patch) -- `deps.spawnSync`, untouched by the transport cutover. `claude`
+// moved off it entirely (card #239 chantier, A5b-2): `claudeReplies` is now an array of stream-json
+// LINE-arrays (test/helpers.js's `fakeSpawnedChild` shape, built by claudeReplyLines above),
+// consumed in call order through the SEPARATE `deps.spawn` seam below -- CITATION_VERIFIER first
+// (only when touchesRdoMembers), then VALIDATE, the last entry repeating for any call past the end
+// of the list (same "last one repeats" convention the old claudeIdx dispatch used). `ghResult`
+// answers every `gh issue comment` call (there is at most one per test here). Returns
+// `{spawnSync, spawn, calls}` -- callers hand both `spawnSync` and `spawn` to validateCtx.
+function makeValidateSpawn({ claudeReplies = [], ghResult, calls = [] }) {
   const spawnSync = (command, args) => {
     calls.push({ command, args: [...args] });
     if (command === 'npm') return ok('');
@@ -325,11 +343,6 @@ function makeValidateSpawn({ claudeReplies, ghResult, calls = [] }) {
       if (args.includes('status') && args.includes('--porcelain')) return ok('');
       if (args.includes('diff')) return ok('diff --git a/z.ts b/z.ts\n+change\n');
       return ok('');
-    }
-    if (command === 'claude') {
-      const reply = claudeReplies[Math.min(claudeIdx, claudeReplies.length - 1)];
-      claudeIdx += 1;
-      return reply;
     }
     if (command === 'gh') {
       // A FUNCTION ghResult is CALLED, not returned. Without this the hostile-shape test below
@@ -342,7 +355,15 @@ function makeValidateSpawn({ claudeReplies, ghResult, calls = [] }) {
     return ok('');
   };
   spawnSync.calls = calls;
-  return spawnSync;
+
+  let claudeIdx = 0;
+  function spawn(command, args, spawnOpts) {
+    const lines = claudeReplies[Math.min(claudeIdx, claudeReplies.length - 1)];
+    claudeIdx += 1;
+    return fakeSpawnedChild(lines, { signal: spawnOpts.signal });
+  }
+
+  return { spawnSync, spawn, calls };
 }
 
 test('HANDLERS.VALIDATE (real mode): PASS_WITH_FINDINGS with real corpus findings (JSON-encoded STRING, issue-232 shape) posts the comment on the ISSUE, names the PR, journals validate-findings-posted with the count, and returns MERGE', async () => {
@@ -355,11 +376,11 @@ test('HANDLERS.VALIDATE (real mode): PASS_WITH_FINDINGS with real corpus finding
       summary: 'The new `export { server as httpServer }` bypasses SEC-R-2.',
     },
   ];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: JSON.stringify(findingsPayload) })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: JSON.stringify(findingsPayload) })],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-1', issue: 601, spawnSync, prNumber: 601 });
+  const ctx = validateCtx({ id: 'card-vf-1', issue: 601, spawnSync, spawn, prNumber: 601 });
 
   const next = await HANDLERS.VALIDATE(ctx);
   assert.equal(next, 'MERGE');
@@ -385,11 +406,11 @@ test('HANDLERS.VALIDATE (real mode): PASS_WITH_FINDINGS with real corpus finding
 
 test('HANDLERS.VALIDATE (real mode): plain PASS posts NO comment at all', async () => {
   const calls = [];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS', reasons: [], findings: [] })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS', reasons: [], findings: [] })],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-2', issue: 602, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-2', issue: 602, spawnSync, spawn });
 
   const next = await HANDLERS.VALIDATE(ctx);
   assert.equal(next, 'MERGE');
@@ -398,11 +419,11 @@ test('HANDLERS.VALIDATE (real mode): plain PASS posts NO comment at all', async 
 
 test('HANDLERS.VALIDATE (real mode): PASS_WITH_FINDINGS with an EMPTY findings array posts NO comment at all', async () => {
   const calls = [];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [] })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [] })],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-3', issue: 603, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-3', issue: 603, spawnSync, spawn });
 
   const next = await HANDLERS.VALIDATE(ctx);
   assert.equal(next, 'MERGE');
@@ -423,11 +444,11 @@ test('HANDLERS.VALIDATE (real mode): malformed findings (not JSON, null, an arra
 
   for (const [i, c] of cases.entries()) {
     const calls = [];
-    const spawnSync = makeValidateSpawn({
-      claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: c.findings })],
+    const { spawnSync, spawn } = makeValidateSpawn({
+      claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: c.findings })],
       calls,
     });
-    const ctx = validateCtx({ id: `card-vf-malformed-${i}`, issue: 700 + i, spawnSync });
+    const ctx = validateCtx({ id: `card-vf-malformed-${i}`, issue: 700 + i, spawnSync, spawn });
 
     let next;
     await assert.doesNotReject(async () => {
@@ -439,11 +460,11 @@ test('HANDLERS.VALIDATE (real mode): malformed findings (not JSON, null, an arra
   // "array of nulls" has two (malformed) elements -- there IS something to render, so it DOES
   // post a comment, of two placeholder lines, never a crash.
   const calls2 = [];
-  const spawnSync2 = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [null, null] })],
+  const { spawnSync: spawnSync2, spawn: spawn2 } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [null, null] })],
     calls: calls2,
   });
-  const ctx2 = validateCtx({ id: 'card-vf-nulls-render', issue: 710, spawnSync: spawnSync2 });
+  const ctx2 = validateCtx({ id: 'card-vf-nulls-render', issue: 710, spawnSync: spawnSync2, spawn: spawn2 });
   await HANDLERS.VALIDATE(ctx2);
   const ghCall = calls2.find((c) => c.command === 'gh');
   assert.ok(ghCall, 'two malformed-but-present array elements are still something to render');
@@ -462,14 +483,14 @@ test('HANDLERS.VALIDATE (real mode): citation-verifier DIVERGES journals `entrie
       finding: '0-arg published function, kept as accessor `get` under rule 1.',
     },
   ];
-  const spawnSync = makeValidateSpawn({
+  const { spawnSync, spawn } = makeValidateSpawn({
     claudeReplies: [
-      realShapedLlmReply({ verdict: 'DIVERGES', entries: divergesEntries }), // CITATION_VERIFIER
-      realShapedLlmReply({ verdict: 'PASS', reasons: [], findings: [] }), // VALIDATE
+      claudeReplyLines({ verdict: 'DIVERGES', entries: divergesEntries }), // CITATION_VERIFIER
+      claudeReplyLines({ verdict: 'PASS', reasons: [], findings: [] }), // VALIDATE
     ],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-diverges', issue: 462, touchesRdoMembers: true, spawnSync, prNumber: 470 });
+  const ctx = validateCtx({ id: 'card-vf-diverges', issue: 462, touchesRdoMembers: true, spawnSync, spawn, prNumber: 470 });
 
   const next = await HANDLERS.VALIDATE(ctx);
   assert.equal(next, 'MERGE');
@@ -492,14 +513,14 @@ test('HANDLERS.VALIDATE (real mode): citation-verifier DIVERGES journals `entrie
 
 test('HANDLERS.VALIDATE (real mode): DIVERGES + PASS_WITH_FINDINGS in the same run produce exactly ONE comment with both sections', async () => {
   const calls = [];
-  const spawnSync = makeValidateSpawn({
+  const { spawnSync, spawn } = makeValidateSpawn({
     claudeReplies: [
-      realShapedLlmReply({ verdict: 'DIVERGES', entries: [{ member: 'M', citation: 'c:1', finding: 'f' }] }),
-      realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'a validator finding' }] }),
+      claudeReplyLines({ verdict: 'DIVERGES', entries: [{ member: 'M', citation: 'c:1', finding: 'f' }] }),
+      claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'a validator finding' }] }),
     ],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-both', issue: 463, touchesRdoMembers: true, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-both', issue: 463, touchesRdoMembers: true, spawnSync, spawn });
 
   const next = await HANDLERS.VALIDATE(ctx);
   assert.equal(next, 'MERGE');
@@ -515,12 +536,12 @@ test('HANDLERS.VALIDATE (real mode): DIVERGES + PASS_WITH_FINDINGS in the same r
 
 test('HANDLERS.VALIDATE (real mode): a non-zero `gh` exit never blocks the merge -- journals validate-findings-post-failed, still returns MERGE', async () => {
   const calls = [];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
     ghResult: fail(1),
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-ghfail', issue: 604, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-ghfail', issue: 604, spawnSync, spawn });
 
   const next = await HANDLERS.VALIDATE(ctx);
   assert.equal(next, 'MERGE');
@@ -534,8 +555,8 @@ test('HANDLERS.VALIDATE (real mode): a non-zero `gh` exit never blocks the merge
 
 test('HANDLERS.VALIDATE (real mode): a timed-out `gh` spawn never throws -- journalled as validate-findings-post-failed with timedOut: true, still returns MERGE', async () => {
   const calls = [];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
     ghResult: timeoutResult(),
     calls,
   });
@@ -543,6 +564,7 @@ test('HANDLERS.VALIDATE (real mode): a timed-out `gh` spawn never throws -- jour
     id: 'card-vf-timeout',
     issue: 605,
     spawnSync,
+    spawn,
     configOverrides: { commandTimeoutsMs: { gh: 120000 } },
   });
 
@@ -569,12 +591,12 @@ test('HANDLERS.VALIDATE (real mode): a `gh` spawn that THROWS, or returns undefi
     ['null', () => null],
   ]) {
     const calls = [];
-    const spawnSync = makeValidateSpawn({
-      claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
+    const { spawnSync, spawn } = makeValidateSpawn({
+      claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
       ghResult,
       calls,
     });
-    const ctx = validateCtx({ id: `card-vf-hostile-${label}`, issue: 605, spawnSync });
+    const ctx = validateCtx({ id: `card-vf-hostile-${label}`, issue: 605, spawnSync, spawn });
 
     let next;
     await assert.doesNotReject(async () => {
@@ -598,11 +620,11 @@ test('HANDLERS.VALIDATE (real mode): a REJECT threads its findings onward even w
   // Nothing was lost yet only because the corpus's single REJECT carried an empty array.
   const raw = JSON.stringify([{ summary: 'the rejected thing', category: 'defect' }]);
   const calls = [];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'REJECT', reasons: ['no'], findings: raw })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'REJECT', reasons: ['no'], findings: raw })],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-reject-string', issue: 607, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-reject-string', issue: 607, spawnSync, spawn });
 
   return HANDLERS.VALIDATE(ctx).then((next) => {
     assert.equal(next, 'IMPLEMENT', 'a REJECT within budget goes back to IMPLEMENT');
@@ -631,10 +653,10 @@ test('HANDLERS.VALIDATE (real mode): a REJECT threads its REASONS onward when th
   // concluded the VALIDATE prompt had violated its "exactly one entry" contract -- blaming the
   // producer for the reader's loss, and spending the whole diagnose budget on it.
   const raw = JSON.stringify(['the criterion is not met: two files were never edited']);
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'REJECT', reasons: raw, findings: [] })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'REJECT', reasons: raw, findings: [] })],
   });
-  const ctx = validateCtx({ id: 'card-vf-reject-reasons-string', issue: 640, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-reject-reasons-string', issue: 640, spawnSync, spawn });
 
   return HANDLERS.VALIDATE(ctx).then((next) => {
     assert.equal(next, 'IMPLEMENT');
@@ -665,11 +687,11 @@ test('HANDLERS.VALIDATE (real mode): the change-validator verdict is journalled 
   // earlier in this chantier. It matters because the journal is the ledger: if the post throws,
   // hangs or is killed mid-flight, the verdict must already be on the record.
   const calls = [];
-  const spawnSync = makeValidateSpawn({
-    claudeReplies: [realShapedLlmReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
+  const { spawnSync, spawn } = makeValidateSpawn({
+    claudeReplies: [claudeReplyLines({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: [{ summary: 'x' }] })],
     calls,
   });
-  const ctx = validateCtx({ id: 'card-vf-order', issue: 606, spawnSync });
+  const ctx = validateCtx({ id: 'card-vf-order', issue: 606, spawnSync, spawn });
 
   assert.equal(await HANDLERS.VALIDATE(ctx), 'MERGE');
 

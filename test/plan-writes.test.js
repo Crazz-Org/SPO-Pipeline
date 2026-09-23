@@ -17,7 +17,7 @@ require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 
 function readJournal(taskDir) {
@@ -165,24 +165,28 @@ function readJournal(taskDir) {
     .map((l) => JSON.parse(l));
 }
 
-// A real-mode PLAN reply's spawnSync stand-in: exactly invokeClaudeReal's expected envelope
-// (steps/llm.js), stdout is the JSON string, `result` inside it is itself the JSON-encoded
-// PLAN payload (plan_markdown/invariants_markdown/invariant_ids/check_commands).
+// A real-mode PLAN reply's `deps.spawn` stand-in (card #239 chantier, action A5b-2 Job 3:
+// migrated off `deps.spawnSync`'s old flat `--output-format json` envelope onto the SDK's
+// stream-json shape -- test/helpers.js's `fakeSpawnedChild`, same seam as
+// test/llm-real-card.test.js). A `system`/`init` message, then a `result` message whose own
+// `result` field is the JSON-encoded PLAN payload (plan_markdown/invariants_markdown/
+// invariant_ids/check_commands) -- exactly invokeClaudeReal's expected envelope, one layer down.
 function fakePlanSpawn(planPayload) {
-  return () => ({
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-plan-baseline',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
-  });
+  return () =>
+    fakeSpawnedChild([
+      { type: 'system', subtype: 'init', session_id: 'sess-plan-baseline', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        session_id: 'sess-plan-baseline',
+        modelUsage: { 'claude-fable-5': { inputTokens: 10, outputTokens: 5 } },
+        result: JSON.stringify(planPayload),
+        terminal_reason: 'success',
+        api_error_status: null,
+      },
+    ]);
 }
 
 function realPlanCtx({ id, task, taskDir, accountsDir, deps }) {
@@ -217,14 +221,14 @@ test('handlePlan (real mode): journals a PLAN-time invariants baseline -- a reso
     '',
   ].join('\n');
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: '# Plan\n\nDo the thing.\n',
       invariants_markdown: invariantsMarkdown,
       invariant_ids: ['INV-1', 'INV-2'],
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-baseline-1',
@@ -265,14 +269,14 @@ test('handlePlan (real mode): zero invariants -> journals an empty baseline, not
   const accountsDir = mkTmp('spo-plan-baseline-zero-accts-');
   writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: '# Plan\n\nAdds wholly new ground, nothing to depend on.\n',
       invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
       invariant_ids: [],
       check_commands: [],
     }),
-  };
+  });
 
   const task = {
     id: 'card-baseline-2',
@@ -365,15 +369,15 @@ test('handlePlan: PLAN declaring invariant ids the parser cannot find journals a
   writePoolDir(accountsDir, [{ name: 'acct-1', oauthToken: 'tok' }]);
   fs.writeFileSync(path.join(worktreePath, 'a.js'), 'const x = 1;\n');
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: '# Plan\n\nDo the thing.\n',
       // Prose the parser cannot read: no ## INV-<n> blocks at all, yet three ids declared.
       invariants_markdown: '# Invariants\n\nINV-1, INV-2 and INV-3 all hold in a.js.\n',
       invariant_ids: ['INV-1', 'INV-2', 'INV-3'],
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-canary-1',
@@ -434,8 +438,8 @@ test('handlePlan: PLAN declaring invariant ids as a JSON-STRING (the real wire s
     '',
   ].join('\n');
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: '# Plan\n\nDo the thing.\n',
       invariants_markdown: invariantsMarkdown,
       // The pre-#229 wire shape: a JSON-encoded string, not a real array (#229 flipped it to a
@@ -443,7 +447,7 @@ test('handlePlan: PLAN declaring invariant ids as a JSON-STRING (the real wire s
       invariant_ids: '["INV-1", "INV-2"]',
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-canary-jsonmatch-1',
@@ -478,15 +482,15 @@ test('handlePlan: PLAN declaring invariant ids as a JSON-STRING with a genuine c
   writePoolDir(accountsDir, [{ name: 'acct-1', oauthToken: 'tok' }]);
   fs.writeFileSync(path.join(worktreePath, 'a.js'), 'const x = 1;\n');
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: '# Plan\n\nDo the thing.\n',
       // No ## INV-<n> blocks at all -- the parser finds nothing.
       invariants_markdown: '# Invariants\n\nINV-1, INV-2 and INV-3 all hold in a.js.\n',
       invariant_ids: '["INV-1", "INV-2", "INV-3"]',
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-canary-jsonmismatch-1',
@@ -525,8 +529,8 @@ test('handlePlan: PLAN declaring invariant ids as a bare unparsable string is no
 
   const invariantsMarkdown = ['## INV-1', 'File: foo.js:1-3', '>>> QUOTE', 'function foo() {\n  return 42;\n}', '>>> END QUOTE', ''].join('\n');
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: '# Plan\n\nDo the thing.\n',
       invariants_markdown: invariantsMarkdown,
       // Not JSON, not an array -- a shape that is neither 'array' nor 'json-string', so it is no
@@ -534,7 +538,7 @@ test('handlePlan: PLAN declaring invariant ids as a bare unparsable string is no
       invariant_ids: 'INV-1',
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-canary-unparsable-1',
@@ -594,14 +598,14 @@ test('handlePlan (real mode, fresh path): a plan that reorders the exact span an
   // Line 3 (1-based) names foo.js:2-6 -- overlaps INV-1's real (exact-match) span of foo.js:1-3.
   const planMarkdown = '# Plan\n\nMove the code at foo.js:2-6 up.\n';
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: planMarkdown,
       invariants_markdown: invariantsMarkdown,
       invariant_ids: ['INV-1'],
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-span-conflict-1',
@@ -651,14 +655,14 @@ test('handlePlan (real mode, fresh path): a plan that never mentions the invaria
   ].join('\n');
   const planMarkdown = '# Plan\n\nAdd a brand new helper function elsewhere.\n';
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: planMarkdown,
       invariants_markdown: invariantsMarkdown,
       invariant_ids: ['INV-1'],
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-span-noconflict-1',
@@ -824,14 +828,14 @@ test('handlePlan (real mode): a plan-span-guard detector failure is swallowed --
       '',
     ].join('\n');
 
-    const deps = {
-      spawnSync: fakePlanSpawn({
+    const deps = fakeExecDeps({
+      spawn: fakePlanSpawn({
         plan_markdown: '# Plan\n\nMove the code at foo.js:2-6 up.\n',
         invariants_markdown: invariantsMarkdown,
         invariant_ids: ['INV-1'],
         check_commands: ['npm run typecheck'],
       }),
-    };
+    });
     const task = {
       id: 'card-span-guardthrows-1',
       kind: 'card',
@@ -888,14 +892,14 @@ test('handlePlan (real mode): PLAN_SPAN_CONFLICT_CAP bounds BOTH the journalled 
   // One plan span covering the whole file: every one of the 60 invariants overlaps it.
   const planMarkdown = '# Plan\n\nRewrite foo.js:1-60 from scratch.\n';
 
-  const deps = {
-    spawnSync: fakePlanSpawn({
+  const deps = fakeExecDeps({
+    spawn: fakePlanSpawn({
       plan_markdown: planMarkdown,
       invariants_markdown: blocks.join(''),
       invariant_ids: [],
       check_commands: ['npm run typecheck'],
     }),
-  };
+  });
 
   const task = {
     id: 'card-span-cap-1',

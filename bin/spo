@@ -1275,10 +1275,11 @@ function cmdDashboard(opts) {
 
   // Static mode writes BOTH pages: the flight deck at <out> and health beside it. The deck's
   // track, splits, lives and pars all come from the journal, which this mode already reads --
-  // only live-step.js's transcript probe is server-only, and the deck degrades to the clock
-  // alone without it (see console/live-step.js's rule 1). Two files rather than one because the
-  // externally hosted copy is a `spo dashboard` + rsync artefact owned by SPO-Deploy: if static
-  // mode emitted only the deck, /health would 404 on the public tier.
+  // only live-step.js's own probe (reading a running worker's live-progress.json, since card
+  // #239 action A6) is server-only, and the deck degrades to the clock alone without it (see
+  // console/live-step.js's rule 1). Two files rather than one because the externally hosted copy
+  // is a `spo dashboard` + rsync artefact owned by SPO-Deploy: if static mode emitted only the
+  // deck, /health would 404 on the public tier.
   function generateOnce() {
     const data = collectAll(sources);
     // Cheap enough for a one-shot: refreshes only when the corpus has actually moved, and this

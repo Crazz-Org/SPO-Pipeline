@@ -12,7 +12,7 @@
 // read tokens dominate raw counts by orders of magnitude"). A single "total tokens" figure would
 // just be measuring cache hit rate, not the thing worth watching.
 //
-// Every real `claude -p` call already records its own token counts in an `llm-call` event
+// Every real LLM call already records its own token counts in an `llm-call` event
 // (steps/llm.js's extractTokens, journaled as freshInputTokens/cacheCreationTokens/
 // cacheReadTokens/outputTokens/billableTokens/tokensSource) -- this module only adds them up.
 // There is no second ledger to keep in sync.
@@ -120,7 +120,7 @@ function readTaskTokens(journalRoot, id, { cacheTtlMs } = {}) {
       // carried at least one recognized field, 'transcript' when that was absent but
       // token-ledger lot action 4.3 recovered real numbers from the session transcript instead --
       // any branch that still produced a real sessionId: a deadline kill, an external signal
-      // kill, unparsable stdout, an is_error/non-zero-exit reply, or a successful call whose own
+      // kill, an unparsable reply, an is_error/non-zero-exit reply, or a successful call whose own
       // modelUsage was empty -- null when NEITHER source had anything (an E2BIG or other
       // spawn failure claude never started, or a recovery attempt that found nothing), and
       // ABSENT ENTIRELY on every journal written before token capture shipped -- those events

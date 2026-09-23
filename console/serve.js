@@ -32,8 +32,10 @@ const DEFAULT_DATA_TTL_MS = 5000;
 // The flight deck's own cache. Far shorter than the 30s data cache because `/` is a live view of
 // a card that moves: a two-second-old split time is fine, a thirty-second-old one is a stopped
 // clock. The whole deck build is one journal walk over at most a couple of task directories plus
-// one 64 KB transcript tail (see collect.js's DECK_LINGER_MS gate and live-step.js's rules), so
-// this cadence costs a rounding error even with several browser tabs open.
+// one small live-progress.json read per running card (see collect.js's DECK_LINGER_MS gate and
+// orchestrator/live-progress.js's own header -- card #239 action A6 replaced the old 64 KB
+// transcript-tail read with this), so this cadence costs a rounding error even with several
+// browser tabs open.
 const DEFAULT_DECK_TTL_MS = 1500;
 // Par times are recomputed on the same slow timer as the usage scan -- the pass walks every
 // journal on disk, which is exactly the work console/par-times.js exists to keep off the request
@@ -108,7 +110,11 @@ function createDashboardServer(sources, opts = {}) {
     const now = Date.now();
     if (deckCache && now - deckCache.at <= deckTtlMs) return deckCache.data;
     const data = collectAll(sources);
-    data.liveSteps = probeDeck(data.deck, { accountsDir: sources.accountsDir });
+    // Card #239 action A6: probeDeck reads orchestrator/live-progress.js's own per-task record
+    // (<journalRoot>/<id>/live-progress.json), not the account pool -- the five-link transcript
+    // chain this replaced is what needed accountsDir; the worker-written record needs only the
+    // journal root every other deck read already uses.
+    data.liveSteps = probeDeck(data.deck, { journalRoot: sources.journalRoot });
     deckCache = { at: now, data };
     return data;
   }

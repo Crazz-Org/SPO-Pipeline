@@ -2,7 +2,7 @@
 
 The factory that builds Starpeace WebClient — a **script-first orchestrator** that drives
 development tasks end-to-end (intake → plan → implement → gate → validate → merge → release)
-by calling Claude Code in headless mode (`claude -p`) for the steps that need judgement, and
+by driving Claude Code headlessly through the Claude Agent SDK's `query()` for the steps that need judgement, and
 plain scripts for everything else.
 
 This repository is the successor of the in-repo experiment that lived inside
@@ -78,8 +78,8 @@ Every component writes append-only JSONL journals; the console is a *reader*, ne
 source of truth (same philosophy as `~/.spo-bench/`):
 
 - every state transition of every task is one journal event;
-- every `claude -p` step records its **`sessionId`** (journalled field name; the CLI's own JSON
-  reply calls it `session_id`), model, effort and result — this build carries no cost/$ field
+- every LLM step records its **`sessionId`** (journalled field name; the CLI's own result
+  message calls it `session_id`), model, effort and result — this build carries no cost/$ field
   anywhere, only raw token counts (`steps/llm.js`) — any step can be reopened interactively for
   debugging with `claude --resume <sessionId>`;
 - account events (limit hit, cooldown, recovery) are journal events too;
@@ -93,9 +93,11 @@ source of truth (same philosophy as `~/.spo-bench/`):
   and what the step is doing *while* it runs. **`/health`** is the service tiles, accounts,
   daemon counters and token trend the root page used to carry, unchanged. The deck reads the
   same journals as everything else plus one extra surface no other reader touches — the running
-  step's own `claude` session transcript (`console/live-step.js`), which is the only thing on
-  disk that moves during an LLM call, since those run through `spawnSync` and journal nothing
-  until they return.
+  step's `<journalRoot>/<id>/live-progress.json` (`console/live-step.js` reads it,
+  `orchestrator/live-progress.js` writes it), the one surface the deck reads that moves during an
+  LLM call (the `claude` session transcript is not what the deck reads): those run through an awaited async `query()` call (the vendored Claude Agent SDK, since
+  card #239's cutover, A5b, 2026-09-17) and journal nothing per message, only once the call
+  returns, so since action A6 the worker folds the SDK's own message stream into that file.
 
 ## Migration (strangler, not big-bang)
 

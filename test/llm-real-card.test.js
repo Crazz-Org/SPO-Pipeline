@@ -1,7 +1,17 @@
 'use strict';
 // Unit tests for orchestrator/steps/llm.js's real `kind: "card"` path: step-contracts.js +
 // prompt-template.js wired into runLlm's real branch (no ctx.task.llm.<step> override present).
-// Every spawn is injected via deps.spawnSync -- no real `claude` CLI call, ever.
+//
+// Card #239 chantier, action A5b (the cutover): migrated off `deps.spawnSync`/the old
+// `claude -p`/`--output-format json` transport onto `deps.spawn` (test/helpers.js's
+// `fakeSpawnDeps`/`fakeSpawnedChild`) and `deps.resolveClaudeCodeExecutable` -- see
+// test/llm-real.test.js's own header for the full design of that seam and what did NOT survive
+// the cutover (buildArgv, session-id generation, the `uuid` fallback field, E2BIG). Every real
+// argv-level assertion below (`--model`, `--effort`) still works unchanged: the SDK builds that
+// argv internally from `options.model`/`options.effort` and hands it to
+// `spawnClaudeCodeProcess` as `spawnArgs.args` -- the same real argv this file always checked,
+// just observed one layer further in. Every spawn is still fake -- this file never touches a real
+// `claude` CLI, or even a real spawned OS process, for any test below.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -15,22 +25,36 @@ require('./no-real-spawn');
 const { runLlm } = require('../orchestrator/steps/llm');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
-const { mkTmp } = require('./helpers');
+const { mkTmp, fakeSpawnDeps, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
+const { OPUS_5_5 } = require('../orchestrator/step-contracts');
 
+const SESSION_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
-function fakeSpawnSync(responder) {
-  return (command, argv, opts) => responder(command, argv, opts);
+// fakeExecDeps -- F9 (Opus verifier, fix pass): now shared from test/helpers.js (resolves to the
+// same literal '/fake/bin/claude' this file used to declare locally as FAKE_EXECUTABLE_PATH, now
+// dropped since nothing else in this file read it), rather than hand-rolled here. This file's own
+// top-of-file require('./no-real-spawn') arms SPO_NO_REAL_SPAWN process-wide -- see
+// test/llm-real.test.js's own fakeExecDeps comment for why every deps object here has to opt back
+// out explicitly, deps-scoped, never via an env mutation.
+
+function initMessage(sessionId = SESSION_ID) {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
 }
 
-function realShapedReply(resultObj, overrides = {}) {
+// resultMessage(resultObj, overrides) -- this file's equivalent of the old realShapedReply():
+// wraps `resultObj` as the JSON-encoded `result` string a real json-schema reply carries, on a
+// stream-json `result` message shape (consumeQueryStream's own contract) instead of the old flat
+// `--output-format json` object. `overrides` lands on the MESSAGE itself (is_error, num_turns,
+// modelUsage, ...), matching the old function's own `overrides` parameter one for one.
+function resultMessage(resultObj, overrides = {}) {
   return {
-    result: JSON.stringify(resultObj),
+    type: 'result',
+    subtype: 'success',
     is_error: false,
     num_turns: 1,
-    session_id: 'sess-card-1',
-    modelUsage: { 'claude-fable-5': { costUSD: 0.002 } },
-    terminal_reason: 'success',
-    api_error_status: null,
+    session_id: SESSION_ID,
+    modelUsage: { 'claude-fable-5': { inputTokens: 10, outputTokens: 5 } },
+    result: JSON.stringify(resultObj),
     ...overrides,
   };
 }
@@ -46,9 +70,9 @@ function cardCtx({ taskDir, task, account }) {
   };
 }
 
-// ---- happy path: contract + template feed a real spawn ------------------------------------
+// ---- happy path: contract + template feed a real call ---------------------------------------
 
-test('PLAN real card path: builds argv from step-contracts + filled template, returns the parsed+validated payload', async () => {
+test('PLAN real card path: resolves the real argv from step-contracts + filled template, returns the parsed+validated payload', async () => {
   const taskDir = mkTmp('spo-card-plan-');
   const task = {
     kind: 'card',
@@ -59,37 +83,35 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
     size: 'S',
   };
 
-  let seenArgv = null;
-  let seenInput = null;
-  const deps = {
-    spawnSync: fakeSpawnSync((command, argv, opts) => {
-      seenArgv = argv;
-      seenInput = opts.input;
-      const reply = realShapedReply({
+  let seenPrompt = '';
+  const { spawn, calls } = fakeSpawnDeps(
+    [
+      initMessage(),
+      resultMessage({
         plan_markdown: '# Plan\n\nAdd a widget to the header.\n',
         invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
         invariant_ids: [],
         check_commands: ['npm run typecheck'],
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+      }),
+    ],
+    { onStdinWrite: (chunk) => { seenPrompt += chunk; } }
+  );
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
 
   assert.equal(result.ok, true);
   assert.equal(result.plan_markdown, '# Plan\n\nAdd a widget to the header.\n');
   assert.deepEqual(result.check_commands, ['npm run typecheck']);
-  assert.equal(result.sessionId, 'sess-card-1');
+  assert.equal(result.sessionId, SESSION_ID);
 
+  const seenArgv = calls[0].args;
   assert.ok(seenArgv.includes('--model'));
-  assert.equal(seenArgv[seenArgv.indexOf('--model') + 1], 'opus'); // Opus-first; no planInvalidRetry on this task
+  assert.equal(seenArgv[seenArgv.indexOf('--model') + 1], OPUS_5_5); // Opus-first; no planInvalidRetry on this task
   assert.ok(seenArgv.includes('--effort'));
   assert.equal(seenArgv[seenArgv.indexOf('--effort') + 1], 'medium'); // S -> medium (PLAN_EFFORT_BY_SIZE)
   assert.ok(seenArgv.includes('--json-schema'));
-  const promptArg = seenInput;
-  assert.ok(promptArg.includes('/tmp/worktree-99'));
-  assert.ok(promptArg.includes('Add a widget'));
+  assert.ok(seenPrompt.includes('/tmp/worktree-99'));
+  assert.ok(seenPrompt.includes('Add a widget'));
 
   const journalLines = fs
     .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
@@ -98,7 +120,7 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
     .map((l) => JSON.parse(l));
   const call = journalLines.find((e) => e.event === 'llm-call');
   assert.ok(call);
-  assert.equal(call.model, 'opus');
+  assert.equal(call.model, OPUS_5_5);
   // Action 5.4 item E: the field doc/state-machine-spec.md has documented all along. Spelled
   // `duration_s`, in seconds -- renaming the journalled key to `durationS` passed all 1157 tests
   // when nothing asserted the spelling, and the spec would have gone on claiming a field the
@@ -128,31 +150,29 @@ test('PLAN real card path: a two-model modelUsage payload journals a per-model b
     planInvalidRetry: true,
   };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply(
-        {
-          plan_markdown: '# Plan\n\nAdd a widget to the header.\n',
-          invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
-          invariant_ids: [],
-          check_commands: ['npm run typecheck'],
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage(
+      {
+        plan_markdown: '# Plan\n\nAdd a widget to the header.\n',
+        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+        invariant_ids: [],
+        check_commands: ['npm run typecheck'],
+      },
+      {
+        // The measured shape: the PLAN call itself resolves to fable, but its reply's own
+        // modelUsage names an Opus subagent too -- whole-tree accounting, already summed into
+        // the flat totals before this card, now also broken out per model.
+        modelUsage: {
+          'claude-fable-5': { inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 200, outputTokens: 800 },
+          'claude-opus-5': { inputTokens: 2000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 3000 },
         },
-        {
-          // The measured shape: the PLAN call itself resolves to fable, but its reply's own
-          // modelUsage names an Opus subagent too -- whole-tree accounting, already summed into
-          // the flat totals before this card, now also broken out per model.
-          modelUsage: {
-            'claude-fable-5': { inputTokens: 5000, cacheCreationInputTokens: 1000, cacheReadInputTokens: 200, outputTokens: 800 },
-            'claude-opus-5': { inputTokens: 2000, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, outputTokens: 3000 },
-          },
-          num_turns: 4,
-        }
-      );
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+        num_turns: 4,
+      }
+    ),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   // The internal return shape keeps numTurns -- this card only removes it from the JOURNALLED
   // event, not from runLlm's own return value (24 test files and ~12 return sites depend on it).
@@ -172,6 +192,59 @@ test('PLAN real card path: a two-model modelUsage payload journals a per-model b
   });
   assert.equal(call.billableTokens, 6800 + 5000, 'flat total still sums across both models, unchanged');
   assert.equal('numTurns' in call, false, 'numTurns must be gone from the journalled llm-call event (acceptance criterion 3)');
+});
+
+// F2 (fix pass, this action). The 19-file migration (action A5b-2) dropped the "runLlm ... read
+// back from journal.jsonl" failure-path coverage this repo used to carry (test/llm-real.test.js's
+// own journal.jsonl mentions went 7 -> 1 across that migration) -- restored here, on the real
+// `kind: "card"` path. Mutating runLlm's card-branch appendEvent call from `sessionId: raw.sessionId`
+// to `sessionId: raw.ok ? raw.sessionId : null` leaves invokeClaudeReal's own return value (already
+// pinned elsewhere in this file and in test/llm-real.test.js) completely untouched -- the gap is one
+// layer OUT from there, exactly where token-recovery.js needs the id to actually land: the JOURNAL
+// LINE ON DISK, not runLlm's return value. An externally-killed call (no deadline decision involved)
+// is used here rather than a deadline kill -- see test/llm-real.test.js's own "GAP, STATED RATHER
+// THAN SILENTLY DROPPED" comment for why a REAL elapsed deadline driven through runLlm's own
+// deadlineMsForStep resolution costs 15-30 real minutes at unit-test speed and is not worth paying
+// twice; an external kill reaches the identical `sessionId: raw.sessionId` call site with a real,
+// non-null id and `ok: false`, via a path that settles in milliseconds.
+test('PLAN real card path: an externally-killed call still journals the non-null sessionId (read back from journal.jsonl, not from the return value), even though ok is false', async () => {
+  const taskDir = mkTmp('spo-card-plan-killed-');
+  const task = {
+    kind: 'card',
+    issue: 640,
+    title: 'Add a widget',
+    criterion: 'the widget renders',
+    worktreePath: '/tmp/worktree-640',
+    size: 'S',
+  };
+
+  const child = fakeSpawnedChild([initMessage()], { hang: true }); // init arrives (a real sessionId), then nothing
+  const spawn = () => child;
+
+  const resultPromise = runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
+  // An operator/OOM kill -- something OTHER than this call's own (real, ~1.8e6ms) deadline timer,
+  // which never fires here (mirrors test/llm-real.test.js's own "external signal kill even WITH a
+  // deadline armed" pattern).
+  setTimeout(() => child.forceExit(null, 'SIGKILL'), 10);
+  const result = await resultPromise;
+
+  // Confirm this call actually took the killed/failed branch -- not a stand-in for the journal
+  // assertion below, which is the actual deliverable.
+  assert.equal(result.ok, false);
+  assert.equal(result.sessionId, SESSION_ID);
+
+  const journalLines = fs
+    .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const call = journalLines.find((e) => e.event === 'llm-call');
+  assert.ok(call, 'expected an llm-call journal event');
+  assert.equal(call.ok, false);
+  // THE ACTUAL DELIVERABLE: the id `claude` reported (read off the init message that DID arrive
+  // before the kill) is the one that landed in the journal line on disk -- not null, not undefined
+  // -- exactly what token-recovery.js needs to find this call's transcript by.
+  assert.equal(call.sessionId, SESSION_ID, 'a killed call must journal the id that lets token-recovery.js find its transcript');
 });
 
 // Second fix pass (2026-09-13): the F3 test in test/step-contracts.test.js asserts on
@@ -199,19 +272,17 @@ test('PLAN real card path: check_commands as a JSON-encoded string containing a 
   const checkCommandsRaw = JSON.stringify(['grep -Eq "kind, arity, and citation" src/foo.ts']);
   const invariantIdsRaw = JSON.stringify(['INV-1, the comma-bearing id']);
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({
-        plan_markdown: '# Plan\n\nAdd the RDO citation check.\n',
-        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
-        invariant_ids: invariantIdsRaw,
-        check_commands: checkCommandsRaw,
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({
+      plan_markdown: '# Plan\n\nAdd the RDO citation check.\n',
+      invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+      invariant_ids: invariantIdsRaw,
+      check_commands: checkCommandsRaw,
     }),
-  };
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.check_commands, checkCommandsRaw, 'must be the exact same JSON-encoded STRING reference/value -- not re-parsed into a real array by anything downstream of checkOutputTypes');
   assert.equal(result.invariant_ids, invariantIdsRaw, 'same guard, same reason, for invariant_ids');
@@ -221,10 +292,9 @@ test('PLAN real card path: check_commands as a JSON-encoded string containing a 
 // orchestrator/monotonic-clock.js's monotonicNowMs(), not Date.now(), for durationS) on the
 // JOURNALLED field, not just on invokeClaudeReal's return value -- test/llm-real.test.js pins the
 // return value directly; this one drives the real journal-append path (runLlm -> appendEvent) end
-// to end and reads the llm-call event back out, reusing this file's own journal-reading helpers
-// (fs/path, already exercised by the test above) rather than adding a second route through runLlm
-// elsewhere. Also pins the journalled format (whole milliseconds, at most 3 decimals) on the
-// value's decimal string, since neither arithmetic value nor the existing tests guard that shape.
+// to end and reads the llm-call event back out. Also pins the journalled format (whole
+// milliseconds, at most 3 decimals) on the value's decimal string, since neither arithmetic value
+// nor the existing tests guard that shape.
 test('PLAN real card path: duration_s in the journalled llm-call event is never negative, even when Date.now() steps backward during the call (issue-385/#492 shape)', async () => {
   const taskDir = mkTmp('spo-card-plan-duration-');
   const task = {
@@ -237,39 +307,28 @@ test('PLAN real card path: duration_s in the journalled llm-call event is never 
   };
 
   const realDateNow = Date.now;
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      // Realtime lagging monotonic -- issue-385/#492's shape (see llm-real.test.js's own
-      // comment block for the corpus numbers this encodes). Left patched on return -- the code
-      // under test reads Date.now() again AFTER spawnSync returns (the old
-      // `(Date.now() - startedAt) / 1000` line), so restoring here would undo the jump before
-      // that read ever happens. The outer try/finally below is what restores it.
-      Date.now = () => realDateNow() - 80000;
-      // A short busy-wait on the REAL monotonic clock (untouched by the Date.now patch above),
-      // so the call's true elapsed time is a few whole milliseconds, never exactly 0. Needed for
-      // the non-negativity assertion below to be load-bearing THROUGH the journal: a
-      // sign-flipped duration_s of exactly -0 survives in memory but round-trips through
-      // JSON.stringify/JSON.parse (journal.jsonl) as +0 -- JSON has no negative zero -- which
-      // would make a sub-millisecond fake spawn's mutant undetectable on the journalled value
-      // even with an Object.is(-0) check. A genuinely negative (non-zero) duration_s has no such
-      // blind spot: JSON preserves the sign on every value except -0 itself.
-      const spinUntil = process.hrtime.bigint() + 3000000n; // ~3ms, real hrtime
-      while (process.hrtime.bigint() < spinUntil) {
-        // busy-wait
-      }
-      const reply = realShapedReply({
-        plan_markdown: '# Plan\n\nAdd another widget.\n',
-        invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
-        invariant_ids: [],
-        check_commands: ['npm run typecheck'],
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  // Realtime lagging monotonic -- issue-385/#492's shape (see llm-real.test.js's own comment
+  // block for the corpus numbers this encodes). Patched for the whole call (restored in the
+  // outer try/finally below, AFTER invokeClaudeReal has taken its own post-call Date.now()-
+  // independent monotonic reading) -- this transport measures durationS via monotonicNowMs()
+  // around the whole query()/consume/confirm sequence (llm.js's own header), never Date.now(), so
+  // the patch here only needs to still be in place for anything ELSE in the call path that reads
+  // the wall clock, not for the measurement itself.
+  Date.now = () => realDateNow() - 80000;
+
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({
+      plan_markdown: '# Plan\n\nAdd another widget.\n',
+      invariants_markdown: '# Invariants\n\nNone -- new ground.\n',
+      invariant_ids: [],
+      check_commands: ['npm run typecheck'],
     }),
-  };
+  ]);
 
   let result;
   try {
-    result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+    result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   } finally {
     Date.now = realDateNow;
   }
@@ -283,8 +342,7 @@ test('PLAN real card path: duration_s in the journalled llm-call event is never 
   const call = journalLines.find((e) => e.event === 'llm-call');
   assert.ok(call);
   assert.equal(typeof call.duration_s, 'number');
-  // >= 0 alone would also pass for a sign-flipped duration_s on a sub-millisecond fake spawn
-  // (-0 >= 0 is true) -- Object.is rejects that mutant too.
+  // >= 0 alone would also pass for a sign-flipped duration_s -- Object.is rejects that mutant too.
   assert.ok(
     call.duration_s >= 0 && !Object.is(call.duration_s, -0),
     `duration_s must never be negative, got ${call.duration_s}`
@@ -299,9 +357,11 @@ test('PLAN real card path: duration_s in the journalled llm-call event is never 
   );
 });
 
-test('IMPLEMENT real card path escalates to opus when task.touchesRdoMembers is true', async () => {
+// Since 2026-09-23 (EXP-IMPLEMENT-OPUS-5-5) the escalation is on EFFORT, not model: Opus 5.5 always,
+// 'low' on a plain S card, 'medium' once a signal fires. The task is S-sized so the effort
+// discriminates -- an M card is 'medium' either way.
+test('IMPLEMENT real card path escalates effort to medium when task.touchesRdoMembers is true', async () => {
   const taskDir = mkTmp('spo-card-implement-rdo-');
-  const { appendEvent } = require('../orchestrator/journal');
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: {
       ok: true,
@@ -321,27 +381,27 @@ test('IMPLEMENT real card path escalates to opus when task.touchesRdoMembers is 
     touchesRdoMembers: true,
   };
 
-  let seenArgv = null;
-  const deps = {
-    spawnSync: fakeSpawnSync((command, argv) => {
-      seenArgv = argv;
-      const reply = realShapedReply({
-        summary: 'added ObjectAt',
-        files_changed: ['src/shared/rdo-members.ts'],
-        invariants: [{ id: 'INV-1', status: 'HELD' }],
-        tests_run: ['npm run typecheck'],
-        all_green: true,
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn, calls } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({
+      summary: 'added ObjectAt',
+      files_changed: ['src/shared/rdo-members.ts'],
+      invariants: [{ id: 'INV-1', status: 'HELD' }],
+      tests_run: ['npm run typecheck'],
+      all_green: true,
     }),
-  };
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
 
   assert.equal(result.ok, true);
   assert.equal(result.all_green, true);
+  const seenArgv = calls[0].args;
   const modelIdx = seenArgv.indexOf('--model');
-  assert.equal(seenArgv[modelIdx + 1], 'opus');
+  assert.equal(seenArgv[modelIdx + 1], OPUS_5_5);
+  const effortIdx = seenArgv.indexOf('--effort');
+  assert.ok(effortIdx !== -1, 'expected --effort in argv');
+  assert.equal(seenArgv[effortIdx + 1], 'medium', "S base is 'low' -- only the escalation buys 'medium'");
 });
 
 // ---- missing placeholder -> ParkSignal, no partial fill, no spawn --------------------------
@@ -350,14 +410,13 @@ test('missing placeholder value (worktreePath absent) parks instead of spawning'
   const taskDir = mkTmp('spo-card-missing-placeholder-');
   const task = { kind: 'card', issue: 1, title: 't', criterion: 'c', size: 'S' }; // no worktreePath
 
-  let called = false;
-  const deps = { spawnSync: fakeSpawnSync(() => { called = true; return { status: 0, stdout: '{}', stderr: '', signal: null }; }) };
+  const { spawn, calls } = fakeSpawnDeps([initMessage(), resultMessage({})]);
 
   await assert.rejects(
-    () => runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps),
+    () => runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn })),
     (err) => err instanceof ParkSignal && err.reason === 'prompt-missing-placeholder:worktree'
   );
-  assert.equal(called, false, 'must never spawn once the prompt cannot be filled');
+  assert.equal(calls.length, 0, 'must never spawn once the prompt cannot be filled');
 });
 
 // ---- output-contract validation failure -> {kind:'error'}, same shape as a spawn failure ---
@@ -373,20 +432,14 @@ test('reply missing a required output key -> {ok:false, kind:"error"}, existing 
     size: 'S',
   };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      // PLAN's contract requires plan_markdown/invariants_markdown/invariant_ids/check_commands
-      // -- this reply is missing check_commands.
-      const reply = realShapedReply({
-        plan_markdown: '# Plan\n',
-        invariants_markdown: '# Invariants\n',
-        invariant_ids: [],
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  // PLAN's contract requires plan_markdown/invariants_markdown/invariant_ids/check_commands --
+  // this reply is missing check_commands.
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({ plan_markdown: '# Plan\n', invariants_markdown: '# Invariants\n', invariant_ids: [] }),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   assert.equal(result.ok, false);
   assert.equal(result.kind, 'error');
   assert.match(result.error, /check_commands/);
@@ -396,15 +449,9 @@ test('reply whose result field is not JSON at all -> {ok:false, kind:"error"}', 
   const taskDir = mkTmp('spo-card-nonjson-reply-');
   const task = { kind: 'card', issue: 3, title: 't', criterion: 'c', worktreePath: '/tmp/worktree-3', size: 'S' };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({});
-      reply.result = 'not json at all';
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([initMessage(), resultMessage({}, { result: 'not json at all' })]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
   assert.equal(result.ok, false);
   assert.equal(result.kind, 'error');
 });
@@ -422,15 +469,9 @@ for (const [label, resultField] of [
     const taskDir = mkTmp('spo-card-nonobject-reply-');
     const task = { kind: 'card', issue: 4, title: 't', criterion: 'c', worktreePath: '/tmp/worktree-4', size: 'S' };
 
-    const deps = {
-      spawnSync: fakeSpawnSync(() => {
-        const reply = realShapedReply({});
-        reply.result = resultField;
-        return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-      }),
-    };
+    const { spawn } = fakeSpawnDeps([initMessage(), resultMessage({}, { result: resultField })]);
 
-    const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', deps);
+    const result = await runLlm(cardCtx({ taskDir, task }), 'PLAN', 'llm.PLAN', fakeExecDeps({ spawn }));
     assert.equal(result.ok, false);
     assert.equal(result.kind, 'error');
     assert.match(result.error, /not an object/);
@@ -443,18 +484,12 @@ test('DIAGNOSE reply root_cause is also exposed as rootCause (handleDiagnose rea
   const taskDir = mkTmp('spo-card-diagnose-alias-');
   const task = { kind: 'card', issue: 4, worktreePath: '/tmp/worktree-4' };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({
-        root_cause: 'coverage regression in foo.ts',
-        category: 'coverage',
-        suggested_fix: 'add a test for the new branch',
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({ root_cause: 'coverage regression in foo.ts', category: 'coverage', suggested_fix: 'add a test for the new branch' }),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'DIAGNOSE', 'llm.DIAGNOSE', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'DIAGNOSE', 'llm.DIAGNOSE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.root_cause, 'coverage regression in foo.ts');
   assert.equal(result.rootCause, 'coverage regression in foo.ts');
@@ -471,14 +506,12 @@ test('DIAGNOSE reply with root_cause: null succeeds -- the documented "no new ca
   const taskDir = mkTmp('spo-card-diagnose-rootcause-null-');
   const task = { kind: 'card', issue: 207, worktreePath: '/tmp/worktree-207' };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({ root_cause: null, reason: 'the plan was already fully implemented' });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({ root_cause: null, reason: 'the plan was already fully implemented' }),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'DIAGNOSE', 'llm.DIAGNOSE', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'DIAGNOSE', 'llm.DIAGNOSE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.root_cause, null);
   assert.equal(result.rootCause, null);
@@ -489,7 +522,7 @@ test('DIAGNOSE reply with root_cause: null succeeds -- the documented "no new ca
 function validateTask({ taskDir, issue }) {
   // VALIDATE's own prompt values (task-values.js's buildPromptValues, 'VALIDATE' branch) read
   // invariants_path/invariant_ids off the last journaled PLAN 'result' event -- write one first,
-  // exactly as the "IMPLEMENT real card path escalates to opus" test above does for IMPLEMENT.
+  // exactly as the "IMPLEMENT real card path escalates effort to medium" test above does for IMPLEMENT.
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: {
       ok: true,
@@ -507,14 +540,9 @@ test('VALIDATE reply with reasons as a JSON-encoded string succeeds -- and the r
   const task = validateTask({ taskDir, issue: 200 });
   const raw = JSON.stringify(['the criterion is not met: the widget never renders']);
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({ verdict: 'REJECT', reasons: raw, findings: [] });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([initMessage(), resultMessage({ verdict: 'REJECT', reasons: raw, findings: [] })]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.reasons, raw, 'left untouched -- handleValidate does its own normalizeFindingsPayload downstream, on purpose');
 });
@@ -523,14 +551,9 @@ test('VALIDATE reply with verdict: 42 (a genuinely wrongly-typed required key) f
   const taskDir = mkTmp('spo-card-validate-badverdict-');
   const task = validateTask({ taskDir, issue: 201 });
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({ verdict: 42, reasons: [], findings: [] });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([initMessage(), resultMessage({ verdict: 42, reasons: [], findings: [] })]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, false);
   assert.equal(result.kind, 'error');
   assert.match(result.error, /verdict/);
@@ -541,19 +564,14 @@ test('VALIDATE reply with verdict: 42 (a genuinely wrongly-typed required key) f
 // wildcard rule, but `reasons` carries NO declared type at all -- so this only shows that an
 // UNDECLARED key with a `null` value still succeeds (true, but unrelated to the wildcard rule,
 // which only ever runs for a DECLARED key). The real wildcard-rule pin on the real `runLlm` path
-// is the new DIAGNOSE `root_cause: null` test further down.
+// is the DIAGNOSE `root_cause: null` test above.
 test('VALIDATE reply with reasons: null still succeeds -- reasons carries no declared type at all, so a null value is simply never checked (same real-mode shape test/validate-reject-reasons-contract.test.js\'s (c-1-real) pins)', async () => {
   const taskDir = mkTmp('spo-card-validate-reasons-null-');
   const task = validateTask({ taskDir, issue: 202 });
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({ verdict: 'REJECT', reasons: null, findings: [] });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([initMessage(), resultMessage({ verdict: 'REJECT', reasons: null, findings: [] })]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.reasons, null);
 });
@@ -562,14 +580,12 @@ test('VALIDATE reply with findings as a bare, unparsable, non-JSON string still 
   const taskDir = mkTmp('spo-card-validate-findings-malformed-');
   const task = validateTask({ taskDir, issue: 203 });
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: 'not json at all {{{' });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: 'not json at all {{{' }),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.findings, 'not json at all {{{', 'left completely untouched -- no declared type means no check and no normalization');
 });
@@ -587,20 +603,18 @@ test('IMPLEMENT reply with all_green as the STRING "false" (the real issue-247 c
   });
   const task = { kind: 'card', issue: 204, criterion: 'c', worktreePath: '/tmp/worktree-204', size: 'S' };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({
-        summary: 'Cannot proceed: the required plan file does not exist',
-        files_changed: '[]',
-        invariants: [],
-        tests_run: [],
-        all_green: 'false',
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({
+      summary: 'Cannot proceed: the required plan file does not exist',
+      files_changed: '[]',
+      invariants: [],
+      tests_run: [],
+      all_green: 'false',
     }),
-  };
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.all_green, 'false', 'left untouched -- a declared boolean type would park this real, already-observed shape');
   assert.equal(result.files_changed, '[]', 'files_changed carries no declared type either -- left untouched for state-machine.js\'s own parseFilesChanged to read');
@@ -619,20 +633,12 @@ test('IMPLEMENT reply with files_changed as a bare, unparsable, non-JSON string 
   });
   const task = { kind: 'card', issue: 206, criterion: 'c', worktreePath: '/tmp/worktree-206', size: 'S' };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({
-        summary: 'x',
-        files_changed: 'not json',
-        invariants: [],
-        tests_run: [],
-        all_green: false,
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({ summary: 'x', files_changed: 'not json', invariants: [], tests_run: [], all_green: false }),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.files_changed, 'not json', 'left completely untouched, for state-machine.js\'s own parseFilesChanged to route to DIAGNOSE');
 });
@@ -671,20 +677,18 @@ test('IMPLEMENT reply with tests_run as an array of {cmd, exit_code} objects and
   const invariantsRaw =
     'All 16 invariants (INV-1 through INV-16) checked against the worktree as it now stands: all HELD (exact substring match for every quote).';
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({
-        summary: 'Verified the favorites folder implementation against plan-385.md; all checks green.',
-        files_changed: '[]',
-        invariants: invariantsRaw,
-        tests_run: testsRunRaw,
-        all_green: 'true',
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({
+      summary: 'Verified the favorites folder implementation against plan-385.md; all checks green.',
+      files_changed: '[]',
+      invariants: invariantsRaw,
+      tests_run: testsRunRaw,
+      all_green: 'true',
     }),
-  };
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.tests_run, testsRunRaw, 'left as the raw JSON-encoded string -- tests_run carries no declared type');
   assert.equal(result.invariants, invariantsRaw, 'left as the raw prose string -- invariants carries no declared type');
@@ -710,20 +714,18 @@ test('IMPLEMENT reply with tests_run as an array of {command, exit_code} objects
   const invariantsRaw =
     '[{"id": "INV-1", "status": "HELD"}, {"id": "INV-2", "status": "HELD"}, {"id": "INV-3", "status": "HELD"}, {"id": "INV-4", "status": "HELD"}, {"id": "INV-5", "status": "HELD"}, {"id": "INV-6", "status": "HELD"}, {"id": "INV-7", "status": "HELD"}, {"id": "INV-8", "status": "HELD"}, {"id": "INV-9", "status": "HELD"}, {"id": "INV-10", "status": "HELD"}, {"id": "INV-11", "status": "HELD"}, {"id": "INV-12", "status": "HELD"}, {"id": "INV-13", "status": "HELD"}, {"id": "INV-14", "status": "HELD"}, {"id": "INV-15", "status": "HELD"}, {"id": "INV-16", "status": "HELD"}]';
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({
-        summary: 'Verified the favorites folder implementation against plan-385.md; all checks green.',
-        files_changed: '[]',
-        invariants: invariantsRaw,
-        tests_run: testsRunRaw,
-        all_green: 'true',
-      });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({
+      summary: 'Verified the favorites folder implementation against plan-385.md; all checks green.',
+      files_changed: '[]',
+      invariants: invariantsRaw,
+      tests_run: testsRunRaw,
+      all_green: 'true',
     }),
-  };
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.tests_run, testsRunRaw, 'left as the raw JSON-encoded string -- tests_run carries no declared type');
   assert.equal(result.invariants, invariantsRaw, 'left as the raw JSON-encoded string -- invariants carries no declared type either, so a valid array is left as-is same as a prose string would be');
@@ -737,14 +739,12 @@ test('CITATION_VERIFIER\'s undeclared key (`entries`) behaves exactly as before 
   const taskDir = mkTmp('spo-card-citation-verifier-entries-');
   const task = { kind: 'card', issue: 205, worktreePath: '/tmp/worktree-205', citations: ['AdmMembersRDO.pas:512'] };
 
-  const deps = {
-    spawnSync: fakeSpawnSync(() => {
-      const reply = realShapedReply({ verdict: 'PASS', entries: 'not an array, not JSON, not anything checkable' });
-      return { status: 0, stdout: JSON.stringify(reply), stderr: '', signal: null };
-    }),
-  };
+  const { spawn } = fakeSpawnDeps([
+    initMessage(),
+    resultMessage({ verdict: 'PASS', entries: 'not an array, not JSON, not anything checkable' }),
+  ]);
 
-  const result = await runLlm(cardCtx({ taskDir, task }), 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', deps);
+  const result = await runLlm(cardCtx({ taskDir, task }), 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.entries, 'not an array, not JSON, not anything checkable');
 });

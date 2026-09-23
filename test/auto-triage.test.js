@@ -13,7 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { mkTmp, writePoolDir } = require('./helpers');
+const { mkTmp, writePoolDir, fakeSpawnedChild } = require('./helpers');
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
@@ -57,17 +57,24 @@ function poolDir() {
   return writePoolDir(mkTmp('spo-autotriage-pool-'), [{ name: 'acct1' }]);
 }
 
-// Same shape invokeClaudeReal's real spawn parses (test/intake.test.js's own helper).
-function realShapedReply(resultObj) {
-  return {
-    result: typeof resultObj === 'string' ? resultObj : JSON.stringify(resultObj),
-    is_error: false,
-    num_turns: 1,
-    session_id: 'sess-triage-1',
-    modelUsage: { 'claude-x': { costUSD: 0.001 } },
-    terminal_reason: 'success',
-    api_error_status: null,
-  };
+// Card #239 chantier (A5b-2, Job 3): claude no longer spawns via spawnSync -- it drives the Agent
+// SDK's query() (orchestrator/steps/sdk-call.js), so a fake reply is now a pair of stream-json
+// messages (a `system`/`init`, then a `result`) fed to `deps.spawn`'s fakeSpawnedChild, not a
+// `{status, stdout, stderr, signal}` spawnSync result. `realShapedReply` (this file's old name,
+// same call sites) returns exactly those two messages now.
+function realShapedReply(resultObj, sessionId = 'sess-triage-1') {
+  return [
+    { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: sessionId,
+      modelUsage: { 'claude-x': { input_tokens: 100, output_tokens: 50 } },
+      result: typeof resultObj === 'string' ? resultObj : JSON.stringify(resultObj),
+    },
+  ];
 }
 
 function writePendingReport(spoReportsDir, filename) {
@@ -99,19 +106,49 @@ const VALID_DRAFT = {
 
 // Sequenced `claude` replies (one per invokeClaudeReal call: triageBugReport, then reviewCard for
 // a "draft" outcome) plus a `gh` responder for amendCard/postIssueComment/board:move.
-function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, accountsDir }) {
+//
+// Card #239 chantier (A5b-2, Job 3): claude no longer spawns via spawnSync at all -- `deps.spawn`
+// (the Agent SDK transport's own injection seam, orchestrator/steps/sdk-call.js) replaces the old
+// `spawnSync`'s `command === 'claude'` branch; `gh`/`npm` are untouched, still spawnSync-faked.
+// `claudeRawReplies`, when given, is a sequence of "special" spawn behaviours consumed BEFORE
+// `claudeReplies` -- either `CLAUDE_HANG` (a child that never replies, for a deadline-kill
+// simulation -- pair with a short `deadlineMs` override below, or the real per-step deadline would
+// have to actually elapse) or a pre-built stream-json message array (e.g. claudeLimitLines()).
+// Additive: no existing caller passes it, so claudeReplies' own behaviour is untouched.
+const CLAUDE_HANG = Symbol('claude-hang');
+
+// A {kind: 'limit'} shaped stream-json result (api_error_status: 429 -- steps/llm.js's own
+// unambiguous classifyFailure rule) for the account-rotation tests below.
+function claudeLimitLines() {
+  return [
+    { type: 'system', subtype: 'init', session_id: 'sess-triage-limit', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      num_turns: 1,
+      session_id: 'sess-triage-limit',
+      modelUsage: {},
+      api_error_status: 429,
+      result: 'rate limited',
+    },
+  ];
+}
+
+function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, accountsDir, deadlineMs }) {
   let claudeCallIdx = 0;
-  // claudeRawReplies, when given, is a sequence of raw spawnSync-shaped results consumed BEFORE
-  // claudeReplies -- {status, stdout, stderr, signal} or {error, ...}, for tests that need to
-  // simulate a deadline kill (timeoutSpawnResult-shaped) rather than a parsed JSON reply.
-  // Additive: no existing caller passes it, so claudeReplies' own behaviour is untouched.
-  const claudeCalls = [...(claudeRawReplies || []), ...(claudeReplies || []).map((r) => ok(JSON.stringify(realShapedReply(r))))];
+  const claudeCallSequence = [...(claudeRawReplies || []), ...(claudeReplies || []).map((r) => realShapedReply(r))];
   return {
     accountsDir: accountsDir || poolDir(),
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
+    ...(deadlineMs !== undefined ? { deadlineMs } : {}),
+    spawn: () => {
+      const entry = claudeCallSequence[Math.min(claudeCallIdx++, claudeCallSequence.length - 1)];
+      if (entry === CLAUDE_HANG) return fakeSpawnedChild([], { hang: true });
+      return fakeSpawnedChild(entry);
+    },
     spawnSync: (command, args, opts) => {
-      if (command === 'claude') {
-        return claudeCalls[Math.min(claudeCallIdx++, claudeCalls.length - 1)];
-      }
       if (command === 'gh') {
         if (ghResponder) return ghResponder(args);
         if (args[0] === 'api') return ok(JSON.stringify({ body: 'original raw body' }));
@@ -126,30 +163,6 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
   };
 }
 
-function timeoutSpawnResult() {
-  const err = new Error('spawnSync claude ETIMEDOUT');
-  err.code = 'ETIMEDOUT';
-  return { error: err, status: 143, stdout: '', stderr: '', signal: 'SIGTERM' };
-}
-
-// A {kind: 'limit'} shaped raw spawn result (api_error_status: 429 -- steps/llm.js's own
-// unambiguous classifyFailure rule) for the account-rotation tests below.
-function limitSpawnResult() {
-  return {
-    status: 1,
-    stdout: JSON.stringify({
-      result: 'rate limited',
-      is_error: true,
-      num_turns: 1,
-      session_id: 'sess-triage-limit',
-      modelUsage: {},
-      terminal_reason: 'error',
-      api_error_status: 429,
-    }),
-    stderr: '',
-    signal: null,
-  };
-}
 
 function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1, kind }) {
   appendDaemonEvent(journalRoot, 'report-confirmed', { issue, pendingPath, commentId, kind });
@@ -464,7 +477,8 @@ test('runAutoTriage: a triageBugReport retry after a timeout is journaled as rep
   confirmedEntry(journalRoot, { issue: 449, pendingPath });
 
   const deps = makeDeps({
-    claudeRawReplies: [timeoutSpawnResult()],
+    claudeRawReplies: [CLAUDE_HANG],
+    deadlineMs: 50,
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
       { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
@@ -503,7 +517,8 @@ test('runAutoTriage: dry run -- a retry still happens but is not journaled', asy
   confirmedEntry(journalRoot, { issue: 450, pendingPath });
 
   const deps = makeDeps({
-    claudeRawReplies: [timeoutSpawnResult()],
+    claudeRawReplies: [CLAUDE_HANG],
+    deadlineMs: 50,
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
       { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
@@ -536,7 +551,7 @@ test('runAutoTriage: a triageBugReport rate-limit rotates accounts and is journa
 
   const deps = makeDeps({
     accountsDir,
-    claudeRawReplies: [limitSpawnResult()],
+    claudeRawReplies: [claudeLimitLines()],
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
       { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
@@ -582,7 +597,7 @@ test('runAutoTriage: dry run -- a rate-limit rotation still happens but is not j
 
   const deps = makeDeps({
     accountsDir,
-    claudeRawReplies: [limitSpawnResult()],
+    claudeRawReplies: [claudeLimitLines()],
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
       { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' },
@@ -612,7 +627,7 @@ test('runAutoTriage: a reviewCard rate-limit inside reviewAndFile is journaled a
 
   const deps = makeDeps({
     accountsDir,
-    claudeRawReplies: [limitSpawnResult()], // acct1 -> limit, rotate to acct2
+    claudeRawReplies: [claudeLimitLines()], // acct1 -> limit, rotate to acct2
     claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' }],
     ghResponder: (args) =>
       args[0] === 'api' ? ok(JSON.stringify({ title: '[suggestion] x', body: 'b' })) : ok(''),
@@ -770,16 +785,16 @@ test('processConfirmedReport: claims the report into in-progress/ BEFORE triageB
     ],
     npmResponder: () => ok(''),
   });
-  const baseSpawnSync = deps.spawnSync;
+  const baseSpawn = deps.spawn;
   let sawClaimedWhenCalled = null;
-  deps.spawnSync = (command, args, opts) => {
-    if (command === 'claude' && sawClaimedWhenCalled === null) {
+  deps.spawn = (command, args, opts) => {
+    if (sawClaimedWhenCalled === null) {
       // The ordering assertion: by the moment triageBugReport spawns `claude`, the file must
       // already be gone from pending/ and sitting in in-progress/ -- not just "eventually", at
       // THIS instant, before the expensive call is even made.
       sawClaimedWhenCalled = fs.existsSync(claimedPath) && !fs.existsSync(pendingPath);
     }
-    return baseSpawnSync(command, args, opts);
+    return baseSpawn(command, args, opts);
   };
 
   const entry = { issue: 900, pendingPath, commentId: 1, kind: null };
@@ -2693,11 +2708,11 @@ test('retryHeldReport: carries kind forward for a suggestion report, and the ret
 
   const countClaudeCalls = (baseDeps) => {
     let calls = 0;
-    const spawnSync = (command, args, opts) => {
-      if (command === 'claude') calls++;
-      return baseDeps.spawnSync(command, args, opts);
+    const spawn = (command, args, opts) => {
+      calls++;
+      return baseDeps.spawn(command, args, opts);
     };
-    return { deps: { ...baseDeps, spawnSync }, count: () => calls };
+    return { deps: { ...baseDeps, spawn }, count: () => calls };
   };
 
   // Reach a hold: kind:'suggestion' skips triageBugReport entirely (buildSuggestionDraft is

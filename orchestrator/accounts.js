@@ -74,14 +74,17 @@ const path = require('path');
 // anything that transitively requires it), so this is not a cycle -- see config.js itself.
 const lock = require('./lock');
 const config = require('./config');
-const { STEP_CONTRACTS } = require('./step-contracts');
+const { STEP_CONTRACTS, INTAKE_MODELS } = require('./step-contracts');
 const { monotonicNowMs } = require('./monotonic-clock');
 
 // The model vocabulary this module's per-(account, model) state is keyed by -- DERIVED from
-// step-contracts.js's own table, never restated as a literal list, so a step that introduces a
-// fourth model moves this with it instead of leaving a silent gap. Not a cycle: step-contracts.js
-// requires only `path` and ./bash-policy, and this module already reaches it transitively through
-// config.js. Today it resolves to fable/opus/sonnet.
+// step-contracts.js's own table (every step's baseModel/escalatedModel) plus its INTAKE_MODELS
+// (intake.js's three steps), never restated as a literal list, so a step that introduces another
+// model moves this with it instead of leaving a silent gap. INTAKE_MODELS is not optional here:
+// since IMPLEMENT moved to OPUS_5_5 (2026-09-23), DRAFT_CARD is the only `sonnet` spender, and a
+// STEP_CONTRACTS-only derivation would drop `sonnet` from the fail-safe below. Not a cycle:
+// step-contracts.js requires only `path` and ./bash-policy, and this module already reaches it
+// transitively through config.js. Today it resolves to claude-opus-5-5/fable/sonnet.
 //
 // Used for exactly ONE thing -- markLimit's fail-safe when no model is named (see its own
 // comment). Every other function here treats the model as an opaque string key and never consults
@@ -90,7 +93,10 @@ const { monotonicNowMs } = require('./monotonic-clock');
 const KNOWN_MODELS = Object.freeze(
   Array.from(
     new Set(
-      Object.values(STEP_CONTRACTS).flatMap((def) => [def.baseModel, def.escalatedModel].filter((m) => typeof m === 'string'))
+      Object.values(STEP_CONTRACTS)
+        .flatMap((def) => [def.baseModel, def.escalatedModel])
+        .concat(Object.values(INTAKE_MODELS))
+        .filter((m) => typeof m === 'string')
     )
   ).sort()
 );
@@ -287,8 +293,11 @@ function readLabels(poolDir) {
 
 // Installs one permission policy as the USER-tier settings of every account in the pool.
 //
-// WHY this exists: steps/llm.js spawns `claude -p` with CLAUDE_CONFIG_DIR set to the account's
-// own directory, so the machine's ~/.claude/settings.json is never read by a pipeline step --
+// WHY this exists: steps/llm.js's invokeClaudeReal calls the vendored Agent SDK's `query()` with
+// `options.env.CLAUDE_CONFIG_DIR` set to the account's own directory (sdk-call.js's buildEnv --
+// the OLD transport set the same variable on a spawned `claude -p` child's env; the cutover moved
+// the plumbing, not the effect), so the machine's ~/.claude/settings.json is never read by a
+// pipeline step --
 // an account directory IS its own user-settings tier, and an unsynced one has no rules at all.
 // Today every step happens to land in a directory that carries a project policy (the pipeline
 // root or a product worktree), which masks the gap; a step whose cwd has no .claude/settings.json
