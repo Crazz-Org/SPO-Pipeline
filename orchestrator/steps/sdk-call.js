@@ -81,16 +81,28 @@
 // directly, not carried forward from the brief's "step-contracts.js carries these as
 // space-separated strings" claim, which does not match what is actually in STEP_CONTRACTS. The
 // space-separated STRING shape only exists in `orchestrator/README.md`'s hand-written example of
-// the LEGACY override path (`allowedTools: 'Read Grep'`, orchestrator/README.md:247) -- a shape
-// `runLlm`'s override branch (llm.js) still honours verbatim via `ctx.task.llm.<step>`, and which
-// `buildArgv`'s own `Array.isArray(opts.allowedTools) ? ... .join(' ') : opts.allowedTools` guard
-// already defends against today. `normalizeAllowedTools` below keeps that same defensiveness for
-// both real shapes this pipeline actually produces (an array from step-contracts.js, or a
-// space-separated string from a hand-authored override / README example) -- test 1's table-driven
-// contract-parity check below exercises the array shape (the one every production call takes);
-// there is no override-path fixture exercising the string shape yet, so that half of
-// normalizeAllowedTools is covered by its own direct unit assertion instead (see
-// test/sdk-call-options.test.js).
+// the LEGACY override path (`allowedTools: 'Read Grep'`, orchestrator/README.md:252) -- a shape
+// `runLlm`'s override branch (llm.js) still honours via `ctx.task.llm.<step>`, unchanged except
+// for the same surrounding-whitespace trim normalizeToolList applies to every string tool list
+// (see that function's own comment below).
+//
+// CORRECTED (fix pass, 2026-09-23, maintainer-directed after the disallowedTools fix pass, card
+// #240, flagged allowedTools as carrying the identical defect): this paragraph used to claim
+// `buildArgv`'s string branch (`Array.isArray(opts.allowedTools) ? ... .join(' ') :
+// opts.allowedTools`) was "defended against" by SPLITTING a string on whitespace. Read literally,
+// that ternary's string branch is `opts.allowedTools` UNCHANGED -- the old transport pushed a
+// string allowedTools to argv as ONE UNSPLIT TOKEN, exactly the way it pushed a string
+// disallowedTools (see normalizeToolList's own comment below, and the old, now-deleted buildArgv,
+// commit a0ecec4, orchestrator/steps/llm.js). Splitting it was therefore not "the same
+// tolerance" -- it was a regression that would have silently broken a rule shaped like `claude
+// --help`'s own worked example, `Bash(git *) Edit` (one string whose first entry has an embedded
+// space), shredding it into `['Bash(git', '*)', 'Edit']`, none of which match anything.
+// allowedTools and disallowedTools turn out to be the SAME rule for a string input -- kept as one
+// opaque token, never split -- so both now share one normalizer, `normalizeToolList`. The array
+// shape (every production call today, per step-contracts.js above) is unaffected by this
+// correction; test 1's table-driven contract-parity check below exercises exactly that shape, and
+// test/sdk-call-options.test.js carries the string-shape unit and argv-level assertions for both
+// functions.
 //
 // ---- the no-real-spawn killswitch: safe today, but its future hook belongs to A5, not here -----
 //
@@ -450,78 +462,87 @@ class JsonSchemaParseError extends Error {
   }
 }
 
-// normalizeAllowedTools(allowedTools) -> string[] | undefined
+// normalizeToolList(value) -> string[] | undefined
 //
-// The SDK's own `options.allowedTools` wants an ARRAY (comma-joined internally into
-// `--allowedTools a,b`, see this file's header measurement) -- todays's `buildArgv` (llm.js)
-// accepts either an array (space-joined into `--allowedTools "a b"`) or a bare string (passed to
-// argv untouched) and this function preserves that same tolerance, converging both shapes onto
-// the one the SDK needs:
+// Shared by normalizeAllowedTools and normalizeDisallowedTools below -- allowedTools and
+// disallowedTools turn out to be the SAME rule for normalization purposes, and this fix pass (F10
+// follow-up, 2026-09-23, maintainer-directed) merges what used to be two near-identical, and in
+// allowedTools's case WRONG, function bodies into one.
+//
+// The SDK's own `options.allowedTools`/`options.disallowedTools` each want an ARRAY (comma-joined
+// internally into `--allowedTools a,b` / `--disallowedTools a,b`, see this file's header
+// measurement and `vendor/claude-agent-sdk/sdk.mjs`'s own `ut.join(",")` / `F.join(",")` call
+// sites) -- the OLD transport's now-deleted `buildArgv` (card #240, commit a0ecec4,
+// orchestrator/steps/llm.js) is the specification for what a STRING input must produce, not a
+// guess: given a string, it pushed it to argv COMPLETELY UNCHANGED as a single argv token for
+// BOTH flags alike (`argv.push('--allowedTools', tools)` where `tools` is the bare string for the
+// non-array branch; `if (denied !== '') argv.push('--disallowedTools', denied)` -- no split, no
+// join, either flag), and relied on the real `claude` CLI's own parenthesis-aware splitter
+// (`claude --help`: "Comma or space-separated list of tool names", with a worked example --
+// `Bash(git *) Edit` -- whose first entry itself contains an embedded space) to parse it correctly
+// at the other end.
+//
+// This function reproduces that behaviour under the SDK's array-shaped options, with one
+// difference: it trims surrounding whitespace off the string (`value.trim()` below) before
+// wrapping it. The old transport's `buildArgv` did not trim -- it pushed the raw string to argv
+// completely unchanged. Everything else passes through unaltered: a string becomes a
+// ONE-ELEMENT array, so the SDK's own comma-join has nothing to join against and emits the
+// (trimmed) string as the sole argument. The trim makes no behavioural difference either way,
+// because the real `claude` CLI's own tool-list splitter trims surrounding whitespace around each
+// entry too -- whichever transport sent it, a leading or trailing space never survives to the
+// other end. SPLITTING a string on whitespace here (what
+// allowedTools's first cut did, and what disallowedTools's own F10 fix pass rejected for exactly
+// this reason) would be a REGRESSION from the old transport's own behaviour: a rule whose pattern
+// contains a space inside its own parentheses -- `Bash(git reset --hard*)`, or the CLI's own
+// `Bash(git *) Edit` example -- would shred into fragments (`Bash(git`, `reset`, `--hard*)`, ...)
+// that match nothing, silently dropping the rule with no error. Rejecting the string loudly
+// (throwing) was the other option considered; the old transport never refused a string, so
+// silently breaking a legacy override that worked before this cutover is worse than preserving it.
+//
 //   - an array (step-contracts.js's STEP_CONTRACTS -- the shape every real `kind: "card"` call
-//     takes today) is returned AS THE SAME REFERENCE it was given -- this function does not copy.
-//     That is deliberate here (a pure "which shape did I get" normalizer has no reason to own
-//     copying), but it means the caller must not treat the result as safe to hand to something
-//     that could mutate it: step-contracts.js's STEP_CONTRACTS arrays are process-lifetime,
-//     shared across EVERY call for that step, never rebuilt per call (see resolveStepContract's
-//     own `allowedTools: stepDef.allowedTools`). buildQueryOptions is the one that defensively
-//     copies before storing this on `options` -- see its own comment at the call site (F4, this
-//     action's fix pass: the first cut skipped that copy and aliased the contract's array
-//     directly onto `options.allowedTools`, so `options.allowedTools.push(...)` would have
-//     permanently altered that step's tool grant for every later call in the process. Latent,
-//     never triggered by the SDK itself, but a whole-process blast radius for one missing `[...]`
-//     is worth naming here even though the fix lives one function down).
-//   - a string (the legacy override path's documented shape, orchestrator/README.md:247's
-//     `allowedTools: 'Read Grep'`) is split on whitespace -- `.split` always allocates a fresh
-//     array, so this branch never has the aliasing question the array branch does.
-//   - anything falsy (not supplied at all) returns undefined, so buildQueryOptions omits the
-//     `allowedTools` key entirely rather than sending an empty array (an empty `--allowedTools`
-//     the CLI would read as "allow nothing", a different call from "the flag was never passed").
-function normalizeAllowedTools(allowedTools) {
-  if (Array.isArray(allowedTools)) return allowedTools;
-  if (typeof allowedTools === 'string' && allowedTools.trim() !== '') {
-    return allowedTools.trim().split(/\s+/);
+//     takes today, for both allowedTools and disallowedTools) is returned AS THE SAME REFERENCE it
+//     was given -- this function does not copy. That is deliberate here (a pure "which shape did I
+//     get" normalizer has no reason to own copying), but it means the caller must not treat the
+//     result as safe to hand to something that could mutate it: step-contracts.js's STEP_CONTRACTS
+//     arrays are process-lifetime, shared across EVERY call for that step, never rebuilt per call
+//     (see resolveStepContract's own `allowedTools`/`disallowedTools` fields). buildQueryOptions is
+//     the one that defensively copies before storing either result on `options` -- see its own
+//     comments at each call site (F4, this action's fix pass: the first cut skipped that copy for
+//     allowedTools and aliased the contract's array directly onto `options.allowedTools`, so
+//     `options.allowedTools.push(...)` would have permanently altered that step's tool grant for
+//     every later call in the process. Latent, never triggered by the SDK itself, but a
+//     whole-process blast radius for one missing `[...]` is worth naming here even though the fix
+//     lives one function down).
+//   - a non-empty string (the legacy override path's documented shape, orchestrator/README.md:252's
+//     `allowedTools: 'Read Grep'`, or a hand-authored `disallowedTools: 'Bash(sudo *)'`) becomes a
+//     ONE-ELEMENT array holding the string with surrounding whitespace trimmed; everything
+//     else in it passes through unchanged, never split.
+//   - anything falsy (not supplied at all) returns undefined, so buildQueryOptions omits the key
+//     entirely rather than sending an empty array (an empty `--allowedTools`/`--disallowedTools`
+//     the CLI would read as "allow/deny nothing", a different call from "the flag was never
+//     passed").
+function normalizeToolList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    return [value.trim()];
   }
   return undefined;
 }
 
-// normalizeDisallowedTools(disallowedTools) -> string[] | undefined
-//
-// F10 (Opus verifier, fix pass): NOT the same normalization as normalizeAllowedTools above, on
-// purpose. A DENY rule's own pattern routinely contains a space inside its parentheses --
-// `Bash(git reset --hard*)`, `Bash(sudo *)` -- and `normalizeAllowedTools`'s whitespace `.split`
-// would tear a rule like that into fragments that match nothing (`Bash(git`, `reset`, `--hard*)`,
-// ...), silently dropping the deny with no error. That is not hypothetical: it is exactly what
-// happens if this function is skipped and the generic one reused here instead, and only a
-// hand-authored task file's legacy override can produce a string in the first place --
-// step-contracts.js/orchestrator/bash-policy.js always hand this an array (see
-// resolveStepContract's own `disallowedTools` field) -- so nothing in today's real traffic would
-// ever exercise the bug, which is exactly why it is worth naming rather than trusting review to
-// catch it later.
-//
-// The OLD transport's now-deleted `buildArgv` (card #240, commit a0ecec4) is the specification
-// here, not a guess: given a string, it pushed it to argv COMPLETELY UNCHANGED as a single argv
-// token (`if (denied !== '') argv.push('--disallowedTools', denied)` -- no split, no join), and
-// relied on the real `claude` CLI's own parenthesis-aware splitter (`claude --help`: "Comma or
-// space-separated list of tool names", with a worked example whose first entry itself contains an
-// embedded space) to parse it correctly at the other end. This function reproduces that exact
-// byte-for-byte behaviour under the SDK's array-shaped `options.disallowedTools`: a string becomes
-// a ONE-ELEMENT array, so the SDK's own comma-join (`vendor/claude-agent-sdk/sdk.mjs`'s
-// `ut.join(",")`) has nothing to join against and emits the string verbatim as the sole
-// `--disallowedTools` argument -- the same text, unaltered, that used to reach the same flag on
-// the old transport. Splitting it here would be a REGRESSION from the old transport's own
-// behaviour, not a neutral choice; rejecting the string loudly (throwing) was the other option
-// this fix pass considered, but the old transport never refused a string, so silently breaking a
-// legacy override that worked before this cutover is worse than preserving it.
-//
-// An array (the real, non-legacy shape) is returned as-is, same "no copy here" contract as
-// normalizeAllowedTools -- buildQueryOptions is still the one that copies before storing onto
-// `options` (see its own disallowedTools comment).
+// normalizeAllowedTools(allowedTools) -> string[] | undefined -- see normalizeToolList's own
+// comment for the full reasoning; this is a thin, separately-named wrapper so call sites and
+// tests keep reading which field they are normalizing.
+function normalizeAllowedTools(allowedTools) {
+  return normalizeToolList(allowedTools);
+}
+
+// normalizeDisallowedTools(disallowedTools) -> string[] | undefined -- see normalizeToolList's own
+// comment. Card #240 introduced this name first (F10, Opus verifier, fix pass) when allowedTools's
+// own normalizer still (wrongly) split a string on whitespace; now that allowedTools has been
+// corrected to the same rule, both names delegate to the one shared implementation above rather
+// than forking near-identical logic.
 function normalizeDisallowedTools(disallowedTools) {
-  if (Array.isArray(disallowedTools)) return disallowedTools;
-  if (typeof disallowedTools === 'string' && disallowedTools.trim() !== '') {
-    return [disallowedTools.trim()];
-  }
-  return undefined;
+  return normalizeToolList(disallowedTools);
 }
 
 // buildEnv(opts) -- the child environment for the eventual query() spawn, built the same way
@@ -682,10 +703,10 @@ function buildQueryOptions(opts, deps = {}) {
   // for CITATION_VERIFIER (the one policy step-contracts.js gives no disallowedTools entry at
   // all).
   //
-  // F10 (Opus verifier, fix pass): normalizeDisallowedTools here, NOT normalizeAllowedTools --
-  // see that function's own comment for why the two must not share a normalizer. Reusing
-  // normalizeAllowedTools would split a legacy-override string like `Bash(git reset --hard*)` on
-  // its own internal spaces and silently deliver a deny rule that matches nothing.
+  // normalizeDisallowedTools here -- named separately from normalizeAllowedTools for readability
+  // at call sites, but (fix pass, 2026-09-23) both now delegate to the same normalizeToolList: a
+  // legacy-override string like `Bash(git reset --hard*)` becomes a one-element array, never
+  // split on its own internal spaces. See normalizeToolList's own comment for the full history.
   const disallowedTools = normalizeDisallowedTools(opts.disallowedTools);
   if (disallowedTools !== undefined && disallowedTools.length > 0) {
     options.disallowedTools = [...disallowedTools];

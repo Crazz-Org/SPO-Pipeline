@@ -1376,9 +1376,9 @@ const EXPECTED_CITATIONS = [
   "orchestrator/steps/scripted.js :: worker.ts:751", // card #212: isGateMergeRefusalConfirmed's own comment cites worker.ts:751's refusal-detail literal ("<ref> does not merge cleanly with origin/main (base <sha>)"), confirmed against the real product repo (SPO-WebClient `0b5b5687`+).
   "orchestrator/steps/sdk-call.js :: daemon.js:111", // F8 fix pass: the killswitch header note cites daemon.js:103 (`require('./no-real-spawn-guard').installGuard();`, the first line after that file's own leading comment block) as the measured reason today's real daemon process happens to be safe -- confirmed by reading orchestrator/daemon.js directly. Resolved by basename (no directory prefix); unambiguous, daemon.js exists in this repo only under orchestrator/. Re-pinned for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :103 -> :109, a pure +6-line shift when F3's own daemon.js header edit (the --scanner split rationale, "STALE SINCE, NOT RE-VERIFIED") landed above this line; content byte-identical at :111 (`require('./no-real-spawn-guard').installGuard();`), verified by re-reading the target line.
   "orchestrator/steps/sdk-call.js :: llm.js:1063", // MERGE (2026-09-23): branch's own history (through the CI fix pass) reached :1060; main's card #240 (disallowedTools additions to runLlm's legacy override branch and to buildContractOptions, auto-merged cleanly into this file, unrelated to the sdk-transport conflict) added lines above this target too. Content byte-identical at :1063 (`jsonSchema: override.jsonSchema,`), verified by re-reading the target line.
-  "orchestrator/steps/sdk-call.js :: llm.js:1063", // same target, cited a second time at the jsonSchema-parsing block's own comment further down this same file -- occurrences count separately here, same convention as the orchestrator/README.md:247 pair below. MERGE (2026-09-23): same correction as the row above.
-  "orchestrator/steps/sdk-call.js :: orchestrator/README.md:247", // the module header's mention -- fix pass F7: originally cited a bare "README.md:247", which is genuinely ambiguous (5 tracked README.md files in this repo) and was corrected to the full path rather than allowlisted, since it was a real citation mistake, not a deliberate exception. The extractor counts occurrences, not distinct (file, citation) pairs, so this file's OTHER mention of the same target (normalizeAllowedTools's own comment, already written with the full path) gets its own row immediately below, not a dedup.
-  "orchestrator/steps/sdk-call.js :: orchestrator/README.md:247", // normalizeAllowedTools's own comment -- same target as the row above, cited a second time in this file's prose.
+  "orchestrator/steps/sdk-call.js :: llm.js:1063", // same target, cited a second time at the jsonSchema-parsing block's own comment further down this same file -- occurrences count separately here, same convention as the orchestrator/README.md:252 pair below. MERGE (2026-09-23): same correction as the row above.
+  "orchestrator/steps/sdk-call.js :: orchestrator/README.md:252", // the module header's mention -- fix pass F7: originally cited a bare "README.md:247", which is genuinely ambiguous (5 tracked README.md files in this repo) and was corrected to the full path rather than allowlisted, since it was a real citation mistake, not a deliberate exception. The extractor counts occurrences, not distinct (file, citation) pairs, so this file's OTHER mention of the same target (normalizeAllowedTools's own comment, already written with the full path) gets its own row immediately below, not a dedup. RE-PINNED (fix pass 2026-09-23): :247 -> :252, the exemption's "confirmed by hand" comment had gone stale -- see the self-checking test next to CITATION_ANCHOR_ALLOWLIST below.
+  "orchestrator/steps/sdk-call.js :: orchestrator/README.md:252", // normalizeAllowedTools's own comment -- same target as the row above, cited a second time in this file's prose.
   "prompts/README.md :: plan.md:103",
   "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18",
 ];
@@ -1947,7 +1947,7 @@ const CITATION_ANCHOR_ALLOWLIST = {
     "filename), which the cited JSON content never contains -- a config value has no code-shaped " +
     'identifier to anchor on. Confirmed correct by hand: lines 109-127 (at 93528389) are the ' +
     '`"hooks": {` block through the third PreToolUse hook\'s `"timeout": 10` line.',
-  // Action A3 (card #239) cites orchestrator/README.md:247 twice (the module header and
+  // Action A3 (card #239) cites orchestrator/README.md:252 twice (the module header and
   // normalizeAllowedTools's own comment), both times for the same reason: it is the LEGACY
   // override path's documented `allowedTools: 'Read Grep'` example -- a quoted STRING LITERAL,
   // not a code-shaped identifier, so the heuristic's nearest candidates ('README'/const from the
@@ -1956,15 +1956,24 @@ const CITATION_ANCHOR_ALLOWLIST = {
   // subject" shape as the verify-gate.js:336 and SPO-WebClient .claude/settings.json entries above (not
   // repeating that entry's own citation string here -- it is a bare filename:line-number shape that
   // the citation scanner in this very file would extract as a second, unqualified, and therefore
-  // wrongly-resolved reference to THIS repo's own, much shorter, settings.json). Confirmed
-  // correct by hand: line 247 of orchestrator/README.md is exactly
-  // `  allowedTools: 'Read Grep',      // optional`, the space-separated string shape this
-  // citation exists to name.
-  'orchestrator/steps/sdk-call.js :: orchestrator/README.md:247':
+  // wrongly-resolved reference to THIS repo's own, much shorter, settings.json).
+  //
+  // RE-PINNED (fix pass 2026-09-23): this entry used to say ":247" and claim "confirmed correct by
+  // hand: line 247 ... is exactly `allowedTools: 'Read Grep'`". That had gone stale -- the README
+  // grew a line above the example at some point after the hand check, and the anchor heuristic
+  // that would normally catch a drifted citation cannot fire here (the target is a string literal,
+  // not a code-shaped identifier), so nothing noticed until this fix pass re-read the README by
+  // hand and found the real line at :252. A by-hand confirmation with no mechanical backstop goes
+  // stale silently, so this entry is no longer "confirmed by hand" alone: the
+  // 'CITATION_ANCHOR_ALLOWLIST[...] :247 exemption stays true' test below reads this exact README
+  // line at test time and asserts it is still the `allowedTools: 'Read Grep'` example, so a future
+  // drift fails loudly instead of waiting for the next by-hand audit.
+  'orchestrator/steps/sdk-call.js :: orchestrator/README.md:252':
     "the citation's true subject is a quoted string literal ('Read Grep'), not a code-shaped " +
     "identifier -- 'README' (from the citation's own filename) and 'runLlm' (from this file's " +
-    'own nearby prose) are incidental. Confirmed correct by hand: line 247 is exactly ' +
-    "`  allowedTools: 'Read Grep',      // optional`.",
+    'own nearby prose) are incidental. Line 252 is exactly ' +
+    "`  allowedTools: 'Read Grep',      // optional` -- kept true by the self-checking test below " +
+    "rather than a by-hand confirmation alone, since this target cannot be anchor-checked.",
 };
 
 function isAnchorAllowlisted(rel, raw) {
@@ -1980,10 +1989,30 @@ test('CITATION_ANCHOR_ALLOWLIST holds exactly the entries this action explicitly
       'orchestrator/README.md :: dispatcher.js:643-656',
       'orchestrator/steps/scripted.js :: verify-gate.js:336',
       'orchestrator/steps/scripted.js :: worker.ts:751',
-      'orchestrator/steps/sdk-call.js :: orchestrator/README.md:247',
+      'orchestrator/steps/sdk-call.js :: orchestrator/README.md:252',
     ],
     'CITATION_ANCHOR_ALLOWLIST changed size or membership -- read the new/changed citation by ' +
       'hand against its target before adding an entry; this pin needs updating in the same change, by name.'
+  );
+});
+
+// The one CITATION_ANCHOR_ALLOWLIST entry whose exemption comment is a hand confirmation with no
+// mechanical backstop (its target, orchestrator/README.md:252, is a quoted STRING LITERAL, so the
+// anchor heuristic above has no code-shaped candidate to check it against) went stale exactly this
+// way: the comment said "confirmed correct by hand: line 247 is exactly `allowedTools: 'Read
+// Grep'`" long after the README had drifted to :252, and nothing failed until this fix pass
+// re-read the file by hand. Rather than leave the next drift to the next by-hand audit, this test
+// reads the real line at test time and asserts it still holds the example the allowlist entry
+// names -- the smallest mechanical check this exemption's target admits.
+test('the README.md:252 allowlist exemption stays true -- the cited line is still the allowedTools example', () => {
+  const lines = read('orchestrator/README.md').split('\n');
+  assert.equal(
+    lines[251],
+    "  allowedTools: 'Read Grep',      // optional",
+    'orchestrator/README.md:252 no longer holds the legacy allowedTools string example this ' +
+      'CITATION_ANCHOR_ALLOWLIST entry names -- re-pin sdk-call.js\'s two citations, the ' +
+      'EXPECTED_CITATIONS rows, and this allowlist entry (key, comment, and membership test) to ' +
+      'wherever the example moved, then update this line number.'
   );
 });
 

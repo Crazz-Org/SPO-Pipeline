@@ -48,6 +48,29 @@
 //   4. steps/llm.js's runLlm, the legacy override branch: `disallowedTools:
 //      override.disallowedTools` removed from the `opts` object -- exactly the override test
 //      (below) went red.
+//
+// EXTENDED (card #241 remerge fix pass, 2026-09-23, maintainer-directed): the driver found no
+// standing test asserted any step's --model on the real command line -- changing DIAGNOSE's
+// baseModel in step-contracts.js (line ~992) failed only ONE contract-table test
+// (test/step-contracts.test.js), never an argv-level one. Every case in both tables below (STEP_
+// CASES and INTAKE_CASES) plus the legacy-override test now also asserts modelArgvValue against
+// each call's own intended model, read directly from step-contracts.js/intake.js. PROVEN
+// LOAD-BEARING the same way as above (manual mutation, this fix pass, restored after):
+//   5. step-contracts.js's DIAGNOSE.baseModel changed from OPUS_5_5 to 'fable' -- exactly the
+//      DIAGNOSE case went red (its own --model assertion), the other four STEP_CASES and every
+//      intake/override test stayed green.
+//   6. step-contracts.js's VALIDATE.baseModel changed from 'fable' to 'sonnet' -- exactly the
+//      VALIDATE case went red, nothing else.
+//   7. sdk-call.js's buildQueryOptions: `if (opts.model) options.model = opts.model;` removed --
+//      every case in this file and test/sdk-call-options.test.js that carries a model went red:
+//      15 of 15 (re-measured, fix pass 2026-09-23; this comment previously said 14, undercounting
+//      test/sdk-call-options.test.js's own `buildQueryOptions: a real query() spawn emits the
+//      exact measured argv shape` test, which also asserts --model on the real argv and went red
+//      too). Reproduce: comment out that `if (opts.model) ...` line in buildQueryOptions, then run
+//      `node --test test/sdk-deny-list-e2e.test.js test/sdk-call-options.test.js` -- the 5
+//      STEP_CASES + 3 INTAKE_CASES + the legacy-override test here (9), plus the 5 REAL_STEPS
+//      contract-parity cases + the one real-argv-shape test in test/sdk-call-options.test.js (6),
+//      go red; none of the --disallowedTools-only assertions were newly broken by this cut alone.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -62,6 +85,7 @@ const { runLlm } = require('../orchestrator/steps/llm');
 const { appendEvent } = require('../orchestrator/journal');
 const intake = require('../orchestrator/intake');
 const { READ_ONLY_STEP_BASH_DENY, WRITE_STEP_BASH_DENY, INTAKE_BASH_DENY } = require('../orchestrator/bash-policy');
+const { OPUS_5_5 } = require('../orchestrator/step-contracts');
 const { mkTmp, writePoolDir, fakeSpawnDeps, fakeExecDeps, fakeSpawnedChild } = require('./helpers');
 
 const SESSION_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -83,17 +107,35 @@ function denyArgvValue(argv) {
   return i === -1 ? undefined : argv[i + 1];
 }
 
+// Reads the `--model <value>` argv pair spawnClaudeCodeProcess's real `command`/`args` were
+// called with. Card #241 remerge (2026-09-23): the driver confirmed no standing test asserted
+// DIAGNOSE's own --model on the real command line -- changing DIAGNOSE's baseModel in
+// step-contracts.js failed only one contract-table test (test/step-contracts.test.js), never an
+// argv-level one. This helper backs the model assertions added to both tables below, closing that
+// gap for every step/intake call this file already drives through the real vendored SDK argv.
+function modelArgvValue(argv) {
+  const i = argv.indexOf('--model');
+  return i === -1 ? undefined : argv[i + 1];
+}
+
 // ---- the five real LLM steps, table-driven over step-contracts.js's own resolved deny list -----
 
+// Expected --model is each step's own resolved baseModel (step-contracts.js's STEP_CONTRACTS),
+// read directly from OPUS_5_5/the literal 'fable' rather than re-typed, so a future re-spelling of
+// OPUS_5_5's own value cannot silently desync this table from the source it is meant to pin. The
+// plain task built below (no planInvalidRetry/diagnoseOrValidateRetry/etc. flags) never fires any
+// step's shouldEscalate, so every case here resolves to baseModel, never escalatedModel -- PLAN's
+// own escalatedModel ('fable', on planInvalidRetry) is exercised separately by
+// test/plan-model-fallback.test.js, not duplicated here.
 const STEP_CASES = [
-  ['PLAN', READ_ONLY_STEP_BASH_DENY],
-  ['IMPLEMENT', WRITE_STEP_BASH_DENY],
-  ['DIAGNOSE', READ_ONLY_STEP_BASH_DENY],
-  ['VALIDATE', READ_ONLY_STEP_BASH_DENY],
-  ['CITATION_VERIFIER', undefined], // the one contract with no Bash entry at all -- see step-contracts.js:1240's own comment
+  ['PLAN', READ_ONLY_STEP_BASH_DENY, OPUS_5_5],
+  ['IMPLEMENT', WRITE_STEP_BASH_DENY, OPUS_5_5],
+  ['DIAGNOSE', READ_ONLY_STEP_BASH_DENY, OPUS_5_5],
+  ['VALIDATE', READ_ONLY_STEP_BASH_DENY, 'fable'],
+  ['CITATION_VERIFIER', undefined, 'fable'], // the one contract with no Bash entry at all -- see step-contracts.js:1240's own comment
 ];
 
-for (const [step, expectedDenyList] of STEP_CASES) {
+for (const [step, expectedDenyList, expectedModel] of STEP_CASES) {
   test(`sdk deny-list e2e: runLlm(${step}) reaches the vendored SDK's real argv with ${expectedDenyList ? 'its own resolved deny list' : 'no --disallowedTools at all'}`, async () => {
     const taskDir = mkTmp('sdk-deny-e2e-');
     const task = {
@@ -137,13 +179,23 @@ for (const [step, expectedDenyList] of STEP_CASES) {
     } else {
       assert.equal(got, expectedDenyList.join(','), `${step}'s --disallowedTools must be its own resolved deny list, comma-joined`);
     }
+    assert.equal(
+      modelArgvValue(calls[0].args),
+      expectedModel,
+      `${step}'s --model must be its own resolved baseModel (step-contracts.js), reaching the real argv unchanged`
+    );
   });
 }
 
 // ---- the three intake steps, each with their own INTAKE_BASH_DENY ------------------------------
 
+// Expected --model per intake call (orchestrator/intake.js): draftCard is 'sonnet' (unchanged by
+// PR #249 -- the maintainer decision moved PLAN/IMPLEMENT/DIAGNOSE/TRIAGE_BUG_REPORT to Opus 5.5,
+// DRAFT_CARD stays on Sonnet 5, see that commit's own message), reviewCard is 'fable' (untouched by
+// #249, not in its list of moved steps), triageBugReport is OPUS_5_5 (moved off the `opus` alias by
+// #249, verified by reading intake.js's own triageBugReport call site directly).
 const INTAKE_CASES = [
-  ['draftCard', (deps) => intake.draftCard('add a widget', deps)],
+  ['draftCard', (deps) => intake.draftCard('add a widget', deps), 'sonnet'],
   [
     'reviewCard',
     (deps) =>
@@ -151,6 +203,7 @@ const INTAKE_CASES = [
         { title: 't', body_markdown: 'b', category: 'feature', size: 'S', area: 'client', priority: 'Low', is_bug_report: false, confirmed: false },
         deps
       ),
+    'fable',
   ],
   [
     'triageBugReport',
@@ -159,10 +212,11 @@ const INTAKE_CASES = [
       fs.writeFileSync(reportFile, '{}');
       return intake.triageBugReport(reportFile, 1, deps);
     },
+    OPUS_5_5,
   ],
 ];
 
-for (const [name, call] of INTAKE_CASES) {
+for (const [name, call, expectedModel] of INTAKE_CASES) {
   test(`sdk deny-list e2e: intake.${name} reaches the vendored SDK's real argv with INTAKE_BASH_DENY`, async () => {
     let capturedArgs = null;
     const deps = {
@@ -184,6 +238,11 @@ for (const [name, call] of INTAKE_CASES) {
 
     assert.ok(capturedArgs, `intake.${name} must reach a real spawn`);
     assert.equal(denyArgvValue(capturedArgs), INTAKE_BASH_DENY.join(','), `intake.${name}'s --disallowedTools must be INTAKE_BASH_DENY, comma-joined`);
+    assert.equal(
+      modelArgvValue(capturedArgs),
+      expectedModel,
+      `intake.${name}'s --model must be its own hand-built call config's model, reaching the real argv unchanged`
+    );
   });
 }
 
@@ -210,4 +269,9 @@ test('sdk deny-list e2e: runLlm legacy ctx.task.llm.<step> override -- a string 
 
   assert.equal(calls.length, 1);
   assert.equal(denyArgvValue(calls[0].args), rule, 'a legacy override string must reach real argv completely unsplit');
+  assert.equal(
+    modelArgvValue(calls[0].args),
+    'fable',
+    "the override's own model ('fable' above) must reach real argv unchanged, independent of step-contracts.js's baseModel"
+  );
 });
