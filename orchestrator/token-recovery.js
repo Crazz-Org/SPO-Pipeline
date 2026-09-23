@@ -29,11 +29,52 @@
 // Also NOT by a time-window match ("the session that started closest to this call's own
 // timestamp"): that happened to be unique across every corpus call measured, but is a property of
 // that corpus, not a guarantee -- two kills close enough together collapse into ambiguous
-// candidates under a loose-enough window. This module works only because
-// orchestrator/steps/llm.js's invokeClaudeReal mints `sessionId` BEFORE spawning `claude`, so a
-// killed call still has an id to be found by. See orchestrator/README.md's Tokens section for the
-// measured numbers behind this.
+// candidates under a loose-enough window. See orchestrator/README.md's Tokens section for the
+// measured numbers behind the design below.
 //
+// STALE CLAIM CORRECTED, THEN RESTORED (card #239 chantier). F7's own sibling-grep (Opus verifier
+// fix pass) found this paragraph claiming this module "works only because
+// orchestrator/steps/llm.js's invokeClaudeReal mints `sessionId` BEFORE spawning `claude`, so a
+// killed call still has an id to be found by" -- true of the old spawnSync transport, but false
+// for the few days between action A5b's cutover (which dropped the mint: `state-machine.js` never
+// supplies `opts.sessionId` to a real card call, so `buildQueryOptions` omitted the option
+// entirely and the CLI minted its own id, reported back only once the `system`/`init` message
+// arrived) and this action's Job 2. A call killed before that first message had NO session id for
+// this module to search by during that window -- a real, measured loss of the guarantee this
+// paragraph describes, not a hypothetical one.
+//
+// Job 2 (this action, A5b-2 fix pass) restored it: `invokeClaudeReal` (orchestrator/steps/llm.js)
+// once again mints a UUID -- via `deps.randomUUID`, falling back to `crypto.randomUUID`, the same
+// injection convention this file's own `recoverSessionTokens` uses below -- before every real
+// `query()` call whose caller did not already supply `opts.sessionId`, and passes it through
+// `buildQueryOptions` as `options.sessionId` (a first-class SDK option, `--session-id=<uuid>` on
+// the real CLI's argv). So the guarantee this paragraph originally described holds again, restored
+// rather than reinvented: a call killed before the `system`/`init` message ever arrives still has
+// an id -- the one invokeClaudeReal generated and told `claude` to use -- for this module to search
+// a transcript by. The one behavioural difference from the pre-A5b transport: the CLI's own
+// reported id (once it exists) wins over the generated one if the two ever disagree, since the CLI
+// is the authority on what it actually named the session on disk (see invokeClaudeReal's own
+// `suppliedSessionId` fallback comment) -- in the ordinary case the two are the same value, exactly
+// as they always were.
+//
+// RULED ON, NOT REMOVED (action A7, same chantier). A7's own brief asked whether this module
+// becomes dead code now that a call's usage is read off the SDK's `result` message rather than
+// parsed from a spawnSync reply -- true of a call that produces one, false of the four real shapes
+// on THIS transport that don't (deadline kill, external signal kill, a clean or nonzero-exit stream
+// end with no `result` message -- sdk-call.js's own header, items 4-5). MEASURED end to end
+// (test/token-recovery-e2e.test.js): a real `query()` call driving a real spawned fixture,
+// `recoverSessionTokens` NOT injected, recovers real pre-written transcript tokens on all four; a
+// fifth (killed before the fixture ever wrote anything) correctly still returns null. That proves
+// the WIRING; it does not prove the real `claude` binary still writes a transcript under this
+// wire protocol at all -- no SDK-driven call has run against the real CLI yet (Opus verifier, fix
+// pass F2), so that half is a structural inference (same binary, `--resume` bookkeeping
+// independent of the wire protocol), settled by the first real SDK-driven kill, not by this
+// action. This module and its production call site (llm.js's `maybeRecoverTokens`) both stay --
+// see that function's own comment for the full ruling, the corrected real corpus counts (25 of
+// 810 live-era events, 3.09%, not the 117-of-917 first-pass figure that wrongly counted a
+// retroactive backfill's own writes as live recoveries), and where the open premise gets settled.
+//
+
 // ---- roots searched, in order -------------------------------------------------------------------
 //
 //   1. accountConfigDir's own `projects` directory -- the account the call actually ran under

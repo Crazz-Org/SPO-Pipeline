@@ -457,8 +457,11 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // Per-call $ budget cap (`--max-budget-usd`) is intentionally NOT set anywhere in this file --
 // the maintainer runs a Claude Max subscription with no overage risk, so every LLM step
 // (this table and orchestrator/intake.js's draftCard/reviewCard/triageBugReport) omits the flag
-// entirely and runs unlimited. See steps/llm.js's buildArgv: the flag is only pushed when
-// opts.maxBudgetUsd is a number, so `undefined` here means "no cap", not "cap of undefined".
+// entirely and runs unlimited. See orchestrator/steps/sdk-call.js's buildQueryOptions: `options.
+// maxBudgetUsd` is only set when opts.maxBudgetUsd is a number (action A5b, card #239 chantier --
+// the old transport's now-deleted buildArgv function applied the identical rule before the
+// cutover, same reasoning, new call site), so `undefined` here means "no cap", not "cap of
+// undefined".
 
 // config.js's stepDeadlineMs (120000ms) is sized for the daemon's own scripted steps
 // (steps/scripted.js) and is not a fit for a real LLM step, even with the $ cap above removed:
@@ -473,12 +476,21 @@ const DEFAULT_SIZE = 'M'; // used only if task.size is missing/unrecognized
 // VALIDATE) -- the default every one of them falls back to. LLM_STEP_DEADLINE_MS_BY_STEP below
 // now overrides two of the five (PLAN, IMPLEMENT), so this 900000ms (15 minutes) figure alone
 // governs only the other three (DIAGNOSE, CITATION_VERIFIER, VALIDATE); it still gives a real call
-// room to finish under even an L-sized $12 budget before the process itself is killed. config.js's stepDeadlineMs is untouched and
-// stays state-machine.js's outer callWithDeadline retry-once-then-park bookkeeping value
-// (deadline.js) for every step, scripted or LLM -- but that JS timer is a no-op against a
-// scripted step's own blocking spawnSync (steps/scripted.js), which is bounded instead by
-// config.js's commandTimeoutsMs (see that file's action-2.1 comment). This constant only
-// changes what invokeClaudeReal's own spawnSync timeout is armed with for an LLM call.
+// room to finish under even an L-sized $12 budget before the process itself is killed. config.js's flat, generic stepDeadlineMs (120000ms) is
+// state-machine.js's outer callWithDeadline retry-once-then-park bookkeeping value (deadline.js)
+// only for a step with no stepDeadlineMsByState entry of its own -- true for every SCRIPTED step,
+// and it was true for the five LLM steps too until action A2 (card #239, 2026-09-17) gave each of
+// them their own entry there instead (config.js's LLM_STEP_DEADLINE_ENTRIES, derived from THIS
+// constant plus one stepDeadlineMs margin -- see that file's own comment). For a scripted step
+// that outer JS timer is STILL a no-op against its own blocking spawnSync (steps/scripted.js),
+// which is bounded instead by config.js's commandTimeoutsMs (see that file's action-2.1 comment)
+// -- unchanged by any of this. For an LLM step it is a no-op no longer: since action A5b (card
+// #239, 2026-09-17) replaced invokeClaudeReal's blocking spawnSync with an awaited async
+// query() call, that outer timer genuinely races the inner one this constant governs (see
+// doc/state-machine-spec.md's own Step-contracts section for the fuller account). This constant
+// itself only ever changes the INNER deadline invokeClaudeReal arms for an LLM call -- since
+// action A5b, a real `setTimeout` that calls `options.abortController.abort()` on the query()
+// stream, never a `spawnSync` timeout option (see steps/llm.js's own "Deadline handling" header).
 const LLM_STEP_DEADLINE_MS = 900000;
 
 // LLM_STEP_DEADLINE_MS_BY_STEP -- per-step overrides of the figure above. PLAN and IMPLEMENT both
@@ -640,12 +652,57 @@ const LLM_STEP_DEADLINE_MS_BY_STEP = {
 // is still alive and still un-sweepable. Computed from the map so it can never drift from it.
 const MAX_LLM_STEP_DEADLINE_MS = Math.max(LLM_STEP_DEADLINE_MS, ...Object.values(LLM_STEP_DEADLINE_MS_BY_STEP));
 
-// deadlineMsForStep(stepName) -- the spawnSync timeout steps/llm.js arms for one call. Falls back
+// deadlineMsForStep(stepName) -- the INNER deadline steps/llm.js's invokeClaudeReal arms for one
+// call (since action A5b, card #239, 2026-09-17: a real setTimeout that aborts the query() stream,
+// never a spawnSync timeout option -- see that file's own "Deadline handling" header). Falls back
 // to LLM_STEP_DEADLINE_MS for any step with no override, including an unrecognized name (the
 // intake steps, which carry their own INTAKE_DEADLINE_MS, never reach here).
 function deadlineMsForStep(stepName) {
   return LLM_STEP_DEADLINE_MS_BY_STEP[stepName] || LLM_STEP_DEADLINE_MS;
 }
+
+// STEP_DEADLINE_MARGIN_MS -- action A2 (card #239, 2026-09-17)'s own copy of config.js's
+// STEP_DEADLINE_MS (120000ms, the daemon's generic per-step OUTER deadline -- the one deadline.js's
+// callWithDeadline races against every step, as opposed to the INNER deadlineMsForStep above,
+// which is the query() abort timeout that actually bounds one call). Duplicated, not
+// imported: config.js already requires this file (for MAX_LEASE_AGE_MS, re-exported below), and
+// the reverse -- this file requiring config.js -- would be a load-time cycle, the identical reason
+// MAX_LEASE_AGE_MS itself is defined here rather than in account-lease.js (see that constant's own
+// comment, and account-lease.js's re-export note). Kept from silently drifting by
+// test/llm-step-deadlines.test.js's own pin (`STEP_DEADLINE_MARGIN_MS === config.stepDeadlineMs`),
+// the same "typed independently of the code it checks" contract test/doc-constant-sweep.test.js
+// already runs for ~20 other numbers duplicated between code and prose (see that file's own
+// header for the two incidents that made it exist).
+//
+// WHAT IT'S FOR: config.js's own stepDeadlineMsByState now carries one entry per LLM step
+// (PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE, generated there from STEP_CONTRACTS's own
+// keys so a sixth LLM step cannot be added without one), each
+// `deadlineMsForStep(step) + STEP_DEADLINE_MARGIN_MS` -- the inner deadline plus this same margin
+// for everything runLlm legitimately does around the call itself (prompt fill, journal append,
+// reply parse, token-usage mapping), the identical "poll budget plus one step deadline of margin"
+// shape this file's own CI_CHECKS/GATE entries already use. MAX_LEASE_AGE_MS below has to know
+// this same margin, to re-derive the worst legitimate per-attempt hold now that the outer timer
+// is no longer permanently inert for an LLM step -- see that constant's own comment.
+const STEP_DEADLINE_MARGIN_MS = 120000;
+
+// MAX_LLM_STEP_OUTER_DEADLINE_MS -- the largest value any LLM step's own stepDeadlineMsByState
+// entry can take (config.js): MAX_LLM_STEP_DEADLINE_MS (the running-maximum INNER ceiling, above)
+// plus the one margin every entry adds. Named separately from MAX_LLM_STEP_DEADLINE_MS, not folded
+// into it, because the two now mean different things: MAX_LLM_STEP_DEADLINE_MS is still the bound
+// `deadlineMsForStep` hands to the call itself (steps/llm.js's invokeClaudeReal, action A5b: a real
+// setTimeout that aborts the query() call at this bound, not spawnSync's own `timeout` option);
+// this is the bound the OUTER retry-once-then-park timer (deadline.js's callWithDeadline, armed
+// from config.js's stepDeadlineMsByState) now enforces around it. MAX_LEASE_AGE_MS below is
+// derived from THIS one, not MAX_LLM_STEP_DEADLINE_MS, for the same reason it was already derived
+// from the running maximum rather than the default: the moment one step's OUTER bound needed to be
+// the worst legitimate hold, deriving the lease bound from the inner one alone would understate it
+// again. STEP_DEADLINE_MARGIN_MS (120000ms) comfortably covers action A5b's own worst-case
+// confirm-exit grace window too (sdk-call.js's ABORT_CONFIRM_GRACE_MS, 8500ms: 2000ms SDK-internal
+// delay + 5000ms SIGTERM->SIGKILL escalation + 1500ms margin -- see that constant's own comment) --
+// invokeClaudeReal can now legitimately run up to ~8.5s past its own inner deadlineMs while it
+// confirms the child actually exited before returning, and 8500ms is under 7% of this margin, so
+// the outer timer this margin sizes cannot fire during that hold.
+const MAX_LLM_STEP_OUTER_DEADLINE_MS = MAX_LLM_STEP_DEADLINE_MS + STEP_DEADLINE_MARGIN_MS;
 
 // MAX_LEASE_AGE_MS -- the age past which account-lease.js presumes a lease dead and sweeps it
 // regardless of pid liveness. Its full justification (why 2x, why the +10% slack, and the
@@ -659,24 +716,40 @@ function deadlineMsForStep(stepName) {
 // What config.js needs it for (cross-action defect, C6 verification): accountLeaseWaitMs is how
 // long a worker waits for a sibling's lease before parking `all-accounts-leased`, and it was the
 // single C6 bound derived from an OBSERVED maximum (measured step durations of 90-265s -> a
-// 5-minute wait) instead of from the bound it actually waits on. This constant IS that bound: a
-// lease younger than it is legitimately held and cannot be swept, and a sibling worker's own
-// two-attempt LLM step can legitimately hold one for 2 x MAX_LLM_STEP_DEADLINE_MS = 60 minutes --
-// not the 30 minutes this comment stated before PLAN's 2026-09-04 override and IMPLEMENT's own
-// above each raised the worst legitimate hold past LLM_STEP_DEADLINE_MS's default; that 30-minute
-// figure was this comment restating the DEFAULT rather than the MAXIMUM, the exact drift the
-// derivation two lines below was written to make impossible for the bound itself (only the prose
-// above it still drifted). A 5-minute waiter therefore gave up while the holder was still
-// legitimately alive and still un-sweepable for another 58 minutes, not 26.5 -- and parked the
-// exact park class per-step leasing was built to avoid. The conclusion this constant exists to
-// guarantee is unchanged either way: 63 minutes still outlasts the 60-minute worst legitimate
-// hold, by construction, whichever step (or steps) contribute the longer deadline -- which is
-// exactly why MAX_LEASE_AGE_MS is derived from MAX_LLM_STEP_DEADLINE_MS (the running maximum
-// across every override) below, never from LLM_STEP_DEADLINE_MS (the default) or from a literal.
-// Deriving the wait from this constant makes the wait outlast every legitimate hold by
-// construction -- the same asymmetry product-repo-lock.js states for its own wait bound: waiting
-// too long only delays a card, giving up too early parks a healthy one.
-const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_DEADLINE_MS + Math.round(MAX_LLM_STEP_DEADLINE_MS / 10);
+// 5-minute wait) instead of from the bound it actually waits on. This constant IS that bound.
+//
+// RE-DERIVED for action A2 (card #239, 2026-09-17), and the reason is the action itself. Before A2,
+// "a lease younger than this is legitimately held" only ever had to account for the INNER deadline
+// (deadlineMsForStep): the OUTER per-state timer (deadline.js's callWithDeadline, armed from
+// config.js's stepDeadlineMsByState) had no entry for any LLM step and fell back to the generic
+// 120s stepDeadlineMs, which could never fire against a real call -- every command in real mode ran
+// through a BLOCKING spawnSync, so the event loop never yielded and that outer JS timer was dead
+// code for all five LLM steps. A2 gave every LLM step its own outer entry
+// (config.js's `deadlineMsForStep(step) + STEP_DEADLINE_MS` -- config.js's own constant, not this
+// file's same-valued `STEP_DEADLINE_MARGIN_MS` above, a separate duplicate kept for the load-time-
+// cycle reason that constant's own comment states) so that once card #239's own
+// transport swap (action A5b, landed the same day) replaced that blocking spawn with an awaited
+// stream, the outer timer would not
+// retroactively kill a call still inside its own inner deadline -- the exact hazard this file's own
+// comment above the GATE entry (config.js) already documents for the identical class of bug. THAT
+// SWAP HAS NOW HAPPENED: this makes the OUTER bound, not the inner one alone, the ceiling a
+// two-attempt callLlmStep lease CAN legitimately be held against, now that that outer timer is
+// genuinely live: a sibling worker's own
+// two-attempt LLM step can legitimately hold a lease for 2 x MAX_LLM_STEP_OUTER_DEADLINE_MS =
+// 64 minutes (2 x 1,920,000ms) -- not the 60 minutes this comment stated before A2
+// (2 x MAX_LLM_STEP_DEADLINE_MS, correct only while the outer timer stayed dead code). Had this
+// constant been left at its pre-A2 value (2 x MAX_LLM_STEP_DEADLINE_MS + 10% = 63 minutes exactly),
+// it would now be SHORTER than that new 64-minute worst-case hold: a live holder's lease would
+// become sweepable the instant the outer timer went live -- two `claude` processes on one account,
+// the exact D1 failure MAX_LEASE_AGE_MS exists to prevent, reopened at the lease layer by a fix
+// applied only at the deadline layer. So: re-derived from MAX_LLM_STEP_OUTER_DEADLINE_MS (the
+// running maximum OUTER bound across every per-step override), never from MAX_LLM_STEP_DEADLINE_MS
+// (the inner one) or from a literal -- 67.2 minutes (4,032,000ms), still outlasting the new
+// 64-minute worst legitimate hold, by construction, whichever step (or steps) contribute the
+// longer deadline. Deriving the wait from this constant makes the wait outlast every legitimate
+// hold by construction -- the same asymmetry product-repo-lock.js states for its own wait bound:
+// waiting too long only delays a card, giving up too early parks a healthy one.
+const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_OUTER_DEADLINE_MS + Math.round(MAX_LLM_STEP_OUTER_DEADLINE_MS / 10);
 
 // One table entry per step. `escalatesOn` lists which task-shape signals can move `baseModel`
 // to `escalatedModel` -- resolved by resolveStepContract() below, per
@@ -1149,7 +1222,7 @@ function shouldEscalateEffort(stepDef, task) {
 // task.size/escalation flags decide, plus the static fields (promptFile, allowedTools,
 // permissionMode, cwdKind, outputContract) and a minimal --json-schema envelope built from the
 // output contract's required keys (state-machine-spec.md § Step contracts preamble: every
-// `claude -p` call gets `--json-schema` for its payload).
+// real LLM call gets `--json-schema` for its payload).
 function resolveStepContract(stepName, task = {}) {
   const stepDef = STEP_CONTRACTS[stepName];
   if (!stepDef) {
@@ -1194,17 +1267,22 @@ function resolveStepContract(stepName, task = {}) {
     effort,
     effortEscalated,
     // Per-step, not the module default: PLAN and IMPLEMENT get 1800000ms, every other step
-    // 900000ms. steps/llm.js arms invokeClaudeReal's spawnSync timeout with this rather than
-    // reading the constant itself.
+    // 900000ms. steps/llm.js's invokeClaudeReal arms its OWN deadline timer with this (action
+    // A5b: a real setTimeout that calls options.abortController.abort() on expiry, not spawnSync's
+    // `timeout` option, which no longer exists on this transport) rather than reading the
+    // constant itself.
     deadlineMs: deadlineMsForStep(stepName),
     allowedTools: stepDef.allowedTools,
     // Card #240: undefined for CITATION_VERIFIER, the one contract that declares no `Bash` at all
     // and therefore already falls through to .claude/settings.json's 92 curated rules --
-    // deliberately left exactly as it was. steps/llm.js's buildArgv omits --disallowedTools when
-    // this is absent or empty, so that step's argv is byte-for-byte what it was before this card.
+    // deliberately left exactly as it was. sdk-call.js's buildQueryOptions omits
+    // options.disallowedTools when this is absent or empty (merged in alongside this card, since
+    // action A5b's own buildQueryOptions predates card #240 and never carried this field before),
+    // so that step's real call options are exactly what they were before this card.
     disallowedTools: stepDef.disallowedTools,
     permissionMode: stepDef.permissionMode,
-    // No $ cap: steps/llm.js's buildArgv only passes --max-budget-usd when this is a number.
+    // No $ cap: sdk-call.js's buildQueryOptions only sets options.maxBudgetUsd when this is a
+    // number (action A5b; the old transport's now-deleted buildArgv applied the identical rule).
     maxBudgetUsd: undefined,
     // Card #207: `properties`, built from the step's declared `types` (jsonSchemaPropertiesFor,
     // above) so the schema the model receives matches the shape checkOutputTypes() enforces on
@@ -1213,7 +1291,7 @@ function resolveStepContract(stepName, task = {}) {
     // (`resolveStepContract: jsonSchema.required mirrors the step outputContract`,
     // test/step-contracts.test.js, is unaffected). UNMEASURED, same as the `required`-only
     // envelope this replaces: whether adding `properties` changes what the model actually sends,
-    // or whether `claude -p --json-schema` enforces this schema at all -- see this card's own
+    // or whether `--json-schema` enforces this schema at all -- see this card's own
     // "What the card measured, and what it did NOT" section. The schema is a declaration; the
     // enforcement is checkOutputTypes() in llm.js's reply check.
     jsonSchema: {
@@ -1234,6 +1312,13 @@ module.exports = {
   LLM_STEP_DEADLINE_MS,
   LLM_STEP_DEADLINE_MS_BY_STEP,
   MAX_LLM_STEP_DEADLINE_MS,
+  // Action A2 (card #239): STEP_DEADLINE_MARGIN_MS is config.js's own generic per-step deadline
+  // duplicated here (see that constant's own comment for why it cannot be imported instead), and
+  // MAX_LLM_STEP_OUTER_DEADLINE_MS is the running-maximum OUTER bound derived from it -- both
+  // exported for config.js's own stepDeadlineMsByState derivation and for
+  // test/llm-step-deadlines.test.js's drift pin.
+  STEP_DEADLINE_MARGIN_MS,
+  MAX_LLM_STEP_OUTER_DEADLINE_MS,
   deadlineMsForStep,
   shouldEscalateEffort,
   MAX_LEASE_AGE_MS,

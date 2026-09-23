@@ -1061,7 +1061,7 @@ async function handleImplement(ctx) {
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
   // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
-  // (orchestrator/steps/llm.js:1063 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // (orchestrator/steps/llm.js:1116 calls `resolveStepContract(stepName, ctx.task || {})`), never
   // ctx.counters or ctx.taskDir directly.
   //
   // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact
@@ -1608,7 +1608,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:1102's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1175's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
@@ -3752,10 +3752,21 @@ async function runScanCycle(timers, queueDir, journalRoot, config, scanStates) {
 // drain the queue (`await drainQueueOnce(...)` before the scan cycle, every pass) -- that call is
 // GONE now, on purpose: verification found the plan's premise wrong ("the dispatcher's own short
 // calls (auto-pull, scans) stay spawnSync" -- false about the scans specifically, which reach
-// intake.js's callIntakeStepWithRotation -> a BLOCKING `claude` spawnSync measured at 3-3.5
-// minutes on the live daemon's own journal). Running that inside the DISPATCHER's own loop -- the
+// intake.js's callIntakeStepWithRotation -> AT THE TIME OF THIS ACTION (6.3), a BLOCKING `claude`
+// spawnSync measured at 3-3.5 minutes on the live daemon's own journal. STALE SINCE, NOT
+// RE-VERIFIED (card #239 chantier, action A5b, 2026-09-17): `invokeClaudeReal` (which
+// callIntakeStepWithRotation calls into, same as every other real LLM step) no longer spawns
+// `claude` via a blocking `spawnSync` at all -- it drives the vendored Agent SDK's `query()`, an
+// AWAITED ASYNC call that yields the event loop rather than freezing it (see
+// `orchestrator/steps/llm.js`'s own "Deadline handling" header). The wall-clock cost this
+// paragraph measured (3-3.5 minutes) is still real -- an LLM call still takes that long -- but
+// "would freeze all three for the whole call" is the premise that changed: this whole separate-
+// process design was not re-examined against that change by this fix pass, framed rather than
+// silently fixed (whether the scanner still needs its own process, now that the call it used to
+// justify running out-of-process no longer blocks the event loop, is a DECISION for the
+// maintainer, not a call this action makes). Running that inside the DISPATCHER's own loop -- the
 // process that also refills worker slots, services SIGTERM, and holds the single-instance lock --
-// would freeze all three for the whole call. So this function is no longer "drain, then scan" in
+// would freeze all three for the whole call, UNDER THE OLD TRANSPORT. So this function is no longer "drain, then scan" in
 // one process; it is JUST the scan half, run in its OWN process (daemon.js --scanner), spawned
 // and supervised by dispatcher.js exactly like a worker (see that file's header for the
 // supervision/respawn/breaker design). This function therefore now has exactly ONE caller:
@@ -3810,10 +3821,18 @@ async function runForever(queueDir, journalRoot, config) {
     // dispatcher.js passes), and a null parent is never watched.
     //
     // Checked once per iteration, which bounds an orphan's remaining life by ONE scan cycle
-    // rather than by nothing. It cannot be tightened with a timer: runScanCycle reaches
-    // intake.js's blocking `spawnSync('claude', ...)` (measured at 3m24.9s on the live daemon),
-    // and no timer fires in a single-threaded process that is blocked inside a sync call. One
-    // cycle of duplicate scanning is survivable; forever is not.
+    // rather than by nothing. AT THE TIME THIS WAS WRITTEN, it could not be tightened with a
+    // timer: runScanCycle reached intake.js's blocking `spawnSync('claude', ...)` (measured at
+    // 3m24.9s on the live daemon), and no timer fires in a single-threaded process that is
+    // blocked inside a sync call. STALE SINCE, NOT RE-VERIFIED (card #239 chantier, action A5b,
+    // 2026-09-17): every real LLM call intake.js makes goes through the same `invokeClaudeReal` as every other
+    // real step, which no longer spawns `claude` via a blocking `spawnSync` -- it drives the
+    // vendored Agent SDK's `query()`, an AWAITED ASYNC call that yields the event loop, so a timer
+    // set elsewhere in this same process CAN now fire while `runScanCycle` is mid-call. Whether
+    // that actually opens a cheaper way to bound an orphan's life than "once per iteration" is not
+    // examined by this fix pass -- framed, not silently changed; a DECISION for the maintainer.
+    // Once per iteration is still a real, sufficient bound regardless: one cycle of duplicate
+    // scanning is survivable; forever is not.
     if (Number.isInteger(config.parentPid) && config.parentPid > 0 && process.ppid !== config.parentPid) {
       appendDaemonEvent(journalRoot, 'scanner-orphan-exit', {
         parentPid: config.parentPid,

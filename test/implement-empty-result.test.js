@@ -20,7 +20,7 @@ const path = require('path');
 require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
-const { mkTmp } = require('./helpers');
+const { mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -37,7 +37,14 @@ function readJournal(taskDir) {
 // prompt-template.js + task-values.js) -- no ctx.task.llm.IMPLEMENT override, so the payload
 // actually carries files_changed the way a real reply does. Mirrors
 // test/board-move.test.js's realCtxWithOneAccount/appendEvent-PLAN-result setup.
-function realCardCtx(task, taskDir, spawnSync) {
+//
+// Card #239 chantier, action A5b-2 (Job 3): `deps` now carries BOTH the `claude` fake (`spawn` --
+// test/helpers.js's `fakeSpawnedChild` seam, plus `resolveClaudeCodeExecutable`/
+// `isNoRealSpawnEnabled` -- `fakeExecDeps`) and the git/gh/npm fake (`spawnSync`, unchanged: only
+// the `claude` call moved off spawnSync onto the SDK's `query()`) in ONE object, since
+// `ctx.deps` is a single injection point every real-mode call site (runLlm AND steps/scripted.js's
+// real git/gh calls) reads from.
+function realCardCtx(task, taskDir, deps) {
   const accountsDir = mkTmp('spo-implement-accts-');
   fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
   appendEvent(taskDir, 'PLAN', 'result', {
@@ -53,20 +60,33 @@ function realCardCtx(task, taskDir, spawnSync) {
     dryRun: false,
     stepDeadlineMs: 30000,
     claudeAccountsDir: accountsDir,
-    deps: { spawnSync },
+    deps,
   });
 }
 
-function claudeReply(resultObj) {
-  return JSON.stringify({
-    result: JSON.stringify(resultObj),
-    is_error: false,
-    num_turns: 1,
-    session_id: 'sess-implement-1',
-    modelUsage: { 'claude-x': { costUSD: 0.01 } },
-    terminal_reason: 'success',
-    api_error_status: null,
-  });
+function initMessage(sessionId = 'sess-implement-1') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+// claudeStream(resultObj) -- this file's equivalent of the old flat `claudeReply()`: a
+// `system`/`init` stream-json message, then a `result` message carrying `resultObj` as the
+// JSON-encoded `result` string (consumeQueryStream's own contract for a json-schema reply), fed to
+// `fakeSpawnedChild` so a `deps.spawn` fake can return it directly.
+function claudeStream(resultObj) {
+  return [
+    initMessage(),
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      num_turns: 1,
+      session_id: 'sess-implement-1',
+      modelUsage: { 'claude-x': { inputTokens: 10, outputTokens: 5 } },
+      result: JSON.stringify(resultObj),
+      terminal_reason: 'success',
+      api_error_status: null,
+    },
+  ];
 }
 
 function baseTask(issue) {
@@ -85,21 +105,17 @@ function baseTask(issue) {
 test('handleImplement (real mode): filesChanged as a JSON-encoded empty-array string routes to DIAGNOSE, not CHECK (today\'s issue-247 shape)', async () => {
   const task = baseTask(247);
   const taskDir = mkTmp('spo-implement-emptystr-');
-  const spawnSync = (command) => {
-    if (command === 'claude') {
-      return ok(
-        claudeReply({
-          summary: 'Cannot proceed: the required plan file ... does not exist',
-          files_changed: '[]',
-          invariants: [],
-          tests_run: [],
-          all_green: 'false',
-        })
-      );
-    }
-    return ok('');
-  };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const spawn = () =>
+    fakeSpawnedChild(
+      claudeStream({
+        summary: 'Cannot proceed: the required plan file ... does not exist',
+        files_changed: '[]',
+        invariants: [],
+        tests_run: [],
+        all_green: 'false',
+      })
+    );
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -111,13 +127,8 @@ test('handleImplement (real mode): filesChanged as a JSON-encoded empty-array st
 test('handleImplement (real mode): a real empty array (not a string) also routes to DIAGNOSE', async () => {
   const task = baseTask(248);
   const taskDir = mkTmp('spo-implement-emptyarr-');
-  const spawnSync = (command) => {
-    if (command === 'claude') {
-      return ok(claudeReply({ summary: 'nothing to do', files_changed: [], invariants: [], tests_run: [], all_green: false }));
-    }
-    return ok('');
-  };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'nothing to do', files_changed: [], invariants: [], tests_run: [], all_green: false }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
   assert.equal(next, 'DIAGNOSE');
@@ -126,13 +137,8 @@ test('handleImplement (real mode): a real empty array (not a string) also routes
 test('handleImplement (real mode): an unparsable filesChanged string routes to DIAGNOSE (missing/unparsable treated as empty)', async () => {
   const task = baseTask(249);
   const taskDir = mkTmp('spo-implement-badjson-');
-  const spawnSync = (command) => {
-    if (command === 'claude') {
-      return ok(claudeReply({ summary: 'x', files_changed: 'not json', invariants: [], tests_run: [], all_green: false }));
-    }
-    return ok('');
-  };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'x', files_changed: 'not json', invariants: [], tests_run: [], all_green: false }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
   assert.equal(next, 'DIAGNOSE');
@@ -148,21 +154,17 @@ test('handleImplement (real mode): an unparsable filesChanged string routes to D
 test('handleImplement (real mode): filesChanged that parses as valid JSON but is NOT an array (an object) routes to DIAGNOSE the same as unparsable JSON', async () => {
   const task = baseTask(251);
   const taskDir = mkTmp('spo-implement-jsonnotarray-');
-  const spawnSync = (command) => {
-    if (command === 'claude') {
-      return ok(
-        claudeReply({
-          summary: 'x',
-          files_changed: '{"src/widget.ts":"modified"}', // valid JSON, but an object, not an array
-          invariants: [],
-          tests_run: [],
-          all_green: false,
-        })
-      );
-    }
-    return ok('');
-  };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const spawn = () =>
+    fakeSpawnedChild(
+      claudeStream({
+        summary: 'x',
+        files_changed: '{"src/widget.ts":"modified"}', // valid JSON, but an object, not an array
+        invariants: [],
+        tests_run: [],
+        all_green: false,
+      })
+    );
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -181,21 +183,17 @@ test('handleImplement (real mode): filesChanged that parses as valid JSON but is
 test('handleImplement (real mode): filesChanged present as a bare null (neither array nor string) routes to DIAGNOSE via parseFilesChanged\'s own final fallback', async () => {
   const task = baseTask(252);
   const taskDir = mkTmp('spo-implement-filesnull-');
-  const spawnSync = (command) => {
-    if (command === 'claude') {
-      return ok(
-        claudeReply({
-          summary: 'x',
-          files_changed: null,
-          invariants: [],
-          tests_run: [],
-          all_green: false,
-        })
-      );
-    }
-    return ok('');
-  };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const spawn = () =>
+    fakeSpawnedChild(
+      claudeStream({
+        summary: 'x',
+        files_changed: null,
+        invariants: [],
+        tests_run: [],
+        all_green: false,
+      })
+    );
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -209,25 +207,24 @@ test('handleImplement (real mode): filesChanged present as a bare null (neither 
 test('handleImplement (real mode): a legitimate implement with red tests (non-empty filesChanged, all_green false) still goes to CHECK', async () => {
   const task = baseTask(250);
   const taskDir = mkTmp('spo-implement-redtests-');
+  const spawn = () =>
+    fakeSpawnedChild(
+      claudeStream({
+        summary: 'added the widget, one test still failing',
+        files_changed: ['src/widget.ts'],
+        invariants: [{ id: 'INV-1', status: 'HELD' }],
+        tests_run: ['npm run typecheck'],
+        all_green: false,
+      })
+    );
   const spawnSync = (command, args) => {
-    if (command === 'claude') {
-      return ok(
-        claudeReply({
-          summary: 'added the widget, one test still failing',
-          files_changed: ['src/widget.ts'],
-          invariants: [{ id: 'INV-1', status: 'HELD' }],
-          tests_run: ['npm run typecheck'],
-          all_green: false,
-        })
-      );
-    }
     // The worktree cross-check (state-machine.js's handleImplement, card #385) reads
     // `git status --porcelain` before trusting a non-empty files_changed claim -- report the
     // worktree as genuinely dirty so this legitimate implement still reaches CHECK.
     if (args && args.includes('status') && args.includes('--porcelain')) return ok(' M src/widget.ts\n');
     return ok('');
   };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
   assert.equal(next, 'CHECK');
@@ -240,22 +237,21 @@ test('handleImplement (real mode): a legitimate implement with red tests (non-em
 test('handleImplement (real mode): non-empty filesChanged but a CLEAN worktree routes to DIAGNOSE, journals no-worktree-change', async () => {
   const task = baseTask(385);
   const taskDir = mkTmp('spo-implement-noworktreechange-');
+  const spawn = () =>
+    fakeSpawnedChild(
+      claudeStream({
+        summary: 'implemented the widget',
+        files_changed: ['src/widget.ts', 'src/widget.test.ts'],
+        invariants: [{ id: 'INV-1', status: 'HELD' }],
+        tests_run: ['npm run typecheck'],
+        all_green: true,
+      })
+    );
   const spawnSync = (command, args) => {
-    if (command === 'claude') {
-      return ok(
-        claudeReply({
-          summary: 'implemented the widget',
-          files_changed: ['src/widget.ts', 'src/widget.test.ts'],
-          invariants: [{ id: 'INV-1', status: 'HELD' }],
-          tests_run: ['npm run typecheck'],
-          all_green: true,
-        })
-      );
-    }
     if (args && args.includes('status') && args.includes('--porcelain')) return ok(''); // clean -- nothing actually changed
     return ok('');
   };
-  const ctx = realCardCtx(task, taskDir, spawnSync);
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync }));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -266,22 +262,25 @@ test('handleImplement (real mode): non-empty filesChanged but a CLEAN worktree r
 });
 
 // A fake worktree whose HEAD is `before` until the claude call returns, `after` from then on --
-// the shape of an IMPLEMENT that committed (or did not commit) inside its own session.
+// the shape of an IMPLEMENT that committed (or did not commit) inside its own session. Returns
+// `{spawn, spawnSync}` (Job 3: split off the old single dispatching `spawnSync`, `command ===
+// 'claude'` branch onto `spawn`) -- both share the `implemented` closure flag, so `spawnSync`'s
+// `git rev-parse HEAD` still reads correctly whether it runs before or after the claude call.
 function headMovingSpawn({ before, after, porcelain, beforeExit = 0 }) {
   let implemented = false;
+  const spawn = () => {
+    implemented = true;
+    return fakeSpawnedChild(
+      claudeStream({
+        summary: 'fixed the flaky wall-clock test and committed it',
+        files_changed: ['src/e2e/bench/worker.test.ts'],
+        invariants: [{ id: 'INV-1', status: 'HELD' }],
+        tests_run: ['npm test'],
+        all_green: true,
+      })
+    );
+  };
   const spawnSync = (command, args) => {
-    if (command === 'claude') {
-      implemented = true;
-      return ok(
-        claudeReply({
-          summary: 'fixed the flaky wall-clock test and committed it',
-          files_changed: ['src/e2e/bench/worker.test.ts'],
-          invariants: [{ id: 'INV-1', status: 'HELD' }],
-          tests_run: ['npm test'],
-          all_green: true,
-        })
-      );
-    }
     if (args && args.includes('rev-parse') && args.includes('HEAD')) {
       if (implemented) return ok(`${after}\n`);
       return { ...ok(`${before}\n`), status: beforeExit };
@@ -289,7 +288,7 @@ function headMovingSpawn({ before, after, porcelain, beforeExit = 0 }) {
     if (args && args.includes('status') && args.includes('--porcelain')) return ok(porcelain);
     return ok('');
   };
-  return spawnSync;
+  return { spawn, spawnSync };
 }
 
 // issue-593 / issue-598: IMPLEMENT committed its fix itself, so the tree was clean and the
@@ -300,7 +299,7 @@ test('handleImplement (real mode): a COMMITTED fix on a clean worktree (HEAD mov
   const taskDir = mkTmp('spo-implement-committed-');
   const before = 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1';
   const after = '9e87f89e00000000000000000000000000000000';
-  const ctx = realCardCtx(task, taskDir, headMovingSpawn({ before, after, porcelain: '' }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps(headMovingSpawn({ before, after, porcelain: '' })));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -319,7 +318,7 @@ test('handleImplement (real mode): clean worktree AND an unchanged HEAD still ro
   const task = baseTask(386);
   const taskDir = mkTmp('spo-implement-headunchanged-');
   const sha = 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1';
-  const ctx = realCardCtx(task, taskDir, headMovingSpawn({ before: sha, after: sha, porcelain: '' }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps(headMovingSpawn({ before: sha, after: sha, porcelain: '' })));
 
   const next = await HANDLERS.IMPLEMENT(ctx);
 
@@ -340,7 +339,7 @@ test('handleImplement (real mode): an unreadable pre-attempt HEAD falls back to 
   const ctx = realCardCtx(
     task,
     taskDir,
-    headMovingSpawn({ before: 'HEAD', after: '9e87f89e00000000000000000000000000000000', porcelain: '' })
+    fakeExecDeps(headMovingSpawn({ before: 'HEAD', after: '9e87f89e00000000000000000000000000000000', porcelain: '' }))
   );
 
   const next = await HANDLERS.IMPLEMENT(ctx);
@@ -357,12 +356,14 @@ test('handleImplement (real mode): a pre-attempt rev-parse that EXITS non-zero i
   const ctx = realCardCtx(
     task,
     taskDir,
-    headMovingSpawn({
-      before: 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1',
-      beforeExit: 128,
-      after: '9e87f89e00000000000000000000000000000000',
-      porcelain: '',
-    })
+    fakeExecDeps(
+      headMovingSpawn({
+        before: 'ac1d4ebe7feabd13790922e47c311a1115cdd6f1',
+        beforeExit: 128,
+        after: '9e87f89e00000000000000000000000000000000',
+        porcelain: '',
+      })
+    )
   );
 
   assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');

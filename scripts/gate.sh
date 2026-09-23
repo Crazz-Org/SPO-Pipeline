@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # gate.sh -- the verification gate for THIS repo's own code. Deterministic, empirical, and cheap:
 # it runs SPO-Pipeline's test suite and exits non-zero if anything fails. Nothing else. No LLM
-# judge, no network, no dependencies (this repo has no package.json and no node_modules -- the
+# judge, no network, no dependencies (this repo has no root package.json and no node_modules -- the
 # suite is stdlib `node --test` only), so the same commit produces the same verdict on any machine
-# and in CI.
+# and in CI. `vendor/claude-agent-sdk/` does not change that: it is three third-party files
+# COMMITTED verbatim (its README.md has the provenance), not installed, so a checkout already holds
+# them -- no install step, no lockfile, nothing to fetch. (Its own `package.json` is the one such
+# file in the tree, and an inert provenance record: nothing resolves or installs from it.)
 #
 # WHY THIS EXISTS. Before it, four things could have verified a change to this repo and not one of
 # them did: there was no CI (no .github/workflows at all), `main` was unprotected with zero

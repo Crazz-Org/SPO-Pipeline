@@ -2,7 +2,10 @@
 
 One file per orchestrator LLM step: the five in `state-machine-spec.md` § Step contracts, plus
 the three intake-path steps `orchestrator/intake.js` drives. Each is the text handed to
-`claude -p` for that step, and carries only that step's own brief.
+`claude` for that step (since card #239's transport cutover, action A5b, 2026-09-17: over stdin
+to the vendored Agent SDK's `query()`, never via `claude -p` -- MEASURED, that flag is never
+passed on this transport, see `orchestrator/steps/sdk-call.js`'s own header), and carries only
+that step's own brief.
 
 Domain context is **not** supplied by the caller. No code here reads or trims a `CLAUDE.md`: the
 CLI loads whatever `CLAUDE.md` tree sits at the step's own `cwd` (`steps/llm.js` deliberately
@@ -33,7 +36,11 @@ read out of order.
 | triage-bug-report (intake path — one caller, `auto-triage.js`'s `routeConfirmedReport` (reached from `processConfirmedReport`), behind `spo triage` and the daemon's auto-triage timer) | `triage-bug-report.md` | Opus 5.5 since 2026-09-23 (Opus 5 from the maintainer decision of 2026-08-31 — was Fable 5) | medium | `Read, Grep, Glob, Bash(ro)` (`permissionMode: 'plan'` — the same set `draft-card` holds; this step actually uses its `Bash` for the model-server `curl` and the `gh issue list --search` dedup, neither a write) | `cwd` = `config.productRepo`; reads `{{report_file}}` under `~/.spo-reports` and the product tree (`intake.js`'s `triageBugReport`) |
 
 Every "high"/"low"/"medium" effort and every model choice above is what the *caller* passes as
-`--model` / `--effort` on the `claude -p` invocation — nothing in a prompt file selects its own
+`--model` / `--effort` on the `claude` invocation (both real, literal argv flags on this
+transport too — MEASURED against the real vendored SDK, see `orchestrator/steps/sdk-call.js`'s
+own header — even though the invocation itself is no longer `claude -p`: since card #239's
+transport cutover, action A5b, 2026-09-17, the vendored SDK's `query()` never passes `-p`/
+`--print` at all, see that file's own measured argv shape) — nothing in a prompt file selects its own
 model or effort. Two prompts state their own RDO wire escalation explicitly, because each needs
 to know which side of it applies to it: `implement.md` states its **effort** escalation (Opus 5.5
 on every path, `medium` instead of `low` when a trigger fires — a model escalation until

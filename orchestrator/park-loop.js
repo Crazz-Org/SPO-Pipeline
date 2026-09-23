@@ -354,7 +354,7 @@ function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
 // ---- action 5.1: surface DIAGNOSE on the card -------------------------------------------------
 //
 // Fix round (2026-09-03, adversarial pass, S3): this and its two state-machine.js sibling
-// comments used to append the letter "d" to this action id. The plan (doc/remediation-plan-2026-08.md:205) does not
+// comments used to append the letter "d" to this action id. The plan (doc/remediation-plan-2026-08.md:221) does not
 // letter row 5.1's sub-items at all -- it names three in one cell: pre-worktree board moves,
 // DIAGNOSE activity surfaced (this one), and dropping the redundant IMPLEMENT-retry move.
 // doc/remediation-progress.md:669 confirms the same referent under "DIAGNOSE surfacing" ("6 tasks
@@ -473,7 +473,7 @@ function postDiagnoseSurfaceComment(ctx, deps, { attempt, budget }) {
 // Decision recorded here, not just in the plan: NO auto-filed follow-up card. The plan floats
 // "(and optionally a follow-up draft card)"; this build does not build it. Unattended filing on a
 // judge's own verdict is the exact class of behaviour C3 gated behind a human `confirm` after the
-// 12.8-hour, 128-attempt auto-triage stall (`intake.js:964-966`; `doc/audit-2026-08-30-
+// 12.8-hour, 128-attempt auto-triage stall (`intake.js:969-971`; `doc/audit-2026-08-30-
 // remediation-plan.md` does not exist in this repo -- the citation was stale) -- and a
 // comment is reversible (ignore it, reply, resolve it by hand) where a filed card is not (it sits
 // in the backlog, competing for the same intake budget as everything else, until a human notices

@@ -37,7 +37,7 @@ const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { appendEvent } = require('../orchestrator/journal');
 const { lastJournaledPlanFiles } = require('../orchestrator/task-values');
 const { OPUS_5_5 } = require('../orchestrator/step-contracts');
-const { mkTmp } = require('./helpers');
+const { mkTmp, fakeSpawnDeps, fakeExecDeps } = require('./helpers');
 
 function readJournal(taskDir) {
   return fs
@@ -105,24 +105,31 @@ test('lastJournaledPlanFiles: reads the MOST RECENT PLAN result event, not an ea
 // ---- state-machine.js: guardDeclaredFiles sets ctx.task.planFilesToChange ----------------------
 // =============================================================================================
 
-function planReplyEnvelope(planPayload) {
+// Card #239 chantier, action A5b-2: migrated off `deps.spawnSync`'s `{status, stdout: JSON string,
+// stderr, signal}` shape onto `deps.spawn` (test/helpers.js's `fakeSpawnDeps`/`fakeSpawnedChild`) --
+// same seam and idioms as test/llm-real-card.test.js's own `initMessage`/`resultMessage`.
+function planInitMessage(sessionId = 'sess-implement-rdo-escalation-plan') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+function planResultMessage(planPayload, overrides = {}) {
   return {
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-implement-rdo-escalation-plan',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 1,
+    session_id: 'sess-implement-rdo-escalation-plan',
+    modelUsage: { 'claude-fable-5': { inputTokens: 10, outputTokens: 5 } },
+    result: JSON.stringify(planPayload),
+    ...overrides,
   };
 }
 
-function realPlanCtx({ task, taskDir, worktreePath, spawnSync }) {
+function planReplyLines(planPayload) {
+  return [planInitMessage(), planResultMessage(planPayload)];
+}
+
+function realPlanCtx({ task, taskDir, worktreePath, spawn }) {
   const accountsDir = mkTmp('spo-ire-plan-accts-');
   fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
   return buildCtx(task.id, { ...task, worktreePath }, taskDir, {
@@ -130,7 +137,7 @@ function realPlanCtx({ task, taskDir, worktreePath, spawnSync }) {
     dryRun: false,
     claudeAccountsDir: accountsDir,
     stepDeadlineMs: 30000,
-    deps: { spawnSync },
+    deps: fakeExecDeps({ spawn }),
   });
 }
 
@@ -149,9 +156,9 @@ test('guardDeclaredFiles: sets ctx.task.planFilesToChange to the normalized ARRA
     check_commands: ['npm run typecheck'],
     files_to_change: ['src/components/Header.tsx'],
   };
-  const spawnSync = () => planReplyEnvelope(plan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(plan));
   const task = basePlanTask({ id: 'card-2101', issue: 2101 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT');
@@ -169,9 +176,9 @@ test('guardDeclaredFiles: sets ctx.task.planFilesToChange for the JSON-STRING sh
     check_commands: ['npm run typecheck'],
     files_to_change: JSON.stringify(['src/shared/rdo-members.ts']),
   };
-  const spawnSync = () => planReplyEnvelope(plan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(plan));
   const task = basePlanTask({ id: 'card-2102', issue: 2102 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT');
@@ -189,9 +196,9 @@ test('guardDeclaredFiles: EMPTY declared list still sets ctx.task.planFilesToCha
     check_commands: ['npm run typecheck'],
     files_to_change: [],
   };
-  const spawnSync = () => planReplyEnvelope(plan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(plan));
   const task = basePlanTask({ id: 'card-2103', issue: 2103 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT');
@@ -210,9 +217,9 @@ test('guardDeclaredFiles: leaves ctx.task.planFilesToChange UNSET for the undecl
     check_commands: ['npm run typecheck'],
     // files_to_change omitted entirely.
   };
-  const spawnSync = () => planReplyEnvelope(plan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(plan));
   const task = basePlanTask({ id: 'card-2104', issue: 2104 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT');
@@ -232,9 +239,9 @@ test('guardDeclaredFiles: leaves ctx.task.planFilesToChange UNSET for a malforme
     check_commands: ['npm run typecheck'],
     files_to_change: 'not json at all',
   };
-  const spawnSync = () => planReplyEnvelope(plan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(plan));
   const task = basePlanTask({ id: 'card-2105', issue: 2105 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT');
@@ -245,40 +252,38 @@ test('guardDeclaredFiles: leaves ctx.task.planFilesToChange UNSET for a malforme
 // ---- handleImplement: end-to-end model/effort resolution --------------------------------------------
 // =============================================================================================
 
-// Captures every `claude` argv the handler spawns; anything else (git, npm) is answered blandly.
-// Mirrors test/implement-empty-result.test.js's realCardCtx idiom.
-function claudeReply(resultObj) {
-  return JSON.stringify({
-    result: JSON.stringify(resultObj),
+// Card #239 chantier, action A5b-2: `claude` no longer spawns through `deps.spawnSync` at all --
+// migrated onto `deps.spawn` (fakeSpawnDeps/fakeExecDeps, test/helpers.js), same seam as the PLAN
+// section above. Nothing in this section's tests ever exercises a git/npm spawnSync call (the
+// worktreePath fixtures below are never real git repos), so there is no second, non-claude fake to
+// keep -- `claudeSpy` below is the ONLY spawn seam these tests need.
+function implementInitMessage(sessionId = 'sess-implement-rdo-escalation') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+function implementResultMessage(resultObj, overrides = {}) {
+  return {
+    type: 'result',
+    subtype: 'success',
     is_error: false,
     num_turns: 1,
     session_id: 'sess-implement-rdo-escalation',
-    modelUsage: { 'claude-x': { costUSD: 0.01 } },
-    terminal_reason: 'success',
-    api_error_status: null,
-  });
+    modelUsage: { 'claude-x': { inputTokens: 10, outputTokens: 5 } },
+    result: JSON.stringify(resultObj),
+    ...overrides,
+  };
 }
 
-function ok(stdout = '') {
-  return { status: 0, stdout, stderr: '', signal: null };
-}
-
+// claudeSpy(implementPayload) -- returns { spawn, calls } (fakeSpawnDeps' own shape). `calls[i].args`
+// is the REAL argv the SDK built and handed to `spawn`, the same argv `modelUsed` below used to read
+// straight off the old spawnSync call's own `args` parameter.
 function claudeSpy(implementPayload) {
-  const calls = [];
-  function spy(command, args) {
-    if (command === 'claude') {
-      calls.push(args);
-      return ok(claudeReply(implementPayload));
-    }
-    return ok('');
-  }
-  spy.calls = calls;
-  return spy;
+  return fakeSpawnDeps([implementInitMessage(), implementResultMessage(implementPayload)]);
 }
 
 function argvFlag(spy, flag) {
   assert.equal(spy.calls.length, 1, 'expected exactly one claude call');
-  const args = spy.calls[0];
+  const args = spy.calls[0].args;
   const idx = args.indexOf(flag);
   assert.ok(idx !== -1, `expected ${flag} in argv, got ${JSON.stringify(args)}`);
   return args[idx + 1];
@@ -315,7 +320,7 @@ const IMPLEMENT_OK_PAYLOAD = {
 // Real-mode ctx driving IMPLEMENT through the full `kind: "card"` path, same idiom as
 // test/implement-empty-result.test.js's realCardCtx -- no ctx.task.llm.IMPLEMENT override, so
 // step-contracts.js's resolveStepContract actually runs.
-function realImplementCtx(task, taskDir, spawnSync) {
+function realImplementCtx(task, taskDir, spawn) {
   const accountsDir = mkTmp('spo-ire-implement-accts-');
   fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
   appendEvent(taskDir, 'PLAN', 'result', {
@@ -331,7 +336,11 @@ function realImplementCtx(task, taskDir, spawnSync) {
     dryRun: false,
     stepDeadlineMs: 30000,
     claudeAccountsDir: accountsDir,
-    deps: { spawnSync },
+    // handleImplement also spawns `gh` for a real board move (board.js's moveCard/runSync) -- the
+    // old `claudeSpy`'s `return ok('')` fallback branch answered that call too, before `claude`
+    // itself moved off `deps.spawnSync` entirely. Kept here, blandly, for the exact same reason;
+    // `deps.spawn`/fakeExecDeps below is the ONLY seam the actual `claude` call uses now.
+    deps: { ...fakeExecDeps({ spawn }), spawnSync: () => ({ status: 0, stdout: '', stderr: '', signal: null }) },
   });
 }
 
@@ -355,11 +364,11 @@ function baseImplementTask(issue, overrides = {}) {
 test('handleImplement: rdoDiffTouched === true escalates effort to medium, no plan declaration and no intake guess needed', async () => {
   const task = baseImplementTask(3001, { rdoDiffTouched: true, touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-src1-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 // ---- source 2: the plan's own declaration ------------------------------------------------------
@@ -367,11 +376,11 @@ test('handleImplement: rdoDiffTouched === true escalates effort to medium, no pl
 test('handleImplement: an EMPTY plan declaration resolves planDeclaresRdoMembers false and does NOT fall back to touchesRdoMembers -- stays at low effort', async () => {
   const task = baseImplementTask(3002, { touchesRdoMembers: true, planFilesToChange: [] });
   const taskDir = mkTmp('spo-ire-src2-empty-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertBaseS(spawnSync);
+  assertBaseS(claude);
 });
 
 test('handleImplement: a plan declaring rdo-members.ts escalates effort to medium even with touchesRdoMembers false', async () => {
@@ -380,11 +389,11 @@ test('handleImplement: a plan declaring rdo-members.ts escalates effort to mediu
     planFilesToChange: ['/home/crazz/.spo-worktrees/issue-3003/src/shared/rdo-members.ts'],
   });
   const taskDir = mkTmp('spo-ire-src2-declared-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 test('handleImplement: a plan declaring OTHER files (not rdo-members.ts) resolves false and does not escalate, touchesRdoMembers true or not', async () => {
@@ -393,11 +402,11 @@ test('handleImplement: a plan declaring OTHER files (not rdo-members.ts) resolve
     planFilesToChange: ['/wt/src/components/Header.tsx'],
   });
   const taskDir = mkTmp('spo-ire-src2-other-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertBaseS(spawnSync);
+  assertBaseS(claude);
 });
 
 // ---- source 2, restart-durable fallback: ctx.task.planFilesToChange absent, read from the journal
@@ -405,8 +414,8 @@ test('handleImplement: a plan declaring OTHER files (not rdo-members.ts) resolve
 test('handleImplement: planFilesToChange NOT set in-memory but journaled by an earlier PLAN result -- read via lastJournaledPlanFiles, still escalates', async () => {
   const task = baseImplementTask(3005, { touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-src2-journal-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
   // realImplementCtx already journaled one PLAN 'result' event (no files_to_change); journal a
   // second, later one that DOES declare the catalogue -- lastJournaledPlanFiles reads the LAST
   // PLAN result event, same convention as lastResultPayload/lastJournaledRdoDiffTouched. Carries
@@ -423,7 +432,7 @@ test('handleImplement: planFilesToChange NOT set in-memory but journaled by an e
   });
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 // ---- source 3: touchesRdoMembers, the fallback for "reached neither of the above" --------------
@@ -431,21 +440,21 @@ test('handleImplement: planFilesToChange NOT set in-memory but journaled by an e
 test('handleImplement: no plan declaration at all -- falls through to touchesRdoMembers (today\'s pre-#213 behaviour)', async () => {
   const task = baseImplementTask(3006, { touchesRdoMembers: true });
   const taskDir = mkTmp('spo-ire-src3-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 test('handleImplement: no plan declaration at all AND touchesRdoMembers false -- stays at low effort', async () => {
   const task = baseImplementTask(3007, { touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-src3-false-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertBaseS(spawnSync);
+  assertBaseS(claude);
 });
 
 // ---- lSize: unchanged ---------------------------------------------------------------------------
@@ -457,11 +466,11 @@ test('handleImplement: no plan declaration at all AND touchesRdoMembers false --
 test('handleImplement: an L-sized card still escalates on size alone, no RDO signal at all', async () => {
   const task = baseImplementTask(3008, { size: 'L', touchesRdoMembers: false, planFilesToChange: [] });
   const taskDir = mkTmp('spo-ire-lsize-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 // ---- regression (card #213's own acceptance criterion 3): rdoDiffTouched must win over a plan
@@ -475,11 +484,11 @@ test('REGRESSION: a retry after PUSH_PR on a card whose diff touched rdo-members
     rdoDiffTouched: true, // PUSH_PR already ran once and the real diff disagrees
   });
   const taskDir = mkTmp('spo-ire-regression-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync, 'source 1 (the real diff) must win over source 2 (the plan said no)');
+  assertEscalated(claude, 'source 1 (the real diff) must win over source 2 (the plan said no)');
 });
 
 // ---- trigger 4 (2026-09-12 amendment): a retry after DIAGNOSE or a VALIDATE reject -------------
@@ -487,36 +496,36 @@ test('REGRESSION: a retry after PUSH_PR on a card whose diff touched rdo-members
 test('trigger 4: a first IMPLEMENT on a non-wire, non-L card resolves to low effort', async () => {
   const task = baseImplementTask(3010, { touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-trigger4-first-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
   assert.equal(ctx.counters.diagnoseAttempts, 0, 'sanity: a fresh ctx starts at 0 attempts');
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertBaseS(spawnSync);
+  assertBaseS(claude);
 });
 
 test('trigger 4: the SAME card, retried after a DIAGNOSE attempt, resolves to medium effort', async () => {
   const task = baseImplementTask(3011, { touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-trigger4-diag-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
   // Simulates what handleDiagnose does to this same counter (state-machine.js: `++ctx.counters.diagnoseAttempts`)
   // before routing back to IMPLEMENT, without re-running the whole DIAGNOSE handler.
   ctx.counters.diagnoseAttempts = 1;
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 test('trigger 4: a retry after a VALIDATE reject (validateRejects > 0) also resolves to medium effort', async () => {
   const task = baseImplementTask(3012, { touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-trigger4-validate-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
   ctx.counters.validateRejects = 1;
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });
 
 // ---- trigger 4 survives a --worker resume that rebuilt ctx.counters from state.json -----------
@@ -547,8 +556,8 @@ test('trigger 4: a retry after a VALIDATE reject (validateRejects > 0) also reso
 test('trigger 4 resolves from ctx.counters AT CALL TIME, so a ctx rebuilt by reparkCrashedTask\'s restore lines escalates identically (the resume path itself does not exist -- see above)', async () => {
   const task = baseImplementTask(3013, { touchesRdoMembers: false });
   const taskDir = mkTmp('spo-ire-trigger4-resume-');
-  const spawnSync = claudeSpy(IMPLEMENT_OK_PAYLOAD);
-  const ctx = realImplementCtx(task, taskDir, spawnSync);
+  const claude = claudeSpy(IMPLEMENT_OK_PAYLOAD);
+  const ctx = realImplementCtx(task, taskDir, claude.spawn);
   assert.equal(ctx.counters.diagnoseAttempts, 0, 'sanity: buildCtx always starts a fresh ctx at 0');
 
   // The exact restore state-machine.js's reparkCrashedTask (and orphan-scan.js) apply to a
@@ -560,5 +569,5 @@ test('trigger 4 resolves from ctx.counters AT CALL TIME, so a ctx rebuilt by rep
   ctx.counters.mainMoveUsed = Number(restoredState.mainMoveUsed) || 0;
 
   await HANDLERS.IMPLEMENT(ctx);
-  assertEscalated(spawnSync);
+  assertEscalated(claude);
 });

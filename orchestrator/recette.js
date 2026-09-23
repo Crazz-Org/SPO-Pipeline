@@ -979,10 +979,13 @@ function liveDaemonHolder(productJournalRoot, deps = {}) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Cap: wall-clock ceiling + hard LLM-step-count ceiling, enforced at the one choke point every
-// real spawn (scripted AND `claude -p`, per steps/llm.js's invokeClaudeReal) already passes
-// through: `deps.spawnSync`. No state-machine.js change needed -- this wraps the SAME injection
-// point production code already threads through config.deps.
+// Cap: wall-clock ceiling + hard LLM-step-count ceiling. `deps.spawnSync` is STILL the one choke
+// point every real SCRIPTED spawn passes through, wrapped below the same way it always was -- no
+// state-machine.js change needed for that half, this wraps the SAME injection point production
+// code already threads through config.deps. LLM calls are DIFFERENT since action A5b (card #239,
+// 2026-09-17): `steps/llm.js`'s invokeClaudeReal no longer spawns `claude` via `deps.spawnSync` at
+// all (see the `onLlmCallAttempt` paragraph below, a few lines down, for why counting moved off
+// this hook for that half specifically).
 //
 // Wall clock is checked before every spawn, not preemptively mid-spawn (spawnSync is
 // synchronous and blocking -- nothing here can interrupt an in-flight child). Combined with the
@@ -992,38 +995,61 @@ function liveDaemonHolder(productJournalRoot, deps = {}) {
 // is "abort at the next opportunity", not "abort within capMs of the wall clock". It still always
 // terminates and always cleans up; it does not hang.
 //
-// LLM steps are counted by (command === 'claude') -- every real LLM call in this codebase
-// (invokeClaudeReal) spawns literally 'claude', so this is an exact count, not a heuristic --
-// and the cap is enforced BEFORE the (N+1)th call spawns, so an over-cap call never runs at all.
+// LLM steps are counted at `deps.onLlmCallAttempt` (action A5a, card #239), a hook
+// steps/llm.js's invokeClaudeReal calls itself, immediately before every real spawn/call it
+// makes -- NOT by matching (command === 'claude') any more. That match used to be exact (every
+// real LLM call in this codebase went through invokeClaudeReal, which spawned literally 'claude',
+// so wrapping deps.spawnSync saw every one of them) but action A5b replaced that spawn with an
+// in-process Agent SDK query() call, after which no `claude` spawn exists anywhere -- a counter
+// keyed on the command name would silently stop incrementing, and the hard LLM-step ceiling this
+// cap exists to enforce would degrade to wall-clock-only with nothing failing. Counting inside
+// invokeClaudeReal itself instead survives that transport swap, because it counts the LLM CALL,
+// not the process it happened to spawn to make one -- and it is still the single choke point
+// every real LLM call passes through, including intake.js's draftCard/reviewCard/
+// triageBugReport/report-intake, which call invokeClaudeReal directly rather than through
+// runLlm. The cap is still enforced BEFORE the (N+1)th call runs, so an over-cap call never
+// happens at all -- see onLlmCallAttempt below.
 function makeCap(config, { now = Date.now } = {}) {
   const startedAt = now();
   let llmSteps = 0;
   let tripped = null;
 
+  function checkWallClock() {
+    const elapsedMs = now() - startedAt;
+    if (elapsedMs > config.capMs) {
+      tripped = { reason: 'wall-clock-cap-exceeded', elapsedMs, capMs: config.capMs };
+      throw new RecetteCapExceededError(tripped.reason, tripped);
+    }
+  }
+
   function wrapSpawnSync(spawnSyncFn) {
     const real = spawnSyncFn || require('child_process').spawnSync;
     return (command, args, opts) => {
-      const elapsedMs = now() - startedAt;
-      if (elapsedMs > config.capMs) {
-        tripped = { reason: 'wall-clock-cap-exceeded', elapsedMs, capMs: config.capMs };
-        throw new RecetteCapExceededError(tripped.reason, tripped);
-      }
-      if (command === 'claude') {
-        // Checked BEFORE incrementing, so the over-cap call is never counted as having run --
-        // `llmSteps` after a trip reports exactly how many LLM calls actually executed, and the
-        // (capLlmSteps + 1)th never spawns at all.
-        if (llmSteps + 1 > config.capLlmSteps) {
-          tripped = { reason: 'llm-step-cap-exceeded', llmSteps, capLlmSteps: config.capLlmSteps };
-          throw new RecetteCapExceededError(tripped.reason, tripped);
-        }
-        llmSteps += 1;
-      }
+      checkWallClock();
       return real(command, args, opts);
     };
   }
 
+  // onLlmCallAttempt -- threaded into invokeClaudeReal as `deps.onLlmCallAttempt` (see
+  // runInlineScenario's wrappedDeps below). Checks the wall clock FIRST, same order this file's
+  // own doc/README (and the dispatcher watchdog's own comment, which cites this order by name)
+  // already document for wrapSpawnSync -- a claude call that would also be over the wall-clock
+  // cap must still report 'wall-clock-cap-exceeded', not 'llm-step-cap-exceeded'. Then checks and
+  // increments the LLM-step count, in that order, BEFORE returning -- so a caller (invokeClaudeReal)
+  // that calls this immediately before its own spawn/call never makes the (capLlmSteps + 1)th one:
+  // `llmSteps` after a trip reports exactly how many LLM calls actually executed.
+  function onLlmCallAttempt() {
+    checkWallClock();
+    if (llmSteps + 1 > config.capLlmSteps) {
+      tripped = { reason: 'llm-step-cap-exceeded', llmSteps, capLlmSteps: config.capLlmSteps };
+      throw new RecetteCapExceededError(tripped.reason, tripped);
+    }
+    llmSteps += 1;
+  }
+
   return {
     wrapSpawnSync,
+    onLlmCallAttempt,
     tripped: () => tripped,
     elapsedMs: () => now() - startedAt,
     llmSteps: () => llmSteps,
@@ -1554,7 +1580,12 @@ async function runRecette(opts = {}, deps = {}) {
 // pre-7.2 body, and not an observable one (buildPlan is pure).
 async function runInlineScenario(scenario, config, plan, opts, deps) {
   const cap = makeCap(config);
-  const wrappedDeps = { ...deps, spawnSync: cap.wrapSpawnSync(deps.spawnSync) };
+  // onLlmCallAttempt (action A5a): threaded alongside the wrapped spawnSync so invokeClaudeReal
+  // (steps/llm.js) -- and intake.js's direct callers, which receive this same `deps` object via
+  // ctx.deps/config.deps -- can enforce the LLM-step cap at the actual call site rather than at
+  // the spawn this file can no longer assume exists, now that A5b has landed (card #239,
+  // 2026-09-17: invokeClaudeReal drives the vendored Agent SDK's query() instead of spawnSync).
+  const wrappedDeps = { ...deps, spawnSync: cap.wrapSpawnSync(deps.spawnSync), onLlmCallAttempt: cap.onLlmCallAttempt };
 
   let issue = null;
   let finalState = null;
@@ -1633,7 +1664,14 @@ function sleepMs(ms) {
 
 // sumLlmSteps(journalRoot, taskIds) -- the out-of-process equivalent of makeCap's own `llmSteps`
 // counter. Sums 'llm-call' events (steps/llm.js's own appendEvent, real attempts only -- a
-// dry-run event never counts, matching makeCap's own `command === 'claude'` count exactly) across
+// dry-run event never counts, matching makeCap's own `onLlmCallAttempt` count: action A5a moved
+// that count off (command === 'claude') and onto a hook invokeClaudeReal itself calls once per
+// real attempt (llm.js's own call site, not this one). The hook and this 'llm-call' event are NOT
+// the same call site -- runLlm appends 'llm-call' right after its own invokeClaudeReal call
+// returns, so on the runLlm path the two counts agree per real attempt; intake.js's calls run the
+// SAME hook but journal through appendDaemonEvent into daemon.jsonl instead, which this function
+// never reads -- a structural divergence the count this replaces already had under the old
+// `command === 'claude'` scheme too, not a regression A5a introduced) across
 // every taskDir this run owns. Re-reads from disk on every call -- cheap (a handful of small
 // files, K bounded by the account pool) and the ONLY way to observe what a separate OS process
 // just wrote, since nothing here can be handed an in-process counter the way makeCap's wrapped
@@ -1658,11 +1696,12 @@ function allTasksTerminal(journalRoot, taskIds) {
 // workers this cap has to bound are separate OS processes, spawned by createDispatcher itself, not
 // calls this process makes. So the shape here is necessarily different from makeCap's, and
 // honestly weaker in one respect, stated plainly rather than implied: makeCap refuses the
-// (capLlmSteps+1)th `claude` spawn BEFORE it happens; this watchdog can only notice AFTER an
-// llm-call event lands on disk and then make sure NO FURTHER one follows, by killing every live
-// child the instant either bound is crossed. Same two trip reasons
+// (capLlmSteps+1)th LLM call attempt BEFORE it happens (action A5a: at invokeClaudeReal's own
+// deps.onLlmCallAttempt hook, today immediately before its `claude` spawn); this watchdog can only
+// notice AFTER an llm-call event lands on disk and then make sure NO FURTHER one follows, by
+// killing every live child the instant either bound is crossed. Same two trip reasons
 // ('wall-clock-cap-exceeded'/'llm-step-cap-exceeded'), same {reason, ...detail} shape, checked in
-// the same order (wall clock first) as makeCap's own wrapSpawnSync.
+// the same order (wall clock first) as makeCap's own onLlmCallAttempt.
 //
 // Resolves WITHOUT tripping the moment every id in `taskIds` reaches a terminal state -- this is
 // what lets a k>1 scenario's own dispatcher run stop on its own once its work is actually done,
@@ -1713,8 +1752,10 @@ async function runDispatcherCapWatchdog({
     // STRICTLY GREATER, matching the inline cap's own permitted-call count (post-verification
     // correction: this used to be `>=`, which tripped the INSTANT the journal showed exactly
     // capLlmSteps calls -- killing a run that had used its full, legitimate budget and needed no
-    // further call at all. makeCap's own wrapSpawnSync permits exactly capLlmSteps calls (refuses
-    // only the (capLlmSteps+1)th, `llmSteps + 1 > config.capLlmSteps`); this watchdog is
+    // further call at all. makeCap's own onLlmCallAttempt (action A5a moved this check off
+    // wrapSpawnSync, which after that action permits an unbounded number of LLM calls -- it only
+    // calls checkWallClock()) permits exactly capLlmSteps calls (refuses only the (capLlmSteps+1)th,
+    // `llmSteps + 1 > config.capLlmSteps`); this watchdog is
     // necessarily POST-HOC (see this function's own header: it can only notice a call AFTER it
     // landed on disk, never refuse it beforehand) -- so the honest equivalent is "trip once a
     // (capLlmSteps+1)th call has ALREADY happened", i.e. `llmSteps > capLlmSteps`, not "trip the

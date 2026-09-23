@@ -98,10 +98,43 @@ register exists to prevent.
   see "Corrected into scope, again" above for why that reason stopped holding. The two are no
   longer one bucket: `CLAUDE.md` is prose a reader trusts, `.claude/**` is configuration an agent
   cannot touch.
-- **Vendored or generated files** — this exclusion class is currently **empty**: there is no
-  `node_modules/`, no build output, and no generated file checked into this repo (verified:
-  `ls node_modules` fails, no `dist/`/`build/` directory exists). Named so the exclusion is
-  not silently assumed; if one is ever added, it belongs here.
+- **Vendored or generated files** — no longer empty as of 2026-09-17: card #239's chantier added
+  three third-party files, `vendor/claude-agent-sdk/{sdk.mjs,package.json,LICENSE.md}`, copied in
+  from `npm install @anthropic-ai/claude-agent-sdk`, never installed inside this repo (see
+  `orchestrator/sdk.js`'s header). Excluded here because these three are code this repo did not
+  write and make no claim of their own about this pipeline's behavior. (`sdk.mjs` is minified but
+  not degenerate — measured: 225 lines, 14 comment lines, 150 of the 225 under 200 characters; an
+  earlier draft of this entry mischaracterized it as "one minified line," corrected here. That
+  earlier draft is also the reason this bucket is worded the way it now is: see the next
+  paragraph.) `vendor/claude-agent-sdk/README.md`, by contrast, is **not** in this exclusion — it
+  is prose this repo wrote (byte count, md5, version pair, update ritual) and is in scope for
+  `doc/remediation-plan-2026-08.md`'s execution rule 6, which names `vendor/**/README.md`
+  explicitly as of the same date.
+
+  **Measured, by planting a symptom, that the three excluded files do not enter any sweep's**
+  **corpus** — not merely by re-running the suite unmodified and noting the failure count held,
+  which the first draft of this entry did and which a same-day, same-suite regression could
+  satisfy by accident without proving absence of anything. The actual check: a synthetic offender
+  file — one `action 99.9a` banner id documented nowhere, one possessive symbol citation to a
+  file named `zz-nonexistent-file.js` (which does not exist), and one bare `gh api ... -f` call
+  with no `--method`/`-X` — was planted as `vendor/claude-agent-sdk/zz-probe.js` and the file
+  removed afterward (never committed). Command: `node --test test/gh-api-argv.test.js
+  test/doc-constant-sweep.test.js test/park-reason-doc-sweep.test.js test/gate-scope.test.js
+  test/test-comment-citation-sweep.test.js`. Result with the file under `vendor/`: 129 tests,
+  127 pass, 2 fail — identical to the same command with no probe file present at all (the same
+  two pre-existing citation-anchor failures this register's own header does not track). The
+  IDENTICAL file content, planted instead at `orchestrator/zz-probe.js` (which every scanner
+  here dynamically walks via `fs.readdirSync`, not a fixed list): 129 tests, 124 pass, **5**
+  fail — the same 2 pre-existing plus 3 new, named failures: `doc-constant-sweep.test.js`'s
+  `"<file>.js's <CodeShapedIdent>"` symbol-citation check, its `"action N.Na"` banner check, and
+  `gh-api-argv.test.js`'s `-f`/`--method` check. Same bytes, same filename pattern (`zz-probe.js`),
+  different directory, 0 vs. 3 new failures — that is what "does not enter the corpus" means here,
+  demonstrated rather than inferred from an unmodified tree's failure count.
+
+  Still no `node_modules/`, no build output, and no other generated file checked into this repo
+  (verified: `ls node_modules` fails, no `dist/`/`build/` directory exists) — this bucket's other
+  members remain absent; only the three vendored files above populate it. If a future addition
+  changes that, name it here too.
 - **Blank lines and executable code lines inside `orchestrator/**/*.js`, `bin/spo`,
   `console/**/*.js`, `scripts/**`** — only comment lines in these files carry documentation
   claims; a code line's truthfulness is what the test suite already checks, not what this
@@ -115,19 +148,27 @@ register exists to prevent.
 - **`.gitignore`** (repo root) — a git configuration file; it carries no claim about system
   behaviour for a reader to trust or distrust, so it is not documentation in the sense this
   register partitions.
+- **`.gitattributes`** (repo root) — added 2026-09-17 (card #239 A1's fix pass, F12: `vendor/**
+  -diff linguist-vendored`, so `git diff`/GitHub's language stats don't treat the vendored SDK as
+  this repo's own code). Same reason as `.gitignore` immediately above: a git configuration file,
+  not a claim about system behaviour.
 
 **Top-level directory/file check (every entry in the repo root, verified against this tree):**
 `.claude` (excluded, harness-governed, above), `.github` (in scope since 2026-09-05 —
 `gate.yml`'s comment lines; **it was missing from this check entirely until then**), `accounts`
 (in scope, added 2026-09-02), `bin` (in scope, `bin/spo`), `console` (in scope), `doc` (in scope),
 `orchestrator` (in scope), `prompts` (in scope), `scripts` (in scope, added 2026-09-02), `test`
-(excluded, above), `worktrees` (excluded, untracked, above), `CLAUDE.md` (**in scope since
-2026-09-05**, above), `README.md` (in scope), `.gitignore` (excluded, above), `.recette`
-(excluded, untracked and absent from disk, above). Every top-level entry is now placed in exactly
-one bucket, with a reason — a sentence this section already made once, on 2026-09-02, while
-omitting `.github`, so read it as the current claim and not as a guarantee that it is checked by
-anything. Derived with `git ls-files | awk -F/ '{if(NF==1) print $0; else print $1}' | sort -u`,
-which is the check that was missing.
+(excluded, above), `vendor` (**split, added 2026-09-17** — `vendor/claude-agent-sdk/{sdk.mjs,
+package.json,LICENSE.md}` excluded, the "Vendored or generated files" bucket above, which this
+entry newly populates; `vendor/claude-agent-sdk/README.md` is in scope, same bucket's second
+paragraph), `worktrees` (excluded, untracked, above),
+`CLAUDE.md` (**in scope since 2026-09-05**, above), `README.md` (in scope), `.gitignore`
+(excluded, above), `.gitattributes` (**excluded, added 2026-09-17**, above), `.recette` (excluded,
+untracked and absent from disk, above). Every top-level
+entry is now placed in exactly one bucket, with a reason — a sentence this section already made
+once, on 2026-09-02, while omitting `.github`, so read it as the current claim and not as a
+guarantee that it is checked by anything. Derived with `git ls-files | awk -F/ '{if(NF==1) print
+$0; else print $1}' | sort -u`, which is the check that was missing.
 
 ## 2 · Measurement commands (reproducible)
 
@@ -811,7 +852,526 @@ reboot check's own blind spot), the verdict is exactly what it would have been w
 `'draining'` off liveness alone, or the pre-#208 wall-clock bound -- never a guess dressed up as a
 measurement.
 
-## 12 · Bare `Bash` in 7 of 8 tool policies — what card #240 closed, and what it did not, 2026-09-22
+## 12 · `--deadline-ms` widened gap (action A2, card #239), 2026-09-17
+
+Action A2 gave PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE their own
+`config.stepDeadlineMsByState` entry (`deadlineMsForStep(step) + stepDeadlineMs`, clamped to
+Node's timer ceiling) so the outer `deadline.js` timer would not retroactively kill a still-healthy
+LLM call once card #239's own transport swap (action A5b, landed the same day) made that timer
+live in real mode -- which it now is, not merely anticipated -- see
+`orchestrator/config.js`'s own `LLM_STEP_DEADLINE_ENTRIES` comment for the full hazard. The
+`--deadline-ms` CLI flag (`daemon.js`) only ever overrides the GENERIC `config.stepDeadlineMs`
+default, never a state's own `stepDeadlineMsByState` entry, and that flag is not new to this
+action — `CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE` already had their own entries the flag could not
+reach, before card #239 was ever opened. What IS new is how much of the daemon's dispatch surface
+that gap now covers.
+
+**Measured.** `orchestrator/state-machine.js`'s `callWithDeadline(ctx, <state>, ...)` call sites
+name 12 distinct states: 7 literal (`CHECK`, `CI_CHECKS`, `FINISH`, `GATE`, `MERGE`, `PUSH_PR`,
+`WORKTREE`) plus 5 reached through `callLlmStep`'s own `stepName` variable
+(`PLAN`/`IMPLEMENT`/`DIAGNOSE`/`CITATION_VERIFIER`/`VALIDATE`) — `grep -oE
+"callWithDeadline\(ctx, '[A-Z_]+'" orchestrator/state-machine.js | sort -u` finds the 7; the other
+5 are read off `callLlmStep`'s own five call sites (`PLAN`/`IMPLEMENT`/`DIAGNOSE`/
+`CITATION_VERIFIER`/`VALIDATE`, each passed as a literal string argument, not a `callWithDeadline`
+literal itself). Before A2, 4 of the 12 carried their own `stepDeadlineMsByState` entry
+(`CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE`) — `--deadline-ms` reached the other 8 (the three scripted
+states plus all five LLM steps). After A2, 9 of the 12 carried their own entry — `--deadline-ms`
+reached only the remaining 3 (`CHECK`, `PUSH_PR`, `MERGE`).
+
+**Superseded by card #224 (merged into this chantier, not this action's own work): MERGE gained
+its own `stepDeadlineMsByState` entry too** (`MERGE_STEP_DEADLINE_MS`, `orchestrator/config.js`'s
+own comment on that constant names the production incident, SPO-WebClient#587, that motivated it).
+So the count above is a snapshot of A2 alone, not of this tree's current state: as merged, 10 of
+the 12 states carry their own entry, and `--deadline-ms` reaches only the remaining 2 (`CHECK`,
+`PUSH_PR`). The "Why this is a live gap" paragraph's "3 of 12"/"the other 9" below is the same A2-only
+snapshot and is left as originally written, since the gap's shape (some states are not reachable by
+the flag) is unchanged by which state closed the last one.
+
+**Why this is a live gap, not a cosmetic one.** `orchestrator/dispatcher.js`'s `buildWorkerArgv`
+(:296) forwards `config.stepDeadlineMs` as `--deadline-ms` to every `--worker` subprocess it
+spawns — the real, continuous-mode dispatch path a running daemon actually uses, not only the
+`--once`/test-harness invocations this repo's own suite drives directly. A maintainer (or a test)
+reaching for `--deadline-ms` to shrink every step's deadline for a live debugging session now
+shrinks only 3 of 12 states' worth of ceiling; the other 9 keep their derived, multi-minute
+figures regardless of the flag. This gap was found, not designed: card #239's own action A2 had to
+retarget two tests (`test/deadline-and-catchall.test.js`'s "step deadline expiry" test and
+`test/park-alert.test.js`'s "finalizePark: a shadow-mode park" test) off `IMPLEMENT` and onto
+`CHECK` specifically because `--deadline-ms` could no longer reach `IMPLEMENT`'s own new entry —
+the test comments at both sites state this verbatim.
+
+**Not fixed here**, per this register's own posture (a named, accepted gap, not a silently-shipped
+one): making `--deadline-ms` scale every `stepDeadlineMsByState` entry (proportionally, or as a
+hard ceiling) is a design decision about what a maintainer debugging a live daemon actually wants
+— scale the derived entries down with it, or leave them alone as "these are load-bearing, minimum
+safe values, not defaults" — and is left to chantier 9 or a future action to decide, not assumed
+here.
+
+## 13 · `settingSources` default-equivalence gap (action A3, card #239), 2026-09-17
+
+Action A3 (`orchestrator/steps/sdk-call.js`'s `buildQueryOptions`) pins the Agent SDK's
+`settingSources` option to `['user', 'project', 'local']` on every call, unconditionally — see
+that file's own `SETTING_SOURCES` comment for the full reasoning (`.claude/settings.json` is this
+pipeline's entire permission policy and must never depend on a CLI default this repo does not
+control). This is a genuinely NEW pin, not a preservation of the OLD transport's behaviour: the
+transport as of action A3 (`orchestrator/steps/llm.js`'s `buildArgv`, deleted by action A5b's
+cutover the same day — this entry predates that deletion and is left in the past tense on
+purpose) never emitted `--setting-sources` at all — no flag, no opts field, nothing fed one. No
+test in this repo's suite can catch a wrong choice
+here, by construction: every assertion that touches `settingSources` (this action's own
+`test/sdk-call-options.test.js`) compares against the SAME pinned constant on both sides of the
+equals sign. A test cannot discover what it does not independently know.
+
+**Measured (this action, against the real vendored SDK and a real `claude` 2.1.274 binary).**
+Half of the equivalence question is SETTLED: the CLI's internal allowed-source list is
+`["userSettings", "projectSettings", "localSettings", "flagSettings", "policySettings"]`, and its
+own `--setting-sources` flag only ever narrows the first THREE (its own `--help` enum is exactly
+`user`, `project`, `local`) — `flagSettings` (the CLI's real `--settings <file-or-json>` flag,
+confirmed against `claude --help` on 2.1.274 — there is no separate `--append-settings`) and
+`policySettings` (managed/enterprise policy) are added UNCONDITIONALLY, regardless of what
+`--setting-sources` names or omits. So pinning all three of the flag's own options can never cause
+a managed or enterprise-policy setting to be silently dropped — that failure mode does not exist
+for this flag at all, pinned or not.
+
+**Not settled:** whether OMITTING the flag entirely (today's behaviour) reads the same three
+sources as explicitly passing all three (this action's pin), or some different subset. That
+depends on the CLI's own launch-time
+default for the allowed-sources field, which lives inside a ~230 MB compiled binary this repo does
+not build from source. The trace so far: an `allowedSettingSources()` / `replaceAllowedSettingSources()`
+accessor pair gates both the hooks loader and the permission-rule loader, and a named constant
+literally spelled `["userSettings", "projectSettings", "localSettings"]` appears as what looks like
+that accessor's default value — strong circumstantial evidence that the flag-omitted default and
+this action's explicit pin already agree — but the accessor's actual INITIALIZER (what it is set to
+before any caller ever touches it) could not be pinned by static reading alone; only running a live
+session and comparing what it actually loads would settle it, and no such session was run for this
+gap.
+
+**Why this is a live gap, not a cosmetic one.** If the flag-omitted default ever turns out to
+differ from `['user', 'project', 'local']` (for instance, by ALSO reading some source this pin
+excludes, or by reading fewer), every LLM step running under this transport (the SDK's `query()`,
+current since action A5b, not merely "new" any more) reads a genuinely different permission
+surface than the OLD, now-deleted `claude -p`/`buildArgv` transport's calls did, silently, with no
+test positioned to notice because the test and the code share one constant.
+
+**Not fixed here, and not fixable by more static reading** — per this register's own posture, a
+named gap rather than a silently-assumed one. **Closes at A10's live recette**: that action already
+runs one real card through this transport end-to-end at real cost, which is the cheapest point
+in this chantier to also diff `claude --setting-sources=user,project,local`'s actual loaded
+settings against a flag-omitted invocation's, on a live account, and confirm or correct this pin
+from that one comparison rather than from another round of static tracing.
+
+## 14 · Detached grandchild survives a deadline kill (action A5b, card #239), 2026-09-17
+
+Action A5b (`orchestrator/steps/llm.js`'s `invokeClaudeReal`, driving `query()` instead of
+`spawnSync`) was built to prove "a call exceeding `opts.deadlineMs` is terminated ... and leaves
+no live child" — the brief's own wording, and the property `sdk-call.js`'s `confirmProcessExit`
+exists to hold this function's own return open until it can honestly claim. That property holds
+for the DIRECT child (the `claude` process itself, or its equivalent in this action's own fake --
+see `test/helpers.js`'s `fakeSpawnedChild`), confirmed by an event-driven `'exit'` listener on the
+real handle `spawnClaudeCodeProcess` captures, not a guess. It does **not** hold, and cannot be
+made to hold from this action alone, for a DETACHED GRANDCHILD -- a tool subprocess `claude` itself
+spawns (its own Bash tool, most concretely).
+
+**Measured (this action, live probe against the real vendored SDK -- a fake `claude` that ignores
+SIGTERM and spawns a `{ detached: true }` grandchild that also ignores SIGTERM, script deleted
+after use, not committed).** After `abortController.abort()` drove the SDK's own kill escalation
+through to a confirmed SIGKILL of the direct child (~5.9-7.1s, matching `SDK_ABORT_KILL_DELAY_MS`
++ `SDK_ABORT_SIGKILL_ESCALATION_MS`), the detached grandchild was still alive and still emitting
+heartbeats at the end of a 9-second observation window -- it never received any signal at all. This
+is not new to this transport: neither the OLD transport's `spawnSync` `killSignal`, nor the abort
+path this action wires up, ever signals a process GROUP (a negative-pid `kill`) -- the one place the
+vendored SDK's own source does that (`process.kill(-pid, "SIGKILL")`, grepped directly) is the
+Bash-tool's OWN subprocess manager, a different class entirely, reachable only when the SDK itself
+runs a tool in-process (not this pipeline's usage, which only ever drives `query()` for a single
+`claude` child). So "no live child" was never a group guarantee under either transport -- a
+detached tool subprocess has always been able to outlive a killed `claude`, on the old transport
+and the new one alike.
+
+**Why this is a live gap, not a cosmetic one.** The card's own "leaves no live child" language,
+read literally (every process in the call's subtree, not only the one this pipeline directly
+spawned), is false the moment `claude`'s own Bash tool detaches a long-running command before a
+deadline kills the parent. In practice the blast radius is bounded by what PLAN/IMPLEMENT/DIAGNOSE/
+CITATION_VERIFIER/VALIDATE actually run inside the sandboxed worktree each step already operates
+in (never a `nohup`-style detach by the STEP's own prompts, as far as this action's own reading of
+`prompts/*.md` goes) -- but nothing in this transport, or the old one, structurally prevents a
+future tool call (or a future SDK version's own tool implementation) from detaching a process that
+then outlives a deadline-killed `claude`.
+
+`interrupt()` (the SDK's own protocol-level graceful-cancel message, distinct from `abort()`'s hard
+kill) was checked and is not a substitute: it asks the CLI to stop its current turn cooperatively,
+which a hung or misbehaving call is by construction not guaranteed to honour, and it does nothing
+for a grandchild that has already detached regardless.
+
+**Not fixed here, and not fixable from this action alone** — per this register's own posture. A
+real fix (killing the process GROUP the direct child belongs to, which requires either spawning
+`claude` itself with its own session/pgid via a custom `spawnClaudeCodeProcess` that takes over
+process management from the SDK's own default — a materially larger, riskier scope than this
+action's brief called for — or a future SDK-provided hook for exactly this) is left to a future
+action or card, named here rather than silently accepted. Closing condition: either the vendored
+SDK ships its own process-group kill for `spawnClaudeCodeProcess`-managed children, or a future
+action measures the real blast radius of detached tool subprocesses against the live corpus and
+decides the custom-spawn approach is worth its own risk.
+
+## 15 · F3 prose-sweep scope: what "`claude -p`" was left alone, and why (A5b-2 fix pass, card #239), 2026-09-17
+
+Action A5b's cutover (`spawnSync`/`buildArgv` deleted, replaced by the vendored Agent SDK's
+`query()`) left a large number of comments across `doc/`, `prompts/`, `orchestrator/`, and `test/`
+describing the OLD transport in the present tense. The A5b-2 fix pass corrected every stale
+MECHANISM claim it found by repeated, widening greps (`spawnSync`, `claude -p`, `buildArgv`,
+`argv`, `blocking`, `synchronously`, `output-format json`, `stdout`, plus targeted
+`invokeClaudeReal`+`spawnSync`/`synchronous`/`blocking` combinations) — three separate sweep
+rounds, the last prompted by a verifier cross-check that found sites the first two missed. This
+entry records the boundary that sweep drew, in the tree, not only in a chat report — so a later
+reader can tell "checked and deliberately kept" from "never looked" (the failure mode that let the
+scope slip twice: **`prompts/README.md`'s "`--model`/`--effort` on the `claude -p` invocation"
+looked like harmless shorthand and was actually a MEASURABLE claim that turned out half-false** —
+the flags are real, MEASURED against the vendored SDK argv probe (`sdk-call.js`'s own header), but
+`-p`/`--print` is never passed on this transport at all. That one correction is the reason the
+categories below are stated as "measured, not assumed" rather than "obviously fine").
+
+**Fixed** (mechanism claims — describing HOW something currently works): every present-tense
+"spawns `claude -p`", "the `claude -p` invocation/call/session", "`deps.spawnSync` is the
+[injection point / choke point] `invokeClaudeReal` uses", "the argv it builds", "parses stdout",
+and "once A5b lands" (or "once card #239's transport swap...", present/future tense for an action
+that has landed) — across `orchestrator/config.js`, `account-lease.js`, `step-contracts.js`,
+`recette.js`, `daemon.js`, `dispatcher.js`, `journal.js`, `state-machine.js`, `accounts.js`,
+`tokens.js`, `steps/llm.js`, `steps/scripted.js`, `steps/sdk-call.js`, `sdk.js`,
+`auto-triage.js`, `console/live-step.js`, `scripts/smoke-llm.js`, `orchestrator/README.md`
+(multiple independent copies of the same claim, in different sections), `README.md` (repo root),
+`doc/state-machine-spec.md`, `doc/permissions.md`, `doc/accepted-gaps.md` §12, `prompts/README.md`,
+and `test/account-settings-sync.test.js`.
+
+**Left alone, deliberately, by category — each MEASURED against this HEAD, not assumed true
+by pattern-matching the word "`claude -p`":**
+
+1. **Historical/dated records that already disclaim themselves.** `doc/deployment.md`'s
+   `killedByDeadline`/`isSpawnTimeout` section ("this section is a record of the finding, not of
+   current code"), `doc/remediation-progress.md`/`doc/remediation-plan-2026-08.md`'s dated action
+   logs, `doc/improvisation-analysis.md`'s "v1's `claude -p` model" (explicitly the RETIRED
+   product driver, not this pipeline), config.js's own "a live measurement (2026-08, this
+   machine) of a `claude -p` call" (the measurement genuinely ran on the pre-A5b transport — the
+   date predates A5b by weeks, so the claim is true AS WRITTEN, about a specific past event).
+2. **Test-file comments describing their OWN migration history**, already correctly framed in
+   past tense at the point A5b's own commit and the A5b-2 fix pass touched them (e.g.
+   `test/llm-real.test.js`'s "this file used to fake the old `claude -p` transport",
+   `test/account-rotation.test.js`, `test/status-5.4.test.js`, `test/llm-real-card.test.js`) — by
+   construction these are already correct, since they were written or corrected describing a
+   transition that had already happened.
+3. **`doc/state-machine-spec.md`'s Step-contracts table** (`| PLAN | `claude -p` | ... |`, four
+   rows): a KIND-label naming which rows are LLM steps vs scripted ones, not a claim about argv or
+   spawn mechanics — parallel to the `| script |` label the WORKTREE row carries. Left as `claude -p`
+   deliberately: renaming it to `query()`/`invokeClaudeReal` would suggest the table is making a
+   mechanism claim it never made, and the prose paragraph immediately below the table (fixed in
+   this pass, see doc/state-machine-spec.md's own "Whichever figure applies..." paragraph) is
+   where the actual mechanism is described.
+4. **Cost/count shorthand describing WHAT an LLM call costs, not HOW it runs** — "`spo ask` makes
+   about two real `claude -p` calls per request", "every real `claude -p` call already records its
+   own token counts" (these two -- `orchestrator/README.md`'s `spo ask` cost line and its token-count line -- and
+   `tokens.js`'s twin at its line 15 were changed to "LLM call" by card #239's action A9), "a real `claude -p` reproduction" (account-pool exhaustion cost), "a wide
+   `claude -p` outage" (auto-triage's incident-class name) — none of these assert the `-p` flag,
+   `spawnSync`, or argv construction; they use "`claude -p`" as this repo's established informal
+   name for "one real LLM invocation," the same way "a claude -p call" and "an LLM call" are used
+   interchangeably throughout this very entry. MEASURED risk of leaving these: low — none of them
+   would mislead a maintainer about the CURRENT transport's mechanics, only about a naming
+   convention that predates this chantier and is unrelated to it.
+
+**Not closed by this entry** *(closed by A9, 2026-09-21 — see § 17)*: the pre-existing
+`killedByDeadline` field-name references in `orchestrator/README.md` and `steps/scripted.js`'s own
+comment (both cite a field that does not exist in `steps/llm.js` today — the real field is
+`timedOut` — a naming drift that predates card #239 and is not caused by the A5b transport swap).
+Found during this sweep, out of scope for it, named here rather than silently carried forward
+uncorrected.
+
+## 16 · `canUseTool` rejected as A8's mechanism — dead on three independent grounds, and wiring it would loosen policy (action A8, card #239), 2026-09-17
+
+**REWRITTEN WHOLE, not patched line by line** (verifier fix pass, 2026-09-17): the first version
+of this entry invented a CLAUDE.md quotation, argued from a false premise about `Task`, and
+proposed an "unlock" that its own quoted evidence already contradicted. Each defect is preserved
+below only where naming it is the honest way to present the corrected claim; this version is
+organized around the three things this action and its fix passes actually measured, plus the
+conclusion those three measurements support.
+
+Card #239's own text proposed `options.canUseTool` (the Agent SDK's permission-decision callback)
+as the way to make "per-step tool and permission policy expressed in code and covered by the
+suite" — its rationale being that `allowedTools`/`permissionMode` are strings pushed onto argv and
+resolved inside the child, while a callback moves the decision into code the suite can exercise.
+Action A3 (2026-09-17, same day) had already put `allowedTools`/`permissionMode` into code for
+STEP_CONTRACTS's five LLM steps (`step-contracts.js`, mapped by `buildQueryOptions`), table-driven
+tested (`test/sdk-call-options.test.js` test 1). But STEP_CONTRACTS's five are not this repo's
+whole in-code tool policy: `orchestrator/intake.js` builds three more inline
+(`draftCard`/`reviewCard`/`triageBugReport`) — EIGHT policies in total. A8's job was to rule
+whether `canUseTool` adds anything A3's five did not already close, the same discipline A7 applied
+to its own card-supplied mechanism before finding it wrong.
+
+**RULING: `canUseTool` is the wrong mechanism, on three independent grounds, all measured.**
+
+**1 — every one of the eight real policies shadows the callback by its OWN `allowedTools` shape.**
+The vendored SDK (`vendor/claude-agent-sdk/sdk.mjs`) ships its own diagnostic for this — a function
+pair (`RGe`/`n9`) that computes, from `(hasCanUseTool, permissionMode, allowedTools)`, whether the
+callback would ever actually be consulted, and calls `process.emitWarning(msg, {code:
+'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED'})` when it would not: a bare `allowedTools` entry (no `Bash(git
+*)`-style scoping) auto-approves that whole tool before the callback is ever consulted, and
+`permissionMode: 'bypassPermissions'` auto-approves every tool call regardless. All eight real
+policies declare every `allowedTools` entry bare — STEP_CONTRACTS's five (`PLAN: ['Read', 'Grep',
+'Glob', 'Bash']`, `IMPLEMENT: [...,'Edit','Write']`, `DIAGNOSE: ['Read','Grep','Bash']`,
+`CITATION_VERIFIER: ['Read','Grep']`, `VALIDATE: ['Read','Grep','Glob','Bash']`) and intake.js's
+three (`draftCard`/`reviewCard`/`triageBugReport`, all `['Read','Grep','Glob','Bash']`) — and none
+of the eight sets `bypassPermissions`. MEASURED (a real `query()` call per policy against a
+throwaway `node` fixture that exits immediately, never `claude`, no real spawn —
+`test/sdk-call-options.test.js`'s eight `canUseTool would be shadowed for <policy>` tests):
+attaching a `canUseTool` callback to each fires exactly one `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`
+warning, naming every tool that policy declares.
+
+**2 — the one case that looked like it would fire (a step's own subagent call) also does not,**
+closing HALF of the open question PLAN's own STEP_CONTRACTS entry raises (`allowedTools` is NOT
+the authority on what a call can spawn — 11 of a measured PLAN(fable) window's sessions carried an
+Opus subagent despite `Task` never being declared). An earlier draft of this entry read that as
+`canUseTool`'s one live-firing case; it is not, and NOT on the same mechanism as point 1 (the fix
+pass that added "on the SAME shadowing mechanism" here was itself wrong: PLAN declares neither
+`Task` nor `Agent` at all, so a bare-`allowedTools` entry cannot be what auto-approves this call --
+this is genuinely the SECOND independent ground the heading already promises, not a restatement of
+the first). What auto-approves it is the CLI's own NO-RULE-NEEDED DEFAULT-ALLOW SET, a mechanism
+point 1 never touches. MEASURED against the installed CLI binary (2.1.274,
+`~/.local/share/claude/versions/2.1.274`, direct byte search, not the vendored `sdk.mjs`): a
+legacy-tool-name alias table (`var i={Task:"Agent",...}`, consumed by `function qc(e){return
+Object.hasOwn(i,e)?i[e]:e}`, called on `e.tool_name` inside the binary's own
+`PermissionRequest`/`PermissionDenied` handling) canonicalizes the wire name `Task` to `Agent`
+before any permission check runs; and the permission-rule resolver (`function Jn(e,n,r={})`)
+contains `var gl=new Set(["Read","Glob","Grep","NotebookRead","Skill","AskUserQuestion",
+"TaskCreate","TaskGet","TaskList","TaskUpdate","TaskStop","TaskOutput","Agent","TodoWrite"])` and,
+inside `Jn`, `else if(gl.has(y.toolName))i.push(h)` — pushed straight onto the allowed list, no
+further check, no callback consulted. So a step's OWN `Agent`/`Task` call resolves `allow` in
+local rule evaluation and never reaches the `--permission-prompt-tool` fall-through — CLOSED, this
+agrees with the observed behaviour (those 11 PLAN(fable) subagent sessions ran with no
+`--permission-prompt-tool` wired at all; had the call instead required one, it would have been
+refused headless, and no subagent would have spawned). **This closes only the PARENT half.**
+Whether a spawned subagent's own NESTED tool calls (inside the `Agent`, not the `Agent` call
+itself) are separately gated by the parent `query()`'s `allowedTools` was unmeasured when this
+entry was written — the mechanism is plausible either way (`--allowedTools` becoming a
+session-scoped `alwaysAllowRules.cliArg` would inherit down; an agent definition carrying its own
+`tools` set would override) — and answerable with **no LLM spend**. A9 ran the walk (2026-09-21,
+below, § *A9's transcript walk*): **the answer is still NOT known** — the corpus holds no subagent
+call that could have told the two mechanisms apart.
+
+**3 — even rescoping `allowedTools` would not unlock the callback for most of these tools, because
+`.claude/settings.json` shadows them independently, and this action's own quoted SDK text already
+said so.** An earlier draft of this entry proposed rescoping a bare tool into a scoped one (e.g.
+`Bash(git *)`) as "what would unlock `canUseTool`", backed by a fabricated CLAUDE.md quotation.
+Both the mechanism and the citation were wrong. MEASURED (`.claude/settings.json`, pinned by
+`test/sdk-call-options.test.js`'s own settings-shape test): `permissions.allow` has 98 entries, of
+which exactly `Read`, `Grep`, `Glob`, `Edit`, `Write` (plus one MCP tool name) are bare; the other
+92 are scoped `Bash(...)`; all 14 `deny` entries are also scoped; there is no bare `Bash` anywhere
+in the file. This is not taken on CLAUDE.md's word alone -- VERIFIED at the use site and against
+the live machine: `bin/spo`'s `readPipelineSettingsText()` reads THIS EXACT FILE
+(`path.join(__dirname, '..', '.claude', 'settings.json')`) and passes it to
+`accounts.stampManagedSettings()`, which `cmdAccountSyncSettings` (`spo account sync-settings`,
+run automatically on `account add` and every `--real` startup) writes into every pool account's
+own `settings.json`, stamped `"//": "machine-owned -- written by \`spo account sync-settings\`
+from <repo>/.claude/settings.json..."`. MEASURED on this machine: both live pool directories
+(`~/.claude-accounts/pool1/settings.json`, `~/.claude-accounts/pool2/settings.json`) carry that
+exact stamp, and their PARSED `permissions` object is byte-identical to the repo's own
+`.claude/settings.json`'s right now -- the FILES differ (the pool copies additionally carry the
+`"//"` machine-owned stamp; the identity claim is about the `permissions` object only, not the
+file bytes) -- so the bare-allow shape above is not a claim about policy
+intent, it is the actual, live, installed state every real LLM call's `CLAUDE_CONFIG_DIR` resolves
+against, regardless of what STEP_CONTRACTS/intake.js say. And the SAME diagnostic named in point 1 (`RGe`)
+says, in the exact text it builds for the warning message, in so many words: *"Allow rules from
+settings files can also shadow the callback but are not visible here."* So rescoping `Read`/`Grep`/`Glob`/`Edit`/`Write`
+inside this repo's own code would unshadow NOTHING for those five — the settings file's own bare
+allow keeps shadowing them regardless of what STEP_CONTRACTS says. `Bash` is the only tool among
+all eight policies that settings.json does NOT bare-allow, so it is the only one this repo's own
+rescoping could actually affect at all — but SEVEN of the EIGHT policies ALSO declare `Bash` bare
+themselves (STEP_CONTRACTS's PLAN/IMPLEMENT/DIAGNOSE/VALIDATE and all three of intake.js's; only
+CITATION_VERIFIER omits it), which is itself a separate, larger structural gap than the
+`canUseTool` question — see the pointer below rather than this entry resolving it. The
+honest unlock, for the five tools settings.json bare-allows: editing `.claude/settings.json`
+itself, which CLAUDE.md says "cannot be edited by an agent: the harness refuses them as sensitive
+files, regardless of the repo's own rules." That is the real basis for reading this as the
+maintainer's decision, not a builder action's — not the invented quotation the first draft used.
+
+**CONCLUSION: wiring `canUseTool` would LOOSEN this pipeline's policy, not tighten it — this is
+the headline, not a footnote.** Attaching the callback pushes `--permission-prompt-tool stdio`
+onto every real call's argv (MEASURED, from the vendored SDK's own argv builder: `if(te){...
+W.push("--permission-prompt-tool","stdio")}` where `te` is `canUseTool`) — handing the callback
+exactly the tool calls that today are hard-refused, never soft-decided, because no rule anywhere
+covers them: `Bash` under CITATION_VERIFIER (the one policy that declares no `Bash` at all — a
+call there today is refused, not asked); and `WebFetch`/`WebSearch`, which MEASURED appear in
+**none** of the eight in-code policies, in neither `.claude/settings.json`'s allow nor its deny
+list, and not in the CLI's own no-rule-needed set (`gl`, point 2 above). CLAUDE.md § Permissions is
+explicit that DIAGNOSE/VALIDATE/CITATION_VERIFIER run with no human, so "whatever
+`.claude/settings.json` doesn't allow is refused, not queued" — never auto-approved instead. A
+`canUseTool` callback converts exactly that hard-refusal path into a decision our own code makes at
+runtime. Nothing available to this chantier makes the callback fire for any OTHER call, per points
+1–3 above — so the one behaviour change wiring it would actually produce is turning today's
+walls into decisions, dressed as a policy-tightening feature.
+
+**Filed separately, not resolved here**: point 3's own aside — `.claude/settings.json` carries no
+bare `Bash` (92 curated scoped rules instead), but SEVEN of this entry's own EIGHT policies give
+`Bash` bare (STEP_CONTRACTS's PLAN/IMPLEMENT/DIAGNOSE/VALIDATE, and all three of intake.js's
+draftCard/reviewCard/triageBugReport), which enters the CLI as a bare `alwaysAllowRules.cliArg`
+and auto-approves the whole tool regardless of those 92 rules. So for SEVEN of the EIGHT in-code
+tool policies the effective shell boundary is the 14 scoped denies and nothing else; the 92
+curated allow rules bind exactly ONE of the eight — CITATION_VERIFIER, the only policy that omits
+`Bash` entirely. This is a materially bigger gap than the `canUseTool` question (bigger than this
+entry's own first-draft count of "four of five" said, once intake.js's three are counted in) —
+and NOT seven uniform instances of one finding: STEP_CONTRACTS's four run in a DISPOSABLE
+per-issue worktree (PLAN/IMPLEMENT, `cwdKind: 'worktree'`) or the pipeline's own tree
+(DIAGNOSE/VALIDATE, `cwdKind: 'pipeline'`), but all three of intake.js's steps pass `cwd:
+productRepo` (`draftCard`/`reviewCard`/`triageBugReport`, each with its own comment on the call
+site), which `config.js` resolves to `process.env.SPO_PRODUCT_REPO || ~/SPO-WebClient` -- the
+LIVE, PERSISTENT checkout the daemon itself works against, not a disposable one. Of those three,
+`reviewCard` is the SHARPEST single instance, not merely one more of a flat seven: it is the ONE
+intake policy whose `permissionMode` is `default` rather than `plan` (MEASURED,
+`orchestrator/intake.js`'s own three call sites -- `draftCard`/`triageBugReport` are both `plan`,
+read-only-enforced; `reviewCard` alone is not), so its bare `Bash` is not even backed by the
+read-only posture the other two at least declare: it combines bare `Bash`, a non-read-only
+`permissionMode`, the live `productRepo` checkout, AND the heaviest model/effort pairing of the
+three (`fable`/`high`, against `draftCard`'s `sonnet`/`medium` and `triageBugReport`'s
+`opus`/`medium`) in one policy. `config.js`'s own comment on that constant already records a scar
+from something writing there unintentionally
+(a mutation-testing round on 2026-08-31 left 44 fixture-named worktrees and 61 branches inside the
+live product repo). A bare-`Bash` grant landing in that shared, persistent tree is a different,
+and worse, instance of this gap than one landing in a worktree FINISH later deletes or in the
+pipeline's own tree -- filed as its own card; this entry only points at it.
+
+**A test-suite note, so a future red run is not misread**: every shadow-probe test named above is
+written to PASS today and FAIL the day any of the eight policies ever gains a scoped `allowedTools`
+entry — the SDK's shadowing rule stops applying once one does (`test/sdk-call-options.test.js`'s
+"omits a SCOPED allowedTools entry" test proves the probe discriminates bare from scoped, not
+"always warns"). That is by design: a red result there means this ruling's premise changed and
+this entry needs re-reading, not that the suite or the SDK regressed.
+
+**What DOES satisfy the card's Done means** ("per-step tool and permission policy is expressed in
+code and covered by the suite") **is what A3 already built for STEP_CONTRACTS's five, now extended
+to intake.js's three** (M15, verifier fix pass — the card's own clause covers all in-code tool
+policy, and intake.js's three were previously covered by nothing but the doc-parity sweep):
+`test/sdk-call-options.test.js` now asserts, by name, over all eight policies: only IMPLEMENT's
+grants one of the CLI's own dedicated write tools (`Write`/`Edit`/`MultiEdit`/`NotebookEdit` —
+MEASURED against the installed binary's own `uWe`/`fAt` write-tool set, not a guessed
+`['Edit','Write']` pair, and stated honestly as NOT a general write-capability check: every other
+policy also declares bare `Bash`, which a tool-name whitelist cannot characterize); no policy's
+`permissionMode` is `bypassPermissions`, and each matches this BUILD's own chosen default exactly
+(`plan`/`acceptEdits`/`default`/`default`/`default`/`plan`/`default`/`plan` — stated as this
+build's own inferred default, per step-contracts.js's own header, never as something either
+spec/README document fixes a value for); and no policy declares `Task` OR its CLI-canonical alias
+`Agent`. Intake.js's three are read from its own source text (no accessor exists there the way
+`resolveStepContract` is one for STEP_CONTRACTS), so a future edit to any of the eight is caught by
+a named test instead of only the doc-parity sweep.
+
+**A9's transcript walk (2026-09-21, card #239) — the CHILD half, measured, NOT answered.**
+Method: `listCandidateFiles` from `console/usage-scan.js` itself (so the `<sessionId>/subagents/`
+subdirectory a flat readdir misses is included) over both pool accounts' `projects/` trees, each
+subagent transcript attributed to its parent session by the parent's own first user message (the
+`# PLAN` / `# IMPLEMENT` / `# triage-bug-report` heading). MEASURED: 131 subagent transcripts, 67
+distinct parent sessions (the `Agent`/`Task` spawns in those parents: 128 `Explore`, 1
+`general-purpose`, 1 `Plan`, 1 default), 4,924 subagent `tool_use` calls — `Bash` 3,834, `Read`
+792, `Grep` 255, `Edit` 31, `Glob` 12. Against each parent step's declared set (PLAN
+`Read/Grep/Glob/Bash`; IMPLEMENT plus `Edit/Write`; triage `Read/Grep/Glob/Bash`): **zero**
+subagent calls name a tool outside it, so there is **no** call that returned a result where the
+parent's set would have refused — and none that was refused either. This is a corpus-wide ABSENCE
+and is weak evidence, not a negative finding. It is NOT that the corpus could not have shown an
+escape: `Explore`'s tool set includes `WebFetch`/`WebSearch` (`Edit`/`Write`/`NotebookEdit`
+and `Agent` are among the excluded ones, per the agent-type listing), and none of the 131 transcripts contains a `tool_use` naming either —
+the subagents simply never tried. The method can see a refusal, though the evidence is thinner than
+first written. Parent-level `WebFetch` calls: three `tool_use`s in two sessions. In the first
+(`pool1/projects/-home-crazz-SPO-Pipeline-worktrees-issue-486/1e734be4-…`) two were refused by two
+DIFFERENT layers — one `Claude requested permissions to use WebFetch, but you haven't granted it
+yet.` (that string appears twice on one line: the `tool_result` and its `toolUseResult` echo, so it
+is ONE refusal) and one `denied by the Claude Code auto mode classifier`. In the second
+(`pool2/…issue-516/61e17910-…`) the call was not refused at all: it reached the network and failed
+`connect ECONNREFUSED`. Both sessions ran under TODAY'S PLAN `permissionMode` (`'plan'` -- both
+transcripts record it, and `step-contracts.js`'s PLAN value has been `'plan'` since 2026-08-29,
+before either session), on the PRE-cutover CLI transport, with the auto-mode classifier active
+inside plan mode. And it is the SAME URL in both: blocked by the classifier in issue-486 and let
+through to the network in issue-516, a day apart, under the same permission mode. So they DO speak
+to PLAN's policy -- the classifier's verdict on an identical call is not stable -- and say nothing
+about the SDK transport's own permission layer, which neither session ran through. One subagent transcript
+(`779d6fec-…/subagents/agent-a417d3697efc32ad1`, an IMPLEMENT parent) shows a path-scoped
+`requested permissions to write to …/.claude/agents/card-reviewer.md` refusal, i.e. a subagent's
+own call does reach a permission gate. That last one proves the gate is there, not that
+`allowedTools` membership feeds it: `Edit`/`Write` were in that parent's declared set. Every
+transcript walked predates the SDK cutover (mtimes 2026-08-30 to 2026-09-16; `abf11db` landed
+2026-09-17), so this says nothing about the SDK transport's own subagent handling.
+
+**What would answer it**: one deliberate probe — a PLAN-shaped `query()` whose prompt makes an
+`Explore`/`general-purpose` subagent attempt `WebFetch` (or `Write`) — one call, worth spending only
+if the answer would change what PLAN may declare; it is filed here, not run. Its limit, stated
+now: it answers the PRACTICAL question (can a subagent escape PLAN's set?) only if the call
+RETURNS A RESULT. A refusal is ambiguous about mechanism — the two hypotheses this entry frames
+(`cliArg` inheritance versus an agent's own `tools` overriding) both predict a refusal for some
+tool, and the parent's own denials above already came from two different layers — so a refusal
+would close the practical question the other way without ever choosing between them.
+
+**Not closed by this entry**: (a) the subagent question's CHILD half — whether a spawned
+subagent's own nested tool calls are gated by the parent's `allowedTools` — walked by A9 (above)
+and still open, with the one probe that would close it named; (b) whether the sibling card's bare-`Bash`-vs-
+scoped-settings.json gap is worth closing, and how; (c) the "editing `.claude/settings.json`"
+lever itself, which this action cannot pull and does not recommend pulling. All three are the
+maintainer's call, not a builder action's.
+
+## 17 · A9's sibling grep and the two mechanical checks it earned (card #239), 2026-09-21
+
+**Rule B — a pin's closing testimony must name the pin's own line.** `test/doc-constant-sweep.test.js`
+proved an `EXPECTED_CITATIONS` key *points* at a real line and never that the sentence describing
+the pin is true. Measured at A9's start: 8 of 96 entries had a correct key and a closing
+`content byte-identical at :M` clause naming a different line (0 after the fix). Three of the eight
+(`auto-triage.js → park-loop.js:1569`, `auto-triage.js → state-machine.js:3436`,
+`state-machine.js → park-loop.js:1457`) already existed at `41fb081`, the merge before this
+chantier: the class predates the card that found it. The check is `pinTestimonyOffenders`, the LAST
+clause only — earlier hop-history is legitimate (the naive "no foreign line number" rule fired on
+37 of 48 entries, every one a false positive, per the Opus verifier that measured it). Known limit: it reads the registry's own source lines, so it
+needs one entry per line; the same test asserts the keys it extracts deepEqual `EXPECTED_CITATIONS`
+so a reformatted entry fails loudly instead of leaving the check.
+
+**Still open, deliberately: `.yml` citations are resolver-invisible.** `CITATION_RE` matches
+`js|md|sh|ts|json` only. Exactly three `file.yml:N` citations existed (`orchestrator/sdk.js:11`,
+`test/sdk-loader.test.js:123`, a mention in `test/doc-constant-sweep.test.js`'s CORPUS_FILES
+comment), all `.github/workflows/gate.yml:9-12`; this section's own mention makes four, verified by hand this pass (that range still
+opens `Deterministic by construction`). Widening the regex is a change to `test/citation-pins.js`, whose
+extractor `doc-constant-sweep` and `test-comment-citation-sweep` both use; for three citations it
+was not done here, and not measured beyond counting them.
+
+**`orchestrator/live-progress.js` is now in `CORPUS_FILES`** (70 files): it names four other
+modules, holds zero `file:N` citations today (measured), and registering costs no
+`EXPECTED_CITATIONS` row. Planting `orchestrator/journal.js:99999` in its header turns test 21
+("every file:line citation ... resolves") red by name. Not every module is in the corpus; this one
+carries cross-file claims about the transport, which is what earns a place.
+
+**The sibling grep.** Scope: `doc/ prompts/ orchestrator/ bin/spo console/ scripts/ accounts/
+.github/ README.md CLAUDE.md test/ vendor/claude-agent-sdk/README.md`, excluding the dated
+records §15 category 1 names. Claims this chantier corrected, old phrasing → new phrasing:
+
+- *Transport* (`claude -p`, `spawnSync`+claude, `buildArgv`, `--output-format json`, "parses
+  stdout") → `query()`: §15 did the first pass. A9 additionally fixed `README.md` (headless
+  `claude -p` intro, the "every `claude -p` step" bullet), `steps/llm.js`'s file title,
+  `prompt-template.js`, `orchestrator/README.md`'s PLAN-reuse sentence, and `steps/sdk-call.js`'s
+  three explicit "today's `claude -p` transport" lines plus a header note that its other
+  "today's transport" wording means the pre-cutover one (rewriting all ~14 was judged riskier than
+  one note — recorded, not silently kept).
+- *Deadline* (`spawnSync` `timeout` bounds LLM steps) → abort timer: `orchestrator/README.md`
+  (`LLM_STEP_DEADLINE_MS` bullet, the "Deadline handling" paragraph) and `doc/state-machine-spec.md`
+  (the `duration_s` sentence) corrected; the `commandTimeoutsMs` sentences describe SCRIPTED
+  spawns, which really are `spawnSync`, and stay.
+- *Live progress* (transcript chain → `live-progress.json`): `README.md` and
+  `console/render-deck.js` corrected; `console/serve.js`, `console/live-step.js`,
+  `orchestrator/README.md` were already right.
+- *`killedByDeadline`* → `timedOut`: `orchestrator/README.md` and `steps/scripted.js`. It was a
+  local variable in `steps/llm.js` (`3396eae`), gone before this chantier (absent at `41fb081`).
+- *No `package.json`* → root only, `vendor/` explained: `scripts/gate.sh`, `.github/workflows/gate.yml`,
+  `orchestrator/README.md`'s "zero dependencies", `doc/operating.md` (deploy carries `vendor/`
+  with no extra step; measured with the two commands `scripts/release.sh` cuts a release by).
+- *Token recovery kept* (A7) and *`canUseTool` ruled against* (A8): grep of `token-recovery`,
+  `maybeRecoverTokens`, `canUseTool`, `permission-prompt-tool` finds no doc still claiming the
+  recovery path is removed, and `canUseTool` outside `doc/accepted-gaps.md` and its own tests.
+
+**Left alone, on purpose, each with its reason:** `doc/state-machine-spec.md`'s step-table
+`claude -p` labels (§15 category 3, unchanged: a kind label, not a mechanism claim); `doc/driver-wait-protocol.md`'s quote of "disposition 6" (a dated quotation of an
+older document, not a present claim); `orchestrator/config.js`'s "verified by running `claude -p`
+in `worktrees/issue-640`" (a dated measurement of what actually ran); `E2BIG` as the example of a
+call `claude` never started in `tokens.js`/`task-summary.js`/`bin/spo` (the class survives via
+ENOENT/EACCES, and `orchestrator/README.md` states plainly that a prompt can no longer reach it);
+`orchestrator/README.md`'s inline-cap "checked before every spawn ... `spawnSync` is synchronous"
+(describes the SCRIPTED spawns the cap wraps; the LLM half is described in the paragraph above it).
+## 18 · Bare `Bash` in 7 of 8 tool policies — what card #240 closed, and what it did not, 2026-09-22
 
 **What this supersedes.** Card #239's action A8 (2026-09-17) established the finding and filed it
 as issue #240: seven of the eight in-repo tool policies declare bare `Bash`, which the CLI reads as
@@ -819,10 +1379,15 @@ an allow rule covering the whole tool ("Any Bash command"), so `.claude/settings
 `Bash(...)` allows bound **exactly one** policy — CITATION_VERIFIER, the only contract that omits
 `Bash` — and for the other seven the effective shell boundary was the 14 scoped denies alone. That
 finding stands unchanged and is *not* restated here. Issue #240's "Done means" points at
-"`doc/accepted-gaps.md` entry 16"; **no entry 16 exists or existed** — this register ran `## 1`
-through `## 11` on the day the issue was written and this section is the entry that discharges
-that line. What follows is what card #240 added on top: the measurement, the decision, and the
-residual surface the fix deliberately leaves open.
+"`doc/accepted-gaps.md` entry 16"; **on main, where this section was written, no entry 16
+existed** — that register ran `## 1` through `## 11` on the day the issue was written, so this
+section is the entry that discharged that line there. This merge changes that: the combined
+register now has an entry 16 (`## 16`, action A8's own `canUseTool`-rejection write-up,
+chantier-side, also 2026-09-17) — the same entry issue #240's own opening paragraph already cites
+for the A8 measurement's full trace. It is not a second copy of this section, and this section is
+still the write-up that discharges the "Done means" line — entry 16 was never rewritten to hold
+the fix decision itself. What follows is what card #240 added on top: the measurement, the
+decision, and the residual surface the fix deliberately leaves open.
 
 **The measurement (2026-09-22).** Source: every pool-account transcript,
 `~/.claude-accounts/pool{1,2}/projects/**/*.jsonl` — 1520 files, of which 1379 carry a prompt whose

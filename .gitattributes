@@ -1,0 +1,31 @@
+# .gitattributes -- card #239's chantier, action A1 fix pass (F12).
+#
+# vendor/claude-agent-sdk/{sdk.mjs,package.json,LICENSE.md} are a third-party, minified vendor
+# drop (see orchestrator/sdk.js's header and vendor/claude-agent-sdk/README.md for provenance) --
+# nobody reviews a diff of sdk.mjs line-by-line, and `git diff`/`git log -p` doing so anyway is
+# pure noise: it is a 1,556,674-byte, largely single-line file that would otherwise be diffed and
+# language-classified like this repo's own hand-written code.
+#
+# `-diff` -- suppresses line-by-line diffing for this path (git shows "Binary files differ" or an
+# equivalent instead); a real change still shows up as a changed file, just not expanded inline.
+# `linguist-vendored` -- the GitHub Linguist convention (recognized by GitHub's own UI and by
+# other tools that read .gitattributes for language stats) marking a path as vendored code, so it
+# is excluded from the repo's language breakdown and from "changed files" review defaults that key
+# off Linguist's vendored classification.
+#
+# Deliberately scoped to `vendor/**`, not the whole repo: this repo's own code should never get
+# either treatment, and a future addition under `vendor/` (see doc/accepted-gaps.md §1's
+# "Vendored or generated files" bucket) inherits this rule automatically without a second edit.
+vendor/** -diff linguist-vendored
+
+# Exception, added in this fix pass (R3): vendor/claude-agent-sdk/README.md is THIS repo's own
+# prose, not a vendored third-party file (see that file's own top section, and F6/doc/
+# remediation-plan-2026-08.md's execution rule 6, which puts it IN sibling-grep scope for exactly
+# this reason). Git attributes apply last-match-wins within a file, so a later, more specific
+# pattern overrides the blanket rule above for this one path. MEASURED (2026-09-17): without this
+# line, `git check-attr diff -- vendor/claude-agent-sdk/README.md` read "unset" -- suppressing
+# line-by-line diff on the one file in this directory that F6 explicitly declared reviewable, so a
+# future correction to its md5/byte-count/version claims would have shown as "Binary files differ"
+# instead of a real diff. `linguist-vendored` is left negated too, for the same reason: GitHub's
+# language stats and "vendored" review defaults should see this file as ordinary repo prose.
+vendor/**/README.md diff -linguist-vendored

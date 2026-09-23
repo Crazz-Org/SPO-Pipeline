@@ -26,9 +26,21 @@ const {
   INTAKE_BASH_DENY,
 } = require('../orchestrator/bash-policy');
 const { STEP_CONTRACTS, resolveStepContract } = require('../orchestrator/step-contracts');
-const { buildArgv } = require('../orchestrator/steps/llm');
+// Merge note (chantier/sdk-transport + main, 2026-09-23): this file originally imported
+// `buildArgv` from `orchestrator/steps/llm` -- the OLD spawnSync/`claude -p` transport's argv
+// builder. Card #239's action A5b (2026-09-17, landed on this branch before card #240 existed on
+// main) deleted `buildArgv` outright; `orchestrator/steps/sdk-call.js`'s `buildQueryOptions` is
+// the only transport left, and now the only place `disallowedTools` is proven to reach the real
+// call (added by this same merge -- buildQueryOptions had never carried it before, since A5b
+// predates card #240). The three tests below that used to call `buildArgv` directly now call
+// `buildQueryOptions` instead, pinning the SAME properties (CITATION_VERIFIER gets no
+// disallowedTools; a non-empty list reaches the real options; an absent/empty list omits the key)
+// against the mechanism this tree actually runs.
+const { buildQueryOptions } = require('../orchestrator/steps/sdk-call');
 
 const REPO_ROOT = path.join(__dirname, '..');
+const FAKE_EXECUTABLE_PATH = '/fake/bin/claude'; // never resolved for real -- always injected
+const fakeResolver = (returnValue) => () => returnValue;
 
 // ---- a matcher that mirrors what the CLI documents and what the corpus proved ---------------
 //
@@ -275,34 +287,30 @@ test('the host/daemon control surface is denied for every policy that holds Bash
 
 // ---- the two things this card may not change ------------------------------------------------
 
-test("CITATION_VERIFIER's contract is untouched: no Bash, and no --disallowedTools in its argv", () => {
+test("CITATION_VERIFIER's contract is untouched: no Bash, and no disallowedTools in its real call options", () => {
   assert.deepEqual(STEP_CONTRACTS.CITATION_VERIFIER.allowedTools, ['Read', 'Grep']);
   assert.equal(STEP_CONTRACTS.CITATION_VERIFIER.disallowedTools, undefined);
 
   const contract = resolveStepContract('CITATION_VERIFIER', {});
   assert.equal(contract.disallowedTools, undefined);
-  const argv = buildArgv({
-    promptText: 'x',
-    model: contract.model,
-    effort: contract.effort,
-    allowedTools: contract.allowedTools,
-    disallowedTools: contract.disallowedTools,
-    permissionMode: contract.permissionMode,
-  });
-  assert.equal(argv.includes('--disallowedTools'), false);
-  assert.deepEqual(argv, [
-    '-p',
-    '--model',
-    contract.model,
-    '--effort',
-    contract.effort,
-    '--output-format',
-    'json',
-    '--allowedTools',
-    'Read Grep',
-    '--permission-mode',
-    'default',
-  ]);
+  const { options } = buildQueryOptions(
+    {
+      promptText: 'x',
+      model: contract.model,
+      effort: contract.effort,
+      allowedTools: contract.allowedTools,
+      disallowedTools: contract.disallowedTools,
+      permissionMode: contract.permissionMode,
+      cwd: '/tmp',
+      account: null,
+    },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+  );
+  assert.equal('disallowedTools' in options, false);
+  assert.equal(options.model, contract.model);
+  assert.equal(options.effort, contract.effort);
+  assert.deepEqual(options.allowedTools, ['Read', 'Grep']);
+  assert.equal(options.permissionMode, 'default');
 });
 
 test('bare `Bash` is still what the other seven policies grant -- this card denied, it did not rescope', () => {
@@ -329,36 +337,38 @@ test('all three intake policies carry INTAKE_BASH_DENY, alongside their unchange
 
 // ---- argv plumbing ---------------------------------------------------------------------------
 
-test('buildArgv: --disallowedTools is space-joined and sits between --allowedTools and --permission-mode', () => {
-  const argv = buildArgv({
-    promptText: 'x',
-    model: 'sonnet',
-    effort: 'medium',
-    allowedTools: ['Read', 'Bash'],
-    disallowedTools: ['Bash(git reset*)', 'Bash(sudo *)'],
-    permissionMode: 'default',
-  });
-  assert.deepEqual(argv, [
-    '-p',
-    '--model',
-    'sonnet',
-    '--effort',
-    'medium',
-    '--output-format',
-    'json',
-    '--allowedTools',
-    'Read Bash',
-    '--disallowedTools',
-    'Bash(git reset*) Bash(sudo *)',
-    '--permission-mode',
-    'default',
-  ]);
+test('buildQueryOptions: a non-empty disallowedTools reaches options.disallowedTools as an array, unjoined', () => {
+  // The OLD transport's buildArgv (deleted by action A5b) had to space-join this into one argv
+  // string by hand. This transport hands the SDK an array instead -- the vendored SDK's own
+  // argv builder does the comma-join itself (measured, vendor/claude-agent-sdk/sdk.mjs:
+  // `if(F.length>0)W.push("--disallowedTools",F.join(","))`) -- so no join belongs here at all.
+  const denyList = Object.freeze(['Bash(git reset*)', 'Bash(sudo *)']);
+  const { options } = buildQueryOptions(
+    {
+      promptText: 'x',
+      model: 'sonnet',
+      effort: 'medium',
+      allowedTools: ['Read', 'Bash'],
+      disallowedTools: denyList,
+      permissionMode: 'default',
+      cwd: '/tmp',
+      account: null,
+    },
+    { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+  );
+  assert.deepEqual(options.disallowedTools, ['Bash(git reset*)', 'Bash(sudo *)']);
+  // Copy, never alias -- the same F4 discipline allowedTools already gets (sdk-call.js's own
+  // comment): orchestrator/bash-policy.js's lists are frozen and shared across every call.
+  assert.notEqual(options.disallowedTools, denyList);
 });
 
-test('buildArgv: an absent or empty disallowedTools omits the flag entirely', () => {
+test('buildQueryOptions: an absent or empty disallowedTools omits the key entirely', () => {
   for (const value of [undefined, [], '']) {
-    const argv = buildArgv({ promptText: 'x', model: 'sonnet', effort: 'medium', disallowedTools: value });
-    assert.equal(argv.includes('--disallowedTools'), false, `flag emitted for ${JSON.stringify(value)}`);
+    const { options } = buildQueryOptions(
+      { promptText: 'x', model: 'sonnet', effort: 'medium', disallowedTools: value, cwd: '/tmp', account: null },
+      { resolveClaudeCodeExecutable: fakeResolver(FAKE_EXECUTABLE_PATH) }
+    );
+    assert.equal('disallowedTools' in options, false, `key present for ${JSON.stringify(value)}`);
   }
 });
 

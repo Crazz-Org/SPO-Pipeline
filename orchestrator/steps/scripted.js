@@ -9,15 +9,20 @@
 // ctx.dryRun (daemon.js's --dry-run flag, real-mode semantics without spawning): every scripted
 // step is "fixture-free assumed success" -- exit 0, no command run -- so a synthetic card can
 // walk the whole lifecycle to DONE with zero subprocesses. This is the scripted-step half of
-// --dry-run; the LLM half (building the filled prompt + argv without spawning `claude`) lives in
+// --dry-run; the LLM half (building the filled prompt + `query()` options, since card #239's
+// transport cutover action A5b, 2026-09-17 -- no argv builder exists any more, see
+// steps/llm.js/sdk-call.js's own headers -- without ever calling `query()`) lives in
 // steps/llm.js's runLlm.
 //
 // Real mode (ctx.shadowMode === false && ctx.dryRun === false, daemon.js's --real flag or a
 // direct unit test): one function per orchestrator state that has scripted work (realWorktree,
 // realCheck, realPushPr, realGate, realCiChecks, realMerge, realFinish below), each building the
-// exact product npm-alias / git / gh argv the state needs, spawning it through the same
-// injectable-runner pattern steps/llm.js already uses (`deps.spawnSync`, production code never
-// passing it -- see invokeClaudeReal), and judging the result on its exit code alone (principle
+// exact product npm-alias / git / gh argv the state needs, spawning it through this file's own
+// injectable-runner pattern (`deps.spawnSync`, production code never passing it) -- the SAME
+// pattern steps/llm.js's invokeClaudeReal used before card #239's transport cutover (action A5b,
+// 2026-09-17); that function now injects `deps.spawn`/`deps.resolveClaudeCodeExecutable` instead
+// (see its own header), a different seam for a different transport, this file's own untouched --
+// and judging the result on its exit code alone (principle
 // 1, doc/state-machine-spec.md). Every spawn journals a compact {state, argv (first 6 tokens),
 // exit, ms} event via appendEvent and appends its stdout (falling back to stderr) tail to
 // journal/<id>/logs/<STATE>.log -- see spawnStep. state-machine.js's handlers dispatch to these
@@ -84,9 +89,11 @@ async function runScripted(ctx, fixtureKey, opts = {}) {
 
 // ---- real mode: shared spawn primitive --------------------------------------------------
 
-// `deps.spawnSync` is the test injection point (same convention as steps/llm.js's
-// invokeClaudeReal) -- production code never passes it, so a real call always spawns the real
-// binary on PATH.
+// `deps.spawnSync` is the test injection point -- production code never passes it, so a real
+// call always spawns the real binary on PATH. This was the same convention steps/llm.js's
+// invokeClaudeReal used too, before card #239's transport cutover (action A5b, 2026-09-17); that
+// function now injects `deps.spawn`/`deps.resolveClaudeCodeExecutable` instead (see its own
+// header) -- a different seam for a different transport, this file's own untouched.
 function runSync(deps, command, args, opts = {}) {
   const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
   return spawnSyncFn(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
@@ -133,11 +140,11 @@ function appendSpawnLog(taskDir, state, header, text) {
 // `status: null` (which a timeout kill also produces) straight to exit 1, indistinguishable
 // from a genuine failure -- so a timeout-killed GATE (exit 1 -> DIAGNOSE) paid a real LLM call
 // to diagnose a hang. `timedOut` is therefore branched FIRST, before the exit mapping, mirroring
-// llm.js's own `killedByDeadline` idiom (not a new third convention -- though that one still
-// carries the `|| (signal && deadlineArmed)` clause corrected here, and is left alone on purpose:
-// its `timedOut` drives intake.js's retry-once-on-the-same-account policy, so it is worth its own
-// corpus pass rather than a ride-along, and `claude` is measurably the wrong child to hit it --
-// it handles SIGTERM and exits 143 rather than dying by signal, so the clause barely fires there).
+// llm.js's own `timedOut` result field (not a new third convention; card #239 A9 corrected this
+// line, which named a `killedByDeadline` that is not a field and was only ever a local variable
+// long since removed). llm.js no longer has the `|| (signal && deadlineArmed)` clause corrected
+// here: invokeClaudeReal aborts a `query()` explicitly rather than through spawnSync's `timeout`,
+// so there is no bare `signal` there to classify -- see that file's own header, § Deadline.
 // A bare `signal` -- an
 // operator's kill, an OOM kill, the SIGTERM a deploy restart sends -- is NOT a timeout, and since
 // the isSpawnTimeout correction it is no longer misreported as one; it gets `killedBySignal`

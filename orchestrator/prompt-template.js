@@ -5,7 +5,7 @@
 // with an HTML-comment header naming its {{placeholders}} and the exact JSON shape expected on
 // stdout -- read that before the body. The body is written directly to the model ..."). That
 // last clause matters here: the header is meta-documentation for whoever is wiring the prompt
-// up (this module, a human skimming prompts/), not part of what a `claude -p` call should ever
+// up (this module, a human skimming prompts/), not part of what an LLM call should ever
 // see -- so the header is stripped before filling, never sent to the model. Filling the whole
 // file (header included) would also self-destruct: the header's own "Placeholders: {{a}} {{b}}
 // ..." line contains every placeholder token too, and substituting it in place would replace

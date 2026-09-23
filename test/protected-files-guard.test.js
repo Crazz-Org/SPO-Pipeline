@@ -54,7 +54,7 @@ const intake = require('../orchestrator/intake');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
-const { writePoolDir, mkTmp } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnDeps, fakeExecDeps } = require('./helpers');
 
 
 function readJournal(taskDir) {
@@ -318,25 +318,37 @@ test('handleIntake: real-flag-required still parks a real-mode card without conf
 // ---- handlePlan: source 'files_to_change' (normal path) ---------------------------------------
 // =============================================================================================
 
-// Same envelope/ctx-building idioms as test/plan-resume.test.js.
-function planReplyEnvelope(planPayload) {
+// Card #239 chantier, action A5b-2: migrated off `deps.spawnSync`'s `{status, stdout: JSON string,
+// stderr, signal}` shape onto `deps.spawn` (test/helpers.js's `fakeSpawnDeps`/`fakeSpawnedChild`) --
+// same seam and idioms as test/llm-real-card.test.js's own `initMessage`/`resultMessage`. A fake
+// `claude` reply is now a stream of stream-json LINES (a `system`/`init` message reporting a
+// session id, then a `result` message carrying `is_error`/`num_turns`/`modelUsage`/`result`), not a
+// single parsed `--output-format json` object.
+function planInitMessage(sessionId = 'sess-protected-files-guard') {
+  return { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] };
+}
+
+function planResultMessage(planPayload, overrides = {}) {
   return {
-    status: 0,
-    stdout: JSON.stringify({
-      result: JSON.stringify(planPayload),
-      is_error: false,
-      num_turns: 1,
-      session_id: 'sess-protected-files-guard',
-      modelUsage: { 'claude-fable-5': { costUSD: 0.001 } },
-      terminal_reason: 'success',
-      api_error_status: null,
-    }),
-    stderr: '',
-    signal: null,
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    num_turns: 1,
+    session_id: 'sess-protected-files-guard',
+    modelUsage: { 'claude-fable-5': { inputTokens: 10, outputTokens: 5 } },
+    result: JSON.stringify(planPayload),
+    ...overrides,
   };
 }
 
-function realPlanCtx({ task, taskDir, worktreePath, spawnSync }) {
+// planReplyLines(planPayload) -- this file's equivalent of the old planReplyEnvelope(): the two
+// stream-json lines a fake `claude` now writes for one PLAN call, handed straight to
+// fakeSpawnDeps([...]) at each call site.
+function planReplyLines(planPayload) {
+  return [planInitMessage(), planResultMessage(planPayload)];
+}
+
+function realPlanCtx({ task, taskDir, worktreePath, spawn }) {
   const accountsDir = mkTmp('spo-pfg-accts-');
   writePoolDir(accountsDir, [{ name: 'default', disabled: false }]);
   return buildCtx(task.id, { ...task, worktreePath }, taskDir, {
@@ -344,7 +356,7 @@ function realPlanCtx({ task, taskDir, worktreePath, spawnSync }) {
     dryRun: false,
     claudeAccountsDir: accountsDir,
     stepDeadlineMs: 30000,
-    deps: { spawnSync },
+    deps: fakeExecDeps({ spawn }),
   });
 }
 
@@ -371,9 +383,9 @@ test('handlePlan: parks plan-requires-protected-files, source "files_to_change",
     check_commands: ['npm run typecheck'],
     files_to_change: ['src/components/Header.tsx', '.claude/settings.json'],
   };
-  const spawnSync = countingSpawn(planReplyEnvelope(dirtyPlan));
+  const { spawn, calls } = fakeSpawnDeps(planReplyLines(dirtyPlan));
   const task = baseTask({ id: 'card-1101', issue: 1101 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   await assert.rejects(
     () => HANDLERS.PLAN(ctx),
@@ -409,7 +421,7 @@ test('handlePlan: parks plan-requires-protected-files, source "files_to_change",
     !parkedEvents.some((e) => e.state === 'PLAN' && e.event === 'invariants-baseline'),
     'buildBaseline must still happen strictly after the guard -- a parking card never pays for it'
   );
-  assert.equal(spawnSync.callCount, 1, 'only the PLAN call itself ran; IMPLEMENT must never have been invoked');
+  assert.equal(calls.length, 1, 'only the PLAN call itself ran; IMPLEMENT must never have been invoked');
 });
 
 test('handlePlan: parks plan-requires-protected-files, source "files_to_change", when a declared file is under .claude/hooks/', async () => {
@@ -423,9 +435,9 @@ test('handlePlan: parks plan-requires-protected-files, source "files_to_change",
     check_commands: ['npm run typecheck'],
     files_to_change: ['.claude/hooks/pre-tool-use.sh'],
   };
-  const spawnSync = countingSpawn(planReplyEnvelope(dirtyPlan));
+  const { spawn, calls } = fakeSpawnDeps(planReplyLines(dirtyPlan));
   const task = baseTask({ id: 'card-1103', issue: 1103 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   await assert.rejects(
     () => HANDLERS.PLAN(ctx),
@@ -440,7 +452,7 @@ test('handlePlan: parks plan-requires-protected-files, source "files_to_change",
   );
 
   assert.ok(fs.existsSync(path.join(taskDir, 'scratch', 'plan-1103.md')));
-  assert.equal(spawnSync.callCount, 1);
+  assert.equal(calls.length, 1);
 });
 
 test('handlePlan: a clean files_to_change is not blocked -- the existing happy path still reaches IMPLEMENT with files written', async () => {
@@ -454,9 +466,9 @@ test('handlePlan: a clean files_to_change is not blocked -- the existing happy p
     check_commands: ['npm run typecheck'],
     files_to_change: ['src/components/Header.tsx'],
   };
-  const spawnSync = () => planReplyEnvelope(cleanPlan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(cleanPlan));
   const task = baseTask({ id: 'card-1102', issue: 1102 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT');
@@ -503,9 +515,9 @@ test('handlePlan: does NOT park when files_to_change is clean but plan_markdown 
     check_commands: ['npm run typecheck'],
     files_to_change: ['src/components/Header.tsx'],
   };
-  const spawnSync = () => planReplyEnvelope(dirtyProsePlan);
+  const { spawn } = fakeSpawnDeps(planReplyLines(dirtyProsePlan));
   const task = baseTask({ id: 'card-1104', issue: 1104 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   const next = await HANDLERS.PLAN(ctx);
   assert.equal(next, 'IMPLEMENT', 'a plan whose PROSE mentions protected paths but whose files_to_change is clean must reach IMPLEMENT');
@@ -529,9 +541,9 @@ function undeclaredPlanCtx(idSuffix, filesToChangeValue) {
   if (filesToChangeValue !== '__omit__') {
     payload.files_to_change = filesToChangeValue;
   }
-  const spawnSync = () => planReplyEnvelope(payload);
+  const { spawn } = fakeSpawnDeps(planReplyLines(payload));
   const task = baseTask({ id: `card-undecl-${idSuffix}`, issue: 1200 + Number(idSuffix.replace(/\D/g, '')) || 1200 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
   return { ctx, taskDir };
 }
 
@@ -655,9 +667,9 @@ test('handlePlan: D1 -- hundreds of protected declared files still yield a park 
     check_commands: ['npm run typecheck'],
     files_to_change: manyFiles,
   };
-  const spawnSync = countingSpawn(planReplyEnvelope(dirtyPlan));
+  const { spawn } = fakeSpawnDeps(planReplyLines(dirtyPlan));
   const task = baseTask({ id: 'card-pathological-many', issue: 9001 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   let caughtDetail;
   await assert.rejects(
@@ -690,9 +702,9 @@ test('handlePlan: D1 -- a single pathologically long declared-file entry still y
     check_commands: ['npm run typecheck'],
     files_to_change: [longEntry],
   };
-  const spawnSync = countingSpawn(planReplyEnvelope(dirtyPlan));
+  const { spawn } = fakeSpawnDeps(planReplyLines(dirtyPlan));
   const task = baseTask({ id: 'card-pathological-long', issue: 9002 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   let caughtDetail;
   await assert.rejects(
@@ -787,10 +799,10 @@ function jsonStringPlanCtx(idSuffix, filesToChangeJson, extra = {}) {
     files_to_change: filesToChangeJson,
     ...extra,
   };
-  const spawnSync = countingSpawn(planReplyEnvelope(payload));
+  const { spawn, calls } = fakeSpawnDeps(planReplyLines(payload));
   const task = baseTask({ id: `card-wire-${idSuffix}`, issue: 1300 });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
-  return { ctx, taskDir, spawnSync, payload };
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
+  return { ctx, taskDir, calls, payload };
 }
 
 // THE regression test for #118. Before the fix this exact input reached IMPLEMENT: Array.isArray
@@ -799,7 +811,7 @@ function jsonStringPlanCtx(idSuffix, filesToChangeJson, extra = {}) {
 // specifies, which is the trap the card flagged as assumed-but-unpinned.
 test('handlePlan: files_to_change as a JSON-ENCODED STRING naming .claude/settings.json parks plan-requires-protected-files (the #118 regression -- the shape 93/93 real replies sent pre-#229)', async () => {
   const declared = ['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/components/Header.tsx', '/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/settings.json'];
-  const { ctx, taskDir, spawnSync } = jsonStringPlanCtx('settings', JSON.stringify(declared));
+  const { ctx, taskDir, calls } = jsonStringPlanCtx('settings', JSON.stringify(declared));
 
   await assert.rejects(
     () => HANDLERS.PLAN(ctx),
@@ -815,7 +827,7 @@ test('handlePlan: files_to_change as a JSON-ENCODED STRING naming .claude/settin
     }
   );
 
-  assert.equal(spawnSync.callCount, 1, 'IMPLEMENT must never have been invoked');
+  assert.equal(calls.length, 1, 'IMPLEMENT must never have been invoked');
   const events = readJournal(taskDir);
   assert.ok(
     !events.some((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared'),
@@ -925,9 +937,9 @@ test('handlePlan: a REUSED plan whose declaration names a protected file parks i
     baseMainSha: 'sha-X',
     filesToChange: JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/settings.json']),
   });
-  const spawnSync = countingSpawn(planReplyEnvelope({ ok: true, plan_markdown: 'must not be read', invariants_markdown: 'must not be read' }));
+  const { spawn, calls } = fakeSpawnDeps(planReplyLines({ ok: true, plan_markdown: 'must not be read', invariants_markdown: 'must not be read' }));
   const task = baseTask({ id: 'card-1400', issue: 1400, baseMainSha: 'sha-X' });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   await assert.rejects(
     () => HANDLERS.PLAN(ctx),
@@ -940,7 +952,7 @@ test('handlePlan: a REUSED plan whose declaration names a protected file parks i
       return true;
     }
   );
-  assert.equal(spawnSync.callCount, 0, 'a reuse never calls the LLM -- not even to park');
+  assert.equal(calls.length, 0, 'a reuse never calls the LLM -- not even to park');
 
   const events = readJournal(taskDir);
   assert.ok(events.some((e) => e.event === 'plan-reused'), 'the run really did take the reuse path');
@@ -957,21 +969,21 @@ test('handlePlan: a REUSED plan with a clean declaration still reaches IMPLEMENT
     baseMainSha: 'sha-X',
     filesToChange: JSON.stringify(['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/components/Header.tsx']),
   });
-  const spawnSync = countingSpawn(planReplyEnvelope({ ok: true, plan_markdown: 'must not be read', invariants_markdown: 'must not be read' }));
+  const { spawn, calls } = fakeSpawnDeps(planReplyLines({ ok: true, plan_markdown: 'must not be read', invariants_markdown: 'must not be read' }));
   const task = baseTask({ id: 'card-1401', issue: 1400, baseMainSha: 'sha-X' });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
-  assert.equal(spawnSync.callCount, 0);
+  assert.equal(calls.length, 0);
 });
 
 test('handlePlan: a REUSED plan that declares nothing at all journals plan-files-undeclared with reused:true, and still reaches IMPLEMENT', async () => {
   const taskDir = mkTmp('spo-pfg-reuse-undecl-');
   const worktreePath = mkTmp('spo-pfg-reuse-undecl-wt-');
   priorPlanRun(taskDir, { baseMainSha: 'sha-X', filesToChange: undefined });
-  const spawnSync = countingSpawn(planReplyEnvelope({ ok: true, plan_markdown: 'x', invariants_markdown: 'y' }));
+  const { spawn } = fakeSpawnDeps(planReplyLines({ ok: true, plan_markdown: 'x', invariants_markdown: 'y' }));
   const task = baseTask({ id: 'card-1402', issue: 1400, baseMainSha: 'sha-X' });
-  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawnSync });
+  const ctx = realPlanCtx({ task, taskDir, worktreePath, spawn });
 
   assert.equal(await HANDLERS.PLAN(ctx), 'IMPLEMENT');
   const ev = readJournal(taskDir).find((e) => e.state === 'PLAN' && e.event === 'plan-files-undeclared');

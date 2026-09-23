@@ -67,8 +67,8 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    the driver re-resolving anchors.
 6. **The sibling grep** (action 7bis.6). Any action that corrects a factual claim greps
    **both** the corrected phrasing and the pre-correction phrasing across `doc/`, `prompts/`,
-   `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`, `.github/`, `README.md` and
-   `CLAUDE.md` before
+   `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`, `.github/`, `README.md`,
+   `vendor/**/README.md` and `CLAUDE.md` before
    committing, and reports what
    it found; its Opus verifier checks that it did, and treats "I corrected it in the file the
    action names" as an incomplete answer. This is enforced by rule 2 — a human-and-verifier
@@ -105,6 +105,22 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
    business of contradicting them. **The generalisation now has two instances, so state it as a
    standing obligation rather than a lesson: an exclusion's *reason* is as perishable as the claim
    it excludes, and re-checking the list means re-checking the reasons, not just the entries.**
+
+   **Amended 2026-09-17: the scope list above now names `vendor/**/README.md` explicitly; the**
+   **three vendored files themselves stay OUT.** Card #239's chantier added
+   `vendor/claude-agent-sdk/` — three third-party files (`sdk.mjs`, `package.json`, `LICENSE.md`,
+   copied in from `npm install @anthropic-ai/claude-agent-sdk`, never `npm install`ed inside this
+   repo — see `orchestrator/sdk.js`'s header) plus one file this repo itself wrote,
+   `vendor/claude-agent-sdk/README.md` (provenance: byte count, md5, license summary, update
+   ritual). The two halves are not one decision. The three vendored files correct no claim of
+   their own — there is no "old phrasing" for a sibling grep to ever chase in code this repo did
+   not author — so they are named in `doc/accepted-gaps.md` §1's out-of-scope list instead, under
+   "Vendored or generated files," with the measurement (a planted-offender probe, not a
+   before/after failure count — see that entry) that none of the three enters any sweep's corpus.
+   `vendor/claude-agent-sdk/README.md` is the opposite case: it is this repo's own prose, making
+   its own factual claims (a byte count, an md5, a version pair) exactly like any other doc this
+   rule already covers — so it is IN the scope list above, not excluded, and a future correction
+   to its claims greps it like any other file named there.
 
 ---
 

@@ -243,8 +243,11 @@ function readLabels(poolDir) {
 
 // Installs one permission policy as the USER-tier settings of every account in the pool.
 //
-// WHY this exists: steps/llm.js spawns `claude -p` with CLAUDE_CONFIG_DIR set to the account's
-// own directory, so the machine's ~/.claude/settings.json is never read by a pipeline step --
+// WHY this exists: steps/llm.js's invokeClaudeReal calls the vendored Agent SDK's `query()` with
+// `options.env.CLAUDE_CONFIG_DIR` set to the account's own directory (sdk-call.js's buildEnv --
+// the OLD transport set the same variable on a spawned `claude -p` child's env; the cutover moved
+// the plumbing, not the effect), so the machine's ~/.claude/settings.json is never read by a
+// pipeline step --
 // an account directory IS its own user-settings tier, and an unsynced one has no rules at all.
 // Today every step happens to land in a directory that carries a project policy (the pipeline
 // root or a product worktree), which masks the gap; a step whose cwd has no .claude/settings.json

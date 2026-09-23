@@ -33,7 +33,12 @@
 // (intake.js's callIntakeStepWithRotation, reached from auto-triage) measured at 3-3.5 minutes on
 // the live daemon's own journal -- long enough that running the scans inside the dispatcher's own
 // loop would freeze worker-slot refills, timer service, and SIGTERM handling for that whole
-// window (see dispatcher.js's header for the full measurement). So the scans now run in a
+// window (see dispatcher.js's header for the full measurement). STALE SINCE, NOT RE-VERIFIED
+// (card #239 chantier, action A5b, 2026-09-17): that call is no longer a blocking `spawnSync` --
+// `invokeClaudeReal` now drives the vendored Agent SDK's `query()`, an AWAITED ASYNC call that
+// yields the event loop rather than freezing it; the 3-3.5 minute cost is still real, whether it
+// still justifies this process split is a maintainer DECISION this fix pass frames, not resolves.
+// So the scans now run in a
 // SEPARATE, long-lived SCANNER process (daemon.js --scanner, state-machine.js's runForever) that
 // the dispatcher spawns and supervises, and "not owned by a live worker" -- case (b)'s own
 // sub-question -- is something the scanner's own process CANNOT answer from memory: the
