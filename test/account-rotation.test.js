@@ -142,15 +142,25 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
   // internal `now` snapshot (markLimit persists them), so comparing the two fields PRODUCTION wrote
   // against each other establishes the identical "1-hour probe tier, not the 5-hour escalated one" fact
   // exactly, with no clock read on the test's own side at all.
+  // card #167: the cooldown lands under the model this step actually ran on -- the task's
+  // `llm.PLAN.model` override ('fable'), which is what steps/llm.js's resolveCallModel resolves
+  // and therefore what callLlmStep leased and cooled. Reading it from `byModel.fable` rather
+  // than from a flat field is the whole point: acct-a's SONNET quota is untouched below.
+  const fable = state['acct-a'].byModel.fable;
   assert.equal(
-    typeof state['acct-a'].lastUsageLimitAt,
+    typeof fable.lastUsageLimitAt,
     'number',
     'a first usage hit must record lastUsageLimitAt'
   );
   assert.equal(
-    state['acct-a'].cooldownUntil,
-    state['acct-a'].lastUsageLimitAt + accounts.USAGE_PROBE_COOLDOWN_MS,
+    fable.cooldownUntil,
+    fable.lastUsageLimitAt + accounts.USAGE_PROBE_COOLDOWN_MS,
     'a first 429 must cool the account for exactly the 1-hour probe tier, anchored to its own lastUsageLimitAt'
+  );
+  assert.deepEqual(
+    Object.keys(state['acct-a'].byModel),
+    ['fable'],
+    'card #167: a fable limit must not cool this account for any other model'
   );
   assert.ok(!state['acct-b'], 'acct-b should not be cooling');
 
@@ -191,8 +201,12 @@ test('429 (usage limit) through callLlmStep on an account whose PROBE already ex
   // landing between this read and pick()'s own could make pick() still read acct-a as cooling,
   // throw AllAccountsCoolingError before markLimit ever runs, and fail this test's assertions below
   // for a reason that has nothing to do with escalation.
+  // card #167: seeded under byModel.fable -- the model this task's `llm.PLAN` override runs on,
+  // and therefore the quota whose escalation history decides the tier below. A flat pre-#167
+  // entry here would carry no model attribution at all and would (correctly) read as "nothing on
+  // record", probing at 1h instead of escalating -- see accounts.js's own header.
   accounts.writeState(accountsDir, {
-    'acct-a': { cooldownUntil: now - 3600_000, lastUsageLimitAt, usageLimitStreak: 1 }, // already expired -> pick()-able
+    'acct-a': { byModel: { fable: { cooldownUntil: now - 3600_000, lastUsageLimitAt, usageLimitStreak: 1 } } }, // already expired -> pick()-able
   });
 
   const ctx = makeCtx({
@@ -211,11 +225,11 @@ test('429 (usage limit) through callLlmStep on an account whose PROBE already ex
   // cooldownUntil = now + ms, lastUsageLimitAt = now), instead of comparing against this test's
   // own `now` -- which was captured before the call and is not what markLimit actually read.
   assert.equal(
-    state['acct-a'].cooldownUntil,
-    state['acct-a'].lastUsageLimitAt + accounts.USAGE_ESCALATED_COOLDOWN_MS,
+    state['acct-a'].byModel.fable.cooldownUntil,
+    state['acct-a'].byModel.fable.lastUsageLimitAt + accounts.USAGE_ESCALATED_COOLDOWN_MS,
     'must escalate to exactly the 5h tier, anchored to its own lastUsageLimitAt'
   );
-  assert.equal(state['acct-a'].usageLimitStreak, 2);
+  assert.equal(state['acct-a'].byModel.fable.usageLimitStreak, 2);
 
   const journalLines = fs
     .readFileSync(path.join(taskDir, 'journal.jsonl'), 'utf8')
@@ -286,10 +300,11 @@ test('529 (overloaded) on the first account cools it for 5 minutes only, and rot
   assert.ok(cooldownEvent, 'expected an account-cooldown journal event');
   assert.equal(cooldownEvent.account, 'acct-a');
   assert.equal(
-    state['acct-a'].cooldownUntil,
+    state['acct-a'].byModel.fable.cooldownUntil,
     cooldownEvent.cooldownUntil,
     'the persisted cooldown must be exactly the one the journalled event reported'
   );
+  assert.equal(cooldownEvent.model, 'fable', 'card #167: the event names the model that was cooled');
   assert.equal(cooldownEvent.cooldownMs, accounts.OVERLOADED_COOLDOWN_MS);
 });
 

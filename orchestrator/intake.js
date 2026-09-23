@@ -43,7 +43,10 @@ const { leaseHealthyAccount } = require('./account-lease');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
-const { OPUS_5_5 } = require('./step-contracts');
+// card #167: INTAKE_MODELS lives in step-contracts.js (see its own comment there for why not
+// here) -- this file consumes it at each step's opts AND at callIntakeStepWithRotation's
+// lease/markLimit, and re-exports it below.
+const { INTAKE_MODELS } = require('./step-contracts');
 const { appendDaemonEvent } = require('./journal');
 const { armTimeout } = require('./command-timeout');
 // Card #240. All three intake steps run against config.productRepo -- `~/SPO-WebClient`, the LIVE
@@ -167,9 +170,10 @@ function normalizeExit(result) {
 // auto-triage cycles over 12.8 hours, 128 attempts, every one re-picking the same rate-limited
 // account, because nothing ever cooled it down. This is the fix, mirroring state-machine.js's
 // callLlmStep (see its own header comment) exactly for the pick/call/cool/retry mechanics --
-// pick a healthy account, call, and on a `{kind: 'limit'}` result cool that account down
-// (accounts.markLimit) and pick again, bounded to one pass over the pool's enabled accounts, so
-// a step can never retry the same account twice for a limit and never spins forever.
+// pick a healthy account, call, and on a `{kind: 'limit'}` result cool that account's quota FOR
+// THE MODEL THIS STEP SPENDS down (accounts.markLimit with `opts.model`, card #167) and pick
+// again, bounded to one pass over the pool's enabled accounts, so a step can never retry the same
+// account twice for a limit and never spins forever.
 //
 // action 6.2: "pick" is now account-lease.js's leaseHealthyAccount, not a bare accounts.pick().
 // Under C6 this file's callers (draftCard/reviewCard/triageBugReport) run in the SCANNER process
@@ -202,7 +206,8 @@ function normalizeExit(result) {
 // `timedOut === true` retries ONCE on the SAME account/deadline (a deadline kill says nothing
 // about account health -- see triageBugReport's own comment on why). Only once that inner retry
 // is exhausted does `kind` decide whether to rotate: a `{kind: 'limit'}` result (from either the
-// first call or the timeout retry) cools the account and moves to the next one; anything else
+// first call or the timeout retry) cools that account FOR THIS STEP'S MODEL (card #167) and moves
+// to the next one; anything else
 // returns immediately, rotation never considered. One account attempt therefore costs at most
 // TWO invokeClaudeReal calls, and the whole loop at most `enabled accounts * 2` -- the hard
 // bound that matters for an unattended 15-minute timer against a metered API. Note the two
@@ -211,8 +216,18 @@ function normalizeExit(result) {
 // two calls on the account it gave up on, still inside the same bound, and it keeps its
 // `retriedAfterTimeout` record (see the hoist comment inside the loop).
 //
+// card #167: the model each intake step spends is ONE constant per step, INTAKE_MODELS (defined
+// in step-contracts.js, imported above) -- it is needed in TWO places, the `invokeClaudeReal` opts
+// the step builds and the lease/markLimit calls in the rotation loop below, and two literals is
+// one drift away from leasing for one model while cooling another.
+// test/accounts-per-model-cooldown.test.js asserts the model handed to the lease is the same one
+// that reaches the real query() argv's `--model`.
+//
 // `buildOpts(account)` builds the exact `invokeClaudeReal` opts object the caller already built
 // inline, with `account` now supplied by this loop instead of a single `pickAccount()` call.
+// `model` (card #167) is the model every call in this pass will spend -- the caller's own
+// INTAKE_MODELS entry, passed into the lease (so an account cooling on a DIFFERENT model is still
+// usable here) and into markLimit (so a limit cools that model's quota, not the whole account).
 // Returns either {ok: false, error, cooldowns} (pool exhausted or nothing to try), or
 // {raw, account, retriedAfterTimeout, cooldowns} for the caller to finish parsing/validating.
 // journalIntakeLlmCall(deps, opts, raw) -- the intake half of the token ledger. Writes the SAME
@@ -263,7 +278,7 @@ function journalIntakeLlmCall(deps, opts, raw) {
   });
 }
 
-async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
+async function callIntakeStepWithRotation(prefix, deps, buildOpts, model) {
   const accountsDir = (deps && deps.accountsDir) || config.claudeAccountsDir;
   const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
 
@@ -289,6 +304,7 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
         sleep: deps && deps.leaseSleep,
         now: deps && deps.leaseNow,
         isAlive: deps && deps.leaseIsAlive,
+        model, // card #167 -- lease an account healthy for THIS step's model, not for all of them
       });
     } catch (err) {
       if (
@@ -335,13 +351,16 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts) {
       return { raw, account, retriedAfterTimeout, cooldowns };
     }
 
-    const event = accounts.markLimit(accountsDir, account.name, raw.limitKind);
+    // card #167: cool the model this step actually spent, not the whole account -- the same
+    // `model` the lease above asked for, so the two can never describe different quotas.
+    const event = accounts.markLimit(accountsDir, account.name, raw.limitKind, Date.now(), { model });
     cooldowns.push({ account: account.name, ...event });
   }
 
   // R6 (F3): name a wall-clock time in the exhaustion string, not just an account count -- same
   // fix as state-machine.js's callLlmStep (see its own comment on lastCooldownUntilIso for why
-  // this got worse once R1 made cooldown duration escalate per-account instead of staying flat).
+  // this got worse once R1 made cooldown duration escalate per (account, model) instead of staying
+// flat).
   const lastCooldown = cooldowns.length > 0 ? cooldowns[cooldowns.length - 1] : null;
   const lastDetail = raw ? `${raw.error || raw.result || raw.kind}` : 'no attempts made';
   return {
@@ -387,7 +406,8 @@ function withIntakeRetryAndCooldowns(retriedAfterTimeout, cooldowns) {
 // malformed reply. Result carries `retriedAfterTimeout` on both success and failure.
 //
 // Account rotation: routed through callIntakeStepWithRotation (see its own header) instead of a
-// bare accounts.pick() -- a {kind: 'limit'} result now cools the account and rotates to the next
+// bare accounts.pick() -- a {kind: 'limit'} result now cools this step's model on that account
+// (card #167) and rotates to the next
 // one, bounded to one pass over the pool, instead of re-picking the same limited account forever.
 // Result carries `cooldowns` whenever this call caused at least one.
 async function draftCard(requestText, deps = {}) {
@@ -402,7 +422,7 @@ async function draftCard(requestText, deps = {}) {
 
   const attempt = await callIntakeStepWithRotation('draftCard', deps, (account) => ({
     step: 'DRAFT_CARD',
-    model: 'sonnet',
+    model: INTAKE_MODELS.draftCard,
     effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     disallowedTools: INTAKE_BASH_DENY, // card #240 -- see the note above INTAKE_BASH_DENY's import
@@ -413,7 +433,7 @@ async function draftCard(requestText, deps = {}) {
     cwd: productRepo, // needs Read/Grep over the product tree to find file:line references
     account,
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
-  }));
+  }), INTAKE_MODELS.draftCard);
 
   if (attempt.ok === false) return attempt; // pool exhausted or nothing to try -- see helper header
 
@@ -530,7 +550,7 @@ async function reviewCard(draft, deps = {}) {
   // whenever this call caused at least one.
   const attempt = await callIntakeStepWithRotation('reviewCard', deps, (account) => ({
     step: 'REVIEW_CARD',
-    model: 'fable',
+    model: INTAKE_MODELS.reviewCard,
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'], // review-card.md: "Read, Grep, Glob, Bash(ro)"
     disallowedTools: INTAKE_BASH_DENY, // card #240 -- the "(ro)" above, enforced at the tool layer
@@ -541,7 +561,7 @@ async function reviewCard(draft, deps = {}) {
     cwd: productRepo, // reads the product tree + `gh issue list --repo {{repo}}`
     account,
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
-  }));
+  }), INTAKE_MODELS.reviewCard);
 
   if (attempt.ok === false) return attempt; // pool exhausted or nothing to try -- see helper header
 
@@ -1042,7 +1062,7 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
   // this step, not the shared mechanics.)
   const attempt = await callIntakeStepWithRotation('triageBugReport', deps, (account) => ({
     step: 'TRIAGE_BUG_REPORT',
-    model: OPUS_5_5,
+    model: INTAKE_MODELS.triageBugReport,
     effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     // Card #240. "never file, never post" is exactly what BASH_DENY_REMOTE_WRITES enforces; the
@@ -1055,7 +1075,7 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
     cwd: productRepo, // needs Read/Grep/Bash over the product tree, plus curl/gh
     account,
     deadlineMs: deps.deadlineMs || INTAKE_DEADLINE_MS,
-  }));
+  }), INTAKE_MODELS.triageBugReport);
 
   if (attempt.ok === false) return attempt; // pool exhausted or nothing to try -- see helper header
 
@@ -1466,4 +1486,9 @@ module.exports = {
   // same-account timeout retry) rather than against a number a comment claims -- see
   // test/account-lease.test.js's own derivation test.
   INTAKE_DEADLINE_MS,
+  // card #167: re-exported (defined in step-contracts.js) so a test can assert that the model each
+  // intake step LEASES and COOLS is the same one that reaches the real query() argv -- the
+  // correspondence this constant exists to make unbreakable. See
+  // test/accounts-per-model-cooldown.test.js.
+  INTAKE_MODELS,
 };

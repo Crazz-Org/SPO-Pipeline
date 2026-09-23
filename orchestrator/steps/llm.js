@@ -528,7 +528,7 @@ async function maybeRecoverTokens(result, opts, deps) {
 // has actually observed plus the API's documented error type names", which overstated the
 // evidence for more than one entry below):
 //   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
-//     intake.js:969-971's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     intake.js:989-991's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
 //     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
 //   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
 //     observed as a real reply in this repo; included because it is structured (not free text)
@@ -1019,6 +1019,39 @@ function writeDryRunArtifact(taskDir, stepName, options, promptText) {
   return file;
 }
 
+// resolveCallModel(ctx, stepName) -- WHICH model this step's `query()` call will actually run
+// on (the `--model` value buildQueryOptions puts on the vendored SDK's argv), answered BEFORE the
+// call, from the same two inputs runLlm below answers it from.
+//
+// Card #167 needs this because cooldowns are now per (account, model): state-machine.js's
+// callLlmStep has to lease an account healthy for the model it is about to spend, and cool THAT
+// model's quota when the call comes back `{kind: 'limit'}`. Resolving it there by reaching for
+// the step contract alone would have been wrong, and silently: runLlm has TWO branches, and the
+// legacy `ctx.task.llm.<step>` override branch (hand-authored real-mode task files, and this
+// suite's own account-rotation/llm-real tests) takes its model from the override, NOT from the
+// contract. A callLlmStep that leased for the contract's model while the spawn ran on the
+// override's would cool a quota nobody spent and leave the one that actually limited hot -- the
+// exact class of bug this card exists to remove, reintroduced one layer up.
+//
+// So the precedence here mirrors runLlm's own, branch for branch: an override present at all
+// wins (including one that names no model -- runLlm then puts `model: undefined` in its opts,
+// sdk-call.js's buildQueryOptions drops a falsy model (`if (opts.model)`), no `--model` reaches
+// the argv and the CLI runs its own default; an honest `undefined` here makes markLimit fall back
+// to cooling every model, which is the safe direction). `|| undefined` mirrors that same
+// truthiness test, so an override's empty-string model -- which also sends no `--model` -- cannot
+// cool a key named '' while the default model that really ran stays hot. Otherwise the step
+// contract decides, escalation flags and all.
+//
+// Deliberately NOT called from runLlm's own two branches. Each keeps its own independent
+// expression, so test/accounts-per-model-cooldown.test.js's correspondence check compares two
+// separately-written derivations against each other rather than one function against itself --
+// a single shared helper would agree with itself even after a mutation broke both.
+function resolveCallModel(ctx, stepName) {
+  const override = ctx && ctx.task && ctx.task.llm && ctx.task.llm[stepName];
+  if (override) return override.model || undefined;
+  return resolveStepContract(stepName, (ctx && ctx.task) || {}).model;
+}
+
 async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   if (ctx.shadowMode) {
     const payload = ctx.fixture(fixtureKey, null);
@@ -1351,6 +1384,9 @@ module.exports = {
   withCamelAliases,
   cannedDryRunPayload,
   NONINTERACTIVE_ENV_DEFAULTS,
+  // card #167: exported for state-machine.js's callLlmStep, which must know the model this call
+  // will spend BEFORE it leases an account for it. See the function's own header.
+  resolveCallModel,
   // Exported for test/llm-dryrun-placeholder.test.js's M1/M4 pins (fix pass on card #239's
   // dry-run CI fix) -- those tests read the artifact's displayed executable field back and
   // compare it against this same literal, rather than duplicating the string.

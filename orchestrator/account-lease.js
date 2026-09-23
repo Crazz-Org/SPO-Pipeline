@@ -234,6 +234,20 @@ function releaseLease(poolDir, name, held) {
 //                       reason as `now` above.
 //   isAlive(pid)    -- defaults to lock.js's processAlive. Lets a test simulate a lease held by a
 //                       pid that is/isn't "alive" without spawning a real process for every case.
+//   model           -- card #167. The model this lease's one `claude` call will actually spend,
+//                       threaded straight into accounts.pick's own opts.model so an account
+//                       cooling on a DIFFERENT model is still leasable. Both callers resolve it
+//                       the same way the call itself will: state-machine.js's callLlmStep from
+//                       steps/llm.js's resolveCallModel(ctx, stepName) (runLlm's own two
+//                       branches -- the legacy ctx.task.llm.<step> override, else
+//                       resolveStepContract -- so the lease and the spend can never disagree),
+//                       intake.js from step-contracts.js's INTAKE_MODELS entry for the step, the
+//                       same constant its call opts carry. Omitted (any caller not yet threaded through) keeps
+//                       pick()'s union behaviour -- "is this account cooling at all" -- exactly
+//                       as before. LEASING is untouched by it: a lease is a hold on the ACCOUNT
+//                       (one `claude` process per CLAUDE_CONFIG_DIR at a time), not on a model,
+//                       so `.lease-<name>.json` stays one file per account and two steps wanting
+//                       different models still serialize on the same account.
 //
 // Throws accounts.AllAccountsCoolingError / accounts.NoAccountsRegisteredError immediately (no
 // wait), or accounts.AllAccountsLeasedError once opts.waitMs has elapsed with nothing acquired.
@@ -251,7 +265,7 @@ async function leaseHealthyAccount(poolDir, opts = {}) {
     let account = null;
     let pickErr = null;
     try {
-      account = accountsModule.pick(poolDir, now(), { excludeAccounts });
+      account = accountsModule.pick(poolDir, now(), { excludeAccounts, model: opts.model });
     } catch (err) {
       // Cooling / no-accounts-at-all: never worth waiting on -- propagate straight through,
       // exactly as a bare accounts.pick() call would have. Only AllAccountsLeasedError is ours

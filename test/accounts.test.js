@@ -126,16 +126,23 @@ test("markLimit: first usage limit for an account -> the 1h probe, not the 5h es
   writePoolDir(dir, [{ name: 'acct-a' }]);
 
   const now = 5000;
-  const event = accounts.markLimit(dir, 'acct-a', 'usage', now);
+  // card #167: the model is named, so the cooldown and its escalation history land under
+  // byModel.fable -- the real production shape (state-machine.js through steps/llm.js's
+  // resolveCallModel, intake.js from step-contracts.js's INTAKE_MODELS). The tiers themselves are
+  // unchanged.
+  const event = accounts.markLimit(dir, 'acct-a', 'usage', now, { model: 'fable' });
   assert.equal(event.limitKind, 'usage');
+  assert.equal(event.model, 'fable');
+  assert.deepEqual(event.models, ['fable'], 'a named model cools that model alone');
   assert.equal(event.defaulted, false);
   assert.equal(event.escalated, false);
   assert.equal(event.cooldownMs, accounts.USAGE_PROBE_COOLDOWN_MS);
   assert.equal(event.cooldownUntil, now + accounts.USAGE_PROBE_COOLDOWN_MS);
 
   const state = accounts.readState(dir);
-  assert.equal(state['acct-a'].lastUsageLimitAt, now);
-  assert.equal(state['acct-a'].usageLimitStreak, 1);
+  assert.equal(state['acct-a'].byModel.fable.lastUsageLimitAt, now);
+  assert.equal(state['acct-a'].byModel.fable.usageLimitStreak, 1);
+  assert.deepEqual(Object.keys(state['acct-a'].byModel), ['fable'], 'no other model was touched');
 });
 
 test('markLimit: a second usage limit within the escalation window of the first -> the 5h escalated tier', () => {
@@ -143,16 +150,16 @@ test('markLimit: a second usage limit within the escalation window of the first 
   writePoolDir(dir, [{ name: 'acct-a' }]);
 
   const first = 0;
-  accounts.markLimit(dir, 'acct-a', 'usage', first);
+  accounts.markLimit(dir, 'acct-a', 'usage', first, { model: 'fable' });
 
   const second = first + accounts.ESCALATION_WINDOW_MS; // right at the edge, still "within"
-  const event = accounts.markLimit(dir, 'acct-a', 'usage', second);
+  const event = accounts.markLimit(dir, 'acct-a', 'usage', second, { model: 'fable' });
   assert.equal(event.escalated, true);
   assert.equal(event.cooldownMs, accounts.USAGE_ESCALATED_COOLDOWN_MS);
   assert.equal(event.cooldownUntil, second + accounts.USAGE_ESCALATED_COOLDOWN_MS);
 
   const state = accounts.readState(dir);
-  assert.equal(state['acct-a'].usageLimitStreak, 2);
+  assert.equal(state['acct-a'].byModel.fable.usageLimitStreak, 2);
 });
 
 test('markLimit: a second usage limit AFTER the escalation window has elapsed -> back to the 1h probe, not escalated', () => {
@@ -160,15 +167,15 @@ test('markLimit: a second usage limit AFTER the escalation window has elapsed ->
   writePoolDir(dir, [{ name: 'acct-a' }]);
 
   const first = 0;
-  accounts.markLimit(dir, 'acct-a', 'usage', first);
+  accounts.markLimit(dir, 'acct-a', 'usage', first, { model: 'fable' });
 
   const second = first + accounts.ESCALATION_WINDOW_MS + 1; // one ms outside the window
-  const event = accounts.markLimit(dir, 'acct-a', 'usage', second);
+  const event = accounts.markLimit(dir, 'acct-a', 'usage', second, { model: 'fable' });
   assert.equal(event.escalated, false);
   assert.equal(event.cooldownMs, accounts.USAGE_PROBE_COOLDOWN_MS);
 
   const state = accounts.readState(dir);
-  assert.equal(state['acct-a'].usageLimitStreak, 1, 'streak resets once the window has elapsed');
+  assert.equal(state['acct-a'].byModel.fable.usageLimitStreak, 1, 'streak resets once the window has elapsed');
 });
 
 test('markLimit: overloaded is always the flat 5-minute tier and never escalates, even on repeated hits', () => {
@@ -192,17 +199,17 @@ test('markLimit: an overloaded hit does not touch usage-escalation history, so t
   writePoolDir(dir, [{ name: 'acct-a' }]);
 
   const t0 = 0;
-  accounts.markLimit(dir, 'acct-a', 'usage', t0);
+  accounts.markLimit(dir, 'acct-a', 'usage', t0, { model: 'fable' });
 
   // An overloaded hit lands in between -- must not reset or advance the usage streak/timestamp.
-  accounts.markLimit(dir, 'acct-a', 'overloaded', t0 + 10);
+  accounts.markLimit(dir, 'acct-a', 'overloaded', t0 + 10, { model: 'fable' });
   let state = accounts.readState(dir);
-  assert.equal(state['acct-a'].lastUsageLimitAt, t0);
-  assert.equal(state['acct-a'].usageLimitStreak, 1);
+  assert.equal(state['acct-a'].byModel.fable.lastUsageLimitAt, t0);
+  assert.equal(state['acct-a'].byModel.fable.usageLimitStreak, 1);
 
   // A usage hit shortly after, still within the escalation window measured from t0, escalates.
   const t1 = t0 + accounts.ESCALATION_WINDOW_MS - 1;
-  const event = accounts.markLimit(dir, 'acct-a', 'usage', t1);
+  const event = accounts.markLimit(dir, 'acct-a', 'usage', t1, { model: 'fable' });
   assert.equal(event.escalated, true);
   assert.equal(event.cooldownMs, accounts.USAGE_ESCALATED_COOLDOWN_MS);
 });
@@ -326,7 +333,10 @@ test('markLimit: state.json is published by rename, from a tmp inside the pool d
   assert.equal(path.dirname(pub.from), poolDir, 'tmp must sit in the pool dir -- rename is only atomic within a filesystem');
   assert.equal(pub.to, path.join(poolDir, 'state.json'));
   assert.doesNotThrow(() => JSON.parse(pub.source), 'the tmp is already complete JSON before the rename');
-  assert.ok(JSON.parse(pub.source).pool1.cooldownUntil > 0);
+  // card #167: this call named no model, so the fail-safe cooled EVERY known model (see
+  // computeLimitUpdate) -- the pre-#167 whole-account behaviour, which is what keeps the
+  // `pick(poolDir) === 'pool2'` assertion below meaning what it always did.
+  assert.ok(JSON.parse(pub.source).pool1.byModel.fable.cooldownUntil > 0);
 
   // No litter, and the cooldown survives a re-read.
   const litter = fs.readdirSync(poolDir).filter((f) => f.includes('.tmp'));
@@ -408,14 +418,14 @@ test('markLimit: when the state lock cannot be acquired within its bound, it deg
   assert.ok(held, 'test setup: must actually hold the lock for this to prove anything');
 
   try {
-    const event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, { lockWaitMs: 0 });
+    const event = accounts.markLimit(dir, 'acct-a', 'usage', 1000, { lockWaitMs: 0, model: 'fable' });
     assert.equal(event.degraded, true, 'the lock was held by a live process the whole time -- this call must report it degraded');
     assert.equal(event.account, 'acct-a');
 
     // The update itself must still have landed -- "degrade, never fail" means the bookkeeping
     // still happens, just without the exclusivity guarantee.
     const state = accounts.readState(dir);
-    assert.equal(state['acct-a'].cooldownUntil, 1000 + accounts.USAGE_PROBE_COOLDOWN_MS);
+    assert.equal(state['acct-a'].byModel.fable.cooldownUntil, 1000 + accounts.USAGE_PROBE_COOLDOWN_MS);
   } finally {
     lock.releaseShortLock(accounts.stateLockPath(dir), held);
   }
@@ -459,7 +469,7 @@ test('markLimit under real concurrency: 4 processes marking 4 different accounts
   const children = names.map(
     (name) =>
       new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [MARK_LIMIT_ONCE_FIXTURE, dir, name, 'usage', barrier], { stdio: 'ignore' });
+        const child = spawn(process.execPath, [MARK_LIMIT_ONCE_FIXTURE, dir, name, 'usage', barrier, 'fable'], { stdio: 'ignore' });
         child.once('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${name}: exited ${code}`))));
         child.once('error', reject);
       })
@@ -471,7 +481,7 @@ test('markLimit under real concurrency: 4 processes marking 4 different accounts
   const state = accounts.readState(dir);
   for (const name of names) {
     assert.ok(state[name], `${name}'s cooldown entry must survive concurrent markLimit calls from other processes -- got ${JSON.stringify(Object.keys(state))}`);
-    assert.ok(state[name].cooldownUntil > 0);
+    assert.ok(state[name].byModel.fable.cooldownUntil > 0, 'card #167: the cooldown lands under the model each child named');
   }
 });
 

@@ -258,14 +258,18 @@ test('spo status: an expired cooldown renders as none, a live one renders with t
   fs.writeFileSync(
     path.join(accountsDir, 'state.json'),
     JSON.stringify({
-      pool1: { cooldownUntil: now - 60 * 60 * 1000, lastUsageLimitAt: now - 2 * 60 * 60 * 1000, usageLimitStreak: 1 }, // expired
-      pool2: { cooldownUntil: now + 2 * 60 * 60 * 1000 + 30 * 1000 }, // live, ~2h remaining
+      // card #167: per (account, model). pool1's fable cooldown has expired; pool2's is live.
+      pool1: { byModel: { fable: { cooldownUntil: now - 60 * 60 * 1000, lastUsageLimitAt: now - 2 * 60 * 60 * 1000, usageLimitStreak: 1 } } }, // expired
+      pool2: { byModel: { fable: { cooldownUntil: now + 2 * 60 * 60 * 1000 + 30 * 1000 } } }, // live, ~2h remaining
     })
   );
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir, '--accounts-dir', accountsDir]);
   assert.match(out, /account pool1\s+enabled=true\s+cooldown=none/);
-  assert.match(out, /account pool2\s+enabled=true\s+cooldown=cooling, 2h0\dm remaining/);
+  // card #167: the line names the MODEL(S) cooling. "cooling, 2h remaining" alone would read as
+  // a whole-account outage, which is exactly the misreport this card removes -- pool2's sonnet
+  // and opus quotas are untouched.
+  assert.match(out, /account pool2\s+enabled=true\s+cooldown=cooling fable, 2h0\dm remaining/);
 });
 
 // ---- D: today's spend ---------------------------------------------------------------------------

@@ -997,8 +997,17 @@ function createDispatcher(queueDir, journalRoot, config) {
       const registry = accounts.readRegistry(accountsDir);
       const state = accounts.readState(accountsDir);
       enabledAccounts = registry.filter((a) => a.enabled).map((a) => a.name);
+      // card #167: an account's cooldown is per (account, model) now, so "when does this account
+      // become usable again" is the LAST of its active per-model cooldowns -- which is precisely
+      // accounts.activeCooldownUntil's union answer, the same one the bare countHealthyAccounts
+      // call above uses to decide `healthy`. Asking accounts.js rather than reaching into the
+      // entry keeps this number and the clamp it explains derived from ONE definition; a second
+      // local derivation is how the two would drift into reporting an expiry that does not match
+      // when the clamp actually lifts. Across accounts the EARLIEST of those is when `healthy`
+      // first rises above zero, which is the question a maintainer reading this line is asking.
+      const now = Date.now();
       for (const name of enabledAccounts) {
-        const until = state[name] && state[name].cooldownUntil;
+        const until = accounts.activeCooldownUntil(state[name], undefined, now);
         if (until && (earliestCooldownUntil === null || until < earliestCooldownUntil)) earliestCooldownUntil = until;
       }
     } catch {
@@ -1020,6 +1029,16 @@ function createDispatcher(queueDir, journalRoot, config) {
   function fillSlots() {
     if (stopReason) return;
     for (;;) {
+      // card #167 made cooldowns per (account, model) and gave countHealthyAccounts an optional
+      // `model` argument. This call stays BARE on purpose -- it is a scope boundary, not an
+      // oversight. A worker SLOT is not bound to one model at spawn time: the card that fills it
+      // runs INTAKE -> WORKTREE (no model at all) -> PLAN (claude-opus-5-5, fable on fallback) ->
+      // IMPLEMENT (claude-opus-5-5) -> VALIDATE (fable) over its lifetime, so "the requested model" has no single answer at the moment K
+      // is computed. The bare (union) count -- "accounts not cooling on anything" -- is the honest
+      // one for a budget that has to cover every step the slot will run, and the per-model
+      // question is asked where it can actually be answered: account-lease.js, once per LLM call,
+      // with that call's own model in hand. K is a concurrency budget, not a per-step admission
+      // test, and nothing downstream of this line consults it again.
       const healthy = accounts.countHealthyAccounts(accountsDir);
       const k = Math.min(resolveWorkerCount(config), Math.max(healthy, 0));
 

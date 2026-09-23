@@ -986,6 +986,20 @@ function renderSystemFragment(system) {
 
 // Per-account token detail lives in the Tokens section's "by account" table (renderTokensBreakdownInner)
 // -- NOT duplicated here as a nested subtable, to avoid showing the same numbers twice.
+// card #167: WHICH models a cooling account is cooling on, appended to the "cooling until" cell
+// as " (fable)" / " (fable, opus)". The timestamp alone used to be the whole story because a
+// cooldown took the whole account down; now that the quota is modelled per (account, model), a
+// row saying only "cooling until 14:20" cannot distinguish a fable-only cooldown -- which leaves
+// IMPLEMENT's Opus 5.5 capacity fully available -- from a real whole-account outage. APPENDED
+// rather than given its own column: the ISO timestamp stays the cell's leading text (what the
+// dashboard test matches on), and the accounts table already carries seven columns.
+// Empty when the collector supplied no list (a snapshot written before this field existed):
+// missing detail must degrade to the old rendering, never to "(undefined)".
+function coolingModelsNote(a) {
+  const models = Array.isArray(a.coolingModels) ? a.coolingModels : [];
+  return models.length === 0 ? '' : ` (${escapeHtml(models.join(', '))})`;
+}
+
 function renderAccountsInner(accounts, tokens) {
   const rows = (accounts && accounts.rows) || [];
   if (rows.length === 0) {
@@ -999,7 +1013,7 @@ function renderAccountsInner(accounts, tokens) {
       <td>${a.email ? escapeHtml(a.email) : '—'}</td>
       <td>${a.plan ? escapeHtml(a.plan) : '—'}</td>
       <td>${a.enabled ? 'yes' : 'no'}</td>
-      <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) : '—'}</td>
+      <td>${a.cooldownUntil ? escapeHtml(a.cooldownUntil) + coolingModelsNote(a) : '—'}</td>
       <td>${a.hasToken ? 'yes' : 'no'}</td>
       <td>${a.hasCredentials ? 'yes' : 'no'}</td>
     </tr>`

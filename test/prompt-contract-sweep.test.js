@@ -423,20 +423,28 @@ function objectLiteralKeys(spanText) {
   return keys;
 }
 
-// An intake call site names its model either as a string literal (`model: 'sonnet'`) or, since
-// 2026-09-23, as a constant exported by step-contracts.js (`model: OPUS_5_5`). The constant is
-// resolved against that module's REAL export, never guessed from its name, and an identifier the
-// module does not export (or exports as a non-string) throws rather than being skipped.
+// An intake call site names its model either as a string literal (`model: 'sonnet'`), as a
+// constant exported by step-contracts.js (`model: OPUS_5_5`, 2026-09-23), or -- card #167 -- as a
+// member of one exported by it (`model: INTAKE_MODELS.draftCard`, the one constant intake.js
+// reads for both the call's opts and its lease/markLimit, so the two cannot drift). The constant
+// is resolved against that module's REAL export, never guessed from its name, and an identifier
+// (or member) the module does not export as a string throws rather than being skipped -- so this
+// sweep keeps checking the value that actually reaches the query() argv, not the spelling of the
+// thing that holds it.
 function intakeModelFromSlice(slice, name, exportsModule = STEP_CONTRACTS_MODULE) {
-  const modelMatch = slice.match(/\bmodel:\s*(?:'([^']*)'|([A-Za-z_$][A-Za-z0-9_$]*)\b)/);
+  const modelMatch = slice.match(
+    /\bmodel:\s*(?:'([^']*)'|([A-Za-z_$][A-Za-z0-9_$]*)(?:\.([A-Za-z_$][A-Za-z0-9_$]*))?\b)/
+  );
   if (!modelMatch) {
     throw new Error(`prompt-contract-sweep: no model found for intake step ${name}`);
   }
   if (modelMatch[1] !== undefined) return modelMatch[1];
-  const resolved = exportsModule[modelMatch[2]];
+  const head = exportsModule[modelMatch[2]];
+  const resolved = modelMatch[3] !== undefined ? head && head[modelMatch[3]] : head;
+  const spelled = modelMatch[3] !== undefined ? `${modelMatch[2]}.${modelMatch[3]}` : modelMatch[2];
   if (typeof resolved !== 'string' || !resolved) {
     throw new Error(
-      `prompt-contract-sweep: intake step ${name} names model ${modelMatch[2]}, which step-contracts.js does not export as a string`
+      `prompt-contract-sweep: intake step ${name} names model ${spelled}, which step-contracts.js does not export as a string`
     );
   }
   return resolved;
@@ -997,6 +1005,12 @@ test('intakeModelFromSlice: a string literal, a real step-contracts export, and 
   assert.equal(intakeModelFromSlice("{ model: 'sonnet', effort: 'medium' }", 'X'), 'sonnet');
   assert.equal(intakeModelFromSlice('{ model: OPUS_5_5, effort: \'medium\' }', 'X'), 'claude-opus-5-5');
   assert.throws(() => intakeModelFromSlice('{ model: NOT_AN_EXPORT }', 'X'), /does not export as a string/);
+  // card #167: a member of an exported constant resolves through the real export too, and a
+  // member it lacks -- or the bare object itself -- throws instead of reading as a model.
+  assert.equal(intakeModelFromSlice('{ model: INTAKE_MODELS.draftCard, effort: \'medium\' }', 'X'), 'sonnet');
+  assert.equal(intakeModelFromSlice('{ model: INTAKE_MODELS.triageBugReport }', 'X'), 'claude-opus-5-5');
+  assert.throws(() => intakeModelFromSlice('{ model: INTAKE_MODELS.nope }', 'X'), /INTAKE_MODELS\.nope.*does not export as a string/);
+  assert.throws(() => intakeModelFromSlice('{ model: INTAKE_MODELS, effort: 1 }', 'X'), /does not export as a string/);
   assert.throws(() => intakeModelFromSlice('{ effort: \'medium\' }', 'X'), /no model found/);
 });
 

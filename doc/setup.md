@@ -36,10 +36,13 @@ cd ~/SPO-Pipeline && bin/spo account add pool1
   `state.json` entry, not just `cooldownUntil` — `lastUsageLimitAt` and `usageLimitStreak` go
   with it (`accounts.js`'s `clearCooldown`), which matters: leaving `lastUsageLimitAt` behind
   keeps the escalation window armed, so the next limit inside it jumps straight to the 5h tier
-  as though nothing had been cleared. The cooldown itself is invented locally and never
-  re-checked against the server (#483), so an account can read as cooling while its dashboard
-  shows headroom -- most often because the quota is per *model* and the cooldown is per
-  *account*.
+  as though nothing had been cleared. It takes no `--model` flag: it clears every model at once
+  (card #167 -- "fully reset this account" is the documented UX, and the printed report names
+  which models were on record and which were still cooling). The cooldown itself is invented
+  locally and never re-checked against the server (#483), so an account can still read as cooling
+  while its dashboard shows headroom. One long-standing cause of that is now gone: the quota is
+  per *model*, and since card #167 the cooldown is too, so a Fable limit no longer shows the
+  account as unusable for Sonnet and Opus work it could still do.
 - Verify an account end to end (one real call, ~$0.02):
 
 ```bash

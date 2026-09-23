@@ -187,7 +187,12 @@ function extractIntakeStepPolicy(stepLabel, source = INTAKE_JS_SOURCE) {
   const anchor = `step: '${stepLabel}'`;
   const anchorIdx = source.indexOf(anchor);
   assert.notEqual(anchorIdx, -1, `orchestrator/intake.js: could not find ${anchor}`);
-  const window = source.slice(anchorIdx, anchorIdx + 400);
+  // 600, not 400 (card #167 port, 2026-09-23): TRIAGE_BUG_REPORT's `model:` became
+  // `INTAKE_MODELS.triageBugReport` (+21 chars over `OPUS_5_5`), which pushed its `permissionMode`
+  // -- already behind card #240's two-line comment -- past the old 400-char window. Each intake
+  // call site is hundreds of lines from the next, so 600 still cannot reach a different step's
+  // object literal.
+  const window = source.slice(anchorIdx, anchorIdx + 600);
   const allowedToolsMatch = window.match(/allowedTools:\s*(\[[^\]]*\])/);
   const permissionModeMatch = window.match(/permissionMode:\s*'([^']*)'/);
   assert.ok(allowedToolsMatch, `orchestrator/intake.js: no allowedTools found near ${anchor}`);

@@ -37,6 +37,23 @@ const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 // 5 -- registered as EXP-IMPLEMENT-OPUS-5-5 in doc/model-experiments.md.
 const OPUS_5_5 = 'claude-opus-5-5';
 
+// INTAKE_MODELS -- card #167: the model each of intake.js's three LLM steps spends, one constant
+// per step. Unlike the pipeline steps below (task-shaped, resolved by resolveStepContract), each is
+// a fixed value -- but it is needed in TWO places, the `invokeClaudeReal` opts the step builds and
+// the lease/markLimit calls in intake.js's callIntakeStepWithRotation, and two literals is one
+// drift away from leasing for one model while cooling another. It lives HERE rather than in
+// intake.js because accounts.js's KNOWN_MODELS (markLimit's no-model fail-safe, "cool every model
+// this pool can spend") must see it: intake.js requires accounts.js, so accounts.js cannot require
+// intake.js back, and step-contracts.js is already the module that vocabulary is derived from.
+// Since IMPLEMENT moved to OPUS_5_5 (2026-09-23) DRAFT_CARD is the only `sonnet` spender, so a
+// KNOWN_MODELS derived from STEP_CONTRACTS alone no longer contains `sonnet` -- a no-model limit
+// would then leave draftCard's quota hot. intake.js re-exports this same object (test/accounts-per-model-cooldown.test.js).
+const INTAKE_MODELS = Object.freeze({
+  draftCard: 'sonnet',
+  reviewCard: 'fable',
+  triageBugReport: OPUS_5_5, // was the `opus` alias (= claude-opus-5) until 2026-09-23
+});
+
 // ---- outputContract types (card #207) --------------------------------------------------------
 //
 // Every outputContract below was `{ required: [...] }` (PLAN also carries `optional`) with no
@@ -967,11 +984,22 @@ const STEP_CONTRACTS = {
     // least Fable's equal as a JUDGE on this project -- that finding was taken on the one step
     // where it was examined and never propagated to the four steps that judge.
     //
-    // AVAILABILITY. Four of five steps defaulted to Fable, and accounts.markLimit keys its cooldown
-    // by ACCOUNT, not by model -- so a Fable-only usage limit takes the whole account out for every
-    // model, Sonnet IMPLEMENT included. That has stalled the pool twice: 12.8h on 2026-08-30/31 (53
-    // cycles, 128 attempts) and again on 2026-09-04 with every account at 100% Fable quota. DIAGNOSE
-    // is the cheapest step to take off that single point of failure.
+    // AVAILABILITY. Four of five steps defaulted to Fable, and (as of this move, 2026-09-04)
+    // accounts.markLimit keyed its cooldown by ACCOUNT, not by model -- so a Fable-only usage limit
+    // took the whole account out for every model, Sonnet IMPLEMENT included. That has stalled the
+    // pool twice: 12.8h on 2026-08-30/31 (53 cycles, 128 attempts) and again on 2026-09-04 with
+    // every account at 100% Fable quota. DIAGNOSE is the cheapest step to take off that single
+    // point of failure.
+    //
+    // ERRATUM, card #167 (2026-09-22): that cooldown is now keyed by (account, MODEL), so the
+    // mechanism as stated above is no longer live -- a Fable limit cools Fable alone and leaves
+    // IMPLEMENT (Opus 5.5 since 2026-09-23) untouched. The AVAILABILITY reason is NOT thereby void, but it is narrower
+    // than it reads: what remains is CONCENTRATION. Four of five steps on one model means one
+    // pool-WIDE Fable exhaustion (the 2026-09-04 shape: every account at 100% Fable quota) still
+    // stalls all four at once, and no cooldown granularity can help with that -- it is a model-
+    // fallback question, SPO-Pipeline#166. The 2026-08-30/31 and 2026-09-04 incidents are both
+    // still real; only the "takes the whole account out for every model" half of the explanation
+    // has been retired.
     //
     // NOT because Fable was diagnosing badly. Post-C1 the corpus shows 8/8 DIAGNOSE calls succeeded
     // and ZERO diagnose-* parks across 10 cards -- every card that entered a DIAGNOSE->IMPLEMENT
@@ -1325,6 +1353,8 @@ module.exports = {
   shouldEscalate,
   escalationSignalFires,
   OPUS_5_5,
+  // card #167 -- see its own comment above; read by intake.js and accounts.js's KNOWN_MODELS.
+  INTAKE_MODELS,
   resolveStepContract,
   // Card #207: exported for llm.js's reply check (checkOutputTypes) and for the table-driven
   // type-checker tests in test/step-contracts.test.js (valueSatisfiesType, jsonSchemaPropertiesFor).
