@@ -87,6 +87,16 @@ test('card #167 pick(): with NO model, the legacy union answer is preserved -- c
   accounts.writeState(dir, {
     'acct-a': { byModel: { fable: { cooldownUntil: now + 1000 }, opus: { cooldownUntil: now + HOUR } } },
   });
+  // Probed at now+500, while BOTH cooldowns are still active, so min and max differ there: the
+  // union's answer (and the park reason naming when to retry) must be the LATER of the two. At
+  // now+2000 fable has already expired and min == max, which cannot tell the two apart.
+  assert.throws(
+    () => accounts.pick(dir, now + 500),
+    (err) =>
+      err instanceof accounts.AllAccountsCoolingError &&
+      err.reason === `all-accounts-cooling-until-${new Date(now + HOUR).toISOString()}`
+  );
+  assert.equal(accounts.activeCooldownUntil(accounts.readState(dir)['acct-a'], undefined, now + 500), now + HOUR);
   assert.throws(() => accounts.pick(dir, now + 2000), accounts.AllAccountsCoolingError);
   assert.equal(accounts.pick(dir, now + HOUR + 1).name, 'acct-a');
   // The per-model question, asked at the same instant, answers independently of that union.
@@ -255,6 +265,29 @@ test('card #167 clearCooldown(): clears EVERY model, and reports which ones were
   assert.deepEqual(result.clearedModels, ['fable', 'opus'], 'every model on record is cleared -- no --model flag, by decision');
   assert.deepEqual(result.coolingModels, ['fable'], 'only fable was actually cooling at clear time');
   assert.equal(accounts.readState(dir)['acct-a'], undefined);
+});
+
+test('card #167 clearCooldown(): escalationWasArmed is true when ANY model is armed -- including one that is not iterated last', () => {
+  // clearCooldown walks the models in sorted order (['fable', 'opus'] here). The armed record is
+  // fable, deliberately FIRST: a computation that only looked at the last model it visited -- or
+  // let a later, unarmed model overwrite the flag -- would read opus's stale history and say
+  // "not armed", telling the maintainer the clear discarded nothing when it discarded a live
+  // escalation streak.
+  const dir = poolWith('spo-167-clear-armed-', ['acct-a']);
+  const t0 = Date.now();
+  accounts.writeState(dir, {
+    'acct-a': {
+      byModel: {
+        fable: { cooldownUntil: t0 + HOUR, lastUsageLimitAt: t0 - 1000, usageLimitStreak: 2 },
+        opus: { cooldownUntil: t0 - 10 * HOUR, lastUsageLimitAt: t0 - 10 * HOUR, usageLimitStreak: 1 },
+      },
+    },
+  });
+
+  const result = accounts.clearCooldown(dir, 'acct-a', t0);
+  assert.deepEqual(result.clearedModels, ['fable', 'opus'], 'test premise: the armed model is not the last one visited');
+  assert.ok(10 * HOUR > accounts.ESCALATION_WINDOW_MS, 'test premise: opus\'s history is outside the escalation window');
+  assert.equal(result.escalationWasArmed, true, 'fable was armed 1s ago -- an armed model anywhere in the entry arms the clear');
 });
 
 test('card #167 clearCooldown(): a legacy pre-#167 flat entry is cleared without throwing', () => {

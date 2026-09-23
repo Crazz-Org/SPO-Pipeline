@@ -990,7 +990,7 @@ function renderSystemFragment(system) {
 // as " (fable)" / " (fable, opus)". The timestamp alone used to be the whole story because a
 // cooldown took the whole account down; now that the quota is modelled per (account, model), a
 // row saying only "cooling until 14:20" cannot distinguish a fable-only cooldown -- which leaves
-// IMPLEMENT's sonnet capacity fully available -- from a real whole-account outage. APPENDED
+// IMPLEMENT's Opus 5.5 capacity fully available -- from a real whole-account outage. APPENDED
 // rather than given its own column: the ISO timestamp stays the cell's leading text (what the
 // dashboard test matches on), and the accounts table already carries seven columns.
 // Empty when the collector supplied no list (a snapshot written before this field existed):

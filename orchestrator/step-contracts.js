@@ -993,7 +993,7 @@ const STEP_CONTRACTS = {
     //
     // ERRATUM, card #167 (2026-09-22): that cooldown is now keyed by (account, MODEL), so the
     // mechanism as stated above is no longer live -- a Fable limit cools Fable alone and leaves
-    // Sonnet IMPLEMENT untouched. The AVAILABILITY reason is NOT thereby void, but it is narrower
+    // IMPLEMENT (Opus 5.5 since 2026-09-23) untouched. The AVAILABILITY reason is NOT thereby void, but it is narrower
     // than it reads: what remains is CONCENTRATION. Four of five steps on one model means one
     // pool-WIDE Fable exhaustion (the 2026-09-04 shape: every account at 100% Fable quota) still
     // stalls all four at once, and no cooldown granularity can help with that -- it is a model-

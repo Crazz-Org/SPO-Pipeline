@@ -127,8 +127,9 @@ test("markLimit: first usage limit for an account -> the 1h probe, not the 5h es
 
   const now = 5000;
   // card #167: the model is named, so the cooldown and its escalation history land under
-  // byModel.fable -- the real production shape (state-machine.js resolves it from the step
-  // contract, intake.js from its own constant). The tiers themselves are unchanged.
+  // byModel.fable -- the real production shape (state-machine.js through steps/llm.js's
+  // resolveCallModel, intake.js from step-contracts.js's INTAKE_MODELS). The tiers themselves are
+  // unchanged.
   const event = accounts.markLimit(dir, 'acct-a', 'usage', now, { model: 'fable' });
   assert.equal(event.limitKind, 'usage');
   assert.equal(event.model, 'fable');

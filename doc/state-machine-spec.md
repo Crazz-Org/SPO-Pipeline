@@ -763,7 +763,8 @@ separate repos with no shared runtime.
   mid-cycle (one of this dispatcher's own workers just hit a limit) is reflected on the very next
   spawn decision. That call is deliberately **bare** — the union count, not a per-model one
   (card #167). A worker slot is not bound to one model at spawn time: the card that fills it runs
-  INTAKE → WORKTREE (no model) → PLAN (opus) → IMPLEMENT (sonnet) → VALIDATE (fable) over its
+  INTAKE → WORKTREE (no model) → PLAN (`claude-opus-5-5`, Fable on fallback) → IMPLEMENT
+  (`claude-opus-5-5`) → VALIDATE (fable) over its
   life, so "the requested model" has no single answer there. The per-model question is asked
   where it can be answered — `account-lease.js`, once per LLM call, with that call's model in
   hand. A clamp to zero healthy accounts is journalled

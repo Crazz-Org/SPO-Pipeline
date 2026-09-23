@@ -1323,7 +1323,7 @@ function cmdAccounts(opts) {
     // card #167: a cooldown belongs to a (account, model) pair, so the column names the MODEL(S)
     // -- `cooldownUntil=fable:2026-...Z` -- instead of a bare timestamp that reads as "this
     // account is gone". That distinction is the whole point of the card: on the real pool every
-    // limit ever observed was on Fable, and a fable-only cooldown leaves IMPLEMENT's Sonnet
+    // limit ever observed was on Fable, and a fable-only cooldown leaves IMPLEMENT's Opus 5.5
     // capacity on that same account fully usable. Printing the timestamp alone would have the CLI
     // assert the defect this card removed. Not cooling on anything still prints exactly `-`, the
     // same token as before, so "is anything wrong here" stays a one-glance question.

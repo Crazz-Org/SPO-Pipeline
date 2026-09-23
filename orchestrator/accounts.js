@@ -399,7 +399,7 @@ function byModelOf(entry) {
 //
 //   `model` a string  -- exactly that model's own cooldownUntil. Cooling on a DIFFERENT model is
 //                        invisible here, which is the whole point of card #167: a Fable limit
-//                        must not remove this account's Sonnet (IMPLEMENT) capacity.
+//                        must not remove this account's Opus 5.5 (IMPLEMENT) capacity.
 //   `model` omitted   -- the UNION: the account counts as cooling while ANY model's cooldown is
 //     (or null)        still in the future, so it becomes healthy again only once the LAST of
 //                      them expires -- hence `max`, not `min`. That is the honest answer to the
@@ -468,8 +468,10 @@ function coolingSummary(entry, now = Date.now()) {
 // which is why healthyCount is tracked independently of the early return below rather than
 // inferred from whether the loop reached the end.
 //
-// card #167: `opts.model` (optional, one of step-contracts.js's baseModel/escalatedModel strings)
-// scopes the cooldown filter to the model the caller is about to actually spend -- an account
+// card #167: `opts.model` (optional: the model the caller's call will send -- a step contract's
+// baseModel/escalatedModel, a step-contracts.js INTAKE_MODELS entry, or a legacy
+// ctx.task.llm.<step> override's own model) scopes the cooldown filter to the model the caller is
+// about to actually spend -- an account
 // cooling on 'fable' is still returned for a 'sonnet' request. OMITTING it keeps the union
 // behaviour byte-for-byte (see activeCooldownUntil): bin/spo and every pre-#167 test call this
 // bare and must keep getting "is this account cooling at all". Deliberately additive in the same
@@ -543,8 +545,8 @@ function pick(poolDir, now = Date.now(), opts = {}) {
 //
 // SCOPE BOUNDARY, deliberate: dispatcher.js's fillSlots still calls this BARE (no model), and
 // that is not an oversight -- see the comment at that call site. A worker slot is not bound to
-// one model at spawn time (a card runs INTAKE -> WORKTREE -> PLAN/opus -> IMPLEMENT/sonnet ->
-// VALIDATE/fable over its life), so "the requested model" has no single answer there; the bare
+// one model at spawn time (a card runs INTAKE -> WORKTREE -> PLAN/claude-opus-5-5 (fable on
+// fallback) -> IMPLEMENT/claude-opus-5-5 -> VALIDATE/fable over its life), so "the requested model" has no single answer there; the bare
 // union count is the honest one. The capability lives here, tested here, for the callers that DO
 // have one model in hand.
 function countHealthyAccounts(poolDir, now = Date.now(), model = undefined) {
@@ -600,8 +602,9 @@ function countHealthyAccounts(poolDir, now = Date.now(), model = undefined) {
 // {nextState, event}; never touches disk itself.
 // card #167: `model` names WHICH model hit the limit, and the cooldown lands under
 // `byModel[model]` -- the escalation history (lastUsageLimitAt/usageLimitStreak) is per-model too,
-// because the quota it models is. Real callers always name it (state-machine.js resolves it from
-// the step contract, intake.js passes each function's own hardcoded literal).
+// because the quota it models is. Real callers always name it (state-machine.js's callLlmStep
+// through steps/llm.js's resolveCallModel -- a legacy ctx.task.llm.<step> override's model, else
+// the step contract's -- and intake.js from step-contracts.js's INTAKE_MODELS entry for the step).
 //
 // WHEN NO MODEL IS NAMED this cools EVERY model in KNOWN_MODELS -- i.e. exactly the pre-#167
 // whole-account behaviour. That is the fail-safe direction on purpose: the alternative (cool
@@ -726,8 +729,9 @@ function sleepSyncMs(ms) {
 // `opts.model` (card #167) -- WHICH model hit the limit, so the cooldown lands on that model's
 // quota alone instead of taking the account's other models down with it. See computeLimitUpdate
 // above for the semantics, including what happens when it is omitted (cool every known model --
-// the pre-#167 behaviour, kept as the fail-safe). Real callers resolve it from the step contract
-// (state-machine.js) or pass their own hardcoded literal (intake.js) -- never guess it from
+// the pre-#167 behaviour, kept as the fail-safe). Real callers resolve it the way the call itself
+// does -- state-machine.js through steps/llm.js's resolveCallModel (override model, else step
+// contract), intake.js from step-contracts.js's INTAKE_MODELS -- never guess it from
 // `limitKind`, which says what KIND of limit fired, not which quota it was drawn against.
 //
 // `defaulted` means exactly what R2 (F2) needed it to mean again: no *recognised* limitKind

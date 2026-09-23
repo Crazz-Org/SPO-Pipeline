@@ -735,13 +735,23 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
   // One enabled account, cooling until a known instant -> countHealthyAccounts returns 0.
   const poolDir = mkTmp('spo-disp-accts-');
   writePoolDir(poolDir, [{ name: 'acct0' }]);
-  const coolUntil = Date.now() + 60_000;
   // card #167: cooldowns are per (account, model); acct0 is cooling on EVERY model here, which
   // is what makes countHealthyAccounts' bare (union) count fall to zero. The dispatcher's clamp
   // deliberately asks the union question -- see its own comment at the countHealthyAccounts call.
+  //
+  // DISTINCT expiries per model, on purpose. poolIdleDetail reports, per account,
+  // accounts.activeCooldownUntil's union answer -- the LATEST active per-model cooldown, i.e. when
+  // this account is usable for every model again and the bare count stops excluding it -- then the
+  // earliest of those across accounts. With one shared expiry every per-model reading agrees and
+  // a mutation reading only one model (or the earliest one) would pass. The latest sits on
+  // neither `fable` nor the last key in iteration order, so neither shortcut can land on it.
+  const base = Date.now();
+  const expiries = { 'claude-opus-5-5': base + 60_000, fable: base + 20_000, sonnet: base + 40_000 };
+  assert.deepEqual(Object.keys(expiries).sort(), [...accounts.KNOWN_MODELS].sort(), 'test premise: every known model is cooling');
+  const coolUntil = Math.max(...Object.values(expiries));
   fs.writeFileSync(
     path.join(poolDir, 'state.json'),
-    JSON.stringify({ acct0: { byModel: Object.fromEntries(accounts.KNOWN_MODELS.map((m) => [m, { cooldownUntil: coolUntil }])) } })
+    JSON.stringify({ acct0: { byModel: Object.fromEntries(Object.entries(expiries).map(([m, until]) => [m, { cooldownUntil: until }])) } })
   );
 
   const config = baseConfig({
@@ -759,7 +769,7 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
     assert.equal(
       idle.earliestCooldownUntil,
       new Date(coolUntil).toISOString(),
-      'a maintainer needs to know WHEN this resolves by itself -- the pre-C6 park said so and this must too'
+      'a maintainer needs to know WHEN this resolves by itself -- the LATEST of acct0\'s per-model cooldowns, when the bare count stops excluding it'
     );
     assert.deepEqual(idle.enabledAccounts, ['acct0']);
 
@@ -783,6 +793,50 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
     const back = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-healthy-accounts-returned');
     assert.equal(back.healthy, 1);
     await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'idle-a'));
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// card #167 SCOPE BOUNDARY, pinned: the K-clamp counts accounts BARE -- "not cooling on ANY
+// model" -- never per model (dispatcher.js's own comment at the countHealthyAccounts call: a
+// worker slot runs PLAN/IMPLEMENT on claude-opus-5-5 and VALIDATE on fable over one card's life,
+// so no single model answers "is this slot's budget healthy"). A sole account cooling on fable
+// ALONE must therefore clamp K to 0, even though it is perfectly healthy for claude-opus-5-5.
+test('card #167: a sole account cooling on fable ONLY still clamps K to zero -- the clamp asks the union question', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-i.json', { id: 'idle-fable', kind: 'synthetic' });
+
+  const poolDir = mkTmp('spo-disp-accts-');
+  writePoolDir(poolDir, [{ name: 'acct0' }]);
+  const coolUntil = Date.now() + 60_000;
+  accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: coolUntil } } } });
+  assert.equal(accounts.countHealthyAccounts(poolDir, Date.now(), 'claude-opus-5-5'), 1, 'test premise: healthy for Opus 5.5');
+  assert.equal(accounts.countHealthyAccounts(poolDir), 0, 'test premise: cooling under the union question');
+
+  const config = baseConfig({
+    claudeAccountsDir: poolDir,
+    deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn },
+  });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => {
+      const ev = readDaemonEvents(journalDir);
+      return ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts') || ev.some((e) => e.event === 'worker-spawn');
+    });
+    const events = readDaemonEvents(journalDir);
+    assert.equal(
+      events.some((e) => e.event === 'worker-spawn'),
+      false,
+      'a fable-only cooldown must still clamp K to 0 -- the clamp is not a per-model admission test'
+    );
+    const idle = events.find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+    assert.ok(idle, 'the zero clamp is journalled');
+    assert.equal(idle.healthy, 0);
+    assert.equal(idle.earliestCooldownUntil, new Date(coolUntil).toISOString());
   } finally {
     dispatcher.stop();
     await runPromise;
